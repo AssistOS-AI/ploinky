@@ -13,6 +13,12 @@ import {
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
 } from '../../cli/sandbox/bwrap/bwrapServiceManager.js';
+import { BWRAP_HOME_SOURCE_KINDS } from '../../Agent/lib/providerSandbox.mjs';
+
+const sandboxHomeSource = (homeKey = 'ploinky_demo_01234567.sandbox-v2') => ({
+    sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+    homeKey,
+});
 
 function tempDir(prefix = 'bwrap-args-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -38,7 +44,7 @@ function hasBind(args, source, target = source) {
 
 test('trusted service launch uses the fd launcher and fixed clean-HOME policy', () => {
     const launch = buildTrustedServiceLaunch({
-        runtimeKey: 'ploinky_demo_01234567',
+        homeSource: sandboxHomeSource(),
         command: ['node', '/Agent/server/AgentServer.mjs'],
         nodeRuntimePath: '/opt/ploinky',
         agentRuntimePath: '/workspace/.ploinky/deps/bwrap-runtime/demo/Agent',
@@ -57,7 +63,7 @@ test('trusted service launch uses the fd launcher and fixed clean-HOME policy', 
 
     assert.equal(BWRAP_HELPER_PATH, '/usr/local/libexec/ploinky-bwrap-launch');
     assert.equal(launch.helperPath, BWRAP_HELPER_PATH);
-    assert.equal(launch.descriptor.subarray(0, 8).toString('ascii'), 'PLBWLP01');
+    assert.equal(launch.descriptor.subarray(0, 8).toString('ascii'), 'PLBWLP02');
     assert.equal(launch.env.HOME, '/home/agent');
     assert.equal(launch.env.PORT, '17000');
     assert.equal(launch.env.PLOINKY_RUNTIME, 'bwrap');
@@ -72,7 +78,11 @@ test('trusted service launch uses the fd launcher and fixed clean-HOME policy', 
 
     const mounts = launch.records.filter((record) => record.type !== 'ARG');
     assert.ok(mounts.some((record) => record.type === 'WORKSPACE' && record.mode === 'rw'));
-    assert.ok(mounts.some((record) => record.type === 'HOME' && record.runtimeKey === 'ploinky_demo_01234567'));
+    assert.ok(mounts.some((record) => (
+        record.type === 'HOME'
+        && record.sourceKind === BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2
+        && record.homeKey === 'ploinky_demo_01234567.sandbox-v2'
+    )));
     assert.ok(mounts.some((record) => record.type === 'RO_PATH' && record.target === '/opt/ploinky-node'));
     assert.ok(mounts.some((record) => record.type === 'RO_PATH' && record.target === '/Agent'));
     assert.ok(mounts.some((record) => record.type === 'RO_PATH' && record.target === '/code'));
@@ -87,7 +97,7 @@ test('trusted service launch uses the fd launcher and fixed clean-HOME policy', 
 
 test('trusted service launch emits the fixed 0400 pipe-fed credential data mount', () => {
     const launch = buildTrustedServiceLaunch({
-        runtimeKey: 'ploinky_demo_01234567',
+        homeSource: sandboxHomeSource(),
         command: ['node', '/Agent/server/AgentServer.mjs'],
         nodeRuntimePath: '/opt/ploinky',
         agentRuntimePath: '/workspace/.ploinky/deps/bwrap-runtime/demo/Agent',
@@ -117,6 +127,26 @@ test('trusted service launch emits the fixed 0400 pipe-fed credential data mount
     assert.equal(args.filter((value) => value === '--ro-bind-data').length, 1);
 });
 
+test('trusted service launch refuses an unsuffixed container HOME key', () => {
+    assert.throws(() => buildTrustedServiceLaunch({
+        homeSource: sandboxHomeSource('ploinky_demo_01234567'),
+        command: ['node', '/Agent/server/AgentServer.mjs'],
+        nodeRuntimePath: '/opt/ploinky',
+        agentRuntimePath: '/workspace/.ploinky/deps/bwrap-runtime/demo/Agent',
+        codePath: '/workspace/.ploinky/repos/repo/demo',
+        codeDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        agentDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        identity: {
+            principalId: 'agent:repo/demo',
+            instanceId: 'ploinky_demo_01234567',
+            enableGeneration: 'generation:1',
+        },
+        agentName: 'demo',
+        repoName: 'repo',
+        listenPort: 17000,
+    }), (error) => error?.code === 'PLOINKY_HOME_STATE_INCOMPATIBLE');
+});
+
 test('long-lived bwrap service has no raw bwrap or legacy argument-builder route', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url), 'utf8');
     const start = source.indexOf('function startBwrapProcess(');
@@ -128,6 +158,9 @@ test('long-lived bwrap service has no raw bwrap or legacy argument-builder route
     assert.match(body, /credentialFd:\s*4/);
     assert.match(body, /credentialNonceDigest:\s*agentCredential\.publicAttestation\.nonceDigest/);
     assert.match(body, /bwrapOwner\s*=\s*saveBwrapPid/);
+    assert.match(body, /sourceKind:\s*BWRAP_HOME_SOURCE_KINDS\.SANDBOX_WORKSPACE_V2/);
+    assert.match(body, /homeKey:\s*agentHomeState\.homeKey/);
+    assert.match(body, /agents\[containerName\]\s*=\s*\{[\s\S]*?homeKey:\s*agentHomeState\.homeKey/);
     assert.match(body, /target: '\/home\/agent'/);
     assert.doesNotMatch(body, /target: '\/root'|target: '\/shared'/);
 });

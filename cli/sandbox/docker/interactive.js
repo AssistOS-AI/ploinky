@@ -26,6 +26,10 @@ import {
 import { loadAgents } from '../../utils/workspace.js';
 import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
 import { SHARED_DIR } from '../../utils/config.js';
+import {
+    resolveInteractiveSpawnResult,
+    shouldAllocateInteractiveTty,
+} from '../interactiveProcess.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -508,9 +512,9 @@ function buildExecArgs(containerName, workdir, entryCommand, interactive = true,
     return args;
 }
 
-function resolveContainerWorkdir(containerName, workdir) {
+function resolveContainerWorkdir(containerName, workdir, registryRecord = null) {
     try {
-        const record = loadAgents()?.[containerName];
+        const record = registryRecord || loadAgents()?.[containerName];
         if (record?.runMode === 'isolated' && record.projectPath && path.resolve(record.projectPath) === path.resolve(workdir)) {
             return '/root';
         }
@@ -518,17 +522,56 @@ function resolveContainerWorkdir(containerName, workdir) {
     return workdir;
 }
 
-function attachInteractive(containerName, workdir, entryCommand) {
-    const runtime = getRuntime();
-    // PLOINKY_NO_TTY=1 disables TTY allocation (used by webchat to ensure stdin EOF propagates)
-    const allocateTty = process.env.PLOINKY_NO_TTY !== '1';
-    const containerWorkdir = resolveContainerWorkdir(containerName, workdir);
-    const execArgs = buildExecArgs(containerName, containerWorkdir, entryCommand, true, allocateTty, {
-        env: process.env,
+function requireInteractivePodmanIdentity(options = {}) {
+    const record = options.registryRecord;
+    const exactText = (value) => typeof value === 'string'
+        && value !== ''
+        && value === value.trim();
+    if (!record
+        || record.type !== 'agent'
+        || record.runtime !== 'podman'
+        || typeof record.containerId !== 'string'
+        || !/^[a-f0-9]{64}$/.test(record.containerId)
+        || !exactText(record.instanceId)
+        || !exactText(record.enableGeneration)) {
+        const error = new Error('interactive container attach requires one exact immutable Podman registry identity');
+        error.code = 'PLOINKY_INTERACTIVE_RUNTIME_IDENTITY_INVALID';
+        error.status = 409;
+        throw error;
+    }
+    return record;
+}
+
+function requireInteractivePodmanRuntime(options = {}) {
+    if (options.runtime !== 'podman') {
+        const requestedRuntime = options.runtime ?? '';
+        const error = new Error(
+            `interactive container attach requires exact runtime 'podman'; received '${String(requestedRuntime) || 'missing'}'`,
+        );
+        error.code = 'PLOINKY_INTERACTIVE_RUNTIME_MISMATCH';
+        error.status = 409;
+        error.context = Object.freeze({ requestedRuntime });
+        throw error;
+    }
+    return options.runtime;
+}
+
+function attachInteractive(containerName, workdir, entryCommand, options = {}) {
+    const env = options.env || process.env;
+    const runtime = requireInteractivePodmanRuntime(options);
+    const registryRecord = requireInteractivePodmanIdentity(options);
+    const allocateTty = shouldAllocateInteractiveTty({
+        env,
+        stdin: options.stdin || process.stdin,
+        stdout: options.stdout || process.stdout,
+    });
+    const containerWorkdir = resolveContainerWorkdir(containerName, workdir, registryRecord);
+    const execArgs = buildExecArgs(registryRecord.containerId, containerWorkdir, entryCommand, true, allocateTty, {
+        env,
         historyName: containerName
     });
-    const result = spawnSync(runtime, execArgs, { stdio: 'inherit' });
-    return result.status ?? 0;
+    const result = (options.spawnSyncImpl || spawnSync)(runtime, execArgs, { stdio: 'inherit' });
+    return resolveInteractiveSpawnResult(result, { label: `container shell '${containerName}'` });
 }
 
 export {

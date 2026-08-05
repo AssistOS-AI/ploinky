@@ -26,11 +26,15 @@ function exactMode(target) {
     return fs.lstatSync(target).mode & 0o7777;
 }
 
-function markerBytes(homeKey, createdByGeneration = 'generation-original') {
+function sandboxHomeKey(runtimeKey) {
+    return `${runtimeKey}.sandbox-v2`;
+}
+
+function markerBytes(runtimeKey, createdByGeneration = 'generation-original') {
     return `${JSON.stringify({
         abi: 'ploinky-home-v2',
         createdByGeneration,
-        homeKey,
+        homeKey: sandboxHomeKey(runtimeKey),
         schemaVersion: 2,
     })}\n`;
 }
@@ -50,8 +54,10 @@ test('clean HOME ABI preserves the exact safe key and writes a canonical immutab
         const result = ensureAgentHomeAbi(homeKey, 'generation-original', {
             agentsDataDir: value.agentsDataDir,
         });
-        const expectedHome = path.join(value.agentsDataDir, homeKey);
+        const expectedHomeKey = sandboxHomeKey(homeKey);
+        const expectedHome = path.join(value.agentsDataDir, expectedHomeKey);
         assert.equal(result.homePath, expectedHome);
+        assert.equal(result.homeKey, expectedHomeKey);
         assert.equal(getAgentHomeAbiPath(homeKey, {
             agentsDataDir: value.agentsDataDir,
         }), expectedHome);
@@ -77,7 +83,7 @@ test('clean HOME ABI preserves the exact safe key and writes a canonical immutab
 test('an existing truly empty HOME receives the marker but unmarked state is never adopted', () => {
     const emptyFixture = fixture();
     try {
-        const emptyHome = path.join(emptyFixture.agentsDataDir, 'empty-home');
+        const emptyHome = path.join(emptyFixture.agentsDataDir, sandboxHomeKey('empty-home'));
         fs.mkdirSync(emptyHome, { mode: 0o700 });
         assert.doesNotThrow(() => ensureAgentHomeAbi('empty-home', 'generation-empty', {
             agentsDataDir: emptyFixture.agentsDataDir,
@@ -90,7 +96,7 @@ test('an existing truly empty HOME receives the marker but unmarked state is nev
 
     const occupiedFixture = fixture();
     try {
-        const occupiedHome = path.join(occupiedFixture.agentsDataDir, 'occupied-home');
+        const occupiedHome = path.join(occupiedFixture.agentsDataDir, sandboxHomeKey('occupied-home'));
         fs.mkdirSync(occupiedHome, { mode: 0o700 });
         const statePath = path.join(occupiedHome, 'credentials.json');
         fs.writeFileSync(statePath, 'do-not-touch');
@@ -104,7 +110,7 @@ test('an existing truly empty HOME receives the marker but unmarked state is nev
     }
 });
 
-test('HOME ABI rejects lossy, traversal, empty, and oversized keys and empty generations', () => {
+test('HOME ABI rejects lossy, traversal, empty, and suffix-unsafe keys and empty generations', () => {
     const value = fixture();
     try {
         for (const homeKey of [
@@ -115,7 +121,7 @@ test('HOME ABI rejects lossy, traversal, empty, and oversized keys and empty gen
             'repo\\agent',
             'space key',
             'ümlaut',
-            'a'.repeat(256),
+            'a'.repeat(245),
         ]) {
             assertIncompatible(() => ensureAgentHomeAbi(homeKey, 'generation', {
                 agentsDataDir: value.agentsDataDir,
@@ -129,6 +135,9 @@ test('HOME ABI rejects lossy, traversal, empty, and oversized keys and empty gen
             'trailing ',
             'line\nbreak',
             'nul\0byte',
+            'quote"generation',
+            'backslash\\generation',
+            'unicode- generation-λ',
             'a'.repeat(256),
             'é'.repeat(128),
         ]) {
@@ -137,8 +146,13 @@ test('HOME ABI rejects lossy, traversal, empty, and oversized keys and empty gen
             }));
         }
         assert.deepEqual(fs.readdirSync(value.agentsDataDir), []);
+        const boundaryKey = 'k'.repeat(244);
+        const boundaryPath = getAgentHomeAbiPath(boundaryKey, {
+            agentsDataDir: value.agentsDataDir,
+        });
+        assert.equal(Buffer.byteLength(path.basename(boundaryPath)), 255);
         const boundaryGeneration = 'g'.repeat(255);
-        const boundary = ensureAgentHomeAbi('boundary-generation', boundaryGeneration, {
+        const boundary = ensureAgentHomeAbi(boundaryKey, boundaryGeneration, {
             agentsDataDir: value.agentsDataDir,
         });
         assert.equal(boundary.createdByGeneration, boundaryGeneration);
@@ -153,7 +167,7 @@ test('malformed, noncanonical, mismatched, and permissive HOME state fails witho
         { name: 'missing-field', bytes: '{"abi":"ploinky-home-v2"}\n' },
         {
             name: 'extra-field',
-            bytes: '{"abi":"ploinky-home-v2","createdByGeneration":"generation-original","homeKey":"extra-field","schemaVersion":2,"extra":true}\n',
+            bytes: '{"abi":"ploinky-home-v2","createdByGeneration":"generation-original","homeKey":"extra-field.sandbox-v2","schemaVersion":2,"extra":true}\n',
         },
         { name: 'key-mismatch', bytes: markerBytes('different-key') },
         {
@@ -161,16 +175,20 @@ test('malformed, noncanonical, mismatched, and permissive HOME state fails witho
             bytes: `${JSON.stringify({
                 abi: 'ploinky-home-v2',
                 createdByGeneration: 'generation-original',
-                homeKey: 'noncanonical',
+                homeKey: sandboxHomeKey('noncanonical'),
                 schemaVersion: 2,
             }, null, 2)}\n`,
         },
         { name: 'missing-newline', bytes: markerBytes('missing-newline').trimEnd() },
+        {
+            name: 'unsafe-generation',
+            bytes: markerBytes('unsafe-generation', 'generation"forged'),
+        },
     ];
     for (const entry of cases) {
         const value = fixture();
         try {
-            const home = path.join(value.agentsDataDir, entry.name);
+            const home = path.join(value.agentsDataDir, sandboxHomeKey(entry.name));
             const marker = path.join(home, AGENT_HOME_ABI_MARKER);
             fs.mkdirSync(home, { mode: 0o700 });
             fs.writeFileSync(marker, entry.bytes, { mode: 0o600 });
@@ -185,7 +203,7 @@ test('malformed, noncanonical, mismatched, and permissive HOME state fails witho
 
     const wrongModes = fixture();
     try {
-        const home = path.join(wrongModes.agentsDataDir, 'wrong-mode');
+        const home = path.join(wrongModes.agentsDataDir, sandboxHomeKey('wrong-mode'));
         const marker = path.join(home, AGENT_HOME_ABI_MARKER);
         fs.mkdirSync(home, { mode: 0o700 });
         fs.writeFileSync(marker, markerBytes('wrong-mode'), { mode: 0o600 });
@@ -214,12 +232,12 @@ test('symlinked data, HOME, and marker paths fail closed', () => {
 
         const externalHome = path.join(value.root, 'external-home');
         fs.mkdirSync(externalHome, { mode: 0o700 });
-        fs.symlinkSync(externalHome, path.join(value.agentsDataDir, 'linked-home'), 'dir');
+        fs.symlinkSync(externalHome, path.join(value.agentsDataDir, sandboxHomeKey('linked-home')), 'dir');
         assertIncompatible(() => ensureAgentHomeAbi('linked-home', 'generation', {
             agentsDataDir: value.agentsDataDir,
         }));
 
-        const markerHome = path.join(value.agentsDataDir, 'linked-marker');
+        const markerHome = path.join(value.agentsDataDir, sandboxHomeKey('linked-marker'));
         const externalMarker = path.join(value.root, 'external-marker.json');
         fs.mkdirSync(markerHome, { mode: 0o700 });
         fs.writeFileSync(externalMarker, markerBytes('linked-marker'), { mode: 0o600 });
@@ -235,7 +253,7 @@ test('symlinked data, HOME, and marker paths fail closed', () => {
 test('an atomic marker creation race fails instead of adopting the competing marker', () => {
     const value = fixture();
     const homeKey = 'raced-home';
-    const markerPath = path.join(value.agentsDataDir, homeKey, AGENT_HOME_ABI_MARKER);
+    const markerPath = path.join(value.agentsDataDir, sandboxHomeKey(homeKey), AGENT_HOME_ABI_MARKER);
     const originalOpenSync = fs.openSync;
     let injected = false;
     try {
@@ -266,7 +284,7 @@ test('an atomic marker creation race fails instead of adopting the competing mar
 test('a file appearing between the empty check and marker creation fails closed', () => {
     const value = fixture();
     const homeKey = 'raced-state-home';
-    const homePath = path.join(value.agentsDataDir, homeKey);
+    const homePath = path.join(value.agentsDataDir, sandboxHomeKey(homeKey));
     const markerPath = path.join(homePath, AGENT_HOME_ABI_MARKER);
     const racedStatePath = path.join(homePath, 'credentials.json');
     const originalOpenSync = fs.openSync;
@@ -287,6 +305,37 @@ test('a file appearing between the empty check and marker creation fails closed'
         assert.equal(fs.readFileSync(markerPath, 'utf8'), markerBytes(homeKey, 'requested-generation'));
     } finally {
         fs.openSync = originalOpenSync;
+        removeFixture(value);
+    }
+});
+
+test('sandbox HOME creation never reads or modifies the unsuffixed container HOME sibling', () => {
+    const value = fixture();
+    const runtimeKey = 'shared-runtime-key';
+    const containerHome = path.join(value.agentsDataDir, runtimeKey);
+    const sentinel = path.join(containerHome, 'container-state.json');
+    try {
+        fs.mkdirSync(containerHome, { mode: 0o755 });
+        fs.writeFileSync(sentinel, '{"container":true}\n', { mode: 0o644 });
+        const beforeHome = fs.lstatSync(containerHome);
+        const beforeSentinel = fs.lstatSync(sentinel);
+
+        const sandboxHome = ensureAgentHomeAbi(runtimeKey, 'generation-sandbox', {
+            agentsDataDir: value.agentsDataDir,
+        });
+
+        assert.equal(sandboxHome.homeKey, sandboxHomeKey(runtimeKey));
+        assert.equal(fs.readFileSync(sentinel, 'utf8'), '{"container":true}\n');
+        const afterHome = fs.lstatSync(containerHome);
+        const afterSentinel = fs.lstatSync(sentinel);
+        assert.equal(afterHome.ino, beforeHome.ino);
+        assert.equal(afterHome.mode, beforeHome.mode);
+        assert.equal(afterHome.mtimeNs, beforeHome.mtimeNs);
+        assert.equal(afterSentinel.ino, beforeSentinel.ino);
+        assert.equal(afterSentinel.mode, beforeSentinel.mode);
+        assert.equal(afterSentinel.mtimeNs, beforeSentinel.mtimeNs);
+        assert.equal(fs.existsSync(path.join(containerHome, AGENT_HOME_ABI_MARKER)), false);
+    } finally {
         removeFixture(value);
     }
 });

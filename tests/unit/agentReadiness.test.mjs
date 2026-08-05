@@ -23,6 +23,10 @@ function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
         record: {
             repoName: 'AssistOSExplorer',
             agentName: 'explorer',
+            runtime: 'podman',
+            containerId: 'a'.repeat(64),
+            instanceId: 'nested-explorer-instance',
+            enableGeneration: 'nested-explorer-generation',
         },
     };
     return {
@@ -41,6 +45,7 @@ function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
                 enabled = true;
             },
             readManifest: () => ({
+                container: 'docker.io/assistos/ploinky-node:24-bookworm-tools',
                 cli: '/Agent/default_cli.sh',
                 readiness: { protocol: 'mcp' },
             }),
@@ -60,7 +65,12 @@ function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
             },
             ensureAgentService: () => {
                 events.push(['ensure']);
-                return { containerName: 'nested-explorer', hostPort: 15517 };
+                return {
+                    containerName: 'nested-explorer',
+                    containerId: 'a'.repeat(64),
+                    hostPort: 15517,
+                    registryRecord: record.record,
+                };
             },
             waitForAgentReady: async () => {
                 events.push(['ready']);
@@ -69,7 +79,8 @@ function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
             withNetworkLifecycleLock: callback => callback(Object.freeze({ test: 'network-lifecycle' })),
             loadAgentsMap: () => ({
                 'nested-explorer': {
-                    runtime: 'container',
+                    ...record.record,
+                    type: 'agent',
                     containerImage: 'docker.io/assistos/ploinky-node:24-bookworm-tools',
                 },
             }),
@@ -120,7 +131,7 @@ function findFreePort() {
     });
 }
 
-function bwrapOwner({ containerName = 'bwrap-coding', hostPort } = {}) {
+function sandboxOwner({ containerName = 'bwrap-coding', hostPort } = {}) {
     return {
         schemaVersion: 5,
         role: 'service',
@@ -146,8 +157,8 @@ function bwrapOwner({ containerName = 'bwrap-coding', hostPort } = {}) {
     };
 }
 
-function buildBwrapReadinessCandidate(hostPort) {
-    const containerName = 'bwrap-coding';
+function buildSandboxReadinessCandidate(hostPort, runtime = 'bwrap') {
+    const containerName = `${runtime}-coding`;
     return buildRelayReadinessRoute({
         route: { container: containerName, hostPort },
         manifest: { readiness: { protocol: 'mcp' } },
@@ -155,12 +166,12 @@ function buildBwrapReadinessCandidate(hostPort) {
             containerName,
             hostPort,
             registryRecord: {
-                runtime: 'bwrap',
+                runtime,
                 instanceId: 'instance-bwrap-1',
                 enableGeneration: 'enable-bwrap-1',
                 repoName: 'AchillesCLI',
                 agentName: 'codexAgent',
-                bwrapOwner: bwrapOwner({ containerName, hostPort }),
+                bwrapOwner: sandboxOwner({ containerName, hostPort }),
             },
         },
     });
@@ -204,6 +215,7 @@ test('explicit readiness port builds a confined relay target from the exact runt
         },
         runtimeResult: {
             containerName: 'nested-api',
+            containerId,
             registryRecord: {
                 runtime: 'podman',
                 containerId,
@@ -230,19 +242,29 @@ test('explicit readiness port builds a confined relay target from the exact runt
 });
 
 test('bwrap readiness route carries an immutable exact owner, principal, generation, and root port', () => {
-    const route = buildBwrapReadinessCandidate(27117);
+    const route = buildSandboxReadinessCandidate(27117);
 
     assert.equal(route.hostPort, 27117);
-    assert.deepEqual(route.bwrapReadiness, {
-        kind: 'bwrap-root-mcp',
+    assert.deepEqual(route.sandboxReadiness, {
+        kind: 'sandbox-root-mcp',
+        runtime: 'bwrap',
         targetAgentId: 'agent:AchillesCLI/codexAgent',
         effectiveInstanceId: 'instance-bwrap-1',
         enableGeneration: 'enable-bwrap-1',
         hostPort: 27117,
-        bwrapOwner: bwrapOwner({ hostPort: 27117 }),
+        sandboxOwner: sandboxOwner({ hostPort: 27117 }),
     });
-    assert.equal(Object.isFrozen(route.bwrapReadiness), true);
-    assert.equal(Object.isFrozen(route.bwrapReadiness.bwrapOwner), true);
+    assert.equal(Object.isFrozen(route.sandboxReadiness), true);
+    assert.equal(Object.isFrozen(route.sandboxReadiness.sandboxOwner), true);
+});
+
+test('seatbelt readiness uses the same exact sandbox-owner root route', () => {
+    const route = buildSandboxReadinessCandidate(27119, 'seatbelt');
+
+    assert.equal(route.sandboxReadiness.kind, 'sandbox-root-mcp');
+    assert.equal(route.sandboxReadiness.runtime, 'seatbelt');
+    assert.equal(route.sandboxReadiness.hostPort, 27119);
+    assert.equal(route.sandboxReadiness.sandboxOwner.runtimeKey, 'seatbelt-coding');
 });
 
 test('malformed bwrap ownership fails closed instead of falling back to direct readiness', () => {
@@ -258,10 +280,10 @@ test('malformed bwrap ownership fails closed instead of falling back to direct r
                 enableGeneration: 'enable-bwrap-1',
                 repoName: 'AchillesCLI',
                 agentName: 'codexAgent',
-                bwrapOwner: bwrapOwner({ hostPort: 27118 }),
+                bwrapOwner: sandboxOwner({ hostPort: 27118 }),
             },
         },
-    }), (error) => error?.code === 'BWRAP_AGENT_READINESS_INVALID');
+    }), (error) => error?.code === 'SANDBOX_AGENT_READINESS_INVALID');
 });
 
 test('bwrap MCP readiness verifies the exact owner immediately before dial and sends a bound router request', async () => {
@@ -289,23 +311,23 @@ test('bwrap MCP readiness verifies the exact owner immediately before dial and s
         server.listen(0, '127.0.0.1', resolve);
     });
     const hostPort = server.address().port;
-    const route = buildBwrapReadinessCandidate(hostPort);
+    const route = buildSandboxReadinessCandidate(hostPort);
     let mintInput;
     try {
         const ready = await waitForAgentReady(route, {
             protocol: 'mcp',
             timeoutMs: 1000,
             probeTimeoutMs: 250,
-            bwrapBeforeDial: (candidate) => {
+            sandboxBeforeDial: (candidate) => {
                 observations.push('owner');
-                assert.equal(candidate.bwrapReadiness.bwrapOwner, route.bwrapReadiness.bwrapOwner);
+                assert.equal(candidate.sandboxReadiness.sandboxOwner, route.sandboxReadiness.sandboxOwner);
                 return true;
             },
-            bwrapCreateConnection: (options, callback) => {
+            sandboxCreateConnection: (options, callback) => {
                 observations.push('dial');
                 return net.createConnection(options, callback);
             },
-            bwrapMintRouterRequest: (input) => {
+            sandboxMintRouterRequest: (input) => {
                 observations.push('mint');
                 mintInput = input;
                 return { token: 'bound-readiness-token' };
@@ -347,22 +369,22 @@ test('bwrap MCP readiness verifies the exact owner immediately before dial and s
 
 test('invalid bwrap owner blocks the socket before net.createConnection', async () => {
     const hostPort = await findFreePort();
-    const route = buildBwrapReadinessCandidate(hostPort);
+    const route = buildSandboxReadinessCandidate(hostPort);
     let dialed = false;
     const ready = await waitForAgentReady(route, {
         protocol: 'mcp',
         timeoutMs: 0,
         probeTimeoutMs: 1,
-        bwrapBeforeDial: () => {
+        sandboxBeforeDial: () => {
             const error = new Error('stale owner');
             error.code = 'BWRAP_AGENT_OWNER_INVALID';
             throw error;
         },
-        bwrapCreateConnection: () => {
+        sandboxCreateConnection: () => {
             dialed = true;
             throw new Error('must not dial');
         },
-        bwrapMintRouterRequest: () => ({ token: 'unusable-readiness-token' }),
+        sandboxMintRouterRequest: () => ({ token: 'unusable-readiness-token' }),
     });
 
     assert.equal(ready, false);
@@ -370,16 +392,16 @@ test('invalid bwrap owner blocks the socket before net.createConnection', async 
 });
 
 test('bwrap tcp readiness fails closed without minting or probing the root port', async () => {
-    const route = buildBwrapReadinessCandidate(await findFreePort());
+    const route = buildSandboxReadinessCandidate(await findFreePort());
     let touched = false;
     const ready = await waitForAgentReady(route, {
         protocol: 'tcp',
         timeoutMs: 0,
-        bwrapMintRouterRequest: () => {
+        sandboxMintRouterRequest: () => {
             touched = true;
             return { token: 'must-not-be-minted' };
         },
-        bwrapCreateConnection: () => {
+        sandboxCreateConnection: () => {
             touched = true;
             throw new Error('must not dial');
         },
@@ -391,11 +413,11 @@ test('bwrap tcp readiness fails closed without minting or probing the root port'
 
 test('a malformed bwrap readiness marker cannot fall through to the direct tcp probe', async () => {
     const { server, port } = await listenOnEphemeralPort();
-    const route = buildBwrapReadinessCandidate(port);
+    const route = buildSandboxReadinessCandidate(port);
     const malformedRoute = {
         ...route,
-        bwrapReadiness: {
-            ...route.bwrapReadiness,
+        sandboxReadiness: {
+            ...route.sandboxReadiness,
             hostPort: port + 1,
         },
     };
@@ -407,6 +429,44 @@ test('a malformed bwrap readiness marker cannot fall through to the direct tcp p
         assert.equal(ready, false);
     } finally {
         await new Promise((resolve) => server.close(resolve));
+    }
+});
+
+test('readiness preserves the exact Docker and Podman container relay ABI', () => {
+    const base = {
+        route: { container: 'nested-api' },
+        manifest: { readiness: { protocol: 'tcp', port: 7000 } },
+        runtimeResult: {
+            containerName: 'nested-api',
+            containerId: 'a'.repeat(64),
+            registryRecord: {
+                containerId: 'a'.repeat(64),
+                instanceId: 'instance-1',
+                enableGeneration: 'enable-1',
+                repoName: 'example',
+                agentName: 'api',
+            },
+        },
+    };
+    for (const runtime of ['docker', 'podman']) {
+        const registryRecord = { ...base.runtimeResult.registryRecord, runtime };
+        const route = buildRelayReadinessRoute({
+            ...base,
+            runtimeResult: { ...base.runtimeResult, registryRecord },
+        });
+        assert.equal(route.relay.runtime, runtime);
+    }
+    for (const runtime of [undefined, null, '', 'container', 'Podman', ' podman ', 'podman ']) {
+        const registryRecord = { ...base.runtimeResult.registryRecord };
+        if (runtime !== undefined) registryRecord.runtime = runtime;
+        assert.throws(
+            () => buildRelayReadinessRoute({
+                ...base,
+                runtimeResult: { ...base.runtimeResult, registryRecord },
+            }),
+            (error) => error?.code === 'PLOINKY_AGENT_READINESS_RUNTIME_INVALID',
+            `runtime ${JSON.stringify(runtime)} must fail closed`,
+        );
     }
 });
 

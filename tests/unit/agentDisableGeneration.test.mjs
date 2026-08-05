@@ -22,6 +22,8 @@ test.after(() => {
 function agentRecord(agentName, overrides = {}) {
     return {
         type: 'agent',
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
         repoName: 'demo',
         agentName,
         instanceId: `${agentName}-instance`,
@@ -90,20 +92,42 @@ function lifecycleHarness({
             assert.equal(received, lease);
             if (failAbort) throw new Error('durable disable abort failed');
         },
-        isSandboxRuntimeImpl() {
-            return false;
-        },
-        stopAndRemoveImpl(containerName) {
+        stopAndRemoveImpl(containerName, options) {
             events.push(`remove:${containerName}`);
+            assert.deepEqual(options?.records, {
+                [containerName]: initialRegistry[containerName],
+            });
             if (failRemoval) throw new Error('engine refused removal');
             existing.delete(containerName);
         },
-        stopAndRemoveManyImpl(containerNames) {
+        stopAndRemoveManyImpl(containerNames, options) {
             events.push(`remove-many:${containerNames.join(',')}`);
+            assert.deepEqual(
+                options?.records,
+                Object.fromEntries(containerNames.map((name) => [name, initialRegistry[name]])),
+            );
             if (failRemoval) throw new Error('engine refused removal');
             containerNames.forEach((name) => existing.delete(name));
         },
-        containerExistsImpl(containerName) {
+        containerExistsImpl(containerName, options) {
+            assert.deepEqual(options, { runtime: 'podman' });
+            return existing.has(containerName);
+        },
+        stopSandboxImpl(containerName, options) {
+            events.push(`stop-sandbox:${containerName}`);
+            assert.deepEqual(options, {
+                expectedIdentity: {
+                    instanceId: initialRegistry[containerName].instanceId,
+                    enableGeneration: initialRegistry[containerName].enableGeneration,
+                },
+            });
+            existing.delete(containerName);
+        },
+        sandboxRunningImpl(containerName, expectedIdentity) {
+            assert.deepEqual(expectedIdentity, {
+                instanceId: initialRegistry[containerName].instanceId,
+                enableGeneration: initialRegistry[containerName].enableGeneration,
+            });
             return existing.has(containerName);
         },
     };
@@ -365,6 +389,31 @@ test('batch disable stages every exact route removal before one physical batch r
         harness.events.indexOf('remove-many:beta_container,alpha_container')
             < harness.events.indexOf('apply'),
     );
+});
+
+test('sandbox disable binds stop and liveness checks to the captured generation identity', () => {
+    const sandboxRecord = agentRecord('sandbox', {
+        runtime: 'bwrap',
+        containerId: undefined,
+    });
+    const harness = lifecycleHarness({
+        initialRegistry: { sandbox_runtime: sandboxRecord },
+        initialRouting: {
+            port: 8080,
+            routes: {
+                sandbox: {
+                    container: 'sandbox_runtime',
+                    repo: 'demo',
+                    agent: 'sandbox',
+                    hostPort: 34500,
+                },
+            },
+        },
+    });
+
+    assert.equal(agents.disableAgent('sandbox_runtime', harness.dependencies).status, 'removed');
+    assert.equal(harness.events.includes('stop-sandbox:sandbox_runtime'), true);
+    assert.equal(harness.events.some((event) => event.startsWith('remove:')), false);
 });
 
 test('disable is idempotent after exact removal and empty batch inputs are inert', () => {

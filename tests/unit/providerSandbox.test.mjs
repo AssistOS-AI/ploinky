@@ -13,6 +13,7 @@ import {
 import {
     BWRAP_LAUNCH_LIMITS,
     BWRAP_RECORD_TYPES,
+    BWRAP_HOME_SOURCE_KINDS,
     PROVIDER_SANDBOX_HELPER,
     PROVIDER_SANDBOX_MODES,
     PROVIDER_SANDBOX_PROVIDERS,
@@ -59,7 +60,7 @@ function identified(processIdentity = IDENTITY_A, processUid = CURRENT_UID) {
 }
 
 function parseDescriptor(descriptor) {
-    assert.equal(descriptor.subarray(0, 8).toString('ascii'), 'PLBWLP01');
+    assert.equal(descriptor.subarray(0, 8).toString('ascii'), 'PLBWLP02');
     assert.equal(descriptor.readUInt32BE(12), 0);
     const declared = descriptor.readUInt32BE(8);
     const records = [];
@@ -127,6 +128,8 @@ function containerCredentialContext(t) {
     env.PLOINKY_ROUTER_DESCRIPTOR_FILE = descriptorFile;
     env.PLOINKY_AGENT_SECRET = 'a'.repeat(64);
     env.PLOINKY_AGENT_PRIVATE_SECRET = 'b'.repeat(64);
+    env.PLOINKY_AGENT_HOME_KEY = 'coding-agent_container';
+    env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY = 'generated';
     return createContainerAgentCredentialContext(env);
 }
 
@@ -153,7 +156,10 @@ function recordIndex(records, predicate) {
 
 function basePolicy(overrides = {}) {
     return buildTrustedServicePolicy({
-        runtimeKey: 'coding-agent_alias-1',
+        homeSource: {
+            sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+            homeKey: 'coding-agent_alias-1.sandbox-v2',
+        },
         command: ['node', '/Agent/server/AgentServer.mjs'],
         nodeRuntimePath: '/usr/local',
         agentRuntimePath: '/opt/ploinky/Agent',
@@ -257,10 +263,13 @@ function createP1P2P3RemovalRace(t) {
     return { root, first, p2, p3, p3Raw };
 }
 
-test('typed records encode the exact deterministic PLBWLP01 wire ABI', () => {
+test('typed records encode the exact deterministic PLBWLP02 wire ABI', () => {
     const records = [
         createWorkspaceRecord('rw'),
-        createHomeRecord('agent-1'),
+        createHomeRecord({
+            sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+            homeKey: 'agent-1.sandbox-v2',
+        }),
         createReadOnlyPathRecord('/opt/source', '/opt/runtime', 'directory'),
         createReadOnlyDataFileRecord('/etc/hosts', '/etc/hosts'),
         createProcRecord(),
@@ -275,7 +284,8 @@ test('typed records encode the exact deterministic PLBWLP01 wire ABI', () => {
     const parsed = parseDescriptor(first);
     assert.deepEqual(parsed.map(({ type }) => type), [2, 4, 5, 12, 8, 9, 11, 1, 1]);
     assert.deepEqual(parsed[0].payload, Buffer.from([2]));
-    assert.equal(parsed[1].payload.toString(), '.data/agent-1');
+    assert.equal(parsed[1].payload[0], 1);
+    assert.equal(parsed[1].payload.subarray(1).toString(), 'agent-1.sandbox-v2');
     assert.equal(parsed[2].payload[0], 1);
     assert.equal(parsed[2].payload.readUInt16BE(1), Buffer.byteLength('/opt/source'));
     assert.equal(parsed[2].payload.readUInt16BE(3), Buffer.byteLength('/opt/runtime'));
@@ -283,6 +293,27 @@ test('typed records encode the exact deterministic PLBWLP01 wire ABI', () => {
     assert.equal(parsed[6].payload.readUInt32BE(4), 5);
     assert.equal(parsed[7].payload.toString(), '--');
     assert.equal(parsed[8].payload.toString(), '/bin/true');
+
+    const nativeHome = parseDescriptor(encodeBwrapLaunchDescriptor([
+        createHomeRecord({ sourceKind: BWRAP_HOME_SOURCE_KINDS.CONTAINER_NATIVE }),
+        createArgRecord('--'),
+        createArgRecord('/bin/true'),
+    ]));
+    assert.deepEqual(nativeHome[0].payload, Buffer.from([2]));
+    assert.throws(
+        () => createHomeRecord({
+            sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+            homeKey: 'agent-1',
+        }),
+        { code: 'PLOINKY_HOME_STATE_INCOMPATIBLE' },
+    );
+    assert.throws(
+        () => createHomeRecord({
+            sourceKind: BWRAP_HOME_SOURCE_KINDS.CONTAINER_NATIVE,
+            homeKey: 'attacker-path',
+        }),
+        /unknown field homeKey/,
+    );
 });
 
 test('read-only data records admit only the shared exact system mapping pairs', () => {
@@ -388,7 +419,10 @@ test('trusted service policy is fixed, frozen, explicit-network, and ends with c
     const workspace = policy.records.filter((record) => record.type === 'WORKSPACE');
     const home = policy.records.filter((record) => record.type === 'HOME');
     assert.deepEqual(workspace, [createWorkspaceRecord('rw')]);
-    assert.deepEqual(home, [createHomeRecord('coding-agent_alias-1')]);
+    assert.deepEqual(home, [createHomeRecord({
+        sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+        homeKey: 'coding-agent_alias-1.sandbox-v2',
+    })]);
     assert.equal(policy.records.some((record) => record.type === 'TMPFS' && record.target === '/tmp'), true);
     assert.equal(policy.records.some((record) => record.type === 'TMPFS' && record.target === '/run'), true);
     assert.equal(policy.records.some((record) => record.type === 'PROC'), true);
@@ -1493,7 +1527,7 @@ test('different HOME keys proceed independently and callback release runs on fai
     assert.equal(fs.existsSync(path.join(root, 'callback-agent.lease.json')), false);
 });
 
-test('provider task policy derives HOME and generation only from the bwrap credential context and orders isolation mounts', (t) => {
+test('provider task policy derives mode-separated HOME and generation only from credential context and orders isolation mounts', (t) => {
     const policy = buildProviderSandboxPolicy(providerTaskInput({
         environment: {
             PLOINKY_TASK_BROKER_URL: PROVIDER_BROKER_URL,
@@ -1505,7 +1539,14 @@ test('provider task policy derives HOME and generation only from the bwrap crede
     assert.equal(Object.isFrozen(policy), true);
     assert.equal(Object.isFrozen(policy.records), true);
     assert.deepEqual(policy.identity, {
-        runtimeKey: PROVIDER_INSTANCE,
+        runtimeKind: 'bwrap',
+        homeKey: `${PROVIDER_INSTANCE}.sandbox-v2`,
+        homeSource: {
+            sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+            homeKey: `${PROVIDER_INSTANCE}.sandbox-v2`,
+        },
+        nodeRuntimeSource: '/opt/ploinky-node',
+        providerHomeSource: '/home/agent',
         generation: PROVIDER_GENERATION,
     });
     assert.equal(policy.cwd, '/workspace/projects/alpha');
@@ -1530,7 +1571,11 @@ test('provider task policy derives HOME and generation only from the bwrap crede
 
     assert.equal(policy.records[workspace].mode, 'ro');
     assert.deepEqual(policy.records[workdir], { type: 'WORKDIR', path: 'projects/alpha' });
-    assert.deepEqual(policy.records[home], { type: 'HOME', runtimeKey: PROVIDER_INSTANCE });
+    assert.deepEqual(policy.records[home], {
+        type: 'HOME',
+        sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+        homeKey: `${PROVIDER_INSTANCE}.sandbox-v2`,
+    });
     assert.ok(workspace < ploinkyMask && ploinkyMask < dataMask && dataMask < workdir);
     assert.ok(workdir < home && home < executable && executable < privateProc && privateProc < clearenv);
     assert.equal(policy.records.filter((record) => record.type === 'WORKSPACE').length, 1);
@@ -1553,12 +1598,26 @@ test('provider task policy derives HOME and generation only from the bwrap crede
         })),
         (error) => error?.code === 'PLOINKY_AGENT_CREDENTIAL_CONTEXT_REQUIRED',
     );
-    assert.throws(
-        () => buildProviderSandboxPolicy(providerTaskInput({
-            credentialContext: containerCredentialContext(t),
-        })),
-        (error) => error?.code === 'PLOINKY_PROVIDER_CONTEXT_INVALID',
-    );
+    const container = buildProviderSandboxPolicy(providerTaskInput({
+        credentialContext: containerCredentialContext(t),
+    }));
+    assert.deepEqual(container.records.find((record) => record.type === 'HOME'), {
+        type: 'HOME',
+        sourceKind: BWRAP_HOME_SOURCE_KINDS.CONTAINER_NATIVE,
+    });
+    assert.equal(container.identity.runtimeKind, 'container');
+    assert.equal(container.identity.homeKey, 'coding-agent_container');
+    assert.equal(container.identity.providerHomeSource, '/root');
+    assert.ok(container.records.some((record) => (
+        record.type === 'RO_PATH'
+        && record.source === '/root/.opencode/bin/opencode'
+        && record.target === '/home/agent/.opencode/bin/opencode'
+    )));
+    assert.ok(container.records.some((record) => (
+        record.type === 'RO_PATH'
+        && record.source === '/usr/local'
+        && record.target === '/opt/ploinky-node'
+    )));
 });
 
 test('provider readiness uses an empty private workspace, fixed harmless command, and no task capability', () => {
@@ -1863,7 +1922,14 @@ test('provider spawn writes fd3 before R, acquires lease and capability before G
             assert.equal(details.mode, PROVIDER_SANDBOX_MODES.TASK);
             assert.equal(details.workdir, 'projects/alpha');
             assert.deepEqual(details.identity, {
-                runtimeKey: PROVIDER_INSTANCE,
+                runtimeKind: 'bwrap',
+                homeKey: `${PROVIDER_INSTANCE}.sandbox-v2`,
+                homeSource: {
+                    sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+                    homeKey: `${PROVIDER_INSTANCE}.sandbox-v2`,
+                },
+                nodeRuntimeSource: '/opt/ploinky-node',
+                providerHomeSource: '/home/agent',
                 generation: PROVIDER_GENERATION,
             });
         },
@@ -1889,7 +1955,7 @@ test('provider spawn writes fd3 before R, acquires lease and capability before G
         acquireProviderHomeLease(input) {
             events.push('lease:acquire');
             assert.deepEqual(input, {
-                homeKey: PROVIDER_INSTANCE,
+                homeKey: `${PROVIDER_INSTANCE}.sandbox-v2`,
                 generation: PROVIDER_GENERATION,
                 role: 'provider-task',
                 metadata: {

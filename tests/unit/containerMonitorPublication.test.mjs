@@ -6,6 +6,9 @@ import path from 'node:path';
 
 import { performContainerRestart } from '../../cli/server/containerMonitor.js';
 
+const OLD_CONTAINER_ID = 'c'.repeat(64);
+const NEW_CONTAINER_ID = 'd'.repeat(64);
+
 function restartTarget(manifestPath, overrides = {}) {
     return {
         containerName: 'agent_container',
@@ -13,7 +16,10 @@ function restartTarget(manifestPath, overrides = {}) {
         repoName: 'repo',
         alias: null,
         type: 'agent',
-        runtime: 'container',
+        runtime: 'podman',
+        containerId: OLD_CONTAINER_ID,
+        instanceId: 'instance-v1',
+        enableGeneration: 'enable-v1',
         manifestPath,
         isRestarting: true,
         lastError: null,
@@ -24,11 +30,14 @@ function restartTarget(manifestPath, overrides = {}) {
 function preparedRestartResult(overrides = {}) {
     return {
         containerName: 'agent_container',
+        containerId: NEW_CONTAINER_ID,
         hostPort: 43123,
         registryRecord: {
             type: 'agent',
             repoName: 'repo',
             agentName: 'demo',
+            runtime: 'podman',
+            containerId: NEW_CONTAINER_ID,
             instanceId: 'instance-v2',
             enableGeneration: 'enable-v2',
             config: { ports: [{ containerPort: 7000, hostPort: 43123 }] },
@@ -37,6 +46,8 @@ function preparedRestartResult(overrides = {}) {
             type: 'agent',
             repoName: 'repo',
             agentName: 'demo',
+            runtime: 'podman',
+            containerId: NEW_CONTAINER_ID,
             instanceId: 'instance-v2',
             enableGeneration: 'enable-v2',
         },
@@ -53,6 +64,10 @@ function preparedRestartResult(overrides = {}) {
 
 function nextTurn() {
     return new Promise((resolve) => setImmediate(resolve));
+}
+
+function withTestNetworkLifecycle(callback) {
+    return callback(Object.freeze({ testOnly: true }));
 }
 
 test('monitor acquires the common workspace lease and defers without mutation on contention', async () => {
@@ -104,6 +119,7 @@ test('monitor resolves the router endpoint under the workspace mutation lease', 
             log() {},
             resolveRouterEndpoint() { throw invalidPort; },
             createWorkspaceMutationLease() { leaseCalls += 1; return {}; },
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             ensureAgentService() { ensureCalls += 1; },
         };
         const target = {
@@ -141,6 +157,7 @@ test('monitor rejects manifest bytes changed during ensure before readiness or a
             isShuttingDown: () => false,
             log(_level, event) { events.push(event); },
             createWorkspaceMutationLease: () => ({ token: 'workspace' }),
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             releaseWorkspaceMutationLease() { events.push('workspace-release'); },
             resolveRouterEndpoint: () => Object.freeze({
                 mode: 'default',
@@ -200,6 +217,7 @@ test('monitor waits for exact semantic readiness before committing the returned 
             isShuttingDown: () => false,
             log(_level, event) { events.push(event); },
             createWorkspaceMutationLease() { events.push('workspace-lease'); return { token: 'workspace' }; },
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             releaseWorkspaceMutationLease(lease) {
                 assert.equal(lease.token, 'workspace');
                 events.push('workspace-release');
@@ -213,7 +231,7 @@ test('monitor waits for exact semantic readiness before committing the returned 
             ensureAgentService() { events.push('ensure'); return result; },
             async waitForAgentReady(route, options) {
                 events.push('readiness-start');
-                assert.deepEqual(route, { hostPort: 43123 });
+                assert.deepEqual(route, { hostPort: 43123, container: 'agent_container' });
                 assert.equal(options.protocol, 'mcp');
                 return readinessGate;
             },
@@ -291,6 +309,7 @@ test('monitor rejects staged registry metadata drift before committing the runti
             isShuttingDown: () => false,
             log(_level, event) { events.push(event); },
             createWorkspaceMutationLease: () => ({ token: 'workspace' }),
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             releaseWorkspaceMutationLease() {},
             resolveRouterEndpoint: () => Object.freeze({
                 mode: 'default',
@@ -354,6 +373,7 @@ test('monitor readiness failure aborts the exact preparation, applies no route, 
             isShuttingDown: () => false,
             log(_level, event) { events.push(event); },
             createWorkspaceMutationLease: () => ({ token: 'workspace' }),
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             releaseWorkspaceMutationLease() { events.push('workspace-release'); },
             resolveRouterEndpoint: () => Object.freeze({
                 mode: 'default',
@@ -418,6 +438,7 @@ test('monitor preserves the exact failed candidate and propagates recovery failu
             isShuttingDown: () => false,
             log(level, event, data) { logged.push({ level, event, data }); },
             createWorkspaceMutationLease: () => ({ token: 'workspace' }),
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             releaseWorkspaceMutationLease() {},
             resolveRouterEndpoint: () => Object.freeze({
                 mode: 'default',
@@ -491,6 +512,7 @@ test('monitor apply failure aborts the exact preparation, cleans only the failed
             isShuttingDown: () => false,
             log(_level, event) { events.push(event); },
             createWorkspaceMutationLease: () => ({ token: 'workspace' }),
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             releaseWorkspaceMutationLease() {},
             resolveRouterEndpoint: () => Object.freeze({
                 mode: 'default',
@@ -555,6 +577,7 @@ test('monitor accepts a healthy exact reuse race without readiness, mutation, or
             isShuttingDown: () => false,
             log(_level, event) { events.push(event); },
             createWorkspaceMutationLease: () => ({ token: 'workspace' }),
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             releaseWorkspaceMutationLease() {},
             resolveRouterEndpoint: () => Object.freeze({
                 mode: 'default',
@@ -564,10 +587,13 @@ test('monitor accepts a healthy exact reuse race without readiness, mutation, or
             }),
             ensureAgentService: () => ({
                 containerName: 'agent_container',
+                containerId: OLD_CONTAINER_ID,
                 registryRecord: {
                     type: 'agent',
                     repoName: 'repo',
                     agentName: 'demo',
+                    runtime: 'podman',
+                    containerId: OLD_CONTAINER_ID,
                     instanceId: 'unchanged-instance',
                     enableGeneration: 'unchanged-generation',
                 },
@@ -604,6 +630,7 @@ test('monitor rejects a malformed ensure result instead of reporting healthy reu
             isShuttingDown: () => false,
             log(_level, event) { events.push(event); },
             createWorkspaceMutationLease: () => ({ token: 'workspace' }),
+            withNetworkLifecycleLock: withTestNetworkLifecycle,
             releaseWorkspaceMutationLease() {},
             resolveRouterEndpoint: () => Object.freeze({
                 mode: 'default',

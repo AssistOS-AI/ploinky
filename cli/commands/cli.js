@@ -17,6 +17,8 @@ import {
     activatePreparedRuntimeAfterReadiness,
     cleanupFailedPreparedRuntime,
     admitDirectAgentRuntimeManifest,
+    assertSelectedManualRuntime,
+    probeSelectedManualRuntime,
 } from './workspaceUtil.js';
 import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
@@ -24,13 +26,11 @@ import {
     getAgentContainerName,
     getRuntime,
     containerExists,
-    isContainerRunning,
     stopConfiguredAgents,
     destroyWorkspaceContainers,
     ensureAgentService
 } from '../sandbox/docker/index.js';
-import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
-import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
+import { isSandboxRuntime } from '../sandbox/docker/common.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import { handleSystemCommand, handleInvalidCommand, resetLlmInvokerCache } from './llmSystemCommands.js';
 import * as inputState from './inputState.js';
@@ -238,8 +238,7 @@ async function handleCommand(args) {
     switch (command) {
         case 'shell':
             if (!options[0]) { showHelp(); break; }
-            await runShell(options[0]);
-            break;
+            return runShell(options[0]);
         case 'cli':
             return handleCliCommand(options);
         // 'agent' command removed; use 'enable agent <agentName>' then 'start'
@@ -527,72 +526,17 @@ async function handleCommand(args) {
                 });
                 const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode);
 
-                const agentRuntime = getRuntimeForAgent(manifest);
+                const agentRuntime = directAdmission.runtime;
                 const containerName = registryRecord?.containerName || getAgentContainerName(resolved.shortAgentName, resolved.repo);
+                const runtimeRunning = probeSelectedManualRuntime(
+                    agentRuntime,
+                    containerName,
+                    registryRecord?.record,
+                );
 
                 if (isSandboxRuntime(agentRuntime)) {
-                    // Sandbox restart: stop process, then re-create via ensureAgentService
-                    const bwrapRunning = Boolean(
-                        registryRecord?.record?.instanceId
-                        && registryRecord?.record?.enableGeneration,
-                    ) && isBwrapProcessRunning(containerName, {
-                        instanceId: registryRecord.record.instanceId,
-                        enableGeneration: registryRecord.record.enableGeneration,
-                    });
-                    const containerAlsoRunning = isContainerRunning(containerName);
-                    const containerPresent = containerAlsoRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
-                    if (!bwrapRunning && !containerPresent) {
-                        console.error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
-                        return;
-                    }
-
-                    if (!bwrapRunning && !containerAlsoRunning && containerPresent) {
-                        console.log(`Starting (${agentRuntime}) agent '${agentName}'...`);
-                        try {
-                            await withMaintenanceLock(containerName, {
-                                operation: 'start',
-                                metadata: {
-                                    agent: resolved.shortAgentName,
-                                    repo: resolved.repo,
-                                },
-                            }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
-                                const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
-                                    containerName,
-                                    alias: registryRecord?.record?.alias,
-                                    profileName: profileResolution.resolvedProfileName,
-                                    profileResolution,
-                                    routerEndpoint,
-                                    runtimeAdmission: directAdmission.runtimeAdmission,
-                                    networkLifecycleCapability,
-                                });
-                                try {
-                                    await waitForManifestReadiness({
-                                        key: `start:${resolved.shortAgentName}`,
-                                        label: resolved.shortAgentName,
-                                        kind: 'reinstall',
-                                        manifest,
-                                        route: {
-                                            container: result?.containerName || containerName,
-                                            hostPort: result?.hostPort || 0,
-                                        },
-                                    });
-                                    await activatePreparedRuntimeAfterReadiness({
-                                        result,
-                                        routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
-                                        repoName: registryRecord?.record?.repoName || resolved.repo,
-                                        shortAgentName: resolved.shortAgentName,
-                                        agentPath: path.dirname(resolved.manifestPath),
-                                        alias: registryRecord?.record?.alias || '',
-                                    });
-                                } catch (error) {
-                                    cleanupFailedPreparedRuntime(result, error, 'manual-start-readiness-failed');
-                                    throw error;
-                                }
-                            }));
-                            console.log('✓ Agent started.');
-                        } catch (e) {
-                            console.error(`Failed to start container ${containerName}: ${e.message}`);
-                        }
+                    if (!runtimeRunning) {
+                        console.error(`Agent '${agentName}' has no running ${agentRuntime} service. Run 'ploinky reinstall ${agentName}'.`);
                         return;
                     }
 
@@ -616,6 +560,10 @@ async function handleCommand(args) {
                                 routerEndpoint,
                                 runtimeAdmission: directAdmission.runtimeAdmission,
                                 networkLifecycleCapability,
+                            });
+                            assertSelectedManualRuntime(agentRuntime, restartResult?.registryRecord, {
+                                agentName: resolved.shortAgentName,
+                                operation: 'restart preparation',
                             });
                             const {
                                 containerName: newContainerName,
@@ -655,15 +603,17 @@ async function handleCommand(args) {
                     // Recreate through the managed transaction so a manual
                     // restart cannot bypass endpoint, bridge, or ownership
                     // validation on a stopped or legacy container.
-                    const containerRunning = isContainerRunning(containerName);
-                    const containerPresent = containerRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
+                    const containerRunning = runtimeRunning;
+                    const containerPresent = containerRunning
+                        || containerExists(containerName, { runtime: agentRuntime })
+                        || Boolean(registryRecord?.containerName);
                     if (!containerPresent) {
                         console.error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
                         return;
                     }
 
                     const runtimeAction = 'restart';
-                    console.log(`Restarting (${getRuntime()}) agent '${agentName}'...`);
+                    console.log(`Restarting (${agentRuntime}) agent '${agentName}'...`);
                     try {
                         await withMaintenanceLock(containerName, {
                             operation: runtimeAction,
@@ -682,6 +632,10 @@ async function handleCommand(args) {
                                     routerEndpoint,
                                     runtimeAdmission: directAdmission.runtimeAdmission,
                                     networkLifecycleCapability,
+                                });
+                                assertSelectedManualRuntime(agentRuntime, result?.registryRecord, {
+                                    agentName: resolved.shortAgentName,
+                                    operation: 'restart preparation',
                                 });
                                 try {
                                     await waitForManifestReadiness({
@@ -710,9 +664,9 @@ async function handleCommand(args) {
                                 throw new Error(`managed restart failed: ${routeError?.message || routeError}`);
                             }
                         }));
-                        console.log('✓ Agent restarted.');
+                        console.log(`✓ Agent restarted (${agentRuntime}).`);
                     } catch (e) {
-                        console.error(`Failed to ${runtimeAction} container ${containerName}: ${e.message}`);
+                        console.error(`Failed to ${runtimeAction} ${agentRuntime} container ${containerName}: ${e.message}`);
                     }
                 }
             } else {
@@ -931,8 +885,8 @@ function disableAllAgents() {
 }
 
 export {
-    stopExactRouterForLifecycle,
     handleCommand,
+    stopExactRouterForLifecycle,
     getAgentNames,
     getRepoNames,
     findAgentManifest,

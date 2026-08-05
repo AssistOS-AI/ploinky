@@ -2,7 +2,51 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { collectAgentRuntimeStates } from '../../cli/sandbox/agentRuntimeState.js';
+import { inspectOwnership } from '../../cli/sandbox/docker/containerRegistry.js';
 import { __testables as marketplaceTestables } from '../../cli/server/authHandlers/marketplaceRoutes.js';
+
+const MANAGED_LABELS = Object.freeze({
+    'io.assistos.ploinky.managed': '1',
+    'io.assistos.ploinky.resource': 'agent',
+    'io.assistos.ploinky.network-schema': '2',
+    'io.assistos.ploinky.workspace': 'a'.repeat(12),
+    'io.assistos.ploinky.network-contract': 'b'.repeat(64),
+    'io.assistos.ploinky.instance-id': 'instance-current',
+    'io.assistos.ploinky.enable-generation': 'generation-current',
+});
+
+test('container inspection extracts only exact managed Podman ownership', () => {
+    const data = {
+        Id: 'c'.repeat(64),
+        Name: '/exactKey',
+        Config: { Labels: MANAGED_LABELS },
+    };
+    const expected = {
+        workspaceHash: 'a'.repeat(12),
+        containerId: 'c'.repeat(64),
+        instanceId: 'instance-current',
+        enableGeneration: 'generation-current',
+    };
+    assert.deepEqual(inspectOwnership(data, 'exactKey', expected), {
+        containerId: 'c'.repeat(64),
+        instanceId: 'instance-current',
+        enableGeneration: 'generation-current',
+        ownershipVerified: true,
+    });
+
+    for (const mutated of [
+        { ...data, Id: 'short-id' },
+        { ...data, Name: '/replacementKey' },
+        { ...data, Config: { Labels: { ...MANAGED_LABELS, 'io.assistos.ploinky.managed': '0' } } },
+        { ...data, Config: { Labels: { ...MANAGED_LABELS, 'io.assistos.ploinky.instance-id': ' stale ' } } },
+    ]) {
+        assert.equal(inspectOwnership(mutated, 'exactKey', expected).ownershipVerified, false);
+    }
+    assert.equal(inspectOwnership(data, 'exactKey', {
+        ...expected,
+        workspaceHash: 'f'.repeat(12),
+    }).ownershipVerified, false);
+});
 
 test('collectAgentRuntimeStates uses exact registry runtime ownership and surfaces host metadata', () => {
     const reads = [];
@@ -16,6 +60,7 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
             projectPath: '/workspace',
             instanceId: 'instance-bwrap',
             enableGeneration: 'generation-bwrap',
+            homeKey: 'bwrapKey.sandbox-v2',
         },
         seatbeltKey: {
             type: 'agent',
@@ -25,6 +70,7 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
             projectPath: '/workspace',
             instanceId: 'instance-seatbelt',
             enableGeneration: 'generation-seatbelt',
+            homeKey: 'seatbeltKey.sandbox-v2',
         },
     };
     const owners = {
@@ -38,7 +84,7 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
             processUid: 501,
             instanceId: 'instance-bwrap',
             enableGeneration: 'generation-bwrap',
-            homeKey: 'bwrapKey',
+            homeKey: 'bwrapKey.sandbox-v2',
             workdir: '/workspace/projects/current',
             logPath: '/workspace/.ploinky/logs/bwrapKey-bwrap.log',
             taskId: '',
@@ -61,7 +107,7 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
             processUid: 501,
             instanceId: 'instance-seatbelt',
             enableGeneration: 'stale-seatbelt-generation',
-            homeKey: 'seatbeltKey',
+            homeKey: 'seatbeltKey.sandbox-v2',
             workdir: '/workspace',
             logPath: '/workspace/.ploinky/logs/seatbeltKey-seatbelt.log',
             taskId: '',
@@ -127,7 +173,7 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
         ownerKey: 'service-bwrap-owner',
         instanceId: 'instance-bwrap',
         enableGeneration: 'generation-bwrap',
-        homeKey: 'bwrapKey',
+        homeKey: 'bwrapKey.sandbox-v2',
         workdir: '/workspace/projects/current',
         logPath: '/workspace/.ploinky/logs/bwrapKey-bwrap.log',
         taskId: '',
@@ -143,16 +189,27 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
             runtime: 'podman',
             repoName: 'Agents',
             agentName: 'runningAgent',
+            containerId: 'a'.repeat(64),
+            instanceId: 'instance-running',
+            enableGeneration: 'generation-running',
         },
         stoppedKey: {
             type: 'agent',
-            runtime: 'docker',
+            runtime: 'podman',
             repoName: 'Agents',
             agentName: 'stoppedAgent',
+            containerId: 'b'.repeat(64),
+            instanceId: 'instance-stopped',
+            enableGeneration: 'generation-stopped',
         },
     };
     const liveContainers = [{
         containerName: 'runningKey',
+        runtime: 'podman',
+        ownershipVerified: true,
+        containerId: 'a'.repeat(64),
+        instanceId: 'instance-running',
+        enableGeneration: 'generation-running',
         repoName: 'Agents',
         agentName: 'runningAgent',
         state: { status: 'running', running: true, pid: 99 },
@@ -163,7 +220,7 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
 
     assert.equal(states[0].runtime, 'podman');
     assert.equal(states[0].state.running, true);
-    assert.equal(states[1].runtime, 'docker');
+    assert.equal(states[1].runtime, 'podman');
     assert.equal(states[1].state.status, 'stopped');
     for (const state of states) {
         for (const hostOnlyField of [
@@ -181,6 +238,171 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
         ]) {
             assert.equal(Object.hasOwn(state, hostOnlyField), false, `${hostOnlyField} must remain host-only`);
         }
+    }
+});
+
+test('collectAgentRuntimeStates rejects legacy and non-exact registry runtimes before probing OCI', () => {
+    for (const runtime of [undefined, null, '', 'container', 'docker', 'Podman', ' podman ', 'nerdctl']) {
+        let probes = 0;
+        assert.throws(
+            () => collectAgentRuntimeStates({
+                registry: {
+                    invalidKey: {
+                        type: 'agent',
+                        ...(runtime === undefined ? {} : { runtime }),
+                        containerId: 'a'.repeat(64),
+                        instanceId: 'instance-invalid',
+                        enableGeneration: 'generation-invalid',
+                    },
+                },
+                collectContainers() {
+                    probes += 1;
+                    return [];
+                },
+            }),
+            (error) => error?.code === 'PLOINKY_AGENT_RUNTIME_STATE_INVALID'
+                && /invalidKey/.test(error.message),
+            `runtime ${JSON.stringify(runtime)} must fail closed`,
+        );
+        assert.equal(probes, 0, 'invalid registry state must fail before probing a container engine');
+    }
+});
+
+test('collectAgentRuntimeStates does not probe a container engine for an all-sandbox registry', () => {
+    let probes = 0;
+    const states = collectAgentRuntimeStates({
+        registry: {
+            sandboxOnly: {
+                type: 'agent',
+                runtime: 'bwrap',
+                instanceId: 'instance-sandbox',
+                enableGeneration: 'generation-sandbox',
+                homeKey: 'sandboxOnly.sandbox-v2',
+            },
+        },
+        collectContainers() {
+            probes += 1;
+            return [];
+        },
+        readSandboxServiceOwner() {
+            return null;
+        },
+    });
+
+    assert.equal(probes, 0);
+    assert.equal(states.length, 1);
+    assert.equal(states[0].runtime, 'bwrap');
+    assert.equal(states[0].state.running, false);
+});
+
+test('collectAgentRuntimeStates matches Podman state by immutable ID and exact generation identity', () => {
+    const registry = {
+        exactKey: {
+            type: 'agent',
+            runtime: 'podman',
+            agentName: 'currentAgent',
+            containerId: 'a'.repeat(64),
+            instanceId: 'instance-current',
+            enableGeneration: 'generation-current',
+        },
+    };
+    const baseLive = {
+        containerName: 'exactKey',
+        runtime: 'podman',
+        ownershipVerified: true,
+        containerId: 'a'.repeat(64),
+        instanceId: 'instance-current',
+        enableGeneration: 'generation-current',
+        agentName: 'currentAgent',
+        state: { status: 'running', running: true, pid: 99 },
+    };
+
+    for (const stale of [
+        { containerId: 'b'.repeat(64) },
+        { instanceId: 'instance-stale' },
+        { enableGeneration: 'generation-stale' },
+        { runtime: 'docker' },
+        { ownershipVerified: false },
+    ]) {
+        const states = collectAgentRuntimeStates({
+            registry,
+            liveContainers: [{ ...baseLive, ...stale }],
+        });
+        const enabled = states.find((entry) => entry.enabled === true);
+        assert.equal(enabled.state.running, false, `stale identity ${JSON.stringify(stale)} must not match`);
+    }
+
+    const exact = collectAgentRuntimeStates({ registry, liveContainers: [baseLive] });
+    assert.equal(exact.find((entry) => entry.enabled === true).state.running, true);
+});
+
+test('collectAgentRuntimeStates never surfaces a foreign or unregistered live Podman runtime', () => {
+    const registry = {
+        exactKey: {
+            type: 'agent',
+            runtime: 'podman',
+            agentName: 'currentAgent',
+            containerId: 'a'.repeat(64),
+            instanceId: 'instance-current',
+            enableGeneration: 'generation-current',
+        },
+    };
+    const states = collectAgentRuntimeStates({
+        registry,
+        liveContainers: [{
+            containerName: 'foreignKey',
+            runtime: 'podman',
+            ownershipVerified: true,
+            containerId: 'b'.repeat(64),
+            instanceId: 'instance-foreign',
+            enableGeneration: 'generation-foreign',
+            agentName: 'foreignAgent',
+            repoName: 'foreignRepo',
+            state: { status: 'running', running: true, pid: 999 },
+        }],
+    });
+    assert.deepEqual(states.map((entry) => entry.containerName), ['exactKey']);
+    assert.equal(states[0].enabled, true);
+    assert.equal(states[0].state.running, false);
+});
+
+test('collectAgentRuntimeStates rejects legacy or mismatched sandbox HOME keys', () => {
+    for (const homeKey of [undefined, '', 'sandboxKey', 'other.sandbox-v2', ' sandboxKey.sandbox-v2 ']) {
+        assert.throws(
+            () => collectAgentRuntimeStates({
+                registry: {
+                    sandboxKey: {
+                        type: 'agent',
+                        runtime: 'bwrap',
+                        instanceId: 'instance-current',
+                        enableGeneration: 'generation-current',
+                        ...(homeKey === undefined ? {} : { homeKey }),
+                    },
+                },
+                liveContainers: [],
+            }),
+            error => error?.code === 'PLOINKY_AGENT_RUNTIME_STATE_INVALID'
+                && /sandbox-v2 HOME key/.test(error.message),
+        );
+    }
+});
+
+test('collectAgentRuntimeStates rejects incomplete Podman registry identities', () => {
+    const complete = {
+        type: 'agent',
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
+        instanceId: 'instance-current',
+        enableGeneration: 'generation-current',
+    };
+    for (const field of ['containerId', 'instanceId', 'enableGeneration']) {
+        const record = { ...complete };
+        delete record[field];
+        assert.throws(
+            () => collectAgentRuntimeStates({ registry: { incomplete: record }, liveContainers: [] }),
+            (error) => error?.code === 'PLOINKY_AGENT_RUNTIME_STATE_INVALID'
+                && error.message.includes(field),
+        );
     }
 });
 

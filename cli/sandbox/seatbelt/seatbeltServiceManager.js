@@ -75,6 +75,7 @@ import { buildFullEnvMap } from '../bwrap/bwrapServiceManager.js';
 // Seatbelt profile generator
 import { buildSeatbeltProfile, writeSeatbeltProfile } from './seatbeltProfile.js';
 import { assertRouterEndpoint } from '../routerPort.js';
+import { resolveInteractiveSpawnResult } from '../interactiveProcess.js';
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
@@ -675,7 +676,9 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
                 agentPath,
                 repoName,
                 manifest,
-                skipInstallHooks: true
+                skipInstallHooks: true,
+                runtime: 'seatbelt',
+                runtimeIdentity,
             });
             if (!lifecycleResult.success) {
                 const details = lifecycleResult.errors.join('; ');
@@ -960,7 +963,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         env: envMap,
         cwd: record.projectPath || agentWorkDir
     });
-    return result.status ?? 0;
+    return resolveInteractiveSpawnResult(result, { label: `seatbelt interactive session '${agentName}'` });
 }
 
 export {

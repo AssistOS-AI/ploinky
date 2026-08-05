@@ -145,6 +145,8 @@ test('stripReservedAgentEnv drops master + identity names, keeps the rest', () =
         FOO: 'keep', BAR: 'also-keep',
         PLOINKY_MASTER_KEY: 'x', PLOINKY_DERIVED_MASTER_KEY: 'y',
         PLOINKY_AGENT_ID: 'z', PLOINKY_AGENT_PRINCIPAL: 'p', PLOINKY_AGENT_SECRET: 's',
+        PLOINKY_AGENT_HOME_KEY: 'attacker-home',
+        PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY: 'manifest',
         PLOINKY_ENV_SOURCE_PLOINKY_FUTURE_PROTECTED_FIELD: 'manifest',
     };
     stripReservedAgentEnv(env);

@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import {
+    BWRAP_HOME_SOURCE_KINDS,
     buildTrustedServicePolicy,
     encodeBwrapLaunchDescriptor,
 } from '../../Agent/lib/providerSandbox.mjs';
@@ -23,6 +24,22 @@ function waitForExit(child, timeoutMs = 5_000) {
         new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal }))),
         new Promise((_, reject) => setTimeout(() => reject(new Error('trusted service did not exit')), timeoutMs)),
     ]);
+}
+
+function writeDescriptor(child, descriptor, stderr) {
+    return new Promise((resolve, reject) => {
+        const stream = child.stdio[3];
+        stream.once('error', async (error) => {
+            let terminal = null;
+            try { terminal = await waitForExit(child); } catch (_) { }
+            reject(new Error([
+                `trusted helper descriptor transport failed: ${error.code || error.message}`,
+                terminal ? `terminal=${JSON.stringify(terminal)}` : 'terminal=unobserved',
+                `stderr=${stderr.value}`,
+            ].join('; '), { cause: error }));
+        });
+        stream.end(descriptor, resolve);
+    });
 }
 
 async function readReady(port, child, stderr) {
@@ -111,12 +128,15 @@ test('native trusted AgentServer uses only fd launcher policy and direct HOME', 
         fs.writeFileSync(path.join(codePath, 'fixture.txt'), 'immutable code\n');
 
         const home = ensureAgentHomeAbi(runtimeKey, 'native-phase4');
-        assert.equal(home.homePath, path.join(workspaceRoot, '.data', runtimeKey));
+        assert.equal(home.homePath, path.join(workspaceRoot, '.data', home.homeKey));
         const markerStat = fs.lstatSync(path.join(home.homePath, AGENT_HOME_ABI_MARKER));
         assert.equal(markerStat.mode & 0o7777, 0o600);
 
         const policy = buildTrustedServicePolicy({
-            runtimeKey,
+            homeSource: {
+                sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+                homeKey: home.homeKey,
+            },
             command: ['/opt/ploinky-node/bin/node', '/Agent/server/AgentServer.mjs'],
             nodeRuntimePath,
             agentRuntimePath,
@@ -147,7 +167,7 @@ test('native trusted AgentServer uses only fd launcher policy and direct HOME', 
         }
         child.stderr.setEncoding('utf8');
         child.stderr.on('data', (chunk) => { stderr.value += chunk; });
-        child.stdio[3].end(descriptor);
+        await writeDescriptor(child, descriptor, stderr);
 
         const report = await readReady(port, child, stderr);
         assert.equal(report.cwd, '/code');
@@ -171,6 +191,6 @@ test('native trusted AgentServer uses only fd launcher policy and direct HOME', 
         }
         fs.rmSync(workspaceWritePath, { force: true });
         fs.rmSync(fixtureRoot, { recursive: true, force: true });
-        fs.rmSync(path.join(workspaceRoot, '.data', runtimeKey), { recursive: true, force: true });
+        fs.rmSync(path.join(workspaceRoot, '.data', `${runtimeKey}.sandbox-v2`), { recursive: true, force: true });
     }
 });

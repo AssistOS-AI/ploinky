@@ -9,17 +9,58 @@ import {
     assertNoWaitAdoptionStillCurrent,
     assertNoWaitLifecycleRebase,
     assertNoWaitLifecycleSnapshot,
+    assertNoWaitPodmanAdoptionOwnership,
     assertNoWaitRegistryRecord,
     cleanupNoWaitTaskOwnedCandidate,
     launchNoWaitHostRuntime,
     resolveNoWaitWorkerLifecycleSnapshot,
     recoverNoWaitTaskOwnedCandidate,
     waitForNoWaitLifecycle,
+    waitForNoWaitReadiness,
     waitForNoWaitRouteActivation,
-    waitForPriorWorker,
+    waitForPriorWorker as waitForPriorWorkerRaw,
     withActiveNoWaitWorkerLifecycleLease,
-    writeStatus,
+    writeStatus as writeStatusRaw,
 } from '../../cli/commands/noWaitWorker.js';
+
+const STATUS_CONTAINER_ID = '9'.repeat(64);
+
+function exactStatusIdentity(containerName, overrides = {}) {
+    return {
+        runtime: 'podman',
+        containerName,
+        instanceId: `instance-${containerName}`,
+        enableGeneration: `generation-${containerName}`,
+        containerId: STATUS_CONTAINER_ID,
+        ...overrides,
+    };
+}
+
+function exactStatus(containerName, payload = {}) {
+    const waitForStatusFile = payload.waitForStatusFile;
+    const predecessorName = waitForStatusFile
+        ? path.basename(waitForStatusFile, '.json')
+        : '';
+    return {
+        ...exactStatusIdentity(containerName),
+        ...(predecessorName ? {
+            waitForIdentity: exactStatusIdentity(predecessorName),
+        } : {}),
+        ...payload,
+    };
+}
+
+function writeStatus(containerName, payload, options) {
+    return writeStatusRaw(containerName, exactStatus(containerName, payload), options);
+}
+
+function waitForPriorWorker(statusPath, options = {}) {
+    const containerName = path.basename(statusPath, '.json');
+    return waitForPriorWorkerRaw(statusPath, {
+        expectedIdentity: exactStatusIdentity(containerName),
+        ...options,
+    });
+}
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-no-wait-worker-'));
@@ -36,20 +77,111 @@ test('no-wait status replacement is atomic and leaves no temporary file', (t) =>
 
     for (let sequence = 0; sequence < 50; sequence += 1) {
         writeStatus(containerName, { state: 'starting', sequence }, { runningDir });
-        assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), {
-            state: 'starting',
-            sequence,
-        });
+        assert.deepEqual(
+            JSON.parse(fs.readFileSync(target, 'utf8')),
+            exactStatus(containerName, { state: 'starting', sequence }),
+        );
         assert.deepEqual(fs.readdirSync(statusDir), [`${containerName}.json`]);
     }
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+});
+
+test('no-wait status publication rejects missing, coerced, and mixed runtime identity', (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_identity';
+    const exact = exactStatus(containerName, { state: 'starting' });
+    const invalidStatuses = [
+        { state: 'starting' },
+        { ...exact, state: 'Starting' },
+        { ...exact, runtime: ' podman' },
+        { ...exact, containerName: `${containerName}-stale` },
+        { ...exact, instanceId: new String(exact.instanceId) },
+        { ...exact, containerId: 'short-id' },
+    ];
+    for (const status of invalidStatuses) {
+        assert.throws(
+            () => writeStatusRaw(containerName, status, { runningDir }),
+            /exact no-wait status identity/,
+        );
+    }
+    const { containerId: _unavailableContainerId, ...freshPodmanStatus } = exact;
+    assert.doesNotThrow(
+        () => writeStatusRaw(containerName, freshPodmanStatus, { runningDir }),
+        'a fresh Podman generation has no immutable container ID before its first launch',
+    );
+});
+
+test('no-wait predecessor rejects a status from a different lifecycle identity', async (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_identity_predecessor';
+    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    writeStatus(containerName, { state: 'running' }, { runningDir });
+
+    await assert.rejects(
+        () => waitForPriorWorkerRaw(target, {
+            runningDir,
+            expectedIdentity: exactStatusIdentity(containerName, {
+                enableGeneration: 'stale-generation',
+            }),
+        }),
+        /predecessor status identity mismatch/,
+    );
+});
+
+test('no-wait predecessor matches Podman container-id presence as part of the exact identity', async (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_fresh_predecessor';
+    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    const withContainerId = exactStatusIdentity(containerName);
+    const { containerId: _unavailableContainerId, ...withoutContainerId } = withContainerId;
+
+    writeStatusRaw(containerName, { ...withoutContainerId, state: 'running' }, { runningDir });
+    await assert.rejects(
+        () => waitForPriorWorkerRaw(target, {
+            runningDir,
+            expectedIdentity: withContainerId,
+        }),
+        /predecessor status identity mismatch/,
+    );
+
+    writeStatusRaw(containerName, { ...withContainerId, state: 'running' }, { runningDir });
+    await assert.rejects(
+        () => waitForPriorWorkerRaw(target, {
+            runningDir,
+            expectedIdentity: withoutContainerId,
+        }),
+        /predecessor status identity mismatch/,
+    );
+});
+
+test('no-wait predecessor chain rejects a mixed-generation nested status', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'identity-successor.json');
+    writeStatus('identity-predecessor', { state: 'running' }, { runningDir });
+    writeStatus('identity-successor', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'identity-predecessor.json',
+        waitForIdentity: exactStatusIdentity('identity-predecessor', {
+            enableGeneration: 'foreign-generation',
+        }),
+    }, { runningDir });
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, { runningDir }),
+        /predecessor status identity mismatch/,
+    );
 });
 
 test('no-wait predecessor observes a complete atomically published terminal state', async (t) => {
     const { runningDir } = fixture(t);
     const containerName = 'ploinky_demo_predecessor';
     const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, { state: 'starting' }, { runningDir });
+    writeStatus(containerName, {
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: Date.now(),
+    }, { runningDir });
     let polls = 0;
 
     const status = await waitForPriorWorker(target, {
@@ -64,6 +196,18 @@ test('no-wait predecessor observes a complete atomically published terminal stat
 
     assert.equal(polls, 1);
     assert.deepEqual(status, { state: 'running' });
+});
+
+test('no-wait predecessor rejects a mixed-generation starting status without a sequence phase', async (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_legacy_predecessor';
+    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    writeStatus(containerName, { state: 'starting' }, { runningDir });
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, { runningDir }),
+        /missing its exact sequence phase/,
+    );
 });
 
 test('no-wait predecessor returns a terminal failure without exposing its details', async (t) => {
@@ -84,7 +228,11 @@ test('no-wait predecessor permits one bounded terminal-publication grace window'
     const { runningDir } = fixture(t);
     const containerName = 'ploinky_demo_slow_predecessor';
     const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, { state: 'starting' }, { runningDir });
+    writeStatus(containerName, {
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: 0,
+    }, { runningDir });
     let now = 0;
 
     const status = await waitForPriorWorker(target, {
@@ -109,7 +257,11 @@ test('no-wait predecessor terminal-publication grace remains bounded and fail-cl
     const { runningDir } = fixture(t);
     const containerName = 'ploinky_demo_stuck_predecessor';
     const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, { state: 'starting' }, { runningDir });
+    writeStatus(containerName, {
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: 0,
+    }, { runningDir });
     let now = 0;
 
     await assert.rejects(
@@ -132,7 +284,11 @@ test('no-wait predecessor reports failure published during the bounded grace win
     const { runningDir } = fixture(t);
     const containerName = 'ploinky_demo_late_failed_predecessor';
     const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, { state: 'starting' }, { runningDir });
+    writeStatus(containerName, {
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: 0,
+    }, { runningDir });
     let now = 0;
 
     const status = await waitForPriorWorker(target, {
@@ -208,7 +364,7 @@ test('no-wait predecessor budget follows the one active worker across a cumulati
         },
     });
 
-    assert.equal(now, 2_700, 'the common spawn-time legacy deadline must not truncate valid progress');
+    assert.equal(now, 2_700, 'the exact active-phase deadline must not truncate valid progress');
     assert.deepEqual(status, { state: 'running' });
 });
 
@@ -893,6 +1049,8 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
                     alias: 'background',
                     instanceId: 'instance-one',
                     enableGeneration: 'enable-one',
+                    runtime: 'podman',
+                    containerId: 'c'.repeat(64),
                 },
             },
             routing: {
@@ -922,6 +1080,10 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
         alias: 'background',
         routeKey: 'background',
         agentPath: '/workspace/demo/worker',
+        runtime: 'podman',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
+        containerId: 'c'.repeat(64),
     };
 
     const lifecycle = assertNoWaitLifecycleSnapshot(active, identity);
@@ -930,6 +1092,25 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
     assert.equal(lifecycle.selectorActivationId, 'activation-one');
     assert.equal(lifecycle.routerPort, 8080);
     assert.equal(lifecycle.routerHostPort, 19090);
+    const { containerId: _freshContainerId, ...freshIdentity } = identity;
+    const { containerId: _freshRecordContainerId, ...freshRecord } = active.generation.agents.ploinky_demo_worker;
+    assert.doesNotThrow(() => assertNoWaitLifecycleSnapshot({
+        ...active,
+        generation: {
+            ...active.generation,
+            agents: { ploinky_demo_worker: freshRecord },
+        },
+    }, freshIdentity));
+    for (const changedIdentity of [
+        { ...identity, instanceId: 'foreign-instance' },
+        { ...identity, enableGeneration: 'foreign-generation' },
+        { ...identity, containerId: 'd'.repeat(64) },
+    ]) {
+        assert.throws(
+            () => assertNoWaitLifecycleSnapshot(active, changedIdentity),
+            /exact selected runtime|exact immutable runtime identity/,
+        );
+    }
     assert.throws(
         () => assertNoWaitLifecycleSnapshot({
             generation: {
@@ -949,7 +1130,7 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
     assert.doesNotThrow(() => assertNoWaitRegistryRecord({
         ...active.generation.agents.ploinky_demo_worker,
         runtime: 'podman',
-        containerId: 'runtime-one',
+        containerId: 'c'.repeat(64),
     }, active.generation.agents.ploinky_demo_worker, identity));
     assert.throws(
         () => assertNoWaitRegistryRecord({
@@ -958,6 +1139,115 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
         }, active.generation.agents.ploinky_demo_worker, identity),
         /registry identity inconsistent/,
     );
+    assert.throws(
+        () => assertNoWaitRegistryRecord({
+            ...active.generation.agents.ploinky_demo_worker,
+            repoName: { toString: () => 'demo' },
+            containerId: 'c'.repeat(64),
+        }, active.generation.agents.ploinky_demo_worker, identity),
+        /registry identity inconsistent/,
+    );
+    assert.throws(
+        () => assertNoWaitRegistryRecord({
+            ...active.generation.agents.ploinky_demo_worker,
+            containerId: { toString: () => 'c'.repeat(64) },
+        }, active.generation.agents.ploinky_demo_worker, identity),
+        /registry identity inconsistent/,
+    );
+    assert.throws(
+        () => assertNoWaitRegistryRecord({
+            ...active.generation.agents.ploinky_demo_worker,
+            instanceId: { toString: () => 'instance-one' },
+            containerId: 'c'.repeat(64),
+        }, active.generation.agents.ploinky_demo_worker, identity),
+        /registry identity inconsistent/,
+    );
+    for (const invalidRuntime of ['', 'container', 'docker', ' podman', 'podman ']) {
+        assert.throws(
+            () => assertNoWaitLifecycleSnapshot({
+                ...active,
+                generation: {
+                    ...active.generation,
+                    agents: {
+                        ploinky_demo_worker: {
+                            ...active.generation.agents.ploinky_demo_worker,
+                            runtime: invalidRuntime,
+                        },
+                    },
+                },
+            }, identity),
+            /exact selected runtime/,
+        );
+    }
+    for (const [field, value] of [
+        ['instanceId', ' instance-one'],
+        ['enableGeneration', 'enable-one '],
+    ]) {
+        assert.throws(
+            () => assertNoWaitLifecycleSnapshot({
+                ...active,
+                generation: {
+                    ...active.generation,
+                    agents: {
+                        ploinky_demo_worker: {
+                            ...active.generation.agents.ploinky_demo_worker,
+                            [field]: value,
+                        },
+                    },
+                },
+            }, identity),
+            /staged registry identity/,
+        );
+    }
+    const { containerId: _ignoredRuntimeContainerId, ...sandboxIdentity } = identity;
+    assert.throws(
+        () => assertNoWaitLifecycleSnapshot(active, { ...sandboxIdentity, runtime: 'bwrap' }),
+        /exact selected runtime/,
+    );
+    assert.throws(
+        () => assertNoWaitLifecycleSnapshot({
+            ...active,
+            generation: {
+                ...active.generation,
+                routing: {
+                    routes: {
+                        background: {
+                            ...active.generation.routing.routes.background,
+                            hostPath: '/workspace/demo/worker/..',
+                        },
+                    },
+                },
+            },
+        }, identity),
+        /exact staged route identity/,
+    );
+    assert.throws(
+        () => assertNoWaitRegistryRecord({
+            ...active.generation.agents.ploinky_demo_worker,
+            runtime: 'bwrap',
+        }, active.generation.agents.ploinky_demo_worker, identity),
+        /registry identity inconsistent/,
+    );
+    for (const runtime of ['bwrap', 'seatbelt']) {
+        const { containerId: _ignoredContainerId, ...podmanStaged } = active.generation.agents.ploinky_demo_worker;
+        const staged = {
+            ...podmanStaged,
+            runtime,
+        };
+        const { containerId: _ignoredIdentityContainerId, ...baseIdentity } = identity;
+        assert.doesNotThrow(() => assertNoWaitLifecycleSnapshot({
+            ...active,
+            generation: {
+                ...active.generation,
+                agents: { ploinky_demo_worker: staged },
+            },
+        }, { ...baseIdentity, runtime }));
+        assert.doesNotThrow(() => assertNoWaitRegistryRecord(
+            staged,
+            staged,
+            { ...baseIdentity, runtime },
+        ));
+    }
 });
 
 test('queued no-wait launch adopts the exact ready runtime published by a foreground start', () => {
@@ -968,6 +1258,10 @@ test('queued no-wait launch adopts the exact ready runtime published by a foregr
         alias: 'background',
         routeKey: 'background',
         agentPath: '/workspace/demo/worker',
+        runtime: 'podman',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
+        containerId: 'a'.repeat(64),
     };
     const ready = {
         selector: {
@@ -1013,6 +1307,15 @@ test('queued no-wait launch adopts the exact ready runtime published by a foregr
     assert.equal(lifecycle.targetState, 'ready');
     assert.equal(lifecycle.route.hostPort, 43123);
     assert.equal(lifecycle.record.containerId, 'a'.repeat(64));
+    assert.equal(assertNoWaitPodmanAdoptionOwnership(lifecycle, [{
+        containerName: 'ploinky_demo_worker',
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
+        ownershipVerified: true,
+        state: { running: true },
+    }]), lifecycle);
     assert.equal(
         assertNoWaitAdoptionStillCurrent(lifecycle, {
             ...lifecycle,
@@ -1065,6 +1368,28 @@ test('queued no-wait launch adopts the exact ready runtime published by a foregr
         }, identity),
         /adopted runtime changed/,
     );
+    for (const change of [
+        { ownershipVerified: false },
+        { containerId: 'b'.repeat(64) },
+        { instanceId: 'replacement-instance' },
+        { enableGeneration: 'replacement-generation' },
+        { runtime: 'docker' },
+        { state: { running: false } },
+    ]) {
+        assert.throws(
+            () => assertNoWaitPodmanAdoptionOwnership(lifecycle, [{
+                containerName: 'ploinky_demo_worker',
+                runtime: 'podman',
+                containerId: 'a'.repeat(64),
+                instanceId: 'instance-one',
+                enableGeneration: 'enable-one',
+                ownershipVerified: true,
+                state: { running: true },
+                ...change,
+            }]),
+            /exact rootless Podman ownership/,
+        );
+    }
 });
 
 test('queued no-wait launch rejects incomplete or foreign published targets', () => {
@@ -1075,6 +1400,10 @@ test('queued no-wait launch rejects incomplete or foreign published targets', ()
         alias: '',
         routeKey: 'worker',
         agentPath: '/workspace/demo/worker',
+        runtime: 'podman',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
+        containerId: 'b'.repeat(64),
     };
     const active = {
         selector: {
@@ -1135,6 +1464,99 @@ test('queued no-wait launch rejects incomplete or foreign published targets', ()
         }, identity),
         /exact staged route identity/,
     );
+    assert.throws(
+        () => resolveNoWaitWorkerLifecycleSnapshot({
+            ...active,
+            generation: {
+                ...active.generation,
+                agents: {
+                    ploinky_demo_worker: {
+                        ...active.generation.agents.ploinky_demo_worker,
+                        runtime: 'docker',
+                    },
+                },
+                routing: {
+                    routes: {
+                        worker: {
+                            ...active.generation.routing.routes.worker,
+                            hostPort: 43123,
+                        },
+                    },
+                },
+            },
+        }, identity),
+        /exact selected runtime/,
+    );
+});
+
+test('sandbox no-wait readiness never executes an OCI script probe', async () => {
+    for (const runtime of ['bwrap', 'seatbelt']) {
+        let containerProbeCalls = 0;
+        await assert.rejects(
+            () => waitForNoWaitReadiness({
+                manifest: {
+                    start: 'node server.mjs',
+                    health: { readiness: { script: 'ready.sh' } },
+                },
+                shortAgent: 'worker',
+                containerName: 'ploinky_demo_worker',
+                hostPort: 43123,
+                runtimeResult: {
+                    registryRecord: {
+                        runtime,
+                        instanceId: 'instance-one',
+                        enableGeneration: 'enable-one',
+                    },
+                },
+                networkMode: 'host',
+                generationDigest: 'sha256:active',
+                selectedRuntime: runtime,
+            }, {
+                runContainerScriptReadinessFn() {
+                    containerProbeCalls += 1;
+                    return { status: 'success' };
+                },
+            }),
+            (error) => error?.code === 'PLOINKY_SANDBOX_SCRIPT_READINESS_UNSUPPORTED',
+        );
+        assert.equal(containerProbeCalls, 0);
+    }
+});
+
+test('Podman no-wait script readiness pins both exec and running probes to Podman', async () => {
+    const runningCalls = [];
+    let scriptCalls = 0;
+    await waitForNoWaitReadiness({
+        manifest: {
+            start: 'node server.mjs',
+            health: { readiness: { script: 'ready.sh' } },
+        },
+        shortAgent: 'worker',
+        containerName: 'ploinky_demo_worker',
+        runtimeResult: { registryRecord: { runtime: 'podman' } },
+        networkMode: 'default',
+        generationDigest: 'sha256:active',
+        selectedRuntime: 'podman',
+    }, {
+        runContainerScriptReadinessFn(agentName, containerName, probe, options) {
+            scriptCalls += 1;
+            assert.equal(agentName, 'worker');
+            assert.equal(containerName, 'ploinky_demo_worker');
+            assert.equal(probe.script, 'ready.sh');
+            assert.equal(options.runtime, 'podman');
+            assert.equal(options.isContainerRunningImpl(containerName, { timeoutMs: 321 }), true);
+            return { status: 'success' };
+        },
+        isContainerRunningFn(containerName, options) {
+            runningCalls.push({ containerName, options });
+            return true;
+        },
+    });
+    assert.equal(scriptCalls, 1);
+    assert.deepEqual(runningCalls, [{
+        containerName: 'ploinky_demo_worker',
+        options: { timeoutMs: 321, runtime: 'podman' },
+    }]);
 });
 
 test('no-wait failure cleanup removes only a runtime created by this launch', async () => {

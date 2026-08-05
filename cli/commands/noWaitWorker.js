@@ -41,6 +41,66 @@ import {
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import { withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 
+const EXACT_NO_WAIT_RUNTIMES = new Set(['podman', 'bwrap', 'seatbelt']);
+const IMMUTABLE_CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
+const EXACT_NO_WAIT_STATES = new Set(['starting', 'running', 'failed']);
+
+function isExactIdentityText(value) {
+    return typeof value === 'string' && value !== '' && value === value.trim();
+}
+
+function assertExactNoWaitRuntime(runtime, description = 'no-wait lifecycle') {
+    if (typeof runtime !== 'string' || !EXACT_NO_WAIT_RUNTIMES.has(runtime)) {
+        const error = new Error(
+            `${description} requires one exact selected runtime (podman, bwrap, or seatbelt)`,
+        );
+        error.code = 'PLOINKY_NO_WAIT_RUNTIME_MISMATCH';
+        throw error;
+    }
+    return runtime;
+}
+
+function assertExactNoWaitIdentity(identity, description = 'no-wait identity') {
+    const runtime = assertExactNoWaitRuntime(identity?.runtime, description);
+    if (!isExactIdentityText(identity?.containerName)
+        || !isExactIdentityText(identity?.instanceId)
+        || !isExactIdentityText(identity?.enableGeneration)) {
+        throw new Error(`${description} requires exact container, instance, and enable-generation identity`);
+    }
+    const ownsContainerId = Object.prototype.hasOwnProperty.call(identity, 'containerId');
+    if (runtime === 'podman') {
+        if (ownsContainerId && (typeof identity.containerId !== 'string'
+            || !IMMUTABLE_CONTAINER_ID_PATTERN.test(identity.containerId))) {
+            throw new Error(`${description} has an invalid immutable Podman container identity`);
+        }
+    } else if (ownsContainerId) {
+        throw new Error(`${description} must not attach a Podman container identity to '${runtime}'`);
+    }
+    return identity;
+}
+
+export function assertNoWaitStatusIdentity(status, expectedIdentity = null, {
+    description = 'exact no-wait status identity',
+} = {}) {
+    if (!status || typeof status !== 'object' || Array.isArray(status)
+        || !EXACT_NO_WAIT_STATES.has(status.state)) {
+        throw new Error(`${description} requires one exact status state`);
+    }
+    assertExactNoWaitIdentity(status, description);
+    if (!expectedIdentity) return status;
+    assertExactNoWaitIdentity(expectedIdentity, `${description} expectation`);
+    const fields = ['runtime', 'containerName', 'instanceId', 'enableGeneration'];
+    const mismatch = fields.some((field) => status[field] !== expectedIdentity[field]);
+    const statusOwnsContainerId = Object.prototype.hasOwnProperty.call(status, 'containerId');
+    const expectedOwnsContainerId = Object.prototype.hasOwnProperty.call(expectedIdentity, 'containerId');
+    if (mismatch
+        || statusOwnsContainerId !== expectedOwnsContainerId
+        || (statusOwnsContainerId && status.containerId !== expectedIdentity.containerId)) {
+        throw new Error(`${description} mismatch`);
+    }
+    return status;
+}
+
 function parseArgs(argv) {
     const out = {};
     for (let i = 0; i < argv.length; i += 1) {
@@ -63,6 +123,15 @@ function statusPathFor(containerName, { runningDir = RUNNING_DIR } = {}) {
 }
 
 export function writeStatus(containerName, payload, { runningDir = RUNNING_DIR } = {}) {
+    assertNoWaitStatusIdentity(payload, {
+        runtime: payload?.runtime,
+        containerName,
+        instanceId: payload?.instanceId,
+        enableGeneration: payload?.enableGeneration,
+        ...(Object.prototype.hasOwnProperty.call(payload || {}, 'containerId')
+            ? { containerId: payload.containerId }
+            : {}),
+    });
     const target = statusPathFor(containerName, { runningDir });
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
@@ -94,12 +163,14 @@ function resolveSequenceObservation(statusPath, status, {
     statusRoot,
     timeoutMs,
     terminalPublicationGraceMs,
-    legacyDeadline,
+    publicationDeadline,
     nowMs,
+    expectedIdentity,
     maxDepth = 128,
 } = {}) {
     let currentPath = statusPath;
     let current = status;
+    let currentExpectedIdentity = expectedIdentity;
     const visited = new Set();
 
     for (let depth = 0; depth < maxDepth; depth += 1) {
@@ -107,6 +178,10 @@ function resolveSequenceObservation(statusPath, status, {
             throw new Error('no-wait predecessor status chain contains a cycle');
         }
         visited.add(currentPath);
+
+        assertNoWaitStatusIdentity(current, currentExpectedIdentity, {
+            description: 'no-wait predecessor status identity',
+        });
 
         if (current?.state === 'running' || current?.state === 'failed') {
             if (currentPath === statusPath) return { terminal: current.state };
@@ -123,9 +198,9 @@ function resolveSequenceObservation(statusPath, status, {
             throw new Error('no-wait predecessor status is missing its state');
         }
 
-        // Legacy workers did not publish a sequence phase. Keep their original
-        // single bounded window so mixed-version state fails closed.
-        if (!current.sequencePhase) return { deadline: legacyDeadline };
+        if (!current.sequencePhase) {
+            throw new Error('no-wait predecessor starting status is missing its exact sequence phase');
+        }
 
         if (current.sequencePhase === 'active') {
             const phaseStartedAtMs = parseSequenceTimestamp(
@@ -143,6 +218,10 @@ function resolveSequenceObservation(statusPath, status, {
         if (current.sequencePhase !== 'waiting-predecessor') {
             throw new Error(`no-wait predecessor has invalid sequence phase '${current.sequencePhase}'`);
         }
+        assertExactNoWaitIdentity(
+            current.waitForIdentity,
+            'no-wait predecessor waiting identity',
+        );
         const predecessorFile = String(current.waitForStatusFile || '');
         if (!predecessorFile
             || path.basename(predecessorFile) !== predecessorFile
@@ -150,10 +229,14 @@ function resolveSequenceObservation(statusPath, status, {
             throw new Error('no-wait predecessor waiting phase has an invalid status reference');
         }
         currentPath = path.join(statusRoot, predecessorFile);
+        if (current.waitForIdentity.containerName !== path.basename(predecessorFile, '.json')) {
+            throw new Error('no-wait predecessor waiting identity does not match its status reference');
+        }
+        currentExpectedIdentity = current.waitForIdentity;
         try {
             current = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
         } catch (error) {
-            if (error?.code === 'ENOENT') return { deadline: legacyDeadline };
+            if (error?.code === 'ENOENT') return { deadline: publicationDeadline };
             throw new Error(`no-wait predecessor status chain is invalid: ${error?.message || error}`);
         }
     }
@@ -173,8 +256,10 @@ export async function waitForPriorWorker(rawStatusPath, {
     pollIntervalMs = 100,
     sleepFn = sleep,
     nowFn = Date.now,
+    expectedIdentity = null,
 } = {}) {
     if (!rawStatusPath) return;
+    assertExactNoWaitIdentity(expectedIdentity, 'no-wait predecessor expected identity');
     const statusPath = path.resolve(rawStatusPath);
     const allowedRoot = `${path.resolve(runningDir, 'no-wait')}${path.sep}`;
     if (!statusPath.startsWith(allowedRoot) || path.extname(statusPath) !== '.json') {
@@ -186,19 +271,22 @@ export async function waitForPriorWorker(rawStatusPath, {
     const boundedTerminalPublicationGraceMs = Number.isFinite(terminalPublicationGraceMs)
         ? Math.min(Math.max(0, terminalPublicationGraceMs), 300000)
         : 60000;
-    const legacyDeadline = nowFn() + boundedTimeoutMs + boundedTerminalPublicationGraceMs;
+    const initialPublicationDeadline = nowFn()
+        + boundedTimeoutMs
+        + boundedTerminalPublicationGraceMs;
     const statusRoot = path.resolve(runningDir, 'no-wait');
     while (true) {
         const nowMs = nowFn();
-        let observation = { deadline: legacyDeadline };
+        let observation = { deadline: initialPublicationDeadline };
         try {
             const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
             observation = resolveSequenceObservation(statusPath, status, {
                 statusRoot,
                 timeoutMs: boundedTimeoutMs,
                 terminalPublicationGraceMs: boundedTerminalPublicationGraceMs,
-                legacyDeadline,
+                publicationDeadline: initialPublicationDeadline,
                 nowMs,
+                expectedIdentity,
             });
         } catch (error) {
             if (error?.code !== 'ENOENT') {
@@ -283,6 +371,10 @@ export function assertNoWaitRegistryRecord(record, stagedRecord, {
     shortAgent,
     alias,
 }) {
+    const stagedRuntime = assertExactNoWaitRuntime(
+        stagedRecord?.runtime,
+        `no-wait staged identity for '${containerName}'`,
+    );
     const invariantFields = [
         ['type', 'agent'],
         ['repoName', repoName],
@@ -294,11 +386,18 @@ export function assertNoWaitRegistryRecord(record, stagedRecord, {
         ['runMode', stagedRecord?.runMode],
         ['projectPath', stagedRecord?.projectPath],
         ['develRepo', stagedRecord?.develRepo],
+        ['runtime', stagedRuntime],
     ];
     const mismatch = !record || invariantFields.some(([field, expected]) => (
-        String(record?.[field] || '') !== String(expected || '')
-    )) || String(record?.auth?.mode || '') !== String(stagedRecord?.auth?.mode || '');
-    if (mismatch) {
+        record?.[field] !== expected
+    )) || record?.auth?.mode !== stagedRecord?.auth?.mode
+        || record?.instanceId !== stagedRecord?.instanceId
+        || record?.enableGeneration !== stagedRecord?.enableGeneration
+        || record?.runtime !== stagedRuntime;
+    const exactPodmanContainer = stagedRuntime !== 'podman'
+        || (typeof record?.containerId === 'string'
+            && IMMUTABLE_CONTAINER_ID_PATTERN.test(record.containerId));
+    if (mismatch || !exactPodmanContainer) {
         throw new Error(`no-wait runtime returned a registry identity inconsistent with '${containerName}'`);
     }
     return record;
@@ -429,32 +528,69 @@ export async function recoverNoWaitTaskOwnedCandidate(candidate, originalFailure
     }
 }
 
-function assertNoWaitLifecycleIdentity(active, {
-    containerName,
-    repoName,
-    shortAgent,
-    alias,
-    routeKey,
-    agentPath,
-}) {
+function assertNoWaitLifecycleIdentity(active, identity) {
+    const {
+        containerName,
+        repoName,
+        shortAgent,
+        alias,
+        routeKey,
+        agentPath,
+        runtime,
+        instanceId,
+        enableGeneration,
+        containerId,
+    } = identity;
+    const ownsContainerId = Object.prototype.hasOwnProperty.call(identity, 'containerId');
+    assertExactNoWaitIdentity({
+        runtime,
+        containerName,
+        instanceId,
+        enableGeneration,
+        ...(ownsContainerId ? { containerId } : {}),
+    }, `no-wait lifecycle identity for '${containerName}'`);
+    const selectedRuntime = assertExactNoWaitRuntime(
+        runtime,
+        `no-wait selector for '${routeKey}'`,
+    );
     const record = active?.generation?.agents?.[containerName];
+    const recordAlias = record?.alias === undefined ? '' : record.alias;
     if (!record || record.type !== 'agent'
-        || String(record.repoName || '') !== repoName
-        || String(record.agentName || '') !== shortAgent
-        || String(record.alias || '') !== alias
-        || !String(record.instanceId || '')
-        || !String(record.enableGeneration || '')) {
-        throw new Error(`no-wait lifecycle requires the exact staged registry identity for '${containerName}'`);
+        || record.repoName !== repoName
+        || record.agentName !== shortAgent
+        || recordAlias !== alias
+        || record.instanceId !== instanceId
+        || record.enableGeneration !== enableGeneration
+        || record.runtime !== selectedRuntime) {
+        const error = new Error(
+            `no-wait lifecycle requires the exact selected runtime and staged registry identity for '${containerName}'`,
+        );
+        error.code = 'PLOINKY_NO_WAIT_RUNTIME_MISMATCH';
+        throw error;
+    }
+    const recordOwnsContainerId = Object.prototype.hasOwnProperty.call(record, 'containerId');
+    if (recordOwnsContainerId !== ownsContainerId
+        || (ownsContainerId && record.containerId !== containerId)) {
+        const error = new Error(
+            `no-wait lifecycle requires the exact immutable runtime identity for '${containerName}'`,
+        );
+        error.code = 'PLOINKY_NO_WAIT_RUNTIME_MISMATCH';
+        throw error;
     }
     const route = active?.generation?.routing?.routes?.[routeKey];
+    const routeAlias = route?.alias === undefined ? '' : route.alias;
     if (!route
-        || String(route.container || '') !== containerName
-        || String(route.repo || '') !== repoName
-        || String(route.agent || '') !== shortAgent
-        || String(route.alias || '') !== alias
-        || !String(route.hostPath || '')
-        || !String(agentPath || '')
-        || path.resolve(String(route.hostPath)) !== path.resolve(String(agentPath))) {
+        || route.container !== containerName
+        || route.repo !== repoName
+        || route.agent !== shortAgent
+        || routeAlias !== alias
+        || !isExactIdentityText(route.hostPath)
+        || !isExactIdentityText(agentPath)
+        || !path.isAbsolute(route.hostPath)
+        || !path.isAbsolute(agentPath)
+        || path.normalize(route.hostPath) !== route.hostPath
+        || path.normalize(agentPath) !== agentPath
+        || route.hostPath !== agentPath) {
         throw new Error(`no-wait lifecycle requires one exact staged route identity for '${routeKey}'`);
     }
     const manifest = active?.generation?.manifests?.[routeKey];
@@ -487,14 +623,15 @@ export function assertNoWaitLifecycleSnapshot(active, identity) {
 export function assertNoWaitAdoptableLifecycleSnapshot(active, identity) {
     const lifecycle = assertNoWaitLifecycleIdentity(active, identity);
     const hostPort = Number(lifecycle.route.hostPort);
-    const runtime = String(lifecycle.record.runtime || '').trim();
-    const containerId = String(lifecycle.record.containerId || '').trim().toLowerCase();
+    const runtime = lifecycle.record.runtime;
+    const containerId = lifecycle.record.containerId;
     if (!Number.isInteger(hostPort) || hostPort <= 0 || hostPort > 65535
         || Object.prototype.hasOwnProperty.call(lifecycle.route, 'serviceTargets')
-        || !['docker', 'podman'].includes(runtime)
-        || !/^[a-f0-9]{64}$/.test(containerId)) {
+        || runtime !== 'podman'
+        || typeof containerId !== 'string'
+        || !IMMUTABLE_CONTAINER_ID_PATTERN.test(containerId)) {
         throw new Error(
-            `no-wait lifecycle cannot adopt an existing target for '${identity.routeKey}' without one exact container runtime and private host port`,
+            `no-wait lifecycle cannot adopt an existing target for '${identity.routeKey}' without one exact Podman runtime identity and private host port`,
         );
     }
     return Object.freeze({
@@ -502,6 +639,39 @@ export function assertNoWaitAdoptableLifecycleSnapshot(active, identity) {
         route: Object.freeze({ ...lifecycle.route }),
         targetState: 'ready',
     });
+}
+
+export function assertNoWaitPodmanAdoptionOwnership(lifecycle, liveRuntimeRecords) {
+    const record = lifecycle?.record;
+    const containerName = lifecycle?.route?.container;
+    const containerId = record?.containerId;
+    const matching = Array.isArray(liveRuntimeRecords)
+        ? liveRuntimeRecords.filter((candidate) => (
+            candidate?.containerName === containerName
+            && candidate?.containerId === containerId
+        ))
+        : [];
+    const live = matching.length === 1 ? matching[0] : null;
+    if (lifecycle?.targetState !== 'ready'
+        || record?.runtime !== 'podman'
+        || typeof containerName !== 'string'
+        || typeof containerId !== 'string'
+        || !IMMUTABLE_CONTAINER_ID_PATTERN.test(containerId)
+        || !isExactIdentityText(record?.instanceId)
+        || !isExactIdentityText(record?.enableGeneration)
+        || !live
+        || live.runtime !== 'podman'
+        || live.ownershipVerified !== true
+        || live.instanceId !== record.instanceId
+        || live.enableGeneration !== record.enableGeneration
+        || live.state?.running !== true) {
+        const error = new Error(
+            `no-wait adoption requires exact rootless Podman ownership labels and immutable runtime identity for '${containerName}'`,
+        );
+        error.code = 'PLOINKY_NO_WAIT_ADOPTION_OWNERSHIP_INVALID';
+        throw error;
+    }
+    return lifecycle;
 }
 
 export function resolveNoWaitWorkerLifecycleSnapshot(active, identity) {
@@ -773,7 +943,7 @@ export async function launchNoWaitHostRuntime(identity, initialLifecycle, launch
     throw error;
 }
 
-async function waitForNoWaitReadiness({
+export async function waitForNoWaitReadiness({
     manifest,
     shortAgent,
     containerName,
@@ -781,12 +951,44 @@ async function waitForNoWaitReadiness({
     runtimeResult,
     networkMode,
     generationDigest,
-}) {
+    selectedRuntime,
+}, {
+    runContainerScriptReadinessFn = runContainerScriptReadiness,
+    isContainerRunningFn = dockerSvc.isContainerRunning,
+} = {}) {
+    const exactRuntime = assertExactNoWaitRuntime(
+        selectedRuntime,
+        `no-wait readiness for '${containerName}'`,
+    );
+    if (runtimeResult?.registryRecord?.runtime !== exactRuntime) {
+        const error = new Error(
+            `no-wait readiness selected '${exactRuntime}' but the returned runtime identity does not match`,
+        );
+        error.code = 'PLOINKY_NO_WAIT_RUNTIME_MISMATCH';
+        throw error;
+    }
     const protocol = resolveAgentReadinessProtocol(manifest);
     if (protocol === 'none') return;
     if (protocol === 'script') {
+        if (isSandboxRuntime(exactRuntime)) {
+            const error = new Error(
+                `sandbox runtime '${exactRuntime}' cannot execute container script readiness`,
+            );
+            error.code = 'PLOINKY_SANDBOX_SCRIPT_READINESS_UNSUPPORTED';
+            throw error;
+        }
         const probe = normalizeProbeConfig('readiness', manifest?.health?.readiness);
-        const result = await Promise.resolve(runContainerScriptReadiness(shortAgent, containerName, probe));
+        const result = await Promise.resolve(
+            runContainerScriptReadinessFn(shortAgent, containerName, probe, {
+                runtime: exactRuntime,
+                isContainerRunningImpl(runtimeContainerName, probeOptions = {}) {
+                    return isContainerRunningFn(runtimeContainerName, {
+                        ...probeOptions,
+                        runtime: exactRuntime,
+                    });
+                },
+            }),
+        );
         if (result?.status !== 'success') {
             throw new Error(`readiness script failed (${result?.reason || 'unknown failure'})`);
         }
@@ -825,10 +1027,32 @@ async function main() {
     const profileName = args.profile || '';
     const waitForStatus = args.waitForStatus || '';
 
-    if (!containerName || !shortAgent || !repoName || !manifestPath || !agentPath) {
+    if (!containerName || !shortAgent || !repoName || !manifestPath || !agentPath
+        || !args.runtime || !args.instanceId || !args.enableGeneration) {
         console.error('[no-wait] missing required arguments; refusing to run.');
         console.error('[no-wait] args:', JSON.stringify(args));
         process.exit(2);
+    }
+
+    const dispatchIdentity = Object.freeze(assertExactNoWaitIdentity({
+        runtime: args.runtime,
+        containerName,
+        instanceId: args.instanceId,
+        enableGeneration: args.enableGeneration,
+        ...(args.containerId ? { containerId: args.containerId } : {}),
+    }, 'no-wait dispatched lifecycle identity'));
+    let waitForIdentity = null;
+    if (waitForStatus) {
+        waitForIdentity = Object.freeze(assertExactNoWaitIdentity({
+            runtime: args.waitForRuntime,
+            containerName: args.waitForContainer,
+            instanceId: args.waitForInstanceId,
+            enableGeneration: args.waitForEnableGeneration,
+            ...(args.waitForContainerId ? { containerId: args.waitForContainerId } : {}),
+        }, 'no-wait dispatched predecessor identity'));
+        if (path.basename(waitForStatus, '.json') !== waitForIdentity.containerName) {
+            throw new Error('no-wait dispatched predecessor identity does not match its status file');
+        }
     }
 
     // Detached workers write status immediately so predecessor workers can
@@ -842,6 +1066,13 @@ async function main() {
         path: `manifest(${repoName}/${shortAgent})`,
     });
     const admittedRuntime = getRuntimeForAgent(admittedManifest);
+    if (admittedRuntime !== dispatchIdentity.runtime) {
+        const error = new Error(
+            `no-wait manifest runtime does not match dispatched runtime for '${containerName}'`,
+        );
+        error.code = 'PLOINKY_NO_WAIT_RUNTIME_MISMATCH';
+        throw error;
+    }
     const admittedRuntimeKind = isSandboxRuntime(admittedRuntime) ? admittedRuntime : 'container';
     const llmAdmissionContext = admittedRuntimeKind === 'container'
         ? resolveLlmRuntimeAdmissionContext({
@@ -874,6 +1105,7 @@ async function main() {
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
     let baseStatus = {
+        ...dispatchIdentity,
         containerName,
         shortAgent,
         repoName,
@@ -881,13 +1113,17 @@ async function main() {
         routeKey,
         manifestPath,
         agentPath,
+        runtime: admittedRuntime,
         pid: process.pid,
         startedAt,
         startedAtMs,
         sequencePhase: waitForStatus ? 'waiting-predecessor' : 'active',
         sequencePhaseStartedAt: startedAt,
         sequencePhaseStartedAtMs: startedAtMs,
-        ...(waitForStatus ? { waitForStatusFile: path.basename(waitForStatus) } : {}),
+        ...(waitForStatus ? {
+            waitForStatusFile: path.basename(waitForStatus),
+            waitForIdentity,
+        } : {}),
     };
     writeStatus(containerName, { ...baseStatus, state: 'starting' });
 
@@ -895,7 +1131,7 @@ async function main() {
 
     let taskOwnedCandidate = null;
     try {
-        await waitForPriorWorker(waitForStatus);
+        await waitForPriorWorker(waitForStatus, { expectedIdentity: waitForIdentity });
         if (waitForStatus) {
             const sequencePhaseStartedAtMs = Date.now();
             baseStatus = {
@@ -905,6 +1141,7 @@ async function main() {
                 sequencePhaseStartedAtMs,
             };
             delete baseStatus.waitForStatusFile;
+            delete baseStatus.waitForIdentity;
             writeStatus(containerName, { ...baseStatus, state: 'starting' });
         }
         const expectedIdentity = Object.freeze({
@@ -914,6 +1151,12 @@ async function main() {
             alias,
             routeKey,
             agentPath,
+            runtime: admittedRuntime,
+            instanceId: dispatchIdentity.instanceId,
+            enableGeneration: dispatchIdentity.enableGeneration,
+            ...(Object.prototype.hasOwnProperty.call(dispatchIdentity, 'containerId')
+                ? { containerId: dispatchIdentity.containerId }
+                : {}),
         });
         // The parent start may still own this lease while detached workers are
         // spawned, and Cloudflare publication uses the same lease afterward.
@@ -950,11 +1193,23 @@ async function main() {
             profileName: profileResolution.resolvedProfileName,
             runtimeKind: admittedRuntimeKind,
         });
+        if (lifecycle.record.runtime !== admittedRuntime) {
+            const changed = new Error(
+                `no-wait selected runtime changed before launch for '${routeKey}'`,
+            );
+            changed.code = 'PLOINKY_NO_WAIT_RUNTIME_MISMATCH';
+            changed.status = 409;
+            throw changed;
+        }
         const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
             explicitPort: lifecycle.routerPort || undefined,
         });
         if (lifecycle.targetState === 'ready'
             && !['default', 'bridge'].includes(profileResolution.network.mode)) {
+            assertNoWaitPodmanAdoptionOwnership(
+                lifecycle,
+                dockerSvc.collectLiveAgentContainers(),
+            );
             const hostPort = Number(lifecycle.route.hostPort);
             await waitForNoWaitReadiness({
                 manifest,
@@ -968,13 +1223,22 @@ async function main() {
                 },
                 networkMode: profileResolution.network.mode,
                 generationDigest: lifecycle.generationDigest,
+                selectedRuntime: admittedRuntime,
             });
             const currentLifecycle = loadNoWaitWorkerLifecycle(expectedIdentity);
             assertNoWaitAdoptionStillCurrent(lifecycle, currentLifecycle, expectedIdentity);
+            assertNoWaitPodmanAdoptionOwnership(
+                currentLifecycle,
+                dockerSvc.collectLiveAgentContainers(),
+            );
             const finishedAtMs = Date.now();
             const finishedAt = new Date(finishedAtMs).toISOString();
             writeStatus(containerName, {
                 ...baseStatus,
+                runtime: lifecycle.record.runtime,
+                instanceId: lifecycle.record.instanceId,
+                enableGeneration: lifecycle.record.enableGeneration,
+                containerId: lifecycle.record.containerId,
                 state: 'running',
                 finishedAt,
                 finishedAtMs,
@@ -1000,6 +1264,7 @@ async function main() {
             instanceId: lifecycle.record.instanceId,
             enableGeneration: lifecycle.record.enableGeneration,
             networkLifecycleCapability,
+            runtimeAdmission,
         };
         const launch = () => dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
         const result = profileResolution.network.mode === 'host'
@@ -1028,6 +1293,7 @@ async function main() {
             runtimeResult: result,
             networkMode: profileResolution.network.mode,
             generationDigest: lifecycle.generationDigest,
+            selectedRuntime: admittedRuntime,
         });
 
         await upsertRoute(routeKey, {
@@ -1054,6 +1320,12 @@ async function main() {
         const finishedAt = new Date(finishedAtMs).toISOString();
         writeStatus(containerName, {
             ...baseStatus,
+            runtime: registryRecord.runtime,
+            instanceId: registryRecord.instanceId,
+            enableGeneration: registryRecord.enableGeneration,
+            ...(registryRecord.runtime === 'podman'
+                ? { containerId: registryRecord.containerId }
+                : {}),
             state: 'running',
             finishedAt,
             finishedAtMs,

@@ -98,28 +98,49 @@ test('container startup inspection has per-call and aggregate deadlines', () => 
     assert.deepEqual(sleeps, [1]);
 });
 
-test('sixteen container targets share one status snapshot in an actual monitor tick', () => {
+function exactTarget(index) {
+    return {
+        runtime: 'podman',
+        containerName: `container-${index}`,
+        containerId: index.toString(16).padStart(64, '0'),
+        instanceId: `instance-${index}`,
+        enableGeneration: `generation-${index}`,
+        agentName: `agent-${index}`,
+        repoName: 'demo-repo',
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+}
+
+function exactLiveEntry(target) {
+    return {
+        containerName: target.containerName,
+        runtime: 'podman',
+        containerId: target.containerId,
+        instanceId: target.instanceId,
+        enableGeneration: target.enableGeneration,
+        ownershipVerified: true,
+        state: { running: true },
+    };
+}
+
+test('sixteen exact Podman targets share one ownership-verified status snapshot in an actual monitor tick', () => {
     let calls = 0;
     const logs = [];
     const probeStarts = [];
     const monitor = {
         targets: new Map(Array.from({ length: 16 }, (_, index) => [
             `container-${index}`,
-            {
-                runtime: 'container',
-                containerName: `container-${index}`,
-                agentName: `agent-${index}`,
-                repoName: 'demo-repo',
-                probeState: 'pending',
-            },
+            exactTarget(index),
         ])),
         config: {},
         isShuttingDown: () => false,
         inspectWorkspaceStartLock: () => ({ active: false, stale: false }),
         syncManagedContainers() {},
-        listRunningContainerNames() {
+        collectLiveAgentContainers() {
             calls += 1;
-            return Array.from({ length: 16 }, (_, index) => `container-${index}`);
+            return Array.from({ length: 16 }, (_, index) => exactLiveEntry(exactTarget(index)));
         },
         startProbeWorker(_monitor, target) {
             probeStarts.push(target.containerName);
@@ -136,27 +157,19 @@ test('sixteen container targets share one status snapshot in an actual monitor t
     assert.deepEqual(logs, []);
 });
 
-test('snapshot failure defers every OCI target without per-target amplification or false restart', () => {
+test('snapshot failure defers every exact Podman target without per-target amplification or false restart', () => {
     const logs = [];
     let calls = 0;
     const monitor = {
         targets: new Map(Array.from({ length: 16 }, (_, index) => [
             `container-${index}`,
-            {
-                runtime: 'container',
-                containerName: `container-${index}`,
-                agentName: `agent-${index}`,
-                repoName: 'demo-repo',
-                probeState: 'pending',
-                isRestarting: false,
-                pendingRestartTimer: null,
-            },
+            exactTarget(index),
         ])),
         config: {},
         isShuttingDown: () => false,
         inspectWorkspaceStartLock: () => ({ active: false, stale: false }),
         syncManagedContainers() {},
-        listRunningContainerNames() {
+        collectLiveAgentContainers() {
             calls += 1;
             throw new Error('snapshot unavailable');
         },

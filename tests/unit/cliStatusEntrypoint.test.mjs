@@ -47,6 +47,9 @@ test('status renders master-compatible runtime details without changing workspac
         ploinky_example: {
             type: 'agent',
             runtime: 'podman',
+            containerId: 'a'.repeat(64),
+            instanceId: 'instance-status-fixture',
+            enableGeneration: 'generation-status-fixture',
             agentName: 'exampleAgent',
             repoName: 'exampleRepo',
             containerImage: 'example/image:latest',

@@ -553,7 +553,7 @@ test('strict selector is manifest-driven by default while missing selector remai
                     { 'lite-sandbox': true },
                     { platform: 'linux', runtimeInstalled: (name) => name === 'bwrap' },
                 ),
-                containerRuntime: getRuntimeForAgent({}),
+                containerRuntime: getRuntimeForAgent({ container: 'test/runtime:approved' }),
             }));
         `;
         const result = runModuleScript({
@@ -576,7 +576,7 @@ test('strict selector is manifest-driven by default while missing selector remai
     }
 });
 
-test('strict selector has an exact platform and manifest conflict matrix', () => {
+test('strict selector has an exact platform and dual-mode manifest matrix', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-matrix-'));
     try {
         const binDir = makeFakeRuntimeBin(root, 'podman');
@@ -585,17 +585,34 @@ test('strict selector has an exact platform and manifest conflict matrix', () =>
             const installed = () => true;
             const errors = {};
             for (const [name, manifest, options] of [
-                ['containerConflict', { 'lite-sandbox': true, container: 'legacy' }, { platform: 'linux', runtimeInstalled: installed }],
+                ['missingContainer', {}, {}],
+                ['falseWithoutContainer', { 'lite-sandbox': false }, {}],
+                ['blankContainer', { container: '' }, {}],
+                ['paddedContainer', { container: ' image:tag ' }, {}],
+                ['nonStringContainer', { container: { image: 'tag' } }, {}],
+                ['stringSelector', { 'lite-sandbox': 'true', container: 'coding-image:approved' }, {}],
+                ['numericSelector', { 'lite-sandbox': 1, container: 'coding-image:approved' }, {}],
+                ['nullSelector', { 'lite-sandbox': null, container: 'coding-image:approved' }, {}],
+                ['objectSelector', { 'lite-sandbox': {}, container: 'coding-image:approved' }, {}],
                 ['unsupported', { 'lite-sandbox': true }, { platform: 'freebsd', runtimeInstalled: installed }],
             ]) {
                 try { getRuntimeForAgent(manifest, options); errors[name] = 'accepted'; }
                 catch (error) { errors[name] = error.code; }
             }
             console.log(JSON.stringify({
-                linux: getRuntimeForAgent({ 'lite-sandbox': true }, { platform: 'linux', runtimeInstalled: installed }),
-                darwin: getRuntimeForAgent({ 'lite-sandbox': true }, { platform: 'darwin', runtimeInstalled: installed }),
-                explicitFalse: getRuntimeForAgent({ 'lite-sandbox': false }),
-                missing: getRuntimeForAgent({}),
+                linux: getRuntimeForAgent({
+                    'lite-sandbox': true,
+                    container: { deliberately: 'invalid-but-dormant' },
+                }, { platform: 'linux', runtimeInstalled: installed }),
+                darwin: getRuntimeForAgent({
+                    'lite-sandbox': true,
+                    container: '',
+                }, { platform: 'darwin', runtimeInstalled: installed }),
+                explicitFalse: getRuntimeForAgent({
+                    'lite-sandbox': false,
+                    container: 'coding-image:approved',
+                }),
+                missing: getRuntimeForAgent({ container: 'coding-image:approved' }),
                 errors,
             }));
         `;
@@ -607,10 +624,129 @@ test('strict selector has an exact platform and manifest conflict matrix', () =>
             explicitFalse: 'podman',
             missing: 'podman',
             errors: {
-                containerConflict: 'PLOINKY_SANDBOX_CONTAINER_CONFLICT',
+                missingContainer: 'PLOINKY_CONTAINER_DECLARATION_REQUIRED',
+                falseWithoutContainer: 'PLOINKY_CONTAINER_DECLARATION_REQUIRED',
+                blankContainer: 'PLOINKY_CONTAINER_DECLARATION_REQUIRED',
+                paddedContainer: 'PLOINKY_CONTAINER_DECLARATION_REQUIRED',
+                nonStringContainer: 'PLOINKY_CONTAINER_DECLARATION_REQUIRED',
+                stringSelector: 'PLOINKY_LITE_SANDBOX_SELECTOR_INVALID',
+                numericSelector: 'PLOINKY_LITE_SANDBOX_SELECTOR_INVALID',
+                nullSelector: 'PLOINKY_LITE_SANDBOX_SELECTOR_INVALID',
+                objectSelector: 'PLOINKY_LITE_SANDBOX_SELECTOR_INVALID',
                 unsupported: 'PLOINKY_HOST_SANDBOX_UNAVAILABLE',
             },
         });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('true selector treats every container declaration shape as dormant and performs no engine probe', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-dormant-container-'));
+    try {
+        const binDir = makeFakeRuntimeBin(root, 'podman');
+        const engineMarker = path.join(root, 'podman-called');
+        fs.writeFileSync(
+            path.join(binDir, 'podman'),
+            `#!/bin/sh\nprintf called > ${JSON.stringify(engineMarker)}\nexit 0\n`,
+        );
+        fs.chmodSync(path.join(binDir, 'podman'), 0o755);
+        const script = `
+            const fs = await import('node:fs');
+            const { getRuntimeForAgent } = await import(${JSON.stringify(dockerCommonUrl)});
+            const runtimes = [
+                {},
+                { container: 'coding-image:approved' },
+                { container: '' },
+                { container: { invalid: 'dormant metadata must not be inspected' } },
+            ].map((metadata) => getRuntimeForAgent({
+                'lite-sandbox': true,
+                ...metadata,
+            }, {
+                platform: 'linux',
+                runtimeInstalled: (name) => name === 'bwrap',
+            }));
+            console.log(JSON.stringify({
+                runtimes,
+                engineCalled: fs.existsSync(${JSON.stringify(engineMarker)}),
+            }));
+        `;
+        const result = runModuleScript({ cwd: root, env: { PATH: binDir }, script });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.deepEqual(parseLastJsonLine(result.stdout), {
+            runtimes: ['bwrap', 'bwrap', 'bwrap', 'bwrap'],
+            engineCalled: false,
+        });
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('false or missing selector requires Podman and never falls back to Docker', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-selector-podman-only-'));
+    try {
+        const binDir = makeFakeRuntimeBin(root, 'docker');
+        const script = `
+            const { getRuntimeForAgent } = await import(${JSON.stringify(dockerCommonUrl)});
+            try {
+                getRuntimeForAgent({ container: 'coding-image:approved' });
+                console.log(JSON.stringify({ code: 'accepted' }));
+            } catch (error) {
+                console.log(JSON.stringify({ code: error.code, message: error.message }));
+            }
+        `;
+        const result = runModuleScript({ cwd: root, env: { PATH: binDir }, script });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const output = parseLastJsonLine(result.stdout);
+        assert.equal(output.code, 'PLOINKY_CONTAINER_RUNTIME_UNAVAILABLE');
+        assert.match(output.message, /Podman/);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('status applies the selector by capability, independent of agent identity', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-selector-identity-independent-'));
+    try {
+        const binDir = makeFakeRuntimeBin(root, 'podman');
+        const reposRoot = path.join(root, 'repos');
+        for (const [repoName, agentName, manifest] of [
+            ['arbitrary-a', 'First', { container: 'shared/runtime:approved' }],
+            ['arbitrary-b', 'Second', { 'lite-sandbox': false, container: 'shared/runtime:approved' }],
+            ['arbitrary-c', 'MissingDeclaration', {}],
+            ['arbitrary-d', 'MalformedSelector', { 'lite-sandbox': 'true', container: 'shared/runtime:approved' }],
+        ]) {
+            const agentDir = path.join(reposRoot, repoName, agentName);
+            fs.mkdirSync(agentDir, { recursive: true });
+            fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify(manifest));
+        }
+        const script = `
+            const { getSandboxStatus } = await import(${JSON.stringify(sandboxRuntimeUrl)});
+            const status = getSandboxStatus({
+                reposRoot: ${JSON.stringify(reposRoot)},
+                agents: {
+                    alpha: { type: 'agent', repoName: 'arbitrary-a', agentName: 'First' },
+                    beta: { type: 'agent', repoName: 'arbitrary-b', agentName: 'Second' },
+                    invalid: { type: 'agent', repoName: 'arbitrary-c', agentName: 'MissingDeclaration' },
+                    malformed: { type: 'agent', repoName: 'arbitrary-d', agentName: 'MalformedSelector' },
+                },
+            });
+            console.log(JSON.stringify(status.agents));
+        `;
+        const result = runModuleScript({ cwd: root, env: { PATH: binDir }, script });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const agents = parseLastJsonLine(result.stdout);
+        assert.deepEqual(agents.map(({ runtimeKey, selectedRuntime, available, errorCode }) => ({
+            runtimeKey,
+            selectedRuntime,
+            available,
+            errorCode,
+        })), [
+            { runtimeKey: 'alpha', selectedRuntime: 'podman', available: true, errorCode: '' },
+            { runtimeKey: 'beta', selectedRuntime: 'podman', available: true, errorCode: '' },
+            { runtimeKey: 'invalid', selectedRuntime: 'invalid', available: false, errorCode: 'PLOINKY_CONTAINER_DECLARATION_REQUIRED' },
+            { runtimeKey: 'malformed', selectedRuntime: 'invalid', available: false, errorCode: 'PLOINKY_LITE_SANDBOX_SELECTOR_INVALID' },
+        ]);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -751,7 +887,7 @@ test('lite-sandbox fails with guidance when host sandbox runtime is unavailable'
         assert.equal(output.code, 'PLOINKY_HOST_SANDBOX_UNAVAILABLE');
         assert.match(output.message, /lite-sandbox: true requested/);
         assert.match(output.message, /Remove that selector/);
-        assert.match(output.message, /podman\/docker/);
+        assert.match(output.message, /Podman/);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -829,7 +965,7 @@ esac
                 status,
                 lines,
                 lite: getRuntimeForAgent({ 'lite-sandbox': true }, boxOptions),
-                container: getRuntimeForAgent({}, boxOptions),
+                container: getRuntimeForAgent({ container: 'explorer:test' }, boxOptions),
                 legacyCode,
             }));
         `;

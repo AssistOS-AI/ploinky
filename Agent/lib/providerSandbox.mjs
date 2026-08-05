@@ -9,7 +9,7 @@ import {
 } from './processIdentity.mjs';
 import { assertAgentCredentialContext } from './agentCredentialContext.mjs';
 
-export const BWRAP_LAUNCH_PROTOCOL = 'PLBWLP01';
+export const BWRAP_LAUNCH_PROTOCOL = 'PLBWLP02';
 export const BWRAP_LAUNCH_LIMITS = Object.freeze({
     descriptorBytes: 256 * 1024,
     records: 1024,
@@ -31,6 +31,10 @@ export const BWRAP_RECORD_TYPES = Object.freeze({
     SYMLINK: 10,
     PREEXEC_BARRIER: 11,
     RO_DATA_PATH: 12,
+});
+export const BWRAP_HOME_SOURCE_KINDS = Object.freeze({
+    SANDBOX_WORKSPACE_V2: 'sandbox-workspace-v2',
+    CONTAINER_NATIVE: 'container-native',
 });
 export const BWRAP_SYMLINK_MAPPINGS = Object.freeze({
     'usr-bin': 1,
@@ -109,6 +113,24 @@ const FIXED_SYSTEM_PATHS = Object.freeze([
     Object.freeze({ source: '/etc/alternatives', target: '/etc/alternatives', sourceType: 'directory' }),
     Object.freeze({ source: '/etc/crypto-policies', target: '/etc/crypto-policies', sourceType: 'directory' }),
 ]);
+const CONTAINER_SYSTEM_PATHS = Object.freeze([
+    Object.freeze({ source: '/usr', target: '/usr', sourceType: 'directory' }),
+    Object.freeze({ source: '/etc/resolv.conf', target: '/etc/resolv.conf', dataFile: true }),
+    Object.freeze({ source: '/etc/hosts', target: '/etc/hosts', dataFile: true }),
+    Object.freeze({ source: '/etc/passwd', target: '/etc/passwd', dataFile: true }),
+    Object.freeze({ source: '/etc/group', target: '/etc/group', dataFile: true }),
+    Object.freeze({ source: '/etc/nsswitch.conf', target: '/etc/nsswitch.conf', dataFile: true }),
+    Object.freeze({ source: '/etc/ld.so.cache', target: '/etc/ld.so.cache', dataFile: true }),
+    Object.freeze({ source: '/etc/ssl', target: '/etc/ssl', sourceType: 'directory' }),
+]);
+const FIXED_DATA_FILE_MAPPINGS = Object.freeze([
+    ...FIXED_SYSTEM_PATHS,
+    ...CONTAINER_SYSTEM_PATHS,
+].filter((entry, index, entries) => entry.dataFile === true && entries.findIndex((candidate) => (
+    candidate.dataFile === true
+    && candidate.source === entry.source
+    && candidate.target === entry.target
+)) === index));
 
 const PROVIDER_PROFILES = Object.freeze({
     [PROVIDER_SANDBOX_PROVIDERS.OPENCODE]: Object.freeze({
@@ -185,6 +207,7 @@ const PROVIDER_RESERVED_ENV_PREFIXES = Object.freeze([
 ]);
 const MAX_PROVIDER_ENV_ENTRIES = 24;
 const MAX_PROVIDER_ENV_BYTES = 16 * 1024;
+const SANDBOX_HOME_SUFFIX = '.sandbox-v2';
 
 export const TRUSTED_SERVICE_ENV = Object.freeze({
     HOME: '/home/agent',
@@ -230,6 +253,7 @@ const TRUSTED_SERVICE_RESERVED_ENV_NAMES = new Set([
     'PLOINKY_AGENT_PRINCIPAL',
     'PLOINKY_AGENT_INSTANCE_ID',
     'PLOINKY_AGENT_ENABLE_GENERATION',
+    'PLOINKY_AGENT_HOME_KEY',
     'PLOINKY_AGENT_API_KEY',
     'PLOINKY_AGENT_API_PUBLIC_KEY',
     'PLOINKY_AGENT_SECRET',
@@ -336,6 +360,37 @@ function validateRuntimeKey(value) {
     return value;
 }
 
+function normalizeHomeSource(value) {
+    assertPlainObject(value, 'HOME source');
+    if (value.sourceKind === BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2) {
+        assertExactKeys(
+            value,
+            new Set(['sourceKind', 'homeKey']),
+            new Set(['sourceKind', 'homeKey']),
+            'sandbox HOME source',
+        );
+        const homeKey = validateRuntimeKey(value.homeKey);
+        if (!homeKey.endsWith(SANDBOX_HOME_SUFFIX)
+            || homeKey.length === SANDBOX_HOME_SUFFIX.length) {
+            throw policyError(
+                'sandbox HOME source requires the versioned sandbox-v2 key',
+                'PLOINKY_HOME_STATE_INCOMPATIBLE',
+            );
+        }
+        return Object.freeze({ sourceKind: value.sourceKind, homeKey });
+    }
+    if (value.sourceKind === BWRAP_HOME_SOURCE_KINDS.CONTAINER_NATIVE) {
+        assertExactKeys(
+            value,
+            new Set(['sourceKind']),
+            new Set(['sourceKind']),
+            'container HOME source',
+        );
+        return Object.freeze({ sourceKind: value.sourceKind });
+    }
+    throw policyError('HOME source kind is unsupported', 'PLOINKY_HOME_PATH_INVALID');
+}
+
 function frozenRecord(type, fields = {}) {
     if (!RECORD_NAMES.has(type)) throw policyError(`unknown record type ${type}`);
     return Object.freeze({ type, ...fields });
@@ -363,8 +418,8 @@ export function createWorkdirRecord(relativePath) {
     return frozenRecord('WORKDIR', { path: relativePath });
 }
 
-export function createHomeRecord(runtimeKey) {
-    return frozenRecord('HOME', { runtimeKey: validateRuntimeKey(runtimeKey) });
+export function createHomeRecord(homeSource) {
+    return frozenRecord('HOME', normalizeHomeSource(homeSource));
 }
 
 export function createReadOnlyPathRecord(source, target, sourceType = 'directory') {
@@ -388,9 +443,8 @@ export function createReadOnlyPathRecord(source, target, sourceType = 'directory
 export function createReadOnlyDataFileRecord(source, target) {
     requireAbsolutePath(source, 'RO_DATA_PATH source');
     requireAbsolutePath(target, 'RO_DATA_PATH target');
-    if (!FIXED_SYSTEM_PATHS.some((entry) => (
-        entry.dataFile === true
-        && entry.source === source
+    if (!FIXED_DATA_FILE_MAPPINGS.some((entry) => (
+        entry.source === source
         && entry.target === target
     ))) {
         throw policyError('RO_DATA_PATH source and target are not an exact fixed data-file mapping', 'PLOINKY_MOUNT_DESTINATION_UNSUPPORTED');
@@ -477,11 +531,15 @@ function isForbiddenBwrapOption(value) {
 function validateRecordShape(record, index) {
     assertPlainObject(record, `record ${index}`);
     if (!RECORD_NAMES.has(record.type)) throw policyError(`record ${index} has unknown type`);
+    if (record.type === 'HOME') {
+        const { type: _type, ...homeSource } = record;
+        normalizeHomeSource(homeSource);
+        return;
+    }
     const fields = {
         ARG: ['type', 'value'],
         WORKSPACE: ['type', 'mode'],
         WORKDIR: ['type', 'path'],
-        HOME: ['type', 'runtimeKey'],
         RO_PATH: ['type', 'source', 'target', 'sourceType'],
         RO_DATA_PATH: ['type', 'source', 'target'],
         DIR: ['type', 'target'],
@@ -499,7 +557,15 @@ function encodeRecordPayload(record) {
     case 'ARG': return utf8(createArgRecord(record.value).value, 'ARG', { maxBytes: BWRAP_LAUNCH_LIMITS.argumentBytes });
     case 'WORKSPACE': return Buffer.from([createWorkspaceRecord(record.mode).mode === 'rw' ? 2 : 1]);
     case 'WORKDIR': return utf8(createWorkdirRecord(record.path).path, 'WORKDIR');
-    case 'HOME': return utf8(`.data/${createHomeRecord(record.runtimeKey).runtimeKey}`, 'HOME');
+    case 'HOME': {
+        const { type: _type, ...homeSource } = record;
+        const checked = createHomeRecord(homeSource);
+        if (checked.sourceKind === BWRAP_HOME_SOURCE_KINDS.CONTAINER_NATIVE) {
+            return Buffer.from([2]);
+        }
+        const homeKey = utf8(checked.homeKey, 'HOME key');
+        return Buffer.concat([Buffer.from([1]), homeKey]);
+    }
     case 'RO_PATH': {
         const checked = createReadOnlyPathRecord(record.source, record.target, record.sourceType);
         const source = utf8(checked.source, 'RO_PATH source');
@@ -678,7 +744,7 @@ function validateRecordPolicy(records) {
 
 export function encodeBwrapLaunchDescriptor(records) {
     if (!Array.isArray(records) || records.length === 0 || records.length > BWRAP_LAUNCH_LIMITS.records) {
-        throw policyError('launch record count is outside the v1 bound');
+        throw policyError('launch record count is outside the v2 bound');
     }
     validateRecordPolicy(records);
     let descriptorLength = 16;
@@ -752,17 +818,23 @@ function buildTrustedServicePlatformEnvironment(input) {
 
 export function buildTrustedServicePolicy(input) {
     const allowed = new Set([
-        'runtimeKey', 'command', 'nodeRuntimePath', 'agentRuntimePath',
+        'homeSource', 'command', 'nodeRuntimePath', 'agentRuntimePath',
         'codePath', 'codeDependenciesPath', 'agentDependenciesPath', 'preexecBarrier',
         'environment', 'credentialFd', 'identity', 'agentName', 'repoName', 'listenPort',
     ]);
     const required = new Set([
-        'runtimeKey', 'command', 'nodeRuntimePath', 'agentRuntimePath',
+        'homeSource', 'command', 'nodeRuntimePath', 'agentRuntimePath',
         'codePath', 'codeDependenciesPath', 'agentDependenciesPath',
         'identity', 'agentName', 'repoName', 'listenPort',
     ]);
     assertExactKeys(input, allowed, required, 'trusted service policy input');
-    validateRuntimeKey(input.runtimeKey);
+    const homeSource = normalizeHomeSource(input.homeSource);
+    if (homeSource.sourceKind !== BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2) {
+        throw policyError(
+            'trusted bwrap service requires the sandbox HOME ABI',
+            'PLOINKY_HOME_STATE_INCOMPATIBLE',
+        );
+    }
     if (!Array.isArray(input.command) || input.command.length === 0) {
         throw policyError('trusted service command must be a non-empty argv array');
     }
@@ -831,7 +903,7 @@ export function buildTrustedServicePolicy(input) {
         createReadOnlyPathRecord(agentDependenciesPath, '/Agent/node_modules'),
         createWorkspaceRecord('rw'),
         createDirectoryRecord('/home'),
-        createHomeRecord(input.runtimeKey),
+        createHomeRecord(homeSource),
         createTmpfsRecord('/tmp'),
         createTmpfsRecord('/run'),
         ...(credentialFd === null ? [] : [createDirectoryRecord('/run/ploinky-agent')]),
@@ -865,7 +937,12 @@ export function buildTrustedServicePolicy(input) {
     records.push(createArgRecord('--'), ...command.map(createArgRecord));
     if (credentialFd !== null) TRUSTED_CREDENTIAL_RECORDS.add(records);
     validateRecordPolicy(records);
-    return Object.freeze({ records: Object.freeze(records), env, command });
+    return Object.freeze({
+        records: Object.freeze(records),
+        env,
+        command,
+        homeSource,
+    });
 }
 
 function normalizeProvider(value) {
@@ -885,22 +962,65 @@ function normalizeProviderMode(value) {
 function providerIdentityFromCredentialContext(value) {
     const credentialContext = assertAgentCredentialContext(value);
     credentialContext.assertActive();
-    if (credentialContext.runtime.runtimeKind !== 'bwrap'
-        || credentialContext.source !== 'bwrap-credential-v1') {
+    const generation = normalizeBoundedText(
+        credentialContext.identity.enableGeneration,
+        'provider sandbox generation',
+        256,
+        /^[A-Za-z0-9][A-Za-z0-9:._-]*$/,
+    );
+    if (credentialContext.runtime.runtimeKind === 'bwrap'
+        && credentialContext.source === 'bwrap-credential-v1') {
+        const runtimeKey = validateRuntimeKey(credentialContext.runtime.runtimeKey);
+        const homeKey = validateRuntimeKey(`${runtimeKey}${SANDBOX_HOME_SUFFIX}`);
+        return Object.freeze({
+            runtimeKind: 'bwrap',
+            homeKey,
+            homeSource: Object.freeze({
+                sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+                homeKey,
+            }),
+            nodeRuntimeSource: '/opt/ploinky-node',
+            providerHomeSource: '/home/agent',
+            generation,
+        });
+    }
+    if (credentialContext.runtime.runtimeKind === 'container'
+        && credentialContext.source === 'container-generated-env-v1') {
+        return Object.freeze({
+            runtimeKind: 'container',
+            homeKey: validateRuntimeKey(credentialContext.runtime.homeKey),
+            homeSource: Object.freeze({
+                sourceKind: BWRAP_HOME_SOURCE_KINDS.CONTAINER_NATIVE,
+            }),
+            nodeRuntimeSource: '/usr/local',
+            providerHomeSource: '/root',
+            generation,
+        });
+    }
+    throw policyError(
+        'provider sandbox requires an exact runtime credential context',
+        'PLOINKY_PROVIDER_CONTEXT_INVALID',
+    );
+}
+
+function providerSystemPaths(identity) {
+    if (identity.runtimeKind === 'bwrap') return FIXED_SYSTEM_PATHS;
+    if (identity.runtimeKind === 'container') return CONTAINER_SYSTEM_PATHS;
+    throw policyError(
+        'provider sandbox runtime context is unsupported',
+        'PLOINKY_PROVIDER_CONTEXT_INVALID',
+    );
+}
+
+function providerImmutableSource(identity, logicalSource) {
+    const providerHomePrefix = '/home/agent/';
+    if (!logicalSource.startsWith(providerHomePrefix)) {
         throw policyError(
-            'provider sandbox requires the pipe-verified bwrap credential context',
-            'PLOINKY_PROVIDER_CONTEXT_INVALID',
+            'provider immutable source is outside the logical provider HOME',
+            'PLOINKY_PROVIDER_EXECUTABLE_INVALID',
         );
     }
-    return Object.freeze({
-        runtimeKey: validateRuntimeKey(credentialContext.runtime.runtimeKey),
-        generation: normalizeBoundedText(
-            credentialContext.identity.enableGeneration,
-            'provider sandbox generation',
-            256,
-            /^[A-Za-z0-9][A-Za-z0-9:._-]*$/,
-        ),
-    });
+    return `${identity.providerHomeSource}/${logicalSource.slice(providerHomePrefix.length)}`;
 }
 
 function normalizeProviderWorkdir(value) {
@@ -1051,7 +1171,7 @@ export function buildProviderSandboxPolicy(input) {
     });
 
     const records = [
-        ...FIXED_SYSTEM_PATHS.map((entry) => entry.dataFile
+        ...providerSystemPaths(identity).map((entry) => entry.dataFile
             ? createReadOnlyDataFileRecord(entry.source, entry.target)
             : createReadOnlyPathRecord(entry.source, entry.target, entry.sourceType)),
         createSymlinkRecord('usr-bin'),
@@ -1059,7 +1179,7 @@ export function buildProviderSandboxPolicy(input) {
         createSymlinkRecord('usr-lib'),
         createSymlinkRecord('usr-lib64'),
         createDirectoryRecord('/opt'),
-        createReadOnlyPathRecord('/opt/ploinky-node', '/opt/ploinky-node'),
+        createReadOnlyPathRecord(identity.nodeRuntimeSource, '/opt/ploinky-node'),
         createReadOnlyPathRecord('/code', '/code'),
         ...(mode === PROVIDER_SANDBOX_MODES.TASK
             ? [
@@ -1074,9 +1194,9 @@ export function buildProviderSandboxPolicy(input) {
                 createDirectoryRecord('/workspace/readiness'),
             ]),
         createDirectoryRecord('/home'),
-        createHomeRecord(identity.runtimeKey),
+        createHomeRecord(identity.homeSource),
         ...profile.immutableRoots.map((root) => createReadOnlyPathRecord(
-            root.source,
+            providerImmutableSource(identity, root.source),
             root.target,
             root.sourceType,
         )),
@@ -1643,7 +1763,7 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         );
         await readyPromise;
         lease = dependencies.acquireProviderHomeLease({
-            homeKey: launch.identity.runtimeKey,
+            homeKey: launch.identity.homeKey,
             generation: launch.identity.generation,
             role: launch.mode === PROVIDER_SANDBOX_MODES.READINESS ? 'readiness' : 'provider-task',
             metadata: {

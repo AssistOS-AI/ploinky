@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 
 import {
     AGENT_LIB_PATH,
@@ -9,6 +10,34 @@ import {
     verifyEnabledAgentStarted,
 } from '../../cli/utils/agents.js';
 import { mergeRuntimeRoute } from '../../cli/server/routingFile.js';
+
+function exactRuntimeRecord(runtime) {
+    return {
+        type: 'agent',
+        runtime,
+        instanceId: 'instance-current',
+        enableGeneration: 'generation-current',
+        ...(runtime === 'podman' ? { containerId: 'a'.repeat(64) } : {}),
+    };
+}
+
+test('enable planning records only the selected runtime and never inspects a dormant image', () => {
+    const source = fs.readFileSync(new URL('../../cli/utils/agents.js', import.meta.url), 'utf8');
+    assert.match(source, /containerImage:\s*runtimeKind === 'container'\s*\? manifest\.container\s*:\s*`host \(\$\{selectedRuntime\}\)`/);
+    assert.match(source, /runtime:\s*selectedRuntime/);
+    assert.doesNotMatch(source, /containerImage:\s*manifest\.container\s*\|\|/);
+    assert.doesNotMatch(source, /started\?\.registryRecord\?\.runtime\s*\|\|\s*['"]container['"]/);
+});
+
+test('enable readiness pins Podman liveness and script probes to immutable identity', () => {
+    const source = fs.readFileSync(new URL('../../cli/utils/agents.js', import.meta.url), 'utf8');
+    assert.match(source, /selectedRuntime === 'podman'[\s\S]*started\?\.containerId/);
+    assert.match(source, /record\?\.runtime !== 'podman'/);
+    assert.match(source, /containerId: record\.containerId/);
+    assert.match(source, /instanceId: record\.instanceId/);
+    assert.match(source, /enableGeneration: record\.enableGeneration/);
+    assert.match(source, /PLOINKY_SANDBOX_SCRIPT_READINESS_UNSUPPORTED/);
+});
 
 test('enable mounts the tracked Agent runtime from the Ploinky checkout', () => {
     assert.equal(
@@ -225,15 +254,18 @@ test('enable transition to none neither prefers nor retains the old routed host 
 
 test('verifyEnabledAgentStarted logs when the enabled agent container is running', () => {
     const logs = [];
+    const containerId = 'a'.repeat(64);
 
-    assert.doesNotThrow(() => verifyEnabledAgentStarted('codexAgent', 'ploinky_codexAgent_test', {
+    assert.doesNotThrow(() => verifyEnabledAgentStarted('codexAgent', containerId, {
+        runtime: 'podman',
+        runtimeRecord: exactRuntimeRecord('podman'),
         isRunning: () => true,
         waitRunning: () => false,
         log: (message) => logs.push(message)
     }));
 
     assert.deepEqual(logs, [
-        "Agent 'codexAgent' started successfully with container runtime 'ploinky_codexAgent_test'."
+        `Agent 'codexAgent' started successfully with podman runtime '${containerId}'.`
     ]);
 });
 
@@ -242,10 +274,15 @@ test('verifyEnabledAgentStarted checks the sandbox PID for a bwrap agent', () =>
 
     assert.doesNotThrow(() => verifyEnabledAgentStarted('opencodeAgent', 'ploinky_opencodeAgent_test', {
         runtime: 'bwrap',
+        runtimeRecord: exactRuntimeRecord('bwrap'),
         isRunning: () => assert.fail('container status must not be checked for bwrap'),
         waitRunning: () => assert.fail('container startup must not be awaited for bwrap'),
-        isSandboxRunning: (runtimeInstanceName) => {
+        isSandboxRunning: (runtimeInstanceName, identity) => {
             assert.equal(runtimeInstanceName, 'ploinky_opencodeAgent_test');
+            assert.deepEqual(identity, {
+                instanceId: 'instance-current',
+                enableGeneration: 'generation-current',
+            });
             return true;
         },
         log: (message) => logs.push(message)
@@ -259,6 +296,7 @@ test('verifyEnabledAgentStarted checks the sandbox PID for a bwrap agent', () =>
 test('verifyEnabledAgentStarted reports a bwrap process that exits during startup', () => {
     assert.throws(() => verifyEnabledAgentStarted('opencodeAgent', 'ploinky_opencodeAgent_test', {
         runtime: 'bwrap',
+        runtimeRecord: exactRuntimeRecord('bwrap'),
         isSandboxRunning: () => false,
         log: () => {}
     }), /enable agent: failed to start 'opencodeAgent': bwrap process 'opencodeAgent' exited during startup/);
@@ -269,6 +307,7 @@ test('verifyEnabledAgentStarted checks the shared sandbox PID tracker for seatbe
 
     assert.doesNotThrow(() => verifyEnabledAgentStarted('piAgent', 'ploinky_piAgent_test', {
         runtime: 'seatbelt',
+        runtimeRecord: exactRuntimeRecord('seatbelt'),
         isRunning: () => assert.fail('container status must not be checked for seatbelt'),
         waitRunning: () => assert.fail('container startup must not be awaited for seatbelt'),
         isSandboxRunning: (runtimeInstanceName) => {
@@ -286,7 +325,10 @@ test('verifyEnabledAgentStarted waits briefly before failing a non-running conta
     let waitAttempts = 0;
     let waitDelayMs = 0;
 
-    assert.throws(() => verifyEnabledAgentStarted('codexAgent', 'ploinky_codexAgent_test', {
+    const containerId = 'a'.repeat(64);
+    assert.throws(() => verifyEnabledAgentStarted('codexAgent', containerId, {
+        runtime: 'podman',
+        runtimeRecord: exactRuntimeRecord('podman'),
         isRunning: () => false,
         waitRunning: (_containerName, attempts, delayMs) => {
             waitCalls += 1;
@@ -295,7 +337,7 @@ test('verifyEnabledAgentStarted waits briefly before failing a non-running conta
             return false;
         },
         log: () => {}
-    }), /enable agent: failed to start 'codexAgent': container 'ploinky_codexAgent_test' exited during startup/);
+    }), new RegExp(`enable agent: failed to start 'codexAgent': container '${containerId}' exited during startup`));
 
     assert.equal(waitCalls, 1);
     assert.equal(waitAttempts, 40);
@@ -304,8 +346,32 @@ test('verifyEnabledAgentStarted waits briefly before failing a non-running conta
 
 test('verifyEnabledAgentStarted fails clearly when startup returns no runtime instance', () => {
     assert.throws(() => verifyEnabledAgentStarted('codexAgent', '', {
+        runtime: 'podman',
+        runtimeRecord: exactRuntimeRecord('podman'),
         isRunning: () => true,
         waitRunning: () => true,
         log: () => {}
     }), /enable agent: failed to start 'codexAgent': no runtime instance was returned/);
+});
+
+test('verifyEnabledAgentStarted rejects a stale or malformed runtime identity before liveness', () => {
+    const valid = exactRuntimeRecord('bwrap');
+    for (const runtimeRecord of [
+        undefined,
+        { ...valid, runtime: 'podman' },
+        { ...valid, instanceId: ' instance-current ' },
+        { ...valid, enableGeneration: '' },
+    ]) {
+        let probed = false;
+        assert.throws(() => verifyEnabledAgentStarted('opencodeAgent', 'sandbox-key', {
+            runtime: 'bwrap',
+            ...(runtimeRecord ? { runtimeRecord } : {}),
+            isSandboxRunning: () => {
+                probed = true;
+                return true;
+            },
+            log: () => {},
+        }), error => error?.code === 'PLOINKY_RUNTIME_INPUT_CHANGED');
+        assert.equal(probed, false);
+    }
 });

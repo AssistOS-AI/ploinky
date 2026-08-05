@@ -22,7 +22,7 @@ import {
     mergePackageJson,
 } from '../utils/dependencies/dependencyInstaller.js';
 import { getRepoAgentCodePath } from '../utils/workspaceStructure.js';
-import { getRuntimeForAgent } from '../sandbox/docker/common.js';
+import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
 import { readManifestStartCommand } from '../sandbox/docker/agentCommands.js';
 
 const USAGE = [
@@ -65,12 +65,24 @@ function resolveAgentManifest(repoName, agentName) {
     return null;
 }
 
-function runtimeKeyForAgent(repoName, agentName) {
-    const manifest = resolveAgentManifest(repoName, agentName);
+function requireAgentManifest(repoName, agentName, manifest = resolveAgentManifest(repoName, agentName)) {
     if (!manifest) {
         throw new Error(`Could not resolve manifest for ${repoName}/${agentName}.`);
     }
-    return detectRuntimeKeyForAgent(manifest, repoName, agentName);
+    return manifest;
+}
+
+function runtimeKeyForAgent(repoName, agentName, manifest) {
+    const exactManifest = requireAgentManifest(repoName, agentName, manifest);
+    return detectRuntimeKeyForAgent(exactManifest, repoName, agentName);
+}
+
+function resolveDependencyRuntime(manifest) {
+    const runtime = getRuntimeForAgent(manifest);
+    return {
+        runtime,
+        image: isSandboxRuntime(runtime) ? '' : manifest.container,
+    };
 }
 
 function resolveAgentPackagePath(repoName, agentName) {
@@ -87,7 +99,8 @@ function agentNeedsDependencyPreparation(repoName, agentName, manifest = null) {
     return !startCmd || Boolean(agentPackagePath);
 }
 
-function prepareOne({ repoName, agentName, runtimeKey, log, runtime = 'bwrap', image = '' }) {
+function prepareOne({ repoName, agentName, runtimeKey, log, runtime, image = '' }) {
+    if (!runtime) throw new Error(`Dependency preparation requires an admitted runtime for ${repoName}/${agentName}.`);
     const agentPackagePath = resolveAgentPackagePath(repoName, agentName);
     return prepareAgentCache({
         repoName,
@@ -106,12 +119,12 @@ function depsPrepare(args) {
 
     if (target) {
         const { repoName, agentName } = parseRepoAgent(target);
-        const manifest = resolveAgentManifest(repoName, agentName);
+        const manifest = requireAgentManifest(repoName, agentName);
         if (!agentNeedsDependencyPreparation(repoName, agentName, manifest)) {
             log(`[deps] ${repoName}/${agentName} does not require prepared Node dependencies.`);
             return;
         }
-        const runtimeKey = runtimeKeyForAgent(repoName, agentName);
+        const runtimeKey = runtimeKeyForAgent(repoName, agentName, manifest);
         if (isNoNodeRuntimeKey(runtimeKey)) {
             if (resolveAgentPackagePath(repoName, agentName)) {
                 throw new Error(`[deps] ${repoName}/${agentName}: container image has no Node binary but package.json dependencies are present.`);
@@ -120,13 +133,13 @@ function depsPrepare(args) {
             return;
         }
         log(`[deps] preparing ${repoName}/${agentName} (${runtimeKey})`);
+        const dependencyRuntime = resolveDependencyRuntime(manifest);
         const result = prepareOne({
             repoName,
             agentName,
             runtimeKey,
             log,
-            runtime: manifest ? getRuntimeForAgent(manifest) : 'bwrap',
-            image: manifest?.container || manifest?.image || '',
+            ...dependencyRuntime,
         });
         log(result.reused ? '[deps] reused existing cache' : '[deps] prepared fresh cache');
         return;
@@ -140,11 +153,11 @@ function depsPrepare(args) {
     const runtimeKeys = new Map();
     for (const { repoName, agentName } of agents) {
         try {
-            const manifest = resolveAgentManifest(repoName, agentName);
+            const manifest = requireAgentManifest(repoName, agentName);
             if (!agentNeedsDependencyPreparation(repoName, agentName, manifest)) {
                 continue;
             }
-            const runtimeKey = runtimeKeyForAgent(repoName, agentName);
+            const runtimeKey = runtimeKeyForAgent(repoName, agentName, manifest);
             if (isNoNodeRuntimeKey(runtimeKey)) {
                 if (resolveAgentPackagePath(repoName, agentName)) {
                     console.warn(`[deps] skipping ${repoName}/${agentName}: image has no Node binary but package.json dependencies are present`);
@@ -152,10 +165,7 @@ function depsPrepare(args) {
                 continue;
             }
             if (!runtimeKeys.has(runtimeKey)) {
-                runtimeKeys.set(runtimeKey, {
-                    runtime: manifest ? getRuntimeForAgent(manifest) : 'bwrap',
-                    image: manifest?.container || manifest?.image || '',
-                });
+                runtimeKeys.set(runtimeKey, resolveDependencyRuntime(manifest));
             }
         } catch (err) {
             console.warn(`[deps] skipping runtime-key detection for ${repoName}/${agentName}: ${err.message}`);
@@ -168,12 +178,12 @@ function depsPrepare(args) {
     }
     for (const { repoName, agentName } of agents) {
         try {
-            const manifest = resolveAgentManifest(repoName, agentName);
+            const manifest = requireAgentManifest(repoName, agentName);
             if (!agentNeedsDependencyPreparation(repoName, agentName, manifest)) {
                 log(`[deps] skipping ${repoName}/${agentName}: no Node dependency cache required`);
                 continue;
             }
-            const runtimeKey = runtimeKeyForAgent(repoName, agentName);
+            const runtimeKey = runtimeKeyForAgent(repoName, agentName, manifest);
             if (isNoNodeRuntimeKey(runtimeKey)) {
                 if (resolveAgentPackagePath(repoName, agentName)) {
                     console.warn(`[deps] skipping ${repoName}/${agentName}: image has no Node binary but package.json dependencies are present`);
@@ -183,13 +193,13 @@ function depsPrepare(args) {
                 continue;
             }
             log(`[deps] preparing ${repoName}/${agentName} (${runtimeKey})`);
+            const dependencyRuntime = resolveDependencyRuntime(manifest);
             prepareOne({
                 repoName,
                 agentName,
                 runtimeKey,
                 log,
-                runtime: manifest ? getRuntimeForAgent(manifest) : 'bwrap',
-                image: manifest?.container || manifest?.image || '',
+                ...dependencyRuntime,
             });
         } catch (err) {
             console.warn(`[deps] skipping ${repoName}/${agentName}: ${err.message}`);

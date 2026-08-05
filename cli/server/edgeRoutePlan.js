@@ -22,6 +22,7 @@ import { createRoutePlan } from './proxy/RoutePlan.js';
 
 const LOCAL_CONTROL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', 'router.localhost']);
 const MANAGED_ROUTER_HOST = 'host.containers.internal';
+const SANDBOX_SERVICE_RUNTIMES = new Set(['bwrap', 'seatbelt']);
 const AGENT_ROOT_AUTH_SUPPORT_PATHS = new Set([
     '/auth/callback',
     '/auth/logged-out',
@@ -106,17 +107,26 @@ function snapshotPolicy(snapshot) {
     });
 }
 
+function exactNonEmptyString(value) {
+    return typeof value === 'string' && value.length > 0 && value === value.trim()
+        ? value
+        : '';
+}
+
 function exactAgentRuntime(snapshot, routeKey, route) {
-    const containerName = String(route?.container || '').trim();
+    const containerName = exactNonEmptyString(route?.container);
     const record = snapshot.agents?.[containerName];
     if (!containerName || !record || record.type !== 'agent') return null;
-    if (String(record.repoName || '') !== String(route.repo || '')
-        || String(record.agentName || '') !== String(route.agent || '')) return null;
-    const runtime = String(record.runtime || '').trim();
-    const containerId = String(record.containerId || '').trim().toLowerCase();
-    const effectiveInstanceId = String(record.instanceId || '').trim();
-    const enableGeneration = String(record.enableGeneration || '').trim();
+    if (!exactNonEmptyString(record.repoName)
+        || !exactNonEmptyString(record.agentName)
+        || record.repoName !== route.repo
+        || record.agentName !== route.agent) return null;
+    const runtime = record.runtime;
+    const containerId = record.containerId;
+    const effectiveInstanceId = exactNonEmptyString(record.instanceId);
+    const enableGeneration = exactNonEmptyString(record.enableGeneration);
     if (!['docker', 'podman'].includes(runtime)
+        || typeof containerId !== 'string'
         || !/^[a-f0-9]{64}$/.test(containerId)
         || !effectiveInstanceId
         || !enableGeneration) return null;
@@ -146,20 +156,22 @@ function exactAgentRuntime(snapshot, routeKey, route) {
 }
 
 function exactRouteAgentRecord(snapshot, route) {
-    const containerName = String(route?.container || '').trim();
+    const containerName = exactNonEmptyString(route?.container);
     const record = snapshot.agents?.[containerName];
     if (!containerName || !record || record.type !== 'agent') return null;
-    if (String(record.repoName || '') !== String(route.repo || '')
-        || String(record.agentName || '') !== String(route.agent || '')) return null;
-    if (!String(record.instanceId || '').trim()
-        || !String(record.enableGeneration || '').trim()) return null;
+    if (!exactNonEmptyString(record.repoName)
+        || !exactNonEmptyString(record.agentName)
+        || record.repoName !== route.repo
+        || record.agentName !== route.agent) return null;
+    if (!exactNonEmptyString(record.instanceId)
+        || !exactNonEmptyString(record.enableGeneration)) return null;
     return { containerName, record };
 }
 
-function bwrapRootOwnerAttestation(snapshot, routeKey, route, hostPort) {
+function sandboxRootOwnerAttestation(snapshot, routeKey, route, hostPort) {
     const matched = exactRouteAgentRecord(snapshot, route);
-    if (!matched || String(matched.record.runtime || '').trim() !== 'bwrap') {
-        return { kind: 'not-bwrap' };
+    if (!matched || !SANDBOX_SERVICE_RUNTIMES.has(matched.record.runtime)) {
+        return { kind: 'not-sandbox' };
     }
     const owner = matched.record.bwrapOwner;
     if (!owner || typeof owner !== 'object' || Array.isArray(owner)
@@ -167,12 +179,14 @@ function bwrapRootOwnerAttestation(snapshot, routeKey, route, hostPort) {
         || owner.runtimeKey !== matched.containerName
         || owner.routeKey !== routeKey
         || owner.rootPort !== hostPort
+        || !Number.isSafeInteger(matched.record.pid)
+        || matched.record.pid < 1
         || owner.pid !== matched.record.pid
-        || owner.instanceId !== String(matched.record.instanceId || '').trim()
-        || owner.enableGeneration !== String(matched.record.enableGeneration || '').trim()) {
+        || owner.instanceId !== matched.record.instanceId
+        || owner.enableGeneration !== matched.record.enableGeneration) {
         return { kind: 'invalid' };
     }
-    return { kind: 'bwrap', owner };
+    return { kind: 'sandbox', runtime: matched.record.runtime, owner };
 }
 
 function manifestRouteSpecs(manifest = {}) {
@@ -245,7 +259,7 @@ function agentPortPlan({
         });
     }
     const selectedRuntime = exactRouteAgentRecord(snapshot, selected.route);
-    if (String(selectedRuntime?.record?.runtime || '').trim() === 'bwrap') {
+    if (SANDBOX_SERVICE_RUNTIMES.has(selectedRuntime?.record?.runtime)) {
         return deny(403, 'BWRAP_AGENT_PORT_UNSUPPORTED', {
             matched: true,
             listener,
@@ -591,14 +605,26 @@ function agentRootPlan({ req, host, listener, pathname, parsedUrl, hostSelection
     if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
         return deny(503, 'TARGET_INACTIVE', { lease, hostSelection });
     }
-    const bwrapOwner = bwrapRootOwnerAttestation(
+    const selectedRuntime = exactRouteAgentRecord(snapshot, agent.route);
+    if (!selectedRuntime) {
+        return deny(503, 'AGENT_RUNTIME_INACTIVE', { matched: true, lease, hostSelection });
+    }
+    if (['docker', 'podman'].includes(selectedRuntime.record.runtime)
+        && !exactAgentRuntime(snapshot, agent.routeKey, agent.route)) {
+        return deny(503, 'AGENT_RUNTIME_INACTIVE', { matched: true, lease, hostSelection });
+    }
+    if (!['docker', 'podman'].includes(selectedRuntime.record.runtime)
+        && !SANDBOX_SERVICE_RUNTIMES.has(selectedRuntime.record.runtime)) {
+        return deny(503, 'AGENT_RUNTIME_INACTIVE', { matched: true, lease, hostSelection });
+    }
+    const sandboxOwner = sandboxRootOwnerAttestation(
         snapshot,
         agent.routeKey,
         agent.route,
         hostPort,
     );
-    if (bwrapOwner.kind === 'invalid') {
-        return deny(503, 'BWRAP_AGENT_OWNER_INVALID', {
+    if (sandboxOwner.kind === 'invalid') {
+        return deny(503, 'SANDBOX_AGENT_OWNER_INVALID', {
             matched: true,
             lease,
             hostSelection,
@@ -624,8 +650,8 @@ function agentRootPlan({ req, host, listener, pathname, parsedUrl, hostSelection
         routeKey: agent.routeKey,
         route: agent.route,
         target: { hostname: '127.0.0.1', hostPort },
-        ...(bwrapOwner.kind === 'bwrap'
-            ? { ownerAttestation: bwrapOwner.owner }
+        ...(sandboxOwner.kind === 'sandbox'
+            ? { ownerAttestation: sandboxOwner.owner }
             : {}),
         upstreamPath: `${agent.upstreamPath}${parsedUrl.search || ''}`,
         decision,
@@ -819,6 +845,11 @@ export function httpAccessForEdgeRoutePlan(plan) {
     if (!plan?.ok) return null;
     return plan.kind === 'agent-port' ? (plan.access || null) : (plan.decision || null);
 }
+
+export const __testables = Object.freeze({
+    exactAgentRuntime,
+    sandboxRootOwnerAttestation,
+});
 
 export default {
     commitRouteGeneration,

@@ -48,8 +48,10 @@ const {
     admitWorkspaceGraphRuntimeCapabilities,
     assertWorkspaceGraphAdmissionsCurrent,
     buildBlockingReadinessEntryFromNode,
-    ensureGraphNodesEnabled,
-    reprepareGraphAfterStartupProviders,
+    graphNodeRuntimeReplacementReason,
+    isRegistryRuntimeRunning,
+    ensureGraphNodesEnabled: ensureGraphNodesEnabledImpl,
+    reprepareGraphAfterStartupProviders: reprepareGraphAfterStartupProvidersImpl,
     reinstallAgent,
     resolveGraphNodeExecutionRecord,
     resolveRetainedGraphNodeExecutionRecord,
@@ -57,6 +59,51 @@ const {
     startWorkspace,
     waitForReadinessEntries,
 } = await import(`${workspaceUtilModuleUrl.href}${moduleSuffix}`);
+
+const fixtureContainer = 'test/runtime:approved';
+
+function withContainerRuntimeFixture(node) {
+    if (!node || Object.hasOwn(node, 'manifest')) return node;
+    return { ...node, manifest: { container: fixtureContainer } };
+}
+
+function withContainerRuntimeGraphFixture(graph) {
+    return {
+        ...graph,
+        nodes: new Map(
+            Array.from(graph?.nodes?.entries?.() || [])
+                .map(([id, node]) => [id, withContainerRuntimeFixture(node)]),
+        ),
+    };
+}
+
+function withAdditionalContainerRuntimeFixtures(nodes) {
+    return Array.isArray(nodes) ? nodes.map(withContainerRuntimeFixture) : [];
+}
+
+// These graph-lifecycle fixtures exercise behavior after runtime admission.
+// Make their intended Podman capability explicit without weakening production
+// admission or masking tests that supply an explicit manifest themselves.
+function ensureGraphNodesEnabled(graph, registry, options = {}) {
+    return ensureGraphNodesEnabledImpl(withContainerRuntimeGraphFixture(graph), registry, {
+        ...options,
+        additionalNodes: withAdditionalContainerRuntimeFixtures(options.additionalNodes),
+    });
+}
+
+function reprepareGraphAfterStartupProviders(graph, registry, initialPreparedGraph, options = {}) {
+    return reprepareGraphAfterStartupProvidersImpl(
+        withContainerRuntimeGraphFixture(graph),
+        registry,
+        initialPreparedGraph,
+        {
+            ...options,
+            additionalNodes: withAdditionalContainerRuntimeFixtures(options.additionalNodes),
+            ensureGraphNodesEnabledImpl: options.ensureGraphNodesEnabledImpl
+                || ensureGraphNodesEnabled,
+        },
+    );
+}
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -89,6 +136,154 @@ test('workspace graph admission retains exact manifest bytes for under-lock reva
         () => assertWorkspaceGraphAdmissionsCurrent(admissions),
         { code: 'PLOINKY_RUNTIME_INPUT_CHANGED' },
     );
+});
+
+test('retained container graph probes are pinned to the selected Podman runtime', () => {
+    fs.mkdirSync(path.join(tempDir, '.ploinky'), { recursive: true });
+    fs.writeFileSync(
+        path.join(tempDir, '.ploinky', 'routing.json'),
+        JSON.stringify({ port: 8080, routes: {} }),
+    );
+    const probes = [];
+    const containerId = 'a'.repeat(64);
+    const plan = {
+        node: {
+            id: 'demo/retained',
+            repoName: 'demo',
+            shortAgentName: 'retained',
+            manifest: { container: fixtureContainer },
+        },
+        existing: {
+            key: 'retained_container',
+            rec: {
+                runtime: 'podman',
+                containerId,
+                instanceId: 'retained-instance',
+                enableGeneration: 'retained-generation',
+            },
+        },
+    };
+    const reason = graphNodeRuntimeReplacementReason(plan, {
+        getRuntimeForAgentImpl() { return 'podman'; },
+        containerExistsImpl(name, options) {
+            probes.push(['exists', name, options]);
+            return true;
+        },
+        isContainerRunningImpl(name, options) {
+            probes.push(['running', name, options]);
+            return true;
+        },
+        computeEnvHashImpl() { return ''; },
+        isLlmRuntimeManifestImpl() { return false; },
+        createNetworkLifecycleAdapterImpl(options) {
+            probes.push(['network', options]);
+            return { inspectContainerContract(target) {
+                probes.push(['network-target', target]);
+                return { state: 'owned' };
+            } };
+        },
+    });
+
+    assert.equal(reason, '');
+    assert.deepEqual(probes, [
+        ['exists', containerId, { runtime: 'podman' }],
+        ['running', containerId, { runtime: 'podman' }],
+        ['network', { runtime: 'podman' }],
+        ['network-target', containerId],
+    ]);
+});
+
+test('retained graph rejects padded identity and missing immutable Podman IDs before probing', () => {
+    for (const rec of [
+        {
+            runtime: 'podman',
+            containerId: 'a'.repeat(64),
+            instanceId: ' padded-instance ',
+            enableGeneration: 'retained-generation',
+        },
+        {
+            runtime: 'podman',
+            instanceId: 'retained-instance',
+            enableGeneration: 'retained-generation',
+        },
+    ]) {
+        let probeCalls = 0;
+        const reason = graphNodeRuntimeReplacementReason({
+            node: {
+                id: 'demo/retained',
+                repoName: 'demo',
+                shortAgentName: 'retained',
+                manifest: { container: fixtureContainer },
+            },
+            existing: { key: 'retained_container', rec },
+        }, {
+            getRuntimeForAgentImpl() { return 'podman'; },
+            containerExistsImpl() {
+                probeCalls += 1;
+                return true;
+            },
+        });
+
+        assert.equal(reason, 'missingRuntimeIdentity');
+        assert.equal(probeCalls, 0);
+    }
+});
+
+test('additional startup runtime probes require exact identities and immutable Podman IDs', () => {
+    const calls = [];
+    const containerId = 'b'.repeat(64);
+    assert.equal(isRegistryRuntimeRunning('mutable_name', {
+        runtime: 'podman',
+        containerId,
+        instanceId: 'instance',
+        enableGeneration: 'generation',
+    }, {
+        isContainerRunningImpl(target, options) {
+            calls.push([target, options]);
+            return true;
+        },
+    }), true);
+    assert.deepEqual(calls, [[containerId, { runtime: 'podman' }]]);
+
+    for (const record of [
+        { runtime: 'podman', containerId, instanceId: ' instance ', enableGeneration: 'generation' },
+        { runtime: 'podman', instanceId: 'instance', enableGeneration: 'generation' },
+    ]) {
+        assert.equal(isRegistryRuntimeRunning('mutable_name', record, {
+            isContainerRunningImpl() {
+                assert.fail('invalid persisted identity must not be probed');
+            },
+        }), false);
+    }
+});
+
+test('retained graph rejects a mixed runtime generation before probing it', () => {
+    let probeCalls = 0;
+    const reason = graphNodeRuntimeReplacementReason({
+        node: {
+            id: 'demo/retained',
+            repoName: 'demo',
+            shortAgentName: 'retained',
+            manifest: { container: fixtureContainer },
+        },
+        existing: {
+            key: 'retained_container',
+            rec: {
+                runtime: 'docker',
+                instanceId: 'legacy-instance',
+                enableGeneration: 'legacy-generation',
+            },
+        },
+    }, {
+        getRuntimeForAgentImpl() { return 'podman'; },
+        containerExistsImpl() {
+            probeCalls += 1;
+            return true;
+        },
+    });
+
+    assert.equal(reason, 'runtimeSelectionChanged');
+    assert.equal(probeCalls, 0);
 });
 
 test('resolveEnabledAgentRegistryRecord matches core direct, alias, canonical, and ambiguity semantics', () => {
@@ -285,6 +480,7 @@ test('exact-workspace Router readiness and both inactive graph preparations prec
 
 test('prepared runtime records and routes commit together before activation, including no-wait workers', () => {
     const source = startWorkspace.toString();
+    const workspaceUtilSource = fs.readFileSync(workspaceUtilModuleUrl, 'utf8');
     assert.match(source, /reg\[result\.containerName\] = result\.registryRecord/);
     assert.ok(
         source.lastIndexOf('workspaceSvc.saveAgents(reg,')
@@ -335,7 +531,22 @@ test('prepared runtime records and routes commit together before activation, inc
         /writeRoutingConfig\(next, \{ coordinate: false \}\);[\s\S]*captureExpectedGeneration\(validatedActiveGeneration\)[\s\S]*expectedGeneration/,
         'the exact post-mutation generation must be captured and bound to the coordinated apply',
     );
-    assert.match(noWaitSource, /await waitForPriorWorker\(waitForStatus\)/);
+    assert.match(noWaitSource, /await waitForPriorWorker\(waitForStatus, \{ expectedIdentity: waitForIdentity \}\)/);
+    for (const argument of [
+        '--runtime',
+        '--instance-id',
+        '--enable-generation',
+        '--container-id',
+        '--wait-for-runtime',
+        '--wait-for-container',
+        '--wait-for-instance-id',
+        '--wait-for-enable-generation',
+        '--wait-for-container-id',
+    ]) {
+        assert.match(workspaceUtilSource, new RegExp(`['"]${argument}['"]`));
+    }
+    assert.match(workspaceUtilSource, /waitForIdentity:\s*previousNoWaitIdentity/);
+    assert.match(workspaceUtilSource, /previousNoWaitIdentity = runtimeIdentity/);
     assert.doesNotMatch(source, /await waitForPriorWorker|Waiting for .*background route activation/);
     assert.ok(
         source.indexOf('spawnNoWaitWorker({')

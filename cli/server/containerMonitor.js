@@ -16,8 +16,8 @@ import {
 import {
     cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
-    listRunningContainerNames,
 } from '../sandbox/docker/index.js';
+import { collectLiveAgentContainers } from '../sandbox/docker/containerRegistry.js';
 import { shouldMonitorManifestRuntime } from '../utils/runtime/manifestStartup.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
@@ -48,6 +48,7 @@ const __dirname = path.dirname(__filename);
 const PROBE_WORKER_URL = new URL('./probeWorker.js', import.meta.url);
 const LOGGED_RESTART_FAILURES = new WeakSet();
 const TERMINAL_POLICY_CODES = new Set([
+    'PLOINKY_AGENT_RUNTIME_STATE_INVALID',
     'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
     'PLOINKY_MANIFEST_SECURITY_INVALID',
     'PLOINKY_MANIFEST_SECURITY_PROFILE_UNSUPPORTED',
@@ -60,6 +61,7 @@ const TERMINAL_LEDGER_SCHEMA_VERSION = 1;
 // present. Once the entry disappears, retain the tombstone only long enough
 // to suppress a short remove/re-add race; it must not grow without bound.
 const DEFAULT_TERMINAL_TOMBSTONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const PODMAN_CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
 
 function noopLog() {}
 
@@ -151,9 +153,56 @@ function pruneTerminalLedger(monitor, presentRegistryNames, now = Date.now()) {
 
 function classifyTerminalFailure(error) {
     const code = String(error?.code || '');
+    if (code === 'PLOINKY_AGENT_RUNTIME_STATE_INVALID') return 'identity';
     if (TERMINAL_POLICY_CODES.has(code)) return 'policy';
     if (code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS') return 'identity';
     return '';
+}
+
+function exactIdentityText(value) {
+    return typeof value === 'string' && value !== '' && value === value.trim();
+}
+
+function invalidRuntimeState(containerName, message) {
+    const error = new Error(`watchdog runtime state '${containerName}' ${message}`);
+    error.code = 'PLOINKY_AGENT_RUNTIME_STATE_INVALID';
+    return error;
+}
+
+function validateWatchdogRuntimeRecord(containerName, record) {
+    const runtime = record?.runtime;
+    if (runtime !== 'podman' && runtime !== 'bwrap' && runtime !== 'seatbelt') {
+        throw invalidRuntimeState(
+            containerName,
+            "requires exact runtime 'podman', 'bwrap', or 'seatbelt'",
+        );
+    }
+    for (const field of ['instanceId', 'enableGeneration']) {
+        if (!exactIdentityText(record?.[field])) {
+            throw invalidRuntimeState(containerName, `requires exact ${field}`);
+        }
+    }
+    if (runtime === 'podman' && !PODMAN_CONTAINER_ID_PATTERN.test(String(record?.containerId || ''))) {
+        throw invalidRuntimeState(
+            containerName,
+            'requires an immutable lowercase 64-hex containerId',
+        );
+    }
+    return Object.freeze({
+        runtime,
+        containerId: runtime === 'podman' ? record.containerId : null,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+    });
+}
+
+function podmanRuntimeIdentityKey(target) {
+    return [
+        target.containerName,
+        target.containerId,
+        target.instanceId,
+        target.enableGeneration,
+    ].join('\0');
 }
 
 function recordTerminalFailure(monitor, info, error, restartInputDigest) {
@@ -218,8 +267,10 @@ function createContainerTarget(info, monitor) {
         containerName: info.containerName,
         agentName: info.agentName,
         repoName: info.repoName,
+        runtime: info.runtime,
         alias: info.alias || null,
         profile: info.profile || null,
+        containerId: info.containerId || null,
         instanceId: info.instanceId || null,
         enableGeneration: info.enableGeneration || null,
         type: info.type,
@@ -257,12 +308,14 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         profileName: info.profile || undefined,
         path: `manifest(${info.repoName}/${info.agentName})`,
     });
-    const runtimeKind = info.runtime === 'bwrap' || info.runtime === 'seatbelt'
-        ? info.runtime
-        : 'container';
-    const selectedRuntime = runtimeKind === 'container'
-        ? getRuntimeForAgent(manifest)
-        : info.runtime;
+    const selectedRuntime = getRuntimeForAgent(manifest);
+    if (selectedRuntime !== info.runtime) {
+        throw invalidRuntimeState(
+            info.containerName,
+            `records '${info.runtime}' but the exact manifest selects '${selectedRuntime}'`,
+        );
+    }
+    const runtimeKind = isSandboxRuntime(info.runtime) ? info.runtime : 'container';
     const llmAdmissionContext = runtimeKind === 'container'
         ? resolveLlmRuntimeAdmissionContext({
             runtime: selectedRuntime,
@@ -297,6 +350,7 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         capabilityPolicyVersion: RUNTIME_CAPABILITY_POLICY_VERSION,
         runtimeKind,
         runtime: info.runtime,
+        containerId: info.containerId,
         imageDigest: String(record.imageDigest || record.containerImageDigest || record.containerImage || ''),
         runnerAbi: String(record.runnerAbi || ''),
         network: profileResolution.network,
@@ -321,6 +375,7 @@ function resolveWatchdogRestartInput(record, info, monitor) {
             alias: info.alias || null,
             profile: info.profile || null,
             runtime: info.runtime,
+            containerId: info.containerId || null,
             instanceId: info.instanceId || null,
             enableGeneration: info.enableGeneration || null,
             manifestPath: info.manifestPath,
@@ -387,6 +442,21 @@ export function startProbeWorker(monitor, target) {
     if (!monitor || !target) return;
     if (target.circuitBreakerTripped) return;
     if (target.probeWorker || target.probeState === 'success') return;
+    if (isSandboxRuntime(target.runtime)) {
+        target.probeState = 'success';
+        target.probeLastSuccessAt = Date.now();
+        return;
+    }
+    if (target.runtime !== 'podman') {
+        handleProbeFailure(monitor, target, `invalid exact runtime '${String(target.runtime || '')}'`);
+        return;
+    }
+    try {
+        validateWatchdogRuntimeRecord(target.containerName, target);
+    } catch (error) {
+        handleProbeFailure(monitor, target, error?.message || error);
+        return;
+    }
 
     let manifest;
     try {
@@ -408,6 +478,10 @@ export function startProbeWorker(monitor, target) {
             workerData: {
                 agentName: target.agentName,
                 containerName: target.containerName,
+                containerId: target.containerId,
+                instanceId: target.instanceId,
+                enableGeneration: target.enableGeneration,
+                runtime: 'podman',
                 manifest: { health: manifest.health }
             },
             stdout: true,
@@ -482,21 +556,52 @@ function readNoWaitStatus(containerName) {
     }
 }
 
-function shouldDeferNoWaitRestart(monitor, target) {
+function matchesExactNoWaitTarget(status, target) {
+    if (!status || typeof status !== 'object' || Array.isArray(status)
+        || (status.state !== 'starting' && status.state !== 'failed')
+        || status.runtime !== target?.runtime
+        || status.containerName !== target?.containerName
+        || status.instanceId !== target?.instanceId
+        || status.enableGeneration !== target?.enableGeneration
+        || !exactIdentityText(target?.containerName)
+        || !exactIdentityText(target?.instanceId)
+        || !exactIdentityText(target?.enableGeneration)
+        || (target?.runtime !== 'podman'
+            && target?.runtime !== 'bwrap'
+            && target?.runtime !== 'seatbelt')) {
+        return false;
+    }
+    if (target.runtime === 'podman') {
+        return typeof target.containerId === 'string'
+            && PODMAN_CONTAINER_ID_PATTERN.test(target.containerId)
+            && status.containerId === target.containerId;
+    }
+    if (target.runtime !== 'bwrap' && target.runtime !== 'seatbelt') return false;
+    return !Object.prototype.hasOwnProperty.call(status, 'containerId');
+}
+
+export function shouldDeferNoWaitRestart(monitor, target) {
     const readStatus = monitor?.readNoWaitStatus || readNoWaitStatus;
     const status = readStatus(target?.containerName || '');
-    const state = String(status?.state || '').trim().toLowerCase();
-    if (state !== 'starting' && state !== 'failed') {
+    if (!matchesExactNoWaitTarget(status, target)) {
         target.noWaitDeferredState = null;
         return false;
     }
-    if (target.noWaitDeferredState !== state) {
-        target.noWaitDeferredState = state;
+    const deferredIdentity = JSON.stringify([
+        status.state,
+        status.runtime,
+        status.containerName,
+        status.instanceId,
+        status.enableGeneration,
+        ...(status.runtime === 'podman' ? [status.containerId] : []),
+    ]);
+    if (target.noWaitDeferredState !== deferredIdentity) {
+        target.noWaitDeferredState = deferredIdentity;
         logEvent(monitor, 'info', 'container_no_wait_restart_deferred', {
             container: target.containerName,
             agent: target.agentName,
             repo: target.repoName,
-            state,
+            state: status.state,
             statusFile: path.join(RUNNING_DIR, 'no-wait', `${target.containerName}.json`)
         });
     }
@@ -580,15 +685,17 @@ export function syncManagedContainers(monitor) {
 
         let restartInput;
         try {
+            const runtimeIdentity = validateWatchdogRuntimeRecord(containerName, record);
             restartInput = resolveWatchdogRestartInput(record, {
                 containerName,
                 agentName,
                 repoName,
                 alias,
                 profile: record.profile || null,
-                runtime: record.runtime || 'container',
-                instanceId: String(record.instanceId || '').trim() || null,
-                enableGeneration: String(record.enableGeneration || '').trim() || null,
+                runtime: runtimeIdentity.runtime,
+                containerId: runtimeIdentity.containerId,
+                instanceId: runtimeIdentity.instanceId,
+                enableGeneration: runtimeIdentity.enableGeneration,
                 manifestPath,
                 routing,
             }, monitorRef);
@@ -605,7 +712,8 @@ export function syncManagedContainers(monitor) {
                     try { return digestValue(fs.readFileSync(manifestPath).toString('base64')); } catch (_) { return ''; }
                 })(),
                 profile: record.profile || null,
-                runtime: record.runtime || 'container',
+                runtime: record.runtime,
+                containerId: record.containerId,
                 instanceId: String(record.instanceId || ''),
                 enableGeneration: String(record.enableGeneration || ''),
             });
@@ -614,8 +722,8 @@ export function syncManagedContainers(monitor) {
                     containerName,
                     agentName,
                     repoName,
-                    instanceId: String(record.instanceId || '').trim() || null,
-                    enableGeneration: String(record.enableGeneration || '').trim() || null,
+                    instanceId: typeof record.instanceId === 'string' ? record.instanceId : null,
+                    enableGeneration: typeof record.enableGeneration === 'string' ? record.enableGeneration : null,
                 };
                 const existing = monitorRef.terminalLedger?.get(containerName);
                 if (existing?.restartInputDigest !== fallbackDigest) {
@@ -640,10 +748,11 @@ export function syncManagedContainers(monitor) {
             continue;
         }
 
-        const runtime = record.runtime || 'container';
+        const runtime = record.runtime;
         const profile = record.profile || null;
-        const instanceId = String(record.instanceId || '').trim() || null;
-        const enableGeneration = String(record.enableGeneration || '').trim() || null;
+        const containerId = runtime === 'podman' ? record.containerId : null;
+        const instanceId = record.instanceId;
+        const enableGeneration = record.enableGeneration;
         const info = {
             containerName,
             type,
@@ -653,6 +762,7 @@ export function syncManagedContainers(monitor) {
             profile,
             manifestPath,
             runtime,
+            containerId,
             instanceId,
             enableGeneration,
             restartInputDigest: restartInput.restartInputDigest,
@@ -704,6 +814,7 @@ export function syncManagedContainers(monitor) {
             target.repoName = repoName;
             target.alias = alias;
             target.profile = profile;
+            target.containerId = containerId;
             target.instanceId = instanceId;
             target.enableGeneration = enableGeneration;
             target.type = type;
@@ -849,22 +960,28 @@ function positiveInteger(value, fallback) {
 }
 
 function assertRestartPreparationResult(target, result) {
-    const containerName = String(result?.containerName || '').trim();
+    const containerName = result?.containerName;
     const record = result?.registryRecord;
-    if (!containerName || containerName !== String(target.containerName || '')
+    if (!exactIdentityText(containerName) || containerName !== target.containerName
         || !record || typeof record !== 'object' || Array.isArray(record)
         || record.type !== 'agent'
+        || record.runtime !== target.runtime
         || String(record.repoName || '') !== String(target.repoName || '')
         || String(record.agentName || '') !== String(target.agentName || '')
         || String(record.alias || '') !== String(target.alias || '')
         || !String(record.instanceId || '')
-        || !String(record.enableGeneration || '')) {
+        || !exactIdentityText(record.instanceId)
+        || !exactIdentityText(record.enableGeneration)
+        || (target.runtime === 'podman'
+            && (!PODMAN_CONTAINER_ID_PATTERN.test(String(result?.containerId || ''))
+                || result.containerId !== record.containerId))) {
         throw new Error(`watchdog runtime ensure returned a mismatched exact registry identity for '${containerName || target.containerName}'`);
     }
     if (result?.requiresEdgeActivation !== true) return null;
     const stagedRecord = result?.stagedRegistryRecord;
     if (!stagedRecord || typeof stagedRecord !== 'object' || Array.isArray(stagedRecord)
         || stagedRecord.type !== 'agent'
+        || stagedRecord.runtime !== record.runtime
         || String(stagedRecord.repoName || '') !== String(record.repoName || '')
         || String(stagedRecord.agentName || '') !== String(record.agentName || '')
         || String(stagedRecord.alias || '') !== String(record.alias || '')
@@ -900,6 +1017,12 @@ async function waitForRestartedContainerReadiness(
             target.agentName,
             result.containerName,
             manifest?.health?.readiness,
+            {
+                runtime: target.runtime,
+                containerId: result.containerId,
+                instanceId: result.registryRecord?.instanceId,
+                enableGeneration: result.registryRecord?.enableGeneration,
+            },
         ));
         if (probe?.status !== 'success') {
             const detail = probe?.detail ? `, output='${probe.detail}'` : '';
@@ -1177,6 +1300,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             forceRecreate: reason === 'semantic_probe_failed',
             networkLifecycleCapability,
             runtimeAdmission: target.runtimeAdmission,
+            runtime: target.runtime,
         }));
         assertRestartAttemptCurrent(monitor, target, attempt, 'post-physical-ensure', {
             expectedRegistryRecord: preActivationRegistryRecord(result),
@@ -1235,6 +1359,9 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                     activationCommitted = true;
                     target.instanceId = String(result?.registryRecord?.instanceId || '') || null;
                     target.enableGeneration = String(result?.registryRecord?.enableGeneration || '') || null;
+                    target.containerId = target.runtime === 'podman'
+                        ? String(result?.registryRecord?.containerId || '') || null
+                        : null;
 
                     if (prepared.containerName !== target.containerName) {
                         const oldName = target.containerName;
@@ -1299,14 +1426,19 @@ export async function performContainerRestart(monitor, target, reason, attempt =
 }
 
 export function snapshotRunningContainerNames(monitor) {
-    if (![...monitor.targets.values()].some((target) => (
-        target && !isSandboxRuntime(target.runtime)
-    ))) {
+    if (![...monitor.targets.values()].some((target) => target?.runtime === 'podman')) {
         return null;
     }
     try {
-        const listRunning = monitor.listRunningContainerNames || listRunningContainerNames;
-        return new Set(listRunning());
+        const collectLive = monitor.collectLiveAgentContainers || collectLiveAgentContainers;
+        return new Set((collectLive() || []).filter((entry) => (
+            entry?.runtime === 'podman'
+            && entry?.ownershipVerified === true
+            && entry?.state?.running === true
+            && PODMAN_CONTAINER_ID_PATTERN.test(String(entry?.containerId || ''))
+            && exactIdentityText(entry?.instanceId)
+            && exactIdentityText(entry?.enableGeneration)
+        )).map(podmanRuntimeIdentityKey));
     } catch (error) {
         logEvent(monitor, 'error', 'container_status_snapshot_failed', {
             error: error?.message || error,
@@ -1355,8 +1487,13 @@ export function monitorTick(monitor) {
                         instanceId: target.instanceId,
                         enableGeneration: target.enableGeneration,
                     });
-            } else if (runningContainerNames) {
-                running = runningContainerNames.has(target.containerName);
+            } else if (target.runtime === 'podman' && runningContainerNames) {
+                running = runningContainerNames.has(podmanRuntimeIdentityKey(target));
+            } else if (target.runtime !== 'podman') {
+                throw invalidRuntimeState(
+                    target.containerName,
+                    `has invalid active target runtime '${String(target.runtime || '')}'`,
+                );
             } else {
                 // A failed shared runtime snapshot means container state is
                 // unknown. Defer this tick instead of multiplying the outage

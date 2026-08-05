@@ -8,6 +8,8 @@ import {
     drainTargetedContainer,
 } from '../../cli/sandbox/docker/targetedContainerLifecycle.js';
 
+const CONTAINER_ID = 'f'.repeat(64);
+
 function fixture({ runningChecks = [true, false], exitCode = 0 } = {}) {
     const events = [];
     let index = 0;
@@ -17,21 +19,39 @@ function fixture({ runningChecks = [true, false], exitCode = 0 } = {}) {
         events,
         options: {
             runtime: 'podman',
+            containerId: CONTAINER_ID,
+            runtimeIdentity: Object.freeze({
+                instanceId: 'instance-exact',
+                enableGeneration: 'generation-exact',
+            }),
             timeoutMs: 10,
             pollMs: 1,
             acknowledgement: TARGETED_DRAIN_ACKNOWLEDGEMENT,
             affectedSelectors: ['service:route/editor'],
-            exists: () => exists,
-            isRunning: () => runningChecks[Math.min(index++, runningChecks.length - 1)],
+            exists: (id, options) => {
+                assert.equal(id, CONTAINER_ID);
+                assert.deepEqual(options, { runtime: 'podman' });
+                return exists;
+            },
+            isRunning: (id, options) => {
+                assert.equal(id, CONTAINER_ID);
+                assert.deepEqual(options, { runtime: 'podman' });
+                return runningChecks[Math.min(index++, runningChecks.length - 1)];
+            },
+            inspectRuntimeIdentity: (identity) => {
+                assert.equal(identity.containerId, CONTAINER_ID);
+                events.push(['identity', identity.containerId]);
+                return identity;
+            },
             assertSelectorsInactive: ({ affectedSelectors }) => {
                 events.push(['selector-check', ...affectedSelectors]);
                 return true;
             },
-            signal: (_runtime, name) => { events.push(['signal', name]); return { status: 0 }; },
+            signal: (_runtime, id) => { events.push(['signal', id]); return { status: 0 }; },
             inspect: () => ({ State: { ExitCode: exitCode, OOMKilled: false, Error: '' } }),
             now: () => time,
             sleep: (ms) => { time += ms; events.push(['wait', ms]); },
-            remove: (_runtime, name) => { events.push(['remove', name]); exists = false; return { status: 0 }; },
+            remove: (_runtime, id) => { events.push(['remove', id]); exists = false; return { status: 0 }; },
         },
     };
 }
@@ -46,7 +66,7 @@ test('targeted drain proves exact selectors inactive before SIGTERM and removes 
         affectedSelectors: ['service:route/editor'],
         removed: true,
     });
-    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'signal', 'remove']);
+    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'identity', 'signal', 'remove']);
 });
 
 test('failed application drain remains running and blocks force removal, recreate, and activation', () => {
@@ -57,8 +77,8 @@ test('failed application drain remains running and blocks force removal, recreat
             && /refusing SIGKILL, removal, recreate, or selector activation/.test(error.message),
     );
     const eventNames = state.events.map(([event]) => event);
-    assert.deepEqual(eventNames.slice(0, 2), ['selector-check', 'signal']);
-    assert.ok(eventNames.slice(2).every((event) => event === 'wait'));
+    assert.deepEqual(eventNames.slice(0, 3), ['selector-check', 'identity', 'signal']);
+    assert.ok(eventNames.slice(3).every((event) => event === 'wait'));
     assert.ok(!eventNames.includes('remove'));
 });
 
@@ -68,7 +88,7 @@ test('signal-style exit 143 is not an application acknowledgement and blocks rem
         () => drainAndRemoveTargetedContainer('ploinky_agent', state.options),
         (error) => error?.code === 'TARGETED_DRAIN_FAILED',
     );
-    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'signal']);
+    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'identity', 'signal']);
 });
 
 test('an already-stopped predecessor still requires an exit-zero acknowledgement', () => {
@@ -77,7 +97,7 @@ test('an already-stopped predecessor still requires an exit-zero acknowledgement
         () => drainAndRemoveTargetedContainer('ploinky_agent', state.options),
         (error) => error?.code === 'TARGETED_DRAIN_FAILED',
     );
-    assert.deepEqual(state.events.map(([event]) => event), ['selector-check']);
+    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'identity']);
 });
 
 test('active or unproved affected selectors block signaling even when the container is absent', () => {
@@ -113,4 +133,21 @@ test('targeted drain bound is fixed and rejects attempts to extend it', () => {
         (error) => error?.code === 'TARGETED_DRAIN_INVALID',
     );
     assert.deepEqual(state.events, []);
+});
+
+test('targeted drain rejects generic runtime and incomplete immutable identity before selector or Podman access', () => {
+    const state = fixture();
+    for (const invalid of [
+        { runtime: 'container' },
+        { containerId: 'ploinky_agent' },
+        { runtimeIdentity: { instanceId: '', enableGeneration: 'generation-exact' } },
+        { runtimeIdentity: { instanceId: 'instance-exact', enableGeneration: ' padded ' } },
+    ]) {
+        state.events.length = 0;
+        assert.throws(
+            () => drainTargetedContainer('ploinky_agent', { ...state.options, ...invalid }),
+            { code: 'PLOINKY_PODMAN_RUNTIME_IDENTITY_INVALID' },
+        );
+        assert.deepEqual(state.events, []);
+    }
 });

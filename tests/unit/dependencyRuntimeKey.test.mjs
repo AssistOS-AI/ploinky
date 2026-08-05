@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 
 import {
     detectHostRuntimeKey,
@@ -12,6 +13,13 @@ import {
     buildRuntimeKey,
     SUPPORTED_FAMILIES,
 } from '../../cli/utils/dependencies/dependencyRuntimeKey.js';
+
+test('dependency preparation has no implicit bwrap or legacy image fallback', () => {
+    const source = fs.readFileSync(new URL('../../cli/commands/depsCommands.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /manifest\s*\?\s*getRuntimeForAgent\(manifest\)\s*:\s*['"]bwrap['"]/);
+    assert.doesNotMatch(source, /manifest\?\.container\s*\|\|\s*manifest\?\.image/);
+    assert.match(source, /resolveDependencyRuntime\(manifest\)/);
+});
 
 test('detectHostRuntimeKey returns <family>-<platform>-<arch>-node<major> for bwrap', () => {
     const key = detectHostRuntimeKey('bwrap');

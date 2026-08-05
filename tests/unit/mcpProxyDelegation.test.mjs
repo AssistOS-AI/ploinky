@@ -55,6 +55,8 @@ fs.writeFileSync(path.join(tempDir, '.ploinky', 'routing.json'), JSON.stringify(
 fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
     'git-agent-container': {
         type: 'agent',
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
         repoName: 'AssistOSExplorer',
         agentName: 'gitAgent',
         instanceId: 'git-agent-instance',

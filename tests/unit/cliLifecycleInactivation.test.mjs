@@ -126,12 +126,11 @@ test('single restart and reinstall delegate physical replacement to the shared r
 });
 
 test('sandbox ownership checks use exact runtime keys rather than short agent names', () => {
-    assert.match(cliSource, /isBwrapProcessRunning\(containerName, \{/);
+    assert.match(cliSource, /probeSelectedManualRuntime\(\s*agentRuntime,\s*containerName,/);
+    assert.match(workspaceSource, /isSandboxRunning\(runtimeKey, \{/);
     assert.match(workspaceSource, /isSandboxRunningImpl\(existing\.key, \{/);
-    assert.match(workspaceSource, /isBwrapProcessRunning\(containerName, \{/);
+    assert.match(workspaceSource, /isSandboxRunningImpl\(containerName, \{/);
     assert.doesNotMatch(workspaceSource, /isBwrapProcessRunning\(containerName\);/);
-    for (const source of [cliSource, workspaceSource]) {
-        assert.match(source, /instanceId:/);
-        assert.match(source, /enableGeneration:/);
-    }
+    assert.match(workspaceSource, /instanceId:/);
+    assert.match(workspaceSource, /enableGeneration:/);
 });

@@ -32,18 +32,20 @@ async function findManifestPaths(directory) {
     return manifests;
 }
 
-test('test manifests keep one explicit strict bwrap fixture separate from container fixtures', async () => {
+test('test manifests validate sandbox capability without an agent-name or count allowlist', async () => {
     const selectorManifests = [];
     for (const manifestPath of await findManifestPaths(testsRoot)) {
         const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
         if (manifest['lite-sandbox'] === true) {
             selectorManifests.push(manifestPath);
-            assert.equal(Object.hasOwn(manifest, 'container'), false, `${manifestPath} must not declare container`);
-            assert.equal(Object.hasOwn(manifest, 'image'), false, `${manifestPath} must not declare image`);
+            assert.equal(Object.hasOwn(manifest, 'network'), false, `${manifestPath} uses platform networking`);
         }
     }
 
-    assert.deepEqual(selectorManifests, [strictBwrapManifestPath]);
+    assert.equal(selectorManifests.includes(strictBwrapManifestPath), true);
+    const strictBwrapManifest = JSON.parse(await fs.readFile(strictBwrapManifestPath, 'utf8'));
+    assert.equal(strictBwrapManifest['lite-sandbox'], true);
+    assert.equal(Object.hasOwn(strictBwrapManifest, 'network'), false);
 
     const containerManifest = JSON.parse(await fs.readFile(containerManifestPath, 'utf8'));
     assert.equal(containerManifest.container, 'node:24.15.0-bullseye');

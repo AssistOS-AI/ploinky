@@ -1,7 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync, spawnSync } from 'child_process';
-import { getRuntime } from '../../sandbox/docker/common.js';
+import {
+    inspectExactPodmanRuntimeIdentity,
+    requireExactPodmanRuntimeIdentity,
+} from '../../sandbox/docker/exactPodmanRuntime.js';
 import { debugLog } from '../utils.js';
 import { getProfileConfig, getProfileEnvVars, getHookNames, getActiveProfile } from './profileService.js';
 import { validateSecrets, getSecrets, createEnvWithSecrets, formatMissingSecretsError } from '../security/secretInjector.js';
@@ -231,7 +234,12 @@ export function executeHostHook(scriptPath, env = {}, options = {}) {
  * @returns {{ success: boolean, message: string, output?: string }}
  */
 export function executeContainerHook(containerName, script, env = {}, options = {}) {
-    const { timeout = 300000, workdir = '/code' } = options;
+    const {
+        timeout = 300000,
+        workdir = '/code',
+        spawnSyncImpl = spawnSync,
+        inspectRuntimeIdentity = inspectExactPodmanRuntimeIdentity,
+    } = options;
 
     if (!script) {
         return { success: true, message: 'No hook script specified' };
@@ -243,14 +251,21 @@ export function executeContainerHook(containerName, script, env = {}, options = 
     }
 
     try {
-        const runtime = getRuntime();
+        const identity = requireExactPodmanRuntimeIdentity({
+            runtime: options.runtime,
+            containerName,
+            containerId: options.containerId,
+            instanceId: options.runtimeIdentity?.instanceId,
+            enableGeneration: options.runtimeIdentity?.enableGeneration,
+        });
+        inspectRuntimeIdentity(identity);
         debugLog(`[hook] Executing container hook in ${containerName}: ${script}`);
-        const result = spawnSync(runtime, [
+        const result = spawnSyncImpl('podman', [
             'exec',
             ...envFlags,
             '-w',
             workdir,
-            containerName,
+            identity.containerId,
             'sh',
             '-c',
             script
@@ -318,7 +333,10 @@ export function runProfileLifecycle(agentName, profileName, options = {}) {
         manifest,
         skipContainer = false,
         skipInstallHooks = false,  // Skip steps 6-10 if install already ran in temp container
-        verbose = false
+        verbose = false,
+        runtime,
+        runtimeIdentity,
+        containerId,
     } = options;
 
     const steps = [];
@@ -330,8 +348,10 @@ export function runProfileLifecycle(agentName, profileName, options = {}) {
 
     const containerInfo = {
         containerName,
-        containerId: containerName // We use container name as ID for simplicity
+        containerId,
     };
+    const containerHookOptions = { runtime, runtimeIdentity, containerId };
+    const sandboxRuntime = runtime === 'bwrap' || runtime === 'seatbelt';
 
     // Validate secrets
     if (profileConfig.secrets && profileConfig.secrets.length > 0) {
@@ -409,9 +429,9 @@ export function runProfileLifecycle(agentName, profileName, options = {}) {
         });
 
         // Step 9: install [CONTAINER]
-        if (profileConfig.install && containerName) {
+        if (profileConfig.install && containerName && !sandboxRuntime) {
             console.log(`[install] ${agentName}: ${profileConfig.install}`);
-            const result = executeContainerHook(containerName, profileConfig.install, hookEnv);
+            const result = executeContainerHook(containerName, profileConfig.install, hookEnv, containerHookOptions);
             if (result.output) {
                 console.log(result.output.trim());
             }
@@ -422,9 +442,9 @@ export function runProfileLifecycle(agentName, profileName, options = {}) {
         }
 
         // Step 10: postinstall [CONTAINER]
-        if (profileConfig.postinstall && containerName) {
+        if (profileConfig.postinstall && containerName && !sandboxRuntime) {
             log('[lifecycle] Step 10: Running postinstall hook...');
-            const result = executeContainerHook(containerName, profileConfig.postinstall, hookEnv);
+            const result = executeContainerHook(containerName, profileConfig.postinstall, hookEnv, containerHookOptions);
             steps.push({ step: 10, name: 'postinstall', success: result.success, output: result.output });
             if (!result.success) {
                 errors.push(`postinstall hook failed: ${result.message}`);
@@ -436,9 +456,9 @@ export function runProfileLifecycle(agentName, profileName, options = {}) {
         steps.push({ step: 9, name: 'install', success: true, skipped: true });
 
         // Step 10: postinstall [CONTAINER] - runs AFTER main container is up, not in temp container
-        if (profileConfig.postinstall && containerName) {
+        if (profileConfig.postinstall && containerName && !sandboxRuntime) {
             console.log(`[postinstall] ${agentName}: ${profileConfig.postinstall}`);
-            const result = executeContainerHook(containerName, profileConfig.postinstall, hookEnv);
+            const result = executeContainerHook(containerName, profileConfig.postinstall, hookEnv, containerHookOptions);
             if (result.output) {
                 console.log(result.output.trim());
             }
@@ -562,7 +582,14 @@ export function runPreContainerLifecycle(agentName, repoName, agentPath, profile
  * @returns {{ success: boolean, errors: string[] }}
  */
 export function runPostStartLifecycle(containerName, agentName, profileName, options = {}) {
-    const { repoName, agentPath, verbose = false } = options;
+    const {
+        repoName,
+        agentPath,
+        verbose = false,
+        runtime,
+        runtimeIdentity,
+        containerId,
+    } = options;
     const errors = [];
     const log = verbose ? console.log : debugLog;
 
@@ -591,10 +618,15 @@ export function runPostStartLifecycle(containerName, agentName, profileName, opt
 
     // Container hooks (preinstall is a HOST hook, not a container hook)
     const hooks = ['install', 'postinstall'];
+    const sandboxRuntime = runtime === 'bwrap' || runtime === 'seatbelt';
     for (const hookName of hooks) {
-        if (profileConfig[hookName]) {
+        if (profileConfig[hookName] && !sandboxRuntime) {
             log(`[lifecycle] Running ${hookName}...`);
-            const result = executeContainerHook(containerName, profileConfig[hookName], hookEnv);
+            const result = executeContainerHook(containerName, profileConfig[hookName], hookEnv, {
+                runtime,
+                runtimeIdentity,
+                containerId,
+            });
             if (!result.success) {
                 errors.push(`${hookName}: ${result.message}`);
             }

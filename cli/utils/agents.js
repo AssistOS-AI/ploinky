@@ -245,7 +245,8 @@ function buildDefaultLocalAuthVars(routeKey) {
 }
 
 export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
-    runtime = 'container',
+    runtime,
+    runtimeRecord,
     isRunning = isContainerRunning,
     waitRunning = waitForContainerRunning,
     isSandboxRunning = isBwrapProcessRunning,
@@ -254,10 +255,37 @@ export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
     if (!runtimeInstanceName) {
         throw new Error(`enable agent: failed to start '${shortAgentName}': no runtime instance was returned.`);
     }
+    if (!['podman', 'bwrap', 'seatbelt'].includes(runtime)) {
+        const error = new Error(`enable agent: exact selected runtime is required for '${shortAgentName}'.`);
+        error.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
+        throw error;
+    }
+    const exactIdentity = runtimeRecord
+        && runtimeRecord.type === 'agent'
+        && runtimeRecord.runtime === runtime
+        && typeof runtimeRecord.instanceId === 'string'
+        && runtimeRecord.instanceId !== ''
+        && runtimeRecord.instanceId === runtimeRecord.instanceId.trim()
+        && typeof runtimeRecord.enableGeneration === 'string'
+        && runtimeRecord.enableGeneration !== ''
+        && runtimeRecord.enableGeneration === runtimeRecord.enableGeneration.trim();
+    const exactPodmanIdentity = runtime !== 'podman'
+        || (typeof runtimeInstanceName === 'string'
+            && /^[a-f0-9]{64}$/.test(runtimeInstanceName)
+            && runtimeRecord?.containerId === runtimeInstanceName);
+    if (!exactIdentity || !exactPodmanIdentity) {
+        const error = new Error(`enable agent: exact selected runtime identity is required for '${shortAgentName}'.`);
+        error.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
+        throw error;
+    }
     const sandboxRuntime = runtime === 'bwrap' || runtime === 'seatbelt';
     const running = sandboxRuntime
-        ? isSandboxRunning(runtimeInstanceName)
-        : isRunning(runtimeInstanceName) || waitRunning(runtimeInstanceName, 40, 250);
+        ? isSandboxRunning(runtimeInstanceName, {
+            instanceId: runtimeRecord.instanceId,
+            enableGeneration: runtimeRecord.enableGeneration,
+        })
+        : isRunning(runtimeInstanceName, { runtime: 'podman' })
+            || waitRunning(runtimeInstanceName, 40, 250, { runtime: 'podman' });
     if (!running) {
         const details = sandboxRuntime
             ? `${runtime} process '${shortAgentName}' exited during startup. Check sandbox logs for details.`
@@ -270,15 +298,42 @@ export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
 async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
     networkMode = '',
     generationDigest = '',
+    selectedRuntime,
 } = {}) {
     const protocol = resolveAgentReadinessProtocol(manifest);
     if (protocol === 'none') return;
     if (protocol === 'script') {
+        if (selectedRuntime !== 'podman') {
+            const error = new Error(`sandbox runtime '${String(selectedRuntime)}' cannot execute container script readiness`);
+            error.code = 'PLOINKY_SANDBOX_SCRIPT_READINESS_UNSUPPORTED';
+            throw error;
+        }
+        const record = started?.registryRecord;
+        if (record?.runtime !== 'podman'
+            || typeof record.containerId !== 'string'
+            || !/^[a-f0-9]{64}$/.test(record.containerId)
+            || started?.containerId !== record.containerId
+            || typeof record.instanceId !== 'string'
+            || !record.instanceId
+            || record.instanceId !== record.instanceId.trim()
+            || typeof record.enableGeneration !== 'string'
+            || !record.enableGeneration
+            || record.enableGeneration !== record.enableGeneration.trim()) {
+            const error = new Error('container script readiness requires one exact admitted Podman runtime identity');
+            error.code = 'PLOINKY_PODMAN_RUNTIME_IDENTITY_INVALID';
+            throw error;
+        }
         const probe = normalizeProbeConfig('readiness', manifest?.health?.readiness);
         const result = await Promise.resolve(runContainerScriptReadiness(
             shortAgentName,
             started?.containerName,
             probe,
+            {
+                runtime: 'podman',
+                containerId: record.containerId,
+                instanceId: record.instanceId,
+                enableGeneration: record.enableGeneration,
+            },
         ));
         if (result?.status !== 'success') {
             const detail = result?.detail ? `, output='${result.detail}'` : '';
@@ -485,7 +540,9 @@ function resolveAgentEnableInput({
         profileResolution,
         repoName,
         routerEndpoint,
+        runtimeKind,
         runtimeAdmission,
+        selectedRuntime,
         shortAgentName,
     };
 }
@@ -508,7 +565,9 @@ function planAgentEnable({
         profileResolution,
         repoName,
         routerEndpoint,
+        runtimeKind,
         runtimeAdmission,
+        selectedRuntime,
         shortAgentName,
     } = resolvedInput || resolveAgentEnableInput({ agentName, mode, repoNameParam, authOptions });
     const alias = normalizeAlias(aliasParam);
@@ -595,12 +654,13 @@ function planAgentEnable({
     const record = {
         agentName: shortAgentName,
         repoName,
-        containerImage: manifest.container || manifest.image || 'node:18-alpine',
+        containerImage: runtimeKind === 'container' ? manifest.container : `host (${selectedRuntime})`,
         createdAt: new Date().toISOString(),
         projectPath,
         runMode,
         develRepo: runMode === 'devel' ? String(normalized.repoNameParam || '') : undefined,
         type: 'agent',
+        runtime: selectedRuntime,
         instanceId,
         enableGeneration,
         config: {
@@ -703,6 +763,7 @@ function planAgentEnable({
         routeKey,
         routerEndpoint,
         runtimeAdmission,
+        selectedRuntime,
         runMode,
         shortAgentName,
     };
@@ -902,6 +963,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
         routeKey,
         routerEndpoint,
         runtimeAdmission,
+        selectedRuntime,
         runMode,
         shortAgentName,
     } = plan;
@@ -927,12 +989,16 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 networkLifecycleCapability,
                 runtimeAdmission,
             });
-            verifyEnabledAgentStarted(shortAgentName, started?.containerName || containerName, {
-                runtime: started?.runtime || started?.registryRecord?.runtime || 'container',
+            verifyEnabledAgentStarted(shortAgentName, selectedRuntime === 'podman'
+                ? started?.containerId
+                : (started?.containerName || containerName), {
+                runtime: selectedRuntime,
+                runtimeRecord: started?.registryRecord,
             });
             await waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
                 networkMode: profileResolution.network.mode,
                 generationDigest: prepared.preparedGeneration?.preparationLease?.preparedGeneration || '',
+                selectedRuntime,
             });
 
             const hostPort = profileResolution.network.mode === 'none'
@@ -1090,28 +1156,51 @@ function commitAgentDisableGeneration(prepared, {
 function removeDisabledRuntimes(disabledRecords, {
     stopAndRemoveImpl = stopAndRemove,
     stopAndRemoveManyImpl = stopAndRemoveMany,
-    isSandboxRuntimeImpl = isSandboxRuntime,
     stopSandboxImpl = stopBwrapProcess,
     sandboxRunningImpl = isBwrapProcessRunning,
     containerExistsImpl = containerExists,
 } = {}) {
-    const containerTargets = [];
+    const containerRecords = {};
     for (const { containerName, record } of disabledRecords) {
-        if (isSandboxRuntimeImpl(record?.runtime)) {
-            stopSandboxImpl(containerName);
-            if (sandboxRunningImpl(containerName)) {
+        if (!record || record.type !== 'agent'
+            || typeof record.instanceId !== 'string'
+            || !record.instanceId
+            || record.instanceId !== record.instanceId.trim()
+            || typeof record.enableGeneration !== 'string'
+            || !record.enableGeneration
+            || record.enableGeneration !== record.enableGeneration.trim()) {
+            throw new Error(`runtime removal for '${containerName}' requires an exact managed-agent identity`);
+        }
+        if (record.runtime === 'bwrap' || record.runtime === 'seatbelt') {
+            const expectedIdentity = Object.freeze({
+                instanceId: record.instanceId,
+                enableGeneration: record.enableGeneration,
+            });
+            stopSandboxImpl(containerName, { expectedIdentity });
+            if (sandboxRunningImpl(containerName, expectedIdentity)) {
                 throw new Error(`sandbox runtime '${containerName}' is still running`);
             }
-        } else {
-            containerTargets.push(containerName);
+            continue;
         }
+        if (record.runtime !== 'podman') {
+            throw new Error(
+                `runtime removal for '${containerName}' runtime must be exactly 'podman', 'bwrap', or 'seatbelt'`,
+            );
+        }
+        if (typeof record.containerId !== 'string' || !/^[a-f0-9]{64}$/.test(record.containerId)) {
+            throw new Error(`runtime removal for '${containerName}' requires an immutable container ID`);
+        }
+        containerRecords[containerName] = record;
     }
+    const containerTargets = Object.keys(containerRecords);
     if (containerTargets.length === 1) {
-        stopAndRemoveImpl(containerTargets[0]);
+        stopAndRemoveImpl(containerTargets[0], { records: containerRecords });
     } else if (containerTargets.length > 1) {
-        stopAndRemoveManyImpl(containerTargets);
+        stopAndRemoveManyImpl(containerTargets, { records: containerRecords });
     }
-    const retained = containerTargets.filter((containerName) => containerExistsImpl(containerName));
+    const retained = containerTargets.filter((containerName) => (
+        containerExistsImpl(containerName, { runtime: 'podman' })
+    ));
     if (retained.length) {
         throw new Error(`runtime removal left existing container(s): ${retained.join(', ')}`);
     }

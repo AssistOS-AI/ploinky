@@ -52,12 +52,17 @@ export function installGeneratedRouterRuntime({
     const signed = signGeneratedRouterDescriptorEnvelope(payload);
     const descriptorFile = path.join(tempDir, `router-descriptor-${sequence}.json`);
     writeGeneratedRouterDescriptorFile(descriptorFile, signed.bytes);
+    const homeKey = agentPrincipal
+        .replace(/^agent:/, '')
+        .replace(/[^A-Za-z0-9._-]+/g, '_');
     const env = {
         ...buildGeneratedRouterDescriptorEnv(payload, { descriptorFile }),
+        PLOINKY_AGENT_HOME_KEY: homeKey,
         PLOINKY_AGENT_API_PUBLIC_KEY: signed.publicKey,
         PLOINKY_AGENT_API_KEY: buildSubjectIdentityKey(agentPrincipal),
         PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY: 'generated',
         PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'generated',
+        PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY: 'generated',
     };
     Object.assign(process.env, env);
     return Object.freeze({ descriptorFile, env: Object.freeze(env), payload });

@@ -1,16 +1,10 @@
-import { execSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { debugLog } from '../../utils/utils.js';
 import { PLOINKY_DIR } from '../../utils/config.js';
 import { loadAgents } from '../../utils/workspace.js';
 import {
-    containerExists,
-    getRuntime,
-    isContainerRunning,
-    isSandboxRuntime,
     loadAgentsMap,
-    probeContainerRuntime
 } from './common.js';
 import { clearLivenessState } from './healthProbes.js';
 import { stopBwrapProcesses, isBwrapProcessRunning } from '../bwrap/bwrapFleet.js';
@@ -86,6 +80,36 @@ function defaultPause(milliseconds) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
+function exactRegistryText(value) {
+    return typeof value === 'string' && value.length > 0 && value === value.trim();
+}
+
+function classifyExactAgentRuntime(name, record) {
+    if (!record || typeof record !== 'object' || Array.isArray(record) || record.type !== 'agent') {
+        throw new Error(`fleet lifecycle for '${name}' requires a current managed-agent registry record`);
+    }
+    if (!exactRegistryText(record.instanceId) || !exactRegistryText(record.enableGeneration)) {
+        throw new Error(`fleet lifecycle for '${name}' requires a complete managed-agent registry identity`);
+    }
+    if (record.runtime === 'podman') {
+        if (typeof record.containerId !== 'string' || !/^[a-f0-9]{64}$/.test(record.containerId)) {
+            throw new Error(`fleet lifecycle for '${name}' requires its immutable registry container ID`);
+        }
+        return 'podman';
+    }
+    if (record.runtime === 'bwrap' || record.runtime === 'seatbelt') return record.runtime;
+    throw new Error(
+        `fleet lifecycle for '${name}' runtime must be exactly 'podman', 'bwrap', or 'seatbelt'`,
+    );
+}
+
+function sandboxRuntimeIdentity(record) {
+    return Object.freeze({
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+    });
+}
+
 function assertExactContainerOwnership(name, record, inspected, expectedId, workspaceHash) {
     const actualId = String(inspected?.Id || inspected?.ID || '');
     const actualName = String(inspected?.Name || '').replace(/^\//, '');
@@ -95,8 +119,8 @@ function assertExactContainerOwnership(name, record, inspected, expectedId, work
     if (record?.type !== 'agent') {
         throw new Error(`fleet lifecycle for '${name}' requires a current managed-agent registry record`);
     }
-    const expectedInstanceId = String(record?.instanceId || '').trim();
-    const expectedEnableGeneration = String(record?.enableGeneration || '').trim();
+    const expectedInstanceId = record?.instanceId;
+    const expectedEnableGeneration = record?.enableGeneration;
     const labels = labelsOf(inspected);
     if (!expectedInstanceId || !expectedEnableGeneration
         || labels?.[NETWORK_LABELS.managed] !== '1'
@@ -143,15 +167,11 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     now = Date.now,
     workspaceIdentity = workspaceNetworkIdentity,
 } = {}) {
-    const expectedId = String(record?.containerId || '').trim();
-    if (!/^[a-f0-9]{64}$/.test(expectedId)) {
-        throw new Error(`fleet lifecycle for '${name}' requires its immutable registry container ID`);
+    if (runtime !== 'podman' || record?.runtime !== 'podman') {
+        throw new Error(`fleet lifecycle for '${name}' runtime must be exactly 'podman'`);
     }
-    if (record?.type !== 'agent'
-        || !String(record?.instanceId || '').trim()
-        || !String(record?.enableGeneration || '').trim()) {
-        throw new Error(`fleet lifecycle for '${name}' requires a complete managed-agent registry identity`);
-    }
+    classifyExactAgentRuntime(name, record);
+    const expectedId = record.containerId;
     return withLock(() => {
         const artifact = captureRecordedGeneratedRouterDescriptor(record);
         const workspaceHash = String(workspaceIdentity()?.hash || '');
@@ -225,71 +245,13 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
 }
 
 function removeExactRegisteredContainer(name, record, options = {}) {
-    const runtime = options.runtime || getRuntime();
-    return removeExactContainerAndDescriptor(name, record, runtime, {
+    if (options.runtime !== 'podman') {
+        throw new Error(`fleet lifecycle for '${name}' runtime must be exactly 'podman'`);
+    }
+    return removeExactContainerAndDescriptor(name, record, 'podman', {
         ...options,
         remove: true,
     });
-}
-
-function chunkArray(list, size = 8) {
-    const chunks = [];
-    if (!Array.isArray(list) || size <= 0) return chunks;
-    for (let i = 0; i < list.length; i += size) {
-        chunks.push(list.slice(i, i + size));
-    }
-    return chunks;
-}
-
-function gracefulStopContainer(name, { prefix = '[destroy]' } = {}) {
-    const exists = containerExists(name);
-    if (!exists) return false;
-
-    const log = (msg) => console.log(`${prefix} ${msg}`);
-    if (!isContainerRunning(name)) {
-        log(`${name} already stopped.`);
-        return true;
-    }
-
-    try {
-        const runtime = getRuntime();
-        log(`Sending SIGTERM to ${name}...`);
-        execSync(`${runtime} kill --signal SIGTERM ${name}`, { stdio: 'ignore' });
-    } catch (e) {
-        debugLog(`gracefulStopContainer SIGTERM ${name}: ${e?.message || e}`);
-    }
-    return true;
-}
-
-function waitForContainers(names, timeoutSec = 5) {
-    const deadline = Date.now() + timeoutSec * 1000;
-    while (Date.now() < deadline) {
-        const stillRunning = names.filter((name) => isContainerRunning(name));
-        if (!stillRunning.length) return [];
-        try { execSync('sleep 1', { stdio: 'ignore' }); } catch (_) { }
-    }
-    return names.filter((name) => isContainerRunning(name));
-}
-
-function forceStopContainers(names, { prefix } = {}) {
-    if (!Array.isArray(names) || !names.length) return;
-    const runtime = getRuntime();
-    for (const chunk of chunkArray(names)) {
-        try {
-            console.log(`${prefix} Forcing kill for ${chunk.join(', ')}...`);
-            execSync(`${runtime} kill ${chunk.join(' ')}`, { stdio: 'ignore' });
-        } catch (e) {
-            debugLog(`forceStopContainers kill ${chunk.join(', ')}: ${e?.message || e}`);
-            for (const name of chunk) {
-                try {
-                    console.log(`${prefix} Forcing kill for ${name}...`);
-                    execSync(`${runtime} kill ${name}`, { stdio: 'ignore' });
-                } catch (err) {
-                    debugLog(`forceStopContainers (single) kill ${name}: ${err?.message || err}`);
-                }
-            }
-        }
-    }
 }
 
 function getContainerCandidates(name, rec) {
@@ -304,30 +266,45 @@ function stopConfiguredAgents({ fast = false } = {}) {
     const entries = Object.entries(agents || {})
         .filter(([name, rec]) => rec && (rec.type === 'agent' || rec.type === 'agentCore') && typeof name === 'string' && !name.startsWith('_'));
 
-    // Handle sandbox (bwrap/seatbelt) agents first
-    const bwrapStopped = [];
-    const bwrapEntries = [];
-    const containerEntries = [];
+    const sandboxStopped = [];
+    const sandboxEntries = [];
+    const podmanEntries = [];
     for (const [name, rec] of entries) {
-        if (isSandboxRuntime(rec?.runtime)) {
-            const agentName = rec.agentName || name;
-            if (isBwrapProcessRunning(name)) {
-                bwrapEntries.push({ name, runtimeKey: name, agentName, runtime: rec.runtime });
-            } else {
-                console.log(`[stop] ${agentName}: no running ${rec.runtime} process found.`);
+        try {
+            const runtime = classifyExactAgentRuntime(name, rec);
+            if (runtime === 'podman') {
+                podmanEntries.push([name, rec]);
+                continue;
             }
-        } else {
-            containerEntries.push([name, rec]);
+            const agentName = rec.agentName || name;
+            const expectedIdentity = sandboxRuntimeIdentity(rec);
+            if (isBwrapProcessRunning(name, expectedIdentity)) {
+                sandboxEntries.push({
+                    name,
+                    runtimeKey: name,
+                    agentName,
+                    runtime,
+                    expectedIdentity,
+                });
+            } else {
+                console.log(`[stop] ${agentName}: no running ${runtime} process found.`);
+            }
+        } catch (error) {
+            console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
         }
     }
-    if (bwrapEntries.length) {
-        const stoppedSandboxRuntimes = new Set(stopBwrapProcesses(bwrapEntries.map((entry) => entry.runtimeKey), {
-            timeout: fast ? 100 : 5000
-        }));
-        for (const entry of bwrapEntries) {
+    if (sandboxEntries.length) {
+        const expectedIdentities = new Map(
+            sandboxEntries.map((entry) => [entry.runtimeKey, entry.expectedIdentity]),
+        );
+        const stoppedSandboxRuntimes = new Set(stopBwrapProcesses(
+            sandboxEntries.map((entry) => entry.runtimeKey),
+            { timeout: fast ? 100 : 5000, expectedIdentities },
+        ));
+        for (const entry of sandboxEntries) {
             if (!stoppedSandboxRuntimes.has(entry.runtimeKey)) continue;
             console.log(`[stop] Stopped ${entry.agentName} (${entry.runtime})`);
-            bwrapStopped.push(entry.name);
+            sandboxStopped.push(entry.name);
         }
     }
 
@@ -335,11 +312,9 @@ function stopConfiguredAgents({ fast = false } = {}) {
     // signal targets a revalidated immutable container ID while the shared
     // network lifecycle lock is held.
     const stoppedContainers = [];
-    let runtime = null;
-    for (const [name, rec] of containerEntries) {
+    for (const [name, rec] of podmanEntries) {
         try {
-            runtime ||= getRuntime();
-            const result = removeExactContainerAndDescriptor(name, rec, runtime, {
+            const result = removeExactContainerAndDescriptor(name, rec, 'podman', {
                 fast,
                 remove: false,
             });
@@ -354,7 +329,7 @@ function stopConfiguredAgents({ fast = false } = {}) {
             console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
         }
     }
-    return [...bwrapStopped, ...stoppedContainers];
+    return [...sandboxStopped, ...stoppedContainers];
 }
 
 function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
@@ -365,37 +340,54 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
         ...(records && typeof records === 'object' ? records : {})
     };
 
-    // Handle sandbox (bwrap/seatbelt) agents first
-    const bwrapEntries = [];
-    const containerNames = [];
+    const sandboxEntries = [];
+    const podmanNames = [];
+    const prefix = fast ? '[destroy-fast]' : '[destroy]';
     for (const agentName of names) {
         if (!agentName) continue;
         const rec = agents ? agents[agentName] : null;
-        if (isSandboxRuntime(rec?.runtime)) {
-            bwrapEntries.push({ agentName, runtimeKey: agentName });
-            continue;
-        }
-        containerNames.push(agentName);
-    }
-    if (bwrapEntries.length) {
-        stopBwrapProcesses(bwrapEntries.map((entry) => entry.runtimeKey), {
-            timeout: fast ? 100 : 5000
-        });
-    }
-    const bwrapRemoved = bwrapEntries.map((entry) => entry.agentName);
-
-    const prefix = fast ? '[destroy-fast]' : '[destroy]';
-    let runtime = null;
-    const removed = [];
-    for (const name of containerNames) {
-        const record = agents?.[name];
-        if (!record) {
-            console.log(`${prefix} Preserved ${name}: no exact registry record.`);
+        if (!rec) {
+            console.log(`${prefix} Preserved ${agentName}: no exact registry record.`);
             continue;
         }
         try {
-            runtime ||= getRuntime();
-            const result = removeExactContainerAndDescriptor(name, record, runtime, {
+            const runtime = classifyExactAgentRuntime(agentName, rec);
+            if (runtime === 'podman') {
+                podmanNames.push(agentName);
+            } else {
+                sandboxEntries.push({
+                    agentName,
+                    runtimeKey: agentName,
+                    expectedIdentity: sandboxRuntimeIdentity(rec),
+                });
+            }
+        } catch (error) {
+            console.log(`${prefix} Preserved ${agentName}: ${error?.message || error}`);
+        }
+    }
+    const sandboxRemoved = [];
+    if (sandboxEntries.length) {
+        const expectedIdentities = new Map(
+            sandboxEntries.map((entry) => [entry.runtimeKey, entry.expectedIdentity]),
+        );
+        stopBwrapProcesses(sandboxEntries.map((entry) => entry.runtimeKey), {
+            timeout: fast ? 100 : 5000,
+            expectedIdentities,
+        });
+        for (const entry of sandboxEntries) {
+            if (isBwrapProcessRunning(entry.runtimeKey, entry.expectedIdentity)) {
+                console.log(`${prefix} Preserved ${entry.agentName}: exact sandbox runtime is still running.`);
+                continue;
+            }
+            sandboxRemoved.push(entry.agentName);
+        }
+    }
+
+    const removed = [];
+    for (const name of podmanNames) {
+        const record = agents?.[name];
+        try {
+            const result = removeExactContainerAndDescriptor(name, record, 'podman', {
                 fast,
                 remove: true,
             });
@@ -409,7 +401,7 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
         }
     }
 
-    return [...bwrapRemoved, ...removed];
+    return [...sandboxRemoved, ...removed];
 }
 
 function stopAndRemove(name, fastOrOptions = false) {
@@ -420,21 +412,14 @@ function stopAndRemove(name, fastOrOptions = false) {
     return stopAndRemoveMany([name], options) || [];
 }
 
-function listAllContainerNames() {
-    const runtime = probeContainerRuntime();
-    if (!runtime) return [];
-    try {
-        const out = execSync(`${runtime} ps -a --format "{{.Names}}"`, { stdio: 'pipe' }).toString().trim();
-        return out ? out.split(/\n+/).filter(Boolean) : [];
-    } catch (e) {
-        debugLog(`listAllContainerNames error: ${e?.message || e}`);
-        return [];
-    }
-}
-
 function destroyAllPloinky({ fast = false } = {}) {
-    const names = listAllContainerNames().filter((n) => n.startsWith('ploinky_'));
-    return stopAndRemoveMany(names, { fast }).length;
+    const agents = loadAgentsMap();
+    const records = {};
+    for (const [name, record] of Object.entries(agents || {})) {
+        if (!name.startsWith('ploinky_') || record?.type !== 'agent') continue;
+        records[name] = record;
+    }
+    return stopAndRemoveMany(Object.keys(records), { fast, records }).length;
 }
 
 function destroyWorkspaceContainers({ fast = false } = {}) {
@@ -442,12 +427,11 @@ function destroyWorkspaceContainers({ fast = false } = {}) {
     const names = [];
     for (const [name, rec] of Object.entries(agents || {})) {
         if (!rec || typeof name !== 'string' || name.startsWith('_')) continue;
-        if (rec.type === 'agent' || rec.type === 'agentCore') {
+        if (rec.type === 'agent') {
             names.push(name);
         }
     }
-    // stopAndRemoveMany now handles bwrap agents internally
-    return stopAndRemoveMany(names, { fast });
+    return stopAndRemoveMany(names, { fast, records: agents });
 }
 
 const SESSION = new Set();
@@ -460,7 +444,8 @@ function addSessionContainer(name) {
 
 function cleanupSessionSet() {
     const list = Array.from(SESSION);
-    stopAndRemoveMany(list);
+    const agents = loadAgentsMap();
+    stopAndRemoveMany(list, { records: agents });
     SESSION.clear();
     return list.length;
 }
@@ -470,14 +455,10 @@ export {
     cleanupSessionSet,
     destroyAllPloinky,
     destroyWorkspaceContainers,
-    forceStopContainers,
     getContainerCandidates,
-    gracefulStopContainer,
-    listAllContainerNames,
     removeExactContainerAndDescriptor,
     stopAndRemove,
     stopAndRemoveMany,
     removeExactRegisteredContainer,
-    stopConfiguredAgents,
-    waitForContainers
+    stopConfiguredAgents
 };

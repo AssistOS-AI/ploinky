@@ -89,6 +89,8 @@ function createFixture(t, {
     fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
         'alpha-container': {
             type: 'agent',
+            runtime: 'podman',
+            containerId: 'a'.repeat(64),
             repoName: 'fixtures',
             agentName: 'alpha',
             instanceId: 'alpha-instance',
@@ -97,6 +99,8 @@ function createFixture(t, {
         },
         'beta-container': {
             type: 'agent',
+            runtime: 'podman',
+            containerId: 'b'.repeat(64),
             repoName: 'fixtures',
             agentName: 'beta',
             instanceId: 'beta-instance',
@@ -119,6 +123,36 @@ function createFixture(t, {
         fs.rmSync(workspace, { recursive: true, force: true });
     });
     return { workspace, ploinkyDir, edgeDir, alphaDir };
+}
+
+function sandboxOwnerAttestation({
+    runtimeKey = 'alpha-container',
+    routeKey = 'alpha',
+    rootPort = 43101,
+} = {}) {
+    return {
+        schemaVersion: 5,
+        role: 'service',
+        runtimeKey,
+        ownerKey: serviceOwnerKey(runtimeKey),
+        instanceId: 'alpha-instance',
+        enableGeneration: 'alpha-enable-generation',
+        homeKey: 'alpha',
+        workdir: '/code',
+        logPath: '/workspace/.ploinky/logs/alpha-sandbox.log',
+        taskId: '',
+        provider: '',
+        routeKey,
+        rootPort,
+        credentialNonceDigest: `sha256:${'1'.repeat(64)}`,
+        credentialExpiresAt: 4102444800,
+        manifestDigest: `sha256:${'2'.repeat(64)}`,
+        admissionDigest: `sha256:${'3'.repeat(64)}`,
+        networkHash: `sha256:${'4'.repeat(64)}`,
+        pid: 1234,
+        processUid: typeof process.getuid === 'function' ? process.getuid() : 0,
+        processIdentity: 'linux-proc:123e4567-e89b-12d3-a456-426614174000:1234',
+    };
 }
 
 test('fresh edge initialization creates unversioned empty desired state exactly once', (t) => {
@@ -253,29 +287,7 @@ test('bwrap publishes only an owner-attested root route and rejects additional p
     const fixture = createFixture(t);
     const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
     const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
-    const ownerAttestation = {
-        schemaVersion: 5,
-        role: 'service',
-        runtimeKey: 'alpha-container',
-        ownerKey: serviceOwnerKey('alpha-container'),
-        instanceId: 'alpha-instance',
-        enableGeneration: 'alpha-enable-generation',
-        homeKey: 'alpha',
-        workdir: '/code',
-        logPath: '/workspace/.ploinky/logs/alpha-bwrap.log',
-        taskId: '',
-        provider: '',
-        routeKey: 'alpha',
-        rootPort: 43101,
-        credentialNonceDigest: `sha256:${'1'.repeat(64)}`,
-        credentialExpiresAt: 4102444800,
-        manifestDigest: `sha256:${'2'.repeat(64)}`,
-        admissionDigest: `sha256:${'3'.repeat(64)}`,
-        networkHash: `sha256:${'4'.repeat(64)}`,
-        pid: 1234,
-        processUid: typeof process.getuid === 'function' ? process.getuid() : 0,
-        processIdentity: 'linux-proc:123e4567-e89b-12d3-a456-426614174000:1234',
-    };
+    const ownerAttestation = sandboxOwnerAttestation();
     agents['alpha-container'] = {
         ...agents['alpha-container'],
         pid: 1234,
@@ -313,6 +325,66 @@ test('bwrap publishes only an owner-attested root route and rejects additional p
     assert.equal(additionalPortPlan.code, 'BWRAP_AGENT_PORT_UNSUPPORTED');
 });
 
+test('seatbelt publishes only the same owner-attested root route and rejects additional ports', (t) => {
+    const fixture = createFixture(t);
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    const ownerAttestation = sandboxOwnerAttestation();
+    agents['alpha-container'] = {
+        ...agents['alpha-container'],
+        pid: 1234,
+        runtime: 'seatbelt',
+        bwrapOwner: ownerAttestation,
+    };
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+    applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'seatbelt-root-owner',
+    });
+
+    const rootPlan = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/alpha/mcp',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+    });
+    assert.equal(rootPlan.ok, true);
+    assert.deepEqual(rootPlan.ownerAttestation, ownerAttestation);
+
+    const additionalPortPlan = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/base-agent-additional-server/alpha/7000/status',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+    });
+    assert.equal(additionalPortPlan.ok, false);
+    assert.equal(additionalPortPlan.code, 'BWRAP_AGENT_PORT_UNSUPPORTED');
+});
+
+test('edge generation rejects missing, legacy, and padded runtime records', (t) => {
+    const fixture = createFixture(t);
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const exact = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    for (const runtime of [undefined, null, '', 'container', 'docker', 'Podman', ' podman ']) {
+        const agents = structuredClone(exact);
+        if (runtime === undefined) delete agents['alpha-container'].runtime;
+        else agents['alpha-container'].runtime = runtime;
+        fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+        assert.throws(
+            () => applyEdgeRoutingGeneration({
+                workspaceRoot: fixture.workspace,
+                reason: 'invalid-runtime-record',
+            }),
+            (error) => error?.code === 'PLOINKY_AGENT_RUNTIME_INVALID',
+            `runtime ${JSON.stringify(runtime)} must fail closed`,
+        );
+    }
+});
+
 test('bwrap root route refuses a mismatched immutable owner before generation publication', (t) => {
     const fixture = createFixture(t);
     const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
@@ -333,7 +405,7 @@ test('bwrap root route refuses a mismatched immutable owner before generation pu
     assert.throws(() => applyEdgeRoutingGeneration({
         workspaceRoot: fixture.workspace,
         reason: 'bwrap-root-owner-mismatch',
-    }), { code: 'BWRAP_AGENT_OWNER_INVALID' });
+    }), { code: 'SANDBOX_AGENT_OWNER_INVALID' });
 });
 
 test('agent-mcp exposes only the selected root manifest dependency closure', (t) => {
@@ -425,6 +497,8 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
     agents['gamma-container'] = {
         type: 'agent',
+        runtime: 'podman',
+        containerId: 'c'.repeat(64),
         repoName: 'fixtures',
         agentName: 'gamma',
         instanceId: 'gamma-instance',
@@ -433,6 +507,8 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
     };
     agents['unrelated-container'] = {
         type: 'agent',
+        runtime: 'podman',
+        containerId: 'd'.repeat(64),
         repoName: 'fixtures',
         agentName: 'unrelated',
         instanceId: 'unrelated-instance',

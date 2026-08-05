@@ -156,6 +156,17 @@ function requireOwnGenerated(env, name) {
     return env[name];
 }
 
+function requireGeneratedContainerHomeKey(env) {
+    const homeKey = requireOwnGenerated(env, 'PLOINKY_AGENT_HOME_KEY');
+    if (homeKey.length > 255 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(homeKey)) {
+        fail(
+            'PLOINKY_AGENT_CREDENTIAL_CONTEXT_PROVENANCE',
+            'PLOINKY_AGENT_HOME_KEY is not an exact safe container HOME key',
+        );
+    }
+    return homeKey;
+}
+
 function createContainerContextWith(env, loadDescriptor) {
     if (!env || typeof env !== 'object' || Array.isArray(env)) {
         fail('PLOINKY_AGENT_CREDENTIAL_CONTEXT_ENV', 'an explicit container environment is required');
@@ -176,6 +187,7 @@ function createContainerContextWith(env, loadDescriptor) {
     }
     const apiKey = requireOwnGenerated(env, 'PLOINKY_AGENT_API_KEY');
     const apiPublicKey = requireOwnGenerated(env, 'PLOINKY_AGENT_API_PUBLIC_KEY');
+    const homeKey = requireGeneratedContainerHomeKey(env);
     const agentSecret = exactCredential(env.PLOINKY_AGENT_SECRET, 'PLOINKY_AGENT_SECRET', HEX_SECRET_RE);
     const privateSecret = exactCredential(env.PLOINKY_AGENT_PRIVATE_SECRET, 'PLOINKY_AGENT_PRIVATE_SECRET', HEX_SECRET_RE);
     if (!apiKey.startsWith(`${principalId}|`)) {
@@ -190,7 +202,8 @@ function createContainerContextWith(env, loadDescriptor) {
         },
         runtime: {
             runtimeKind: 'container',
-            runtimeKey: payload.instanceId,
+            runtimeKey: homeKey,
+            homeKey,
             routeKey,
         },
         router: {

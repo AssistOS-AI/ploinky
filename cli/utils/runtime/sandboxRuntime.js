@@ -7,6 +7,12 @@ import { BOX_MARKER_PATH } from '../../../ploinky-box/constants.mjs';
 import { IMAGE_CONTRACT } from '../../../ploinky-box/contract/image.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 import { REPOS_DIR } from '../config.js';
+import {
+    CONTAINER_DECLARATION_REQUIRED_CODE,
+    LITE_SANDBOX_SELECTOR_INVALID_CODE,
+    hasValidLiteSandboxSelector,
+    isUsableContainerDeclaration,
+} from './agentRuntimeSelector.js';
 
 const ENV_DISABLE_HOST_SANDBOX = 'PLOINKY_DISABLE_HOST_SANDBOX';
 const RUNTIME_PROBE_TIMEOUT_MS = 5_000;
@@ -144,14 +150,15 @@ function selectAgentRuntime(manifest, status, platform) {
         };
     }
 
+    if (!hasValidLiteSandboxSelector(manifest)) {
+        return {
+            selectedRuntime: 'invalid',
+            available: false,
+            errorCode: LITE_SANDBOX_SELECTOR_INVALID_CODE,
+        };
+    }
+
     if (manifest?.['lite-sandbox'] === true) {
-        if (Object.prototype.hasOwnProperty.call(manifest, 'container')) {
-            return {
-                selectedRuntime: 'invalid',
-                available: false,
-                errorCode: 'PLOINKY_SANDBOX_CONTAINER_CONFLICT',
-            };
-        }
         const selectedRuntime = status.insideBox || platform === 'linux'
             ? 'bwrap'
             : (platform === 'darwin' ? 'seatbelt' : 'unsupported');
@@ -185,6 +192,14 @@ function selectAgentRuntime(manifest, status, platform) {
         };
     }
 
+    if (!isUsableContainerDeclaration(manifest?.container)) {
+        return {
+            selectedRuntime: 'invalid',
+            available: false,
+            errorCode: CONTAINER_DECLARATION_REQUIRED_CODE,
+        };
+    }
+
     if (status.insideBox) {
         return {
             selectedRuntime: 'podman',
@@ -192,9 +207,7 @@ function selectAgentRuntime(manifest, status, platform) {
             errorCode: status.podman.available ? '' : 'PLOINKY_BOX_PODMAN_REQUIRED',
         };
     }
-    const selectedRuntime = status.podman.available
-        ? 'podman'
-        : (status.docker.available ? 'docker' : 'container');
+    const selectedRuntime = status.podman.available ? 'podman' : 'container';
     return {
         selectedRuntime,
         available: selectedRuntime !== 'container',

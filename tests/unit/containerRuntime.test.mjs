@@ -518,7 +518,7 @@ for (let index = 0; index < args.length; index += 1) {
 }
 const running = fs.existsSync(runningPath);
 process.stdout.write(JSON.stringify([{
-  Id: 'candidate1234567890',
+  Id: '${'a'.repeat(64)}',
   Name: fs.readFileSync(statePath, 'utf8').trim(),
   Config: { Labels: labels },
   HostConfig: { Init: args.includes('--init'), NetworkMode: 'none' },
@@ -815,11 +815,12 @@ esac
 
         const result = runModuleSnippet(
             `const { resolvePublishedPortMappings } = await import(${JSON.stringify(agentServiceManagerUrl)});
+const containerId = 'a'.repeat(64);
 const mappings = [
   { hostPort: 0, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
   { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
 ];
-process.stdout.write(JSON.stringify(resolvePublishedPortMappings('demo-container', mappings)));`,
+process.stdout.write(JSON.stringify(resolvePublishedPortMappings(containerId, mappings, 'podman')));`,
             { PATH: binDir },
         );
 
@@ -828,36 +829,68 @@ process.stdout.write(JSON.stringify(resolvePublishedPortMappings('demo-container
             { hostPort: 49152, containerPort: 9000, hostIp: '127.0.0.1', protocol: 'tcp' },
             { hostPort: 18080, containerPort: 8080, hostIp: '127.0.0.1', protocol: 'tcp' },
         ]);
+
+        const rejected = runModuleSnippet(
+            `const { resolvePublishedPortMappings } = await import(${JSON.stringify(agentServiceManagerUrl)});
+for (const runtime of [undefined, '', 'docker', 'container']) {
+  try {
+    resolvePublishedPortMappings('a'.repeat(64), [{ hostPort: 0, containerPort: 9000 }], runtime);
+    process.exit(2);
+  } catch (error) {
+    if (!/Podman runtime/.test(error.message)) process.exit(3);
+  }
+}`,
+            { PATH: binDir },
+        );
+        assert.equal(rejected.status, 0, rejected.stderr);
+
+        const invalidIds = runModuleSnippet(
+            `const { resolvePublishedPortMappings } = await import(${JSON.stringify(agentServiceManagerUrl)});
+for (const containerId of ['', 'a'.repeat(63), 'A'.repeat(64), ' ' + 'a'.repeat(64), { toString: () => 'a'.repeat(64) }]) {
+  try {
+    resolvePublishedPortMappings(containerId, [{ hostPort: 0, containerPort: 9000 }], 'podman');
+    process.exit(2);
+  } catch (error) {
+    if (error?.code !== 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS') process.exit(3);
+  }
+}`,
+            { PATH: binDir },
+        );
+        assert.equal(invalidIds.status, 0, invalidIds.stderr);
     } finally {
         fs.rmSync(binDir, { recursive: true, force: true });
     }
 });
 
-test('collectLiveAgentContainers probes the runtime before listing live containers', () => {
+test('collectLiveAgentContainers inspects only the registry-pinned Podman ID for this workspace', () => {
     const binDir = tempDir();
     try {
         const podmanPath = path.join(binDir, 'podman');
+        const containerId = 'c'.repeat(64);
         fs.writeFileSync(
             podmanPath,
             `#!/bin/sh
-case "$1" in
-  ps)
-    printf '%s\\n' 'ploinky_repoA_agentA_project_12345678'
-    ;;
-  inspect)
-    printf '%s\\n' '[{"Mounts":[{"Destination":"/code","Source":"/tmp/ws/.ploinky/repos/repoA/agentA"}],"Config":{"Env":["AGENT_NAME=agentA"],"Image":"node:20-alpine"},"NetworkSettings":{"Ports":{"7000/tcp":[{"HostIp":"127.0.0.1","HostPort":"12345"}]}}}]'
-    ;;
-  *)
-    exit 1
-    ;;
-esac
+test "$1" = container || exit 91
+test "$2" = inspect || exit 92
+test "$3" = '${containerId}' || exit 93
+printf '%s\\n' '[{"Id":"${containerId}","Name":"/ploinky_repoA_agentA_project_12345678","Mounts":[{"Destination":"/code","Source":"/tmp/ws/.ploinky/repos/repoA/agentA"}],"Config":{"Env":["AGENT_NAME=agentA"],"Image":"node:20-alpine","Labels":{"io.assistos.ploinky.managed":"1","io.assistos.ploinky.resource":"agent","io.assistos.ploinky.network-schema":"2","io.assistos.ploinky.workspace":"aaaaaaaaaaaa","io.assistos.ploinky.network-contract":"${'b'.repeat(64)}","io.assistos.ploinky.instance-id":"instance-current","io.assistos.ploinky.enable-generation":"generation-current"}},"State":{"Status":"running","Running":true,"Pid":123},"NetworkSettings":{"Ports":{"7000/tcp":[{"HostIp":"127.0.0.1","HostPort":"12345"}]}}}]'
 `,
         );
         fs.chmodSync(podmanPath, 0o755);
 
         const result = runModuleSnippet(
             `import { collectLiveAgentContainers } from './cli/sandbox/docker/containerRegistry.js';
-process.stdout.write(JSON.stringify(collectLiveAgentContainers()));`,
+const name = 'ploinky_repoA_agentA_project_12345678';
+process.stdout.write(JSON.stringify(collectLiveAgentContainers({
+  workspaceHash: 'a'.repeat(12),
+  registry: {
+    [name]: {
+      type: 'agent', runtime: 'podman', containerId: 'c'.repeat(64),
+      instanceId: 'instance-current', enableGeneration: 'generation-current',
+      repoName: 'repoA', agentName: 'agentA'
+    }
+  }
+})));`,
             { PATH: binDir },
         );
 
@@ -878,7 +911,15 @@ test('collectLiveAgentContainers is non-fatal when no container runtime is insta
     try {
         const result = runModuleSnippet(
             `import { collectLiveAgentContainers } from './cli/sandbox/docker/containerRegistry.js';
-process.stdout.write(JSON.stringify(collectLiveAgentContainers()));`,
+process.stdout.write(JSON.stringify(collectLiveAgentContainers({
+  workspaceHash: 'a'.repeat(12),
+  registry: {
+    exact: {
+      type: 'agent', runtime: 'podman', containerId: 'c'.repeat(64),
+      instanceId: 'instance-current', enableGeneration: 'generation-current'
+    }
+  }
+})));`,
             { PATH: emptyBin },
         );
 
@@ -936,6 +977,7 @@ const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(agentDir,
 try {
   startAgentContainer('demo', manifest, ${JSON.stringify(agentDir)}, {
     containerName: 'test_host',
+    runtime: 'podman',
     profileName: 'default',
     routerEndpoint: buildRouterEndpoint('host', 8080),
     runtimeIdentity: { instanceId: 'instance-current', enableGeneration: 'enable-current' },

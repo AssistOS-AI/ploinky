@@ -16,6 +16,7 @@ import {
 import { createRootAgentDialContext } from '../../cli/server/rootAgentDial.js';
 import { createAgentRootUpgradeDialAgent } from '../../cli/server/wsAgentRootProxy.js';
 import { serveAgentStaticRequest } from '../../cli/server/static/index.js';
+import { __testables as edgeRouteTestables } from '../../cli/server/edgeRoutePlan.js';
 
 function responseCapture() {
     let resolve;
@@ -38,6 +39,89 @@ function responseCapture() {
         },
     };
 }
+
+test('edge additional-port runtime resolution preserves the Docker and Podman relay ABI', () => {
+    const route = {
+        container: 'alpha-runtime',
+        repo: 'repo',
+        agent: 'alpha-agent',
+    };
+    const baseRecord = {
+        type: 'agent',
+        repoName: 'repo',
+        agentName: 'alpha-agent',
+        containerId: 'a'.repeat(64),
+        instanceId: 'instance-1',
+        enableGeneration: 'generation-1',
+    };
+    const snapshotFor = (runtime) => ({
+        agents: {
+            'alpha-runtime': {
+                ...baseRecord,
+                ...(runtime === undefined ? {} : { runtime }),
+            },
+        },
+        manifests: {},
+    });
+
+    for (const runtime of ['docker', 'podman']) {
+        assert.equal(
+            edgeRouteTestables.exactAgentRuntime(snapshotFor(runtime), 'alpha', route).runtime,
+            runtime,
+        );
+    }
+    for (const runtime of [undefined, null, '', 'container', 'Podman', ' podman ', 'podman ']) {
+        assert.equal(
+            edgeRouteTestables.exactAgentRuntime(snapshotFor(runtime), 'alpha', route),
+            null,
+            `runtime ${JSON.stringify(runtime)} must not produce a relay target`,
+        );
+    }
+});
+
+test('edge root owner attestation is exact for bwrap and seatbelt and rejects malformed runtimes', () => {
+    const route = {
+        container: 'alpha-runtime',
+        repo: 'repo',
+        agent: 'alpha-agent',
+    };
+    const owner = Object.freeze({
+        role: 'service',
+        pid: 1234,
+        runtimeKey: 'alpha-runtime',
+        routeKey: 'alpha',
+        rootPort: 4123,
+        instanceId: 'instance-1',
+        enableGeneration: 'generation-1',
+    });
+    const snapshotFor = (runtime) => ({
+        agents: {
+            'alpha-runtime': {
+                type: 'agent',
+                runtime,
+                pid: 1234,
+                repoName: 'repo',
+                agentName: 'alpha-agent',
+                instanceId: 'instance-1',
+                enableGeneration: 'generation-1',
+                bwrapOwner: owner,
+            },
+        },
+    });
+
+    for (const runtime of ['bwrap', 'seatbelt']) {
+        assert.deepEqual(
+            edgeRouteTestables.sandboxRootOwnerAttestation(snapshotFor(runtime), 'alpha', route, 4123),
+            { kind: 'sandbox', runtime, owner },
+        );
+    }
+    for (const runtime of [undefined, 'container', 'docker', ' bwrap ', ' seatbelt ']) {
+        assert.deepEqual(
+            edgeRouteTestables.sandboxRootOwnerAttestation(snapshotFor(runtime), 'alpha', route, 4123),
+            { kind: 'not-sandbox' },
+        );
+    }
+});
 
 test('aggregate async task metadata is pinned to the captured Router route key', () => {
     const upstream = {
@@ -222,6 +306,73 @@ test('stale bwrap owner assertion prevents the kernel socket after the captured 
         });
     });
     assert.equal(leaseCommits, 1);
+    assert.equal(ownerAssertions, 1);
+    assert.equal(connectionFactoryCalls, 0);
+});
+
+test('seatbelt root dials require the same exact owner assertion before the kernel socket', async () => {
+    let ownerAssertions = 0;
+    let connectionFactoryCalls = 0;
+    const owner = Object.freeze({
+        role: 'service',
+        pid: 1234,
+        runtimeKey: 'alpha-runtime',
+        routeKey: 'alpha',
+        rootPort: 4128,
+        instanceId: 'instance-1',
+        enableGeneration: 'generation-1',
+    });
+    const route = Object.freeze({
+        container: 'alpha-runtime',
+        repo: 'repo',
+        agent: 'alpha-agent',
+        hostPort: 4128,
+    });
+    const routePlan = Object.freeze({
+        kind: 'agent-root',
+        routeKey: 'alpha',
+        route,
+        target: Object.freeze({ hostPort: 4128 }),
+        ownerAttestation: owner,
+        lease: Object.freeze({
+            snapshot: Object.freeze({
+                agents: Object.freeze({
+                    'alpha-runtime': Object.freeze({
+                        type: 'agent',
+                        runtime: 'seatbelt',
+                        pid: 1234,
+                        repoName: 'repo',
+                        agentName: 'alpha-agent',
+                        instanceId: 'instance-1',
+                        enableGeneration: 'generation-1',
+                        bwrapOwner: owner,
+                    }),
+                }),
+            }),
+            commit: () => true,
+        }),
+    });
+    const agent = createLeaseCommittedAgent(createRootAgentDialContext({ routePlan }), {
+        assertServiceOwner() {
+            ownerAssertions += 1;
+            throw new Error('seatbelt process identity changed');
+        },
+        createConnection() {
+            connectionFactoryCalls += 1;
+            throw new Error('stale owner must never reach the socket factory');
+        },
+    });
+
+    await new Promise((resolve, reject) => {
+        agent.createConnection({ host: '127.0.0.1', port: 4128 }, (error) => {
+            try {
+                assert.equal(error.code, 'EDGE_GENERATION_CHANGED');
+                resolve();
+            } catch (assertionError) {
+                reject(assertionError);
+            }
+        });
+    });
     assert.equal(ownerAssertions, 1);
     assert.equal(connectionFactoryCalls, 0);
 });

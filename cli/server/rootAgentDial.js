@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { assertExactServiceOwner } from '../sandbox/bwrap/bwrapFleet.js';
 
 const TRUSTED_ROOT_DIAL_CONTEXTS = new WeakSet();
+const SANDBOX_SERVICE_RUNTIMES = new Set(['bwrap', 'seatbelt']);
 
 function edgeGenerationChangedError(cause = null) {
     const error = new Error(
@@ -27,14 +28,20 @@ function copyOwner(value) {
         : null;
 }
 
+function exactNonEmptyString(value) {
+    return typeof value === 'string' && value.length > 0 && value === value.trim()
+        ? value
+        : '';
+}
+
 function ownerFromCapturedRoute({ routePlan, routeKey, route, targetPort }) {
     const planOwner = copyOwner(routePlan?.ownerAttestation);
     const snapshot = routePlan?.lease?.snapshot;
-    const containerName = String(route?.container || '').trim();
+    const containerName = exactNonEmptyString(route?.container);
     const record = snapshot?.agents?.[containerName];
-    if (!record || String(record.runtime || '').trim() !== 'bwrap') {
+    if (!record || !SANDBOX_SERVICE_RUNTIMES.has(record.runtime)) {
         if (planOwner) {
-            return { invalid: new Error('captured plan owner does not belong to a bwrap route record') };
+            return { invalid: new Error('captured plan owner does not belong to an exact sandbox route record') };
         }
         return { ownerAttestation: null };
     }
@@ -42,23 +49,28 @@ function ownerFromCapturedRoute({ routePlan, routeKey, route, targetPort }) {
     const recordOwner = copyOwner(record.bwrapOwner);
     const invalid = !containerName
         || record.type !== 'agent'
-        || String(record.repoName || '') !== String(route?.repo || '')
-        || String(record.agentName || '') !== String(route?.agent || '')
+        || !exactNonEmptyString(record.repoName)
+        || !exactNonEmptyString(record.agentName)
+        || record.repoName !== route?.repo
+        || record.agentName !== route?.agent
         || !recordOwner
         || recordOwner.role !== 'service'
         || !Number.isSafeInteger(record.pid)
         || record.pid < 1
         || recordOwner.pid !== record.pid
         || recordOwner.runtimeKey !== containerName
-        || recordOwner.routeKey !== String(routeKey || '')
+        || !exactNonEmptyString(routeKey)
+        || recordOwner.routeKey !== routeKey
         || exactPort(recordOwner.rootPort) !== targetPort
-        || recordOwner.instanceId !== String(record.instanceId || '').trim()
-        || recordOwner.enableGeneration !== String(record.enableGeneration || '').trim()
+        || !exactNonEmptyString(record.instanceId)
+        || !exactNonEmptyString(record.enableGeneration)
+        || recordOwner.instanceId !== record.instanceId
+        || recordOwner.enableGeneration !== record.enableGeneration
         || (routePlan?.kind === 'agent-root' && !planOwner)
         || (planOwner && exactPort(routePlan?.target?.hostPort) !== targetPort)
         || (planOwner && !isDeepStrictEqual(planOwner, recordOwner));
     return invalid
-        ? { invalid: new Error('captured bwrap route has no exact immutable service owner') }
+        ? { invalid: new Error('captured sandbox route has no exact immutable service owner') }
         : { ownerAttestation: planOwner || recordOwner };
 }
 

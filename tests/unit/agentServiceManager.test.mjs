@@ -9,6 +9,7 @@ import {
     buildBoxPodmanHostArgs,
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
+    cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
     expectedBindMountsFromArgs,
     hasExactManagedEnv,
@@ -166,10 +167,25 @@ test('Box host-gateway compatibility does not duplicate the managed network mapp
 });
 
 test('service dispatch selects the strict runtime once and reuses that admission decision', () => {
+    const managerSource = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     const source = ensureAgentService.toString();
+    const startSource = startAgentContainer.toString();
     assert.equal(source.match(/getRuntimeForAgent\(manifest\)/g)?.length, 1);
     assert.match(source, /const agentRuntime = preflightAgentRuntime/);
+    assert.match(source, /const runtime = assertExactPodmanRuntime\([\s\S]*agentRuntime/);
+    assert.match(source, /startAgentContainer\([\s\S]*?runtime,/);
+    assert.doesNotMatch(source, /const runtime = getRuntime\(\)/);
+    assert.match(startSource, /const runtime = assertExactPodmanRuntime\([\s\S]*options\.runtime/);
+    assert.doesNotMatch(startSource, /getRuntime\(\)/);
+    assert.doesNotMatch(source, /containerExists\(containerName\)/);
+    assert.doesNotMatch(source, /isContainerRunning\(containerName\)/);
+    assert.doesNotMatch(source, /getContainerLabel\(containerName,\s*['"][^'"]+['"]\)/);
+    assert.match(source, /resolveHostPort\(containerName, existingRecord, containerPortCandidates, runtime\)/);
     assert.match(source, /sandboxAdmission = options\.runtimeAdmission \|\| serviceAdmission/);
+    assert.doesNotMatch(managerSource, /\bgetRuntime\(\)/);
+    assert.doesNotMatch(managerSource, /containerExists\(containerName\)/);
+    assert.doesNotMatch(managerSource, /isContainerRunning\(containerName\)/);
+    assert.match(managerSource, /resolvePublishedPortMappings\(started\.containerId, allPortMappings, runtime\)/);
 });
 
 test('prepared graph launches suppress intermediate registry persistence only for the exact staged identity', () => {
@@ -226,6 +242,7 @@ test('prepared graph launches suppress intermediate registry persistence only fo
 });
 
 test('effective generation capability requires the exact managed runtime to be running', () => {
+    const containerId = 'a'.repeat(64);
     const owner = {
         agentId: 'agent:repo/livekit',
         instanceId: 'instance-current',
@@ -249,12 +266,23 @@ test('effective generation capability requires the exact managed runtime to be r
         agents: {
             [owner.containerName]: {
                 type: 'agent',
+                runtime: 'podman',
+                containerId,
                 repoName: 'repo',
                 agentName: 'livekit',
                 instanceId: owner.instanceId,
                 enableGeneration: owner.enableGeneration,
             },
         },
+    };
+    const runtimeCalls = [];
+    const exists = (name, options) => {
+        runtimeCalls.push(['exists', name, options]);
+        return true;
+    };
+    const running = (name, options) => {
+        runtimeCalls.push(['running', name, options]);
+        return true;
     };
     const neverInspect = () => assert.fail('non-running runtime must not be inspected');
     assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
@@ -268,30 +296,80 @@ test('effective generation capability requires the exact managed runtime to be r
         inspectContainerContract: neverInspect,
     }), false);
     assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
-        exists: () => true,
-        isRunning: () => true,
+        exists,
+        isRunning: running,
         inspectContainerContract: () => ({ state: 'foreign' }),
     }), false);
     assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
-        exists: () => true,
-        isRunning: () => true,
+        exists,
+        isRunning: running,
         inspectContainerContract: (containerName, _network, agentName, options) => {
             assert.equal(containerName, owner.containerName);
             assert.equal(agentName, 'livekit');
             assert.equal(options.instanceId, owner.instanceId);
             assert.equal(options.enableGeneration, owner.enableGeneration);
             assert.equal(options.requireRuntimeIdentity, true);
-            return { state: 'exact', id: 'candidate-current' };
+            return { state: 'exact', id: containerId };
         },
     }), true);
+    assert.deepEqual(runtimeCalls, [
+        ['exists', containerId, { runtime: 'podman' }],
+        ['running', containerId, { runtime: 'podman' }],
+        ['exists', containerId, { runtime: 'podman' }],
+        ['running', containerId, { runtime: 'podman' }],
+    ]);
     assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
         exists: () => true,
         isRunning: () => true,
         inspectContainerContract: () => ({ state: 'owned-drift', reason: 'runtime-identity' }),
     }), false);
+    assert.equal(isGenerationCapabilityRuntimeEffective({
+        generation: {
+            ...generation,
+            agents: {
+                [owner.containerName]: {
+                    ...generation.agents[owner.containerName],
+                    runtime: 'docker',
+                },
+            },
+        },
+        owner,
+    }, {
+        exists: () => assert.fail('invalid runtime must fail before probing'),
+        isRunning: () => assert.fail('invalid runtime must fail before probing'),
+        inspectContainerContract: () => assert.fail('invalid runtime must fail before inspection'),
+    }), false);
+    assert.equal(isGenerationCapabilityRuntimeEffective({ generation, owner }, {
+        exists: () => true,
+        isRunning: () => true,
+        inspectContainerContract: () => ({ state: 'exact', id: 'b'.repeat(64) }),
+    }), false);
+});
+
+test('exact runtime candidate cleanup rejects generic and legacy container runtime identities', () => {
+    for (const runtime of ['', 'container', 'docker', ' podman', undefined]) {
+        assert.throws(() => cleanupExactAgentRuntimeCandidate({
+            containerName: 'candidate-container',
+            containerId: 'a'.repeat(64),
+            runtimeNetwork: { mode: 'host' },
+            registryRecord: {
+                type: 'agent',
+                runtime,
+                containerId: 'a'.repeat(64),
+                agentName: 'livekit',
+                repoName: 'repo',
+                instanceId: 'instance-current',
+                enableGeneration: 'enable-current',
+            },
+            cleanupReceipt: null,
+        }), /exact (?:Podman|sandbox) runtime identity/);
+    }
 });
 
 test('targeted capability restart cannot activate before exact semantic readiness succeeds', () => {
+    const predecessorContainerId = 'a'.repeat(64);
+    const failedContainerId = 'b'.repeat(64);
+    const readyContainerId = 'c'.repeat(64);
     const owner = {
         agentId: 'agent:media/livekit',
         instanceId: 'instance-current',
@@ -315,6 +393,8 @@ test('targeted capability restart cannot activate before exact semantic readines
         agents: {
             [owner.containerName]: {
                 type: 'agent',
+                runtime: 'podman',
+                containerId: predecessorContainerId,
                 repoName: 'media',
                 agentName: 'livekit',
                 instanceId: owner.instanceId,
@@ -328,6 +408,7 @@ test('targeted capability restart cannot activate before exact semantic readines
     const assertLifecycleCapability = (capability) => {
         assert.equal(capability, networkLifecycleCapability);
     };
+    const failedRuntimeCalls = [];
     assert.throws(() => restartGenerationCapabilityRuntime({
         generation,
         owner,
@@ -340,10 +421,18 @@ test('targeted capability restart cannot activate before exact semantic readines
         resolveReadinessProtocol: () => 'script',
         ensureService: () => ({
             containerName: owner.containerName,
-            containerId: 'candidate-current',
+            containerId: failedContainerId,
+            registryRecord: {
+                ...generation.agents[owner.containerName],
+                containerId: failedContainerId,
+            },
         }),
-        isRunning: () => true,
-        runScriptReadiness: () => {
+        isRunning: (name, options) => {
+            failedRuntimeCalls.push(['running', name, options]);
+            return true;
+        },
+        runScriptReadiness: (agentName, containerName, probe, options) => {
+            failedRuntimeCalls.push(['readiness', agentName, containerName, probe, options]);
             readinessCalls += 1;
             return { status: 'failed', reason: 'udp owner mismatch' };
         },
@@ -354,10 +443,22 @@ test('targeted capability restart cannot activate before exact semantic readines
         assertLifecycleCapability,
     }), /semantic readiness failed.*udp owner mismatch/);
     assert.equal(readinessCalls, 1);
+    assert.deepEqual(failedRuntimeCalls, [
+        ['running', failedContainerId, { runtime: 'podman' }],
+        ['readiness', 'livekit', owner.containerName, generation.manifests.livekit.health.readiness, {
+            runtime: 'podman',
+            containerId: failedContainerId,
+            instanceId: owner.instanceId,
+            enableGeneration: owner.enableGeneration,
+        }],
+    ]);
     assert.equal(cleanupCalls.length, 1);
     assert.equal(cleanupCalls[0].containerName, owner.containerName);
-    assert.equal(cleanupCalls[0].containerId, 'candidate-current');
-    assert.deepEqual(cleanupCalls[0].record, generation.agents[owner.containerName]);
+    assert.equal(cleanupCalls[0].containerId, failedContainerId);
+    assert.deepEqual(cleanupCalls[0].record, {
+        ...generation.agents[owner.containerName],
+        containerId: failedContainerId,
+    });
     assert.equal(cleanupCalls[0].network.mode, 'host');
 
     assert.deepEqual(restartGenerationCapabilityRuntime({
@@ -372,18 +473,59 @@ test('targeted capability restart cannot activate before exact semantic readines
         resolveReadinessProtocol: () => 'script',
         ensureService: () => ({
             containerName: owner.containerName,
-            containerId: 'candidate-ready',
+            containerId: readyContainerId,
+            registryRecord: {
+                ...generation.agents[owner.containerName],
+                containerId: readyContainerId,
+            },
             marker: 'ready',
         }),
-        isRunning: () => true,
-        runScriptReadiness: () => ({ status: 'success' }),
+        isRunning: (_name, options) => {
+            assert.deepEqual(options, { runtime: 'podman' });
+            return true;
+        },
+        runScriptReadiness: (_agentName, _containerName, _probe, options) => {
+            assert.deepEqual(options, {
+                runtime: 'podman',
+                containerId: readyContainerId,
+                instanceId: owner.instanceId,
+                enableGeneration: owner.enableGeneration,
+            });
+            return { status: 'success' };
+        },
         removeCandidate: () => assert.fail('ready candidate must not be removed'),
         assertLifecycleCapability,
     }), {
         containerName: owner.containerName,
-        containerId: 'candidate-ready',
+        containerId: readyContainerId,
+        registryRecord: {
+            ...generation.agents[owner.containerName],
+            containerId: readyContainerId,
+        },
         marker: 'ready',
     });
+
+    for (const runtime of ['', 'container', 'docker', ' podman', undefined]) {
+        assert.throws(() => restartGenerationCapabilityRuntime({
+            generation: {
+                ...generation,
+                agents: {
+                    [owner.containerName]: {
+                        ...generation.agents[owner.containerName],
+                        runtime,
+                    },
+                },
+            },
+            owner,
+            affectedSelectors: ['media:agent:media/livekit'],
+            assertSelectorsInactive: () => true,
+            preparedHostModeCapability: Object.freeze({}),
+            networkLifecycleCapability,
+        }, {
+            ensureService: () => assert.fail('invalid runtime must fail before restart'),
+            assertLifecycleCapability,
+        }), /exact Podman runtime identity/);
+    }
 });
 
 test('managed Docker identity derivation is a fail-closed launch precondition', () => {
@@ -394,6 +536,9 @@ test('managed Docker identity derivation is a fail-closed launch precondition', 
     assert.match(source, /Only non-secret principal fields exist before topology attestation/);
     assert.match(source, /generationLease\.checkpoint\('pre-credentials'\)[\s\S]*?signGeneratedRouterDescriptorEnvelope\(payload\)[\s\S]*?buildAgentCredentialEnv\(principalId, runtimeIdentity\)/);
     assert.match(source, /computeSemanticEnvHash[\s\S]*PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST[\s\S]*PLOINKY_AGENT_ENABLE_GENERATION/);
+    assert.match(source, /computeSemanticEnvHash[\s\S]*PLOINKY_AGENT_HOME_KEY:\s*containerName/);
+    assert.match(source, /const launchEnv = Object\.freeze\(\{[\s\S]*PLOINKY_AGENT_HOME_KEY:\s*containerName,[\s\S]*PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY:\s*'generated'/);
+    assert.match(source, /const expectedEnv = Object\.freeze\(\{[\s\S]*PLOINKY_AGENT_HOME_KEY:\s*containerName,[\s\S]*PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY:\s*'generated'/);
     assert.match(source, /canReuseExisting && runtimeNetworkPlan\.requiresManagedNetwork[\s\S]*prepareEdgeRoutingGenerationRaw/);
 });
 
@@ -559,9 +704,9 @@ test('reserved env filtering restores only the runtime-owned Router authority', 
 test('existing-container ownership inspection is unconditional across network modes', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.doesNotMatch(source, /\bresolveRouterEndpoint\s*\(/, 'service manager must not reread persisted routing state');
-    assert.match(source, /const networkLifecycle = createNetworkLifecycleAdapter\(\{ runtime \}\);[\s\S]*?if \(containerExists\(containerName\)\) \{\s+const contractInspection = networkLifecycle\.inspectContainerContract/);
+    assert.match(source, /const networkLifecycle = createNetworkLifecycleAdapter\(\{ runtime \}\);[\s\S]*?if \(containerExists\(containerName, \{ runtime \}\)\) \{\s+const contractInspection = networkLifecycle\.inspectContainerContract/);
     assert.doesNotMatch(source, /if \(containerExists\(containerName\) && managedNetworkLifecycle\)/);
-    assert.match(source, /else if \(!isContainerRunning\(containerName\)\)/);
+    assert.match(source, /else if \(!isContainerRunning\(containerName, \{ runtime \}\)\)/);
     assert.match(source, /recreateReason \|\|= 'runtimeStopped'/);
     assert.match(source, /reuseInspection\.id !== inspectedContainerId/);
     assert.match(source, /recreateReason \|\|= 'runtimeStoppedAfterInspection'/);
@@ -595,7 +740,7 @@ test('targeted restart contract cannot be enabled implicitly', () => {
         assert.throws(
             () => ensureAgentService(
                 'agent',
-                { network: { mode: 'none' } },
+                { container: 'test/runtime:approved', network: { mode: 'none' } },
                 '/tmp/repo/agent',
                 { routerEndpoint: null, targetedRestart },
             ),

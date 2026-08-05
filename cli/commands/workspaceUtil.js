@@ -12,7 +12,6 @@ import * as dockerSvc from '../sandbox/docker/index.js';
 import {
   computeEnvHash,
   getContainerLabel,
-  getRuntime,
   getRuntimeForAgent,
   isSandboxRuntime,
   loadAgentsMap,
@@ -105,6 +104,93 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function manualRuntimeError(code, message, context) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = 409;
+  error.context = Object.freeze({ ...context });
+  return error;
+}
+
+export function assertSelectedManualRuntime(selectedRuntime, registryRecord, {
+  agentName = '',
+  operation = 'manual lifecycle',
+  expectedIdentity = null,
+} = {}) {
+  const selected = typeof selectedRuntime === 'string' ? selectedRuntime : '';
+  const recorded = typeof registryRecord?.runtime === 'string' ? registryRecord.runtime : '';
+  const selectedIsSandbox = isSandboxRuntime(selected);
+  const selectedIsSupported = selectedIsSandbox || selected === 'podman';
+  const sameRuntimeGeneration = selectedIsSupported && recorded === selected;
+  const subject = agentName ? ` for agent '${agentName}'` : '';
+
+  if (!sameRuntimeGeneration) {
+    throw manualRuntimeError(
+      'PLOINKY_MANUAL_RUNTIME_MISMATCH',
+      `${operation}${subject} selected '${selected || 'unknown'}' but the exact registry generation recorded '${recorded || 'missing'}'; mixed-runtime generations are unsupported.`,
+      { operation, agentName, selectedRuntime: selected, recordedRuntime: recorded },
+    );
+  }
+
+  if (selectedIsSupported) {
+    const instanceId = registryRecord?.instanceId;
+    const enableGeneration = registryRecord?.enableGeneration;
+    const exactInstanceId = typeof instanceId === 'string'
+      && instanceId !== ''
+      && instanceId === instanceId.trim();
+    const exactEnableGeneration = typeof enableGeneration === 'string'
+      && enableGeneration !== ''
+      && enableGeneration === enableGeneration.trim();
+    if (!exactInstanceId || !exactEnableGeneration) {
+      throw manualRuntimeError(
+        'PLOINKY_MANUAL_RUNTIME_IDENTITY_MISSING',
+        `${operation}${subject} requires an exact ${selected} instanceId and enableGeneration before runtime access.`,
+        { operation, agentName, selectedRuntime: selected },
+      );
+    }
+    const containerId = registryRecord?.containerId;
+    if (selected === 'podman'
+        && (typeof containerId !== 'string' || !/^[a-f0-9]{64}$/.test(containerId))) {
+      throw manualRuntimeError(
+        'PLOINKY_MANUAL_RUNTIME_IDENTITY_MISSING',
+        `${operation}${subject} requires an exact immutable Podman containerId before runtime access.`,
+        { operation, agentName, selectedRuntime: selected },
+      );
+    }
+    const expectedInstanceId = expectedIdentity?.instanceId;
+    const expectedEnableGeneration = expectedIdentity?.enableGeneration;
+    const expectedContainerId = expectedIdentity?.containerId;
+    if ((expectedInstanceId && expectedInstanceId !== instanceId)
+        || (expectedEnableGeneration && expectedEnableGeneration !== enableGeneration)
+        || (expectedContainerId && expectedContainerId !== containerId)) {
+      throw manualRuntimeError(
+        'PLOINKY_MANUAL_RUNTIME_IDENTITY_MISMATCH',
+        `${operation}${subject} observed a different ${selected} generation than the one prepared for dispatch.`,
+        { operation, agentName, selectedRuntime: selected },
+      );
+    }
+  }
+
+  return registryRecord;
+}
+
+export function probeSelectedManualRuntime(selectedRuntime, runtimeKey, registryRecord, {
+  isSandboxRunning = isBwrapProcessRunning,
+  isContainerRunning = dockerSvc.isContainerRunning,
+} = {}) {
+  const exactRecord = assertSelectedManualRuntime(selectedRuntime, registryRecord, {
+    agentName: registryRecord?.agentName || '',
+    operation: 'manual runtime probe',
+  });
+  if (isSandboxRuntime(selectedRuntime)) {
+    return isSandboxRunning(runtimeKey, {
+      instanceId: exactRecord.instanceId,
+      enableGeneration: exactRecord.enableGeneration,
+    });
+  }
+  return isContainerRunning(exactRecord.containerId, { runtime: selectedRuntime });
+}
+
 function createAppendLogStdio(logFile) {
   const opened = [];
   try {
@@ -151,10 +237,46 @@ function spawnNoWaitWorker({
   routeKey,
   registryAlias,
   routerPort,
+  runtimeIdentity,
   forceRecreate = false,
   waitForStatusFile = '',
+  waitForIdentity = null,
 }) {
   const containerName = registryName;
+  const exactRuntime = runtimeIdentity?.runtime;
+  const exactIdentityText = value => typeof value === 'string'
+    && value !== ''
+    && value === value.trim();
+  const selectedRuntime = ['podman', 'bwrap', 'seatbelt'].includes(exactRuntime);
+  const ownsContainerId = Object.hasOwn(runtimeIdentity || {}, 'containerId');
+  const exactContainerId = typeof runtimeIdentity?.containerId === 'string'
+    && /^[a-f0-9]{64}$/.test(runtimeIdentity.containerId);
+  if (!selectedRuntime
+      || runtimeIdentity?.containerName !== containerName
+      || !exactIdentityText(runtimeIdentity?.instanceId)
+      || !exactIdentityText(runtimeIdentity?.enableGeneration)
+      || (exactRuntime === 'podman'
+        ? (ownsContainerId && !exactContainerId)
+        : ownsContainerId)) {
+    throw new Error(`no-wait dispatch for '${containerName}' requires one exact selected runtime identity`);
+  }
+  if (waitForStatusFile) {
+    const waitOwnsContainerId = Object.hasOwn(waitForIdentity || {}, 'containerId');
+    const exactWaitContainerId = typeof waitForIdentity?.containerId === 'string'
+      && /^[a-f0-9]{64}$/.test(waitForIdentity.containerId);
+    if (!['podman', 'bwrap', 'seatbelt'].includes(waitForIdentity?.runtime)
+        || !exactIdentityText(waitForIdentity?.containerName)
+        || !exactIdentityText(waitForIdentity?.instanceId)
+        || !exactIdentityText(waitForIdentity?.enableGeneration)
+        || path.basename(waitForStatusFile, '.json') !== waitForIdentity.containerName
+        || (waitForIdentity.runtime === 'podman'
+          ? (waitOwnsContainerId && !exactWaitContainerId)
+          : waitOwnsContainerId)) {
+      throw new Error(`no-wait dispatch for '${containerName}' requires the exact predecessor runtime identity`);
+    }
+  } else if (waitForIdentity !== null) {
+    throw new Error(`no-wait dispatch for '${containerName}' received predecessor identity without a status file`);
+  }
   const noWaitLogDir = path.join(LOGS_DIR, 'no-wait');
   const noWaitStatusDir = path.join(RUNNING_DIR, 'no-wait');
   fs.mkdirSync(noWaitLogDir, { recursive: true });
@@ -170,7 +292,13 @@ function spawnNoWaitWorker({
     '--manifest-path', node.manifestPath,
     '--agent-path', node.agentPath,
     '--route-key', String(routeKey || registryAlias || node.shortAgentName),
+    '--runtime', runtimeIdentity.runtime,
+    '--instance-id', runtimeIdentity.instanceId,
+    '--enable-generation', runtimeIdentity.enableGeneration,
   ];
+  if (Object.hasOwn(runtimeIdentity, 'containerId')) {
+    args.push('--container-id', runtimeIdentity.containerId);
+  }
   if (registryAlias) {
     args.push('--alias', registryAlias);
   }
@@ -185,6 +313,15 @@ function spawnNoWaitWorker({
   }
   if (waitForStatusFile) {
     args.push('--wait-for-status', waitForStatusFile);
+    args.push(
+      '--wait-for-runtime', waitForIdentity.runtime,
+      '--wait-for-container', waitForIdentity.containerName,
+      '--wait-for-instance-id', waitForIdentity.instanceId,
+      '--wait-for-enable-generation', waitForIdentity.enableGeneration,
+    );
+    if (Object.hasOwn(waitForIdentity, 'containerId')) {
+      args.push('--wait-for-container-id', waitForIdentity.containerId);
+    }
   }
   // A successor must never mistake a terminal status from an earlier start
   // invocation for completion of this worker.
@@ -759,7 +896,6 @@ function graphNodeRuntimeReplacementReason(plan, {
   isContainerRunningImpl = dockerSvc.isContainerRunning,
   isSandboxRunningImpl = isBwrapProcessRunning,
   getRuntimeForAgentImpl = getRuntimeForAgent,
-  getRuntimeImpl = getRuntime,
   getContainerLabelImpl = getContainerLabel,
   computeEnvHashImpl = computeEnvHash,
   createNetworkLifecycleAdapterImpl = createNetworkLifecycleAdapter,
@@ -771,7 +907,10 @@ function graphNodeRuntimeReplacementReason(plan, {
 } = {}) {
   const { node, existing } = plan;
   const record = existing.rec;
-  if (!String(record.instanceId || '').trim() || !String(record.enableGeneration || '').trim()) {
+  const exactIdentityText = value => typeof value === 'string'
+    && value !== ''
+    && value === value.trim();
+  if (!exactIdentityText(record.instanceId) || !exactIdentityText(record.enableGeneration)) {
     return 'missingRuntimeIdentity';
   }
 
@@ -781,6 +920,9 @@ function graphNodeRuntimeReplacementReason(plan, {
     path: `manifest(${node.repoName}/${node.shortAgentName})`,
   });
   const runtimeKind = getRuntimeForAgentImpl(node.manifest);
+  if (record.runtime !== runtimeKind) {
+    return 'runtimeSelectionChanged';
+  }
   const routerEndpoint = resolveManifestRouterEndpoint(node.manifest, {
     explicitPort: resolvePersistedRouterPort(),
     profileName: node.profile || undefined,
@@ -801,10 +943,23 @@ function graphNodeRuntimeReplacementReason(plan, {
     return '';
   }
 
-  if (!containerExistsImpl(existing.key)) return 'registeredRuntimeMissing';
-  if (!isContainerRunningImpl(existing.key)) return 'runtimeStopped';
+  if (runtimeKind !== 'podman') {
+    throw manualRuntimeError(
+      'PLOINKY_AGENT_RUNTIME_UNSUPPORTED',
+      `workspace graph selected unsupported container runtime '${runtimeKind || 'missing'}' for '${node.id}'`,
+      { agentName: node.id, selectedRuntime: runtimeKind || '' },
+    );
+  }
+  const containerId = record.containerId;
+  if (typeof containerId !== 'string' || !/^[a-f0-9]{64}$/.test(containerId)) {
+    return 'missingRuntimeIdentity';
+  }
+  if (!containerExistsImpl(containerId, { runtime: runtimeKind })) {
+    return 'registeredRuntimeMissing';
+  }
+  if (!isContainerRunningImpl(containerId, { runtime: runtimeKind })) return 'runtimeStopped';
 
-  const runtime = getRuntimeImpl();
+  const runtime = runtimeKind;
   const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, profileResolution.network);
   const runtimeRouterEnv = buildRuntimeRouterEnv(runtime, {
     routerEndpoint,
@@ -816,7 +971,11 @@ function graphNodeRuntimeReplacementReason(plan, {
     { ...runtimeRouterEnv, ...runtimeNetworkPlan.hashEnv },
     { agentName: node.shortAgentName, repoName: node.repoName },
   );
-  if (desiredEnvHash && desiredEnvHash !== getContainerLabelImpl(existing.key, 'ploinky.envhash')) {
+  if (desiredEnvHash && desiredEnvHash !== getContainerLabelImpl(
+    containerId,
+    'ploinky.envhash',
+    { runtime },
+  )) {
     return 'envHashChanged';
   }
   if (isLlmRuntimeManifestImpl(node.manifest, profileResolution.profileConfig)) {
@@ -838,13 +997,17 @@ function graphNodeRuntimeReplacementReason(plan, {
     });
     if (probe.enabled
         && probe.reuseHash
-        && probe.reuseHash !== getContainerLabelImpl(existing.key, 'ploinky.reusehash')) {
+        && probe.reuseHash !== getContainerLabelImpl(
+          containerId,
+          'ploinky.reusehash',
+          { runtime },
+        )) {
       return 'llmReuseHashChanged';
     }
   }
 
   const inspection = createNetworkLifecycleAdapterImpl({ runtime }).inspectContainerContract(
-    existing.key,
+    containerId,
     profileResolution.network,
     node.shortAgentName,
     {
@@ -905,16 +1068,27 @@ function loadRegistryManifest(record) {
   return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 }
 
-function isRegistryRuntimeRunning(containerName, record) {
+function isRegistryRuntimeRunning(containerName, record, {
+  isContainerRunningImpl = dockerSvc.isContainerRunning,
+  isSandboxRunningImpl = isBwrapProcessRunning,
+} = {}) {
+  const exactIdentityText = value => typeof value === 'string'
+    && value !== ''
+    && value === value.trim();
   if (isSandboxRuntime(record?.runtime)) {
-    if (!String(record?.instanceId || '').trim()
-        || !String(record?.enableGeneration || '').trim()) return false;
-    return isBwrapProcessRunning(containerName, {
+    if (!exactIdentityText(record?.instanceId)
+        || !exactIdentityText(record?.enableGeneration)) return false;
+    return isSandboxRunningImpl(containerName, {
       instanceId: record.instanceId,
       enableGeneration: record.enableGeneration,
     });
   }
-  return dockerSvc.isContainerRunning(containerName);
+  if (record?.runtime !== 'podman'
+      || !exactIdentityText(record?.instanceId)
+      || !exactIdentityText(record?.enableGeneration)
+      || typeof record?.containerId !== 'string'
+      || !/^[a-f0-9]{64}$/.test(record.containerId)) return false;
+  return isContainerRunningImpl(record.containerId, { runtime: 'podman' });
 }
 
 export function admitWorkspaceGraphRuntimeCapabilities(graph, {
@@ -2485,6 +2659,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     workspaceRuntimeCandidates.length = 0;
 
     let previousNoWaitStatusFile = '';
+    let previousNoWaitIdentity = null;
     for (const { node, registryName } of deferredNoWaitLaunches) {
       if (!registryName) {
         console.warn(`[start] no-wait node '${formatGraphNodeLabel(node, staticAgent)}' missing registry entry; skipping background launch.`);
@@ -2492,6 +2667,17 @@ async function startWorkspace(staticAgentArg, portArg, {
       }
       const rec = reg[registryName] || {};
       const routeKey = rec.alias || node.shortAgentName;
+      const runtimeIdentity = Object.freeze({
+        runtime: rec.runtime,
+        containerName: registryName,
+        instanceId: rec.instanceId,
+        enableGeneration: rec.enableGeneration,
+        ...(rec.runtime === 'podman'
+          && typeof rec.containerId === 'string'
+          && /^[a-f0-9]{64}$/.test(rec.containerId)
+          ? { containerId: rec.containerId }
+          : {}),
+      });
       try {
         const { pid, logFile, statusFile } = spawnNoWaitWorker({
           node,
@@ -2499,10 +2685,13 @@ async function startWorkspace(staticAgentArg, portArg, {
           routeKey,
           registryAlias: rec.alias || node.alias || '',
           routerPort: staticPort,
+          runtimeIdentity,
           forceRecreate: newlyPreparedContainers.has(registryName),
           waitForStatusFile: previousNoWaitStatusFile,
+          waitForIdentity: previousNoWaitIdentity,
         });
         previousNoWaitStatusFile = statusFile;
+        previousNoWaitIdentity = runtimeIdentity;
         console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
       } catch (spawnErr) {
         console.error(`[start] no-wait launch for '${formatGraphNodeLabel(node, staticAgent)}' failed to spawn: ${spawnErr?.message || spawnErr}`);
@@ -2674,6 +2863,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     agentId: resolvedManifestRef,
     persistedProfileName: registryRecord?.record?.profile,
   });
+  const selectedRuntime = directAdmission.runtime;
   resolveManifestStartup(manifest);
   if (routerEndpoint === undefined) {
     routerEndpoint = resolveRouterEndpointForManifestImpl(manifest, {
@@ -2713,6 +2903,12 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     const refreshedRecord = loadAgentsMapImpl()?.[initialContainerName];
     if (refreshedRecord?.type === 'agent') {
       registryRecord = { containerName: initialContainerName, record: refreshedRecord };
+    }
+    if (registryRecord?.record) {
+      assertSelectedManualRuntime(selectedRuntime, registryRecord.record, {
+        agentName: shortAgentName,
+        operation: 'interactive CLI service start',
+      });
     }
     const lifecycleResult = await withNetworkLifecycleLockImpl(async (networkLifecycleCapability) => {
       let result = null;
@@ -2786,11 +2982,13 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     containerName = lifecycleResult.containerName;
   });
 
-  // Determine actual runtime from registry (may differ from manifest if sandbox
-  // failed and fell back to container during ensureAgentService)
   const agents = loadAgentsMapImpl();
   const registryEntry = agents[containerName] || {};
-  const actualRuntime = registryEntry.runtime;
+  assertSelectedManualRuntime(selectedRuntime, registryEntry, {
+    agentName: shortAgentName,
+    operation: 'interactive CLI attach',
+    expectedIdentity: containerInfo?.registryRecord,
+  });
 
   let exitCode = 0;
   if (!suppressLauncherLogs) {
@@ -2804,13 +3002,13 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     }
   }
 
-  if (actualRuntime === 'bwrap') {
+  if (selectedRuntime === 'bwrap') {
     const attach = attachBwrapInteractive
       || (await import('../sandbox/bwrap/bwrapServiceManager.js')).attachBwrapInteractive;
     exitCode = withSuspendedInput(() => {
       return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
     });
-  } else if (actualRuntime === 'seatbelt') {
+  } else if (selectedRuntime === 'seatbelt') {
     const attach = attachSeatbeltInteractive
       || (await import('../sandbox/seatbelt/seatbeltServiceManager.js')).attachSeatbeltInteractive;
     exitCode = withSuspendedInput(() => {
@@ -2818,7 +3016,10 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     });
   } else {
     exitCode = withSuspendedInput(() => {
-      return attachInteractive(containerName, projectPath, cmd);
+      return attachInteractive(containerName, projectPath, cmd, {
+        runtime: selectedRuntime,
+        registryRecord: registryEntry,
+      });
     });
   }
   return Number.isInteger(exitCode) ? exitCode : 0;
@@ -2867,6 +3068,7 @@ async function runShell(agentName) {
     agentId: manifestLookup,
     persistedProfileName: registryRecord?.record?.profile,
   });
+  const selectedRuntime = directAdmission.runtime;
   const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
     persistedProfileName: registryRecord?.record?.profile,
     path: `manifest(${manifestLookup})`,
@@ -2875,6 +3077,12 @@ async function runShell(agentName) {
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
   const registeredContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
+  if (registryRecord?.record) {
+    assertSelectedManualRuntime(selectedRuntime, registryRecord.record, {
+      agentName: shortAgentName,
+      operation: 'interactive shell service start',
+    });
+  }
   const { containerInfo, containerName } = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
     let result = null;
     try {
@@ -2920,32 +3128,37 @@ async function runShell(agentName) {
   const cmd = '/bin/sh';
   const projPath = getConfiguredProjectPath(shortAgentName, repoName, registryRecord?.record?.alias);
 
-  // Determine actual runtime from registry (may differ from manifest if sandbox
-  // failed and fell back to container during ensureAgentService)
   const agents = loadAgentsMap();
   const registryEntry = agents[containerName] || {};
-  const actualRuntime = registryEntry.runtime;
+  assertSelectedManualRuntime(selectedRuntime, registryEntry, {
+    agentName: shortAgentName,
+    operation: 'interactive shell attach',
+    expectedIdentity: containerInfo?.registryRecord,
+  });
 
-  if (actualRuntime === 'bwrap') {
+  if (selectedRuntime === 'bwrap') {
     console.log(`[shell] bwrap agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachBwrapInteractive } = await import('../sandbox/bwrap/bwrapServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
+    return runWithSuspendedInput(() => {
+      return attachBwrapInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
     });
-  } else if (actualRuntime === 'seatbelt') {
+  } else if (selectedRuntime === 'seatbelt') {
     console.log(`[shell] seatbelt agent: ${shortAgentName}`);
     console.log(`[shell] command: ${cmd}`);
     const { attachSeatbeltInteractive } = await import('../sandbox/seatbelt/seatbeltServiceManager.js');
-    runWithSuspendedInput(() => {
-      attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
+    return runWithSuspendedInput(() => {
+      return attachSeatbeltInteractive(shortAgentName, manifest, agentDir, projPath, cmd, { containerName, routerEndpoint });
     });
   } else {
-    console.log(`[shell] container: ${containerName}`);
+    console.log(`[shell] ${selectedRuntime} container: ${containerName}`);
     console.log(`[shell] command: ${cmd}`);
     console.log(`[shell] agent: ${shortAgentName}`);
-    runWithSuspendedInput(() => {
-      attachInteractive(containerName, projPath, cmd);
+    return runWithSuspendedInput(() => {
+      return attachInteractive(containerName, projPath, cmd, {
+        runtime: selectedRuntime,
+        registryRecord: registryEntry,
+      });
     });
   }
 }
@@ -2957,7 +3170,7 @@ async function reinstallAgent(agentName, {
     const routerPort = resolvePersistedRouterPort();
     if (!agentName) { throw new Error('Usage: reinstall <name> | reinstall agent <name>'); }
 
-    const { getAgentContainerName, isContainerRunning, ensureAgentService } = dockerSvc;
+    const { getAgentContainerName, ensureAgentService } = dockerSvc;
     let registryRecord = null;
     try {
         registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
@@ -2998,15 +3211,14 @@ async function reinstallAgent(agentName, {
         persistedProfileName: registryRecord?.record?.profile,
     });
 
-    const agentRuntime = getRuntimeForAgent(manifest);
-    const bwrapRunning = isSandboxRuntime(agentRuntime)
-        && Boolean(registryRecord?.record?.instanceId && registryRecord?.record?.enableGeneration)
-        && isBwrapProcessRunning(containerName, {
-            instanceId: registryRecord.record.instanceId,
-            enableGeneration: registryRecord.record.enableGeneration,
-        });
+    const agentRuntime = directAdmission.runtime;
+    const runtimeRunning = probeSelectedManualRuntime(
+        agentRuntime,
+        containerName,
+        registryRecord?.record,
+    );
 
-    if (!isContainerRunning(containerName) && !bwrapRunning) {
+    if (!runtimeRunning) {
         console.error(`Agent '${agentName}' is not running.`);
         return;
     }
@@ -3036,6 +3248,10 @@ async function reinstallAgent(agentName, {
                 routerEndpoint,
                 runtimeAdmission: directAdmission.runtimeAdmission,
                 networkLifecycleCapability,
+            });
+            assertSelectedManualRuntime(agentRuntime, reinstallResult?.registryRecord, {
+                agentName: short,
+                operation: 'reinstall preparation',
             });
             const { containerName: newContainerName, hostPort } = reinstallResult;
 
@@ -3108,6 +3324,8 @@ export {
   assertStaticPreinstallSucceeded,
   buildDashboardUrl,
   buildBlockingReadinessEntryFromNode,
+  graphNodeRuntimeReplacementReason,
+  isRegistryRuntimeRunning,
   activatePreparedRuntimeAfterReadiness,
   ensureGraphNodesEnabled,
   reprepareGraphAfterStartupProviders,

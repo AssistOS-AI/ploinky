@@ -2,6 +2,8 @@ import { execSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { buildShellCommand, spawnBwrapInteractive } from './interactive.js';
+import { shouldAllocateInteractiveTty } from '../interactiveProcess.js';
 import {
     assertManifestEnvProfileCompleteness,
     buildEnvMap,
@@ -101,6 +103,7 @@ import { assertHostModeGenerationCapability } from '../edgeGeneration.js';
 import { buildRouterAuthorityTopologyIntent } from '../routerAuthorityAttestation.js';
 import { IMAGE_CONTRACT } from '../../../ploinky-box/contract/image.mjs';
 import {
+    BWRAP_HOME_SOURCE_KINDS,
     TRUSTED_SERVICE_ENV,
     buildTrustedServicePolicy,
     encodeBwrapLaunchDescriptor,
@@ -911,10 +914,6 @@ function shellQuote(value) {
     return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-function buildShellCommand(argv) {
-    return argv.map((arg) => shellQuote(arg)).join(' ');
-}
-
 function buildBwrapInteractiveCommand(workdir, entryCommand, options = {}) {
     const wd = workdir || '/code';
     const rawCommand = entryCommand && String(entryCommand).trim()
@@ -928,16 +927,6 @@ function buildBwrapInteractiveCommand(workdir, entryCommand, options = {}) {
 
 function sanitizeHistoryName(value) {
     return String(value || 'agent').replace(/[^A-Za-z0-9_.-]/g, '_');
-}
-
-function spawnBwrapInteractive(bwrapArgs, options = {}) {
-    const usePty = options.usePty === true;
-    const scriptPath = '/usr/bin/script';
-    if (usePty && fs.existsSync(scriptPath)) {
-        const command = buildShellCommand([BWRAP_PATH, ...bwrapArgs]);
-        return spawnSync(scriptPath, ['-qfec', command, '/dev/null'], { stdio: 'inherit' });
-    }
-    return spawnSync(BWRAP_PATH, bwrapArgs, { stdio: 'inherit' });
 }
 
 /**
@@ -1101,7 +1090,10 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const entryCmd = buildBwrapEntryCommand(agentName, manifest, profileConfig);
     const trustedEnvironment = buildTrustedServiceDynamicEnvironment(envMap);
     const trustedLaunch = buildTrustedServiceLaunch({
-        runtimeKey: containerName,
+        homeSource: {
+            sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+            homeKey: agentHomeState.homeKey,
+        },
         command: ['/bin/sh', '-c', entryCmd],
         nodeRuntimePath: nodeRuntime.hostRuntimePath,
         agentRuntimePath: agentLibPath,
@@ -1187,7 +1179,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     try {
         bwrapOwner = saveBwrapPid(containerName, child.pid, {
             ...runtimeIdentity,
-            homeKey: containerName,
+            homeKey: agentHomeState.homeKey,
             workdir: '/code',
             logPath: logFile,
             routeKey,
@@ -1229,6 +1221,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         type: 'agent',
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        homeKey: agentHomeState.homeKey,
         bwrapOwner,
         runtimeStaging: {
             agentLibPath
@@ -1265,7 +1258,9 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
                 agentPath,
                 repoName,
                 manifest,
-                skipInstallHooks: true
+                skipInstallHooks: true,
+                runtime: 'bwrap',
+                runtimeIdentity,
             });
             if (!lifecycleResult.success) {
                 const details = lifecycleResult.errors.join('; ');
@@ -1361,6 +1356,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     }
 
     let exactRuntimeRunning = isBwrapProcessRunning(containerName, runtimeIdentity);
+    let reusableHomeState = null;
 
     // Force recreate
     if (forceRecreate) {
@@ -1371,6 +1367,31 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
 
     if (!forceRecreate && !exactRuntimeRunning && stopBwrapProcess(containerName)) {
         console.log(`[bwrap] ${agentName}: runtime generation changed, replacing stale sandbox...`);
+    }
+
+    if (exactRuntimeRunning) {
+        try {
+            reusableHomeState = ensureAgentHomeAbi(
+                containerName,
+                runtimeIdentity.enableGeneration,
+            );
+        } catch (error) {
+            stopBwrapProcess(containerName, { expectedIdentity: runtimeIdentity });
+            throw error;
+        }
+
+        if (existingRecord.homeKey !== reusableHomeState.homeKey
+            || existingRecord.bwrapOwner?.homeKey !== reusableHomeState.homeKey) {
+            console.log(`[bwrap] ${agentName}: sandbox HOME ABI changed, restarting...`);
+            if (!stopBwrapProcess(containerName, { expectedIdentity: runtimeIdentity })) {
+                throw trustedServicePolicyError(
+                    'exact sandbox service could not be stopped after HOME ABI drift',
+                    'PLOINKY_HOME_STATE_INCOMPATIBLE',
+                );
+            }
+            exactRuntimeRunning = false;
+            reusableHomeState = null;
+        }
     }
 
     if (exactRuntimeRunning) {
@@ -1397,12 +1418,8 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;
             const instanceName = containerName;
-            const agentHomeState = ensureAgentHomeAbi(
-                containerName,
-                runtimeIdentity.enableGeneration,
-            );
             syncAgentMcpConfig(containerName, agentPath, instanceName, {
-                workDir: agentHomeState.homePath,
+                workDir: reusableHomeState.homePath,
             });
             return {
                 containerName,
@@ -1502,7 +1519,9 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
     const hostPort = record.config?.ports?.[0]?.hostPort;
     if (hostPort) envMap.PORT = String(hostPort);
-    const forceInteractiveShell = entryCommand && String(entryCommand).trim() === '/bin/sh' && process.stdin.isTTY;
+    const forceInteractiveShell = entryCommand
+        && String(entryCommand).trim() === '/bin/sh'
+        && shouldAllocateInteractiveTty();
     if (forceInteractiveShell) {
         for (const key of ['TERM', 'COLORTERM', 'LINES', 'COLUMNS']) {
             if (process.env[key]) envMap[key] = process.env[key];
@@ -1552,8 +1571,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
             routeKey: record.alias || agentName,
             containerName,
         });
-        const result = spawnBwrapInteractive(bwrapArgs, { usePty: process.stdin.isTTY });
-        return result.status ?? 0;
+        return spawnBwrapInteractive(BWRAP_PATH, bwrapArgs);
     } finally {
         try {
             fs.rmSync(agentLibPath, { recursive: true, force: true });

@@ -5,8 +5,12 @@ import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR, AGENTS_DATA_DIR, CODE_DIR, SKILLS_
 export const AGENT_HOME_ABI = 'ploinky-home-v2';
 export const AGENT_HOME_ABI_SCHEMA_VERSION = 2;
 export const AGENT_HOME_ABI_MARKER = '.ploinky-home-abi.json';
+export const SANDBOX_AGENT_HOME_SUFFIX = '.sandbox-v2';
 
-const AGENT_HOME_KEY_PATTERN = /^[A-Za-z0-9_.-]{1,255}$/;
+const AGENT_HOME_KEY_PATTERN = /^[A-Za-z0-9_.-]+$/;
+const AGENT_HOME_COMPONENT_MAX_BYTES = 255;
+const SANDBOX_RUNTIME_KEY_MAX_BYTES = AGENT_HOME_COMPONENT_MAX_BYTES
+    - Buffer.byteLength(SANDBOX_AGENT_HOME_SUFFIX, 'utf8');
 const AGENT_HOME_MARKER_KEYS = Object.freeze([
     'abi',
     'createdByGeneration',
@@ -14,6 +18,7 @@ const AGENT_HOME_MARKER_KEYS = Object.freeze([
     'schemaVersion',
 ]);
 const AGENT_HOME_MARKER_MAX_BYTES = 4096;
+const AGENT_HOME_GENERATION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._/-]*$/;
 
 export class AgentHomeStateIncompatibleError extends Error {
     constructor(reason) {
@@ -32,14 +37,19 @@ function homeStateError(reason) {
     return new AgentHomeStateIncompatibleError(reason);
 }
 
-function requireAgentHomeKey(homeKey) {
-    if (typeof homeKey !== 'string'
-        || !AGENT_HOME_KEY_PATTERN.test(homeKey)
-        || homeKey === '.'
-        || homeKey === '..') {
+function requireSandboxRuntimeKey(runtimeKey) {
+    if (typeof runtimeKey !== 'string'
+        || !AGENT_HOME_KEY_PATTERN.test(runtimeKey)
+        || Buffer.byteLength(runtimeKey, 'utf8') > SANDBOX_RUNTIME_KEY_MAX_BYTES
+        || runtimeKey === '.'
+        || runtimeKey === '..') {
         throw homeStateError('invalid-home-key');
     }
-    return homeKey;
+    return runtimeKey;
+}
+
+function sandboxHomeKey(runtimeKey) {
+    return `${requireSandboxRuntimeKey(runtimeKey)}${SANDBOX_AGENT_HOME_SUFFIX}`;
 }
 
 function requireGeneration(generation) {
@@ -47,7 +57,7 @@ function requireGeneration(generation) {
         || generation.length === 0
         || Buffer.byteLength(generation, 'utf8') > 255
         || generation.trim() !== generation
-        || /[\u0000-\u001f\u007f]/.test(generation)) {
+        || !AGENT_HOME_GENERATION_PATTERN.test(generation)) {
         throw homeStateError('invalid-generation');
     }
     return generation;
@@ -166,6 +176,8 @@ function inspectHomeMarker(markerPath, homeKey, expectedUid) {
         || marker.abi !== AGENT_HOME_ABI
         || typeof marker.createdByGeneration !== 'string'
         || marker.createdByGeneration.length === 0
+        || Buffer.byteLength(marker.createdByGeneration, 'utf8') > 255
+        || !AGENT_HOME_GENERATION_PATTERN.test(marker.createdByGeneration)
         || marker.homeKey !== homeKey
         || marker.schemaVersion !== AGENT_HOME_ABI_SCHEMA_VERSION
         || raw !== canonicalHomeMarker(marker)) {
@@ -349,17 +361,18 @@ export function getAgentDataDir(instanceName) {
 }
 
 /**
- * Resolve the clean provider HOME backing directory without sanitizing or
- * otherwise changing the admitted runtime key.
+ * Resolve the sandbox-only provider HOME backing directory without sanitizing
+ * or otherwise changing the admitted runtime key. The ABI suffix is always
+ * appended here so callers cannot accidentally select the container HOME.
  *
- * @param {string} homeKey - Exact effective container/runtime key
+ * @param {string} runtimeKey - Exact effective runtime key before ABI suffix
  * @param {{ agentsDataDir?: string }} [options]
  * @returns {string} The physical HOME path below .data
  */
-export function getAgentHomeAbiPath(homeKey, {
+export function getAgentHomeAbiPath(runtimeKey, {
     agentsDataDir = AGENTS_DATA_DIR,
 } = {}) {
-    const exactHomeKey = requireAgentHomeKey(homeKey);
+    const exactHomeKey = sandboxHomeKey(runtimeKey);
     if (typeof agentsDataDir !== 'string' || agentsDataDir.length === 0) {
         throw homeStateError('invalid-data-root');
     }
@@ -367,23 +380,25 @@ export function getAgentHomeAbiPath(homeKey, {
 }
 
 /**
- * Create or validate the clean provider HOME ABI. Existing marked provider
- * state is accepted without rewriting its immutable creation provenance.
- * Existing unmarked state is never migrated or removed.
+ * Create or validate the clean sandbox provider HOME ABI. Existing marked
+ * sandbox state is accepted without rewriting its immutable creation
+ * provenance. The unsuffixed container HOME is never inspected or changed.
+ * Existing unmarked sandbox state is never migrated or removed.
  *
- * @param {string} homeKey - Exact effective container/runtime key
+ * @param {string} runtimeKey - Exact effective runtime key before ABI suffix
  * @param {string} createdByGeneration - Exact nonempty creation generation
  * @param {{ agentsDataDir?: string }} [options]
  * @returns {{ homePath: string, homeKey: string, createdByGeneration: string, markerPath: string }}
  */
-export function ensureAgentHomeAbi(homeKey, createdByGeneration, {
+export function ensureAgentHomeAbi(runtimeKey, createdByGeneration, {
     agentsDataDir = AGENTS_DATA_DIR,
 } = {}) {
-    const exactHomeKey = requireAgentHomeKey(homeKey);
+    const exactRuntimeKey = requireSandboxRuntimeKey(runtimeKey);
+    const exactHomeKey = sandboxHomeKey(exactRuntimeKey);
     const exactGeneration = requireGeneration(createdByGeneration);
     const expectedUid = currentUid();
     const dataRootBefore = inspectDataRoot(agentsDataDir, expectedUid);
-    const homePath = getAgentHomeAbiPath(exactHomeKey, {
+    const homePath = getAgentHomeAbiPath(exactRuntimeKey, {
         agentsDataDir: dataRootBefore.dataPath,
     });
 

@@ -34,9 +34,16 @@ function cc() {
     return process.env.CC || 'cc';
 }
 
-function compile(output, { sha = TEST_SHA, defineSha = true } = {}) {
+function compile(output, {
+    sha = TEST_SHA,
+    defineSha = true,
+    workspaceRoot,
+    bwrapPath,
+} = {}) {
     const args = ['-std=c11', '-Wall', '-Wextra', '-Werror'];
     if (defineSha) args.push(`-DPLOINKY_SOURCE_SHA="${sha}"`);
+    if (workspaceRoot) args.push(`-DPLOINKY_WORKSPACE_ROOT="${workspaceRoot}"`);
+    if (bwrapPath) args.push(`-DPLOINKY_BWRAP_PATH="${bwrapPath}"`);
     args.push(SOURCE, '-o', output);
     return spawnSync(cc(), args, { encoding: 'utf8' });
 }
@@ -51,9 +58,25 @@ function record(type, payload) {
 
 function descriptor(records) {
     const header = Buffer.alloc(16);
-    header.write('PLBWLP01', 0, 'ascii');
+    header.write('PLBWLP02', 0, 'ascii');
     header.writeUInt32BE(records.length, 8);
     return Buffer.concat([header, ...records]);
+}
+
+function homeRecord(sourceKind, homeKey = '') {
+    return record(RECORD.HOME, Buffer.concat([
+        Buffer.from([sourceKind]),
+        Buffer.from(homeKey),
+    ]));
+}
+
+function homeMarker(homeKey, createdByGeneration = 'generation:phase-4') {
+    return `${JSON.stringify({
+        abi: 'ploinky-home-v2',
+        createdByGeneration,
+        homeKey,
+        schemaVersion: 2,
+    })}\n`;
 }
 
 function argsDescriptor(args, extraRecords = []) {
@@ -96,6 +119,8 @@ function roDataPathRecord(source, target) {
 }
 
 function launchWithDescriptor(bytes, {
+    executable = helper,
+    env = process.env,
     fd4 = false,
     fd5 = false,
     argv = [],
@@ -106,7 +131,7 @@ function launchWithDescriptor(bytes, {
         const stdio = ['ignore', 'pipe', 'pipe', 'pipe'];
         if (fd4) stdio.push(fd4 === true ? 'pipe' : fd4);
         if (fd5) stdio.push(fd5 === true ? 'pipe' : fd5);
-        const child = spawn(helper, argv, { stdio });
+        const child = spawn(executable, argv, { stdio, env });
         const stdout = [];
         const stderr = [];
         child.stdout.on('data', (chunk) => stdout.push(chunk));
@@ -169,11 +194,11 @@ test('version and capability output expose the fixed source and fd ABI', () => {
     const version = spawnSync(helper, ['--version'], { encoding: 'utf8' });
     assert.equal(version.status, 0);
     assert.equal(version.stdout,
-        `ploinky-bwrap-launch-v1 source-sha=${TEST_SHA}\n`);
+        `ploinky-bwrap-launch-v2 source-sha=${TEST_SHA}\n`);
 
     const capabilities = spawnSync(helper, ['--capabilities'], { encoding: 'utf8' });
     assert.equal(capabilities.status, 0);
-    assert.match(capabilities.stdout, /protocol=1 descriptor-fd=3/);
+    assert.match(capabilities.stdout, /protocol=2 descriptor-fd=3/);
     assert.match(capabilities.stdout,
         /path-resolution=openat2-beneath-no-magiclinks-no-symlinks/);
     assert.match(capabilities.stdout,
@@ -183,6 +208,10 @@ test('version and capability output expose the fixed source and fd ABI', () => {
     assert.match(capabilities.stdout, /ro-data-path-hardening=sealed-memfd-ro-bind-data/);
     assert.match(capabilities.stdout, /preexec-barrier=R\/G/);
     assert.match(capabilities.stdout, /credential-bound=4096/);
+    assert.match(capabilities.stdout,
+        /home-sources=sandbox-workspace-v2,container-native/);
+    assert.match(capabilities.stdout, /home-marker=ploinky-home-v2-schema-2/);
+    assert.match(capabilities.stdout, /home-revalidation=post-barrier-G/);
 });
 
 test('normal launch accepts only its bounded versioned descriptor on fd 3', async () => {
@@ -201,6 +230,260 @@ test('normal launch accepts only its bounded versioned descriptor on fd 3', asyn
     const oversized = await launchWithDescriptor(Buffer.alloc(256 * 1024 + 1));
     assert.equal(oversized.status, 65);
     assert.match(oversized.stderr, /^PLOINKY_BWRAP_PROTOCOL_TOO_LARGE:/);
+});
+
+test('protocol v2 HOME is typed and rejects caller paths and malformed source contracts', async () => {
+    const invalidPayloads = [
+        Buffer.alloc(0),
+        Buffer.from([0]),
+        Buffer.from([3]),
+        Buffer.from([2, 0x78]),
+        Buffer.from([1]),
+        Buffer.concat([Buffer.from([1]), Buffer.from('.data/codex.sandbox-v2')]),
+        Buffer.concat([Buffer.from([1]), Buffer.from('codex')]),
+        Buffer.concat([Buffer.from([1]), Buffer.from('../codex.sandbox-v2')]),
+        Buffer.concat([Buffer.from([1]), Buffer.from('codex/escape.sandbox-v2')]),
+        Buffer.concat([Buffer.from([1]), Buffer.from('codex\0.sandbox-v2')]),
+        Buffer.concat([Buffer.from([1]), Buffer.from('codex+unsafe.sandbox-v2')]),
+        Buffer.concat([Buffer.from([1]), Buffer.alloc(256, 0x61)]),
+    ];
+
+    for (const payload of invalidPayloads) {
+        const result = await launchWithDescriptor(descriptor([
+            record(RECORD.HOME, payload),
+            record(RECORD.ARG, '--'),
+            record(RECORD.ARG, '/bin/true'),
+        ]));
+        assert.equal(result.status, 76, `${payload.toString('hex')}: ${result.stderr}`);
+        assert.match(result.stderr, /^PLOINKY_HOME_STATE_INCOMPATIBLE:/);
+    }
+
+    for (const valid of [
+        homeRecord(1, 'codex.sandbox-v2'),
+        homeRecord(2),
+    ]) {
+        const result = await launchWithDescriptor(descriptor([
+            valid,
+            record(RECORD.ARG, '--'),
+            record(RECORD.ARG, '/bin/true'),
+        ]));
+        assert.doesNotMatch(result.stderr, /^PLOINKY_BWRAP_PROTOCOL_INVALID:/);
+        if (process.platform !== 'linux') {
+            assert.equal(result.status, 70, result.stderr);
+        }
+    }
+});
+
+test('sandbox HOME validates its fd-pinned directory and exact ABI marker before exec', {
+    skip: process.platform !== 'linux',
+}, async () => {
+    const workspaceRoot = path.join(fixtureRoot, 'workspace-home-fixture');
+    const dataRoot = path.join(workspaceRoot, '.data');
+    const fakeBwrap = path.join(fixtureRoot, 'fake-bwrap');
+    const stateHelper = path.join(fixtureRoot, 'ploinky-bwrap-home-state');
+    fs.mkdirSync(dataRoot, { recursive: true });
+    fs.writeFileSync(fakeBwrap, [
+        '#!/bin/sh',
+        'while [ "$#" -ge 3 ]; do',
+        '  if [ "$1" = "--bind-fd" ] && [ "$3" = "/home/agent" ]; then',
+        '    actual=$(readlink "/proc/self/fd/$2") || exit 92',
+        '    [ "$actual" = "$PLOINKY_TEST_EXPECTED_HOME" ] || exit 93',
+        '    exit 0',
+        '  fi',
+        '  shift',
+        'done',
+        'exit 91',
+        '',
+    ].join('\n'), { mode: 0o700 });
+    const compiled = compile(stateHelper, { workspaceRoot, bwrapPath: fakeBwrap });
+    assert.equal(compiled.status, 0, compiled.stderr);
+
+    async function launchHomeRecord(home, expectedHome) {
+        return launchWithDescriptor(descriptor([
+            home,
+            record(RECORD.ARG, '--'),
+            record(RECORD.ARG, '/bin/true'),
+        ]), {
+            executable: stateHelper,
+            env: { ...process.env, PLOINKY_TEST_EXPECTED_HOME: expectedHome },
+        });
+    }
+
+    async function launchHome(homeKey) {
+        return launchHomeRecord(homeRecord(1, homeKey), path.join(dataRoot, homeKey));
+    }
+
+    function launchHomeAcrossBarrier(homeKey, mutateAfterReady) {
+        return new Promise((resolve, reject) => {
+            const expectedHome = path.join(dataRoot, homeKey);
+            const child = spawn(stateHelper, [], {
+                env: { ...process.env, PLOINKY_TEST_EXPECTED_HOME: expectedHome },
+                stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
+            });
+            const stdout = [];
+            const stderr = [];
+            child.stdout.on('data', (chunk) => stdout.push(chunk));
+            child.stderr.on('data', (chunk) => stderr.push(chunk));
+            child.on('error', reject);
+            child.stdio[3].on('error', () => {});
+            child.stdio[3].end(descriptor([
+                homeRecord(1, homeKey),
+                barrierRecord(4, 5),
+                record(RECORD.ARG, '--'),
+                record(RECORD.ARG, '/bin/true'),
+            ]));
+            child.stdio[4].once('data', (ready) => {
+                try {
+                    assert.equal(ready.toString('utf8'), 'R');
+                    mutateAfterReady();
+                    child.stdio[5].end('G');
+                } catch (error) {
+                    child.kill();
+                    reject(error);
+                }
+            });
+            child.on('close', (status, signal) => resolve({
+                status,
+                signal,
+                stdout: Buffer.concat(stdout).toString('utf8'),
+                stderr: Buffer.concat(stderr).toString('utf8'),
+            }));
+        });
+    }
+
+    function makeHome(homeKey, marker = homeMarker(homeKey), {
+        homeMode = 0o700,
+        markerMode = 0o600,
+    } = {}) {
+        const homePath = path.join(dataRoot, homeKey);
+        fs.mkdirSync(homePath, { mode: homeMode });
+        if (marker !== null) {
+            fs.writeFileSync(path.join(homePath, '.ploinky-home-abi.json'), marker, {
+                mode: markerMode,
+            });
+        }
+        return homePath;
+    }
+
+    makeHome('valid.sandbox-v2');
+    const valid = await launchHome('valid.sandbox-v2');
+    assert.equal(valid.status, 0, valid.stderr);
+
+    const boundaryGenerationKey = 'boundary-generation.sandbox-v2';
+    makeHome(boundaryGenerationKey,
+        homeMarker(boundaryGenerationKey, `A${'b'.repeat(254)}`));
+    const boundaryGeneration = await launchHome(boundaryGenerationKey);
+    assert.equal(boundaryGeneration.status, 0, boundaryGeneration.stderr);
+
+    const containerNative = await launchHomeRecord(homeRecord(2), '/root');
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+        assert.equal(containerNative.status, 0, containerNative.stderr);
+    } else {
+        assert.equal(containerNative.status, 76, containerNative.stderr);
+        assert.match(containerNative.stderr, /^PLOINKY_HOME_STATE_INCOMPATIBLE:/);
+    }
+
+    const barrierValidKey = 'barrier-valid.sandbox-v2';
+    makeHome(barrierValidKey);
+    const barrierValid = await launchHomeAcrossBarrier(barrierValidKey, () => {});
+    assert.equal(barrierValid.status, 0, barrierValid.stderr);
+
+    const barrierRaceKey = 'barrier-race.sandbox-v2';
+    const barrierRaceHome = makeHome(barrierRaceKey);
+    const barrierRace = await launchHomeAcrossBarrier(barrierRaceKey, () => {
+        const markerPath = path.join(barrierRaceHome, '.ploinky-home-abi.json');
+        fs.rmSync(markerPath);
+        fs.writeFileSync(markerPath, 'replaced-after-first-validation\n', { mode: 0o600 });
+    });
+    assert.equal(barrierRace.status, 76, barrierRace.stderr);
+    assert.match(barrierRace.stderr, /^PLOINKY_HOME_STATE_INCOMPATIBLE:/);
+
+    const fixtures = [
+        {
+            key: 'open-mode.sandbox-v2',
+            options: { homeMode: 0o755 },
+        },
+        {
+            key: 'missing-marker.sandbox-v2',
+            marker: null,
+        },
+        {
+            key: 'marker-mode.sandbox-v2',
+            options: { markerMode: 0o644 },
+        },
+        {
+            key: 'wrong-key.sandbox-v2',
+            marker: homeMarker('different.sandbox-v2'),
+        },
+        {
+            key: 'bad-generation.sandbox-v2',
+            marker: homeMarker('bad-generation.sandbox-v2', 'bad generation'),
+        },
+        {
+            key: 'bad-generation-first.sandbox-v2',
+            marker: homeMarker('bad-generation-first.sandbox-v2', ':bad'),
+        },
+        {
+            key: 'long-generation.sandbox-v2',
+            marker: homeMarker('long-generation.sandbox-v2', `A${'b'.repeat(255)}`),
+        },
+        {
+            key: 'noncanonical.sandbox-v2',
+            marker: `${JSON.stringify({
+                schemaVersion: 2,
+                homeKey: 'noncanonical.sandbox-v2',
+                createdByGeneration: 'generation:phase-4',
+                abi: 'ploinky-home-v2',
+            })}\n`,
+        },
+        {
+            key: 'extra-key.sandbox-v2',
+            marker: '{"abi":"ploinky-home-v2","createdByGeneration":"generation:phase-4","homeKey":"extra-key.sandbox-v2","schemaVersion":2,"extra":true}\n',
+        },
+        {
+            key: 'oversized-marker.sandbox-v2',
+            marker: 'x'.repeat(4097),
+        },
+    ];
+
+    for (const fixture of fixtures) {
+        makeHome(fixture.key, fixture.marker === undefined
+            ? homeMarker(fixture.key)
+            : fixture.marker, fixture.options);
+        const result = await launchHome(fixture.key);
+        assert.equal(result.status, 76, `${fixture.key}: ${result.stderr}`);
+        assert.match(result.stderr, /^PLOINKY_HOME_STATE_INCOMPATIBLE:/);
+    }
+
+    const hardlinkedKey = 'hardlinked-marker.sandbox-v2';
+    const hardlinkedHome = makeHome(hardlinkedKey);
+    fs.linkSync(
+        path.join(hardlinkedHome, '.ploinky-home-abi.json'),
+        path.join(hardlinkedHome, 'marker-link'),
+    );
+    const hardlinked = await launchHome(hardlinkedKey);
+    assert.equal(hardlinked.status, 76, hardlinked.stderr);
+    assert.match(hardlinked.stderr, /^PLOINKY_HOME_STATE_INCOMPATIBLE:/);
+
+    const symlinkMarkerKey = 'symlink-marker.sandbox-v2';
+    const symlinkMarkerHome = makeHome(symlinkMarkerKey, null);
+    fs.writeFileSync(path.join(symlinkMarkerHome, 'marker-target'),
+        homeMarker(symlinkMarkerKey), { mode: 0o600 });
+    fs.symlinkSync('marker-target',
+        path.join(symlinkMarkerHome, '.ploinky-home-abi.json'));
+    const symlinkMarker = await launchHome(symlinkMarkerKey);
+    assert.equal(symlinkMarker.status, 76, symlinkMarker.stderr);
+    assert.match(symlinkMarker.stderr, /^PLOINKY_HOME_STATE_INCOMPATIBLE:/);
+
+    const symlinkHomeKey = 'symlink-home.sandbox-v2';
+    const externalHome = path.join(fixtureRoot, 'external-sandbox-home');
+    fs.mkdirSync(externalHome, { mode: 0o700 });
+    fs.writeFileSync(path.join(externalHome, '.ploinky-home-abi.json'),
+        homeMarker(symlinkHomeKey), { mode: 0o600 });
+    fs.symlinkSync(externalHome, path.join(dataRoot, symlinkHomeKey));
+    const symlinkHome = await launchHome(symlinkHomeKey);
+    assert.equal(symlinkHome.status, 76, symlinkHome.stderr);
+    assert.match(symlinkHome.stderr, /^PLOINKY_HOME_STATE_INCOMPATIBLE:/);
 });
 
 test('workspace root, traversal, protected state, and duplicate targets fail before openat2', async () => {
@@ -335,7 +618,7 @@ test('typed filesystem records enforce exact destinations, collisions, and paren
         record(RECORD.DIR, '/run/ploinky-agent'),
         record(RECORD.DIR, '/opt'),
         record(RECORD.DIR, '/home'),
-        record(RECORD.HOME, '.data/codex'),
+        homeRecord(1, 'codex.sandbox-v2'),
         roPathRecord('/tmp', '/home/agent/.local'),
         record(RECORD.PROC, ''),
         record(RECORD.DEV, ''),
@@ -409,7 +692,7 @@ test('typed filesystem records enforce exact destinations, collisions, and paren
         },
         {
             records: [
-                record(RECORD.HOME, '.data/codex'),
+                homeRecord(1, 'codex.sandbox-v2'),
                 roPathRecord('/tmp', '/home/agent/.local/bin/codex', 2),
                 roPathRecord('/tmp', '/home/agent/.local'),
             ],

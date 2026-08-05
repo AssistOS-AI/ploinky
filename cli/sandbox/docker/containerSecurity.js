@@ -15,7 +15,12 @@ export function resolveContainerSecurity(manifest, profileConfig) {
 }
 
 export function buildContainerSecurityArgs(containerSecurity) {
-    const manifest = { containerSecurity };
+    // This synthetic manifest is admitted only to bind the renderer to a
+    // container-mode descriptor; the image reference is never resolved or run.
+    const manifest = {
+        container: 'docker.io/assistos/ploinky-policy-only:admission',
+        containerSecurity,
+    };
     const admission = admitManifestRuntimeCapabilities(manifest, {
         manifestBytes: Buffer.from(JSON.stringify(manifest), 'utf8'),
         insideBox: false,

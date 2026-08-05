@@ -2,9 +2,12 @@ import { spawnSync } from 'node:child_process';
 
 import {
     containerExists,
-    getRuntime,
     isContainerRunning,
 } from './common.js';
+import {
+    inspectExactPodmanRuntimeIdentity,
+    requireExactPodmanRuntimeIdentity,
+} from './exactPodmanRuntime.js';
 
 export const TARGETED_DRAIN_TIMEOUT_MS = 35_000;
 export const TARGETED_DRAIN_POLL_MS = 100;
@@ -129,15 +132,25 @@ export function drainTargetedContainer(name, {
     assertSelectorsInactive,
     timeoutMs = TARGETED_DRAIN_TIMEOUT_MS,
     pollMs = TARGETED_DRAIN_POLL_MS,
-    runtime = getRuntime(),
+    runtime,
+    containerId,
+    runtimeIdentity,
     exists = containerExists,
     isRunning = isContainerRunning,
     signal = defaultSignal,
     inspect = defaultInspect,
+    inspectRuntimeIdentity = inspectExactPodmanRuntimeIdentity,
     now = () => Date.now(),
     sleep = sleepSync,
 } = {}) {
     const containerName = validateName(name);
+    const identity = requireExactPodmanRuntimeIdentity({
+        runtime,
+        containerName,
+        containerId,
+        instanceId: runtimeIdentity?.instanceId,
+        enableGeneration: runtimeIdentity?.enableGeneration,
+    });
     const boundedTimeout = validateTimeout(timeoutMs);
     const boundedPoll = Math.max(1, Math.min(Number(pollMs) || TARGETED_DRAIN_POLL_MS, boundedTimeout));
     if (acknowledgement !== TARGETED_DRAIN_ACKNOWLEDGEMENT) {
@@ -176,15 +189,16 @@ export function drainTargetedContainer(name, {
             'TARGETED_SELECTOR_ACTIVE',
         );
     }
-    if (!exists(containerName)) {
+    if (!exists(identity.containerId, { runtime: 'podman' })) {
         return Object.freeze({ state: 'absent', containerName, affectedSelectors: selectors });
     }
-    if (!isRunning(containerName)) {
-        const exitCode = assertCleanTermination(containerName, inspect(runtime, containerName));
+    inspectRuntimeIdentity(identity);
+    if (!isRunning(identity.containerId, { runtime: 'podman' })) {
+        const exitCode = assertCleanTermination(containerName, inspect('podman', identity.containerId));
         return Object.freeze({ state: 'already-stopped', containerName, exitCode, affectedSelectors: selectors });
     }
 
-    const signaled = signal(runtime, containerName);
+    const signaled = signal('podman', identity.containerId);
     if (signaled?.error || signaled?.status !== 0) {
         throw lifecycleError(
             `cannot send SIGTERM to targeted container '${containerName}': ${runtimeFailure(signaled)}; selector remains inactive`,
@@ -193,8 +207,8 @@ export function drainTargetedContainer(name, {
     }
 
     const deadline = now() + boundedTimeout;
-    while (isRunning(containerName) && now() < deadline) sleep(Math.min(boundedPoll, Math.max(1, deadline - now())));
-    if (isRunning(containerName)) {
+    while (isRunning(identity.containerId, { runtime: 'podman' }) && now() < deadline) sleep(Math.min(boundedPoll, Math.max(1, deadline - now())));
+    if (isRunning(identity.containerId, { runtime: 'podman' })) {
         throw lifecycleError(
             `targeted drain for '${containerName}' exceeded ${boundedTimeout}ms and the container remains running; refusing SIGKILL, removal, recreate, or selector activation`,
             'TARGETED_DRAIN_TIMEOUT',
@@ -202,26 +216,32 @@ export function drainTargetedContainer(name, {
         );
     }
 
-    const exitCode = assertCleanTermination(containerName, inspect(runtime, containerName));
+    const exitCode = assertCleanTermination(containerName, inspect('podman', identity.containerId));
     return Object.freeze({ state: 'drained', containerName, exitCode, affectedSelectors: selectors });
 }
 
 export function drainAndRemoveTargetedContainer(name, options = {}) {
     const containerName = validateName(name);
-    const runtime = options.runtime || getRuntime();
+    const identity = requireExactPodmanRuntimeIdentity({
+        runtime: options.runtime,
+        containerName,
+        containerId: options.containerId,
+        instanceId: options.runtimeIdentity?.instanceId,
+        enableGeneration: options.runtimeIdentity?.enableGeneration,
+    });
     const exists = options.exists || containerExists;
-    const result = drainTargetedContainer(containerName, { ...options, runtime, exists });
+    const result = drainTargetedContainer(containerName, { ...options, ...identity, exists });
     if (result.state === 'absent') return Object.freeze({ ...result, removed: false });
 
     const remove = options.remove || defaultRemove;
-    const removed = remove(runtime, containerName);
+    const removed = remove('podman', identity.containerId);
     if (removed?.error || removed?.status !== 0) {
         throw lifecycleError(
             `targeted container '${containerName}' drained but could not be removed without force: ${runtimeFailure(removed)}; selector remains inactive`,
             'TARGETED_REMOVE_FAILED',
         );
     }
-    if (exists(containerName)) {
+    if (exists(identity.containerId, { runtime: 'podman' })) {
         throw lifecycleError(
             `targeted container '${containerName}' still exists after non-forced removal; refusing recreate`,
             'TARGETED_REMOVE_FAILED',

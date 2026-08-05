@@ -37,26 +37,48 @@ function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function bwrapReadinessError(message, code = 'BWRAP_AGENT_READINESS_INVALID') {
+const SANDBOX_SERVICE_RUNTIMES = new Set(['bwrap', 'seatbelt']);
+
+function sandboxReadinessError(message, code = 'SANDBOX_AGENT_READINESS_INVALID') {
     const error = new Error(message);
     error.code = code;
     return error;
 }
 
-function exactBwrapReadinessRoute({ route, manifest, runtimeResult, record }) {
-    const containerName = String(runtimeResult?.containerName || route?.container || '').trim();
-    const routeContainer = String(route?.container || '').trim();
-    const effectiveInstanceId = String(record.instanceId || '').trim();
-    const enableGeneration = String(record.enableGeneration || '').trim();
-    const repoName = String(record.repoName || '').trim();
-    const agentName = String(record.agentName || '').trim();
+function exactNonEmptyString(value) {
+    return typeof value === 'string' && value.length > 0 && value === value.trim()
+        ? value
+        : '';
+}
+
+function exactServicePort(value) {
+    return Number.isSafeInteger(value) && value >= 1 && value <= 65535 ? value : null;
+}
+
+function readinessRuntimeError(runtime) {
+    const error = new Error(`agent readiness requires an exact selected runtime; received ${JSON.stringify(runtime)}`);
+    error.code = 'PLOINKY_AGENT_READINESS_RUNTIME_INVALID';
+    return error;
+}
+
+function exactSandboxReadinessRoute({ route, manifest, runtimeResult, record }) {
+    const runtime = record.runtime;
+    const containerName = exactNonEmptyString(runtimeResult?.containerName || route?.container);
+    const routeDeclaresContainer = route?.container !== undefined;
+    const routeContainer = routeDeclaresContainer ? exactNonEmptyString(route.container) : '';
+    const effectiveInstanceId = exactNonEmptyString(record.instanceId);
+    const enableGeneration = exactNonEmptyString(record.enableGeneration);
+    const repoName = exactNonEmptyString(record.repoName);
+    const agentName = exactNonEmptyString(record.agentName);
     const owner = record.bwrapOwner;
-    const runtimeHostPort = resolvePort(runtimeResult?.hostPort);
-    const routeHostPort = resolvePort(route?.hostPort);
-    const ownerHostPort = resolvePort(owner?.rootPort);
+    const runtimeHostPort = exactServicePort(runtimeResult?.hostPort);
+    const routeHostPort = exactServicePort(route?.hostPort);
+    const ownerHostPort = exactServicePort(owner?.rootPort);
     const explicitReadinessPort = resolveAgentReadinessPort(manifest);
 
-    if (!containerName
+    if (!SANDBOX_SERVICE_RUNTIMES.has(runtime)
+        || !containerName
+        || (routeDeclaresContainer && !routeContainer)
         || (routeContainer && routeContainer !== containerName)
         || !effectiveInstanceId
         || !enableGeneration
@@ -74,19 +96,13 @@ function exactBwrapReadinessRoute({ route, manifest, runtimeResult, record }) {
         || !runtimeHostPort
         || !routeHostPort
         || !ownerHostPort
-        || !Number.isSafeInteger(runtimeHostPort)
-        || runtimeHostPort > 65535
-        || !Number.isSafeInteger(routeHostPort)
-        || routeHostPort > 65535
-        || !Number.isSafeInteger(ownerHostPort)
-        || ownerHostPort > 65535
         || runtimeHostPort !== routeHostPort
         || runtimeHostPort !== ownerHostPort) {
-        throw bwrapReadinessError('bwrap readiness requires one exact owner-bound principal, generation, route, and root port');
+        throw sandboxReadinessError('sandbox readiness requires one exact owner-bound principal, generation, route, and root port');
     }
     if (explicitReadinessPort && explicitReadinessPort !== runtimeHostPort) {
-        throw bwrapReadinessError(
-            'bwrap readiness supports only the authenticated root MCP port',
+        throw sandboxReadinessError(
+            'sandbox readiness supports only the authenticated root MCP port',
             'BWRAP_AGENT_PORT_UNSUPPORTED',
         );
     }
@@ -95,20 +111,21 @@ function exactBwrapReadinessRoute({ route, manifest, runtimeResult, record }) {
     try {
         targetAgentId = deriveAgentPrincipalId(repoName, agentName);
     } catch (cause) {
-        throw bwrapReadinessError(`bwrap readiness principal is invalid: ${cause?.message || cause}`);
+        throw sandboxReadinessError(`sandbox readiness principal is invalid: ${cause?.message || cause}`);
     }
-    const bwrapOwner = Object.freeze({ ...owner });
+    const sandboxOwner = Object.freeze({ ...owner });
     return {
         ...route,
         container: containerName,
         hostPort: runtimeHostPort,
-        bwrapReadiness: Object.freeze({
-            kind: 'bwrap-root-mcp',
+        sandboxReadiness: Object.freeze({
+            kind: 'sandbox-root-mcp',
+            runtime,
             targetAgentId,
             effectiveInstanceId,
             enableGeneration,
             hostPort: runtimeHostPort,
-            bwrapOwner,
+            sandboxOwner,
         }),
     };
 }
@@ -120,28 +137,37 @@ export function buildRelayReadinessRoute({
     networkMode = '',
     generationDigest = '',
 } = {}) {
-    const record = runtimeResult?.registryRecord || {};
-    const runtime = String(record.runtime || '').trim();
-    if (runtime === 'bwrap') {
-        return exactBwrapReadinessRoute({ route, manifest, runtimeResult, record });
+    const record = runtimeResult?.registryRecord;
+    const runtime = record?.runtime;
+    if (SANDBOX_SERVICE_RUNTIMES.has(runtime)) {
+        return exactSandboxReadinessRoute({ route, manifest, runtimeResult, record });
     }
+    if (!['docker', 'podman'].includes(runtime)) throw readinessRuntimeError(runtime);
     const port = resolveAgentReadinessPort(manifest);
-    if (!port) return route;
-    const containerId = String(runtimeResult?.containerId || record.containerId || '').trim().toLowerCase();
-    const containerName = String(runtimeResult?.containerName || route?.container || '').trim();
-    const effectiveInstanceId = String(record.instanceId || '').trim();
-    const enableGeneration = String(record.enableGeneration || '').trim();
-    const repoName = String(record.repoName || '').trim();
-    const agentName = String(record.agentName || '').trim();
-    if (!['docker', 'podman'].includes(runtime)
+    const resultContainerId = runtimeResult?.containerId;
+    const recordContainerId = record.containerId;
+    const containerId = resultContainerId;
+    const containerName = exactNonEmptyString(runtimeResult?.containerName || route?.container);
+    const routeDeclaresContainer = route?.container !== undefined;
+    const routeContainer = routeDeclaresContainer ? exactNonEmptyString(route.container) : '';
+    const effectiveInstanceId = exactNonEmptyString(record.instanceId);
+    const enableGeneration = exactNonEmptyString(record.enableGeneration);
+    const repoName = exactNonEmptyString(record.repoName);
+    const agentName = exactNonEmptyString(record.agentName);
+    if (typeof containerId !== 'string'
         || !/^[a-f0-9]{64}$/.test(containerId)
+        || typeof recordContainerId !== 'string'
+        || recordContainerId !== containerId
         || !containerName
+        || (routeDeclaresContainer && !routeContainer)
+        || (routeContainer && routeContainer !== containerName)
         || !effectiveInstanceId
         || !enableGeneration
         || !repoName
         || !agentName) {
-        return route;
+        throw readinessRuntimeError(runtime);
     }
+    if (!port) return { ...route, container: containerName };
     const targetAgentId = deriveAgentPrincipalId(repoName, agentName);
     const digest = String(generationDigest || '').trim() || crypto.createHash('sha256')
         .update(JSON.stringify([
@@ -324,36 +350,37 @@ async function probeAgentMcp(port, timeoutMs = 700) {
     }
 }
 
-function resolveBwrapReadinessRoute(agentOrRoute) {
+function resolveSandboxReadinessRoute(agentOrRoute) {
     const route = typeof agentOrRoute === 'string'
         ? resolveAgentRoute(agentOrRoute)
         : agentOrRoute;
-    const readiness = route?.bwrapReadiness;
-    if (readiness?.kind !== 'bwrap-root-mcp'
-        || !String(readiness.targetAgentId || '').trim()
-        || !String(readiness.effectiveInstanceId || '').trim()
-        || !String(readiness.enableGeneration || '').trim()
+    const readiness = route?.sandboxReadiness;
+    if (readiness?.kind !== 'sandbox-root-mcp'
+        || !SANDBOX_SERVICE_RUNTIMES.has(readiness.runtime)
+        || !exactNonEmptyString(readiness.targetAgentId)
+        || !exactNonEmptyString(readiness.effectiveInstanceId)
+        || !exactNonEmptyString(readiness.enableGeneration)
         || !Number.isInteger(readiness.hostPort)
         || readiness.hostPort < 1
         || readiness.hostPort > 65535
-        || readiness.hostPort !== resolvePort(route?.hostPort)
-        || !readiness.bwrapOwner
-        || typeof readiness.bwrapOwner !== 'object'
-        || Array.isArray(readiness.bwrapOwner)) {
+        || readiness.hostPort !== exactServicePort(route?.hostPort)
+        || !readiness.sandboxOwner
+        || typeof readiness.sandboxOwner !== 'object'
+        || Array.isArray(readiness.sandboxOwner)) {
         return null;
     }
     return route;
 }
 
-function hasBwrapReadinessMarker(agentOrRoute) {
+function hasSandboxReadinessMarker(agentOrRoute) {
     const route = typeof agentOrRoute === 'string'
         ? resolveAgentRoute(agentOrRoute)
         : agentOrRoute;
-    return Boolean(route && Object.prototype.hasOwnProperty.call(route, 'bwrapReadiness'));
+    return Boolean(route && Object.prototype.hasOwnProperty.call(route, 'sandboxReadiness'));
 }
 
-function verifyBwrapReadinessOwner(route) {
-    assertExactServiceOwner(route.bwrapReadiness.bwrapOwner);
+function verifySandboxReadinessOwner(route) {
+    assertExactServiceOwner(route.sandboxReadiness.sandboxOwner);
     return true;
 }
 
@@ -370,12 +397,12 @@ function bwrapInitializeParams() {
     };
 }
 
-async function probeBwrapMcp(route, timeoutMs, {
-    beforeDial = verifyBwrapReadinessOwner,
+async function probeSandboxMcp(route, timeoutMs, {
+    beforeDial = verifySandboxReadinessOwner,
     createConnection = net.createConnection,
     mintRouterRequest = buildRouterRequest,
 } = {}) {
-    const readiness = route.bwrapReadiness;
+    const readiness = route.sandboxReadiness;
     const params = bwrapInitializeParams();
     const payload = {
         jsonrpc: '2.0',
@@ -401,15 +428,15 @@ async function probeBwrapMcp(route, timeoutMs, {
     });
     const token = typeof minted === 'string' ? minted : minted?.token;
     if (typeof token !== 'string' || !token) {
-        throw bwrapReadinessError('bwrap readiness minter returned no router-request token');
+        throw sandboxReadinessError('sandbox readiness minter returned no router-request token');
     }
 
     const ownerCheckedAgent = new http.Agent({ keepAlive: false });
     ownerCheckedAgent.createConnection = (options, callback) => {
         if (beforeDial(route) !== true) {
-            throw bwrapReadinessError(
-                'bwrap readiness owner verification rejected the socket',
-                'BWRAP_AGENT_OWNER_INVALID',
+            throw sandboxReadinessError(
+                'sandbox readiness owner verification rejected the socket',
+                'SANDBOX_AGENT_OWNER_INVALID',
             );
         }
         return createConnection(options, callback);
@@ -613,49 +640,49 @@ export async function waitForAgentReady(agentOrRoute, {
     onProgress = null,
     beforeProbe = null,
     relayProbe = probeRelay,
-    bwrapProbe = probeBwrapMcp,
-    bwrapBeforeDial = verifyBwrapReadinessOwner,
-    bwrapCreateConnection = net.createConnection,
-    bwrapMintRouterRequest = buildRouterRequest,
+    sandboxProbe = probeSandboxMcp,
+    sandboxBeforeDial = verifySandboxReadinessOwner,
+    sandboxCreateConnection = net.createConnection,
+    sandboxMintRouterRequest = buildRouterRequest,
 } = {}) {
     const readinessTarget = typeof agentOrRoute === 'string'
         && !/^\d+$/.test(agentOrRoute.trim())
         ? resolveAgentRoute(agentOrRoute.trim())
         : agentOrRoute;
-    const bwrapRoute = resolveBwrapReadinessRoute(readinessTarget);
-    if (hasBwrapReadinessMarker(readinessTarget) && !bwrapRoute) return false;
+    const sandboxRoute = resolveSandboxReadinessRoute(readinessTarget);
+    if (hasSandboxReadinessMarker(readinessTarget) && !sandboxRoute) return false;
     const relayRoute = resolveRelayReadinessRoute(readinessTarget);
     const port = resolveAgentPort(readinessTarget);
-    if (!bwrapRoute && !relayRoute && !port) {
+    if (!sandboxRoute && !relayRoute && !port) {
         return false;
     }
     const deadline = Date.now() + Math.max(0, timeoutMs);
     const normalizedProtocol = String(protocol || 'mcp').trim().toLowerCase();
     if (!['tcp', 'mcp'].includes(normalizedProtocol)) return false;
-    if (bwrapRoute && normalizedProtocol !== 'mcp') return false;
+    if (sandboxRoute && normalizedProtocol !== 'mcp') return false;
     const startedAt = Date.now();
     let attempt = 0;
     while (true) {
         attempt += 1;
         if (beforeProbe && beforeProbe() !== true) return false;
-        if (bwrapRoute) {
+        if (sandboxRoute) {
             let ready = false;
             let lastError = '';
             try {
-                ready = await bwrapProbe(
-                    bwrapRoute,
+                ready = await sandboxProbe(
+                    sandboxRoute,
                     Math.max(500, probeTimeoutMs * 2),
                     {
-                        beforeDial: bwrapBeforeDial,
-                        createConnection: bwrapCreateConnection,
-                        mintRouterRequest: bwrapMintRouterRequest,
+                        beforeDial: sandboxBeforeDial,
+                        createConnection: sandboxCreateConnection,
+                        mintRouterRequest: sandboxMintRouterRequest,
                     },
                 );
             } catch (error) {
                 lastError = error?.code || error?.message || 'error';
             }
             onProgress?.({
-                port: bwrapRoute.bwrapReadiness.hostPort,
+                port: sandboxRoute.sandboxReadiness.hostPort,
                 protocol: normalizedProtocol,
                 elapsedMs: Date.now() - startedAt,
                 timeoutMs,

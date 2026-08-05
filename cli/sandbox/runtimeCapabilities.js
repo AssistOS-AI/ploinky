@@ -16,6 +16,10 @@ import {
     emitRunArgs,
     validatePolicyShape,
 } from './docker/containerRuntimePolicy.js';
+import {
+    assertValidLiteSandboxSelector,
+    requireUsableContainerDeclaration,
+} from '../utils/runtime/agentRuntimeSelector.js';
 
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 export const RUNTIME_ADMISSION_SCHEMA_VERSION = 2;
@@ -211,17 +215,8 @@ export function validateManifestRuntimeCapabilities(manifest, {
     if (!isPlainObject(manifest)) {
         throw securityError(`${path} must be a plain object`, { agentId, path });
     }
+    assertValidLiteSandboxSelector(manifest, { agentId, path });
     const context = { agentId: String(agentId || ''), path: String(path || 'manifest') };
-    if (manifest['lite-sandbox'] === true
-        && Object.prototype.hasOwnProperty.call(manifest, 'container')) {
-        throw new RuntimeCapabilityError(
-            `${path}.container is incompatible with lite-sandbox: true`,
-            {
-                code: 'PLOINKY_SANDBOX_CONTAINER_CONFLICT',
-                context,
-            },
-        );
-    }
     rejectDirectCapabilityFields(manifest, path, context);
     const containerSecurity = validateContainerSecurityBlock(manifest.containerSecurity, context);
     validateLlmRuntimeBlock(manifest.llmRuntime, `${path}.llmRuntime`, context);
@@ -469,6 +464,12 @@ export function admitManifestRuntimeCapabilities(manifest, {
                 context: { agentId: String(agentId || ''), runtimeKind },
             },
         );
+    }
+    if (!hostSandboxRuntime) {
+        requireUsableContainerDeclaration(exactManifest, {
+            agentId,
+            path: agentId ? `manifest(${agentId})` : 'manifest',
+        });
     }
     const effectiveNetwork = hostSandboxRuntime
         ? deriveHostSandboxNetworkContract(exactManifest, {

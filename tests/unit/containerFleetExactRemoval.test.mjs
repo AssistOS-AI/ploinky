@@ -15,6 +15,7 @@ const WORKSPACE_HASH = 'workspace-identity';
 function registryRecord(overrides = {}) {
     return {
         type: 'agent',
+        runtime: 'podman',
         containerId: CONTAINER_ID,
         instanceId: 'instance-exact',
         enableGeneration: 'generation-exact',
@@ -147,14 +148,26 @@ test('fleet removal preserves absent, incomplete, and legacy registry targets', 
     assert.equal(controls, 0);
 
     for (const invalid of [
+        registryRecord({ runtime: 'docker' }),
+        registryRecord({ runtime: ' podman' }),
         registryRecord({ containerId: NAME }),
+        registryRecord({ containerId: ` ${CONTAINER_ID}` }),
         registryRecord({ type: 'agentCore' }),
         registryRecord({ instanceId: '' }),
+        registryRecord({ instanceId: ' instance-exact' }),
         registryRecord({ enableGeneration: '' }),
+        registryRecord({ enableGeneration: 'generation-exact ' }),
     ]) {
         assert.throws(
             () => removeExactContainerAndDescriptor(NAME, invalid, 'podman'),
-            /immutable registry container ID|complete managed-agent registry identity/,
+            /runtime must be exactly 'podman'|immutable registry container ID|complete managed-agent registry identity|current managed-agent registry record/,
+        );
+    }
+
+    for (const runtime of ['docker', ' podman', 'podman ', '', undefined]) {
+        assert.throws(
+            () => removeExactContainerAndDescriptor(NAME, registryRecord(), runtime),
+            /runtime must be exactly 'podman'/,
         );
     }
 });
@@ -170,5 +183,6 @@ test('fleet bulk lifecycle contains no mutable-name signal/removal fallback', ()
     );
     assert.doesNotMatch(bulk, /execSync\(/);
     assert.doesNotMatch(bulk, /\['rm', '-f', name\]/);
-    assert.match(bulk, /removeExactContainerAndDescriptor\(name, record, runtime/);
+    assert.match(bulk, /removeExactContainerAndDescriptor\(name, record, 'podman'/);
+    assert.doesNotMatch(bulk, /getRuntime\(|probeContainerRuntime\(/);
 });

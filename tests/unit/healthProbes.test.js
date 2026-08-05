@@ -32,6 +32,27 @@ const {
 } = __testConstants;
 
 const containerName = 'test_container_health';
+const containerId = 'a'.repeat(64);
+
+function exactPodmanProbe(overrides = {}) {
+    return {
+        runtime: 'podman',
+        containerId,
+        instanceId: 'instance-health',
+        enableGeneration: 'generation-health',
+        inspectRuntimeIdentityImpl(identity) {
+            assert.deepEqual(identity, {
+                runtime: 'podman',
+                containerName: identity.containerName,
+                containerId,
+                instanceId: 'instance-health',
+                enableGeneration: 'generation-health',
+            });
+            return { identity };
+        },
+        ...overrides,
+    };
+}
 
 function resetContainerState() {
     clearLivenessState(containerName);
@@ -136,8 +157,7 @@ test('blocking container script readiness succeeds after the configured success 
         timeout: 2,
         failureThreshold: 3,
         successThreshold: 2,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: (() => {
             let sequence = 0;
             return () => `success-${sequence += 1}`;
@@ -148,14 +168,14 @@ test('blocking container script readiness succeeds after the configured success 
         ], calls),
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
-    });
+    }));
 
     assert.equal(result.status, 'success');
     assert.equal(result.detail, 'ready');
     assert.equal(calls.length, 3);
     assert.deepEqual(calls[1].args.slice(0, 6), [
         'exec',
-        'database-container',
+        containerId,
         'sh',
         '/Agent/server/HealthProbeRunner.sh',
         'run',
@@ -178,15 +198,14 @@ test('blocking container script readiness reports nonzero exhaustion', () => {
         interval: 0.001,
         timeout: 1,
         failureThreshold: 2,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         spawnSyncImpl: fakeSpawnSequence([
             { status: 9, stdout: '', stderr: 'not ready\n' },
             { status: 9, stdout: '', stderr: 'still not ready\n' },
         ], calls),
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
-    });
+    }));
 
     assert.deepEqual(result, {
         status: 'failed',
@@ -201,15 +220,14 @@ test('blocking container script readiness reports the in-container hard deadline
         script: 'healthcheck.sh',
         timeout: 0.01,
         failureThreshold: 1,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'inner-timeout',
         spawnSyncImpl: fakeSpawnSequence([
             { status: 124, stdout: '', stderr: '' },
         ], calls),
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
-    });
+    }));
 
     assert.deepEqual(result, { status: 'failed', reason: 'timeout', detail: '' });
     assert.equal(
@@ -225,12 +243,11 @@ test('probe identity rejects unsafe generated tokens before runtime execution', 
         script: 'healthcheck.sh',
         timeout: 1,
         failureThreshold: 1,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'unsafe token; touch /tmp/escaped',
         spawnSyncImpl: fakeSpawnSequence([], calls),
         isContainerRunningImpl() { return true; },
-    }), /generated probe token is invalid/);
+    })), /generated probe token is invalid/);
     assert.equal(calls.length, 1, 'only the argv-safe script existence check may run');
 });
 
@@ -240,8 +257,7 @@ test('probe termination without an exit status fails closed', () => {
         script: 'healthcheck.sh',
         timeout: 1,
         failureThreshold: 1,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'signal-exit',
         spawnSyncImpl: fakeSpawnSequence([
             { status: null, signal: 'SIGKILL', stdout: '', stderr: '' },
@@ -249,7 +265,7 @@ test('probe termination without an exit status fails closed', () => {
         ], calls),
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
-    });
+    }));
 
     assert.deepEqual(result, { status: 'failed', reason: 'exit 125', detail: '' });
     assert.equal(calls.some(({ args }) => args.includes('cleanup')), true);
@@ -263,8 +279,7 @@ test('non-timeout client errors clean the exact execution before surfacing', () 
         script: 'healthcheck.sh',
         timeout: 1,
         failureThreshold: 1,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'client-error',
         spawnSyncImpl: fakeSpawnSequence([
             { status: null, error: clientError, stdout: '', stderr: '' },
@@ -272,7 +287,7 @@ test('non-timeout client errors clean the exact execution before surfacing', () 
         ], calls),
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
-    }), /failed to run 'healthcheck\.sh': client output overflow/);
+    })), /failed to run 'healthcheck\.sh': client output overflow/);
     assert.deepEqual(calls[2].args.slice(-3), [
         'cleanup',
         '/tmp/.ploinky-health-probe-client-error',
@@ -288,8 +303,7 @@ test('outer exec timeout invokes exact marker cleanup before reporting timeout',
         script: 'healthcheck.sh',
         timeout: 0.01,
         failureThreshold: 1,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'outer-timeout',
         spawnSyncImpl: fakeSpawnSequence([
             { status: null, signal: 'SIGTERM', error: timeoutError, stdout: '', stderr: '' },
@@ -297,12 +311,12 @@ test('outer exec timeout invokes exact marker cleanup before reporting timeout',
         ], calls),
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
-    });
+    }));
 
     assert.deepEqual(result, { status: 'failed', reason: 'timeout', detail: '' });
     assert.deepEqual(calls[2].args, [
         'exec',
-        'database-container',
+        containerId,
         'sh',
         '/Agent/server/HealthProbeRunner.sh',
         'cleanup',
@@ -320,8 +334,7 @@ test('outer exec timeout fails closed when exact cleanup cannot be proved', () =
         script: 'healthcheck.sh',
         timeout: 0.01,
         failureThreshold: 1,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'cleanup-failure',
         spawnSyncImpl: fakeSpawnSequence([
             { status: null, error: timeoutError, stdout: '', stderr: '' },
@@ -329,7 +342,7 @@ test('outer exec timeout fails closed when exact cleanup cannot be proved', () =
         ], []),
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
-    }), (error) => {
+    })), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_CLEANUP_FAILED');
         assert.match(error.message, /descendant survived/);
         return true;
@@ -343,8 +356,7 @@ test('reserved runner cleanup failure is fatal and cannot enter the retry loop',
         interval: 0.001,
         timeout: 1,
         failureThreshold: 180,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'runner-cleanup-failure',
         spawnSyncImpl: fakeSpawnSequence([
             {
@@ -358,7 +370,7 @@ test('reserved runner cleanup failure is fatal and cannot enter the retry loop',
             assert.fail('unsafe cleanup must not be retried');
         },
         isContainerRunningImpl() { return true; },
-    }), (error) => {
+    })), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_EXECUTION_UNSAFE');
         assert.match(error.message, /descendants survived cleanup/);
         return true;
@@ -374,13 +386,12 @@ test('reserved runner cleanup failure is fatal and cannot enter the retry loop',
 test('blocking container script readiness fails fast when the script is missing', () => {
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'missing.sh',
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         spawnSyncImpl(_runtime, args) {
             assert.ok(args.at(-1).startsWith('[ -f '));
             return { status: 1 };
         },
-    }), /missing\.sh not found inside container/);
+    })), /missing\.sh not found inside container/);
 });
 
 test('script inspection has a hard deadline and reports a typed timeout', () => {
@@ -389,14 +400,13 @@ test('script inspection has a hard deadline and reports a typed timeout', () => 
     const calls = [];
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         controlPlaneTimeoutMs: 123,
         spawnSyncImpl(runtime, args, options) {
             calls.push({ runtime, args, options });
             return { status: null, error: timeoutError };
         },
-    }), (error) => {
+    })), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
         assert.match(error.message, /runtime did not answer/);
         return true;
@@ -412,14 +422,13 @@ test('blocking container script readiness fails immediately after the container 
         script: 'healthcheck.sh',
         interval: 30,
         failureThreshold: 60,
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         spawnSyncImpl: fakeSpawnSequence([], calls),
         isContainerRunningImpl() { return false; },
         sleepMsImpl() {
             assert.fail('an exited container must not consume another probe interval');
         },
-    });
+    }));
 
     assert.deepEqual(result, {
         status: 'failed',
@@ -445,15 +454,14 @@ test('continuous health runs cheap liveness while activation-only readiness stay
                 continuous: false,
             },
         },
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'liveness-only',
         waitForContainerRunningImpl() { return true; },
         isContainerRunningImpl() { return true; },
         spawnSyncImpl: fakeSpawnSequence([
             { status: 0, stdout: 'live\n', stderr: '' },
         ], calls),
-    });
+    }));
 
     const executedScripts = calls
         .filter(({ args }) => args.includes('/Agent/server/HealthProbeRunner.sh'))
@@ -474,9 +482,9 @@ test('activation-only readiness without recurring liveness fails closed', () => 
                 continuous: false,
             },
         },
-    }, {
+    }, exactPodmanProbe({
         waitForContainerRunningImpl() { return true; },
-    }), (error) => {
+    })), (error) => {
         assert.equal(error.code, 'PLOINKY_CONTINUOUS_PROBE_REQUIRED');
         assert.match(error.message, /requires a recurring health\.liveness\.script/);
         return true;
@@ -492,15 +500,14 @@ test('recurring readiness exhaustion is fatal to the probe worker cycle', () => 
                 failureThreshold: 1,
             },
         },
-    }, {
-        runtime: 'fake-runtime',
+    }, exactPodmanProbe({
         tokenFactory: () => 'readiness-failure',
         waitForContainerRunningImpl() { return true; },
         isContainerRunningImpl() { return true; },
         spawnSyncImpl: fakeSpawnSequence([
             { status: 7, stdout: '', stderr: 'semantic dependency unavailable\n' },
         ], calls),
-    }), (error) => {
+    })), (error) => {
         assert.equal(error.code, 'PLOINKY_READINESS_FAILED');
         assert.match(error.message, /readiness probe failed \(exit 7, output='semantic dependency unavailable'\)/);
         assert.match(error.message, /managed restart required/);
@@ -510,6 +517,31 @@ test('recurring readiness exhaustion is fatal to the probe worker cycle', () => 
         calls.filter(({ args }) => args.includes('/Agent/server/HealthProbeRunner.sh')).length,
         1,
     );
+});
+
+test('Podman health probes reject generic, missing, or incomplete runtime identity before execution', () => {
+    for (const options of [
+        {},
+        { runtime: 'docker' },
+        { runtime: 'container' },
+        { runtime: 'podman', containerId: 'short', instanceId: 'i', enableGeneration: 'g' },
+        { runtime: 'podman', containerId, instanceId: ' padded ', enableGeneration: 'g' },
+    ]) {
+        let calls = 0;
+        assert.throws(
+            () => runContainerScriptReadiness('database', 'database-container', {
+                script: 'healthcheck.sh',
+            }, {
+                ...options,
+                spawnSyncImpl() {
+                    calls += 1;
+                    return { status: 0 };
+                },
+            }),
+            (error) => error?.code === 'PLOINKY_PODMAN_RUNTIME_IDENTITY_INVALID',
+        );
+        assert.equal(calls, 0);
+    }
 });
 
 test('probe runner is executable and binds cleanup to exact kernel identity', () => {

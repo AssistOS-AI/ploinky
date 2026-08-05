@@ -161,12 +161,16 @@ test('container adapter preserves the signed generated-local container contract'
         'utf8',
     ));
     env.PLOINKY_ROUTER_DESCRIPTOR_FILE = descriptorFile;
+    env.PLOINKY_AGENT_HOME_KEY = 'AchillesCLI_achilles-cli';
+    env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY = 'generated';
     env.PLOINKY_AGENT_SECRET = secret;
     env.PLOINKY_AGENT_PRIVATE_SECRET = privateSecret;
 
     const context = createContainerAgentCredentialContext(env);
     assert.equal(context.source, 'container-generated-env-v1');
     assert.equal(context.runtime.runtimeKind, 'container');
+    assert.equal(context.runtime.runtimeKey, 'AchillesCLI_achilles-cli');
+    assert.equal(context.runtime.homeKey, 'AchillesCLI_achilles-cli');
     assert.equal(context.runtime.routeKey, 'achilles-cli');
     assert.equal(context.router.physicalOrigin, 'http://host.containers.internal:8080');
     assert.equal(context.router.requestAuthority, '127.0.0.1:18080');
@@ -187,5 +191,19 @@ test('container adapter preserves the signed generated-local container contract'
             PLOINKY_AGENT_PRIVATE_SECRET: undefined,
         }),
         /PLOINKY_AGENT_PRIVATE_SECRET is invalid/,
+    );
+    assert.throws(
+        () => createContainerAgentCredentialContext({
+            ...env,
+            PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY: 'manifest',
+        }),
+        /generated provenance/,
+    );
+    assert.throws(
+        () => createContainerAgentCredentialContext({
+            ...env,
+            PLOINKY_AGENT_HOME_KEY: '../other-home',
+        }),
+        /exact safe container HOME key/,
     );
 });

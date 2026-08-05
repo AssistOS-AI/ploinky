@@ -907,34 +907,66 @@ function compileAgentMcpRouteClosure(rootRouteKey, routing, manifests, agents) {
     return [...allowed].sort();
 }
 
-function validateBwrapRootOwnerBindings(routing, agents) {
+const EDGE_AGENT_RUNTIMES = new Set(['podman', 'bwrap', 'seatbelt']);
+const EDGE_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
+
+function exactEdgeString(value) {
+    return typeof value === 'string' && value.length > 0 && value === value.trim()
+        ? value
+        : '';
+}
+
+function validateSandboxRootOwnerBindings(routing, agents) {
     for (const [routeKey, route] of Object.entries(routing.routes || {})) {
         if (!route || route.disabled) continue;
-        const containerName = String(route.container || '').trim();
+        const containerName = exactEdgeString(route.container);
         const record = agents?.[containerName];
-        if (!containerName || !isPlainObject(record) || record.type !== 'agent') continue;
-        if (String(record.runtime || '').trim() !== 'bwrap') continue;
+        if (!containerName || !isPlainObject(record) || record.type !== 'agent') {
+            throw edgeError(
+                `route '${routeKey}' has no exact selected agent runtime record`,
+                'PLOINKY_AGENT_RUNTIME_INVALID',
+            );
+        }
+        if (!EDGE_AGENT_RUNTIMES.has(record.runtime)) {
+            throw edgeError(
+                `route '${routeKey}' has an invalid selected runtime`,
+                'PLOINKY_AGENT_RUNTIME_INVALID',
+            );
+        }
+        if (!exactEdgeString(record.repoName)
+            || !exactEdgeString(record.agentName)
+            || !exactEdgeString(record.instanceId)
+            || !exactEdgeString(record.enableGeneration)
+            || record.repoName !== route.repo
+            || record.agentName !== route.agent) {
+            throw edgeError(
+                `route '${routeKey}' runtime identity does not match its exact route and generation`,
+                'PLOINKY_AGENT_RUNTIME_INVALID',
+            );
+        }
+        if (!EDGE_SANDBOX_RUNTIMES.has(record.runtime)) continue;
         let owner;
         try {
             owner = normalizeExactServiceOwnerAttestation(record.bwrapOwner);
         } catch (cause) {
             throw edgeError(
-                `bwrap route '${routeKey}' has no exact immutable service owner: ${cause?.message || cause}`,
-                'BWRAP_AGENT_OWNER_INVALID',
+                `sandbox route '${routeKey}' has no exact immutable service owner: ${cause?.message || cause}`,
+                'SANDBOX_AGENT_OWNER_INVALID',
             );
         }
-        const hostPort = Number(route.hostPort);
-        if (String(record.repoName || '') !== String(route.repo || '')
-            || String(record.agentName || '') !== String(route.agent || '')
+        const hostPort = route.hostPort;
+        if (!Number.isSafeInteger(hostPort)
+            || hostPort < 1
+            || hostPort > 65535
             || owner.runtimeKey !== containerName
             || owner.routeKey !== routeKey
             || owner.rootPort !== hostPort
             || owner.pid !== record.pid
-            || owner.instanceId !== String(record.instanceId || '').trim()
-            || owner.enableGeneration !== String(record.enableGeneration || '').trim()) {
+            || owner.instanceId !== record.instanceId
+            || owner.enableGeneration !== record.enableGeneration) {
             throw edgeError(
-                `bwrap route '${routeKey}' service owner does not match its exact route and generation`,
-                'BWRAP_AGENT_OWNER_INVALID',
+                `sandbox route '${routeKey}' service owner does not match its exact route and generation`,
+                'SANDBOX_AGENT_OWNER_INVALID',
             );
         }
     }
@@ -944,7 +976,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);
     assertObject(agents, 'agents registry');
-    validateBwrapRootOwnerBindings(routing, agents);
+    validateSandboxRootOwnerBindings(routing, agents);
     const normalizedDesired = normalizeDesired(desired);
     const hostNetworkCapabilities = collectManifestHostNetworkCapabilities(routing, manifests, agents);
     const turnCredentialConsumers = (normalizedDesired.turn?.credentialConsumers || []).map((agentRef) => (

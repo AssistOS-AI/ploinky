@@ -9,6 +9,8 @@ const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 const ploinkyDir = path.join(workspace, '.ploinky');
 const agentDir = path.join(ploinkyDir, 'repos', 'demo', 'unsafe');
+const OLD_CONTAINER_ID = 'a'.repeat(64);
+const NEW_CONTAINER_ID = 'b'.repeat(64);
 fs.mkdirSync(agentDir, { recursive: true });
 fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
     unsafe_runtime: {
@@ -17,7 +19,8 @@ fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
         agentName: 'unsafe',
         instanceId: 'instance-one',
         enableGeneration: 'enable-one',
-        runtime: 'container',
+        runtime: 'podman',
+        containerId: OLD_CONTAINER_ID,
     },
 }, null, 2));
 fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
@@ -102,7 +105,8 @@ test('watchdog restart attempt rejects concurrent registry drift before runtime 
         agentName: 'unsafe',
         instanceId: 'instance-one',
         enableGeneration: 'enable-one',
-        runtime: 'container',
+        runtime: 'podman',
+        containerId: OLD_CONTAINER_ID,
     };
     fs.writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
         unsafe_runtime: originalRecord,
@@ -145,16 +149,17 @@ test('watchdog restart attempt preserves its staged successor across monitor syn
         agentName: 'unsafe',
         instanceId: 'instance-old',
         enableGeneration: 'enable-old',
-        runtime: 'container',
+        runtime: 'podman',
+        containerId: OLD_CONTAINER_ID,
     };
     const stagedRecord = {
         ...originalRecord,
         instanceId: 'instance-new',
         enableGeneration: 'enable-new',
+        containerId: NEW_CONTAINER_ID,
     };
     const finalRecord = {
         ...stagedRecord,
-        containerId: 'container-new',
         config: { ports: [{ containerPort: 7000, hostPort: 43123 }] },
     };
     const agentsFile = path.join(ploinkyDir, 'agents.json');
@@ -188,6 +193,7 @@ test('watchdog restart attempt preserves its staged successor across monitor syn
         fs.writeFileSync(agentsFile, JSON.stringify({ unsafe_runtime: stagedRecord }, null, 2));
         return {
             containerName: 'unsafe_runtime',
+            containerId: NEW_CONTAINER_ID,
             hostPort: 43123,
             registryRecord: structuredClone(finalRecord),
             stagedRegistryRecord: structuredClone(stagedRecord),

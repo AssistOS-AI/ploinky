@@ -50,14 +50,14 @@
 #endif
 
 /*
- * ploinky-bwrap-launch wire protocol, version 1
+ * ploinky-bwrap-launch wire protocol, version 2
  *
  * Normal launch has no command-line options. The complete non-secret launch
  * description is read from inherited fd 3. Introspection is limited to the
  * exact --version and --capabilities commands.
  *
  * Header (16 bytes):
- *   0..7   ASCII "PLBWLP01"
+ *   0..7   ASCII "PLBWLP02"
  *   8..11  big-endian record count
  *   12..15 zero
  *
@@ -73,8 +73,17 @@
  *                to PLOINKY_WORKSPACE_ROOT and /workspace
  *   3 WORKDIR    existing protected-policy-checked workspace-relative dir;
  *                emitted RW at the identical /workspace/<relative> target
- *   4 HOME       exact .data/<runtime-key> workspace-relative dir; emitted
- *                RW at /home/agent
+ *   4 HOME       byte source kind followed by its typed payload:
+ *                1=sandbox-workspace-v2 plus one exact safe <home-key>
+ *                  ending .sandbox-v2; helper derives .data/<home-key>
+ *                2=container-native with no trailing payload; helper derives
+ *                  fixed /root beneath its retained filesystem root fd
+ *                Both are emitted RW at /home/agent. No caller path is used,
+ *                and both dirs require euid ownership and exact mode 0700.
+ *                Source kind 1 additionally openat2-pins a regular euid-owned
+ *                mode-0600, single-link, <=4096-byte .ploinky-home-abi.json
+ *                and requires exact canonical ploinky-home-v2 schema-2 JSON
+ *                for its home key before exec.
  *   5 RO_PATH    byte source type (1=directory, 2=regular file), u16 source
  *                length, u16 target length, then absolute source and target
  *   6 DIR        one normalized absolute directory target
@@ -86,7 +95,8 @@
  *                2=usr/sbin->/sbin, 3=usr/lib->/lib, 4=usr/lib64->/lib64
  *  11 PREEXEC_BARRIER two big-endian u32 inherited fds: ready-write then
  *                release-read. Helper writes 'R', closes ready, requires one
- *                'G', and closes release after path opens but before exec.
+ *                'G', closes release, and revalidates every retained HOME
+ *                (including the current marker entry) before exec.
  *
  * All mount sources are opened only after the complete message, argv, mount
  * destinations, and duplicate checks have passed. Workspace-relative opens
@@ -115,6 +125,8 @@ enum {
     MAX_PATH_BYTES = 4096,
     MAX_PRESERVED_FDS = 16,
     MAX_RO_DATA_FILE_BYTES = 4 * 1024 * 1024,
+    MAX_HOME_KEY_BYTES = 255,
+    MAX_HOME_MARKER_BYTES = 4096,
 };
 
 enum record_type {
@@ -150,6 +162,11 @@ enum source_type {
     SOURCE_REGULAR = 2,
 };
 
+enum home_source_kind {
+    HOME_SOURCE_SANDBOX_WORKSPACE_V2 = 1,
+    HOME_SOURCE_CONTAINER_NATIVE = 2,
+};
+
 enum exit_status {
     EXIT_PROTOCOL_INVALID = 64,
     EXIT_PROTOCOL_TOO_LARGE = 65,
@@ -161,6 +178,7 @@ enum exit_status {
     EXIT_PATH_INVALID = 73,
     EXIT_BWRAP_UNAVAILABLE = 74,
     EXIT_BWRAP_EXEC_FAILED = 75,
+    EXIT_HOME_STATE_INCOMPATIBLE = 76,
 };
 
 struct open_how_compat {
@@ -179,6 +197,7 @@ struct record {
 struct mount {
     enum mount_kind kind;
     enum source_type source_type;
+    enum home_source_kind home_source_kind;
     bool writable;
     const unsigned char *source;
     size_t source_length;
@@ -422,24 +441,57 @@ static void validate_workdir(const unsigned char *bytes, size_t length)
     }
 }
 
-static void validate_home(const unsigned char *bytes, size_t length)
+static bool home_key_has_sandbox_suffix(const unsigned char *bytes, size_t length)
 {
+    static const char suffix[] = ".sandbox-v2";
+
+    return length > sizeof(suffix) - 1 &&
+           memcmp(bytes + length - (sizeof(suffix) - 1), suffix,
+                  sizeof(suffix) - 1) == 0;
+}
+
+static enum home_source_kind validate_home(
+    const unsigned char *bytes, size_t length,
+    const unsigned char **home_key, size_t *home_key_length)
+{
+    enum home_source_kind kind;
     size_t i;
 
-    if (!is_clean_relative_path(bytes, length) ||
-        relative_component_count(bytes, length) != 2 ||
-        !component_equals(bytes, length, 0, ".data")) {
-        fail(EXIT_PATH_INVALID, "PLOINKY_HOME_PATH_INVALID",
-             "HOME source must be exactly .data/<runtime-key>");
+    if (length == 0) {
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "HOME source kind is missing");
     }
-    for (i = sizeof(".data/") - 1; i < length; i++) {
+    kind = (enum home_source_kind)bytes[0];
+    if (kind == HOME_SOURCE_CONTAINER_NATIVE) {
+        if (length != 1) {
+            fail(EXIT_HOME_STATE_INCOMPATIBLE,
+                 "PLOINKY_HOME_STATE_INCOMPATIBLE",
+                 "container-native HOME has an unexpected caller payload");
+        }
+        *home_key = NULL;
+        *home_key_length = 0;
+        return kind;
+    }
+    if (kind != HOME_SOURCE_SANDBOX_WORKSPACE_V2 || length <= 1 ||
+        length - 1 > MAX_HOME_KEY_BYTES ||
+        !home_key_has_sandbox_suffix(bytes + 1, length - 1)) {
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "sandbox HOME requires one safe homeKey ending .sandbox-v2");
+    }
+    for (i = 1; i < length; i++) {
         unsigned char c = bytes[i];
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
               (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) {
-            fail(EXIT_PATH_INVALID, "PLOINKY_HOME_PATH_INVALID",
-                 "HOME runtime key contains unsupported characters");
+            fail(EXIT_HOME_STATE_INCOMPATIBLE,
+                 "PLOINKY_HOME_STATE_INCOMPATIBLE",
+                 "sandbox HOME key contains unsupported characters");
         }
     }
+    *home_key = bytes + 1;
+    *home_key_length = length - 1;
+    return kind;
 }
 
 static char *copy_string(const unsigned char *bytes, size_t length,
@@ -995,7 +1047,7 @@ static void validate_argument_policy(struct launch *launch)
 
 static void parse_descriptor(struct launch *launch)
 {
-    static const unsigned char magic[] = "PLBWLP01";
+    static const unsigned char magic[] = "PLBWLP02";
     uint32_t declared_records;
     size_t offset;
     size_t i;
@@ -1119,15 +1171,20 @@ static void parse_descriptor(struct launch *launch)
             launch->has_workdir = true;
         } else if (record->type == RECORD_HOME) {
             struct mount *mount;
-            validate_home(record->payload, payload_length);
+            const unsigned char *home_key;
+            size_t home_key_length;
+            enum home_source_kind home_source_kind =
+                validate_home(record->payload, payload_length,
+                              &home_key, &home_key_length);
             reject_duplicate_target(launch, "/home/agent");
             reject_hiding_prior_target(launch, "/home/agent");
             mount = new_mount(launch);
             mount->kind = MOUNT_HOME;
             mount->source_type = SOURCE_DIRECTORY;
+            mount->home_source_kind = home_source_kind;
             mount->writable = true;
-            mount->source = record->payload;
-            mount->source_length = payload_length;
+            mount->source = home_key;
+            mount->source_length = home_key_length;
             mount->target = strdup("/home/agent");
         } else if (record->type == RECORD_RO_PATH) {
             struct mount *mount;
@@ -1330,30 +1387,30 @@ static int openat2_beneath(int root_fd, const char *relative, bool directory,
 #endif
 }
 
-static int open_workspace_root(void)
+static int open_workspace_root(int policy_status, const char *policy_code)
 {
     struct stat status;
     int fd = open(PLOINKY_WORKSPACE_ROOT,
                   O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 
     if (fd < 0) {
-        fail(EXIT_PATH_INVALID, "PLOINKY_WORKSPACE_INVALID",
+        fail(policy_status, policy_code,
              "cannot open exact workspace root: %s", strerror(errno));
     }
     if (fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode) ||
         status.st_dev == 0 || status.st_uid != geteuid()) {
         close(fd);
-        fail(EXIT_PATH_INVALID, "PLOINKY_WORKSPACE_INVALID",
+        fail(policy_status, policy_code,
              "workspace root ownership, type, or device is invalid");
     }
     return fd;
 }
 
-static int open_filesystem_root(void)
+static int open_filesystem_root(int policy_status, const char *policy_code)
 {
     int fd = open("/", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
-        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+        fail(policy_status, policy_code,
              "cannot retain filesystem root fd");
     }
     return fd;
@@ -1415,6 +1472,200 @@ static int reopen_pinned_regular_readonly(int path_fd)
     return fd;
 }
 #endif
+
+static int reopen_pinned_home_marker_readonly(int path_fd)
+{
+    char proc_path[64];
+    struct stat pinned;
+    struct stat readable;
+    int written;
+    int fd;
+
+    if (fstat(path_fd, &pinned) != 0 || !S_ISREG(pinned.st_mode)) {
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "cannot inspect the fd-pinned HOME ABI marker");
+    }
+    written = snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", path_fd);
+    if (written < 0 || (size_t)written >= sizeof(proc_path)) {
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "cannot address the fd-pinned HOME ABI marker");
+    }
+    fd = open(proc_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &readable) != 0 ||
+        readable.st_dev != pinned.st_dev || readable.st_ino != pinned.st_ino ||
+        !S_ISREG(readable.st_mode)) {
+        if (fd >= 0) close(fd);
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "cannot reopen the exact fd-pinned HOME ABI marker");
+    }
+    return fd;
+}
+
+static bool home_generation_first(unsigned char value)
+{
+    return (value >= 'a' && value <= 'z') ||
+           (value >= 'A' && value <= 'Z') ||
+           (value >= '0' && value <= '9');
+}
+
+static bool home_generation_character(unsigned char value)
+{
+    return home_generation_first(value) || value == ':' || value == '.' ||
+           value == '_' || value == '/' || value == '-';
+}
+
+static void require_canonical_home_marker(const unsigned char *marker,
+                                          size_t marker_length,
+                                          const unsigned char *home_key,
+                                          size_t home_key_length)
+{
+    static const char prefix[] =
+        "{\"abi\":\"ploinky-home-v2\",\"createdByGeneration\":\"";
+    static const char middle[] = "\",\"homeKey\":\"";
+    static const char suffix[] = "\",\"schemaVersion\":2}\n";
+    size_t offset = 0;
+    size_t generation_start;
+    size_t generation_length;
+
+    if (marker_length < sizeof(prefix) - 1 ||
+        memcmp(marker, prefix, sizeof(prefix) - 1) != 0) {
+        goto incompatible;
+    }
+    offset = sizeof(prefix) - 1;
+    generation_start = offset;
+    while (offset < marker_length && marker[offset] != '"') {
+        if (!home_generation_character(marker[offset])) {
+            goto incompatible;
+        }
+        offset++;
+    }
+    generation_length = offset - generation_start;
+    if (generation_length == 0 || generation_length > 255 ||
+        !home_generation_first(marker[generation_start])) {
+        goto incompatible;
+    }
+    if (marker_length - offset < sizeof(middle) - 1 ||
+        memcmp(marker + offset, middle, sizeof(middle) - 1) != 0) {
+        goto incompatible;
+    }
+    offset += sizeof(middle) - 1;
+    if (marker_length - offset < home_key_length ||
+        memcmp(marker + offset, home_key, home_key_length) != 0) {
+        goto incompatible;
+    }
+    offset += home_key_length;
+    if (marker_length - offset != sizeof(suffix) - 1 ||
+        memcmp(marker + offset, suffix, sizeof(suffix) - 1) != 0) {
+        goto incompatible;
+    }
+    return;
+
+incompatible:
+    fail(EXIT_HOME_STATE_INCOMPATIBLE,
+         "PLOINKY_HOME_STATE_INCOMPATIBLE",
+         "HOME ABI marker is not exact canonical ploinky-home-v2 schema 2 JSON");
+}
+
+static void validate_sandbox_home_marker(int home_fd,
+                                         const unsigned char *home_key,
+                                         size_t home_key_length)
+{
+    static const char marker_name[] = ".ploinky-home-abi.json";
+    unsigned char bytes[MAX_HOME_MARKER_BYTES + 1];
+    struct stat pinned;
+    struct stat after;
+    int marker_fd;
+    int readable_fd;
+    size_t used = 0;
+
+    marker_fd = openat2_beneath(home_fd, marker_name, false,
+                                EXIT_HOME_STATE_INCOMPATIBLE,
+                                "PLOINKY_HOME_STATE_INCOMPATIBLE");
+    if (fstat(marker_fd, &pinned) != 0 || !S_ISREG(pinned.st_mode) ||
+        pinned.st_uid != geteuid() || (pinned.st_mode & 07777) != 0600 ||
+        pinned.st_nlink != 1 || pinned.st_size <= 0 ||
+        pinned.st_size > (off_t)MAX_HOME_MARKER_BYTES) {
+        close(marker_fd);
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "HOME ABI marker type, owner, mode, link count, or size is invalid");
+    }
+    readable_fd = reopen_pinned_home_marker_readonly(marker_fd);
+    for (;;) {
+        ssize_t count = read(readable_fd, bytes + used, sizeof(bytes) - used);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            close(readable_fd);
+            close(marker_fd);
+            fail(EXIT_HOME_STATE_INCOMPATIBLE,
+                 "PLOINKY_HOME_STATE_INCOMPATIBLE",
+                 "cannot read the fd-pinned HOME ABI marker");
+        }
+        if (count == 0) {
+            break;
+        }
+        used += (size_t)count;
+        if (used > MAX_HOME_MARKER_BYTES) {
+            close(readable_fd);
+            close(marker_fd);
+            fail(EXIT_HOME_STATE_INCOMPATIBLE,
+                 "PLOINKY_HOME_STATE_INCOMPATIBLE",
+                 "HOME ABI marker exceeds 4096 bytes");
+        }
+    }
+    if (fstat(readable_fd, &after) != 0 ||
+        after.st_dev != pinned.st_dev || after.st_ino != pinned.st_ino ||
+        !S_ISREG(after.st_mode) || after.st_uid != geteuid() ||
+        (after.st_mode & 07777) != 0600 || after.st_nlink != 1 ||
+        after.st_size != pinned.st_size || used != (size_t)after.st_size) {
+        close(readable_fd);
+        close(marker_fd);
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "HOME ABI marker changed or became incompatible while pinned");
+    }
+    close(readable_fd);
+    close(marker_fd);
+    require_canonical_home_marker(bytes, used, home_key, home_key_length);
+}
+
+static char *sandbox_home_relative_path(const struct mount *mount)
+{
+    static const char prefix[] = ".data/";
+    size_t prefix_length = sizeof(prefix) - 1;
+    char *relative = malloc(prefix_length + mount->source_length + 1);
+
+    if (relative == NULL) {
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "cannot allocate the derived sandbox HOME path");
+    }
+    memcpy(relative, prefix, prefix_length);
+    memcpy(relative + prefix_length, mount->source, mount->source_length);
+    relative[prefix_length + mount->source_length] = '\0';
+    return relative;
+}
+
+static void validate_home_directory(const struct mount *mount)
+{
+    struct stat status;
+
+    if (fstat(mount->fd, &status) != 0 || !S_ISDIR(status.st_mode) ||
+        status.st_uid != geteuid() || (status.st_mode & 07777) != 0700) {
+        fail(EXIT_HOME_STATE_INCOMPATIBLE,
+             "PLOINKY_HOME_STATE_INCOMPATIBLE",
+             "HOME directory type, owner, or exact mode 0700 is invalid");
+    }
+    if (mount->home_source_kind == HOME_SOURCE_SANDBOX_WORKSPACE_V2) {
+        validate_sandbox_home_marker(mount->fd, mount->source,
+                                     mount->source_length);
+    }
+}
 
 static int snapshot_pinned_regular_readonly(int path_fd)
 {
@@ -1506,14 +1757,21 @@ static void open_mount_sources(struct launch *launch)
         }
 
         if (mount->kind == MOUNT_WORKSPACE || mount->kind == MOUNT_WORKDIR ||
-            mount->kind == MOUNT_HOME ||
+            (mount->kind == MOUNT_HOME &&
+             mount->home_source_kind == HOME_SOURCE_SANDBOX_WORKSPACE_V2) ||
             ((mount->kind == MOUNT_RO_PATH || mount->kind == MOUNT_RO_DATA_PATH) &&
              mount->source_length > workspace_prefix_length &&
              memcmp(mount->source, PLOINKY_WORKSPACE_ROOT,
                     workspace_prefix_length) == 0 &&
              mount->source[workspace_prefix_length] == '/')) {
             if (workspace_fd < 0) {
-                workspace_fd = open_workspace_root();
+                workspace_fd = open_workspace_root(
+                    mount->kind == MOUNT_HOME
+                        ? EXIT_HOME_STATE_INCOMPATIBLE
+                        : EXIT_PATH_INVALID,
+                    mount->kind == MOUNT_HOME
+                        ? "PLOINKY_HOME_STATE_INCOMPATIBLE"
+                        : "PLOINKY_WORKSPACE_INVALID");
             }
         }
 
@@ -1522,16 +1780,41 @@ static void open_mount_sources(struct launch *launch)
             if (mount->fd >= 0) {
                 fcntl(mount->fd, F_SETFD, FD_CLOEXEC);
             }
-        } else if (mount->kind == MOUNT_WORKDIR || mount->kind == MOUNT_HOME) {
+        } else if (mount->kind == MOUNT_WORKDIR) {
             char *relative = copy_string(mount->source, mount->source_length,
                                          "PLOINKY_PATH_INVALID");
             mount->fd = openat2_beneath(workspace_fd, relative, true,
-                                        mount->kind == MOUNT_WORKDIR
-                                            ? EXIT_WORKDIR_INVALID
-                                            : EXIT_PATH_INVALID,
-                                        mount->kind == MOUNT_WORKDIR
-                                            ? "PLOINKY_WORKDIR_INVALID"
-                                            : "PLOINKY_HOME_PATH_INVALID");
+                                        EXIT_WORKDIR_INVALID,
+                                        "PLOINKY_WORKDIR_INVALID");
+            free(relative);
+        } else if (mount->kind == MOUNT_HOME) {
+            char *relative;
+            int root_fd;
+
+            if (mount->home_source_kind == HOME_SOURCE_SANDBOX_WORKSPACE_V2) {
+                relative = sandbox_home_relative_path(mount);
+                root_fd = workspace_fd;
+            } else if (mount->home_source_kind == HOME_SOURCE_CONTAINER_NATIVE) {
+                if (filesystem_fd < 0) {
+                    filesystem_fd = open_filesystem_root(
+                        EXIT_HOME_STATE_INCOMPATIBLE,
+                        "PLOINKY_HOME_STATE_INCOMPATIBLE");
+                }
+                relative = strdup("root");
+                if (relative == NULL) {
+                    fail(EXIT_HOME_STATE_INCOMPATIBLE,
+                         "PLOINKY_HOME_STATE_INCOMPATIBLE",
+                         "cannot allocate the derived container HOME path");
+                }
+                root_fd = filesystem_fd;
+            } else {
+                fail(EXIT_HOME_STATE_INCOMPATIBLE,
+                     "PLOINKY_HOME_STATE_INCOMPATIBLE",
+                     "HOME source kind was not retained exactly");
+            }
+            mount->fd = openat2_beneath(
+                root_fd, relative, true, EXIT_HOME_STATE_INCOMPATIBLE,
+                "PLOINKY_HOME_STATE_INCOMPATIBLE");
             free(relative);
         } else if (mount->kind == MOUNT_RO_PATH ||
                    mount->kind == MOUNT_RO_DATA_PATH) {
@@ -1551,7 +1834,9 @@ static void open_mount_sources(struct launch *launch)
                                             "PLOINKY_PATH_INVALID");
             } else {
                 if (filesystem_fd < 0) {
-                    filesystem_fd = open_filesystem_root();
+                    filesystem_fd = open_filesystem_root(
+                        EXIT_PATHFD_UNAVAILABLE,
+                        "PLOINKY_PATHFD_UNAVAILABLE");
                 }
                 relative = copy_path_without_prefix(mount->source,
                                                     mount->source_length, 1);
@@ -1570,21 +1855,21 @@ static void open_mount_sources(struct launch *launch)
         require_source_type(mount->fd, mount->source_type,
                             mount->kind == MOUNT_WORKDIR
                                 ? EXIT_WORKDIR_INVALID
-                                : EXIT_PATH_INVALID,
+                                : mount->kind == MOUNT_HOME
+                                    ? EXIT_HOME_STATE_INCOMPATIBLE
+                                    : EXIT_PATH_INVALID,
                             mount->kind == MOUNT_WORKDIR
                                 ? "PLOINKY_WORKDIR_INVALID"
-                                : "PLOINKY_PATH_INVALID");
+                                : mount->kind == MOUNT_HOME
+                                    ? "PLOINKY_HOME_STATE_INCOMPATIBLE"
+                                    : "PLOINKY_PATH_INVALID");
         if (mount->kind == MOUNT_RO_DATA_PATH) {
             int snapshot_fd = snapshot_pinned_regular_readonly(mount->fd);
             close(mount->fd);
             mount->fd = snapshot_fd;
         }
         if (mount->kind == MOUNT_HOME) {
-            struct stat status;
-            if (fstat(mount->fd, &status) != 0 || status.st_uid != geteuid()) {
-                fail(EXIT_PATH_INVALID, "PLOINKY_HOME_PATH_INVALID",
-                     "HOME ownership is invalid");
-            }
+            validate_home_directory(mount);
         }
     }
     if (workspace_fd >= 0) {
@@ -1885,6 +2170,17 @@ static void run_preexec_barrier(struct launch *launch)
     launch->barrier_release_fd = -1;
 }
 
+static void revalidate_home_sources_after_barrier(struct launch *launch)
+{
+    size_t i;
+
+    for (i = 0; i < launch->mount_count; i++) {
+        if (launch->mounts[i].kind == MOUNT_HOME) {
+            validate_home_directory(&launch->mounts[i]);
+        }
+    }
+}
+
 static void launch_bwrap(void)
 {
     struct launch launch;
@@ -1902,6 +2198,7 @@ static void launch_bwrap(void)
     open_mount_sources(&launch);
     argv = build_bwrap_argv(&launch);
     run_preexec_barrier(&launch);
+    revalidate_home_sources_after_barrier(&launch);
     internalize_credential_pipe(&launch);
     make_preserved_fds_inheritable(&launch);
     close_unlisted_fds(&launch);
@@ -1919,15 +2216,18 @@ int main(int argc, char **argv)
     require_source_sha();
 
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        printf("ploinky-bwrap-launch-v1 source-sha=%s\n", PLOINKY_SOURCE_SHA);
+        printf("ploinky-bwrap-launch-v2 source-sha=%s\n", PLOINKY_SOURCE_SHA);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--capabilities") == 0) {
-        printf("ploinky-bwrap-launch-v1 source-sha=%s protocol=1 descriptor-fd=3 "
+        printf("ploinky-bwrap-launch-v2 source-sha=%s protocol=2 descriptor-fd=3 "
                "path-resolution=openat2-beneath-no-magiclinks-no-symlinks "
                "bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms "
                "typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file "
                "ro-data-path-hardening=sealed-memfd-ro-bind-data "
+               "home-sources=sandbox-workspace-v2,container-native "
+               "home-marker=ploinky-home-v2-schema-2 "
+               "home-revalidation=post-barrier-G "
                "preexec-barrier=R/G credential-bound=4096\n",
                PLOINKY_SOURCE_SHA);
         return 0;

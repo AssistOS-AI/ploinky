@@ -9,6 +9,10 @@ import { buildEnvFlags, buildEnvMap } from '../../utils/security/secretVars.js';
 import { loadAgents, saveAgents } from '../../utils/workspace.js';
 import { debugLog } from '../../utils/utils.js';
 import { isHostSandboxDisabled } from '../../utils/runtime/sandboxRuntime.js';
+import {
+    assertValidLiteSandboxSelector,
+    requireUsableContainerDeclaration,
+} from '../../utils/runtime/agentRuntimeSelector.js';
 import { intervalsOverlap, parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 import { IMAGE_CONTRACT } from '../../../ploinky-box/contract/image.mjs';
@@ -128,6 +132,18 @@ function requireContainerRuntime(boxMarkerPath) {
         process.exit(1);
     }
     return rt;
+}
+
+function requireAgentPodmanRuntime({ boxMarkerPath, runtimeInstalled = isRuntimeInstalled } = {}) {
+    if (runtimeInstalled('podman')) return 'podman';
+    const insideBox = isPloinkyBoxRuntime(boxMarkerPath);
+    const error = new Error(insideBox
+        ? 'Ploinky box requires nested Podman, but podman was not found in PATH. Docker fallback is not permitted inside the box.'
+        : 'Podman is required when lite-sandbox is false or missing, but podman was not found in PATH. Docker fallback is not permitted for agent runtime selection.');
+    error.code = insideBox
+        ? 'PLOINKY_BOX_PODMAN_REQUIRED'
+        : 'PLOINKY_CONTAINER_RUNTIME_UNAVAILABLE';
+    throw error;
 }
 
 const DEFAULT_IMAGE_PULL_TIMEOUT_MS = 30 * 60 * 1000;
@@ -309,6 +325,25 @@ function isContainerRunning(containerName, options = {}) {
     if (!runtime) return false;
     debugLog(`Checking if container '${containerName}' is running via ${runtime}.`);
     try {
+        if (/^[a-f0-9]{64}$/.test(containerName)) {
+            const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
+            const result = spawnSyncImpl(
+                runtime,
+                ['container', 'inspect', containerName],
+                {
+                    encoding: 'utf8',
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    timeout: options.timeoutMs || CONTAINER_CONTROL_PLANE_TIMEOUT_MS,
+                    killSignal: 'SIGKILL',
+                },
+            );
+            if (result?.error || result?.status !== 0) return false;
+            const parsed = JSON.parse(String(result.stdout || ''));
+            const record = Array.isArray(parsed) ? parsed[0] : parsed;
+            return String(record?.Id || record?.ID || '') === containerName
+                && record?.State?.Running === true
+                && record?.State?.Status === 'running';
+        }
         const running = listRunningContainerNames({
             ...options,
             runtime,
@@ -352,9 +387,9 @@ function listRunningContainerNames(options = {}) {
     );
 }
 
-function containerExists(containerName) {
+function containerExists(containerName, options = {}) {
     // Use inspect instead of grep - more reliable and avoids race conditions
-    const runtime = probeContainerRuntime();
+    const runtime = options.runtime || probeContainerRuntime();
     if (!runtime) return false;
     const command = `${runtime} inspect --format "{{.Name}}" "${containerName}"`;
     debugLog(`Checking if container exists with command: ${command}`);
@@ -594,9 +629,9 @@ function computeEnvHash(manifest, profileConfig, extraEnv = {}, options = {}) {
     }
 }
 
-function getContainerLabel(containerName, key) {
+function getContainerLabel(containerName, key, options = {}) {
     try {
-        const runtime = probeContainerRuntime();
+        const runtime = options.runtime || probeContainerRuntime();
         if (!runtime) return '';
         const out = execSync(`${runtime} inspect ${containerName} --format '{{ json .Config.Labels }}'`, { stdio: 'pipe' }).toString();
         const labels = JSON.parse(out || '{}') || {};
@@ -712,7 +747,7 @@ function getHostSandboxInstallHint(platform = process.platform) {
 }
 
 function getHostSandboxDisableHint() {
-    return 'lite-sandbox: true is strict. Remove that selector to use podman/docker, or clear the explicit host-sandbox disable policy.';
+    return 'lite-sandbox: true is strict. Remove that selector to use mandatory Podman, or clear the explicit host-sandbox disable policy.';
 }
 
 function createHostSandboxError(reason, { platform = process.platform } = {}) {
@@ -756,12 +791,6 @@ function createSandboxPolicyConflictError() {
     return error;
 }
 
-function createSandboxContainerConflictError() {
-    const error = new Error("lite-sandbox: true cannot be combined with a manifest 'container' declaration");
-    error.code = 'PLOINKY_SANDBOX_CONTAINER_CONFLICT';
-    return error;
-}
-
 function probeBoxBwrapHelper(helperPath = IMAGE_CONTRACT.bwrapHelper, spawnSyncImpl = spawnSync) {
     const result = spawnSyncImpl(helperPath, ['--capabilities'], {
         encoding: 'utf8',
@@ -787,10 +816,8 @@ function getRuntimeForAgent(manifest, {
     if (typeof manifest?.runtime === 'string') {
         throw createLegacyRuntimeStringError(manifest.runtime);
     }
+    assertValidLiteSandboxSelector(manifest);
     if (manifest?.['lite-sandbox'] === true) {
-        if (Object.prototype.hasOwnProperty.call(manifest, 'container')) {
-            throw createSandboxContainerConflictError();
-        }
         if (isHostSandboxDisabled()) {
             throw createSandboxPolicyConflictError();
         }
@@ -814,5 +841,6 @@ function getRuntimeForAgent(manifest, {
         }
         throw createHostSandboxError(`platform ${effectivePlatform} is not supported`, { platform: effectivePlatform });
     }
-    return requireContainerRuntime(boxMarkerPath);
+    requireUsableContainerDeclaration(manifest);
+    return requireAgentPodmanRuntime({ boxMarkerPath, runtimeInstalled });
 }

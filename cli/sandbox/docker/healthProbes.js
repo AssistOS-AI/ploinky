@@ -2,11 +2,14 @@ import { spawnSync } from 'child_process';
 import { randomUUID } from 'node:crypto';
 import { parentPort } from 'worker_threads';
 import {
-    getRuntime,
     isContainerRunning,
     waitForContainerRunning,
     sleepMs
 } from './common.js';
+import {
+    inspectExactPodmanRuntimeIdentity,
+    requireExactPodmanRuntimeIdentity,
+} from './exactPodmanRuntime.js';
 
 const DEFAULT_INTERVAL_SECONDS = 1;
 const DEFAULT_TIMEOUT_SECONDS = 5;
@@ -85,14 +88,31 @@ function probeToken(options = {}) {
     return token;
 }
 
+function exactProbeIdentity(containerName, options = {}) {
+    return requireExactPodmanRuntimeIdentity({
+        runtime: options.runtime,
+        containerName,
+        containerId: options.containerId,
+        instanceId: options.instanceId,
+        enableGeneration: options.enableGeneration,
+    });
+}
+
+function inspectProbeIdentity(identity, options = {}) {
+    const inspect = options.inspectRuntimeIdentityImpl || inspectExactPodmanRuntimeIdentity;
+    return inspect(identity, {
+        spawnSyncImpl: options.identitySpawnSyncImpl,
+    });
+}
+
 function cleanupExactProbe(agentName, containerName, markerPath, token, options = {}) {
-    const runtime = options.runtime || getRuntime();
+    const identity = exactProbeIdentity(containerName, options);
     const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
     const cleanupRes = spawnSyncImpl(
-        runtime,
+        'podman',
         [
             'exec',
-            containerName,
+            identity.containerId,
             'sh',
             PROBE_RUNNER_PATH,
             'cleanup',
@@ -122,7 +142,7 @@ function cleanupExactProbe(agentName, containerName, markerPath, token, options 
 }
 
 function runProbeOnce(agentName, containerName, probe, options = {}) {
-    const runtime = options.runtime || getRuntime();
+    const identity = exactProbeIdentity(containerName, options);
     const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
     const token = probeToken(options);
     const markerPath = `${PROBE_MARKER_PREFIX}${token}`;
@@ -132,7 +152,7 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
     );
     const execCommand = [
         'exec',
-        containerName,
+        identity.containerId,
         'sh',
         PROBE_RUNNER_PATH,
         'run',
@@ -143,7 +163,7 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
         String(killGraceSeconds),
     ];
     const execRes = spawnSyncImpl(
-        runtime,
+        'podman',
         execCommand,
         {
             encoding: 'utf8',
@@ -187,12 +207,12 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
 }
 
 function ensureScriptExists(agentName, containerName, probe, options = {}) {
-    const runtime = options.runtime || getRuntime();
+    const identity = exactProbeIdentity(containerName, options);
     const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
     const scriptPath = `/code/${probe.script}`;
     const exists = spawnSyncImpl(
-        runtime,
-        ['exec', containerName, 'sh', '-lc', `[ -f "${scriptPath}" ]`],
+        'podman',
+        ['exec', identity.containerId, 'sh', '-lc', `[ -f "${scriptPath}" ]`],
         {
             stdio: 'ignore',
             timeout: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
@@ -216,13 +236,16 @@ function ensureScriptExists(agentName, containerName, probe, options = {}) {
 }
 
 function runProbeLoop(agentName, containerName, type, probe, options = {}) {
+    const identity = exactProbeIdentity(containerName, options);
+    inspectProbeIdentity(identity, options);
     ensureScriptExists(agentName, containerName, probe, options);
     postProbeLog('info', `[probe] ${agentName}: ${type} probe -> script='${probe.script}', interval=${probe.interval}s, timeout=${probe.timeout}s, successThreshold=${probe.successThreshold}, failureThreshold=${probe.failureThreshold}, continuous=${probe.continuous}`);
     let consecutiveSuccesses = 0;
     let consecutiveFailures = 0;
     while (true) {
         const isContainerRunningImpl = options.isContainerRunningImpl || isContainerRunning;
-        if (!isContainerRunningImpl(containerName, {
+        if (!isContainerRunningImpl(identity.containerId, {
+            runtime: 'podman',
             timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
         })) {
             return {
@@ -351,8 +374,11 @@ function ensureReadiness(agentName, containerName, probe, options = {}) {
 }
 
 export function runHealthProbes(agentName, containerName, manifest = {}, options = {}) {
+    const identity = exactProbeIdentity(containerName, options);
+    inspectProbeIdentity(identity, options);
     const waitForRunning = options.waitForContainerRunningImpl || waitForContainerRunning;
-    if (!waitForRunning(containerName, 40, 250, {
+    if (!waitForRunning(identity.containerId, 40, 250, {
+        runtime: 'podman',
         timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
         totalTimeoutMs: options.containerWaitTimeoutMs || PROBE_CONTAINER_WAIT_TIMEOUT_MS,
     })) {

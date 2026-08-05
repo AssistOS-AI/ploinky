@@ -41,7 +41,6 @@ import {
     getAgentContainerName,
     getConfiguredProjectPath,
     getContainerLabel,
-    getRuntime,
     getRuntimeForAgent,
     ensureImagePresent,
     isContainerRunning,
@@ -164,8 +163,28 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
 const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
+const PODMAN_RUNTIME = 'podman';
+const IMMUTABLE_CONTAINER_ID = /^[a-f0-9]{64}$/;
 const AUTHORIZED_CLEANUP_RECEIPTS = new WeakMap();
 const CONSUMED_CLEANUP_RECEIPTS = new WeakSet();
+
+function assertExactPodmanRuntime(runtime, operation) {
+    if (runtime !== PODMAN_RUNTIME) {
+        const error = new Error(`${operation} requires the exact Podman runtime identity`);
+        error.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
+        throw error;
+    }
+    return runtime;
+}
+
+function assertImmutableContainerId(value, operation) {
+    if (typeof value !== 'string' || !IMMUTABLE_CONTAINER_ID.test(value)) {
+        const error = new Error(`${operation} requires one exact immutable 64-hex container ID`);
+        error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+        throw error;
+    }
+    return value;
+}
 
 function freezeCleanupReceipt(value) {
     if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
@@ -344,11 +363,14 @@ function retryableCleanupCandidateId(receipt, observedCandidateId = '') {
         || receipt.inspectionComplete !== true) {
         return '';
     }
-    const candidateId = String(receipt.candidateId || '').trim();
-    if (!candidateId) {
+    const candidateId = receipt.candidateId;
+    if (!IMMUTABLE_CONTAINER_ID.test(candidateId)) {
         throw invalidCleanupReceipt('retryable cleanup receipt is missing its immutable candidate ID');
     }
-    const observed = String(observedCandidateId || '').trim();
+    const observed = observedCandidateId;
+    if (observed !== '' && (typeof observed !== 'string' || observed !== observed.trim())) {
+        throw invalidCleanupReceipt('observed cleanup candidate ID is not exact');
+    }
     if (observed && observed !== candidateId) {
         throw invalidCleanupReceipt('retryable cleanup receipt does not match the observed runtime candidate ID');
     }
@@ -888,7 +910,8 @@ function appendEnvFlagsFromMap(envFlags, envMap) {
 }
 
 function removeContainerForRecreate(runtime, containerName, label, record = null) {
-    if (!containerExists(containerName)) return { removed: false, state: 'absent' };
+    assertExactPodmanRuntime(runtime, `removeContainerForRecreate(${containerName})`);
+    if (!containerExists(containerName, { runtime })) return { removed: false, state: 'absent' };
     const exactRecord = record || loadAgentsMap()[containerName];
     try {
         const result = removeExactRegisteredContainer(containerName, exactRecord, { runtime });
@@ -934,7 +957,7 @@ export function removeAgentContainerForRecreate(
     label = 'executionModeChanged',
     predecessorRecord = null,
 ) {
-    const runtime = getRuntime();
+    const runtime = PODMAN_RUNTIME;
     return removeContainerForRecreate(runtime, containerName, label, predecessorRecord);
 }
 
@@ -1123,7 +1146,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         network: manifestNetwork,
         runtimeKind: 'container',
     });
-    const runtime = getRuntime();
+    const runtime = assertExactPodmanRuntime(
+        options.runtime,
+        `startAgentContainer(${agentName})`,
+    );
     const llmAdmissionContext = resolveLlmRuntimeAdmissionContext({
         runtime,
         manifest,
@@ -1185,7 +1211,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // Ensure workspace structure exists and run preinstall [HOST] before any
     // image-dependent work. Hooks may build local images or seed vars that image
     // resolution and dependency-cache probes consume.
-    const preLifecycle = runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile);
+    const preLifecycle = runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile, {
+        runtime,
+        runtimeIdentity,
+    });
     if (!preLifecycle.success) {
         throw new Error(`[profile] ${agentName}: pre-container lifecycle failed: ${preLifecycle.errors.join('; ')}`);
     }
@@ -1635,6 +1664,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         PLOINKY_AGENT_PRINCIPAL: principalId,
         PLOINKY_AGENT_INSTANCE_ID: runtimeIdentity.instanceId,
         PLOINKY_AGENT_ENABLE_GENERATION: runtimeIdentity.enableGeneration,
+        PLOINKY_AGENT_HOME_KEY: containerName,
     }, { agentName, repoName });
     const prepareGeneratedRouterAttestation = (plan) => {
         if (runtime !== 'podman' || !['default', 'bridge'].includes(plan?.mode)) {
@@ -1728,6 +1758,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             const launchEnv = Object.freeze({
                 ...buildGeneratedRouterDescriptorEnv(payload),
                 ...buildAgentCredentialEnv(principalId, runtimeIdentity),
+                PLOINKY_AGENT_HOME_KEY: containerName,
+                PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY: 'generated',
             });
             const semanticEnvHash = computeSemanticEnvHash(payload);
             return Object.freeze({
@@ -1780,7 +1812,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
             const descriptorEnv = buildGeneratedRouterDescriptorEnv(payload);
             const credentialEnv = buildAgentCredentialEnv(principalId, runtimeIdentity);
-            const expectedEnv = Object.freeze({ ...descriptorEnv, ...credentialEnv });
+            const expectedEnv = Object.freeze({
+                ...descriptorEnv,
+                ...credentialEnv,
+                PLOINKY_AGENT_HOME_KEY: containerName,
+                PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY: 'generated',
+            });
             const expectedMounts = expectedBindMountsFromArgs(args, descriptorHostFile);
             const expectedEnvHash = computeSemanticEnvHash(payload);
             if (!hasExactManagedEnv(record, expectedEnv)) {
@@ -1981,7 +2018,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             runtimeIdentity,
         }) || '');
     }
-    if (!launchedContainerId) {
+    if (!IMMUTABLE_CONTAINER_ID.test(launchedContainerId)) {
         throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
     }
     } catch (error) {
@@ -2010,6 +2047,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             runtimeNetwork: structuredClone(manifestNetwork),
             registryRecord: {
                 type: 'agent',
+                runtime,
+                ...(cleanupCandidateId ? { containerId: cleanupCandidateId } : {}),
                 agentName,
                 repoName,
                 ...(options.alias ? { alias: options.alias } : {}),
@@ -2063,6 +2102,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         cleanupReceipt,
         registryRecord: Object.freeze({
             type: 'agent',
+            runtime,
+            containerId: launchedContainerId,
             agentName,
             repoName,
             ...(options.alias ? { alias: options.alias } : {}),
@@ -2163,6 +2204,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         develRepo: persistedRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
+        runtime,
+        containerId: launchedContainerId,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         config: {
@@ -2211,7 +2254,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     agentPath,
                     repoName,
                     manifest,
-                    skipInstallHooks: true
+                    skipInstallHooks: true,
+                    runtime,
+                    runtimeIdentity,
+                    containerId: launchedContainerId,
                 });
             if (!lifecycleResult.success) {
                 const details = lifecycleResult.errors.join('; ');
@@ -2220,14 +2266,25 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         } else {
             // Preinstall already ran before container start. Runtime containers no
             // longer install dependencies; only postinstall hooks run after boot.
-            runPostinstallHook(agentName, containerName, manifest, cwd);
+            runPostinstallHook(agentName, containerName, manifest, cwd, {
+                runtime,
+                runtimeIdentity,
+                containerId: launchedContainerId,
+            });
         }
     } catch (error) {
         cleanupExactLaunch(error);
     }
     if (launchExplicitSidecar) {
         try {
-            launchAgentSidecar({ containerName, agentCommand: explicitAgentCmd, agentName });
+            launchAgentSidecar({
+                containerName,
+                agentCommand: explicitAgentCmd,
+                agentName,
+                runtime,
+                runtimeIdentity,
+                containerId: launchedContainerId,
+            });
         } catch (error) {
             cleanupExactLaunch(error);
         }
@@ -2247,10 +2304,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     };
 }
 
-function resolveHostPort(containerName, existingRecord, containerPortCandidates) {
+function resolveHostPort(containerName, existingRecord, containerPortCandidates, runtime) {
+    assertExactPodmanRuntime(runtime, `resolveHostPort(${containerName})`);
     const fromRecord = resolveHostPortFromRecord(existingRecord, containerPortCandidates);
     if (fromRecord) return fromRecord;
-    return resolveHostPortFromRuntime(containerName, containerPortCandidates);
+    const containerId = assertImmutableContainerId(
+        existingRecord?.containerId,
+        `resolveHostPort(${containerName})`,
+    );
+    return resolveHostPortFromRuntime(containerId, containerPortCandidates, runtime);
 }
 
 function resolveHostPortFromRecord(record, containerPortCandidates) {
@@ -2265,23 +2327,31 @@ function resolveHostPortFromRecord(record, containerPortCandidates) {
     return ports[0]?.hostPort || 0;
 }
 
-function resolveHostPortFromRuntime(containerName, containerPortCandidates) {
-    const runtime = getRuntime();
+function resolveHostPortFromRuntime(containerId, containerPortCandidates, runtime) {
+    assertExactPodmanRuntime(runtime, `resolveHostPortFromRuntime(${containerId})`);
+    const exactContainerId = assertImmutableContainerId(
+        containerId,
+        `resolveHostPortFromRuntime(${containerId})`,
+    );
     for (const containerPort of containerPortCandidates) {
-        try {
-            const portMap = execSync(`${runtime} port ${containerName} ${containerPort}/tcp`, { stdio: 'pipe' }).toString().trim();
-            const hostPort = parseHostPort(portMap);
-            if (hostPort) {
-                return hostPort;
-            }
-        } catch (_) {
-            // ignore and try next
+        const result = spawnSync(runtime, ['port', exactContainerId, `${containerPort}/tcp`], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        if (!result.error && result.status === 0) {
+            const hostPort = parseHostPort(String(result.stdout || '').trim());
+            if (hostPort) return hostPort;
         }
     }
     return 0;
 }
 
-function resolvePublishedPortMappings(containerName, portMappings) {
+function resolvePublishedPortMappings(containerId, portMappings, runtime) {
+    assertExactPodmanRuntime(runtime, `resolvePublishedPortMappings(${containerId})`);
+    const exactContainerId = assertImmutableContainerId(
+        containerId,
+        `resolvePublishedPortMappings(${containerId})`,
+    );
     if (!Array.isArray(portMappings) || portMappings.length === 0) {
         return [];
     }
@@ -2294,7 +2364,7 @@ function resolvePublishedPortMappings(containerName, portMappings) {
         if (Number.isFinite(hostPort) && hostPort > 0) {
             return mapping;
         }
-        const resolvedHostPort = resolveHostPortFromRuntime(containerName, [containerPort]);
+        const resolvedHostPort = resolveHostPortFromRuntime(exactContainerId, [containerPort], runtime);
         return resolvedHostPort > 0
             ? { ...mapping, hostPort: resolvedHostPort }
             : mapping;
@@ -2509,6 +2579,7 @@ export function coordinateReplacementRuntimeIdentity({
                 preparationLease: prepared.preparationLease,
                 registryRecord: Object.freeze({
                     type: 'agent',
+                    runtime: PODMAN_RUNTIME,
                     ...runtimeIdentity,
                 }),
             }, mismatch, `${coordinationReason}:identity-mismatch`, { abortPreparation });
@@ -2536,9 +2607,14 @@ export function resolveReplacementRuntimeIdentity({
 } = {}, dependencies = {}) {
     if (!targetedRestart && !preservePreparedRegistryRecord
         && existingRuntime && !recreateReason) {
-        const instanceId = String(existingRecord?.instanceId || '').trim();
-        const enableGeneration = String(existingRecord?.enableGeneration || '').trim();
-        if (!instanceId || !enableGeneration) {
+        const instanceId = existingRecord?.instanceId;
+        const enableGeneration = existingRecord?.enableGeneration;
+        if (typeof instanceId !== 'string'
+            || instanceId === ''
+            || instanceId !== instanceId.trim()
+            || typeof enableGeneration !== 'string'
+            || enableGeneration === ''
+            || enableGeneration !== enableGeneration.trim()) {
             throw new Error('runtime reuse requires the exact registered instanceId and enableGeneration');
         }
         return Object.freeze({
@@ -2929,8 +3005,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    const runtime = getRuntime();
-    const existingRuntimeAtEntry = containerExists(containerName);
+    const runtime = assertExactPodmanRuntime(
+        agentRuntime,
+        `ensureAgentService(${agentName})`,
+    );
+    const existingRuntimeAtEntry = containerExists(containerName, { runtime });
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     // LLM-runtime agents get their real image from the hardware-aware catalog in
     // startAgentContainer; tolerate an unresolved manifest container placeholder
@@ -2979,19 +3058,19 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     let recreateReason = targetedRestart ? 'targetedRestart' : (forceRecreate ? 'forceRecreate' : null);
     const requestedEnableGeneration = String(options.enableGeneration || existingRecord.enableGeneration || randomUUID());
     const requestedInstanceId = String(options.instanceId || existingRecord.instanceId || '');
-    if (containerExists(containerName) && (!existingRecord.instanceId || !existingRecord.enableGeneration)) {
+    if (containerExists(containerName, { runtime }) && (!existingRecord.instanceId || !existingRecord.enableGeneration)) {
         recreateReason ||= 'missingRuntimeIdentity';
     }
-    if (containerExists(containerName) && (
+    if (containerExists(containerName, { runtime }) && (
         (options.instanceId && options.instanceId !== existingRecord.instanceId)
         || (options.enableGeneration && options.enableGeneration !== existingRecord.enableGeneration)
     )) {
         recreateReason ||= 'runtimeIdentityChanged';
     }
 
-    if (containerExists(containerName) && !runtimeNetworkPlan.requiresManagedNetwork) {
+    if (containerExists(containerName, { runtime }) && !runtimeNetworkPlan.requiresManagedNetwork) {
         const desired = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
-        const current = getContainerLabel(containerName, 'ploinky.envhash');
+        const current = getContainerLabel(containerName, 'ploinky.envhash', { runtime });
         if (desired && desired !== current) {
             debugLog(`[ensureAgentService] ${agentName}: env hash changed (current=${current || '<none>'}, desired=${desired.slice(0, 12)}…), recreating container`);
             recreateReason ||= 'envHashChanged';
@@ -2999,7 +3078,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
-    if (containerExists(containerName) && isLlmRuntimeManifest(manifest, profileConfig)) {
+    if (containerExists(containerName, { runtime }) && isLlmRuntimeManifest(manifest, profileConfig)) {
         try {
             const desiredEnvHash = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
             const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
@@ -3020,7 +3099,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 writeState: false,
             });
             if (probe.enabled) {
-                const currentReuse = getContainerLabel(containerName, 'ploinky.reusehash');
+                const currentReuse = getContainerLabel(containerName, 'ploinky.reusehash', { runtime });
                 if (probe.reuseHash && probe.reuseHash !== currentReuse) {
                     debugLog(`[ensureAgentService] ${agentName}: LLM reuse hash changed (current=${currentReuse || '<none>'}, desired=${probe.reuseHash.slice(0, 12)}…), recreating container`);
                     recreateReason ||= 'llmReuseHashChanged';
@@ -3038,7 +3117,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const networkLifecycle = createNetworkLifecycleAdapter({ runtime });
     let inspectedContainerId = null;
     let managedReconciliationPreparationLease = options.preparationLease;
-    if (containerExists(containerName)) {
+    if (containerExists(containerName, { runtime })) {
         const contractInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
             instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
             contractHash: networkContractHash(manifestNetwork),
@@ -3049,6 +3128,12 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (contractInspection.state === 'foreign') {
             throw new Error(`refusing to replace foreign/unsupported exact-name container '${containerName}': managed agent identity labels do not match`);
         }
+        if (contractInspection.state === 'exact'
+            && !IMMUTABLE_CONTAINER_ID.test(String(contractInspection.id || ''))) {
+            const error = new Error(`refusing to replace '${containerName}' because its immutable Podman container ID was not proven`);
+            error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+            throw error;
+        }
         inspectedContainerId = contractInspection.id;
         if (contractInspection.state === 'owned-drift') {
             const driftReason = contractInspection.reason === 'runtime-identity'
@@ -3056,7 +3141,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 : 'networkContractDrift';
             debugLog(`[ensureAgentService] ${agentName}: managed runtime contract drifted (${driftReason}); recreating container`);
             recreateReason ||= driftReason;
-        } else if (!isContainerRunning(containerName)) {
+        } else if (!isContainerRunning(containerName, { runtime })) {
             // A stopped runtime is an instance replacement, not a process-resume
             // optimization. Its old identity is inactivated and rotated before
             // any host/none/managed process can start again.
@@ -3064,7 +3149,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    if (containerExists(containerName) && !recreateReason) {
+    if (containerExists(containerName, { runtime }) && !recreateReason) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
         const reuseInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
@@ -3080,7 +3165,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (reuseInspection.state !== 'exact' || !inspectedContainerId || reuseInspection.id !== inspectedContainerId) {
             canReuseExisting = false;
             recreateReason ||= 'runtimeChangedDuringInspection';
-        } else if (!isContainerRunning(containerName)) {
+        } else if (!isContainerRunning(containerName, { runtime })) {
             // Never resume a stopped container under its predecessor identity.
             // Re-enter the coordinated inactive-generation replacement path.
             canReuseExisting = false;
@@ -3110,6 +3195,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                             preparationLease: prepared.preparationLease,
                             registryRecord: Object.freeze({
                                 type: 'agent',
+                                runtime,
                                 agentName,
                                 repoName,
                                 ...(aliasOverride ? { alias: aliasOverride } : {}),
@@ -3138,7 +3224,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             const hostPort = runtimeNetworkPlan.mode === 'host'
                 ? (containerPortCandidates[0] || 0)
                 : (containerPortCandidates.length
-                    ? resolveHostPort(containerName, existingRecord, containerPortCandidates)
+                    ? resolveHostPort(containerName, existingRecord, containerPortCandidates, runtime)
                     : 0);
             syncAgentMcpConfig(containerName, agentPath, agentName);
             const registryRecord = {
@@ -3155,7 +3241,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             };
         }
     }
-    if (existingRuntimeAtEntry && !containerExists(containerName)) {
+    if (existingRuntimeAtEntry && !containerExists(containerName, { runtime })) {
         recreateReason ||= 'runtimeDisappearedAfterInspection';
     }
 
@@ -3223,6 +3309,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     if (targetedRestart) {
         const drainOptions = {
             runtime,
+            runtimeIdentity: Object.freeze({
+                instanceId: String(existingRecord.instanceId || ''),
+                enableGeneration: String(existingRecord.enableGeneration || ''),
+            }),
+            containerId: String(existingRecord.containerId || ''),
             reason: `coordinated-targeted-restart:${containerName}`,
             acknowledgement: targetedRestart.acknowledgement,
             affectedSelectors: targetedRestart.affectedSelectors,
@@ -3240,6 +3331,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
         started = startAgentContainer(agentName, manifest, agentPath, {
+            runtime,
             publish: additionalPorts,
             publishMappings: additionalPortMappings,
             containerName,
@@ -3260,7 +3352,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
         });
-    allPortMappings = resolvePublishedPortMappings(containerName, allPortMappings);
+    allPortMappings = resolvePublishedPortMappings(started.containerId, allPortMappings, runtime);
     const agentCodePath = getAgentCodePath(agentName);
     const agentSkillsPath = getAgentSkillsPath(agentName);
     const profileEnv = normalizeProfileEnv(profileConfig?.env);
@@ -3402,6 +3494,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
         const candidateRecord = started?.registryRecord || error?.ploinkyRestartCandidate?.registryRecord || {
             type: 'agent',
+            runtime,
+            ...(candidateId ? { containerId: candidateId } : {}),
             agentName,
             repoName,
             ...(aliasOverride ? { alias: aliasOverride } : {}),
@@ -3461,12 +3555,25 @@ function removeExactGenerationCandidate({
     network,
     record,
 } = {}) {
-    const cleanup = createNetworkLifecycleAdapter({ runtime: getRuntime() }).removeExactContainer(
+    assertExactPodmanRuntime(record?.runtime, `removeExactGenerationCandidate(${containerName})`);
+    const exactContainerId = assertImmutableContainerId(
+        containerId,
+        `removeExactGenerationCandidate(${containerName})`,
+    );
+    if (String(record?.containerId || '') !== exactContainerId) {
+        const error = new Error('exact failed candidate registry identity does not match its immutable container ID');
+        error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+        throw error;
+    }
+    if (!network || typeof network !== 'object' || Array.isArray(network)) {
+        throw new Error('exact failed candidate cleanup requires its immutable runtime network');
+    }
+    const cleanup = createNetworkLifecycleAdapter({ runtime: PODMAN_RUNTIME }).removeExactContainer(
         containerName,
         network,
         record.agentName,
         {
-            expectedContainerId: containerId,
+            expectedContainerId: exactContainerId,
             instanceKey: effectiveInstanceKey(record.repoName, record.agentName, record.alias || ''),
             contractHash: networkContractHash(network),
             instanceId: record.instanceId,
@@ -3488,9 +3595,26 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
         || !String(record.enableGeneration || '').trim()) {
         throw new Error('exact runtime candidate cleanup requires its name and immutable registry identity');
     }
-    const runtimeKind = record.runtime === 'bwrap' || record.runtime === 'seatbelt'
-        ? record.runtime
-        : 'container';
+    const exactRuntime = record.runtime;
+    if (![PODMAN_RUNTIME, 'bwrap', 'seatbelt'].includes(exactRuntime)) {
+        throw new Error('exact runtime candidate cleanup requires an exact Podman runtime identity or exact sandbox runtime identity');
+    }
+    const runtimeKind = exactRuntime === PODMAN_RUNTIME ? 'container' : exactRuntime;
+    const suppliedContainerId = candidate?.containerId ?? '';
+    const recordedContainerId = record.containerId ?? '';
+    if ((suppliedContainerId !== '' && typeof suppliedContainerId !== 'string')
+        || (recordedContainerId !== '' && typeof recordedContainerId !== 'string')) {
+        throw new Error('exact Podman candidate identity must use string container IDs');
+    }
+    if (runtimeKind === 'container' && (suppliedContainerId || recordedContainerId)) {
+        const exactContainerId = assertImmutableContainerId(
+            suppliedContainerId,
+            `cleanupExactAgentRuntimeCandidate(${containerName})`,
+        );
+        if (recordedContainerId !== exactContainerId) {
+            throw new Error('exact Podman candidate registry identity does not match its immutable container ID');
+        }
+    }
     const cleanupReceipt = consumeCandidateCleanupReceipt(candidate?.cleanupReceipt, {
         runtimeKind,
         candidateName: containerName,
@@ -3498,8 +3622,8 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
             instanceId: String(record.instanceId),
             enableGeneration: String(record.enableGeneration),
         },
-        ...(runtimeKind === 'container' && candidate?.containerId
-            ? { candidateId: String(candidate.containerId) }
+        ...(runtimeKind === 'container' && suppliedContainerId
+            ? { candidateId: suppliedContainerId }
             : {}),
     });
     if (cleanupReceipt.state === 'absent-proven' || cleanupReceipt.state === 'removed-proven'
@@ -3511,7 +3635,7 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
         error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
         throw error;
     }
-    if (record.runtime === 'bwrap' || record.runtime === 'seatbelt') {
+    if (exactRuntime === 'bwrap' || exactRuntime === 'seatbelt') {
         const identity = {
             instanceId: record.instanceId,
             enableGeneration: record.enableGeneration,
@@ -3526,8 +3650,11 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
         clearLivenessState(containerName);
         return { removed: true, state: 'removed' };
     }
-    const containerId = String(candidate?.containerId || '').trim();
-    if (!containerId || !candidate?.runtimeNetwork) {
+    const containerId = assertImmutableContainerId(
+        suppliedContainerId,
+        `cleanupExactAgentRuntimeCandidate(${containerName})`,
+    );
+    if (!candidate?.runtimeNetwork) {
         throw new Error('exact container candidate cleanup requires its immutable ID and runtime network');
     }
     return removeExactGenerationCandidate({
@@ -3577,6 +3704,13 @@ function restartGenerationCapabilityRuntime({
     const route = generation.routing?.routes?.[owner.routeKey];
     const manifest = generation.manifests?.[owner.routeKey];
     const record = generation.agents?.[owner.containerName];
+    if (record?.runtime !== PODMAN_RUNTIME) {
+        throw new Error('coordinated capability-runtime restart requires an exact Podman runtime identity');
+    }
+    assertImmutableContainerId(
+        record.containerId,
+        'coordinated capability-runtime restart',
+    );
     if (!route || !manifest || !record || record.type !== 'agent'
         || String(route.container || '') !== owner.containerName
         || `agent:${record.repoName}/${record.agentName}` !== owner.agentId
@@ -3599,6 +3733,7 @@ function restartGenerationCapabilityRuntime({
         alias: record.alias || undefined,
         profileName: profileResolution.resolvedProfileName,
         profileResolution,
+        runtime: PODMAN_RUNTIME,
         routerEndpoint: buildRouterEndpoint('host', INITIAL_ROUTER_PORT),
         forceRecreate: true,
         instanceId: owner.instanceId,
@@ -3612,16 +3747,34 @@ function restartGenerationCapabilityRuntime({
         networkLifecycleCapability,
     });
     try {
+        const resultContainerId = String(result?.containerId || '');
+        const resultRecord = result?.registryRecord;
         if (result?.containerName !== owner.containerName
-            || !String(result?.containerId || '')
-            || !isRunning(owner.containerName)) {
+            || !IMMUTABLE_CONTAINER_ID.test(resultContainerId)
+            || !resultRecord
+            || resultRecord.type !== 'agent'
+            || resultRecord.runtime !== PODMAN_RUNTIME
+            || String(resultRecord.containerId || '') !== resultContainerId
+            || String(resultRecord.instanceId || '') !== owner.instanceId
+            || String(resultRecord.enableGeneration || '') !== owner.enableGeneration
+            || !isRunning(resultContainerId, { runtime: PODMAN_RUNTIME })) {
             throw new Error(`coordinated capability-runtime restart did not start exact container '${owner.containerName}' with an immutable ID`);
         }
         const readinessProtocol = resolveReadinessProtocol(manifest);
         if (readinessProtocol !== 'script') {
             throw new Error('media capability runtime requires an exact semantic script readiness probe before generation activation');
         }
-        const readiness = runScriptReadiness(record.agentName, owner.containerName, manifest?.health?.readiness);
+        const readiness = runScriptReadiness(
+            record.agentName,
+            owner.containerName,
+            manifest?.health?.readiness,
+            {
+                runtime: PODMAN_RUNTIME,
+                containerId: resultContainerId,
+                instanceId: owner.instanceId,
+                enableGeneration: owner.enableGeneration,
+            },
+        );
         if (readiness && typeof readiness.then === 'function') {
             throw new Error('media capability runtime readiness must complete synchronously before selector commit');
         }
@@ -3630,13 +3783,16 @@ function restartGenerationCapabilityRuntime({
             throw new Error(`media capability runtime semantic readiness failed (${readiness?.reason || 'unknown failure'}${detail})`);
         }
     } catch (error) {
-        if (result?.containerName === owner.containerName && String(result?.containerId || '')) {
+        if (result?.containerName === owner.containerName
+            && IMMUTABLE_CONTAINER_ID.test(String(result?.containerId || ''))
+            && result?.registryRecord?.runtime === PODMAN_RUNTIME
+            && String(result.registryRecord.containerId || '') === String(result.containerId)) {
             try {
                 removeCandidate({
                     containerName: owner.containerName,
                     containerId: result.containerId,
                     network: profileResolution.network,
-                    record,
+                    record: result.registryRecord,
                 });
             } catch (cleanupError) {
                 appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
@@ -3670,6 +3826,8 @@ export function isGenerationCapabilityRuntimeEffective({
     const manifest = generation.manifests?.[owner.routeKey];
     const record = generation.agents?.[owner.containerName];
     if (!route || !manifest || !record || record.type !== 'agent'
+        || record.runtime !== PODMAN_RUNTIME
+        || !IMMUTABLE_CONTAINER_ID.test(String(record.containerId || ''))
         || String(route.container || '') !== owner.containerName
         || `agent:${record.repoName}/${record.agentName}` !== owner.agentId
         || String(record.instanceId || '') !== owner.instanceId
@@ -3682,11 +3840,11 @@ export function isGenerationCapabilityRuntimeEffective({
         path: `manifest(${record.repoName}/${record.agentName})`,
     });
     if (profileResolution.network.mode !== 'host'
-        || !exists(owner.containerName)
-        || !isRunning(owner.containerName)) {
+        || !exists(record.containerId, { runtime: PODMAN_RUNTIME })
+        || !isRunning(record.containerId, { runtime: PODMAN_RUNTIME })) {
         return false;
     }
-    const inspect = inspectContainerContract || createNetworkLifecycleAdapter({ runtime: getRuntime() })
+    const inspect = inspectContainerContract || createNetworkLifecycleAdapter({ runtime: PODMAN_RUNTIME })
         .inspectContainerContract;
     const inspection = inspect(owner.containerName, profileResolution.network, record.agentName, {
         instanceKey: effectiveInstanceKey(record.repoName, record.agentName, record.alias || ''),
@@ -3695,7 +3853,8 @@ export function isGenerationCapabilityRuntimeEffective({
         enableGeneration: owner.enableGeneration,
         requireRuntimeIdentity: true,
     });
-    return inspection?.state === 'exact';
+    return inspection?.state === 'exact'
+        && String(inspection.id || '') === String(record.containerId);
 }
 
 export {

@@ -1,7 +1,57 @@
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import path from 'path';
 import { debugLog } from '../../utils/utils.js';
-import { probeContainerRuntime, loadAgentsMap } from './common.js';
+import {
+    NETWORK_LABELS,
+    workspaceNetworkIdentity,
+} from '../networkLifecycle.js';
+import { NETWORK_SCHEMA_VERSION } from '../networkContract.js';
+import { loadAgentsMap } from './common.js';
+
+const CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
+const WORKSPACE_HASH_PATTERN = /^[a-f0-9]{12}$/;
+const CONTRACT_HASH_PATTERN = /^[a-f0-9]{64}$/;
+
+function exactLabelText(value) {
+    return typeof value === 'string' && value !== '' && value === value.trim();
+}
+
+function inspectOwnership(data, expectedName, expectedIdentity = {}) {
+    const labels = data?.Config?.Labels || {};
+    const rawContainerId = data?.Id ?? data?.ID;
+    const containerId = typeof rawContainerId === 'string' ? rawContainerId : '';
+    const rawName = data?.Name;
+    const inspectedName = typeof rawName === 'string' && rawName.startsWith('/')
+        ? rawName.slice(1)
+        : rawName;
+    const instanceId = labels[NETWORK_LABELS.instanceId];
+    const enableGeneration = labels[NETWORK_LABELS.enableGeneration];
+    const workspaceHash = expectedIdentity?.workspaceHash;
+    const expectedContainerId = expectedIdentity?.containerId;
+    const expectedInstanceId = expectedIdentity?.instanceId;
+    const expectedEnableGeneration = expectedIdentity?.enableGeneration;
+    const exactExpectedIdentity = WORKSPACE_HASH_PATTERN.test(workspaceHash)
+        && CONTAINER_ID_PATTERN.test(expectedContainerId)
+        && exactLabelText(expectedInstanceId)
+        && exactLabelText(expectedEnableGeneration);
+    const ownershipVerified = exactExpectedIdentity
+        && CONTAINER_ID_PATTERN.test(containerId)
+        && containerId === expectedContainerId
+        && inspectedName === expectedName
+        && labels[NETWORK_LABELS.managed] === '1'
+        && labels[NETWORK_LABELS.resource] === 'agent'
+        && labels[NETWORK_LABELS.schema] === NETWORK_SCHEMA_VERSION
+        && labels[NETWORK_LABELS.workspace] === workspaceHash
+        && CONTRACT_HASH_PATTERN.test(labels[NETWORK_LABELS.contract])
+        && instanceId === expectedInstanceId
+        && enableGeneration === expectedEnableGeneration;
+    return {
+        containerId,
+        instanceId: exactLabelText(instanceId) ? instanceId : '',
+        enableGeneration: exactLabelText(enableGeneration) ? enableGeneration : '',
+        ownershipVerified,
+    };
+}
 
 function parseAgentInfoFromMounts(mounts = []) {
     let repoName = '-';
@@ -42,52 +92,71 @@ function getAgentsRegistry() {
     return loadAgentsMap();
 }
 
-function collectLiveAgentContainers() {
-    const runtime = probeContainerRuntime();
-    if (!runtime) return [];
-    let names = [];
-    try {
-        const raw = execSync(`${runtime} ps --format "{{.Names}}"`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-        if (raw) {
-            names = raw.split(/\n+/).map((n) => n.trim()).filter((n) => n.startsWith('ploinky_'));
-        }
-    } catch (_) {
-        return [];
-    }
+/**
+ * Inspect only immutable Podman IDs already admitted in this workspace's
+ * registry. Global name discovery would allow a foreign or predecessor
+ * runtime to become lifecycle authority again.
+ */
+function collectLiveAgentContainers({
+    registry = loadAgentsMap(),
+    workspaceHash = workspaceNetworkIdentity().hash,
+    spawnSyncImpl = spawnSync,
+} = {}) {
+    if (!WORKSPACE_HASH_PATTERN.test(workspaceHash)) return [];
+    const runtime = 'podman';
     const results = [];
-    for (const name of names) {
+    for (const [name, record] of Object.entries(registry || {})) {
+        if (record?.type !== 'agent'
+            || record.runtime !== runtime
+            || !CONTAINER_ID_PATTERN.test(record.containerId)
+            || !exactLabelText(record.instanceId)
+            || !exactLabelText(record.enableGeneration)) {
+            continue;
+        }
         try {
-            const inspectRaw = execSync(`${runtime} inspect ${name}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-            const parsed = JSON.parse(inspectRaw);
-            if (!Array.isArray(parsed) || !parsed.length) continue;
+            const inspected = spawnSyncImpl(
+                runtime,
+                ['container', 'inspect', record.containerId],
+                { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+            );
+            if (inspected?.error || inspected?.status !== 0) continue;
+            const parsed = JSON.parse(String(inspected?.stdout || ''));
+            if (!Array.isArray(parsed) || parsed.length !== 1) continue;
             const data = parsed[0];
-            const mounts = data.Mounts || [];
+            const ownership = inspectOwnership(data, name, {
+                workspaceHash,
+                containerId: record.containerId,
+                instanceId: record.instanceId,
+                enableGeneration: record.enableGeneration,
+            });
+            if (!ownership.ownershipVerified || data?.State?.Running !== true) continue;
+            const mounts = Array.isArray(data.Mounts) ? data.Mounts : [];
             const envPairs = Array.isArray(data.Config?.Env) ? data.Config.Env : [];
             const env = envPairs.map((entry) => {
                 const idx = entry.indexOf('=');
                 const key = idx === -1 ? entry : entry.slice(0, idx);
                 return { name: key, value: idx === -1 ? '' : entry.slice(idx + 1) };
             });
-            let agentName = env.find((e) => e.name === 'AGENT_NAME')?.value || '-';
-            const { repoName, agentName: mountAgent } = parseAgentInfoFromMounts(mounts);
-            if (agentName === '-' && mountAgent && mountAgent !== '-') {
-                agentName = mountAgent;
-            }
+            const mountIdentity = parseAgentInfoFromMounts(mounts);
             const ports = formatPortBindings(data.NetworkSettings?.Ports || {});
             results.push({
                 containerName: name,
-                agentName,
-                repoName,
-                containerImage: data.Config?.Image || '-',
-                createdAt: data.Created || '-',
-                projectPath: data.Config?.WorkingDir || '-',
+                runtime,
+                ...ownership,
+                agentName: exactLabelText(record.agentName)
+                    ? record.agentName
+                    : (env.find((entry) => entry.name === 'AGENT_NAME')?.value || mountIdentity.agentName),
+                repoName: exactLabelText(record.repoName) ? record.repoName : mountIdentity.repoName,
+                containerImage: data.Config?.Image || record.containerImage || '-',
+                createdAt: data.Created || record.createdAt || '-',
+                projectPath: record.projectPath || data.Config?.WorkingDir || '-',
                 state: {
-                    status: data.State?.Status || '-',
-                    running: Boolean(data.State?.Running),
+                    status: data.State?.Status || 'running',
+                    running: true,
                     pid: data.State?.Pid || 0
                 },
                 config: {
-                    binds: mounts.map((m) => ({ source: m.Source, target: m.Destination })),
+                    binds: mounts.map((mount) => ({ source: mount.Source, target: mount.Destination })),
                     env,
                     ports
                 }
@@ -103,5 +172,6 @@ export {
     collectLiveAgentContainers,
     formatPortBindings,
     getAgentsRegistry,
+    inspectOwnership,
     parseAgentInfoFromMounts
 };

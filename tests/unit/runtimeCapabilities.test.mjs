@@ -91,12 +91,62 @@ test('effective descriptor is frozen and binds policy, profile, and manifest ide
     assert.equal(descriptor.profileName, 'qa');
     assert.equal(descriptor.runtimePolicy.resources.memory, '2g');
     assert.match(runtimeCapabilityDigest(descriptor), /^sha256:[a-f0-9]{64}$/);
-    const manifest = { containerSecurity: {} };
+    const manifest = { container: 'test/runtime:approved', containerSecurity: {} };
     const admission = admitManifestRuntimeCapabilities(manifest, {
         manifestBytes: Buffer.from(JSON.stringify(manifest)),
         insideBox: false,
     });
     assert.deepEqual(renderContainerSecurityArgs(admission.descriptor), []);
+});
+
+test('selected container admission requires a usable container declaration', () => {
+    for (const manifest of [
+        {},
+        { 'lite-sandbox': false },
+        { container: '' },
+        { container: ' image:tag ' },
+        { container: { image: 'tag' } },
+    ]) {
+        assert.throws(
+            () => admitManifestRuntimeCapabilities(manifest, {
+                runtime: 'podman',
+                runtimeKind: 'container',
+                insideBox: false,
+            }),
+            { code: 'PLOINKY_CONTAINER_DECLARATION_REQUIRED' },
+        );
+    }
+
+    assert.doesNotThrow(() => admitManifestRuntimeCapabilities({
+        container: 'registry.example/runtime:${VERSION}',
+    }, {
+        runtime: 'podman',
+        runtimeKind: 'container',
+        insideBox: false,
+    }));
+});
+
+test('runtime capability validation rejects non-boolean lite-sandbox selectors', () => {
+    for (const selector of ['true', 1, null, {}]) {
+        assert.throws(
+            () => validateManifestRuntimeCapabilities({
+                'lite-sandbox': selector,
+                container: 'registry.example/runtime:approved',
+            }),
+            { code: 'PLOINKY_LITE_SANDBOX_SELECTOR_INVALID', status: 422 },
+        );
+    }
+    assert.doesNotThrow(() => validateManifestRuntimeCapabilities({
+        container: 'registry.example/runtime:approved',
+    }));
+    assert.doesNotThrow(() => validateManifestRuntimeCapabilities({
+        'lite-sandbox': false,
+        container: 'registry.example/runtime:approved',
+    }));
+    assert.doesNotThrow(() => validateManifestRuntimeCapabilities({
+        'lite-sandbox': true,
+        container: { deliberately: 'dormant' },
+    }));
 });
 
 test('argument renderers reject a forged public-version descriptor', () => {
@@ -147,8 +197,11 @@ test('strict Box marker permits admitted bwrap host networking but rejects other
     }
 });
 
-test('strict sandbox admission schema records absent declaration and effective network hash', () => {
-    const manifest = { 'lite-sandbox': true };
+test('strict sandbox admission ignores dormant container metadata and records the effective network hash', () => {
+    const manifest = {
+        'lite-sandbox': true,
+        container: { deliberately: 'invalid-but-dormant' },
+    };
     const admission = admitManifestRuntimeCapabilities(manifest, {
         manifestBytes: Buffer.from(JSON.stringify(manifest)),
         runtime: 'bwrap',
@@ -195,13 +248,10 @@ test('strict sandbox admission schema records absent declaration and effective n
         }),
         { code: 'PLOINKY_SANDBOX_POLICY_CONFLICT' },
     );
-    assert.throws(
-        () => admitManifestRuntimeCapabilities({
-            'lite-sandbox': true,
-            container: 'legacy-image',
-        }, { runtimeKind: 'bwrap', insideBox: false }),
-        { code: 'PLOINKY_SANDBOX_CONTAINER_CONFLICT' },
-    );
+    assert.doesNotThrow(() => admitManifestRuntimeCapabilities({
+        'lite-sandbox': true,
+        container: { malformed: 'ignored by sandbox admission' },
+    }, { runtimeKind: 'bwrap', insideBox: false }));
 });
 
 test('host runtime admission requires the exact derived platform network contract', () => {

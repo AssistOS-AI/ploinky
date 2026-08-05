@@ -270,6 +270,24 @@ test('the explicit targeted restart contract preserves its captured tuple', () =
     });
 });
 
+test('runtime reuse rejects padded or non-string persisted generation identity', () => {
+    for (const [field, value] of [
+        ['instanceId', ' instance-current'],
+        ['instanceId', 'instance-current\n'],
+        ['instanceId', { toString: () => 'instance-current' }],
+        ['enableGeneration', '\tgeneration-current'],
+        ['enableGeneration', 'generation-current '],
+        ['enableGeneration', { toString: () => 'generation-current' }],
+    ]) {
+        assert.throws(() => resolveReplacementRuntimeIdentity({
+            containerName,
+            existingRecord: { ...existingRecord(), [field]: value },
+            existingRuntime: true,
+            recreateReason: null,
+        }), /exact registered instanceId and enableGeneration/);
+    }
+});
+
 test('failed coordinated prepare retains the new candidate tuple and leaves the selector inactive', () => {
     let registry = { [containerName]: existingRecord() };
     const inactivations = [];

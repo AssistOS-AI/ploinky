@@ -10,14 +10,10 @@ export {
     cleanupSessionSet,
     destroyAllPloinky,
     destroyWorkspaceContainers,
-    forceStopContainers,
     getContainerCandidates,
-    gracefulStopContainer,
-    listAllContainerNames,
     stopAndRemove,
     stopAndRemoveMany,
-    stopConfiguredAgents,
-    waitForContainers
+    stopConfiguredAgents
 } from './containerFleet.js';
 
 export {
