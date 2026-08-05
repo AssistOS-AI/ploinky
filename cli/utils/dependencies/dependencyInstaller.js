@@ -3,7 +3,26 @@ import path from 'path';
 import { spawnSync } from 'child_process';
 import { GLOBAL_DEPS_PATH } from '../config.js';
 import { debugLog } from '../utils.js';
-import { remoteBranchExists } from '../repos.js';
+
+const IMMUTABLE_GIT_COMMIT = /^[0-9a-f]{40}$/;
+const IMMUTABLE_GIT_SOURCE = /^(?:git\+(?:https?|ssh):\/\/|git:\/\/|github:)/;
+
+function assertImmutableAgentlibDependency(spec, label) {
+    const value = String(spec || '').trim();
+    const firstHashIdx = value.indexOf('#');
+    const hashIdx = value.lastIndexOf('#');
+    const commit = hashIdx >= 0 ? value.slice(hashIdx + 1) : '';
+    const source = hashIdx >= 0 ? value.slice(0, hashIdx) : '';
+    if (
+        hashIdx <= 0
+        || firstHashIdx !== hashIdx
+        || !IMMUTABLE_GIT_SOURCE.test(source)
+        || !IMMUTABLE_GIT_COMMIT.test(commit)
+    ) {
+        throw new Error(`${label} must use an immutable 40-hex commit.`);
+    }
+    return value;
+}
 
 /**
  * Merge global and agent package.json objects.
@@ -77,28 +96,39 @@ function readGlobalDepsPackage(env = process.env) {
  * achillesAgentLib is normally pinned to a fixed git ref in
  * globalDeps/package.json. `PLOINKY_AGENTLIB_REF` (set by `ploinky start` from
  * the global --branch, or exported directly) points every agent's
- * achillesAgentLib at a different branch or source for a single deploy without
+ * achillesAgentLib at a resolved immutable commit for a single deploy without
  * editing tracked files.
  *
- * A bare value (e.g. "my-feature") is treated as a branch
- * and swapped onto the existing dependency URL. A full npm spec (git+..., a
- * URL, github:, npm: or file:) is used verbatim.
+ * A bare immutable commit is swapped onto the existing dependency URL. A full
+ * npm git spec is used verbatim only when its ref is also an immutable commit.
+ * Moving branch/tag refs and local sources are rejected before cache/install.
  *
  * @param {object} pkg - Parsed globalDeps package.json (mutated in place).
  * @param {NodeJS.ProcessEnv} [env=process.env] - Environment to read the override from.
  * @returns {object} The same pkg object.
  */
 function overrideGlobalDeps(pkg, env = process.env) {
+    const deps = pkg.dependencies || (pkg.dependencies = {});
+    assertImmutableAgentlibDependency(
+        deps.achillesAgentLib,
+        'The tracked achillesAgentLib dependency',
+    );
+
     const ref = String(env.PLOINKY_AGENTLIB_REF || '').trim();
     if (!ref) {
         return pkg;
     }
-    const deps = pkg.dependencies || (pkg.dependencies = {});
     const isFullSpec = /:\/\//.test(ref) || /^(git\+|github:|npm:|file:|https?:)/.test(ref);
     let value;
     if (isFullSpec) {
-        value = ref;
+        value = assertImmutableAgentlibDependency(
+            ref,
+            'PLOINKY_AGENTLIB_REF',
+        );
     } else {
+        if (!IMMUTABLE_GIT_COMMIT.test(ref)) {
+            throw new Error('PLOINKY_AGENTLIB_REF must be an immutable 40-hex commit or a git spec pinned to one.');
+        }
         const current = String(deps.achillesAgentLib || '');
         const hashIdx = current.indexOf('#');
         const base = hashIdx >= 0 ? current.slice(0, hashIdx) : current;
@@ -109,6 +139,32 @@ function overrideGlobalDeps(pkg, env = process.env) {
     }
     deps.achillesAgentLib = value;
     return pkg;
+}
+
+function resolveRemoteAgentlibBranch(remoteUrl, branch, lsRemote) {
+    if (!remoteUrl) {
+        return null;
+    }
+    const expectedRef = `refs/heads/${branch}`;
+    const result = lsRemote(
+        'git',
+        ['ls-remote', '--exit-code', '--heads', remoteUrl, expectedRef],
+        {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+        },
+    );
+    if (result?.error || result?.status !== 0) {
+        return null;
+    }
+    const matches = String(result.stdout || '')
+        .split(/\r?\n/)
+        .map((line) => line.trim().split(/\s+/))
+        .filter(([commit, ref]) => IMMUTABLE_GIT_COMMIT.test(commit) && ref === expectedRef);
+    if (matches.length !== 1) {
+        return null;
+    }
+    return matches[0][0];
 }
 
 /**
@@ -135,25 +191,26 @@ function pinnedAgentlibUrl() {
 /**
  * Resolve the achillesAgentLib ref implied by a global --branch policy.
  *
- * If the branch exists on the achillesAgentLib remote, use it. A missing branch
- * is always fatal: silently substituting the default dependency spec makes it
- * impossible to prove which AgentLib implementation a release candidate ran.
+ * Resolve the exact requested remote branch to its current immutable commit. A
+ * missing or mismatched ref is always fatal: remote HEAD/default output never
+ * substitutes for the requested branch, and npm never receives a moving ref.
  * Called from `ploinky start` with the parsed --branch policy.
  *
  * @param {object} branchPolicy - parsed --branch policy ({ branch, fallback, ... }).
  * @param {object} [opts]
- * @param {(url: string, branch: string) => boolean} [opts.branchExists] - remote-branch probe (injectable for tests).
+ * @param {typeof spawnSync} [opts.lsRemote] - `git ls-remote` runner (injectable for tests).
  * @param {string} [opts.url] - achillesAgentLib remote URL (defaults to the pinned globalDeps URL).
- * @returns {string|null} branch to use, or null when no branch was requested.
+ * @returns {string|null} immutable commit to use, or null when no branch was requested.
  */
-function resolveAgentlibBranchRef(branchPolicy, { branchExists = remoteBranchExists, url } = {}) {
+function resolveAgentlibBranchRef(branchPolicy, { lsRemote = spawnSync, url } = {}) {
     const branch = branchPolicy?.branch;
     if (!branch) {
         return null;
     }
     const remoteUrl = url === undefined ? pinnedAgentlibUrl() : url;
-    if (remoteUrl && branchExists(remoteUrl, branch)) {
-        return branch;
+    const commit = resolveRemoteAgentlibBranch(remoteUrl, branch, lsRemote);
+    if (commit) {
+        return commit;
     }
     const fallback = branchPolicy?.fallback || 'default';
     throw new Error(
