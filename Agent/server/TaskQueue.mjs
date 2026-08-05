@@ -5,9 +5,38 @@ import { inspectProcessIdentity, normalizeProcessIdentity } from '../lib/process
 
 const DEFAULT_MAX_LOG_TAIL_BYTES = 128 * 1024;
 const DEFAULT_CANCEL_GRACE_MS = 2000;
+const DEFAULT_CLOSE_TIMEOUT_MS = 10_000;
 const CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
 const TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const PROVIDER_LOGIN_OPERATIONS = new Set([
+    'login_start', 'login_status', 'login_respond', 'login_cancel',
+]);
+
+function taskQueueError(code, message, options) {
+    const error = new Error(message, options);
+    error.code = code;
+    return error;
+}
+
+function isRetainedLifecycleFailure(error) {
+    return error?.ownershipRetained === true
+        || error?.code === 'PLOINKY_PROVIDER_RUNTIME_TERMINATION_UNPROVEN'
+        || error?.code === 'PLOINKY_PROVIDER_TERMINATION_UNPROVEN'
+        || error?.code === 'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED';
+}
+
+function hasExactProviderTerminationProof(error) {
+    if (error?.ownershipRetained !== false || !Array.isArray(error.terminationEvidence)
+        || error.terminationEvidence.length === 0) {
+        return false;
+    }
+    return error.terminationEvidence.some((entry) => (
+        entry && typeof entry === 'object'
+        && entry.state === 'terminated'
+        && (entry.phase === 'initial' || entry.terminal === true)
+    ));
+}
 
 function parsePositiveInt(value, fallback) {
     const parsed = Number.parseInt(value, 10);
@@ -51,6 +80,7 @@ function cloneCommandSpec(commandSpec = {}) {
             provider: commandSpec.provider,
             module: commandSpec.module,
             exportName: commandSpec.exportName,
+            sandboxMode: commandSpec.sandboxMode,
             timeoutMs: commandSpec.timeoutMs,
         };
     }
@@ -71,6 +101,7 @@ export class TaskQueue {
         executor,
         maxLogTailBytes = DEFAULT_MAX_LOG_TAIL_BYTES,
         cancelGraceMs = DEFAULT_CANCEL_GRACE_MS,
+        closeTimeoutMs = DEFAULT_CLOSE_TIMEOUT_MS,
         processIdentityInspector = inspectProcessIdentity,
         signalProcessGroup = (pid, signal) => process.kill(-pid, signal),
         getUid = () => (typeof process.getuid === 'function' ? process.getuid() : null),
@@ -83,6 +114,7 @@ export class TaskQueue {
         this.executor = executor;
         this.maxLogTailBytes = parsePositiveInt(maxLogTailBytes, DEFAULT_MAX_LOG_TAIL_BYTES);
         this.cancelGraceMs = parsePositiveInt(cancelGraceMs, DEFAULT_CANCEL_GRACE_MS);
+        this.closeTimeoutMs = parsePositiveInt(closeTimeoutMs, DEFAULT_CLOSE_TIMEOUT_MS);
         if (typeof processIdentityInspector !== 'function'
             || typeof signalProcessGroup !== 'function' || typeof getUid !== 'function') {
             throw new Error('TaskQueue process identity dependencies are invalid');
@@ -98,8 +130,39 @@ export class TaskQueue {
         this.activeProcessOwnership = new Map();
         this.activeAbortControllers = new Map();
         this.cancelTimers = new Map();
+        this.lifecycleFailures = new Map();
         this.lifecycleFailure = null;
         this.initialized = false;
+        this.admissionClosed = false;
+        this.runPromises = new Map();
+        this.closePromise = null;
+        this.cleanupComplete = false;
+    }
+
+    syncLifecycleFailure() {
+        this.lifecycleFailure = this.lifecycleFailures.values().next().value ?? null;
+    }
+
+    recordLifecycleFailure(record) {
+        const taskId = record?.taskId ?? '__queue__';
+        const previous = this.lifecycleFailures.get(taskId);
+        const next = Object.freeze({
+            ...(previous ?? {}),
+            ...record,
+            taskId,
+            cleanupRetry: record?.cleanupRetry ?? previous?.cleanupRetry ?? null,
+        });
+        this.lifecycleFailures.set(taskId, next);
+        this.syncLifecycleFailure();
+        return next;
+    }
+
+    clearLifecycleFailure(taskId) {
+        const key = taskId ?? '__queue__';
+        this.lifecycleFailures.delete(key);
+        this.activeChildren.delete(key);
+        this.activeProcessOwnership.delete(key);
+        this.syncLifecycleFailure();
     }
 
     initialize() {
@@ -293,6 +356,22 @@ export class TaskQueue {
         continuationTool = '',
     }) {
         this.initialize();
+        if (this.admissionClosed) {
+            throw taskQueueError('PLOINKY_TASK_QUEUE_CLOSED', 'TaskQueue admission is closed');
+        }
+        if (this.lifecycleFailures.size > 0) {
+            throw taskQueueError(
+                'PLOINKY_TASK_QUEUE_CLEANUP_UNPROVEN',
+                'TaskQueue admission is blocked until exact lifecycle cleanup is proven',
+            );
+        }
+        if (commandSpec?.kind === 'provider-module'
+            && PROVIDER_LOGIN_OPERATIONS.has(payload?.input?.operation)) {
+            throw taskQueueError(
+                'PLOINKY_PROVIDER_LOGIN_ASYNC_FORBIDDEN',
+                'provider login operations cannot enter the persistent task queue',
+            );
+        }
         const id = this.generateId();
         const payloadWithId = { ...payload, taskId: id };
         const task = {
@@ -337,7 +416,7 @@ export class TaskQueue {
     }
 
     processQueue() {
-        if (this.lifecycleFailure) return;
+        if (this.lifecycleFailures.size > 0 || this.admissionClosed) return;
         while (this.running.size < this.maxConcurrent && this.pending.length > 0) {
             const nextId = this.pending.shift();
             if (!nextId) {
@@ -433,6 +512,25 @@ export class TaskQueue {
         }
     }
 
+    taskProcessOwnershipReleased(taskId) {
+        const ownership = this.activeProcessOwnership.get(taskId);
+        if (!ownership) return false;
+        const observation = this.inspectTaskProcess(ownership.pid);
+        const inspected = observation.inspected;
+        if (inspected?.state === 'dead') return true;
+        let processIdentity = null;
+        try { processIdentity = normalizeProcessIdentity(inspected?.processIdentity); } catch (_) { }
+        return inspected?.state === 'identified'
+            && processIdentity !== null
+            && processIdentity !== ownership.processIdentity;
+    }
+
+    reconcileTaskTerminationFailure(task) {
+        if (!task?.terminationFailure || !this.taskProcessOwnershipReleased(task.id)) return false;
+        task.terminationFailure = null;
+        return true;
+    }
+
     requestRunningTaskCancellation(task, child) {
         if (!task || !child) return;
         try { this.signalTaskProcess(task.id, 'SIGTERM'); } catch (error) {
@@ -490,7 +588,9 @@ export class TaskQueue {
         this.running.add(task.id);
         this.persistTasks();
         const runPromise = this.executeTask(task);
+        this.runPromises.set(task.id, runPromise);
         runPromise.finally(() => {
+            this.runPromises.delete(task.id);
             this.running.delete(task.id);
             if (task.status === 'pending') {
                 if (!this.pending.includes(task.id)) {
@@ -506,6 +606,10 @@ export class TaskQueue {
     async executeTask(task) {
         let timer = null;
         let timedOut = false;
+        let spawnAdmissionFailure = null;
+        let spawnTerminalObserved = false;
+        let unverifiedSpawnChild = null;
+        let retainedCleanupRetry = null;
         const abortController = new AbortController();
         this.activeAbortControllers.set(task.id, abortController);
         try {
@@ -528,7 +632,17 @@ export class TaskQueue {
                         const ownership = this.captureTaskProcessOwnership(child);
                         this.activeProcessOwnership.set(task.id, ownership);
                     } catch (error) {
-                        this.lifecycleFailure = Object.freeze({ taskId: task.id, child, error });
+                        spawnAdmissionFailure = error;
+                        unverifiedSpawnChild = child;
+                        child?.once?.('close', () => {
+                            spawnTerminalObserved = true;
+                            const retained = this.lifecycleFailures.get(task.id);
+                            if (retained?.phase === 'spawn-admission'
+                                && retained.child === child) {
+                                this.clearLifecycleFailure(task.id);
+                                this.processQueue();
+                            }
+                        });
                         throw error;
                     }
                     if (task.cancelRequested) {
@@ -554,11 +668,22 @@ export class TaskQueue {
                 },
                 detached: true,
                 signal: abortController.signal,
+                onRetainedCleanup: (cleanup) => {
+                    if (retainedCleanupRetry || typeof cleanup !== 'function') {
+                        throw taskQueueError(
+                            'PLOINKY_TASK_QUEUE_CLEANUP_INVALID',
+                            'executor retained cleanup registration is invalid',
+                        );
+                    }
+                    retainedCleanupRetry = cleanup;
+                },
             });
 
             if (timer) {
                 clearTimeout(timer);
             }
+
+            this.reconcileTaskTerminationFailure(task);
 
             const success = !timedOut && result.code === 0;
             const parsedResult = commandResult(result.stdout);
@@ -570,7 +695,8 @@ export class TaskQueue {
                 task.status = 'failed';
                 task.error = `${task.terminationFailure.code}: exact task termination was not proven`;
                 task.result = null;
-                this.lifecycleFailure ||= Object.freeze({
+                this.recordLifecycleFailure({
+                    phase: 'process-termination',
                     taskId: task.id,
                     child: this.activeChildren.get(task.id) ?? null,
                     error: task.terminationFailure,
@@ -618,11 +744,39 @@ export class TaskQueue {
             if (timer) {
                 clearTimeout(timer);
             }
-            if ((task.cancelRequested || task.status === 'cancelling') && task.terminationFailure) {
+            this.reconcileTaskTerminationFailure(task);
+            if (spawnAdmissionFailure) {
+                const cleanupProven = spawnTerminalObserved || hasExactProviderTerminationProof(err);
+                const failure = isRetainedLifecycleFailure(err) ? err : spawnAdmissionFailure;
+                task.status = 'failed';
+                task.error = `${err?.code || spawnAdmissionFailure.code}: ${err?.message || spawnAdmissionFailure.message}`;
+                task.result = null;
+                if (!cleanupProven) {
+                    this.recordLifecycleFailure({
+                        phase: 'spawn-admission',
+                        taskId: task.id,
+                        child: unverifiedSpawnChild,
+                        error: failure,
+                        cleanupRetry: retainedCleanupRetry,
+                    });
+                }
+            } else if (isRetainedLifecycleFailure(err)) {
+                task.status = 'failed';
+                task.error = `${err.code || 'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED'}: ${err.message || 'exact provider cleanup was not proven'}`;
+                task.result = null;
+                this.recordLifecycleFailure({
+                    phase: 'retained-cleanup',
+                    taskId: task.id,
+                    child: this.activeChildren.get(task.id) ?? null,
+                    error: err,
+                    cleanupRetry: retainedCleanupRetry,
+                });
+            } else if ((task.cancelRequested || task.status === 'cancelling') && task.terminationFailure) {
                 task.status = 'failed';
                 task.error = `${task.terminationFailure.code}: exact task termination was not proven`;
                 task.result = null;
-                this.lifecycleFailure ||= Object.freeze({
+                this.recordLifecycleFailure({
+                    phase: 'process-termination',
                     taskId: task.id,
                     child: this.activeChildren.get(task.id) ?? null,
                     error: task.terminationFailure,
@@ -639,7 +793,10 @@ export class TaskQueue {
                 task.result = null;
             }
         } finally {
-            if (this.lifecycleFailure?.taskId !== task.id) {
+            const retained = this.lifecycleFailures.get(task.id);
+            if (retained?.phase === 'close-timeout') {
+                this.clearLifecycleFailure(task.id);
+            } else if (!retained) {
                 this.activeChildren.delete(task.id);
                 this.activeProcessOwnership.delete(task.id);
             }
@@ -649,6 +806,95 @@ export class TaskQueue {
             this.cancelTimers.delete(task.id);
             task.updatedAt = new Date().toISOString();
             this.persistTasks();
+        }
+    }
+
+    async close() {
+        this.initialize();
+        this.admissionClosed = true;
+        if (this.cleanupComplete) return;
+        if (!this.closePromise) {
+            this.closePromise = (async () => {
+                for (const taskId of [...this.pending]) this.cancelTask(taskId);
+                for (const taskId of [...this.running]) this.cancelTask(taskId);
+                let timer = null;
+                const timedOut = Symbol('task-queue-close-timeout');
+                const outcome = await Promise.race([
+                    Promise.all([...this.runPromises.values()].map((promise) => promise.catch(() => {}))),
+                    new Promise((resolve) => {
+                        timer = setTimeout(() => resolve(timedOut), this.closeTimeoutMs);
+                        timer.unref?.();
+                    }),
+                ]);
+                if (timer) clearTimeout(timer);
+                if (outcome === timedOut) {
+                    const error = taskQueueError(
+                        'PLOINKY_TASK_QUEUE_CLEANUP_UNPROVEN',
+                        'TaskQueue shutdown deadline expired before exact active cleanup',
+                    );
+                    error.ownershipRetained = true;
+                    error.evidence = Object.freeze({
+                        running: this.running.size,
+                        activeChildren: this.activeChildren.size,
+                        activeProcessOwnership: this.activeProcessOwnership.size,
+                        runPromises: this.runPromises.size,
+                    });
+                    this.recordLifecycleFailure({
+                        phase: 'close-timeout',
+                        taskId: [...this.running][0] ?? null,
+                        child: this.activeChildren.values().next().value ?? null,
+                        error,
+                    });
+                    throw error;
+                }
+                if (this.lifecycleFailures.size > 0) {
+                    const retained = [...this.lifecycleFailures.entries()];
+                    const results = await Promise.allSettled(retained.map(([, failure]) => (
+                        failure.cleanupRetry
+                            ? failure.cleanupRetry()
+                            : Promise.reject(failure.error)
+                    )));
+                    const unresolved = [];
+                    for (let index = 0; index < retained.length; index += 1) {
+                        const [taskId, failure] = retained[index];
+                        const result = results[index];
+                        if (result.status === 'fulfilled') {
+                            this.clearLifecycleFailure(taskId);
+                        } else {
+                            const updated = this.recordLifecycleFailure({
+                                ...failure,
+                                taskId,
+                                error: result.reason,
+                            });
+                            unresolved.push(updated.error);
+                        }
+                    }
+                    if (unresolved.length === 1) throw unresolved[0];
+                    if (unresolved.length > 1) {
+                        const error = new AggregateError(
+                            unresolved,
+                            'TaskQueue retained cleanup retries remain unproven',
+                            { cause: unresolved[0] },
+                        );
+                        error.code = 'PLOINKY_TASK_QUEUE_CLEANUP_UNPROVEN';
+                        error.ownershipRetained = true;
+                        throw error;
+                    }
+                }
+                if (this.running.size !== 0 || this.activeChildren.size !== 0
+                    || this.activeProcessOwnership.size !== 0 || this.activeAbortControllers.size !== 0) {
+                    throw taskQueueError(
+                        'PLOINKY_TASK_QUEUE_CLEANUP_UNPROVEN',
+                        'TaskQueue shutdown could not prove exact active cleanup',
+                    );
+                }
+                this.cleanupComplete = true;
+            })();
+        }
+        try {
+            await this.closePromise;
+        } finally {
+            if (!this.cleanupComplete) this.closePromise = null;
         }
     }
 

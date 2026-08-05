@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -13,7 +13,11 @@ import {
 import {
     createMemoryReplayCache
 } from '../lib/jwtVerify.mjs';
-import { runProviderSandboxReadiness } from '../lib/providerSandbox.mjs';
+import {
+    PROVIDER_SANDBOX_MODES,
+    runProviderSandboxReadiness,
+} from '../lib/providerSandbox.mjs';
+import { createProviderOperationSessionRegistry } from '../lib/providerOperationSessions.mjs';
 import { createProviderTaskRuntime } from '../lib/providerTaskRuntime.mjs';
 import { startScopedSoulBrokerRegistry } from '../lib/scopedSoulBroker.mjs';
 import {
@@ -73,8 +77,20 @@ const TASK_CANCEL_TOOL = '__task_cancel__';
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 const PROVIDER_NAME_RE = /^(?:opencode|pi|codex)$/;
 const PROVIDER_EXPORT_RE = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
+const PROVIDER_LOGIN_OPERATIONS = new Set([
+    'login_start',
+    'login_status',
+    'login_respond',
+    'login_cancel',
+]);
+const PROVIDER_LOGIN_CONTROL_OPERATIONS = new Set([
+    'login_status',
+    'login_respond',
+    'login_cancel',
+]);
 
 let scopedSoulBrokerRegistryPromise = null;
+const providerOperationSessionRegistry = createProviderOperationSessionRegistry();
 
 function providerPolicyError(code, message) {
     const error = new Error(message);
@@ -104,6 +120,168 @@ async function ensureScopedSoulBrokerRegistry() {
         });
     }
     return scopedSoulBrokerRegistryPromise;
+}
+
+export async function __closeProviderInfrastructure({
+    taskQueueInstance,
+    operationSessionRegistry = providerOperationSessionRegistry,
+    brokerRegistryPromise = scopedSoulBrokerRegistryPromise,
+} = {}) {
+    if (!taskQueueInstance || typeof taskQueueInstance.close !== 'function'
+        || !operationSessionRegistry || typeof operationSessionRegistry.close !== 'function') {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_SHUTDOWN_INVALID',
+            'provider shutdown requires the task queue and operation session registry',
+        );
+    }
+    let taskQueueFailure = null;
+    let operationSessionFailure = null;
+    try {
+        await taskQueueInstance.close();
+    } catch (error) {
+        taskQueueFailure = error;
+    }
+    try {
+        await operationSessionRegistry.close();
+    } catch (error) {
+        operationSessionFailure = error;
+    }
+    if (taskQueueFailure && operationSessionFailure) {
+        const error = new AggregateError(
+            [taskQueueFailure, operationSessionFailure],
+            'provider shutdown could not prove task and retained-session cleanup',
+            { cause: taskQueueFailure },
+        );
+        error.code = 'PLOINKY_PROVIDER_SHUTDOWN_CLEANUP_UNPROVEN';
+        throw error;
+    }
+    if (taskQueueFailure) throw taskQueueFailure;
+    if (operationSessionFailure) throw operationSessionFailure;
+    if (brokerRegistryPromise) {
+        const brokerRegistry = await brokerRegistryPromise;
+        if (!brokerRegistry || typeof brokerRegistry.close !== 'function') {
+            throw providerPolicyError(
+                'PLOINKY_PROVIDER_SHUTDOWN_INVALID',
+                'provider shutdown requires the scoped broker registry',
+            );
+        }
+        await brokerRegistry.close();
+    }
+}
+
+export async function __shutdownAgentServerRuntime({
+    taskQueueInstance,
+    operationSessionRegistry = providerOperationSessionRegistry,
+    brokerRegistryPromise = scopedSoulBrokerRegistryPromise,
+    sessions: activeSessions,
+    serverHttp,
+    maxProviderCleanupAttempts = 3,
+    retryDelayMs = 100,
+    transportCloseTimeoutMs = 5_000,
+    delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+} = {}) {
+    if (!serverHttp || typeof serverHttp.close !== 'function'
+        || typeof serverHttp.closeAllConnections !== 'function'
+        || !activeSessions || typeof activeSessions !== 'object'
+        || !Number.isSafeInteger(maxProviderCleanupAttempts)
+        || maxProviderCleanupAttempts < 1 || maxProviderCleanupAttempts > 10
+        || !Number.isSafeInteger(retryDelayMs) || retryDelayMs < 0 || retryDelayMs > 10_000
+        || !Number.isSafeInteger(transportCloseTimeoutMs)
+        || transportCloseTimeoutMs < 1 || transportCloseTimeoutMs > 60_000
+        || typeof delay !== 'function') {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_SHUTDOWN_INVALID',
+            'AgentServer shutdown dependencies are invalid',
+        );
+    }
+    const httpClosed = new Promise((resolve, reject) => {
+        try {
+            serverHttp.close((error) => {
+                if (!error || error.code === 'ERR_SERVER_NOT_RUNNING') {
+                    resolve();
+                } else {
+                    reject(error);
+                }
+            });
+        } catch (error) {
+            reject(error);
+        }
+    });
+    let providerCleanupFailure = null;
+    for (let attempt = 1; attempt <= maxProviderCleanupAttempts; attempt += 1) {
+        try {
+            await __closeProviderInfrastructure({
+                taskQueueInstance,
+                operationSessionRegistry,
+                brokerRegistryPromise,
+            });
+            providerCleanupFailure = null;
+            break;
+        } catch (error) {
+            providerCleanupFailure = error;
+            if (attempt < maxProviderCleanupAttempts && retryDelayMs > 0) {
+                await delay(retryDelayMs);
+            }
+        }
+    }
+    if (providerCleanupFailure) throw providerCleanupFailure;
+
+    const transportResultsPromise = Promise.allSettled(Object.values(activeSessions).map((entry) => {
+        if (!entry?.transport) return Promise.resolve();
+        try {
+            return Promise.resolve(entry.transport.close());
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    }));
+    let closeAllFailure = null;
+    try {
+        serverHttp.closeAllConnections();
+    } catch (error) {
+        closeAllFailure = error;
+    }
+    let timeout = null;
+    const timedOut = Symbol('agent-server-transport-close-timeout');
+    const containment = await Promise.race([
+        Promise.all([
+            transportResultsPromise,
+            Promise.allSettled([httpClosed]),
+        ]),
+        new Promise((resolve) => {
+            timeout = setTimeout(() => resolve(timedOut), transportCloseTimeoutMs);
+        }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+    if (containment === timedOut) {
+        const error = providerPolicyError(
+            'PLOINKY_AGENT_SERVER_SHUTDOWN_TIMEOUT',
+            'AgentServer transport and HTTP cleanup exceeded the fixed shutdown deadline',
+        );
+        error.evidence = Object.freeze({
+            transportCount: Object.keys(activeSessions).length,
+            timeoutMs: transportCloseTimeoutMs,
+        });
+        throw error;
+    }
+    const [transportResults, httpResults] = containment;
+    const transportFailures = transportResults
+        .filter((result) => result.status === 'rejected')
+        .map((result) => result.reason);
+    const containmentFailures = [
+        ...transportFailures,
+        ...httpResults.filter((result) => result.status === 'rejected').map((result) => result.reason),
+        ...(closeAllFailure ? [closeAllFailure] : []),
+    ];
+    if (containmentFailures.length === 1) throw containmentFailures[0];
+    if (containmentFailures.length > 1) {
+        const error = new AggregateError(
+            containmentFailures,
+            'AgentServer shutdown could not close all MCP transports and HTTP connections',
+            { cause: containmentFailures[0] },
+        );
+        error.code = 'PLOINKY_AGENT_SERVER_TRANSPORT_CLEANUP_FAILED';
+        throw error;
+    }
 }
 
 function resolveAgentDisplayName(manifest, fallback = 'agent') {
@@ -393,8 +571,10 @@ function buildCommandSpec(entry, defaultCwd) {
             throw providerPolicyError('PLOINKY_PROVIDER_EXECUTION_INVALID', 'providerExecution must be an object');
         }
         const keys = Object.keys(execution);
-        if (keys.some((key) => !['provider', 'module', 'export'].includes(key))
+        if (keys.some((key) => !['provider', 'mode', 'module', 'export'].includes(key))
             || !PROVIDER_NAME_RE.test(String(execution.provider || ''))
+            || (execution.mode !== PROVIDER_SANDBOX_MODES.TASK
+                && execution.mode !== PROVIDER_SANDBOX_MODES.OPERATION)
             || typeof execution.module !== 'string'
             || !execution.module.startsWith('/code/')
             || !execution.module.endsWith('.mjs')
@@ -410,6 +590,7 @@ function buildCommandSpec(entry, defaultCwd) {
         return Object.freeze({
             kind: 'provider-module',
             provider: execution.provider,
+            sandboxMode: execution.mode,
             module: execution.module,
             exportName: execution.export,
             timeoutMs: Number.isFinite(entry?.timeoutMs) ? entry.timeoutMs : undefined,
@@ -482,9 +663,18 @@ function resolveOpenAiChatKind(manifest) {
     const chat = manifest && typeof manifest === 'object' && manifest.endpoints && typeof manifest.endpoints === 'object'
         ? manifest.endpoints.chatCompletions
         : null;
-    if (chat && typeof chat === 'object' && typeof chat.command === 'string' && chat.command.trim()) {
+    if (chat && typeof chat === 'object'
+        && (chat.providerExecution !== undefined
+            || (typeof chat.command === 'string' && chat.command.trim()))) {
         const commandSpec = buildCommandSpec(chat, process.env.PLOINKY_CODE_DIR || '/code');
         if (commandSpec) {
+            if (commandSpec.kind === 'provider-module'
+                && (chat.supportsStream === true || chat.stream === true)) {
+                throw providerPolicyError(
+                    'PLOINKY_PROVIDER_EXECUTION_INVALID',
+                    'provider chat execution does not support direct stream passthrough',
+                );
+            }
             return { kind: 'command', commandSpec, supportsStream: chat.supportsStream === true || chat.stream === true };
         }
     }
@@ -501,7 +691,9 @@ function resolveOpenAiModelsKind(manifest) {
     const models = manifest && typeof manifest === 'object' && manifest.endpoints && typeof manifest.endpoints === 'object'
         ? manifest.endpoints.models
         : null;
-    if (models && typeof models === 'object' && typeof models.command === 'string' && models.command.trim()) {
+    if (models && typeof models === 'object'
+        && (models.providerExecution !== undefined
+            || (typeof models.command === 'string' && models.command.trim()))) {
         const commandSpec = buildCommandSpec(models, process.env.PLOINKY_CODE_DIR || '/code');
         if (commandSpec) {
             return { kind: 'command', commandSpec };
@@ -519,7 +711,7 @@ export async function __buildAgenticCompletion({ body, manifest, config, agentId
         tools: config?.tools,
         defaultCwd: process.env.PLOINKY_CODE_DIR || '/code',
         buildCommandSpec,
-        runTool: executeShell,
+        runTool: executeCommand,
     });
     return runResponder({
         toolsMap,
@@ -695,7 +887,7 @@ function createFieldSchema(fieldSpec) {
     return schema;
 }
 
-function executeShell(spec, payload, options = {}) {
+export function __executeShell(spec, payload, options = {}) {
     return new Promise((resolve, reject) => {
         const { command, args = [], cwd, env, timeoutMs } = spec;
         const child = spawn(command, args, {
@@ -705,15 +897,20 @@ function executeShell(spec, payload, options = {}) {
             timeout: timeoutMs,
             detached: options.detached === true,
         });
-        if (typeof options.onSpawn === 'function') {
-            try {
-                options.onSpawn(child);
-            } catch (err) {
-                console.warn('[AgentServer/MCP] onSpawn hook failed:', err);
-            }
-        }
         const stdout = [];
         const stderr = [];
+        let settled = false;
+        let spawnHookError = null;
+        const settleReject = (error) => {
+            if (settled) return;
+            settled = true;
+            reject(error);
+        };
+        const settleResolve = (result) => {
+            if (settled) return;
+            settled = true;
+            resolve(result);
+        };
         child.stdout.on('data', chunk => {
             stdout.push(chunk);
             if (typeof options.onStdoutChunk === 'function') {
@@ -734,27 +931,311 @@ function executeShell(spec, payload, options = {}) {
                 }
             }
         });
-        child.on('error', reject);
+        child.on('error', (error) => settleReject(spawnHookError ?? error));
         child.stdin.on('error', err => {
             if (err?.code === 'EPIPE') {
                 return;
             }
-            reject(err);
+            settleReject(spawnHookError ?? err);
         });
         child.on('close', (code, signal) => {
-            resolve({
+            if (spawnHookError) {
+                settleReject(spawnHookError);
+                return;
+            }
+            settleResolve({
                 code,
                 signal,
                 stdout: Buffer.concat(stdout).toString('utf8'),
                 stderr: Buffer.concat(stderr).toString('utf8')
             });
         });
+        if (typeof options.onSpawn === 'function') {
+            try {
+                options.onSpawn(child);
+            } catch (error) {
+                spawnHookError = error;
+                child.stdin.destroy();
+                return;
+            }
+        }
         try {
             child.stdin.end(JSON.stringify(payload ?? {}) + '\n');
         } catch (_) {
             // ignore broken pipes
         }
     });
+}
+
+export function __resolveProviderInvocationIdentity(payload, createId = randomUUID) {
+    const suppliedTaskId = typeof payload?.taskId === 'string' ? payload.taskId.trim() : '';
+    const operation = typeof payload?.tool === 'string' && payload.tool.trim()
+        ? payload.tool.trim()
+        : (typeof payload?.endpoint === 'string' ? payload.endpoint.trim() : '');
+    if (!operation || operation.length > 128 || !/^[a-z][a-z0-9._-]*$/.test(operation)) {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_EXECUTION_INVALID',
+            'provider execution requires a named tool or endpoint operation',
+        );
+    }
+    const taskId = suppliedTaskId || `operation:${createId()}`;
+    if (taskId.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9:._/-]*$/.test(taskId)) {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_EXECUTION_INVALID',
+            'provider execution task identity is invalid',
+        );
+    }
+    return Object.freeze({ taskId, operation });
+}
+
+export function __resolveProviderOperationSession(payload) {
+    const operation = payload?.input?.operation;
+    return typeof operation === 'string' && PROVIDER_LOGIN_OPERATIONS.has(operation)
+        ? operation
+        : null;
+}
+
+function exactOwnerClaim(value, label) {
+    if (typeof value !== 'string' || !value || value !== value.trim()
+        || Buffer.byteLength(value, 'utf8') > 2048 || value.includes('\0')) {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_LOGIN_OWNER_INVALID',
+            `provider login ${label} is invalid`,
+        );
+    }
+    return value;
+}
+
+export function __deriveProviderOperationOwner(payload, credentialContext = agentCredentialContext) {
+    const invocation = payload?.metadata?.invocation;
+    const tool = exactOwnerClaim(payload?.tool, 'tool');
+    if (!invocation || typeof invocation !== 'object' || Array.isArray(invocation)
+        || exactOwnerClaim(invocation.tool, 'invocation tool') !== tool) {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_LOGIN_OWNER_INVALID',
+            'provider login requires a verified caller identity',
+        );
+    }
+    const caller = invocation.caller && typeof invocation.caller === 'object'
+        ? `${exactOwnerClaim(invocation.caller.kind, 'caller kind')}:${exactOwnerClaim(invocation.caller.id, 'caller id')}`
+        : (typeof invocation.caller === 'string' && invocation.caller
+            ? exactOwnerClaim(invocation.caller, 'caller')
+            : 'none');
+    const actor = invocation.actor && typeof invocation.actor === 'object'
+        ? `${exactOwnerClaim(invocation.actor.kind, 'actor kind')}:${exactOwnerClaim(invocation.actor.id, 'actor id')}`
+        : 'none';
+    const binding = [
+        'provider-login-owner-v1',
+        exactOwnerClaim(credentialContext?.identity?.principalId, 'agent principal'),
+        exactOwnerClaim(credentialContext?.identity?.instanceId, 'agent instance'),
+        exactOwnerClaim(credentialContext?.identity?.enableGeneration, 'agent generation'),
+        exactOwnerClaim(credentialContext?.runtime?.runtimeKey, 'runtime key'),
+        exactOwnerClaim(invocation.iss, 'issuer'),
+        exactOwnerClaim(invocation.sub, 'subject'),
+        exactOwnerClaim(invocation.workspace_id, 'workspace'),
+        caller,
+        actor,
+        tool,
+    ];
+    return createHash('sha256').update(JSON.stringify(binding)).digest('hex');
+}
+
+export function __parseProviderEndpointResponse(result, commandSpec) {
+    let parsed;
+    try { parsed = JSON.parse(result?.stdout || '{}'); } catch (cause) {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_ENDPOINT_RESPONSE_INVALID',
+            'provider endpoint did not return valid JSON',
+        );
+    }
+    if (commandSpec?.kind !== 'provider-module') return parsed;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || parsed.ok !== true || !parsed.response
+        || typeof parsed.response !== 'object' || Array.isArray(parsed.response)
+        || Object.keys(parsed).some((key) => key !== 'ok' && key !== 'response')) {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_ENDPOINT_RESPONSE_INVALID',
+            'provider endpoint module must return the exact response envelope',
+        );
+    }
+    return parsed.response;
+}
+
+export async function __executeProviderModuleWithRuntime({
+    execute,
+    payload,
+    provider,
+    providerRuntime,
+    operationSessionRegistry,
+    sessionOperation = __resolveProviderOperationSession(payload),
+    ownerBinding,
+    signal,
+    onStdoutChunk,
+    registerRetainedCleanup,
+} = {}) {
+    if (typeof execute !== 'function' || !PROVIDER_NAME_RE.test(String(provider || ''))
+        || !providerRuntime || typeof providerRuntime !== 'object'
+        || typeof providerRuntime.assertBoundaryUsed !== 'function'
+        || typeof providerRuntime.assertBoundaryUnused !== 'function'
+        || typeof providerRuntime.close !== 'function'
+        || (registerRetainedCleanup !== undefined
+            && typeof registerRetainedCleanup !== 'function')
+        || (sessionOperation !== null && !PROVIDER_LOGIN_OPERATIONS.has(sessionOperation))
+        || (sessionOperation !== null
+            && (!operationSessionRegistry
+                || typeof operationSessionRegistry.createInvocation !== 'function'))) {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_EXECUTION_INVALID',
+            'provider module execution dependencies are invalid',
+        );
+    }
+    let operationSessionInvocation = null;
+    let runtimeOwnedByRegistry = false;
+    let abortListener = null;
+    let abortCleanupPromise = null;
+    try {
+        operationSessionInvocation = sessionOperation === null
+            ? null
+            : operationSessionRegistry.createInvocation({
+                provider,
+                operation: sessionOperation,
+                ownerBinding: ownerBinding ?? __deriveProviderOperationOwner(payload),
+                providerRuntime,
+            });
+        const operationSessions = operationSessionInvocation?.providerApi ?? null;
+        const executePromise = Promise.resolve().then(() => execute(payload, Object.freeze({
+            providerRuntime,
+            operationSessions,
+            signal,
+        })));
+        let result;
+        if (sessionOperation === 'login_start' && signal) {
+            const abortError = providerPolicyError(
+                'PLOINKY_PROVIDER_LOGIN_START_ABORTED',
+                'provider login start was aborted before registry commit',
+            );
+            const abortPromise = new Promise((_, reject) => {
+                abortListener = () => {
+                    operationSessionInvocation?.revoke?.();
+                    if (!abortCleanupPromise) {
+                        abortCleanupPromise = (async () => {
+                            const current = operationSessionInvocation?.disposition();
+                            if (current === 'staged' || current === 'retained') {
+                                await operationSessionInvocation.rollback();
+                            }
+                        })();
+                    }
+                    abortCleanupPromise.then(
+                        () => reject(abortError),
+                        (cleanupError) => reject(cleanupError),
+                    );
+                };
+                signal.addEventListener('abort', abortListener, { once: true });
+                if (signal.aborted) abortListener();
+            });
+            result = await Promise.race([executePromise, abortPromise]);
+        } else {
+            result = await executePromise;
+        }
+        const disposition = operationSessionInvocation?.disposition() ?? 'unused';
+        let controlResult = null;
+        if (PROVIDER_LOGIN_CONTROL_OPERATIONS.has(sessionOperation)) {
+            controlResult = await operationSessionInvocation.requireControlResult();
+            if (operationSessionInvocation.disposition() !== 'control') {
+                throw providerPolicyError(
+                    'PLOINKY_PROVIDER_LOGIN_CONTROL_REQUIRED',
+                    'provider login control must use the AgentServer-owned session registry',
+                );
+            }
+            providerRuntime.assertBoundaryUnused();
+        } else if (disposition === 'staged') {
+            // Serialize and validate the exact start response before committing
+            // the retained runtime to process-wide registry ownership.
+        } else if (disposition === 'retained') {
+            throw providerPolicyError(
+                'PLOINKY_PROVIDER_LOGIN_RETAIN_INVALID',
+                'provider module cannot commit its own retained runtime',
+            );
+        } else if (disposition === 'control') {
+            throw providerPolicyError(
+                'PLOINKY_PROVIDER_LOGIN_CONTROL_UNEXPECTED',
+                'provider execution used a login control session for the wrong operation',
+            );
+        } else {
+            providerRuntime.assertBoundaryUsed();
+        }
+        const normalized = result && typeof result === 'object'
+            ? result
+            : { ok: false, error: 'provider module returned an invalid result' };
+        const stdout = `${JSON.stringify(normalized)}\n`;
+        let exactResponse = null;
+        if ((disposition === 'staged' || PROVIDER_LOGIN_CONTROL_OPERATIONS.has(sessionOperation))
+            && normalized.ok === true) {
+            exactResponse = __parseProviderEndpointResponse(
+                { stdout },
+                { kind: 'provider-module' },
+            );
+        }
+        if (PROVIDER_LOGIN_CONTROL_OPERATIONS.has(sessionOperation)) {
+            if (normalized.ok !== true
+                || JSON.stringify(exactResponse) !== JSON.stringify(controlResult)) {
+                throw providerPolicyError(
+                    'PLOINKY_PROVIDER_LOGIN_CONTROL_RESPONSE_INVALID',
+                    'provider login control response does not match the registry result',
+                );
+            }
+        }
+        if (disposition === 'staged') {
+            if (signal?.aborted) {
+                if (abortCleanupPromise) await abortCleanupPromise;
+                await operationSessionInvocation.rollback();
+                throw providerPolicyError(
+                    'PLOINKY_PROVIDER_LOGIN_START_ABORTED',
+                    'provider login start was aborted before registry commit',
+                );
+            }
+            if (normalized.ok !== true || !normalized.response) {
+                await operationSessionInvocation.rollback();
+            } else {
+                operationSessionInvocation.commitRetainedOperation(exactResponse);
+                runtimeOwnedByRegistry = true;
+            }
+        }
+        if (typeof onStdoutChunk === 'function') onStdoutChunk(Buffer.from(stdout));
+        return {
+            code: normalized.ok === true ? 0 : 1,
+            signal: null,
+            stdout,
+            stderr: '',
+        };
+    } catch (error) {
+        if (operationSessionInvocation
+            && (operationSessionInvocation.disposition() === 'staged'
+                || operationSessionInvocation.disposition() === 'retained')) {
+            try {
+                await operationSessionInvocation.rollback();
+                runtimeOwnedByRegistry = false;
+            } catch (cleanupError) {
+                // Cleanup proof is the authoritative failure. Do not mutate a
+                // possibly frozen error object or attach provider-controlled
+                // publication details to the surfaced cleanup error.
+                throw cleanupError;
+            }
+        }
+        throw error;
+    } finally {
+        if (signal && abortListener) signal.removeEventListener('abort', abortListener);
+        if (!runtimeOwnedByRegistry) {
+            try {
+                await providerRuntime.close();
+            } catch (error) {
+                if (error?.ownershipRetained === true && registerRetainedCleanup) {
+                    registerRetainedCleanup(() => providerRuntime.close());
+                }
+                throw error;
+            }
+        }
+    }
 }
 
 async function executeProviderModule(spec, payload, options = {}) {
@@ -765,56 +1246,50 @@ async function executeProviderModule(spec, payload, options = {}) {
             'provider execution does not match the admitted AgentServer provider',
         );
     }
-    const taskId = typeof payload?.taskId === 'string' ? payload.taskId.trim() : '';
-    const toolName = typeof payload?.tool === 'string' ? payload.tool.trim() : '';
-    if (!taskId || !toolName) {
+    const { taskId, operation } = __resolveProviderInvocationIdentity(payload);
+    const sessionOperation = __resolveProviderOperationSession(payload);
+    // Import and validate provider code before allocating a scoped broker lease.
+    // A failed import must not leave an otherwise-unreachable task runtime open.
+    const imported = await import(pathToFileURL(spec.module).href);
+    const execute = imported?.[spec.exportName];
+    if (typeof execute !== 'function') {
         throw providerPolicyError(
             'PLOINKY_PROVIDER_EXECUTION_INVALID',
-            'provider execution requires an AgentServer task identity',
+            'provider module does not export the admitted execution function',
         );
     }
     const brokerRegistry = await ensureScopedSoulBrokerRegistry();
     const providerRuntime = createProviderTaskRuntime({
         credentialContext: agentCredentialContext,
         brokerRegistry,
+        mode: spec.sandboxMode,
         provider: spec.provider,
         taskId,
-        audience: `${agentPrincipalId}/${toolName}`,
-        signal: options.signal,
+        audience: `${agentPrincipalId}/${operation}`,
+        // A retained login runtime is owned by the AgentServer registry after
+        // the request ends. The request signal still reaches the provider
+        // module during admission, but cannot later terminate the retained
+        // canonical helper behind the registry's ownership boundary.
+        signal: sessionOperation === 'login_start' ? undefined : options.signal,
         onSpawn: options.onSpawn,
     });
-    try {
-        const imported = await import(pathToFileURL(spec.module).href);
-        const execute = imported?.[spec.exportName];
-        if (typeof execute !== 'function') {
-            throw providerPolicyError(
-                'PLOINKY_PROVIDER_EXECUTION_INVALID',
-                'provider module does not export the admitted execution function',
-            );
-        }
-        const result = await execute(payload, Object.freeze({
-            providerRuntime,
-            signal: options.signal,
-        }));
-        const normalized = result && typeof result === 'object'
-            ? result
-            : { ok: false, error: 'provider module returned an invalid result' };
-        const stdout = `${JSON.stringify(normalized)}\n`;
-        if (typeof options.onStdoutChunk === 'function') options.onStdoutChunk(Buffer.from(stdout));
-        return {
-            code: normalized.ok === true ? 0 : 1,
-            signal: null,
-            stdout,
-            stderr: '',
-        };
-    } finally {
-        await providerRuntime.close();
-    }
+    return __executeProviderModuleWithRuntime({
+        execute,
+        payload,
+        provider: spec.provider,
+        providerRuntime,
+        operationSessionRegistry: providerOperationSessionRegistry,
+        sessionOperation,
+        ownerBinding: sessionOperation === null ? undefined : __deriveProviderOperationOwner(payload),
+        signal: options.signal,
+        onStdoutChunk: options.onStdoutChunk,
+        registerRetainedCleanup: options.onRetainedCleanup,
+    });
 }
 
 function executeCommand(spec, payload, options = {}) {
     if (spec?.kind === 'provider-module') return executeProviderModule(spec, payload, options);
-    if (spec?.kind === 'shell') return executeShell(spec, payload, options);
+    if (spec?.kind === 'shell') return __executeShell(spec, payload, options);
     throw providerPolicyError('PLOINKY_COMMAND_SPEC_INVALID', 'command specification kind is invalid');
 }
 
@@ -987,15 +1462,27 @@ async function handleOpenAiChatCompletions(req, res, body) {
     };
 
     if (!wantsStream) {
-        const result = await executeShell(openAiConfig.commandSpec, payload);
+        const cancellation = new AbortController();
+        const abort = () => cancellation.abort();
+        req.once('aborted', abort);
+        res.once('close', abort);
+        let result;
+        try {
+            result = await executeCommand(openAiConfig.commandSpec, payload, {
+                signal: cancellation.signal,
+            });
+        } finally {
+            req.removeListener('aborted', abort);
+            res.removeListener('close', abort);
+        }
         if (result.code !== 0) {
             sendOpenAiError(res, 500, describeShellFailure(result));
             return;
         }
         let parsed;
         try {
-            parsed = JSON.parse(result.stdout || '{}');
-        } catch (error) {
+            parsed = __parseProviderEndpointResponse(result, openAiConfig.commandSpec);
+        } catch (_) {
             sendOpenAiError(res, 502, 'Chat completions handler did not return valid JSON');
             return;
         }
@@ -1078,9 +1565,11 @@ function buildFallbackModelsResponse(manifest) {
     const agentName = resolveAgentDisplayName(manifest);
     const declaredTags = normalizeTagList(manifest?.capabilities?.tags);
     const tags = declaredTags.length > 0 ? declaredTags : ['generic-agent'];
-    const supportsStreaming = manifest?.endpoints?.chatCompletions?.stream === true
-        || manifest?.endpoints?.chatCompletions?.supportsStream === true
-        || !manifest?.endpoints?.chatCompletions?.command;
+    const chatEndpoint = manifest?.endpoints?.chatCompletions;
+    const hasCustomChatHandler = Boolean(chatEndpoint?.command || chatEndpoint?.providerExecution);
+    const supportsStreaming = chatEndpoint?.stream === true
+        || chatEndpoint?.supportsStream === true
+        || !hasCustomChatHandler;
     return {
         object: 'list',
         data: [
@@ -1127,14 +1616,26 @@ async function handleOpenAiModels(req, res) {
             authInfo: parseAuthInfoHeader(req.headers),
         },
     };
-    const result = await executeShell(modelsKind.commandSpec, payload);
+    const cancellation = new AbortController();
+    const abort = () => cancellation.abort();
+    req.once('aborted', abort);
+    res.once('close', abort);
+    let result;
+    try {
+        result = await executeCommand(modelsKind.commandSpec, payload, {
+            signal: cancellation.signal,
+        });
+    } finally {
+        req.removeListener('aborted', abort);
+        res.removeListener('close', abort);
+    }
     if (result.code !== 0) {
         sendOpenAiError(res, 500, describeShellFailure(result));
         return;
     }
     let parsed;
     try {
-        parsed = JSON.parse(result.stdout || '{}');
+        parsed = __parseProviderEndpointResponse(result, modelsKind.commandSpec);
     } catch (_) {
         sendOpenAiError(res, 502, 'Models handler did not return valid JSON');
         return;
@@ -1177,7 +1678,7 @@ function sanitizeInvocationForLog(invocation = null) {
 }
 
 function shouldRedactLogField(key) {
-    return /authorization|cookie|jwt|token|secret|password|credential|access[_-]?key|api[_-]?key|^value$|^task$|prompt|messages?|resources?|content|base64|stdin|payload/i.test(String(key || ''));
+    return /authorization|cookie|jwt|token|secret|password|credential|access[_-]?key|api[_-]?key|continuation[_-]?handle|^response$|^value$|^task$|prompt|messages?|resources?|content|base64|stdin|payload/i.test(String(key || ''));
 }
 
 function sanitizeValueForLog(value, key = '') {
@@ -1194,6 +1695,10 @@ function sanitizeValueForLog(value, key = '') {
         return out;
     }
     return value;
+}
+
+export function __sanitizeProviderLogValue(value) {
+    return sanitizeValueForLog(value);
 }
 
 function sanitizeContextForLog(context = {}) {
@@ -1277,12 +1782,6 @@ async function registerFromConfig(server, config, helpers) {
             };
 
             const isAsync = tool.async === true;
-            if (commandSpec.kind === 'provider-module' && !isAsync) {
-                throw providerPolicyError(
-                    'PLOINKY_PROVIDER_EXECUTION_INVALID',
-                    `provider tool ${name} must use the cancellable TaskQueue path`,
-                );
-            }
             const asyncTimeout = Number.isFinite(tool.timeoutMs)
                 ? tool.timeoutMs
                 : (Number.isFinite(tool.timeout) ? tool.timeout : undefined);
@@ -1340,7 +1839,9 @@ async function registerFromConfig(server, config, helpers) {
                         }
                     };
                 }
-                const result = await executeCommand(commandSpec, payload);
+                const result = await executeCommand(commandSpec, payload, {
+                    signal: context?.signal instanceof AbortSignal ? context.signal : undefined,
+                });
                 if (result.code !== 0) {
                     const message = describeShellFailure(result);
                     if (helpers && helpers.McpError && helpers.ErrorCode) {
@@ -1388,6 +1889,12 @@ async function registerFromConfig(server, config, helpers) {
                 console.warn(`[AgentServer/MCP] Skipping resource '${name}' - missing command`);
                 continue;
             }
+            if (commandSpec.kind === 'provider-module') {
+                throw providerPolicyError(
+                    'PLOINKY_PROVIDER_EXECUTION_INVALID',
+                    `provider resource ${name} is unsupported; use a named tool or endpoint operation`,
+                );
+            }
             const metadata = {
                 title: resource.title || name,
                 description: resource.description || '',
@@ -1406,7 +1913,7 @@ async function registerFromConfig(server, config, helpers) {
                         helpers
                     });
                     const payload = { resource: name, uri: uri.href, params };
-                    const result = await executeShell(commandSpec, payload);
+                    const result = await __executeShell(commandSpec, payload);
                     if (result.code !== 0) {
                         throw new McpError(ErrorCode.InternalError, describeShellFailure(result));
                     }
@@ -1426,7 +1933,7 @@ async function registerFromConfig(server, config, helpers) {
                         helpers
                     });
                     const payload = { resource: name, uri: uri.href };
-                    const result = await executeShell(commandSpec, payload);
+                    const result = await __executeShell(commandSpec, payload);
                     if (result.code !== 0) {
                         throw new McpError(ErrorCode.InternalError, describeShellFailure(result));
                     }
@@ -1743,6 +2250,34 @@ async function main() {
     serverHttp.listen(PORT, HOST, () => {
         console.log(`[AgentServer/MCP] Streamable HTTP listening on ${HOST}:${PORT} (/mcp)`);
     });
+
+    let shutdownPromise = null;
+    let sessionGcStopped = false;
+    const shutdown = async (signal) => {
+        if (shutdownPromise) return shutdownPromise;
+        if (!sessionGcStopped) {
+            clearInterval(sessionGcTimer);
+            sessionGcStopped = true;
+        }
+        const attempt = __shutdownAgentServerRuntime({
+            taskQueueInstance: taskQueue,
+            sessions,
+            serverHttp,
+        });
+        shutdownPromise = attempt;
+        try {
+            await attempt;
+            process.exitCode = 0;
+        } catch (error) {
+            console.error(`[AgentServer/MCP] ${signal} shutdown failed safely:`, error);
+            serverHttp.closeAllConnections?.();
+            process.exitCode = 1;
+            if (shutdownPromise === attempt) shutdownPromise = null;
+            throw error;
+        }
+    };
+    process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => {}); });
+    process.on('SIGINT', () => { shutdown('SIGINT').catch(() => {}); });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

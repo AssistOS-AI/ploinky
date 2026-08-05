@@ -46,6 +46,7 @@ export const DEFAULT_PROVIDER_HOME_LEASE_ROOT = '/workspace/.ploinky/run/provide
 export const PROVIDER_SANDBOX_HELPER = '/usr/local/libexec/ploinky-bwrap-launch';
 export const PROVIDER_SANDBOX_MODES = Object.freeze({
     TASK: 'task',
+    OPERATION: 'operation',
     READINESS: 'readiness',
 });
 export const PROVIDER_SANDBOX_PROVIDERS = Object.freeze({
@@ -63,6 +64,7 @@ const MAX_METADATA_KEYS = 32;
 const MAX_METADATA_DEPTH = 3;
 const DEFAULT_PROVIDER_TERM_GRACE_MS = 250;
 const DEFAULT_PROVIDER_KILL_GRACE_MS = 2_000;
+const DEFAULT_PROVIDER_AFTER_EXIT_TIMEOUT_MS = 5_000;
 const LEASE_SCHEMA_VERSION = 2;
 const LEASE_LINEAGE_SCHEMA_VERSION = 2;
 const MAX_LEASE_LINEAGE_BYTES = 1024;
@@ -136,6 +138,7 @@ const PROVIDER_PROFILES = Object.freeze({
     [PROVIDER_SANDBOX_PROVIDERS.OPENCODE]: Object.freeze({
         executable: '/home/agent/.opencode/bin/opencode',
         pathPrefix: '/home/agent/.opencode/bin',
+        privateEnvironment: Object.freeze(['OPENCODE_SERVER_PASSWORD']),
         immutableRoots: Object.freeze([
             Object.freeze({
                 source: '/home/agent/.opencode/bin/opencode',
@@ -293,6 +296,23 @@ function compareText(left, right) {
 function policyError(message, code = 'PLOINKY_BWRAP_PROTOCOL_INVALID', options) {
     const error = new Error(message, options);
     error.code = code;
+    return error;
+}
+
+function annotatedProviderError(source, {
+    code = source?.code ?? 'PLOINKY_PROVIDER_LIFECYCLE_FAILED',
+    message = source?.message ?? 'provider lifecycle failed safely',
+    terminationEvidence,
+    ownershipRetained = source?.ownershipRetained,
+    evidence = source?.evidence,
+    retainedProcess = source?.retainedProcess,
+    cause = source,
+} = {}) {
+    const error = policyError(message, code, cause instanceof Error ? { cause } : undefined);
+    if (terminationEvidence !== undefined) error.terminationEvidence = terminationEvidence;
+    if (ownershipRetained !== undefined) error.ownershipRetained = ownershipRetained;
+    if (evidence !== undefined) error.evidence = evidence;
+    if (retainedProcess !== undefined) error.retainedProcess = retainedProcess;
     return error;
 }
 
@@ -458,6 +478,7 @@ export function createDirectoryRecord(target) {
         target === '/opt'
         || target === '/home'
         || target === '/workspace/readiness'
+        || target === '/workspace/operation'
         || target === '/run/ploinky-agent'
         || target === '/workspace/.ploinky/repos'
         || target.startsWith('/workspace/.ploinky/repos/')
@@ -709,8 +730,10 @@ function validateRecordPolicy(records) {
         if (record.type === 'DIR' && target.startsWith('/run/') && !targets.has('/run')) {
             throw policyError('/run tmpfs must precede its directories', 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID');
         }
-        if (record.type === 'DIR' && target === '/workspace/readiness' && targetKinds.get('/workspace') !== 'TMPFS') {
-            throw policyError('private readiness requires /workspace TMPFS first', 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID');
+        if (record.type === 'DIR'
+            && (target === '/workspace/readiness' || target === '/workspace/operation')
+            && targetKinds.get('/workspace') !== 'TMPFS') {
+            throw policyError('private provider mode requires /workspace TMPFS first', 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID');
         }
         if (record.type === 'TMPFS' && target === '/tmp/cache' && !targets.has('/tmp')) {
             throw policyError('/tmp tmpfs must precede /tmp/cache', 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID');
@@ -953,7 +976,9 @@ function normalizeProvider(value) {
 }
 
 function normalizeProviderMode(value) {
-    if (value !== PROVIDER_SANDBOX_MODES.TASK && value !== PROVIDER_SANDBOX_MODES.READINESS) {
+    if (value !== PROVIDER_SANDBOX_MODES.TASK
+        && value !== PROVIDER_SANDBOX_MODES.OPERATION
+        && value !== PROVIDER_SANDBOX_MODES.READINESS) {
         throw policyError('provider sandbox mode is unsupported', 'PLOINKY_PROVIDER_MODE_UNSUPPORTED');
     }
     return value;
@@ -1102,7 +1127,8 @@ function buildProviderEnvironment({ mode, profile, workdir, environment = {} }) 
     let bytes = 0;
     const dynamic = {};
     for (const [name, value] of entries.sort(([left], [right]) => compareText(left, right))) {
-        if (!PROVIDER_UX_ENV.has(name) && !PROVIDER_TASK_ENV.has(name)) {
+        const profilePrivate = profile.privateEnvironment?.includes(name) === true;
+        if (!PROVIDER_UX_ENV.has(name) && !PROVIDER_TASK_ENV.has(name) && !profilePrivate) {
             const reserved = PROVIDER_RESERVED_ENV_PREFIXES.some((prefix) => name.startsWith(prefix))
                 || isTrustedServiceReservedEnvName(name)
                 || /(?:SECRET|TOKEN|API_KEY|PRIVATE_KEY|MASTER_KEY|CREDENTIAL)/u.test(name);
@@ -1115,6 +1141,9 @@ function buildProviderEnvironment({ mode, profile, workdir, environment = {} }) 
             throw policyError(`provider environment ${name} must be a string`, 'PLOINKY_PROVIDER_ENV_INVALID');
         }
         const valueBytes = utf8(value, `provider environment ${name}`, { allowEmpty: true, maxBytes: 4096 });
+        if (name === 'OPENCODE_SERVER_PASSWORD' && !/^[A-Za-z0-9_-]{43}$/.test(value)) {
+            throw policyError('provider private server password is invalid', 'PLOINKY_PROVIDER_ENV_INVALID');
+        }
         bytes += Buffer.byteLength(name) + valueBytes.length;
         if (bytes > MAX_PROVIDER_ENV_BYTES) {
             throw policyError('provider environment exceeds its byte limit', 'PLOINKY_PROVIDER_ENV_INVALID');
@@ -1124,7 +1153,9 @@ function buildProviderEnvironment({ mode, profile, workdir, environment = {} }) 
     validateProviderBrokerEnvironment(dynamic, mode);
     const cwd = mode === PROVIDER_SANDBOX_MODES.READINESS
         ? '/workspace/readiness'
-        : `/workspace/${workdir}`;
+        : (mode === PROVIDER_SANDBOX_MODES.OPERATION
+            ? '/workspace/operation'
+            : `/workspace/${workdir}`);
     return Object.freeze({
         ...PROVIDER_FIXED_ENV,
         PATH: `${profile.pathPrefix}:/opt/ploinky-node/bin:/usr/bin:/bin`,
@@ -1152,8 +1183,8 @@ export function buildProviderSandboxPolicy(input) {
     const workdir = mode === PROVIDER_SANDBOX_MODES.TASK
         ? normalizeProviderWorkdir(input.workdir)
         : null;
-    if (mode === PROVIDER_SANDBOX_MODES.READINESS && input.workdir !== undefined) {
-        throw policyError('readiness cannot select a real workspace directory', 'PLOINKY_WORKDIR_INVALID');
+    if (mode !== PROVIDER_SANDBOX_MODES.TASK && input.workdir !== undefined) {
+        throw policyError('private provider modes cannot select a real workspace directory', 'PLOINKY_WORKDIR_INVALID');
     }
     if (mode === PROVIDER_SANDBOX_MODES.READINESS
         && (input.command !== undefined || input.environment !== undefined)) {
@@ -1191,7 +1222,9 @@ export function buildProviderSandboxPolicy(input) {
             ]
             : [
                 createTmpfsRecord('/workspace'),
-                createDirectoryRecord('/workspace/readiness'),
+                createDirectoryRecord(mode === PROVIDER_SANDBOX_MODES.READINESS
+                    ? '/workspace/readiness'
+                    : '/workspace/operation'),
             ]),
         createDirectoryRecord('/home'),
         createHomeRecord(identity.homeSource),
@@ -1270,7 +1303,7 @@ function providerSpawnDependencies(overrides = {}) {
             'spawn', 'acquireProviderHomeLease', 'releaseProviderHomeLease',
             'inspectProcessIdentity', 'getUid', 'signalProcessGroup',
             'setTimeout', 'clearTimeout', 'termGraceMs', 'killGraceMs',
-            'identityCaptureAttempts', 'identityCaptureRetryMs',
+            'identityCaptureAttempts', 'identityCaptureRetryMs', 'afterExitTimeoutMs',
         ]),
         new Set(),
         'provider spawn dependencies',
@@ -1279,13 +1312,15 @@ function providerSpawnDependencies(overrides = {}) {
     const killGraceMs = overrides.killGraceMs ?? DEFAULT_PROVIDER_KILL_GRACE_MS;
     const identityCaptureAttempts = overrides.identityCaptureAttempts ?? 8;
     const identityCaptureRetryMs = overrides.identityCaptureRetryMs ?? 10;
+    const afterExitTimeoutMs = overrides.afterExitTimeoutMs ?? DEFAULT_PROVIDER_AFTER_EXIT_TIMEOUT_MS;
     for (const [label, value] of [['termGraceMs', termGraceMs], ['killGraceMs', killGraceMs]]) {
         if (!Number.isSafeInteger(value) || value < 1 || value > 60_000) {
             throw policyError(`provider ${label} is invalid`, 'PLOINKY_PROVIDER_TERMINATION_INVALID');
         }
     }
     if (!Number.isSafeInteger(identityCaptureAttempts) || identityCaptureAttempts < 1 || identityCaptureAttempts > 100
-        || !Number.isSafeInteger(identityCaptureRetryMs) || identityCaptureRetryMs < 1 || identityCaptureRetryMs > 1_000) {
+        || !Number.isSafeInteger(identityCaptureRetryMs) || identityCaptureRetryMs < 1 || identityCaptureRetryMs > 1_000
+        || !Number.isSafeInteger(afterExitTimeoutMs) || afterExitTimeoutMs < 1 || afterExitTimeoutMs > 60_000) {
         throw policyError('provider identity capture retry policy is invalid', 'PLOINKY_PROVIDER_TERMINATION_INVALID');
     }
     return {
@@ -1301,6 +1336,7 @@ function providerSpawnDependencies(overrides = {}) {
         killGraceMs,
         identityCaptureAttempts,
         identityCaptureRetryMs,
+        afterExitTimeoutMs,
     };
 }
 
@@ -1600,7 +1636,7 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         lifecycle,
         new Set([
             'activateCapability', 'deactivateCapability', 'onSpawn', 'afterExit',
-            'leaseRoot', 'leaseMetadata', 'stdio',
+            'leaseRoot', 'leaseMetadata', 'stdio', 'validateAfterLease',
         ]),
         new Set(),
         'provider sandbox lifecycle',
@@ -1616,6 +1652,9 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
     }
     if (lifecycle.afterExit !== undefined && typeof lifecycle.afterExit !== 'function') {
         throw new TypeError('afterExit must be a function');
+    }
+    if (lifecycle.validateAfterLease !== undefined && typeof lifecycle.validateAfterLease !== 'function') {
+        throw new TypeError('validateAfterLease must be a function');
     }
     const dependencies = providerSpawnDependencies(dependencyOverrides);
     const policyInput = { ...input, preexecBarrier: { readyFd: 4, releaseFd: 5 } };
@@ -1648,25 +1687,33 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
             delay(dependencies.killGraceMs, dependencies),
         ]);
         const terminalObserved = Boolean(terminalAfterClose?.terminal);
-        error.ownershipRetained = !terminalObserved;
-        error.evidence = Object.freeze({
+        const evidence = Object.freeze({
             ...(error.evidence ?? {}),
             terminalObserved,
             transportClosed: true,
         });
+        let retainedProcess;
         if (!terminalObserved) {
-            error.retainedProcess = Object.freeze({
+            retainedProcess = Object.freeze({
                 pid: Number.isSafeInteger(Number(child?.pid)) ? Number(child.pid) : null,
                 child,
                 terminal,
             });
         }
-        throw error;
+        throw annotatedProviderError(error, {
+            ownershipRetained: !terminalObserved,
+            evidence,
+            retainedProcess,
+        });
     }
     let terminationPromise = null;
     const terminate = (reason = 'cleanup') => {
         if (!terminationPromise) {
-            terminationPromise = terminateExactProviderProcess({ ownership, terminal }, dependencies, reason);
+            const attempt = terminateExactProviderProcess({ ownership, terminal }, dependencies, reason);
+            terminationPromise = attempt;
+            void attempt.catch(() => {
+                if (terminationPromise === attempt) terminationPromise = null;
+            });
         }
         return terminationPromise;
     };
@@ -1692,8 +1739,7 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
             const terminated = await terminate('helper-transport');
             transportError.terminationEvidence = terminated.evidence;
         } catch (terminationError) {
-            terminationError.cause = transportError;
-            throw terminationError;
+            throw annotatedProviderError(terminationError);
         }
         throw transportError;
     }
@@ -1703,14 +1749,16 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
     readyPromise.catch(() => {});
     if (lifecycle.onSpawn) {
         try { lifecycle.onSpawn(child, processControl); } catch (error) {
+            let terminated;
             try {
-                const terminated = await terminate('on-spawn-hook');
-                error.terminationEvidence = terminated.evidence;
+                terminated = await terminate('on-spawn-hook');
             } catch (terminationError) {
-                terminationError.cause = error;
-                throw terminationError;
+                throw annotatedProviderError(terminationError);
             }
-            throw error;
+            throw annotatedProviderError(error, {
+                terminationEvidence: terminated.evidence,
+                ownershipRetained: false,
+            });
         }
     }
 
@@ -1725,12 +1773,12 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
     const releaseLease = () => {
         if (!lease) return;
         const ownedLease = lease;
-        lease = null;
         dependencies.releaseProviderHomeLease(ownedLease);
+        lease = null;
     };
     const cleanupResources = async () => {
         if (cleanupPromise) return cleanupPromise;
-        cleanupPromise = (async () => {
+        const attempt = (async () => {
             let firstError = null;
             try { await deactivateCapability(); } catch (error) { firstError = error; }
             if (!firstError) {
@@ -1751,6 +1799,10 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
                 throw error;
             }
         })();
+        cleanupPromise = attempt;
+        void attempt.catch(() => {
+            if (cleanupPromise === attempt) cleanupPromise = null;
+        });
         return cleanupPromise;
     };
 
@@ -1765,16 +1817,29 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         lease = dependencies.acquireProviderHomeLease({
             homeKey: launch.identity.homeKey,
             generation: launch.identity.generation,
-            role: launch.mode === PROVIDER_SANDBOX_MODES.READINESS ? 'readiness' : 'provider-task',
+            role: launch.mode === PROVIDER_SANDBOX_MODES.READINESS
+                ? 'readiness'
+                : (launch.mode === PROVIDER_SANDBOX_MODES.OPERATION
+                    ? 'provider-operation'
+                    : 'provider-task'),
             metadata: {
+                ...(lifecycle.leaseMetadata ?? {}),
                 provider: launch.provider,
                 mode: launch.mode,
                 ...(launch.workdir ? { workdir: launch.workdir } : {}),
-                ...(lifecycle.leaseMetadata ?? {}),
             },
             ...(lifecycle.leaseRoot ? { leaseRoot: lifecycle.leaseRoot } : {}),
             ownerPid: child.pid,
         });
+        if (lifecycle.validateAfterLease) {
+            await lifecycle.validateAfterLease(Object.freeze({
+                provider: launch.provider,
+                mode: launch.mode,
+                workdir: launch.workdir,
+                homePath: launch.identity.providerHomeSource,
+                runtimeKind: launch.identity.runtimeKind,
+            }));
+        }
         if (lifecycle.activateCapability) {
             await lifecycle.activateCapability({
                 childPid: child.pid,
@@ -1797,21 +1862,19 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         try {
             terminated = await terminate('provider-bootstrap');
         } catch (terminationError) {
-            terminationError.cause = error;
-            throw terminationError;
+            throw annotatedProviderError(terminationError, { cause: error });
         }
         try {
             await cleanupResources();
         } catch (cleanupError) {
-            cleanupError.cause = error;
-            cleanupError.terminationEvidence = terminated.evidence;
-            throw cleanupError;
+            throw annotatedProviderError(cleanupError, {
+                terminationEvidence: terminated.evidence,
+            });
         }
-        error.terminationEvidence = terminated.evidence;
-        throw error;
+        throw annotatedProviderError(error, { terminationEvidence: terminated.evidence });
     }
 
-    const completion = terminal.then(async (result) => {
+    const provenTerminal = terminal.then((result) => {
         const observed = inspectExactSpawnedProcess(ownership, dependencies);
         if (observed.state !== 'terminated') {
             throw exactProcessError(
@@ -1820,44 +1883,114 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
                 { phase: 'terminal-close', observedState: observed.observedState ?? observed.state },
             );
         }
-        let afterExit;
-        try {
-            await deactivateCapability();
-        } catch (cause) {
-            const error = policyError(
-                'provider capability cleanup failed after terminal exit',
-                'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED',
-                { cause },
-            );
-            error.ownershipRetained = true;
-            error.evidence = Object.freeze({ capabilityActive, leaseRetained: Boolean(lease) });
-            throw error;
-        }
-        if (lifecycle.afterExit) {
-            try {
-                afterExit = await lifecycle.afterExit(Object.freeze({
-                    code: result.code,
-                    signal: result.signal,
-                    child,
-                    launch,
-                }));
-            } catch (error) {
-                try { releaseLease(); } catch (releaseError) { error.cause = releaseError; }
-                throw error;
-            }
-        }
-        releaseLease();
-        cleanupPromise = Promise.resolve();
-        if (result.error) throw result.error;
-        return Object.freeze({
+        return result;
+    });
+    let afterExitSettled = false;
+    let afterExitValue;
+    let afterExitFailure = null;
+    let terminalFinalizationPromise = null;
+    let terminalFinalizationComplete = false;
+    let terminalFinalizationError = null;
+    const runAfterExit = async (result) => {
+        let timer = null;
+        const timedOut = Symbol('provider-after-exit-timeout');
+        const callback = Promise.resolve().then(() => lifecycle.afterExit(Object.freeze({
             code: result.code,
             signal: result.signal,
-            ...(lifecycle.afterExit ? { afterExit } : {}),
+            child,
+            launch,
+        })));
+        const timeout = new Promise((resolve) => {
+            timer = dependencies.setTimeout(
+                () => resolve(timedOut),
+                dependencies.afterExitTimeoutMs,
+            );
+            timer?.unref?.();
         });
-    });
+        try {
+            const value = await Promise.race([callback, timeout]);
+            if (value === timedOut) {
+                throw policyError(
+                    'provider afterExit callback exceeded its fixed deadline',
+                    'PLOINKY_PROVIDER_AFTER_EXIT_TIMEOUT',
+                );
+            }
+            return value;
+        } finally {
+            if (timer) dependencies.clearTimeout(timer);
+        }
+    };
+    const finalizeTerminal = (result) => {
+        if (terminalFinalizationComplete) {
+            return terminalFinalizationError
+                ? Promise.reject(terminalFinalizationError)
+                : Promise.resolve(Object.freeze({
+                    code: result.code,
+                    signal: result.signal,
+                    ...(lifecycle.afterExit ? { afterExit: afterExitValue } : {}),
+                }));
+        }
+        if (terminalFinalizationPromise) return terminalFinalizationPromise;
+        const attempt = (async () => {
+            try {
+                await deactivateCapability();
+            } catch (cause) {
+                const error = policyError(
+                    'provider capability cleanup failed after terminal exit',
+                    'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED',
+                    { cause },
+                );
+                error.ownershipRetained = Boolean(capabilityActive || lease);
+                error.evidence = Object.freeze({ capabilityActive, leaseRetained: Boolean(lease) });
+                throw error;
+            }
+            if (lifecycle.afterExit && !afterExitSettled) {
+                try {
+                    afterExitValue = await runAfterExit(result);
+                } catch (error) {
+                    afterExitFailure = annotatedProviderError(error);
+                } finally {
+                    afterExitSettled = true;
+                }
+            }
+            try {
+                releaseLease();
+            } catch (cause) {
+                const error = policyError(
+                    'provider terminal resource cleanup failed',
+                    'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED',
+                    { cause },
+                );
+                error.ownershipRetained = Boolean(capabilityActive || lease);
+                error.evidence = Object.freeze({
+                    capabilityActive,
+                    leaseRetained: Boolean(lease),
+                    causeCode: cause?.code ?? null,
+                });
+                throw error;
+            }
+            cleanupPromise = Promise.resolve();
+            terminalFinalizationComplete = true;
+            terminalFinalizationError = afterExitFailure ?? result.error ?? null;
+            if (terminalFinalizationError) throw terminalFinalizationError;
+            return Object.freeze({
+                code: result.code,
+                signal: result.signal,
+                ...(lifecycle.afterExit ? { afterExit: afterExitValue } : {}),
+            });
+        })();
+        terminalFinalizationPromise = attempt;
+        void attempt.catch(() => {
+            if (!terminalFinalizationComplete && terminalFinalizationPromise === attempt) {
+                terminalFinalizationPromise = null;
+            }
+        });
+        return attempt;
+    };
+    const completion = provenTerminal.then(finalizeTerminal);
     const cleanup = async () => {
         await terminate('explicit-cleanup');
-        return completion;
+        return finalizeTerminal(await provenTerminal);
     };
     return Object.freeze({ child, launch, lease, ownership, processControl, completion, terminate, cleanup });
 }
@@ -3306,4 +3439,51 @@ export async function withProviderHomeLease(input, callback, dependencyOverrides
             else throw releaseError;
         }
     }
+}
+
+/**
+ * Run one audited, in-process provider state resolver while holding the exact
+ * runtime-derived HOME lease. The callback receives only the physical HOME
+ * path visible to AgentServer and non-secret runtime labels; it never receives
+ * the credential context, lease token, or provider credentials.
+ */
+export async function withCredentialProviderHomeLease(input, callback, dependencyOverrides = {}) {
+    if (typeof callback !== 'function') throw new TypeError('credential-bound provider HOME lease requires a callback');
+    assertExactKeys(
+        input,
+        new Set(['credentialContext', 'provider', 'taskId', 'audience', 'leaseRoot']),
+        new Set(['credentialContext', 'provider', 'taskId', 'audience']),
+        'credential-bound provider HOME lease input',
+    );
+    const identity = providerIdentityFromCredentialContext(input.credentialContext);
+    const provider = normalizeProvider(input.provider);
+    const taskId = normalizeBoundedText(
+        input.taskId,
+        'provider state resolution task id',
+        256,
+        /^[A-Za-z0-9][A-Za-z0-9:._/-]*$/,
+    );
+    const audience = normalizeBoundedText(
+        input.audience,
+        'provider state resolution audience',
+        512,
+        /^[A-Za-z0-9][A-Za-z0-9:._/-]*$/,
+    );
+    return withProviderHomeLease({
+        homeKey: identity.homeKey,
+        generation: identity.generation,
+        role: 'provider-state-resolution',
+        metadata: {
+            audience,
+            mode: PROVIDER_SANDBOX_MODES.OPERATION,
+            provider,
+            purpose: 'state-resolution',
+            taskId,
+        },
+        ...(input.leaseRoot ? { leaseRoot: input.leaseRoot } : {}),
+    }, () => callback(Object.freeze({
+        homePath: identity.providerHomeSource,
+        provider,
+        runtimeKind: identity.runtimeKind,
+    })), dependencyOverrides);
 }

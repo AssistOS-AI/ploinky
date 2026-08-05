@@ -35,6 +35,7 @@ import {
     releaseProviderHomeLease,
     runProviderSandboxReadiness,
     spawnProviderSandbox,
+    withCredentialProviderHomeLease,
     withProviderHomeLease,
 } from '../../Agent/lib/providerSandbox.mjs';
 import { buildBwrapAgentCredential } from '../../cli/sandbox/bwrap/bwrapAgentCredential.js';
@@ -145,6 +146,50 @@ function providerTaskInput(overrides = {}) {
             PLOINKY_TASK_BROKER_KEY: PROVIDER_BROKER_KEY,
         },
         ...overrides,
+    };
+}
+
+function fakeProviderSpawnHarness({ pid, releaseProviderHomeLease: releaseLease = () => true } = {}) {
+    const readyStream = new PassThrough();
+    const descriptorStream = new Writable({
+        write(_chunk, _encoding, callback) { callback(); },
+        final(callback) {
+            callback();
+            queueMicrotask(() => readyStream.end(Buffer.from('R')));
+        },
+    });
+    const releaseStream = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    const child = Object.assign(new EventEmitter(), {
+        pid,
+        exitCode: null,
+        signalCode: null,
+        stdio: [null, new PassThrough(), new PassThrough(), descriptorStream, readyStream, releaseStream],
+    });
+    let dead = false;
+    const lease = Object.freeze({ id: `lease-${pid}` });
+    return {
+        child,
+        lease,
+        dependencies: {
+            spawn: () => child,
+            inspectProcessIdentity: () => dead ? { state: 'dead' } : identified(IDENTITY_A),
+            getUid: () => CURRENT_UID,
+            signalProcessGroup(_pid, signal) {
+                if (!dead) {
+                    dead = true;
+                    child.signalCode = signal;
+                    queueMicrotask(() => child.emit('close', null, signal));
+                }
+            },
+            acquireProviderHomeLease: () => lease,
+            releaseProviderHomeLease: releaseLease,
+        },
+        finish(code = 0, signal = null) {
+            dead = true;
+            child.exitCode = code;
+            child.signalCode = signal;
+            child.emit('close', code, signal);
+        },
     };
 }
 
@@ -1527,6 +1572,44 @@ test('different HOME keys proceed independently and callback release runs on fai
     assert.equal(fs.existsSync(path.join(root, 'callback-agent.lease.json')), false);
 });
 
+test('credential-bound HOME resolver exposes only the runtime HOME while holding the exact lease', async (t) => {
+    const root = leaseRoot(t);
+    const seen = [];
+    const result = await withCredentialProviderHomeLease({
+        credentialContext: providerCredentialContext(),
+        provider: PROVIDER_SANDBOX_PROVIDERS.CODEX,
+        taskId: 'continuation:codex:1',
+        audience: 'agent:AchillesCLI/codexAgent/continue-task',
+        leaseRoot: root,
+    }, async (home) => {
+        seen.push(home);
+        assert.deepEqual(Object.keys(home).sort(), ['homePath', 'provider', 'runtimeKind']);
+        assert.equal(Object.isFrozen(home), true);
+        const leaseFiles = fs.readdirSync(root).filter((name) => name.endsWith('.lease.json'));
+        assert.deepEqual(leaseFiles, [`${PROVIDER_INSTANCE}.sandbox-v2.lease.json`]);
+        const record = JSON.parse(fs.readFileSync(path.join(root, leaseFiles[0]), 'utf8'));
+        assert.equal(record.homeKey, `${PROVIDER_INSTANCE}.sandbox-v2`);
+        assert.equal(record.generation, PROVIDER_GENERATION);
+        assert.equal(record.role, 'provider-state-resolution');
+        assert.deepEqual(record.metadata, {
+            audience: 'agent:AchillesCLI/codexAgent/continue-task',
+            mode: 'operation',
+            provider: 'codex',
+            purpose: 'state-resolution',
+            taskId: 'continuation:codex:1',
+        });
+        return { opaqueSession: 'session-1' };
+    }, leaseDeps());
+
+    assert.deepEqual(result, { opaqueSession: 'session-1' });
+    assert.deepEqual(seen, [{
+        homePath: '/home/agent',
+        provider: 'codex',
+        runtimeKind: 'bwrap',
+    }]);
+    assert.equal(fs.existsSync(path.join(root, `${PROVIDER_INSTANCE}.sandbox-v2.lease.json`)), false);
+});
+
 test('provider task policy derives mode-separated HOME and generation only from credential context and orders isolation mounts', (t) => {
     const policy = buildProviderSandboxPolicy(providerTaskInput({
         environment: {
@@ -1679,6 +1762,51 @@ test('provider readiness uses an empty private workspace, fixed harmless command
     );
 });
 
+test('provider operation mode uses a private empty workspace with a scoped broker and no task workdir', () => {
+    const policy = buildProviderSandboxPolicy({
+        mode: PROVIDER_SANDBOX_MODES.OPERATION,
+        provider: PROVIDER_SANDBOX_PROVIDERS.CODEX,
+        credentialContext: providerCredentialContext(),
+        command: ['/home/agent/.local/bin/codex', 'app-server', '--stdio'],
+        environment: {
+            PLOINKY_TASK_BROKER_URL: PROVIDER_BROKER_URL,
+            PLOINKY_TASK_BROKER_KEY: PROVIDER_BROKER_KEY,
+        },
+    });
+
+    const workspaceMask = recordIndex(policy.records, (record) => (
+        record.type === 'TMPFS' && record.target === '/workspace'
+    ));
+    const operationDir = recordIndex(policy.records, (record) => (
+        record.type === 'DIR' && record.target === '/workspace/operation'
+    ));
+    const home = recordIndex(policy.records, (record) => record.type === 'HOME');
+    assert.ok(workspaceMask < operationDir && operationDir < home);
+    assert.equal(policy.records.some((record) => record.type === 'WORKSPACE'), false);
+    assert.equal(policy.records.some((record) => record.type === 'WORKDIR'), false);
+    assert.equal(policy.records.some((record) => record.target === '/workspace/.ploinky'), false);
+    assert.equal(policy.records.some((record) => record.target === '/workspace/.data'), false);
+    assert.equal(policy.cwd, '/workspace/operation');
+    assert.equal(policy.workdir, null);
+    assert.equal(policy.env.PLOINKY_TASK_BROKER_URL, PROVIDER_BROKER_URL);
+    assert.equal(policy.env.PLOINKY_TASK_BROKER_KEY, PROVIDER_BROKER_KEY);
+    assert.deepEqual(policy.command, ['/home/agent/.local/bin/codex', 'app-server', '--stdio']);
+    assert.throws(
+        () => buildProviderSandboxPolicy({
+            mode: PROVIDER_SANDBOX_MODES.OPERATION,
+            provider: PROVIDER_SANDBOX_PROVIDERS.CODEX,
+            credentialContext: providerCredentialContext(),
+            workdir: 'real-project',
+            command: ['/home/agent/.local/bin/codex', 'app-server', '--stdio'],
+            environment: {
+                PLOINKY_TASK_BROKER_URL: PROVIDER_BROKER_URL,
+                PLOINKY_TASK_BROKER_KEY: PROVIDER_BROKER_KEY,
+            },
+        }),
+        (error) => error?.code === 'PLOINKY_WORKDIR_INVALID',
+    );
+});
+
 test('provider workdir validation rejects roots and protected state while reconstructing only managed-repo parents', () => {
     for (const [workdir, code] of [
         ['/workspace', 'PLOINKY_WORKDIR_ROOT_FORBIDDEN'],
@@ -1794,6 +1922,45 @@ test('provider environment is scoped-broker-only, clearenv-based, and rejects in
     assert.equal(
         policy.records.some((record) => record.type === 'ARG' && record.value === '--clearenv'),
         true,
+    );
+
+    const serverPassword = 's'.repeat(43);
+    const authenticatedOpenCode = buildProviderSandboxPolicy(providerTaskInput({
+        mode: PROVIDER_SANDBOX_MODES.OPERATION,
+        workdir: undefined,
+        command: ['/home/agent/.opencode/bin/opencode', 'serve', '--pure'],
+        environment: {
+            PLOINKY_TASK_BROKER_URL: PROVIDER_BROKER_URL,
+            PLOINKY_TASK_BROKER_KEY: PROVIDER_BROKER_KEY,
+            OPENCODE_SERVER_PASSWORD: serverPassword,
+        },
+    }));
+    assert.equal(authenticatedOpenCode.env.OPENCODE_SERVER_PASSWORD, serverPassword);
+    for (const invalid of ['short', 'x'.repeat(42), 'x'.repeat(44), 'x'.repeat(42) + '=']) {
+        assert.throws(
+            () => buildProviderSandboxPolicy(providerTaskInput({
+                environment: {
+                    PLOINKY_TASK_BROKER_URL: PROVIDER_BROKER_URL,
+                    PLOINKY_TASK_BROKER_KEY: PROVIDER_BROKER_KEY,
+                    OPENCODE_SERVER_PASSWORD: invalid,
+                },
+            })),
+            (error) => error?.code === 'PLOINKY_PROVIDER_ENV_INVALID',
+        );
+    }
+    assert.throws(
+        () => buildProviderSandboxPolicy(providerTaskInput({
+            mode: PROVIDER_SANDBOX_MODES.OPERATION,
+            provider: PROVIDER_SANDBOX_PROVIDERS.CODEX,
+            workdir: undefined,
+            command: ['/home/agent/.local/bin/codex', 'app-server', '--stdio'],
+            environment: {
+                PLOINKY_TASK_BROKER_URL: PROVIDER_BROKER_URL,
+                PLOINKY_TASK_BROKER_KEY: PROVIDER_BROKER_KEY,
+                OPENCODE_SERVER_PASSWORD: serverPassword,
+            },
+        })),
+        (error) => error?.code === 'PLOINKY_PROVIDER_ENV_INVALID',
     );
 
     for (const environment of [
@@ -1915,6 +2082,16 @@ test('provider spawn writes fd3 before R, acquires lease and capability before G
         stdio: ['ignore', 'pipe', 'pipe'],
         leaseRoot: '/workspace/.ploinky/run/provider-home-leases',
         leaseMetadata: { taskId: 'task-1' },
+        async validateAfterLease(details) {
+            events.push('home:revalidate');
+            assert.deepEqual(details, {
+                provider: 'opencode',
+                mode: 'task',
+                workdir: 'projects/alpha',
+                homePath: '/home/agent',
+                runtimeKind: 'bwrap',
+            });
+        },
         async activateCapability(details) {
             events.push('capability:activate');
             assert.equal(details.childPid, child.pid);
@@ -1991,6 +2168,7 @@ test('provider spawn writes fd3 before R, acquires lease and capability before G
         'fd3:descriptor',
         'fd4:R',
         'lease:acquire',
+        'home:revalidate',
         'capability:activate',
         'fd5:G',
     ]);
@@ -2017,6 +2195,181 @@ test('provider spawn writes fd3 before R, acquires lease and capability before G
         'lease:release',
     ]);
     assert.equal(events.includes('kill'), false);
+});
+
+test('provider terminal cleanup retains and retries an exact HOME lease after an uncertain release', async () => {
+    let releaseAttempts = 0;
+    const releaseError = Object.freeze(Object.assign(new Error('lease release proof failed'), {
+        code: 'PLOINKY_PROVIDER_HOME_LEASE_REMOVE_UNPROVEN',
+    }));
+    const harness = fakeProviderSpawnHarness({
+        pid: 62301,
+        releaseProviderHomeLease(received) {
+            assert.equal(received, harness.lease);
+            releaseAttempts += 1;
+            if (releaseAttempts === 1) throw releaseError;
+            return true;
+        },
+    });
+    const running = await spawnProviderSandbox(providerTaskInput(), {}, harness.dependencies);
+    harness.finish();
+    await assert.rejects(
+        running.completion,
+        (error) => error?.code === 'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED'
+            && error.ownershipRetained === true
+            && error.evidence?.leaseRetained === true,
+    );
+    assert.equal(releaseAttempts, 1);
+    assert.deepEqual(await running.cleanup(), { code: 0, signal: null });
+    assert.equal(releaseAttempts, 2);
+});
+
+test('provider terminal cleanup retries only HOME release after afterExit has already failed', async () => {
+    let callbackAttempts = 0;
+    let releaseAttempts = 0;
+    const harness = fakeProviderSpawnHarness({
+        pid: 62302,
+        releaseProviderHomeLease(received) {
+            assert.equal(received, harness.lease);
+            releaseAttempts += 1;
+            if (releaseAttempts === 1) {
+                throw Object.assign(new Error('lease release proof failed'), {
+                    code: 'PLOINKY_PROVIDER_HOME_LEASE_REMOVE_UNPROVEN',
+                });
+            }
+            return true;
+        },
+    });
+    const running = await spawnProviderSandbox(providerTaskInput(), {
+        afterExit() {
+            callbackAttempts += 1;
+            throw Object.assign(new Error('callback failed'), { code: 'CALLBACK_FAILED' });
+        },
+    }, harness.dependencies);
+    harness.finish();
+    await assert.rejects(
+        running.completion,
+        (error) => error?.code === 'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED'
+            && error.ownershipRetained === true,
+    );
+    await assert.rejects(
+        running.cleanup(),
+        (error) => error?.code === 'CALLBACK_FAILED',
+    );
+    assert.equal(callbackAttempts, 1);
+    assert.equal(releaseAttempts, 2);
+});
+
+test('provider afterExit is bounded, releases HOME, and never mutates frozen lifecycle errors', async () => {
+    for (const behavior of ['frozen-error', 'hang']) {
+        let releases = 0;
+        const harness = fakeProviderSpawnHarness({
+            pid: behavior === 'hang' ? 62401 : 62402,
+            releaseProviderHomeLease() { releases += 1; return true; },
+        });
+        const frozenError = Object.freeze(Object.assign(new Error('frozen afterExit failure'), {
+            code: 'FROZEN_AFTER_EXIT_FAILURE',
+        }));
+        const running = await spawnProviderSandbox(providerTaskInput(), {
+            afterExit() {
+                if (behavior === 'hang') return new Promise(() => {});
+                throw frozenError;
+            },
+        }, {
+            ...harness.dependencies,
+            afterExitTimeoutMs: 5,
+        });
+        harness.finish();
+        await assert.rejects(
+            Promise.race([
+                running.completion,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('afterExit remained unbounded')), 100)),
+            ]),
+            behavior === 'hang'
+                ? (error) => error?.code === 'PLOINKY_PROVIDER_AFTER_EXIT_TIMEOUT'
+                : (error) => error?.code === 'FROZEN_AFTER_EXIT_FAILURE'
+                    && error !== frozenError,
+        );
+        assert.equal(releases, 1);
+    }
+});
+
+test('provider onSpawn cleanup reports a frozen callback error without mutation', async () => {
+    const harness = fakeProviderSpawnHarness({ pid: 62403 });
+    const frozenError = Object.freeze(Object.assign(new Error('frozen spawn hook failure'), {
+        code: 'FROZEN_ON_SPAWN_FAILURE',
+    }));
+    await assert.rejects(
+        spawnProviderSandbox(providerTaskInput(), {
+            onSpawn() { throw frozenError; },
+        }, harness.dependencies),
+        (error) => error?.code === 'FROZEN_ON_SPAWN_FAILURE'
+            && error !== frozenError
+            && Array.isArray(error.terminationEvidence),
+    );
+});
+
+test('provider spawn rejects failed HOME revalidation before capability activation and G', async () => {
+    const events = [];
+    const readyStream = new PassThrough();
+    const descriptorStream = new Writable({
+        write(_chunk, _encoding, callback) { callback(); },
+        final(callback) {
+            callback();
+            queueMicrotask(() => readyStream.end(Buffer.from('R')));
+        },
+    });
+    const releaseStream = new Writable({
+        write(_chunk, _encoding, callback) {
+            events.push(`release:${Buffer.from(_chunk).toString('ascii')}`);
+            callback();
+        },
+    });
+    let dead = false;
+    const child = Object.assign(new EventEmitter(), {
+        pid: 62501,
+        exitCode: null,
+        signalCode: null,
+        stdio: [null, null, null, descriptorStream, readyStream, releaseStream],
+    });
+    const lease = Object.freeze({ id: 'revalidation-lease' });
+
+    await assert.rejects(
+        spawnProviderSandbox(providerTaskInput(), {
+            validateAfterLease() {
+                events.push('home:revalidate');
+                const error = new Error('continuation changed under lease');
+                error.code = 'CONTINUATION_CHANGED';
+                throw error;
+            },
+            activateCapability() { events.push('capability:activate'); },
+        }, {
+            spawn: () => child,
+            inspectProcessIdentity: () => dead ? { state: 'dead' } : identified(IDENTITY_A),
+            getUid: () => CURRENT_UID,
+            signalProcessGroup(_pid, signal) {
+                events.push(signal);
+                if (signal === 'SIGTERM') {
+                    dead = true;
+                    queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+                }
+            },
+            acquireProviderHomeLease() { events.push('lease:acquire'); return lease; },
+            releaseProviderHomeLease(received) {
+                assert.equal(received, lease);
+                events.push('lease:release');
+                return true;
+            },
+        }),
+        (error) => error?.code === 'CONTINUATION_CHANGED'
+            && Array.isArray(error.terminationEvidence),
+    );
+    assert.deepEqual(events, [
+        'lease:acquire',
+        'home:revalidate',
+        'SIGTERM',
+        'lease:release',
+    ]);
 });
 
 test('provider spawn retries delayed boot-bound identity capture before publishing ownership', async () => {
@@ -2057,6 +2410,50 @@ test('provider spawn retries delayed boot-bound identity capture before publishi
     child.exitCode = 0;
     child.emit('close', 0, null);
     assert.deepEqual(await handle.completion, { code: 0, signal: null });
+});
+
+test('exact process termination retries after an unproven attempt instead of replaying its rejection', async () => {
+    const readyStream = new PassThrough();
+    const descriptorStream = new Writable({
+        write(_chunk, _encoding, callback) { callback(); },
+        final(callback) {
+            callback();
+            queueMicrotask(() => readyStream.end(Buffer.from('R')));
+        },
+    });
+    const releaseStream = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    const child = Object.assign(new EventEmitter(), {
+        pid: 63201,
+        exitCode: null,
+        signalCode: null,
+        stdio: [null, null, null, descriptorStream, readyStream, releaseStream],
+    });
+    let dead = false;
+    const signals = [];
+    const handle = await spawnProviderSandbox(providerTaskInput(), {}, {
+        spawn: () => child,
+        inspectProcessIdentity: () => dead ? { state: 'dead' } : identified(IDENTITY_A),
+        getUid: () => CURRENT_UID,
+        termGraceMs: 1,
+        killGraceMs: 1,
+        signalProcessGroup(_pid, signal) {
+            signals.push(signal);
+            if (signals.length === 3) {
+                dead = true;
+                queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+            }
+        },
+        acquireProviderHomeLease: () => Object.freeze({ id: 'retry-termination-lease' }),
+        releaseProviderHomeLease: () => true,
+    });
+    await assert.rejects(
+        handle.processControl.terminate('first-attempt'),
+        (error) => error?.code === 'PLOINKY_PROVIDER_TERMINATION_UNPROVEN',
+    );
+    const retried = await handle.processControl.terminate('retry-attempt');
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL', 'SIGTERM']);
+    assert.equal(retried.result.signal, 'SIGTERM');
+    assert.deepEqual(await handle.completion, { code: null, signal: 'SIGTERM' });
 });
 
 test('unverified identity capture returns a durable retained handle and never signals an unknown PID', async () => {

@@ -6,7 +6,8 @@ import { assertAgentCredentialContext } from './agentCredentialContext.mjs';
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const DEFAULT_CAPABILITY_TTL_SECONDS = 60 * 60;
-const ALLOWED_MODELS = new Set(['fast', 'plan', 'deep']);
+const CHAT_MODELS = new Set(['fast', 'plan', 'deep']);
+const CODEX_RESPONSE_MODELS = new Set(['gpt-5.6-sol']);
 const PROVIDERS = new Set(['opencode', 'pi', 'codex']);
 const TEXT_RE = /^[A-Za-z0-9][A-Za-z0-9:._/-]*$/;
 const REGISTRIES = new WeakMap();
@@ -40,27 +41,68 @@ function normalizeNow(now) {
 }
 
 function normalizeRouter(context) {
+    const runtimeKind = String(context.runtime.runtimeKind || '');
+    const exactRuntimeContext = (
+        runtimeKind === 'bwrap' && context.source === 'bwrap-credential-v1'
+    ) || (
+        runtimeKind === 'container' && context.source === 'container-generated-env-v1'
+    );
+    if (!exactRuntimeContext) {
+        fail(
+            'PLOINKY_SCOPED_BROKER_CONTEXT_INVALID',
+            'provider broker requires an exact supported runtime credential context',
+        );
+    }
     const physicalOrigin = String(context.router.physicalOrigin || '');
     const requestAuthority = String(context.router.requestAuthority || '');
     let origin;
     try { origin = new URL(physicalOrigin); } catch (cause) {
         fail('PLOINKY_SCOPED_BROKER_CONTEXT_INVALID', 'credential context Router origin is invalid', cause);
     }
-    if (origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1'
-        || origin.port !== '8080' || origin.pathname !== '/'
+    const routerPort = Number(context.router.port);
+    if (origin.protocol !== 'http:' || origin.hostname !== context.router.host
+        || Number(origin.port) !== routerPort
+        || !Number.isSafeInteger(routerPort) || routerPort < 1 || routerPort > 65535
+        || origin.pathname !== '/'
         || origin.username || origin.password || origin.search || origin.hash
-        || context.router.host !== '127.0.0.1' || context.router.port !== 8080) {
-        fail('PLOINKY_SCOPED_BROKER_CONTEXT_INVALID', 'credential context Router origin is not the strict Box loopback endpoint');
+        || (runtimeKind === 'bwrap'
+            && (context.router.host !== '127.0.0.1' || routerPort !== 8080))) {
+        fail('PLOINKY_SCOPED_BROKER_CONTEXT_INVALID', 'credential context Router origin is not the exact admitted endpoint');
     }
-    if (!/^127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(requestAuthority)) {
+    let authority;
+    try { authority = new URL(`http://${requestAuthority}`); } catch (cause) {
+        fail('PLOINKY_SCOPED_BROKER_CONTEXT_INVALID', 'credential context Router authority is invalid', cause);
+    }
+    if (!requestAuthority || requestAuthority.length > 255
+        || /[\u0000-\u0020\u007f/?#@]/u.test(requestAuthority)
+        || authority.protocol !== 'http:' || !authority.hostname || !authority.port
+        || authority.host !== requestAuthority || authority.pathname !== '/'
+        || authority.username || authority.password || authority.search || authority.hash) {
         fail('PLOINKY_SCOPED_BROKER_CONTEXT_INVALID', 'credential context Router authority is invalid');
     }
-    const authorityPort = Number(requestAuthority.slice(requestAuthority.lastIndexOf(':') + 1));
+    const authorityPort = Number(authority.port);
     if (!Number.isSafeInteger(authorityPort) || authorityPort > 65535) {
         fail('PLOINKY_SCOPED_BROKER_CONTEXT_INVALID', 'credential context Router authority port is invalid');
     }
-    origin.pathname = '/base-agent-additional-server/soul-gateway/7000/v1/chat/completions';
-    return Object.freeze({ upstream: origin, requestAuthority });
+    origin.pathname = '/base-agent-additional-server/soul-gateway/7000/v1/';
+    return Object.freeze({ upstreamRoot: origin, requestAuthority });
+}
+
+function normalizeProviderRequest({ method, url, provider, payload }) {
+    const expectedPath = provider === 'codex' ? '/v1/responses' : '/v1/chat/completions';
+    if (method !== 'POST' || url !== expectedPath) {
+        return Object.freeze({ ok: false, status: 404, message: 'not found' });
+    }
+    const models = provider === 'codex' ? CODEX_RESPONSE_MODELS : CHAT_MODELS;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+        || !models.has(payload.model)) {
+        return Object.freeze({
+            ok: false,
+            status: 400,
+            message: 'model is not allowed for this provider',
+        });
+    }
+    return Object.freeze({ ok: true, upstreamPath: expectedPath });
 }
 
 function jsonError(response, status, message) {
@@ -96,10 +138,11 @@ function closeEntry(entry) {
     entry.requests.clear();
 }
 
-function forwardRequest({ body, context, entry, router, response }) {
+function forwardRequest({ body, context, entry, router, response, upstreamPath }) {
     context.assertActive();
-    const transport = router.upstream.protocol === 'https:' ? https : http;
-    const upstreamRequest = transport.request(router.upstream, {
+    const upstream = new URL(upstreamPath.slice('/v1/'.length), router.upstreamRoot);
+    const transport = upstream.protocol === 'https:' ? https : http;
+    const upstreamRequest = transport.request(upstream, {
         method: 'POST',
         headers: {
             host: router.requestAuthority,
@@ -179,9 +222,6 @@ export async function startScopedSoulBrokerRegistry({
 } = {}) {
     const context = assertAgentCredentialContext(credentialContext);
     context.assertActive();
-    if (context.runtime.runtimeKind !== 'bwrap') {
-        fail('PLOINKY_SCOPED_BROKER_CONTEXT_INVALID', 'provider broker requires a bwrap AgentCredentialContext');
-    }
     if (typeof now !== 'function' || typeof random !== 'function') {
         fail('PLOINKY_SCOPED_BROKER_INPUT_INVALID', 'broker dependencies are invalid');
     }
@@ -191,10 +231,6 @@ export async function startScopedSoulBrokerRegistry({
 
     const server = http.createServer(async (request, response) => {
         try {
-            if (request.method !== 'POST' || request.url !== '/v1/chat/completions') {
-                jsonError(response, 404, 'not found');
-                return;
-            }
             const authorization = String(request.headers.authorization || '');
             const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
             const entry = capabilities.get(token);
@@ -213,11 +249,24 @@ export async function startScopedSoulBrokerRegistry({
                 jsonError(response, 400, 'request body must be JSON');
                 return;
             }
-            if (!payload || typeof payload !== 'object' || !ALLOWED_MODELS.has(payload.model)) {
-                jsonError(response, 400, 'model must be fast, plan, or deep');
+            const route = normalizeProviderRequest({
+                method: request.method,
+                url: request.url,
+                provider: entry.metadata.provider,
+                payload,
+            });
+            if (!route.ok) {
+                jsonError(response, route.status, route.message);
                 return;
             }
-            forwardRequest({ body, context, entry, router, response });
+            forwardRequest({
+                body,
+                context,
+                entry,
+                router,
+                response,
+                upstreamPath: route.upstreamPath,
+            });
         } catch (_) {
             jsonError(response, 500, 'broker request failed');
         }
@@ -292,3 +341,5 @@ export async function startScopedSoulBrokerRegistry({
     REGISTRIES.set(registry, context);
     return registry;
 }
+
+export const __testables = Object.freeze({ normalizeProviderRequest });

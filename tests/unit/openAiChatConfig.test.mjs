@@ -13,7 +13,10 @@ Object.assign(process.env, await createAgentServerContainerEnvironment({
 }));
 const {
     __buildAgenticCompletion,
+    __parseProviderEndpointResponse,
+    __resolveProviderInvocationIdentity,
     resolveOpenAiChatKind,
+    resolveOpenAiModelsKind,
 } = await import(`../../Agent/server/AgentServer.mjs?credential=${Date.now()}`);
 
 test.after(() => fs.rmSync(credentialDir, { recursive: true, force: true }));
@@ -35,6 +38,80 @@ test('command spec → command kind', () => {
     assert.equal(r.kind, 'command');
     assert.equal(r.supportsStream, true);
     assert.ok(r.commandSpec);
+});
+
+test('provider endpoint specs admit exact modules without a shell fallback', () => {
+    const providerExecution = {
+        provider: 'opencode',
+        mode: 'operation',
+        module: '/code/openai-api/provider-endpoint.mjs',
+        export: 'executeProviderEndpoint',
+    };
+    const chat = resolveOpenAiChatKind({
+        endpoints: { chatCompletions: { providerExecution, supportsStream: false } },
+    });
+    const models = resolveOpenAiModelsKind({
+        endpoints: { models: { providerExecution } },
+    });
+
+    assert.equal(chat.kind, 'command');
+    assert.equal(chat.commandSpec.kind, 'provider-module');
+    assert.deepEqual(chat.commandSpec, {
+        kind: 'provider-module',
+        provider: 'opencode',
+        sandboxMode: 'operation',
+        module: '/code/openai-api/provider-endpoint.mjs',
+        exportName: 'executeProviderEndpoint',
+        timeoutMs: undefined,
+    });
+    assert.equal(models.kind, 'command');
+    assert.equal(models.commandSpec.kind, 'provider-module');
+    assert.throws(
+        () => resolveOpenAiModelsKind({
+            endpoints: { models: { providerExecution: { ...providerExecution, mode: undefined } } },
+        }),
+        /providerExecution must be an exact/,
+    );
+    assert.throws(
+        () => resolveOpenAiChatKind({
+            endpoints: { chatCompletions: { providerExecution, supportsStream: true } },
+        }),
+        /provider chat execution does not support direct stream passthrough/,
+    );
+});
+
+test('provider endpoint execution gets a bounded named operation identity and exact response envelope', () => {
+    assert.deepEqual(
+        __resolveProviderInvocationIdentity({ taskId: 'task-1', tool: 'continue-task' }),
+        { taskId: 'task-1', operation: 'continue-task' },
+    );
+    assert.deepEqual(
+        __resolveProviderInvocationIdentity(
+            { endpoint: 'openai.models' },
+            () => '11111111-2222-4333-8444-555555555555',
+        ),
+        {
+            taskId: 'operation:11111111-2222-4333-8444-555555555555',
+            operation: 'openai.models',
+        },
+    );
+    assert.throws(
+        () => __resolveProviderInvocationIdentity({}, () => 'unused'),
+        /named tool or endpoint/,
+    );
+
+    const response = { object: 'list', data: [{ id: 'fast' }] };
+    assert.deepEqual(__parseProviderEndpointResponse({
+        code: 0,
+        stdout: JSON.stringify({ ok: true, response }),
+    }, { kind: 'provider-module' }), response);
+    assert.throws(
+        () => __parseProviderEndpointResponse({
+            code: 0,
+            stdout: JSON.stringify({ ok: true }),
+        }, { kind: 'provider-module' }),
+        /exact response envelope/,
+    );
 });
 
 test('__buildAgenticCompletion returns a chat.completion using injected responder', async () => {

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -159,6 +160,7 @@ test('TaskQueue preserves the exact provider-module admission across queue persi
         provider: 'opencode',
         module: '/code/scripts/execute-task.mjs',
         exportName: 'executeProviderTask',
+        sandboxMode: 'task',
         timeoutMs: 30_000,
     };
     const { id } = queue.enqueueTask({
@@ -367,6 +369,218 @@ test('TaskQueue aborts in-process provider bootstrap before a child is spawned',
     assert.equal(observedSignal.aborted, true);
 });
 
+test('TaskQueue never persists provider login controls or prompt secrets', (t) => {
+    const storagePath = makeTempStorage(t);
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        executor: async () => ({ code: 0, stdout: '', stderr: '' }),
+    });
+    assert.throws(
+        () => queue.enqueueTask({
+            toolName: 'task-session-control',
+            commandSpec: {
+                kind: 'provider-module',
+                provider: 'pi',
+                module: '/code/task-session-control.mjs',
+                exportName: 'executeTaskSessionControl',
+            },
+            payload: {
+                tool: 'task-session-control',
+                input: {
+                    operation: 'login_respond',
+                    flowId: 'login:11111111-1111-4111-8111-111111111111',
+                    continuationHandle: 'h'.repeat(43),
+                    seq: 1,
+                    nonce: 'nonce-0000000001',
+                    response: 'oauth-code-must-never-persist',
+                },
+            },
+        }),
+        (error) => error?.code === 'PLOINKY_PROVIDER_LOGIN_ASYNC_FORBIDDEN',
+    );
+    assert.throws(() => readFileSync(storagePath, 'utf8'), { code: 'ENOENT' });
+});
+
+test('TaskQueue close stops admission, cancels pending work, and awaits active cleanup', async (t) => {
+    const storagePath = makeTempStorage(t);
+    let activeSignal;
+    let finishActive;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        executor: (_spec, _payload, options) => new Promise((resolve) => {
+            activeSignal = options.signal;
+            finishActive = resolve;
+            options.signal.addEventListener('abort', () => resolve({
+                code: 1, signal: 'SIGTERM', stdout: '', stderr: '',
+            }), { once: true });
+        }),
+    });
+    const active = queue.enqueueTask(dummyTaskConfig({ order: 1 })).id;
+    const pending = queue.enqueueTask(dummyTaskConfig({ order: 2 })).id;
+    await waitFor(() => activeSignal);
+    await queue.close();
+    assert.equal(activeSignal.aborted, true);
+    assert.equal(queue.getTask(active)?.status, 'cancelled');
+    assert.equal(queue.getTask(pending)?.status, 'cancelled');
+    assert.throws(
+        () => queue.enqueueTask(dummyTaskConfig({ order: 3 })),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_CLOSED',
+    );
+    void finishActive;
+});
+
+test('TaskQueue close is bounded and retains fail-closed ownership when an executor ignores abort', async (t) => {
+    const storagePath = makeTempStorage(t);
+    let activeSignal;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        closeTimeoutMs: 10,
+        executor: (_spec, _payload, options) => {
+            activeSignal = options.signal;
+            return new Promise(() => {});
+        },
+    });
+    queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => activeSignal);
+    await assert.rejects(
+        queue.close(),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_CLEANUP_UNPROVEN'
+            && error.ownershipRetained === true,
+    );
+    assert.equal(activeSignal.aborted, true);
+    assert.equal(queue.admissionClosed, true);
+    assert.equal(queue.running.size, 1);
+    assert.equal(queue.runPromises.size, 1);
+    assert.equal(queue.lifecycleFailure?.error?.ownershipRetained, true);
+});
+
+test('TaskQueue close retry succeeds after a timed-out executor later proves terminal settlement', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const signals = [];
+    let complete;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        closeTimeoutMs: 10,
+        ...processIdentityOptions(signals),
+        executor: (_spec, _payload, options) => new Promise((resolve) => {
+            complete = resolve;
+            options.onSpawn({ pid: 8484, killed: false });
+        }),
+    });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.status === 'running');
+    await assert.rejects(
+        queue.close(),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_CLEANUP_UNPROVEN',
+    );
+    assert.equal(queue.lifecycleFailures.get(id)?.phase, 'close-timeout');
+    complete({ code: null, signal: 'SIGTERM', stdout: '', stderr: '' });
+    await waitFor(() => queue.getTask(id)?.status === 'cancelled');
+    await queue.close();
+    assert.deepEqual(signals, ['SIGTERM']);
+    assert.equal(queue.lifecycleFailures.size, 0);
+    assert.equal(queue.activeChildren.size, 0);
+    assert.equal(queue.activeProcessOwnership.size, 0);
+    assert.equal(queue.cleanupComplete, true);
+});
+
+test('TaskQueue preserves executor retained ownership as a fail-closed cancellation failure', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const signals = [];
+    let rejectExecution;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        ...processIdentityOptions(signals),
+        executor: (_spec, _payload, options) => new Promise((_, reject) => {
+            rejectExecution = reject;
+            options.onSpawn({ pid: 8585, killed: false });
+        }),
+    });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.status === 'running');
+    queue.cancelTask(id);
+    const cleanupError = Object.assign(new Error('provider cleanup remained unproven'), {
+        code: 'PLOINKY_PROVIDER_RUNTIME_TERMINATION_UNPROVEN',
+        ownershipRetained: true,
+    });
+    rejectExecution(cleanupError);
+    await waitFor(() => queue.getTask(id)?.status === 'failed');
+    assert.match(queue.getTask(id)?.error, /^PLOINKY_PROVIDER_RUNTIME_TERMINATION_UNPROVEN:/);
+    assert.equal(queue.lifecycleFailure?.error, cleanupError);
+    assert.equal(queue.activeChildren.has(id), true);
+    assert.equal(queue.activeProcessOwnership.has(id), true);
+    assert.deepEqual(signals, ['SIGTERM']);
+    assert.throws(
+        () => queue.enqueueTask(dummyTaskConfig({ job: 'must-not-backlog' })),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_CLEANUP_UNPROVEN'
+            && error.message === 'TaskQueue admission is blocked until exact lifecycle cleanup is proven',
+    );
+    assert.equal(queue.pending.length, 0);
+    await assert.rejects(queue.close(), (error) => error === cleanupError);
+});
+
+test('TaskQueue releases an unverified spawn after the provider executor proves exact termination', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        processIdentityInspector: () => ({ state: 'unknown' }),
+        signalProcessGroup() { throw new Error('must not signal an unverified child'); },
+        getUid: () => TEST_UID,
+        executor: async (_spec, _payload, options) => {
+            try {
+                options.onSpawn({ pid: 8686, killed: false });
+            } catch (cause) {
+                const error = new Error(cause.message, { cause });
+                error.code = cause.code;
+                error.ownershipRetained = false;
+                error.terminationEvidence = Object.freeze([Object.freeze({
+                    phase: 'after-term',
+                    state: 'terminated',
+                    terminal: true,
+                })]);
+                throw error;
+            }
+            throw new Error('spawn admission unexpectedly succeeded');
+        },
+    });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.status === 'failed');
+    assert.match(queue.getTask(id)?.error, /^PLOINKY_TASK_PROCESS_IDENTITY_UNVERIFIED:/);
+    assert.equal(queue.lifecycleFailure, null);
+    assert.equal(queue.activeChildren.size, 0);
+    assert.equal(queue.activeProcessOwnership.size, 0);
+    await queue.close();
+});
+
+test('TaskQueue retains an unverified spawn when the executor supplies no exact termination proof', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        processIdentityInspector: () => ({ state: 'unknown' }),
+        signalProcessGroup() { throw new Error('must not signal an unverified child'); },
+        getUid: () => TEST_UID,
+        executor: async (_spec, _payload, options) => {
+            options.onSpawn({ pid: 8787, killed: false });
+        },
+    });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.status === 'failed');
+    assert.equal(queue.lifecycleFailure?.phase, 'spawn-admission');
+    assert.equal(queue.activeChildren.has(id), true);
+    assert.equal(queue.activeProcessOwnership.has(id), false);
+    await assert.rejects(
+        queue.close(),
+        (error) => error?.code === 'PLOINKY_TASK_PROCESS_IDENTITY_UNVERIFIED',
+    );
+});
+
 test('TaskQueue keeps a running task in cancelling until cleanup returns its continuation', async (t) => {
     const storagePath = makeTempStorage(t);
     const signals = [];
@@ -479,6 +693,47 @@ test('TaskQueue never signals PID-reused, unknown, or UID-diverged children', as
     }
 });
 
+test('TaskQueue reconciles a transient cancellation identity failure after exact child death', async (t) => {
+    const storagePath = makeTempStorage(t);
+    let processState = 'identified';
+    let complete;
+    const child = new EventEmitter();
+    child.pid = 6464;
+    child.killed = false;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        cancelGraceMs: 100,
+        getUid: () => TEST_UID,
+        signalProcessGroup() { assert.fail('an unknown child identity must not be signalled'); },
+        processIdentityInspector: () => processState === 'identified'
+            ? {
+                state: 'identified',
+                processIdentity: TEST_IDENTITY,
+                processUid: TEST_UID,
+            }
+            : { state: processState },
+        executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
+            complete = resolve;
+            options.onSpawn?.(child);
+        }),
+    });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.status === 'running');
+    processState = 'unknown';
+    assert.equal(queue.cancelTask(id)?.status, 'cancelling');
+    processState = 'dead';
+    child.emit('close', null, 'SIGTERM');
+    complete({ code: null, signal: 'SIGTERM', stdout: '', stderr: '' });
+
+    await waitFor(() => queue.getTask(id)?.status === 'cancelled');
+    assert.equal(queue.lifecycleFailures.size, 0);
+    assert.equal(queue.activeChildren.size, 0);
+    assert.equal(queue.activeProcessOwnership.size, 0);
+    await queue.close();
+    assert.equal(queue.cleanupComplete, true);
+});
+
 test('TaskQueue treats identity-inspector exceptions as typed retained lifecycle failures', async (t) => {
     const storagePath = makeTempStorage(t);
     const signals = [];
@@ -512,7 +767,9 @@ test('TaskQueue treats identity-inspector exceptions as typed retained lifecycle
     assert.deepEqual(signals, []);
     assert.match(queue.getTask(id)?.error, /^PLOINKY_TASK_PROCESS_IDENTITY_UNVERIFIED:/);
 
-    const queued = queue.enqueueTask(dummyTaskConfig());
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(queue.getTask(queued.id)?.status, 'pending');
+    assert.throws(
+        () => queue.enqueueTask(dummyTaskConfig()),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_CLEANUP_UNPROVEN',
+    );
+    assert.equal(queue.pending.length, 0);
 });
