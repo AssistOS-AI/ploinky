@@ -80,6 +80,29 @@ test('overrideGlobalDeps: ambiguous multiple fragments are rejected', () => {
     );
 });
 
+test('overrideGlobalDeps: malformed immutable git sources are rejected', () => {
+    for (const source of [
+        `git+https://#${OVERRIDE_SHA}`,
+        `git+ssh://#${OVERRIDE_SHA}`,
+        `git://#${OVERRIDE_SHA}`,
+        `github:#${OVERRIDE_SHA}`,
+        `github:owner#${OVERRIDE_SHA}`,
+        `github:owner/.#${OVERRIDE_SHA}`,
+        `github:owner/..#${OVERRIDE_SHA}`,
+        `github:../repo#${OVERRIDE_SHA}`,
+        `github:-/-#${OVERRIDE_SHA}`,
+        `git+https://example.com/.git#${OVERRIDE_SHA}`,
+        `git+https://example.com/%20#${OVERRIDE_SHA}`,
+        `git+https://-/-#${OVERRIDE_SHA}`,
+    ]) {
+        assert.throws(
+            () => overrideGlobalDeps(freshPkg(), { PLOINKY_AGENTLIB_REF: source }),
+            /immutable 40-hex commit/,
+            source,
+        );
+    }
+});
+
 test('overrideGlobalDeps: no env leaves deps unchanged', () => {
     const out = overrideGlobalDeps(freshPkg(), {});
     assert.equal(out.dependencies.achillesAgentLib, BASE);

@@ -5,7 +5,40 @@ import { GLOBAL_DEPS_PATH } from '../config.js';
 import { debugLog } from '../utils.js';
 
 const IMMUTABLE_GIT_COMMIT = /^[0-9a-f]{40}$/;
-const IMMUTABLE_GIT_SOURCE = /^(?:git\+(?:https?|ssh):\/\/|git:\/\/|github:)/;
+function isImmutableGitSource(source) {
+    const meaningfulPathSegment = (segment) => /^[A-Za-z0-9._~-]+$/.test(segment)
+        && /[A-Za-z0-9]/.test(segment)
+        && segment !== '.' && segment !== '..';
+    if (/^github:/.test(source)) {
+        const match = /^github:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(source);
+        if (!match) return false;
+        const repository = match[2].endsWith('.git') ? match[2].slice(0, -4) : match[2];
+        return meaningfulPathSegment(match[1]) && meaningfulPathSegment(repository);
+    }
+    const rawUrl = source.startsWith('git+') ? source.slice(4) : source;
+    let parsed;
+    try {
+        parsed = new URL(rawUrl);
+    } catch (_) {
+        return false;
+    }
+    const hostname = parsed.hostname;
+    const hostnameIsMeaningful = /^\[[0-9A-Fa-f:]+\]$/.test(hostname)
+        || hostname.split('.').every((label) => (
+            /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label)
+        ));
+    const pathSegments = parsed.pathname.split('/').filter(Boolean);
+    if (pathSegments.length > 0 && pathSegments.at(-1).endsWith('.git')) {
+        pathSegments[pathSegments.length - 1] = pathSegments.at(-1).slice(0, -4);
+    }
+    if (!['http:', 'https:', 'ssh:', 'git:'].includes(parsed.protocol)
+        || !hostname || !hostnameIsMeaningful || parsed.pathname.includes('%')
+        || pathSegments.length === 0 || !pathSegments.every(meaningfulPathSegment)
+        || parsed.search || parsed.hash) {
+        return false;
+    }
+    return source.startsWith('git+') || parsed.protocol === 'git:';
+}
 
 function assertImmutableAgentlibDependency(spec, label) {
     const value = String(spec || '').trim();
@@ -16,7 +49,7 @@ function assertImmutableAgentlibDependency(spec, label) {
     if (
         hashIdx <= 0
         || firstHashIdx !== hashIdx
-        || !IMMUTABLE_GIT_SOURCE.test(source)
+        || !isImmutableGitSource(source)
         || !IMMUTABLE_GIT_COMMIT.test(commit)
     ) {
         throw new Error(`${label} must use an immutable 40-hex commit.`);
