@@ -5,6 +5,7 @@ import { GLOBAL_DEPS_PATH } from '../config.js';
 import { debugLog } from '../utils.js';
 
 const IMMUTABLE_GIT_COMMIT = /^[0-9a-f]{40}$/;
+const ACTIVE_AGENTLIB_REF_ENVIRONMENTS = new WeakSet();
 function isImmutableGitSource(source) {
     const meaningfulPathSegment = (segment) => /^[A-Za-z0-9._~-]+$/.test(segment)
         && /[A-Za-z0-9]/.test(segment)
@@ -235,7 +236,26 @@ function pinnedAgentlibUrl() {
  * @param {string} [opts.url] - achillesAgentLib remote URL (defaults to the pinned globalDeps URL).
  * @returns {string|null} immutable commit to use, or null when no branch was requested.
  */
-function resolveAgentlibBranchRef(branchPolicy, { lsRemote = spawnSync, url } = {}) {
+function resolveAgentlibBranchRef(branchPolicy, {
+    lsRemote = spawnSync,
+    url,
+    env = process.env,
+} = {}) {
+    const explicitRef = String(env?.PLOINKY_AGENTLIB_REF || '').trim();
+    if (explicitRef) {
+        if (IMMUTABLE_GIT_COMMIT.test(explicitRef)) {
+            return explicitRef;
+        }
+        if (/:\/\//.test(explicitRef) || /^(git\+|github:|npm:|file:|https?:)/.test(explicitRef)) {
+            return assertImmutableAgentlibDependency(
+                explicitRef,
+                'PLOINKY_AGENTLIB_REF',
+            );
+        }
+        throw new Error(
+            'PLOINKY_AGENTLIB_REF must be an immutable 40-hex commit or a git spec pinned to one.',
+        );
+    }
     const branch = branchPolicy?.branch;
     if (!branch) {
         return null;
@@ -252,9 +272,38 @@ function resolveAgentlibBranchRef(branchPolicy, { lsRemote = spawnSync, url } = 
     );
 }
 
+async function withScopedAgentlibRef(ref, callback, { env = process.env } = {}) {
+    if (typeof callback !== 'function') {
+        throw new TypeError('scoped AgentLib ref requires a callback');
+    }
+    let normalized = String(ref || '').trim();
+    if (normalized && !IMMUTABLE_GIT_COMMIT.test(normalized)) {
+        normalized = assertImmutableAgentlibDependency(normalized, 'scoped AgentLib ref');
+    }
+    if (!env || typeof env !== 'object') {
+        throw new TypeError('scoped AgentLib ref environment is invalid');
+    }
+    if (ACTIVE_AGENTLIB_REF_ENVIRONMENTS.has(env)) {
+        throw new Error('a scoped AgentLib ref is already active for this environment');
+    }
+    ACTIVE_AGENTLIB_REF_ENVIRONMENTS.add(env);
+    const hadPrevious = Object.hasOwn(env, 'PLOINKY_AGENTLIB_REF');
+    const previous = env.PLOINKY_AGENTLIB_REF;
+    if (normalized) env.PLOINKY_AGENTLIB_REF = normalized;
+    else delete env.PLOINKY_AGENTLIB_REF;
+    try {
+        return await callback();
+    } finally {
+        if (hadPrevious) env.PLOINKY_AGENTLIB_REF = previous;
+        else delete env.PLOINKY_AGENTLIB_REF;
+        ACTIVE_AGENTLIB_REF_ENVIRONMENTS.delete(env);
+    }
+}
+
 export {
     readGlobalDepsPackage,
     overrideGlobalDeps,
     resolveAgentlibBranchRef,
+    withScopedAgentlibRef,
     mergePackageJson,
 };

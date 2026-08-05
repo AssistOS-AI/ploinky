@@ -128,7 +128,7 @@ test('no-wait predecessor rejects a status from a different lifecycle identity',
     );
 });
 
-test('no-wait predecessor matches Podman container-id presence as part of the exact identity', async (t) => {
+test('no-wait predecessor permits only a fresh Podman running status to attach its immutable container ID', async (t) => {
     const { runningDir } = fixture(t);
     const containerName = 'ploinky_demo_fresh_predecessor';
     const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
@@ -145,6 +145,14 @@ test('no-wait predecessor matches Podman container-id presence as part of the ex
     );
 
     writeStatusRaw(containerName, { ...withContainerId, state: 'running' }, { runningDir });
+    await assert.doesNotReject(
+        () => waitForPriorWorkerRaw(target, {
+            runningDir,
+            expectedIdentity: withoutContainerId,
+        }),
+    );
+
+    writeStatusRaw(containerName, { ...withContainerId, state: 'starting' }, { runningDir });
     await assert.rejects(
         () => waitForPriorWorkerRaw(target, {
             runningDir,
@@ -1250,6 +1258,30 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
     }
 });
 
+test('no-wait registry validation treats an omitted alias as the exact empty alias', () => {
+    const staged = {
+        type: 'agent',
+        repoName: 'demo',
+        agentName: 'worker',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
+        profile: null,
+        runMode: 'service',
+        projectPath: '/workspace',
+        develRepo: false,
+        runtime: 'podman',
+    };
+    assert.doesNotThrow(() => assertNoWaitRegistryRecord({
+        ...staged,
+        containerId: 'c'.repeat(64),
+    }, staged, {
+        containerName: 'ploinky_demo_worker',
+        repoName: 'demo',
+        shortAgent: 'worker',
+        alias: '',
+    }));
+});
+
 test('queued no-wait launch adopts the exact ready runtime published by a foreground start', () => {
     const identity = {
         containerName: 'ploinky_demo_worker',
@@ -1526,6 +1558,7 @@ test('sandbox no-wait readiness never executes an OCI script probe', async () =>
 test('Podman no-wait script readiness pins both exec and running probes to Podman', async () => {
     const runningCalls = [];
     let scriptCalls = 0;
+    const containerId = 'c'.repeat(64);
     await waitForNoWaitReadiness({
         manifest: {
             start: 'node server.mjs',
@@ -1533,7 +1566,15 @@ test('Podman no-wait script readiness pins both exec and running probes to Podma
         },
         shortAgent: 'worker',
         containerName: 'ploinky_demo_worker',
-        runtimeResult: { registryRecord: { runtime: 'podman' } },
+        runtimeResult: {
+            containerId,
+            registryRecord: {
+                runtime: 'podman',
+                containerId,
+                instanceId: 'instance-one',
+                enableGeneration: 'enable-one',
+            },
+        },
         networkMode: 'default',
         generationDigest: 'sha256:active',
         selectedRuntime: 'podman',
@@ -1544,6 +1585,9 @@ test('Podman no-wait script readiness pins both exec and running probes to Podma
             assert.equal(containerName, 'ploinky_demo_worker');
             assert.equal(probe.script, 'ready.sh');
             assert.equal(options.runtime, 'podman');
+            assert.equal(options.containerId, containerId);
+            assert.equal(options.instanceId, 'instance-one');
+            assert.equal(options.enableGeneration, 'enable-one');
             assert.equal(options.isContainerRunningImpl(containerName, { timeoutMs: 321 }), true);
             return { status: 'success' };
         },
@@ -1555,7 +1599,13 @@ test('Podman no-wait script readiness pins both exec and running probes to Podma
     assert.equal(scriptCalls, 1);
     assert.deepEqual(runningCalls, [{
         containerName: 'ploinky_demo_worker',
-        options: { timeoutMs: 321, runtime: 'podman' },
+        options: {
+            timeoutMs: 321,
+            runtime: 'podman',
+            containerId,
+            instanceId: 'instance-one',
+            enableGeneration: 'enable-one',
+        },
     }]);
 });
 

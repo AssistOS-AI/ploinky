@@ -25,7 +25,8 @@ export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v
 export const RUNTIME_ADMISSION_SCHEMA_VERSION = 2;
 const ADMITTED_DESCRIPTORS = new WeakSet();
 
-const CONTAINER_SECURITY_KEYS = new Set(['privileged']);
+const CONTAINER_SECURITY_KEYS = new Set(['privileged', 'nestedBwrap']);
+const NESTED_BWRAP_SECURITY_LABEL = 'ploinky.security.nested-bwrap=unmask-all-v1';
 const DIRECT_CAPABILITY_FIELDS = new Set([
     'privileged',
     'devices',
@@ -146,7 +147,7 @@ function securityError(message, context = {}) {
 }
 
 function validateContainerSecurityBlock(value, context) {
-    if (value === undefined) return Object.freeze({ privileged: false });
+    if (value === undefined) return Object.freeze({ privileged: false, nestedBwrap: false });
     if (!isPlainObject(value)) {
         throw securityError('manifest.containerSecurity must be a plain object', context);
     }
@@ -158,7 +159,16 @@ function validateContainerSecurityBlock(value, context) {
     if (value.privileged !== undefined && typeof value.privileged !== 'boolean') {
         throw securityError('manifest.containerSecurity.privileged must be boolean', context);
     }
-    return Object.freeze({ privileged: value.privileged === true });
+    if (value.nestedBwrap !== undefined && typeof value.nestedBwrap !== 'boolean') {
+        throw securityError('manifest.containerSecurity.nestedBwrap must be boolean', context);
+    }
+    if (value.privileged === true && value.nestedBwrap === true) {
+        throw securityError('manifest.containerSecurity.nestedBwrap cannot be combined with privileged mode', context);
+    }
+    return Object.freeze({
+        privileged: value.privileged === true,
+        nestedBwrap: value.nestedBwrap === true,
+    });
 }
 
 function profileEntries(manifest) {
@@ -331,6 +341,7 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
     }, { workspaceRoot });
     const capabilities = {
         privileged: validated.containerSecurity.privileged,
+        nestedBwrap: validated.containerSecurity.nestedBwrap,
         devices: Array.isArray(runtimePolicy.devices) ? runtimePolicy.devices.length : 0,
         cdi: Array.isArray(runtimePolicy.devices)
             ? runtimePolicy.devices.filter((entry) => entry?.type === 'cdi').length
@@ -600,7 +611,14 @@ export function renderContainerSecurityArgs(descriptor) {
             code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
         });
     }
-    return descriptor.containerSecurity.privileged ? ['--privileged'] : [];
+    if (descriptor.containerSecurity.privileged) return ['--privileged'];
+    if (descriptor.containerSecurity.nestedBwrap) {
+        return [
+            '--security-opt', 'unmask=ALL',
+            '--label', NESTED_BWRAP_SECURITY_LABEL,
+        ];
+    }
+    return [];
 }
 
 export function renderRuntimePolicyArgs(descriptor, { runtime } = {}) {

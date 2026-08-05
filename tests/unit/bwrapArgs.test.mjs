@@ -10,6 +10,7 @@ import {
     buildBwrapInteractiveCommand,
     buildTrustedInteractiveLaunch,
     buildTrustedServiceLaunch,
+    ensureBwrapAgentCodeDir,
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
 } from '../../cli/sandbox/bwrap/bwrapServiceManager.js';
@@ -453,6 +454,31 @@ test('ensureBwrapAgentLibDir creates the nested dependency mount point outside t
         assert.equal(fs.existsSync(path.join(stagedAgentLibPath, 'server', 'AgentServer.mjs')), true);
         assert.equal(fs.statSync(path.join(stagedAgentLibPath, 'node_modules')).isDirectory(), true);
         assert.equal(fs.existsSync(path.join(stagedAgentLibPath, 'node_modules', 'stale.txt')), false);
+        assert.equal(fs.existsSync(path.join(sourceNodeModules, 'stale.txt')), true);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('ensureBwrapAgentCodeDir stages an immutable code tree with a nested dependency mount point', () => {
+    const root = tempDir('bwrap-agent-code-');
+    try {
+        const sourceCodePath = path.join(root, 'source', 'agent');
+        const sourceNodeModules = path.join(sourceCodePath, 'node_modules');
+        const runtimeRoot = path.join(root, 'runtime');
+        fs.mkdirSync(path.join(sourceCodePath, 'scripts'), { recursive: true });
+        fs.mkdirSync(sourceNodeModules, { recursive: true });
+        fs.writeFileSync(path.join(sourceCodePath, 'scripts', 'runner.mjs'), 'export {};\n');
+        fs.writeFileSync(path.join(sourceNodeModules, 'stale.txt'), 'must not be copied\n');
+
+        const stagedCodePath = ensureBwrapAgentCodeDir('demo alias', sourceCodePath, {
+            runtimeRoot,
+        });
+
+        assert.match(path.basename(stagedCodePath), /^Code-\d+-\d+$/);
+        assert.equal(fs.existsSync(path.join(stagedCodePath, 'scripts', 'runner.mjs')), true);
+        assert.equal(fs.statSync(path.join(stagedCodePath, 'node_modules')).isDirectory(), true);
+        assert.equal(fs.existsSync(path.join(stagedCodePath, 'node_modules', 'stale.txt')), false);
         assert.equal(fs.existsSync(path.join(sourceNodeModules, 'stale.txt')), true);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });

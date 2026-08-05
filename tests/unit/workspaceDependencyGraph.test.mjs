@@ -489,6 +489,11 @@ test('prepared runtime records and routes commit together before activation, inc
     );
     assert.match(source, /forceRecreate:\s*newlyPreparedContainers\.has\(name\)/);
     assert.match(source, /forceRecreate:\s*newlyPreparedContainers\.has\(registryName\)/);
+    assert.match(
+        source,
+        /prepareHostModeCapabilityForInactiveGeneration\(\{[\s\S]*?containerName:\s*name,[\s\S]*?\},\s*\{\s*preparationLease:\s*workspacePreparationLease,?\s*\}\)/,
+        'host-mode workspace launches must bind capability admission to the exact prepared graph lease',
+    );
 
     const noWaitSource = fs.readFileSync(
         new URL('../../cli/commands/noWaitWorker.js', import.meta.url),

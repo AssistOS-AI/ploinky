@@ -100,6 +100,7 @@ import {
 } from '../../utils/runtime/profileService.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../../utils/runtime/startupReadiness.js';
 import {
+    ensureContainerAgentHome,
     getAgentWorkDir,
     getAgentCodePath,
     getAgentSkillsPath
@@ -1060,6 +1061,24 @@ function expectedBindMountsFromArgs(args, descriptorHostFile = '') {
     return Object.freeze(specs);
 }
 
+function hasExactNestedBwrapSecurityContract(record, descriptor) {
+    const observed = String(
+        record?.Config?.Labels?.['ploinky.security.nested-bwrap']
+        || record?.Labels?.['ploinky.security.nested-bwrap']
+        || '',
+    );
+    const securityOptions = Array.isArray(record?.HostConfig?.SecurityOpt)
+        ? record.HostConfig.SecurityOpt.map((value) => String(value))
+        : [];
+    const unmaskOptions = securityOptions.filter((value) => /^unmask(?:=|:)/i.test(value));
+    if (descriptor?.containerSecurity?.nestedBwrap === true) {
+        return observed === 'unmask-all-v1'
+            && unmaskOptions.length === 1
+            && unmaskOptions[0].toLowerCase() === 'unmask=all';
+    }
+    return observed === '' && unmaskOptions.length === 0;
+}
+
 function hasExactManagedMountContract(record, expectedMounts) {
     const actual = Array.isArray(record?.Mounts) ? record.Mounts : [];
     if (actual.length !== expectedMounts.length) return false;
@@ -1300,8 +1319,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const agentCodePath = resolveSymlinkPath(agentCodePathSymlink);
     const agentSkillsPath = resolveSymlinkPath(agentSkillsPathSymlink);
 
-    // Ensure persistent agent home exists before container start.
-    fs.mkdirSync(agentHomeDir, { recursive: true });
+    // Provider helper v2 admits container-native HOME only when the exact
+    // mode-specific directory is private and caller-owned.
+    ensureContainerAgentHome(instanceName);
     // Ensure MCP config is staged in the persistent agent home before container start.
     syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentWorkDir });
 
@@ -1405,8 +1425,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         });
     }
 
-    // Ensure the agent home directory exists on host.
-    fs.mkdirSync(agentHomeDir, { recursive: true });
+    // Revalidate the same physical HOME after dependency/runtime staging and
+    // immediately before its bind is rendered.
+    ensureContainerAgentHome(instanceName);
 
     // Build volume mount arguments using new workspace structure
     // Prepared node_modules are mounted read-only; runtime containers never mutate deps.
@@ -1840,6 +1861,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     !== managedUserNamespaceFromAttestation(attested)
                 || String(record?.Config?.WorkingDir || '') !== containerWorkdir
                 || String(record?.Config?.Labels?.['ploinky.envhash'] || record?.Labels?.['ploinky.envhash'] || '') !== expectedEnvHash
+                || !hasExactNestedBwrapSecurityContract(record, runtimeAdmission.descriptor)
                 || !hasExactManagedMountContract(record, expectedMounts)) {
                 return { adopted: false, reason: 'runtime-contract' };
             }
@@ -1863,9 +1885,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         || finalVerified.payload.agentPrincipal !== principalId
                         || finalVerified.payload.instanceId !== runtimeIdentity.instanceId
                         || finalVerified.payload.generationId !== runtimeIdentity.enableGeneration
-                        || String(finalRecord?.Config?.WorkingDir || '') !== containerWorkdir
-                        || String(finalRecord?.Config?.Labels?.['ploinky.envhash'] || finalRecord?.Labels?.['ploinky.envhash'] || '') !== expectedEnvHash
-                        || !hasExactManagedEnv(finalRecord, expectedEnv)
+                    || String(finalRecord?.Config?.WorkingDir || '') !== containerWorkdir
+                    || String(finalRecord?.Config?.Labels?.['ploinky.envhash'] || finalRecord?.Labels?.['ploinky.envhash'] || '') !== expectedEnvHash
+                    || !hasExactNestedBwrapSecurityContract(finalRecord, runtimeAdmission.descriptor)
+                    || !hasExactManagedEnv(finalRecord, expectedEnv)
                         || !hasExactManagedMountContract(finalRecord, expectedMounts)) {
                         throw new Error('managed adoption descriptor changed during final inspection');
                     }
@@ -1904,6 +1927,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 !== managedUserNamespaceFromAttestation(launch.attested)
             || String(record?.Config?.WorkingDir || '') !== containerWorkdir
             || String(record?.Config?.Labels?.['ploinky.envhash'] || record?.Labels?.['ploinky.envhash'] || '') !== launch.envHash
+            || !hasExactNestedBwrapSecurityContract(record, runtimeAdmission.descriptor)
             || !hasExactManagedMountContract(record, expectedMounts)) {
             throw new Error('managed candidate image/init/user/descriptor inspection failed');
         }
@@ -2943,7 +2967,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 containerName,
             };
             if (!preparedHostModeCapability && requiresEdgeActivation) {
-                preparedHostModeCapability = prepareHostModeCapabilityForInactiveGeneration(exactOwner);
+                preparedHostModeCapability = prepareHostModeCapabilityForInactiveGeneration(exactOwner, {
+                    preparationLease: runtimeIdentity.preparationLease || options.preparationLease,
+                });
             }
             assertHostModeGenerationCapability(exactOwner, { preparedCapability: preparedHostModeCapability });
             const sandboxOptions = {
@@ -3353,7 +3379,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             containerName,
         };
         if (!preparedHostModeCapability && requiresEdgeActivation) {
-            preparedHostModeCapability = prepareHostModeCapabilityForInactiveGeneration(exactOwner);
+            preparedHostModeCapability = prepareHostModeCapabilityForInactiveGeneration(exactOwner, {
+                preparationLease: runtimeIdentity.preparationLease || managedReconciliationPreparationLease,
+            });
         }
         assertHostModeGenerationCapability(exactOwner, { preparedCapability: preparedHostModeCapability });
     }
@@ -3928,6 +3956,7 @@ export {
     expectedBindMountsFromArgs,
     hasExactManagedEnv,
     hasExactManagedMountContract,
+    hasExactNestedBwrapSecurityContract,
     mergeNodeOptions,
     manifestVolumeMountSuffix,
     podmanManifestVolumeMountSuffix,

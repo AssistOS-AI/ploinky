@@ -15,6 +15,13 @@ function parseArgumentPort(value, source) {
     }
 }
 
+function parseLocalImageId(value) {
+    if (!/^[a-f0-9]{64}$/.test(String(value || ''))) {
+        throw argumentError('--local-box-image-id must be exactly 64 lowercase hexadecimal characters');
+    }
+    return value;
+}
+
 function consumeValue(tokens, index, flag) {
     const next = tokens[index + 1];
     if (!next || next.text === '') {
@@ -73,6 +80,8 @@ export function parseOuterArguments(argv) {
         .filter((token) => token.rawIndex !== firstDebugIndex);
     const removedRawIndexes = new Set();
     let explicitPort = null;
+    let explicitMediaPort = null;
+    let localBoxImageId = null;
     let dryRun = false;
     let help = false;
     let commandToken = null;
@@ -98,6 +107,34 @@ export function parseOuterArguments(argv) {
         if (token.text.startsWith('--port=')) {
             throw argumentError('--port=PORT is unsupported; use --port PORT before start');
         }
+        if (token.text === '--local-box-image-id') {
+            if (localBoxImageId !== null) {
+                throw argumentError('--local-box-image-id was supplied more than once');
+            }
+            const value = consumeValue(tokens, index, '--local-box-image-id');
+            localBoxImageId = parseLocalImageId(value.text);
+            removedRawIndexes.add(token.rawIndex);
+            removedRawIndexes.add(value.rawIndex);
+            index += 1;
+            continue;
+        }
+        if (token.text.startsWith('--local-box-image-id=')) {
+            throw argumentError('--local-box-image-id=ID is unsupported; use two arguments');
+        }
+        if (token.text === '--local-media-port') {
+            if (explicitMediaPort !== null) {
+                throw argumentError('--local-media-port was supplied more than once');
+            }
+            const value = consumeValue(tokens, index, '--local-media-port');
+            explicitMediaPort = parseArgumentPort(value.text, '--local-media-port');
+            removedRawIndexes.add(token.rawIndex);
+            removedRawIndexes.add(value.rawIndex);
+            index += 1;
+            continue;
+        }
+        if (token.text.startsWith('--local-media-port=')) {
+            throw argumentError('--local-media-port=PORT is unsupported; use two arguments');
+        }
         if (token.text === '--dry-run') {
             if (dryRun) throw argumentError('--dry-run was supplied more than once');
             dryRun = true;
@@ -120,8 +157,18 @@ export function parseOuterArguments(argv) {
         break;
     }
 
-    if (explicitPort !== null && commandToken?.text !== 'start') {
-        throw argumentError('--port is valid only before start');
+    if ((localBoxImageId === null) !== (explicitMediaPort === null)) {
+        throw argumentError(
+            '--local-box-image-id and --local-media-port must be supplied together',
+        );
+    }
+
+    if (explicitPort !== null
+        && commandToken?.text !== 'start'
+        && localBoxImageId === null) {
+        throw argumentError(
+            '--port outside start requires the coupled local Box image and media-port options',
+        );
     }
     const classificationArgv = tokens.map((token) => token.text);
     const command = commandToken?.text || '';
@@ -163,6 +210,8 @@ export function parseOuterArguments(argv) {
         help,
         terminated,
         explicitPort,
+        explicitMediaPort,
+        localBoxImageId,
         start,
         agentCli,
     });

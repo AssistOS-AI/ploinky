@@ -93,9 +93,13 @@ export function assertNoWaitStatusIdentity(status, expectedIdentity = null, {
     const mismatch = fields.some((field) => status[field] !== expectedIdentity[field]);
     const statusOwnsContainerId = Object.prototype.hasOwnProperty.call(status, 'containerId');
     const expectedOwnsContainerId = Object.prototype.hasOwnProperty.call(expectedIdentity, 'containerId');
+    const attachesFreshPodmanContainerId = expectedIdentity.runtime === 'podman'
+        && expectedOwnsContainerId === false
+        && statusOwnsContainerId === true
+        && status.state === 'running';
     if (mismatch
-        || statusOwnsContainerId !== expectedOwnsContainerId
-        || (statusOwnsContainerId && status.containerId !== expectedIdentity.containerId)) {
+        || (statusOwnsContainerId !== expectedOwnsContainerId && !attachesFreshPodmanContainerId)
+        || (expectedOwnsContainerId && status.containerId !== expectedIdentity.containerId)) {
         throw new Error(`${description} mismatch`);
     }
     return status;
@@ -375,11 +379,13 @@ export function assertNoWaitRegistryRecord(record, stagedRecord, {
         stagedRecord?.runtime,
         `no-wait staged identity for '${containerName}'`,
     );
+    const expectedAlias = alias === undefined ? '' : alias;
+    const recordAlias = record?.alias === undefined ? '' : record.alias;
+    const stagedAlias = stagedRecord?.alias === undefined ? '' : stagedRecord.alias;
     const invariantFields = [
         ['type', 'agent'],
         ['repoName', repoName],
         ['agentName', shortAgent],
-        ['alias', alias],
         ['instanceId', stagedRecord?.instanceId],
         ['enableGeneration', stagedRecord?.enableGeneration],
         ['profile', stagedRecord?.profile],
@@ -388,7 +394,10 @@ export function assertNoWaitRegistryRecord(record, stagedRecord, {
         ['develRepo', stagedRecord?.develRepo],
         ['runtime', stagedRuntime],
     ];
-    const mismatch = !record || invariantFields.some(([field, expected]) => (
+    const mismatch = !record
+        || recordAlias !== expectedAlias
+        || stagedAlias !== expectedAlias
+        || invariantFields.some(([field, expected]) => (
         record?.[field] !== expected
     )) || record?.auth?.mode !== stagedRecord?.auth?.mode
         || record?.instanceId !== stagedRecord?.instanceId
@@ -977,14 +986,34 @@ export async function waitForNoWaitReadiness({
             error.code = 'PLOINKY_SANDBOX_SCRIPT_READINESS_UNSUPPORTED';
             throw error;
         }
+        const readinessIdentity = assertExactNoWaitIdentity({
+            runtime: exactRuntime,
+            containerName,
+            containerId: runtimeResult?.registryRecord?.containerId,
+            instanceId: runtimeResult?.registryRecord?.instanceId,
+            enableGeneration: runtimeResult?.registryRecord?.enableGeneration,
+        }, `no-wait script readiness for '${containerName}'`);
+        if (runtimeResult?.containerId !== readinessIdentity.containerId) {
+            const error = new Error(
+                `no-wait script readiness returned a mismatched immutable runtime for '${containerName}'`,
+            );
+            error.code = 'PLOINKY_NO_WAIT_RUNTIME_MISMATCH';
+            throw error;
+        }
         const probe = normalizeProbeConfig('readiness', manifest?.health?.readiness);
         const result = await Promise.resolve(
             runContainerScriptReadinessFn(shortAgent, containerName, probe, {
                 runtime: exactRuntime,
+                containerId: readinessIdentity.containerId,
+                instanceId: readinessIdentity.instanceId,
+                enableGeneration: readinessIdentity.enableGeneration,
                 isContainerRunningImpl(runtimeContainerName, probeOptions = {}) {
                     return isContainerRunningFn(runtimeContainerName, {
                         ...probeOptions,
                         runtime: exactRuntime,
+                        containerId: readinessIdentity.containerId,
+                        instanceId: readinessIdentity.instanceId,
+                        enableGeneration: readinessIdentity.enableGeneration,
                     });
                 },
             }),

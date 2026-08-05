@@ -41,11 +41,13 @@ function transactionError(message, cause, rollbackFailures = []) {
 function oldDesired(identity, ownership, repositoryRoot, engine) {
     const container = ownership.handles.container;
     const hostPort = Number(container.labels['io.assistos.ploinky-box.router-host-port']);
+    const mediaHostPort = Number(container.labels['io.assistos.ploinky-box.media-host-port']);
     const imageRef = container.labels['io.assistos.ploinky-box.image-ref'];
     const imageId = container.runtime.imageId;
     const desired = {
         identity,
         hostPort,
+        mediaHostPort,
         imageRef,
         imageId,
         repositoryRoot,
@@ -94,6 +96,7 @@ async function createAndStart({
     image,
     imageRef,
     hostPort,
+    mediaHostPort,
     repositoryRoot,
     runner,
     lock,
@@ -117,6 +120,7 @@ async function createAndStart({
         imageId: image.immutableId,
         imageRef,
         hostPort,
+        mediaHostPort,
         repositoryRoot,
         cidfile,
         hostKind: engine.hostKind,
@@ -143,6 +147,7 @@ async function createAndStart({
     const handle = validateCreatedContainer(finalOwnership, {
         identity,
         hostPort,
+        mediaHostPort,
         imageId: image.immutableId,
         imageRef,
         repositoryRoot,
@@ -171,6 +176,7 @@ async function restoreOldContainer({
         image: { immutableId: old.imageId },
         imageRef: old.imageRef,
         hostPort: old.hostPort,
+        mediaHostPort: old.mediaHostPort,
         repositoryRoot: old.repositoryRoot,
         runner,
         lock,
@@ -194,6 +200,8 @@ export async function reconcileBoxContainer({
     lock,
     repositoryRoot,
     explicitPort,
+    explicitMediaPort,
+    localBoxImageId,
     imageRef = BOX_IMAGE_REFERENCE,
     platform = process.platform,
     env = process.env,
@@ -221,14 +229,25 @@ export async function reconcileBoxContainer({
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
-    const portPlan = resolveEffectiveHostPort({ explicitPort, ownership });
+    if (localBoxImageId !== undefined && localBoxImageId !== null
+        && !/^[a-f0-9]{64}$/.test(String(localBoxImageId))) {
+        throw new PloinkyBoxError(
+            'Local Box image ID must be exactly 64 lowercase hexadecimal characters',
+            { code: 'PLOINKY_BOX_LOCAL_IMAGE_ID_INVALID' },
+        );
+    }
+    const selectedLocalImageId = localBoxImageId ? String(localBoxImageId) : null;
+    const portPlan = resolveEffectiveHostPort({ explicitPort, explicitMediaPort, ownership });
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
     if (old) {
         dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
     }
     const requiresReplacement = Boolean(old) && (
-        old.hostPort !== portPlan.hostPort || old.imageRef !== imageRef
+        old.hostPort !== portPlan.hostPort
+        || old.mediaHostPort !== portPlan.mediaHostPort
+        || old.imageRef !== imageRef
+        || (selectedLocalImageId !== null && old.imageId !== selectedLocalImageId)
     );
     if (old && !requiresReplacement) {
         dependencies.revalidateVolumes({
@@ -245,15 +264,33 @@ export async function reconcileBoxContainer({
         }
         const finalOwnership = dependencies.discover(identity, { runner });
         validateCreatedContainer(finalOwnership, old);
-        return Object.freeze({ action: 'reused', ownership: finalOwnership, hostPort: old.hostPort });
+        return Object.freeze({
+            action: 'reused',
+            ownership: finalOwnership,
+            hostPort: old.hostPort,
+            mediaHostPort: old.mediaHostPort,
+            imageId: old.imageId,
+        });
     }
 
     await dependencies.preflight({
         hostPort: portPlan.hostPort,
+        mediaHostPort: portPlan.mediaHostPort,
         existingPublication: portPlan.existingPublication,
     });
-    await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
-    const image = dependencies.validateImage(engine.name, imageRef, runner);
+    if (selectedLocalImageId === null) {
+        await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
+    } else {
+        writeProgress(stderr, `Validating local Box image ${selectedLocalImageId} without pulling...`);
+    }
+    const selectedImageRef = selectedLocalImageId || imageRef;
+    const image = dependencies.validateImage(engine.name, selectedImageRef, runner);
+    if (selectedLocalImageId !== null && image.immutableId !== selectedLocalImageId) {
+        throw new PloinkyBoxError(
+            'Local Box image inspection did not return the exact requested immutable ID',
+            { code: 'PLOINKY_BOX_LOCAL_IMAGE_ID_MISMATCH' },
+        );
+    }
     let volumeResult;
     try {
         volumeResult = dependencies.ensureVolumes({
@@ -294,6 +331,7 @@ export async function reconcileBoxContainer({
             image,
             imageRef,
             hostPort: portPlan.hostPort,
+            mediaHostPort: portPlan.mediaHostPort,
             repositoryRoot,
             runner,
             lock,
@@ -312,6 +350,7 @@ export async function reconcileBoxContainer({
             action: old ? 'replaced' : 'created',
             ownership: created.ownership,
             hostPort: portPlan.hostPort,
+            mediaHostPort: portPlan.mediaHostPort,
             imageId: image.immutableId,
         });
     } catch (error) {

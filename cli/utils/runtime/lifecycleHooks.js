@@ -13,8 +13,7 @@ import { buildAgentPrincipalEnv, stripReservedAgentEnv } from '../security/agent
 import { deriveAgentPrincipalId } from '../security/agentIdentity.js';
 import {
     initWorkspaceStructure,
-    createAgentSymlinks,
-    createAgentWorkDir
+    createAgentSymlinks
 } from '../workspaceStructure.js';
 import { PLOINKY_WORKSPACE_ROOT } from '../config.js';
 
@@ -387,7 +386,6 @@ export function runProfileLifecycle(agentName, profileName, options = {}) {
     try {
         if (agentPath) {
             createAgentSymlinks(agentName, repoName, agentPath);
-            createAgentWorkDir(agentName);
         }
         steps.push({ step: 2, name: 'symlinks', success: true });
     } catch (err) {
@@ -521,7 +519,6 @@ export function runPreContainerLifecycle(agentName, repoName, agentPath, profile
 
     try {
         createAgentSymlinks(agentName, repoName, agentPath);
-        createAgentWorkDir(agentName);
     } catch (err) {
         errors.push(`Symlink creation failed: ${err.message}`);
     }

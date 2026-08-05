@@ -221,16 +221,18 @@ test('pruneStaleRuntimeEntries removes only entries whose pid is no longer alive
         const stalePid = 999999; // unlikely to be assigned to a live process
         const staleEntry = `Agent-${stalePid}-2`;
         const staleCodeEntry = `code-${stalePid}-3`;
+        const staleBwrapCodeEntry = `Code-${stalePid}-4`;
         const unrelatedEntry = 'README.txt';
         fs.mkdirSync(path.join(runtimeRoot, liveEntry), { recursive: true });
         fs.mkdirSync(path.join(runtimeRoot, staleEntry), { recursive: true });
         fs.mkdirSync(path.join(runtimeRoot, staleCodeEntry), { recursive: true });
+        fs.mkdirSync(path.join(runtimeRoot, staleBwrapCodeEntry), { recursive: true });
         fs.writeFileSync(path.join(runtimeRoot, unrelatedEntry), 'hi\n');
 
         const removed = pruneStaleRuntimeEntries(runtimeRoot);
         const remaining = fs.readdirSync(runtimeRoot).sort();
 
-        assert.deepEqual(removed.sort(), [staleEntry, staleCodeEntry].sort());
+        assert.deepEqual(removed.sort(), [staleEntry, staleCodeEntry, staleBwrapCodeEntry].sort());
         assert.deepEqual(remaining, [liveEntry, unrelatedEntry].sort());
     } finally {
         fs.rmSync(root, { recursive: true, force: true });

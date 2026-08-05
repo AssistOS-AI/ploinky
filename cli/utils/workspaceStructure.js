@@ -361,6 +361,54 @@ export function getAgentDataDir(instanceName) {
 }
 
 /**
+ * Create or validate the unsuffixed container HOME used by isolated agents.
+ * Helper protocol v2 revalidates container-native HOME as an exact 0700
+ * directory owned by the calling uid before releasing a provider process.
+ * Existing incompatible state is never chmodded, migrated, or removed.
+ *
+ * @param {string} instanceName - Exact admitted agent instance/alias name.
+ * @param {{ agentsDataDir?: string }} [options]
+ * @returns {{ homePath: string, homeKey: string }}
+ */
+export function ensureContainerAgentHome(instanceName, {
+    agentsDataDir = AGENTS_DATA_DIR,
+} = {}) {
+    const homeKey = sanitizeAgentDataName(instanceName);
+    if (!AGENT_HOME_KEY_PATTERN.test(homeKey)
+        || homeKey === '.'
+        || homeKey === '..'
+        || Buffer.byteLength(homeKey, 'utf8') > AGENT_HOME_COMPONENT_MAX_BYTES) {
+        throw homeStateError('invalid-home-key');
+    }
+    const expectedUid = currentUid();
+    try {
+        fs.mkdirSync(path.resolve(agentsDataDir), { mode: 0o700 });
+    } catch (error) {
+        if (error?.code !== 'EEXIST') throw homeStateError('invalid-data-root');
+    }
+    const dataRootBefore = inspectDataRoot(agentsDataDir, expectedUid);
+    const homePath = path.join(dataRootBefore.dataPath, homeKey);
+    let created = false;
+    try {
+        fs.mkdirSync(homePath, { mode: 0o700 });
+        created = true;
+    } catch (error) {
+        if (error?.code !== 'EEXIST') throw homeStateError('home-creation-failed');
+    }
+    const homeBefore = inspectHome(homePath, homeKey, dataRootBefore, expectedUid);
+    const dataRootAfter = inspectDataRoot(agentsDataDir, expectedUid);
+    const homeAfter = inspectHome(homePath, homeKey, dataRootAfter, expectedUid);
+    if (!sameFilesystemObject(dataRootBefore.stats, dataRootAfter.stats)
+        || !sameFilesystemObject(homeBefore.stats, homeAfter.stats)) {
+        throw homeStateError('home-identity-race');
+    }
+    if (created && exactMode(homeAfter.stats) !== 0o700) {
+        throw homeStateError('home-creation-race');
+    }
+    return Object.freeze({ homePath, homeKey });
+}
+
+/**
  * Resolve the sandbox-only provider HOME backing directory without sanitizing
  * or otherwise changing the admitted runtime key. The ABI suffix is always
  * appended here so callers cannot accidentally select the container HOME.
@@ -526,11 +574,7 @@ export function getAgentSkillsPath(agentName) {
  * @returns {string} The created directory path
  */
 export function createAgentWorkDir(agentName) {
-    const workDir = getAgentWorkDir(agentName);
-    if (!fs.existsSync(workDir)) {
-        fs.mkdirSync(workDir, { recursive: true });
-    }
-    return workDir;
+    return ensureContainerAgentHome(agentName).homePath;
 }
 
 /**

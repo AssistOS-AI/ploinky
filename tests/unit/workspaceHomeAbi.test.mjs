@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
     AGENT_HOME_ABI_MARKER,
     ensureAgentHomeAbi,
+    ensureContainerAgentHome,
     getAgentHomeAbiPath,
     getAgentWorkDir,
 } from '../../cli/utils/workspaceStructure.js';
@@ -77,6 +78,57 @@ test('clean HOME ABI preserves the exact safe key and writes a canonical immutab
         assert.match(getAgentWorkDir('repo/agent'), /repo_agent$/);
     } finally {
         removeFixture(value);
+    }
+});
+
+test('container HOME is created with the exact helper-v2 ownership and mode contract', () => {
+    const value = fixture();
+    try {
+        const result = ensureContainerAgentHome('repo.agent-alias_1', {
+            agentsDataDir: value.agentsDataDir,
+        });
+        const expectedHome = path.join(value.agentsDataDir, 'repo.agent-alias_1');
+        assert.equal(result.homePath, expectedHome);
+        assert.equal(result.homeKey, 'repo.agent-alias_1');
+        assert.equal(exactMode(expectedHome), 0o700);
+
+        fs.writeFileSync(path.join(expectedHome, 'provider-state.json'), '{"keep":true}\n');
+        const reused = ensureContainerAgentHome('repo.agent-alias_1', {
+            agentsDataDir: value.agentsDataDir,
+        });
+        assert.equal(reused.homePath, expectedHome);
+        assert.equal(fs.readFileSync(path.join(expectedHome, 'provider-state.json'), 'utf8'), '{"keep":true}\n');
+    } finally {
+        removeFixture(value);
+    }
+});
+
+test('container HOME refuses permissive or redirected existing state without rewriting it', () => {
+    const permissive = fixture();
+    try {
+        const home = path.join(permissive.agentsDataDir, 'permissive-home');
+        const sentinel = path.join(home, 'credentials.json');
+        fs.mkdirSync(home, { mode: 0o755 });
+        fs.writeFileSync(sentinel, 'do-not-touch');
+        assertIncompatible(() => ensureContainerAgentHome('permissive-home', {
+            agentsDataDir: permissive.agentsDataDir,
+        }));
+        assert.equal(exactMode(home), 0o755);
+        assert.equal(fs.readFileSync(sentinel, 'utf8'), 'do-not-touch');
+    } finally {
+        removeFixture(permissive);
+    }
+
+    const redirected = fixture();
+    try {
+        const external = path.join(redirected.root, 'external-home');
+        fs.mkdirSync(external, { mode: 0o700 });
+        fs.symlinkSync(external, path.join(redirected.agentsDataDir, 'linked-home'), 'dir');
+        assertIncompatible(() => ensureContainerAgentHome('linked-home', {
+            agentsDataDir: redirected.agentsDataDir,
+        }));
+    } finally {
+        removeFixture(redirected);
     }
 });
 

@@ -38,7 +38,10 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
             : { state: statusState, handles: null },
     };
     return {
-        prepareBoxForCommand: async () => { events.push('prepare'); return prepared; },
+        prepareBoxForCommand: async (options = {}) => {
+            events.push(Object.keys(options).length > 0 ? ['prepare', options] : 'prepare');
+            return prepared;
+        },
         runStartTransaction: async (argv, options) => events.push(['start', argv, options]),
         runStopTransaction: async () => events.push('stop'),
         runDestroyTransaction: async (id, options) => events.push(['destroy', id, options]),
@@ -140,6 +143,70 @@ test('explicit start is reachable and retains normalized debug argv', async () =
         ['--debug', 'start', 'Agent', '8080'],
         { explicitPort: 19090 },
     ]]);
+});
+
+test('outer start forwards only a validated immutable AgentLib deploy ref', async () => {
+    const agentlibRef = 'b'.repeat(40);
+    const events = [];
+    const code = await runOuterCli(['start', 'Agent'], {
+        env: { PLOINKY_AGENTLIB_REF: agentlibRef },
+        input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events),
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(events, [[
+        'start',
+        ['start', 'Agent', '8080'],
+        { explicitPort: null, agentlibRef },
+    ]]);
+
+    for (const invalid of ['', 'main', 'B'.repeat(40), `${agentlibRef}\nINJECTED=1`]) {
+        if (!invalid) continue;
+        const invalidEvents = [];
+        await assert.rejects(
+            () => runOuterCli(['start', 'Agent'], {
+                env: { PLOINKY_AGENTLIB_REF: invalid },
+                input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+                supervisor: fakeSupervisor(invalidEvents),
+            }),
+            /PLOINKY_AGENTLIB_REF.*40 lowercase hexadecimal/,
+        );
+        assert.deepEqual(invalidEvents, []);
+    }
+});
+
+test('local immutable admission reaches start and agent CLI preparation as one coupled pair', async () => {
+    const imageId = 'c'.repeat(64);
+    const prefix = [
+        '--local-box-image-id', imageId,
+        '--local-media-port', '17882',
+    ];
+    const startEvents = [];
+    await runOuterCli([...prefix, '--port', '18080', 'start', 'Agent'], {
+        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(startEvents),
+    });
+    assert.deepEqual(startEvents, [[
+        'start',
+        ['start', 'Agent', '8080'],
+        {
+            explicitPort: 18080,
+            localBoxImageId: imageId,
+            explicitMediaPort: 17882,
+        },
+    ]]);
+
+    const cliEvents = [];
+    await runOuterCli([...prefix, '--port', '18080', 'cli', 'Agent', '--workdir', '/workspace/project', '--'], {
+        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(cliEvents),
+        execute() { return 0; },
+    });
+    assert.deepEqual(cliEvents[0], ['prepare', {
+        localBoxImageId: imageId,
+        explicitMediaPort: 17882,
+        explicitPort: 18080,
+    }]);
 });
 
 test('generic forwarding prepares under the supervisor then execs the fixed target', async () => {
@@ -253,4 +320,24 @@ test('dry-run and invalid arguments cause no preparation or execution', async ()
         env: {}, supervisor: fakeSupervisor(events),
     }), error => error?.code === 'PLOINKY_WORKDIR_REQUIRED');
     assert.equal(events.length, 1);
+});
+
+test('dry-run carries local immutable admission without preparing the Box', async () => {
+    const events = [];
+    const imageId = 'd'.repeat(64);
+    await runOuterCli([
+        '--dry-run',
+        '--local-box-image-id', imageId,
+        '--local-media-port', '17883',
+        '--port', '18081',
+        'start', 'Agent',
+    ], {
+        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events),
+    });
+    assert.deepEqual(events, [['dry-run', {
+        explicitPort: 18081,
+        localBoxImageId: imageId,
+        explicitMediaPort: 17883,
+    }]]);
 });

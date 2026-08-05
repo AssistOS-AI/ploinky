@@ -2468,6 +2468,8 @@ async function startWorkspace(staticAgentArg, portArg, {
                 enableGeneration: rec.enableGeneration,
                 routeKey,
                 containerName: name,
+              }, {
+                preparationLease: workspacePreparationLease,
               })
             : undefined;
           const runtimeResult = ensureAgentService(shortAgentName, manifest, agentPath, {

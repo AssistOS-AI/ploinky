@@ -31,6 +31,7 @@ export const BWRAP_RECORD_TYPES = Object.freeze({
     SYMLINK: 10,
     PREEXEC_BARRIER: 11,
     RO_DATA_PATH: 12,
+    TASK_BROKER_KEY: 13,
 });
 export const BWRAP_HOME_SOURCE_KINDS = Object.freeze({
     SANDBOX_WORKSPACE_V2: 'sandbox-workspace-v2',
@@ -44,10 +45,12 @@ export const BWRAP_SYMLINK_MAPPINGS = Object.freeze({
 });
 export const DEFAULT_PROVIDER_HOME_LEASE_ROOT = '/workspace/.ploinky/run/provider-home-leases';
 export const PROVIDER_SANDBOX_HELPER = '/usr/local/libexec/ploinky-bwrap-launch';
+export const PROVIDER_TASK_BROKER_KEY_PATH = '/run/ploinky-task-broker-key';
 export const PROVIDER_SANDBOX_MODES = Object.freeze({
     TASK: 'task',
     OPERATION: 'operation',
     READINESS: 'readiness',
+    INSTALL: 'install',
 });
 export const PROVIDER_SANDBOX_PROVIDERS = Object.freeze({
     OPENCODE: 'opencode',
@@ -65,6 +68,14 @@ const MAX_METADATA_DEPTH = 3;
 const DEFAULT_PROVIDER_TERM_GRACE_MS = 250;
 const DEFAULT_PROVIDER_KILL_GRACE_MS = 2_000;
 const DEFAULT_PROVIDER_AFTER_EXIT_TIMEOUT_MS = 5_000;
+const MAX_HELPER_DIAGNOSTIC_PREFIX_BYTES = 128;
+const PROVIDER_TASK_BROKER_BOOTSTRAP = Object.freeze([
+    `ploinky_task_broker_key="$(cat -- ${PROVIDER_TASK_BROKER_KEY_PATH})" || exit 125`,
+    'PLOINKY_TASK_BROKER_KEY="$ploinky_task_broker_key"',
+    'export PLOINKY_TASK_BROKER_KEY',
+    'unset ploinky_task_broker_key',
+    'exec "$@"',
+].join('\n'));
 const LEASE_SCHEMA_VERSION = 2;
 const LEASE_LINEAGE_SCHEMA_VERSION = 2;
 const MAX_LEASE_LINEAGE_BYTES = 1024;
@@ -121,7 +132,9 @@ const CONTAINER_SYSTEM_PATHS = Object.freeze([
     Object.freeze({ source: '/etc/hosts', target: '/etc/hosts', dataFile: true }),
     Object.freeze({ source: '/etc/passwd', target: '/etc/passwd', dataFile: true }),
     Object.freeze({ source: '/etc/group', target: '/etc/group', dataFile: true }),
-    Object.freeze({ source: '/etc/nsswitch.conf', target: '/etc/nsswitch.conf', dataFile: true }),
+    // The immutable v2 helper admits only the Fedora canonical nsswitch
+    // mapping. Container-native Debian homes cannot supply that source, so
+    // leave nsswitch absent and use libc's built-in hosts lookup defaults.
     Object.freeze({ source: '/etc/ld.so.cache', target: '/etc/ld.so.cache', dataFile: true }),
     Object.freeze({ source: '/etc/ssl', target: '/etc/ssl', sourceType: 'directory' }),
 ]);
@@ -306,6 +319,7 @@ function annotatedProviderError(source, {
     ownershipRetained = source?.ownershipRetained,
     evidence = source?.evidence,
     retainedProcess = source?.retainedProcess,
+    helperCode = source?.helperCode,
     cause = source,
 } = {}) {
     const error = policyError(message, code, cause instanceof Error ? { cause } : undefined);
@@ -313,6 +327,54 @@ function annotatedProviderError(source, {
     if (ownershipRetained !== undefined) error.ownershipRetained = ownershipRetained;
     if (evidence !== undefined) error.evidence = evidence;
     if (retainedProcess !== undefined) error.retainedProcess = retainedProcess;
+    if (helperCode !== undefined) error.helperCode = helperCode;
+    return error;
+}
+
+function collectSanitizedHelperDiagnostic(stream) {
+    let prefix = '';
+    let helperCode = null;
+    let lineStart = true;
+    const inspectByte = (byte) => {
+        if (helperCode) return;
+        if (byte === 0x0a || byte === 0x0d) {
+            prefix = '';
+            lineStart = true;
+            return;
+        }
+        if (!lineStart) return;
+        if (prefix.length >= MAX_HELPER_DIAGNOSTIC_PREFIX_BYTES) {
+            prefix = '';
+            lineStart = false;
+            return;
+        }
+        const character = String.fromCharCode(byte);
+        prefix += character;
+        if (character === ':') {
+            const candidate = prefix.slice(0, -1);
+            if (/^PLOINKY_[A-Z0-9_]+$/.test(candidate)) helperCode = candidate;
+            prefix = '';
+            lineStart = false;
+        } else if (!/^[A-Z0-9_]$/.test(character)) {
+            prefix = '';
+            lineStart = false;
+        }
+    };
+    const onData = (chunk) => {
+        for (const byte of Buffer.from(chunk)) inspectByte(byte);
+    };
+    stream?.on?.('data', onData);
+    return Object.freeze({
+        code() { return helperCode; },
+        close() { stream?.removeListener?.('data', onData); },
+    });
+}
+
+function attachSanitizedHelperDiagnostic(error, diagnostic) {
+    const helperCode = diagnostic?.code?.();
+    if (!helperCode) return error;
+    error.helperCode = helperCode;
+    error.message = `${error.message} [${helperCode}]`;
     return error;
 }
 
@@ -479,6 +541,7 @@ export function createDirectoryRecord(target) {
         || target === '/home'
         || target === '/workspace/readiness'
         || target === '/workspace/operation'
+        || target === '/workspace/install'
         || target === '/run/ploinky-agent'
         || target === '/workspace/.ploinky/repos'
         || target.startsWith('/workspace/.ploinky/repos/')
@@ -491,6 +554,13 @@ export function createDirectoryRecord(target) {
 export function createTmpfsRecord(target) {
     if (!TMPFS_TARGETS.has(target)) throw policyError('TMPFS target is not in the v1 allowlist', 'PLOINKY_MOUNT_DESTINATION_UNSUPPORTED');
     return frozenRecord('TMPFS', { target });
+}
+
+export function createTaskBrokerKeyRecord(value) {
+    if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{43,128}$/.test(value)) {
+        throw policyError('task broker key is invalid', 'PLOINKY_PROVIDER_BROKER_INVALID');
+    }
+    return frozenRecord('TASK_BROKER_KEY', { value });
 }
 
 export function createProcRecord() { return frozenRecord('PROC'); }
@@ -523,6 +593,7 @@ export const typedBwrapRecords = Object.freeze({
     readOnlyDataFile: createReadOnlyDataFileRecord,
     directory: createDirectoryRecord,
     tmpfs: createTmpfsRecord,
+    taskBrokerKey: createTaskBrokerKeyRecord,
     proc: createProcRecord,
     dev: createDevRecord,
     symlink: createSymlinkRecord,
@@ -541,6 +612,7 @@ function recordTarget(record) {
     case 'PROC': return '/proc';
     case 'DEV': return '/dev';
     case 'SYMLINK': return `/${record.mapping.replace('usr-', '')}`;
+    case 'TASK_BROKER_KEY': return PROVIDER_TASK_BROKER_KEY_PATH;
     default: return null;
     }
 }
@@ -569,6 +641,7 @@ function validateRecordShape(record, index) {
         DEV: ['type'],
         SYMLINK: ['type', 'mapping'],
         PREEXEC_BARRIER: ['type', 'readyFd', 'releaseFd'],
+        TASK_BROKER_KEY: ['type', 'value'],
     }[record.type];
     assertExactKeys(record, new Set(fields), new Set(fields), `record ${index}`);
 }
@@ -624,6 +697,10 @@ function encodeRecordPayload(record) {
         payload.writeUInt32BE(checked.releaseFd, 4);
         return payload;
     }
+    case 'TASK_BROKER_KEY': return utf8(
+        createTaskBrokerKeyRecord(record.value).value,
+        'TASK_BROKER_KEY',
+    );
     default: throw policyError(`unsupported record type ${record.type}`);
     }
 }
@@ -730,8 +807,16 @@ function validateRecordPolicy(records) {
         if (record.type === 'DIR' && target.startsWith('/run/') && !targets.has('/run')) {
             throw policyError('/run tmpfs must precede its directories', 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID');
         }
+        if (record.type === 'TASK_BROKER_KEY' && targetKinds.get('/run') !== 'TMPFS') {
+            throw policyError(
+                '/run tmpfs must precede the task broker key',
+                'PLOINKY_BWRAP_MOUNT_ORDER_INVALID',
+            );
+        }
         if (record.type === 'DIR'
-            && (target === '/workspace/readiness' || target === '/workspace/operation')
+            && (target === '/workspace/readiness'
+                || target === '/workspace/operation'
+                || target === '/workspace/install')
             && targetKinds.get('/workspace') !== 'TMPFS') {
             throw policyError('private provider mode requires /workspace TMPFS first', 'PLOINKY_BWRAP_MOUNT_ORDER_INVALID');
         }
@@ -1057,7 +1142,8 @@ function normalizeProvider(value) {
 function normalizeProviderMode(value) {
     if (value !== PROVIDER_SANDBOX_MODES.TASK
         && value !== PROVIDER_SANDBOX_MODES.OPERATION
-        && value !== PROVIDER_SANDBOX_MODES.READINESS) {
+        && value !== PROVIDER_SANDBOX_MODES.READINESS
+        && value !== PROVIDER_SANDBOX_MODES.INSTALL) {
         throw policyError('provider sandbox mode is unsupported', 'PLOINKY_PROVIDER_MODE_UNSUPPORTED');
     }
     return value;
@@ -1127,7 +1213,7 @@ function providerImmutableSource(identity, logicalSource) {
     return `${identity.providerHomeSource}/${logicalSource.slice(providerHomePrefix.length)}`;
 }
 
-function normalizeProviderWorkdir(value) {
+export function normalizeProviderWorkdir(value) {
     if (typeof value !== 'string' || value.includes('\0')) {
         throw policyError('provider WORKDIR is invalid', 'PLOINKY_WORKDIR_INVALID');
     }
@@ -1154,7 +1240,15 @@ function managedRepositoryParents(workdir) {
     return targets;
 }
 
-function normalizeProviderCommand(command, profile, mode) {
+function normalizeProviderCommand(command, profile, mode, installHook) {
+    if (mode === PROVIDER_SANDBOX_MODES.INSTALL) {
+        if (typeof installHook !== 'string' || !installHook.trim()
+            || installHook.includes('\0')
+            || Buffer.byteLength(installHook) > BWRAP_LAUNCH_LIMITS.argumentBytes) {
+            throw policyError('provider install hook is invalid', 'PLOINKY_PROVIDER_INSTALL_INVALID');
+        }
+        return Object.freeze(['/bin/sh', '-c', installHook]);
+    }
     const source = mode === PROVIDER_SANDBOX_MODES.READINESS
         ? [profile.executable, ...profile.readinessArgs]
         : command;
@@ -1174,9 +1268,10 @@ function normalizeProviderCommand(command, profile, mode) {
 function validateProviderBrokerEnvironment(environment, mode) {
     const url = environment.PLOINKY_TASK_BROKER_URL;
     const key = environment.PLOINKY_TASK_BROKER_KEY;
-    if (mode === PROVIDER_SANDBOX_MODES.READINESS) {
+    if (mode === PROVIDER_SANDBOX_MODES.READINESS
+        || mode === PROVIDER_SANDBOX_MODES.INSTALL) {
         if (url !== undefined || key !== undefined) {
-            throw policyError('readiness cannot receive a task broker capability', 'PLOINKY_PROVIDER_ENV_INVALID');
+            throw policyError('private bootstrap cannot receive a task broker capability', 'PLOINKY_PROVIDER_ENV_INVALID');
         }
         return;
     }
@@ -1232,9 +1327,11 @@ function buildProviderEnvironment({ mode, profile, workdir, environment = {} }) 
     validateProviderBrokerEnvironment(dynamic, mode);
     const cwd = mode === PROVIDER_SANDBOX_MODES.READINESS
         ? '/workspace/readiness'
-        : (mode === PROVIDER_SANDBOX_MODES.OPERATION
-            ? '/workspace/operation'
-            : `/workspace/${workdir}`);
+        : (mode === PROVIDER_SANDBOX_MODES.INSTALL
+            ? '/workspace/install'
+            : (mode === PROVIDER_SANDBOX_MODES.OPERATION
+                ? '/workspace/operation'
+                : `/workspace/${workdir}`));
     return Object.freeze({
         ...PROVIDER_FIXED_ENV,
         PATH: `${profile.pathPrefix}:/opt/ploinky-node/bin:/usr/bin:/bin`,
@@ -1251,7 +1348,7 @@ function buildProviderEnvironment({ mode, profile, workdir, environment = {} }) 
 export function buildProviderSandboxPolicy(input) {
     const allowed = new Set([
         'mode', 'provider', 'credentialContext', 'workdir', 'command', 'environment',
-        'preexecBarrier',
+        'preexecBarrier', 'installHook',
     ]);
     const required = new Set(['mode', 'provider', 'credentialContext']);
     assertExactKeys(input, allowed, required, 'provider sandbox policy input');
@@ -1272,13 +1369,40 @@ export function buildProviderSandboxPolicy(input) {
             'PLOINKY_PROVIDER_READINESS_INVALID',
         );
     }
-    const command = normalizeProviderCommand(input.command, profile, mode);
+    if (mode === PROVIDER_SANDBOX_MODES.INSTALL
+        && (input.command !== undefined || input.environment !== undefined)) {
+        throw policyError(
+            'install command and environment are fixed by provider policy',
+            'PLOINKY_PROVIDER_INSTALL_INVALID',
+        );
+    }
+    if (mode !== PROVIDER_SANDBOX_MODES.INSTALL && input.installHook !== undefined) {
+        throw policyError(
+            'installHook is valid only for provider install mode',
+            'PLOINKY_PROVIDER_INSTALL_INVALID',
+        );
+    }
+    const command = normalizeProviderCommand(input.command, profile, mode, input.installHook);
     const env = buildProviderEnvironment({
         mode,
         profile,
         workdir,
         environment: input.environment,
     });
+    const brokerKey = env.PLOINKY_TASK_BROKER_KEY;
+    const bwrapEnv = Object.fromEntries(Object.entries(env).filter(([name]) => (
+        name !== 'PLOINKY_TASK_BROKER_KEY'
+    )));
+    const providerCommand = mode === PROVIDER_SANDBOX_MODES.READINESS
+        || mode === PROVIDER_SANDBOX_MODES.INSTALL
+        ? command
+        : Object.freeze([
+            '/bin/sh',
+            '-c',
+            PROVIDER_TASK_BROKER_BOOTSTRAP,
+            'ploinky-provider-bootstrap',
+            ...command,
+        ]);
 
     const records = [
         ...providerSystemPaths(identity).map((entry) => entry.dataFile
@@ -1303,18 +1427,23 @@ export function buildProviderSandboxPolicy(input) {
                 createTmpfsRecord('/workspace'),
                 createDirectoryRecord(mode === PROVIDER_SANDBOX_MODES.READINESS
                     ? '/workspace/readiness'
-                    : '/workspace/operation'),
+                    : (mode === PROVIDER_SANDBOX_MODES.INSTALL
+                        ? '/workspace/install'
+                        : '/workspace/operation')),
             ]),
         createDirectoryRecord('/home'),
         createHomeRecord(identity.homeSource),
-        ...profile.immutableRoots.map((root) => createReadOnlyPathRecord(
-            providerImmutableSource(identity, root.source),
-            root.target,
-            root.sourceType,
-        )),
+        ...(mode === PROVIDER_SANDBOX_MODES.INSTALL ? [] : profile.immutableRoots.map((root) => (
+            createReadOnlyPathRecord(
+                providerImmutableSource(identity, root.source),
+                root.target,
+                root.sourceType,
+            )
+        ))),
         createTmpfsRecord('/tmp'),
         createTmpfsRecord('/tmp/cache'),
         createTmpfsRecord('/run'),
+        ...(brokerKey === undefined ? [] : [createTaskBrokerKeyRecord(brokerKey)]),
         createProcRecord(),
         createDevRecord(),
         createArgRecord('--die-with-parent'),
@@ -1324,7 +1453,7 @@ export function buildProviderSandboxPolicy(input) {
         createArgRecord('--unshare-uts'),
         createArgRecord('--share-net'),
         createArgRecord('--clearenv'),
-        ...Object.entries(env).sort(([left], [right]) => compareText(left, right)).flatMap(([name, value]) => [
+        ...Object.entries(bwrapEnv).sort(([left], [right]) => compareText(left, right)).flatMap(([name, value]) => [
             createArgRecord('--setenv'),
             createArgRecord(name),
             createArgRecord(value),
@@ -1344,7 +1473,7 @@ export function buildProviderSandboxPolicy(input) {
             input.preexecBarrier.releaseFd,
         ));
     }
-    records.push(createArgRecord('--'), ...command.map(createArgRecord));
+    records.push(createArgRecord('--'), ...providerCommand.map(createArgRecord));
     validateRecordPolicy(records);
     return Object.freeze({
         mode,
@@ -1754,6 +1883,7 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         detached: true,
         stdio: [...requestedStdio, 'pipe', 'pipe', 'pipe'],
     });
+    const helperDiagnostic = collectSanitizedHelperDiagnostic(child.stderr ?? child.stdio?.[2]);
     let childError = null;
     const terminal = new Promise((resolve) => {
         child.once('error', (error) => { childError = error; });
@@ -1811,6 +1941,18 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         },
         terminate,
     });
+    let abortListener = null;
+    const detachAbortListener = () => {
+        if (abortListener) {
+            lifecycle.signal?.removeEventListener('abort', abortListener);
+            abortListener = null;
+        }
+    };
+    if (lifecycle.signal) {
+        abortListener = () => { void terminate('lifecycle-abort').catch(() => {}); };
+        lifecycle.signal.addEventListener('abort', abortListener, { once: true });
+        if (lifecycle.signal.aborted) abortListener();
+    }
     const descriptorStream = child.stdio?.[3];
     const readyStream = child.stdio?.[4];
     const releaseStream = child.stdio?.[5];
@@ -1903,9 +2045,11 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
             generation: launch.identity.generation,
             role: launch.mode === PROVIDER_SANDBOX_MODES.READINESS
                 ? 'readiness'
-                : (launch.mode === PROVIDER_SANDBOX_MODES.OPERATION
-                    ? 'provider-operation'
-                    : 'provider-task'),
+                : (launch.mode === PROVIDER_SANDBOX_MODES.INSTALL
+                    ? 'provider-install'
+                    : (launch.mode === PROVIDER_SANDBOX_MODES.OPERATION
+                        ? 'provider-operation'
+                        : 'provider-task')),
             metadata: {
                 ...(lifecycle.leaseMetadata ?? {}),
                 provider: launch.provider,
@@ -1955,7 +2099,12 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
                 terminationEvidence: terminated.evidence,
             });
         }
-        throw annotatedProviderError(error, { terminationEvidence: terminated.evidence });
+        helperDiagnostic.close();
+        detachAbortListener();
+        throw annotatedProviderError(
+            attachSanitizedHelperDiagnostic(error, helperDiagnostic),
+            { terminationEvidence: terminated.evidence },
+        );
     }
 
     const provenTerminal = terminal.then((result) => {
@@ -2071,7 +2220,10 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         });
         return attempt;
     };
-    const completion = provenTerminal.then(finalizeTerminal);
+    const completion = provenTerminal.then(finalizeTerminal).finally(() => {
+        helperDiagnostic.close();
+        detachAbortListener();
+    });
     const cleanup = async () => {
         await terminate('explicit-cleanup');
         return finalizeTerminal(await provenTerminal);
@@ -2084,11 +2236,20 @@ export async function runProviderSandboxReadiness({
     credentialContext,
     timeoutMs = 15_000,
     leaseRoot,
+    signal,
+    validateAfterLease,
     dependencyOverrides,
 } = {}) {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
         throw policyError('provider readiness timeout is invalid', 'PLOINKY_PROVIDER_READINESS_INVALID');
     }
+    if (signal !== undefined && !(signal instanceof AbortSignal)) {
+        throw policyError('provider readiness signal is invalid', 'PLOINKY_PROVIDER_READINESS_INVALID');
+    }
+    if (validateAfterLease !== undefined && typeof validateAfterLease !== 'function') {
+        throw policyError('provider readiness validator is invalid', 'PLOINKY_PROVIDER_READINESS_INVALID');
+    }
+    signal?.throwIfAborted();
     let timer;
     let processControl = null;
     let resolveProcessControl;
@@ -2106,6 +2267,8 @@ export async function runProviderSandboxReadiness({
     }, {
         stdio: ['ignore', 'pipe', 'pipe'],
         ...(leaseRoot ? { leaseRoot } : {}),
+        ...(signal ? { signal } : {}),
+        ...(validateAfterLease ? { validateAfterLease } : {}),
         onSpawn(_child, exactProcessControl) {
             processControl = exactProcessControl;
             resolveProcessControl(Object.freeze({ kind: 'process-control', processControl: exactProcessControl }));
@@ -2190,6 +2353,134 @@ export async function runProviderSandboxReadiness({
             provider: handle.launch.provider,
             mode: handle.launch.mode,
             output: Buffer.concat(output).toString('utf8'),
+        });
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+export async function runProviderSandboxInstall({
+    provider,
+    credentialContext,
+    installHook,
+    timeoutMs = 300_000,
+    leaseRoot,
+    signal,
+    validateAfterLease,
+    dependencyOverrides,
+} = {}) {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 600_000
+        || (signal !== undefined && !(signal instanceof AbortSignal))
+        || typeof validateAfterLease !== 'function') {
+        throw policyError('provider install lifecycle is invalid', 'PLOINKY_PROVIDER_INSTALL_INVALID');
+    }
+    signal?.throwIfAborted();
+    let timer;
+    let processControl = null;
+    let resolveProcessControl;
+    const processControlAvailable = new Promise((resolve) => {
+        resolveProcessControl = resolve;
+    });
+    const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(Object.freeze({ kind: 'timeout' })), timeoutMs);
+        timer.unref?.();
+    });
+    const spawnOutcome = Promise.resolve().then(() => spawnProviderSandbox({
+        mode: PROVIDER_SANDBOX_MODES.INSTALL,
+        provider,
+        credentialContext,
+        installHook,
+    }, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...(leaseRoot ? { leaseRoot } : {}),
+        ...(signal ? { signal } : {}),
+        validateAfterLease,
+        onSpawn(_child, exactProcessControl) {
+            processControl = exactProcessControl;
+            resolveProcessControl(Object.freeze({
+                kind: 'process-control',
+                processControl: exactProcessControl,
+            }));
+        },
+    }, dependencyOverrides)).then(
+        (handle) => Object.freeze({ kind: 'handle', handle }),
+        (error) => Object.freeze({ kind: 'spawn-error', error }),
+    );
+
+    const cleanupTimedOutInstall = async (initialOutcome = null) => {
+        let outcome = initialOutcome;
+        let controller = processControl;
+        if (!outcome && !controller) {
+            const available = await Promise.race([processControlAvailable, spawnOutcome]);
+            if (available.kind === 'process-control') controller = available.processControl;
+            else outcome = available;
+        }
+        if (outcome?.kind === 'handle') controller = outcome.handle.processControl;
+
+        let termination = null;
+        if (controller) termination = await controller.terminate('install-timeout');
+        if (!outcome) outcome = await spawnOutcome;
+        if (outcome.kind === 'handle') {
+            if (!termination) termination = await outcome.handle.terminate('install-timeout');
+            try {
+                await outcome.handle.completion;
+            } catch (error) {
+                if (error?.ownershipRetained
+                    || error?.code === 'PLOINKY_PROVIDER_TERMINATION_UNPROVEN'
+                    || error?.code === 'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED') {
+                    throw error;
+                }
+            }
+        } else if (outcome.error?.ownershipRetained
+            || outcome.error?.code === 'PLOINKY_PROVIDER_TERMINATION_UNPROVEN'
+            || outcome.error?.code === 'PLOINKY_PROVIDER_TERMINAL_CLEANUP_FAILED') {
+            throw outcome.error;
+        }
+        return termination;
+    };
+
+    try {
+        const launched = await Promise.race([spawnOutcome, timeout]);
+        if (launched.kind === 'timeout') {
+            const termination = await cleanupTimedOutInstall();
+            const timeoutError = policyError(
+                'provider install timed out',
+                'PLOINKY_PROVIDER_INSTALL_TIMEOUT',
+            );
+            timeoutError.terminationEvidence = termination?.evidence ?? Object.freeze([]);
+            throw timeoutError;
+        }
+        if (launched.kind === 'spawn-error') throw launched.error;
+
+        const handle = launched.handle;
+        let outputBytes = 0;
+        const drainBounded = (chunk) => {
+            if (outputBytes >= 64 * 1024) return;
+            outputBytes += Math.min(Buffer.byteLength(chunk), 64 * 1024 - outputBytes);
+        };
+        handle.child.stdout?.on('data', drainBounded);
+        handle.child.stderr?.on('data', drainBounded);
+        const completionOutcome = handle.completion.then(
+            (result) => Object.freeze({ kind: 'completion', result }),
+            (error) => Object.freeze({ kind: 'completion-error', error }),
+        );
+        const completed = await Promise.race([completionOutcome, timeout]);
+        if (completed.kind === 'timeout') {
+            const termination = await cleanupTimedOutInstall(launched);
+            const timeoutError = policyError(
+                'provider install timed out',
+                'PLOINKY_PROVIDER_INSTALL_TIMEOUT',
+            );
+            timeoutError.terminationEvidence = termination?.evidence ?? Object.freeze([]);
+            throw timeoutError;
+        }
+        if (completed.kind === 'completion-error') throw completed.error;
+        if (completed.result.code !== 0 || completed.result.signal) {
+            throw policyError('provider install command failed', 'PLOINKY_PROVIDER_INSTALL_FAILED');
+        }
+        return Object.freeze({
+            provider: handle.launch.provider,
+            mode: handle.launch.mode,
         });
     } finally {
         if (timer) clearTimeout(timer);

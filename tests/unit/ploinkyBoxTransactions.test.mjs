@@ -43,6 +43,7 @@ function containerHandle({
     imageId,
     imageRef,
     hostPort,
+    mediaHostPort = 7882,
     id,
     running = true,
     hostKind = 'native-linux',
@@ -55,6 +56,7 @@ function containerHandle({
             [BOX_LABELS.role]: 'box',
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: String(hostPort),
+            [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
         },
         runtime: {
             complete: true,
@@ -74,7 +76,7 @@ function containerHandle({
                 HOSTNAME: id.slice(0, 12),
             },
             publications: [
-                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
+                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
                 { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: String(hostPort) },
             ],
             running,
@@ -89,6 +91,9 @@ function containerHandle({
                 { hostPath: '/dev/fuse', containerPath: '/dev/fuse', permissions: 'rwm' },
                 { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
             ],
+            tmpfs: {
+                '/tmp': 'rw,nosuid,nodev,mode=1777,rprivate,tmpcopyup',
+            },
             mounts: [
                 { type: 'volume', name: identity.volumes.containers, source: '', destination: '/home/podman/.local/share/containers', rw: true },
                 { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
@@ -257,12 +262,14 @@ function harness(state, {
                 const imageId = args.at(-1);
                 const imageRefLabel = args.find((value) => value.startsWith(`${BOX_LABELS.imageRef}=`));
                 const portLabel = args.find((value) => value.startsWith(`${BOX_LABELS.routerHostPort}=`));
+                const mediaPortLabel = args.find((value) => value.startsWith(`${BOX_LABELS.mediaHostPort}=`));
                 current = containerHandle({
                     identity: state.identity,
                     repositoryRoot: state.root,
                     imageId,
                     imageRef: imageRefLabel.slice(imageRefLabel.indexOf('=') + 1),
                     hostPort: Number(portLabel.slice(portLabel.indexOf('=') + 1)),
+                    mediaHostPort: Number(mediaPortLabel.slice(mediaPortLabel.indexOf('=') + 1)),
                     id: cid,
                     running: false,
                 });
@@ -285,12 +292,12 @@ function harness(state, {
     };
     const handles = volumeHandles(state.identity);
     const seams = {
-        async preflight() {
-            calls.push(['seam', 'preflight']);
+        async preflight(input) {
+            calls.push(['seam', 'preflight', input.hostPort, input.mediaHostPort]);
             if (failPreflight) throw new Error('port conflict');
         },
-        validateImage() {
-            calls.push(['seam', 'validate-image']);
+        validateImage(engine, selectedImage) {
+            calls.push(['seam', 'validate-image', engine, selectedImage]);
             return { immutableId: candidateImage };
         },
         validateExistingImage(engine, imageId, imageRef) {
@@ -353,6 +360,60 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.filter((value) => value.endsWith(':U')).length, 3);
 });
 
+test('Box /tmp is an ephemeral private tmpfs so nested rootless runtime state cannot poison restart', (t) => {
+    const state = fixture(t);
+    const args = containerCreateArgs({
+        identity: state.identity,
+        imageId: 'a'.repeat(64),
+        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        hostPort: 18080,
+        mediaHostPort: 17882,
+        repositoryRoot: state.root,
+        cidfile: path.join(state.lock.path, 'candidate.cid'),
+    });
+    assert.deepEqual(args.flatMap((value, index) => (
+        value === '--tmpfs' ? [args[index + 1]] : []
+    )), ['/tmp:rw,nosuid,nodev,mode=1777']);
+
+    const handle = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        hostPort: 18080,
+        mediaHostPort: 17882,
+        id: 'b'.repeat(64),
+    });
+    handle.runtime.tmpfs = {};
+    assert.throws(() => validateContainerConfiguration(handle, {
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        hostPort: 18080,
+        mediaHostPort: 17882,
+    }), /tmpfs contract is incompatible/);
+});
+
+test('container argv publishes an owned host UDP port to fixed container UDP 7882', (t) => {
+    const state = fixture(t);
+    const args = containerCreateArgs({
+        identity: state.identity,
+        imageId: 'a'.repeat(64),
+        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        hostPort: 18080,
+        mediaHostPort: 17882,
+        repositoryRoot: state.root,
+        cidfile: path.join(state.lock.path, 'candidate.cid'),
+    });
+    assert.equal(args.includes('0.0.0.0:17882:7882/udp'), true);
+    assert.equal(args.includes('0.0.0.0:7882:7882/udp'), false);
+    assert.equal(
+        args.includes(`${BOX_LABELS.mediaHostPort}=17882`),
+        true,
+    );
+});
+
 test('container validation rejects a Box that cannot reap orphaned children', (t) => {
     const state = fixture(t);
     const handle = containerHandle({
@@ -391,6 +452,53 @@ test('initial transaction preflights before pull, volumes, and container creatio
     assert.ok(flat.findIndex((value) => value.includes('preflight')) < flat.findIndex((value) => value.includes('stream podman pull')));
     assert.ok(flat.findIndex((value) => value.includes('stream podman pull')) < flat.findIndex((value) => value.includes('ensure-volumes')));
     assert.ok(flat.findIndex((value) => value.includes('ensure-volumes')) < flat.findIndex((value) => value.includes('container create')));
+});
+
+test('local immutable image admission validates the exact ID without any pull', async (t) => {
+    const state = fixture(t);
+    const imageId = 'c'.repeat(64);
+    const h = harness(state, { candidateImage: imageId });
+    const result = await reconcileBoxContainer({
+        identity: state.identity,
+        ownership: { state: 'absent', handles: null },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        explicitPort: 18080,
+        explicitMediaPort: 17882,
+        localBoxImageId: imageId,
+    }, h.seams);
+    assert.equal(result.imageId, imageId);
+    assert.equal(result.hostPort, 18080);
+    assert.equal(result.mediaHostPort, 17882);
+    assert.equal(h.calls.some((call) => call.includes('pull')), false);
+    assert.deepEqual(
+        h.calls.find((call) => call[0] === 'seam' && call[1] === 'validate-image'),
+        ['seam', 'validate-image', 'podman', imageId],
+    );
+    const create = h.calls.find((call) => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
+    assert.equal(create.includes('0.0.0.0:17882:7882/udp'), true);
+    assert.equal(create.at(-1), imageId);
+});
+
+test('local immutable image mismatch fails before volume or container mutation', async (t) => {
+    const state = fixture(t);
+    const h = harness(state, { candidateImage: 'd'.repeat(64) });
+    await assert.rejects(() => reconcileBoxContainer({
+        identity: state.identity,
+        ownership: { state: 'absent', handles: null },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        explicitPort: 18080,
+        explicitMediaPort: 17882,
+        localBoxImageId: 'c'.repeat(64),
+    }, h.seams), (error) => error.code === 'PLOINKY_BOX_LOCAL_IMAGE_ID_MISMATCH');
+    assert.equal(h.calls.some((call) => call.includes('pull')), false);
+    assert.equal(h.calls.some((call) => call.includes('ensure-volumes')), false);
+    assert.equal(h.calls.some((call) => call.includes('container') && call.includes('create')), false);
 });
 
 test('validated reuse rechecks pre-existing volume handles without registry or volume mutation', async (t) => {

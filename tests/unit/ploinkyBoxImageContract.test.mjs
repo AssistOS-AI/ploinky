@@ -71,6 +71,27 @@ test('complete semantic image metadata validates to an immutable image handle', 
     assert.equal(result.sourceSha, SOURCE_SHA);
 });
 
+test('a narrowly validated Buildah provenance label is accepted without opening arbitrary labels', () => {
+    const record = validRecord();
+    record[0].Config.Labels['io.buildah.version'] = '1.44.1';
+    const result = validateImageContract(normalizeImageInspect(record), 'runtime', {
+        availableBinaries: binaries,
+    });
+    assert.equal(result.sourceSha, SOURCE_SHA);
+
+    for (const invalidVersion of ['', 'latest', '1.44.1\nUNTRUSTED=1']) {
+        const invalid = validRecord();
+        invalid[0].Config.Labels['io.buildah.version'] = invalidVersion;
+        assert.throws(
+            () => validateImageContract(normalizeImageInspect(invalid), 'runtime', {
+                availableBinaries: binaries,
+            }),
+            (error) => error.code === 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT'
+                && error.message.includes('Config.Labels'),
+        );
+    }
+});
+
 test('every required image field has a field-specific fail-closed diagnostic', () => {
     const mutations = [
         ['image ID', (record) => { record[0].Id = ''; }],

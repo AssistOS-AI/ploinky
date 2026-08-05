@@ -68,6 +68,7 @@ export function containerCreateArgs({
     imageId,
     imageRef,
     hostPort,
+    mediaHostPort = BOX_MEDIA_PORT,
     repositoryRoot,
     cidfile,
     hostKind = 'native-linux',
@@ -78,6 +79,7 @@ export function containerCreateArgs({
         [BOX_LABELS.role]: BOX_ROLES.container,
         [BOX_LABELS.imageRef]: imageRef,
         [BOX_LABELS.routerHostPort]: String(hostPort),
+        [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
     };
     return [
         'container', 'create',
@@ -89,7 +91,8 @@ export function containerCreateArgs({
         '--security-opt', 'unmask=ALL',
         ...(hostKind === 'podman-machine' ? ['--security-opt', 'label=disable'] : []),
         '--publish', `127.0.0.1:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
-        '--publish', `0.0.0.0:${BOX_MEDIA_PORT}:${BOX_MEDIA_PORT}/udp`,
+        '--publish', `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
+        '--tmpfs', '/tmp:rw,nosuid,nodev,mode=1777',
         '--volume', `${source}:/opt/ploinky:ro`,
         ...volumeMountArgs(identity),
         '--env', 'PLOINKY_PUBLIC_BIND=0.0.0.0',

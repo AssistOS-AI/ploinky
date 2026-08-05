@@ -25,6 +25,7 @@ const RECORD = Object.freeze({
     SYMLINK: 10,
     PREEXEC_BARRIER: 11,
     RO_DATA_PATH: 12,
+    TASK_BROKER_KEY: 13,
 });
 
 let fixtureRoot;
@@ -206,6 +207,8 @@ test('version and capability output expose the fixed source and fd ABI', () => {
     assert.match(capabilities.stdout,
         /typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file/);
     assert.match(capabilities.stdout, /ro-data-path-hardening=sealed-memfd-ro-bind-data/);
+    assert.match(capabilities.stdout,
+        /task-broker-transport=type13-sealed-memfd-ro-bind-data-0400/);
     assert.match(capabilities.stdout, /preexec-barrier=R\/G/);
     assert.match(capabilities.stdout, /credential-bound=4096/);
     assert.match(capabilities.stdout,
@@ -225,6 +228,75 @@ test('every Box runtime consumer requires the canonical helper protocol v2', () 
         assert.match(source, /protocol=2 descriptor-fd=3/, relativePath);
         assert.doesNotMatch(source, /protocol=1 descriptor-fd=3/, relativePath);
         assert.doesNotMatch(source, /ploinky-bwrap-launch-v1/, relativePath);
+        assert.match(source,
+            /task-broker-transport=type13-sealed-memfd-ro-bind-data-0400/,
+            relativePath);
+    }
+});
+
+test('typed task broker key is sealed, mounted 0400, and absent from bwrap argv and env', {
+    skip: process.platform !== 'linux',
+}, async () => {
+    const brokerKey = `phase10b_broker_canary_${'x'.repeat(20)}`;
+    assert.equal(brokerKey.length, 43);
+    const fakeBwrap = path.join(fixtureRoot, 'fake-bwrap-broker');
+    const brokerHelper = path.join(fixtureRoot, 'ploinky-bwrap-broker');
+    fs.writeFileSync(fakeBwrap, [
+        '#!/bin/sh',
+        `secret='${brokerKey}'`,
+        '[ -z "${PLOINKY_TASK_BROKER_KEY+x}" ] || exit 91',
+        'while [ "$#" -gt 0 ]; do',
+        '  [ "$1" != "$secret" ] || exit 92',
+        '  if [ "$1" = "--perms" ] && [ "$2" = "0400" ] && [ "$3" = "--ro-bind-data" ] && [ "$5" = "/run/ploinky-task-broker-key" ]; then',
+        '    actual="$(cat "/proc/self/fd/$4")" || exit 93',
+        '    [ "$actual" = "$secret" ] || exit 94',
+        '    printf "%s" "$actual"',
+        '    exit 0',
+        '  fi',
+        '  shift',
+        'done',
+        'exit 95',
+        '',
+    ].join('\n'), { mode: 0o700 });
+    const compiled = compile(brokerHelper, { bwrapPath: fakeBwrap });
+    assert.equal(compiled.status, 0, compiled.stderr);
+
+    const result = await launchWithDescriptor(descriptor([
+        record(RECORD.TMPFS, '/run'),
+        record(RECORD.TASK_BROKER_KEY, brokerKey),
+        record(RECORD.ARG, '--'),
+        record(RECORD.ARG, '/bin/true'),
+    ]), {
+        executable: brokerHelper,
+        env: Object.fromEntries(Object.entries(process.env).filter(([name]) => (
+            name !== 'PLOINKY_TASK_BROKER_KEY'
+        ))),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, brokerKey);
+    assert.equal(result.stderr.includes(brokerKey), false);
+});
+
+test('typed task broker key rejects malformed, duplicate, and unprepared records without disclosure', async () => {
+    const valid = 'k'.repeat(43);
+    for (const records of [
+        [record(RECORD.TASK_BROKER_KEY, valid)],
+        [record(RECORD.TMPFS, '/run'), record(RECORD.TASK_BROKER_KEY, 'short')],
+        [
+            record(RECORD.TMPFS, '/run'),
+            record(RECORD.TASK_BROKER_KEY, valid),
+            record(RECORD.TASK_BROKER_KEY, valid),
+        ],
+    ]) {
+        const result = await launchWithDescriptor(descriptor([
+            ...records,
+            record(RECORD.ARG, '--'),
+            record(RECORD.ARG, '/bin/true'),
+        ]));
+        assert.equal(result.status, 64, result.stderr);
+        assert.match(result.stderr,
+            /^PLOINKY_BWRAP_PROTOCOL_INVALID:|^PLOINKY_BWRAP_MOUNT_ORDER_INVALID:|^PLOINKY_BWRAP_DUPLICATE_MOUNT:/);
+        assert.equal(result.stderr.includes(valid), false);
     }
 });
 
@@ -819,6 +891,26 @@ test('private readiness uses an exact empty workspace tmpfs and ordered readines
         /PLOINKY_BWRAP_(?:PROTOCOL_INVALID|MOUNT_ORDER_INVALID|DUPLICATE_MOUNT)|PLOINKY_MOUNT_DESTINATION_UNSUPPORTED/);
 });
 
+test('private install directory requires the exact empty workspace tmpfs first', async () => {
+    for (const target of ['/workspace/readiness', '/workspace/operation', '/workspace/install']) {
+        const missing = await launchWithDescriptor(descriptor([
+            record(RECORD.DIR, target),
+            record(RECORD.ARG, '--'),
+            record(RECORD.ARG, '/bin/true'),
+        ]));
+        assert.equal(missing.status, 64, `${target}: ${missing.stderr}`);
+        assert.match(missing.stderr, /^PLOINKY_BWRAP_MOUNT_ORDER_INVALID:/);
+
+        const ordered = await launchWithDescriptor(descriptor([
+            record(RECORD.TMPFS, '/workspace'),
+            record(RECORD.DIR, target),
+            record(RECORD.ARG, '--'),
+            record(RECORD.ARG, '/bin/true'),
+        ]));
+        assert.doesNotMatch(ordered.stderr, /^PLOINKY_BWRAP_MOUNT_ORDER_INVALID:/);
+    }
+});
+
 test('pre-exec barrier accepts only distinct anonymous IPC fds and cannot alias credentials', async () => {
     const sameFd = await launchWithDescriptor(descriptor([
         barrierRecord(4, 4),
@@ -953,6 +1045,8 @@ test('source pins every path with openat2 flags and has no pathname fallback', (
     assert.match(source, /O_PATH \| O_CLOEXEC/);
     assert.match(source, /"--bind-fd" : "--ro-bind-fd"/);
     assert.match(source, /MOUNT_RO_DATA_PATH/);
+    assert.match(source, /MOUNT_TASK_BROKER_KEY/);
+    assert.match(source, /MOUNT_TASK_BROKER_KEY[\s\S]+"0400"[\s\S]+"--ro-bind-data"/);
     assert.match(source, /MOUNT_RO_DATA_PATH[\s\S]+"--ro-bind-data"/);
     assert.match(source, /reopen_pinned_regular_readonly/);
     assert.match(source, /memfd_create\("ploinky-ro-data", MFD_CLOEXEC \| MFD_ALLOW_SEALING\)/);

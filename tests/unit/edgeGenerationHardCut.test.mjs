@@ -237,6 +237,76 @@ test('additive preparation and failed commit preserve the exact active predecess
     abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
 });
 
+test('sandbox preparation may stage an ownerless identity but activation requires its exact service owner', (t) => {
+    const fixture = createFixture(t);
+    const predecessor = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'sandbox-preparation-predecessor',
+    });
+    const selectorBefore = fs.readFileSync(predecessor.paths.activeSelectorFile);
+    const stagedRouting = structuredClone(predecessor.generation.routing);
+    delete stagedRouting.routes.alpha.hostPort;
+    const stagedAgents = structuredClone(predecessor.generation.agents);
+    stagedAgents['alpha-container'] = {
+        ...stagedAgents['alpha-container'],
+        runtime: 'bwrap',
+    };
+    delete stagedAgents['alpha-container'].containerId;
+
+    let prepared;
+    withEdgeGenerationApplyLock((applyLockCapability) => {
+        prepared = prepareAdditiveEdgeRoutingGeneration({
+            workspaceRoot: fixture.workspace,
+            routing: stagedRouting,
+            agents: stagedAgents,
+            applyLockCapability,
+            reason: 'sandbox-ownerless-preparation',
+        });
+    }, { workspaceRoot: fixture.workspace });
+    assert.deepEqual(fs.readFileSync(predecessor.paths.activeSelectorFile), selectorBefore);
+    assert.deepEqual(assertPreparedRuntimeIdentity(prepared.preparationLease, {
+        workspaceRoot: fixture.workspace,
+        containerName: 'alpha-container',
+        instanceId: 'alpha-instance',
+        enableGeneration: 'alpha-enable-generation',
+    }), stagedAgents['alpha-container']);
+
+    assert.throws(() => withEdgeGenerationApplyLock((applyLockCapability) => (
+        commitAdditiveEdgeRoutingGeneration(prepared.preparationLease, {
+            workspaceRoot: fixture.workspace,
+            routing: stagedRouting,
+            agents: stagedAgents,
+            applyLockCapability,
+        })
+    ), {
+        workspaceRoot: fixture.workspace,
+        preparationLease: prepared.preparationLease,
+    }), { code: 'SANDBOX_AGENT_OWNER_INVALID' });
+    assert.deepEqual(fs.readFileSync(predecessor.paths.activeSelectorFile), selectorBefore);
+
+    const readyRouting = structuredClone(stagedRouting);
+    readyRouting.routes.alpha.hostPort = 43101;
+    const readyAgents = structuredClone(stagedAgents);
+    readyAgents['alpha-container'].pid = 1234;
+    readyAgents['alpha-container'].bwrapOwner = sandboxOwnerAttestation();
+    const committed = withEdgeGenerationApplyLock((applyLockCapability) => (
+        commitAdditiveEdgeRoutingGeneration(prepared.preparationLease, {
+            workspaceRoot: fixture.workspace,
+            routing: readyRouting,
+            agents: readyAgents,
+            applyLockCapability,
+        })
+    ), {
+        workspaceRoot: fixture.workspace,
+        preparationLease: prepared.preparationLease,
+    });
+    assert.equal(committed.selector.state, 'active');
+    assert.deepEqual(
+        committed.generation.agents['alpha-container'].bwrapOwner,
+        sandboxOwnerAttestation(),
+    );
+});
+
 test('additive commit rejects manifest byte drift without changing active routing', (t) => {
     const fixture = createFixture(t);
     const predecessor = applyEdgeRoutingGeneration({

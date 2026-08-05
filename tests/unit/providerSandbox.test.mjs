@@ -29,6 +29,7 @@ import {
     createProcRecord,
     createReadOnlyDataFileRecord,
     createReadOnlyPathRecord,
+    createTaskBrokerKeyRecord,
     createTmpfsRecord,
     createWorkspaceRecord,
     encodeBwrapLaunchDescriptor,
@@ -1669,6 +1670,7 @@ test('provider task policy derives mode-separated HOME and generation only from 
         record.type === 'RO_PATH' && record.target === '/home/agent/.opencode/bin/opencode'
     ));
     const privateProc = recordIndex(policy.records, (record) => record.type === 'PROC');
+    const brokerKey = recordIndex(policy.records, (record) => record.type === 'TASK_BROKER_KEY');
     const clearenv = recordIndex(policy.records, (record) => record.type === 'ARG' && record.value === '--clearenv');
 
     assert.equal(policy.records[workspace].mode, 'ro');
@@ -1679,12 +1681,39 @@ test('provider task policy derives mode-separated HOME and generation only from 
         homeKey: `${PROVIDER_INSTANCE}.sandbox-v2`,
     });
     assert.ok(workspace < ploinkyMask && ploinkyMask < dataMask && dataMask < workdir);
-    assert.ok(workdir < home && home < executable && executable < privateProc && privateProc < clearenv);
+    assert.ok(workdir < home && home < executable && executable < brokerKey
+        && brokerKey < privateProc && privateProc < clearenv);
+    assert.deepEqual(policy.records[brokerKey], {
+        type: 'TASK_BROKER_KEY',
+        value: PROVIDER_BROKER_KEY,
+    });
     assert.equal(policy.records.filter((record) => record.type === 'WORKSPACE').length, 1);
     assert.equal(policy.records.filter((record) => record.type === 'WORKDIR').length, 1);
     assert.equal(policy.records.filter((record) => record.type === 'HOME').length, 1);
     assert.equal(policy.records.some((record) => record.type === 'TMPFS' && record.target === '/workspace'), false);
+    assert.equal(policy.records.some((record) => (
+        record.type === 'ARG' && record.value === PROVIDER_BROKER_KEY
+    )), false, 'the scoped broker key must never become a bwrap argv record');
     assert.doesNotThrow(() => parseDescriptor(encodeBwrapLaunchDescriptor(policy.records)));
+
+    const separator = recordIndex(policy.records, (record) => (
+        record.type === 'ARG' && record.value === '--'
+    ));
+    assert.deepEqual(
+        policy.records.slice(separator + 1).map((record) => record.value),
+        [
+            '/bin/sh',
+            '-c',
+            'ploinky_task_broker_key="$(cat -- /run/ploinky-task-broker-key)" || exit 125\n'
+                + 'PLOINKY_TASK_BROKER_KEY="$ploinky_task_broker_key"\n'
+                + 'export PLOINKY_TASK_BROKER_KEY\n'
+                + 'unset ploinky_task_broker_key\n'
+                + 'exec "$@"',
+            'ploinky-provider-bootstrap',
+            '/home/agent/.opencode/bin/opencode',
+            'run',
+        ],
+    );
 
     const serialized = JSON.stringify(policy);
     for (const secret of ['a'.repeat(64), 'b'.repeat(64), `${PROVIDER_PRINCIPAL}|fixture-signature`]) {
@@ -1720,6 +1749,10 @@ test('provider task policy derives mode-separated HOME and generation only from 
         && record.source === '/usr/local'
         && record.target === '/opt/ploinky-node'
     )));
+    assert.equal(container.records.some((record) => (
+        record.source === '/etc/nsswitch.conf'
+        || record.target === '/etc/nsswitch.conf'
+    )), false, 'container policy must stay within the pinned helper data-file allowlist');
 });
 
 test('provider readiness uses an empty private workspace, fixed harmless command, and no task capability', () => {
@@ -1746,6 +1779,7 @@ test('provider readiness uses an empty private workspace, fixed harmless command
     assert.equal(policy.workdir, null);
     assert.equal(policy.env.PLOINKY_TASK_BROKER_URL, undefined);
     assert.equal(policy.env.PLOINKY_TASK_BROKER_KEY, undefined);
+    assert.equal(policy.records.some((record) => record.type === 'TASK_BROKER_KEY'), false);
     assert.deepEqual(policy.command, ['/home/agent/.local/bin/pi', '--version']);
     assert.equal(JSON.stringify(policy.records).includes('/bin/sh'), false);
 
@@ -1779,6 +1813,82 @@ test('provider readiness uses an empty private workspace, fixed harmless command
         }),
         (error) => error?.code === 'PLOINKY_PROVIDER_READINESS_INVALID',
     );
+});
+
+test('provider install mode mutates only the isolated HOME before readiness', () => {
+    const installHook = 'sh /code/scripts/install-opencode.sh';
+    const policy = buildProviderSandboxPolicy({
+        mode: PROVIDER_SANDBOX_MODES.INSTALL,
+        provider: PROVIDER_SANDBOX_PROVIDERS.OPENCODE,
+        credentialContext: providerCredentialContext(),
+        installHook,
+    });
+    const workspaceMask = recordIndex(policy.records, (record) => (
+        record.type === 'TMPFS' && record.target === '/workspace'
+    ));
+    const installDir = recordIndex(policy.records, (record) => (
+        record.type === 'DIR' && record.target === '/workspace/install'
+    ));
+    const home = recordIndex(policy.records, (record) => record.type === 'HOME');
+    assert.ok(workspaceMask < installDir && installDir < home);
+    assert.equal(policy.cwd, '/workspace/install');
+    assert.equal(policy.workdir, null);
+    assert.equal(policy.env.PLOINKY_TASK_BROKER_URL, undefined);
+    assert.equal(policy.env.PLOINKY_TASK_BROKER_KEY, undefined);
+    assert.equal(policy.records.some((record) => record.type === 'WORKSPACE'), false);
+    assert.equal(policy.records.some((record) => record.type === 'WORKDIR'), false);
+    assert.equal(policy.records.some((record) => record.type === 'TASK_BROKER_KEY'), false);
+    assert.equal(policy.records.some((record) => (
+        record.type === 'RO_PATH'
+        && record.target.startsWith('/home/agent/')
+    )), false, 'pre-install provider executable roots cannot be required');
+    assert.ok(policy.records.some((record) => (
+        record.type === 'RO_PATH'
+        && record.source === '/code'
+        && record.target === '/code'
+    )));
+    assert.deepEqual(policy.command, ['/bin/sh', '-c', installHook]);
+    const separator = recordIndex(policy.records, (record) => (
+        record.type === 'ARG' && record.value === '--'
+    ));
+    assert.deepEqual(
+        policy.records.slice(separator + 1).map((record) => record.value),
+        ['/bin/sh', '-c', installHook],
+    );
+    assert.doesNotThrow(() => parseDescriptor(encodeBwrapLaunchDescriptor(policy.records)));
+
+    for (const invalid of ['', ' ', 'x\0y', 'x'.repeat(BWRAP_LAUNCH_LIMITS.argumentBytes + 1)]) {
+        assert.throws(
+            () => buildProviderSandboxPolicy({
+                mode: PROVIDER_SANDBOX_MODES.INSTALL,
+                provider: PROVIDER_SANDBOX_PROVIDERS.OPENCODE,
+                credentialContext: providerCredentialContext(),
+                installHook: invalid,
+            }),
+            (error) => error?.code === 'PLOINKY_PROVIDER_INSTALL_INVALID',
+        );
+    }
+});
+
+test('typed task-broker records enforce the exact scoped token grammar', () => {
+    assert.deepEqual(createTaskBrokerKeyRecord(PROVIDER_BROKER_KEY), {
+        type: 'TASK_BROKER_KEY',
+        value: PROVIDER_BROKER_KEY,
+    });
+    for (const invalid of [
+        '',
+        'a'.repeat(42),
+        'a'.repeat(129),
+        `${'a'.repeat(42)}=`,
+        `${'a'.repeat(42)}+`,
+        `${'a'.repeat(42)}/`,
+        Buffer.alloc(43),
+    ]) {
+        assert.throws(
+            () => createTaskBrokerKeyRecord(invalid),
+            (error) => error?.code === 'PLOINKY_PROVIDER_BROKER_INVALID',
+        );
+    }
 });
 
 test('provider operation mode uses a private empty workspace with a scoped broker and no task workdir', () => {
@@ -2711,6 +2821,58 @@ test('retained-fd readiness close without end is typed and exactly cleaned', asy
             && Array.isArray(error.terminationEvidence),
     );
     assert.deepEqual(events, ['SIGTERM']);
+});
+
+test('retained-fd failure exposes only the helper error code and redacts stderr detail', async () => {
+    const readyStream = new PassThrough();
+    const descriptorStream = new Writable({
+        write(_chunk, _encoding, callback) { callback(); },
+        final(callback) {
+            callback();
+            queueMicrotask(() => {
+                child.stderr.write('PLOINKY_PATH_INVALID: detail contains phase10b-secret-canary\n');
+                readyStream.end();
+            });
+        },
+    });
+    const releaseStream = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    let dead = false;
+    const child = Object.assign(new EventEmitter(), {
+        pid: 65202,
+        exitCode: null,
+        signalCode: null,
+        stdio: [null, new PassThrough(), new PassThrough(), descriptorStream, readyStream, releaseStream],
+    });
+    child.stderr = child.stdio[2];
+
+    await assert.rejects(
+        runProviderSandboxReadiness({
+            provider: PROVIDER_SANDBOX_PROVIDERS.OPENCODE,
+            credentialContext: providerCredentialContext(),
+            timeoutMs: 100,
+            dependencyOverrides: {
+                spawn: () => child,
+                inspectProcessIdentity: () => dead ? { state: 'dead' } : identified(IDENTITY_A),
+                getUid: () => CURRENT_UID,
+                termGraceMs: 20,
+                killGraceMs: 20,
+                signalProcessGroup(_pid, signal) {
+                    if (signal === 'SIGTERM') {
+                        dead = true;
+                        queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+                    }
+                },
+                acquireProviderHomeLease() {
+                    throw new Error('lease must not be acquired');
+                },
+            },
+        }),
+        (error) => error?.code === 'PLOINKY_PROVIDER_PREEXEC_BARRIER_FAILED'
+            && error?.helperCode === 'PLOINKY_PATH_INVALID'
+            && error.message.includes('[PLOINKY_PATH_INVALID]')
+            && !JSON.stringify(error).includes('phase10b-secret-canary')
+            && !error.message.includes('detail contains'),
+    );
 });
 
 test('readiness timeout retains its live lease when exact cleanup cannot be proven', async () => {

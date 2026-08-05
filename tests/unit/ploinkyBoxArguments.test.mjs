@@ -114,3 +114,61 @@ test('unsupported public override surfaces reject before routing', () => {
         assert.throws(() => parseOuterArguments(argv), /not a supported public Box option/);
     }
 });
+
+test('local immutable Box admission requires an exact ID and owned media port pair', () => {
+    const imageId = 'a'.repeat(64);
+    const parsed = parseOuterArguments([
+        '--local-box-image-id', imageId,
+        '--local-media-port', '17882',
+        '--port', '18080',
+        'start', 'Agent',
+    ]);
+    assert.equal(parsed.localBoxImageId, imageId);
+    assert.equal(parsed.explicitMediaPort, 17882);
+    assert.deepEqual(parsed.start.coreArgv, ['start', 'Agent', '8080']);
+    assert.deepEqual(routeOuterCommand(parsed), {
+        kind: 'start',
+        hostPort: 18080,
+        localBoxImageId: imageId,
+        mediaHostPort: 17882,
+        coreArgv: ['start', 'Agent', '8080'],
+    });
+
+    const isolatedCli = routeOuterCommand(parseOuterArguments([
+        '--local-box-image-id', imageId,
+        '--local-media-port', '17882',
+        '--port', '18080',
+        'cli',
+    ]));
+    assert.deepEqual(isolatedCli, {
+        kind: 'bash',
+        localBoxImageId: imageId,
+        mediaHostPort: 17882,
+        hostPort: 18080,
+    });
+
+    for (const argv of [
+        ['--local-box-image-id', imageId, 'start', 'Agent'],
+        ['--local-media-port', '17882', 'start', 'Agent'],
+        ['--local-box-image-id', 'sha256:' + imageId, '--local-media-port', '17882', 'start', 'Agent'],
+        ['--local-box-image-id', 'A'.repeat(64), '--local-media-port', '17882', 'start', 'Agent'],
+        ['--local-box-image-id', 'a'.repeat(63), '--local-media-port', '17882', 'start', 'Agent'],
+        ['--local-box-image-id=' + imageId, '--local-media-port', '17882', 'start', 'Agent'],
+        ['--local-box-image-id', imageId, '--local-media-port=17882', 'start', 'Agent'],
+        ['--local-box-image-id', imageId, '--local-box-image-id', imageId, '--local-media-port', '17882', 'start', 'Agent'],
+        ['--local-box-image-id', imageId, '--local-media-port', '0', 'start', 'Agent'],
+        ['--port', '18080', 'cli'],
+    ]) {
+        assert.throws(() => parseOuterArguments(argv), { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
+    }
+});
+
+test('read-only and destructive routes reject local Box admission options', () => {
+    const prefix = ['--local-box-image-id', 'b'.repeat(64), '--local-media-port', '17883'];
+    for (const tail of [['help'], ['status'], ['stop'], ['destroy']]) {
+        assert.throws(
+            () => routeOuterCommand(parseOuterArguments([...prefix, ...tail])),
+            /local Box admission is not supported/,
+        );
+    }
+});

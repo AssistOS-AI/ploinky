@@ -47,6 +47,7 @@ export const IMAGE_CONTRACT = Object.freeze({
     ]),
     networkHelpers: Object.freeze(['pasta', 'slirp4netns']),
     sourceShaLabel: 'io.assistos.ploinky.source-sha',
+    buildahVersionLabel: 'io.buildah.version',
     bubblewrapNevra: 'bubblewrap-0:0.11.0-4.fc44',
     bwrapHelper: '/usr/local/libexec/ploinky-bwrap-launch',
 });
@@ -143,15 +144,23 @@ function sameRecord(left, right) {
 
 function validateSourceLabel(labels, imageRef) {
     const label = IMAGE_CONTRACT.sourceShaLabel;
-    const keys = isRecord(labels) ? Object.keys(labels) : [];
-    const sourceSha = keys.length === 1 && keys[0] === label
-        ? String(labels[label] ?? '')
-        : '';
-    if (!/^[0-9a-f]{40}$/.test(sourceSha)) {
+    const buildahLabel = IMAGE_CONTRACT.buildahVersionLabel;
+    const keys = isRecord(labels) ? Object.keys(labels).sort() : [];
+    const allowedKeys = new Set([label, buildahLabel]);
+    const sourceSha = String(labels?.[label] ?? '');
+    const buildahVersion = labels?.[buildahLabel];
+    const hasOnlyAllowedLabels = keys.length >= 1
+        && keys.every((key) => allowedKeys.has(key));
+    const hasValidBuildahVersion = buildahVersion === undefined
+        || /^[0-9]+(?:\.[0-9]+){1,3}$/.test(String(buildahVersion));
+    if (!hasOnlyAllowedLabels
+        || !/^[0-9a-f]{40}$/.test(sourceSha)
+        || !hasValidBuildahVersion) {
         throw contractError(
             imageRef,
             'Config.Labels',
-            `exactly ${label}=<40 lowercase hexadecimal Ploinky commit>`,
+            `only ${label}=<40 lowercase hexadecimal Ploinky commit>`
+                + ` and optional ${buildahLabel}=<numeric dotted version>`,
             labels,
             'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT',
             '; destroy and recreate the Box with the current runtime image',
@@ -271,6 +280,7 @@ export function probeImageBinaries(engine, imageId, runner, {
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms' >/dev/null",
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file' >/dev/null",
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'ro-data-path-hardening=sealed-memfd-ro-bind-data' >/dev/null",
+            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'task-broker-transport=type13-sealed-memfd-ro-bind-data-0400' >/dev/null",
             "if command -v pasta >/dev/null 2>&1; then command -v pasta; elif command -v slirp4netns >/dev/null 2>&1; then command -v slirp4netns; else exit 17; fi",
         ].join('; '),
     ], { timeoutMs: IMAGE_PROBE_TIMEOUT_MS });

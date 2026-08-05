@@ -50,7 +50,10 @@ import {
     findAgentManifest,
 } from './repoAgentCommands.js';
 import { parseStartArgs } from '../utils/repos.js';
-import { resolveAgentlibBranchRef } from '../utils/dependencies/dependencyInstaller.js';
+import {
+    resolveAgentlibBranchRef,
+    withScopedAgentlibRef,
+} from '../utils/dependencies/dependencyInstaller.js';
 import {
     handleVarsCommand,
     handleVarCommand,
@@ -426,15 +429,16 @@ async function handleCommand(args) {
             // read host-side by readGlobalDepsPackage and inherited by the
             // Watchdog/router via buildRouterEnv.
             const agentlibRef = resolveAgentlibBranchRef(startParsed.branchPolicy);
-            if (agentlibRef) {
-                process.env.PLOINKY_AGENTLIB_REF = agentlibRef;
-            }
             reconcileConfiguredProviderTaskOwnership({ registry: workspaceSvc.loadAgents() });
-            await startWorkspace(startParsed.staticAgent, startParsed.port ?? undefined, {
-                enableAgent,
-                killRouterIfRunning,
-                branchPolicy: startParsed.branchPolicy,
-            });
+            await withScopedAgentlibRef(agentlibRef, () => startWorkspace(
+                startParsed.staticAgent,
+                startParsed.port ?? undefined,
+                {
+                    enableAgent,
+                    killRouterIfRunning,
+                    branchPolicy: startParsed.branchPolicy,
+                },
+            ));
             break;
         }
         // 'route' and 'probe' commands removed (replaced by start/status and client commands)

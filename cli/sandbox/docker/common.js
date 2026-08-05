@@ -4,7 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { REPOS_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
-import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
+import { ensureContainerAgentHome, getAgentWorkDir } from '../../utils/workspaceStructure.js';
 import { buildEnvFlags, buildEnvMap } from '../../utils/security/secretVars.js';
 import { loadAgents, saveAgents } from '../../utils/workspace.js';
 import { debugLog } from '../../utils/utils.js';
@@ -64,9 +64,7 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
         if (alias) {
             const aliasRec = Object.values(map || {}).find(r => r && r.type === 'agent' && r.alias === alias);
             if (aliasRec && (aliasRec.runMode || 'isolated') === 'isolated') {
-                const isolatedPath = getAgentWorkDir(alias);
-                try { fs.mkdirSync(isolatedPath, { recursive: true }); } catch (_) {}
-                return isolatedPath;
+                return ensureContainerAgentHome(alias).homePath;
             }
             if (aliasRec && aliasRec.projectPath && typeof aliasRec.projectPath === 'string') {
                 const normalized = normalizeProjectPath(aliasRec.projectPath, aliasRec.runMode);
@@ -75,18 +73,16 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
         }
         const rec = Object.values(map || {}).find(r => r && r.type === 'agent' && r.agentName === agentName && r.repoName === repoName);
         if (rec && (rec.runMode || 'isolated') === 'isolated') {
-            const isolatedPath = getAgentWorkDir(rec.alias || agentName);
-            try { fs.mkdirSync(isolatedPath, { recursive: true }); } catch (_) {}
-            return isolatedPath;
+            return ensureContainerAgentHome(rec.alias || agentName).homePath;
         }
         if (rec && rec.projectPath && typeof rec.projectPath === 'string') {
             const normalized = normalizeProjectPath(rec.projectPath, rec.runMode);
             if (normalized) return normalized;
         }
-    } catch (_) {}
-    const fallback = getAgentWorkDir(agentName);
-    try { fs.mkdirSync(fallback, { recursive: true }); } catch (_) {}
-    return fallback;
+    } catch (error) {
+        if (error?.code === 'PLOINKY_HOME_STATE_INCOMPATIBLE') throw error;
+    }
+    return ensureContainerAgentHome(agentName).homePath;
 }
 
 function isRuntimeInstalled(runtime) {
@@ -803,7 +799,8 @@ function probeBoxBwrapHelper(helperPath = IMAGE_CONTRACT.bwrapHelper, spawnSyncI
         && output.includes('path-resolution=openat2-beneath-no-magiclinks-no-symlinks')
         && output.includes('bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms')
         && output.includes('typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file')
-        && output.includes('ro-data-path-hardening=sealed-memfd-ro-bind-data');
+        && output.includes('ro-data-path-hardening=sealed-memfd-ro-bind-data')
+        && output.includes('task-broker-transport=type13-sealed-memfd-ro-bind-data-0400');
 }
 
 function getRuntimeForAgent(manifest, {

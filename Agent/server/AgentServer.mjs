@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { bootstrapAgentCredentialContext } from '../lib/agentCredentialBootstrap.mjs';
+import { runProviderInstallBootstrap } from '../lib/providerInstallBootstrap.mjs';
 import {
     createMemoryReplayCache
 } from '../lib/jwtVerify.mjs';
@@ -2001,17 +2002,40 @@ async function createServerInstance() {
 
 async function main() {
     const { StreamableHTTPServerTransport, isInitializeRequest } = await loadSdkDeps();
-    const providerConfig = normalizeProviderSandboxConfig(initialConfig);
-    validateAgentServerManifestExecution(getManifestResult()?.manifest ?? {}, initialConfig);
-    if (providerConfig) {
-        // This is deliberately before broker-listener creation and before the
-        // HTTP service binds: the fixed helper must prove the empty-workspace,
-        // private-proc provider boundary with the frozen credential context.
-        await runProviderSandboxReadiness({
-            provider: providerConfig.provider,
-            credentialContext: agentCredentialContext,
-        });
-        await ensureScopedSoulBrokerRegistry();
+    const bootstrapAbort = new AbortController();
+    const abortBootstrap = () => {
+        const error = providerPolicyError(
+            'PLOINKY_AGENT_BOOTSTRAP_ABORTED',
+            'AgentServer bootstrap was interrupted',
+        );
+        bootstrapAbort.abort(error);
+    };
+    process.once('SIGTERM', abortBootstrap);
+    process.once('SIGINT', abortBootstrap);
+    let providerConfig;
+    try {
+        providerConfig = normalizeProviderSandboxConfig(initialConfig);
+        validateAgentServerManifestExecution(getManifestResult()?.manifest ?? {}, initialConfig);
+        if (providerConfig) {
+            // Installation and readiness are admitted inside the selected
+            // provider sandbox before any broker, queue, or HTTP listener can
+            // exist. Both share the frozen credential context and HOME owner.
+            await runProviderInstallBootstrap({
+                provider: providerConfig.provider,
+                credentialContext: agentCredentialContext,
+                signal: bootstrapAbort.signal,
+            });
+            await runProviderSandboxReadiness({
+                provider: providerConfig.provider,
+                credentialContext: agentCredentialContext,
+                signal: bootstrapAbort.signal,
+            });
+            await ensureScopedSoulBrokerRegistry();
+        }
+    } catch (error) {
+        process.removeListener('SIGTERM', abortBootstrap);
+        process.removeListener('SIGINT', abortBootstrap);
+        throw error;
     }
     taskQueue.initialize();
     const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 7000;
@@ -2252,12 +2276,6 @@ async function main() {
         }
     });
 
-    const isContainerRuntime = Boolean(process.env.PLOINKY_CONTAINER_ID || process.env.PLOINKY_CONTAINER_NAME);
-    const HOST = process.env.PLOINKY_AGENT_BIND_HOST || (isContainerRuntime ? '0.0.0.0' : '127.0.0.1');
-    serverHttp.listen(PORT, HOST, () => {
-        console.log(`[AgentServer/MCP] Streamable HTTP listening on ${HOST}:${PORT} (/mcp)`);
-    });
-
     let shutdownPromise = null;
     let sessionGcStopped = false;
     const shutdown = async (signal) => {
@@ -2283,8 +2301,22 @@ async function main() {
             throw error;
         }
     };
-    process.on('SIGTERM', () => { shutdown('SIGTERM').catch(() => {}); });
-    process.on('SIGINT', () => { shutdown('SIGINT').catch(() => {}); });
+    const handleSigterm = () => { shutdown('SIGTERM').catch(() => {}); };
+    const handleSigint = () => { shutdown('SIGINT').catch(() => {}); };
+    process.on('SIGTERM', handleSigterm);
+    process.on('SIGINT', handleSigint);
+    process.removeListener('SIGTERM', abortBootstrap);
+    process.removeListener('SIGINT', abortBootstrap);
+    if (bootstrapAbort.signal.aborted) {
+        await shutdown('bootstrap-interrupt');
+        return;
+    }
+
+    const isContainerRuntime = Boolean(process.env.PLOINKY_CONTAINER_ID || process.env.PLOINKY_CONTAINER_NAME);
+    const HOST = process.env.PLOINKY_AGENT_BIND_HOST || (isContainerRuntime ? '0.0.0.0' : '127.0.0.1');
+    serverHttp.listen(PORT, HOST, () => {
+        console.log(`[AgentServer/MCP] Streamable HTTP listening on ${HOST}:${PORT} (/mcp)`);
+    });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

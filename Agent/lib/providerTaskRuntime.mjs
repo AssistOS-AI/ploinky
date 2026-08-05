@@ -4,6 +4,7 @@ import { StringDecoder } from 'node:string_decoder';
 import {
     PROVIDER_SANDBOX_MODES,
     PROVIDER_SANDBOX_PROVIDERS,
+    normalizeProviderWorkdir,
     spawnProviderSandbox,
     withCredentialProviderHomeLease,
 } from './providerSandbox.mjs';
@@ -336,6 +337,14 @@ export function createProviderTaskRuntime({
         }
         assertPlainObject(input, 'provider launch input');
         const launchMode = activeMode;
+        const expectedWorkdir = launchMode === PROVIDER_SANDBOX_MODES.TASK
+            ? normalizeProviderWorkdir(input.workdir)
+            : null;
+        const expectedCwd = launchMode === PROVIDER_SANDBOX_MODES.TASK
+            ? `/workspace/${expectedWorkdir}`
+            : (launchMode === PROVIDER_SANDBOX_MODES.OPERATION
+                ? '/workspace/operation'
+                : '/workspace/readiness');
         if (input.provider !== undefined || input.mode !== undefined
             || input.credentialContext !== undefined || input.environment !== undefined) {
             fail('PLOINKY_PROVIDER_RUNTIME_INPUT_INVALID', 'provider launch cannot override trusted runtime fields');
@@ -391,9 +400,7 @@ export function createProviderTaskRuntime({
                         || metadata.identity.providerHomeSource !== (context.runtime.runtimeKind === 'bwrap'
                             ? '/home/agent'
                             : '/root')
-                        || metadata.workdir !== (launchMode === PROVIDER_SANDBOX_MODES.TASK
-                            ? input.workdir
-                            : null)
+                        || metadata.workdir !== expectedWorkdir
                         || (metadata.childPid !== undefined
                             && (!Number.isSafeInteger(metadata.childPid) || metadata.childPid <= 0))) {
                         fail(
@@ -519,7 +526,9 @@ export function createProviderTaskRuntime({
             || handle.launch?.helper !== '/usr/local/libexec/ploinky-bwrap-launch'
             || handle.launch?.provider !== provider
             || handle.launch?.mode !== launchMode
+            || handle.launch?.workdir !== expectedWorkdir
             || typeof handle.launch?.cwd !== 'string'
+            || handle.launch.cwd !== expectedCwd
             || !handle.launch.cwd.startsWith('/workspace/')
             || handle.launch.cwd.endsWith('/')
             || handle.launch.cwd.includes('//')

@@ -52,9 +52,10 @@
 /*
  * ploinky-bwrap-launch wire protocol, version 2
  *
- * Normal launch has no command-line options. The complete non-secret launch
- * description is read from inherited fd 3. Introspection is limited to the
- * exact --version and --capabilities commands.
+ * Normal launch has no command-line options. The bounded launch description
+ * is read from inherited fd 3. It may contain one short-lived scoped task
+ * broker key, which is never copied into argv or diagnostics. Introspection
+ * is limited to the exact --version and --capabilities commands.
  *
  * Header (16 bytes):
  *   0..7   ASCII "PLBWLP02"
@@ -97,6 +98,13 @@
  *                release-read. Helper writes 'R', closes ready, requires one
  *                'G', closes release, and revalidates every retained HOME
  *                (including the current marker entry) before exec.
+ *  12 RO_DATA_PATH u16 source length, u16 target length, then one exact fixed
+ *                data-file source/target pair. The helper snapshots it into a
+ *                sealed memfd and emits --perms 0444 --ro-bind-data.
+ *  13 TASK_BROKER_KEY one 43..128-byte base64url scoped key. It requires the
+ *                /run TMPFS first, is copied into a sealed memfd, zeroed in
+ *                the descriptor, and emitted only as --perms 0400
+ *                --ro-bind-data at /run/ploinky-task-broker-key.
  *
  * All mount sources are opened only after the complete message, argv, mount
  * destinations, and duplicate checks have passed. Workspace-relative opens
@@ -127,6 +135,8 @@ enum {
     MAX_RO_DATA_FILE_BYTES = 4 * 1024 * 1024,
     MAX_HOME_KEY_BYTES = 255,
     MAX_HOME_MARKER_BYTES = 4096,
+    MIN_TASK_BROKER_KEY_BYTES = 43,
+    MAX_TASK_BROKER_KEY_BYTES = 128,
 };
 
 enum record_type {
@@ -142,6 +152,7 @@ enum record_type {
     RECORD_SYMLINK = 10,
     RECORD_PREEXEC_BARRIER = 11,
     RECORD_RO_DATA_PATH = 12,
+    RECORD_TASK_BROKER_KEY = 13,
 };
 
 enum mount_kind {
@@ -150,6 +161,7 @@ enum mount_kind {
     MOUNT_HOME,
     MOUNT_RO_PATH,
     MOUNT_RO_DATA_PATH,
+    MOUNT_TASK_BROKER_KEY,
     MOUNT_DIR,
     MOUNT_TMPFS,
     MOUNT_PROC,
@@ -254,6 +266,27 @@ static bool has_nul(const unsigned char *bytes, size_t length)
 {
     return memchr(bytes, '\0', length) != NULL;
 }
+
+static bool is_task_broker_key(const unsigned char *bytes, size_t length)
+{
+    size_t i;
+
+    if (length < MIN_TASK_BROKER_KEY_BYTES ||
+        length > MAX_TASK_BROKER_KEY_BYTES || has_nul(bytes, length)) {
+        return false;
+    }
+    for (i = 0; i < length; i++) {
+        unsigned char byte = bytes[i];
+        if (!((byte >= 'A' && byte <= 'Z') ||
+              (byte >= 'a' && byte <= 'z') ||
+              (byte >= '0' && byte <= '9') || byte == '_' || byte == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void secure_zero(void *buffer, size_t length);
 
 static bool source_sha_is_valid(void)
 {
@@ -652,6 +685,8 @@ static void validate_dir_target(const unsigned char *bytes, size_t length)
     if (!(strcmp(target, "/opt") == 0 ||
           strcmp(target, "/home") == 0 ||
           strcmp(target, "/workspace/readiness") == 0 ||
+          strcmp(target, "/workspace/operation") == 0 ||
+          strcmp(target, "/workspace/install") == 0 ||
           strcmp(target, "/run/ploinky-agent") == 0 ||
           path_has_prefix(target, "/workspace/.ploinky/repos"))) {
         free(target);
@@ -1260,6 +1295,27 @@ static void parse_descriptor(struct launch *launch)
             mount->source = source;
             mount->source_length = source_length;
             mount->target = target_string;
+        } else if (record->type == RECORD_TASK_BROKER_KEY) {
+            static const char target[] = "/run/ploinky-task-broker-key";
+            struct mount *mount;
+
+            if (!is_task_broker_key(record->payload, payload_length)) {
+                fail(EXIT_PROTOCOL_INVALID, "PLOINKY_BWRAP_PROTOCOL_INVALID",
+                     "invalid scoped task broker key record");
+            }
+            if (!target_seen(launch, "/run", MOUNT_TMPFS)) {
+                fail(EXIT_PROTOCOL_INVALID,
+                     "PLOINKY_BWRAP_MOUNT_ORDER_INVALID",
+                     "the /run tmpfs must precede the task broker key");
+            }
+            reject_duplicate_target(launch, target);
+            reject_hiding_prior_target(launch, target);
+            mount = new_mount(launch);
+            mount->kind = MOUNT_TASK_BROKER_KEY;
+            mount->source_type = SOURCE_REGULAR;
+            mount->source = record->payload;
+            mount->source_length = payload_length;
+            mount->target = strdup(target);
         } else if (record->type == RECORD_DIR) {
             struct mount *mount;
             char *target;
@@ -1267,10 +1323,12 @@ static void parse_descriptor(struct launch *launch)
             target = copy_string(record->payload, payload_length,
                                  "PLOINKY_MOUNT_DESTINATION_UNSUPPORTED");
             require_workspace_parent_before_child(launch, target);
-            if (strcmp(target, "/workspace/readiness") == 0 &&
+            if ((strcmp(target, "/workspace/readiness") == 0 ||
+                 strcmp(target, "/workspace/operation") == 0 ||
+                 strcmp(target, "/workspace/install") == 0) &&
                 !target_seen(launch, "/workspace", MOUNT_TMPFS)) {
                 fail(EXIT_PROTOCOL_INVALID, "PLOINKY_BWRAP_MOUNT_ORDER_INVALID",
-                     "private readiness requires the /workspace tmpfs first");
+                     "private provider bootstrap requires the /workspace tmpfs first");
             }
             if (path_has_prefix(target, "/run") && strcmp(target, "/run") != 0 &&
                 !target_seen(launch, "/run", MOUNT_TMPFS)) {
@@ -1442,7 +1500,8 @@ static bool mount_needs_fd(const struct mount *mount)
 {
     return mount->kind == MOUNT_WORKSPACE || mount->kind == MOUNT_WORKDIR ||
            mount->kind == MOUNT_HOME || mount->kind == MOUNT_RO_PATH ||
-           mount->kind == MOUNT_RO_DATA_PATH;
+           mount->kind == MOUNT_RO_DATA_PATH ||
+           mount->kind == MOUNT_TASK_BROKER_KEY;
 }
 
 #ifdef __linux__
@@ -1742,6 +1801,54 @@ static int snapshot_pinned_regular_readonly(int path_fd)
 #endif
 }
 
+static int snapshot_task_broker_key(const unsigned char *bytes, size_t length)
+{
+#ifdef __linux__
+    const int required_seals = F_SEAL_SEAL | F_SEAL_SHRINK |
+                               F_SEAL_GROW | F_SEAL_WRITE;
+    int snapshot_fd = memfd_create("ploinky-task-broker-key",
+                                   MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int installed_seals;
+    size_t written = 0;
+
+    if (snapshot_fd < 0) {
+        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+             "cannot create sealed task broker key snapshot");
+    }
+    while (written < length) {
+        ssize_t result = write(snapshot_fd, bytes + written, length - written);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            close(snapshot_fd);
+            fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+                 "cannot populate sealed task broker key snapshot");
+        }
+        written += (size_t)result;
+    }
+    if (lseek(snapshot_fd, 0, SEEK_SET) != 0 ||
+        fcntl(snapshot_fd, F_ADD_SEALS, required_seals) != 0) {
+        close(snapshot_fd);
+        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+             "cannot seal task broker key snapshot");
+    }
+    installed_seals = fcntl(snapshot_fd, F_GET_SEALS);
+    if (installed_seals < 0 ||
+        (installed_seals & required_seals) != required_seals) {
+        close(snapshot_fd);
+        fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+             "cannot verify task broker key snapshot seals");
+    }
+    return snapshot_fd;
+#else
+    (void)bytes;
+    (void)length;
+    fail(EXIT_PATHFD_UNAVAILABLE, "PLOINKY_PATHFD_UNAVAILABLE",
+         "Linux sealed memfd support is required for task broker transport");
+#endif
+}
+
 static void open_mount_sources(struct launch *launch)
 {
     size_t workspace_prefix_length = strlen(PLOINKY_WORKSPACE_ROOT);
@@ -1756,7 +1863,13 @@ static void open_mount_sources(struct launch *launch)
             continue;
         }
 
-        if (mount->kind == MOUNT_WORKSPACE || mount->kind == MOUNT_WORKDIR ||
+        if (mount->kind == MOUNT_TASK_BROKER_KEY) {
+            mount->fd = snapshot_task_broker_key(mount->source,
+                                                 mount->source_length);
+            secure_zero((void *)mount->source, mount->source_length);
+            mount->source = NULL;
+            mount->source_length = 0;
+        } else if (mount->kind == MOUNT_WORKSPACE || mount->kind == MOUNT_WORKDIR ||
             (mount->kind == MOUNT_HOME &&
              mount->home_source_kind == HOME_SOURCE_SANDBOX_WORKSPACE_V2) ||
             ((mount->kind == MOUNT_RO_PATH || mount->kind == MOUNT_RO_DATA_PATH) &&
@@ -2096,9 +2209,11 @@ static char **build_bwrap_argv(struct launch *launch)
             argv[count++] = launch->args[record->mount_index];
         } else if (record->type != RECORD_PREEXEC_BARRIER) {
             struct mount *mount = &launch->mounts[record->mount_index];
-            if (mount->kind == MOUNT_RO_DATA_PATH) {
+            if (mount->kind == MOUNT_RO_DATA_PATH ||
+                mount->kind == MOUNT_TASK_BROKER_KEY) {
                 argv[count++] = "--perms";
-                argv[count++] = "0444";
+                argv[count++] = mount->kind == MOUNT_TASK_BROKER_KEY
+                    ? "0400" : "0444";
                 argv[count++] = "--ro-bind-data";
                 snprintf(mount->fd_string, sizeof(mount->fd_string), "%d", mount->fd);
                 argv[count++] = mount->fd_string;
@@ -2225,6 +2340,7 @@ int main(int argc, char **argv)
                "bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms "
                "typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file "
                "ro-data-path-hardening=sealed-memfd-ro-bind-data "
+               "task-broker-transport=type13-sealed-memfd-ro-bind-data-0400 "
                "home-sources=sandbox-workspace-v2,container-native "
                "home-marker=ploinky-home-v2-schema-2 "
                "home-revalidation=post-barrier-G "

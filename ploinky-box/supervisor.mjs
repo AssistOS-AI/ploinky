@@ -250,6 +250,8 @@ export function createBoxSupervisor({
 
     async function prepareBoxForCommand({
         explicitPort,
+        explicitMediaPort,
+        localBoxImageId,
         imageRef = BOX_IMAGE_REFERENCE,
     } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
@@ -261,6 +263,8 @@ export function createBoxSupervisor({
                 lock,
                 repositoryRoot,
                 explicitPort,
+                explicitMediaPort,
+                localBoxImageId,
                 imageRef,
                 platform,
                 env,
@@ -283,6 +287,8 @@ export function createBoxSupervisor({
                 lock,
                 repositoryRoot,
                 explicitPort: options.explicitPort,
+                explicitMediaPort: options.explicitMediaPort,
+                localBoxImageId: options.localBoxImageId,
                 imageRef: options.imageRef || BOX_IMAGE_REFERENCE,
                 platform,
                 env,
@@ -306,7 +312,11 @@ export function createBoxSupervisor({
                 coreArgs,
                 prepared.hostPort,
                 runner,
-                { stdout, stderr },
+                {
+                    stdout,
+                    stderr,
+                    ...(options.agentlibRef ? { agentlibRef: options.agentlibRef } : {}),
+                },
             );
             await healthCheck(prepared.hostPort);
             return Object.freeze({ identity, ...prepared, containerId });
@@ -452,7 +462,9 @@ export function createBoxSupervisor({
             identity: identity.instance,
             ownership: ownership.state,
             desiredImage: BOX_IMAGE_REFERENCE,
+            desiredLocalImageId: options.localBoxImageId || null,
             desiredHostPort: options.explicitPort || null,
+            desiredMediaHostPort: options.explicitMediaPort || null,
             mutationPerformed: false,
         });
     }
@@ -527,14 +539,21 @@ export async function runBoundedCoreStart(
         stdout = process.stdout,
         stderr = process.stderr,
         timeoutMs = 1_800_000,
+        agentlibRef,
     } = {},
 ) {
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
         throw supervisorError('Bounded core start requires normalized start argv');
     }
+    if (agentlibRef !== undefined && !/^[0-9a-f]{40}$/.test(String(agentlibRef))) {
+        throw supervisorError(
+            'Bounded core start requires PLOINKY_AGENTLIB_REF to be exactly 40 lowercase hexadecimal characters',
+        );
+    }
     const result = await runner.stream(engine.name, [
         'container', 'exec',
         '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
+        ...(agentlibRef ? ['--env', `PLOINKY_AGENTLIB_REF=${agentlibRef}`] : []),
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,

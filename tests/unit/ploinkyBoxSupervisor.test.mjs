@@ -617,12 +617,20 @@ test('bounded start requires the external Dashboard URL and preserves normalized
                 };
             },
         },
-        { stdout: output, stderr: output, timeoutMs: 1000 },
+        {
+            stdout: output,
+            stderr: output,
+            timeoutMs: 1000,
+            agentlibRef: 'b'.repeat(40),
+        },
     );
     assert.equal(status, 0);
     assert.deepEqual(calls[0][1].slice(-4), ['--debug', 'start', 'Agent', '8080']);
-    assert.deepEqual(calls[0][1].slice(0, 5), [
-        'container', 'exec', '--env', 'PLOINKY_ROUTER_HOST_PORT=19090', '--user',
+    assert.deepEqual(calls[0][1].slice(0, 7), [
+        'container', 'exec',
+        '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
+        '--env', `PLOINKY_AGENTLIB_REF=${'b'.repeat(40)}`,
+        '--user',
     ]);
     assert.equal(calls[0][2].stdout, output);
     assert.equal(calls[0][2].stderr, output);

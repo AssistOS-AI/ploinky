@@ -418,6 +418,7 @@ test('getConfiguredProjectPath uses .data agent folder for isolated records', ()
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
+        fs.mkdirSync(path.join(workspaceDir, '.data'), { mode: 0o700 });
         fs.writeFileSync(path.join(workspaceDir, '.ploinky/agents.json'), JSON.stringify({
             demoContainer: {
                 type: 'agent',
@@ -436,6 +437,7 @@ process.stdout.write(getConfiguredProjectPath('demo', 'repo'));`,
 
         assert.equal(result.status, 0, result.stderr);
         assert.equal(result.stdout, path.join(workspaceDir, '.data', 'demo'));
+        assert.equal(fs.statSync(result.stdout).mode & 0o7777, 0o700);
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }
@@ -445,6 +447,7 @@ test('getConfiguredProjectPath uses alias as isolated .data folder name', () => 
     const workspaceDir = tempDir();
     try {
         fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
+        fs.mkdirSync(path.join(workspaceDir, '.data'), { mode: 0o700 });
         fs.writeFileSync(path.join(workspaceDir, '.ploinky/agents.json'), JSON.stringify({
             demoAliasContainer: {
                 type: 'agent',
@@ -464,6 +467,7 @@ process.stdout.write(getConfiguredProjectPath('demo', 'repo', 'demoAlias'));`,
 
         assert.equal(result.status, 0, result.stderr);
         assert.equal(result.stdout, path.join(workspaceDir, '.data', 'demoAlias'));
+        assert.equal(fs.statSync(result.stdout).mode & 0o7777, 0o700);
     } finally {
         fs.rmSync(workspaceDir, { recursive: true, force: true });
     }

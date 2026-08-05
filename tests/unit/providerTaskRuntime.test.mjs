@@ -231,7 +231,7 @@ test('provider runtime publishes proven ownership before admission and settles o
                 cwd: '/workspace/projects/alpha',
             },
         };
-    }, { workdir: 'projects/alpha' });
+    }, { workdir: '/workspace/projects/alpha' });
 
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(admitted, false);
@@ -1368,7 +1368,7 @@ test('provider runtime retries exact retained cleanup after an unproven close at
                     helper: '/usr/local/libexec/ploinky-bwrap-launch',
                     provider: 'codex',
                     mode: 'operation',
-                    workdir: 'operation',
+                    workdir: null,
                     cwd: '/workspace/operation',
                 },
             };

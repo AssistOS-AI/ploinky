@@ -24,7 +24,7 @@ function prepareFreshRuntimeRoot(runtimeRoot, parentRoot) {
     return runtimeRoot;
 }
 
-const STAGED_ENTRY_PATTERN = /^(Agent|code)-(\d+)-\d+$/;
+const STAGED_ENTRY_PATTERN = /^(Agent|Code|code)-(\d+)-\d+$/;
 
 function isPidAlive(pid) {
     if (!Number.isFinite(pid) || pid <= 0) return false;
@@ -39,7 +39,8 @@ function isPidAlive(pid) {
 }
 
 /**
- * Sweep runtimeRoot and remove staged Agent-<pid>-<ts> / code-<pid>-<ts>
+ * Sweep runtimeRoot and remove staged Agent-<pid>-<ts> / Code-<pid>-<ts> /
+ * code-<pid>-<ts>
  * entries whose embedded PID is no longer alive on the host. Used by
  * runtimes (e.g. seatbelt) where a per-agent wipe would race against
  * concurrent interactive shells that share the same agent name.

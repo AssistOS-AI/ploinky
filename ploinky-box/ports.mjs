@@ -24,49 +24,45 @@ export function parseHostPort(value, { source = 'Box host port' } = {}) {
     return Number(value);
 }
 
-export function resolveEffectiveHostPort({ explicitPort, ownership }) {
-    if (explicitPort !== undefined && explicitPort !== null && explicitPort !== '') {
-        let existingPublication = null;
-        if (ownership?.state === 'owned' && ownership.handles?.container) {
-            const existingLabelPort = parseHostPort(
-                ownership.handles?.container?.labels?.[
-                    'io.assistos.ploinky-box.router-host-port'
-                ],
-                { source: 'owned Box host-port label' },
-            );
-            existingPublication = validateContainerPublications(
-                ownership.handles.container,
-                existingLabelPort,
-            );
-        }
-        return Object.freeze({
-            hostPort: parseHostPort(explicitPort),
-            source: 'explicit',
-            existingPublication,
-        });
-    }
-    if (ownership?.state === 'owned' && ownership.handles?.container) {
-        const labelPort = ownership.handles?.container?.labels?.[
-            'io.assistos.ploinky-box.router-host-port'
-        ];
-        const hostPort = parseHostPort(labelPort, { source: 'owned Box host-port label' });
-        return Object.freeze({
-            hostPort,
-            source: 'existing',
-            existingPublication: validateContainerPublications(
-                ownership.handles.container,
-                hostPort,
-            ),
-        });
+export function resolveEffectiveHostPort({ explicitPort, explicitMediaPort, ownership }) {
+    const container = ownership?.state === 'owned' ? ownership.handles?.container : null;
+    let existingPublication = null;
+    if (container) {
+        const existingHostPort = parseHostPort(
+            container.labels?.['io.assistos.ploinky-box.router-host-port'],
+            { source: 'owned Box host-port label' },
+        );
+        const existingMediaHostPort = parseHostPort(
+            container.labels?.['io.assistos.ploinky-box.media-host-port'],
+            { source: 'owned Box media host-port label' },
+        );
+        existingPublication = validateContainerPublications(
+            container,
+            existingHostPort,
+            existingMediaHostPort,
+        );
     }
     if (ownership?.state !== 'absent'
-        && !(ownership?.state === 'owned' && !ownership.handles?.container)) {
+        && !(ownership?.state === 'owned' && (!ownership.handles?.container || container))) {
         throw portError(
             `Cannot select a port while Box ownership is ${ownership?.state || 'unknown'}`,
             'PLOINKY_BOX_PORT_OWNERSHIP_UNKNOWN',
         );
     }
-    return Object.freeze({ hostPort: BOX_ROUTER_CONTAINER_PORT, source: 'default', existingPublication: null });
+    const hasExplicitHost = explicitPort !== undefined && explicitPort !== null && explicitPort !== '';
+    const hasExplicitMedia = explicitMediaPort !== undefined
+        && explicitMediaPort !== null
+        && explicitMediaPort !== '';
+    const hostPort = hasExplicitHost
+        ? parseHostPort(explicitPort)
+        : existingPublication?.hostPort ?? BOX_ROUTER_CONTAINER_PORT;
+    const mediaHostPort = hasExplicitMedia
+        ? parseHostPort(explicitMediaPort, { source: 'Box media host port' })
+        : existingPublication?.mediaHostPort ?? BOX_MEDIA_PORT;
+    const source = hasExplicitHost || hasExplicitMedia
+        ? 'explicit'
+        : existingPublication ? 'existing' : 'default';
+    return Object.freeze({ hostPort, mediaHostPort, source, existingPublication });
 }
 
 export function probeTcpAvailability(port, {
@@ -120,6 +116,7 @@ export function probeUdpAvailability(port = BOX_MEDIA_PORT, {
 
 export async function preflightPublications({
     hostPort,
+    mediaHostPort = BOX_MEDIA_PORT,
     existingPublication = null,
     checkTcp = probeTcpAvailability,
     checkUdp = probeUdpAvailability,
@@ -127,25 +124,30 @@ export async function preflightPublications({
     const port = parseHostPort(hostPort);
     const [tcpAvailable, udpAvailable] = await Promise.all([
         checkTcp(port),
-        checkUdp(BOX_MEDIA_PORT),
+        checkUdp(parseHostPort(mediaHostPort, { source: 'Box media host port' })),
     ]);
-    const selfReservation = existingPublication?.running === true;
-    if (!tcpAvailable && !(selfReservation && existingPublication.hostPort === port)) {
+    const mediaPort = parseHostPort(mediaHostPort, { source: 'Box media host port' });
+    const tcpSelfReservation = existingPublication?.running === true
+        && existingPublication.hostPort === port;
+    const udpSelfReservation = existingPublication?.running === true
+        && existingPublication.mediaHostPort === mediaPort;
+    if (!tcpAvailable && !tcpSelfReservation) {
         throw portError(
             `Physical-host TCP 127.0.0.1:${port} is already in use`,
             'PLOINKY_BOX_TCP_CONFLICT',
         );
     }
-    if (!udpAvailable && !selfReservation) {
+    if (!udpAvailable && !udpSelfReservation) {
         throw portError(
-            `Physical-host UDP 0.0.0.0:${BOX_MEDIA_PORT} is already in use`,
+            `Physical-host UDP 0.0.0.0:${mediaPort} is already in use`,
             'PLOINKY_BOX_UDP_CONFLICT',
         );
     }
     return Object.freeze({
         hostPort: port,
+        mediaHostPort: mediaPort,
         tcp: `127.0.0.1:${port}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
-        udp: `0.0.0.0:${BOX_MEDIA_PORT}:${BOX_MEDIA_PORT}/udp`,
+        udp: `0.0.0.0:${mediaPort}:${BOX_MEDIA_PORT}/udp`,
         reusedSelfReservation: !tcpAvailable || !udpAvailable,
     });
 }

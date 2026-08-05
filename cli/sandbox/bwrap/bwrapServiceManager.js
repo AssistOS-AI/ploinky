@@ -553,6 +553,35 @@ function ensureBwrapAgentLibDir(instanceName, nodeModulesDir, options = {}) {
     return stagedAgentLibPath;
 }
 
+function ensureBwrapAgentCodeDir(instanceName, sourceCodePath, options = {}) {
+    const runtimeBase = options.runtimeRoot || BWRAP_RUNTIME_ROOT;
+    const runtimeRoot = path.join(runtimeBase, runtimeSegment(instanceName));
+    const stagedCodePath = path.join(
+        runtimeRoot,
+        `Code-${process.pid}-${Date.now()}${process.hrtime.bigint()}`
+    );
+    const sourceNodeModules = path.join(sourceCodePath, 'node_modules');
+
+    if (!fs.existsSync(sourceCodePath) || !fs.statSync(sourceCodePath).isDirectory()) {
+        throw new Error(`[bwrap] agent code source is unavailable: ${sourceCodePath}`);
+    }
+    fs.mkdirSync(runtimeRoot, { recursive: true });
+    fs.cpSync(sourceCodePath, stagedCodePath, {
+        recursive: true,
+        filter(sourcePath) {
+            const resolvedSource = path.resolve(sourcePath);
+            return resolvedSource !== sourceNodeModules
+                && !resolvedSource.startsWith(`${sourceNodeModules}${path.sep}`);
+        }
+    });
+
+    // The fd-pinned launcher cannot create a dependency target below an
+    // already read-only /code mount. Stage the exact source tree outside the
+    // managed checkout and create only this empty, later-overmounted target.
+    fs.mkdirSync(path.join(stagedCodePath, 'node_modules'), { recursive: true });
+    return stagedCodePath;
+}
+
 function resolveSymlinkPath(symlinkPath) {
     try {
         if (fs.existsSync(symlinkPath)) {
@@ -1042,6 +1071,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const bwrapAgentRoot = path.join(BWRAP_RUNTIME_ROOT, runtimeSegment(instanceName));
     fs.mkdirSync(bwrapAgentRoot, { recursive: true });
     pruneStaleRuntimeEntries(bwrapAgentRoot);
+    const stagedAgentCodePath = ensureBwrapAgentCodeDir(instanceName, agentCodePath);
     const agentLibPath = ensureBwrapAgentLibDir(instanceName, nodeModulesDir);
 
     // Port resolution — with shared host network, hostPort === containerPort
@@ -1129,7 +1159,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         command: ['/bin/sh', '-c', entryCmd],
         nodeRuntimePath: nodeRuntime.hostRuntimePath,
         agentRuntimePath: agentLibPath,
-        codePath: agentCodePath,
+        codePath: stagedAgentCodePath,
         codeDependenciesPath: nodeModulesDir,
         agentDependenciesPath: nodeModulesDir,
         environment: trustedEnvironment,
@@ -1256,12 +1286,13 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         homeKey: agentHomeState.homeKey,
         bwrapOwner,
         runtimeStaging: {
-            agentLibPath
+            agentLibPath,
+            agentCodePath: stagedAgentCodePath,
         },
         config: {
             binds: [
                 { source: agentLibPath, target: '/Agent', ro: true },
-                { source: agentCodePath, target: '/code', ro: true },
+                { source: stagedAgentCodePath, target: '/code', ro: true },
                 { source: nodeModulesDir, target: '/code/node_modules', ro: true },
                 { source: nodeModulesDir, target: '/Agent/node_modules', ro: true },
                 { source: nodeRuntime.hostRuntimePath, target: BWRAP_NODE_RUNTIME_PATH, ro: true },
@@ -1549,9 +1580,11 @@ async function attachBwrapInteractive(agentName, manifest, agentPath, workdir, e
     const bwrapAgentRoot = path.join(BWRAP_RUNTIME_ROOT, runtimeSegment(instanceName));
     fs.mkdirSync(bwrapAgentRoot, { recursive: true });
     const serviceAgentLibPath = record.runtimeStaging?.agentLibPath;
+    const serviceAgentCodePath = record.runtimeStaging?.agentCodePath;
     pruneStaleRuntimeEntries(bwrapAgentRoot, {
-        keepPaths: serviceAgentLibPath ? [serviceAgentLibPath] : []
+        keepPaths: [serviceAgentLibPath, serviceAgentCodePath].filter(Boolean)
     });
+    const stagedAgentCodePath = ensureBwrapAgentCodeDir(instanceName, agentCodePath);
     const agentLibPath = ensureBwrapAgentLibDir(instanceName, nodeModulesDir);
 
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
@@ -1623,7 +1656,7 @@ async function attachBwrapInteractive(agentName, manifest, agentPath, workdir, e
         command: ['/bin/sh', '-lc', String(entryCommand || '')],
         nodeRuntimePath: nodeRuntime.hostRuntimePath,
         agentRuntimePath: agentLibPath,
-        codePath: agentCodePath,
+        codePath: stagedAgentCodePath,
         codeDependenciesPath: nodeModulesDir,
         agentDependenciesPath: nodeModulesDir,
         environment: trustedEnvironment,
@@ -1674,6 +1707,9 @@ async function attachBwrapInteractive(agentName, manifest, agentPath, workdir, e
         try {
             fs.rmSync(agentLibPath, { recursive: true, force: true });
         } catch (_) {}
+        try {
+            fs.rmSync(stagedAgentCodePath, { recursive: true, force: true });
+        } catch (_) {}
     }
 }
 
@@ -1687,6 +1723,7 @@ export {
     buildBwrapArgs,
     buildFullEnvMap,
     buildBwrapInteractiveCommand,
+    ensureBwrapAgentCodeDir,
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
     attachBwrapInteractive,

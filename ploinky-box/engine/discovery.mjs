@@ -250,14 +250,18 @@ function hasExactResourceLabels(labels, pathHash, role) {
         return hasExactLabels(labels, expectedImmutableLabels(pathHash, role));
     }
     const hostPort = String(labels?.[BOX_LABELS.routerHostPort] || '');
+    const mediaHostPort = String(labels?.[BOX_LABELS.mediaHostPort] || '');
     const imageRef = String(labels?.[BOX_LABELS.imageRef] || '');
     return /^[1-9][0-9]{0,4}$/.test(hostPort)
         && Number(hostPort) <= 65535
+        && /^[1-9][0-9]{0,4}$/.test(mediaHostPort)
+        && Number(mediaHostPort) <= 65535
         && imageRef.length > 0
         && hasExactLabels(labels, {
             ...expectedImmutableLabels(pathHash, role),
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: hostPort,
+            [BOX_LABELS.mediaHostPort]: mediaHostPort,
         });
 }
 

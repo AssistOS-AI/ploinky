@@ -916,7 +916,9 @@ function exactEdgeString(value) {
         : '';
 }
 
-function validateSandboxRootOwnerBindings(routing, agents) {
+function validateSandboxRootOwnerBindings(routing, agents, {
+    allowOwnerlessPreparation = false,
+} = {}) {
     for (const [routeKey, route] of Object.entries(routing.routes || {})) {
         if (!route || route.disabled) continue;
         const containerName = exactEdgeString(route.container);
@@ -945,6 +947,12 @@ function validateSandboxRootOwnerBindings(routing, agents) {
             );
         }
         if (!EDGE_SANDBOX_RUNTIMES.has(record.runtime)) continue;
+        if (allowOwnerlessPreparation
+            && !Object.hasOwn(record, 'bwrapOwner')
+            && !Object.hasOwn(record, 'pid')
+            && !Object.hasOwn(route, 'hostPort')) {
+            continue;
+        }
         let owner;
         try {
             owner = normalizeExactServiceOwnerAttestation(record.bwrapOwner);
@@ -972,11 +980,18 @@ function validateSandboxRootOwnerBindings(routing, agents) {
     }
 }
 
-function compileGeneration({ routing, policy, desired, agents, manifests }) {
+function compileGeneration({
+    routing,
+    policy,
+    desired,
+    agents,
+    manifests,
+    allowOwnerlessPreparation = false,
+}) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);
     assertObject(agents, 'agents registry');
-    validateSandboxRootOwnerBindings(routing, agents);
+    validateSandboxRootOwnerBindings(routing, agents, { allowOwnerlessPreparation });
     const normalizedDesired = normalizeDesired(desired);
     const hostNetworkCapabilities = collectManifestHostNetworkCapabilities(routing, manifests, agents);
     const turnCredentialConsumers = (normalizedDesired.turn?.credentialConsumers || []).map((agentRef) => (
@@ -1058,7 +1073,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     };
 }
 
-function collectCapturedSources(paths) {
+function collectCapturedSources(paths, { allowOwnerlessPreparation = false } = {}) {
     const routingBytes = readExact(paths.routingFile, { label: 'routing.json' });
     const policyBytes = readExact(paths.policyFile, { label: 'policy-state.json' });
     const desiredBytes = readExact(paths.desiredFile, { label: 'edge desired state' });
@@ -1078,7 +1093,14 @@ function collectCapturedSources(paths) {
         manifestBytes[routeKey] = bytes;
         manifests[routeKey] = parseJsonBytes(bytes, `manifest(${routeKey})`);
     }
-    const semantic = compileGeneration({ routing, policy, desired, agents, manifests });
+    const semantic = compileGeneration({
+        routing,
+        policy,
+        desired,
+        agents,
+        manifests,
+        allowOwnerlessPreparation,
+    });
     const parts = [
         ['routing.json', routingBytes],
         ['policy-state.json', policyBytes],
@@ -1116,6 +1138,7 @@ function collectCandidateSources(paths, {
     desired,
     agents,
     manifestBytes = {},
+    allowOwnerlessPreparation = false,
 } = {}) {
     const routingBytes = candidateSourceBytes(routing, paths.routingFile, 'routing.json');
     const policyBytes = candidateSourceBytes(policy, paths.policyFile, 'policy-state.json');
@@ -1145,6 +1168,7 @@ function collectCandidateSources(paths, {
         desired: parsedDesired,
         agents: parsedAgents,
         manifests,
+        allowOwnerlessPreparation,
     });
     const parts = [
         ['routing.json', routingBytes],
@@ -1495,7 +1519,9 @@ export function prepareHostModeCapabilityForInactiveGeneration(owner, options = 
         || (!preparationLease && selector?.state !== 'inactive')) {
         throw edgeError('host network launch requires one selected prepared configuration generation', 'HOST_MODE_CAPABILITY_DENIED');
     }
-    const generation = loadGenerationById(paths, generationId);
+    const generation = preparationLease
+        ? loadCapturedGeneration(paths, generationId).generation
+        : loadGenerationById(paths, generationId);
     const exact = (generation.compiled?.security?.hostNetworkCapabilities || []).find((entry) => (
         entry.agentId === String(owner?.agentId || '')
         && entry.instanceId === String(owner?.instanceId || '')
@@ -1903,7 +1929,9 @@ function decodeGenerationSources(document) {
     };
 }
 
-function reconstructGeneration(document, selector) {
+function reconstructGeneration(document, selector, {
+    allowOwnerlessPreparation = false,
+} = {}) {
     if (document.schemaVersion !== EDGE_GENERATION_SCHEMA_VERSION || document.generation !== selector.generation) {
         throw edgeError('active edge routing generation schema or identity is invalid', 'EDGE_GENERATION_CORRUPT');
     }
@@ -1939,6 +1967,7 @@ function reconstructGeneration(document, selector) {
             agents,
             manifests,
             routerHostPort,
+            allowOwnerlessPreparation,
         });
     } catch (error) {
         throw edgeError(`active edge routing generation semantics are invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
@@ -1993,10 +2022,12 @@ function loadCapturedGeneration(paths, generationId) {
     } catch (error) {
         throw edgeError(`prepared edge routing generation is corrupt: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
     }
+    const preparationLease = readPreparationLease(paths);
+    const allowOwnerlessPreparation = preparationLease?.preparedGeneration === generationId;
     const generation = reconstructGeneration(document, {
         generation: generationId,
         publicationState: 'error',
-    });
+    }, { allowOwnerlessPreparation });
     return { generation, bytes: decodeGenerationSources(document) };
 }
 
@@ -2135,7 +2166,9 @@ export function applyEdgeRoutingGeneration(options = {}) {
             const candidateBytes = readDesiredCandidateFile(options.desiredCandidateFile);
             atomicWrite(paths.desiredFile, candidateBytes, { mode: 0o600 });
         }
-        const captured = collectCapturedSources(paths);
+        const allowOwnerlessPreparation = options.activate === false
+            && options.createPreparationLease === true;
+        const captured = collectCapturedSources(paths, { allowOwnerlessPreparation });
         if (expectedGeneration !== null && captured.generation !== expectedGeneration) {
             throw edgeError(
                 'edge routing sources changed before exact generation commit',
@@ -2158,7 +2191,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
                 })
                 : null,
         });
-        const recaptured = collectCapturedSources(paths);
+        const recaptured = collectCapturedSources(paths, { allowOwnerlessPreparation });
         if (recaptured.generation !== captured.generation) {
             throw edgeError('edge routing sources changed during coordinated apply', 'EDGE_GENERATION_RACE');
         }
@@ -2368,7 +2401,10 @@ export function prepareAdditiveEdgeRoutingGeneration(options = {}) {
             'EDGE_GENERATION_SOURCE_CHANGED',
         );
     }
-    const captured = collectCandidateSources(paths, options);
+    const captured = collectCandidateSources(paths, {
+        ...options,
+        allowOwnerlessPreparation: true,
+    });
     persistCapturedGeneration(paths, captured, options);
     const generation = capturedGenerationSnapshot(captured, 'error');
     const preparationLease = createPreparationLease(
