@@ -983,8 +983,8 @@ export function __resolveProviderInvocationIdentity(payload, createId = randomUU
             'provider execution requires a named tool or endpoint operation',
         );
     }
-    const taskId = suppliedTaskId || `operation:${createId()}`;
-    if (taskId.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9:._/-]*$/.test(taskId)) {
+    const taskId = suppliedTaskId || `operation-${createId()}`;
+    if (taskId.length > 255 || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/.test(taskId)) {
         throw providerPolicyError(
             'PLOINKY_PROVIDER_EXECUTION_INVALID',
             'provider execution task identity is invalid',

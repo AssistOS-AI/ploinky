@@ -130,10 +130,16 @@ test('provider endpoint execution gets a bounded named operation identity and ex
             () => '11111111-2222-4333-8444-555555555555',
         ),
         {
-            taskId: 'operation:11111111-2222-4333-8444-555555555555',
+            taskId: 'operation-11111111-2222-4333-8444-555555555555',
             operation: 'openai.models',
         },
     );
+    for (const unsafeTaskId of ['task:one', 'task/one']) {
+        assert.throws(
+            () => __resolveProviderInvocationIdentity({ taskId: unsafeTaskId, tool: 'continue-task' }),
+            { code: 'PLOINKY_PROVIDER_EXECUTION_INVALID' },
+        );
+    }
     assert.throws(
         () => __resolveProviderInvocationIdentity({}, () => 'unused'),
         /named tool or endpoint/,

@@ -9,6 +9,7 @@ import {
 } from './providerSandbox.mjs';
 import { assertScopedSoulBrokerRegistry } from './scopedSoulBroker.mjs';
 import { inspectProcessIdentity, normalizeProcessIdentity } from './processIdentity.mjs';
+import { createProviderTaskLifecycleClient } from './providerTaskLifecycleClient.mjs';
 
 const PROVIDERS = new Set(Object.values(PROVIDER_SANDBOX_PROVIDERS));
 
@@ -34,6 +35,31 @@ function retainedRuntimeError(source) {
         terminalObserved: source?.evidence?.terminalObserved === true,
         transportClosed: source?.evidence?.transportClosed === true,
     });
+    return error;
+}
+
+function retainedLifecycleError(source) {
+    const error = new ProviderTaskRuntimeError(
+        'PLOINKY_PROVIDER_RUNTIME_LIFECYCLE_UNPROVEN',
+        'provider runtime could not prove the private lifecycle settlement',
+        source ? { cause: source } : undefined,
+    );
+    error.ownershipRetained = true;
+    error.evidence = Object.freeze({
+        phase: 'provider-lifecycle-settlement',
+        terminalObserved: source?.evidence?.terminalObserved === true,
+        transportClosed: source?.evidence?.transportClosed === true,
+    });
+    return error;
+}
+
+function failedLifecycleError(source) {
+    const error = new ProviderTaskRuntimeError(
+        'PLOINKY_PROVIDER_RUNTIME_LIFECYCLE_FAILED',
+        'provider runtime lifecycle failed after exact terminal ownership removal',
+        source ? { cause: source } : undefined,
+    );
+    error.ownershipRetained = false;
     return error;
 }
 
@@ -240,6 +266,7 @@ export function createProviderTaskRuntime({
     spawnProviderSandbox: spawnSandbox = spawnProviderSandbox,
     inspectProcessIdentity: inspectIdentity = inspectProcessIdentity,
     getUid = () => (typeof process.getuid === 'function' ? process.getuid() : null),
+    createProviderTaskLifecycleClient: createLifecycleClient = createProviderTaskLifecycleClient,
 } = {}) {
     const context = assertAgentCredentialContext(credentialContext);
     context.assertActive();
@@ -253,7 +280,7 @@ export function createProviderTaskRuntime({
     if (!PROVIDERS.has(provider)) {
         fail('PLOINKY_PROVIDER_RUNTIME_INPUT_INVALID', 'provider is unsupported');
     }
-    exactText(taskId, 'taskId');
+    exactText(taskId, 'taskId', /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/);
     exactText(audience, 'audience');
     if (signal !== undefined && !(signal instanceof AbortSignal)) {
         fail('PLOINKY_PROVIDER_RUNTIME_INPUT_INVALID', 'signal must be an AbortSignal');
@@ -262,7 +289,8 @@ export function createProviderTaskRuntime({
         fail('PLOINKY_PROVIDER_RUNTIME_INPUT_INVALID', 'onSpawn must be a function');
     }
     if (typeof withHomeLease !== 'function' || typeof spawnSandbox !== 'function'
-        || typeof inspectIdentity !== 'function' || typeof getUid !== 'function') {
+        || typeof inspectIdentity !== 'function' || typeof getUid !== 'function'
+        || typeof createLifecycleClient !== 'function') {
         fail('PLOINKY_PROVIDER_RUNTIME_INPUT_INVALID', 'process identity dependencies are invalid');
     }
 
@@ -273,6 +301,7 @@ export function createProviderTaskRuntime({
     let pendingChild = null;
     let pendingPublicChild = null;
     let pendingProcessControl = null;
+    let pendingOwnership = null;
     let closed = false;
     let failedClosed = false;
     let retainedError = null;
@@ -341,6 +370,7 @@ export function createProviderTaskRuntime({
         const capability = brokerRegistry.prepare({ taskId, provider, audience });
         currentCapability = capability;
         let capabilityWasActivated = false;
+        let activatedBoundary = null;
         let handle;
         try {
             handle = await spawnTaskSandbox({
@@ -351,12 +381,32 @@ export function createProviderTaskRuntime({
                 ...(signal ? { signal } : {}),
                 activateCapability(metadata) {
                     if (!metadata || metadata.provider !== provider
-                        || metadata.mode !== launchMode) {
+                        || metadata.mode !== launchMode
+                        || !metadata.identity || typeof metadata.identity !== 'object'
+                        || metadata.identity.runtimeKind !== context.runtime.runtimeKind
+                        || metadata.identity.homeKey !== (context.runtime.runtimeKind === 'bwrap'
+                            ? `${context.runtime.runtimeKey}.sandbox-v2`
+                            : context.runtime.homeKey)
+                        || metadata.identity.generation !== context.identity.enableGeneration
+                        || metadata.identity.providerHomeSource !== (context.runtime.runtimeKind === 'bwrap'
+                            ? '/home/agent'
+                            : '/root')
+                        || metadata.workdir !== (launchMode === PROVIDER_SANDBOX_MODES.TASK
+                            ? input.workdir
+                            : null)
+                        || (metadata.childPid !== undefined
+                            && (!Number.isSafeInteger(metadata.childPid) || metadata.childPid <= 0))) {
                         fail(
                             'PLOINKY_PROVIDER_RUNTIME_BOUNDARY_INVALID',
                             'provider adapter attempted to activate the wrong sandbox boundary',
                         );
                     }
+                    activatedBoundary = Object.freeze({
+                        childPid: metadata.childPid ?? null,
+                        runtimeKind: metadata.identity.runtimeKind,
+                        homeKey: metadata.identity.homeKey,
+                        generation: metadata.identity.generation,
+                    });
                     capability.activate();
                     capabilityWasActivated = true;
                 },
@@ -364,15 +414,27 @@ export function createProviderTaskRuntime({
                     capability.close();
                 },
                 onSpawn: (child, processControl) => {
-                    captureRuntimeOwnership(child, processControl, inspectIdentity, getUid);
+                    pendingOwnership = captureRuntimeOwnership(
+                        child,
+                        processControl,
+                        inspectIdentity,
+                        getUid,
+                    );
                     pendingChild = child;
                     pendingProcessControl = processControl;
                     pendingPublicChild = publicChild(child, [
                         capability.environment.PLOINKY_TASK_BROKER_KEY,
                         ...privateOutputValues,
                     ], processControl);
-                    if (onSpawn) onSpawn(pendingPublicChild);
-                    if (lifecycle.observeProcess) lifecycle.observeProcess(pendingPublicChild);
+                    if (signal && !abortListener) {
+                        abortListener = () => {
+                            processControl.terminate('runtime-abort').catch((error) => {
+                                failedClosed = true;
+                                retainedError = error;
+                            });
+                        };
+                        signal.addEventListener('abort', abortListener, { once: true });
+                    }
                     if (closed || signal?.aborted) {
                         processControl.terminate('runtime-aborted-during-spawn').catch((error) => {
                             failedClosed = true;
@@ -444,6 +506,7 @@ export function createProviderTaskRuntime({
                 pendingChild = null;
                 pendingPublicChild = null;
                 pendingProcessControl = null;
+                pendingOwnership = null;
             }
             throw error;
         }
@@ -455,7 +518,15 @@ export function createProviderTaskRuntime({
             || !processControl
             || handle.launch?.helper !== '/usr/local/libexec/ploinky-bwrap-launch'
             || handle.launch?.provider !== provider
-            || handle.launch?.mode !== launchMode) {
+            || handle.launch?.mode !== launchMode
+            || typeof handle.launch?.cwd !== 'string'
+            || !handle.launch.cwd.startsWith('/workspace/')
+            || handle.launch.cwd.endsWith('/')
+            || handle.launch.cwd.includes('//')
+            || handle.launch.cwd.split('/').some((part) => part === '.' || part === '..')
+            || !pendingOwnership || !activatedBoundary
+            || (activatedBoundary.childPid !== null
+                && activatedBoundary.childPid !== pendingOwnership.pid)) {
             if (!processControl) {
                 failedClosed = true;
                 const error = new ProviderTaskRuntimeError(
@@ -498,6 +569,7 @@ export function createProviderTaskRuntime({
             }
             capability.close();
             if (currentCapability === capability) currentCapability = null;
+            pendingOwnership = null;
             fail(
                 'PLOINKY_PROVIDER_RUNTIME_BOUNDARY_INVALID',
                 'provider adapter did not return the canonical activated helper boundary',
@@ -508,20 +580,153 @@ export function createProviderTaskRuntime({
             ...privateOutputValues,
         ], processControl);
         pendingPublicChild = null;
-        pendingProcessControl = null;
-        activeHandle = handle;
-        activeProcessControl = processControl;
-        canonicalLaunches += 1;
-        if (signal) {
-            abortListener = () => {
-                processControl.terminate('runtime-abort').catch((error) => {
+        const ownership = Object.freeze({
+            ...pendingOwnership,
+            processGroupId: pendingOwnership.pid,
+        });
+        pendingOwnership = null;
+        const lifecycleClient = createLifecycleClient(Object.freeze({
+            credentialContext: context,
+            provider,
+            mode: launchMode,
+            taskId,
+            audience,
+            inspectProcessIdentity: inspectIdentity,
+            onBridgeFailure(error) {
+                failedClosed = true;
+                retainedError = retainedLifecycleError(error);
+                void processControl.terminate('runtime-lifecycle-bridge-failure').catch((cause) => {
+                    failedClosed = true;
+                    retainedError = retainedRuntimeError(cause);
+                });
+            },
+        }));
+        if (!lifecycleClient || typeof lifecycleClient.publish !== 'function'
+            || typeof lifecycleClient.log !== 'function'
+            || typeof lifecycleClient.terminal !== 'function') {
+            try { await processControl.terminate('runtime-lifecycle-client-rejection'); } catch (error) {
+                failedClosed = true;
+                retainedError = error;
+                throw retainedRuntimeError(error);
+            }
+            try { await handle.completion; } catch (error) {
+                if (error?.ownershipRetained) throw retainedRuntimeError(error);
+            }
+            fail(
+                'PLOINKY_PROVIDER_RUNTIME_BOUNDARY_INVALID',
+                'provider lifecycle client does not expose the exact required boundary',
+            );
+        }
+        try {
+            await lifecycleClient.publish(Object.freeze({
+                runtimeKind: context.runtime.runtimeKind,
+                runtimeKey: context.runtime.runtimeKey,
+                homeKey: context.runtime.runtimeKind === 'bwrap'
+                    ? `${context.runtime.runtimeKey}.sandbox-v2`
+                    : context.runtime.homeKey,
+                workdir: handle.launch.cwd,
+                ownership,
+            }));
+        } catch (publishError) {
+            try { await processControl.terminate('runtime-lifecycle-publish-rejection'); } catch (error) {
+                failedClosed = true;
+                retainedError = error;
+                throw retainedRuntimeError(error);
+            }
+            try {
+                await handle.completion;
+            } catch (error) {
+                if (error?.ownershipRetained) {
                     failedClosed = true;
                     retainedError = error;
+                    throw retainedRuntimeError(error);
+                }
+            }
+            if (lifecycleClient.publicationAttempted) {
+                try {
+                    await lifecycleClient.terminal({ terminalState: 'cancelled' });
+                } catch (error) {
+                    failedClosed = true;
+                    retainedError = error;
+                    throw retainedLifecycleError(error);
+                }
+            }
+            capability.close();
+            if (currentCapability === capability) currentCapability = null;
+            pendingProcessControl = null;
+            throw publishError;
+        }
+
+        let logTail = Promise.resolve();
+        let logFailure = null;
+        const outputListeners = [];
+        const attachOutput = (stream, name) => {
+            if (!stream || typeof stream.on !== 'function') return;
+            const listener = (chunk) => {
+                const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+                logTail = logTail.then(() => lifecycleClient.log(name, text)).catch((error) => {
+                    logFailure ||= error;
                 });
             };
-            signal.addEventListener('abort', abortListener, { once: true });
-        }
-        handle.completion.then(() => {
+            stream.on('data', listener);
+            outputListeners.push([stream, listener]);
+        };
+        attachOutput(childView.stdout, 'stdout');
+        attachOutput(childView.stderr, 'stderr');
+        const detachOutput = () => {
+            for (const [stream, listener] of outputListeners) stream.removeListener('data', listener);
+            outputListeners.length = 0;
+        };
+        let terminalState = null;
+        const finishLifecycle = async (result, completionError = null) => {
+            detachOutput();
+            await logTail;
+            terminalState ||= signal?.aborted || closed
+                ? 'cancelled'
+                : (!completionError && result?.code === 0 && result?.signal == null
+                    ? 'completed'
+                    : 'failed');
+            try {
+                await lifecycleClient.terminal({ terminalState });
+            } catch (error) {
+                if (error?.ownershipRetained === true) throw retainedLifecycleError(error);
+                throw failedLifecycleError(error);
+            }
+            if (logFailure) throw failedLifecycleError(logFailure);
+            if (completionError) throw completionError;
+            return result;
+        };
+        const rawCompletion = handle.completion;
+        const completion = rawCompletion.then(
+            (result) => finishLifecycle(result),
+            (error) => {
+                if (error?.ownershipRetained) throw error;
+                return finishLifecycle(null, error);
+            },
+        );
+        const lifecycleHandle = Object.freeze({
+            ...handle,
+            completion,
+            async cleanup() {
+                let result = null;
+                let completionError = null;
+                try {
+                    result = await rawCompletion;
+                } catch (error) {
+                    if (error?.ownershipRetained && typeof handle.cleanup === 'function') {
+                        result = await handle.cleanup();
+                    } else {
+                        completionError = error;
+                    }
+                }
+                return finishLifecycle(result, completionError);
+            },
+        });
+        pendingProcessControl = null;
+        activeHandle = lifecycleHandle;
+        activeProcessControl = processControl;
+        canonicalLaunches += 1;
+        completion.then(() => {
             if (signal && abortListener) signal.removeEventListener('abort', abortListener);
             abortListener = null;
             activeHandle = null;
@@ -541,11 +746,38 @@ export function createProviderTaskRuntime({
                 activeProcessControl = null;
                 capability.close();
                 if (currentCapability === capability) currentCapability = null;
+                failedClosed = false;
+                retainedError = null;
             }
         });
+        if (closed || signal?.aborted) {
+            try {
+                await processControl.terminate('runtime-aborted-before-admission');
+                await completion;
+            } catch (error) {
+                if (error?.ownershipRetained) throw error;
+            }
+            fail(
+                'PLOINKY_PROVIDER_RUNTIME_ABORTED',
+                'provider runtime was aborted before lifecycle admission',
+                signal?.reason,
+            );
+        }
+        try {
+            if (onSpawn) onSpawn(childView);
+            if (lifecycle.observeProcess) lifecycle.observeProcess(childView);
+        } catch (error) {
+            try {
+                await processControl.terminate('runtime-admission-observer-rejection');
+                await completion;
+            } catch (cleanupError) {
+                if (cleanupError?.ownershipRetained) throw cleanupError;
+            }
+            throw error;
+        }
         return Object.freeze({
             child: childView,
-            completion: handle.completion,
+            completion,
             launch: publicLaunch(handle.launch),
         });
     };

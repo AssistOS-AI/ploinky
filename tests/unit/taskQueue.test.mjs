@@ -1,7 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import fs from 'node:fs';
+import {
+    mkdtempSync,
+    rmSync,
+    readFileSync,
+    realpathSync,
+    chmodSync,
+    readdirSync,
+    symlinkSync,
+    writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -23,7 +33,7 @@ function processIdentityOptions(signals) {
 }
 
 function makeTempStorage(t) {
-    const dir = mkdtempSync(path.join(os.tmpdir(), 'task-queue-test-'));
+    const dir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'task-queue-test-')));
     const storagePath = path.join(dir, 'queue.json');
     t.after(() => {
         rmSync(dir, { recursive: true, force: true });
@@ -172,6 +182,103 @@ test('TaskQueue preserves the exact provider-module admission across queue persi
     const snapshot = JSON.parse(readFileSync(storagePath, 'utf8'));
     const restoredEntry = snapshot.find((entry) => entry?.id === id);
     assert.deepEqual(restoredEntry?.commandSpec, commandSpec);
+});
+
+test('TaskQueue durably restores public terminal status and result', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const queue = new TaskQueue({
+        storagePath,
+        executor: async () => ({ code: 0, stdout: 'durable-result', stderr: '' }),
+    });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.status === 'completed');
+
+    const restored = new TaskQueue({
+        storagePath,
+        executor: async () => assert.fail('terminal task must not execute after restore'),
+    });
+    restored.initialize();
+    assert.equal(restored.getTask(id)?.status, 'completed');
+    assert.equal(restored.getTask(id)?.result?.content?.[0]?.text, 'durable-result');
+});
+
+test('TaskQueue fails closed on malformed or symlinked persistence instead of admitting work', (t) => {
+    const malformedPath = makeTempStorage(t);
+    writeFileSync(malformedPath, '{not-json');
+    chmodSync(malformedPath, 0o600);
+    let malformedExecutions = 0;
+    const malformedQueue = new TaskQueue({
+        storagePath: malformedPath,
+        executor: async () => {
+            malformedExecutions += 1;
+            return { code: 0, stdout: '', stderr: '' };
+        },
+    });
+    assert.throws(
+        () => malformedQueue.enqueueTask(dummyTaskConfig()),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_PERSISTENCE_INVALID',
+    );
+    assert.equal(malformedExecutions, 0);
+    assert.equal(malformedQueue.admissionClosed, true);
+
+    const symlinkPath = makeTempStorage(t);
+    const targetPath = `${symlinkPath}.target`;
+    writeFileSync(targetPath, '[]');
+    symlinkSync(targetPath, symlinkPath);
+    let symlinkExecutions = 0;
+    const symlinkQueue = new TaskQueue({
+        storagePath: symlinkPath,
+        executor: async () => {
+            symlinkExecutions += 1;
+            return { code: 0, stdout: '', stderr: '' };
+        },
+    });
+    assert.throws(
+        () => symlinkQueue.enqueueTask(dummyTaskConfig()),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+    );
+    assert.equal(symlinkExecutions, 0);
+    assert.equal(readFileSync(targetPath, 'utf8'), '[]');
+});
+
+test('TaskQueue atomic persistence failure preserves the old snapshot and removes the private temp', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const initialQueue = new TaskQueue({
+        storagePath,
+        executor: async () => ({ code: 0, stdout: 'canonical-old-result', stderr: '' }),
+    });
+    const initialId = initialQueue.enqueueTask(dummyTaskConfig()).id;
+    await waitFor(() => initialQueue.getTask(initialId)?.status === 'completed');
+    const oldSnapshot = readFileSync(storagePath, 'utf8');
+    let executions = 0;
+    const injectedFs = {
+        ...fs,
+        renameSync() {
+            const error = new Error('simulated atomic rename failure');
+            error.code = 'EIO';
+            throw error;
+        },
+    };
+    const failingQueue = new TaskQueue({
+        storagePath,
+        fsImpl: injectedFs,
+        executor: async () => {
+            executions += 1;
+            return { code: 0, stdout: '', stderr: '' };
+        },
+    });
+
+    assert.throws(
+        () => failingQueue.enqueueTask(dummyTaskConfig({ next: true })),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_PERSISTENCE_FAILED',
+    );
+    assert.equal(failingQueue.admissionClosed, true);
+    assert.equal(executions, 0);
+    assert.equal(readFileSync(storagePath, 'utf8'), oldSnapshot);
+    assert.deepEqual(
+        readdirSync(path.dirname(storagePath)).filter((name) => name.includes('.tmp')),
+        [],
+    );
 });
 
 test('TaskQueue exposes stderr as live logs without leaking stdout result payloads', async (t) => {
@@ -367,6 +474,43 @@ test('TaskQueue aborts in-process provider bootstrap before a child is spawned',
     assert.equal(queue.cancelTask(id)?.status, 'cancelling');
     await waitFor(() => queue.getTask(id)?.status === 'cancelled');
     assert.equal(observedSignal.aborted, true);
+});
+
+test('TaskQueue delegates provider-module process termination exclusively to the provider runtime', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const signals = [];
+    let observedSignal;
+    let finish;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        cancelGraceMs: 10,
+        ...processIdentityOptions(signals),
+        executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
+            finish = resolve;
+            observedSignal = options.signal;
+            options.onSpawn({ pid: 4242, killed: false });
+        }),
+    });
+    const { id } = queue.enqueueTask({
+        toolName: 'execute-task',
+        commandSpec: {
+            kind: 'provider-module',
+            provider: 'opencode',
+            module: '/code/scripts/execute-task.mjs',
+            exportName: 'executeProviderTask',
+        },
+        payload: { prompt: 'test' },
+    });
+    await waitFor(() => observedSignal);
+
+    assert.equal(queue.cancelTask(id)?.status, 'cancelling');
+    assert.equal(observedSignal.aborted, true);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(signals, []);
+    finish({ code: null, signal: 'SIGTERM', stdout: '', stderr: '' });
+    await waitFor(() => queue.getTask(id)?.status === 'cancelled');
+    assert.deepEqual(signals, []);
 });
 
 test('TaskQueue never persists provider login controls or prompt secrets', (t) => {

@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { describeShellFailure } from '../lib/toolError.mjs';
 import { inspectProcessIdentity, normalizeProcessIdentity } from '../lib/processIdentity.mjs';
 
@@ -12,6 +13,81 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const PROVIDER_LOGIN_OPERATIONS = new Set([
     'login_start', 'login_status', 'login_respond', 'login_cancel',
 ]);
+const RESTORABLE_STATUSES = new Set([
+    'pending', 'running', 'cancelling', 'completed', 'failed', 'cancelled',
+]);
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
+const PERSISTENCE_SCHEMA_VERSION = 1;
+const MAX_PERSISTENCE_BYTES = 16 * 1024 * 1024;
+const MAX_PERSISTED_TASKS = 10_000;
+const MAX_PERSISTED_VALUE_BYTES = 1024 * 1024;
+const PERSISTED_TASK_KEYS = new Set([
+    'schemaVersion', 'id', 'toolName', 'commandSpec', 'payload', 'status', 'timeoutMs',
+    'createdAt', 'updatedAt', 'error', 'result', 'logRetention', 'continuationTool',
+    'logTail', 'logSeq', 'logTruncated',
+]);
+
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function boundedJson(value, maximum = MAX_PERSISTED_VALUE_BYTES) {
+    try {
+        const encoded = JSON.stringify(value);
+        return typeof encoded === 'string' && Buffer.byteLength(encoded, 'utf8') <= maximum;
+    } catch {
+        return false;
+    }
+}
+
+function exactPersistedTask(entry, maxLogTailBytes) {
+    if (!isPlainObject(entry) || Object.keys(entry).length !== PERSISTED_TASK_KEYS.size
+        || Object.keys(entry).some((key) => !PERSISTED_TASK_KEYS.has(key))
+        || entry.schemaVersion !== PERSISTENCE_SCHEMA_VERSION
+        || !TASK_ID_RE.test(entry.id)
+        || !TOOL_NAME_RE.test(entry.toolName)
+        || !isPlainObject(entry.commandSpec)
+        || !isPlainObject(entry.payload) || !boundedJson(entry.payload)
+        || !RESTORABLE_STATUSES.has(entry.status)
+        || (entry.timeoutMs !== null
+            && (!Number.isSafeInteger(entry.timeoutMs) || entry.timeoutMs <= 0))
+        || typeof entry.createdAt !== 'string' || !Number.isFinite(Date.parse(entry.createdAt))
+        || typeof entry.updatedAt !== 'string' || !Number.isFinite(Date.parse(entry.updatedAt))
+        || (entry.error !== null
+            && (typeof entry.error !== 'string' || Buffer.byteLength(entry.error, 'utf8') > 64 * 1024))
+        || (entry.result !== null && (!isPlainObject(entry.result) || !boundedJson(entry.result)))
+        || (entry.logRetention !== 'full' && entry.logRetention !== 'bounded')
+        || typeof entry.continuationTool !== 'string'
+        || (entry.continuationTool !== '' && !TOOL_NAME_RE.test(entry.continuationTool))
+        || typeof entry.logTail !== 'string'
+        || Buffer.byteLength(entry.logTail, 'utf8') > (entry.logRetention === 'full'
+            ? MAX_PERSISTED_VALUE_BYTES
+            : maxLogTailBytes)
+        || !Number.isSafeInteger(entry.logSeq) || entry.logSeq < 0
+        || typeof entry.logTruncated !== 'boolean') {
+        return false;
+    }
+    const commandKeys = Object.keys(entry.commandSpec);
+    if (entry.commandSpec.kind === 'provider-module') {
+        const allowed = new Set([
+            'kind', 'provider', 'module', 'exportName', 'sandboxMode', 'timeoutMs',
+        ]);
+        return commandKeys.every((key) => allowed.has(key))
+            && typeof entry.commandSpec.provider === 'string'
+            && typeof entry.commandSpec.module === 'string'
+            && typeof entry.commandSpec.exportName === 'string';
+    }
+    const allowed = new Set(['kind', 'command', 'args', 'cwd', 'env', 'timeoutMs']);
+    return commandKeys.every((key) => allowed.has(key))
+        && typeof entry.commandSpec.kind === 'string'
+        && typeof entry.commandSpec.command === 'string'
+        && Array.isArray(entry.commandSpec.args)
+        && entry.commandSpec.args.every((argument) => typeof argument === 'string')
+        && (entry.commandSpec.cwd === undefined || typeof entry.commandSpec.cwd === 'string')
+        && isPlainObject(entry.commandSpec.env)
+        && boundedJson(entry.commandSpec);
+}
 
 function taskQueueError(code, message, options) {
     const error = new Error(message, options);
@@ -105,6 +181,7 @@ export class TaskQueue {
         processIdentityInspector = inspectProcessIdentity,
         signalProcessGroup = (pid, signal) => process.kill(-pid, signal),
         getUid = () => (typeof process.getuid === 'function' ? process.getuid() : null),
+        fsImpl = fs,
     }) {
         if (typeof executor !== 'function') {
             throw new Error('TaskQueue requires an executor function');
@@ -116,12 +193,14 @@ export class TaskQueue {
         this.cancelGraceMs = parsePositiveInt(cancelGraceMs, DEFAULT_CANCEL_GRACE_MS);
         this.closeTimeoutMs = parsePositiveInt(closeTimeoutMs, DEFAULT_CLOSE_TIMEOUT_MS);
         if (typeof processIdentityInspector !== 'function'
-            || typeof signalProcessGroup !== 'function' || typeof getUid !== 'function') {
+            || typeof signalProcessGroup !== 'function' || typeof getUid !== 'function'
+            || !fsImpl || typeof fsImpl !== 'object') {
             throw new Error('TaskQueue process identity dependencies are invalid');
         }
         this.processIdentityInspector = processIdentityInspector;
         this.signalProcessGroup = signalProcessGroup;
         this.getUid = getUid;
+        this.fs = fsImpl;
         this.tasks = new Map();
         this.taskLogs = new Map();
         this.pending = [];
@@ -137,6 +216,7 @@ export class TaskQueue {
         this.runPromises = new Map();
         this.closePromise = null;
         this.cleanupComplete = false;
+        this.persistenceFailure = null;
     }
 
     syncLifecycleFailure() {
@@ -204,41 +284,104 @@ export class TaskQueue {
         if (!this.storagePath) {
             return;
         }
+        let descriptor = null;
         try {
-            const raw = fs.readFileSync(this.storagePath, 'utf8');
+            const uid = this.getUid();
+            const parent = path.dirname(this.storagePath);
+            if (!Number.isSafeInteger(uid) || uid < 0
+                || this.fs.realpathSync(parent) !== path.resolve(parent)) {
+                throw taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+                    'TaskQueue persistence has an untrusted owner or symlinked ancestor',
+                );
+            }
+            const parentStat = this.fs.lstatSync(parent);
+            if (!parentStat.isDirectory() || parentStat.isSymbolicLink()
+                || parentStat.uid !== uid || (parentStat.mode & 0o022) !== 0) {
+                throw taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+                    'TaskQueue persistence parent ownership or mode is unsafe',
+                );
+            }
+            const stat = this.fs.lstatSync(this.storagePath);
+            if (stat.isSymbolicLink() || !stat.isFile() || stat.uid !== uid
+                || stat.nlink !== 1 || (stat.mode & 0o077) !== 0
+                || stat.size <= 0 || stat.size > MAX_PERSISTENCE_BYTES) {
+                throw taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+                    'TaskQueue persistence ownership, links, mode, or size are unsafe',
+                );
+            }
+            descriptor = this.fs.openSync(
+                this.storagePath,
+                this.fs.constants.O_RDONLY | (this.fs.constants.O_NOFOLLOW ?? 0),
+            );
+            const openedStat = this.fs.fstatSync(descriptor);
+            if (!openedStat.isFile() || openedStat.dev !== stat.dev || openedStat.ino !== stat.ino
+                || openedStat.uid !== uid || openedStat.nlink !== 1
+                || (openedStat.mode & 0o077) !== 0 || openedStat.size !== stat.size) {
+                throw taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+                    'TaskQueue persistence identity changed while opening',
+                );
+            }
+            const raw = this.fs.readFileSync(descriptor, 'utf8');
             const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) {
-                for (const entry of parsed) {
-                    if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string') {
-                        continue;
-                    }
-                    const commandSpec = entry.commandSpec || {};
-                    const task = {
-                        id: entry.id,
-                        toolName: entry.toolName,
-                        commandSpec: cloneCommandSpec(commandSpec),
-                        payload: entry.payload,
-                        status: entry.status || 'pending',
-                        timeoutMs: entry.timeoutMs ?? null,
-                        logRetention: entry.logRetention === 'full' ? 'full' : 'bounded',
-                        continuationTool: TOOL_NAME_RE.test(String(entry.continuationTool || '').trim())
-                            ? String(entry.continuationTool).trim()
-                            : '',
-                        createdAt: entry.createdAt || new Date().toISOString(),
-                        updatedAt: entry.updatedAt || entry.createdAt || new Date().toISOString(),
-                        error: entry.error ?? null,
-                        result: null,
-                        logTail: '',
-                        logSeq: 0,
-                        logTruncated: false
-                    };
-                    this.tasks.set(task.id, task);
+            if (!Array.isArray(parsed) || parsed.length > MAX_PERSISTED_TASKS) {
+                throw taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_INVALID',
+                    'TaskQueue persistence root must be an array',
+                );
+            }
+            for (const entry of parsed) {
+                if (!exactPersistedTask(entry, this.maxLogTailBytes)
+                    || this.tasks.has(entry.id)) {
+                    throw taskQueueError(
+                        'PLOINKY_TASK_QUEUE_PERSISTENCE_INVALID',
+                        'TaskQueue persistence contains an invalid task record',
+                    );
                 }
+                const task = {
+                    id: entry.id,
+                    toolName: entry.toolName,
+                    commandSpec: cloneCommandSpec(entry.commandSpec),
+                    payload: entry.payload,
+                    status: entry.status,
+                    timeoutMs: entry.timeoutMs ?? null,
+                    logRetention: entry.logRetention === 'full' ? 'full' : 'bounded',
+                    continuationTool: TOOL_NAME_RE.test(String(entry.continuationTool || '').trim())
+                        ? String(entry.continuationTool).trim()
+                        : '',
+                    createdAt: entry.createdAt || new Date().toISOString(),
+                    updatedAt: entry.updatedAt || entry.createdAt || new Date().toISOString(),
+                    error: entry.error ?? null,
+                    result: entry.result ?? null,
+                    logTail: typeof entry.logTail === 'string' ? entry.logTail : '',
+                    logSeq: Number.isSafeInteger(entry.logSeq) && entry.logSeq >= 0 ? entry.logSeq : 0,
+                    logTruncated: entry.logTruncated === true,
+                };
+                this.tasks.set(task.id, task);
+                this.taskLogs.set(task.id, {
+                    tail: task.logTail,
+                    tailBytes: Buffer.byteLength(task.logTail, 'utf8'),
+                    seq: task.logSeq,
+                    truncated: task.logTruncated,
+                });
             }
         } catch (err) {
-            if (err?.code !== 'ENOENT') {
-                console.error('[AgentServer/MCP] Failed to restore task queue:', err);
-            }
+            if (err?.code === 'ENOENT') return;
+            const error = err?.code?.startsWith?.('PLOINKY_TASK_QUEUE_PERSISTENCE_')
+                ? err
+                : taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_INVALID',
+                    'TaskQueue persistence could not be restored exactly',
+                    { cause: err },
+                );
+            this.persistenceFailure = error;
+            this.admissionClosed = true;
+            throw error;
+        } finally {
+            if (descriptor !== null) this.fs.closeSync(descriptor);
         }
     }
 
@@ -246,8 +389,43 @@ export class TaskQueue {
         if (!this.storagePath) {
             return;
         }
+        if (this.persistenceFailure) throw this.persistenceFailure;
+        const parent = path.dirname(this.storagePath);
+        const basename = path.basename(this.storagePath);
+        let temporaryPath = null;
+        let descriptor = null;
         try {
+            const uid = this.getUid();
+            if (!Number.isSafeInteger(uid) || uid < 0
+                || this.fs.realpathSync(parent) !== path.resolve(parent)) {
+                throw taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+                    'TaskQueue persistence has an untrusted owner or symlinked ancestor',
+                );
+            }
+            const parentStat = this.fs.lstatSync(parent);
+            if (!parentStat.isDirectory() || parentStat.isSymbolicLink()
+                || parentStat.uid !== uid || (parentStat.mode & 0o022) !== 0) {
+                throw taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+                    'TaskQueue persistence parent ownership or mode is unsafe',
+                );
+            }
+            try {
+                const current = this.fs.lstatSync(this.storagePath);
+                if (current.isSymbolicLink() || !current.isFile() || current.uid !== uid
+                    || current.nlink !== 1 || (current.mode & 0o077) !== 0
+                    || current.size <= 0 || current.size > MAX_PERSISTENCE_BYTES) {
+                    throw taskQueueError(
+                        'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+                        'TaskQueue persistence must be an exact regular file, never a symlink',
+                    );
+                }
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+            }
             const snapshot = [...this.tasks.values()].map(task => ({
+                schemaVersion: PERSISTENCE_SCHEMA_VERSION,
                 id: task.id,
                 toolName: task.toolName,
                 commandSpec: task.commandSpec,
@@ -257,12 +435,69 @@ export class TaskQueue {
                 createdAt: task.createdAt,
                 updatedAt: task.updatedAt,
                 error: task.error,
+                result: task.result,
                 logRetention: task.logRetention,
                 continuationTool: task.continuationTool,
+                logTail: task.logTail,
+                logSeq: task.logSeq,
+                logTruncated: task.logTruncated,
             }));
-            fs.writeFileSync(this.storagePath, JSON.stringify(snapshot, null, 2));
+            const encoded = JSON.stringify(snapshot, null, 2);
+            if (snapshot.length > MAX_PERSISTED_TASKS
+                || snapshot.some((entry) => !exactPersistedTask(entry, this.maxLogTailBytes))
+                || Buffer.byteLength(encoded, 'utf8') > MAX_PERSISTENCE_BYTES) {
+                throw taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_INVALID',
+                    'TaskQueue persistence snapshot exceeds exact bounds',
+                );
+            }
+            temporaryPath = path.join(
+                parent,
+                `.${basename}.${process.pid}.${randomBytes(12).toString('hex')}.tmp`,
+            );
+            descriptor = this.fs.openSync(
+                temporaryPath,
+                this.fs.constants.O_CREAT | this.fs.constants.O_EXCL | this.fs.constants.O_WRONLY
+                    | (this.fs.constants.O_NOFOLLOW ?? 0),
+                0o600,
+            );
+            this.fs.writeFileSync(descriptor, encoded, 'utf8');
+            this.fs.fsyncSync(descriptor);
+            this.fs.closeSync(descriptor);
+            descriptor = null;
+            try {
+                const current = this.fs.lstatSync(this.storagePath);
+                if (current.isSymbolicLink() || !current.isFile() || current.uid !== uid
+                    || current.nlink !== 1 || (current.mode & 0o077) !== 0) {
+                    throw taskQueueError(
+                        'PLOINKY_TASK_QUEUE_PERSISTENCE_UNSAFE',
+                        'TaskQueue persistence changed to an unsafe target before commit',
+                    );
+                }
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+            }
+            this.fs.renameSync(temporaryPath, this.storagePath);
+            temporaryPath = null;
+            const parentDescriptor = this.fs.openSync(parent, this.fs.constants.O_RDONLY);
+            try { this.fs.fsyncSync(parentDescriptor); } finally { this.fs.closeSync(parentDescriptor); }
         } catch (err) {
-            console.error('[AgentServer/MCP] Failed to persist task queue:', err);
+            if (descriptor !== null) {
+                try { this.fs.closeSync(descriptor); } catch { }
+            }
+            if (temporaryPath !== null) {
+                try { this.fs.unlinkSync(temporaryPath); } catch { }
+            }
+            const error = err?.code?.startsWith?.('PLOINKY_TASK_QUEUE_PERSISTENCE_')
+                ? err
+                : taskQueueError(
+                    'PLOINKY_TASK_QUEUE_PERSISTENCE_FAILED',
+                    'TaskQueue persistence could not be committed atomically',
+                    { cause: err },
+                );
+            this.persistenceFailure = error;
+            this.admissionClosed = true;
+            throw error;
         }
     }
 
@@ -533,6 +768,9 @@ export class TaskQueue {
 
     requestRunningTaskCancellation(task, child) {
         if (!task || !child) return;
+        if (task.commandSpec?.kind === 'provider-module') {
+            return;
+        }
         try { this.signalTaskProcess(task.id, 'SIGTERM'); } catch (error) {
             task.terminationFailure = Object.freeze({
                 code: error.code || 'PLOINKY_TASK_PROCESS_SIGNAL_FAILED',
@@ -628,22 +866,24 @@ export class TaskQueue {
             const result = await this.executor(task.commandSpec, task.payload, {
                 onSpawn: (child) => {
                     this.activeChildren.set(task.id, child);
-                    try {
-                        const ownership = this.captureTaskProcessOwnership(child);
-                        this.activeProcessOwnership.set(task.id, ownership);
-                    } catch (error) {
-                        spawnAdmissionFailure = error;
-                        unverifiedSpawnChild = child;
-                        child?.once?.('close', () => {
-                            spawnTerminalObserved = true;
-                            const retained = this.lifecycleFailures.get(task.id);
-                            if (retained?.phase === 'spawn-admission'
-                                && retained.child === child) {
-                                this.clearLifecycleFailure(task.id);
-                                this.processQueue();
-                            }
-                        });
-                        throw error;
+                    if (task.commandSpec.kind !== 'provider-module') {
+                        try {
+                            const ownership = this.captureTaskProcessOwnership(child);
+                            this.activeProcessOwnership.set(task.id, ownership);
+                        } catch (error) {
+                            spawnAdmissionFailure = error;
+                            unverifiedSpawnChild = child;
+                            child?.once?.('close', () => {
+                                spawnTerminalObserved = true;
+                                const retained = this.lifecycleFailures.get(task.id);
+                                if (retained?.phase === 'spawn-admission'
+                                    && retained.child === child) {
+                                    this.clearLifecycleFailure(task.id);
+                                    this.processQueue();
+                                }
+                            });
+                            throw error;
+                        }
                     }
                     if (task.cancelRequested) {
                         this.requestRunningTaskCancellation(task, child);
@@ -652,6 +892,12 @@ export class TaskQueue {
                         timer = setTimeout(() => {
                             if (!child.killed) {
                                 timedOut = true;
+                                if (task.commandSpec.kind === 'provider-module') {
+                                    abortController.abort(taskQueueError(
+                                        'PLOINKY_TASK_TIMEOUT',
+                                        `Task timed out after ${task.timeoutMs}ms`,
+                                    ));
+                                }
                                 this.requestRunningTaskCancellation(task, child);
                             }
                         }, task.timeoutMs);

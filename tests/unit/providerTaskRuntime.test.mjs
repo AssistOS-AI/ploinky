@@ -21,7 +21,24 @@ const GENERATION = '66666666-7777-4888-8999-aaaaaaaaaaaa';
 const TEST_UID = typeof process.getuid === 'function' ? process.getuid() : 501;
 const TEST_IDENTITY = 'linux-proc:11111111-1111-4111-8111-111111111111:100';
 
-function runtimeIdentityOptions() {
+function inertLifecycleClient() {
+    let publicationAttempted = false;
+    const client = {
+        async publish() {
+            publicationAttempted = true;
+            return Object.freeze({ ownerKey: 'test-owner', logPath: '/workspace/.ploinky/logs/test.log' });
+        },
+        async log() {},
+        async heartbeat() { return true; },
+        async terminal() {},
+    };
+    Object.defineProperty(client, 'publicationAttempted', {
+        get: () => publicationAttempted,
+    });
+    return Object.freeze(client);
+}
+
+function runtimeIdentityOptions(overrides = {}) {
     return {
         inspectProcessIdentity: () => ({
             state: 'identified',
@@ -29,6 +46,22 @@ function runtimeIdentityOptions() {
             processUid: TEST_UID,
         }),
         getUid: () => TEST_UID,
+        createProviderTaskLifecycleClient: () => inertLifecycleClient(),
+        ...overrides,
+    };
+}
+
+function activationMetadata(provider, mode) {
+    return {
+        provider,
+        mode,
+        workdir: mode === 'task' ? 'projects/alpha' : null,
+        identity: {
+            runtimeKind: 'bwrap',
+            homeKey: `${INSTANCE}.sandbox-v2`,
+            generation: GENERATION,
+            providerHomeSource: '/home/agent',
+        },
     };
 }
 
@@ -138,6 +171,232 @@ function pipedFakeChild(pid = 4242) {
     return child;
 }
 
+test('provider runtime publishes proven ownership before admission and settles only after logs and terminal proof', async (t) => {
+    const context = credentialContext();
+    const registry = await startScopedSoulBrokerRegistry({ credentialContext: context });
+    t.after(() => registry.close());
+    const rawCompletion = deferred();
+    const publishGate = deferred();
+    const terminalGate = deferred();
+    const events = [];
+    let publishInput;
+    let admitted = false;
+    const lifecycleClient = {
+        publicationAttempted: false,
+        async publish(input) {
+            this.publicationAttempted = true;
+            publishInput = input;
+            events.push('publish');
+            await publishGate.promise;
+            events.push('published');
+            return { ownerKey: 'test-owner', logPath: '/workspace/.ploinky/logs/task.log' };
+        },
+        async log(stream, chunk) { events.push(`log:${stream}:${chunk}`); },
+        async heartbeat() { return true; },
+        async terminal({ terminalState }) {
+            events.push(`terminal:${terminalState}`);
+            await terminalGate.promise;
+            events.push('terminal-proven');
+        },
+    };
+    const child = pipedFakeChild(4242);
+    const processControl = fakeProcessControl(child);
+    const runtime = createProviderTaskRuntime({
+        credentialContext: context,
+        brokerRegistry: registry,
+        mode: 'task',
+        provider: 'opencode',
+        taskId: 'task-lifecycle-order',
+        audience: `${PRINCIPAL}/execute-task`,
+        onSpawn() {
+            admitted = true;
+            events.push('admitted');
+        },
+        ...runtimeIdentityOptions({
+            createProviderTaskLifecycleClient: () => lifecycleClient,
+        }),
+    });
+    const launchPromise = runtime.spawnWith(async (_input, lifecycle) => {
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
+        lifecycle.onSpawn(child, processControl);
+        return {
+            child,
+            processControl,
+            completion: rawCompletion.promise,
+            launch: {
+                helper: '/usr/local/libexec/ploinky-bwrap-launch',
+                provider: 'opencode',
+                mode: 'task',
+                workdir: 'projects/alpha',
+                cwd: '/workspace/projects/alpha',
+            },
+        };
+    }, { workdir: 'projects/alpha' });
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(admitted, false);
+    assert.deepEqual(events, ['publish']);
+    assert.deepEqual(publishInput, {
+        runtimeKind: 'bwrap',
+        runtimeKey: INSTANCE,
+        homeKey: `${INSTANCE}.sandbox-v2`,
+        workdir: '/workspace/projects/alpha',
+        ownership: {
+            pid: 4242,
+            processGroupId: 4242,
+            processIdentity: TEST_IDENTITY,
+            processUid: TEST_UID,
+        },
+    });
+    publishGate.resolve();
+    const handle = await launchPromise;
+    assert.equal(admitted, true);
+    assert.deepEqual(events, ['publish', 'published', 'admitted']);
+
+    child.stdout.write('safe-out');
+    child.stderr.write('safe-err');
+    child.stdout.end();
+    child.stderr.end();
+    await new Promise((resolve) => setImmediate(resolve));
+    rawCompletion.resolve({ code: 0, signal: null });
+    let settled = false;
+    void handle.completion.then(() => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.deepEqual(events, [
+        'publish', 'published', 'admitted',
+        'log:stdout:safe-out', 'log:stderr:safe-err', 'terminal:completed',
+    ]);
+    terminalGate.resolve();
+    assert.deepEqual(await handle.completion, { code: 0, signal: null });
+    assert.equal(settled, true);
+    assert.equal(events.at(-1), 'terminal-proven');
+    await runtime.close();
+});
+
+test('provider runtime contains lifecycle bridge death and preserves non-retained failure after terminal removal', async (t) => {
+    const context = credentialContext();
+    const registry = await startScopedSoulBrokerRegistry({ credentialContext: context });
+    t.after(() => registry.close());
+    const rawCompletion = deferred();
+    const child = pipedFakeChild(4342);
+    const processControl = fakeProcessControl(child);
+    let bridgeFailureCallback;
+    let terminalCalls = 0;
+    const bridgeError = Object.assign(new Error('Router bridge failed'), {
+        code: 'PLOINKY_PROVIDER_LIFECYCLE_HEARTBEAT_FAILED',
+        ownershipRetained: true,
+    });
+    const runtime = createProviderTaskRuntime({
+        credentialContext: context,
+        brokerRegistry: registry,
+        mode: 'task',
+        provider: 'opencode',
+        taskId: 'task-bridge-death',
+        audience: `${PRINCIPAL}/execute-task`,
+        ...runtimeIdentityOptions({
+            createProviderTaskLifecycleClient(options) {
+                bridgeFailureCallback = options.onBridgeFailure;
+                return {
+                    publicationAttempted: true,
+                    async publish() {},
+                    async log() {},
+                    async terminal() {
+                        terminalCalls += 1;
+                        const error = Object.assign(new Error('bridge failed before removal'), {
+                            code: 'PLOINKY_PROVIDER_LIFECYCLE_BRIDGE_FAILED',
+                            ownershipRetained: false,
+                        });
+                        throw error;
+                    },
+                };
+            },
+        }),
+    });
+    const handle = await runtime.spawnWith(async (_input, lifecycle) => {
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
+        lifecycle.onSpawn(child, processControl);
+        return {
+            child,
+            processControl,
+            completion: rawCompletion.promise,
+            launch: {
+                helper: '/usr/local/libexec/ploinky-bwrap-launch',
+                provider: 'opencode',
+                mode: 'task',
+                workdir: 'projects/alpha',
+                cwd: '/workspace/projects/alpha',
+            },
+        };
+    }, { workdir: 'projects/alpha' });
+
+    assert.equal(typeof bridgeFailureCallback, 'function');
+    bridgeFailureCallback(bridgeError);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(processControl.signals.includes('terminate'), true);
+    rawCompletion.resolve({ code: null, signal: 'SIGTERM' });
+    await assert.rejects(
+        handle.completion,
+        (error) => error?.code === 'PLOINKY_PROVIDER_RUNTIME_LIFECYCLE_FAILED'
+            && error.ownershipRetained === false,
+    );
+    assert.equal(terminalCalls, 1);
+    await runtime.close();
+});
+
+test('provider runtime fails the task without retaining ownership when logs fail but terminal removal succeeds', async (t) => {
+    const context = credentialContext();
+    const registry = await startScopedSoulBrokerRegistry({ credentialContext: context });
+    t.after(() => registry.close());
+    const rawCompletion = deferred();
+    const child = pipedFakeChild(4442);
+    const processControl = fakeProcessControl(child);
+    let terminalCalls = 0;
+    const runtime = createProviderTaskRuntime({
+        credentialContext: context,
+        brokerRegistry: registry,
+        mode: 'task',
+        provider: 'opencode',
+        taskId: 'task-log-bridge-failure',
+        audience: `${PRINCIPAL}/execute-task`,
+        ...runtimeIdentityOptions({
+            createProviderTaskLifecycleClient: () => ({
+                publicationAttempted: true,
+                async publish() {},
+                async log() { throw new Error('log bridge unavailable'); },
+                async terminal() { terminalCalls += 1; },
+            }),
+        }),
+    });
+    const handle = await runtime.spawnWith(async (_input, lifecycle) => {
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
+        lifecycle.onSpawn(child, processControl);
+        return {
+            child,
+            processControl,
+            completion: rawCompletion.promise,
+            launch: {
+                helper: '/usr/local/libexec/ploinky-bwrap-launch',
+                provider: 'opencode',
+                mode: 'task',
+                workdir: 'projects/alpha',
+                cwd: '/workspace/projects/alpha',
+            },
+        };
+    }, { workdir: 'projects/alpha' });
+    child.stdout.end('redacted-public-output');
+    await new Promise((resolve) => setImmediate(resolve));
+    rawCompletion.resolve({ code: 0, signal: null });
+
+    await assert.rejects(
+        handle.completion,
+        (error) => error?.code === 'PLOINKY_PROVIDER_RUNTIME_LIFECYCLE_FAILED'
+            && error.ownershipRetained === false,
+    );
+    assert.equal(terminalCalls, 1);
+    await runtime.close();
+});
+
 test('provider runtime rejects an already-aborted launch before invoking any provider spawn adapter', async (t) => {
     for (const provider of ['codex', 'opencode', 'pi']) {
         await t.test(provider, async (providerTest) => {
@@ -153,7 +412,7 @@ test('provider runtime rejects an already-aborted launch before invoking any pro
                 brokerRegistry: registry,
                 mode: 'task',
                 provider,
-                taskId: `task:pre-aborted:${provider}`,
+                taskId: `task-pre-aborted-${provider}`,
                 audience: `${PRINCIPAL}/execute-task`,
                 signal: controller.signal,
                 ...runtimeIdentityOptions(),
@@ -188,7 +447,7 @@ test('provider runtime propagates its trusted signal across asynchronous adapter
         brokerRegistry: registry,
         mode: 'task',
         provider: 'codex',
-        taskId: 'task:adapter-bootstrap-abort',
+        taskId: 'task-adapter-bootstrap-abort',
         audience: `${PRINCIPAL}/execute-task`,
         signal: controller.signal,
         ...runtimeIdentityOptions(),
@@ -222,7 +481,7 @@ test('provider runtime keeps context and broker private and activates only at th
         brokerRegistry: registry,
         mode: 'task',
         provider: 'opencode',
-        taskId: 'task:1',
+        taskId: 'task-1',
         audience: `${PRINCIPAL}/execute-task`,
         onSpawn: (child) => spawned.push(child.pid),
         ...runtimeIdentityOptions(),
@@ -249,7 +508,7 @@ test('provider runtime keeps context and broker private and activates only at th
         adapterInput = input;
         adapterLifecycle = lifecycle;
         assert.equal(await requestBroker(input.environment, { model: 'invalid' }), 401);
-        lifecycle.activateCapability({ provider: 'opencode', mode: 'task' });
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
         assert.equal(await requestBroker(input.environment, { model: 'invalid' }), 400);
         const child = fakeChild();
         const processControl = fakeProcessControl(child);
@@ -326,12 +585,12 @@ test('provider child lifecycle listeners cannot recover the raw child receiver o
         brokerRegistry: registry,
         mode: 'task',
         provider: 'opencode',
-        taskId: 'task:listener-facade',
+        taskId: 'task-listener-facade',
         audience: `${PRINCIPAL}/execute-task`,
         ...runtimeIdentityOptions(),
     });
     const handle = await runtime.spawnWith(async (_input, lifecycle) => {
-        lifecycle.activateCapability({ provider: 'opencode', mode: 'task' });
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
         lifecycle.onSpawn(rawChild, processControl);
         return {
             child: rawChild,
@@ -415,7 +674,7 @@ test('provider runtime keeps raw retained-process authority private and retries 
         brokerRegistry: registry,
         mode: 'task',
         provider: 'opencode',
-        taskId: 'task:retained-private',
+        taskId: 'task-retained-private',
         audience: `${PRINCIPAL}/execute-task`,
         ...runtimeIdentityOptions(),
     });
@@ -460,10 +719,10 @@ test('retained operation controller hides process identity and is claimable exac
         brokerRegistry: registry,
         mode: 'operation',
         provider: 'codex',
-        taskId: 'operation:login-start',
+        taskId: 'operation-login-start',
         audience: `${PRINCIPAL}/login_start`,
         async spawnProviderSandbox(_input, lifecycle) {
-            lifecycle.activateCapability({ provider: 'codex', mode: 'operation' });
+            lifecycle.activateCapability(activationMetadata('codex', 'operation'));
             const child = pipedFakeChild(8361);
             const processControl = fakeProcessControl(child);
             lifecycle.onSpawn(child, processControl);
@@ -514,7 +773,7 @@ test('provider runtime rejects lifecycle/context overrides and wrong-boundary ac
         brokerRegistry: registry,
         mode: 'task',
         provider: 'pi',
-        taskId: 'task:2',
+        taskId: 'task-2',
         audience: `${PRINCIPAL}/execute-task`,
         ...runtimeIdentityOptions(),
     });
@@ -528,7 +787,7 @@ test('provider runtime rejects lifecycle/context overrides and wrong-boundary ac
     );
     await assert.rejects(
         runtime.spawnWith(async (_input, lifecycle) => {
-            lifecycle.activateCapability({ provider: 'opencode', mode: 'task' });
+            lifecycle.activateCapability(activationMetadata('opencode', 'task'));
         }, { workdir: 'projects/alpha' }),
         { code: 'PLOINKY_PROVIDER_RUNTIME_BOUNDARY_INVALID' },
     );
@@ -544,7 +803,7 @@ test('provider runtime rejects adapters that bypass canonical helper activation'
         brokerRegistry: registry,
         mode: 'task',
         provider: 'codex',
-        taskId: 'task:3',
+        taskId: 'task-3',
         audience: `${PRINCIPAL}/execute-task`,
         ...runtimeIdentityOptions(),
     });
@@ -581,12 +840,12 @@ test('floating launch is not a pure control and close waits for exact pending-la
         brokerRegistry: registry,
         mode: 'operation',
         provider: 'pi',
-        taskId: 'operation:floating-close',
+        taskId: 'operation-floating-close',
         audience: `${PRINCIPAL}/login_status`,
         async spawnProviderSandbox(_input, lifecycle) {
             adapterEntered.resolve();
             await adapterGate.promise;
-            lifecycle.activateCapability({ provider: 'pi', mode: 'operation' });
+            lifecycle.activateCapability(activationMetadata('pi', 'operation'));
             const child = pipedFakeChild(8585);
             const processControl = fakeProcessControl(child);
             lifecycle.onSpawn(child, processControl);
@@ -630,14 +889,14 @@ test('provider runtime accepts a canonical helper that exits and revokes before 
         brokerRegistry: registry,
         mode: 'task',
         provider: 'opencode',
-        taskId: 'task:fast-exit',
+        taskId: 'task-fast-exit',
         audience: `${PRINCIPAL}/execute-task`,
         ...runtimeIdentityOptions(),
     });
     let environment;
     const handle = await runtime.spawnWith(async (input, lifecycle) => {
         environment = input.environment;
-        lifecycle.activateCapability({ provider: 'opencode', mode: 'task' });
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
         assert.equal(await requestBroker(environment, { model: 'invalid' }), 400);
         lifecycle.deactivateCapability();
         const child = fakeChild(6262);
@@ -671,13 +930,13 @@ test('provider runtime binds a private named operation to the exact operation sa
         brokerRegistry: registry,
         mode: 'operation',
         provider: 'codex',
-        taskId: 'operation:models',
+        taskId: 'operation-models',
         audience: `${PRINCIPAL}/openai.models`,
         ...runtimeIdentityOptions(),
     });
     const handle = await runtime.spawnWith(async (_input, lifecycle) => {
         assert.equal(lifecycle.leaseMetadata.mode, 'operation');
-        lifecycle.activateCapability({ provider: 'codex', mode: 'operation' });
+        lifecycle.activateCapability(activationMetadata('codex', 'operation'));
         const child = fakeChild(6363);
         const processControl = fakeProcessControl(child);
         lifecycle.onSpawn(child, processControl);
@@ -710,14 +969,14 @@ test('provider runtime resolves trusted HOME state under lease then revalidates 
         brokerRegistry: registry,
         mode: 'operation',
         provider: 'pi',
-        taskId: 'continuation:1',
+        taskId: 'continuation-1',
         audience: `${PRINCIPAL}/continue-task`,
         async withCredentialProviderHomeLease(input, callback) {
             assert.equal(input.credentialContext, context);
             assert.deepEqual({ ...input, credentialContext: undefined }, {
                 credentialContext: undefined,
                 provider: 'pi',
-                taskId: 'continuation:1',
+                taskId: 'continuation-1',
                 audience: `${PRINCIPAL}/continue-task`,
             });
             return callback(Object.freeze({
@@ -775,7 +1034,7 @@ test('provider runtime resolves trusted HOME state under lease then revalidates 
             homePath: '/home/agent',
             runtimeKind: 'bwrap',
         });
-        lifecycle.activateCapability({ provider: 'pi', mode: 'task' });
+        lifecycle.activateCapability(activationMetadata('pi', 'task'));
         const child = pipedFakeChild(8102);
         const processControl = fakeProcessControl(child);
         lifecycle.onSpawn(child, processControl);
@@ -817,7 +1076,7 @@ test('provider runtime never resolves or transitions after a failed HOME resolve
         brokerRegistry: registry,
         mode: 'task',
         provider: 'opencode',
-        taskId: 'task:no-transition',
+        taskId: 'task-no-transition',
         audience: `${PRINCIPAL}/execute-task`,
         ...runtimeIdentityOptions(),
     });
@@ -840,7 +1099,7 @@ test('provider runtime never resolves or transitions after a failed HOME resolve
         brokerRegistry: registry,
         mode: 'operation',
         provider: 'codex',
-        taskId: 'continuation:failed',
+        taskId: 'continuation-failed',
         audience: `${PRINCIPAL}/continue-task`,
         async withCredentialProviderHomeLease(_input, callback) {
             return callback(Object.freeze({
@@ -877,7 +1136,7 @@ test('provider runtime can explicitly continue a revalidated operation after tru
         brokerRegistry: registry,
         mode: 'operation',
         provider: 'opencode',
-        taskId: 'operation:login-control',
+        taskId: 'operation-login-control',
         audience: `${PRINCIPAL}/login_status`,
         async withCredentialProviderHomeLease(_input, callback) {
             return callback(Object.freeze({
@@ -913,7 +1172,7 @@ test('provider runtime can explicitly continue a revalidated operation after tru
             homePath: '/home/agent',
             runtimeKind: 'bwrap',
         });
-        lifecycle.activateCapability({ provider: 'opencode', mode: 'operation' });
+        lifecycle.activateCapability(activationMetadata('opencode', 'operation'));
         const child = pipedFakeChild(8401);
         const processControl = fakeProcessControl(child);
         lifecycle.onSpawn(child, processControl);
@@ -951,7 +1210,7 @@ test('provider runtime redacts broker and private provider credentials across ou
         brokerRegistry: registry,
         mode: 'task',
         provider: 'opencode',
-        taskId: 'task:redaction',
+        taskId: 'task-redaction',
         audience: `${PRINCIPAL}/execute-task`,
         ...runtimeIdentityOptions(),
     });
@@ -963,7 +1222,7 @@ test('provider runtime redacts broker and private provider credentials across ou
         rawChild = pipedFakeChild(7272);
         const processControl = fakeProcessControl(rawChild);
         lifecycle.onSpawn(rawChild, processControl);
-        lifecycle.activateCapability({ provider: 'opencode', mode: 'task' });
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
         return {
             child: rawChild,
             processControl,
@@ -1013,7 +1272,7 @@ test('provider runtime retains capability ownership and blocks relaunch after un
         brokerRegistry: registry,
         mode: 'task',
         provider: 'opencode',
-        taskId: 'task:retained-termination',
+        taskId: 'task-retained-termination',
         audience: `${PRINCIPAL}/execute-task`,
         signal: abortController.signal,
         ...runtimeIdentityOptions(),
@@ -1036,7 +1295,7 @@ test('provider runtime retains capability ownership and blocks relaunch after un
     });
     await runtime.spawnWith(async (input, lifecycle) => {
         environment = input.environment;
-        lifecycle.activateCapability({ provider: 'opencode', mode: 'task' });
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
         lifecycle.onSpawn(child, processControl);
         return {
             child,
@@ -1096,11 +1355,11 @@ test('provider runtime retries exact retained cleanup after an unproven close at
         brokerRegistry: registry,
         mode: 'operation',
         provider: 'codex',
-        taskId: 'operation:retry-retained-cleanup',
+        taskId: 'operation-retry-retained-cleanup',
         audience: `${PRINCIPAL}/login_start`,
         spawnProviderSandbox: async (_input, lifecycle) => {
             lifecycle.onSpawn(child, processControl);
-            lifecycle.activateCapability({ provider: 'codex', mode: 'operation' });
+            lifecycle.activateCapability(activationMetadata('codex', 'operation'));
             return {
                 child,
                 processControl,
@@ -1136,7 +1395,7 @@ test('provider runtime revokes capability after proven termination even when com
         brokerRegistry: registry,
         mode: 'task',
         provider: 'opencode',
-        taskId: 'task:ordinary-completion-error',
+        taskId: 'task-ordinary-completion-error',
         audience: `${PRINCIPAL}/execute-task`,
         ...runtimeIdentityOptions(),
     });
@@ -1159,7 +1418,7 @@ test('provider runtime revokes capability after proven termination even when com
     });
     await runtime.spawnWith(async (input, lifecycle) => {
         environment = input.environment;
-        lifecycle.activateCapability({ provider: 'opencode', mode: 'task' });
+        lifecycle.activateCapability(activationMetadata('opencode', 'task'));
         lifecycle.onSpawn(child, processControl);
         return {
             child,
