@@ -178,8 +178,9 @@ export function stageSmokeGraph({
         }
     }
     runner.run(engine, [
-        'container', 'exec', '--user', 'podman', '--workdir', '/workspace', containerId,
-        '/opt/ploinky/bin/ploinky-local', 'list', 'agents',
+        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
+        '--env', 'PLOINKY_WORKSPACE_ROOT=/workspace', containerId,
+        'node', '/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs',
     ]);
     const desiredDirectory = '/workspace/.ploinky/data/edge-routing';
     const desiredTarget = `${desiredDirectory}/desired.json`;

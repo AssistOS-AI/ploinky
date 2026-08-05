@@ -66,8 +66,8 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
     assert.ok(copyCalls.every((call) => !call.at(-1).endsWith('/AssistOSExplorer')));
     assert.ok(copyCalls.some((call) => call.at(-1).endsWith('/desired.json.smoke-candidate')));
     const initializeIndex = calls.findIndex((call) => (
-        call.includes('/opt/ploinky/bin/ploinky-local')
-        && call.slice(-2).join(' ') === 'list agents'
+        call.includes('/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs')
+        && call.includes('PLOINKY_WORKSPACE_ROOT=/workspace')
     ));
     const desiredCopyIndex = calls.findIndex((call) => (
         call[1] === 'container'

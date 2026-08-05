@@ -122,8 +122,8 @@ test('staging initializes all sources, verifies bytes before activation, and is 
     }
 
     const firstInitialize = calls.findIndex((call) => (
-        call.includes('/opt/ploinky/bin/ploinky-local')
-        && call.slice(-2).join(' ') === 'list agents'
+        call.includes('/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs')
+        && call.includes('PLOINKY_WORKSPACE_ROOT=/workspace')
     ));
     const firstCopy = calls.findIndex((call) => call.includes('cp'));
     const stagedDigest = calls.findIndex((call) => (

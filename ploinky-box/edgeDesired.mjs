@@ -116,8 +116,9 @@ export function stageWorkspaceEdgeDesired({
     const stagedTarget = `${desiredTarget}.box-candidate`;
 
     runner.run(engineName, [
-        'container', 'exec', '--user', 'podman', '--workdir', '/workspace', containerId,
-        '/opt/ploinky/bin/ploinky-local', 'list', 'agents',
+        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
+        '--env', 'PLOINKY_WORKSPACE_ROOT=/workspace', containerId,
+        'node', '/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs',
     ]);
     runner.run(engineName, [
         'container', 'exec', '--user', 'podman', containerId,
