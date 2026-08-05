@@ -24,7 +24,21 @@ function containerLogDiagnostic(logs, limit = 2048) {
         .replace(/\s+/g, ' ');
     if (!text) return 'container logs were empty';
     const bounded = text.length <= limit ? text : `…${text.slice(-limit)}`;
-    return `container logs: ${bounded}`;
+    const deviceHint = /\/dev\/net\/tun (?:not present|is missing or inaccessible)/.test(text)
+        ? '; /dev/net/tun must exist on the host and be accessible inside the Box for nested networking. Verify that Podman recorded both --device /dev/net/tun and --security-opt label=disable'
+        : /\/dev\/fuse (?:not present|is missing or inaccessible)/.test(text)
+            ? '; /dev/fuse must exist on the host and be accessible inside the Box for nested container storage. Verify that Podman recorded both --device /dev/fuse and --security-opt label=disable'
+            : '';
+    return `container logs: ${bounded}${deviceHint}`;
+}
+
+function writeLogDelta(output, currentValue, previousValue) {
+    const current = String(currentValue || '');
+    const previous = String(previousValue || '');
+    if (!current || current === previous) return current;
+    const delta = current.startsWith(previous) ? current.slice(previous.length) : current;
+    output?.write?.(delta);
+    return current;
 }
 
 export function containerCreateArgs({
@@ -51,7 +65,7 @@ export function containerCreateArgs({
         '--device', '/dev/fuse',
         '--device', '/dev/net/tun',
         '--security-opt', 'unmask=ALL',
-        ...(hostKind === 'podman-machine' ? ['--security-opt', 'label=disable'] : []),
+        '--security-opt', 'label=disable',
         '--publish', `127.0.0.1:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
         '--publish', `0.0.0.0:${BOX_MEDIA_PORT}:${BOX_MEDIA_PORT}/udp`,
         '--volume', `${source}:/opt/ploinky:ro`,
@@ -127,10 +141,18 @@ export async function waitForReadyLine(engine, containerId, runner, {
     timeoutMs = 60_000,
     intervalMs = 100,
     delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    stdout = process.stdout,
+    stderr = process.stderr,
 } = {}) {
     const deadline = Date.now() + timeoutMs;
+    let emittedStdout = '';
+    let emittedStderr = '';
     while (Date.now() <= deadline) {
         const logs = runner.query(engine.name, ['container', 'logs', containerId]);
+        if (logs.ok) {
+            emittedStdout = writeLogDelta(stdout, logs.stdout, emittedStdout);
+            emittedStderr = writeLogDelta(stderr, logs.stderr, emittedStderr);
+        }
         if (logs.ok && String(logs.stdout || '').split(/\r?\n/).includes(readyLine)) {
             return;
         }

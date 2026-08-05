@@ -200,7 +200,7 @@ export function validateContainerConfiguration(containerHandle, {
     }
     const expectedSecurityOptions = [
         'unmask=all',
-        ...(hostKind === 'podman-machine' ? ['label=disable'] : []),
+        'label=disable',
     ].sort();
     if (!Array.isArray(runtime.securityOptions)
         || JSON.stringify(runtime.securityOptions.map((value) => value.toLowerCase()).sort())

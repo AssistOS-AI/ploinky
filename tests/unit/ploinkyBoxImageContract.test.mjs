@@ -149,3 +149,13 @@ test('image contract requires cloudflared and entrypoint validates token-file su
     assert.match(entrypoint, /--token-file/);
     assert.match(entrypoint, /EXPECTED_CLOUDFLARED_VERSION/);
 });
+
+test('entrypoint reports actionable device and SELinux diagnostics', () => {
+    const entrypoint = fs.readFileSync(path.resolve(
+        import.meta.dirname,
+        '../../ploinky-box/entrypoint/ploinky-box-entrypoint',
+    ), 'utf8');
+    assert.match(entrypoint, /missing or inaccessible inside ploinky-box/);
+    assert.match(entrypoint, /Podman accepted --device \$device/);
+    assert.match(entrypoint, /SELinux hosts the Box also requires --security-opt label=disable/);
+});

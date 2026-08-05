@@ -72,7 +72,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
             status: running ? 'running' : 'exited',
             init: true,
             privileged: false,
-            securityOptions: ['unmask=ALL'],
+            securityOptions: ['label=disable', 'unmask=ALL'],
             devices: [
                 { hostPath: '/dev/fuse', containerPath: '/dev/fuse', permissions: 'rwm' },
                 { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
@@ -135,14 +135,6 @@ test('Podman Machine validation tolerates its omitted device inspection only', (
         () => validateContainerConfiguration(handle, desired),
         /device set is incompatible/,
     );
-    assert.throws(
-        () => validateContainerConfiguration(handle, {
-            ...desired,
-            hostKind: 'podman-machine',
-        }),
-        /security options are incompatible/,
-    );
-    handle.runtime.securityOptions = ['label=disable', 'unmask=ALL'];
     handle.runtime.createCommand = [
         'podman', 'container', 'create',
         '--device', '/dev/fuse', '--device', '/dev/net/tun',
@@ -205,21 +197,23 @@ test('omitted device inspection requires the exact recorded device arguments', (
     );
 });
 
-test('Podman Machine container argv disables only its outer SELinux label confinement', (t) => {
+test('Box container argv disables outer SELinux label confinement on every supported host', (t) => {
     const state = fixture(t);
-    const args = containerCreateArgs({
-        identity: state.identity,
-        imageId: 'a'.repeat(64),
-        imageRef: 'runtime',
-        hostPort: 19090,
-        repositoryRoot: state.root,
-        cidfile: path.join(state.root, 'candidate.cid'),
-        hostKind: 'podman-machine',
-    });
-    assert.deepEqual(args.flatMap((value, index) => (
-        value === '--security-opt' ? [args[index + 1]] : []
-    )), ['unmask=ALL', 'label=disable']);
-    assert.equal(args.includes('--privileged'), false);
+    for (const hostKind of ['native-linux', 'podman-machine']) {
+        const args = containerCreateArgs({
+            identity: state.identity,
+            imageId: 'a'.repeat(64),
+            imageRef: 'runtime',
+            hostPort: 19090,
+            repositoryRoot: state.root,
+            cidfile: path.join(state.root, 'candidate.cid'),
+            hostKind,
+        });
+        assert.deepEqual(args.flatMap((value, index) => (
+            value === '--security-opt' ? [args[index + 1]] : []
+        )), ['unmask=ALL', 'label=disable']);
+        assert.equal(args.includes('--privileged'), false);
+    }
 });
 
 function harness(state, {
@@ -238,7 +232,6 @@ function harness(state, {
     const runner = {
         run(command, args) {
             calls.push(['run', command, ...args]);
-            if (args[0] === 'pull' && failPull) throw new Error('pull failed');
             if (args[0] === 'container' && args[1] === 'create') {
                 if (failCreate) throw new Error('create race');
                 createCount += 1;
@@ -261,6 +254,13 @@ function harness(state, {
             if (args[0] === 'container' && args[1] === 'start') current.runtime.running = true;
             if (args[0] === 'container' && args[1] === 'stop') current.runtime.running = false;
             if (args[0] === 'container' && args[1] === 'rm') current = null;
+        },
+        async stream(command, args) {
+            calls.push(['stream', command, ...args]);
+            if (args[0] === 'pull' && failPull) {
+                return { ok: false, status: 125, stdout: '', stderr: 'pull failed' };
+            }
+            return { ok: true, status: 0, stdout: 'pull complete\n', stderr: '' };
         },
         query(command, args) {
             calls.push(['query', command, ...args]);
@@ -312,7 +312,7 @@ function harness(state, {
     return { runner, seams, calls, current: () => current };
 }
 
-test('container argv is exact, least-privileged, and ends with immutable image ID', (t) => {
+test('container argv is exact, unprivileged, and ends with immutable image ID', (t) => {
     const state = fixture(t);
     const cidfile = path.join(state.lock.path, 'candidate.cid');
     const args = containerCreateArgs({
@@ -331,6 +331,7 @@ test('container argv is exact, least-privileged, and ends with immutable image I
     assert.equal(args.includes('127.0.0.1:19090:8080/tcp'), true);
     assert.equal(args.includes('0.0.0.0:7882:7882/udp'), true);
     assert.equal(args.includes('unmask=ALL'), true);
+    assert.equal(args.includes('label=disable'), true);
     assert.equal(args.includes('/dev/fuse'), true);
     assert.equal(args.includes('/dev/net/tun'), true);
     assert.equal(args.filter((value) => value.endsWith(':U')).length, 3);
@@ -371,8 +372,8 @@ test('initial transaction preflights before pull, volumes, and container creatio
     }, h.seams);
     assert.equal(result.action, 'created');
     const flat = h.calls.map((call) => call.join(' '));
-    assert.ok(flat.findIndex((value) => value.includes('preflight')) < flat.findIndex((value) => value.includes('run podman pull')));
-    assert.ok(flat.findIndex((value) => value.includes('run podman pull')) < flat.findIndex((value) => value.includes('ensure-volumes')));
+    assert.ok(flat.findIndex((value) => value.includes('preflight')) < flat.findIndex((value) => value.includes('stream podman pull')));
+    assert.ok(flat.findIndex((value) => value.includes('stream podman pull')) < flat.findIndex((value) => value.includes('ensure-volumes')));
     assert.ok(flat.findIndex((value) => value.includes('ensure-volumes')) < flat.findIndex((value) => value.includes('container create')));
 });
 
@@ -603,6 +604,57 @@ test('readiness failure rereads bounded container self-check diagnostics after e
         /container logs: \[ploinky-box\] SELF-CHECK FAILED: inner runtime is unavailable/,
     );
     assert.equal(logReads, 2);
+});
+
+test('readiness explains legacy TUN self-check failures as an access problem', async () => {
+    const runner = {
+        query(_command, args) {
+            if (args[1] === 'logs') {
+                return {
+                    ok: true,
+                    stdout: '',
+                    stderr: '[ploinky-box] SELF-CHECK FAILED: /dev/net/tun not present\n',
+                };
+            }
+            return { ok: true, stdout: 'exited\n', stderr: '' };
+        },
+    };
+    await assert.rejects(
+        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+            stdout: { write() {} },
+            stderr: { write() {} },
+        }),
+        /must exist on the host and be accessible inside the Box for nested networking.*label=disable/,
+    );
+});
+
+test('readiness streams each Box log line once before readiness', async () => {
+    const stdout = { value: '', write(chunk) { this.value += String(chunk); } };
+    const stderr = { value: '', write(chunk) { this.value += String(chunk); } };
+    let logReads = 0;
+    const runner = {
+        query(_command, args) {
+            if (args[1] === 'logs') {
+                logReads += 1;
+                return logReads === 1
+                    ? { ok: true, stdout: '[ploinky-box] Starting runtime self-checks\n', stderr: '' }
+                    : {
+                        ok: true,
+                        stdout: `[ploinky-box] Starting runtime self-checks\n${BOX_READY_LINE}\n`,
+                        stderr: '[ploinky-box] diagnostic\n',
+                    };
+            }
+            return { ok: true, stdout: 'running\n', stderr: '' };
+        },
+    };
+    await waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+        stdout,
+        stderr,
+        intervalMs: 0,
+        delay: async () => {},
+    });
+    assert.equal(stdout.value, `[ploinky-box] Starting runtime self-checks\n${BOX_READY_LINE}\n`);
+    assert.equal(stderr.value, '[ploinky-box] diagnostic\n');
 });
 
 test('a corrupt cidfile can recover only through rediscovered immutable image identity', async (t) => {
