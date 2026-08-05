@@ -16,6 +16,7 @@ import {
     isGenerationCapabilityRuntimeEffective,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
+    startAgentContainer,
     stripReservedAndRestoreRuntimeRouterEnvFlags,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
 import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
@@ -116,6 +117,23 @@ test('managed semantic-adoption preparation rejection uses canonical abort recov
         source.slice(rejection, throwInvalid),
         /abortEdgeRoutingPreparation\s*\(/,
     );
+});
+
+test('managed failure cleanup never promotes a raw observed predecessor ID to cleanup authority', () => {
+    const startSource = startAgentContainer.toString();
+    assert.match(startSource, /cleanupCandidateId = retryableCleanupCandidateId\(/);
+    assert.match(startSource, /containerId: cleanupCandidateId/);
+    assert.doesNotMatch(
+        startSource,
+        /managedRecovery\?\.candidateId \? \{ containerId: managedRecovery\.candidateId \}/,
+    );
+
+    const ensureSource = ensureAgentService.toString();
+    const authorization = ensureSource.indexOf('candidateId = retryableCleanupCandidateId');
+    const removal = ensureSource.indexOf('removeExactGenerationCandidate', authorization);
+    assert.ok(authorization >= 0);
+    assert.ok(removal > authorization);
+    assert.match(ensureSource, /containerId: candidateId/);
 });
 
 test('Box host-gateway compatibility does not duplicate the managed network mapping', () => {

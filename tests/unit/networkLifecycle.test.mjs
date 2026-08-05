@@ -1116,6 +1116,129 @@ test('fresh semantic adoption reuses one exact immutable runtime without stop, r
     assert.equal(harness.calls.slice(callsBefore).some((args) => ['stop', 'rm', 'create'].includes(args[0])), false);
 });
 
+test('semantic adoption attestation timeout preserves the exact predecessor without creating a candidate', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const plan = harness.adapter.prepare(network, 'demo');
+    const id = 'timeout123456789';
+    const predecessor = managedAgentRecord({
+        id,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: { [plan.attachments[0].name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+        running: true,
+    });
+    harness.containers.set(id, predecessor);
+    const callsBefore = harness.calls.length;
+    const timeout = new Error('semantic adoption attestation timed out');
+    timeout.code = 'ETIMEDOUT';
+
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        inspectAdoption() { throw timeout; },
+        createContainer: () => assert.fail('failed adoption must not create a candidate runtime'),
+        beforeFailureCleanup(evidence) {
+            assert.equal(evidence.candidateCreationAttempted, false);
+            assert.equal(evidence.candidatePresent, true);
+            assert.equal(evidence.candidateId, id);
+            assert.equal(evidence.candidateInspectionComplete, true);
+            assert.equal(evidence.candidateOwned, true);
+        },
+    }), (error) => {
+        assert.equal(error, timeout);
+        assert.equal(error.ploinkyManagedFailureRecovery?.candidateCreationAttempted, false);
+        assert.equal(error.ploinkyManagedFailureRecovery?.candidatePresent, true);
+        assert.equal(error.ploinkyManagedFailureRecovery?.candidateId, id);
+        assert.equal(error.ploinkyManagedFailureRecovery?.candidateInspectionComplete, true);
+        assert.equal(error.ploinkyManagedFailureRecovery?.candidateOwned, true);
+        return true;
+    });
+
+    assert.equal(harness.containers.get(id), predecessor);
+    assert.equal(predecessor.State.Running, true);
+    assert.equal(harness.calls.slice(callsBefore).some((args) => (
+        ['create', 'stop', 'rm'].includes(args[0])
+    )), false);
+});
+
+test('managed failure recovery reports successful inspection of an absent candidate', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer() {},
+        beforeFailureCleanup(evidence) {
+            assert.equal(evidence.candidateCreationAttempted, true);
+            assert.equal(evidence.candidateInspectionComplete, true);
+            assert.equal(evidence.candidatePresent, false);
+            assert.equal(evidence.candidateId, '');
+            assert.equal(evidence.candidateOwned, false);
+        },
+    }), (error) => {
+        const recovery = error.ploinkyManagedFailureRecovery;
+        assert.equal(recovery?.candidateCreationAttempted, true);
+        assert.equal(recovery?.candidateInspectionComplete, true);
+        assert.equal(recovery?.candidatePresent, false);
+        assert.equal(recovery?.candidateId, '');
+        assert.equal(recovery?.candidateOwned, false);
+        return true;
+    });
+});
+
+test('managed failure recovery preserves a present owned candidate without an immutable ID', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const candidateKey = 'present-without-id';
+    let candidate;
+    const callsBefore = harness.calls.length;
+
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer(plan) {
+            const primary = plan.attachments[0];
+            candidate = managedAgentRecord({
+                id: '',
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias] } },
+            });
+            harness.containers.set(candidateKey, candidate);
+            harness.networks.get(primary.name).Containers[candidateKey] = { Name: candidate.Name };
+        },
+        beforeFailureCleanup(evidence) {
+            assert.equal(evidence.candidateCreationAttempted, true);
+            assert.equal(evidence.candidateInspectionComplete, true);
+            assert.equal(evidence.candidatePresent, true);
+            assert.equal(evidence.candidateId, '');
+            assert.equal(evidence.candidateOwned, true);
+        },
+    }), (error) => {
+        assert.match(error.message, /immutable container ID is missing/);
+        const recovery = error.ploinkyManagedFailureRecovery;
+        assert.equal(recovery?.candidateCreationAttempted, true);
+        assert.equal(recovery?.candidateInspectionComplete, true);
+        assert.equal(recovery?.candidatePresent, true);
+        assert.equal(recovery?.candidateId, '');
+        assert.equal(recovery?.candidateOwned, true);
+        return true;
+    });
+
+    assert.equal(harness.containers.get(candidateKey), candidate);
+    assert.equal(harness.calls.slice(callsBefore).some((args) => (
+        ['create', 'stop', 'rm'].includes(args[0])
+    )), false);
+});
+
 test('semantic adoption mismatch preserves the exact predecessor for identity rotation', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'default' });

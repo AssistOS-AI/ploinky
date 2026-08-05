@@ -18,7 +18,7 @@ const STATES = new Set([
     'preserved-ambiguous',
 ]);
 const NEXT_PHASES = Object.freeze({
-    resolve: new Set(['predecessor-inspected', 'pre-create', 'create-attempted', 'candidate-observed']),
+    resolve: new Set(['predecessor-inspected', 'pre-create', 'create-attempted', 'candidate-observed', 'readiness']),
     'predecessor-inspected': new Set(['predecessor-removed']),
     'predecessor-removed': new Set(['pre-create']),
     'pre-create': new Set(['create-attempted']),
@@ -32,6 +32,85 @@ function invalidReceipt(message) {
     const error = new Error(message);
     error.code = 'PLOINKY_RUNTIME_CLEANUP_RECEIPT_INVALID';
     return error;
+}
+
+// This classifier is deliberately pure. It may describe a lifecycle
+// transition, but only the private lifecycle owner can mint or advance an
+// authorized cleanup receipt from it.
+export function classifyManagedFailureRecovery(recovery) {
+    const candidateId = typeof recovery?.candidateId === 'string'
+        ? recovery.candidateId.trim()
+        : '';
+    const exactCleanupEvidence = (
+        recovery?.candidatePresent === false
+        && recovery?.candidateOwned === false
+        && recovery?.candidateId === ''
+    ) || (
+        recovery?.candidatePresent === true
+        && recovery?.candidateOwned === true
+        && Boolean(candidateId)
+    );
+    if (recovery?.exactCleanupPerformed === true
+        && recovery?.candidateCreationAttempted === true
+        && recovery?.candidateInspectionComplete === true
+        && exactCleanupEvidence) {
+        return Object.freeze({
+            phase: 'readiness',
+            state: 'removed-proven',
+            candidateId: '',
+            inspectionComplete: true,
+            ownershipProof: Object.freeze({ exactAbsenceProven: true }),
+        });
+    }
+    if (recovery?.exactCleanupPerformed !== true
+        && recovery?.candidateInspectionComplete === true
+        && typeof recovery?.candidateCreationAttempted === 'boolean'
+        && recovery?.candidatePresent === false
+        && recovery?.candidateOwned === false
+        && recovery?.candidateId === '') {
+        return Object.freeze({
+            phase: 'readiness',
+            state: 'absent-proven',
+            candidateId: '',
+            inspectionComplete: true,
+            ownershipProof: Object.freeze({ exactAbsenceProven: true }),
+        });
+    }
+    if (recovery?.exactCleanupPerformed !== true
+        && recovery?.candidateInspectionComplete === true
+        && recovery?.candidatePresent === true
+        && recovery?.candidateOwned === true
+        && candidateId
+        && recovery?.candidateCreationAttempted === false) {
+        return Object.freeze({
+            phase: 'candidate-observed',
+            state: 'not-created-proven',
+            candidateId: '',
+            inspectionComplete: true,
+            ownershipProof: Object.freeze({ adoptedExistingRuntime: true }),
+        });
+    }
+    if (recovery?.exactCleanupPerformed !== true
+        && recovery?.candidateInspectionComplete === true
+        && recovery?.candidatePresent === true
+        && recovery?.candidateOwned === true
+        && candidateId
+        && recovery?.candidateCreationAttempted === true) {
+        return Object.freeze({
+            phase: 'candidate-observed',
+            state: 'retryable-exact-id',
+            candidateId,
+            inspectionComplete: true,
+            ownershipProof: Object.freeze({ immutableId: true }),
+        });
+    }
+    return Object.freeze({
+        phase: 'readiness',
+        state: 'preserved-ambiguous',
+        candidateId: '',
+        inspectionComplete: recovery?.candidateInspectionComplete === true,
+        ownershipProof: Object.freeze({ exactAbsenceProven: false }),
+    });
 }
 
 export function isCandidateCleanupReceiptDocument(receipt) {
@@ -80,7 +159,9 @@ export function assertCandidateLifecycleTransition(previous, next) {
             && Boolean(String(next.candidateId || ''));
         const adoptedCandidate = next.state === 'not-created-proven'
             && next.creationAttempted === false
-            && next.inspectionComplete === true;
+            && next.inspectionComplete === true
+            && !Boolean(String(next.candidateId || ''))
+            && next.ownershipProof?.adoptedExistingRuntime === true;
         if (!exactCandidate && !adoptedCandidate) {
             throw invalidReceipt('candidate-observed requires exact inspected ownership or proven adoption');
         }

@@ -155,6 +155,7 @@ import {
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 import {
     assertCandidateLifecycleTransition,
+    classifyManagedFailureRecovery,
     isCandidateCleanupReceiptDocument,
     RUNTIME_CLEANUP_RECEIPT_VERSION,
 } from '../runtimeCleanupReceipt.js';
@@ -318,43 +319,40 @@ export function abortPreparedRuntimeCandidateBeforeCleanup(candidate, originalFa
 
 function managedFailureCleanupReceipt(receipt, recovery) {
     if (!receipt || !recovery) return receipt;
-    if (recovery.exactCleanupPerformed === true) {
-        return advanceCandidateLifecycle(receipt, {
-            phase: 'readiness',
-            state: 'removed-proven',
-            inspectionComplete: true,
-            ownershipProof: { ...receipt.ownershipProof, exactAbsenceProven: true },
-        });
-    }
-    if (recovery.candidateInspectionComplete === true && !recovery.candidateId) {
-        return advanceCandidateLifecycle(receipt, {
-            phase: 'readiness',
-            state: 'absent-proven',
-            inspectionComplete: true,
-            ownershipProof: { ...receipt.ownershipProof, exactAbsenceProven: true },
-        });
-    }
-    if (recovery.candidateInspectionComplete === true
-        && recovery.candidateOwned === true
-        && recovery.candidateId) {
-        return advanceCandidateLifecycle(receipt, {
-            phase: 'candidate-observed',
-            state: 'retryable-exact-id',
-            candidateId: recovery.candidateId,
-            inspectionComplete: true,
-            ownershipProof: {
-                immutableId: true,
-                instanceId: receipt.runtimeIdentity.instanceId,
-                enableGeneration: receipt.runtimeIdentity.enableGeneration,
-            },
-        });
-    }
+    const transition = classifyManagedFailureRecovery(recovery);
     return advanceCandidateLifecycle(receipt, {
-        phase: 'readiness',
-        state: 'preserved-ambiguous',
-        inspectionComplete: recovery.candidateInspectionComplete === true,
-        ownershipProof: { ...receipt.ownershipProof, exactAbsenceProven: false },
+        ...transition,
+        ownershipProof: {
+            ...receipt.ownershipProof,
+            ...transition.ownershipProof,
+            ...(transition.state === 'retryable-exact-id'
+                ? {
+                    instanceId: receipt.runtimeIdentity.instanceId,
+                    enableGeneration: receipt.runtimeIdentity.enableGeneration,
+                }
+                : {}),
+        },
     });
+}
+
+function retryableCleanupCandidateId(receipt, observedCandidateId = '') {
+    if (!receipt) return '';
+    assertCandidateCleanupReceipt(receipt);
+    if (receipt.phase !== 'candidate-observed'
+        || receipt.state !== 'retryable-exact-id'
+        || receipt.creationAttempted !== true
+        || receipt.inspectionComplete !== true) {
+        return '';
+    }
+    const candidateId = String(receipt.candidateId || '').trim();
+    if (!candidateId) {
+        throw invalidCleanupReceipt('retryable cleanup receipt is missing its immutable candidate ID');
+    }
+    const observed = String(observedCandidateId || '').trim();
+    if (observed && observed !== candidateId) {
+        throw invalidCleanupReceipt('retryable cleanup receipt does not match the observed runtime candidate ID');
+    }
+    return candidateId;
 }
 
 function runtimeCandidateContractHash(admission, runtimeIdentity, network, runtimeKind) {
@@ -1995,9 +1993,20 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 appendExactCleanupFailure(error, `receipt transition: ${receiptError?.message || receiptError}`);
             }
         }
+        let cleanupCandidateId = '';
+        try {
+            cleanupCandidateId = retryableCleanupCandidateId(
+                cleanupReceipt,
+                managedRecovery?.candidateId,
+            );
+        } catch (receiptError) {
+            appendExactCleanupFailure(error, `cleanup authorization: ${receiptError?.message || receiptError}`);
+        }
         let failureCandidate = {
             containerName,
-            ...(managedRecovery?.candidateId ? { containerId: managedRecovery.candidateId } : {}),
+            // Explicitly erase any untrusted/predecessor ID already attached to
+            // the thrown error when the live receipt does not authorize cleanup.
+            containerId: cleanupCandidateId,
             runtimeNetwork: structuredClone(manifestNetwork),
             registryRecord: {
                 type: 'agent',
@@ -3382,7 +3391,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         let exactCleanupPerformed = error?.ploinkyRestartCandidate?.exactCleanupPerformed === true;
         const cleanupReceipt = started?.cleanupReceipt
             || error?.ploinkyRestartCandidate?.cleanupReceipt;
-        const candidateId = String(started?.containerId || error?.ploinkyRestartCandidate?.containerId || '');
+        const observedCandidateId = String(
+            started?.containerId || error?.ploinkyRestartCandidate?.containerId || '',
+        );
+        let candidateId = '';
+        try {
+            candidateId = retryableCleanupCandidateId(cleanupReceipt, observedCandidateId);
+        } catch (receiptError) {
+            appendExactCleanupFailure(error, `cleanup authorization: ${receiptError?.message || receiptError}`);
+        }
         const candidateRecord = started?.registryRecord || error?.ploinkyRestartCandidate?.registryRecord || {
             type: 'agent',
             agentName,
@@ -3394,7 +3411,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         let failureCandidate = {
             ...(error?.ploinkyRestartCandidate || {}),
             containerName,
-            ...(candidateId ? { containerId: candidateId } : {}),
+            // Overwrite, rather than omit, so a prior attached predecessor ID
+            // cannot survive when the receipt authorizes no destructive cleanup.
+            containerId: candidateId,
             runtimeNetwork: structuredClone(manifestNetwork),
             registryRecord: structuredClone(candidateRecord),
             requiresEdgeActivation,

@@ -1122,6 +1122,7 @@ export function createNetworkLifecycleAdapter({
                 plan ||= error?.ploinkyManagedNetworkFailurePlan || null;
                 let candidate = null;
                 let candidateInspectionComplete = false;
+                let candidatePresent = false;
                 let candidateId = '';
                 let candidateOwned = false;
                 let launchArtifactCleanupSafe = false;
@@ -1133,6 +1134,7 @@ export function createNetworkLifecycleAdapter({
                 try {
                     candidate = inspectContainer(containerName);
                     candidateInspectionComplete = true;
+                    candidatePresent = Boolean(candidate);
                     candidateId = String(candidate?.Id || candidate?.ID || '');
                     candidateOwned = Boolean(candidate && hasRequiredLabels(labelsOf(candidate), agentLabels));
                 } catch (inspectError) {
@@ -1142,6 +1144,7 @@ export function createNetworkLifecycleAdapter({
                     try {
                         beforeFailureCleanup(Object.freeze({
                             candidateCreationAttempted,
+                            candidatePresent,
                             candidateId,
                             candidateInspectionComplete,
                             candidateOwned,
@@ -1155,6 +1158,7 @@ export function createNetworkLifecycleAdapter({
                             writable: false,
                             value: Object.freeze({
                                 candidateCreationAttempted,
+                                candidatePresent,
                                 candidateId,
                                 candidateInspectionComplete,
                                 candidateOwned,
@@ -1208,6 +1212,7 @@ export function createNetworkLifecycleAdapter({
                     writable: false,
                     value: Object.freeze({
                         candidateCreationAttempted,
+                        candidatePresent,
                         candidateId,
                         candidateInspectionComplete,
                         candidateOwned,
