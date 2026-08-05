@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import test from 'node:test';
 
 import {
+    reconcileConfiguredProviderTaskOwnership,
+    removeExactStoppedRegistryRecord,
     removeExactContainerAndDescriptor,
 } from '../../cli/sandbox/docker/containerFleet.js';
 import { NETWORK_LABELS } from '../../cli/sandbox/networkLifecycle.js';
@@ -185,4 +187,71 @@ test('fleet bulk lifecycle contains no mutable-name signal/removal fallback', ()
     assert.doesNotMatch(bulk, /\['rm', '-f', name\]/);
     assert.match(bulk, /removeExactContainerAndDescriptor\(name, record, 'podman'/);
     assert.doesNotMatch(bulk, /getRuntime\(|probeContainerRuntime\(/);
+});
+
+test('container task owners are removed only after immutable containment and before descriptors', () => {
+    const source = fs.readFileSync(
+        new URL('../../cli/sandbox/docker/containerFleet.js', import.meta.url),
+        'utf8',
+    );
+    const start = source.indexOf('function removeExactContainerAndDescriptor(');
+    const end = source.indexOf('\nfunction removeExactRegisteredContainer(', start);
+    const lifecycle = source.slice(start, end);
+    assert.ok(lifecycle.indexOf("control(runtime, ['kill', '--signal', 'SIGTERM', expectedId])")
+        < lifecycle.indexOf('clearContainedProviderOwners();'));
+    assert.ok(lifecycle.indexOf('clearContainedProviderOwners();')
+        < lifecycle.indexOf("control(runtime, ['rm', '-f', expectedId])"));
+    assert.doesNotMatch(lifecycle, /process\.kill\s*\(/);
+});
+
+test('Box stop removes only the exact stopped nested-container registry record', () => {
+    const record = registryRecord();
+    const registry = { [NAME]: record, unrelated: { type: 'agent', runtime: 'bwrap' } };
+    let saved;
+    assert.equal(removeExactStoppedRegistryRecord(NAME, record, {
+        loadRegistry: () => structuredClone(registry),
+        saveRegistry(next, options) { saved = { next, options }; },
+    }), true);
+    assert.deepEqual(saved, {
+        next: { unrelated: { type: 'agent', runtime: 'bwrap' } },
+        options: { coordinate: false },
+    });
+    assert.throws(() => removeExactStoppedRegistryRecord(NAME, record, {
+        loadRegistry: () => ({ [NAME]: { ...record, enableGeneration: 'replacement' } }),
+        saveRegistry() { assert.fail('drifted registry must not be written'); },
+    }), /identity changed/);
+});
+
+test('production reconciliation fails closed for durable corrupt, mixed, PID-reused, stale, and uncontained evidence', () => {
+    const owner = { ownerKey: 'provider-owner' };
+    const run = (classification, overrides = {}) => reconcileConfiguredProviderTaskOwnership({
+        registry: {},
+        collectProviderOwners: () => [owner],
+        collectRuntimeStates: () => [],
+        reconcileProviderOwners: () => [{ classification }],
+        ...overrides,
+    });
+    assert.deepEqual(run('live'), [{ classification: 'live' }]);
+    let removedTerminal = null;
+    assert.deepEqual(run('terminal', {
+        removeTerminalOwner(entry) { removedTerminal = entry; },
+    }), [{ classification: 'terminal' }]);
+    assert.deepEqual(removedTerminal, { classification: 'terminal' });
+    for (const classification of [
+        'mixed-generation', 'pid-reused', 'stale', 'parent-contained',
+    ]) {
+        assert.throws(
+            () => run(classification),
+            (error) => error?.code === 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED'
+                && error.classifications.includes(classification),
+        );
+    }
+    assert.throws(
+        () => run('live', {
+            collectProviderOwners() { throw new Error('secret corrupt path'); },
+        }),
+        (error) => error?.code === 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED'
+            && error.classifications.includes('corrupt')
+            && !error.message.includes('secret corrupt path'),
+    );
 });

@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { launchCli } from '../../cli/index.js';
+import { formatAgentRuntimeStatus } from '../../cli/utils/status.js';
 
 function treeHash(root) {
     const hash = crypto.createHash('sha256');
@@ -52,6 +53,7 @@ test('status renders master-compatible runtime details without changing workspac
             enableGeneration: 'generation-status-fixture',
             agentName: 'exampleAgent',
             repoName: 'exampleRepo',
+            alias: 'editor',
             containerImage: 'example/image:latest',
             createdAt: '2026-07-31T00:00:00.000Z',
             projectPath: '/workspace',
@@ -75,8 +77,51 @@ test('status renders master-compatible runtime details without changing workspac
         assert.equal(result.status, 0, result.stderr);
         assert.match(result.stdout, /Workspace status:/);
         assert.match(result.stdout, /Agent runtimes:/);
-        assert.match(result.stdout, /ploinky_example \[stopped\] \[podman\]/);
+        assert.match(result.stdout, /editor \[stopped\] \[container\] \[service\]/);
         assert.match(result.stdout, /agent: exampleAgent  repo: exampleRepo/);
+        assert.match(result.stdout, /readiness: not-ready/);
+        assert.match(result.stdout, new RegExp(`log: podman:\/\/${'a'.repeat(64)}`));
         assert.equal(treeHash(root), before);
     }
+});
+
+test('runtime status labels provider tasks with exact allowlisted ownership and no secret spill', () => {
+    const text = formatAgentRuntimeStatus({
+        containerName: 'ploinky_agents_codex_workspace_deadbeef',
+        effectiveInstance: 'writer',
+        agentName: 'codexAgent',
+        repoName: 'AchillesCLI',
+        runtime: 'bwrap',
+        role: 'provider-task',
+        provider: 'codex',
+        taskId: 'task-phase9',
+        enableGeneration: 'generation-phase9',
+        ownerKey: 'provider-task-owner-phase9',
+        processIdentity: 'linux-proc:123e4567-e89b-12d3-a456-426614174000:9001',
+        workdir: '/workspace/projects/current',
+        homeKey: 'ploinky_agents_codex_workspace_deadbeef.sandbox-v2',
+        readiness: 'ready',
+        logPath: '/workspace/.ploinky/logs/agents/instance-phase9/tasks/task-phase9-provider.log',
+        state: { status: 'running', running: true, pid: 73 },
+        secret: 'status-secret-canary',
+        config: {
+            env: ['PLOINKY_TASK_BROKER_KEY=status-secret-canary'],
+            binds: ['/private/secret'],
+        },
+    });
+
+    for (const expected of [
+        'writer [running] [bwrap] [provider-task]',
+        'provider: codex  task: task-phase9',
+        'generation: generation-phase9',
+        'owner: provider-task-owner-phase9',
+        'process: linux-proc:123e4567-e89b-12d3-a456-426614174000:9001',
+        'workdir: /workspace/projects/current',
+        'home: ploinky_agents_codex_workspace_deadbeef.sandbox-v2',
+        'readiness: ready',
+        'log: /workspace/.ploinky/logs/agents/instance-phase9/tasks/task-phase9-provider.log',
+    ]) {
+        assert.match(text, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    }
+    assert.doesNotMatch(text, /status-secret-canary|PLOINKY_TASK_BROKER_KEY|\/private\/secret/);
 });

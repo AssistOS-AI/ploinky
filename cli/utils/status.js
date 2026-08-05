@@ -64,6 +64,56 @@ export function findAgentManifest(agentName) {
     return manifestPath;
 }
 
+export function formatAgentRuntimeStatus(entry = {}) {
+    const status = String(entry.state?.status || 'stopped').trim().toLowerCase() || 'stopped';
+    const statusFormatter = ({
+        running: styles.success,
+        completed: styles.success,
+        failed: styles.danger,
+        exited: styles.danger,
+        paused: styles.warn,
+        restarting: styles.warn,
+        created: styles.info,
+        cancelled: styles.warn,
+    })[status] || styles.warn;
+    const runtime = entry.runtime === 'podman'
+        ? 'container'
+        : (String(entry.runtime || 'container').trim().toLowerCase() || 'container');
+    const role = String(entry.role || 'service').trim().toLowerCase() === 'provider-task'
+        ? 'provider-task'
+        : 'service';
+    const instance = String(entry.effectiveInstance || entry.containerName || '-').trim() || '-';
+    const pidInfo = entry.state?.pid ? ` ${styles.muted(`pid ${Number(entry.state.pid) || 0}`)}` : '';
+    const lines = [
+        `  ${bulletSymbol} ${styles.name(instance)} ${statusFormatter(`[${status}]`)} ${styles.muted(`[${runtime}]`)} ${styles.muted(`[${role}]`)}${pidInfo}`,
+        `     ${styles.label('agent')}: ${styles.accent(String(entry.agentName || '-'))}`
+            + `  ${styles.label('repo')}: ${styles.accent(String(entry.repoName || '-'))}`,
+    ];
+    if (role === 'provider-task') {
+        lines.push(
+            `     ${styles.label('provider')}: ${String(entry.provider || '-')}`
+                + `  ${styles.label('task')}: ${String(entry.taskId || '-')}`,
+        );
+    } else if (entry.containerImage) {
+        lines.push(`     ${styles.label('image')}: ${String(entry.containerImage)}`);
+    }
+    const details = [
+        ['generation', entry.enableGeneration],
+        ['owner', entry.ownerKey],
+        ['process', entry.processIdentity],
+        ['workdir', entry.workdir || entry.projectPath],
+        ['home', entry.homeKey],
+        ['readiness', entry.readiness],
+        ['log', entry.logPath],
+    ];
+    for (const [label, value] of details) {
+        if (typeof value === 'string' && value.trim()) {
+            lines.push(`     ${styles.label(label)}: ${value}`);
+        }
+    }
+    return lines.join('\n');
+}
+
 export function listRepos() {
     const installed = new Set(reposSvc.getInstalledRepos(REPOS_DIR));
     const allRepos = { ...PREDEFINED_REPOS };
@@ -94,37 +144,8 @@ export function listCurrentAgents() {
     }
     console.log(styles.header('Agent runtimes:'));
     for (const entry of runtimes) {
-        const binds = entry.config?.binds?.length || 0;
-        const envs = entry.config?.env?.length || 0;
-        const ports = (entry.config?.ports || [])
-            .map(p => `${p.containerPort}->${p.hostPort || ''}`)
-            .filter(Boolean)
-            .join(', ');
-        const status = (entry.state?.status || '-').toLowerCase();
-        const statusFormatter = ({
-            running: styles.success,
-            exited: styles.danger,
-            paused: styles.warn,
-            restarting: styles.warn,
-            created: styles.info
-        })[status] || styles.warn;
-        const pidInfo = entry.state?.pid ? ` ${styles.muted(`pid ${entry.state.pid}`)}` : '';
-        const runtime = entry.runtime || 'container';
-        console.log(`  ${bulletSymbol} ${styles.name(entry.containerName)} ${statusFormatter(`[${status}]`)} ${styles.muted(`[${runtime}]`)}${pidInfo}`);
-        console.log(`     ${styles.label('agent')}: ${styles.accent(entry.agentName || '-')}` +
-            `  ${styles.label('repo')}: ${styles.accent(entry.repoName || '-')}`);
-        console.log(`     ${styles.label('image')}: ${entry.containerImage || '-'}`);
-        console.log(`     ${styles.label('created')}: ${entry.createdAt || '-'}`);
-        console.log(`     ${styles.label('cwd')}: ${entry.projectPath || '-'}`);
-        const resourceParts = [
-            `${styles.label('binds')}: ${binds}`,
-            `${styles.label('env')}: ${envs}`
-        ];
-        if (ports) {
-            resourceParts.push(`${styles.label('ports')}: ${ports}`);
-        }
-        console.log(`     ${resourceParts.join('  ')}`);
-        console.log('');
+        console.log(formatAgentRuntimeStatus(entry));
+        console.log();
     }
 }
 

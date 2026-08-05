@@ -1,13 +1,26 @@
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { isDeepStrictEqual } from 'node:util';
 import { PLOINKY_DIR } from '../../utils/config.js';
-import { loadAgents } from '../../utils/workspace.js';
+import { loadAgents, saveAgents } from '../../utils/workspace.js';
 import {
     loadAgentsMap,
 } from './common.js';
 import { clearLivenessState } from './healthProbes.js';
-import { stopBwrapProcesses, isBwrapProcessRunning } from '../bwrap/bwrapFleet.js';
+import {
+    isBwrapProcessRunning,
+    readServiceOwnerReadOnly,
+    stopBwrapProcesses,
+} from '../bwrap/bwrapFleet.js';
+import {
+    collectProviderTaskOwnersReadOnly,
+    listProviderTaskOwners,
+    reconcileProviderTaskOwnershipReadOnly,
+    removeProviderTaskOwnersAfterContainment,
+    removeReportedTerminalProviderTaskOwner,
+} from '../providerTaskOwnership.js';
+import { collectAgentRuntimeStates } from '../agentRuntimeState.js';
 import {
     NETWORK_LABELS,
     withNetworkLifecycleLock,
@@ -172,6 +185,20 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     }
     classifyExactAgentRuntime(name, record);
     const expectedId = record.containerId;
+    const providerOwners = listProviderTaskOwners({
+        runtimeKey: name,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+    });
+    const clearContainedProviderOwners = () => removeProviderTaskOwnersAfterContainment(
+        providerOwners,
+        {
+            contained: true,
+            runtimeKey: name,
+            instanceId: record.instanceId,
+            enableGeneration: record.enableGeneration,
+        },
+    );
     return withLock(() => {
         const artifact = captureRecordedGeneratedRouterDescriptor(record);
         const workspaceHash = String(workspaceIdentity()?.hash || '');
@@ -222,6 +249,10 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
             }
         }
 
+        // The exact immutable container is now stopped. Remove task owners
+        // while that containment evidence and the registry descriptor remain
+        // available for retry; only then remove container-owned artifacts.
+        clearContainedProviderOwners();
         if (!remove) {
             return Object.freeze({ found: true, stopped: true, removed: false });
         }
@@ -254,6 +285,70 @@ function removeExactRegisteredContainer(name, record, options = {}) {
     });
 }
 
+function removeExactStoppedRegistryRecord(name, record, {
+    loadRegistry = loadAgents,
+    saveRegistry = saveAgents,
+} = {}) {
+    const registry = loadRegistry();
+    if (!registry || typeof registry !== 'object' || Array.isArray(registry)
+        || !Object.hasOwn(registry, name)
+        || !isDeepStrictEqual(registry[name], record)) {
+        throw new Error(`nested container registry identity changed for '${name}'`);
+    }
+    const next = { ...registry };
+    delete next[name];
+    saveRegistry(next, { coordinate: false });
+    return true;
+}
+
+function providerReconciliationError(classifications, cause) {
+    const labels = Array.from(new Set(classifications || [])).sort();
+    const suffix = labels.length ? ` (${labels.join(', ')})` : '';
+    const error = new Error(`provider task lifecycle reconciliation failed closed${suffix}`, {
+        cause,
+    });
+    error.code = 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED';
+    error.classifications = Object.freeze(labels);
+    return error;
+}
+
+function reconcileConfiguredProviderTaskOwnership({
+    registry = loadAgents(),
+    serviceStates,
+    runtimeReports = [],
+    collectRuntimeStates = collectAgentRuntimeStates,
+    collectProviderOwners = collectProviderTaskOwnersReadOnly,
+    reconcileProviderOwners = reconcileProviderTaskOwnershipReadOnly,
+    removeTerminalOwner = removeReportedTerminalProviderTaskOwner,
+    blockedClassifications = ['mixed-generation', 'pid-reused', 'stale', 'parent-contained'],
+} = {}) {
+    try {
+        const durableOwners = collectProviderOwners();
+        if (!durableOwners.length) return Object.freeze([]);
+        const exactServiceStates = Array.isArray(serviceStates)
+            ? serviceStates
+            : collectRuntimeStates({ registry }).filter((entry) => entry?.role === 'service');
+        const reconciled = reconcileProviderOwners({
+            registry,
+            serviceStates: exactServiceStates,
+            runtimeReports,
+        });
+        for (const terminal of reconciled.filter((entry) => entry.classification === 'terminal')) {
+            removeTerminalOwner(terminal);
+        }
+        const blocked = reconciled.filter((entry) => blockedClassifications.includes(
+            entry.classification,
+        ));
+        if (blocked.length) {
+            throw providerReconciliationError(blocked.map((entry) => entry.classification));
+        }
+        return reconciled;
+    } catch (error) {
+        if (error?.code === 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED') throw error;
+        throw providerReconciliationError(['corrupt'], error);
+    }
+}
+
 function getContainerCandidates(name, rec) {
     // Registry keys are the exact runtime identifiers. Expanding an alias into
     // a derived canonical name can stop or delete a different current runtime
@@ -261,12 +356,29 @@ function getContainerCandidates(name, rec) {
     return name ? [name] : [];
 }
 
-function stopConfiguredAgents({ fast = false } = {}) {
-    const agents = loadAgents();
+function stopConfiguredAgents({
+    fast = false,
+    removeContainers = false,
+    removeRegistry = false,
+    loadRegistry = loadAgents,
+    saveRegistry = saveAgents,
+    runtimeReports = [],
+    reconcileProviderOwnership = reconcileConfiguredProviderTaskOwnership,
+} = {}) {
+    const agents = loadRegistry();
+    // Mixed-generation evidence has no exact parent authority that this fleet
+    // may reinterpret. PID-reused/stale evidence proceeds only to exact parent
+    // containment; the host never signals the attested inner PID.
+    reconcileProviderOwnership({
+        registry: agents,
+        runtimeReports,
+        blockedClassifications: ['mixed-generation'],
+    });
     const entries = Object.entries(agents || {})
         .filter(([name, rec]) => rec && (rec.type === 'agent' || rec.type === 'agentCore') && typeof name === 'string' && !name.startsWith('_'));
 
     const sandboxStopped = [];
+    const survivors = [];
     const sandboxEntries = [];
     const podmanEntries = [];
     for (const [name, rec] of entries) {
@@ -278,19 +390,21 @@ function stopConfiguredAgents({ fast = false } = {}) {
             }
             const agentName = rec.agentName || name;
             const expectedIdentity = sandboxRuntimeIdentity(rec);
-            if (isBwrapProcessRunning(name, expectedIdentity)) {
-                sandboxEntries.push({
-                    name,
-                    runtimeKey: name,
-                    agentName,
-                    runtime,
-                    expectedIdentity,
-                });
-            } else {
+            const running = isBwrapProcessRunning(name, expectedIdentity);
+            sandboxEntries.push({
+                name,
+                runtimeKey: name,
+                agentName,
+                runtime,
+                expectedIdentity,
+                running,
+            });
+            if (!running) {
                 console.log(`[stop] ${agentName}: no running ${runtime} process found.`);
             }
         } catch (error) {
             console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
+            survivors.push(Object.freeze({ runtimeKey: name, classification: 'registry-invalid' }));
         }
     }
     if (sandboxEntries.length) {
@@ -302,7 +416,20 @@ function stopConfiguredAgents({ fast = false } = {}) {
             { timeout: fast ? 100 : 5000, expectedIdentities },
         ));
         for (const entry of sandboxEntries) {
-            if (!stoppedSandboxRuntimes.has(entry.runtimeKey)) continue;
+            if (!stoppedSandboxRuntimes.has(entry.runtimeKey)) {
+                const noOwner = readServiceOwnerReadOnly(entry.runtimeKey) === null;
+                const noProviderTasks = listProviderTaskOwners({
+                    runtimeKey: entry.runtimeKey,
+                    instanceId: entry.expectedIdentity.instanceId,
+                    enableGeneration: entry.expectedIdentity.enableGeneration,
+                }).length === 0;
+                if (!entry.running && noOwner && noProviderTasks) continue;
+                survivors.push(Object.freeze({
+                    runtimeKey: entry.runtimeKey,
+                    classification: 'sandbox-containment-unproved',
+                }));
+                continue;
+            }
             console.log(`[stop] Stopped ${entry.agentName} (${entry.runtime})`);
             sandboxStopped.push(entry.name);
         }
@@ -316,20 +443,53 @@ function stopConfiguredAgents({ fast = false } = {}) {
         try {
             const result = removeExactContainerAndDescriptor(name, rec, 'podman', {
                 fast,
-                remove: false,
+                remove: removeContainers,
             });
             if (!result.found) {
                 console.log(`[stop] ${rec?.agentName || name}: no exact registered container found.`);
+                survivors.push(Object.freeze({
+                    runtimeKey: name,
+                    classification: 'container-containment-unproved',
+                }));
                 continue;
+            }
+            if (removeRegistry) {
+                if (!removeContainers || result.removed !== true) {
+                    throw new Error(`nested container registry removal for '${name}' requires exact container removal`);
+                }
+                removeExactStoppedRegistryRecord(name, rec, { loadRegistry, saveRegistry });
             }
             console.log(`[stop] Stopped ${name}`);
             clearLivenessState(name);
             stoppedContainers.push(name);
         } catch (error) {
             console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
+            survivors.push(Object.freeze({
+                runtimeKey: name,
+                classification: 'container-containment-failed',
+            }));
         }
     }
-    return [...sandboxStopped, ...stoppedContainers];
+    try {
+        reconcileProviderOwnership({
+            registry: removeRegistry ? loadRegistry() : agents,
+            runtimeReports,
+            blockedClassifications: [
+                'live', 'mixed-generation', 'pid-reused', 'stale', 'parent-contained', 'terminal',
+            ],
+        });
+    } catch (error) {
+        survivors.push(Object.freeze({
+            runtimeKey: 'provider-task-ownership',
+            classification: error?.classifications?.join('+') || 'reconciliation-failed',
+        }));
+    }
+    const result = [...sandboxStopped, ...stoppedContainers];
+    Object.defineProperty(result, 'survivors', {
+        value: Object.freeze(survivors),
+        enumerable: false,
+    });
+    return result;
 }
 
 function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
@@ -456,7 +616,9 @@ export {
     destroyAllPloinky,
     destroyWorkspaceContainers,
     getContainerCandidates,
+    reconcileConfiguredProviderTaskOwnership,
     removeExactContainerAndDescriptor,
+    removeExactStoppedRegistryRecord,
     stopAndRemove,
     stopAndRemoveMany,
     removeExactRegisteredContainer,

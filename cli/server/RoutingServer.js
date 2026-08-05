@@ -41,6 +41,7 @@ import {
     readPrivateRequestBody,
     sendPrivateError,
 } from './privateRouter.js';
+import { handleProviderTaskOperation } from '../sandbox/providerTaskOwnership.js';
 import { createListenerInterfaceClassifier } from './listenerInterfaceClassifier.js';
 import {
     classifyPrivateListenerRequest,
@@ -791,7 +792,11 @@ async function processPrivateRequest(req, res) {
     }
     let body;
     try {
-        body = await readPrivateRequestBody(req);
+        body = await readPrivateRequestBody(req, {
+            maxBytes: String(routePlan.operation || '').startsWith('provider-tasks/')
+                ? 64 * 1024
+                : undefined,
+        });
         authorizePrivateRoutePlan({ req, plan: routePlan, body });
     } catch (error) {
         sendPrivateError(res, error);
@@ -820,6 +825,43 @@ async function processPrivateRequest(req, res) {
             appendLog('turn_credentials_rejected', {
                 callerAgentId: req.privateAgentIdentity?.agentId,
                 code: error?.code || 'TURN_CREDENTIAL_MINT_FAILED',
+            });
+            sendPrivateError(res, error);
+        }
+        return;
+    }
+    if (routePlan.kind === 'private-operation'
+        && String(routePlan.operation || '').startsWith('provider-tasks/')) {
+        if (!req.privateAgentIdentity?.retired && !commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        try {
+            let parsedBody;
+            try { parsedBody = JSON.parse(body.toString('utf8')); } catch (_) {
+                const parseError = new Error('provider task request must be JSON');
+                parseError.code = 'PLOINKY_PROVIDER_TASK_INVALID';
+                parseError.status = 400;
+                throw parseError;
+            }
+            const response = handleProviderTaskOperation({
+                operation: routePlan.operation,
+                body: parsedBody,
+                snapshot: routePlan.snapshot,
+                callerIdentity: req.privateAgentIdentity,
+                allowRetiredOwner: req.privateAgentIdentity?.retired === true,
+            });
+            appendLog('provider_task_operation', {
+                operation: routePlan.operation,
+                callerAgentId: req.privateAgentIdentity?.agentId,
+                instanceId: req.privateAgentIdentity?.instanceId,
+                enableGeneration: req.privateAgentIdentity?.enableGeneration,
+            });
+            sendJsonResponse(res, 200, response, { 'Cache-Control': 'no-store' });
+        } catch (error) {
+            appendLog('provider_task_operation_rejected', {
+                operation: routePlan.operation,
+                code: error?.code || 'PLOINKY_PROVIDER_TASK_FAILED',
             });
             sendPrivateError(res, error);
         }

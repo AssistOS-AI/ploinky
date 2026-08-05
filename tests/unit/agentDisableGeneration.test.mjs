@@ -92,6 +92,10 @@ function lifecycleHarness({
             assert.equal(received, lease);
             if (failAbort) throw new Error('durable disable abort failed');
         },
+        reconcileProviderOwnershipImpl() {
+            events.push('reconcile-provider-ownership');
+            return [];
+        },
         stopAndRemoveImpl(containerName, options) {
             events.push(`remove:${containerName}`);
             assert.deepEqual(options?.records, {
@@ -178,6 +182,11 @@ test('single disable commits exact registry and route removal before runtime rem
     assert.equal(harness.routing().routes.current.hostPort, 31000);
     assert.equal(harness.snapshots[0].routing.routes.old, undefined);
     assert.ok(
+        harness.events.indexOf('reconcile-provider-ownership')
+            < harness.events.indexOf('inactive:agent-disable-prepare'),
+        'provider ownership must reconcile before disable invalidates and removes the selected runtime',
+    );
+    assert.ok(
         harness.events.indexOf('prepare') < harness.events.indexOf('remove:old_container'),
         'the inactive route-removal generation must exist before physical removal',
     );
@@ -185,6 +194,24 @@ test('single disable commits exact registry and route removal before runtime rem
         harness.events.indexOf('remove:old_container') < harness.events.indexOf('apply'),
         'authorization may commit only after physical removal succeeds',
     );
+});
+
+test('single disable fails closed before generation mutation when provider ownership is unreconciled', () => {
+    const harness = lifecycleHarness({
+        initialRegistry: { old_container: agentRecord('old') },
+        initialRouting: { port: 8080, routes: {} },
+    });
+    harness.dependencies.reconcileProviderOwnershipImpl = () => {
+        const error = new Error('provider ownership mixed-generation');
+        error.code = 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED';
+        throw error;
+    };
+    assert.throws(
+        () => agents.disableAgent('old_container', harness.dependencies),
+        { code: 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED' },
+    );
+    assert.deepEqual(harness.registry().old_container, agentRecord('old'));
+    assert.equal(harness.events.length, 0);
 });
 
 test('runtime removal failure leaves the exact removal sources inactive and never restores stale routing', () => {

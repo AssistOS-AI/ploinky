@@ -8,6 +8,7 @@ import {
 } from '../sandbox/edgeGeneration.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js';
+import { resolveRetiredProviderTaskCaller } from '../sandbox/providerTaskOwnership.js';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
@@ -103,6 +104,15 @@ function callerAclForPlan(plan) {
                 paths: ['/api/edge/turn-credentials'],
             };
         }
+        if (String(plan.operation || '').startsWith('provider-tasks/')) {
+            return {
+                operation: plan.operation,
+                callers: [],
+                anyCurrentCaller: true,
+                methods: ['POST'],
+                paths: [`/api/edge/${plan.operation}`],
+            };
+        }
         return null;
     }
     if (plan.kind === 'agent-port' && plan.access?.access === 'authenticated') {
@@ -136,11 +146,30 @@ export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), a
     const token = Array.isArray(header) ? header[0] : String(header || '').trim();
     const untrusted = parseUntrustedPayload(token);
     const agentId = String(untrusted?.iss || '');
-    const current = currentEnabledAgentIdentity(plan.snapshot, agentId);
-    if (!current || !current.enableGeneration) throw unauthorized('private assertion caller is not currently enabled');
-    if (String(untrusted?.instanceId || '') !== current.instanceId
-        || String(untrusted?.enableGeneration || '') !== current.enableGeneration) {
-        throw unauthorized('private assertion instance or generation is stale');
+    let current = currentEnabledAgentIdentity(plan.snapshot, agentId);
+    const assertionIsCurrent = Boolean(!plan.retiredTerminalOnly && current?.enableGeneration
+        && String(untrusted?.instanceId || '') === current.instanceId
+        && String(untrusted?.enableGeneration || '') === current.enableGeneration);
+    if (!assertionIsCurrent) {
+        if (plan.operation !== 'provider-tasks/terminal') {
+            if (!current?.enableGeneration) throw unauthorized('private assertion caller is not currently enabled');
+            throw unauthorized('private assertion instance or generation is stale');
+        }
+        let parsedBody;
+        try { parsedBody = JSON.parse(Buffer.from(body).toString('utf8')); } catch (_) {
+            throw unauthorized('retired provider terminal request is malformed');
+        }
+        let retired;
+        try { retired = resolveRetiredProviderTaskCaller(parsedBody); } catch (_) {
+            throw unauthorized('retired provider terminal claim is invalid');
+        }
+        if (!retired
+            || retired.agentId !== agentId
+            || retired.instanceId !== String(untrusted?.instanceId || '')
+            || retired.enableGeneration !== String(untrusted?.enableGeneration || '')) {
+            throw unauthorized('retired provider terminal assertion has no exact published owner');
+        }
+        current = retired;
     }
     if (!acl.anyCurrentCaller && !(acl.callers || []).some((entry) => exactCaller(entry, current))) {
         throw forbidden('private assertion caller is not in the exact ACL');

@@ -7,7 +7,7 @@ import { showHelp } from './help.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import * as agentsSvc from '../utils/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../utils/status.js';
-import { logsTail, showLast } from './logUtils.js';
+import { logsTail, parseLogTarget, showLast } from './logUtils.js';
 import {
     startWorkspace,
     runCli,
@@ -26,6 +26,7 @@ import {
     getAgentContainerName,
     getRuntime,
     containerExists,
+    reconcileConfiguredProviderTaskOwnership,
     stopConfiguredAgents,
     destroyWorkspaceContainers,
     ensureAgentService
@@ -94,6 +95,33 @@ function stopExactRouterForLifecycle(label, {
     stopRouter = killRouterIfRunning,
 } = {}) {
     return requireRouterStopCompleted(stopRouter(), label);
+}
+
+function logCommandError() {
+    const error = new Error(
+        'Usage: logs tail [router|service <runtime-key>|task <runtime-key> <task-id>] | '
+        + 'logs last <count> [router|service <runtime-key>|task <runtime-key> <task-id>]',
+    );
+    error.code = 'PLOINKY_LOG_COMMAND_INVALID';
+    return error;
+}
+
+function parseLogsCommandOptions(options = []) {
+    if (!Array.isArray(options)) throw logCommandError();
+    const [action, ...rest] = options;
+    if (action === 'tail') {
+        return Object.freeze({ action, target: parseLogTarget(rest) });
+    }
+    if (action === 'last') {
+        const [rawCount, ...targetTokens] = rest;
+        if (typeof rawCount !== 'string' || !/^[1-9][0-9]*$/.test(rawCount)) {
+            throw logCommandError();
+        }
+        const count = Number(rawCount);
+        if (!Number.isSafeInteger(count)) throw logCommandError();
+        return Object.freeze({ action, count, target: parseLogTarget(targetTokens) });
+    }
+    throw logCommandError();
 }
 
 async function ensureLlmAgentsLoaded() {
@@ -401,6 +429,7 @@ async function handleCommand(args) {
             if (agentlibRef) {
                 process.env.PLOINKY_AGENTLIB_REF = agentlibRef;
             }
+            reconcileConfiguredProviderTaskOwnership({ registry: workspaceSvc.loadAgents() });
             await startWorkspace(startParsed.staticAgent, startParsed.port ?? undefined, {
                 enableAgent,
                 killRouterIfRunning,
@@ -674,12 +703,16 @@ async function handleCommand(args) {
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) { console.error('restart: start is not configured. Run: start <staticAgent> <port>'); break; }
                 resolvePersistedRouterPort();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
-                console.log('[restart] Stopping Router and configured agents...');
-                const routerStopResult = stopExactRouterForLifecycle('restart');
-                console.log('[restart] Stopping configured agent containers...');
-                const list = stopConfiguredAgents();
+                console.log('[restart] Draining configured agent tasks and runtimes...');
+                const list = stopConfiguredAgents({ removeContainers: fs.existsSync('/etc/ploinky-box') });
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
                 else { console.log('[restart] No containers to stop.'); }
+                console.log('[restart] Stopping Router after runtime containment...');
+                const routerStopResult = stopExactRouterForLifecycle('restart');
+                if (list.survivors?.length) {
+                    throw new Error(`restart preserved ${list.survivors.length} selected runtime(s) after containment failure`);
+                }
+                reconcileConfiguredProviderTaskOwnership({ registry: workspaceSvc.loadAgents() });
                 console.log('[restart] Starting workspace...');
                 await startWorkspace(undefined, undefined, {
                     enableAgent,
@@ -694,10 +727,10 @@ async function handleCommand(args) {
             break;
         case 'shutdown': {
             inactivateEdgeRoutingGeneration('cli-workspace-shutdown');
-            console.log('[shutdown] Stopping RoutingServer...');
-            stopExactRouterForLifecycle('shutdown');
-            console.log('[shutdown] Removing workspace containers...');
+            console.log('[shutdown] Draining tasks and removing workspace runtimes...');
             const list = destroyWorkspaceContainers();
+            console.log('[shutdown] Stopping RoutingServer after runtime containment...');
+            stopExactRouterForLifecycle('shutdown');
             if (list.length) {
                 console.log('[shutdown] Removed containers:');
                 list.forEach(n => console.log(` - ${n}`));
@@ -711,10 +744,17 @@ async function handleCommand(args) {
                 break;
             }
             inactivateEdgeRoutingGeneration('cli-workspace-stop');
-            console.log('[stop] Stopping RoutingServer...');
+            console.log('[stop] Draining tasks and stopping configured agent runtimes...');
+            const boxRuntime = fs.existsSync('/etc/ploinky-box');
+            const list = stopConfiguredAgents({
+                removeContainers: boxRuntime,
+                removeRegistry: boxRuntime,
+            });
+            console.log('[stop] Stopping RoutingServer after runtime containment...');
             stopExactRouterForLifecycle('stop');
-            console.log('[stop] Stopping configured agent containers...');
-            const list = stopConfiguredAgents();
+            if (list.survivors?.length) {
+                throw new Error(`stop preserved ${list.survivors.length} selected runtime(s) after containment failure`);
+            }
             if (list.length) {
                 console.log('[stop] Stopped containers:');
                 list.forEach(n => console.log(` - ${n}`));
@@ -724,23 +764,15 @@ async function handleCommand(args) {
         }
         case 'destroy':
             inactivateEdgeRoutingGeneration('cli-workspace-destroy');
-            console.log('[destroy] Stopping RoutingServer...');
-            stopExactRouterForLifecycle('destroy');
-            console.log('[destroy] Removing all workspace containers...');
+            console.log('[destroy] Draining tasks and removing all workspace runtimes...');
             await destroyAll();
+            console.log('[destroy] Stopping RoutingServer after runtime containment...');
+            stopExactRouterForLifecycle('destroy');
             break;
         case 'logs': {
-            const sub = options[0];
-            if (sub === 'tail') {
-                const kind = options[1] || 'router';
-                if (kind !== 'router') { console.log('Only router logs are available.'); break; }
-                await logsTail('router');
-            } else if (sub === 'last') {
-                const count = options[1] || '200';
-                const kind = options[2];
-                if (kind && kind !== 'router') { console.log('Only router logs are available.'); break; }
-                showLast(count, 'router');
-            } else { console.log("Usage: logs tail [router] | logs last <count>"); }
+            const request = parseLogsCommandOptions(options);
+            if (request.action === 'tail') await logsTail(request.target);
+            else showLast(request.count, request.target);
             break;
         }
         case 'clean':
@@ -886,6 +918,7 @@ function disableAllAgents() {
 
 export {
     handleCommand,
+    parseLogsCommandOptions,
     stopExactRouterForLifecycle,
     getAgentNames,
     getRepoNames,

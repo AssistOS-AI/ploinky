@@ -11,6 +11,8 @@ export {
     destroyAllPloinky,
     destroyWorkspaceContainers,
     getContainerCandidates,
+    reconcileConfiguredProviderTaskOwnership,
+    removeExactStoppedRegistryRecord,
     stopAndRemove,
     stopAndRemoveMany,
     stopConfiguredAgents

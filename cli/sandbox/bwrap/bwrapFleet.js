@@ -5,6 +5,12 @@ import path from 'node:path';
 import { PLOINKY_DIR } from '../../utils/config.js';
 import { debugLog } from '../../utils/utils.js';
 import { inspectProcessIdentity, normalizeProcessIdentity } from '../processIdentity.js';
+import {
+    listProviderTaskOwners as listDurableProviderTaskOwners,
+    publishProviderTask,
+    readProviderTaskOwner as readDurableProviderTaskOwner,
+    removeProviderTaskOwnersAfterContainment,
+} from '../providerTaskOwnership.js';
 
 const BWRAP_PIDS_DIR = path.join(PLOINKY_DIR, 'bwrap-pids');
 const SANDBOX_OWNER_SCHEMA_VERSION = 5;
@@ -579,7 +585,14 @@ function readServiceOwner(runtimeKey) {
     return readSandboxOwner(serviceOwnerKey(normalized));
 }
 
-function readProviderTaskOwner(runtimeKey, taskId) {
+function readServiceOwnerReadOnly(runtimeKey) {
+    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
+    const expectedOwnerKey = serviceOwnerKey(normalized);
+    return collectServiceOwnersReadOnly()
+        .find((owner) => owner.ownerKey === expectedOwnerKey) ?? null;
+}
+
+function readLegacyProviderTaskOwner(runtimeKey, taskId) {
     return readSandboxOwner(providerTaskOwnerKey(runtimeKey, taskId));
 }
 
@@ -788,6 +801,12 @@ function saveSandboxOwner(value, { allowUnroutedService = false } = {}) {
         allowUnroutedService,
         requireFuture: true,
     });
+    if (metadata.role !== SANDBOX_OWNER_ROLES.service) {
+        throw ownerError(
+            'provider task ownership must use the inner-runtime v6 boundary',
+            'PLOINKY_PROVIDER_TASK_HOST_SIGNAL_DENIED',
+        );
+    }
     const pid = Number(value.pid);
     const processUid = currentProcessUid();
     const processInspection = inspectProcessIdentity(pid);
@@ -832,7 +851,7 @@ function saveServiceOwner(value) {
     });
 }
 
-function saveProviderTaskOwner(value) {
+function saveLegacyProviderTaskOwner(value) {
     return saveSandboxOwner({
         ...value,
         role: SANDBOX_OWNER_ROLES.providerTask,
@@ -853,8 +872,13 @@ function isSandboxOwnerRunning(ownerKey, expected) {
     }
     const record = readSandboxOwner(ownerKey);
     if (!record || !ownerMatchesExpected(record, expected)) return false;
+    if (record.role !== SANDBOX_OWNER_ROLES.service) {
+        throw ownerError(
+            'provider pids are inner-runtime attestations and cannot be probed by the host',
+            'PLOINKY_PROVIDER_TASK_HOST_SIGNAL_DENIED',
+        );
+    }
     if (isExactSandboxOwnerProcess(record)) return true;
-    clearOwnerIfExact(record);
     return false;
 }
 
@@ -877,7 +901,45 @@ function listServiceOwners(options = {}) {
     return listSandboxOwners({ ...options, role: SANDBOX_OWNER_ROLES.service });
 }
 
-function listProviderTaskOwners(options = {}) {
+function collectServiceOwnersReadOnly() {
+    if (!fs.existsSync(PLOINKY_DIR)) return Object.freeze([]);
+    const rootStat = fs.lstatSync(PLOINKY_DIR);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || rootStat.uid !== currentProcessUid()) {
+        throw ownerError(
+            'sandbox owner root is not an exact trusted directory',
+            'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+        );
+    }
+    if (!fs.existsSync(BWRAP_PIDS_DIR)) return Object.freeze([]);
+    const stat = fs.lstatSync(BWRAP_PIDS_DIR);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== currentProcessUid()
+        || (stat.mode & 0o777) !== 0o700) {
+        throw ownerError(
+            'sandbox owner directory is not an exact private directory',
+            'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+        );
+    }
+    const owners = [];
+    for (const name of fs.readdirSync(BWRAP_PIDS_DIR)) {
+        if (!name.endsWith(OWNER_RECORD_SUFFIX)) {
+            throw ownerError(
+                'sandbox ownership store contains incomplete or unexpected state',
+                'PLOINKY_SANDBOX_OWNER_STORE_INVALID',
+            );
+        }
+        const owner = readOwnerFile(name.slice(0, -OWNER_RECORD_SUFFIX.length));
+        if (owner?.role === SANDBOX_OWNER_ROLES.providerTask) {
+            throw ownerError(
+                'legacy host-PID provider ownership requires lifecycle reconciliation',
+                'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+            );
+        }
+        if (owner) owners.push(owner);
+    }
+    return Object.freeze(owners.sort((left, right) => left.ownerKey.localeCompare(right.ownerKey)));
+}
+
+function listLegacyProviderTaskOwners(options = {}) {
     return listSandboxOwners({ ...options, role: SANDBOX_OWNER_ROLES.providerTask });
 }
 
@@ -922,13 +984,32 @@ function stopSandboxOwner(ownerKey, {
     }
     const record = readSandboxOwner(ownerKey);
     if (!record || !ownerMatchesExpected(record, expected)) return false;
+    if (record.role !== SANDBOX_OWNER_ROLES.service) {
+        throw ownerError(
+            'host lifecycle may stop exact service owners only; provider pids are inner-runtime attestations',
+            'PLOINKY_PROVIDER_TASK_HOST_SIGNAL_DENIED',
+        );
+    }
+    const providerOwners = listDurableProviderTaskOwners({
+        runtimeKey: record.runtimeKey,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+    });
+    const clearProviderOwners = () => removeProviderTaskOwnersAfterContainment(providerOwners, {
+        contained: true,
+        runtimeKey: record.runtimeKey,
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+    });
     if (!isExactSandboxOwnerProcess(record)) {
+        clearProviderOwners();
         clearOwnerIfExact(record);
         return true;
     }
     if (!signalExactOwner(record, signal)) return false;
     if (!waitForOwnerExit(record, timeout)) {
         if (!isExactSandboxOwnerProcess(record)) {
+            clearProviderOwners();
             clearOwnerIfExact(record);
             return true;
         }
@@ -936,6 +1017,7 @@ function stopSandboxOwner(ownerKey, {
             return false;
         }
     }
+    clearProviderOwners();
     clearOwnerIfExact(record);
     return true;
 }
@@ -954,9 +1036,21 @@ function stopSandboxOwners(owners, options = {}) {
     return stopped;
 }
 
-/** Stop every exact service/task owner and return the stopped ownerKey values. */
+/** Stop exact host service owners only. Provider pids are never host signal targets. */
 function stopAllSandboxOwners(options = {}) {
-    return stopSandboxOwners([...listSandboxOwners()], options);
+    return stopSandboxOwners([...listServiceOwners()], options);
+}
+
+function saveProviderTaskOwner(options) {
+    return publishProviderTask(options);
+}
+
+function readProviderTaskOwner(runtimeKey, taskId) {
+    return readDurableProviderTaskOwner(runtimeKey, taskId);
+}
+
+function listProviderTaskOwners(options = {}) {
+    return listDurableProviderTaskOwners(options);
 }
 
 function assertBwrapPidSlotAvailable(runtimeKey) {
@@ -1019,7 +1113,6 @@ function isBwrapProcessRunning(runtimeKey, expectedIdentity = undefined) {
     const record = readServiceOwner(runtimeKey);
     if (!record || !ownerMatchesExpected(record, expectedIdentity)) return false;
     if (isExactSandboxOwnerProcess(record)) return true;
-    clearOwnerIfExact(record);
     return false;
 }
 
@@ -1085,6 +1178,7 @@ export {
     assertExactServiceOwner,
     assertBwrapPidSlotAvailable,
     clearBwrapPid,
+    collectServiceOwnersReadOnly,
     getBwrapPid,
     isBwrapProcessRunning,
     isSandboxOwnerRunning,
@@ -1098,6 +1192,7 @@ export {
     readProviderTaskOwner,
     readSandboxOwner,
     readServiceOwner,
+    readServiceOwnerReadOnly,
     saveBwrapPid,
     saveProviderTaskOwner,
     saveSandboxOwner,

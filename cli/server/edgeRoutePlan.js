@@ -5,6 +5,7 @@ import { domainToASCII } from 'node:url';
 import {
     captureEdgeRoutingLease,
     captureEdgeRoutingObservationLease,
+    readEdgeRoutingSelection,
 } from '../sandbox/edgeGeneration.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
@@ -31,6 +32,17 @@ const AGENT_ROOT_AUTH_SUPPORT_PATHS = new Set([
     '/auth/account',
     '/auth/token',
 ]);
+const PRIVATE_PROVIDER_TASK_OPERATIONS = new Map([
+    ['/api/edge/provider-tasks/publish', 'provider-tasks/publish'],
+    ['/api/edge/provider-tasks/heartbeat', 'provider-tasks/heartbeat'],
+    ['/api/edge/provider-tasks/log', 'provider-tasks/log'],
+    ['/api/edge/provider-tasks/report', 'provider-tasks/report'],
+    ['/api/edge/provider-tasks/terminal', 'provider-tasks/terminal'],
+]);
+
+export function privateProviderTaskOperation(pathname) {
+    return PRIVATE_PROVIDER_TASK_OPERATIONS.get(String(pathname || '')) || null;
+}
 
 function deny(status, code, details = {}) {
     return { matched: false, ok: false, status, code, ...details };
@@ -680,6 +692,7 @@ export function resolveEdgeRoutePlan({
     authorityObservationGeneration = '',
 } = {}) {
     let lease;
+    let retiredTerminalOnly = false;
     try {
         lease = authorityObservationGeneration
             ? captureEdgeRoutingObservationLease({
@@ -687,7 +700,29 @@ export function resolveEdgeRoutePlan({
             })
             : captureEdgeRoutingLease();
     } catch (error) {
-        return deny(503, error?.code || 'EDGE_GENERATION_INACTIVE');
+        let fallbackUrl;
+        const fallbackHost = normalizeExactHost(req?.headers?.host);
+        try {
+            fallbackUrl = parsedUrl || new URL(
+                req?.url || '/',
+                `http://${fallbackHost === '::1' ? '[::1]' : fallbackHost}`,
+            );
+        } catch (_) {}
+        const terminalCandidate = listener === 'private'
+            && isPrivateInterfaceAllowed(req, listener)
+            && String(req?.method || '').toUpperCase() === 'POST'
+            && fallbackUrl?.pathname === '/api/edge/provider-tasks/terminal'
+            && (fallbackHost === MANAGED_ROUTER_HOST || LOCAL_CONTROL_HOSTS.has(fallbackHost));
+        if (!terminalCandidate) return deny(503, error?.code || 'EDGE_GENERATION_INACTIVE');
+        try {
+            const selected = readEdgeRoutingSelection();
+            lease = captureEdgeRoutingObservationLease({
+                expectedGeneration: selected.selector.generation,
+            });
+            retiredTerminalOnly = true;
+        } catch (fallbackError) {
+            return deny(503, fallbackError?.code || 'EDGE_GENERATION_INACTIVE');
+        }
     }
     const snapshot = lease.snapshot;
     const host = normalizeExactHost(req?.headers?.host);
@@ -723,6 +758,23 @@ export function resolveEdgeRoutePlan({
     if (conventionPlan) return conventionPlan;
 
     if (listener === 'private') {
+        const providerTaskOperation = privateProviderTaskOperation(pathname);
+        if (providerTaskOperation) {
+            return {
+                matched: true,
+                ok: true,
+                kind: 'private-operation',
+                operation: providerTaskOperation,
+                listener,
+                host,
+                hostSelection,
+                pathname,
+                parsedUrl: url,
+                lease,
+                snapshot,
+                ...(retiredTerminalOnly ? { retiredTerminalOnly: true } : {}),
+            };
+        }
         if (pathname === '/api/edge/turn-credentials') {
             return {
                 matched: true,

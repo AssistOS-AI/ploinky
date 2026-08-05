@@ -1291,12 +1291,21 @@ test('managed replacement reconciles a failed stop only after the exact owned co
         workspaceRoot: harness.identity.canonical,
         lockPath: path.join(harness.dir, 'reconciled-stop.lock'),
     });
+    let containedPredecessor = null;
 
     const result = adapter.runManagedContainerTransaction({
         network,
         canonicalAgentId: 'demo',
         containerName: 'demo-container',
         runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        afterPredecessorContained(evidence) {
+            containedPredecessor = evidence;
+            assert.equal(evidence.containerId, previousId);
+            assert.equal(evidence.record.State.Running, false);
+            assert.equal(harness.calls.some((args) => (
+                args[0] === 'rm' && args.at(-1) === previousId
+            )), false, 'provider ownership cleanup must run before predecessor removal');
+        },
         createContainer(plan) {
             const id = 'candidate123456789';
             const primary = plan.attachments[0];
@@ -1312,11 +1321,70 @@ test('managed replacement reconciles a failed stop only after the exact owned co
     });
 
     assert.equal(result.containerId, 'candidate123456789');
+    assert.equal(containedPredecessor.containerId, previousId);
     assert.equal(harness.containers.has(previousId), false);
     assert.equal(harness.containers.get(result.containerId).State.Running, true);
     assert.equal(harness.calls.some((args) => (
         args[0] === 'container' && args[1] === 'inspect' && args[2] === previousId
     )), true);
+});
+
+test('managed replacement retries provider cleanup against the preserved stopped predecessor', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const previousId = 'cleanupretry12345';
+    harness.containers.set(previousId, managedAgentRecord({
+        id: previousId,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network),
+        running: true,
+    }));
+    let cleanupAttempts = 0;
+    const transaction = () => harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        requirePredecessorContainment: true,
+        afterPredecessorContained({ containerId, state }) {
+            cleanupAttempts += 1;
+            assert.equal(containerId, previousId);
+            assert.equal(state, 'stopped');
+            if (cleanupAttempts === 1) throw new Error('injected provider cleanup failure');
+        },
+        createContainer(plan) {
+            const id = 'cleanupnew123456';
+            const primary = plan.attachments[0];
+            const candidate = managedAgentRecord({
+                id,
+                name: 'demo-container',
+                labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+            });
+            harness.containers.set(id, candidate);
+            harness.networks.get(primary.name).Containers[id] = { Name: candidate.Name };
+        },
+    });
+    assert.throws(transaction, /injected provider cleanup failure/);
+    assert.equal(harness.containers.get(previousId).State.Running, false);
+    assert.equal(harness.calls.some((args) => args[0] === 'rm' && args.at(-1) === previousId), false);
+    const result = transaction();
+    assert.equal(cleanupAttempts, 2);
+    assert.equal(result.containerId, 'cleanupnew123456');
+    assert.equal(harness.containers.has(previousId), false);
+});
+
+test('managed replacement cannot bypass required predecessor containment', (t) => {
+    const harness = networkHarness(t);
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network: canonicalizeNetwork({ mode: 'default' }),
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container',
+        runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        requirePredecessorContainment: true,
+        afterPredecessorContained() {},
+        createContainer() { assert.fail('missing predecessor must block creation'); },
+    }), /required predecessor is absent/);
 });
 
 test('managed replacement preserves a still-running container after a failed stop', (t) => {

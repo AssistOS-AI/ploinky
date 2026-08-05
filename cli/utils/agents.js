@@ -18,6 +18,7 @@ import {
     waitForContainerRunning,
     stopAndRemove,
     stopAndRemoveMany,
+    reconcileConfiguredProviderTaskOwnership,
     cleanupExactAgentRuntimeCandidate,
     ensureAgentService
 } from '../sandbox/docker/index.js';
@@ -25,6 +26,7 @@ import { findAgent } from './utils.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
 import { isBwrapProcessRunning, stopBwrapProcess } from '../sandbox/bwrap/bwrapFleet.js';
+import { listProviderTaskOwners } from '../sandbox/providerTaskOwnership.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { resolveManifestRuntimeProfile } from './runtime/profileService.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
@@ -1159,6 +1161,7 @@ function removeDisabledRuntimes(disabledRecords, {
     stopSandboxImpl = stopBwrapProcess,
     sandboxRunningImpl = isBwrapProcessRunning,
     containerExistsImpl = containerExists,
+    listProviderOwnersImpl = listProviderTaskOwners,
 } = {}) {
     const containerRecords = {};
     for (const { containerName, record } of disabledRecords) {
@@ -1179,6 +1182,13 @@ function removeDisabledRuntimes(disabledRecords, {
             stopSandboxImpl(containerName, { expectedIdentity });
             if (sandboxRunningImpl(containerName, expectedIdentity)) {
                 throw new Error(`sandbox runtime '${containerName}' is still running`);
+            }
+            if (listProviderOwnersImpl({
+                runtimeKey: containerName,
+                instanceId: record.instanceId,
+                enableGeneration: record.enableGeneration,
+            }).length) {
+                throw new Error(`sandbox runtime '${containerName}' retained provider owners without containment proof`);
             }
             continue;
         }
@@ -1203,6 +1213,16 @@ function removeDisabledRuntimes(disabledRecords, {
     ));
     if (retained.length) {
         throw new Error(`runtime removal left existing container(s): ${retained.join(', ')}`);
+    }
+    const retainedProviderOwners = Object.entries(containerRecords).filter(([containerName, record]) => (
+        listProviderOwnersImpl({
+            runtimeKey: containerName,
+            instanceId: record.instanceId,
+            enableGeneration: record.enableGeneration,
+        }).length > 0
+    )).map(([containerName]) => containerName);
+    if (retainedProviderOwners.length) {
+        throw new Error(`runtime removal retained provider owners: ${retainedProviderOwners.join(', ')}`);
     }
 }
 
@@ -1356,6 +1376,14 @@ export function disableAgent(agentRef, dependencies = {}) {
 
     const [containerName, record] = matches[0];
 
+    const reconcileProviderOwnership = dependencies.reconcileProviderOwnershipImpl
+        || reconcileConfiguredProviderTaskOwnership;
+    reconcileProviderOwnership({
+        registry: map,
+        runtimeReports: dependencies.runtimeReports || [],
+        blockedClassifications: ['mixed-generation', 'pid-reused'],
+    });
+
     delete map[containerName];
 
     clearStaticConfig({
@@ -1458,6 +1486,16 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
         }
         return true;
     };
+
+    if (targets.some((containerName) => map?.[containerName]?.type === 'agent')) {
+        const reconcileProviderOwnership = dependencies.reconcileProviderOwnershipImpl
+            || reconcileConfiguredProviderTaskOwnership;
+        reconcileProviderOwnership({
+            registry: map,
+            runtimeReports: dependencies.runtimeReports || [],
+            blockedClassifications: ['mixed-generation', 'pid-reused'],
+        });
+    }
 
     for (const containerName of targets) {
         const record = map?.[containerName];

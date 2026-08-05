@@ -1,9 +1,11 @@
 import {
     isSandboxOwnerRunning,
-    readServiceOwner,
+    collectServiceOwnersReadOnly,
     serviceOwnerKey,
 } from './bwrap/bwrapFleet.js';
 import { collectLiveAgentContainers, getAgentsRegistry } from './docker/containerRegistry.js';
+import { classifyProviderTaskOwnersReadOnly } from './providerTaskOwnership.js';
+import { loadActiveEdgeRoutingGeneration } from './edgeGeneration.js';
 
 const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
 const AGENT_RUNTIME_STATE_INVALID_CODE = 'PLOINKY_AGENT_RUNTIME_STATE_INVALID';
@@ -70,8 +72,52 @@ function publicLiveRuntimeEntry(entry) {
     return visible;
 }
 
+function effectiveRuntimeAlias(containerName, record) {
+    const alias = String(record?.alias || record?.agentName || containerName);
+    return exactIdentityText(alias) && !/[\u0000-\u001f\u007f]/u.test(alias)
+        ? alias
+        : containerName;
+}
+
+function podmanLogSource(record) {
+    return `podman://${String(record.containerId)}`;
+}
+
+function exactAuthenticatedReadiness(active, containerName, record, running) {
+    if (!running || active?.selector?.state !== 'active'
+        || active?.selector?.publicationState !== 'ready') return 'not-ready';
+    const selected = active?.generation?.agents?.[containerName];
+    return selected?.type === 'agent'
+        && selected.runtime === record.runtime
+        && selected.instanceId === record.instanceId
+        && selected.enableGeneration === record.enableGeneration
+        ? 'ready'
+        : 'not-ready';
+}
+
 function stoppedRuntimeEntry(containerName, record, runtime) {
+    const effectiveInstance = effectiveRuntimeAlias(containerName, record);
     return {
+        role: 'service',
+        runtimeKey: containerName,
+        ownerKey: runtime === 'podman'
+            ? `container:${String(record?.containerId || '')}`
+            : serviceOwnerKey(containerName),
+        instanceId: String(record?.instanceId || ''),
+        enableGeneration: String(record?.enableGeneration || ''),
+        homeKey: String(record?.homeKey || containerName),
+        workdir: String(record?.workdir || record?.projectPath || '-'),
+        logPath: runtime === 'podman'
+            ? podmanLogSource(record)
+            : String(record?.logPath || '-'),
+        readiness: 'not-ready',
+        alias: effectiveInstance,
+        effectiveInstance,
+        taskId: '',
+        provider: '',
+        processIdentity: runtime === 'podman'
+            ? `container:${String(record?.containerId || '')}`
+            : '',
         containerName,
         agentName: String(record?.agentName || '-'),
         repoName: String(record?.repoName || '-'),
@@ -135,8 +181,30 @@ function collectAgentRuntimeStates(options = {}) {
             ? (options.liveContainers || [])
             : (options.collectContainers || collectLiveAgentContainers)() || [])
         : [];
-    const readSandboxServiceOwner = options.readSandboxServiceOwner || readServiceOwner;
+    const sandboxServiceOwners = options.readSandboxServiceOwner
+        ? null
+        : new Map((options.collectSandboxServiceOwners || collectServiceOwnersReadOnly)()
+            .map((owner) => [owner.runtimeKey, owner]));
+    const readSandboxServiceOwner = options.readSandboxServiceOwner
+        || ((runtimeKey) => sandboxServiceOwners.get(runtimeKey) || null);
     const sandboxOwnerRunning = options.isSandboxOwnerRunning || isSandboxOwnerRunning;
+    const providerClassifications = Object.hasOwn(options, 'providerOwners')
+        ? (options.providerOwners || []).map((owner) => ({
+            classification: owner.classification || 'live',
+            owner: owner.owner || owner,
+            processAuthority: 'inner-runtime-attestation',
+        }))
+        : (options.classifyProviderOwners || classifyProviderTaskOwnersReadOnly)();
+    let activeEdgeGeneration = Object.hasOwn(options, 'activeEdgeGeneration')
+        ? options.activeEdgeGeneration
+        : undefined;
+    if (activeEdgeGeneration === undefined) {
+        try {
+            activeEdgeGeneration = (options.loadActiveGeneration || loadActiveEdgeRoutingGeneration)();
+        } catch (_) {
+            activeEdgeGeneration = null;
+        }
+    }
     const containersByIdentity = new Map(liveContainers
         .filter(validLivePodmanIdentity)
         .map((entry) => [
@@ -164,6 +232,12 @@ function collectAgentRuntimeStates(options = {}) {
             states.push({
                 ...stoppedRuntimeEntry(containerName, record, runtime),
                 ...hostRuntimeOwnership(containerName, record, identityMatches ? owner : null),
+                readiness: exactAuthenticatedReadiness(
+                    activeEdgeGeneration,
+                    containerName,
+                    record,
+                    running,
+                ),
                 state: {
                     status: running ? 'running' : 'stopped',
                     running,
@@ -178,6 +252,25 @@ function collectAgentRuntimeStates(options = {}) {
         if (liveEntry) {
             states.push({
                 ...publicLiveRuntimeEntry(liveEntry),
+                role: 'service',
+                runtimeKey: containerName,
+                ownerKey: `container:${record.containerId}`,
+                instanceId: record.instanceId,
+                enableGeneration: record.enableGeneration,
+                homeKey: containerName,
+                workdir: String(record.workdir || record.projectPath || '-'),
+                logPath: podmanLogSource(record),
+                readiness: exactAuthenticatedReadiness(
+                    activeEdgeGeneration,
+                    containerName,
+                    record,
+                    true,
+                ),
+                alias: effectiveRuntimeAlias(containerName, record),
+                effectiveInstance: effectiveRuntimeAlias(containerName, record),
+                taskId: '',
+                provider: '',
+                processIdentity: `container:${record.containerId}`,
                 agentName: String(record.agentName || liveEntry.agentName || '-'),
                 repoName: String(record.repoName || liveEntry.repoName || '-'),
                 runtime,
@@ -193,6 +286,69 @@ function collectAgentRuntimeStates(options = {}) {
         }
 
         states.push(stoppedRuntimeEntry(containerName, record, runtime));
+    }
+
+    const serviceByRuntime = new Map(states
+        .filter((state) => state.role === 'service')
+        .map((state) => [state.runtimeKey, state]));
+    for (const classified of providerClassifications) {
+        const owner = classified.owner;
+        const record = registry?.[owner?.runtimeKey];
+        const exactHomeSelection = record?.runtime === 'podman'
+            ? owner?.homeKey === owner?.runtimeKey
+            : typeof record?.homeKey === 'string' && record.homeKey === owner?.homeKey;
+        const exactSelection = Boolean(record && record.type === 'agent'
+            && record.instanceId === owner.instanceId
+            && record.enableGeneration === owner.enableGeneration
+            && exactHomeSelection);
+        let selectionValid = exactSelection;
+        if (exactSelection) {
+            const selectedRuntime = validateRegistryRuntime(owner.runtimeKey, record);
+            const expectedDisplayRuntime = selectedRuntime === 'podman' ? 'container' : selectedRuntime;
+            selectionValid = owner.role === 'provider-task' && owner.runtime === expectedDisplayRuntime;
+        }
+        const parent = serviceByRuntime.get(owner.runtimeKey);
+        const parentRunning = Boolean(selectionValid && parent?.state?.running === true);
+        const parentReady = Boolean(parentRunning && parent?.readiness === 'ready');
+        const live = parentReady && classified.classification === 'live';
+        const failedClassification = !selectionValid
+            ? 'generation-mismatch'
+            : !parentRunning
+                ? 'parent-runtime-contained'
+                : !parentReady
+                    ? 'parent-runtime-not-ready'
+                : classified.classification;
+        states.push({
+            role: 'provider-task',
+            runtimeKey: owner.runtimeKey,
+            ownerKey: owner.ownerKey,
+            containerName: owner.runtimeKey,
+            agentName: String(record?.agentName || '-'),
+            repoName: String(record?.repoName || '-'),
+            runtime: owner.runtime,
+            enabled: selectionValid,
+            alias: owner.alias,
+            effectiveInstance: owner.alias,
+            instanceId: owner.instanceId,
+            enableGeneration: owner.enableGeneration,
+            homeKey: owner.homeKey,
+            workdir: owner.workdir,
+            logPath: owner.logPath,
+            taskId: owner.taskId,
+            provider: owner.provider,
+            mode: owner.mode,
+            pid: owner.pid,
+            processGroupId: owner.processGroupId,
+            processIdentity: owner.processIdentity,
+            readiness: owner.readiness,
+            classification: failedClassification,
+            processAuthority: 'inner-runtime-attestation',
+            state: {
+                status: live ? 'running' : 'failed',
+                running: live,
+                pid: owner.pid,
+            },
+        });
     }
 
     return states;

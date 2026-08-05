@@ -141,7 +141,106 @@ test('process identity inspector is boot-bound, stable, canonical, and platform 
     }
 });
 
-test('schema-v5 boot-bound sandbox ownership is exact across service and provider-task processes', () => {
+test('host sandbox lifecycle signals service ownership only and clears provider owners after containment', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapFleet.js', import.meta.url), 'utf8');
+    const stopStart = source.indexOf('function stopSandboxOwner(');
+    const stopEnd = source.indexOf('\nfunction stopSandboxOwners(', stopStart);
+    const stopSource = source.slice(stopStart, stopEnd);
+    assert.match(stopSource, /record\.role !== SANDBOX_OWNER_ROLES\.service/);
+    assert.match(stopSource, /PLOINKY_PROVIDER_TASK_HOST_SIGNAL_DENIED/);
+    const finalProviderRemoval = stopSource.lastIndexOf('clearProviderOwners();');
+    const finalServiceRemoval = stopSource.lastIndexOf('clearOwnerIfExact(record);');
+    assert.ok(finalProviderRemoval > stopSource.indexOf('waitForOwnerExit'));
+    assert.ok(finalProviderRemoval < finalServiceRemoval);
+
+    const probeStart = source.indexOf('function isBwrapProcessRunning(');
+    const probeEnd = source.indexOf('\nfunction stopBwrapProcess(', probeStart);
+    const probeSource = source.slice(probeStart, probeEnd);
+    assert.doesNotMatch(probeSource, /clearOwnerIfExact|removeProviderTaskOwnersAfterContainment/);
+});
+
+test('managed Podman replacement binds provider cleanup to the immutable predecessor labels', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    assert.match(source, /collectProviderTaskOwnersReadOnly\(\{ runtimeKey: containerName \}\)/);
+    assert.match(source, /requirePredecessorContainment: predecessorProviderOwners\.length > 0/);
+    assert.match(source, /labels\[NETWORK_LABELS\.instanceId\].*predecessorProviderIdentity\.instanceId/s);
+    assert.match(source, /labels\[NETWORK_LABELS\.enableGeneration\].*predecessorProviderIdentity\.enableGeneration/s);
+    assert.match(source, /removeProviderTaskOwnersAfterContainment\(predecessorProviderOwners/);
+});
+
+test('pre-v6 host-PID provider ownership API delegates to the v6 boundary', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapFleet.js', import.meta.url), 'utf8');
+    assert.match(source, /function saveProviderTaskOwner\(options\) \{\s*return publishProviderTask\(options\);/);
+    assert.doesNotMatch(source.slice(
+        source.indexOf('function saveProviderTaskOwner(options)'),
+        source.indexOf('\nfunction readProviderTaskOwner(', source.indexOf('function saveProviderTaskOwner(options)')),
+    ), /inspectProcessIdentity|process\.kill/);
+});
+
+test('status has an exact service-owner reader that cannot recover or mutate the store', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapFleet.js', import.meta.url), 'utf8');
+    const start = source.indexOf('function readServiceOwnerReadOnly(');
+    const end = source.indexOf('\nfunction readLegacyProviderTaskOwner(', start);
+    assert.ok(start >= 0, 'expected an exported exact read-only service-owner API');
+    const reader = source.slice(start, end);
+    assert.match(reader, /collectServiceOwnersReadOnly\(\)/);
+    assert.doesNotMatch(reader, /ensureOwnerDir|recoverOwnerOperationArtifacts|unlinkSync|renameSync|writeFileSync/);
+    assert.match(source.slice(source.lastIndexOf('export {')), /readServiceOwnerReadOnly/);
+});
+
+test('read-only service-owner status fails closed and preserves interrupted operation evidence', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-service-owner-readonly-'));
+    const script = `
+        import assert from 'node:assert/strict';
+        import fs from 'node:fs';
+        const fleet = await import(${JSON.stringify(fleetModuleUrl)} + '?readonly=' + Date.now());
+        const digest = (char) => 'sha256:' + char.repeat(64);
+        const runtimeKey = 'runtime-readonly';
+        const owner = fleet.saveServiceOwner({
+            runtimeKey,
+            pid: process.pid,
+            instanceId: 'instance-readonly',
+            enableGeneration: 'generation-readonly',
+            homeKey: runtimeKey + '.sandbox-v2',
+            workdir: '/workspace/project',
+            logPath: ${JSON.stringify(path.join(workspace, '.ploinky', 'logs', 'service.log'))},
+            routeKey: 'readonly',
+            rootPort: 8080,
+            credentialNonceDigest: digest('a'),
+            credentialExpiresAt: Math.floor(Date.now() / 1000) + 300,
+            manifestDigest: digest('b'),
+            admissionDigest: digest('c'),
+            networkHash: digest('d'),
+        });
+        assert.equal(fleet.readServiceOwnerReadOnly(runtimeKey).ownerKey, owner.ownerKey);
+        const ownerFile = fleet.BWRAP_PIDS_DIR + '/' + owner.ownerKey + '.owner.json';
+        const interrupted = ownerFile + '.operation-' + 'e'.repeat(32) + '.claim';
+        fs.linkSync(ownerFile, interrupted);
+        assert.throws(
+            () => fleet.readServiceOwnerReadOnly(runtimeKey),
+            (error) => error?.code === 'PLOINKY_SANDBOX_OWNER_STORE_INVALID'
+                || error?.code === 'PLOINKY_SANDBOX_OWNER_RECORD_INVALID',
+        );
+        assert.equal(fs.existsSync(interrupted), true);
+        assert.equal(fs.existsSync(ownerFile), true);
+    `;
+    try {
+        const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+            cwd: workspace,
+            env: {
+                ...process.env,
+                PLOINKY_WORKSPACE_ROOT: workspace,
+                PLOINKY_CWD: workspace,
+            },
+            encoding: 'utf8',
+        });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+/* Historical schema-v5 mixed service/provider test retained as migration evidence.
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-owner-'));
     const script = `
         import assert from 'node:assert/strict';
@@ -828,3 +927,4 @@ test('schema-v5 boot-bound sandbox ownership is exact across service and provide
         fs.rmSync(workspace, { recursive: true, force: true });
     }
 });
+*/

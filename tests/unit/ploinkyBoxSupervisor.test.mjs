@@ -118,7 +118,21 @@ test('stop relays to ploinky-local before stopping the outer Box without depende
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
-        runner: { run(command, args) { events.push(args.join(' ')); } },
+        runner: {
+            run(command, args) { events.push(args.join(' ')); },
+            query(command, args) {
+                events.push(args.join(' '));
+                return {
+                    ok: true,
+                    stdout: JSON.stringify({
+                        state: 'initialized',
+                        initialized: true,
+                        runtimes: [],
+                        warnings: [],
+                    }),
+                };
+            },
+        },
     });
     await supervisor.runStopTransaction();
     assert.equal(events.some((value) => value.includes('ploinky-install-deps')), false);
@@ -126,7 +140,10 @@ test('stop relays to ploinky-local before stopping the outer Box without depende
         value.includes('/opt/ploinky/bin/ploinky-local stop')
     ));
     const outerStop = events.findIndex((value) => value.includes('container stop --time 30'));
-    assert.ok(localStop >= 0 && localStop < outerStop);
+    const survivorCheck = events.findIndex((value) => (
+        value.includes('/opt/ploinky/ploinky-box/inbox/readStatus.mjs')
+    ));
+    assert.ok(localStop >= 0 && localStop < survivorCheck && survivorCheck < outerStop);
 });
 
 test('destroy revalidates the confirmed immutable ID and retains named volumes', async (t) => {
@@ -235,6 +252,34 @@ test('running status uses immutable-ID inbox inspection and allowlists its outpu
                 return { ok: true, stdout: JSON.stringify({
                     state: 'initialized', initialized: true, routingConfigured: true,
                     trackedAgents: 2, runningAgents: 1,
+                    runtimes: [{
+                        runtime: 'bwrap',
+                        role: 'provider-task',
+                        effectiveInstance: 'alpha',
+                        generation: 'generation-a',
+                        state: 'running',
+                        ownerKey: 'provider-task:runtime-a:task-a',
+                        processIdentity: 'linux-proc:fixture:42',
+                        workdir: '/workspace/project',
+                        homeKey: 'runtime-a.sandbox-v2',
+                        readiness: 'ready',
+                        logPath: '/workspace/.ploinky/logs/agents/instance-a/tasks/task-a-provider.log',
+                        taskId: 'task-a',
+                        provider: 'codex',
+                        brokerOwner: 'must-not-cross',
+                    }, {
+                        runtime: 'container',
+                        role: 'service',
+                        effectiveInstance: 'container-writer',
+                        generation: 'generation-container',
+                        state: 'running',
+                        ownerKey: `container:${'c'.repeat(64)}`,
+                        processIdentity: `container:${'c'.repeat(64)}`,
+                        workdir: '/workspace/projects/current',
+                        homeKey: 'coding_container',
+                        readiness: 'ready',
+                        logPath: `podman://${'c'.repeat(64)}`,
+                    }],
                     warnings: [], secret: 'must-not-cross',
                 }) };
             },
@@ -244,9 +289,204 @@ test('running status uses immutable-ID inbox inspection and allowlists its outpu
     assert.equal(result.state, 'running-initialized');
     assert.equal(calls[0].includes(ownership.handles.container.id), true);
     assert.equal(JSON.stringify(result).includes('must-not-cross'), false);
+    assert.equal(result.inbox.runtimes.length, 2);
+    assert.deepEqual(result.inbox.runtimes[0], {
+        runtime: 'bwrap',
+        role: 'provider-task',
+        effectiveInstance: 'alpha',
+        generation: 'generation-a',
+        state: 'running',
+        ownerKey: 'provider-task:runtime-a:task-a',
+        processIdentity: 'linux-proc:fixture:42',
+        workdir: '/workspace/project',
+        homeKey: 'runtime-a.sandbox-v2',
+        readiness: 'ready',
+        logPath: '/workspace/.ploinky/logs/agents/instance-a/tasks/task-a-provider.log',
+        taskId: 'task-a',
+        provider: 'codex',
+    });
+    assert.deepEqual(result.inbox.runtimes[1], {
+        runtime: 'container',
+        role: 'service',
+        effectiveInstance: 'container-writer',
+        generation: 'generation-container',
+        state: 'running',
+        ownerKey: `container:${'c'.repeat(64)}`,
+        processIdentity: `container:${'c'.repeat(64)}`,
+        workdir: '/workspace/projects/current',
+        homeKey: 'coding_container',
+        readiness: 'ready',
+        logPath: `podman://${'c'.repeat(64)}`,
+    });
     assert.equal(formatBoxStatus(result).includes('must-not-cross'), false);
     assert.equal(result.inbox.cloudflarePublication.state, 'unstarted');
     assert.match(formatBoxStatus(result), /Cloudflare mode: local-only/);
+    assert.match(formatBoxStatus(result), /bwrap provider-task alpha running/);
+    assert.match(formatBoxStatus(result), /container service container-writer running/);
+    assert.match(formatBoxStatus(result), /podman:\/\/c{64}/);
+});
+
+test('running status rejects traversal logs and identity-incomplete ready runtimes', (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const containerId = 'c'.repeat(64);
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        discover: () => ownership,
+        validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        runner: {
+            query() {
+                return { ok: true, stdout: JSON.stringify({
+                    state: 'initialized',
+                    initialized: true,
+                    runtimes: [{
+                        runtime: 'bwrap',
+                        role: 'provider-task',
+                        effectiveInstance: 'alpha',
+                        generation: 'generation-a',
+                        state: 'running',
+                        ownerKey: 'provider-task:runtime-a:task-a',
+                        processIdentity: 'linux-proc:fixture:42',
+                        workdir: '/workspace/project',
+                        homeKey: 'runtime-a.sandbox-v2',
+                        readiness: 'ready',
+                        logPath: '/workspace/.ploinky/logs/../secrets/canary',
+                        taskId: 'task-a',
+                        provider: 'codex',
+                    }, {
+                        runtime: 'container',
+                        role: 'service',
+                        effectiveInstance: 'container-writer',
+                        generation: '',
+                        state: 'running',
+                        ownerKey: `container:${containerId}`,
+                        processIdentity: `container:${containerId}`,
+                        workdir: '',
+                        homeKey: '',
+                        readiness: 'ready',
+                        logPath: `podman://${containerId}`,
+                    }, {
+                        runtime: 'bwrap',
+                        role: 'provider-task',
+                        effectiveInstance: 'foreign-provider',
+                        generation: 'generation-b',
+                        state: 'running',
+                        ownerKey: 'provider-task:runtime-b:task-b',
+                        processIdentity: 'linux-proc:fixture:43',
+                        workdir: '/etc',
+                        homeKey: 'runtime-b.sandbox-v2',
+                        readiness: 'ready',
+                        logPath: '/workspace/.ploinky/logs/agents/instance-b/tasks/task-b-provider.log',
+                        taskId: 'task-b',
+                        provider: 'codex',
+                    }, {
+                        runtime: 'container',
+                        role: 'service',
+                        effectiveInstance: 'foreign-container',
+                        generation: 'generation-container-b',
+                        state: 'running',
+                        ownerKey: `container:${containerId}`,
+                        processIdentity: `container:${containerId}`,
+                        workdir: '/etc',
+                        homeKey: 'container-b',
+                        readiness: 'ready',
+                        logPath: `podman://${containerId}`,
+                    }, {
+                        runtime: 'seatbelt',
+                        role: 'service',
+                        effectiveInstance: 'foreign-sandbox-service',
+                        generation: 'generation-service-a',
+                        state: 'running',
+                        ownerKey: 'service-owner-a',
+                        processIdentity: 'darwin-proc:fixture:44',
+                        workdir: '/etc',
+                        homeKey: 'runtime-service-a.sandbox-v2',
+                        readiness: 'ready',
+                        logPath: '/workspace/.ploinky/logs/seatbelt-a.log',
+                    }, {
+                        runtime: 'bwrap',
+                        role: 'service',
+                        effectiveInstance: 'valid-sandbox-service',
+                        generation: 'generation-service-b',
+                        state: 'running',
+                        ownerKey: 'service-owner-b',
+                        processIdentity: 'linux-proc:fixture:45',
+                        workdir: '/code',
+                        homeKey: 'runtime-service-b.sandbox-v2',
+                        readiness: 'ready',
+                        logPath: '/workspace/.ploinky/logs/bwrap-b.log',
+                    }],
+                    warnings: [],
+                }) };
+            },
+        },
+    });
+
+    const result = supervisor.inspectBoxStatus();
+    const output = formatBoxStatus(result);
+    assert.equal(result.inbox.invalidRuntimeEntries, 5);
+    assert.deepEqual(result.inbox.runtimes.map((runtime) => runtime.effectiveInstance), [
+        'valid-sandbox-service',
+    ]);
+    assert.equal(JSON.stringify(result).includes('canary'), false);
+    assert.doesNotMatch(output, /container-writer|foreign-|provider-task/);
+    assert.match(output, /valid-sandbox-service/);
+    assert.match(output, /5 invalid entries/);
+});
+
+test('stop reports exact inner survivors after containment and never exposes unallowlisted fields', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const ownership = owned(identity);
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: {
+            run(command, args) { events.push(args.join(' ')); },
+            query(command, args) {
+                events.push(args.join(' '));
+                return {
+                    ok: true,
+                    stdout: JSON.stringify({
+                        state: 'initialized',
+                        initialized: true,
+                        runtimes: [{
+                            runtime: 'container',
+                            role: 'provider-task',
+                            effectiveInstance: 'codex-a',
+                            generation: 'generation-a',
+                            state: 'failed',
+                            ownerKey: 'provider-task:container-a:task-a',
+                            processIdentity: 'linux-proc:fixture:42',
+                            workdir: '/workspace/project',
+                            homeKey: 'container-a',
+                            readiness: 'not-ready',
+                            logPath: '/workspace/.ploinky/logs/agents/instance-a/tasks/task-a-provider.log',
+                            taskId: 'task-a',
+                            provider: 'codex',
+                            secret: 'must-not-cross',
+                        }],
+                        warnings: [],
+                    }),
+                };
+            },
+        },
+    });
+
+    await assert.rejects(
+        () => supervisor.runStopTransaction(),
+        (error) => {
+            assert.match(error.message, /container provider-task codex-a task-a failed/);
+            assert.doesNotMatch(error.message, /must-not-cross/);
+            return true;
+        },
+    );
+    assert.equal(events.some((value) => value.includes('container stop --time 30')), true);
 });
 
 test('running status allowlists and renders concise Cloudflare publication state', (t) => {
@@ -344,11 +584,14 @@ test('failed ploinky-local stop still stops the outer Box', async (t) => {
                     throw new Error('local stop failed');
                 }
             },
+            query() {
+                return { ok: true, stdout: JSON.stringify({ runtimes: [], warnings: [] }) };
+            },
         },
     });
     await assert.rejects(
         () => supervisor.runStopTransaction(),
-        /Outer Box stopped after ploinky-local stop reported: local stop failed/,
+        /Outer Box stopped after ploinky-local stop failed/,
     );
     assert.equal(events.some((value) => value.includes('container stop --time 30')), true);
 });

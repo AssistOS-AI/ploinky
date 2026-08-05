@@ -24,25 +24,27 @@ test('whole-workspace and Router lifecycle commands inactivate edge authorizatio
     ]);
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-restart')",
+        "const list = stopConfiguredAgents({ removeContainers: fs.existsSync('/etc/ploinky-box') });",
         "const routerStopResult = stopExactRouterForLifecycle('restart')",
-        'const list = stopConfiguredAgents();',
         'await startWorkspace(',
         'killRouterIfRunning: () => routerStopResult',
     ]);
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-shutdown')",
-        "stopExactRouterForLifecycle('shutdown')",
         'const list = destroyWorkspaceContainers();',
+        "stopExactRouterForLifecycle('shutdown')",
     ]);
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-stop')",
+        "const boxRuntime = fs.existsSync('/etc/ploinky-box');",
+        'removeContainers: boxRuntime,',
+        'removeRegistry: boxRuntime,',
         "stopExactRouterForLifecycle('stop')",
-        'const list = stopConfiguredAgents();',
     ]);
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-destroy')",
-        "stopExactRouterForLifecycle('destroy')",
         'await destroyAll();',
+        "stopExactRouterForLifecycle('destroy')",
     ]);
     assert.doesNotMatch(cliSource, /killRouterIfRunning:\s*\(\)\s*=>\s*\{\s*\}/);
 });

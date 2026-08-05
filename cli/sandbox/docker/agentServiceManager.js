@@ -55,6 +55,10 @@ import {
 import { clearLivenessState, runContainerScriptReadiness } from './healthProbes.js';
 import { removeExactRegisteredContainer, stopAndRemove } from './containerFleet.js';
 import {
+    collectProviderTaskOwnersReadOnly,
+    removeProviderTaskOwnersAfterContainment,
+} from '../providerTaskOwnership.js';
+import {
     TARGETED_DRAIN_ACKNOWLEDGEMENT,
     drainAndRemoveTargetedContainer,
     drainTargetedContainer,
@@ -120,6 +124,7 @@ import {
     networkContractHash,
 } from '../networkContract.js';
 import {
+    NETWORK_LABELS,
     assertNetworkLifecycleCapability,
     createNetworkLifecycleAdapter,
     withNetworkLifecycleLock,
@@ -1965,6 +1970,30 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let launchedContainerId = '';
     let generatedLaunch = null;
     let adoptedExistingRuntime = false;
+    const predecessorProviderOwners = runtimeNetworkPlan.requiresManagedNetwork
+        ? collectProviderTaskOwnersReadOnly({ runtimeKey: containerName })
+        : [];
+    let predecessorProviderIdentity = null;
+    if (predecessorProviderOwners.length) {
+        const identities = new Map(predecessorProviderOwners.map((owner) => [
+            `${owner.instanceId}\0${owner.enableGeneration}`,
+            Object.freeze({
+                instanceId: owner.instanceId,
+                enableGeneration: owner.enableGeneration,
+            }),
+        ]));
+        if (identities.size !== 1 || predecessorProviderOwners.some((owner) => (
+            owner.runtimeKey !== containerName
+            || owner.runtime !== 'container'
+            || owner.runtimeKind !== 'container'
+            || owner.homeKey !== containerName
+        ))) {
+            const error = new Error(`managed predecessor '${containerName}' has mixed or mismatched provider ownership`);
+            error.code = 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED';
+            throw error;
+        }
+        predecessorProviderIdentity = identities.values().next().value;
+    }
     try {
     if (runtimeNetworkPlan.requiresManagedNetwork) {
         // Resolve both the target and fixed probe images before the network
@@ -1983,6 +2012,24 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             prepareLaunch: prepareGeneratedRouterLaunch,
             preStartLaunch: preStartGeneratedRouterLaunch,
             finalizeLaunch: finalizeGeneratedRouterLaunch,
+            requirePredecessorContainment: predecessorProviderOwners.length > 0,
+            afterPredecessorContained: predecessorProviderOwners.length
+                ? ({ record }) => {
+                    const labels = record?.Config?.Labels || record?.Labels || record?.labels || {};
+                    if (String(labels[NETWORK_LABELS.instanceId] || '') !== predecessorProviderIdentity.instanceId
+                        || String(labels[NETWORK_LABELS.enableGeneration] || '') !== predecessorProviderIdentity.enableGeneration) {
+                        const error = new Error(`managed predecessor '${containerName}' provider identity does not match its immutable container labels`);
+                        error.code = 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED';
+                        throw error;
+                    }
+                    removeProviderTaskOwnersAfterContainment(predecessorProviderOwners, {
+                        contained: true,
+                        runtimeKey: containerName,
+                        instanceId: predecessorProviderIdentity.instanceId,
+                        enableGeneration: predecessorProviderIdentity.enableGeneration,
+                    });
+                }
+                : null,
             beforeFailureCleanup: runtimeIdentity.preparationLease
                 ? ({ error }) => {
                     abortPreparedRuntimeCandidateBeforeCleanup({

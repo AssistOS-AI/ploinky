@@ -76,7 +76,8 @@ test('layer-aware main help preserves unrelated command lines', () => {
         assert.match(text, /dashboard\s+Print the administrator-only Dashboard access URL/);
         assert.match(text, /client tool <name>\s+Invoke any MCP tool/);
         assert.match(text, /restart\s+Restart enabled agents \+ Router/);
-        assert.match(text, /logs last <N>\s+Show last N router log lines/);
+        assert.match(text, /logs tail \[target\]\s+Follow the selected owned log/);
+        assert.match(text, /logs last <N> \[target\]\s+Show the last N selected log lines/);
     }
 });
 

@@ -71,8 +71,8 @@ ${lifecycleHelpLines(surface).join('\n')}
   restart                        Restart enabled agents + Router
   disable agents-all             Disable all enabled agents and remove their containers
   reinstall <agentName>          Re-create a running agent container (destructive)
-  logs tail [router]             Follow router logs
-  logs last <N>                  Show last N router log lines
+  logs tail [target]             Follow the selected owned log
+  logs last <N> [target]         Show the last N selected log lines
 
 ▶ FOR DETAILED HELP
   help <command>                 Show detailed help for a command
@@ -342,19 +342,29 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             notes: 'A named restart requires the persisted RoutingServer port and refuses foreign or old-contract containers. The general restart fails if start was not configured yet.'
         },
         'logs': {
-            description: 'Inspect router logs',
+            description: 'Inspect Router, exact service, or exact provider-task logs without runtime fallback.',
             subcommands: {
                 'tail': {
-                    syntax: 'logs tail [router]',
-                    description: 'Follow router logs',
-                    examples: [ 'logs tail', 'logs tail router' ]
+                    syntax: 'logs tail [router|service <runtime-key>|task <runtime-key> <task-id>]',
+                    description: 'Follow the selected owned log',
+                    examples: [
+                        'logs tail',
+                        'logs tail router',
+                        'logs tail service bwrap:assistant',
+                        'logs tail task bwrap:assistant operation-123'
+                    ]
                 },
                 'last': {
-                    syntax: 'logs last <N>',
-                    description: 'Show last N router log lines',
-                    examples: [ 'logs last 200', 'logs last 50' ]
+                    syntax: 'logs last <N> [router|service <runtime-key>|task <runtime-key> <task-id>]',
+                    description: 'Show the last N selected log lines',
+                    examples: [
+                        'logs last 200',
+                        'logs last 50 service bwrap:assistant',
+                        'logs last 100 task bwrap:assistant operation-123'
+                    ]
                 }
-            }
+            },
+            notes: 'Target identities are exact. Service and provider-task logs must have a matching durable owner record.'
         },
         '/settings': {
             description: 'Open the interactive model/settings menu.',

@@ -125,6 +125,7 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
     const states = collectAgentRuntimeStates({
         registry,
         liveContainers: [],
+        providerOwners: [],
         readSandboxServiceOwner(runtimeKey) {
             reads.push(runtimeKey);
             return owners[runtimeKey] || null;
@@ -192,6 +193,7 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
             containerId: 'a'.repeat(64),
             instanceId: 'instance-running',
             enableGeneration: 'generation-running',
+            alias: 'editor-running',
         },
         stoppedKey: {
             type: 'agent',
@@ -201,6 +203,7 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
             containerId: 'b'.repeat(64),
             instanceId: 'instance-stopped',
             enableGeneration: 'generation-stopped',
+            alias: 'editor-stopped',
         },
     };
     const liveContainers = [{
@@ -216,29 +219,51 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
         config: {},
     }];
 
-    const states = collectAgentRuntimeStates({ registry, liveContainers });
+    const states = collectAgentRuntimeStates({ registry, liveContainers, providerOwners: [] });
 
     assert.equal(states[0].runtime, 'podman');
     assert.equal(states[0].state.running, true);
+    assert.equal(states[0].effectiveInstance, 'editor-running');
+    assert.equal(states[0].readiness, 'not-ready');
+    assert.equal(states[0].logPath, `podman://${'a'.repeat(64)}`);
     assert.equal(states[1].runtime, 'podman');
     assert.equal(states[1].state.status, 'stopped');
+    assert.equal(states[1].effectiveInstance, 'editor-stopped');
+    assert.equal(states[1].readiness, 'not-ready');
+    assert.equal(states[1].logPath, `podman://${'b'.repeat(64)}`);
     for (const state of states) {
-        for (const hostOnlyField of [
-            'role',
-            'runtimeKey',
-            'ownerKey',
-            'instanceId',
-            'enableGeneration',
-            'homeKey',
-            'workdir',
-            'logPath',
-            'taskId',
-            'provider',
-            'processIdentity',
-        ]) {
-            assert.equal(Object.hasOwn(state, hostOnlyField), false, `${hostOnlyField} must remain host-only`);
-        }
+        assert.equal(state.role, 'service');
+        assert.ok(state.runtimeKey);
+        assert.equal(state.instanceId.startsWith('instance-'), true);
+        assert.equal(state.enableGeneration.startsWith('generation-'), true);
     }
+});
+
+test('service readiness requires the exact active authenticated generation', () => {
+    const record = {
+        type: 'agent', runtime: 'podman', alias: 'editor', agentName: 'agent',
+        containerId: 'a'.repeat(64), instanceId: 'instance-ready',
+        enableGeneration: 'generation-ready',
+    };
+    const live = [{
+        containerName: 'runtime-ready', runtime: 'podman', ownershipVerified: true,
+        containerId: record.containerId, instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+        state: { status: 'running', running: true, pid: 99 },
+    }];
+    const collect = (activeEdgeGeneration) => collectAgentRuntimeStates({
+        registry: { 'runtime-ready': record }, liveContainers: live, providerOwners: [],
+        activeEdgeGeneration,
+    })[0];
+    assert.equal(collect(null).readiness, 'not-ready');
+    assert.equal(collect({
+        selector: { state: 'active', publicationState: 'ready' },
+        generation: { agents: { 'runtime-ready': { ...record } } },
+    }).readiness, 'ready');
+    assert.equal(collect({
+        selector: { state: 'active', publicationState: 'ready' },
+        generation: { agents: { 'runtime-ready': { ...record, enableGeneration: 'stale' } } },
+    }).readiness, 'not-ready');
 });
 
 test('collectAgentRuntimeStates rejects legacy and non-exact registry runtimes before probing OCI', () => {
@@ -259,6 +284,7 @@ test('collectAgentRuntimeStates rejects legacy and non-exact registry runtimes b
                     probes += 1;
                     return [];
                 },
+                providerOwners: [],
             }),
             (error) => error?.code === 'PLOINKY_AGENT_RUNTIME_STATE_INVALID'
                 && /invalidKey/.test(error.message),
@@ -287,6 +313,7 @@ test('collectAgentRuntimeStates does not probe a container engine for an all-san
         readSandboxServiceOwner() {
             return null;
         },
+        providerOwners: [],
     });
 
     assert.equal(probes, 0);
@@ -327,12 +354,17 @@ test('collectAgentRuntimeStates matches Podman state by immutable ID and exact g
         const states = collectAgentRuntimeStates({
             registry,
             liveContainers: [{ ...baseLive, ...stale }],
+            providerOwners: [],
         });
         const enabled = states.find((entry) => entry.enabled === true);
         assert.equal(enabled.state.running, false, `stale identity ${JSON.stringify(stale)} must not match`);
     }
 
-    const exact = collectAgentRuntimeStates({ registry, liveContainers: [baseLive] });
+    const exact = collectAgentRuntimeStates({
+        registry,
+        liveContainers: [baseLive],
+        providerOwners: [],
+    });
     assert.equal(exact.find((entry) => entry.enabled === true).state.running, true);
 });
 
@@ -349,6 +381,7 @@ test('collectAgentRuntimeStates never surfaces a foreign or unregistered live Po
     };
     const states = collectAgentRuntimeStates({
         registry,
+        providerOwners: [],
         liveContainers: [{
             containerName: 'foreignKey',
             runtime: 'podman',
@@ -380,6 +413,7 @@ test('collectAgentRuntimeStates rejects legacy or mismatched sandbox HOME keys',
                     },
                 },
                 liveContainers: [],
+                providerOwners: [],
             }),
             error => error?.code === 'PLOINKY_AGENT_RUNTIME_STATE_INVALID'
                 && /sandbox-v2 HOME key/.test(error.message),
@@ -399,11 +433,99 @@ test('collectAgentRuntimeStates rejects incomplete Podman registry identities', 
         const record = { ...complete };
         delete record[field];
         assert.throws(
-            () => collectAgentRuntimeStates({ registry: { incomplete: record }, liveContainers: [] }),
+            () => collectAgentRuntimeStates({
+                registry: { incomplete: record },
+                liveContainers: [],
+                providerOwners: [],
+            }),
             (error) => error?.code === 'PLOINKY_AGENT_RUNTIME_STATE_INVALID'
                 && error.message.includes(field),
         );
     }
+});
+
+test('provider status is allowlisted and live only under its exact running parent runtime', () => {
+    const runtimeKey = 'runtime-provider';
+    const registry = {
+        [runtimeKey]: {
+            type: 'agent',
+            runtime: 'bwrap',
+            repoName: 'fixtures',
+            agentName: 'alpha',
+            alias: 'editor',
+            instanceId: 'instance-provider',
+            enableGeneration: 'generation-provider',
+            homeKey: `${runtimeKey}.sandbox-v2`,
+        },
+    };
+    const serviceOwner = {
+        ownerKey: 'service-owner',
+        runtimeKey,
+        instanceId: 'instance-provider',
+        enableGeneration: 'generation-provider',
+        homeKey: `${runtimeKey}.sandbox-v2`,
+        pid: 41,
+    };
+    const providerOwner = {
+        role: 'provider-task',
+        ownerKey: 'provider-owner',
+        runtimeKey,
+        runtime: 'bwrap',
+        alias: 'editor',
+        instanceId: 'instance-provider',
+        enableGeneration: 'generation-provider',
+        homeKey: `${runtimeKey}.sandbox-v2`,
+        workdir: '/workspace/project',
+        logPath: '/workspace/.ploinky/logs/agents/instance-provider/tasks/task-1-provider.log',
+        taskId: 'task-1',
+        provider: 'codex',
+        mode: 'task',
+        audience: 'secret-audience',
+        brokerOwner: `sha256:${'a'.repeat(64)}`,
+        pid: 42,
+        processGroupId: 42,
+        processIdentity: 'linux-proc:123e4567-e89b-12d3-a456-426614174000:42',
+        processUid: 1000,
+        readiness: 'ready',
+        state: 'running',
+    };
+    const states = collectAgentRuntimeStates({
+        registry,
+        providerOwners: [providerOwner],
+        readSandboxServiceOwner: () => serviceOwner,
+        isSandboxOwnerRunning: () => true,
+        activeEdgeGeneration: {
+            selector: { state: 'active', publicationState: 'ready' },
+            generation: { agents: registry },
+        },
+    });
+    const provider = states.find((state) => state.role === 'provider-task');
+    assert.equal(provider.state.status, 'running');
+    assert.equal(provider.effectiveInstance, 'editor');
+    assert.equal(provider.processAuthority, 'inner-runtime-attestation');
+    assert.equal(Object.hasOwn(provider, 'audience'), false);
+    assert.equal(Object.hasOwn(provider, 'brokerOwner'), false);
+    assert.equal(Object.hasOwn(provider, 'processUid'), false);
+
+    const unpublished = collectAgentRuntimeStates({
+        registry,
+        providerOwners: [providerOwner],
+        readSandboxServiceOwner: () => serviceOwner,
+        isSandboxOwnerRunning: () => true,
+        activeEdgeGeneration: null,
+    }).find((state) => state.role === 'provider-task');
+    assert.equal(unpublished.state.status, 'failed');
+    assert.equal(unpublished.classification, 'parent-runtime-not-ready');
+
+    const contained = collectAgentRuntimeStates({
+        registry,
+        providerOwners: [providerOwner],
+        readSandboxServiceOwner: () => serviceOwner,
+        isSandboxOwnerRunning: () => false,
+        activeEdgeGeneration: null,
+    }).find((state) => state.role === 'provider-task');
+    assert.equal(contained.state.status, 'failed');
+    assert.equal(contained.classification, 'parent-runtime-contained');
 });
 
 test('Marketplace reports an enabled bwrap agent as running from generic runtime state', () => {

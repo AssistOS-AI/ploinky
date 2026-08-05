@@ -38,6 +38,183 @@ function defaultDiscovery(identity, runner, platform, env) {
     return discoverBoxOwnership(identity, { runner, platform, env });
 }
 
+const INBOX_RUNTIME_KINDS = new Set(['bwrap', 'seatbelt', 'container']);
+const INBOX_RUNTIME_ROLES = new Set(['service', 'provider-task']);
+const INBOX_RUNTIME_STATES = new Set(['running', 'stopped', 'failed']);
+const INBOX_READINESS_STATES = new Set(['ready', 'not-ready']);
+const INBOX_SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
+const INBOX_LOG_ROOT = '/workspace/.ploinky/logs';
+
+function boundedInboxText(value, { allowEmpty = false, maxBytes = 4096 } = {}) {
+    return typeof value === 'string'
+        && value === value.trim()
+        && (allowEmpty || value !== '')
+        && Buffer.byteLength(value, 'utf8') <= maxBytes
+        && !/[\u0000-\u001f\u007f]/u.test(value)
+        ? value
+        : null;
+}
+
+function safeInboxSegment(value) {
+    return typeof value === 'string'
+        && value !== '.'
+        && value !== '..'
+        && INBOX_SAFE_SEGMENT.test(value);
+}
+
+function canonicalInboxPath(value) {
+    return typeof value === 'string'
+        && path.posix.isAbsolute(value)
+        && path.posix.normalize(value) === value;
+}
+
+function exactInboxWorkdir(runtime, role, workdir) {
+    if (!canonicalInboxPath(workdir) || workdir === '/') return false;
+    const workspaceContained = workdir === '/workspace' || workdir.startsWith('/workspace/');
+    if (role === 'provider-task') return workdir !== '/workspace' && workspaceContained;
+    if (runtime === 'container') return workspaceContained;
+    return workdir === '/code';
+}
+
+function exactInboxFileLog(logPath, role, taskId) {
+    if (logPath === '') return role === 'service';
+    if (!canonicalInboxPath(logPath)) return false;
+    const relative = path.posix.relative(INBOX_LOG_ROOT, logPath);
+    if (!relative || relative === '..' || relative.startsWith('../')
+        || path.posix.isAbsolute(relative)) return false;
+    const segments = relative.split('/');
+    if (role === 'provider-task') {
+        return safeInboxSegment(taskId)
+            && segments.length === 4
+            && segments[0] === 'agents'
+            && safeInboxSegment(segments[1])
+            && segments[2] === 'tasks'
+            && segments[3] === `${taskId}-provider.log`;
+    }
+    return !segments.includes('tasks');
+}
+
+function allowlistInboxRuntime(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const runtime = INBOX_RUNTIME_KINDS.has(value.runtime) ? value.runtime : null;
+    const role = INBOX_RUNTIME_ROLES.has(value.role) ? value.role : null;
+    const state = INBOX_RUNTIME_STATES.has(value.state) ? value.state : null;
+    const readiness = INBOX_READINESS_STATES.has(value.readiness) ? value.readiness : null;
+    const effectiveInstance = boundedInboxText(value.effectiveInstance, { maxBytes: 255 });
+    const generation = boundedInboxText(value.generation, { allowEmpty: true, maxBytes: 255 });
+    const ownerKey = boundedInboxText(value.ownerKey, { allowEmpty: true, maxBytes: 512 });
+    const processIdentity = boundedInboxText(value.processIdentity, { allowEmpty: true, maxBytes: 512 });
+    const workdir = boundedInboxText(value.workdir, { allowEmpty: true });
+    const homeKey = boundedInboxText(value.homeKey, { allowEmpty: true, maxBytes: 255 });
+    const logPath = boundedInboxText(value.logPath, { allowEmpty: true });
+    const taskId = role === 'provider-task'
+        ? boundedInboxText(value.taskId, { maxBytes: 255 })
+        : null;
+    const provider = role === 'provider-task'
+        ? boundedInboxText(value.provider, { maxBytes: 64 })
+        : null;
+    const containerIdentity = /^container:([a-f0-9]{64})$/.exec(processIdentity || '');
+    const exactContainerServiceLog = runtime === 'container' && role === 'service'
+        && containerIdentity
+        && ownerKey === processIdentity
+        && logPath === `podman://${containerIdentity[1]}`;
+    const exactFileLog = exactInboxFileLog(logPath, role, taskId);
+    const requiresExactOwnership = state === 'running'
+        || readiness === 'ready'
+        || role === 'provider-task';
+    const exactOwnership = generation !== ''
+        && ownerKey !== ''
+        && processIdentity !== ''
+        && exactInboxWorkdir(runtime, role, workdir)
+        && safeInboxSegment(homeKey);
+    const readinessConsistent = readiness !== 'ready' || state === 'running';
+    if (!runtime || !role || !state || !readiness || !effectiveInstance
+        || generation === null || ownerKey === null || processIdentity === null
+        || workdir === null || homeKey === null || logPath === null
+        || !readinessConsistent
+        || (requiresExactOwnership && !exactOwnership)
+        || (runtime === 'container' && role === 'service'
+            ? !exactContainerServiceLog
+            : !exactFileLog)) {
+        return null;
+    }
+    const result = {
+        runtime,
+        role,
+        effectiveInstance,
+        generation,
+        state,
+        ownerKey,
+        processIdentity,
+        workdir,
+        homeKey,
+        readiness,
+        logPath,
+    };
+    if (role === 'provider-task') {
+        if (!safeInboxSegment(taskId) || !safeInboxSegment(provider)) return null;
+        result.taskId = taskId;
+        result.provider = provider;
+    }
+    return Object.freeze(result);
+}
+
+function allowlistInboxPayload(parsed) {
+    const suppliedRuntimes = Array.isArray(parsed?.runtimes) ? parsed.runtimes : [];
+    const runtimes = suppliedRuntimes.slice(0, 1024).map(allowlistInboxRuntime);
+    const invalidRuntimeEntries = runtimes.filter((value) => value === null).length
+        + Math.max(0, suppliedRuntimes.length - 1024);
+    return Object.freeze({
+        state: String(parsed?.state || 'unknown'),
+        initialized: parsed?.initialized === true,
+        routingConfigured: parsed?.routingConfigured === true,
+        trackedAgents: Number(parsed?.trackedAgents) || 0,
+        runningAgents: Number(parsed?.runningAgents) || 0,
+        runtimes: Object.freeze(runtimes.filter(Boolean)),
+        invalidRuntimeEntries,
+        cloudflarePublication: serializeCloudflarePublicationStatus(
+            parsed?.cloudflarePublication,
+        ),
+        warnings: Object.freeze([
+            ...(Array.isArray(parsed?.warnings)
+                ? parsed.warnings.slice(0, 256).map(() => 'inner lifecycle warning')
+                : []),
+            ...(invalidRuntimeEntries > 0
+                ? [`inner runtime status rejected: ${invalidRuntimeEntries} invalid entries`]
+                : []),
+        ]),
+    });
+}
+
+function queryBoxInbox(engine, containerId, runner) {
+    if (typeof runner?.query !== 'function') {
+        return Object.freeze({ ok: false, inbox: null });
+    }
+    const result = runner.query(engine.name, [
+        'container', 'exec',
+        '--user', 'podman',
+        '--workdir', '/workspace',
+        containerId,
+        '/usr/local/bin/node',
+        '/opt/ploinky/ploinky-box/inbox/readStatus.mjs',
+    ]);
+    if (!result?.ok) return Object.freeze({ ok: false, inbox: null });
+    try {
+        const parsed = JSON.parse(String(result.stdout || '').trim());
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return Object.freeze({ ok: false, inbox: null });
+        }
+        return Object.freeze({ ok: true, inbox: allowlistInboxPayload(parsed) });
+    } catch {
+        return Object.freeze({ ok: false, inbox: null });
+    }
+}
+
+function describeRuntimeSurvivor(runtime) {
+    const task = runtime.role === 'provider-task' ? ` ${runtime.taskId}` : '';
+    return `${runtime.runtime} ${runtime.role} ${runtime.effectiveInstance}${task} ${runtime.state}`;
+}
+
 export function createBoxSupervisor({
     runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
     lockManager = createMutationLockManager(),
@@ -144,18 +321,35 @@ export function createBoxSupervisor({
             }
             if (container.runtime.running) {
                 let localStopError = null;
+                let cleanupVerificationError = null;
+                let survivors = [];
                 try {
                     stopPloinkyLocalByContainerId(ownership.engine, container.id, runner);
                 } catch (error) {
                     localStopError = error;
+                }
+                try {
+                    const checked = queryBoxInbox(ownership.engine, container.id, runner);
+                    if (!checked.ok || checked.inbox.invalidRuntimeEntries > 0) {
+                        cleanupVerificationError = new Error('inner cleanup verification was unavailable');
+                    } else {
+                        survivors = checked.inbox.runtimes.filter((runtime) => runtime.ownerKey !== '');
+                    }
                 } finally {
                     runner.run(ownership.engine.name, [
                         'container', 'stop', '--time', '30', container.id,
                     ]);
                 }
-                if (localStopError) {
+                if (localStopError || cleanupVerificationError || survivors.length > 0) {
+                    const detail = [
+                        ...(localStopError ? ['ploinky-local stop failed'] : []),
+                        ...(cleanupVerificationError ? ['inner cleanup verification failed'] : []),
+                        ...(survivors.length > 0
+                            ? [`exact inner survivors: ${survivors.map(describeRuntimeSurvivor).join(', ')}`]
+                            : []),
+                    ].join('; ');
                     throw supervisorError(
-                        `Outer Box stopped after ploinky-local stop reported: ${localStopError.message}`,
+                        `Outer Box stopped after ${detail}`,
                     );
                 }
             }
@@ -225,15 +419,8 @@ export function createBoxSupervisor({
         if (!container.runtime.running) {
             return Object.freeze({ identity, ownership, state: 'stopped' });
         }
-        const inbox = runner.query(ownership.engine.name, [
-            'container', 'exec',
-            '--user', 'podman',
-            '--workdir', '/workspace',
-            container.id,
-            '/usr/local/bin/node',
-            '/opt/ploinky/ploinky-box/inbox/readStatus.mjs',
-        ]);
-        if (!inbox.ok) {
+        const checkedInbox = queryBoxInbox(ownership.engine, container.id, runner);
+        if (!checkedInbox.ok) {
             return Object.freeze({
                 identity,
                 ownership,
@@ -242,20 +429,7 @@ export function createBoxSupervisor({
             });
         }
         try {
-            const parsed = JSON.parse(String(inbox.stdout || '').trim());
-            const allowlisted = Object.freeze({
-                state: String(parsed.state || 'unknown'),
-                initialized: parsed.initialized === true,
-                routingConfigured: parsed.routingConfigured === true,
-                trackedAgents: Number(parsed.trackedAgents) || 0,
-                runningAgents: Number(parsed.runningAgents) || 0,
-                cloudflarePublication: serializeCloudflarePublicationStatus(
-                    parsed.cloudflarePublication,
-                ),
-                warnings: Object.freeze(Array.isArray(parsed.warnings)
-                    ? parsed.warnings.map(String)
-                    : []),
-            });
+            const allowlisted = checkedInbox.inbox;
             return Object.freeze({
                 identity,
                 ownership,
@@ -331,6 +505,11 @@ export function formatBoxStatus(status) {
         lines.push(`Cloudflare publication: ${status.inbox.cloudflarePublication.state}`);
         lines.push(`Cloudflare connector: ${status.inbox.cloudflarePublication.connectorState}`);
         lines.push(`Cloudflare hosts: ${status.inbox.cloudflarePublication.hostnames.length}`);
+        for (const runtime of status.inbox.runtimes) {
+            const task = runtime.role === 'provider-task' ? ` task=${runtime.taskId}` : '';
+            const log = runtime.logPath ? ` log=${runtime.logPath}` : '';
+            lines.push(`Runtime: ${runtime.runtime} ${runtime.role} ${runtime.effectiveInstance} ${runtime.state}${task}${log}`);
+        }
         for (const warning of status.inbox.warnings) lines.push(`Warning: ${warning}`);
     } else if (status.detail || status.ownership?.message) {
         lines.push(`Detail: ${status.detail || status.ownership.message}`);

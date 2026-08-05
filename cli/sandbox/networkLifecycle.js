@@ -986,6 +986,8 @@ export function createNetworkLifecycleAdapter({
         prepareLaunch = null,
         preStartLaunch = null,
         finalizeLaunch = null,
+        afterPredecessorContained = null,
+        requirePredecessorContainment = false,
         beforeFailureCleanup = null,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
         networkLifecycleCapability,
@@ -1003,6 +1005,15 @@ export function createNetworkLifecycleAdapter({
         if (finalizeLaunch !== null && typeof finalizeLaunch !== 'function') {
             throw new Error('managed container transaction finalizeLaunch must be a function');
         }
+        if (afterPredecessorContained !== null && typeof afterPredecessorContained !== 'function') {
+            throw new Error('managed container transaction afterPredecessorContained must be a function');
+        }
+        if (typeof requirePredecessorContainment !== 'boolean') {
+            throw new Error('managed container transaction requirePredecessorContainment must be boolean');
+        }
+        if (requirePredecessorContainment && !afterPredecessorContained) {
+            throw new Error('managed container transaction required containment needs a cleanup callback');
+        }
         if (beforeFailureCleanup !== null && typeof beforeFailureCleanup !== 'function') {
             throw new Error('managed container transaction beforeFailureCleanup must be a function');
         }
@@ -1019,6 +1030,9 @@ export function createNetworkLifecycleAdapter({
                 assertRequiredLabels(containerName, labelsOf(previous), ownershipLabels);
                 previousId = containerRecordId(previous, containerName);
             }
+            if (requirePredecessorContainment && !previous) {
+                throw new Error(`managed replacement required predecessor is absent for '${containerName}'`);
+            }
             let candidateCreationAttempted = false;
             let plan = null;
             let launch = null;
@@ -1026,7 +1040,7 @@ export function createNetworkLifecycleAdapter({
                 plan = prepareFromPreflight(checked, {
                     deferFailureCleanup: Boolean(beforeFailureCleanup),
                 });
-                if (previous && inspectAdoption
+                if (!requirePredecessorContainment && previous && inspectAdoption
                     && hasRequiredLabels(labelsOf(previous), agentLabels)
                     && (previous?.State?.Running === true || previous?.State?.Status === 'running')) {
                     const adoption = inspectAdoption({
@@ -1082,6 +1096,23 @@ export function createNetworkLifecycleAdapter({
                                 ownershipLabels,
                             );
                         }
+                    }
+                    const contained = inspectContainer(previousId);
+                    if (contained) {
+                        if (containerRecordId(contained, containerName) !== previousId) {
+                            throw new Error(`resource '${containerName}' changed identity after managed containment`);
+                        }
+                        assertRequiredLabels(containerName, labelsOf(contained), ownershipLabels);
+                        if (contained?.State?.Running === true || contained?.State?.Status === 'running') {
+                            throw new Error(`managed predecessor '${containerName}' remained running after stop`);
+                        }
+                    }
+                    if (afterPredecessorContained) {
+                        afterPredecessorContained(Object.freeze({
+                            containerId: previousId,
+                            record: contained || current,
+                            state: contained ? 'stopped' : 'absent',
+                        }));
                     }
                     const removed = execute(['rm', '-f', previousId]);
                     if (!removed.ok && !missing(removed)) {

@@ -21,6 +21,11 @@ const {
     mintTurnCredentials,
 } = await import(`../../cli/server/privateRouter.js${moduleSuffix}`);
 const { installGeneratedRouterRuntime } = await import(`../helpers/generatedRouterRuntime.mjs${moduleSuffix}`);
+const {
+    brokerOwnerFor,
+    publishProviderTask,
+    terminalProviderTask,
+} = await import('../../cli/sandbox/providerTaskOwnership.js');
 const callerAgentId = 'agent:fixtures/beta';
 const generatedRuntime = installGeneratedRouterRuntime({
     origin: 'http://127.0.0.1:8080',
@@ -252,4 +257,82 @@ test('TURN broker resolves only the captured encrypted-store handle', () => {
         secretStore: { readAll: () => { throw new Error('decrypt failed'); } },
         rateLimiter: createTurnCredentialRateLimiter(),
     }), (error) => error.code === 'TURN_SECRET_STORE_UNAVAILABLE' && error.status === 503);
+});
+
+test('retired provider terminal verifies the old exact HMAC and complete durable owner only', () => {
+    const selectedRuntime = {
+        agentId: caller.agentId,
+        alias: caller.routeKey,
+        instanceId: caller.instanceId,
+        enableGeneration: caller.enableGeneration,
+        runtime: 'container',
+        runtimeKind: 'container',
+        runtimeKey: caller.containerName,
+        homeKey: caller.containerName,
+    };
+    const common = {
+        schemaVersion: 1,
+        taskId: 'task-retired',
+        audience: 'https://api.openai.com/v1',
+        provider: 'codex',
+        mode: 'task',
+        runtimeKind: 'container',
+        runtimeKey: caller.containerName,
+        homeKey: caller.containerName,
+        workdir: '/workspace/project',
+        pid: 42,
+        processGroupId: 42,
+        processIdentity: 'linux-proc:123e4567-e89b-12d3-a456-426614174000:42',
+        processUid: 1000,
+        brokerOwner: brokerOwnerFor(
+            caller.agentId,
+            caller.instanceId,
+            caller.enableGeneration,
+            'task-retired',
+            'codex',
+            'https://api.openai.com/v1',
+        ),
+        readiness: 'ready',
+        state: 'running',
+    };
+    publishProviderTask({ body: common, callerIdentity: caller, selectedRuntime });
+    const terminalBody = {
+        ...common,
+        terminalState: 'cancelled',
+        terminalProof: {
+            processTerminal: true,
+            descendantsTerminal: true,
+            brokerClosed: true,
+            leaseReleased: true,
+        },
+    };
+    const plan = {
+        ok: true,
+        listener: 'private',
+        kind: 'private-operation',
+        operation: 'provider-tasks/terminal',
+        retiredTerminalOnly: true,
+        pathname: '/api/edge/provider-tasks/terminal',
+        parsedUrl: new URL('http://host.containers.internal/api/edge/provider-tasks/terminal'),
+        snapshot: { agents: {}, compiled: { security: {} } },
+    };
+    const bytes = Buffer.from(JSON.stringify(terminalBody));
+    const req = signedRequest(plan, bytes);
+    const identity = authorizePrivateRoutePlan({
+        req,
+        plan,
+        body: bytes,
+        assertionCache: createMemoryReplayCache(),
+    });
+    assert.equal(identity.retired, true);
+    assert.throws(() => authorizePrivateRoutePlan({
+        req: signedRequest(plan, Buffer.from(JSON.stringify({ ...terminalBody, pid: 43 }))),
+        plan,
+        body: Buffer.from(JSON.stringify({ ...terminalBody, pid: 43 })),
+        assertionCache: createMemoryReplayCache(),
+    }), (error) => error.code === 'PRIVATE_ASSERTION_REJECTED');
+    assert.deepEqual(terminalProviderTask({
+        body: terminalBody,
+        allowRetiredOwner: true,
+    }), { ok: true });
 });
