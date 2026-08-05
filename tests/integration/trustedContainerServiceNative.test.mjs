@@ -44,6 +44,27 @@ function execJson(containerId, source) {
     return JSON.parse(output);
 }
 
+async function waitForServiceState(containerId, timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError = null;
+    while (Date.now() < deadline) {
+        try {
+            return execJson(containerId, `
+                const fs = await import('node:fs');
+                const state = JSON.parse(fs.readFileSync('/root/native-container-state.json', 'utf8'));
+                process.stdout.write(JSON.stringify({
+                    ...state,
+                    foreignStateVisible: fs.existsSync('/root/foreign-container-state.json'),
+                }));
+            `);
+        } catch (error) {
+            lastError = error;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+    }
+    assert.fail(`native container service did not publish state: ${lastError?.message || 'no diagnostic'}`);
+}
+
 function envMap(entries) {
     return new Map((entries || []).map((entry) => {
         const text = String(entry || '');
@@ -59,6 +80,7 @@ function writeDummyAgent(agentPath, manifest) {
     fs.writeFileSync(path.join(agentPath, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
     fs.writeFileSync(path.join(agentPath, 'AgentServer.mjs'), `
         import fs from 'node:fs';
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
         const statePath = '/root/native-container-state.json';
         let prior = { starts: 0 };
         try { prior = JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch (_) {}
@@ -172,14 +194,7 @@ test('native container-selected AgentServer preserves the /root ABI and exact Po
             assert.equal(rootMounts[0].RW, true);
             assert.equal(fs.realpathSync.native(rootMounts[0].Source), fs.realpathSync.native(homePath));
 
-            const serviceState = execJson(result.containerId, `
-                const fs = await import('node:fs');
-                const state = JSON.parse(fs.readFileSync('/root/native-container-state.json', 'utf8'));
-                process.stdout.write(JSON.stringify({
-                    ...state,
-                    foreignStateVisible: fs.existsSync('/root/foreign-container-state.json'),
-                }));
-            `);
+            const serviceState = await waitForServiceState(result.containerId);
             assert.deepEqual(serviceState, {
                 starts: 1,
                 home: '/root',
