@@ -103,6 +103,7 @@ test('every public verb has the required single-lock depth and release boundary'
         { name: 'stop', argv: ['stop'], locks: 1 },
         { name: 'destroy', argv: ['destroy'], locks: 1 },
         { name: 'start', argv: ['start', 'Agent'], locks: 1 },
+        { name: 'update', argv: ['update'], locks: 1, forwarded: true },
         { name: 'repl', argv: [], locks: 1, forwarded: true },
         { name: 'bash', argv: ['cli'], locks: 1, forwarded: true },
         { name: 'agent-cli', argv: ['cli', 'Agent'], locks: 1, forwarded: true },
@@ -120,6 +121,7 @@ test('every public verb has the required single-lock depth and release boundary'
             supervisor,
             execute,
             confirmDestroy: async () => true,
+            updateHostSource: async () => ({ updated: false }),
         });
         assert.equal(code, 0, scenario.name);
         assert.equal(lockManager.acquisitions, scenario.locks, scenario.name);

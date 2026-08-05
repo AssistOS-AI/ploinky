@@ -167,6 +167,104 @@ test('generic forwarding prepares under the supervisor then execs the fixed targ
     assert.equal(JSON.stringify(events[1][3]).includes('UNRELATED_CANARY'), false);
 });
 
+test('full update pulls the host source and relaunches before touching the Box when HEAD changes', async () => {
+    const events = [];
+    const output = bufferStream();
+    const env = { PATH: '/bin', HOME: '/tmp' };
+    const code = await runOuterCli(['--debug', 'update', 'all'], {
+        env,
+        input: { isTTY: false }, output, errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events),
+        repositoryRoot: '/source/ploinky',
+        async updateHostSource(options) {
+            events.push(['host-update', options]);
+            return { updated: true };
+        },
+        relaunch(command, args, options) {
+            events.push(['relaunch', command, args, options]);
+            return 19;
+        },
+        execute() { throw new Error('changed host update must not execute stale in-Box code'); },
+    });
+    assert.equal(code, 19);
+    assert.deepEqual(events[0], ['host-update', { repositoryRoot: '/source/ploinky' }]);
+    assert.equal(events[1][0], 'relaunch');
+    assert.equal(events[1][1], process.execPath);
+    assert.deepEqual(events[1][2].slice(-3), ['--debug', 'update', 'all']);
+    assert.deepEqual(events[1][3], { env });
+    assert.equal(events.includes('prepare'), false);
+    assert.match(output.value(), /continuing with the updated CLI/);
+});
+
+test('full update refreshes in-Box state then restarts an already configured workspace', async () => {
+    const events = [];
+    const supervisor = fakeSupervisor(events, { statusState: 'running-initialized' });
+    const status = supervisor.inspectBoxStatus;
+    supervisor.inspectBoxStatus = () => ({
+        ...status(),
+        inbox: { routingConfigured: true },
+    });
+    const output = bufferStream();
+    const code = await runOuterCli(['update'], {
+        env: {},
+        input: { isTTY: false }, output, errorOutput: bufferStream(),
+        supervisor,
+        repositoryRoot: '/source/ploinky',
+        async updateHostSource() {
+            events.push('host-update');
+            return { updated: false };
+        },
+        execute(command, args) {
+            events.push(['execute', command, args]);
+            return 0;
+        },
+        relaunch() { throw new Error('unchanged host source must not relaunch'); },
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(events.slice(0, 3), ['host-update', 'status', 'prepare']);
+    const executions = events.filter((entry) => Array.isArray(entry) && entry[0] === 'execute');
+    assert.deepEqual(executions.map((entry) => entry[2].slice(-2)), [
+        ['/opt/ploinky/bin/ploinky-local', 'update'],
+        ['/opt/ploinky/bin/ploinky-local', 'restart'],
+    ]);
+    assert.match(output.value(), /restarting the Router and managed agents/);
+});
+
+test('full update does not restart an unconfigured workspace or continue after update failure', async () => {
+    for (const updateCode of [0, 27]) {
+        const events = [];
+        const output = bufferStream();
+        const code = await runOuterCli(['update', 'all'], {
+            env: {},
+            input: { isTTY: false }, output, errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events, { statusState: 'absent' }),
+            async updateHostSource() { return { updated: false }; },
+            execute(command, args) {
+                events.push(['execute', command, args]);
+                return updateCode;
+            },
+        });
+        assert.equal(code, updateCode);
+        assert.equal(events.filter((entry) => Array.isArray(entry) && entry[0] === 'execute').length, 1);
+        assert.equal(output.value().includes('restarting the Router'), false);
+    }
+});
+
+test('targeted update forms retain generic forwarding without a host pull', async () => {
+    for (const argv of [['update', 'repos'], ['update', 'repo', 'demo']]) {
+        const events = [];
+        const code = await runOuterCli(argv, {
+            env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events),
+            async updateHostSource() { throw new Error('targeted update must not pull host source'); },
+            execute(command, args) { events.push(['execute', command, args]); return 0; },
+        });
+        assert.equal(code, 0);
+        assert.equal(events[0], 'prepare');
+        assert.deepEqual(events[1][2].slice(-argv.length), argv);
+    }
+});
+
 test('TTY flags appear only for interactive commands with both terminal ends', async () => {
     assert.deepEqual(buildContainerExecArgs('a'.repeat(64), [], {
         hostPort: 19090,

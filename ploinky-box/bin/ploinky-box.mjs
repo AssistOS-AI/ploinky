@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline/promises';
 import { parseOuterArguments } from '../command/parse.mjs';
 import { routeOuterCommand } from '../command/route.mjs';
 import { buildContainerExecArgs, executeProcess } from '../command/execute.mjs';
+import { updateHostPloinkySource } from '../command/hostUpdate.mjs';
 import { BOX_LABELS } from '../constants.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { createBoxSupervisor, formatBoxStatus } from '../supervisor.mjs';
@@ -21,6 +22,8 @@ Commands:
   ploinky start AGENT [PORT]      Start the graph; the host port defaults to 8080
   ploinky status                  Inspect Box and core state without mutation
   ploinky stop                    Stop core services and the outer Box
+  ploinky update [all [PATH]]     Update host core, in-Box repos/deps/skills,
+                                  then restart a configured running workspace
   ploinky destroy                 Remove the outer Box after confirmation; retain data volumes
   ploinky destroy --delete-volumes
                                   Remove the outer Box and its data volumes without prompting
@@ -80,6 +83,9 @@ export async function runOuterCli(argv, {
     execute = executeProcess,
     confirmDestroy = defaultConfirmDestroy,
     detectInsideBox = isInsideBox,
+    repositoryRoot = path.resolve(import.meta.dirname, '../..'),
+    updateHostSource = updateHostPloinkySource,
+    relaunch = executeProcess,
 } = {}) {
     if (detectInsideBox()) {
         return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
@@ -152,6 +158,39 @@ export async function runOuterCli(argv, {
             explicitPort: route.hostPort,
         });
         return 0;
+    }
+
+    if (route.kind === 'update') {
+        output.write(`Updating host Ploinky checkout at ${repositoryRoot}...\n`);
+        const hostUpdate = await updateHostSource({ repositoryRoot });
+        if (hostUpdate.updated) {
+            output.write('Host Ploinky checkout updated; continuing with the updated CLI.\n');
+            return relaunch(process.execPath, [fileURLToPath(import.meta.url), ...argv], { env });
+        }
+        output.write('Host Ploinky checkout is already up to date.\n');
+
+        const priorStatus = selectedSupervisor.inspectBoxStatus();
+        const restartAfterUpdate = priorStatus.state === 'running-initialized'
+            && priorStatus.inbox?.routingConfigured === true;
+        const prepared = await selectedSupervisor.prepareBoxForCommand();
+        const updateCode = executePrepared(prepared, route.coreArgv, {
+            execute,
+            input,
+            output,
+            engineEnv,
+        });
+        if (updateCode !== 0) return updateCode;
+        if (!restartAfterUpdate) {
+            output.write('Update complete; no configured running workspace required a restart.\n');
+            return 0;
+        }
+        output.write('Update complete; restarting the Router and managed agents...\n');
+        return executePrepared(prepared, ['restart'], {
+            execute,
+            input,
+            output,
+            engineEnv,
+        });
     }
 
     const prepared = await selectedSupervisor.prepareBoxForCommand();

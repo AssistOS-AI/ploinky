@@ -63,6 +63,7 @@ dependency volume. Ordinary agent containers run one level inside this runtime.
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
+| `ploinky update` / `ploinky update all [PATH]` | Pull the cloned host Ploinky checkout from its configured upstream, refresh in-Box repositories/dependencies/skills, then restart an already configured running workspace |
 | `ploinky destroy` | Confirm and directly remove the outer container; retain its three named volumes |
 | `ploinky destroy --delete-volumes` | Directly remove the outer container and its three owned named volumes without prompting |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |

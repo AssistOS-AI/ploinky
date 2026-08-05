@@ -35,6 +35,23 @@ function routeDestroy(parsed) {
     return Object.freeze({ kind: 'destroy', deleteVolumes: true });
 }
 
+function routeUpdate(parsed) {
+    if (parsed.dryRun) {
+        return Object.freeze({ kind: 'dry-run' });
+    }
+    const scope = String(parsed.commandArgs[0] || '').trim().toLowerCase();
+    if (!scope || scope === 'all') {
+        return Object.freeze({
+            kind: 'update',
+            coreArgv: parsed.forwardingArgv,
+        });
+    }
+    return Object.freeze({
+        kind: 'generic',
+        coreArgv: parsed.forwardingArgv,
+    });
+}
+
 export function routeOuterCommand(parsed) {
     if (parsed.help || parsed.command === 'help') {
         return Object.freeze({ kind: 'help', topic: parsed.commandArgs });
@@ -49,6 +66,9 @@ export function routeOuterCommand(parsed) {
     }
     if (parsed.command === 'destroy') {
         return routeDestroy(parsed);
+    }
+    if (parsed.command === 'update') {
+        return routeUpdate(parsed);
     }
     if (parsed.command === 'start') {
         return Object.freeze({

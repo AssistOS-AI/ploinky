@@ -70,6 +70,10 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
         [['stop'], 'stop'],
         [['destroy'], 'destroy'],
         [['start', 'Agent'], 'start'],
+        [['update'], 'update'],
+        [['update', 'all'], 'update'],
+        [['update', 'repos'], 'generic'],
+        [['update', 'repo', 'demo'], 'generic'],
         [[], 'repl'],
         [['cli'], 'bash'],
         [['bash'], 'bash'],
@@ -79,6 +83,22 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
     for (const [argv, kind] of cases) {
         assert.equal(routeOuterCommand(parseOuterArguments(argv)).kind, kind);
     }
+});
+
+test('full update routes through the host while targeted update forms remain generic', () => {
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['--debug', 'update'])), {
+        kind: 'update',
+        coreArgv: ['--debug', 'update'],
+    });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', 'all', '/workspace/projects'])), {
+        kind: 'update',
+        coreArgv: ['update', 'all', '/workspace/projects'],
+    });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', 'repos'])), {
+        kind: 'generic',
+        coreArgv: ['update', 'repos'],
+    });
+    assert.equal(routeOuterCommand(parseOuterArguments(['--dry-run', 'update'])).kind, 'dry-run');
 });
 
 test('destroy accepts only one explicit trailing volume-deletion flag', () => {
