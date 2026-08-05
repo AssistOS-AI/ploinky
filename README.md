@@ -64,7 +64,7 @@ dependency volume. Ordinary agent containers run one level inside this runtime.
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky update` / `ploinky update all [PATH]` | Pull the cloned host Ploinky checkout from its configured upstream, refresh in-Box repositories/dependencies/skills, then restart an already configured running workspace |
-| `ploinky destroy` | Confirm and directly remove the outer container; retain its three named volumes |
+| `ploinky destroy` | Directly remove the outer container without prompting; retain its three named volumes |
 | `ploinky destroy --delete-volumes` | Directly remove the outer container and its three owned named volumes without prompting |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
@@ -79,8 +79,8 @@ stopped-box start, status, stop, and destroy do not pull. Incompatible images or
 owned resources are rejected before pulling, volume creation, restart, upgrade,
 or replacement. Ploinky does not migrate, clean, relabel, adopt, or replace
 them: run `ploinky destroy` explicitly, then recreate the Box. Ordinary destroy
-retains the three named volumes; `--delete-volumes` performs an explicit full
-data reset.
+runs without prompting and retains the three named volumes; `--delete-volumes`
+performs an explicit full data reset.
 
 A compatible box is reused or started only when its creation configuration is
 an exact normalized match. Any port, image, mount, device, security, or other

@@ -37,7 +37,7 @@ outer runtime.
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
-| `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain all named volumes |
+| `ploinky destroy` | Directly remove the exact outer container without prompting; retain all named volumes |
 | `ploinky destroy --delete-volumes` | Directly remove the exact outer container and its three owned named volumes without prompting |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
@@ -130,13 +130,12 @@ be inventoried; reinstalling it can expose a split on the next command.
 status` reports partial discovery and exits nonzero when ownership is
 unresolved; other commands make no change.
 `ploinky stop` preserves the box and all three volumes. `ploinky destroy`
-confirms and directly removes only the box, using engine volume cleanup to
+directly removes only the box without prompting, using engine volume cleanup to
 remove attached anonymous volumes while retaining all explicitly named
 volumes. If the box is absent, destroy reports any retained named volumes and
-succeeds without prompting or deleting them. `ploinky destroy --delete-volumes`
-uses the same workspace lock and fail-closed ownership checks, skips the prompt,
-and removes the exact three owned named volumes even when only retained volumes
-remain.
+succeeds without deleting them. `ploinky destroy --delete-volumes` uses the
+same workspace lock and fail-closed ownership checks and removes the exact
+three owned named volumes even when only retained volumes remain.
 
 ## Fixed ports and graph-independent start
 

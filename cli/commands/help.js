@@ -18,7 +18,7 @@ function lifecycleHelpLines(surface) {
         return [
             '  status                         Show combined, read-only outer runtime and workspace status',
             '  stop                           Stop core services, then stop the outer runtime',
-            '  destroy [--delete-volumes]     Remove the outer runtime; optionally delete named volumes without prompting',
+            '  destroy [--delete-volumes]     Remove the outer runtime without prompting; optionally delete named volumes',
         ];
     }
     return [
@@ -725,7 +725,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 description: 'Remove the outer runtime, retaining its three named volumes by default.',
                 syntax: 'destroy [--delete-volumes]',
                 examples: ['destroy', 'destroy --delete-volumes'],
-                notes: 'Attached anonymous volumes are always cleaned. Without the flag, this host-level command asks for confirmation and retains the selected workspace, dependency, and nested-container-storage named volumes. With --delete-volumes, it deletes the outer runtime and those exact owned volumes without prompting.',
+                notes: 'This command does not prompt. Attached anonymous volumes are always cleaned. Without the flag, it retains the selected workspace, dependency, and nested-container-storage named volumes. With --delete-volumes, it deletes the outer runtime and those exact owned volumes.',
             },
         }
         : {

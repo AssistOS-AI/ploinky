@@ -37,7 +37,7 @@ test('host and core lifecycle help have different scopes', () => {
     assert.match(host, /combined, read-only outer runtime and workspace status/i);
     assert.match(host, /stop core services, then stop the outer runtime/i);
     assert.match(host, /destroy \[--delete-volumes\]/i);
-    assert.match(host, /delete named volumes without prompting/i);
+    assert.match(host, /without prompting; optionally delete named volumes/i);
     assert.match(core, /leave the outer runtime running/i);
     assert.match(core, /exit the REPL before running host ploinky stop or ploinky destroy/i);
 });
@@ -54,7 +54,7 @@ test('detailed lifecycle help preserves the selected host or core scope', () => 
     assert.match(hostStop, /stop core services, then stop the outer runtime/i);
     assert.match(hostDestroy, /retaining its three named volumes by default/i);
     assert.match(hostDestroy, /destroy --delete-volumes/i);
-    assert.match(hostDestroy, /without prompting/i);
+    assert.match(hostDestroy, /does not prompt/i);
     assert.match(hostDestroy, /anonymous volumes are always cleaned/i);
     assert.match(coreStatus, /workspace\/router\/agent state/i);
     assert.match(coreStop, /leave the outer runtime running/i);

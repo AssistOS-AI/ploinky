@@ -285,30 +285,29 @@ test('TTY flags appear only for interactive commands with both terminal ends', a
     assert.equal(events[1][1].includes('/bin/bash'), true);
 });
 
-test('destroy confirmation occurs after read-only inspect and before its single lock transaction', async () => {
+test('destroy skips confirmation and runs its single lock transaction after read-only inspect', async () => {
     const events = [];
+    const output = bufferStream();
     const supervisor = fakeSupervisor(events, { statusState: 'running-initialized' });
     const code = await runOuterCli(['destroy'], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
         supervisor,
-        confirmDestroy: async () => { events.push('confirm'); return true; },
     });
     assert.equal(code, 0);
     assert.deepEqual(events, [
         'status',
-        'confirm',
         ['destroy', 'a'.repeat(64), { deleteVolumes: false }],
     ]);
+    assert.match(output.value(), /named volumes were retained/);
 });
 
-test('destroy --delete-volumes skips confirmation and deletes retained-volume-only state', async () => {
+test('destroy --delete-volumes deletes retained-volume-only state', async () => {
     for (const statusState of ['running-initialized', 'absent-retained-volumes']) {
         const events = [];
         const output = bufferStream();
         const code = await runOuterCli(['destroy', '--delete-volumes'], {
             env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
             supervisor: fakeSupervisor(events, { statusState }),
-            confirmDestroy: async () => { throw new Error('must not prompt'); },
         });
         assert.equal(code, 0);
         assert.deepEqual(events, [
@@ -321,7 +320,7 @@ test('destroy --delete-volumes skips confirmation and deletes retained-volume-on
     }
 });
 
-test('public help documents explicit no-prompt volume deletion', async () => {
+test('public help documents immediate destroy behavior', async () => {
     const output = bufferStream();
     const code = await runOuterCli(['help'], {
         env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
@@ -330,8 +329,9 @@ test('public help documents explicit no-prompt volume deletion', async () => {
         }),
     });
     assert.equal(code, 0);
+    assert.match(output.value(), /destroy\s+Remove the outer Box immediately/);
     assert.match(output.value(), /destroy --delete-volumes/);
-    assert.match(output.value(), /without prompting/);
+    assert.match(output.value(), /named data volumes immediately/);
 });
 
 test('dry-run and invalid arguments cause no preparation or execution', async () => {

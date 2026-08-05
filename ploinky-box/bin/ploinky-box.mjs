@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createInterface } from 'node:readline/promises';
 
 import { parseOuterArguments } from '../command/parse.mjs';
 import { routeOuterCommand } from '../command/route.mjs';
@@ -24,9 +23,9 @@ Commands:
   ploinky stop                    Stop core services and the outer Box
   ploinky update [all [PATH]]     Update host core, in-Box repos/deps/skills,
                                   then restart a configured running workspace
-  ploinky destroy                 Remove the outer Box after confirmation; retain data volumes
+  ploinky destroy                 Remove the outer Box immediately; retain data volumes
   ploinky destroy --delete-volumes
-                                  Remove the outer Box and its data volumes without prompting
+                                  Remove the outer Box and its named data volumes immediately
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
   ploinky help                    Show this help without engine discovery
@@ -34,16 +33,6 @@ Commands:
 Public image, engine, instance-name, and master-key overrides are intentionally unsupported.
 If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/security authority.
 `;
-}
-
-async function defaultConfirmDestroy(instance, { input, output }) {
-    const terminal = createInterface({ input, output });
-    try {
-        const answer = await terminal.question(`Destroy outer Box ${instance} and retain its named volumes? [y/N] `);
-        return /^y(?:es)?$/i.test(answer.trim());
-    } finally {
-        terminal.close();
-    }
 }
 
 function outerDebug(parsed, route, stdout) {
@@ -81,7 +70,6 @@ export async function runOuterCli(argv, {
     errorOutput = process.stderr,
     supervisor,
     execute = executeProcess,
-    confirmDestroy = defaultConfirmDestroy,
     detectInsideBox = isInsideBox,
     repositoryRoot = path.resolve(import.meta.dirname, '../..'),
     updateHostSource = updateHostPloinkySource,
@@ -133,18 +121,13 @@ export async function runOuterCli(argv, {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }
-        if (!route.deleteVolumes) {
-            const confirmed = await confirmDestroy(status.identity.instance, { input, output });
-            if (!confirmed) {
-                output.write('Destroy cancelled; no resources changed.\n');
-                return 0;
-            }
-        }
         await selectedSupervisor.runDestroyTransaction(container?.id || null, {
             deleteVolumes: route.deleteVolumes,
         });
         if (route.deleteVolumes) {
             output.write(`Ploinky Box ${status.identity.instance} and its named volumes were deleted.\n`);
+        } else {
+            output.write(`Ploinky Box ${status.identity.instance} was deleted; named volumes were retained.\n`);
         }
         return 0;
     }

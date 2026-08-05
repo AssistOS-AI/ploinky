@@ -120,7 +120,6 @@ test('every public verb has the required single-lock depth and release boundary'
             errorOutput: bufferStream(),
             supervisor,
             execute,
-            confirmDestroy: async () => true,
             updateHostSource: async () => ({ updated: false }),
         });
         assert.equal(code, 0, scenario.name);
@@ -221,7 +220,6 @@ test('foreign ownership blocks every lifecycle path with zero engine mutation', 
             env: {}, supervisor,
             input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
             execute() { mutations.push(['execute']); return 0; },
-            confirmDestroy: async () => { throw new Error('foreign destroy must not prompt'); },
         });
         if (argv[0] === 'status' || argv[0] === 'destroy') {
             assert.equal(await invocation, 1, argv.join(' '));
