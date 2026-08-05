@@ -236,7 +236,7 @@ export function probeImageBinaries(engine, imageId, runner, {
         );
     }
     const sourceMatch =
-        `test "$helper_version" = 'ploinky-bwrap-launch-v1 source-sha=${expectedSourceSha}'`;
+        `test "$helper_version" = 'ploinky-bwrap-launch-v2 source-sha=${expectedSourceSha}'`;
     const result = runner.query(engine, [
         'run',
         '--rm',
@@ -266,7 +266,7 @@ export function probeImageBinaries(engine, imageId, runner, {
             `helper_version="$(${IMAGE_CONTRACT.bwrapHelper} --version)"`,
             sourceMatch,
             `helper_capabilities="$(${IMAGE_CONTRACT.bwrapHelper} --capabilities)"`,
-            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'protocol=1 descriptor-fd=3' >/dev/null",
+            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'protocol=2 descriptor-fd=3' >/dev/null",
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'path-resolution=openat2-beneath-no-magiclinks-no-symlinks' >/dev/null",
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms' >/dev/null",
             "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file' >/dev/null",

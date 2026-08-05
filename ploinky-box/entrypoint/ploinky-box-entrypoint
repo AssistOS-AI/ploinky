@@ -189,12 +189,12 @@ require_bubblewrap_contract() {
         || fail "Bubblewrap launcher must not have file capabilities"
     helper_version="$($BWRAP_HELPER --version 2>&1)" \
         || fail "cannot inspect Bubblewrap launcher version: ${helper_version:-no diagnostic}"
-    [[ "$helper_version" =~ ^ploinky-bwrap-launch-v1\ source-sha=[0-9a-f]{40}$ ]] \
+    [[ "$helper_version" =~ ^ploinky-bwrap-launch-v2\ source-sha=[0-9a-f]{40}$ ]] \
         || fail "Bubblewrap launcher returned an invalid immutable source version"
     helper_capabilities="$($BWRAP_HELPER --capabilities 2>&1)" \
         || fail "cannot inspect Bubblewrap launcher capabilities: ${helper_capabilities:-no diagnostic}"
-    [[ "$helper_capabilities" == *"protocol=1 descriptor-fd=3"* ]] \
-        || fail "Bubblewrap launcher lacks descriptor protocol v1"
+    [[ "$helper_capabilities" == *"protocol=2 descriptor-fd=3"* ]] \
+        || fail "Bubblewrap launcher lacks descriptor protocol v2"
     [[ "$helper_capabilities" == *"path-resolution=openat2-beneath-no-magiclinks-no-symlinks"* ]] \
         || fail "Bubblewrap launcher lacks fd-pinned openat2 resolution"
     [[ "$helper_capabilities" == *"bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms"* ]] \

@@ -186,7 +186,7 @@ test('fresh image capability probes allow a cold rootless container start', () =
     const probe = calls[0].args.at(-1);
     assert.match(probe, /bubblewrap-0:0\.11\.0-4\.fc44/);
     assert.match(probe, /--bind-fd FD DEST/);
-    assert.match(probe, /ploinky-bwrap-launch-v1 source-sha=/);
+    assert.match(probe, /ploinky-bwrap-launch-v2 source-sha=/);
     assert.match(probe, /openat2-beneath-no-magiclinks-no-symlinks/);
     assert.throws(
         () => probeImageBinaries('podman', 'sha256:image-id', runner),

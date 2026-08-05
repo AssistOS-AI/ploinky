@@ -214,6 +214,20 @@ test('version and capability output expose the fixed source and fd ABI', () => {
     assert.match(capabilities.stdout, /home-revalidation=post-barrier-G/);
 });
 
+test('every Box runtime consumer requires the canonical helper protocol v2', () => {
+    for (const relativePath of [
+        'ploinky-box/entrypoint/ploinky-box-entrypoint',
+        'ploinky-box/contract/image.mjs',
+        'cli/sandbox/docker/common.js',
+        'cli/utils/runtime/sandboxRuntime.js',
+    ]) {
+        const source = fs.readFileSync(path.join(REPO_ROOT, relativePath), 'utf8');
+        assert.match(source, /protocol=2 descriptor-fd=3/, relativePath);
+        assert.doesNotMatch(source, /protocol=1 descriptor-fd=3/, relativePath);
+        assert.doesNotMatch(source, /ploinky-bwrap-launch-v1/, relativePath);
+    }
+});
+
 test('normal launch accepts only its bounded versioned descriptor on fd 3', async () => {
     const option = await launchWithDescriptor(Buffer.alloc(0), { argv: ['--launch', '3'] });
     assert.equal(option.status, 64);

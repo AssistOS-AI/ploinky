@@ -938,8 +938,8 @@ test('Ploinky box marker reports hybrid capability and strictly selects bwrap', 
         fs.writeFileSync(marker, BOX_MARKER_CONTENT);
         fs.writeFileSync(helper, `#!/bin/sh
 case "$1" in
-  --version) printf '%s\\n' 'ploinky-bwrap-launch-v1 source-sha=0123456789012345678901234567890123456789' ;;
-  --capabilities) printf '%s\\n' 'ploinky-bwrap-launch-v1 protocol=1 descriptor-fd=3 path-resolution=openat2-beneath-no-magiclinks-no-symlinks bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file ro-data-path-hardening=sealed-memfd-ro-bind-data' ;;
+  --version) printf '%s\\n' 'ploinky-bwrap-launch-v2 source-sha=0123456789012345678901234567890123456789' ;;
+  --capabilities) printf '%s\\n' 'ploinky-bwrap-launch-v2 protocol=2 descriptor-fd=3 path-resolution=openat2-beneath-no-magiclinks-no-symlinks bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file ro-data-path-hardening=sealed-memfd-ro-bind-data' ;;
   *) exit 64 ;;
 esac
 `);
@@ -984,7 +984,7 @@ esac
         assert.equal(output.status.podman.available, true);
         assert.equal(output.status.helper.required, true);
         assert.equal(output.status.helper.available, true);
-        assert.match(output.status.helper.version, /^ploinky-bwrap-launch-v1 source-sha=/);
+        assert.match(output.status.helper.version, /^ploinky-bwrap-launch-v2 source-sha=/);
         assert.deepEqual(output.status.agents.map((agent) => ({
             runtimeKey: agent.runtimeKey,
             selectedRuntime: agent.selectedRuntime,
@@ -993,7 +993,7 @@ esac
             { runtimeKey: 'apps-explorer', selectedRuntime: 'podman', available: true },
             { runtimeKey: 'coding-opencode', selectedRuntime: 'bwrap', available: true },
         ]);
-        assert.equal(output.lines.some((line) => /Bwrap fd launcher: ploinky-bwrap-launch-v1/.test(line)), true);
+        assert.equal(output.lines.some((line) => /Bwrap fd launcher: ploinky-bwrap-launch-v2/.test(line)), true);
         assert.equal(output.lines.some((line) => /coding-opencode.*: bwrap - available/.test(line)), true);
         assert.equal(output.lines.some((line) => /apps-explorer.*: podman - available/.test(line)), true);
         assert.equal(output.lite, 'bwrap');
@@ -1036,7 +1036,7 @@ test('Box status exposes an invalid helper capability without selecting Podman f
         assert.equal(result.status, 0, result.stderr || result.stdout);
         const output = parseLastJsonLine(result.stdout);
         assert.equal(output.helper.available, false);
-        assert.equal(output.helper.missingCapabilities.length, 4);
+        assert.equal(output.helper.missingCapabilities.length, 5);
         assert.equal(output.podman.available, true);
         assert.deepEqual(output.agents[0], {
             runtimeKey: 'coding-codex',
