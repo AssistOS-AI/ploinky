@@ -160,10 +160,10 @@ test('native container-selected AgentServer preserves the /root ABI and exact Po
 
             // The approved coding image runs as its declared non-root user. The
             // native container ABI owns this exact bind as /root, so prepare only
-            // the test-owned HOME with an explicit writable mode.
+            // the test-owned HOME with the exact private ABI mode.
             const homePath = getAgentWorkDir(spec.name);
-            fs.mkdirSync(homePath, { recursive: true, mode: 0o777 });
-            fs.chmodSync(homePath, 0o777);
+            fs.mkdirSync(homePath, { recursive: true, mode: 0o700 });
+            fs.chmodSync(homePath, 0o700);
 
             assert.equal(getRuntimeForAgent(manifest), 'podman');
             const result = manager.ensureAgentService(spec.name, manifest, agentPath, {
