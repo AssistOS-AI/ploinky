@@ -930,7 +930,34 @@ function busyError(record, { uncertain = false } = {}) {
     return error;
 }
 
-function recoverOperationArtifacts(filePath, expected, dependencies) {
+function readRecoveryTransactionSnapshots(filePath, artifacts, expected, dependencies) {
+    const claim = artifacts.has('claim')
+        ? readLockSnapshotAt(artifacts.get('claim'), expected, dependencies, {
+            minimumLinks: 1,
+            maximumLinks: 3,
+        })
+        : null;
+    const quarantine = artifacts.has('quarantine')
+        ? readLockSnapshotAt(artifacts.get('quarantine'), expected, dependencies, {
+            minimumLinks: 1,
+            maximumLinks: 3,
+        })
+        : null;
+    const canonical = readLockSnapshotAt(filePath, expected, dependencies, {
+        minimumLinks: 1,
+        maximumLinks: 3,
+    });
+    const entries = [];
+    if (claim) entries.push({ role: 'claim', snapshot: claim });
+    if (quarantine) entries.push({ role: 'quarantine', snapshot: quarantine });
+    if (canonical) entries.push({ role: 'canonical', snapshot: canonical });
+    assertAdmissionLinksAccounted(entries, expected, dependencies);
+    return { claim, quarantine };
+}
+
+function recoverOperationArtifacts(filePath, expected, dependencies, {
+    directorySnapshotRetry = false,
+} = {}) {
     const names = operationArtifactNames(filePath, dependencies);
     if (names.length === 0) return false;
     const escapedPrefix = operationPrefix(filePath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -945,12 +972,23 @@ function recoverOperationArtifacts(filePath, expected, dependencies) {
     }
     if (groups.size !== 1) throw lockError(expected.kind, 'lock store contains multiple interrupted exact releases');
     const [[contentId, artifacts]] = groups;
-    const claim = artifacts.has('claim')
-        ? readLockSnapshotAt(artifacts.get('claim'), expected, dependencies, { minimumLinks: 1, maximumLinks: 2 })
-        : null;
-    const quarantine = artifacts.has('quarantine')
-        ? readLockSnapshotAt(artifacts.get('quarantine'), expected, dependencies, { minimumLinks: 1, maximumLinks: 2 })
-        : null;
+    let claim;
+    let quarantine;
+    try {
+        ({ claim, quarantine } = readRecoveryTransactionSnapshots(
+            filePath,
+            artifacts,
+            expected,
+            dependencies,
+        ));
+    } catch (error) {
+        if (error?.lockAdmissionDirectorySnapshotStale !== true || directorySnapshotRetry) {
+            throw error;
+        }
+        return recoverOperationArtifacts(filePath, expected, dependencies, {
+            directorySnapshotRetry: true,
+        });
+    }
     const operationSnapshot = claim || quarantine;
     if (!operationSnapshot || (claim && operationId(claim) !== contentId)
         || (!claim && operationId(quarantine) !== contentId)) {
@@ -1197,7 +1235,10 @@ function restoreDisplacedPublicationPath(quarantinePath, filePath, displaced, ex
     return true;
 }
 
-function recoverPublicationArtifacts(filePath, expected, dependencies, { ownedContentId = null } = {}) {
+function recoverPublicationArtifacts(filePath, expected, dependencies, {
+    ownedContentId = null,
+    directorySnapshotRetry = false,
+} = {}) {
     const names = publicationArtifactNames(filePath, dependencies);
     if (names.length === 0) return false;
     const escapedPrefix = publicationPrefix(filePath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1215,12 +1256,24 @@ function recoverPublicationArtifacts(filePath, expected, dependencies, { ownedCo
     if (ownedContentId !== null && ownedContentId !== contentId) {
         throw lockError(expected.kind, 'publication cleanup does not own the interrupted content');
     }
-    const claim = artifacts.has('claim')
-        ? readLockSnapshotAt(artifacts.get('claim'), expected, dependencies, { minimumLinks: 1, maximumLinks: 2 })
-        : null;
-    const quarantine = artifacts.has('quarantine')
-        ? readLockSnapshotAt(artifacts.get('quarantine'), expected, dependencies, { minimumLinks: 1, maximumLinks: 2 })
-        : null;
+    let claim;
+    let quarantine;
+    try {
+        ({ claim, quarantine } = readRecoveryTransactionSnapshots(
+            filePath,
+            artifacts,
+            expected,
+            dependencies,
+        ));
+    } catch (error) {
+        if (error?.lockAdmissionDirectorySnapshotStale !== true || directorySnapshotRetry) {
+            throw error;
+        }
+        return recoverPublicationArtifacts(filePath, expected, dependencies, {
+            ownedContentId,
+            directorySnapshotRetry: true,
+        });
+    }
     const operationSnapshot = claim || quarantine;
     if (!operationSnapshot || (claim && operationId(claim) !== contentId)
         || (!claim && operationId(quarantine) !== contentId)) {
@@ -1412,7 +1465,16 @@ function assertAdmissionLinksAccounted(entries, expected, dependencies) {
             throw concurrentArtifactBusy(expected, authority, dependencies);
         }
         if (entry.snapshot.nlink > aliases.length) {
-            throw lockError(expected.kind, 'concurrent operation inode has an unaccounted hard link');
+            const error = lockError(
+                expected.kind,
+                'concurrent operation inode has an unaccounted hard link',
+            );
+            // readdir(2) can capture the transaction before its next durable
+            // hard link is published while the later open/fstat observes that
+            // new alias. Reclassify exactly once from a fresh directory
+            // snapshot; a stable foreign link remains INVALID on the retry.
+            error.lockAdmissionDirectorySnapshotStale = true;
+            throw error;
         }
     }
 }
@@ -1467,7 +1529,14 @@ function classifyPublicationOrReleaseArtifacts({
             throw lockError(expected.kind, `lock ${label} claim and quarantine are not inode-exact`);
         }
         if (canonical && sameLockSnapshot(canonical, claim)) {
-            throw lockError(expected.kind, `lock ${label} recovery has an unexpected canonical alias`);
+            // durableRenameSync is a no-clobber link+unlink transition. Its
+            // exact live midpoint has canonical, claim, and quarantine names
+            // on the same three-link inode; observers preserve it as BUSY.
+            if (claim.nlink !== 3 || quarantine.nlink !== 3 || canonical.nlink !== 3) {
+                throw lockError(expected.kind, `lock ${label} transition triple is not exact`);
+            }
+        } else if (claim.nlink !== 2 || quarantine.nlink !== 2) {
+            throw lockError(expected.kind, `lock ${label} private pair is not exact`);
         }
     } else if (canonical && sameLockSnapshot(canonical, claim)) {
         if (claim.nlink !== 2 || canonical.nlink !== 2) {
@@ -1569,7 +1638,32 @@ function classifyRenewalArtifacts({ group, canonical, expected, dependencies }) 
 // exposed a transaction-private hard link after that inspection completed.
 function classifyConcurrentLockArtifacts(filePath, expected, dependencies, {
     ownedPublicationId = null,
+    directorySnapshotRetry = false,
 } = {}) {
+    try {
+        return classifyConcurrentLockArtifactsSnapshot(
+            filePath,
+            expected,
+            dependencies,
+            ownedPublicationId,
+        );
+    } catch (error) {
+        if (error?.lockAdmissionDirectorySnapshotStale !== true || directorySnapshotRetry) {
+            throw error;
+        }
+        return classifyConcurrentLockArtifacts(filePath, expected, dependencies, {
+            ownedPublicationId,
+            directorySnapshotRetry: true,
+        });
+    }
+}
+
+function classifyConcurrentLockArtifactsSnapshot(
+    filePath,
+    expected,
+    dependencies,
+    ownedPublicationId,
+) {
     if (!assertStoreDirectory(path.dirname(filePath), dependencies)) return;
     const directoryNames = dependencies.fs.readdirSync(path.dirname(filePath));
     const baseName = path.basename(filePath);

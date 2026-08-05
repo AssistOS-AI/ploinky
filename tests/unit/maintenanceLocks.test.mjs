@@ -1686,6 +1686,225 @@ test('exact release admission preserves live post-retirement evidence as busy', 
     assert.deepEqual(snapshotLockNamespace(filePath), before);
 });
 
+test('exact release admission reclassifies a quarantine published after its directory snapshot', (t) => {
+    const filePath = locks.WORKSPACE_START_LOCK_PATH;
+    const lease = locks.createWorkspaceMutationLease({
+        operation: 'release-directory-snapshot-owner',
+    });
+    const bytes = fs.readFileSync(filePath, 'utf8');
+    const contentId = createHash('sha256').update(bytes).digest('hex').slice(0, 32);
+    const claimPath = `${filePath}.operation-${contentId}.claim`;
+    const quarantinePath = `${filePath}.operation-${contentId}.quarantine`;
+    fs.linkSync(filePath, claimPath);
+    let directoryReads = 0;
+    let firstNames = null;
+    let transitionSnapshot = null;
+    t.after(() => removeLockPaths(lockNamespacePaths(filePath)));
+
+    const racingFs = new Proxy(fs, {
+        get(target, property, receiver) {
+            if (property === 'readdirSync') {
+                return (directory, ...args) => {
+                    const names = target.readdirSync(directory, ...args);
+                    if (directory === path.dirname(filePath)) {
+                        directoryReads += 1;
+                        if (directoryReads === 1) {
+                            firstNames = [...names];
+                            target.linkSync(filePath, quarantinePath);
+                            transitionSnapshot = snapshotLockNamespace(filePath);
+                        }
+                    }
+                    return names;
+                };
+            }
+            return Reflect.get(target, property, receiver);
+        },
+    });
+
+    assert.throws(
+        () => locks.createWorkspaceMutationLease(
+            { operation: 'release-directory-snapshot-observer' },
+            { fs: racingFs },
+        ),
+        (error) => error?.code === 'PLOINKY_WORKSPACE_MUTATION_BUSY'
+            && error.concurrentLockArtifacts === true
+            && error.owner?.token === lease.token,
+    );
+    assert.ok(firstNames);
+    assert.equal(firstNames.includes(path.basename(claimPath)), true);
+    assert.equal(firstNames.includes(path.basename(quarantinePath)), false);
+    assert.ok(directoryReads >= 2, 'link surplus must trigger one fresh read-only classification');
+    assert.ok(transitionSnapshot);
+    assert.deepEqual(snapshotLockNamespace(filePath), transitionSnapshot);
+});
+
+test('exact release recovery accepts only an exact canonical triple after owner death or reuse', (t) => {
+    t.after(() => removeLockPaths(lockNamespacePaths(locks.WORKSPACE_START_LOCK_PATH)));
+    for (const ownerState of ['dead', 'reused']) {
+        const filePath = locks.WORKSPACE_START_LOCK_PATH;
+        const seed = locks.createWorkspaceMutationLease({
+            operation: `release-triple-seed-${ownerState}`,
+        });
+        assert.equal(locks.releaseWorkspaceMutationLease(seed), true);
+        const interrupted = provenDeadOwner(seed, {
+            operation: `release-triple-${ownerState}`,
+            token: ownerState === 'dead' ? TOKEN_B : TOKEN_C,
+        });
+        writeExactRecord(filePath, interrupted);
+        const contentId = artifactContentId(interrupted);
+        const claimPath = `${filePath}.operation-${contentId}.claim`;
+        const quarantinePath = `${filePath}.operation-${contentId}.quarantine`;
+        fs.linkSync(filePath, claimPath);
+        fs.linkSync(filePath, quarantinePath);
+        const before = snapshotLockNamespace(filePath);
+        assert.equal(before.length, 3);
+        assert.ok(before.every(({ nlink }) => nlink === 3));
+        assert.equal(new Set(before.map(({ ino }) => ino)).size, 1);
+
+        const recovered = locks.inspectWorkspaceStartLock({
+            inspectProcessIdentity: ownerState === 'dead'
+                ? () => ({ state: 'dead' })
+                : () => identified(IDENTITY_B),
+        });
+        assert.equal(recovered.active, false);
+        assert.equal(recovered.stale, true);
+        assert.deepEqual(lockNamespacePaths(filePath), []);
+    }
+});
+
+test('publication recovery accepts only an exact canonical triple after owner death or reuse', () => {
+    for (const ownerState of ['dead', 'reused']) {
+        const containerName = `publication-triple-${ownerState}`;
+        const filePath = lockFile(containerName);
+        const seed = locks.createMaintenanceLock(containerName, {
+            operation: `publication-triple-seed-${ownerState}`,
+        });
+        assert.equal(locks.removeMaintenanceLock(containerName, seed.token), true);
+        const interrupted = provenDeadOwner(seed, {
+            operation: `publication-triple-${ownerState}`,
+            token: ownerState === 'dead' ? TOKEN_B : TOKEN_C,
+        });
+        writeExactRecord(filePath, interrupted);
+        const contentId = artifactContentId(interrupted);
+        const claimPath = `${filePath}.publication-${contentId}.claim`;
+        const quarantinePath = `${filePath}.publication-${contentId}.quarantine`;
+        fs.linkSync(filePath, claimPath);
+        fs.linkSync(filePath, quarantinePath);
+        const before = snapshotLockNamespace(filePath);
+        assert.equal(before.length, 3);
+        assert.ok(before.every(({ nlink }) => nlink === 3));
+        assert.equal(new Set(before.map(({ ino }) => ino)).size, 1);
+
+        const recovered = locks.inspectMaintenanceLock(containerName, {
+            inspectProcessIdentity: ownerState === 'dead'
+                ? () => ({ state: 'dead' })
+                : () => identified(IDENTITY_B),
+        });
+        assert.equal(recovered.active, false);
+        assert.equal(recovered.stale, true);
+        assert.deepEqual(lockNamespacePaths(filePath), []);
+    }
+});
+
+test('generic recovery re-reads a quarantine published after its directory snapshot', () => {
+    for (const ownerState of ['live', 'dead']) {
+        const filePath = locks.WORKSPACE_START_LOCK_PATH;
+        const seed = locks.createWorkspaceMutationLease({
+            operation: `recovery-directory-snapshot-seed-${ownerState}`,
+        });
+        let owner = seed;
+        if (ownerState === 'dead') {
+            assert.equal(locks.releaseWorkspaceMutationLease(seed), true);
+            owner = provenDeadOwner(seed, {
+                operation: 'recovery-directory-snapshot-dead-owner',
+                token: TOKEN_B,
+            });
+            writeExactRecord(filePath, owner);
+        }
+        const contentId = artifactContentId(owner);
+        const claimPath = `${filePath}.operation-${contentId}.claim`;
+        const quarantinePath = `${filePath}.operation-${contentId}.quarantine`;
+        fs.linkSync(filePath, claimPath);
+        let directoryReads = 0;
+        let firstOperationNames = null;
+        let transitionSnapshot = null;
+        const racingFs = new Proxy(fs, {
+            get(target, property, receiver) {
+                if (property === 'readdirSync') {
+                    return (directory, ...args) => {
+                        const names = target.readdirSync(directory, ...args);
+                        if (directory === path.dirname(filePath)) {
+                            directoryReads += 1;
+                            if (directoryReads === 2) {
+                                firstOperationNames = [...names];
+                                target.linkSync(filePath, quarantinePath);
+                                transitionSnapshot = snapshotLockNamespace(filePath);
+                            }
+                        }
+                        return names;
+                    };
+                }
+                return Reflect.get(target, property, receiver);
+            },
+        });
+
+        try {
+            if (ownerState === 'live') {
+                assert.throws(
+                    () => locks.inspectWorkspaceStartLock({ fs: racingFs }),
+                    (error) => error?.code === 'PLOINKY_WORKSPACE_MUTATION_BUSY'
+                        && error.owner?.token === owner.token,
+                );
+                assert.ok(
+                    directoryReads === 3 || directoryReads === 4,
+                    'generic recovery must take exactly one bounded fresh transaction snapshot',
+                );
+                assert.ok(transitionSnapshot);
+                assert.deepEqual(snapshotLockNamespace(filePath), transitionSnapshot);
+            } else {
+                const recovered = locks.inspectWorkspaceStartLock({
+                    fs: racingFs,
+                    inspectProcessIdentity: () => ({ state: 'dead' }),
+                });
+                assert.equal(recovered.active, false);
+                assert.equal(recovered.stale, true);
+                assert.deepEqual(lockNamespacePaths(filePath), []);
+            }
+            assert.ok(firstOperationNames);
+            assert.equal(firstOperationNames.includes(path.basename(claimPath)), true);
+            assert.equal(firstOperationNames.includes(path.basename(quarantinePath)), false);
+        } finally {
+            removeLockPaths(lockNamespacePaths(filePath));
+        }
+    }
+});
+
+test('a stable foreign third link remains INVALID after admission reclassification', (t) => {
+    const filePath = locks.WORKSPACE_START_LOCK_PATH;
+    const lease = locks.createWorkspaceMutationLease({
+        operation: 'stable-foreign-third-link-owner',
+    });
+    const contentId = artifactContentId(lease);
+    const claimPath = `${filePath}.operation-${contentId}.claim`;
+    const foreignPath = `${filePath}.foreign-third-link`;
+    fs.linkSync(filePath, claimPath);
+    fs.linkSync(filePath, foreignPath);
+    const before = snapshotLockNamespace(filePath);
+    t.after(() => removeLockPaths(lockNamespacePaths(filePath)));
+    assert.equal(before.length, 3);
+    assert.ok(before.every(({ nlink }) => nlink === 3));
+    assert.equal(new Set(before.map(({ ino }) => ino)).size, 1);
+
+    assert.throws(
+        () => locks.createWorkspaceMutationLease({
+            operation: 'must-not-admit-stable-foreign-third-link',
+        }),
+        (error) => error?.code === 'PLOINKY_WORKSPACE_MUTATION_LOCK_INVALID'
+            && error.message === 'concurrent operation inode has an unaccounted hard link',
+    );
+    assert.deepEqual(snapshotLockNamespace(filePath), before);
+});
+
 test('publication admission preserves an extra-hardlink shape as exact INVALID evidence', (t) => {
     const filePath = locks.WORKSPACE_START_LOCK_PATH;
     const extraPath = `${filePath}.extra-hardlink`;
@@ -1709,7 +1928,8 @@ test('publication admission preserves an extra-hardlink shape as exact INVALID e
                 },
             },
         ),
-        (error) => error?.code === 'PLOINKY_WORKSPACE_MUTATION_LOCK_INVALID',
+        (error) => error?.code === 'PLOINKY_WORKSPACE_MUTATION_LOCK_INVALID'
+            && error.message === 'concurrent operation inode has an unaccounted hard link',
     );
     assert.ok(before);
     assert.deepEqual(snapshotLockNamespace(filePath), before);
