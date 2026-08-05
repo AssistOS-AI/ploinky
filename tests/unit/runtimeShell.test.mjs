@@ -17,14 +17,14 @@ test('cli dispatches solely by argument arity', async () => {
         },
         runAgentCliImpl: async (...args) => calls.push(['agent', ...args]),
     });
-    await handleCliCommand(['explorer', '--help'], {
+    await handleCliCommand(['explorer', '--workdir', 'project', '--', '--help'], {
         runOuterRuntimeShellImpl: () => calls.push(['wrong']),
         runAgentCliImpl: async (...args) => calls.push(['agent', ...args]),
     });
     assert.equal(shellCode, 7);
     assert.deepEqual(calls, [
         ['outer'],
-        ['agent', 'explorer', ['--help']],
+        ['agent', 'explorer', ['--workdir', 'project', '--', '--help']],
     ]);
 });
 

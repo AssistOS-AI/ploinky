@@ -65,7 +65,11 @@ export function routeOuterCommand(parsed) {
         return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'bash' });
     }
     if (parsed.command === 'cli') {
-        return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'agent-cli', coreArgv: parsed.forwardingArgv });
+        return Object.freeze({
+            kind: parsed.dryRun ? 'dry-run' : 'agent-cli',
+            coreArgv: parsed.forwardingArgv,
+            agentCli: parsed.agentCli,
+        });
     }
     return Object.freeze({
         kind: parsed.dryRun ? 'dry-run' : 'generic',

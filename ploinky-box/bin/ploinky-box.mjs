@@ -25,7 +25,8 @@ Commands:
   ploinky destroy --delete-volumes
                                   Remove the outer Box and its data volumes without prompting
   ploinky cli                     Open Bash in the Box
-  ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
+  ploinky cli AGENT --workdir PATH -- [PROVIDER_ARGS]
+                                  Run an agent CLI in an existing non-root workspace directory
   ploinky help                    Show this help without engine discovery
 
 Public image, engine, instance-name, and master-key overrides are intentionally unsupported.

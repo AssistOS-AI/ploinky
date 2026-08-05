@@ -1,35 +1,8 @@
 import fs from 'fs';
-import os from 'os';
 import { configCache } from './configCache.js';
 import { logBootEvent } from './logger.js';
 import { getAppName } from '../authHandlers/index.js';
-import { resolveWebchatCommands, resolveWebchatCommandsForAgent } from '../webchat/commandResolver.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
-
-function tryGetCwd() {
-    try {
-        return process.cwd();
-    } catch (_) {
-        return '';
-    }
-}
-
-function resolveSafeHostWorkdir(preferred = '') {
-    const candidates = [
-        preferred,
-        tryGetCwd(),
-        process.env.PWD || '',
-        os.homedir(),
-        '/',
-    ];
-    for (const candidate of candidates) {
-        if (!candidate) continue;
-        try {
-            if (fs.existsSync(candidate)) return candidate;
-        } catch (_) { }
-    }
-    return '/';
-}
+import { resolveWebchatCommands } from '../webchat/commandResolver.js';
 
 /**
  * Load TTY module with fallback support
@@ -68,8 +41,17 @@ async function loadTTYModules() {
  */
 function buildLocalFactory(createFactoryFn, defaults = {}) {
     if (!createFactoryFn) return null;
-    const safeWorkdir = resolveSafeHostWorkdir(defaults.workdir);
-    return createFactoryFn({ ...defaults, workdir: safeWorkdir });
+    const workdir = defaults.workdir;
+    try {
+        const stat = fs.lstatSync(workdir);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(workdir) !== workdir) {
+            return null;
+        }
+        fs.accessSync(defaults.executable, fs.constants.X_OK);
+        return createFactoryFn({ ...defaults, workdir });
+    } catch (_) {
+        return null;
+    }
 }
 
 /**
@@ -77,78 +59,58 @@ function buildLocalFactory(createFactoryFn, defaults = {}) {
  */
 function createWebchatFactoryConfig(webchatTTYModule, resolvedWebchatCommands) {
     const {
-        createTTYFactory: createWebChatTTYFactory,
         createLocalTTYFactory: createWebChatLocalFactory
     } = webchatTTYModule;
 
     const buildCacheKey = (commands) => commands?.cacheKey || (commands?.agentName ? `webchat:${commands.agentName}` : 'webchat');
     const buildConfig = (commands) => ({
-        hostCommand: commands?.host || '',
-        containerCommand: commands?.container || '',
+        executable: commands?.executable || '',
+        argv: Array.isArray(commands?.argv) ? [...commands.argv] : [],
+        hostWorkdir: commands?.cwd || '',
         source: commands?.source || 'unset',
         agentName: commands?.agentName || '',
         forwardEnvelope: commands?.forwardEnvelope === true,
         unsupportedReason: commands?.unsupportedReason || ''
     });
-    const resolveHostWorkdir = (config) => {
-        // webchat hostCommand runs the direct execution-plane CLI for an agent.
-        // That command must run from the *workspace root* so it sees the correct
-        // `.ploinky/` state (installed repos, enabled agents). If it runs from
-        // `agents/<name>/`, Ploinky bootstraps a new `.ploinky/` and then fails
-        // with: "Agent '<name>' not found".
-        return resolveSafeHostWorkdir(PLOINKY_WORKSPACE_ROOT);
-    };
-
     const buildFactoryResult = (config) => {
-        const hostWorkdir = resolveHostWorkdir(config);
-        if (createWebChatLocalFactory) {
-            const command = config.hostCommand;
-            const factory = buildLocalFactory(createWebChatLocalFactory, { command, workdir: hostWorkdir });
+        if (createWebChatLocalFactory && config.executable && config.argv.length) {
+            const factory = buildLocalFactory(createWebChatLocalFactory, {
+                executable: config.executable,
+                argv: config.argv,
+                workdir: config.hostWorkdir,
+            });
             if (factory) {
                 logBootEvent('webchat_local_process_factory_ready', {
-                    command: command || null,
+                    agent: config.agentName || null,
                     source: config.source
                 });
             }
             return {
                 factory,
-                label: command ? command : 'local shell',
+                label: config.agentName || 'webchat_agent',
                 runtime: 'local',
                 agentName: config.agentName || '',
                 forwardEnvelope: config.forwardEnvelope === true,
-                unavailableReason: ''
+                unavailableReason: factory ? '' : 'PLOINKY_WEBCHAT_DIRECT_CLI_UNAVAILABLE'
             };
         }
-        if (createWebChatTTYFactory) {
-            const entry = config.containerCommand;
-            const containerLabel = config.agentName || 'webchat_agent';
-            const factory = createWebChatTTYFactory({
-                runtime: 'docker',
-                containerName: containerLabel,
-                entry,
-                workdir: '/code',
-            });
-            logBootEvent('webchat_container_factory_ready', {
-                containerName: containerLabel,
-                command: entry || null,
-                source: config.source
-            });
-            return {
-                factory,
-                label: containerLabel,
-                runtime: 'docker',
-                agentName: config.agentName || '',
-                forwardEnvelope: config.forwardEnvelope === true,
-                unavailableReason: ''
-            };
-        }
-        logBootEvent('webchat_factory_disabled', { reason: 'no_factory_available' });
-        return { factory: null, label: '-', runtime: 'disabled', agentName: config.agentName || '', unavailableReason: '' };
+        const unavailableReason = config.unsupportedReason || 'PLOINKY_WEBCHAT_DIRECT_CLI_UNAVAILABLE';
+        logBootEvent('webchat_factory_disabled', {
+            agent: config.agentName || null,
+            reason: unavailableReason,
+        });
+        return {
+            factory: null,
+            label: config.agentName || '-',
+            runtime: 'disabled',
+            agentName: config.agentName || '',
+            unavailableReason,
+        };
     };
 
     return (commandsOverride = null) => {
         let commands = commandsOverride || resolvedWebchatCommands;
-        if (!commandsOverride && (!commands || (!commands.host && !commands.container && !commands.agentName))) {
+        if (!commandsOverride && (!commands || (!commands.executable && !commands.agentName))) {
             commands = resolveWebchatCommands();
         }
         if (!commands) {
@@ -173,7 +135,7 @@ async function initializeTTYFactories() {
     // Resolve webchat commands
     const resolvedWebchatCommands = resolveWebchatCommands();
     if (resolvedWebchatCommands.source === 'manifest' && resolvedWebchatCommands.agentName) {
-        logBootEvent('webchat_manifest_cli_fallback', { agent: resolvedWebchatCommands.agentName });
+        logBootEvent('webchat_manifest_cli_available', { agent: resolvedWebchatCommands.agentName });
     }
 
     // Create factory configurations
@@ -226,6 +188,5 @@ function createServiceConfig(getWebchatFactory) {
 
 export {
     initializeTTYFactories,
-    createServiceConfig,
-    resolveSafeHostWorkdir
+    createServiceConfig
 };

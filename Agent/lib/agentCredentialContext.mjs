@@ -171,10 +171,14 @@ function createContainerContextWith(env, loadDescriptor) {
     if (!env || typeof env !== 'object' || Array.isArray(env)) {
         fail('PLOINKY_AGENT_CREDENTIAL_CONTEXT_ENV', 'an explicit container environment is required');
     }
-    const runtimeKind = String(env.PLOINKY_RUNTIME || '').trim().toLowerCase();
-    if (runtimeKind === 'bwrap' || runtimeKind === 'seatbelt'
+    if ((Object.prototype.hasOwnProperty.call(env, 'PLOINKY_RUNTIME')
+            && env.PLOINKY_RUNTIME !== 'container')
         || Object.prototype.hasOwnProperty.call(env, 'PLOINKY_AGENT_CREDENTIAL_FILE')) {
         fail('PLOINKY_AGENT_CREDENTIAL_CONTEXT_ENV', 'container credential adaptation is forbidden for a host sandbox runtime');
+    }
+    const runtimeKind = requireOwnGenerated(env, 'PLOINKY_RUNTIME');
+    if (runtimeKind !== 'container') {
+        fail('PLOINKY_AGENT_CREDENTIAL_CONTEXT_ENV', 'container credential adaptation requires the exact container runtime');
     }
     const verified = assertVerifiedGeneratedRouterDescriptor(loadDescriptor({ env }));
     const payload = verified.payload;

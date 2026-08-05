@@ -1,7 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { resolveWebchatCommandsForAgent } from '../../webchat/commandResolver.js';
+import {
+    resolveWebchatCommands,
+    resolveWebchatCommandsForAgent,
+} from '../../webchat/commandResolver.js';
 import * as staticSrv from '../../static/index.js';
 import {
     handleWebchatUploadPost,
@@ -43,38 +46,25 @@ function renderTemplate(filenames, replacements) {
     return html;
 }
 
+function sendLaunchError(res, error, fallbackStatus = 400) {
+    const stableCode = typeof error?.code === 'string' && /^PLOINKY_[A-Z0-9_]+$/.test(error.code)
+        ? error.code
+        : 'PLOINKY_WEBCHAT_LAUNCH_REJECTED';
+    const status = Number.isInteger(error?.status) ? error.status : fallbackStatus;
+    res.writeHead(status, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+    });
+    res.end(JSON.stringify({ ok: false, error: stableCode }));
+}
+
 export async function handleWebChat(req, res, appConfig, appState) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname.substring(`/${appName}`.length) || '/';
     const agentOverrideRaw = parsedUrl.searchParams.get('agent') || '';
     const agentOverride = agentOverrideRaw.trim();
-    const launchOptions = resolveWebchatLaunchOptions(parsedUrl);
     let effectiveConfig = appConfig;
     let agentQuery = buildWebchatQuery(parsedUrl);
-
-    if (agentOverride) {
-        const overrideCommands = resolveWebchatCommandsForAgent(agentOverride, {
-            cliArgs: launchOptions.cliArgs
-        });
-        if (!overrideCommands) {
-            res.writeHead(404, { 'Content-Type': 'text/plain' });
-            res.end('Agent not found or not enabled.');
-            return;
-        }
-        if (typeof appConfig.getFactoryForCommands !== 'function') {
-            res.writeHead(503, { 'Content-Type': 'text/plain' });
-            res.end('Dynamic agent selection unavailable.');
-            return;
-        }
-        const overrideConfig = appConfig.getFactoryForCommands(overrideCommands);
-        if (!overrideConfig || !overrideConfig.ttyFactory) {
-            res.writeHead(503, { 'Content-Type': 'text/plain' });
-            res.end('Unable to start agent session.');
-            return;
-        }
-        effectiveConfig = overrideConfig;
-        agentQuery = buildWebchatQuery(parsedUrl, overrideCommands.agentName || agentOverride);
-    }
 
     if (pathname === '/auth' && req.method === 'POST') {
         res.writeHead(410, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -100,7 +90,73 @@ export async function handleWebChat(req, res, appConfig, appState) {
         return redirectToRouterLogin(req, res, parsedUrl, agentOverride);
     }
 
-    const workspaceBase = resolveWebchatWorkspaceBase(parsedUrl);
+    const runtimePath = pathname === '/stream'
+        || (pathname === '/input' && req.method === 'POST')
+        || (pathname === '/control' && req.method === 'POST')
+        || (pathname === '/interaction' && req.method === 'POST');
+    const pagePath = pathname === '/' || pathname === '/index.html';
+    let launchOptions = null;
+    if (runtimePath || pagePath) {
+        try {
+            launchOptions = resolveWebchatLaunchOptions(parsedUrl);
+        } catch (error) {
+            return sendLaunchError(res, error);
+        }
+    }
+
+    if (runtimePath) {
+        const resolverOptions = {
+            cliArgs: launchOptions.cliArgs,
+            workdir: launchOptions.workdirRelative,
+            hostWorkdir: launchOptions.workspaceRoot,
+        };
+        let commands;
+        try {
+            commands = agentOverride
+                ? resolveWebchatCommandsForAgent(agentOverride, resolverOptions)
+                : resolveWebchatCommands(resolverOptions);
+        } catch (error) {
+            return sendLaunchError(res, error);
+        }
+        if (!commands) {
+            return sendLaunchError(res, {
+                code: 'PLOINKY_WEBCHAT_AGENT_NOT_FOUND',
+                status: 404,
+            }, 404);
+        }
+        if (typeof appConfig.getFactoryForCommands !== 'function') {
+            return sendLaunchError(res, {
+                code: 'PLOINKY_WEBCHAT_DIRECT_CLI_UNAVAILABLE',
+                status: 503,
+            }, 503);
+        }
+        let requestConfig;
+        try {
+            requestConfig = appConfig.getFactoryForCommands(commands);
+        } catch (error) {
+            return sendLaunchError(res, error, 503);
+        }
+        if (!requestConfig || !requestConfig.ttyFactory) {
+            return sendLaunchError(res, {
+                code: requestConfig?.unavailableReason || commands.unsupportedReason
+                    || 'PLOINKY_WEBCHAT_DIRECT_CLI_UNAVAILABLE',
+                status: 503,
+            }, 503);
+        }
+        effectiveConfig = requestConfig;
+        agentQuery = buildWebchatQuery(parsedUrl, commands.agentName || agentOverride);
+    } else if (agentOverride) {
+        effectiveConfig = { ...appConfig, agentName: agentOverride };
+        agentQuery = buildWebchatQuery(parsedUrl, agentOverride);
+    }
+
+    const workspaceBase = launchOptions
+        ? {
+            root: launchOptions.workspaceRoot,
+            base: launchOptions.workdir,
+            relativeBase: launchOptions.workdirRelative,
+        }
+        : resolveWebchatWorkspaceBase(parsedUrl);
     const workspaceDirectory = workspaceBase.base;
 
     if (await handleTaskRoute({

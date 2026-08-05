@@ -138,6 +138,79 @@ function pipedFakeChild(pid = 4242) {
     return child;
 }
 
+test('provider runtime rejects an already-aborted launch before invoking any provider spawn adapter', async (t) => {
+    for (const provider of ['codex', 'opencode', 'pi']) {
+        await t.test(provider, async (providerTest) => {
+            const context = credentialContext();
+            const registry = await startScopedSoulBrokerRegistry({ credentialContext: context });
+            providerTest.after(() => registry.close());
+            const controller = new AbortController();
+            const reason = new Error(`cancelled before ${provider} spawn`);
+            controller.abort(reason);
+            let spawnCalls = 0;
+            const runtime = createProviderTaskRuntime({
+                credentialContext: context,
+                brokerRegistry: registry,
+                mode: 'task',
+                provider,
+                taskId: `task:pre-aborted:${provider}`,
+                audience: `${PRINCIPAL}/execute-task`,
+                signal: controller.signal,
+                ...runtimeIdentityOptions(),
+            });
+
+            await assert.rejects(
+                runtime.spawnWith(async () => {
+                    spawnCalls += 1;
+                    throw new Error('spawn adapter must not run');
+                }, { workdir: 'projects/alpha' }),
+                (error) => error?.code === 'PLOINKY_PROVIDER_RUNTIME_ABORTED'
+                    && error?.cause === reason,
+            );
+            assert.equal(spawnCalls, 0);
+            assert.equal(runtime.assertBoundaryUnused(), true);
+            await runtime.close();
+        });
+    }
+});
+
+test('provider runtime propagates its trusted signal across asynchronous adapter bootstrap', async (t) => {
+    const context = credentialContext();
+    const registry = await startScopedSoulBrokerRegistry({ credentialContext: context });
+    t.after(() => registry.close());
+    const controller = new AbortController();
+    const entered = deferred();
+    const release = deferred();
+    const reason = new Error('cancelled during adapter bootstrap');
+    let providerSpawnCalls = 0;
+    const runtime = createProviderTaskRuntime({
+        credentialContext: context,
+        brokerRegistry: registry,
+        mode: 'task',
+        provider: 'codex',
+        taskId: 'task:adapter-bootstrap-abort',
+        audience: `${PRINCIPAL}/execute-task`,
+        signal: controller.signal,
+        ...runtimeIdentityOptions(),
+    });
+
+    const launch = runtime.spawnWith(async (_input, lifecycle) => {
+        assert.equal(lifecycle.signal, controller.signal);
+        entered.resolve();
+        await release.promise;
+        lifecycle.signal.throwIfAborted();
+        providerSpawnCalls += 1;
+        throw new Error('provider spawn must not run after cancellation');
+    }, { workdir: 'projects/alpha' });
+    await entered.promise;
+    controller.abort(reason);
+    release.resolve();
+
+    await assert.rejects(launch, (error) => error === reason);
+    assert.equal(providerSpawnCalls, 0);
+    await runtime.close();
+});
+
 test('provider runtime keeps context and broker private and activates only at the helper barrier', async (t) => {
     const context = credentialContext();
     const registry = await startScopedSoulBrokerRegistry({ credentialContext: context });

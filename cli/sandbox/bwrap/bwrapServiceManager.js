@@ -2,7 +2,7 @@ import { execSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { buildShellCommand, spawnBwrapInteractive } from './interactive.js';
+import { spawnTrustedInteractiveLaunch } from './interactive.js';
 import { shouldAllocateInteractiveTty } from '../interactiveProcess.js';
 import {
     assertManifestEnvProfileCompleteness,
@@ -105,9 +105,11 @@ import { IMAGE_CONTRACT } from '../../../ploinky-box/contract/image.mjs';
 import {
     BWRAP_HOME_SOURCE_KINDS,
     TRUSTED_SERVICE_ENV,
+    buildTrustedInteractivePolicy,
     buildTrustedServicePolicy,
     encodeBwrapLaunchDescriptor,
     isTrustedServiceReservedEnvName,
+    normalizeTrustedInteractiveWorkdir,
 } from '../../../Agent/lib/providerSandbox.mjs';
 import {
     BWRAP_AGENT_CREDENTIAL_FILE,
@@ -122,8 +124,6 @@ const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const BWRAP_RUNTIME_ROOT = path.join(DEPS_DIR, 'bwrap-runtime');
 const BWRAP_NODE_RUNTIME_PATH = '/opt/ploinky-node';
 const BWRAP_HELPER_PATH = IMAGE_CONTRACT.bwrapHelper;
-
-const BWRAP_PATH = '/usr/bin/bwrap';
 
 function trustedServicePolicyError(message, code = 'PLOINKY_BWRAP_SERVICE_POLICY_INVALID') {
     const error = new Error(message);
@@ -300,6 +300,38 @@ function buildTrustedServiceLaunch(options) {
         descriptor: encodeBwrapLaunchDescriptor(policy.records),
         helperPath: BWRAP_HELPER_PATH,
     });
+}
+
+function buildTrustedInteractiveLaunch(options) {
+    const policy = buildTrustedInteractivePolicy(options);
+    return Object.freeze({
+        ...policy,
+        descriptor: encodeBwrapLaunchDescriptor(policy.records),
+        helperPath: BWRAP_HELPER_PATH,
+    });
+}
+
+function normalizeManagedInteractiveWorkdir(value) {
+    if (typeof value !== 'string' || value.includes('\0')
+        || value.split('/').includes('..')) {
+        throw trustedServicePolicyError(
+            'interactive WORKDIR is invalid',
+            'PLOINKY_WORKDIR_INVALID',
+        );
+    }
+    if (!path.isAbsolute(value) || value === '/workspace' || value.startsWith('/workspace/')) {
+        return normalizeTrustedInteractiveWorkdir(value);
+    }
+    const workspaceRoot = path.resolve(PLOINKY_WORKSPACE_ROOT);
+    const candidate = path.resolve(value);
+    const relative = path.relative(workspaceRoot, candidate);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+        throw trustedServicePolicyError(
+            'interactive WORKDIR is outside the workspace',
+            'PLOINKY_WORKDIR_INVALID',
+        );
+    }
+    return normalizeTrustedInteractiveWorkdir(relative);
 }
 
 function spawnTrustedServiceLaunch(launch, logFd, credentialBytes, dependencyOverrides = {}) {
@@ -1453,23 +1485,34 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
  * but runs the given command instead of the agent server.
  * Uses --die-with-parent so the session is cleaned up when the parent exits.
  */
-function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCommand, options = {}) {
+async function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCommand, options = {}) {
     const repoName = path.basename(path.dirname(agentPath));
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agents = loadAgentsMap();
     const record = agents[containerName];
 
     if (!record || record.runtime !== 'bwrap') {
-        throw new Error(`[bwrap] ${agentName}: not running as bwrap agent`);
+        throw trustedServicePolicyError(
+            `[bwrap] ${agentName}: exact bwrap service is not running`,
+            'PLOINKY_MANUAL_RUNTIME_MISMATCH',
+        );
     }
     const runtimeIdentity = normalizeSandboxRuntimeIdentity(record);
+    const selectedWorkdir = normalizeManagedInteractiveWorkdir(workdir);
 
     // Use the running record's persisted profile unless the caller explicitly
     // selected another valid profile for this interactive sandbox.
     const profileResolution = resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options, record);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
-    admitBwrapBoundary(agentName, manifest, agentPath, options, profileResolution);
+    assertTrustedServiceRawConfiguration(manifest, profileConfig);
+    const runtimeBoundary = admitBwrapBoundary(
+        agentName,
+        manifest,
+        agentPath,
+        options,
+        profileResolution,
+    );
     assertHostModeGenerationCapability({
         agentId: deriveAgentPrincipalId(repoName, agentName),
         instanceId: runtimeIdentity.instanceId,
@@ -1477,19 +1520,22 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
         routeKey: record.alias || agentName,
         containerName,
     });
+    const owner = assertExactServiceOwner(record.bwrapOwner);
     const routerEndpoint = resolveSandboxRouterEndpoint(options, profileResolution.network.mode);
 
-    // Resolve paths
+    // Resolve immutable sources only after the selected workdir grammar has
+    // been admitted. The helper performs the final openat2 revalidation.
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
-    const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
     const instanceName = record.alias || agentName;
-    const projectPath = record.projectPath || getConfiguredProjectPath(agentName, repoName, record.alias);
-    const isolatedHome = (record.runMode || 'isolated') === 'isolated';
-    const agentHomeDir = getAgentWorkDir(instanceName);
-    const cwdMountTarget = isolatedHome ? '/root' : projectPath;
-    const workspacePath = isolatedHome ? '/root' : projectPath;
-    const sharedDir = ensureSharedHostDir();
-    fs.mkdirSync(agentHomeDir, { recursive: true });
+    const agentHomeState = ensureAgentHomeAbi(containerName, runtimeIdentity.enableGeneration);
+    if (record.homeKey !== agentHomeState.homeKey
+        || owner.homeKey !== agentHomeState.homeKey) {
+        throw trustedServicePolicyError(
+            'interactive attach observed a different sandbox HOME generation',
+            'PLOINKY_HOME_STATE_INCOMPATIBLE',
+        );
+    }
+    const agentHomeDir = agentHomeState.homePath;
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
     const needsCoreDeps = !startCmd || agentHasPackageJson;
@@ -1507,71 +1553,123 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
         keepPaths: serviceAgentLibPath ? [serviceAgentLibPath] : []
     });
     const agentLibPath = ensureBwrapAgentLibDir(instanceName, nodeModulesDir);
-    const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
 
-    // Build environment (same as running agent)
-    assertTrustedServiceRawConfiguration(manifest, profileConfig);
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
+    assertTrustedServiceInputs(manifest, profileConfig, runtimeResourcePlan);
     const nodeRuntime = resolveBwrapNodeRuntime();
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
-    const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
+    const envMap = buildFullEnvMap(
+        agentName,
+        manifest,
+        profileConfig,
+        '/workspace',
+        repoName,
+        activeProfile,
+        'bwrap',
+        runtimeResourcePlan,
+        routerEndpoint,
+        runtimeIdentity,
+    );
+    if (envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH) {
+        throw trustedServicePolicyError(
+            'interactive bwrap cannot admit a path-mounted agent credential',
+            'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
+        );
+    }
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
     const hostPort = record.config?.ports?.[0]?.hostPort;
-    if (hostPort) envMap.PORT = String(hostPort);
-    const forceInteractiveShell = entryCommand
-        && String(entryCommand).trim() === '/bin/sh'
-        && shouldAllocateInteractiveTty();
-    if (forceInteractiveShell) {
+    if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+        throw trustedServicePolicyError(
+            'interactive bwrap requires the exact running root service port',
+            'PLOINKY_BWRAP_ROOT_PORT_INVALID',
+        );
+    }
+    envMap.PORT = String(hostPort);
+    if (shouldAllocateInteractiveTty()) {
         for (const key of ['TERM', 'COLORTERM', 'LINES', 'COLUMNS']) {
             if (process.env[key]) envMap[key] = process.env[key];
         }
-        envMap.HISTFILE = `/shared/.ploinky-${sanitizeHistoryName(agentName)}-shell-history`;
-        envMap.HISTSIZE = '5000';
-        envMap.HISTFILESIZE = '10000';
-        envMap.PS1 = '$ ';
     }
 
-    // Build bwrap args (same mounts as the running agent)
-    const bwrapArgs = buildBwrapArgs({
-        agentCodePath,
-        agentLibPath,
-        nodeModulesDir,
-        sharedDir,
-        cwd: projectPath,
-        cwdMountTarget,
-        agentHomeDir,
+    const routeKey = record.alias || agentName;
+    const principalId = deriveAgentPrincipalId(repoName, agentName);
+    const routerIntent = buildRouterAuthorityTopologyIntent({
+        networkMode: profileResolution.network.mode,
+        runtimeKind: 'bwrap',
+    });
+    if (!routerIntent
+        || routerIntent.physicalOrigin !== routerEndpoint.url
+        || routerIntent.routerHost !== routerEndpoint.host
+        || Number(routerIntent.routerPort) !== routerEndpoint.port) {
+        throw trustedServicePolicyError(
+            'interactive bwrap Router topology does not match the admitted host contract',
+            'PLOINKY_BWRAP_ROUTER_TOPOLOGY_INVALID',
+        );
+    }
+    const admittedNetworkHash = runtimeBoundary.admission.networkAdmission?.effectiveHash;
+    if (!/^[a-f0-9]{64}$/.test(String(admittedNetworkHash || ''))) {
+        throw trustedServicePolicyError(
+            'interactive bwrap network admission hash is missing or malformed',
+            'PLOINKY_BWRAP_ROUTER_TOPOLOGY_INVALID',
+        );
+    }
+    const trustedEnvironment = buildTrustedServiceDynamicEnvironment(envMap);
+    const trustedLaunch = buildTrustedInteractiveLaunch({
+        homeSource: {
+            sourceKind: BWRAP_HOME_SOURCE_KINDS.SANDBOX_WORKSPACE_V2,
+            homeKey: agentHomeState.homeKey,
+        },
+        workdir: selectedWorkdir,
+        command: ['/bin/sh', '-lc', String(entryCommand || '')],
         nodeRuntimePath: nodeRuntime.hostRuntimePath,
-        skillsPath: agentSkillsPath,
-        envMap,
-        codeReadOnly,
-        skillsReadOnly,
-        volumes: manifest.volumes,
-        volumeOptions: readManifestVolumeOptions(manifest),
-        runtimeResourcePlan,
-        agentPrivateKeyPath
+        agentRuntimePath: agentLibPath,
+        codePath: agentCodePath,
+        codeDependenciesPath: nodeModulesDir,
+        agentDependenciesPath: nodeModulesDir,
+        environment: trustedEnvironment,
+        identity: {
+            principalId,
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+        },
+        agentName,
+        repoName,
+        listenPort: hostPort,
+        credentialFd: 4,
+    });
+    const agentCredential = buildBwrapAgentCredential({
+        principalId,
+        instanceId: runtimeIdentity.instanceId,
+        enableGeneration: runtimeIdentity.enableGeneration,
+        runtimeKey: containerName,
+        routeKey,
+        router: {
+            physicalOrigin: routerIntent.physicalOrigin,
+            requestAuthority: routerIntent.requestAuthority,
+            host: routerEndpoint.host,
+            port: routerEndpoint.port,
+        },
+        admission: {
+            runtimeKind: 'bwrap',
+            manifestDigest: runtimeBoundary.admission.manifestDigest,
+            capabilityDigest: runtimeCapabilityDigest(runtimeBoundary.admission.descriptor),
+            networkHash: `sha256:${admittedNetworkHash}`,
+        },
     });
 
-    // For interactive sessions, die-with-parent IS appropriate
-    // (unlike daemon agents which must outlive the CLI)
-    bwrapArgs.push('--die-with-parent');
-
-    // Build command
-    const sandboxWorkdir = isolatedHome ? '/root' : projectPath;
-    const shellCommand = buildBwrapInteractiveCommand(sandboxWorkdir, entryCommand, { forceInteractiveShell });
-    bwrapArgs.push('--', 'sh', '-lc', shellCommand);
-
-    debugLog(`[bwrap] ${agentName}: interactive session: sh -lc ${JSON.stringify(shellCommand)}`);
+    debugLog(`[bwrap] ${agentName}: trusted interactive helper workdir=/workspace/${selectedWorkdir}`);
 
     try {
         assertHostModeGenerationCapability({
-            agentId: deriveAgentPrincipalId(repoName, agentName),
+            agentId: principalId,
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
-            routeKey: record.alias || agentName,
+            routeKey,
             containerName,
         });
-        return spawnBwrapInteractive(BWRAP_PATH, bwrapArgs);
+        return await spawnTrustedInteractiveLaunch(trustedLaunch, agentCredential.bytes, {
+            assertHelper: assertTrustedBwrapHelper,
+        });
     } finally {
         try {
             fs.rmSync(agentLibPath, { recursive: true, force: true });
@@ -1584,14 +1682,13 @@ export {
     resolveBwrapRuntimeProfile,
     startBwrapProcess,
     buildTrustedServiceLaunch,
+    buildTrustedInteractiveLaunch,
     spawnTrustedServiceLaunch,
     buildBwrapArgs,
     buildFullEnvMap,
     buildBwrapInteractiveCommand,
-    buildShellCommand,
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
     attachBwrapInteractive,
-    BWRAP_HELPER_PATH,
-    BWRAP_PATH
+    BWRAP_HELPER_PATH
 };

@@ -295,6 +295,13 @@ export function createProviderTaskRuntime({
             || homeResolutionPending || (homeResolutionAttempted && resolutionMode === null)) {
             fail('PLOINKY_PROVIDER_RUNTIME_STATE_INVALID', 'provider runtime cannot launch in its current state');
         }
+        if (signal?.aborted) {
+            fail(
+                'PLOINKY_PROVIDER_RUNTIME_ABORTED',
+                'provider runtime was aborted before spawn',
+                signal.reason,
+            );
+        }
         if (typeof spawnTaskSandbox !== 'function') {
             fail('PLOINKY_PROVIDER_RUNTIME_INPUT_INVALID', 'provider sandbox spawn adapter must be a function');
         }
@@ -341,6 +348,7 @@ export function createProviderTaskRuntime({
                 credentialContext: context,
                 environment: { ...extraEnvironment, ...capability.environment },
             }, {
+                ...(signal ? { signal } : {}),
                 activateCapability(metadata) {
                     if (!metadata || metadata.provider !== provider
                         || metadata.mode !== launchMode) {

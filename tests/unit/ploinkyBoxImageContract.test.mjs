@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -14,6 +16,31 @@ import {
 } from '../../ploinky-box/contract/image.mjs';
 
 const SOURCE_SHA = '0123456789abcdef0123456789abcdef01234567';
+const ENTRYPOINT_PATH = path.resolve(
+    import.meta.dirname,
+    '../../ploinky-box/entrypoint/ploinky-box-entrypoint',
+);
+
+function shellFunction(source, name) {
+    const start = source.indexOf(`${name}() {`);
+    const end = source.indexOf('\n}\n', start);
+    assert.notEqual(start, -1, `${name} declaration is missing`);
+    assert.notEqual(end, -1, `${name} declaration is incomplete`);
+    return source.slice(start, end + 3);
+}
+
+function probeRequiredDevice(devicePath, { shellPrelude = '' } = {}) {
+    const entrypoint = fs.readFileSync(ENTRYPOINT_PATH, 'utf8');
+    const script = [
+        shellFunction(entrypoint, 'fail'),
+        shellFunction(entrypoint, 'require_device'),
+        shellPrelude,
+        'require_device "$1" "test purpose"',
+    ].join('\n');
+    return childProcess.spawnSync('bash', ['-c', script, 'require-device', devicePath], {
+        encoding: 'utf8',
+    });
+}
 
 function validRecord() {
     return [{
@@ -206,4 +233,53 @@ test('image contract requires cloudflared and entrypoint validates token-file su
     assert.match(entrypoint, /cannot inspect Bubblewrap launcher file capabilities/);
     assert.match(entrypoint, /command -v getcap/);
     assert.doesNotMatch(entrypoint, /PLOINKY_DISABLE_HOST_SANDBOX/);
+});
+
+test('entrypoint reports actionable device and SELinux diagnostics', () => {
+    const entrypoint = fs.readFileSync(ENTRYPOINT_PATH, 'utf8');
+    assert.match(entrypoint, /missing or inaccessible inside ploinky-box/);
+    assert.match(entrypoint, /Podman accepted --device \$device/);
+    assert.match(entrypoint, /Podman Machine also requires --security-opt label=disable/);
+});
+
+test('entrypoint rejects missing and non-character device paths while accepting a usable device', (t) => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-device-'));
+    t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
+
+    const missing = probeRequiredDevice(path.join(fixtureRoot, 'missing'));
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /is missing/);
+    assert.match(missing.stderr, /--device/);
+
+    const regularFile = path.join(fixtureRoot, 'regular-file');
+    fs.writeFileSync(regularFile, 'not a device');
+    const nonDevice = probeRequiredDevice(regularFile);
+    assert.notEqual(nonDevice.status, 0);
+    assert.match(nonDevice.stderr, /not a character device/);
+    assert.match(nonDevice.stderr, /Diagnostic:/);
+
+    const usableDevice = probeRequiredDevice('/dev/null');
+    assert.equal(usableDevice.status, 0, usableDevice.stderr);
+});
+
+test('entrypoint rejects a character device that is inaccessible to the runtime user', () => {
+    const inaccessible = probeRequiredDevice('/dev/null', {
+        shellPrelude: `test() {
+            case "$1" in
+                -e|-w|-c) return 0 ;;
+                -r) return 1 ;;
+                *) builtin test "$@" ;;
+            esac
+        }`,
+    });
+    assert.notEqual(inaccessible.status, 0);
+    assert.match(inaccessible.stderr, /is inaccessible to the podman user/);
+    assert.match(inaccessible.stderr, /requires read\/write access/);
+    assert.match(inaccessible.stderr, /--device.*label=disable/);
+
+    const entrypoint = fs.readFileSync(ENTRYPOINT_PATH, 'utf8');
+    const requireDevice = shellFunction(entrypoint, 'require_device');
+    assert.match(requireDevice, /test -r "\$device"/);
+    assert.match(requireDevice, /test -w "\$device"/);
+    assert.match(requireDevice, /is inaccessible/);
 });

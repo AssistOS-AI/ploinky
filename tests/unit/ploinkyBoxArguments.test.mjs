@@ -73,7 +73,7 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
         [[], 'repl'],
         [['cli'], 'bash'],
         [['bash'], 'bash'],
-        [['cli', 'Agent'], 'agent-cli'],
+        [['cli', 'Agent', '--workdir', 'project', '--'], 'agent-cli'],
         [['logs'], 'generic'],
     ];
     for (const [argv, kind] of cases) {

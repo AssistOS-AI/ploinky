@@ -142,6 +142,10 @@ test('container adapter requires an explicit generated container environment and
         /forbidden for a host sandbox runtime/,
     );
     assert.throws(
+        () => createContainerAgentCredentialContext({ PLOINKY_RUNTIME: 'container' }),
+        /PLOINKY_RUNTIME lacks exact generated provenance/,
+    );
+    assert.throws(
         () => createContainerAgentCredentialContext({
             PLOINKY_AGENT_CREDENTIAL_FILE: '/run/ploinky-agent/credential.json',
         }),
@@ -165,6 +169,8 @@ test('container adapter preserves the signed generated-local container contract'
     env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY = 'generated';
     env.PLOINKY_AGENT_SECRET = secret;
     env.PLOINKY_AGENT_PRIVATE_SECRET = privateSecret;
+    env.PLOINKY_RUNTIME = 'container';
+    env.PLOINKY_ENV_SOURCE_PLOINKY_RUNTIME = 'generated';
 
     const context = createContainerAgentCredentialContext(env);
     assert.equal(context.source, 'container-generated-env-v1');

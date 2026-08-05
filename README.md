@@ -59,7 +59,7 @@ dependency volume. Ordinary agent containers run one level inside this runtime.
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
-| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky cli <agent> --workdir <path> -- <provider-args>` | Reconcile/start the selected agent runtime; attach its policy-constrained manifest CLI in the existing non-root workspace directory |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
@@ -213,8 +213,8 @@ Node-based agents consume a prepared, runtime-keyed dependency cache. `ploinky s
 - WebChat sends structured message envelopes over stdin. Agents that want a reliable chat experience should expose a real CLI process that reads stdin continuously and writes replies to stdout.
 - A manifest `cli` that points to a plain shell such as `"/bin/sh"` or `"/bin/bash"` does not become conversational by itself. In that setup WebChat mirrors raw input to the shell, and the shell may simply echo or mis-handle the incoming payload.
 - The recommended pattern is a dedicated CLI entrypoint such as `node /code/main.mjs` that parses WebChat input and keeps running for the full session.
-- `ploinky cli <agent>` and WebChat share the same manifest `cli`, so the same command must be suitable for both interactive terminal use and WebChat streaming input.
-- At WebChat startup, the CLI receives `PLOINKY_WEBCHAT_HAS_HISTORY=1` when the selected conversation already contains messages, otherwise `0`. Agents that emit a new-conversation introduction should omit it when the value is `1`; Ploinky supplies the prior conversation context with the next normal user message.
+- `ploinky cli <agent> --workdir <path> -- <provider-args>` and WebChat share the same policy-constrained manifest `cli`. The selector is required, must identify an existing real non-root directory below `/workspace`, and is consumed only before `--`; every argument after `--` belongs to the provider unchanged.
+- WebChat requires one `workspace-dir` selector and derives the same trusted workdir boundary. Browser tab, page, and session identifiers are runtime metadata and are never forwarded as provider arguments.
 
 ## Cloud (preview)
 

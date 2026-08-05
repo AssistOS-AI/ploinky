@@ -26,9 +26,16 @@ function captureHelp(args, options) {
 test('cli help documents outer and agent forms', () => {
     const text = captureHelp(['cli'], { surface: 'core' });
     assert.match(text, /^cli$/m);
-    assert.match(text, /^cli <agentName> \[args\.\.\.\]$/m);
+    assert.match(text, /^cli <agentName> --workdir <path> -- \[provider-args\.\.\.\]$/m);
     assert.match(text, /outer runtime/);
     assert.match(text, /manifest/);
+    assert.match(text, /selected runtime is mandatory/i);
+});
+
+test('start help documents only immutable AgentLib overrides', () => {
+    const text = captureHelp(['start'], { surface: 'core' });
+    assert.match(text, /PLOINKY_AGENTLIB_REF=<40-hex-commit\|git\+https-spec#40-hex-commit>/);
+    assert.doesNotMatch(text, /PLOINKY_AGENTLIB_REF=<branch\|git\+\/file: spec>/);
 });
 
 test('host and core lifecycle help have different scopes', () => {

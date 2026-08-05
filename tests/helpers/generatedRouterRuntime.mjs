@@ -63,6 +63,8 @@ export function installGeneratedRouterRuntime({
         PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY: 'generated',
         PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'generated',
         PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY: 'generated',
+        PLOINKY_RUNTIME: 'container',
+        PLOINKY_ENV_SOURCE_PLOINKY_RUNTIME: 'generated',
     };
     Object.assign(process.env, env);
     return Object.freeze({ descriptorFile, env: Object.freeze(env), payload });

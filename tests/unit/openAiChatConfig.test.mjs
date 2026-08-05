@@ -17,6 +17,7 @@ const {
     __resolveProviderInvocationIdentity,
     resolveOpenAiChatKind,
     resolveOpenAiModelsKind,
+    validateAgentServerManifestExecution,
 } = await import(`../../Agent/server/AgentServer.mjs?credential=${Date.now()}`);
 
 test.after(() => fs.rmSync(credentialDir, { recursive: true, force: true }));
@@ -47,12 +48,13 @@ test('provider endpoint specs admit exact modules without a shell fallback', () 
         module: '/code/openai-api/provider-endpoint.mjs',
         export: 'executeProviderEndpoint',
     };
+    const providerConfig = { providerSandbox: { provider: 'opencode', readiness: true } };
     const chat = resolveOpenAiChatKind({
         endpoints: { chatCompletions: { providerExecution, supportsStream: false } },
-    });
+    }, providerConfig);
     const models = resolveOpenAiModelsKind({
         endpoints: { models: { providerExecution } },
-    });
+    }, providerConfig);
 
     assert.equal(chat.kind, 'command');
     assert.equal(chat.commandSpec.kind, 'provider-module');
@@ -69,14 +71,51 @@ test('provider endpoint specs admit exact modules without a shell fallback', () 
     assert.throws(
         () => resolveOpenAiModelsKind({
             endpoints: { models: { providerExecution: { ...providerExecution, mode: undefined } } },
-        }),
+        }, providerConfig),
         /providerExecution must be an exact/,
     );
     assert.throws(
         () => resolveOpenAiChatKind({
             endpoints: { chatCompletions: { providerExecution, supportsStream: true } },
-        }),
+        }, providerConfig),
         /provider chat execution does not support direct stream passthrough/,
+    );
+});
+
+test('provider capability rejects manifest endpoint shell drift and marker erasure', () => {
+    const providerConfig = { providerSandbox: { provider: 'codex', readiness: true } };
+    for (const resolve of [resolveOpenAiChatKind, resolveOpenAiModelsKind]) {
+        const endpoint = resolve === resolveOpenAiChatKind ? 'chatCompletions' : 'models';
+        assert.throws(
+            () => resolve({
+                endpoints: { [endpoint]: { command: '/bin/sh', args: ['-lc', 'id'] } },
+            }, providerConfig),
+            { code: 'PLOINKY_PROVIDER_EXECUTION_INVALID' },
+        );
+        for (const drift of [{ args: ['id'] }, { cwd: '/tmp' }, { env: { X: '1' } }]) {
+            assert.throws(
+                () => resolve({ endpoints: { [endpoint]: drift } }, providerConfig),
+                { code: 'PLOINKY_PROVIDER_EXECUTION_INVALID' },
+            );
+        }
+        assert.throws(
+            () => resolve({
+                endpoints: {
+                    [endpoint]: {
+                        providerExecution: {
+                            provider: 'codex', mode: 'operation', module: '/code/x.mjs', export: 'run',
+                        },
+                    },
+                },
+            }, {}),
+            { code: 'PLOINKY_PROVIDER_EXECUTION_INVALID' },
+        );
+    }
+    assert.throws(
+        () => validateAgentServerManifestExecution({
+            endpoints: { chatCompletions: { command: '/bin/sh', args: ['-lc', 'id'] } },
+        }, providerConfig),
+        { code: 'PLOINKY_PROVIDER_EXECUTION_INVALID' },
     );
 });
 

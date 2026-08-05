@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import {
+    buildWebchatQuery,
     resolveWebchatLaunchOptions,
     resolveWorkspaceScopedQueryPath,
 } from '../../cli/server/handlers/webchat/launchOptions.js';
@@ -18,20 +21,96 @@ import {
 import {
     extractManifestWebchatOptions
 } from '../../cli/server/webchat/commandResolver.js';
-import { PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 
 test('resolveWebchatLaunchOptions forwards agent-owned launch flags unchanged', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-webchat-envelope-'));
+    try {
+        fs.mkdirSync(path.join(workspaceRoot, 'projects', 'demo'), { recursive: true });
+        const parsedUrl = new URL(
+            '/webchat?agent=achilles-cli&workspace-dir=projects%2Fdemo&feature-tags=1&feature-tags=&workdir=provider-owned&pageInstanceId=p1&tabId=t1&sessionId=s1',
+            'http://localhost'
+        );
+        const options = resolveWebchatLaunchOptions(parsedUrl, { workspaceRoot });
+        assert.equal(options.workdir, fs.realpathSync(path.join(workspaceRoot, 'projects', 'demo')));
+        assert.equal(options.workdirRelative, 'projects/demo');
+        assert.equal(options.runtimeWorkdir, '/workspace/projects/demo');
+        assert.deepEqual(options.cliArgs, [
+            '--dir=/workspace/projects/demo',
+            '--feature-tags=1',
+            '--feature-tags',
+            '--workdir=provider-owned',
+        ]);
+        assert.equal(options.cliArgs.some((arg) => arg.startsWith('--workspace-dir=')), false);
+        assert.equal(options.cliArgs.some((arg) => arg.startsWith('--pageInstanceId=')), false);
+        assert.equal(options.cliArgs.some((arg) => arg.startsWith('--tabId=')), false);
+        assert.equal(options.cliArgs.some((arg) => arg.startsWith('--sessionId=')), false);
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('WebChat workdir admission rejects ambiguous and unsafe selectors with stable codes', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-webchat-admission-'));
+    try {
+        fs.mkdirSync(path.join(workspaceRoot, 'valid folder'), { recursive: true });
+        fs.mkdirSync(path.join(workspaceRoot, 'real', 'child'), { recursive: true });
+        fs.mkdirSync(path.join(workspaceRoot, '.ploinky', 'repos', 'managed'), { recursive: true });
+        fs.writeFileSync(path.join(workspaceRoot, 'file.txt'), 'not a directory');
+        fs.symlinkSync(path.join(workspaceRoot, 'real'), path.join(workspaceRoot, 'linked'));
+
+        const expectCode = (url, code) => {
+            assert.throws(
+                () => resolveWebchatLaunchOptions(new URL(url, 'http://localhost'), { workspaceRoot }),
+                (error) => error?.code === code && error?.status === 400,
+            );
+        };
+        expectCode('/webchat', 'PLOINKY_WORKDIR_REQUIRED');
+        expectCode('/webchat?workspace-dir=valid%20folder&workspaceDir=real%2Fchild', 'PLOINKY_WORKDIR_INVALID');
+        expectCode('/webchat?workspace-dir=.', 'PLOINKY_WORKDIR_ROOT_FORBIDDEN');
+        expectCode('/webchat?workspace-dir=%2Fworkspace', 'PLOINKY_WORKDIR_ROOT_FORBIDDEN');
+        expectCode('/webchat?workspace-dir=real%2F..%2Fvalid%20folder', 'PLOINKY_WORKDIR_INVALID');
+        expectCode('/webchat?workspace-dir=%2Ftmp', 'PLOINKY_WORKDIR_INVALID');
+        expectCode('/webchat?workspace-dir=missing', 'PLOINKY_WORKDIR_INVALID');
+        expectCode('/webchat?workspace-dir=file.txt', 'PLOINKY_WORKDIR_INVALID');
+        expectCode('/webchat?workspace-dir=linked%2Fchild', 'PLOINKY_WORKDIR_INVALID');
+        const nulUrl = new URL('/webchat', 'http://localhost');
+        nulUrl.searchParams.set('workspace-dir', 'real\0child');
+        assert.throws(
+            () => resolveWebchatLaunchOptions(nulUrl, { workspaceRoot }),
+            (error) => error?.code === 'PLOINKY_WORKDIR_INVALID',
+        );
+
+        assert.equal(
+            resolveWebchatLaunchOptions(
+                new URL('/webchat?workspace-dir=valid%20folder', 'http://localhost'),
+                { workspaceRoot },
+            ).workdirRelative,
+            'valid folder',
+        );
+        assert.equal(
+            resolveWebchatLaunchOptions(
+                new URL('/webchat?workspace-dir=.ploinky%2Frepos%2Fmanaged', 'http://localhost'),
+                { workspaceRoot },
+            ).workdirRelative,
+            '.ploinky/repos/managed',
+        );
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('page and connection identifiers do not affect the WebChat runtime query', () => {
     const parsedUrl = new URL(
-        '/webchat?agent=achilles-cli&workspace-dir=projects/demo&feature-tags=1&forward-envelope=1&tabId=t1&sessionId=s1',
-        'http://localhost'
+        '/webchat?workspace-dir=projects%2Fdemo&agent=codex&tabId=t1&sessionId=s1&pageInstanceId=p1&model=o3',
+        'http://localhost',
     );
-    const { cliArgs } = resolveWebchatLaunchOptions(parsedUrl);
-    assert.ok(cliArgs.includes(`--dir=${path.resolve(PLOINKY_WORKSPACE_ROOT, 'projects/demo')}`));
-    assert.ok(cliArgs.includes('--feature-tags=1'));
-    assert.ok(cliArgs.includes('--forward-envelope=1'));
-    assert.equal(cliArgs.some((arg) => arg.startsWith('--workspace-dir=')), false);
-    assert.equal(cliArgs.some((arg) => arg.startsWith('--tabId=')), false);
-    assert.equal(cliArgs.some((arg) => arg.startsWith('--sessionId=')), false);
+    const query = new URLSearchParams(buildWebchatQuery(parsedUrl, 'codex'));
+    assert.equal(query.get('workspace-dir'), 'projects/demo');
+    assert.equal(query.get('agent'), 'codex');
+    assert.equal(query.get('model'), 'o3');
+    assert.equal(query.has('tabId'), false);
+    assert.equal(query.has('sessionId'), false);
+    assert.equal(query.has('pageInstanceId'), false);
 });
 
 test('manifest webchat forwardEnvelope opts an agent into WebChat envelopes', () => {

@@ -56,6 +56,23 @@ const PROVIDER_GENERATION = '66666666-7777-4888-8999-aaaaaaaaaaaa';
 const PROVIDER_BROKER_KEY = 'c'.repeat(43);
 const PROVIDER_BROKER_URL = 'http://127.0.0.1:43123/v1';
 
+test('provider sandbox rejects an aborted lifecycle before spawning the helper', async () => {
+    const controller = new AbortController();
+    const reason = new Error('cancelled before physical provider spawn');
+    controller.abort(reason);
+    let spawnCalls = 0;
+    await assert.rejects(
+        spawnProviderSandbox(providerTaskInput(), { signal: controller.signal }, {
+            spawn() {
+                spawnCalls += 1;
+                throw new Error('helper spawn must not run');
+            },
+        }),
+        (error) => error === reason,
+    );
+    assert.equal(spawnCalls, 0);
+});
+
 function identified(processIdentity = IDENTITY_A, processUid = CURRENT_UID) {
     return { state: 'identified', processIdentity, processUid };
 }
@@ -131,6 +148,8 @@ function containerCredentialContext(t) {
     env.PLOINKY_AGENT_PRIVATE_SECRET = 'b'.repeat(64);
     env.PLOINKY_AGENT_HOME_KEY = 'coding-agent_container';
     env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY = 'generated';
+    env.PLOINKY_RUNTIME = 'container';
+    env.PLOINKY_ENV_SOURCE_PLOINKY_RUNTIME = 'generated';
     return createContainerAgentCredentialContext(env);
 }
 

@@ -415,12 +415,11 @@ function startInteractiveMode() {
 export async function runCoreCli(args = []) {
     assertRuntimeDependencies();
     logPloinkyDirectory();
-    args = [...args];
+    const debug = parseCoreDebugArguments(args);
+    args = debug.argv;
 
-    const debugIndex = args.findIndex(arg => arg === '--debug' || arg === '-d');
-    if (debugIndex > -1) {
+    if (debug.enabled) {
         setDebugMode(true);
-        args.splice(debugIndex, 1);
         console.log('[INFO] Debug mode enabled.');
     }
 
@@ -445,4 +444,18 @@ export async function runCoreCli(args = []) {
 
     if (args.length === 0) return startInteractiveMode();
     return handleCommand(args);
+}
+
+export function parseCoreDebugArguments(rawArgs = []) {
+    const args = [...rawArgs];
+    const leadingCommandIndex = args.findIndex((arg) => arg !== '--debug' && arg !== '-d');
+    const command = leadingCommandIndex >= 0 ? args[leadingCommandIndex] : '';
+    const debugIndex = command === 'cli'
+        ? args.findIndex((arg, index) => index < leadingCommandIndex && (arg === '--debug' || arg === '-d'))
+        : args.findIndex((arg) => arg === '--debug' || arg === '-d');
+    if (debugIndex < 0) {
+        return { argv: args, enabled: false };
+    }
+    args.splice(debugIndex, 1);
+    return { argv: args, enabled: true };
 }

@@ -26,6 +26,18 @@ const MAX_INTERACTION_RESPONSE_BYTES = 16 * 1024;
 const INTERACTION_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const PAGE_INSTANCE_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
+function writeRuntimeAdmissionError(res, code, status = 503, extraHeaders = {}) {
+    const stableCode = typeof code === 'string' && /^PLOINKY_[A-Z0-9_]+$/.test(code)
+        ? code
+        : 'PLOINKY_WEBCHAT_RUNTIME_UNAVAILABLE';
+    res.writeHead(status, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        ...extraHeaders,
+    });
+    return res.end(JSON.stringify({ ok: false, error: stableCode }));
+}
+
 function pageInstanceIdFrom(parsedUrl) {
     const value = String(parsedUrl.searchParams.get('pageInstanceId') || '').trim();
     return PAGE_INSTANCE_RE.test(value) ? value : '';
@@ -81,12 +93,18 @@ export function handleRuntimeRoute({
         }
 
         if (!tab && runtimes.size >= 20) {
-            res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '30' });
-            return res.end('Server at capacity. Please try again later.');
+            return writeRuntimeAdmissionError(
+                res,
+                'PLOINKY_WEBCHAT_RUNTIME_CAPACITY',
+                503,
+                { 'Retry-After': '30' },
+            );
         }
         if (!tab && !effectiveConfig.ttyFactory) {
-            res.writeHead(503, { 'Content-Type': 'text/plain' });
-            return res.end(effectiveConfig.unavailableReason || 'WebChat is not available for this agent.');
+            return writeRuntimeAdmissionError(
+                res,
+                effectiveConfig.unavailableReason || 'PLOINKY_WEBCHAT_RUNTIME_UNAVAILABLE',
+            );
         }
 
         if (!tab) {
@@ -125,9 +143,14 @@ export function handleRuntimeRoute({
                     disposeTab(tab, runtimeKey, { runtimes });
                 });
             } catch (error) {
-                console.error(`[webchat] Failed to create folder session runtime: ${error?.message || error}`);
-                res.writeHead(500, { 'Content-Type': 'text/plain' });
-                return res.end(`Failed to create chat session: ${error?.message || error}`);
+                console.error('[webchat] Failed to create folder session runtime.', {
+                    code: typeof error?.code === 'string' ? error.code : 'PLOINKY_WEBCHAT_RUNTIME_START_FAILED',
+                });
+                return writeRuntimeAdmissionError(
+                    res,
+                    error?.code || 'PLOINKY_WEBCHAT_RUNTIME_START_FAILED',
+                    Number.isInteger(error?.status) ? error.status : 500,
+                );
             }
         }
 

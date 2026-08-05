@@ -43,7 +43,8 @@ function mainHelpText(surface) {
                                  Start agents from .ploinky/agents.json and launch Router
   shell <agentName>              Open interactive shell in container (attached TTY)
   cli                            Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
-  cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
+  cli <agentName> --workdir <path> -- [provider-args...]
+                                 Run manifest "cli" through the selected runtime
   webchat                        Print the authenticated WebChat access URL
   dashboard                      Print the administrator-only Dashboard access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
@@ -166,11 +167,15 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             description: 'Run the agent CLI command interactively',
             subcommands: {
                 'default': {
-                    syntax: 'cli <agentName> [args...]',
+                    syntax: 'cli <agentName> --workdir <path> -- [provider-args...]',
                     description: 'Run manifest "cli" command interactively (attached TTY).',
-                    params: { '<agentName>': 'Agent name', '[args...]': 'Arguments appended to the cli command' },
-                    examples: [ 'cli MyAPI --help' ],
-                    notes: 'Attaches to a persistent container. REPLs stay attached until exit. Requires the agent manifest to define a "cli" entry. WebChat uses the same launch path and appends forwarded URL parameters as long-form CLI flags.'
+                    params: {
+                        '<agentName>': 'Agent name',
+                        '--workdir <path>': 'Existing real non-root directory below /workspace',
+                        '[provider-args...]': 'Exact provider arguments after the required -- separator'
+                    },
+                    examples: [ 'cli MyAPI --workdir projects/demo -- --help' ],
+                    notes: 'Uses the runtime selected by lite-sandbox and fails closed if that backend cannot start. Ploinky consumes exactly one pre-separator --workdir; there is no cwd inference or legacy argument form. WebChat uses the same launch path.'
                 }
             }
         },
@@ -179,9 +184,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             syntax: 'webchat',
             examples: [
                 'webchat',
-                '/webchat?agent=achilles-cli&path=/absolute/path'
+                '/webchat?agent=achilles-cli&workspace-dir=projects/demo'
             ],
-            notes: 'WebChat uses the normal Router login flow. When `/webchat` is opened with `?agent=<name>&...`, every extra query parameter except internal router/session fields is forwarded to `ploinky cli <name>` as a single-token long-form CLI flag in the form `--key=value`.'
+            notes: 'WebChat uses the normal Router login flow and requires one existing non-root `workspace-dir`. It dispatches `ploinky cli <name> --workdir <path> -- ...`; ordinary query parameters become provider-owned long-form flags, while agent/workspace selection and tab/session/page identifiers are reserved.'
         },
         'dashboard': {
             description: 'Print the administrator-only Dashboard URL served at /dashboard.',
@@ -311,7 +316,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             description: 'Start enabled agents and the local Router',
             syntax: 'start <agent> [port] [--profile <name>] [--branch <branch>] [--repo-branch <repo>=<branch>] [--branch-fallback default|fail] [--reset-repos]',
             examples: [ 'start MyStaticAgent 8080 --profile dev', 'start explorer 8080 --profile prod --branch my-feature' ],
-            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. An explicit --profile selects and persists the workspace profile before startup; direct in-box starts that omit it retain the active workspace profile. --branch <branch> applies to the static agent\'s repo, every manifest dependency repo, AND the achillesAgentLib used by agent containers. Missing achillesAgentLib branches always abort without a pinned-ref fallback; other repos use their default branch unless --branch-fallback fail requests an abort. --repo-branch <repo>=<branch> (repeatable) reconciles an existing named repo before manifest traversal and overrides that repo when traversal installs it; --reset-repos hard-resets targeted managed repos to the refreshed remote branch. (Advanced escape hatch: export PLOINKY_AGENTLIB_REF=<branch|git+/file: spec> to override just the achillesAgentLib source.)'
+            notes: 'Reads manifest of static agent: applies repos{} (clone+enable) and enable[] (enable agents). First run needs agent and port. An explicit --profile selects and persists the workspace profile before startup; direct in-box starts that omit it retain the active workspace profile. --branch <branch> applies to the static agent\'s repo, every manifest dependency repo, AND the achillesAgentLib used by agent containers. The requested achillesAgentLib branch must resolve to one exact 40-hex commit; missing or mismatched refs always abort without fallback. Other repos use their default branch unless --branch-fallback fail requests an abort. --repo-branch <repo>=<branch> (repeatable) reconciles an existing named repo before manifest traversal and overrides that repo when traversal installs it; --reset-repos hard-resets targeted managed repos to the refreshed remote branch. (Advanced escape hatch: export PLOINKY_AGENTLIB_REF=<40-hex-commit|git+https-spec#40-hex-commit> to override the trusted achillesAgentLib source immutably.)'
         },
         'status': {
             description: 'Show enabled agents and router configuration',
@@ -742,8 +747,9 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
 cli
   Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
 
-cli <agentName> [args...]
-  Run the agent manifest CLI command interactively (attached TTY).
+cli <agentName> --workdir <path> -- [provider-args...]
+  Run the agent manifest CLI in an existing real non-root workspace directory.
+  The selected runtime is mandatory; arguments after -- are forwarded unchanged.
 `);
         return;
     }

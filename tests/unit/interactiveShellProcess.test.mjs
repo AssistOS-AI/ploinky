@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import {
     resolveInteractiveSpawnResult,
     shouldAllocateInteractiveTty,
 } from '../../cli/sandbox/interactiveProcess.js';
-import { spawnBwrapInteractive } from '../../cli/sandbox/bwrap/interactive.js';
+import { spawnTrustedInteractiveLaunch } from '../../cli/sandbox/bwrap/interactive.js';
 import { attachInteractive } from '../../cli/sandbox/docker/interactive.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -49,40 +50,73 @@ test('interactive spawn results preserve status, signal status, and launch error
     );
 });
 
-test('bwrap uses the PTY wrapper only when both streams are terminals', () => {
+test('bwrap interactive launch uses only the canonical helper with inherited terminal stdio and pipe transport', async () => {
     const calls = [];
-    const spawnSyncImpl = (...args) => {
-        calls.push(args);
-        return { status: 9 };
-    };
-    assert.equal(spawnBwrapInteractive('/usr/bin/bwrap', ['--unshare-all'], {
-        env: {},
-        stdin: { isTTY: false },
-        stdout: { isTTY: true },
-        existsSync: () => true,
-        spawnSyncImpl,
-    }), 9);
-    assert.equal(calls[0][0], '/usr/bin/bwrap');
-
-    calls.length = 0;
-    assert.equal(spawnBwrapInteractive('/usr/bin/bwrap', ['--unshare-all'], {
-        env: {},
-        stdin: { isTTY: true },
-        stdout: { isTTY: true },
-        existsSync: () => true,
-        spawnSyncImpl,
-    }), 9);
-    assert.equal(calls[0][0], '/usr/bin/script');
-
-    calls.length = 0;
-    spawnBwrapInteractive('/usr/bin/bwrap', ['--unshare-all'], {
-        env: { PLOINKY_NO_TTY: '1' },
-        stdin: { isTTY: true },
-        stdout: { isTTY: true },
-        existsSync: () => true,
-        spawnSyncImpl,
+    const writes = [];
+    const credential = Buffer.from('credential');
+    const child = new EventEmitter();
+    child.pid = 4321;
+    child.stdio = [null, null, null, ...['descriptor', 'credential'].map((label) => {
+        const pipe = new EventEmitter();
+        pipe.end = (bytes, callback) => {
+            writes.push([label, Buffer.from(bytes)]);
+            callback?.();
+        };
+        return pipe;
+    })];
+    const launch = Object.freeze({
+        helperPath: '/usr/local/libexec/ploinky-bwrap-launch',
+        descriptor: Buffer.concat([Buffer.from('PLBWLP02'), Buffer.from('descriptor')]),
     });
-    assert.equal(calls[0][0], '/usr/bin/bwrap');
+    const completion = spawnTrustedInteractiveLaunch(launch, credential, {
+        assertHelper: () => calls.push(['assert-helper']),
+        spawnProcess: (...args) => {
+            calls.push(args);
+            queueMicrotask(() => child.emit('exit', 9, null));
+            return child;
+        },
+    });
+    assert.equal(await completion, 9);
+    assert.deepEqual(calls[0], ['assert-helper']);
+    assert.equal(calls[1][0], '/usr/local/libexec/ploinky-bwrap-launch');
+    assert.deepEqual(calls[1][1], []);
+    assert.deepEqual(calls[1][2], {
+        detached: false,
+        stdio: ['inherit', 'inherit', 'inherit', 'pipe', 'pipe'],
+    });
+    assert.equal(writes[0][0], 'descriptor');
+    assert.equal(writes[0][1].subarray(0, 8).toString('ascii'), 'PLBWLP02');
+    assert.deepEqual(writes[1], ['credential', Buffer.from('credential')]);
+    assert.equal(credential.equals(Buffer.alloc(credential.length)), true);
+});
+
+test('bwrap interactive transport fails closed and clears credentials without a helper fallback', async () => {
+    const credential = Buffer.from('credential');
+    const killed = [];
+    const child = new EventEmitter();
+    child.pid = 9876;
+    child.stdio = [null, null, null, ...['descriptor', 'credential'].map((label) => {
+        const pipe = new EventEmitter();
+        pipe.end = (_bytes, callback) => {
+            if (label === 'descriptor') queueMicrotask(() => pipe.emit('error', new Error('pipe failed')));
+            callback?.();
+        };
+        return pipe;
+    })];
+    const completion = spawnTrustedInteractiveLaunch({
+        helperPath: '/usr/local/libexec/ploinky-bwrap-launch',
+        descriptor: Buffer.concat([Buffer.from('PLBWLP02'), Buffer.from('descriptor')]),
+    }, credential, {
+        assertHelper: () => {},
+        spawnProcess: () => child,
+        killProcess: (...args) => killed.push(args),
+    });
+    await assert.rejects(
+        completion,
+        error => error?.code === 'PLOINKY_BWRAP_PIPE_FAILED',
+    );
+    assert.deepEqual(killed, [[9876, 'SIGKILL']]);
+    assert.equal(credential.equals(Buffer.alloc(credential.length)), true);
 });
 
 test('container attach never fabricates -it for piped input and returns the child status', () => {

@@ -86,8 +86,16 @@ function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
             }),
             attachInteractive: (containerName, projectPath, command) => {
                 events.push(['attach', containerName, projectPath, command]);
+                return 0;
             },
-            projectPath: '/workspace',
+            workspaceRoot: '/workspace',
+            resolveWorkdir: (value) => {
+                assert.equal(value, 'project');
+                return Object.freeze({
+                    canonicalPath: '/workspace/project',
+                    runtimePath: '/workspace/project',
+                });
+            },
             log: line => {
                 logs.push(line);
                 if (line.startsWith('[ploinky] image=')) events.push(['banner']);
@@ -671,7 +679,7 @@ test('runCli auto-enables waits identifies final image then attaches', async () 
     const harness = agentCliHarness();
     await runCliWithDependencies(
         'explorer',
-        ['--help'],
+        ['--workdir', 'project', '--', '--help'],
         harness.dependencies,
     );
     assert.deepEqual(
@@ -687,7 +695,7 @@ test('runCli auto-enables waits identifies final image then attaches', async () 
 
 test('runCli no-tty suppresses banners but preserves attachment', async () => {
     const harness = agentCliHarness({ noTTY: true });
-    await runCliWithDependencies('explorer', [], harness.dependencies);
+    await runCliWithDependencies('explorer', ['--workdir', 'project', '--'], harness.dependencies);
     assert.equal(harness.logs.some(line => line.startsWith('[ploinky]')), false);
     assert.ok(harness.events.some(event => event[0] === 'attach'));
 });
@@ -717,7 +725,7 @@ test('runCli holds its maintenance transaction through readiness and activation'
         harness.events.push(['activate']);
     };
 
-    const running = runCliWithDependencies('explorer', [], harness.dependencies);
+    const running = runCliWithDependencies('explorer', ['--workdir', 'project', '--'], harness.dependencies);
     await readinessEntered;
     assert.deepEqual(
         harness.events.map(([name]) => name),
@@ -734,7 +742,7 @@ test('runCli holds its maintenance transaction through readiness and activation'
 test('runCli resolves the router endpoint before auto-enable mutation', async () => {
     const harness = agentCliHarness({ endpointError: new Error('persisted router port is invalid') });
     await assert.rejects(
-        runCliWithDependencies('explorer', [], harness.dependencies),
+        runCliWithDependencies('explorer', ['--workdir', 'project', '--'], harness.dependencies),
         /persisted router port is invalid/,
     );
     assert.deepEqual(harness.events, []);

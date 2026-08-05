@@ -5,6 +5,11 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import { parseAgentCliArguments } from '../../ploinky-box/command/agent-cli.mjs';
+import {
+  admitProviderManifestCli,
+  PROVIDER_INTERACTIVE_ADAPTER,
+} from '../utils/providerCliAdmission.js';
 import * as utils from '../utils/utils.js';
 import * as agentsSvc from '../utils/agents.js';
 import * as workspaceSvc from '../utils/workspace.js';
@@ -43,7 +48,6 @@ import {
   AGENTS_DATA_DIR,
   LOGS_DIR,
   PLOINKY_DIR,
-  PLOINKY_CWD,
   PLOINKY_WORKSPACE_ROOT,
   REPOS_DIR,
   RUNNING_DIR,
@@ -81,6 +85,11 @@ import {
   assertRuntimeAdmissionCurrent,
 } from '../sandbox/runtimeCapabilities.js';
 import { getAgentDataDir } from '../utils/workspaceStructure.js';
+import {
+  normalizeCliWorkdirForRuntime,
+  resolveCliWorkdir,
+  validateCliWorkdir,
+} from '../utils/runtime/cliWorkdir.js';
 import {
   formatAgentAttachmentBanner,
   resolveAgentAttachmentIdentity,
@@ -633,10 +642,12 @@ async function waitForRouterReady(port, child, timeoutMs = 15000, {
   throw error;
 }
 
-function runWithSuspendedInput(callback) {
-  const restoreInput = inputState.prepareForExternalCommand?.() || (() => {});
+export async function runWithSuspendedInput(callback, {
+  prepareForExternalCommand = inputState.prepareForExternalCommand,
+} = {}) {
+  const restoreInput = prepareForExternalCommand?.() || (() => {});
   try {
-    return callback();
+    return await callback();
   } finally {
     restoreInput();
   }
@@ -659,6 +670,24 @@ function shellQuote(str) {
   const s = String(str);
   if (s.length === 0) return "''";
   return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+export { normalizeCliWorkdirForRuntime, resolveCliWorkdir, validateCliWorkdir };
+
+export function buildManifestCliCommand(cliBase, providerArgv = [], { workdir = '' } = {}) {
+  const command = String(cliBase || '').trim();
+  if (!command) return command;
+  if (command === PROVIDER_INTERACTIVE_ADAPTER) {
+    const logicalWorkdir = normalizeCliWorkdirForRuntime(workdir);
+    return [
+      command,
+      '--workdir',
+      shellQuote(logicalWorkdir),
+      '--',
+      ...providerArgv.map((argument) => shellQuote(argument)),
+    ].join(' ');
+  }
+  return [command, ...providerArgv.map((argument) => shellQuote(argument))].join(' ');
 }
 
 function wrapCliWithWebchat(command, env = process.env) {
@@ -2775,7 +2804,6 @@ export function admitDirectAgentRuntimeManifest(manifest, {
 }
 
 export async function runCliWithDependencies(agentName, args, dependencies) {
-  if (!agentName) { throw new Error('Usage: cli <agentName> [args...]'); }
   const {
     env,
     resolveEnabledAgentRecord,
@@ -2795,7 +2823,8 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     attachBwrapInteractive,
     attachSeatbeltInteractive,
     resolveRouterEndpointForManifest: resolveRouterEndpointForManifestImpl = resolveManifestRouterEndpoint,
-    projectPath,
+    workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+    resolveWorkdir = resolveCliWorkdir,
     debugLog = () => {},
     log = () => {},
     warn = () => {},
@@ -2803,6 +2832,10 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     withSuspendedInput = callback => callback(),
     admitRuntimeManifest = admitDirectAgentRuntimeManifest,
   } = dependencies;
+  const invocation = parseAgentCliArguments([agentName, ...(args || [])]);
+  const workdirResolution = resolveWorkdir(invocation.workdir, { workspaceRoot });
+  const selectedWorkdir = workdirResolution.canonicalPath;
+  const providerArgv = invocation.providerArgv;
   const suppressLauncherLogs = env.PLOINKY_NO_TTY === '1';
   let registryRecord = null;
   let manifestLookup = agentName;
@@ -2873,19 +2906,11 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   }
   const cliBase = getCliCmd(manifest);
   if (!cliBase || !cliBase.trim()) { throw new Error(`Manifest for '${shortAgentName}' has no 'cli' command.`); }
+  admitProviderManifestCli(cliBase, { manifestPath });
 
-  // Separate SSO args from regular args — SSO context is passed as env vars,
-  // not CLI flags, so plain shell CLIs (/bin/sh) don't crash on unknown options.
-  const ssoArgs = (args || []).filter(a => /^--sso-/.test(a));
-  const regularArgs = (args || []).filter(a => !/^--sso-/.test(a));
-  const ssoExports = ssoArgs.map(a => {
-    const match = a.match(/^--sso-(.+?)=(.*)$/);
-    if (!match) return '';
-    const envName = 'SSO_' + match[1].toUpperCase().replace(/-/g, '_');
-    return `${envName}=${shellQuote(match[2])}`;
-  }).filter(Boolean);
-  const ssoPrefix = ssoExports.length ? 'export ' + ssoExports.join(' ') + '; ' : '';
-  const rawCmd = ssoPrefix + cliBase + (regularArgs.length ? (' ' + regularArgs.join(' ')) : '');
+  const rawCmd = buildManifestCliCommand(cliBase, providerArgv, {
+    workdir: workdirResolution.runtimePath,
+  });
   const cmd = wrapCliWithWebchat(rawCmd, env);
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
@@ -3005,24 +3030,29 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   if (selectedRuntime === 'bwrap') {
     const attach = attachBwrapInteractive
       || (await import('../sandbox/bwrap/bwrapServiceManager.js')).attachBwrapInteractive;
-    exitCode = withSuspendedInput(() => {
-      return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
+    exitCode = await withSuspendedInput(() => {
+      return attach(shortAgentName, manifest, agentDir, selectedWorkdir, cmd, { containerName, routerEndpoint });
     });
   } else if (selectedRuntime === 'seatbelt') {
     const attach = attachSeatbeltInteractive
       || (await import('../sandbox/seatbelt/seatbeltServiceManager.js')).attachSeatbeltInteractive;
-    exitCode = withSuspendedInput(() => {
-      return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
+    exitCode = await withSuspendedInput(() => {
+      return attach(shortAgentName, manifest, agentDir, selectedWorkdir, cmd, { containerName, routerEndpoint });
     });
   } else {
-    exitCode = withSuspendedInput(() => {
-      return attachInteractive(containerName, projectPath, cmd, {
+    exitCode = await withSuspendedInput(() => {
+      return attachInteractive(containerName, selectedWorkdir, cmd, {
         runtime: selectedRuntime,
         registryRecord: registryEntry,
       });
     });
   }
-  return Number.isInteger(exitCode) ? exitCode : 0;
+  if (!Number.isInteger(exitCode)) {
+    const invalidExit = new Error('interactive CLI attach returned no exact exit status');
+    invalidExit.code = 'PLOINKY_INTERACTIVE_EXIT_STATUS_INVALID';
+    throw invalidExit;
+  }
+  return exitCode;
 }
 
 async function runCli(agentName, args) {
@@ -3040,7 +3070,7 @@ async function runCli(agentName, args) {
     waitForAgentReady,
     loadAgentsMap,
     attachInteractive,
-    projectPath: PLOINKY_CWD,
+    workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     debugLog: (...callArgs) => utils.debugLog(...callArgs),
     log: (...callArgs) => console.log(...callArgs),
     warn: (...callArgs) => console.warn(...callArgs),

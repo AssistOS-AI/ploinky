@@ -1,6 +1,7 @@
 import { BOX_ROUTER_CONTAINER_PORT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { parseHostPort } from '../ports.mjs';
+import { parseAgentCliArguments } from './agent-cli.mjs';
 
 function argumentError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
@@ -63,7 +64,11 @@ export function parseOuterArguments(argv) {
         throw new TypeError('Outer arguments must be an array of strings');
     }
     const raw = [...argv];
-    const firstDebugIndex = raw.findIndex((token) => token === '--debug' || token === '-d');
+    const firstCliIndex = raw.indexOf('cli');
+    const firstDebugIndex = raw.findIndex((token, index) => (
+        (token === '--debug' || token === '-d')
+        && (firstCliIndex < 0 || index < firstCliIndex)
+    ));
     const tokens = raw.map((text, rawIndex) => ({ text, rawIndex }))
         .filter((token) => token.rawIndex !== firstDebugIndex);
     const removedRawIndexes = new Set();
@@ -125,6 +130,7 @@ export function parseOuterArguments(argv) {
         : [];
     const forwarding = raw.filter((_, index) => !removedRawIndexes.has(index));
     let start = null;
+    let agentCli = null;
     if (command === 'start') {
         const analyzed = analyzeStart(tokens, commandToken, explicitPort);
         const normalized = raw.flatMap((token, rawIndex) => {
@@ -139,6 +145,8 @@ export function parseOuterArguments(argv) {
             hostPort: analyzed.hostPort,
             coreArgv: Object.freeze(normalized),
         });
+    } else if (command === 'cli' && commandArgs.length > 0) {
+        agentCli = parseAgentCliArguments(commandArgs);
     }
     return Object.freeze({
         rawArgv: Object.freeze(raw),
@@ -156,5 +164,6 @@ export function parseOuterArguments(argv) {
         terminated,
         explicitPort,
         start,
+        agentCli,
     });
 }

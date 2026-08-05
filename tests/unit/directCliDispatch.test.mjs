@@ -29,6 +29,22 @@ test('Router control handlers dispatch through the direct execution-plane CLI', 
         assert.match(source, /spawn\(DIRECT_CLI_PATH,/);
         assert.doesNotMatch(source, /spawn\(['"]ploinky['"],/);
     }
+
+    const factorySource = readFileSync(
+        path.join(repositoryRoot, 'cli/server/utils/ttyFactories.js'),
+        'utf8',
+    );
+    assert.doesNotMatch(factorySource, /createWebChatTTYFactory|webchat_container_factory_ready/);
+    assert.doesNotMatch(factorySource, /command:\s*(?:command|entry)/);
+
+    const ttySource = readFileSync(
+        path.join(repositoryRoot, 'cli/server/webchat/tty.js'),
+        'utf8',
+    );
+    assert.doesNotMatch(ttySource, /createTTYFactory|buildExecArgs|safeProcessCwd/);
+    assert.doesNotMatch(ttySource, /spawn\(runtime|shellCmd|containerName/);
+    const localFactorySource = ttySource.slice(ttySource.indexOf('function createLocalTTYFactory'));
+    assert.doesNotMatch(localFactorySource, /shell\s*,\s*\['-lc'|parentShell|fallbackEntry/);
 });
 
 test('WebChat host commands use the direct execution-plane CLI', () => {
@@ -52,9 +68,26 @@ test('WebChat host commands use the direct execution-plane CLI', () => {
             },
         }));
 
-        const commands = resolveWebchatCommands({ routingFilePath });
-        assert.equal(commands.host, `'${DIRECT_CLI_PATH}' cli explorer`);
-        assert.doesNotMatch(commands.host, /^ploinky\s/);
+        const commands = resolveWebchatCommands({
+            routingFilePath,
+            workdir: 'repo',
+            hostWorkdir: fixtureRoot,
+            cliArgs: ['--dir=/workspace/repo', '', '--flag=value with spaces'],
+        });
+        assert.equal(commands.executable, DIRECT_CLI_PATH);
+        assert.deepEqual(commands.argv, [
+            'cli',
+            'explorer',
+            '--workdir',
+            'repo',
+            '--',
+            '--dir=/workspace/repo',
+            '',
+            '--flag=value with spaces',
+        ]);
+        assert.equal(commands.cwd, fixtureRoot);
+        assert.equal(Object.hasOwn(commands, 'container'), false);
+        assert.equal(Object.hasOwn(commands, 'host'), false);
     } finally {
         rmSync(fixtureRoot, { force: true, recursive: true });
     }

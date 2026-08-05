@@ -136,7 +136,7 @@ test('every host-sandbox launch boundary revalidates exact generation authority 
             functions: [
                 ['startBwrapProcess', 'spawnTrustedServiceLaunch(trustedLaunch'],
                 ['ensureBwrapService', 'startBwrapProcess('],
-                ['attachBwrapInteractive', 'spawnBwrapInteractive('],
+                ['attachBwrapInteractive', 'spawnTrustedInteractiveLaunch(trustedLaunch'],
             ],
         },
         {
@@ -212,9 +212,9 @@ test('host-sandbox service and interactive boundaries deny an inactive generatio
                 const failures = {};
                 for (const [name, invoke] of [
                     ['start', () => manager[${JSON.stringify(startName)}]('agent', manifest, ${JSON.stringify(agentDir)}, options)],
-                    ['attach', () => manager[${JSON.stringify(attachName)}]('agent', manifest, ${JSON.stringify(agentDir)}, ${JSON.stringify(root)}, '/bin/sh', options)],
+                    ['attach', () => manager[${JSON.stringify(attachName)}]('agent', manifest, ${JSON.stringify(agentDir)}, ${JSON.stringify(agentDir)}, '/bin/sh', options)],
                 ]) {
-                    try { invoke(); failures[name] = 'UNEXPECTED_SUCCESS'; }
+                    try { await invoke(); failures[name] = 'UNEXPECTED_SUCCESS'; }
                     catch (error) { failures[name] = error.code || error.message; }
                 }
                 console.log(JSON.stringify(failures));

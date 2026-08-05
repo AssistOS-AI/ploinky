@@ -24,7 +24,43 @@ function containerLogDiagnostic(logs, limit = 2048) {
         .replace(/\s+/g, ' ');
     if (!text) return 'container logs were empty';
     const bounded = text.length <= limit ? text : `…${text.slice(-limit)}`;
-    return `container logs: ${bounded}`;
+    const deviceHint = /\/dev\/net\/tun (?:not present|is missing or inaccessible)/.test(text)
+        ? '; /dev/net/tun must exist on the host and be accessible inside the Box for nested networking. Verify that Podman recorded --device /dev/net/tun; Podman Machine also requires --security-opt label=disable'
+        : /\/dev\/fuse (?:not present|is missing or inaccessible)/.test(text)
+            ? '; /dev/fuse must exist on the host and be accessible inside the Box for nested container storage. Verify that Podman recorded --device /dev/fuse; Podman Machine also requires --security-opt label=disable'
+            : '';
+    return `container logs: ${bounded}${deviceHint}`;
+}
+
+function suffixPrefixOverlap(previous, current) {
+    const failure = new Uint32Array(current.length);
+    for (let index = 1, matched = 0; index < current.length; index += 1) {
+        while (matched > 0 && current[index] !== current[matched]) {
+            matched = failure[matched - 1];
+        }
+        if (current[index] === current[matched]) matched += 1;
+        failure[index] = matched;
+    }
+
+    let matched = 0;
+    const start = Math.max(0, previous.length - current.length);
+    for (let index = start; index < previous.length; index += 1) {
+        while (matched > 0 && previous[index] !== current[matched]) {
+            matched = failure[matched - 1];
+        }
+        if (previous[index] === current[matched]) matched += 1;
+    }
+    return matched;
+}
+
+function writeLogDelta(output, currentValue, previousValue) {
+    const current = String(currentValue || '');
+    const previous = String(previousValue || '');
+    if (!current || current === previous) return current;
+    const overlap = suffixPrefixOverlap(previous, current);
+    const delta = current.slice(overlap);
+    output?.write?.(delta);
+    return current;
 }
 
 export function containerCreateArgs({
@@ -127,10 +163,18 @@ export async function waitForReadyLine(engine, containerId, runner, {
     timeoutMs = 60_000,
     intervalMs = 100,
     delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    stdout = process.stdout,
+    stderr = process.stderr,
 } = {}) {
     const deadline = Date.now() + timeoutMs;
+    let emittedStdout = '';
+    let emittedStderr = '';
     while (Date.now() <= deadline) {
         const logs = runner.query(engine.name, ['container', 'logs', containerId]);
+        if (logs.ok) {
+            emittedStdout = writeLogDelta(stdout, logs.stdout, emittedStdout);
+            emittedStderr = writeLogDelta(stderr, logs.stderr, emittedStderr);
+        }
         if (logs.ok && String(logs.stdout || '').split(/\r?\n/).includes(readyLine)) {
             return;
         }

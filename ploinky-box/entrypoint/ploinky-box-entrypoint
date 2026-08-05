@@ -16,6 +16,29 @@ fail() {
     exit 1
 }
 
+log() {
+    echo "[ploinky-box] $1"
+}
+
+require_device() {
+    local device="$1"
+    local purpose="$2"
+    local diagnostic
+
+    if ! test -e "$device"; then
+        diagnostic="$(stat -Lc 'type=%F mode=%a owner=%u:%g context=%C' "$device" 2>&1 || true)"
+        fail "$device is missing or inaccessible inside ploinky-box; $purpose cannot work. Verify that it exists on the host and that Podman accepted --device $device. Podman Machine also requires --security-opt label=disable. Diagnostic: ${diagnostic:-unavailable}"
+    fi
+    if ! test -r "$device" || ! test -w "$device"; then
+        diagnostic="$(stat -Lc 'type=%F mode=%a owner=%u:%g context=%C' "$device" 2>&1 || true)"
+        fail "$device is inaccessible to the podman user inside ploinky-box; $purpose requires read/write access. Verify Podman's --device $device mapping; Podman Machine also requires --security-opt label=disable. Diagnostic: ${diagnostic:-unavailable}"
+    fi
+    if ! test -c "$device"; then
+        diagnostic="$(stat -Lc 'type=%F mode=%a owner=%u:%g context=%C' "$device" 2>&1 || true)"
+        fail "$device is not a character device inside ploinky-box; $purpose cannot work. Verify that Podman mapped the host character device with --device $device; Podman Machine also requires --security-opt label=disable. Diagnostic: ${diagnostic:-unavailable}"
+    fi
+}
+
 require_value() {
     local name="$1"
     local expected="$2"
@@ -182,10 +205,13 @@ require_bubblewrap_contract() {
         || fail "Bubblewrap launcher lacks immutable read-only data-path hardening"
 }
 
+log "Starting runtime self-checks"
 test -x "$PREPARE_HELPER" || fail "Box preparation helper missing"
+log "Preparing the mounted Ploinky workspace"
 node "$PREPARE_HELPER" --prepare-only \
     || fail "Box preparation failed"
 
+log "Validating runtime tools and identities"
 command -v bash >/dev/null 2>&1 || fail "bash not on PATH"
 command -v node >/dev/null 2>&1 || fail "node not on PATH"
 command -v npm >/dev/null 2>&1 || fail "npm not on PATH"
@@ -203,10 +229,12 @@ require_value PLOINKY_WORKSPACE_ROOT /workspace
 require_value container oci
 require_value _CONTAINERS_USERNS_CONFIGURED ''
 require_value BUILDAH_ISOLATION chroot
-test -e /dev/fuse || fail "/dev/fuse not present"
-test -e /dev/net/tun || fail "/dev/net/tun not present"
+log "Validating nested-container devices"
+require_device /dev/fuse "nested container storage"
+require_device /dev/net/tun "nested container networking"
 require_helper_privilege newuidmap cap_setuid
 require_helper_privilege newgidmap cap_setgid
+log "Validating nested rootless Podman networking"
 podman version >/dev/null 2>&1 || fail "inner podman version check failed"
 if ! podman_info="$(podman info 2>&1)"; then
     fail "inner podman not functional: ${podman_info:-no diagnostic}"
@@ -220,6 +248,7 @@ require_full_mapping uid
 require_full_mapping gid
 reject_retained_managed_containers
 
+log "Runtime self-checks passed"
 echo "$READY_LINE"
 if [ "$#" -gt 0 ]; then
     exec "$@"

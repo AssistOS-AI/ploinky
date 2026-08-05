@@ -1,6 +1,10 @@
 import path from 'path';
 
 import { getWorkspaceRoot } from '../../utils/workspacePaths.js';
+import {
+    cliWorkdirError,
+    resolveCliWorkdir,
+} from '../../../utils/runtime/cliWorkdir.js';
 
 export function buildWebchatQuery(parsedUrl, agentName = '') {
     const params = new URLSearchParams(parsedUrl.searchParams);
@@ -9,6 +13,7 @@ export function buildWebchatQuery(parsedUrl, agentName = '') {
     }
     params.delete('tabId');
     params.delete('sessionId');
+    params.delete('pageInstanceId');
     return params.toString();
 }
 
@@ -26,28 +31,52 @@ export function resolveWorkspaceScopedQueryPath(value) {
     return resolved;
 }
 
-export function resolveWebchatLaunchOptions(parsedUrl) {
-    const cliArgs = [];
+export function resolveWebchatLaunchOptions(parsedUrl, {
+    workspaceRoot = getWorkspaceRoot(),
+} = {}) {
+    const workdirEntries = [...parsedUrl.searchParams.entries()].filter(([rawKey]) => {
+        const key = String(rawKey || '');
+        return key === 'workspace-dir' || key === 'workspaceDir';
+    });
+    if (workdirEntries.length === 0) {
+        throw cliWorkdirError(
+            'WebChat requires one workspace directory selector',
+            'PLOINKY_WORKDIR_REQUIRED',
+        );
+    }
+    if (workdirEntries.length !== 1) {
+        throw cliWorkdirError('WebChat accepts exactly one workspace directory selector');
+    }
+
+    const workdir = resolveCliWorkdir(workdirEntries[0][1], { workspaceRoot });
+    const providerArgv = [`--dir=${workdir.runtimePath}`];
     for (const [rawKey, rawValue] of parsedUrl.searchParams.entries()) {
-        const key = String(rawKey || '').trim();
-        if (!key || key === 'agent' || key === 'tabId' || key === 'sessionId') {
+        const key = String(rawKey || '');
+        if (!key || key.includes('\0') || String(rawValue).includes('\0')) {
+            throw cliWorkdirError('WebChat launch options must not contain NUL bytes');
+        }
+        if (key === 'agent'
+            || key === 'tabId'
+            || key === 'sessionId'
+            || key === 'pageInstanceId') {
             continue;
         }
         if (key === 'workspace-dir' || key === 'workspaceDir') {
-            const resolved = resolveWorkspaceScopedQueryPath(rawValue);
-            if (resolved) {
-                cliArgs.push(`--dir=${resolved}`);
-            }
             continue;
         }
         if (key === 'workspace-skill-root' || key === 'workspaceSkillRoot') {
-            const resolved = resolveWorkspaceScopedQueryPath(rawValue);
-            if (resolved) {
-                cliArgs.push(`--skill-root=${resolved}`);
-            }
+            const skillRoot = resolveCliWorkdir(rawValue, { workspaceRoot });
+            providerArgv.push(`--skill-root=${skillRoot.runtimePath}`);
             continue;
         }
-        cliArgs.push(rawValue === '' ? `--${key}` : `--${key}=${String(rawValue)}`);
+        providerArgv.push(rawValue === '' ? `--${key}` : `--${key}=${String(rawValue)}`);
     }
-    return { cliArgs };
+    return Object.freeze({
+        cliArgs: Object.freeze(providerArgv),
+        providerArgv: Object.freeze(providerArgv),
+        workdir: workdir.canonicalPath,
+        workdirRelative: workdir.relativePath,
+        workspaceRoot: workdir.canonicalRoot,
+        runtimeWorkdir: workdir.runtimePath,
+    });
 }

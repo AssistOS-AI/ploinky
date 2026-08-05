@@ -248,4 +248,9 @@ test('dry-run and invalid arguments cause no preparation or execution', async ()
         env: {}, supervisor: fakeSupervisor(events),
     }), /range 1..65535/);
     assert.equal(events.length, 1);
+
+    await assert.rejects(() => runOuterCli(['cli', 'futureAgent', '--help'], {
+        env: {}, supervisor: fakeSupervisor(events),
+    }), error => error?.code === 'PLOINKY_WORKDIR_REQUIRED');
+    assert.equal(events.length, 1);
 });

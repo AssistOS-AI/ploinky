@@ -188,7 +188,7 @@ test('AgentServer exits before listen when no credential context can be bootstra
 
     const result = await waitForExit(child, () => output);
     assert.notEqual(result.code, 0, output);
-    assert.match(output, /PLOINKY_AGENT_CREDENTIAL_CONTEXT_REQUIRED|trusted AgentCredentialContext is required/);
+    assert.match(output, /PLOINKY_AGENT_CREDENTIAL_RUNTIME_INVALID|runtime credential selection must be exact/);
     assert.doesNotMatch(output, /Streamable HTTP listening|No configuration file found/);
     await assertPortIsClosed(port);
 });

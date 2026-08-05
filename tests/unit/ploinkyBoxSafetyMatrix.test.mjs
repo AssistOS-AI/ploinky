@@ -105,7 +105,12 @@ test('every public verb has the required single-lock depth and release boundary'
         { name: 'start', argv: ['start', 'Agent'], locks: 1 },
         { name: 'repl', argv: [], locks: 1, forwarded: true },
         { name: 'bash', argv: ['cli'], locks: 1, forwarded: true },
-        { name: 'agent-cli', argv: ['cli', 'Agent'], locks: 1, forwarded: true },
+        {
+            name: 'agent-cli',
+            argv: ['cli', 'Agent', '--workdir', 'project', '--'],
+            locks: 1,
+            forwarded: true,
+        },
         { name: 'generic', argv: ['logs', '--tail'], locks: 1, forwarded: true },
     ];
     for (const scenario of cases) {

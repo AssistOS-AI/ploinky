@@ -25,6 +25,8 @@ function createContainerContext(t) {
     env.PLOINKY_ROUTER_DESCRIPTOR_FILE = descriptorFile;
     env.PLOINKY_AGENT_HOME_KEY = 'AchillesCLI_achilles-cli';
     env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY = 'generated';
+    env.PLOINKY_RUNTIME = 'container';
+    env.PLOINKY_ENV_SOURCE_PLOINKY_RUNTIME = 'generated';
     env.PLOINKY_AGENT_SECRET = 'a'.repeat(64);
     env.PLOINKY_AGENT_PRIVATE_SECRET = 'b'.repeat(64);
     return createContainerAgentCredentialContext(env);

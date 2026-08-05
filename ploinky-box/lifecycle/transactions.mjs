@@ -61,6 +61,33 @@ function cleanCidfile(cidfile, fsApi) {
     }
 }
 
+function writeProgress(stderr, message) {
+    stderr?.write?.(`[ploinky] ${message}\n`);
+}
+
+async function pullBoxImage(engine, imageRef, runner, {
+    stdout = process.stdout,
+    stderr = process.stderr,
+    timeoutMs = 1_800_000,
+} = {}) {
+    writeProgress(stderr, `Pulling Box image ${imageRef}...`);
+    if (typeof runner.stream !== 'function') {
+        runner.run(engine.name, ['pull', imageRef]);
+        return;
+    }
+    const result = await runner.stream(engine.name, ['pull', imageRef], {
+        timeoutMs,
+        stdout,
+        stderr,
+    });
+    if (!result.ok) {
+        throw new PloinkyBoxError(
+            `Box image pull failed with status ${result.status}`,
+            { code: 'PLOINKY_BOX_IMAGE_PULL_FAILED', cause: result.error || undefined },
+        );
+    }
+}
+
 async function createAndStart({
     engine,
     identity,
@@ -77,11 +104,14 @@ async function createAndStart({
     readCidfile,
     fsApi,
     token,
+    stdout,
+    stderr,
 }) {
     lock.assertHeld(identity.instance);
     revalidateVolumes({ engine, identity, handles: volumeHandles, runner, lock });
     const cidfile = secureCidfilePath(lock, token);
     cleanCidfile(cidfile, fsApi);
+    writeProgress(stderr, `Creating Box container ${identity.instance}...`);
     runner.run(engine.name, containerCreateArgs({
         identity,
         imageId: image.immutableId,
@@ -106,8 +136,9 @@ async function createAndStart({
     } finally {
         cleanCidfile(cidfile, fsApi);
     }
+    writeProgress(stderr, `Starting Box container ${identity.instance}; streaming startup logs...`);
     runner.run(engine.name, ['container', 'start', containerId]);
-    await waitReady(engine, containerId, runner);
+    await waitReady(engine, containerId, runner, { stdout, stderr });
     const finalOwnership = discover(identity, { runner });
     const handle = validateCreatedContainer(finalOwnership, {
         identity,
@@ -131,6 +162,8 @@ async function restoreOldContainer({
     lock,
     volumeHandles,
     dependencies,
+    stdout,
+    stderr,
 }) {
     return createAndStart({
         engine,
@@ -148,6 +181,8 @@ async function restoreOldContainer({
         readCidfile: dependencies.readCidfile,
         fsApi: dependencies.fsApi,
         token: dependencies.token('restore'),
+        stdout,
+        stderr,
     });
 }
 
@@ -162,6 +197,8 @@ export async function reconcileBoxContainer({
     imageRef = BOX_IMAGE_REFERENCE,
     platform = process.platform,
     env = process.env,
+    stdout = process.stdout,
+    stderr = process.stderr,
 }, seams = {}) {
     lock.assertHeld(identity.instance);
     if (!['absent', 'owned'].includes(ownership?.state)) {
@@ -202,8 +239,9 @@ export async function reconcileBoxContainer({
             lock,
         });
         if (!currentContainer.runtime.running) {
+            writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
             runner.run(engine.name, ['container', 'start', currentContainer.id]);
-            await dependencies.waitReady(engine, currentContainer.id, runner);
+            await dependencies.waitReady(engine, currentContainer.id, runner, { stdout, stderr });
         }
         const finalOwnership = dependencies.discover(identity, { runner });
         validateCreatedContainer(finalOwnership, old);
@@ -214,7 +252,7 @@ export async function reconcileBoxContainer({
         hostPort: portPlan.hostPort,
         existingPublication: portPlan.existingPublication,
     });
-    runner.run(engine.name, ['pull', imageRef]);
+    await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
     const image = dependencies.validateImage(engine.name, imageRef, runner);
     let volumeResult;
     try {
@@ -266,6 +304,8 @@ export async function reconcileBoxContainer({
             readCidfile: dependencies.readCidfile,
             fsApi: dependencies.fsApi,
             token: dependencies.token('candidate'),
+            stdout,
+            stderr,
         });
         candidateId = created.containerId;
         return Object.freeze({
@@ -300,6 +340,8 @@ export async function reconcileBoxContainer({
                     lock,
                     volumeHandles: volumeResult.handles,
                     dependencies,
+                    stdout,
+                    stderr,
                 });
             } catch (restoreError) {
                 rollbackFailures.push(`old Box restoration: ${restoreError.message}`);

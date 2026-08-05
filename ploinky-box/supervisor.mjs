@@ -87,9 +87,11 @@ export function createBoxSupervisor({
                 imageRef,
                 platform,
                 env,
+                stdout,
+                stderr,
             });
             const containerId = prepared.ownership.handles.container.id;
-            ensureBoxDependencies(ownership.engine, containerId, runner);
+            await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
             return Object.freeze({ identity, ...prepared, containerId, engine: ownership.engine });
         });
     }
@@ -107,9 +109,11 @@ export function createBoxSupervisor({
                 imageRef: options.imageRef || BOX_IMAGE_REFERENCE,
                 platform,
                 env,
+                stdout,
+                stderr,
             });
             const containerId = prepared.ownership.handles.container.id;
-            ensureBoxDependencies(ownership.engine, containerId, runner);
+            await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
             const edgeDesired = readEdgeDesired(identity);
             if (edgeDesired) {
                 stageEdgeDesired({
@@ -289,14 +293,27 @@ export function createBoxSupervisor({
     });
 }
 
-export function ensureBoxDependencies(engine, containerId, runner) {
-    runner.run(engine.name, [
+export async function ensureBoxDependencies(engine, containerId, runner, {
+    stdout = process.stdout,
+    stderr = process.stderr,
+    timeoutMs = 1_800_000,
+} = {}) {
+    const args = [
         'container', 'exec',
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,
         '/opt/ploinky/bin/ploinky-install-deps',
-    ]);
+    ];
+    stderr?.write?.('[ploinky] Verifying and installing Box dependencies...\n');
+    if (typeof runner.stream !== 'function') {
+        runner.run(engine.name, args);
+        return;
+    }
+    const result = await runner.stream(engine.name, args, { timeoutMs, stdout, stderr });
+    if (!result.ok) {
+        throw supervisorError(`Box dependency installation failed with status ${result.status}`);
+    }
 }
 
 export function formatBoxStatus(status) {

@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'node:crypto';
 import { ROUTING_FILE } from '../../utils/config.js';
 import { DIRECT_CLI_PATH } from '../../utils/directCli.js';
+import { admitProviderManifestCli } from '../../utils/providerCliAdmission.js';
 
 function trimCommand(value) {
     if (!value) return '';
@@ -9,19 +11,19 @@ function trimCommand(value) {
     return text.length ? text : '';
 }
 
-function shellEscapeCommandArg(value) {
-    const text = trimCommand(value);
-    if (!text) return '';
-    return `'${text.replace(/'/g, `'\\''`)}'`;
-}
-
 function normalizeCliArgs(rawArgs) {
     if (!Array.isArray(rawArgs)) {
         return [];
     }
-    return rawArgs
-        .map((entry) => trimCommand(entry))
-        .filter(Boolean);
+    return rawArgs.map((entry) => {
+        if (typeof entry !== 'string' || entry.includes('\0')) {
+            const error = new Error('WebChat provider argv must contain exact strings');
+            error.code = 'PLOINKY_WEBCHAT_ARGV_INVALID';
+            error.status = 400;
+            throw error;
+        }
+        return entry;
+    });
 }
 
 function readRoutingConfig(routingFilePath) {
@@ -89,17 +91,33 @@ function resolveCliTarget(record = {}, fallbackName = '') {
     return '';
 }
 
-function buildHostCliCommand(cliTarget, options = {}) {
+function buildHostCliLaunch(cliTarget, options = {}) {
     const target = trimCommand(cliTarget);
-    if (!target) {
-        return '';
+    const workdir = typeof options.workdir === 'string' ? options.workdir : '';
+    const cwd = typeof options.hostWorkdir === 'string' ? options.hostWorkdir : '';
+    if (!target
+        || target.includes('\0')
+        || target.startsWith('-')
+        || !workdir
+        || workdir.includes('\0')
+        || !cwd
+        || cwd.includes('\0')) {
+        return null;
     }
-    let command = `${shellEscapeCommandArg(DIRECT_CLI_PATH)} cli ${target}`;
     const cliArgs = normalizeCliArgs(options.cliArgs);
-    if (cliArgs.length) {
-        command += ` ${cliArgs.map((arg) => shellEscapeCommandArg(arg)).join(' ')}`;
-    }
-    return command;
+    return Object.freeze({
+        executable: DIRECT_CLI_PATH,
+        argv: Object.freeze(['cli', target, '--workdir', workdir, '--', ...cliArgs]),
+        cwd,
+    });
+}
+
+function buildLaunchCacheKey(agentName, launch) {
+    if (!launch) return `webchat:${agentName || 'unset'}:unavailable`;
+    const digest = createHash('sha256')
+        .update(JSON.stringify([launch.executable, launch.argv, launch.cwd]))
+        .digest('hex');
+    return `webchat:${agentName}:${digest}`;
 }
 
 function resolveWebchatCommands(options = {}) {
@@ -107,7 +125,7 @@ function resolveWebchatCommands(options = {}) {
     const { agentName: staticAgentName, hostPath, containerName, alias } = resolveStaticAgentDetails(routingFilePath);
 
     if (!staticAgentName || !hostPath) {
-        return { host: '', container: '', source: 'unset', agentName: '' };
+        return { executable: '', argv: [], source: 'unset', agentName: '' };
     }
 
     const manifestPath = options.manifestPathOverride || path.join(hostPath, 'manifest.json');
@@ -117,9 +135,14 @@ function resolveWebchatCommands(options = {}) {
         if (fs.existsSync(manifestPath)) {
             const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
             manifestCli = extractManifestCli(manifest);
+            admitProviderManifestCli(manifestCli, { manifestPath });
             webchatOptions = extractManifestWebchatOptions(manifest);
         }
-    } catch (_) {
+    } catch (error) {
+        if (error?.code === 'PLOINKY_PROVIDER_CLI_INVALID'
+            || error?.code === 'PLOINKY_PROVIDER_CONFIG_INVALID') {
+            throw error;
+        }
         manifestCli = '';
     }
 
@@ -127,19 +150,28 @@ function resolveWebchatCommands(options = {}) {
         // If we have an agent but no manifest command, we should still return the agent name
         // as other features like blob storage might depend on it.
         // The TTY factory will simply have no command to run, which is handled elsewhere.
-        return { host: '', container: '', source: 'unset', agentName: staticAgentName, ...webchatOptions };
+        return {
+            executable: '',
+            argv: [],
+            source: 'unset',
+            agentName: staticAgentName,
+            unsupportedReason: 'PLOINKY_WEBCHAT_CLI_UNAVAILABLE',
+            ...webchatOptions,
+        };
     }
 
     const cliTarget = resolveCliTarget({ alias, container: containerName }, staticAgentName);
-    const hostCommand = buildHostCliCommand(cliTarget, options);
+    const launch = buildHostCliLaunch(cliTarget, options);
     return {
-        host: hostCommand,
-        container: manifestCli,
+        executable: launch?.executable || '',
+        argv: launch?.argv || [],
+        cwd: launch?.cwd || '',
         source: 'manifest',
         agentName: staticAgentName,
         cliTarget,
         ...webchatOptions,
-        cacheKey: 'webchat'
+        cacheKey: buildLaunchCacheKey(staticAgentName, launch),
+        unsupportedReason: launch ? '' : 'PLOINKY_WORKDIR_REQUIRED',
     };
 }
 
@@ -168,22 +200,30 @@ function resolveWebchatCommandsForAgent(agentRef, options = {}) {
         if (fs.existsSync(manifestPath)) {
             const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
             manifestCli = extractManifestCli(manifest);
+            admitProviderManifestCli(manifestCli, { manifestPath });
             webchatOptions = extractManifestWebchatOptions(manifest);
         }
-    } catch (_) {
+    } catch (error) {
+        if (error?.code === 'PLOINKY_PROVIDER_CLI_INVALID'
+            || error?.code === 'PLOINKY_PROVIDER_CONFIG_INVALID') {
+            throw error;
+        }
         manifestCli = '';
     }
     const cliTarget = resolveCliTarget(record, agentRef);
-    const hostCommand = buildHostCliCommand(cliTarget, options);
-    const cacheSuffix = normalizeCliArgs(options.cliArgs).join('\u0000');
+    const launch = manifestCli ? buildHostCliLaunch(cliTarget, options) : null;
     return {
-        host: hostCommand,
-        container: manifestCli,
+        executable: launch?.executable || '',
+        argv: launch?.argv || [],
+        cwd: launch?.cwd || '',
         source: 'manifest',
         agentName: agentRef,
         cliTarget,
         ...webchatOptions,
-        cacheKey: cacheSuffix ? `webchat:${agentRef}:${cacheSuffix}` : `webchat:${agentRef}`
+        cacheKey: buildLaunchCacheKey(agentRef, launch),
+        unsupportedReason: launch
+            ? ''
+            : (manifestCli ? 'PLOINKY_WORKDIR_REQUIRED' : 'PLOINKY_WEBCHAT_CLI_UNAVAILABLE'),
     };
 }
 

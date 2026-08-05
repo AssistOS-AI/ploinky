@@ -968,6 +968,85 @@ export function buildTrustedServicePolicy(input) {
     });
 }
 
+export function normalizeTrustedInteractiveWorkdir(value) {
+    if (typeof value !== 'string' || value.includes('\0')) {
+        throw policyError('trusted interactive WORKDIR is invalid', 'PLOINKY_WORKDIR_INVALID');
+    }
+    let relative = value;
+    if (value === '/workspace') relative = '';
+    else if (value.startsWith('/workspace/')) relative = value.slice('/workspace/'.length);
+    else if (value.startsWith('/')) {
+        throw policyError(
+            'trusted interactive WORKDIR must be workspace-relative',
+            'PLOINKY_WORKDIR_INVALID',
+        );
+    }
+    return createWorkdirRecord(relative).path;
+}
+
+/**
+ * Build the trusted outer interactive wrapper policy. The wrapper retains the
+ * trusted service's complete workspace authority, but its selected launch
+ * directory is opened and pinned by the native helper before bwrap is exec'd.
+ */
+export function buildTrustedInteractivePolicy(input) {
+    const commonKeys = [
+        'homeSource', 'command', 'nodeRuntimePath', 'agentRuntimePath',
+        'codePath', 'codeDependenciesPath', 'agentDependenciesPath', 'preexecBarrier',
+        'environment', 'credentialFd', 'identity', 'agentName', 'repoName', 'listenPort',
+    ];
+    const allowed = new Set([...commonKeys, 'workdir']);
+    const required = new Set([
+        'homeSource', 'command', 'nodeRuntimePath', 'agentRuntimePath',
+        'codePath', 'codeDependenciesPath', 'agentDependenciesPath',
+        'identity', 'agentName', 'repoName', 'listenPort', 'workdir',
+    ]);
+    assertExactKeys(input, allowed, required, 'trusted interactive policy input');
+    const workdir = normalizeTrustedInteractiveWorkdir(input.workdir);
+    const serviceInput = Object.fromEntries(
+        commonKeys
+            .filter((key) => Object.prototype.hasOwnProperty.call(input, key))
+            .map((key) => [key, input[key]]),
+    );
+    const service = buildTrustedServicePolicy(serviceInput);
+    const records = [...service.records];
+    const workspaceIndex = records.findIndex((record) => record.type === 'WORKSPACE');
+    if (workspaceIndex < 0) {
+        throw policyError(
+            'trusted interactive policy requires the workspace mount',
+            'PLOINKY_BWRAP_MOUNT_ORDER_INVALID',
+        );
+    }
+    records.splice(workspaceIndex + 1, 0, createWorkdirRecord(workdir));
+
+    const chdirIndex = records.findIndex((record, index) => (
+        record.type === 'ARG'
+        && record.value === '--chdir'
+        && records[index + 1]?.type === 'ARG'
+    ));
+    if (chdirIndex < 0) {
+        throw policyError('trusted interactive policy requires a fixed chdir');
+    }
+    const cwd = `/workspace/${workdir}`;
+    records[chdirIndex + 1] = createArgRecord(cwd);
+
+    const unshareIndex = records.findIndex((record) => (
+        record.type === 'ARG' && record.value === '--unshare-user'
+    ));
+    if (unshareIndex < 0) {
+        throw policyError('trusted interactive policy requires user namespace isolation');
+    }
+    records.splice(unshareIndex, 0, createArgRecord('--die-with-parent'));
+    if (input.credentialFd !== undefined) TRUSTED_CREDENTIAL_RECORDS.add(records);
+    validateRecordPolicy(records);
+    return Object.freeze({
+        ...service,
+        records: Object.freeze(records),
+        workdir,
+        cwd,
+    });
+}
+
 function normalizeProvider(value) {
     if (typeof value !== 'string' || !Object.prototype.hasOwnProperty.call(PROVIDER_PROFILES, value)) {
         throw policyError('provider sandbox provider is unsupported', 'PLOINKY_PROVIDER_UNSUPPORTED');
@@ -1636,7 +1715,7 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         lifecycle,
         new Set([
             'activateCapability', 'deactivateCapability', 'onSpawn', 'afterExit',
-            'leaseRoot', 'leaseMetadata', 'stdio', 'validateAfterLease',
+            'leaseRoot', 'leaseMetadata', 'stdio', 'validateAfterLease', 'signal',
         ]),
         new Set(),
         'provider sandbox lifecycle',
@@ -1656,6 +1735,10 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
     if (lifecycle.validateAfterLease !== undefined && typeof lifecycle.validateAfterLease !== 'function') {
         throw new TypeError('validateAfterLease must be a function');
     }
+    if (lifecycle.signal !== undefined && !(lifecycle.signal instanceof AbortSignal)) {
+        throw new TypeError('signal must be an AbortSignal');
+    }
+    lifecycle.signal?.throwIfAborted();
     const dependencies = providerSpawnDependencies(dependencyOverrides);
     const policyInput = { ...input, preexecBarrier: { readyFd: 4, releaseFd: 5 } };
     const launch = buildProviderSandboxLaunch(policyInput);
@@ -1664,6 +1747,7 @@ export async function spawnProviderSandbox(input, lifecycle = {}, dependencyOver
         || requestedStdio.some((value) => !['pipe', 'inherit', 'ignore'].includes(value))) {
         throw policyError('provider stdio must contain exactly three safe modes', 'PLOINKY_PROVIDER_STDIO_INVALID');
     }
+    lifecycle.signal?.throwIfAborted();
     const child = dependencies.spawn(launch.helper, launch.args, {
         cwd: '/',
         env: {},

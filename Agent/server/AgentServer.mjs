@@ -5,11 +5,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import {
-    assertAgentCredentialContext,
-    createBwrapAgentCredentialContext,
-    createContainerAgentCredentialContext,
-} from '../lib/agentCredentialContext.mjs';
+import { bootstrapAgentCredentialContext } from '../lib/agentCredentialBootstrap.mjs';
 import {
     createMemoryReplayCache
 } from '../lib/jwtVerify.mjs';
@@ -17,6 +13,10 @@ import {
     PROVIDER_SANDBOX_MODES,
     runProviderSandboxReadiness,
 } from '../lib/providerSandbox.mjs';
+import {
+    normalizeProviderSandboxConfig,
+    PROVIDER_NAME_RE,
+} from '../lib/providerSandboxConfig.mjs';
 import { createProviderOperationSessionRegistry } from '../lib/providerOperationSessions.mjs';
 import { createProviderTaskRuntime } from '../lib/providerTaskRuntime.mjs';
 import { startScopedSoulBrokerRegistry } from '../lib/scopedSoulBroker.mjs';
@@ -37,17 +37,6 @@ import {
     buildDefaultStreamRejection
 } from './openAiDefaultResponder.mjs';
 import { buildLoopToolsFromMcp } from './mcpToolBridge.mjs';
-
-function bootstrapAgentCredentialContext(env = process.env) {
-    const runtimeKind = String(env?.PLOINKY_RUNTIME || '').trim().toLowerCase();
-    if (runtimeKind === 'bwrap') {
-        return assertAgentCredentialContext(createBwrapAgentCredentialContext());
-    }
-    if (env?.PLOINKY_ROUTER_DESCRIPTOR_FILE) {
-        return assertAgentCredentialContext(createContainerAgentCredentialContext(env));
-    }
-    return assertAgentCredentialContext(null);
-}
 
 // Credential validation is the first runtime bootstrap operation. In the
 // bwrap path it reads the pipe-materialized descriptor exactly once and fails
@@ -75,7 +64,6 @@ const TASK_STATUS_PATHS = new Set(['/getTaskStatus', '/task']);
 const TASK_CANCEL_PATH = '/task/cancel';
 const TASK_CANCEL_TOOL = '__task_cancel__';
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
-const PROVIDER_NAME_RE = /^(?:opencode|pi|codex)$/;
 const PROVIDER_EXPORT_RE = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
 const PROVIDER_LOGIN_OPERATIONS = new Set([
     'login_start',
@@ -96,21 +84,6 @@ function providerPolicyError(code, message) {
     const error = new Error(message);
     error.code = code;
     return error;
-}
-
-function normalizeProviderSandboxConfig(config) {
-    const value = config?.providerSandbox;
-    if (value === undefined) return null;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-        throw providerPolicyError('PLOINKY_PROVIDER_CONFIG_INVALID', 'providerSandbox config must be an object');
-    }
-    const keys = Object.keys(value);
-    if (keys.some((key) => !['provider', 'readiness'].includes(key))
-        || !PROVIDER_NAME_RE.test(String(value.provider || ''))
-        || value.readiness !== true) {
-        throw providerPolicyError('PLOINKY_PROVIDER_CONFIG_INVALID', 'providerSandbox config is not the exact provider/readiness contract');
-    }
-    return Object.freeze({ provider: value.provider, readiness: true });
 }
 
 async function ensureScopedSoulBrokerRegistry() {
@@ -564,14 +537,15 @@ function resolveTaskLogTailBytes(config) {
     return DEFAULT_TASK_LOG_TAIL_BYTES;
 }
 
-function buildCommandSpec(entry, defaultCwd) {
+function buildCommandSpec(entry, defaultCwd, providerCapability = null) {
     if (entry?.providerExecution !== undefined) {
         const execution = entry.providerExecution;
         if (!execution || typeof execution !== 'object' || Array.isArray(execution)) {
             throw providerPolicyError('PLOINKY_PROVIDER_EXECUTION_INVALID', 'providerExecution must be an object');
         }
         const keys = Object.keys(execution);
-        if (keys.some((key) => !['provider', 'mode', 'module', 'export'].includes(key))
+        if (!providerCapability || execution.provider !== providerCapability.provider
+            || keys.some((key) => !['provider', 'mode', 'module', 'export'].includes(key))
             || !PROVIDER_NAME_RE.test(String(execution.provider || ''))
             || (execution.mode !== PROVIDER_SANDBOX_MODES.TASK
                 && execution.mode !== PROVIDER_SANDBOX_MODES.OPERATION)
@@ -595,6 +569,14 @@ function buildCommandSpec(entry, defaultCwd) {
             exportName: execution.export,
             timeoutMs: Number.isFinite(entry?.timeoutMs) ? entry.timeoutMs : undefined,
         });
+    }
+    const hasShellFields = entry && typeof entry === 'object'
+        && ['command', 'args', 'cwd', 'env'].some((key) => Object.hasOwn(entry, key));
+    if (providerCapability && hasShellFields) {
+        throw providerPolicyError(
+            'PLOINKY_PROVIDER_EXECUTION_INVALID',
+            'provider-capable AgentServer entries cannot use generic shell execution',
+        );
     }
     const commandValue = typeof entry?.command === 'string' ? entry.command.trim() : null;
     if (!commandValue) return null;
@@ -659,14 +641,20 @@ function normalizeCapabilities(value) {
     return capabilities;
 }
 
-function resolveOpenAiChatKind(manifest) {
+function resolveOpenAiChatKind(manifest, providerConfig = initialConfig) {
+    const providerCapability = normalizeProviderSandboxConfig(providerConfig);
     const chat = manifest && typeof manifest === 'object' && manifest.endpoints && typeof manifest.endpoints === 'object'
         ? manifest.endpoints.chatCompletions
         : null;
     if (chat && typeof chat === 'object'
-        && (chat.providerExecution !== undefined
+        && (providerCapability
+            || chat.providerExecution !== undefined
             || (typeof chat.command === 'string' && chat.command.trim()))) {
-        const commandSpec = buildCommandSpec(chat, process.env.PLOINKY_CODE_DIR || '/code');
+        const commandSpec = buildCommandSpec(
+            chat,
+            process.env.PLOINKY_CODE_DIR || '/code',
+            providerCapability,
+        );
         if (commandSpec) {
             if (commandSpec.kind === 'provider-module'
                 && (chat.supportsStream === true || chat.stream === true)) {
@@ -687,14 +675,20 @@ function resolveOpenAiChatKind(manifest) {
 
 export { resolveOpenAiChatKind };
 
-function resolveOpenAiModelsKind(manifest) {
+function resolveOpenAiModelsKind(manifest, providerConfig = initialConfig) {
+    const providerCapability = normalizeProviderSandboxConfig(providerConfig);
     const models = manifest && typeof manifest === 'object' && manifest.endpoints && typeof manifest.endpoints === 'object'
         ? manifest.endpoints.models
         : null;
     if (models && typeof models === 'object'
-        && (models.providerExecution !== undefined
+        && (providerCapability
+            || models.providerExecution !== undefined
             || (typeof models.command === 'string' && models.command.trim()))) {
-        const commandSpec = buildCommandSpec(models, process.env.PLOINKY_CODE_DIR || '/code');
+        const commandSpec = buildCommandSpec(
+            models,
+            process.env.PLOINKY_CODE_DIR || '/code',
+            providerCapability,
+        );
         if (commandSpec) {
             return { kind: 'command', commandSpec };
         }
@@ -704,13 +698,24 @@ function resolveOpenAiModelsKind(manifest) {
 
 export { resolveOpenAiModelsKind };
 
+export function validateAgentServerManifestExecution(manifest, providerConfig = initialConfig) {
+    resolveOpenAiChatKind(manifest, providerConfig);
+    resolveOpenAiModelsKind(manifest, providerConfig);
+    return true;
+}
+
 // Testable core: build the OpenAI completion via the agentic loop. `runResponder`
 // is injectable for tests; production passes runOpenAiAgenticResponse.
 export async function __buildAgenticCompletion({ body, manifest, config, agentId, runResponder = runOpenAiAgenticResponse }) {
+    const providerCapability = normalizeProviderSandboxConfig(config);
     const toolsMap = buildLoopToolsFromMcp({
         tools: config?.tools,
         defaultCwd: process.env.PLOINKY_CODE_DIR || '/code',
-        buildCommandSpec,
+        buildCommandSpec: (entry, defaultCwd) => buildCommandSpec(
+            entry,
+            defaultCwd,
+            providerCapability,
+        ),
         runTool: executeCommand,
     });
     return runResponder({
@@ -1765,13 +1770,14 @@ async function registerFromConfig(server, config, helpers) {
     if (!config || typeof config !== 'object') return;
     const { ResourceTemplate, McpError, ErrorCode } = helpers;
     const defaultCwd = process.env.PLOINKY_CODE_DIR || '/code';
+    const providerCapability = normalizeProviderSandboxConfig(config);
 
     if (Array.isArray(config.tools)) {
         for (const tool of config.tools) {
             if (!tool || typeof tool !== 'object') continue;
             const name = typeof tool.name === 'string' ? tool.name : null;
             if (!name) continue;
-            const commandSpec = buildCommandSpec(tool, defaultCwd);
+            const commandSpec = buildCommandSpec(tool, defaultCwd, providerCapability);
             if (!commandSpec) {
                 console.warn(`[AgentServer/MCP] Skipping tool '${name}' - missing command`);
                 continue;
@@ -1884,7 +1890,7 @@ async function registerFromConfig(server, config, helpers) {
             if (!resource || typeof resource !== 'object') continue;
             const name = typeof resource.name === 'string' ? resource.name : null;
             if (!name) continue;
-            const commandSpec = buildCommandSpec(resource, defaultCwd);
+            const commandSpec = buildCommandSpec(resource, defaultCwd, providerCapability);
             if (!commandSpec) {
                 console.warn(`[AgentServer/MCP] Skipping resource '${name}' - missing command`);
                 continue;
@@ -1996,6 +2002,7 @@ async function createServerInstance() {
 async function main() {
     const { StreamableHTTPServerTransport, isInitializeRequest } = await loadSdkDeps();
     const providerConfig = normalizeProviderSandboxConfig(initialConfig);
+    validateAgentServerManifestExecution(getManifestResult()?.manifest ?? {}, initialConfig);
     if (providerConfig) {
         // This is deliberately before broker-listener creation and before the
         // HTTP service binds: the fixed helper must prove the empty-workspace,

@@ -1665,6 +1665,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         PLOINKY_AGENT_INSTANCE_ID: runtimeIdentity.instanceId,
         PLOINKY_AGENT_ENABLE_GENERATION: runtimeIdentity.enableGeneration,
         PLOINKY_AGENT_HOME_KEY: containerName,
+        PLOINKY_RUNTIME: 'container',
     }, { agentName, repoName });
     const prepareGeneratedRouterAttestation = (plan) => {
         if (runtime !== 'podman' || !['default', 'bridge'].includes(plan?.mode)) {
@@ -1760,6 +1761,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ...buildAgentCredentialEnv(principalId, runtimeIdentity),
                 PLOINKY_AGENT_HOME_KEY: containerName,
                 PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY: 'generated',
+                PLOINKY_RUNTIME: 'container',
+                PLOINKY_ENV_SOURCE_PLOINKY_RUNTIME: 'generated',
             });
             const semanticEnvHash = computeSemanticEnvHash(payload);
             return Object.freeze({
@@ -1817,6 +1820,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ...credentialEnv,
                 PLOINKY_AGENT_HOME_KEY: containerName,
                 PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY: 'generated',
+                PLOINKY_RUNTIME: 'container',
+                PLOINKY_ENV_SOURCE_PLOINKY_RUNTIME: 'generated',
             });
             const expectedMounts = expectedBindMountsFromArgs(args, descriptorHostFile);
             const expectedEnvHash = computeSemanticEnvHash(payload);

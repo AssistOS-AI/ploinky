@@ -16,6 +16,10 @@ const exactIdentity = Object.freeze({
     enableGeneration: 'generation-selected',
 });
 
+const cliArgs = (providerArgv = [], workdir = 'project') => [
+    '--workdir', workdir, '--', ...providerArgv,
+];
+
 function runtimeRecord(runtime, overrides = {}) {
     const record = {
         type: 'agent',
@@ -46,6 +50,17 @@ function cliHarness({
     omitRecordedRuntime = false,
     preparedOverrides = {},
     attachedOverrides = {},
+    inputWorkdir = 'project',
+    workdirResolution = Object.freeze({
+        canonicalPath: '/workspace/project',
+        runtimePath: '/workspace/project',
+    }),
+    manifestPath = '/fixtures/coding-agents/codingAgent/manifest.json',
+    manifest = {
+        cli: 'node /code/scripts/interactive-cli.mjs',
+        'lite-sandbox': selectedRuntime === 'bwrap' || selectedRuntime === 'seatbelt',
+        readiness: { protocol: 'none' },
+    },
 }) {
     const events = [];
     const record = runtimeRecord(recordedRuntime);
@@ -61,15 +76,11 @@ function cliHarness({
         resolveEnabledAgentRecord: () => registryRecord,
         findAgent: () => ({
             repo: 'coding-agents',
-            manifestPath: '/fixtures/coding-agents/codingAgent/manifest.json',
+            manifestPath,
             shortAgentName: 'codingAgent',
         }),
         enableAgent: () => assert.fail('already-enabled agent must not be enabled again'),
-        readManifest: () => ({
-            cli: '/code/scripts/interactive-cli.mjs',
-            'lite-sandbox': selectedRuntime === 'bwrap' || selectedRuntime === 'seatbelt',
-            readiness: { protocol: 'none' },
-        }),
+        readManifest: () => manifest,
         admitRuntimeManifest: () => ({
             runtimeAdmission: Object.freeze({ test: 'runtime-admission' }),
             runtime: selectedRuntime,
@@ -106,15 +117,20 @@ function cliHarness({
             events.push(['container-attach', containerName, workdir, entryCommand, options]);
             return 31;
         },
-        attachBwrapInteractive: () => {
-            events.push(['bwrap-attach']);
+        attachBwrapInteractive: (...callArgs) => {
+            events.push(['bwrap-attach', ...callArgs]);
             return 32;
         },
         attachSeatbeltInteractive: () => {
             events.push(['seatbelt-attach']);
             return 33;
         },
-        projectPath: '/workspace/project',
+        workspaceRoot: '/workspace',
+        resolveWorkdir: (value, options) => {
+            assert.equal(value, inputWorkdir);
+            assert.deepEqual(options, { workspaceRoot: '/workspace' });
+            return workdirResolution;
+        },
     };
     return { dependencies, events };
 }
@@ -251,7 +267,9 @@ test('manual sandbox lifecycle requires an exact generation identity before prob
 
 test('interactive CLI dispatches against the selected sandbox runtime', async () => {
     const harness = cliHarness({ selectedRuntime: 'bwrap' });
-    const exitCode = await runCliWithDependencies('codingAgent', ['--version'], harness.dependencies);
+    const exitCode = await runCliWithDependencies('codingAgent', cliArgs([
+        'two words', '--debug', '--sso-token=person token', "quote'arg",
+    ]), harness.dependencies);
 
     assert.equal(exitCode, 32);
     assert.deepEqual(harness.events.map(([event]) => event), [
@@ -259,12 +277,119 @@ test('interactive CLI dispatches against the selected sandbox runtime', async ()
         'activate',
         'bwrap-attach',
     ]);
+    assert.equal(harness.events.at(-1)[4], '/workspace/project');
+    assert.equal(
+        harness.events.at(-1)[5],
+        "node /code/scripts/interactive-cli.mjs --workdir '/workspace/project' -- 'two words' '--debug' '--sso-token=person token' 'quote'\\''arg'",
+    );
+});
+
+test('interactive CLI rejects provider-capability manifest drift before service dispatch', async (t) => {
+    const agentRoot = fs.mkdtempSync('/tmp/ploinky-provider-cli-drift-');
+    t.after(() => fs.rmSync(agentRoot, { recursive: true, force: true }));
+    const manifestPath = `${agentRoot}/manifest.json`;
+    fs.writeFileSync(`${agentRoot}/mcp-config.json`, JSON.stringify({
+        providerSandbox: { provider: 'opencode', readiness: true },
+    }));
+    const harness = cliHarness({
+        selectedRuntime: 'bwrap',
+        manifestPath,
+        manifest: {
+            cli: '/bin/sh -lc "printf provider-bypass"',
+            'lite-sandbox': true,
+            readiness: { protocol: 'none' },
+        },
+    });
+
+    await assert.rejects(
+        runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies),
+        (error) => error?.code === 'PLOINKY_PROVIDER_CLI_INVALID',
+    );
+    assert.deepEqual(harness.events, []);
+});
+
+test('interactive CLI rechecks provider capability after a canonical launch before dynamic drift', async (t) => {
+    const agentRoot = fs.mkdtempSync('/tmp/ploinky-provider-cli-dynamic-drift-');
+    t.after(() => fs.rmSync(agentRoot, { recursive: true, force: true }));
+    const manifestPath = `${agentRoot}/manifest.json`;
+    fs.writeFileSync(`${agentRoot}/mcp-config.json`, JSON.stringify({
+        providerSandbox: { provider: 'codex', readiness: true },
+    }));
+    const manifest = {
+        cli: 'node /code/scripts/interactive-cli.mjs',
+        'lite-sandbox': true,
+        readiness: { protocol: 'none' },
+    };
+    const harness = cliHarness({ selectedRuntime: 'bwrap', manifestPath, manifest });
+
+    assert.equal(
+        await runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies),
+        32,
+    );
+    const acceptedEventTypes = harness.events.map(([event]) => event);
+    const acceptedEventCount = harness.events.length;
+    manifest.cli = '/bin/sh -lc "printf provider-bypass"';
+    await assert.rejects(
+        runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies),
+        { code: 'PLOINKY_PROVIDER_CLI_INVALID' },
+    );
+    assert.equal(harness.events.length, acceptedEventCount);
+    assert.deepEqual(harness.events.map(([event]) => event), acceptedEventTypes);
+});
+
+test('interactive CLI preserves an asynchronous signal-derived attach status exactly', async () => {
+    const harness = cliHarness({ selectedRuntime: 'bwrap' });
+    harness.dependencies.attachBwrapInteractive = async () => 143;
+
+    assert.equal(
+        await runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies),
+        143,
+    );
+});
+
+test('interactive CLI transports only canonical workdir metadata to the provider adapter', async () => {
+    for (const inputWorkdir of ['/workspace//project', './project', 'project/.', 'project//']) {
+        const harness = cliHarness({ selectedRuntime: 'bwrap', inputWorkdir });
+        const exitCode = await runCliWithDependencies(
+            'codingAgent',
+            cliArgs(['--model', 'x y'], inputWorkdir),
+            harness.dependencies,
+        );
+        assert.equal(exitCode, 32);
+        assert.equal(harness.events.at(-1)[4], '/workspace/project');
+        assert.equal(
+            harness.events.at(-1)[5],
+            "node /code/scripts/interactive-cli.mjs --workdir '/workspace/project' -- '--model' 'x y'",
+        );
+    }
+});
+
+test('interactive CLI rejects an attach that loses its exact process status', async () => {
+    const harness = cliHarness({ selectedRuntime: 'bwrap' });
+    harness.dependencies.attachBwrapInteractive = async () => undefined;
+
+    await assert.rejects(
+        runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies),
+        error => error?.code === 'PLOINKY_INTERACTIVE_EXIT_STATUS_INVALID',
+    );
+});
+
+test('interactive CLI rejects invalid grammar before resolving or starting an agent', async () => {
+    const events = [];
+    await assert.rejects(
+        runCliWithDependencies('futureAgent', [], {
+            env: {},
+            resolveEnabledAgentRecord: () => events.push('resolve'),
+        }),
+        error => error?.code === 'PLOINKY_WORKDIR_REQUIRED',
+    );
+    assert.deepEqual(events, []);
 });
 
 test('interactive CLI rejects mixed sandbox/container registry state before service dispatch', async () => {
     const harness = cliHarness({ selectedRuntime: 'bwrap', recordedRuntime: 'podman' });
     await assert.rejects(
-        runCliWithDependencies('codingAgent', [], harness.dependencies),
+        runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies),
         error => error?.code === 'PLOINKY_MANUAL_RUNTIME_MISMATCH',
     );
     assert.deepEqual(harness.events, []);
@@ -273,7 +398,7 @@ test('interactive CLI rejects mixed sandbox/container registry state before serv
 test('interactive CLI rejects a persisted record with no runtime before ensure', async () => {
     const harness = cliHarness({ selectedRuntime: 'podman', omitRecordedRuntime: true });
     await assert.rejects(
-        runCliWithDependencies('codingAgent', [], harness.dependencies),
+        runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies),
         error => error?.code === 'PLOINKY_MANUAL_RUNTIME_MISMATCH'
             && error?.context?.recordedRuntime === '',
     );
@@ -303,7 +428,7 @@ test('interactive CLI rejects a swapped Podman generation before attach', async 
         attachedOverrides: { instanceId: 'instance-swapped' },
     });
     await assert.rejects(
-        runCliWithDependencies('codingAgent', [], harness.dependencies),
+        runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies),
         error => error?.code === 'PLOINKY_MANUAL_RUNTIME_IDENTITY_MISMATCH',
     );
     assert.deepEqual(harness.events.map(([event]) => event), [
@@ -314,7 +439,7 @@ test('interactive CLI rejects a swapped Podman generation before attach', async 
 
 test('interactive CLI keeps false/missing selectors on the container attach path', async () => {
     const harness = cliHarness({ selectedRuntime: 'podman' });
-    const exitCode = await runCliWithDependencies('codingAgent', [], harness.dependencies);
+    const exitCode = await runCliWithDependencies('codingAgent', cliArgs(), harness.dependencies);
 
     assert.equal(exitCode, 31);
     assert.deepEqual(harness.events.map(([event]) => event), [
@@ -326,14 +451,14 @@ test('interactive CLI keeps false/missing selectors on the container attach path
         'container-attach',
         'coding-agent-runtime-key',
         '/workspace/project',
-        '/code/scripts/interactive-cli.mjs',
+        "node /code/scripts/interactive-cli.mjs --workdir '/workspace/project' --",
         { runtime: 'podman', registryRecord: runtimeRecord('podman') },
     ]);
 });
 
 test('manual container attach and restart logging remain pinned to the selected Podman runtime', () => {
     const attachCalls = workspaceSource.match(
-        /attachInteractive\(containerName, (?:projectPath|projPath), cmd, \{\s*runtime: selectedRuntime,\s*registryRecord: registryEntry,\s*\}\)/g,
+        /attachInteractive\(containerName, (?:selectedWorkdir|projPath), cmd, \{\s*runtime: selectedRuntime,\s*registryRecord: registryEntry,\s*\}\)/g,
     ) || [];
     assert.equal(attachCalls.length, 2);
 

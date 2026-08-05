@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { createLocalTTYFactory } from '../../cli/server/webchat/tty.js';
 
 // global.processKill is normally installed by RoutingServer; provide a no-op so
@@ -9,7 +12,11 @@ if (typeof global.processKill !== 'function') {
 }
 
 function makeSession(command, sessionContext = {}) {
-    const factory = createLocalTTYFactory({ workdir: process.cwd(), command });
+    const factory = createLocalTTYFactory({
+        workdir: fs.realpathSync(process.cwd()),
+        executable: '/bin/sh',
+        argv: ['-c', command, '--'],
+    });
     return factory.create({ username: 'guest', id: 'guest', roles: ['guest'] }, sessionContext);
 }
 
@@ -76,4 +83,65 @@ test('webchat child_process: handle exposes a numeric pid and no resize method',
     session.dispose();
     assert.equal(session.isAlive(), false);
     assert.equal(session.write('ignored\n'), false);
+});
+
+test('webchat child_process uses exact direct argv and appends identity only after the separator', () => {
+    const calls = [];
+    const spawnImpl = (executable, argv, options) => {
+        calls.push({ executable, argv, options });
+        const child = new EventEmitter();
+        child.pid = 4242;
+        child.exitCode = null;
+        child.signalCode = null;
+        child.stdin = new PassThrough();
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.kill = () => {};
+        return child;
+    };
+    const cwd = fs.realpathSync(process.cwd());
+    const factory = createLocalTTYFactory({
+        workdir: cwd,
+        executable: '/exact/ploinky-local',
+        argv: [
+            'cli',
+            'codex',
+            '--workdir',
+            'folder with spaces',
+            '--',
+            '--dir=/workspace/folder with spaces',
+            '',
+            '--model=μ-model',
+        ],
+        spawnImpl,
+    });
+    const session = factory.create({
+        username: 'User With Spaces',
+        id: 'user-1',
+        email: 'user@example.test',
+        roles: ['admin', 'reviewer'],
+        sessionId: 'session-1',
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].executable, '/exact/ploinky-local');
+    assert.deepEqual(calls[0].argv, [
+        'cli',
+        'codex',
+        '--workdir',
+        'folder with spaces',
+        '--',
+        '--dir=/workspace/folder with spaces',
+        '',
+        '--model=μ-model',
+        '--sso-user=User With Spaces',
+        '--sso-user-id=user-1',
+        '--sso-email=user@example.test',
+        '--sso-roles=admin,reviewer',
+        '--sso-session-id=session-1',
+    ]);
+    assert.equal(calls[0].options.cwd, cwd);
+    assert.equal(calls[0].options.detached, true);
+    assert.deepEqual(calls[0].options.stdio, ['pipe', 'pipe', 'pipe']);
+    session.dispose();
 });

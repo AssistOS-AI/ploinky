@@ -8,7 +8,7 @@ import {
     BWRAP_HELPER_PATH,
     buildBwrapArgs,
     buildBwrapInteractiveCommand,
-    buildShellCommand,
+    buildTrustedInteractiveLaunch,
     buildTrustedServiceLaunch,
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
@@ -127,6 +127,77 @@ test('trusted service launch emits the fixed 0400 pipe-fed credential data mount
     assert.equal(args.filter((value) => value === '--ro-bind-data').length, 1);
 });
 
+test('trusted interactive launch uses fd-pinned WORKDIR, exact argv, and die-with-parent', () => {
+    const launch = buildTrustedInteractiveLaunch({
+        homeSource: sandboxHomeSource(),
+        workdir: '/workspace/projects/agent one',
+        command: ['node', '/code/scripts/interactive-cli.mjs', '--model', 'agent model'],
+        nodeRuntimePath: '/opt/ploinky',
+        agentRuntimePath: '/workspace/.ploinky/deps/bwrap-runtime/demo/Agent',
+        codePath: '/workspace/.ploinky/repos/repo/demo',
+        codeDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        agentDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        identity: {
+            principalId: 'agent:repo/demo',
+            instanceId: 'ploinky_demo_01234567',
+            enableGeneration: 'generation:1',
+        },
+        agentName: 'demo',
+        repoName: 'repo',
+        listenPort: 17000,
+        credentialFd: 4,
+    });
+
+    assert.equal(launch.helperPath, BWRAP_HELPER_PATH);
+    assert.equal(launch.descriptor.subarray(0, 8).toString('ascii'), 'PLBWLP02');
+    assert.equal(launch.workdir, 'projects/agent one');
+    assert.equal(launch.records.some((record) => (
+        record.type === 'WORKDIR' && record.path === 'projects/agent one'
+    )), true);
+    assert.equal(launch.records.some((record) => (
+        record.type === 'WORKSPACE' && record.mode === 'rw'
+    )), true);
+    const args = launch.records.filter((record) => record.type === 'ARG').map((record) => record.value);
+    assert.equal(args.filter((value) => value === '--die-with-parent').length, 1);
+    const chdir = args.indexOf('--chdir');
+    assert.deepEqual(args.slice(chdir, chdir + 2), ['--chdir', '/workspace/projects/agent one']);
+    assert.deepEqual(args.slice(-5), ['--', 'node', '/code/scripts/interactive-cli.mjs', '--model', 'agent model']);
+    assert.equal(launch.records.some((record) => JSON.stringify(record).includes('/root')), false);
+    assert.equal(launch.records.some((record) => JSON.stringify(record).includes('/shared')), false);
+});
+
+test('trusted interactive launch rejects root, traversal, and non-workspace absolute workdirs', () => {
+    const input = {
+        homeSource: sandboxHomeSource(),
+        command: ['node', '/code/scripts/interactive-cli.mjs'],
+        nodeRuntimePath: '/opt/ploinky',
+        agentRuntimePath: '/workspace/.ploinky/deps/bwrap-runtime/demo/Agent',
+        codePath: '/workspace/.ploinky/repos/repo/demo',
+        codeDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        agentDependenciesPath: '/workspace/.ploinky/deps/agents/repo/demo/node_modules',
+        identity: {
+            principalId: 'agent:repo/demo',
+            instanceId: 'ploinky_demo_01234567',
+            enableGeneration: 'generation:1',
+        },
+        agentName: 'demo',
+        repoName: 'repo',
+        listenPort: 17000,
+        credentialFd: 4,
+    };
+    for (const [workdir, code] of [
+        ['/workspace', 'PLOINKY_WORKDIR_ROOT_FORBIDDEN'],
+        ['.', 'PLOINKY_WORKDIR_ROOT_FORBIDDEN'],
+        ['/workspace/project/../other', 'PLOINKY_PATH_INVALID'],
+        ['/tmp/project', 'PLOINKY_WORKDIR_INVALID'],
+    ]) {
+        assert.throws(
+            () => buildTrustedInteractiveLaunch({ ...input, workdir }),
+            error => error?.code === code,
+        );
+    }
+});
+
 test('trusted service launch refuses an unsuffixed container HOME key', () => {
     assert.throws(() => buildTrustedServiceLaunch({
         homeSource: sandboxHomeSource('ploinky_demo_01234567'),
@@ -165,10 +236,25 @@ test('long-lived bwrap service has no raw bwrap or legacy argument-builder route
     assert.doesNotMatch(body, /target: '\/root'|target: '\/shared'/);
 });
 
+test('interactive bwrap attach uses only the canonical fd launcher and pipe credential', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url), 'utf8');
+    const start = source.indexOf('async function attachBwrapInteractive(');
+    const end = source.indexOf('\nexport {', start);
+    assert.ok(start >= 0 && end > start);
+    const body = source.slice(start, end);
+    assert.match(body, /buildTrustedInteractiveLaunch\(\{/);
+    assert.match(body, /credentialFd:\s*4/);
+    assert.match(body, /buildBwrapAgentCredential\(\{/);
+    assert.match(body, /spawnTrustedInteractiveLaunch\(trustedLaunch, agentCredential\.bytes/);
+    assert.match(body, /assertHelper:\s*assertTrustedBwrapHelper/);
+    assert.doesNotMatch(body, /spawnBwrapInteractive|spawnSync|BWRAP_PATH|buildBwrapArgs\(/);
+    assert.doesNotMatch(body, /\/root|\/shared|agentPrivateKeyPath/);
+});
+
 test('bwrap reuse rejects raw reserved environment before resolution or runtime inspection', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/bwrap/bwrapServiceManager.js', import.meta.url), 'utf8');
     const start = source.indexOf('function ensureBwrapService(');
-    const end = source.indexOf('\nfunction attachBwrapInteractive(', start);
+    const end = source.indexOf('\nasync function attachBwrapInteractive(', start);
     assert.ok(start >= 0 && end > start);
     const body = source.slice(start, end);
 
@@ -388,12 +474,5 @@ test('buildBwrapInteractiveCommand preserves non-shell commands and quotes workd
     assert.equal(
         buildBwrapInteractiveCommand("/tmp/it's-here", 'node /code/src/index.mjs', { forceInteractiveShell: true }),
         "cd '/tmp/it'\\''s-here' && node /code/src/index.mjs"
-    );
-});
-
-test('buildShellCommand quotes argv for script pty wrapper', () => {
-    assert.equal(
-        buildShellCommand(['cmd', 'a b', "it's"]),
-        "'cmd' 'a b' 'it'\\''s'"
     );
 });
