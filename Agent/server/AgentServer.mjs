@@ -6,13 +6,12 @@ import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { bootstrapAgentCredentialContext } from '../lib/agentCredentialBootstrap.mjs';
-import { runProviderInstallBootstrap } from '../lib/providerInstallBootstrap.mjs';
+import { runProviderServerBootstrap } from '../lib/providerInstallBootstrap.mjs';
 import {
     createMemoryReplayCache
 } from '../lib/jwtVerify.mjs';
 import {
     PROVIDER_SANDBOX_MODES,
-    runProviderSandboxReadiness,
 } from '../lib/providerSandbox.mjs';
 import {
     normalizeProviderSandboxConfig,
@@ -2020,17 +2019,12 @@ async function main() {
             // Installation and readiness are admitted inside the selected
             // provider sandbox before any broker, queue, or HTTP listener can
             // exist. Both share the frozen credential context and HOME owner.
-            await runProviderInstallBootstrap({
-                provider: providerConfig.provider,
+            await runProviderServerBootstrap({
+                providerConfig,
                 credentialContext: agentCredentialContext,
                 signal: bootstrapAbort.signal,
+                dependencies: { ensureScopedSoulBrokerRegistry },
             });
-            await runProviderSandboxReadiness({
-                provider: providerConfig.provider,
-                credentialContext: agentCredentialContext,
-                signal: bootstrapAbort.signal,
-            });
-            await ensureScopedSoulBrokerRegistry();
         }
     } catch (error) {
         process.removeListener('SIGTERM', abortBootstrap);

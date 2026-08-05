@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 
 import { assertAgentCredentialContext } from './agentCredentialContext.mjs';
-import { runProviderSandboxInstall } from './providerSandbox.mjs';
+import {
+    runProviderSandboxInstall,
+    runProviderSandboxReadiness,
+} from './providerSandbox.mjs';
 
 export const PROVIDER_INSTALL_MANIFEST_PATH = '/code/manifest.json';
 const PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -159,4 +162,61 @@ export async function runProviderInstallBootstrap({
         },
     });
     return Object.freeze({ provider, profileName: resolved.profileName, installed: true });
+}
+
+export async function runProviderServerBootstrap({
+    providerConfig,
+    credentialContext,
+    signal,
+    dependencies = {},
+} = {}) {
+    const context = assertAgentCredentialContext(credentialContext);
+    context.assertActive();
+    if (!providerConfig || typeof providerConfig !== 'object'
+        || typeof providerConfig.provider !== 'string' || !providerConfig.provider) {
+        throw installError(
+            'PLOINKY_PROVIDER_SERVER_BOOTSTRAP_INVALID',
+            'provider server bootstrap configuration is invalid',
+        );
+    }
+    if (signal !== undefined && !(signal instanceof AbortSignal)) {
+        throw installError(
+            'PLOINKY_PROVIDER_SERVER_BOOTSTRAP_INVALID',
+            'provider server bootstrap signal is invalid',
+        );
+    }
+    const runInstall = dependencies.runProviderInstallBootstrap
+        ?? runProviderInstallBootstrap;
+    const runReadiness = dependencies.runProviderSandboxReadiness
+        ?? runProviderSandboxReadiness;
+    const ensureBroker = dependencies.ensureScopedSoulBrokerRegistry;
+    if (typeof runInstall !== 'function' || typeof runReadiness !== 'function'
+        || typeof ensureBroker !== 'function') {
+        throw installError(
+            'PLOINKY_PROVIDER_SERVER_BOOTSTRAP_INVALID',
+            'provider server bootstrap dependencies are invalid',
+        );
+    }
+
+    // Container services retain their existing outer install lifecycle. Only
+    // the Linux/Box Bubblewrap service needs its admitted hook inside the
+    // selected sandbox HOME before readiness can prove the installed binary.
+    if (context.runtime.runtimeKind === 'bwrap') {
+        await runInstall({
+            provider: providerConfig.provider,
+            credentialContext: context,
+            ...(signal === undefined ? {} : { signal }),
+        });
+    }
+    await runReadiness({
+        provider: providerConfig.provider,
+        credentialContext: context,
+        ...(signal === undefined ? {} : { signal }),
+    });
+    await ensureBroker();
+    return Object.freeze({
+        provider: providerConfig.provider,
+        runtimeKind: context.runtime.runtimeKind,
+        sandboxInstall: context.runtime.runtimeKind === 'bwrap',
+    });
 }

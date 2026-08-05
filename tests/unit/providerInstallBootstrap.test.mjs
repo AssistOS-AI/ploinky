@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+    createContainerAgentCredentialContext,
     __testables as credentialContextTestables,
 } from '../../Agent/lib/agentCredentialContext.mjs';
 import {
     resolveAdmittedProviderInstall,
     runProviderInstallBootstrap,
+    runProviderServerBootstrap,
 } from '../../Agent/lib/providerInstallBootstrap.mjs';
 import { buildBwrapAgentCredential } from '../../cli/sandbox/bwrap/bwrapAgentCredential.js';
 
@@ -53,6 +56,27 @@ function credentialContext(manifestBytes) {
         descriptor: generated.descriptor,
         publicAttestation: generated.publicAttestation,
     });
+}
+
+function containerCredentialContext(t) {
+    const fixtureRoot = path.join(repoRoot, 'tests/fixtures/router-descriptor');
+    const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-bootstrap-container-'));
+    t.after(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }));
+    const descriptorFile = path.join(temporaryRoot, 'router-descriptor.json');
+    fs.copyFileSync(path.join(fixtureRoot, 'public-envelope.json'), descriptorFile);
+    fs.chmodSync(descriptorFile, 0o600);
+    const env = JSON.parse(fs.readFileSync(
+        path.join(fixtureRoot, 'public-environment.json'),
+        'utf8',
+    ));
+    env.PLOINKY_ROUTER_DESCRIPTOR_FILE = descriptorFile;
+    env.PLOINKY_AGENT_SECRET = 'a'.repeat(64);
+    env.PLOINKY_AGENT_PRIVATE_SECRET = 'b'.repeat(64);
+    env.PLOINKY_AGENT_HOME_KEY = 'coding-agent_container';
+    env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_HOME_KEY = 'generated';
+    env.PLOINKY_RUNTIME = 'container';
+    env.PLOINKY_ENV_SOURCE_PLOINKY_RUNTIME = 'generated';
+    return createContainerAgentCredentialContext(env);
 }
 
 test('profile install overrides the root hook without rewriting exact hook bytes', () => {
@@ -155,21 +179,59 @@ test('absent hook is an explicit no-op and malformed profiles fail closed', asyn
 });
 
 test('AgentServer installs inside the selected sandbox before readiness, broker, queue, and listener', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'Agent/server/AgentServer.mjs'), 'utf8');
-    const install = source.indexOf('await runProviderInstallBootstrap({');
-    const readiness = source.indexOf('await runProviderSandboxReadiness({');
-    const broker = source.indexOf('await ensureScopedSoulBrokerRegistry();', readiness);
-    const queue = source.indexOf('taskQueue.initialize();', broker);
-    const listen = source.indexOf('serverHttp.listen(', queue);
+    const serverSource = fs.readFileSync(path.join(repoRoot, 'Agent/server/AgentServer.mjs'), 'utf8');
+    const bootstrapSource = fs.readFileSync(
+        path.join(repoRoot, 'Agent/lib/providerInstallBootstrap.mjs'),
+        'utf8',
+    );
+    const install = bootstrapSource.indexOf('await runInstall({');
+    const readiness = bootstrapSource.indexOf('await runReadiness({');
+    const broker = bootstrapSource.indexOf('await ensureBroker();', readiness);
+    const bootstrap = serverSource.indexOf('await runProviderServerBootstrap({');
+    const queue = serverSource.indexOf('taskQueue.initialize();', bootstrap);
+    const listen = serverSource.indexOf('serverHttp.listen(', queue);
 
-    assert.ok(install >= 0, 'AgentServer must invoke the admitted install bootstrap');
+    assert.ok(install >= 0, 'provider server bootstrap must invoke the admitted install bootstrap');
     assert.ok(install < readiness, 'install must complete before readiness');
     assert.ok(readiness < broker, 'readiness must complete before broker creation');
-    assert.ok(broker < queue, 'broker admission must complete before queue initialization');
+    assert.ok(bootstrap >= 0, 'AgentServer must invoke the provider server bootstrap');
     assert.ok(queue < listen, 'queue initialization must complete before listener creation');
-    assert.match(source, /const bootstrapAbort = new AbortController\(\);/);
-    assert.match(source, /process\.once\('SIGTERM', abortBootstrap\);/);
-    assert.match(source, /process\.once\('SIGINT', abortBootstrap\);/);
-    assert.match(source, /process\.removeListener\('SIGTERM', abortBootstrap\);/);
-    assert.match(source, /process\.removeListener\('SIGINT', abortBootstrap\);/);
+    assert.match(serverSource, /const bootstrapAbort = new AbortController\(\);/);
+    assert.match(serverSource, /process\.once\('SIGTERM', abortBootstrap\);/);
+    assert.match(serverSource, /process\.once\('SIGINT', abortBootstrap\);/);
+    assert.match(serverSource, /process\.removeListener\('SIGTERM', abortBootstrap\);/);
+    assert.match(serverSource, /process\.removeListener\('SIGINT', abortBootstrap\);/);
+});
+
+test('provider server bootstrap preserves true/false/missing selector install parity', async (t) => {
+    for (const testCase of [
+        { selector: true, runtimeKind: 'bwrap', expected: ['install', 'readiness', 'broker'] },
+        { selector: false, runtimeKind: 'container', expected: ['readiness', 'broker'] },
+        { selector: undefined, runtimeKind: 'container', expected: ['readiness', 'broker'] },
+    ]) {
+        await t.test(`lite-sandbox ${String(testCase.selector)}`, async (subtest) => {
+            const events = [];
+            const context = testCase.runtimeKind === 'bwrap'
+                ? credentialContext(Buffer.from('{}\n'))
+                : containerCredentialContext(subtest);
+            await runProviderServerBootstrap({
+                providerConfig: { provider: 'opencode' },
+                credentialContext: context,
+                dependencies: {
+                    async runProviderInstallBootstrap(input) {
+                        assert.equal(input.credentialContext, context);
+                        events.push('install');
+                    },
+                    async runProviderSandboxReadiness(input) {
+                        assert.equal(input.credentialContext, context);
+                        events.push('readiness');
+                    },
+                    async ensureScopedSoulBrokerRegistry() {
+                        events.push('broker');
+                    },
+                },
+            });
+            assert.deepEqual(events, testCase.expected);
+        });
+    }
 });
