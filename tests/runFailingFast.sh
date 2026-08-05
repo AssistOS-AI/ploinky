@@ -133,7 +133,6 @@ test_check "WebChat agent override responds via curl" fast_check_webchat_alias_o
 test_check "WebChat legacy token auth endpoint is disabled" fast_check_webchat_logout_flow
 
 stage_header "WebChat SSO Parameters"
-test_action "Configure WebChat CLI for test agent" configure_webchat_cli_for_test_agent
 wait_for_router
 test_check "Legacy WebChat token-based SSO harness is skipped" test_sso_params_disabled
 

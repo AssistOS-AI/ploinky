@@ -210,9 +210,15 @@ test_action() {
   local callback="$2"
   shift 2
 
+  local output
   test_info "$description"
-  if ! "$callback" "$@" >/dev/null 2>&1; then
+  if ! output=$("$callback" "$@" 2>&1); then
     fail_message "Action '$description' failed."
+    log_result "[FAIL] Action '$description' failed."
+    if [[ -n "$output" ]]; then
+      printf '%s\n' "$output" | sed 's/^/        /' >&2
+      printf '        Error: %s\n' "$output" >> "$FAST_RESULTS_FILE"
+    fi
     # Actions are critical, exit the stage if one fails.
     exit 1
   fi

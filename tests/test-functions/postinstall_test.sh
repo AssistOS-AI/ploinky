@@ -3,8 +3,8 @@ check_postinstall_marker() {
   require_var "TEST_RUN_DIR"
   require_var "TEST_AGENT_DEP_GLOBAL_NAME"
 
-  # Postinstall writes to WORKSPACE_PATH which is $TEST_RUN_DIR/.data/<agent>/
-  local marker_path="$TEST_RUN_DIR/.data/$TEST_AGENT_DEP_GLOBAL_NAME/postinstall_marker.txt"
+  # The global agent's WORKSPACE_PATH is the project workspace root.
+  local marker_path="$TEST_RUN_DIR/postinstall_marker.txt"
 
   if [[ ! -f "$marker_path" ]]; then
     echo "Postinstall marker '$marker_path' not found." >&2

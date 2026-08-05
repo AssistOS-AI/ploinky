@@ -100,6 +100,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+is_fast_suite_run_dir() {
+  local candidate="${1:-}"
+  local temp_root candidate_parent candidate_name
+
+  [[ -n "$candidate" && -d "$candidate" && ! -L "$candidate" ]] || return 1
+  temp_root=$(cd -- "${TMPDIR:-/tmp}" && pwd -P) || return 1
+  candidate_parent=$(cd -- "$(dirname -- "$candidate")" && pwd -P) || return 1
+  candidate_name=$(basename -- "$candidate")
+
+  [[ "$candidate_parent" == "$temp_root" ]] || return 1
+  [[ "$candidate_name" =~ ^ploinky-fast-([[:alnum:]]{6}|XXXXXX\.[[:alnum:]]{10})$ ]]
+}
+
 abort_suite() {
   if [[ $ABORTED -eq 1 ]]; then
     exit 130
@@ -108,15 +121,19 @@ abort_suite() {
   trap - INT TERM
   set +e
   echo "\n[INFO] Interrupt received. Cleaning up workspace..." >&2
+  unset TEST_RUN_DIR TEST_ROUTER_HEALTH_SOCKET
   load_state 2>/dev/null || true
-  if [[ -z "${TEST_RUN_DIR:-}" && -f "$FAST_STATE_FILE" ]]; then
-    TEST_RUN_DIR=$(awk -F'=' '/^TEST_RUN_DIR=/{print substr($0, index($0,$2))}' "$FAST_STATE_FILE" | tail -n1 | xargs printf '%s')
-  fi
-  if [[ -x "${PLOINKY_FAST_CLI:-}" ]]; then
-    "$PLOINKY_FAST_CLI" destroy >/dev/null 2>&1
-  fi
-  if [[ -n "${TEST_RUN_DIR:-}" && -d "$TEST_RUN_DIR" ]]; then
-    rm -rf "$TEST_RUN_DIR"
+  if is_fast_suite_run_dir "${TEST_RUN_DIR:-}"; then
+    if [[ -x "${PLOINKY_FAST_CLI:-}" ]]; then
+      (
+        cd -- "$TEST_RUN_DIR" || exit 1
+        PLOINKY_ROUTER_HEALTH_SOCKET="${TEST_ROUTER_HEALTH_SOCKET:-${PLOINKY_ROUTER_HEALTH_SOCKET:-}}" \
+          timeout -k 5s 60s "$PLOINKY_FAST_CLI" destroy
+      ) >/dev/null 2>&1
+    fi
+    rm -rf -- "$TEST_RUN_DIR"
+  elif [[ -n "${TEST_RUN_DIR:-}" ]]; then
+    echo "[WARN] Refusing interrupt cleanup for non-fast-suite path: ${TEST_RUN_DIR}" >&2
   fi
   if [[ -n "${PLOINKY_WORKTREE:-}" && -d "$PLOINKY_WORKTREE" ]]; then
     git -C "$PLOINKY_REPO_ROOT" worktree remove --force "$PLOINKY_WORKTREE" 2>/dev/null || rm -rf "$PLOINKY_WORKTREE"

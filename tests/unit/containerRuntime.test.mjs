@@ -621,8 +621,10 @@ console.log(JSON.stringify({ record, mcpTools: policyState.mcpTools }));`,
         assert.equal(record.runMode, 'global');
         assert.equal(record.projectPath, workspaceDir);
         assert.deepEqual(record.config.ports, []);
-        assert.match(fs.readFileSync(argsFile, 'utf8'), /(?:^|\n)--init(?:\n|$)/);
-        assert.doesNotMatch(fs.readFileSync(argsFile, 'utf8'), /(?:^|:)7000(?:$|\s)/);
+        const createArgs = fs.readFileSync(argsFile, 'utf8').trim().split('\n');
+        assert.ok(createArgs.includes('--init'));
+        assert.ok(createArgs.includes(`WORKSPACE_PATH=${workspaceDir}`));
+        assert.doesNotMatch(createArgs.join('\n'), /(?:^|:)7000(?:$|\s)/);
         assert.ok(record.config.binds.some((bind) => (
             bind.source === workspaceDir && bind.target === workspaceDir
         )));

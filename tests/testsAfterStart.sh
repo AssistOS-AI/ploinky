@@ -136,12 +136,11 @@ test_check "expose applies to ${FAST_VAR_TEST_NAME}" fast_cli_expose_and_reinsta
 test_check "Agent sees exposed ${FAST_VAR_TEST_NAME} via shell" fast_cli_verify_var_in_shell
 
 stage_header "WebChat Command"
-test_check "webchat --rotate does not recreate a legacy token" fast_check_webchat_token_rotation
+test_check "webchat rejects retired --rotate syntax without recreating a legacy token" fast_check_webchat_token_rotation
 test_check "WebChat agent override redirects to router login" fast_check_webchat_alias_override
 test_check "WebChat legacy token auth endpoint is disabled" fast_check_webchat_logout_flow
 
 stage_header "WebChat SSO Parameters"
-test_action "Configure WebChat CLI for test agent" configure_webchat_cli_for_test_agent
 wait_for_router
 test_check "Legacy WebChat token-based SSO harness is skipped" test_sso_params_disabled
 #test_check "WebChat CLI session logs SSO identity when enabled" test_sso_params_enabled

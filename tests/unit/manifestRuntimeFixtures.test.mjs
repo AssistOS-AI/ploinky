@@ -114,6 +114,57 @@ test('fast-suite container enables wait for the real Router authority socket', a
     assert.ok(stopRouter > stopEnable);
 });
 
+test('fast-suite interrupt cleanup destroys only the exact temporary workspace', async () => {
+    const orchestratorSource = await fs.readFile(path.join(testsRoot, 'test_all.sh'), 'utf8');
+    const abortStart = orchestratorSource.indexOf('\nabort_suite()');
+    const abortEnd = orchestratorSource.indexOf('\ntrap abort_suite INT TERM', abortStart);
+    assert.ok(abortStart >= 0 && abortEnd > abortStart);
+
+    const abortSource = orchestratorSource.slice(abortStart, abortEnd);
+    const destroyCwd = abortSource.indexOf('\n        cd -- "$TEST_RUN_DIR"');
+    const destroyCommand = abortSource.indexOf(
+        'timeout -k 5s 60s "$PLOINKY_FAST_CLI" destroy',
+        destroyCwd,
+    );
+    const removeWorkspace = abortSource.indexOf('\n    rm -rf -- "$TEST_RUN_DIR"', destroyCommand);
+
+    assert.ok(destroyCwd >= 0, 'interrupt cleanup must enter the exact test workspace');
+    assert.ok(destroyCommand > destroyCwd, 'destroy must run only after entering the test workspace');
+    assert.ok(removeWorkspace > destroyCommand, 'workspace removal must follow bounded destroy');
+    assert.match(
+        abortSource,
+        /PLOINKY_ROUTER_HEALTH_SOCKET="\$\{TEST_ROUTER_HEALTH_SOCKET:-\$\{PLOINKY_ROUTER_HEALTH_SOCKET:-\}\}"/,
+    );
+    assert.doesNotMatch(abortSource, /^\s*"\$PLOINKY_FAST_CLI" destroy/m);
+
+    const safetyStart = orchestratorSource.indexOf('\nis_fast_suite_run_dir()');
+    const safetyEnd = orchestratorSource.indexOf('\nabort_suite()', safetyStart);
+    assert.ok(safetyStart >= 0 && safetyEnd > safetyStart);
+    const safetySource = orchestratorSource.slice(safetyStart, safetyEnd);
+    assert.match(safetySource, /candidate_parent.*temp_root/);
+    assert.match(safetySource, /\^ploinky-fast-/);
+});
+
+test('health-probe recovery observes exact Watchdog events instead of the foreground start log', async () => {
+    const probeSource = await fs.readFile(
+        path.join(testsRoot, 'test-functions', 'health_probes_negative.sh'),
+        'utf8'
+    );
+
+    assert.match(probeSource, /\.ploinky\/logs\/watchdog\.log/);
+    assert.match(probeSource, /"event":"container_probe_failed"/);
+    assert.match(probeSource, /"event":"container_scheduling_restart"/);
+    assert.match(probeSource, /TEST_HEALTH_AGENT_CONT_NAME/);
+    assert.match(probeSource, /\[\[ "\$status" == "401" \]\]/);
+    assert.match(probeSource, /AUTH_REQUIRED/);
+    assert.match(probeSource, /JSON\.parse\(fs\.readFileSync/);
+    assert.match(probeSource, /actual === process\.argv\[3\]/);
+    assert.doesNotMatch(probeSource, /grep\s+-q\s+['"]AUTH_REQUIRED/);
+    assert.doesNotMatch(probeSource, /TEST_AGENT_START_LOG/);
+    assert.doesNotMatch(probeSource, /restarting container/);
+    assert.doesNotMatch(probeSource, /\[\[ "\$status" == "200" \]\]/);
+});
+
 test('fast-suite runtime artifacts use TEST_RUN_DIR instead of per-agent dependency storage', async () => {
     const prepareSource = await fs.readFile(path.join(testsRoot, 'doPrepare.sh'), 'utf8');
     const startScriptSource = await fs.readFile(path.join(testsRoot, 'testAgent', 'start_script.sh'), 'utf8');

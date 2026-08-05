@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import net from 'node:net';
@@ -16,6 +15,7 @@ import { createAgentServerContainerEnvironment } from '../helpers/agentServerCre
 const REPO_ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
 const AGENT_SERVER = path.join(REPO_ROOT, 'Agent/server/AgentServer.mjs');
 const credentialWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-server-credential-workspace-'));
+const agentServersByTempDir = new Map();
 
 test.after(async () => {
     await fs.rm(credentialWorkspace, { recursive: true, force: true });
@@ -37,10 +37,50 @@ function isolatedAgentServerEnv() {
 
 async function createTempDir(t) {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-server-session-'));
+    agentServersByTempDir.set(tmp, new Set());
     t.after(async () => {
+        const children = agentServersByTempDir.get(tmp) || [];
+        for (const child of children) {
+            await terminateExactChild(child);
+        }
+        agentServersByTempDir.delete(tmp);
         await fs.rm(tmp, { recursive: true, force: true });
     });
     return tmp;
+}
+
+function waitForExactChildExit(child, timeoutMs) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (exited) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            child.off('exit', onExit);
+            resolve(exited);
+        };
+        const onExit = () => finish(true);
+        const timer = setTimeout(() => finish(false), timeoutMs);
+        timer.unref?.();
+        child.once('exit', onExit);
+
+        // Close the gap between the initial state check and listener registration.
+        if (child.exitCode !== null || child.signalCode !== null) {
+            finish(true);
+        }
+    });
+}
+
+async function terminateExactChild(child) {
+    if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
+
+    child.kill('SIGTERM');
+    if (await waitForExactChildExit(child, 1000)) return;
+
+    child.kill('SIGKILL');
+    if (!await waitForExactChildExit(child, 2000)) {
+        throw new Error(`AgentServer child ${child.pid} did not exit after SIGKILL`);
+    }
 }
 
 async function getFreePort() {
@@ -94,16 +134,9 @@ async function startAgentServer(t, {
     let output = '';
     child.stdout.on('data', chunk => { output += chunk.toString('utf8'); });
     child.stderr.on('data', chunk => { output += chunk.toString('utf8'); });
-
-    t.after(async () => {
-        if (child.exitCode === null && child.signalCode === null) {
-            child.kill('SIGTERM');
-            await Promise.race([
-                once(child, 'exit'),
-                new Promise((resolve) => setTimeout(resolve, 1000))
-            ]);
-        }
-    });
+    const trackedChildren = agentServersByTempDir.get(tmp);
+    assert.ok(trackedChildren, `AgentServer temp directory is not registered for teardown: ${tmp}`);
+    trackedChildren.add(child);
 
     await waitForHealth(port, () => output);
     return { port, output: () => output };

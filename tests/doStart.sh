@@ -25,10 +25,16 @@ write_state_var "TEST_AGENT_START_LOG" "$test_agent_start_log"
 
 if [[ $# -ge 2 ]]; then
   test_info "Starting workspace with specified agent $1 on port $2."
-  ploinky start "$1" "$2" >>"$test_agent_start_log" 2>&1
+  if ! ploinky start "$1" "$2" >>"$test_agent_start_log" 2>&1; then
+    cat "$test_agent_start_log" >&2
+    exit 1
+  fi
 else
   test_info "Starting workspace with saved configuration."
-  ploinky start >>"$test_agent_start_log" 2>&1
+  if ! ploinky start >>"$test_agent_start_log" 2>&1; then
+    cat "$test_agent_start_log" >&2
+    exit 1
+  fi
 fi
 
 test_info "Workspace start output captured in $test_agent_start_log."
@@ -84,7 +90,10 @@ if [[ ! -f "$persist_marker" ]]; then
 fi
 
 fast_mcp_start_demo() {
-  ploinky start demo "$TEST_ROUTER_PORT" >>"$start_log" 2>&1
+  if ! ploinky start demo "$TEST_ROUTER_PORT" >>"$start_log" 2>&1; then
+    cat "$start_log" >&2
+    return 1
+  fi
   local container_name
   container_name=$(compute_container_name "demo" "demo")
   wait_for_container "$container_name"

@@ -22,7 +22,10 @@ restart_log="$TEST_RUN_DIR/.ploinky/logs/restart.log"
 : >"$restart_log"
 write_state_var "TEST_RESTART_LOG" "$restart_log"
 
-ploinky restart >>"$restart_log" 2>&1
+if ! ploinky restart >>"$restart_log" 2>&1; then
+  cat "$restart_log" >&2
+  exit 1
+fi
 
 wait_for_router
 wait_for_agent_log_message "$TEST_AGENT_LOG" "listening"

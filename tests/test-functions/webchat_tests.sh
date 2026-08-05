@@ -4,7 +4,10 @@ fast_check_webchat_token_rotation() {
 
   local secrets_file="$TEST_RUN_DIR/.ploinky/.secrets"
 
-  ploinky webchat --rotate >/dev/null 2>&1
+  if ploinky webchat --rotate >/dev/null 2>&1; then
+    echo "Retired WebChat --rotate syntax must be rejected." >&2
+    return 1
+  fi
 
   if [[ -f "$secrets_file" ]] && grep -q '^WEBCHAT_TOKEN=' "$secrets_file"; then
     echo "WEBCHAT_TOKEN should no longer be written to '$secrets_file'." >&2
