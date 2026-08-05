@@ -262,6 +262,9 @@ export function startCloudflarePublicationRuntime({
     audit = (event, value) => appendLog(event, value),
     retryInitialDelayMs = 1_000,
     retryMaximumDelayMs = 30_000,
+    releaseRetryAttempts = 50,
+    releaseRetryDelayMs = 10,
+    releaseSleep = sleepFor,
     createWorkspaceLease = createWorkspaceMutationLease,
     releaseWorkspaceLease = releaseWorkspaceMutationLease,
     inactivateInvalidGeneration = inactivateEdgeRoutingGeneration,
@@ -273,6 +276,11 @@ export function startCloudflarePublicationRuntime({
     let controller;
     const initialRetryDelay = Math.max(1, Number(retryInitialDelayMs) || 1_000);
     const maximumRetryDelay = Math.max(initialRetryDelay, Number(retryMaximumDelayMs) || 30_000);
+    const maximumReleaseAttempts = Math.max(
+        1,
+        Math.min(100, Math.trunc(Number(releaseRetryAttempts) || 1)),
+    );
+    const releaseDelay = Math.max(1, Math.trunc(Number(releaseRetryDelayMs) || 1));
     const rememberActivation = (activationId) => {
         const id = String(activationId || '');
         if (!id) return;
@@ -317,13 +325,21 @@ export function startCloudflarePublicationRuntime({
         }
     }
 
-    function releasePublicationLease(lease) {
+    async function releasePublicationLease(lease) {
         if (!lease) return;
-        if (!releaseWorkspaceLease(lease)) {
-            audit('cloudflare-workspace-lease-release-failed', {
-                operation: String(lease.operation || 'cloudflare-publication'),
-            });
+        for (let attempt = 1; attempt <= maximumReleaseAttempts; attempt += 1) {
+            if (releaseWorkspaceLease(lease)) return;
+            if (attempt < maximumReleaseAttempts) await releaseSleep(releaseDelay);
         }
+        const operation = String(lease.operation || 'cloudflare-publication');
+        audit('cloudflare-workspace-lease-release-failed', {
+            operation,
+            attempts: maximumReleaseAttempts,
+        });
+        throw publicationRuntimeError(
+            `Cloudflare publication could not release exact workspace lease '${operation}'`,
+            'CLOUDFLARE_WORKSPACE_LEASE_RELEASE_FAILED',
+        );
     }
 
     function retryActivationFor(input, fallbackActivationId) {
@@ -415,7 +431,7 @@ export function startCloudflarePublicationRuntime({
                 });
             } finally {
                 inFlight = null;
-                releasePublicationLease(workspaceLease);
+                await releasePublicationLease(workspaceLease);
                 if (superseded && !stopped) launchBackgroundScan('retry-superseded');
             }
         }, delayMs);
@@ -446,7 +462,7 @@ export function startCloudflarePublicationRuntime({
                         return;
                     }
                 } finally {
-                    releasePublicationLease(workspaceLease);
+                    await releasePublicationLease(workspaceLease);
                 }
             }
             if (!active) return;
@@ -501,7 +517,7 @@ export function startCloudflarePublicationRuntime({
             }
         } finally {
             inFlight = null;
-            releasePublicationLease(workspaceLease);
+            await releasePublicationLease(workspaceLease);
         }
     }
 

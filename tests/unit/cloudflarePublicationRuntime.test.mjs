@@ -739,6 +739,60 @@ test('workspace start contention defers publication without consuming the select
     await runtime.stop();
 });
 
+test('publication retries only the exact workspace lease when release admission races', async (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-release-race-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    let selected = null;
+    let releaseAttempts = 0;
+    let reconciliations = 0;
+    const waits = [];
+    const lease = {
+        token: 'publication-release-race',
+        operation: 'cloudflare-publication:activation-release-race',
+    };
+    const inactive = Object.assign(new Error('inactive'), { code: 'EDGE_GENERATION_INACTIVE' });
+    const runtime = startCloudflarePublicationRuntime({
+        workspaceRoot: workspace,
+        statusFile: path.join(workspace, 'status.json'),
+        pollIntervalMs: 60_000,
+        loadActive: () => {
+            if (!selected) throw inactive;
+            return selected;
+        },
+        createWorkspaceLease: () => lease,
+        releaseWorkspaceLease: (candidate) => {
+            assert.equal(candidate, lease, 'release retries must retain the exact lease token');
+            releaseAttempts += 1;
+            return releaseAttempts === 3;
+        },
+        releaseRetryAttempts: 3,
+        releaseRetryDelayMs: 7,
+        releaseSleep: async (delayMs) => { waits.push(delayMs); },
+        routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
+        controllerFactory: () => ({
+            reconcile: async () => { reconciliations += 1; },
+            getStatus: () => ({ state: 'fixture' }),
+            stop: async () => {},
+        }),
+        probeHostname: async () => ({ ok: true }),
+        audit: () => {},
+    });
+    selected = {
+        selector: {
+            generation: GENERATION,
+            activationId: 'activation-release-race',
+            publicationState: 'ready',
+        },
+        generation: { desired: { hosts: {} } },
+    };
+
+    await runtime.scan();
+    assert.equal(reconciliations, 1);
+    assert.equal(releaseAttempts, 3);
+    assert.deepEqual(waits, [7, 7]);
+    await runtime.stop();
+});
+
 test('invalid selected-generation cleanup holds the shared workspace lease', async (t) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-invalid-'));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
