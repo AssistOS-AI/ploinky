@@ -11,13 +11,17 @@ const { readGlobalDepsPackage } = await import(`${depInstUrl.href}${suffix}`);
 const { resolveGlobalCacheManifest } = await import(`${depCacheUrl.href}${suffix}`);
 
 const SHA = 'a'.repeat(40);
+const EXPECTED_AGENTLIB_COMMIT = 'dd94929443033c0a43bf7569068ec1d2926dba35';
 
 // readGlobalDepsPackage must honor an explicitly passed env so the cache layer
 // (which may run in any process) can resolve the override deterministically.
 test('readGlobalDepsPackage honors an explicit env argument', () => {
     const base = readGlobalDepsPackage({});
     const over = readGlobalDepsPackage({ PLOINKY_AGENTLIB_REF: SHA });
-    assert.match(base.dependencies.achillesAgentLib, /#[0-9a-f]{40}$/);
+    assert.equal(
+        base.dependencies.achillesAgentLib,
+        `git+https://github.com/AssistOS-AI/achillesAgentLib.git#${EXPECTED_AGENTLIB_COMMIT}`,
+    );
     assert.match(over.dependencies.achillesAgentLib, new RegExp(`#${SHA}$`));
 });
 

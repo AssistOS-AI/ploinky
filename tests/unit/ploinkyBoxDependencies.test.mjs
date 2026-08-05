@@ -13,6 +13,8 @@ import {
 } from '../../ploinky-box/entrypoint/install-dependencies.mjs';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 
+const EXPECTED_AGENTLIB_COMMIT = 'dd94929443033c0a43bf7569068ec1d2926dba35';
+
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-deps-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -40,6 +42,7 @@ function readHead(directory) {
 test('dependency lock contains exactly two immutable 40-hex pins', () => {
     const lock = readDependencyLock();
     assert.deepEqual(Object.keys(lock.repositories).sort(), ['achillesAgentLib', 'mcp-sdk']);
+    assert.equal(lock.repositories.achillesAgentLib.commit, EXPECTED_AGENTLIB_COMMIT);
     for (const repository of Object.values(lock.repositories)) {
         assert.match(repository.commit, /^[a-f0-9]{40}$/);
     }
