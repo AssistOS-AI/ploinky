@@ -136,7 +136,6 @@ import {
     abortEdgeRoutingPreparation,
     assertAdditivePreparedRuntimeIdentity,
     assertHostModeGenerationCapability,
-    assertPreparedRuntimeIdentity,
     createRouterAttestationGenerationLease,
     edgeRuntimeEnvironment,
     edgeTopologyMount,
@@ -278,83 +277,6 @@ function attachRestartCandidate(error, candidate) {
         value: Object.freeze({ ...prior, ...candidate }),
     });
     return failure;
-}
-
-export function abortPreparedRuntimeCandidateBeforeCleanup(candidate, originalFailure, reason, {
-    abortPreparation = abortEdgeRoutingPreparation,
-} = {}) {
-    if (originalFailure?.code === 'PLOINKY_RECOVERY_ABORT_FAILED') {
-        throw originalFailure;
-    }
-    if (!candidate?.preparationLease) return Object.freeze({ ...(candidate || {}) });
-    if (candidate.preparationAbortedBeforeCleanup === true) return candidate;
-    try {
-        abortPreparation(candidate.preparationLease, { reason });
-    } catch (abortError) {
-        const recoveryError = new Error(
-            `runtime recovery could not abort the exact edge preparation for '${candidate.containerName || 'unknown candidate'}'; preserving its failed runtime candidate: ${abortError?.message || abortError}`,
-            { cause: abortError },
-        );
-        recoveryError.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
-        Object.defineProperty(recoveryError, 'originalFailure', {
-            configurable: false,
-            enumerable: false,
-            writable: false,
-            value: originalFailure,
-        });
-        throw attachRestartCandidate(recoveryError, {
-            ...candidate,
-            exactCleanupPerformed: false,
-            preparationAbortFailed: true,
-            preparationAbortedBeforeCleanup: false,
-        });
-    }
-    return Object.freeze({
-        ...candidate,
-        preparationAbortFailed: false,
-        preparationAbortedBeforeCleanup: true,
-    });
-}
-
-function managedFailureCleanupReceipt(receipt, recovery) {
-    if (!receipt || !recovery) return receipt;
-    if (recovery.exactCleanupPerformed === true) {
-        return advanceCandidateLifecycle(receipt, {
-            phase: 'readiness',
-            state: 'removed-proven',
-            inspectionComplete: true,
-            ownershipProof: { ...receipt.ownershipProof, exactAbsenceProven: true },
-        });
-    }
-    if (recovery.candidateInspectionComplete === true && !recovery.candidateId) {
-        return advanceCandidateLifecycle(receipt, {
-            phase: 'readiness',
-            state: 'absent-proven',
-            inspectionComplete: true,
-            ownershipProof: { ...receipt.ownershipProof, exactAbsenceProven: true },
-        });
-    }
-    if (recovery.candidateInspectionComplete === true
-        && recovery.candidateOwned === true
-        && recovery.candidateId) {
-        return advanceCandidateLifecycle(receipt, {
-            phase: 'candidate-observed',
-            state: 'retryable-exact-id',
-            candidateId: recovery.candidateId,
-            inspectionComplete: true,
-            ownershipProof: {
-                immutableId: true,
-                instanceId: receipt.runtimeIdentity.instanceId,
-                enableGeneration: receipt.runtimeIdentity.enableGeneration,
-            },
-        });
-    }
-    return advanceCandidateLifecycle(receipt, {
-        phase: 'readiness',
-        state: 'preserved-ambiguous',
-        inspectionComplete: recovery.candidateInspectionComplete === true,
-        ownershipProof: { ...receipt.ownershipProof, exactAbsenceProven: false },
-    });
 }
 
 function runtimeCandidateContractHash(admission, runtimeIdentity, network, runtimeKind) {
@@ -931,13 +853,9 @@ function normalizeTargetedRestart(value) {
     });
 }
 
-export function removeAgentContainerForRecreate(
-    containerName,
-    label = 'executionModeChanged',
-    predecessorRecord = null,
-) {
+export function removeAgentContainerForRecreate(containerName, label = 'executionModeChanged') {
     const runtime = getRuntime();
-    return removeContainerForRecreate(runtime, containerName, label, predecessorRecord);
+    return removeContainerForRecreate(runtime, containerName, label);
 }
 
 function buildPersistentAgentRunArgs({
@@ -1943,14 +1861,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             prepareLaunch: prepareGeneratedRouterLaunch,
             preStartLaunch: preStartGeneratedRouterLaunch,
             finalizeLaunch: finalizeGeneratedRouterLaunch,
-            beforeFailureCleanup: runtimeIdentity.preparationLease
-                ? ({ error }) => {
-                    abortPreparedRuntimeCandidateBeforeCleanup({
-                        containerName,
-                        preparationLease: runtimeIdentity.preparationLease,
-                    }, error, `managed-runtime-launch-failed:${containerName}`);
-                }
-                : null,
             networkLockWaitMs: options.networkLockWaitMs,
             networkLifecycleCapability: options.networkLifecycleCapability,
         });
@@ -1987,17 +1897,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
     }
     } catch (error) {
-        const managedRecovery = error?.ploinkyManagedFailureRecovery || null;
-        if (managedRecovery) {
-            try {
-                cleanupReceipt = managedFailureCleanupReceipt(cleanupReceipt, managedRecovery);
-            } catch (receiptError) {
-                appendExactCleanupFailure(error, `receipt transition: ${receiptError?.message || receiptError}`);
-            }
-        }
-        let failureCandidate = {
+        throw attachRestartCandidate(error, {
             containerName,
-            ...(managedRecovery?.candidateId ? { containerId: managedRecovery.candidateId } : {}),
             runtimeNetwork: structuredClone(manifestNetwork),
             registryRecord: {
                 type: 'agent',
@@ -2008,25 +1909,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 enableGeneration: runtimeIdentity.enableGeneration,
             },
             cleanupReceipt,
-            exactCleanupPerformed: managedRecovery?.exactCleanupPerformed === true,
-            ...(runtimeIdentity.preparationLease
-                ? { preparationLease: runtimeIdentity.preparationLease }
-                : {}),
-            ...(managedRecovery ? {
-                preparationAbortFailed: managedRecovery.preparationAbortFailed === true,
-                preparationAbortedBeforeCleanup: managedRecovery.preparationAbortedBeforeCleanup === true,
-            } : {}),
-        };
-        if (runtimeIdentity.preparationLease
-            && failureCandidate.preparationAbortedBeforeCleanup !== true
-            && failureCandidate.preparationAbortFailed !== true) {
-            failureCandidate = abortPreparedRuntimeCandidateBeforeCleanup(
-                failureCandidate,
-                error,
-                `runtime-launch-failed:${containerName}`,
-            );
-        }
-        throw attachRestartCandidate(error, failureCandidate);
+            exactCleanupPerformed: false,
+        });
     }
     cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, adoptedExistingRuntime
         ? {
@@ -2060,16 +1944,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
         }),
-        ...(runtimeIdentity.preparationLease
-            ? { preparationLease: runtimeIdentity.preparationLease }
-            : {}),
     });
     const cleanupExactLaunch = (error) => {
-        const recoveryCandidate = abortPreparedRuntimeCandidateBeforeCleanup(
-            exactLaunchReceipt,
-            error,
-            `runtime-launch-finalization-failed:${containerName}`,
-        );
         let exactCleanupPerformed = false;
         let finalCleanupReceipt = cleanupReceipt;
         try {
@@ -2117,7 +1993,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
         clearLivenessState(containerName);
         throw attachRestartCandidate(error, {
-            ...recoveryCandidate,
+            ...exactLaunchReceipt,
             cleanupReceipt: finalCleanupReceipt,
             exactCleanupPerformed,
         });
@@ -2391,31 +2267,6 @@ export function assertPreparedRegistryRecordPreservation(existingRecord, options
     return true;
 }
 
-function capturePreparedRegistryRecord(containerName, runtimeIdentity) {
-    if (!runtimeIdentity?.preparationLease) return null;
-    const prepared = assertPreparedRuntimeIdentity(runtimeIdentity.preparationLease, {
-        containerName,
-        instanceId: runtimeIdentity.instanceId,
-        enableGeneration: runtimeIdentity.enableGeneration,
-    });
-    // Additive preparation deliberately leaves the active predecessor's
-    // mutable registry untouched. Its immutable candidate record is therefore
-    // the staged launch authority until the additive commit publishes it.
-    if (runtimeIdentity.preparationLease.mode === 'additive') {
-        return structuredClone(prepared);
-    }
-    const record = loadAgentsMap()?.[containerName];
-    if (!record || record.type !== 'agent'
-        || String(record.instanceId || '') !== String(runtimeIdentity.instanceId || '')
-        || String(record.enableGeneration || '') !== String(runtimeIdentity.enableGeneration || '')
-        || !isDeepStrictEqual(record, prepared)) {
-        throw new Error(
-            `prepared runtime for '${containerName}' lost its exact immutable staged registry record before launch`,
-        );
-    }
-    return structuredClone(record);
-}
-
 function mintReplacementRuntimeIdentity(existingRecord, uuid = randomUUID) {
     const instanceId = String(uuid() || '').trim();
     const enableGeneration = String(uuid() || '').trim();
@@ -2443,7 +2294,6 @@ export function coordinateReplacementRuntimeIdentity({
     saveRegistry = saveAgentsMap,
     withApplyLock = withEdgeGenerationApplyLock,
     uuid = randomUUID,
-    abortPreparation = abortEdgeRoutingPreparation,
 } = {}) {
     const exactContainerName = String(containerName || '').trim();
     if (!exactContainerName) {
@@ -2491,22 +2341,19 @@ export function coordinateReplacementRuntimeIdentity({
     if (prepared?.selector?.state !== 'inactive'
         || String(preparedRecord?.instanceId || '') !== runtimeIdentity.instanceId
         || String(preparedRecord?.enableGeneration || '') !== runtimeIdentity.enableGeneration) {
-        const mismatch = new Error(
-            `coordinated replacement candidate did not remain inactive with the fresh runtime identity for '${exactContainerName}'`,
-        );
-        if (prepared?.preparationLease) {
-            abortPreparedRuntimeCandidateBeforeCleanup({
-                containerName: exactContainerName,
-                preparationLease: prepared.preparationLease,
-                registryRecord: Object.freeze({
-                    type: 'agent',
-                    ...runtimeIdentity,
-                }),
-            }, mismatch, `${coordinationReason}:identity-mismatch`, { abortPreparation });
-        } else {
+        let aborted = false;
+        try {
+            if (prepared?.preparationLease) {
+                abortEdgeRoutingPreparation(prepared.preparationLease, {
+                    reason: `${coordinationReason}:identity-mismatch`,
+                });
+                aborted = true;
+            }
+        } catch (_) {}
+        if (!aborted) {
             try { inactivate(`${coordinationReason}:identity-mismatch`, { preserveSelectedGeneration: true }); } catch (_) {}
         }
-        throw mismatch;
+        throw new Error(`coordinated replacement candidate did not remain inactive with the fresh runtime identity for '${exactContainerName}'`);
     }
     return Object.freeze({
         ...runtimeIdentity,
@@ -2570,16 +2417,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
         throw error;
     }
-    if (!options.networkLifecycleCapability) {
-        return withNetworkLifecycleLock(
-            (networkLifecycleCapability) => ensureAgentService(agentName, manifest, agentPath, {
-                ...options,
-                networkLifecycleCapability,
-            }),
-            { waitMs: Math.max(0, Number(options.networkLockWaitMs || 0)) },
-        );
-    }
-    assertNetworkLifecycleCapability(options.networkLifecycleCapability);
     const preflightRepoName = path.basename(path.dirname(agentPath));
     const preflightManifestPath = path.join(agentPath, 'manifest.json');
     const preflightManifestBytes = fs.existsSync(preflightManifestPath)
@@ -2600,6 +2437,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         profileName: options.profileName,
         persistedProfileName: preflightRecord.profile,
         path: `manifest(${preflightRepoName}/${agentName})`,
+    });
+    // Reject manifest-declared capabilities before even selecting a backend.
+    // A second admission below adds the read-only catalog selection.
+    admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: preflightManifestBytes,
+        manifestPath: preflightManifestPath,
+        agentId: `${preflightRepoName}/${agentName}`,
+        profileName: preflightProfile.resolvedProfileName,
+        profileConfig: preflightProfile.profileConfig,
+        network: preflightProfile.network,
+        runtimeKind: 'container',
     });
     const preflightAgentRuntime = getRuntimeForAgent(manifest);
     const preflightRuntimeKind = isSandboxRuntime(preflightAgentRuntime)
@@ -2636,6 +2484,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         });
     }
     const targetedRestart = normalizeTargetedRestart(options.targetedRestart);
+    if (!options.networkLifecycleCapability) {
+        return withNetworkLifecycleLock(
+            (networkLifecycleCapability) => ensureAgentService(agentName, manifest, agentPath, {
+                ...options,
+                networkLifecycleCapability,
+                runtimeAdmission: options.runtimeAdmission || preflightAdmission,
+            }),
+            { waitMs: Math.max(0, Number(options.networkLockWaitMs || 0)) },
+        );
+    }
+    assertNetworkLifecycleCapability(options.networkLifecycleCapability);
     let preferredHostPort;
     let containerOverride;
     let aliasOverride;
@@ -2692,25 +2551,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             env: process.env,
         })
         : { catalogPolicy: null, catalogIdentity: null };
-    const serviceAdmission = preflightRuntimeKind === 'container'
-        ? admitManifestRuntimeCapabilities(manifest, {
-            manifestBytes: preflightManifestBytes,
-            manifestPath: preflightManifestPath,
-            agentId: `${repoName}/${agentName}`,
-            profileName: activeProfile,
-            profileConfig,
-            network: manifestNetwork,
-            runtime: preflightAgentRuntime,
-            runtimeKind: preflightRuntimeKind,
-            catalogPolicy: serviceLlmAdmissionContext.catalogPolicy,
-            catalogIdentity: serviceLlmAdmissionContext.catalogIdentity,
-        })
-        : preflightAdmission;
-    if (options.runtimeAdmission) {
+    const serviceAdmission = admitManifestRuntimeCapabilities(manifest, {
+        manifestBytes: preflightManifestBytes,
+        manifestPath: preflightManifestPath,
+        agentId: `${repoName}/${agentName}`,
+        profileName: activeProfile,
+        profileConfig,
+        network: manifestNetwork,
+        runtime: preflightAgentRuntime,
+        runtimeKind: 'container',
+        catalogPolicy: serviceLlmAdmissionContext.catalogPolicy,
+        catalogIdentity: serviceLlmAdmissionContext.catalogIdentity,
+    });
+    if (options.runtimeAdmission && preflightRuntimeKind === 'container') {
         assertRuntimeAdmissionCurrent(options.runtimeAdmission, {
             manifestBytes: preflightManifestBytes,
             profileName: activeProfile,
-            runtimeKind: preflightRuntimeKind,
+            runtimeKind: 'container',
             descriptor: serviceAdmission.descriptor,
         });
     }
@@ -2721,7 +2578,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     // Host sandboxes share the host network namespace. Fail closed unless the
     // effective manifest/profile contract explicitly selects host networking.
-    const agentRuntime = preflightAgentRuntime;
+    const agentRuntime = getRuntimeForAgent(manifest);
     let sandboxAdmission = null;
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
         if (options.runtimeAdmission) {
@@ -2731,11 +2588,18 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 runtimeKind: agentRuntime,
             });
         }
-        sandboxAdmission = options.runtimeAdmission || serviceAdmission;
+        sandboxAdmission = options.runtimeAdmission || admitManifestRuntimeCapabilities(manifest, {
+            manifestBytes: preflightManifestBytes,
+            manifestPath: preflightManifestPath,
+            agentId: `${repoName}/${agentName}`,
+            profileName: activeProfile,
+            profileConfig,
+            network: manifestNetwork,
+            runtimeKind: agentRuntime,
+        });
     }
     if (agentRuntime === 'bwrap' || agentRuntime === 'seatbelt') {
         let sandboxRuntimeIdentity = null;
-        let sandboxStagedRegistryRecord = null;
         let sandboxRequiresEdgeActivation = false;
         let sandboxCleanupReceipt = null;
         try {
@@ -2778,7 +2642,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 requestedEnableGeneration: String(options.enableGeneration || existingRecord.enableGeneration || ''),
             }, { preparationLease: options.preparationLease });
             sandboxRuntimeIdentity = runtimeIdentity;
-            sandboxStagedRegistryRecord = capturePreparedRegistryRecord(containerName, runtimeIdentity);
             sandboxRequiresEdgeActivation = requiresEdgeActivation;
             sandboxCleanupReceipt = beginCandidateLifecycle({
                 runtimeKind: agentRuntime,
@@ -2849,9 +2712,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 requiresEdgeActivation,
                 cleanupReceipt: sandboxCleanupReceipt,
                 ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
-                ...(sandboxStagedRegistryRecord
-                    ? { stagedRegistryRecord: structuredClone(sandboxStagedRegistryRecord) }
-                    : {}),
             };
         } catch (err) {
             const failure = createHostSandboxStartupError(agentName, agentRuntime, err);
@@ -2859,27 +2719,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 instanceId: String(sandboxRuntimeIdentity?.instanceId || options.instanceId || existingRecord.instanceId || ''),
                 enableGeneration: String(sandboxRuntimeIdentity?.enableGeneration || options.enableGeneration || existingRecord.enableGeneration || ''),
             };
-            let recoveryCandidate = abortPreparedRuntimeCandidateBeforeCleanup({
-                containerName,
-                runtimeNetwork: structuredClone(manifestNetwork),
-                registryRecord: {
-                    type: 'agent',
-                    runtime: agentRuntime,
-                    agentName,
-                    repoName,
-                    ...(aliasOverride ? { alias: aliasOverride } : {}),
-                    ...identity,
-                },
-                requiresEdgeActivation: sandboxRequiresEdgeActivation,
-                exactCleanupPerformed: false,
-                ...(sandboxStagedRegistryRecord
-                    ? { stagedRegistryRecord: structuredClone(sandboxStagedRegistryRecord) }
-                    : {}),
-                ...(sandboxCleanupReceipt ? { cleanupReceipt: sandboxCleanupReceipt } : {}),
-                ...((sandboxRuntimeIdentity?.preparationLease || options.preparationLease)
-                    ? { preparationLease: sandboxRuntimeIdentity?.preparationLease || options.preparationLease }
-                    : {}),
-            }, failure, `host-sandbox-launch-failed:${containerName}`);
             let exactCleanupPerformed = false;
             if (identity.instanceId && identity.enableGeneration) {
                 try {
@@ -2909,13 +2748,23 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     appendExactCleanupFailure(failure, `receipt transition: ${receiptError?.message || receiptError}`);
                 }
             }
-            recoveryCandidate = {
-                ...recoveryCandidate,
-                ...(sandboxCleanupReceipt ? { cleanupReceipt: sandboxCleanupReceipt } : {}),
-                exactCleanupPerformed,
-            };
             throw attachRestartCandidate(failure, {
-                ...recoveryCandidate,
+                containerName,
+                runtimeNetwork: structuredClone(manifestNetwork),
+                registryRecord: {
+                    type: 'agent',
+                    runtime: agentRuntime,
+                    agentName,
+                    repoName,
+                    ...(aliasOverride ? { alias: aliasOverride } : {}),
+                    ...identity,
+                },
+                requiresEdgeActivation: sandboxRequiresEdgeActivation,
+                exactCleanupPerformed,
+                ...(sandboxCleanupReceipt ? { cleanupReceipt: sandboxCleanupReceipt } : {}),
+                ...((sandboxRuntimeIdentity?.preparationLease || options.preparationLease)
+                    ? { preparationLease: sandboxRuntimeIdentity?.preparationLease || options.preparationLease }
+                    : {}),
             });
         }
     }
@@ -3092,24 +2941,12 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     || !prepared?.preparationLease
                     || String(preparedRecord?.instanceId || '') !== String(existingRecord.instanceId || '')
                     || String(preparedRecord?.enableGeneration || '') !== String(existingRecord.enableGeneration || '')) {
-                    const invalidPreparation = new Error(
-                        `managed semantic adoption for '${containerName}' did not prepare its exact inactive identity`,
-                    );
                     if (prepared?.preparationLease) {
-                        abortPreparedRuntimeCandidateBeforeCleanup({
-                            containerName,
-                            preparationLease: prepared.preparationLease,
-                            registryRecord: Object.freeze({
-                                type: 'agent',
-                                agentName,
-                                repoName,
-                                ...(aliasOverride ? { alias: aliasOverride } : {}),
-                                instanceId: String(preparedRecord?.instanceId || existingRecord.instanceId || ''),
-                                enableGeneration: String(preparedRecord?.enableGeneration || existingRecord.enableGeneration || ''),
-                            }),
-                        }, invalidPreparation, `managed-semantic-adoption-invalid:${containerName}`);
+                        abortEdgeRoutingPreparation(prepared.preparationLease, {
+                            reason: `managed-semantic-adoption-invalid:${containerName}`,
+                        });
                     }
-                    throw invalidPreparation;
+                    throw new Error(`managed semantic adoption for '${containerName}' did not prepare its exact inactive identity`);
                 }
                 managedReconciliationPreparationLease = prepared.preparationLease;
             }
@@ -3189,10 +3026,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         requestedInstanceId,
         requestedEnableGeneration,
     }, { preparationLease: managedReconciliationPreparationLease });
-    let started = null;
-    let stagedRegistryRecord = null;
-    try {
-    stagedRegistryRecord = capturePreparedRegistryRecord(containerName, runtimeIdentity);
     const preserveRuntimeRegistryRecord = Boolean(targetedRestart)
         || preservePreparedRegistryRecord
         || Boolean(runtimeIdentity.preparationLease);
@@ -3230,6 +3063,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         clearLivenessState(containerName);
     }
 
+    let started = null;
+    try {
         started = startAgentContainer(agentName, manifest, agentPath, {
             publish: additionalPorts,
             publishMappings: additionalPortMappings,
@@ -3341,28 +3176,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             cleanupReceipt: started?.cleanupReceipt,
             requiresEdgeActivation,
             ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
-            ...(stagedRegistryRecord
-                ? { stagedRegistryRecord: structuredClone(stagedRegistryRecord) }
-                : {}),
         };
     } catch (error) {
         if (error?.code === 'PLOINKY_SEMANTIC_ADOPTION_MISMATCH'
             && runtimeNetworkPlan.requiresManagedNetwork
             && runtimeIdentity.preparationLease
             && options.semanticAdoptionRetry !== true) {
-            const semanticCandidate = error?.ploinkyRestartCandidate || {
-                containerName,
-                preparationLease: runtimeIdentity.preparationLease,
-                preparationAbortedBeforeCleanup:
-                    error?.ploinkyManagedFailureRecovery?.preparationAbortedBeforeCleanup === true,
-                preparationAbortFailed:
-                    error?.ploinkyManagedFailureRecovery?.preparationAbortFailed === true,
-            };
-            abortPreparedRuntimeCandidateBeforeCleanup(
-                semanticCandidate,
-                error,
-                `semantic-adoption-mismatch:${containerName}`,
-            );
+            abortEdgeRoutingPreparation(runtimeIdentity.preparationLease, {
+                reason: `semantic-adoption-mismatch:${containerName}`,
+            });
             const rotated = coordinateReplacementRuntimeIdentity({
                 containerName,
                 existingRecord,
@@ -3391,32 +3213,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
         };
-        let failureCandidate = {
-            ...(error?.ploinkyRestartCandidate || {}),
-            containerName,
-            ...(candidateId ? { containerId: candidateId } : {}),
-            runtimeNetwork: structuredClone(manifestNetwork),
-            registryRecord: structuredClone(candidateRecord),
-            requiresEdgeActivation,
-            exactCleanupPerformed,
-            ...(stagedRegistryRecord
-                ? { stagedRegistryRecord: structuredClone(stagedRegistryRecord) }
-                : {}),
-            ...(cleanupReceipt ? { cleanupReceipt } : {}),
-            ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
-        };
-        if (failureCandidate.preparationAbortFailed === true) {
-            throw attachRestartCandidate(error, failureCandidate);
-        }
-        failureCandidate = abortPreparedRuntimeCandidateBeforeCleanup(
-            failureCandidate,
-            error,
-            `agent-service-launch-failed:${containerName}`,
-        );
-        if (!exactCleanupPerformed
-            && (!failureCandidate.preparationLease
-                || failureCandidate.preparationAbortedBeforeCleanup === true)
-            && candidateId) {
+        if (!exactCleanupPerformed && candidateId) {
             try {
                 const cleanup = removeExactGenerationCandidate({
                     containerName,
@@ -3430,8 +3227,14 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             }
         }
         throw attachRestartCandidate(error, {
-            ...failureCandidate,
+            containerName,
+            ...(candidateId ? { containerId: candidateId } : {}),
+            runtimeNetwork: structuredClone(manifestNetwork),
+            registryRecord: structuredClone(candidateRecord),
+            requiresEdgeActivation,
             exactCleanupPerformed,
+            ...(cleanupReceipt ? { cleanupReceipt } : {}),
+            ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
         });
     }
 }

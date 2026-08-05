@@ -1,7 +1,0 @@
-{
-  "lite-sandbox": true,
-  "agent": "node -e \"setInterval(() => {}, 1000000)\"",
-  "readiness": {
-    "protocol": "none"
-  }
-}

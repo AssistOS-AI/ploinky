@@ -2,28 +2,17 @@ import http from 'node:http';
 
 import { buildIdentityHeaders, ensureHttpRouteAccess } from './authHandlers/authContext.js';
 import {
+    commitRoutePlan,
     httpAccessForEdgeRoutePlan,
     resolveEdgeRoutePlan,
 } from './edgeRoutePlan.js';
 import {
     buildTrustedForwardingHeaders,
+    createLeaseCommittedAgent,
     stripRouterIdentityHeaders,
 } from './routerHandlers.js';
-import {
-    createLeaseCommittedAgent,
-    createRootAgentDialContext,
-} from './rootAgentDial.js';
 
 const HANDSHAKE_TIMEOUT_MS = 10_000;
-
-export function createAgentRootUpgradeDialAgent(plan, targetPort, dependencies = {}) {
-    return createLeaseCommittedAgent(createRootAgentDialContext({
-        routePlan: plan,
-        routeKey: plan?.routeKey,
-        route: plan?.route,
-        targetPort,
-    }), dependencies);
-}
 
 function lowerKeys(value = {}) {
     return Object.fromEntries(Object.entries(value).map(([key, entry]) => [String(key).toLowerCase(), entry]));
@@ -115,7 +104,7 @@ export async function handleAgentRootUpgrade({
         method: 'GET',
         path: plan.upstreamPath,
         headers,
-        agent: createAgentRootUpgradeDialAgent(plan, targetPort),
+        agent: createLeaseCommittedAgent(() => commitRoutePlan(plan)),
     });
     let settled = false;
     const timer = setTimeout(() => {

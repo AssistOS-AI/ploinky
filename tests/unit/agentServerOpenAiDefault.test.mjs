@@ -29,14 +29,10 @@ import { fileURLToPath } from 'node:url';
 
 import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
-import { createAgentServerContainerEnvironment } from '../helpers/agentServerCredentialRuntime.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SERVER_PATH = path.resolve(__dirname, '../../Agent/server/AgentServer.mjs');
-const credentialWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'agentsrv-credential-workspace-'));
-
-test.after(() => fs.rmSync(credentialWorkspace, { recursive: true, force: true }));
 
 const OPENAI_PATH = '/v1/chat/completions';
 const OPENAI_TOOL = '__openai_chat_completions__';
@@ -132,24 +128,16 @@ async function startServer({ manifest, mcpConfig, agentId, extraEnv = {} }) {
         fs.writeFileSync(path.join(dir, 'mcp-config.json'), JSON.stringify(mcpConfig, null, 2));
     }
     const port = await getFreePort();
-    const principalId = agentId || 'agent:Workspace/testAgent';
-    const credentialEnv = await createAgentServerContainerEnvironment({
-        tempDir: credentialWorkspace,
-        agentPrincipal: principalId,
-        agentSecret: extraEnv.PLOINKY_AGENT_SECRET || deriveAgentRequestSecret(principalId),
-        privateSecret: extraEnv.PLOINKY_AGENT_PRIVATE_SECRET || 'b'.repeat(64),
-        masterKey: extraEnv.PLOINKY_MASTER_KEY || process.env.PLOINKY_MASTER_KEY,
-    });
     const env = {
         ...isolatedAgentServerEnv(),
-        ...extraEnv,
-        ...credentialEnv,
         PORT: String(port),
         PLOINKY_AGENT_BIND_HOST: '127.0.0.1',
+        PLOINKY_AGENT_ID: agentId || '',
         // Point the server's manifest + config loaders at our temp fixtures.
         PLOINKY_AGENT_MANIFEST: path.join(dir, 'manifest.json'),
         MCP_CONFIG_FILE: mcpConfig ? path.join(dir, 'mcp-config.json') : '',
         PLOINKY_CODE_DIR: dir,
+        ...extraEnv
     };
     const child = spawn(process.execPath, [SERVER_PATH], {
         cwd: dir,
@@ -186,8 +174,7 @@ test('opt-out (model:none) responder: 200 + OpenAI-compatible body listing tool 
         // capability/listability responder.
         manifest: { name: 'llmAssistant', endpoints: { chatCompletions: { model: 'none' } } },
         mcpConfig: TOOL_CONFIG,
-        agentId,
-        extraEnv: { AGENT_NAME: 'spoofed-from-environment' },
+        agentId
     });
     try {
         const res = await fetch(`http://127.0.0.1:${srv.port}/v1/chat/completions`, {
@@ -199,7 +186,7 @@ test('opt-out (model:none) responder: 200 + OpenAI-compatible body listing tool 
         const body = await res.json();
         assert.equal(body.object, 'chat.completion');
         assert.ok(body.id.startsWith('chatcmpl-'));
-        assert.equal(body.model, agentId, 'model uses the validated credential-context principal');
+        assert.equal(body.model, agentId, 'model falls back to PLOINKY_AGENT_ID');
         assert.equal(body.choices[0].message.role, 'assistant');
         assert.equal(body.choices[0].finish_reason, 'stop');
         assert.deepEqual(body.usage, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });

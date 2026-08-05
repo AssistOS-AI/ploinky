@@ -101,7 +101,6 @@ export function buildAgentIdentityEnv(principalId, options = {}) {
 // must not be able to redirect a hook, substitute its own signed key, public
 // key, or forge a `generated` provenance claim.
 export const GENERATED_RUNTIME_ENV_NAMES = Object.freeze([
-    'PLOINKY_AGENT_CREDENTIAL_FILE',
     'PLOINKY_ROUTER_DESCRIPTOR_FILE',
     'PLOINKY_ROUTER_HOST',
     'PLOINKY_ROUTER_PORT',

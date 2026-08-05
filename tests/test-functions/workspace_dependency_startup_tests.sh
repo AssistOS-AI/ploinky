@@ -95,6 +95,7 @@ fast_graph_create_start_http_agent() {
 
   cat >"$agent_dir/manifest.json" <<EOF
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/delayed-http.js",
   "enable": ${enable_json},
@@ -140,6 +141,7 @@ EOF
 
   cat >"$agent_dir/manifest.json" <<EOF
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "agent": "node /code/delayed-http.js",
   "enable": ${enable_json},
@@ -198,6 +200,7 @@ EOF
 
   cat >"$agent_dir/manifest.json" <<EOF
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "agent": "sh /code/start-delayed-mcp.sh",
   "enable": ${enable_json},
@@ -334,6 +337,7 @@ fast_test_recursive_dependency_graph_startup() (
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
+    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/recursive-dependency-start.log"
@@ -369,6 +373,7 @@ fast_test_dependency_readiness_protocol_override() (
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
+    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/override-start.log"
@@ -400,6 +405,7 @@ fast_test_static_start_only_tcp_readiness() (
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
+    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/static-start.log"
@@ -431,6 +437,7 @@ fast_test_dependency_failure_blocks_router_startup() (
   (
     cd "$workspace"
     ploinky enable repo graphRepo >/dev/null 2>&1
+    ploinky enable agent graphRepo/root >/dev/null 2>&1
   )
 
   start_log="$workspace/.ploinky/logs/broken-dependency-start.log"
@@ -500,6 +507,7 @@ EOF
 
   cat >"$provider_dir/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/delayed-http.js",
   "readiness": {
@@ -542,6 +550,7 @@ EOF
 
   cat >"$root_dir/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node /code/root.js",
   "readiness": {

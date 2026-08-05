@@ -2,10 +2,8 @@ import crypto from 'crypto';
 
 export const NETWORK_MODES = Object.freeze(['default', 'none', 'host', 'bridge']);
 export const NETWORK_SCHEMA_VERSION = '2';
-export const PLATFORM_LITE_SANDBOX_NETWORK_SOURCE = 'platform-lite-sandbox';
 
 const NETWORK_FIELDS = new Set(['mode', 'attachments']);
-const EFFECTIVE_NETWORK_FIELDS = new Set(['mode', 'attachments', 'source']);
 const ATTACHMENT_FIELDS = new Set(['name', 'primary']);
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
@@ -75,46 +73,6 @@ export function canonicalizeNetwork(value, { path = 'manifest.network' } = {}) {
     return Object.freeze({ mode, attachments: Object.freeze(attachments) });
 }
 
-export function canonicalizeEffectiveNetwork(value, { path = 'network' } = {}) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)
-        || value.source !== PLATFORM_LITE_SANDBOX_NETWORK_SOURCE) {
-        return canonicalizeNetwork(value, { path });
-    }
-    const network = objectAt(value, path);
-    rejectUnknownFields(network, EFFECTIVE_NETWORK_FIELDS, path);
-    if (network.mode !== 'host') {
-        fail(`${path}.mode`, `source '${PLATFORM_LITE_SANDBOX_NETWORK_SOURCE}' requires mode 'host'`);
-    }
-    if (Object.hasOwn(network, 'attachments')) {
-        fail(`${path}.attachments`, `source '${PLATFORM_LITE_SANDBOX_NETWORK_SOURCE}' does not permit attachments`);
-    }
-    return Object.freeze({
-        mode: 'host',
-        source: PLATFORM_LITE_SANDBOX_NETWORK_SOURCE,
-    });
-}
-
-export function deriveHostSandboxNetworkContract(manifest, { path = 'manifest' } = {}) {
-    const source = manifest && typeof manifest === 'object' && !Array.isArray(manifest) ? manifest : {};
-    validateManifestNetworks(source, { path });
-    if (Object.hasOwn(source, 'network')) {
-        fail(`${path}.network`, 'lite-sandbox: true forbids root network declarations; networking is selected by platform policy');
-    }
-    for (const [profileName, profile] of Object.entries(source.profiles || {})) {
-        if (profile && typeof profile === 'object' && !Array.isArray(profile)
-            && Object.hasOwn(profile, 'network')) {
-            fail(
-                `${path}.profiles.${profileName}.network`,
-                'lite-sandbox: true forbids profile network declarations; networking is selected by platform policy',
-            );
-        }
-    }
-    return Object.freeze({
-        mode: 'host',
-        source: PLATFORM_LITE_SANDBOX_NETWORK_SOURCE,
-    });
-}
-
 export function effectiveManifestNetwork(manifest, profileName = 'default', { path = 'manifest' } = {}) {
     const source = manifest && typeof manifest === 'object' && !Array.isArray(manifest) ? manifest : {};
     const root = canonicalizeNetwork(source.network, { path: `${path}.network` });
@@ -151,7 +109,7 @@ export function deriveNetworkAlias(canonicalAgentId, { path = 'agent id' } = {})
 }
 
 export function logicalNetworkAttachments(network, canonicalAgentId, { instanceKey = canonicalAgentId } = {}) {
-    const contract = canonicalizeEffectiveNetwork(network, { path: 'network' });
+    const contract = canonicalizeNetwork(network, { path: 'network' });
     if (contract.mode === 'none' || contract.mode === 'host') return [];
     if (contract.mode === 'default') {
         const instanceHash = crypto.createHash('sha256').update(String(instanceKey)).digest('hex').slice(0, 12);
@@ -161,7 +119,7 @@ export function logicalNetworkAttachments(network, canonicalAgentId, { instanceK
 }
 
 export function networkContractHash(network) {
-    const canonical = canonicalizeEffectiveNetwork(network, { path: 'network' });
+    const canonical = canonicalizeNetwork(network, { path: 'network' });
     return crypto.createHash('sha256').update(JSON.stringify({
         schemaVersion: NETWORK_SCHEMA_VERSION,
         runtimePolicy: 'box-host-gateway-v1',
@@ -187,7 +145,7 @@ function readinessIsNetworkDependent(manifest) {
 }
 
 export function assertNetworkStartupCompatibility(manifest, profileConfig, network, { path = 'manifest' } = {}) {
-    const contract = canonicalizeEffectiveNetwork(network, { path: `${path}.network` });
+    const contract = canonicalizeNetwork(network, { path: `${path}.network` });
     if (contract.mode !== 'none') return contract;
     const executionHasAgentServer = !String(manifest?.start || '').trim()
         || Boolean(String(manifest?.agent || manifest?.commands?.run || '').trim());
@@ -206,15 +164,12 @@ export function assertHostSandboxNetworkCompatibility(network, {
     path = 'manifest.network',
     runtime = 'host sandbox',
 } = {}) {
-    const contract = canonicalizeEffectiveNetwork(network, { path });
+    const contract = canonicalizeNetwork(network, { path });
     if (contract.mode !== 'host') {
         fail(
             path,
-            `${runtime} requires the platform-derived host network contract; effective mode '${contract.mode}' is unsupported`,
+            `${runtime} requires an explicit network.mode 'host'; effective mode '${contract.mode}' is unsupported`,
         );
-    }
-    if (contract.source !== PLATFORM_LITE_SANDBOX_NETWORK_SOURCE) {
-        fail(path, `${runtime} requires network source '${PLATFORM_LITE_SANDBOX_NETWORK_SOURCE}'`);
     }
     return contract;
 }
@@ -222,7 +177,7 @@ export function assertHostSandboxNetworkCompatibility(network, {
 export function preflightNetworkAliases(nodes = []) {
     const scopes = new Map();
     for (const node of nodes) {
-        const network = canonicalizeEffectiveNetwork(node.network, { path: `${node.path || node.agentRef || node.id || 'agent'}.network` });
+        const network = canonicalizeNetwork(node.network, { path: `${node.path || node.agentRef || node.id || 'agent'}.network` });
         const alias = deriveNetworkAlias(node.canonicalAgentId || node.shortAgentName || node.agentId, {
             path: `${node.path || node.agentRef || node.id || 'agent'}.id`,
         });

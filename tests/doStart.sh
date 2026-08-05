@@ -35,7 +35,6 @@ test_info "Workspace start output captured in $test_agent_start_log."
 
 wait_for_router
 wait_for_agent_log_message "$TEST_AGENT_LOG" "listening"
-enable_fast_suite_agents_after_router
 
 require_runtime
 container_pid=$(get_container_pid "$TEST_AGENT_CONT_NAME")

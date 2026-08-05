@@ -6,7 +6,6 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 
 import { signAgentHttpAssertion } from '../../Agent/lib/agentAssertion.mjs';
-import { createContainerAgentCredentialContext } from '../../Agent/lib/agentCredentialContext.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-marketplace-agent-'));
@@ -18,21 +17,12 @@ process.env.PLOINKY_MASTER_KEY = 'm'.repeat(64);
 const suffix = `?test=${Date.now()}`;
 const marketplaceModule = await import(`../../cli/server/authHandlers/marketplaceRoutes.js${suffix}`);
 const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${suffix}`);
-const { installGeneratedRouterRuntime } = await import(`../helpers/generatedRouterRuntime.mjs${suffix}`);
 
 const caller = 'agent:repo/caller';
-const generatedRuntime = installGeneratedRouterRuntime({
-    origin: 'http://127.0.0.1:8080',
-    publicAuthority: '127.0.0.1:8080',
-    tempDir,
-    agentPrincipal: caller,
-});
-const credentialContext = createContainerAgentCredentialContext({
-    ...generatedRuntime.env,
-    PLOINKY_RUNTIME: 'container',
+const agentEnv = {
+    PLOINKY_AGENT_ID: caller,
     PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(caller),
-    PLOINKY_AGENT_PRIVATE_SECRET: 'b'.repeat(64),
-});
+};
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -53,7 +43,7 @@ test('Marketplace verifies an agent-signed enable request and rejects replay', (
         body: rawBody,
         targetAgent: marketplaceModule.MARKETPLACE_AGENT_TARGET,
         tool: marketplaceModule.MARKETPLACE_ENABLE_TOOL,
-        credentialContext,
+        env: agentEnv,
     });
     const req = { headers: { authorization: `Bearer ${token}` } };
     const replayCache = createMemoryReplayCache();
@@ -82,7 +72,7 @@ test('Marketplace assertion is bound to the exact body', () => {
         body: signedBody,
         targetAgent: marketplaceModule.MARKETPLACE_AGENT_TARGET,
         tool: marketplaceModule.MARKETPLACE_ENABLE_TOOL,
-        credentialContext,
+        env: agentEnv,
     });
     assert.throws(() => marketplaceModule.__testables.verifyMarketplaceAgentRequest({
         req: { headers: { authorization: `Bearer ${token}` } },
@@ -100,7 +90,7 @@ test('Marketplace assertion is bound to the exact query', () => {
         query: '',
         targetAgent: marketplaceModule.MARKETPLACE_AGENT_TARGET,
         tool: marketplaceModule.MARKETPLACE_READ_TOOL,
-        credentialContext,
+        env: agentEnv,
     });
     assert.throws(() => marketplaceModule.__testables.verifyMarketplaceAgentRequest({
         req: { headers: { authorization: `Bearer ${token}` } },
@@ -109,15 +99,6 @@ test('Marketplace assertion is bound to the exact query', () => {
         tool: marketplaceModule.MARKETPLACE_READ_TOOL,
         replayCache: createMemoryReplayCache(),
     }), /request hash|rch/i);
-});
-
-test('Marketplace assertion signing rejects a missing credential context', () => {
-    assert.throws(() => signAgentHttpAssertion({
-        method: 'GET',
-        path: marketplaceModule.MARKETPLACE_PATH,
-        targetAgent: marketplaceModule.MARKETPLACE_AGENT_TARGET,
-        tool: marketplaceModule.MARKETPLACE_READ_TOOL,
-    }), (error) => error?.code === 'PLOINKY_AGENT_CREDENTIAL_CONTEXT_REQUIRED');
 });
 
 test('Marketplace rejects agent mutation actions other than enable_agent', async () => {

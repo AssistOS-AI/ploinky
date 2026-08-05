@@ -1,7 +1,6 @@
 import { createMemoryReplayCache } from './jwtVerify.mjs';
 import { verifyRouterRequestToken } from './requestSignedTokens.mjs';
 import { computeRchHttp, sha256RawBodyHash } from './requestHash.mjs';
-import { assertAgentCredentialContext } from './agentCredentialContext.mjs';
 
 const httpRouteReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 const openAiServiceReplayCache = createMemoryReplayCache({ maxSize: 4096 });
@@ -15,10 +14,6 @@ export const OPENAI_CHAT_COMPLETIONS_TOOL = '__openai_chat_completions__';
 export const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 export const OPENAI_MODELS_TOOL = '__openai_models__';
 export const OPENAI_MODELS_PATH = '/v1/models';
-export const MCP_READINESS_PROBE_HEADER = 'x-ploinky-readiness-probe';
-export const MCP_READINESS_PROBE_VALUE = 'v1';
-export const MCP_READINESS_PROBE_TOOL = '__ploinky_readiness__';
-export const MCP_READINESS_PROBE_PATH = '/mcp';
 
 export function readHeaderValue(headers = {}, headerName) {
     const unwrap = (value) => {
@@ -37,27 +32,23 @@ export function hasInvocationTokenHeader(headers = {}) {
     return auth.toLowerCase().startsWith('bearer ');
 }
 
-function activeVerificationCredentials(credentialContext) {
-    const context = assertAgentCredentialContext(credentialContext);
-    context.assertActive();
-    const encodedSecret = context.getAgentSecret();
-    if (!/^[a-f0-9]{64}$/.test(encodedSecret)) {
-        throw new Error('agent credential context contains an invalid request secret');
-    }
-    return {
-        audience: context.identity.principalId,
-        secret: Buffer.from(encodedSecret, 'hex'),
-    };
+export function expectedAudienceForSelf(env = process.env) {
+    // The agent's own canonical id is the audience the router must target.
+    const id = String(env?.PLOINKY_AGENT_ID || '').trim();
+    if (id) return id;
+    const principal = String(env?.PLOINKY_AGENT_PRINCIPAL || '').trim();
+    if (principal) return principal;
+    const agentName = String(env?.AGENT_NAME || '').trim();
+    return agentName ? `agent:${agentName}` : '';
 }
 
-function inactiveCredentialContextResult(credentialContext) {
-    try {
-        const context = assertAgentCredentialContext(credentialContext);
-        context.assertActive();
-        return null;
-    } catch (err) {
-        return { ok: false, reason: err?.message || String(err) };
-    }
+export function readAgentSecret(env = process.env) {
+    // Agents only ever hold their OWN per-agent secret (PLOINKY_AGENT_SECRET,
+    // hex). There is intentionally no fallback to the master or a shared key:
+    // that would let one agent forge Router Request tokens for another agent and
+    // defeat per-agent isolation (DS013).
+    const hex = String(env?.PLOINKY_AGENT_SECRET || '').trim();
+    return hex ? Buffer.from(hex, 'hex') : null;
 }
 
 export const hashHttpRouteBody = sha256RawBodyHash;
@@ -84,19 +75,13 @@ export function parseHttpRouteAuthInfo(headers = {}) {
 // whose type, audience, method, path, tool, or `rch` does not match — even when
 // the HMAC itself is valid.
 export function verifyRouterRequestFromHeaders(headers = {}, {
-    credentialContext,
+    env = process.env,
     replayCache,
     method,
     path,
     tool,
     rch,
 } = {}) {
-    let credentials;
-    try {
-        credentials = activeVerificationCredentials(credentialContext);
-    } catch (err) {
-        return { ok: false, reason: err?.message || String(err) };
-    }
     const auth = readHeaderValue(headers, 'authorization');
     if (!auth.toLowerCase().startsWith('bearer ')) {
         return { ok: false, reason: 'missing router-request token' };
@@ -105,10 +90,18 @@ export function verifyRouterRequestFromHeaders(headers = {}, {
     if (!rawToken) {
         return { ok: false, reason: 'empty router-request token' };
     }
+    const secret = readAgentSecret(env);
+    if (!secret) {
+        return { ok: false, reason: 'PLOINKY_AGENT_SECRET not configured' };
+    }
+    const audience = expectedAudienceForSelf(env);
+    if (!audience) {
+        return { ok: false, reason: 'PLOINKY_AGENT_ID not configured' };
+    }
     try {
         const { payload } = verifyRouterRequestToken(rawToken, {
-            secret: credentials.secret,
-            expectedAudience: credentials.audience,
+            secret,
+            expectedAudience: audience,
             method,
             path,
             tool,
@@ -126,7 +119,7 @@ export function verifyRouterRequestFromHeaders(headers = {}, {
 // the signed invocation body to the actual HTTP surface and body bytes before
 // trusting the forwarded identity.
 export function verifyHttpRouteAuthInfoFromHeaders(headers = {}, {
-    credentialContext,
+    env = process.env,
     replayCache,
     method,
     path,
@@ -134,8 +127,6 @@ export function verifyHttpRouteAuthInfoFromHeaders(headers = {}, {
     body = Buffer.alloc(0),
     bodyHash,
 } = {}) {
-    const inactiveContext = inactiveCredentialContextResult(credentialContext);
-    if (inactiveContext) return inactiveContext;
     const parsed = parseHttpRouteAuthInfo(headers);
     if (!parsed.ok) {
         return parsed;
@@ -183,7 +174,7 @@ export function verifyHttpRouteAuthInfoFromHeaders(headers = {}, {
     const verified = verifyRouterRequestFromHeaders(
         { authorization: `Bearer ${rawToken}` },
         {
-            credentialContext,
+            env,
             replayCache: replayCache || httpRouteReplayCache,
             method: expectedMethod,
             path: expectedPath,
@@ -215,13 +206,11 @@ export function verifyHttpRouteAuthInfoFromHeaders(headers = {}, {
 // for any other surface (a different path, the `__http_route__` tool, an MCP
 // call) is rejected even when its HMAC is valid.
 export function verifyOpenAiServiceAuthInfoFromHeaders(headers = {}, {
-    credentialContext,
+    env = process.env,
     replayCache,
     body = Buffer.alloc(0),
     bodyHash,
 } = {}) {
-    const inactiveContext = inactiveCredentialContextResult(credentialContext);
-    if (inactiveContext) return inactiveContext;
     const parsed = parseHttpRouteAuthInfo(headers);
     if (!parsed.ok) {
         return parsed;
@@ -243,7 +232,7 @@ export function verifyOpenAiServiceAuthInfoFromHeaders(headers = {}, {
     const verified = verifyRouterRequestFromHeaders(
         { authorization: `Bearer ${rawToken}` },
         {
-            credentialContext,
+            env,
             replayCache: replayCache || openAiServiceReplayCache,
             method: expectedMethod,
             path: expectedPath,
@@ -270,11 +259,9 @@ export function verifyOpenAiServiceAuthInfoFromHeaders(headers = {}, {
 // models-list call. This mirrors the chat-completions verifier but binds the
 // token to the GET /v1/models surface with an empty body and query.
 export function verifyOpenAiModelsAuthInfoFromHeaders(headers = {}, {
-    credentialContext,
+    env = process.env,
     replayCache,
 } = {}) {
-    const inactiveContext = inactiveCredentialContextResult(credentialContext);
-    if (inactiveContext) return inactiveContext;
     const parsed = parseHttpRouteAuthInfo(headers);
     if (!parsed.ok) {
         return parsed;
@@ -294,7 +281,7 @@ export function verifyOpenAiModelsAuthInfoFromHeaders(headers = {}, {
     const verified = verifyRouterRequestFromHeaders(
         { authorization: `Bearer ${rawToken}` },
         {
-            credentialContext,
+            env,
             replayCache: replayCache || openAiModelsReplayCache,
             method: expectedMethod,
             path: expectedPath,
@@ -320,6 +307,8 @@ export function verifyOpenAiModelsAuthInfoFromHeaders(headers = {}, {
 export default {
     readHeaderValue,
     hasInvocationTokenHeader,
+    expectedAudienceForSelf,
+    readAgentSecret,
     sha256RawBodyHash,
     hashHttpRouteBody,
     parseHttpRouteAuthInfo,

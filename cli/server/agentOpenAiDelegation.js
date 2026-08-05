@@ -257,7 +257,7 @@ function sendJson(res, statusCode, body) {
  */
 export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentProxyPath, {
     replayCache = assertionReplayCache,
-    dialContext = null,
+    beforeDial = null,
 } = {}) {
     if (!route || !route.hostPort) {
         sendJson(res, 404, { error: 'agent_not_found', agent: routeKey });
@@ -295,7 +295,7 @@ export function handleDelegatedAgentOpenAiCall(req, res, route, routeKey, agentP
             proxyHttpBuffered(req, res, route.hostPort, agentProxyPath, body, {
                 ...result.authInfoHeader,
                 [AGENTIC_DEPTH_HEADER]: String(readAgenticDepth(req.headers) + 1),
-            }, { dialContext });
+            }, { beforeDial });
         },
         onTooLarge: ({ limitBytes }) => {
             const surface = resolveOpenAiSurface(req.method, agentProxyPath) || OPENAI_SURFACES.chat;

@@ -6,8 +6,6 @@ export const PATH_HASH_LABEL =
     'io.assistos.ploinky.path-hash';
 export const VOLUME_ROLE_LABEL =
     'io.assistos.ploinky.volume-role';
-export const PLOINKY_SOURCE_SHA_LABEL =
-    'io.assistos.ploinky.source-sha';
 export const BOX_ROUTER_PORT = 8080;
 export const BOX_MEDIA_PORT = 7882;
 
@@ -19,6 +17,7 @@ export const REQUIRED_IMAGE_ENV = Object.freeze({
     USER: 'podman',
     HOME: '/home/podman',
     PLOINKY_WORKSPACE_ROOT: '/workspace',
+    PLOINKY_DISABLE_HOST_SANDBOX: '1',
     container: 'oci',
     _CONTAINERS_USERNS_CONFIGURED: '',
     BUILDAH_ISOLATION: 'chroot',
@@ -150,19 +149,14 @@ export function validateImageContract(image, imageRef) {
     if (!String(image.id || '').trim()) {
         contractFailure(imageRef, 'image ID', 'a non-empty local image ID', image.id);
     }
-    const labelKeys = isObjectRecord(image.labels) ? Object.keys(image.labels) : [];
-    const sourceSha = labelKeys.length === 1 && labelKeys[0] === PLOINKY_SOURCE_SHA_LABEL
-        ? String(image.labels[PLOINKY_SOURCE_SHA_LABEL] ?? '')
-        : '';
-    if (!/^[0-9a-f]{40}$/.test(sourceSha)) {
+    if (!isObjectRecord(image.labels) || Object.keys(image.labels).length !== 0) {
         contractFailure(
             imageRef,
             'Config.Labels',
-            `exactly ${PLOINKY_SOURCE_SHA_LABEL}=<40 lowercase hexadecimal Ploinky commit>`,
+            'absent or empty',
             image.labels,
         );
     }
-    image.sourceSha = sourceSha;
     if (image.user !== REQUIRED_IMAGE_USER) {
         contractFailure(imageRef, 'Config.User', JSON.stringify(REQUIRED_IMAGE_USER), image.user);
     }

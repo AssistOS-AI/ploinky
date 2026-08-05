@@ -362,7 +362,7 @@ export function startCloudflarePublicationRuntime({
             try {
                 const selected = loadActive({ workspaceRoot });
                 if (selected.selector.activationId !== activationId) {
-                    launchBackgroundScan('retry-selection-changed');
+                    void scan();
                     return;
                 }
             } catch (error) {
@@ -416,7 +416,7 @@ export function startCloudflarePublicationRuntime({
             } finally {
                 inFlight = null;
                 releasePublicationLease(workspaceLease);
-                if (superseded && !stopped) launchBackgroundScan('retry-superseded');
+                if (superseded && !stopped) void scan();
             }
         }, delayMs);
         retry.timer.unref?.();
@@ -505,24 +505,9 @@ export function startCloudflarePublicationRuntime({
         }
     }
 
-    function launchBackgroundScan(trigger) {
-        void scan().catch((error) => {
-            try {
-                audit('cloudflare-publication-scan-error', {
-                    code: error?.code || 'CLOUDFLARE_PUBLICATION_SCAN_FAILED',
-                    message: String(error?.message || error).slice(0, 1024),
-                    trigger,
-                });
-            } catch (_) {}
-        });
-    }
-
-    const timer = setInterval(
-        () => { launchBackgroundScan('poll'); },
-        Math.max(100, Number(pollIntervalMs) || 500),
-    );
+    const timer = setInterval(() => { void scan(); }, Math.max(100, Number(pollIntervalMs) || 500));
     timer.unref?.();
-    launchBackgroundScan('startup');
+    void scan();
     return Object.freeze({
         getStatus: () => controller.getStatus(),
         scan,

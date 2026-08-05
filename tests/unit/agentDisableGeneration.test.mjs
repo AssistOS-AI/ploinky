@@ -36,8 +36,6 @@ function lifecycleHarness({
     initialRouting,
     failRemoval = false,
     failApply = false,
-    failAbort = false,
-    activePreparedSelector = false,
 } = {}) {
     let registry = structuredClone(initialRegistry);
     let routing = structuredClone(initialRouting);
@@ -74,10 +72,7 @@ function lifecycleHarness({
         prepareGeneration() {
             events.push('prepare');
             snapshots.push({ registry: structuredClone(registry), routing: structuredClone(routing) });
-            return {
-                selector: { state: activePreparedSelector ? 'active' : 'inactive' },
-                preparationLease: lease,
-            };
+            return { selector: { state: 'inactive' }, preparationLease: lease };
         },
         applyGeneration(options) {
             events.push('apply');
@@ -88,7 +83,6 @@ function lifecycleHarness({
         abortPreparation(received) {
             events.push('abort');
             assert.equal(received, lease);
-            if (failAbort) throw new Error('durable disable abort failed');
         },
         isSandboxRuntimeImpl() {
             return false;
@@ -189,92 +183,6 @@ test('runtime removal failure leaves the exact removal sources inactive and neve
     );
 });
 
-test('runtime removal abort failure preserves the exact preparation and propagates recovery evidence', () => {
-    const harness = lifecycleHarness({
-        initialRegistry: { old_container: agentRecord('old') },
-        initialRouting: {
-            port: 8080,
-            routes: {
-                old: { container: 'old_container', repo: 'demo', agent: 'old', hostPort: 32500 },
-            },
-        },
-        failRemoval: true,
-        failAbort: true,
-    });
-
-    assert.throws(
-        () => agents.disableAgent('old_container', harness.dependencies),
-        (error) => (
-            error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-            && error.cause?.message === 'durable disable abort failed'
-            && /engine refused removal/.test(error.originalFailure?.message)
-            && Object.isFrozen(error.ploinkyRecoveryPreparation)
-            && error.ploinkyRecoveryPreparation?.preparationLease?.transactionId === 'disable-lease'
-            && error.ploinkyRecoveryPreparation?.preparationAbortFailed === true
-            && error.ploinkyRecoveryPreparation?.preparationAbortedBeforeCleanup === false
-        ),
-    );
-    assert.equal(harness.events.filter((event) => event === 'abort').length, 1);
-    assert.equal(harness.events.includes('apply'), false);
-    assert.equal(harness.events.at(-1), 'abort');
-});
-
-test('invalid active prepared selector aborts its exact lease before runtime removal or apply', () => {
-    const harness = lifecycleHarness({
-        initialRegistry: { old_container: agentRecord('old') },
-        initialRouting: {
-            port: 8080,
-            routes: {
-                old: { container: 'old_container', repo: 'demo', agent: 'old', hostPort: 32700 },
-            },
-        },
-        activePreparedSelector: true,
-    });
-
-    assert.throws(
-        () => agents.disableAgent('old_container', harness.dependencies),
-        /prepared route-removal generation did not remain inactive/,
-    );
-    assert.equal(harness.events.filter((event) => event === 'abort').length, 1);
-    assert.equal(harness.events.some((event) => event.startsWith('remove:')), false);
-    assert.equal(harness.events.includes('apply'), false);
-    assert.deepEqual(harness.events.slice(-2), ['prepare', 'abort']);
-});
-
-test('invalid active prepared selector abort failure preserves its exact preparation evidence', () => {
-    const harness = lifecycleHarness({
-        initialRegistry: { old_container: agentRecord('old') },
-        initialRouting: {
-            port: 8080,
-            routes: {
-                old: { container: 'old_container', repo: 'demo', agent: 'old', hostPort: 32800 },
-            },
-        },
-        activePreparedSelector: true,
-        failAbort: true,
-    });
-
-    assert.throws(
-        () => agents.disableAgent('old_container', harness.dependencies),
-        (error) => (
-            error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-            && error.cause?.message === 'durable disable abort failed'
-            && /prepared route-removal generation did not remain inactive/.test(
-                error.originalFailure?.message,
-            )
-            && Object.isFrozen(error.ploinkyRecoveryPreparation)
-            && error.ploinkyRecoveryPreparation?.preparationLease?.transactionId === 'disable-lease'
-            && error.ploinkyRecoveryPreparation?.reason === 'agent-disable-prepare-invalid'
-            && error.ploinkyRecoveryPreparation?.preparationAbortFailed === true
-            && error.ploinkyRecoveryPreparation?.preparationAbortedBeforeCleanup === false
-        ),
-    );
-    assert.equal(harness.events.filter((event) => event === 'abort').length, 1);
-    assert.equal(harness.events.some((event) => event.startsWith('remove:')), false);
-    assert.equal(harness.events.includes('apply'), false);
-    assert.equal(harness.events.at(-1), 'abort');
-});
-
 test('selector commit failure after removal remains inactive and releases the exact preparation lease', () => {
     const harness = lifecycleHarness({
         initialRegistry: { old_container: agentRecord('old') },
@@ -299,33 +207,6 @@ test('selector commit failure after removal remains inactive and releases the ex
         harness.events.some((event) => event === 'inactive:agent-disable-commit-failed'),
         true,
     );
-});
-
-test('selector commit abort failure is not downgraded to the selector error or retried', () => {
-    const harness = lifecycleHarness({
-        initialRegistry: { old_container: agentRecord('old') },
-        initialRouting: {
-            port: 8080,
-            routes: {
-                old: { container: 'old_container', repo: 'demo', agent: 'old', hostPort: 33500 },
-            },
-        },
-        failApply: true,
-        failAbort: true,
-    });
-
-    assert.throws(
-        () => agents.disableAgent('old_container', harness.dependencies),
-        (error) => (
-            error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-            && error.cause?.message === 'durable disable abort failed'
-            && error.originalFailure?.message === 'selector commit failed'
-            && Object.isFrozen(error.ploinkyRecoveryPreparation)
-            && error.ploinkyRecoveryPreparation?.reason === 'agent-disable-commit-failed'
-        ),
-    );
-    assert.equal(harness.events.filter((event) => event === 'abort').length, 1);
-    assert.equal(harness.events.at(-1), 'abort');
 });
 
 test('batch disable stages every exact route removal before one physical batch removal', () => {

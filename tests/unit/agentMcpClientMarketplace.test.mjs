@@ -5,8 +5,6 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
-import { createContainerAgentCredentialContext } from '../../Agent/lib/agentCredentialContext.mjs';
-
 test('AgentMcpClient signs Marketplace reads and leaves enable mode caller-controlled', async () => {
     const originalCwd = process.cwd();
     const originalEnvironment = { ...process.env };
@@ -14,11 +12,10 @@ test('AgentMcpClient signs Marketplace reads and leaves enable mode caller-contr
     process.chdir(tempDir);
     process.env.PLOINKY_MASTER_KEY = 'd'.repeat(64);
     process.env.PLOINKY_AGENT_ID = 'agent:repo/caller';
-    process.env.PLOINKY_AGENT_SECRET = 'a'.repeat(64);
+    process.env.PLOINKY_AGENT_SECRET = 'caller-secret';
 
     const { installGeneratedRouterRuntime } = await import('../helpers/generatedRouterRuntime.mjs');
     const { createAgentClient } = await import('../../Agent/client/AgentMcpClient.mjs');
-    const { loadVerifiedGeneratedRouterDescriptor } = await import('../../Agent/client/generatedRouterDescriptor.mjs');
     const requests = [];
     let running = false;
     const server = http.createServer((req, res) => {
@@ -45,19 +42,12 @@ test('AgentMcpClient signs Marketplace reads and leaves enable mode caller-contr
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     try {
         const { port } = server.address();
-        const runtime = installGeneratedRouterRuntime({
+        installGeneratedRouterRuntime({
             origin: `http://127.0.0.1:${port}`,
             tempDir,
             agentPrincipal: 'agent:repo/caller',
         });
-        const credentialContext = createContainerAgentCredentialContext({
-            ...runtime.env,
-            PLOINKY_RUNTIME: 'container',
-            PLOINKY_AGENT_SECRET: 'a'.repeat(64),
-            PLOINKY_AGENT_PRIVATE_SECRET: 'b'.repeat(64),
-        });
-        const descriptor = loadVerifiedGeneratedRouterDescriptor({ env: runtime.env });
-        const client = await createAgentClient('worker', { credentialContext, descriptor });
+        const client = await createAgentClient('worker');
         const status = await client.ensureAgentRunning('repo/worker');
         assert.equal(status.running, true);
         await client.ensureAgentRunning('repo/worker');
@@ -93,11 +83,10 @@ test('AgentMcpClient preserves safe Marketplace lifecycle code, status, and caus
     process.chdir(tempDir);
     process.env.PLOINKY_MASTER_KEY = 'e'.repeat(64);
     process.env.PLOINKY_AGENT_ID = 'agent:repo/caller';
-    process.env.PLOINKY_AGENT_SECRET = 'a'.repeat(64);
+    process.env.PLOINKY_AGENT_SECRET = 'caller-secret';
 
     const { installGeneratedRouterRuntime } = await import('../helpers/generatedRouterRuntime.mjs');
     const { createAgentClient } = await import(`../../Agent/client/AgentMcpClient.mjs?error=${Date.now()}`);
-    const { loadVerifiedGeneratedRouterDescriptor } = await import('../../Agent/client/generatedRouterDescriptor.mjs');
     let requests = 0;
     const server = http.createServer((req, res) => {
         requests += 1;
@@ -117,19 +106,12 @@ test('AgentMcpClient preserves safe Marketplace lifecycle code, status, and caus
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     try {
-        const runtime = installGeneratedRouterRuntime({
+        installGeneratedRouterRuntime({
             origin: `http://127.0.0.1:${server.address().port}`,
             tempDir,
             agentPrincipal: 'agent:repo/caller',
         });
-        const credentialContext = createContainerAgentCredentialContext({
-            ...runtime.env,
-            PLOINKY_RUNTIME: 'container',
-            PLOINKY_AGENT_SECRET: 'a'.repeat(64),
-            PLOINKY_AGENT_PRIVATE_SECRET: 'b'.repeat(64),
-        });
-        const descriptor = loadVerifiedGeneratedRouterDescriptor({ env: runtime.env });
-        const client = await createAgentClient('worker', { credentialContext, descriptor });
+        const client = await createAgentClient('worker');
         await assert.rejects(
             () => client.ensureAgentRunning('repo/worker'),
             (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED'

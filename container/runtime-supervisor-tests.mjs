@@ -121,9 +121,7 @@ function capturedArgv(capture) {
 test('compatible image normalizes and validates every required metadata field', () => {
     const normalized = normalizeImageInspect(JSON.stringify([compatibleImage()]));
     assert.equal(normalized.id, 'sha256:runtime-current');
-    assert.deepEqual(normalized.labels, {
-        'io.assistos.ploinky.source-sha': '0123456789abcdef0123456789abcdef01234567',
-    });
+    assert.deepEqual(normalized.labels, {});
     assert.deepEqual(normalized.env, REQUIRED_IMAGE_ENV);
     assert.equal(validateImageContract(normalized, REQUIRED_RUNTIME_IMAGE), normalized);
 });
@@ -133,10 +131,6 @@ test('image configuration validation emits field-specific failures', async t => 
         ['image ID', raw => { raw.Id = ''; }, /image ID/],
         ['unexpected label', raw => { raw.Config.Labels.unexpected = 'present'; }, /Config\.Labels/],
         ['malformed labels', raw => { raw.Config.Labels = []; }, /Config\.Labels/],
-        ['missing source label', raw => { raw.Config.Labels = {}; }, /Config\.Labels/],
-        ['invalid source label', raw => {
-            raw.Config.Labels['io.assistos.ploinky.source-sha'] = 'main';
-        }, /Config\.Labels/],
         ['user', raw => { raw.Config.User = 'root'; }, /Config\.User/],
         ['required env missing', raw => {
             raw.Config.Env = raw.Config.Env.filter(value => !value.startsWith('HOME='));

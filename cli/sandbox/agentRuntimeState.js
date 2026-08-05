@@ -1,8 +1,4 @@
-import {
-    isSandboxOwnerRunning,
-    readServiceOwner,
-    serviceOwnerKey,
-} from './bwrap/bwrapFleet.js';
+import { getBwrapPid, isBwrapProcessRunning } from './bwrap/bwrapFleet.js';
 import { collectLiveAgentContainers, getAgentsRegistry } from './docker/containerRegistry.js';
 
 const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
@@ -31,36 +27,6 @@ function stoppedRuntimeEntry(containerName, record, runtime) {
     };
 }
 
-function registryRuntimeIdentity(record) {
-    const instanceId = typeof record?.instanceId === 'string' ? record.instanceId : '';
-    const enableGeneration = typeof record?.enableGeneration === 'string'
-        ? record.enableGeneration
-        : '';
-    if (!instanceId
-        || !enableGeneration
-        || instanceId !== instanceId.trim()
-        || enableGeneration !== enableGeneration.trim()) {
-        return null;
-    }
-    return Object.freeze({ instanceId, enableGeneration });
-}
-
-function hostRuntimeOwnership(containerName, record, owner) {
-    return {
-        role: 'service',
-        runtimeKey: containerName,
-        ownerKey: owner?.ownerKey || serviceOwnerKey(containerName),
-        instanceId: owner?.instanceId || String(record?.instanceId || ''),
-        enableGeneration: owner?.enableGeneration || String(record?.enableGeneration || ''),
-        homeKey: owner?.homeKey || String(record?.homeKey || containerName),
-        workdir: owner?.workdir || String(record?.workdir || record?.projectPath || '-'),
-        logPath: owner?.logPath || String(record?.logPath || '-'),
-        taskId: '',
-        provider: '',
-        processIdentity: owner?.processIdentity || '',
-    };
-}
-
 /**
  * Return one backend-neutral state record for every enabled agent runtime and
  * retain any live OCI runtime that no longer has a registry record.
@@ -70,8 +36,8 @@ function collectAgentRuntimeStates(options = {}) {
     const liveContainers = Object.hasOwn(options, 'liveContainers')
         ? (options.liveContainers || [])
         : (options.collectContainers || collectLiveAgentContainers)() || [];
-    const readSandboxServiceOwner = options.readSandboxServiceOwner || readServiceOwner;
-    const sandboxOwnerRunning = options.isSandboxOwnerRunning || isSandboxOwnerRunning;
+    const sandboxRunning = options.isSandboxRunning || isBwrapProcessRunning;
+    const sandboxPid = options.getSandboxPid || getBwrapPid;
     const containersByName = new Map(liveContainers.map((entry) => [String(entry?.containerName || ''), entry]));
     const matchedContainers = new Set();
     const states = [];
@@ -82,24 +48,14 @@ function collectAgentRuntimeStates(options = {}) {
         const runtime = normalizeRuntime(record);
 
         if (HOST_SANDBOX_RUNTIMES.has(runtime)) {
-            const owner = readSandboxServiceOwner(containerName);
-            const runtimeIdentity = registryRuntimeIdentity(record);
-            const identityMatches = Boolean(owner
-                && runtimeIdentity
-                && owner.instanceId === runtimeIdentity.instanceId
-                && owner.enableGeneration === runtimeIdentity.enableGeneration);
-            const running = identityMatches && Boolean(sandboxOwnerRunning(owner.ownerKey, {
-                ...runtimeIdentity,
-                role: 'service',
-                runtimeKey: containerName,
-            }));
+            const running = Boolean(sandboxRunning(record.agentName));
+            const pid = running ? Number(sandboxPid(record.agentName) || record.pid || 0) : 0;
             states.push({
                 ...stoppedRuntimeEntry(containerName, record, runtime),
-                ...hostRuntimeOwnership(containerName, record, owner),
                 state: {
                     status: running ? 'running' : 'stopped',
                     running,
-                    pid: running ? owner.pid : 0,
+                    pid,
                 },
             });
             continue;

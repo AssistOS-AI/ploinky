@@ -1,9 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import net from 'net';
-import http from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import * as utils from '../utils/utils.js';
 import * as agentsSvc from '../utils/agents.js';
@@ -39,11 +38,10 @@ import {
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
-import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+import { createWorkspaceStartLock, releaseWorkspaceStartLock, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import {
   AGENTS_DATA_DIR,
   LOGS_DIR,
-  PLOINKY_DIR,
   PLOINKY_CWD,
   PLOINKY_WORKSPACE_ROOT,
   REPOS_DIR,
@@ -93,14 +91,6 @@ import {
   resolvePersistedRouterPort,
   resolveRouterEndpoint,
 } from '../sandbox/routerPort.js';
-import {
-  createRouterProcessRecord,
-  killRouterIfRunning as stopManagedRouter,
-  publishPreparedRouterProcessRecord,
-  requireRouterStopCompleted,
-  terminateExactRouterProcess,
-  terminateRouterProcessRecordIfExact,
-} from './sessionControl.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -218,257 +208,14 @@ function spawnWatchdog(routerPath, port, routerPidFile) {
   return child;
 }
 
-function childHasExited(child) {
-  return (child?.exitCode !== null && child?.exitCode !== undefined)
-    || (child?.signalCode !== null && child?.signalCode !== undefined);
-}
-
-async function acquireSpawnedRouterProcessRecord(child, {
-  workspaceRoot = PLOINKY_WORKSPACE_ROOT,
-  timeoutMs = 2000,
-  retryMs = 20,
-  createRecord = createRouterProcessRecord,
-  now = Date.now,
-  delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-} = {}) {
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0
-      || !Number.isSafeInteger(retryMs) || retryMs < 1) {
-    throw new Error('Router owner identity acquisition bounds are invalid');
-  }
-  const deadline = now() + timeoutMs;
-  let lastIdentityError = null;
-  while (true) {
-    if (childHasExited(child)) {
-      const error = new Error(
-        `Watchdog exited before its exact Router owner identity was acquired (${child.exitCode ?? child.signalCode})`,
-      );
-      error.code = 'PLOINKY_ROUTER_OWNER_LAUNCH_EXITED';
-      throw error;
-    }
-    try {
-      return createRecord(child.pid, workspaceRoot);
-    } catch (error) {
-      if (error?.code !== 'PLOINKY_ROUTER_OWNER_IDENTITY_UNVERIFIED') throw error;
-      lastIdentityError = error;
-    }
-    const remaining = deadline - now();
-    if (remaining <= 0) break;
-    await delay(Math.min(retryMs, remaining));
-  }
-  const error = new Error(
-    `Watchdog pid ${child.pid} did not acquire an exact Router owner identity within ${timeoutMs}ms`,
-    { cause: lastIdentityError },
-  );
-  error.code = 'PLOINKY_ROUTER_OWNER_IDENTITY_TIMEOUT';
-  throw error;
-}
-
-async function waitForSpawnedChildExit(child, timeoutMs, {
-  now = Date.now,
-  delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-} = {}) {
-  const deadline = now() + timeoutMs;
-  while (!childHasExited(child) && now() < deadline) {
-    await delay(Math.min(20, Math.max(1, deadline - now())));
-  }
-  return childHasExited(child);
-}
-
-async function terminateSpawnedWatchdogHandle(child, {
-  timeoutMs = 1000,
-  killTimeoutMs = 1000,
-  ...waitDependencies
-} = {}) {
-  if (childHasExited(child)) return Object.freeze({ stopped: true, signal: null });
-  let termSent = false;
-  try { termSent = child.kill('SIGTERM') !== false; } catch (_) { }
-  if (termSent && await waitForSpawnedChildExit(child, timeoutMs, waitDependencies)) {
-    return Object.freeze({ stopped: true, signal: 'SIGTERM' });
-  }
-  if (childHasExited(child)) return Object.freeze({ stopped: true, signal: 'SIGTERM' });
-  let killSent = false;
-  try { killSent = child.kill('SIGKILL') !== false; } catch (_) { }
-  if (killSent && await waitForSpawnedChildExit(child, killTimeoutMs, waitDependencies)) {
-    return Object.freeze({ stopped: true, signal: 'SIGKILL' });
-  }
-  return Object.freeze({ stopped: false, reason: 'spawn-handle-kill-timeout' });
-}
-
-function routerLaunchCleanupError(label, originalFailure, cleanupFailure) {
-  const cleanupDetail = cleanupFailure?.message
-    || cleanupFailure?.reason
-    || String(cleanupFailure || 'unknown cleanup failure');
-  const error = new Error(
-    `${label}: exact Watchdog launch cleanup failed after '${originalFailure?.message || originalFailure}': ${cleanupDetail}`,
-    { cause: cleanupFailure instanceof Error ? cleanupFailure : originalFailure },
-  );
-  error.code = 'PLOINKY_ROUTER_LAUNCH_CLEANUP_FAILED';
-  Object.defineProperty(error, 'originalFailure', {
-    configurable: false,
-    enumerable: false,
-    writable: false,
-    value: originalFailure,
-  });
-  return error;
-}
-
-function exactRouterCleanupSucceeded(result) {
-  return result?.stopped === true
-    || result?.reason === 'stale-process'
-    || result?.reason === 'stale-record';
-}
-
-async function launchManagedWatchdog({
-  routerPath,
-  port,
-  routerPidFile,
-  label,
-}, {
-  spawnWatchdogImpl = spawnWatchdog,
-  acquireRecord = acquireSpawnedRouterProcessRecord,
-  publishRecord = publishPreparedRouterProcessRecord,
-  terminateExact = terminateExactRouterProcess,
-  terminateRecorded = terminateRouterProcessRecordIfExact,
-  waitForReady = waitForRouterReady,
-  workspaceRoot = PLOINKY_WORKSPACE_ROOT,
-} = {}) {
-  const child = spawnWatchdogImpl(routerPath, port, routerPidFile);
-  let record = null;
-  let published = false;
-  try {
-    record = await acquireRecord(child, { workspaceRoot });
-    publishRecord(routerPidFile, record, workspaceRoot);
-    published = true;
-    child.unref();
-    try {
-      await waitForReady(port, child);
-    } catch (readinessError) {
-      let cleanupResult;
-      try {
-        cleanupResult = terminateRecorded(routerPidFile, workspaceRoot, record);
-      } catch (cleanupError) {
-        throw routerLaunchCleanupError(label, readinessError, cleanupError);
-      }
-      if (!exactRouterCleanupSucceeded(cleanupResult)) {
-        throw routerLaunchCleanupError(label, readinessError, cleanupResult);
-      }
-      throw readinessError;
-    }
-    return Object.freeze({ child, record });
-  } catch (launchError) {
-    if (published) throw launchError;
-    let cleanupResult;
-    try {
-      if (record) {
-        try {
-          cleanupResult = terminateExact(record);
-        } catch (_) {
-          cleanupResult = await terminateSpawnedWatchdogHandle(child);
-        }
-        if (!exactRouterCleanupSucceeded(cleanupResult)) {
-          cleanupResult = await terminateSpawnedWatchdogHandle(child);
-        }
-      } else {
-        cleanupResult = await terminateSpawnedWatchdogHandle(child);
-      }
-    } catch (cleanupError) {
-      throw routerLaunchCleanupError(label, launchError, cleanupError);
-    }
-    if (!exactRouterCleanupSucceeded(cleanupResult)) {
-      throw routerLaunchCleanupError(label, launchError, cleanupResult);
-    }
-    throw launchError;
-  }
-}
-
-function requireRouterReplacementStopped(result, label) {
-  try {
-    return requireRouterStopCompleted(result, label);
-  } catch (cause) {
-    const error = new Error(
-      `${label}: refusing to launch a replacement Watchdog because exact Router ownership cleanup did not complete (${result?.reason || 'invalid-result'})`,
-      { cause },
-    );
-    error.code = 'PLOINKY_ROUTER_REPLACEMENT_REFUSED';
-    throw error;
-  }
-}
-
-function stopRouterForReplacement(killRouterIfRunningImpl, label) {
-  if (typeof killRouterIfRunningImpl !== 'function') {
-    throw new Error(`${label}: exact Router ownership cleanup is unavailable`);
-  }
-  return requireRouterReplacementStopped(killRouterIfRunningImpl(), label);
-}
-
-async function probeRouterHealthSocket(socketPath, { timeoutMs = 250 } = {}) {
-  let socketStat;
-  try {
-    socketStat = fs.lstatSync(socketPath);
-  } catch (_) {
-    return false;
-  }
-  if (!socketStat.isSocket()) return false;
-  if (typeof process.getuid === 'function' && socketStat.uid !== process.getuid()) return false;
-  if ((socketStat.mode & 0o777) !== 0o600) return false;
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let body = '';
-    let request;
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    const timer = setTimeout(() => {
-      request?.destroy();
-      finish(false);
-    }, timeoutMs);
-    request = http.get({
-      socketPath,
-      path: '/health',
-      method: 'GET',
-      headers: { Connection: 'close' },
-    }, (response) => {
-      response.setEncoding('utf8');
-      response.on('data', (chunk) => {
-        body += chunk;
-        if (body.length > 16 * 1024) request.destroy();
-      });
-      response.on('end', () => {
-        try {
-          const health = JSON.parse(body);
-          finish(
-            response.statusCode === 200
-            && health?.status === 'healthy'
-            && Number.isSafeInteger(health?.pid)
-            && health.pid > 0,
-          );
-        } catch (_) {
-          finish(false);
-        }
-      });
-    });
-    request.once('error', () => finish(false));
-  });
-}
-
 async function waitForRouterReady(port, child, timeoutMs = 15000, {
   createConnection = net.createConnection,
-  healthSocketPath = process.env.PLOINKY_ROUTER_HEALTH_SOCKET
-    || path.join(PLOINKY_DIR, 'run', 'router-health.sock'),
-  probeHealthSocket = probeRouterHealthSocket,
 } = {}) {
   const validatedPort = parseRouterPort(port, { source: 'router readiness port' });
   const deadline = Date.now() + timeoutMs;
-  let observedTcpListener = false;
   while (Date.now() < deadline) {
     if (child?.exitCode !== null && child?.exitCode !== undefined) {
-      const error = new Error(`router exited before exact workspace readiness (exit ${child.exitCode})`);
-      error.code = 'PLOINKY_ROUTER_NOT_READY';
-      throw error;
+      throw new Error(`router exited before TCP listener became ready (exit ${child.exitCode})`);
     }
     const tcpReady = await new Promise((resolve) => {
       const socket = createConnection({ host: '127.0.0.1', port: validatedPort });
@@ -477,23 +224,10 @@ async function waitForRouterReady(port, child, timeoutMs = 15000, {
       socket.once('error', () => done(false));
       socket.setTimeout(250, () => done(false));
     });
-    observedTcpListener ||= tcpReady;
-    const exactWorkspaceReady = await probeHealthSocket(healthSocketPath, { timeoutMs: 250 });
-    if (tcpReady && exactWorkspaceReady) return;
+    if (tcpReady) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  if (observedTcpListener) {
-    const error = new Error(
-      `port 127.0.0.1:${validatedPort} is occupied without the exact workspace Router health socket`,
-    );
-    error.code = 'PLOINKY_ROUTER_WORKSPACE_MISMATCH';
-    throw error;
-  }
-  const error = new Error(
-    `router did not become ready at 127.0.0.1:${validatedPort} with health socket ${healthSocketPath}`,
-  );
-  error.code = 'PLOINKY_ROUTER_NOT_READY';
-  throw error;
+  throw new Error(`router TCP listener did not become ready at 127.0.0.1:${validatedPort}`);
 }
 
 function runWithSuspendedInput(callback) {
@@ -907,12 +641,7 @@ function loadRegistryManifest(record) {
 
 function isRegistryRuntimeRunning(containerName, record) {
   if (isSandboxRuntime(record?.runtime)) {
-    if (!String(record?.instanceId || '').trim()
-        || !String(record?.enableGeneration || '').trim()) return false;
-    return isBwrapProcessRunning(containerName, {
-      instanceId: record.instanceId,
-      enableGeneration: record.enableGeneration,
-    });
+    return isBwrapProcessRunning(record.agentName);
   }
   return dockerSvc.isContainerRunning(containerName);
 }
@@ -1115,17 +844,9 @@ function ensureGraphNodesEnabled(graph, reg, {
     reason: 'workspace-graph-enable-prelaunch',
     availabilityMode: 'replacement',
   });
-  if (prepared?.preparedGeneration?.selector?.state !== 'inactive') {
-    const invalidPreparation = new Error(
-      'workspace graph prelaunch generation unexpectedly became active',
-    );
-    abortWorkspacePreparationForRecovery(
-      prepared?.preparedGeneration?.preparationLease,
-      invalidPreparation,
-      'workspace-graph-preparation-invalid',
-      { abortPreparationImpl: abortPreparation },
-    );
-    throw invalidPreparation;
+  if (prepared?.preparedGeneration?.selector
+      && prepared.preparedGeneration.selector.state !== 'inactive') {
+    throw new Error('workspace graph prelaunch generation unexpectedly became active');
   }
 
   try {
@@ -1138,7 +859,6 @@ function ensureGraphNodesEnabled(graph, reg, {
       removeAgentContainerForRecreate(
         plan.existing.key,
         `workspaceGraph:${plan.node.id}:${reasons.join('+')}`,
-        plan.existing.rec,
       );
     }
   } catch (error) {
@@ -1147,12 +867,10 @@ function ensureGraphNodesEnabled(graph, reg, {
         preserveSelectedGeneration: true,
       });
     } catch (_) {}
-    abortWorkspacePreparationForRecovery(
-      prepared?.preparedGeneration?.preparationLease,
-      error,
-      'workspace-graph-runtime-removal-failed',
-      { abortPreparationImpl: abortPreparation },
-    );
+    try {
+      const lease = prepared?.preparedGeneration?.preparationLease;
+      if (lease) abortPreparation(lease, { reason: 'workspace-graph-runtime-removal-failed' });
+    } catch (_) {}
     throw error;
   }
 
@@ -1180,7 +898,6 @@ function reprepareGraphAfterStartupProviders(graph, reg, initialPreparedGraph, {
   deferredNodeIds = new Set(),
   additionalNodes = [],
   abortPreparation = abortEdgeRoutingPreparation,
-  onInitialPreparationAborted = () => {},
   ensureGraphNodesEnabledImpl = ensureGraphNodesEnabled,
   runtimeReplacementReason = graphNodeRuntimeReplacementReason,
   runtimeReplacementOptions,
@@ -1192,17 +909,12 @@ function reprepareGraphAfterStartupProviders(graph, reg, initialPreparedGraph, {
   }
   const alreadyPrepared = preparedContainerNames(initialPreparedGraph);
 
-  abortWorkspacePreparationForRecovery(
-    initialLease,
-    new Error('start: could not retire the early preparation before startup-provider identity re-evaluation'),
-    'workspace-start-provider-reprepare',
-    { abortPreparationImpl: abortPreparation },
-  );
-  onInitialPreparationAborted(initialLease);
+  abortPreparation(initialLease, {
+    reason: 'workspace-start-provider-reprepare',
+  });
 
   const preparedGraph = ensureGraphNodesEnabledImpl(graph, reg, {
     ...graphEnableOptions,
-    abortPreparation,
     deferredNodeIds,
     additionalNodes,
     runtimeReplacementOptions,
@@ -1215,16 +927,7 @@ function reprepareGraphAfterStartupProviders(graph, reg, initialPreparedGraph, {
     },
   });
   if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
-    const invalidPreparation = new Error(
-      'start: post-provider graph generation did not remain inactive',
-    );
-    abortWorkspacePreparationForRecovery(
-      preparedGraph?.preparedGeneration?.preparationLease,
-      invalidPreparation,
-      'workspace-start-provider-reprepare-invalid',
-      { abortPreparationImpl: abortPreparation },
-    );
-    throw invalidPreparation;
+    throw new Error('start: post-provider graph generation did not remain inactive');
   }
 
   const allPrepared = preparedContainerNames(preparedGraph);
@@ -1511,352 +1214,64 @@ async function activatePreparedRuntimeAfterReadiness({
   if (!result?.preparationLease) {
     throw new Error('runtime replacement activation requires its exact preparation lease');
   }
-  await mergeRoutingConfig((cfg) => {
-    const agents = workspaceSvc.loadAgents();
-    agents[result.containerName] = result.registryRecord;
-    workspaceSvc.saveAgents(agents, { coordinate: false });
-    cfg.routes = cfg.routes || {};
-    cfg.routes[routeKey] = {
-      ...(cfg.routes[routeKey] || {}),
-      container: result.containerName,
-      hostPath: agentPath,
-      repo: repoName,
-      agent: shortAgentName,
-      ...(alias ? { alias } : {}),
-      ...(result.hostPort ? { hostPort: result.hostPort } : {}),
-    };
-    if (!result.hostPort) delete cfg.routes[routeKey].hostPort;
-    return cfg;
-  }, {
-    reason: 'runtime-replacement-ready',
-    preparationLease: result.preparationLease,
-  });
-  return true;
-}
-
-export function abortWorkspacePreparationForRecovery(preparationLease, originalFailure, reason, {
-  abortPreparationImpl = abortEdgeRoutingPreparation,
-} = {}) {
-  if (originalFailure?.code === 'PLOINKY_RECOVERY_ABORT_FAILED') throw originalFailure;
-  if (!preparationLease) return false;
   try {
-    abortPreparationImpl(preparationLease, { reason });
-  } catch (abortError) {
-    const recoveryError = new Error(
-      `workspace recovery could not abort the exact edge preparation for '${reason}'; preserving its failure evidence: ${abortError?.message || abortError}`,
-      { cause: abortError },
-    );
-    recoveryError.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
-    Object.defineProperty(recoveryError, 'originalFailure', {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value: originalFailure,
+    await mergeRoutingConfig((cfg) => {
+      const agents = workspaceSvc.loadAgents();
+      agents[result.containerName] = result.registryRecord;
+      workspaceSvc.saveAgents(agents, { coordinate: false });
+      cfg.routes = cfg.routes || {};
+      cfg.routes[routeKey] = {
+        ...(cfg.routes[routeKey] || {}),
+        container: result.containerName,
+        hostPath: agentPath,
+        repo: repoName,
+        agent: shortAgentName,
+        ...(alias ? { alias } : {}),
+        ...(result.hostPort ? { hostPort: result.hostPort } : {}),
+      };
+      if (!result.hostPort) delete cfg.routes[routeKey].hostPort;
+      return cfg;
+    }, {
+      reason: 'runtime-replacement-ready',
+      preparationLease: result.preparationLease,
     });
-    Object.defineProperty(recoveryError, 'ploinkyRecoveryPreparation', {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value: Object.freeze({
-        preparationLease,
-        reason,
-        preparationAbortFailed: true,
-        preparationAbortedBeforeCleanup: false,
-      }),
-    });
-    throw recoveryError;
-  }
-  return true;
-}
-
-function workspaceRuntimeCandidateIdentity(candidate) {
-  const record = candidate?.registryRecord || {};
-  const exactIdentity = [
-    candidate?.containerId,
-    candidate?.containerName,
-    record.runtime,
-    record.instanceId,
-    record.enableGeneration,
-    candidate?.preparationLease?.transactionId,
-    candidate?.preparationLease?.preparedGeneration,
-  ].map((part) => String(part || '')).join('\u0000');
-  return exactIdentity.replaceAll('\u0000', '') ? exactIdentity : null;
-}
-
-function attachWorkspaceRuntimeCandidateEvidence(error, candidates, {
-  preferCandidates = false,
-} = {}) {
-  if (!error || typeof error !== 'object') return error;
-  const suppliedCandidates = Array.isArray(candidates) ? candidates : [];
-  const existingCandidates = [];
-  if (Array.isArray(error.ploinkyRestartCandidates)) {
-    existingCandidates.push(...error.ploinkyRestartCandidates);
-  }
-  if (error.ploinkyRestartCandidate) existingCandidates.push(error.ploinkyRestartCandidate);
-  const combined = preferCandidates
-    ? [...existingCandidates, ...suppliedCandidates]
-    : [...suppliedCandidates, ...existingCandidates];
-
-  const evidenceByIdentity = new Map();
-  const anonymousEvidence = [];
-  for (const candidate of combined) {
-    if (!candidate || typeof candidate !== 'object') continue;
-    const frozenCandidate = Object.isFrozen(candidate)
-      ? candidate
-      : Object.freeze({ ...candidate });
-    const identity = workspaceRuntimeCandidateIdentity(frozenCandidate);
-    if (identity) evidenceByIdentity.set(identity, frozenCandidate);
-    else if (!anonymousEvidence.includes(candidate)) anonymousEvidence.push(frozenCandidate);
-  }
-  const evidence = Object.freeze([...evidenceByIdentity.values(), ...anonymousEvidence]);
-  if (!evidence.length) return error;
-
-  const pluralDescriptor = Object.getOwnPropertyDescriptor(error, 'ploinkyRestartCandidates');
-  if (!pluralDescriptor || pluralDescriptor.configurable === true) {
-    Object.defineProperty(error, 'ploinkyRestartCandidates', {
-      configurable: true,
-      enumerable: false,
-      writable: false,
-      value: evidence,
-    });
-  }
-  const singularDescriptor = Object.getOwnPropertyDescriptor(error, 'ploinkyRestartCandidate');
-  if (!singularDescriptor || singularDescriptor.configurable === true) {
-    const preferredSingular = preferCandidates && suppliedCandidates.length
-      ? suppliedCandidates[suppliedCandidates.length - 1]
-      : evidence[evidence.length - 1];
-    Object.defineProperty(error, 'ploinkyRestartCandidate', {
-      configurable: true,
-      enumerable: false,
-      writable: false,
-      value: preferredSingular,
-    });
-  }
-  return error;
-}
-
-export function cleanupFailedPreparedRuntime(result, error, reason = 'runtime-replacement-readiness-failed', {
-  cleanupExactAgentRuntimeCandidateImpl = dockerSvc.cleanupExactAgentRuntimeCandidate,
-  abortEdgeRoutingPreparationImpl = abortEdgeRoutingPreparation,
-} = {}) {
-  if (error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED') throw error;
-  const attachedCandidateDescriptor = result == null && error && typeof error === 'object'
-    ? Object.getOwnPropertyDescriptor(error, 'ploinkyRestartCandidate')
-    : null;
-  const attachedCandidate = attachedCandidateDescriptor
-    && Object.hasOwn(attachedCandidateDescriptor, 'value')
-    && attachedCandidateDescriptor.writable === false
-    && attachedCandidateDescriptor.value
-    && typeof attachedCandidateDescriptor.value === 'object'
-    && Object.isFrozen(attachedCandidateDescriptor.value)
-    ? attachedCandidateDescriptor.value
-    : null;
-  const candidate = result && typeof result === 'object'
-    ? result
-    : attachedCandidate;
-  if (!candidate) return;
-  if (!candidate.preparationLease) return;
-  let cleanupCandidate = candidate;
-  if (candidate.preparationAbortedBeforeCleanup !== true) {
+    return true;
+  } catch (error) {
     try {
-      abortEdgeRoutingPreparationImpl(candidate.preparationLease, { reason });
-    } catch (abortError) {
-      const recoveryError = new Error(
-        `runtime recovery could not abort the exact edge preparation for '${candidate.containerName || 'unknown candidate'}'; preserving its failed runtime candidate: ${abortError?.message || abortError}`,
-        { cause: abortError },
-      );
-      recoveryError.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
-      Object.defineProperty(recoveryError, 'originalFailure', {
-        configurable: false,
-        enumerable: false,
-        writable: false,
-        value: error,
-      });
-      Object.defineProperty(recoveryError, 'ploinkyRestartCandidate', {
-        configurable: false,
-        enumerable: false,
-        writable: false,
-        value: Object.freeze({
-          ...candidate,
-          exactCleanupPerformed: false,
-          preparationAbortFailed: true,
-          preparationAbortedBeforeCleanup: false,
-        }),
-      });
-      throw recoveryError;
+      dockerSvc.cleanupExactAgentRuntimeCandidate(result);
+    } catch (cleanupError) {
+      error.message += `; exact activation-failure cleanup: ${cleanupError?.message || cleanupError}`;
     }
-    cleanupCandidate = Object.freeze({
-      ...candidate,
-      preparationAbortFailed: false,
-      preparationAbortedBeforeCleanup: true,
-    });
-  } else if (!Object.isFrozen(cleanupCandidate)) {
-    cleanupCandidate = Object.freeze({ ...cleanupCandidate });
-  }
-  attachWorkspaceRuntimeCandidateEvidence(error, [cleanupCandidate]);
-  if (cleanupCandidate.exactCleanupPerformed === true) return;
-  if (cleanupCandidate.preparationLease
-      && cleanupCandidate.containerName
-      && cleanupCandidate.registryRecord
-      && cleanupCandidate.cleanupReceipt) {
     try {
-      cleanupExactAgentRuntimeCandidateImpl(cleanupCandidate);
-      cleanupCandidate = Object.freeze({
-        ...cleanupCandidate,
-        exactCleanupPerformed: true,
+      inactivateEdgeRoutingGeneration('runtime-replacement-activation-failed', {
+        preserveSelectedGeneration: true,
       });
-      attachWorkspaceRuntimeCandidateEvidence(error, [cleanupCandidate], {
-        preferCandidates: true,
+    } catch (_) {}
+    try {
+      abortEdgeRoutingPreparation(result.preparationLease, {
+        reason: 'runtime-replacement-activation-failed',
       });
+    } catch (_) {}
+    throw error;
+  }
+}
+
+export function cleanupFailedPreparedRuntime(result, error, reason = 'runtime-replacement-readiness-failed') {
+  if (!result) return;
+  if (result.preparationLease && result.containerName && result.containerId && result.registryRecord) {
+    try {
+      dockerSvc.cleanupExactAgentRuntimeCandidate(result);
     } catch (cleanupError) {
       error.message += `; exact readiness-failure cleanup: ${cleanupError?.message || cleanupError}`;
     }
   }
-}
-
-export function shouldTrackWorkspaceRuntimeCandidate(result) {
-  return result?.requiresEdgeActivation === true
-    && Boolean(result.preparationLease)
-    && Boolean(result.containerName)
-    && Boolean(result.registryRecord)
-    && Boolean(result.cleanupReceipt);
-}
-
-export function cleanupWorkspaceRuntimeCandidates(candidates, error, {
-  cleanupExactAgentRuntimeCandidateImpl = dockerSvc.cleanupExactAgentRuntimeCandidate,
-  abortEdgeRoutingPreparationImpl = abortEdgeRoutingPreparation,
-  preparationLease = null,
-  preparationAbortedBeforeCleanup = false,
-} = {}) {
-  if (!Array.isArray(candidates)) return;
-  if (error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED') {
-    attachWorkspaceRuntimeCandidateEvidence(error, candidates);
-    throw error;
-  }
-  const attachedEvidence = [
-    ...(Array.isArray(error?.ploinkyRestartCandidates) ? error.ploinkyRestartCandidates : []),
-    ...(error?.ploinkyRestartCandidate ? [error.ploinkyRestartCandidate] : []),
-  ];
-  const attachedEvidenceByIdentity = new Map(attachedEvidence
-    .filter((candidate) => candidate && typeof candidate === 'object' && Object.isFrozen(candidate))
-    .map((candidate) => [workspaceRuntimeCandidateIdentity(candidate), candidate])
-    .filter(([identity]) => identity));
-  const trackedCandidates = candidates
-    .filter((candidate) => shouldTrackWorkspaceRuntimeCandidate(candidate))
-    .map((candidate) => (
-      attachedEvidenceByIdentity.get(workspaceRuntimeCandidateIdentity(candidate)) || candidate
-    ));
-  const preparationRecords = [];
-  const rememberPreparation = (lease, alreadyAborted) => {
-    if (!lease) return;
-    const known = preparationRecords.find((entry) => entry.lease === lease);
-    if (known) {
-      known.alreadyAborted ||= alreadyAborted;
-      return;
-    }
-    preparationRecords.push({ lease, alreadyAborted: Boolean(alreadyAborted) });
-  };
-  rememberPreparation(preparationLease, preparationAbortedBeforeCleanup);
-  for (const candidate of trackedCandidates) {
-    rememberPreparation(
-      candidate.preparationLease,
-      candidate.preparationAbortedBeforeCleanup === true,
-    );
-  }
-  const abortedPreparations = new Set();
-  for (const preparation of preparationRecords) {
-    if (preparation.alreadyAborted) {
-      abortedPreparations.add(preparation.lease);
-      continue;
-    }
-    try {
-      abortEdgeRoutingPreparationImpl(preparation.lease, { reason: 'workspace-start-failed' });
-      abortedPreparations.add(preparation.lease);
-    } catch (abortError) {
-      const preservedCandidates = Object.freeze(trackedCandidates
-        .map((candidate) => Object.freeze({
-          ...candidate,
-          exactCleanupPerformed: false,
-          preparationAbortFailed: candidate.preparationLease === preparation.lease,
-          preparationAbortedBeforeCleanup: abortedPreparations.has(candidate.preparationLease),
-        })));
-      const recoveryError = new Error(
-        `workspace recovery could not abort the exact edge preparation; preserving all failed runtime candidates: ${abortError?.message || abortError}`,
-        { cause: abortError },
-      );
-      recoveryError.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
-      Object.defineProperty(recoveryError, 'originalFailure', {
-        configurable: false,
-        enumerable: false,
-        writable: false,
-        value: error,
-      });
-      Object.defineProperty(recoveryError, 'ploinkyRestartCandidates', {
-        configurable: true,
-        enumerable: false,
-        writable: false,
-        value: preservedCandidates,
-      });
-      if (preservedCandidates.length) {
-        Object.defineProperty(recoveryError, 'ploinkyRestartCandidate', {
-          configurable: true,
-          enumerable: false,
-          writable: false,
-          value: preservedCandidates[preservedCandidates.length - 1],
-        });
-      }
-      throw recoveryError;
-    }
-  }
-  const cleanupCandidates = trackedCandidates.map((candidate) => Object.freeze({
-    ...candidate,
-    preparationAbortFailed: false,
-    preparationAbortedBeforeCleanup: abortedPreparations.has(candidate.preparationLease),
-  }));
-  const cleanupCandidateByOriginal = new Map(
-    trackedCandidates.map((candidate, index) => [candidate, cleanupCandidates[index]]),
-  );
-  attachWorkspaceRuntimeCandidateEvidence(error, cleanupCandidates);
-  const cleanedCandidateIds = new Set();
-  for (const candidate of [...trackedCandidates].reverse()) {
-    if (!shouldTrackWorkspaceRuntimeCandidate(candidate)) continue;
-    if (candidate.exactCleanupPerformed === true) continue;
-    const cleanupCandidate = cleanupCandidateByOriginal.get(candidate) || candidate;
-    const candidateId = String(candidate.containerId || '') || [
-      candidate.registryRecord.runtime,
-      candidate.containerName,
-      candidate.registryRecord.instanceId,
-      candidate.registryRecord.enableGeneration,
-    ].map((part) => String(part || '')).join(':');
-    if (cleanedCandidateIds.has(candidateId)) continue;
-    cleanedCandidateIds.add(candidateId);
-    try {
-      cleanupExactAgentRuntimeCandidateImpl(cleanupCandidate);
-      const completedCandidate = Object.freeze({
-        ...cleanupCandidate,
-        exactCleanupPerformed: true,
-      });
-      const completedIdentity = workspaceRuntimeCandidateIdentity(completedCandidate);
-      for (let index = 0; index < cleanupCandidates.length; index += 1) {
-        if (workspaceRuntimeCandidateIdentity(cleanupCandidates[index]) === completedIdentity) {
-          cleanupCandidates[index] = completedCandidate;
-        }
-      }
-    } catch (cleanupError) {
-      error.message += `; exact workspace candidate cleanup: ${cleanupError?.message || cleanupError}`;
-    }
-  }
-  attachWorkspaceRuntimeCandidateEvidence(error, cleanupCandidates, {
-    preferCandidates: true,
-  });
-  candidates.length = 0;
-}
-
-export function buildWorkspaceRuntimeRegistry(preflightRegistry, workspaceConfig) {
-  return {
-    ...(preflightRegistry || {}),
-    _config: structuredClone(workspaceConfig || {}),
-  };
+  if (!result.preparationLease) return;
+  try {
+    inactivateEdgeRoutingGeneration(reason, { preserveSelectedGeneration: true });
+  } catch (_) {}
+  try {
+    abortEdgeRoutingPreparation(result.preparationLease, { reason });
+  } catch (_) {}
 }
 
 async function resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
@@ -1935,8 +1350,7 @@ export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg) {
 }
 
 async function startWorkspace(staticAgentArg, portArg, {
-  killRouterIfRunning = stopManagedRouter,
-  launchManagedWatchdogImpl = launchManagedWatchdog,
+  killRouterIfRunning,
   branchPolicy,
 } = {}) {
   // Acquire every declared dependency source before resolving the complete
@@ -1968,9 +1382,7 @@ async function startWorkspace(staticAgentArg, portArg, {
   // writes, both inactive prelaunch preparations, and every subsequent start.
   // Only the final post-provider lease may authorize runtime targets.
   resetPreinstallRunInProcess();
-  const workspaceStartLock = await acquireWorkspaceMutationLease({
-    operation: 'workspace-start',
-  });
+  const workspaceStartLock = createWorkspaceStartLock();
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
   try {
@@ -2015,27 +1427,26 @@ async function startWorkspace(staticAgentArg, portArg, {
       routerReadyForStart = true;
       routerPortForStart = staticPort;
       routerContainerForStart = container;
-      console.log('[start] Existing exact-workspace Router listener is ready.');
+      console.log('[start] Existing router TCP listener is ready.');
       return container;
-    } catch (error) {
-      if (error?.code !== 'PLOINKY_ROUTER_NOT_READY') throw error;
-      // No Router listener exists for this workspace. Replace only its managed process.
+    } catch (_) {
+      // No TCP listener exists. Replace only the router process.
     }
-    stopRouterForReplacement(killRouterIfRunning, 'start');
+    if (typeof killRouterIfRunning === 'function') {
+      try { killRouterIfRunning(); } catch (_) {}
+    }
     const runningDir = RUNNING_DIR;
     fs.mkdirSync(runningDir, { recursive: true });
     const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
     const routerPidFile = path.join(runningDir, 'router.pid');
-    const { child } = await launchManagedWatchdogImpl({
-      routerPath,
-      port: staticPort,
-      routerPidFile,
-      label: 'start',
-    });
+    const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
+    try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
+    child.unref();
+    await waitForRouterReady(staticPort, child);
     routerReadyForStart = true;
     routerPortForStart = staticPort;
     routerContainerForStart = container;
-    console.log(`[start] Watchdog launched in background (pid ${child.pid}); exact-workspace Router is ready.`);
+    console.log(`[start] Watchdog launched in background (pid ${child.pid}); router TCP listener is ready.`);
     return container;
   };
     if (staticAgentArg) {
@@ -2096,7 +1507,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     // preinstall and config-provider hooks receive that exact topology before
     // any agent process or container is allowed to start.
     assertWorkspaceGraphAdmissionsCurrent(lockedStart.admissions);
-    const providerRegistry = buildWorkspaceRuntimeRegistry(lockedStart.registry, cfg0);
+    const providerRegistry = lockedStart.registry;
     const dependencyGraph = lockedStart.graph;
 
     let reg = providerRegistry;
@@ -2183,12 +1594,6 @@ async function startWorkspace(staticAgentArg, portArg, {
       {
         deferredNodeIds: waitClassification.noWait,
         additionalNodes: extraRuntimeNodes,
-        onInitialPreparationAborted(abortedLease) {
-          if (workspacePreparationLease !== abortedLease) {
-            throw new Error('start: retired preparation lease did not match workspace recovery state');
-          }
-          workspacePreparationLease = null;
-        },
       },
     );
     preparedGraph = postProviderPreparation.preparedGraph;
@@ -2280,7 +1685,9 @@ async function startWorkspace(staticAgentArg, portArg, {
             preparedHostModeCapability,
             networkLifecycleCapability,
           });
-          if (shouldTrackWorkspaceRuntimeCandidate(runtimeResult)) {
+          if (runtimeResult?.requiresEdgeActivation === true
+              && runtimeResult?.preparationLease
+              && runtimeResult?.containerId) {
             workspaceRuntimeCandidates.push(runtimeResult);
           }
           const {
@@ -2514,14 +1921,26 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Dashboard: ${buildDashboardUrl(staticPort)}`);
   } catch (e) {
-    const failedCandidate = e?.ploinkyRestartCandidate || null;
-    cleanupWorkspaceRuntimeCandidates(workspaceRuntimeCandidates, e, {
-      preparationLease: workspacePreparationLease,
-      preparationAbortedBeforeCleanup:
-        failedCandidate?.preparationAbortedBeforeCleanup === true,
-      preparationAbortFailed: failedCandidate?.preparationAbortFailed === true,
-    });
-    workspacePreparationLease = null;
+    const cleanedCandidateIds = new Set();
+    for (const candidate of workspaceRuntimeCandidates.reverse()) {
+      const candidateId = String(candidate?.containerId || '');
+      if (!candidateId || cleanedCandidateIds.has(candidateId)) continue;
+      cleanedCandidateIds.add(candidateId);
+      try {
+        dockerSvc.cleanupExactAgentRuntimeCandidate(candidate);
+      } catch (cleanupError) {
+        e.message += `; exact workspace candidate cleanup: ${cleanupError?.message || cleanupError}`;
+      }
+    }
+    workspaceRuntimeCandidates.length = 0;
+    if (workspacePreparationLease) {
+      try {
+        abortEdgeRoutingPreparation(workspacePreparationLease, {
+          reason: 'workspace-start-failed',
+        });
+      } catch (_) {}
+      workspacePreparationLease = null;
+    }
     const message = e?.message || String(e);
     if (message.startsWith('start:') || message.startsWith('start (workspace) failed:')) {
       throw e;
@@ -2601,7 +2020,6 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     activateRuntimeAfterReadiness: activateRuntimeAfterReadinessImpl = activatePreparedRuntimeAfterReadiness,
     loadAgentsMap: loadAgentsMapImpl,
     withMaintenanceLock: withMaintenanceLockImpl = withMaintenanceLock,
-    withNetworkLifecycleLock: withNetworkLifecycleLockImpl = withNetworkLifecycleLock,
     attachInteractive,
     attachBwrapInteractive,
     attachSeatbeltInteractive,
@@ -2714,7 +2132,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     if (refreshedRecord?.type === 'agent') {
       registryRecord = { containerName: initialContainerName, record: refreshedRecord };
     }
-    const lifecycleResult = await withNetworkLifecycleLockImpl(async (networkLifecycleCapability) => {
+    const lifecycleResult = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
       let result = null;
       try {
         result = ensureAgentService(shortAgentName, manifest, agentDir, {
@@ -2950,10 +2368,7 @@ async function runShell(agentName) {
   }
 }
 
-async function reinstallAgent(agentName, {
-    killRouterIfRunningImpl = stopManagedRouter,
-    launchManagedWatchdogImpl = launchManagedWatchdog,
-} = {}) {
+async function reinstallAgent(agentName) {
     const routerPort = resolvePersistedRouterPort();
     if (!agentName) { throw new Error('Usage: reinstall <name> | reinstall agent <name>'); }
 
@@ -3069,27 +2484,26 @@ async function reinstallAgent(agentName, {
                 alias: registryRecord?.record?.alias || '',
             });
 
-            let routerIsReady = false;
-            try {
-                await waitForRouterReady(routerPort, null, 300);
-                routerIsReady = true;
-            } catch (routerError) {
-                if (routerError?.code !== 'PLOINKY_ROUTER_NOT_READY') throw routerError;
-            }
-            if (!routerIsReady) {
-                stopRouterForReplacement(killRouterIfRunningImpl, 'reinstall');
+            const isRouterUp = (p) => {
+                try {
+                    const out = execSync(`lsof -t -i :${p} -sTCP:LISTEN`, { stdio: 'pipe' }).toString().trim();
+                    if (out) return true;
+                } catch(_) {}
+                try {
+                    const out = execSync('ss -ltnp', { stdio: 'pipe' }).toString();
+                    return out.includes(`:${p}`) && out.includes('LISTEN');
+                } catch(_) { return false; }
+            };
+            if (!isRouterUp(routerPort)) {
                 const runningDir = RUNNING_DIR;
                 fs.mkdirSync(runningDir, { recursive: true });
                 const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
                 const routerPidFile = path.join(runningDir, 'router.pid');
-                const { child } = await launchManagedWatchdogImpl({
-                    routerPath,
-                    port: routerPort,
-                    routerPidFile,
-                    label: 'reinstall',
-                });
+                const child = spawnWatchdog(routerPath, routerPort, routerPidFile);
+                try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch(_) {}
+                child.unref();
                 console.log(`[reinstall] Watchdog launched (pid ${child.pid}) on port ${routerPort}.`);
-                console.log('[reinstall] Exact-workspace Router readiness verified; Watchdog will restart it if needed.');
+                console.log(`[reinstall] Watchdog will automatically restart the server if needed.`);
             }
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
             } catch (error) {
@@ -3116,11 +2530,6 @@ export {
   resolveAndPersistStartRouterPort,
   resolveGraphNodeExecutionRecord,
   resolveRetainedGraphNodeExecutionRecord,
-  acquireSpawnedRouterProcessRecord,
-  launchManagedWatchdog,
-  probeRouterHealthSocket,
-  requireRouterReplacementStopped,
-  stopRouterForReplacement,
   waitForRouterReady,
   waitForManifestReadiness,
   waitForReadinessEntries,

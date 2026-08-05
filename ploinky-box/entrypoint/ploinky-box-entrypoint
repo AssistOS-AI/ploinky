@@ -6,8 +6,6 @@ EXPECTED_SUBORDINATE_IDS=65534
 EXPECTED_MAPPED_IDS=65535
 MINIMUM_PODMAN_VERSION=5.4
 EXPECTED_CLOUDFLARED_VERSION=2026.7.1
-EXPECTED_BUBBLEWRAP_NEVRA='bubblewrap-0:0.11.0-4.fc44'
-BWRAP_HELPER='/usr/local/libexec/ploinky-bwrap-launch'
 PREPARE_HELPER='/opt/ploinky/ploinky-box/entrypoint/entrypoint.mjs'
 READY_LINE='PLOINKY_BOX_READY'
 
@@ -124,64 +122,6 @@ require_cloudflared_contract() {
         || fail "cloudflared $EXPECTED_CLOUDFLARED_VERSION lacks required --token-file support"
 }
 
-require_bubblewrap_contract() {
-    local rpm_arch
-    local installed_nevra
-    local bwrap_help
-    local bwrap_file_capabilities
-    local helper_version
-    local helper_capabilities
-    local helper_file_capabilities
-
-    command -v bwrap >/dev/null 2>&1 || fail "bwrap not on PATH"
-    command -v getcap >/dev/null 2>&1 || fail "getcap not on PATH"
-    case "$(uname -m)" in
-        x86_64) rpm_arch=x86_64 ;;
-        aarch64) rpm_arch=aarch64 ;;
-        *) fail "unsupported Bubblewrap architecture '$(uname -m)'" ;;
-    esac
-    installed_nevra="$(rpm -q --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' bubblewrap 2>&1)" \
-        || fail "cannot inspect Bubblewrap package: ${installed_nevra:-no diagnostic}"
-    test "$installed_nevra" = "${EXPECTED_BUBBLEWRAP_NEVRA}.${rpm_arch}" \
-        || fail "Bubblewrap package must be ${EXPECTED_BUBBLEWRAP_NEVRA}.${rpm_arch} (observed ${installed_nevra:-unknown})"
-    test "$(stat -c '%a:%u:%g' /usr/bin/bwrap 2>/dev/null)" = '755:0:0' \
-        || fail "bwrap must be root-owned mode 0755"
-    bwrap_file_capabilities="$(getcap /usr/bin/bwrap 2>&1)" \
-        || fail "cannot inspect bwrap file capabilities: ${bwrap_file_capabilities:-no diagnostic}"
-    test -z "$bwrap_file_capabilities" \
-        || fail "bwrap must not have file capabilities"
-    bwrap_help="$(bwrap --help 2>&1)" \
-        || fail "cannot inspect Bubblewrap options: ${bwrap_help:-no diagnostic}"
-    for option in '--bind-fd FD DEST' '--ro-bind-fd FD DEST' '--ro-bind-data FD DEST' '--perms OCTAL'; do
-        printf '%s\n' "$bwrap_help" | grep -F -- "$option" >/dev/null \
-            || fail "bwrap lacks required option $option"
-    done
-
-    test -x "$BWRAP_HELPER" || fail "Bubblewrap launcher missing"
-    test "$(stat -c '%a:%u:%g' "$BWRAP_HELPER" 2>/dev/null)" = '755:0:0' \
-        || fail "Bubblewrap launcher must be root-owned mode 0755"
-    helper_file_capabilities="$(getcap "$BWRAP_HELPER" 2>&1)" \
-        || fail "cannot inspect Bubblewrap launcher file capabilities: ${helper_file_capabilities:-no diagnostic}"
-    test -z "$helper_file_capabilities" \
-        || fail "Bubblewrap launcher must not have file capabilities"
-    helper_version="$($BWRAP_HELPER --version 2>&1)" \
-        || fail "cannot inspect Bubblewrap launcher version: ${helper_version:-no diagnostic}"
-    [[ "$helper_version" =~ ^ploinky-bwrap-launch-v1\ source-sha=[0-9a-f]{40}$ ]] \
-        || fail "Bubblewrap launcher returned an invalid immutable source version"
-    helper_capabilities="$($BWRAP_HELPER --capabilities 2>&1)" \
-        || fail "cannot inspect Bubblewrap launcher capabilities: ${helper_capabilities:-no diagnostic}"
-    [[ "$helper_capabilities" == *"protocol=1 descriptor-fd=3"* ]] \
-        || fail "Bubblewrap launcher lacks descriptor protocol v1"
-    [[ "$helper_capabilities" == *"path-resolution=openat2-beneath-no-magiclinks-no-symlinks"* ]] \
-        || fail "Bubblewrap launcher lacks fd-pinned openat2 resolution"
-    [[ "$helper_capabilities" == *"bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms"* ]] \
-        || fail "Bubblewrap launcher lacks required fd/data mount capabilities"
-    [[ "$helper_capabilities" == *"typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file"* ]] \
-        || fail "Bubblewrap launcher lacks required typed filesystem records"
-    [[ "$helper_capabilities" == *"ro-data-path-hardening=sealed-memfd-ro-bind-data"* ]] \
-        || fail "Bubblewrap launcher lacks immutable read-only data-path hardening"
-}
-
 test -x "$PREPARE_HELPER" || fail "Box preparation helper missing"
 node "$PREPARE_HELPER" --prepare-only \
     || fail "Box preparation failed"
@@ -195,11 +135,11 @@ command -v podman >/dev/null 2>&1 || fail "podman not on PATH"
 command -v ss >/dev/null 2>&1 || fail "ss not on PATH"
 command -v nsenter >/dev/null 2>&1 || fail "nsenter not on PATH"
 require_cloudflared_contract
-require_bubblewrap_contract
 test "$(id -un 2>/dev/null)" = 'podman' || fail "process user must be podman"
 require_value USER podman
 require_value HOME /home/podman
 require_value PLOINKY_WORKSPACE_ROOT /workspace
+require_value PLOINKY_DISABLE_HOST_SANDBOX 1
 require_value container oci
 require_value _CONTAINERS_USERNS_CONFIGURED ''
 require_value BUILDAH_ISOLATION chroot

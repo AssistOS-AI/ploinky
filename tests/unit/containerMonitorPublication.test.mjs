@@ -33,15 +33,7 @@ function preparedRestartResult(overrides = {}) {
             enableGeneration: 'enable-v2',
             config: { ports: [{ containerPort: 7000, hostPort: 43123 }] },
         },
-        stagedRegistryRecord: {
-            type: 'agent',
-            repoName: 'repo',
-            agentName: 'demo',
-            instanceId: 'instance-v2',
-            enableGeneration: 'enable-v2',
-        },
         requiresEdgeActivation: true,
-        cleanupReceipt: Object.freeze({ operationId: 'restart-cleanup' }),
         preparationLease: Object.freeze({
             transactionId: 'restart-lease',
             preparedGeneration: 'sha256:prepared',
@@ -160,9 +152,8 @@ test('monitor rejects manifest bytes changed during ensure before readiness or a
                 events.push('preparation-abort');
                 assert.equal(lease, result.preparationLease);
             },
-            cleanupExactAgentRuntimeCandidate(candidate) {
-                assert.equal(candidate, result);
-                events.push(`candidate-cleanup:${candidate.containerName}`);
+            cleanupFailedRuntime(containerName) {
+                events.push(`candidate-cleanup:${containerName}`);
             },
         };
         const target = restartTarget(manifestPath);
@@ -173,8 +164,8 @@ test('monitor rejects manifest bytes changed during ensure before readiness or a
         );
         assert.deepEqual(events.slice(0, 3), [
             'ensure',
-            'preparation-abort',
             'candidate-cleanup:agent_container',
+            'preparation-abort',
         ]);
         assert.equal(events.includes('container_restart_success'), false);
     } finally {
@@ -190,7 +181,6 @@ test('monitor waits for exact semantic readiness before committing the returned 
         const result = preparedRestartResult();
         const events = [];
         let savedAgents = null;
-        let registryState = structuredClone(result.stagedRegistryRecord);
         let savedRouting = null;
         let releaseReadiness;
         const readinessGate = new Promise((resolve) => { releaseReadiness = resolve; });
@@ -219,13 +209,20 @@ test('monitor waits for exact semantic readiness before committing the returned 
             },
             loadAgents() {
                 events.push('registry-load');
-                return { agent_container: structuredClone(registryState) };
+                return {
+                    agent_container: {
+                        type: 'agent',
+                        repoName: 'repo',
+                        agentName: 'demo',
+                        instanceId: 'instance-v2',
+                        enableGeneration: 'enable-v2',
+                    },
+                };
             },
             saveAgents(agents, options) {
                 events.push('registry-save');
                 assert.deepEqual(options, { coordinate: false });
                 savedAgents = structuredClone(agents);
-                registryState = structuredClone(agents.agent_container);
             },
             async mergeRoutingConfig(mutator, options) {
                 events.push('route-merge-start');
@@ -243,7 +240,7 @@ test('monitor waits for exact semantic readiness before committing the returned 
             abortEdgeRoutingPreparation() {
                 assert.fail('successful restart must commit, not abort, its preparation');
             },
-            cleanupExactAgentRuntimeCandidate() {
+            cleanupFailedRuntime() {
                 assert.fail('successful restart must not clean its runtime');
             },
         };
@@ -273,66 +270,6 @@ test('monitor waits for exact semantic readiness before committing the returned 
         assert.equal(events.includes('container_restart_failed'), false);
         assert.equal(target.isRestarting, false);
         assert.equal(target.lastError, null);
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
-test('monitor rejects staged registry metadata drift before committing the runtime candidate', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-staged-drift-'));
-    try {
-        const manifestPath = path.join(root, 'manifest.json');
-        fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'none' } }));
-        const result = preparedRestartResult({ hostPort: null });
-        const events = [];
-        const monitor = {
-            config: {},
-            targets: new Map(),
-            isShuttingDown: () => false,
-            log(_level, event) { events.push(event); },
-            createWorkspaceMutationLease: () => ({ token: 'workspace' }),
-            releaseWorkspaceMutationLease() {},
-            resolveRouterEndpoint: () => Object.freeze({
-                mode: 'default',
-                host: 'host.containers.internal',
-                port: 8080,
-                url: 'http://host.containers.internal:8080',
-            }),
-            ensureAgentService: () => result,
-            loadAgents: () => ({
-                agent_container: {
-                    ...structuredClone(result.stagedRegistryRecord),
-                    projectPath: '/changed-after-launch',
-                },
-            }),
-            saveAgents() { assert.fail('drifted staged registry must not be overwritten'); },
-            async mergeRoutingConfig(mutator) {
-                await mutator({ routes: {} });
-            },
-            applyEdgeRoutingGeneration() {
-                assert.fail('drifted staged registry must not activate');
-            },
-            abortEdgeRoutingPreparation(lease) {
-                events.push('preparation-abort');
-                assert.equal(lease, result.preparationLease);
-            },
-            cleanupExactAgentRuntimeCandidate(candidate) {
-                assert.equal(candidate, result);
-                events.push(`candidate-cleanup:${candidate.containerName}`);
-            },
-        };
-        const target = restartTarget(manifestPath);
-
-        await assert.rejects(
-            performContainerRestart(monitor, target, 'not_running'),
-            /lost its staged registry identity/,
-        );
-
-        assert.deepEqual(events.slice(0, 2), [
-            'preparation-abort',
-            'candidate-cleanup:agent_container',
-        ]);
-        assert.equal(events.includes('container_restart_success'), false);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -378,9 +315,9 @@ test('monitor readiness failure aborts the exact preparation, applies no route, 
                 assert.equal(options.reason, 'watchdog-runtime-failed:not_running');
                 return { selector: { state: 'inactive' } };
             },
-            cleanupExactAgentRuntimeCandidate(candidate) {
+            cleanupFailedRuntime(containerName) {
                 events.push('candidate-cleanup');
-                assert.equal(candidate, result);
+                assert.equal(containerName, 'agent_container');
             },
         };
         const target = restartTarget(manifestPath);
@@ -390,88 +327,11 @@ test('monitor readiness failure aborts the exact preparation, applies no route, 
             /watchdog readiness script failed \(exit 1, output='not ready'\)/,
         );
 
-        assert.deepEqual(events.slice(0, 4), ['ensure', 'readiness', 'preparation-abort', 'candidate-cleanup']);
+        assert.deepEqual(events.slice(0, 4), ['ensure', 'readiness', 'candidate-cleanup', 'preparation-abort']);
         assert.equal(events.includes('container_restart_failed'), true);
         assert.equal(events.includes('container_restart_success'), false);
         assert.equal(target.isRestarting, false);
         assert.match(target.lastError, /readiness script failed/);
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
-test('monitor preserves the exact failed candidate and propagates recovery failure when preparation abort fails', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-abort-fail-'));
-    try {
-        const manifestPath = path.join(root, 'manifest.json');
-        fs.writeFileSync(manifestPath, JSON.stringify({
-            start: 'node server.mjs',
-            health: { readiness: { script: 'healthcheck.sh' } },
-        }));
-        const result = preparedRestartResult();
-        const abortFailure = new Error('durable preparation remained selected');
-        const logged = [];
-        let cleanupCalls = 0;
-        const monitor = {
-            config: {},
-            targets: new Map(),
-            isShuttingDown: () => false,
-            log(level, event, data) { logged.push({ level, event, data }); },
-            createWorkspaceMutationLease: () => ({ token: 'workspace' }),
-            releaseWorkspaceMutationLease() {},
-            resolveRouterEndpoint: () => Object.freeze({
-                mode: 'default',
-                host: 'host.containers.internal',
-                port: 8080,
-                url: 'http://host.containers.internal:8080',
-            }),
-            ensureAgentService: () => result,
-            runContainerScriptReadiness() {
-                return { status: 'failed', reason: 'exit 1', detail: 'not ready' };
-            },
-            abortEdgeRoutingPreparation(lease) {
-                assert.equal(lease, result.preparationLease);
-                throw abortFailure;
-            },
-            cleanupExactAgentRuntimeCandidate() {
-                cleanupCalls += 1;
-            },
-        };
-        const target = restartTarget(manifestPath);
-
-        await assert.rejects(
-            performContainerRestart(monitor, target, 'not_running'),
-            (error) => (
-                error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-                && error.cause === abortFailure
-                && /preserving its failed runtime candidate/.test(error.message)
-                && /readiness script failed/.test(error.originalFailure?.message || '')
-                && error.ploinkyRestartCandidate?.containerName === result.containerName
-                && error.ploinkyRestartCandidate?.preparationLease === result.preparationLease
-                && error.ploinkyRestartCandidate?.exactCleanupPerformed === false
-                && error.ploinkyRestartCandidate?.preparationAbortFailed === true
-                && error.ploinkyRestartCandidate?.preparationAbortedBeforeCleanup === false
-                && Object.isFrozen(error.ploinkyRestartCandidate)
-            ),
-        );
-
-        assert.equal(cleanupCalls, 0);
-        assert.match(target.lastError, /preserving its failed runtime candidate/);
-        assert.equal(target.isRestarting, false);
-        assert.equal(
-            logged.some(({ event, data }) => (
-                event === 'container_restart_preparation_abort_failed'
-                && data.error === abortFailure.message
-            )),
-            true,
-        );
-        assert.equal(
-            logged.some(({ event, data }) => (
-                event === 'container_restart_failed'
-                && data.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-            )),
-            true,
-        );
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -499,7 +359,15 @@ test('monitor apply failure aborts the exact preparation, cleans only the failed
                 url: 'http://host.containers.internal:8080',
             }),
             ensureAgentService: () => result,
-            loadAgents: () => ({ agent_container: structuredClone(result.stagedRegistryRecord) }),
+            loadAgents: () => ({
+                agent_container: {
+                    type: 'agent',
+                    repoName: 'repo',
+                    agentName: 'demo',
+                    instanceId: 'instance-v2',
+                    enableGeneration: 'enable-v2',
+                },
+            }),
             saveAgents() { events.push('registry-save'); },
             async mergeRoutingConfig(mutator, options) {
                 assert.deepEqual(options, { coordinate: false });
@@ -516,9 +384,8 @@ test('monitor apply failure aborts the exact preparation, cleans only the failed
                 assert.equal(lease, result.preparationLease);
                 return { selector: { state: 'inactive' } };
             },
-            cleanupExactAgentRuntimeCandidate(candidate) {
-                assert.equal(candidate, result);
-                events.push(`candidate-cleanup:${candidate.containerName}`);
+            cleanupFailedRuntime(containerName) {
+                events.push(`candidate-cleanup:${containerName}`);
             },
         };
         const target = restartTarget(manifestPath);
@@ -532,8 +399,8 @@ test('monitor apply failure aborts the exact preparation, cleans only the failed
             'registry-save',
             'route-candidate-written',
             'generation-apply',
-            'preparation-abort',
             'candidate-cleanup:agent_container',
+            'preparation-abort',
         ]);
         assert.equal(events.includes('container_restart_failed'), true);
         assert.equal(events.includes('container_restart_success'), false);
@@ -577,7 +444,7 @@ test('monitor accepts a healthy exact reuse race without readiness, mutation, or
             saveAgents() { assert.fail('healthy reuse must not mutate the registry'); },
             applyEdgeRoutingGeneration() { assert.fail('healthy reuse must not apply a generation'); },
             abortEdgeRoutingPreparation() { assert.fail('healthy reuse has no preparation to abort'); },
-            cleanupExactAgentRuntimeCandidate() { assert.fail('healthy reuse must not be cleaned'); },
+            cleanupFailedRuntime() { assert.fail('healthy reuse must not be cleaned'); },
         };
         const target = restartTarget(manifestPath);
 
@@ -612,7 +479,7 @@ test('monitor rejects a malformed ensure result instead of reporting healthy reu
                 url: 'http://host.containers.internal:8080',
             }),
             ensureAgentService: () => null,
-            cleanupExactAgentRuntimeCandidate() { assert.fail('no returned candidate exists to clean'); },
+            cleanupFailedRuntime() { assert.fail('no returned candidate exists to clean'); },
         };
         const target = restartTarget(manifestPath);
 

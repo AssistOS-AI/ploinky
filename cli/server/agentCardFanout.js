@@ -1,8 +1,4 @@
 import http from 'node:http';
-import {
-    createLeaseCommittedAgent,
-    createRootAgentDialContext,
-} from './rootAgentDial.js';
 
 const SAFE_CALLER_METADATA_HEADERS = new Set(['accept-language', 'user-agent']);
 
@@ -15,35 +11,26 @@ export function sanitizeAgentCardFanoutHeaders(headers = {}) {
     return sanitized;
 }
 
-export function requestAgentCard(route, agentName, callerHeaders = {}, {
-    dialContext = null,
-    routePlan = null,
-} = {}) {
+export function requestAgentCard(route, agentName, callerHeaders = {}, { beforeDial = null } = {}) {
     return new Promise((resolve) => {
-        let capturedDialContext = dialContext;
-        try {
-            capturedDialContext ||= createRootAgentDialContext({
-                routePlan,
-                routeKey: agentName,
-                route,
-                targetPort: route?.hostPort,
-            });
-        } catch (_) {
-            resolve({
-                ok: false,
-                generationChanged: true,
-                error: { name: agentName, error: 'edge_generation_changed' },
-            });
-            return;
-        }
-        const agent = createLeaseCommittedAgent(capturedDialContext);
-        if (!agent) {
-            resolve({
-                ok: false,
-                generationChanged: true,
-                error: { name: agentName, error: 'edge_generation_changed' },
-            });
-            return;
+        if (typeof beforeDial === 'function') {
+            try {
+                if (beforeDial() !== true) {
+                    resolve({
+                        ok: false,
+                        generationChanged: true,
+                        error: { name: agentName, error: 'edge_generation_changed' },
+                    });
+                    return;
+                }
+            } catch (_) {
+                resolve({
+                    ok: false,
+                    generationChanged: true,
+                    error: { name: agentName, error: 'edge_generation_changed' },
+                });
+                return;
+            }
         }
         const upstream = http.request({
             hostname: '127.0.0.1',
@@ -55,7 +42,6 @@ export function requestAgentCard(route, agentName, callerHeaders = {}, {
                 accept: 'application/json',
             },
             timeout: 5000,
-            agent,
         }, upstreamRes => {
             const chunks = [];
             upstreamRes.on('data', chunk => chunks.push(chunk));
@@ -74,22 +60,10 @@ export function requestAgentCard(route, agentName, callerHeaders = {}, {
             });
         });
         upstream.on('timeout', () => upstream.destroy(new Error('agent-card request timed out')));
-        upstream.on('error', err => {
-            agent.destroy();
-            if (err?.code === 'EDGE_GENERATION_CHANGED') {
-                resolve({
-                    ok: false,
-                    generationChanged: true,
-                    error: { name: agentName, error: 'edge_generation_changed' },
-                });
-                return;
-            }
-            resolve({
-                ok: false,
-                error: { name: agentName, error: err?.message || String(err) },
-            });
-        });
-        upstream.once('close', () => agent.destroy());
+        upstream.on('error', err => resolve({
+            ok: false,
+            error: { name: agentName, error: err?.message || String(err) },
+        }));
         upstream.end();
     });
 }

@@ -5,12 +5,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import {
-    createContainerAgentCredentialContext,
-    __testables as credentialContextTestables,
-} from '../../Agent/lib/agentCredentialContext.mjs';
-import { computeAgentCredentialAdmissionDigest } from '../../Agent/lib/agentCredentialDescriptor.mjs';
-
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-client-'));
 const originalCwd = process.cwd();
 const originalEnvironment = { ...process.env };
@@ -35,70 +29,10 @@ const {
 const { installGeneratedRouterRuntime } = await import('../helpers/generatedRouterRuntime.mjs');
 const { loadVerifiedGeneratedRouterDescriptor } = await import('../../Agent/client/generatedRouterDescriptor.mjs');
 
-let currentCredentialContext = null;
-let currentDescriptor = null;
-
 function installRuntime(options) {
     const runtime = installGeneratedRouterRuntime({ tempDir, ...options });
     for (const name of Object.keys(runtime.env)) generatedEnvNames.add(name);
-    currentCredentialContext = createContainerAgentCredentialContext({
-        ...runtime.env,
-        PLOINKY_RUNTIME: 'container',
-        PLOINKY_AGENT_SECRET: 'a'.repeat(64),
-        PLOINKY_AGENT_PRIVATE_SECRET: 'b'.repeat(64),
-    });
-    currentDescriptor = loadVerifiedGeneratedRouterDescriptor({ env: runtime.env });
-    return {
-        ...runtime,
-        credentialContext: currentCredentialContext,
-        descriptor: currentDescriptor,
-    };
-}
-
-function credentialOptions(extra = {}) {
-    return {
-        credentialContext: currentCredentialContext,
-        descriptor: currentDescriptor,
-        ...extra,
-    };
-}
-
-function bwrapCredentialContext() {
-    const issuedAt = Math.floor(Date.now() / 1000) - 1;
-    const admission = {
-        runtimeKind: 'bwrap',
-        manifestDigest: `sha256:${'1'.repeat(64)}`,
-        capabilityDigest: `sha256:${'2'.repeat(64)}`,
-        networkHash: `sha256:${'3'.repeat(64)}`,
-    };
-    return credentialContextTestables.createBwrapContextFromRead({
-        descriptor: {
-            schemaVersion: 1,
-            principalId: 'agent:AssistOSExplorer/onlyOffice',
-            instanceId: 'instance-bwrap',
-            enableGeneration: 'generation-bwrap',
-            runtimeKey: 'runtime-bwrap',
-            routeKey: 'onlyOffice',
-            router: {
-                physicalOrigin: 'http://127.0.0.1:8080',
-                requestAuthority: '127.0.0.1:19090',
-                host: '127.0.0.1',
-                port: 8080,
-            },
-            admission,
-            admissionDigest: computeAgentCredentialAdmissionDigest(admission),
-            nonce: Buffer.alloc(32, 11).toString('base64url'),
-            issuedAt,
-            expiresAt: issuedAt + 86400,
-            credentials: {
-                agentSecret: 'a'.repeat(64),
-                privateSecret: 'b'.repeat(64),
-                apiKey: 'agent:AssistOSExplorer/onlyOffice|fixture',
-                apiPublicKey: Buffer.alloc(32, 12).toString('base64url'),
-            },
-        },
-        publicAttestation: {},
-    });
+    return runtime;
 }
 
 function listen(server) {
@@ -146,16 +80,17 @@ async function withCaptureServer(t, onRequest, runtimeOptions = {}) {
     });
 }
 
-test('container createAgentClient requires an explicit verified descriptor without env fallback', async () => {
-    const runtime = installRuntime({ origin: 'http://127.0.0.1:65534' });
+test('createAgentClient requires a verified generated descriptor without URL fallback synthesis', async () => {
     const previousDescriptor = process.env.PLOINKY_ROUTER_DESCRIPTOR_FILE;
     const previousMarker = process.env.PLOINKY_ENV_SOURCE_PLOINKY_ROUTER_DESCRIPTOR_FILE;
     try {
         process.env.PLOINKY_ROUTER_URL = 'http://127.0.0.1:65535';
         process.env.PLOINKY_ROUTER_PORT = '65535';
+        delete process.env.PLOINKY_ROUTER_DESCRIPTOR_FILE;
+        delete process.env.PLOINKY_ENV_SOURCE_PLOINKY_ROUTER_DESCRIPTOR_FILE;
         await assert.rejects(
-            () => createAgentClient('dpuAgent', { credentialContext: runtime.credentialContext }),
-            /container clients require an explicit verified Router descriptor/,
+            () => createAgentClient('dpuAgent'),
+            /PLOINKY_ROUTER_DESCRIPTOR_FILE/,
         );
     } finally {
         if (previousDescriptor === undefined) delete process.env.PLOINKY_ROUTER_DESCRIPTOR_FILE;
@@ -165,26 +100,6 @@ test('container createAgentClient requires an explicit verified descriptor witho
     }
 });
 
-test('createAgentClient rejects missing and fabricated credential contexts', async () => {
-    installRuntime({ origin: 'http://127.0.0.1:65534' });
-    await assert.rejects(() => createAgentClient('dpuAgent'), /trusted AgentCredentialContext is required/);
-    await assert.rejects(
-        () => createAgentClient('dpuAgent', { credentialContext: Object.freeze({}) }),
-        /trusted AgentCredentialContext is required/,
-    );
-});
-
-test('bwrap createAgentClient uses only credential-bound topology and rejects a generated descriptor', async () => {
-    const runtime = installRuntime({ origin: 'http://127.0.0.1:65534' });
-    const credentialContext = bwrapCredentialContext();
-    const client = await createAgentClient('dpuAgent', { credentialContext });
-    await client.close();
-    await assert.rejects(
-        () => createAgentClient('dpuAgent', { credentialContext, descriptor: runtime.descriptor }),
-        /bwrap topology comes only from the credential context/,
-    );
-});
-
 test('createAgentClient separates the Router transport address from its canonical authority', async (t) => {
     let capturedHost = '';
     await withCaptureServer(t, (req, _body, res) => {
@@ -192,19 +107,15 @@ test('createAgentClient separates the Router transport address from its canonica
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ jsonrpc: '2.0', id: '1', result: { ok: true } }));
     });
-    const client = await createAgentClient('dpuAgent', credentialOptions());
+    const client = await createAgentClient('dpuAgent');
     assert.deepEqual(await client.callTool('dpu_workspace_roots', {}), { ok: true });
     assert.equal(capturedHost, '127.0.0.1:19090');
 });
 
-test('getRouterAuthority uses only an explicit verified descriptor', () => {
-    const runtime = installRuntime({ origin: 'http://127.0.0.1:65535' });
+test('getRouterAuthority rejects an unsigned authority mirror override', () => {
+    installRuntime({ origin: 'http://127.0.0.1:65535' });
     process.env.PLOINKY_ROUTER_REQUEST_AUTHORITY = 'attacker.invalid:8080';
-    assert.equal(getRouterAuthority(runtime.descriptor), '127.0.0.1:19090');
-    assert.throws(
-        () => getRouterAuthority(Object.freeze({ requestAuthority: 'attacker.invalid:8080' })),
-        /verified generated Router descriptor is required/,
-    );
+    assert.throws(() => getRouterAuthority(), /disagrees with the signed descriptor/);
 });
 
 test('createAgentClient sends no delegation header by default', async (t) => {
@@ -214,7 +125,7 @@ test('createAgentClient sends no delegation header by default', async (t) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ jsonrpc: '2.0', id: '1', result: { ok: true } }));
     });
-    const client = await createAgentClient('dpuAgent', credentialOptions());
+    const client = await createAgentClient('dpuAgent');
     const result = await client.callTool('dpu_confidential_get', { id: 'doc-1' });
 
     assert.deepEqual(result, { ok: true });
@@ -229,7 +140,7 @@ test('createAgentClient sends x-ploinky-user-delegation when configured', async 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ jsonrpc: '2.0', id: '1', result: { ok: true } }));
     });
-    const client = await createAgentClient('dpuAgent', credentialOptions({ userDelegationToken: 'delegation-token-1' }));
+    const client = await createAgentClient('dpuAgent', { userDelegationToken: 'delegation-token-1' });
     await client.callTool('dpu_confidential_get', { id: 'doc-1' });
 
     assert.equal(captured.headers['x-ploinky-user-delegation'], 'delegation-token-1');
@@ -257,7 +168,7 @@ test('createAgentClient unwraps JSON text tool results from MCP content envelope
             }
         }));
     });
-    const client = await createAgentClient('dpuAgent', credentialOptions({ userDelegationToken: 'delegation-token-1' }));
+    const client = await createAgentClient('dpuAgent', { userDelegationToken: 'delegation-token-1' });
     const result = await client.callTool('dpu_workspace_roots', {});
 
     assert.deepEqual(result, {
@@ -276,14 +187,14 @@ test('per-call delegation token overrides client delegation token', async (t) =>
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ jsonrpc: '2.0', id: '1', result: { ok: true } }));
     });
-    const client = await createAgentClient('dpuAgent', credentialOptions({ userDelegationToken: 'delegation-token-1' }));
+    const client = await createAgentClient('dpuAgent', { userDelegationToken: 'delegation-token-1' });
     await client.callTool('dpu_confidential_update', { id: 'doc-1' }, { userDelegationToken: 'delegation-token-2' });
 
     assert.equal(captured.headers['x-ploinky-user-delegation'], 'delegation-token-2');
 });
 
 test('createAgentClient rejects non-string delegation tokens', async () => {
-    const client = await createAgentClient('dpuAgent', credentialOptions());
+    const client = await createAgentClient('dpuAgent');
     await assert.rejects(
         () => client.callTool('dpu_confidential_get', { id: 'doc-1' }, { userDelegationToken: 123 }),
         /userDelegationToken must be a string/,
@@ -323,7 +234,7 @@ test('callTool waits for an asynchronous task and does not apply the observer', 
     });
     t.after(removeObserver);
 
-    const client = await createAgentClient('asyncAgent', credentialOptions());
+    const client = await createAgentClient('asyncAgent');
     const updates = [];
     const result = await client.callTool('execute-task', { prompt: 'wait' }, {
         onTaskUpdate: (task) => updates.push(task),
@@ -357,7 +268,7 @@ test('callToolWithoutWait applies the observer and returns without polling', asy
     });
     t.after(removeObserver);
 
-    const client = await createAgentClient('asyncAgent', credentialOptions());
+    const client = await createAgentClient('asyncAgent');
     const result = await client.callToolWithoutWait('execute-task', { prompt: 'detach' });
 
     assert.equal(observations.length, 1);
@@ -404,11 +315,9 @@ test('task observer status callbacks stay pinned to the client router', async (t
         await Promise.all([close(firstRouter), close(secondRouter)]);
     });
 
-    const firstRuntime = installRuntime({ origin: `http://127.0.0.1:${firstPort}` });
-    const client = await createAgentClient('asyncAgent', {
-        descriptor: firstRuntime.descriptor,
-        credentialContext: firstRuntime.credentialContext,
-    });
+    installRuntime({ origin: `http://127.0.0.1:${firstPort}` });
+    const firstDescriptor = loadVerifiedGeneratedRouterDescriptor();
+    const client = await createAgentClient('asyncAgent', { routerDescriptor: firstDescriptor });
     installRuntime({ origin: `http://127.0.0.1:${secondPort}` });
     const removeObserver = setAgentTaskObserver(async (task) => {
         const status = await task.getTaskStatus();
@@ -432,7 +341,7 @@ test('cancelTask sends a request-bound agent assertion through the router', asyn
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ task: { id: 'remote-1', status: 'cancelling' } }));
     });
-    const client = await createAgentClient('asyncAgent', credentialOptions());
+    const client = await createAgentClient('asyncAgent');
     const task = await client.cancelTask('remote-1');
     assert.equal(task.status, 'cancelling');
     assert.equal(captured.method, 'POST');
@@ -446,7 +355,7 @@ test('callTool gives a hanging initial request a typed total-timeout error', asy
         // Deliberately leave the response open until AgentMcpClient enforces
         // the caller's total deadline and destroys its request.
     });
-    const client = await createAgentClient('slowAgent', credentialOptions());
+    const client = await createAgentClient('slowAgent');
     t.after(() => client.close());
 
     await assert.rejects(
@@ -473,7 +382,7 @@ test('callTool gives a hanging asynchronous task poll a typed total-timeout erro
             result: { metadata: { taskId: 'task-hangs', status: 'queued' } },
         }));
     });
-    const client = await createAgentClient('slowAsyncAgent', credentialOptions());
+    const client = await createAgentClient('slowAsyncAgent');
     t.after(() => client.close());
 
     await assert.rejects(
@@ -527,8 +436,8 @@ test('closing one client does not cancel a concurrent asynchronous call on anoth
         }));
     });
 
-    const clientA = await createAgentClient('asyncAgent', credentialOptions());
-    const clientB = await createAgentClient('asyncAgent', credentialOptions());
+    const clientA = await createAgentClient('asyncAgent');
+    const clientB = await createAgentClient('asyncAgent');
     t.after(() => Promise.all([clientA.close(), clientB.close()]));
 
     const callA = clientA.callTool('execute-task', { client: 'a' }, { timeoutMs: 1000 });
@@ -562,7 +471,7 @@ test('getModels reads the target agent model endpoint through a signed router re
         res.end(JSON.stringify(catalog));
     });
 
-    const client = await createAgentClient('codingAgent', credentialOptions());
+    const client = await createAgentClient('codingAgent');
     assert.deepEqual(await client.getModels(), catalog);
     assert.equal(captured.method, 'GET');
     assert.equal(captured.url, '/codingAgent/v1/models');

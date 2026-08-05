@@ -4,11 +4,7 @@ import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_D
 import { validateSecrets } from '../security/secretInjector.js';
 import { collectManifestEnv, validateManifestEnvProfileCompleteness } from '../security/secretVars.js';
 import { debugLog, findAgent } from '../utils.js';
-import {
-    deriveHostSandboxNetworkContract,
-    effectiveManifestNetwork,
-    validateManifestNetworks,
-} from '../../sandbox/networkContract.js';
+import { effectiveManifestNetwork, validateManifestNetworks } from '../../sandbox/networkContract.js';
 
 // Discover all valid profile names from installed agent manifests.
 // Any profile name declared in a manifest's "profiles" section is valid.
@@ -234,9 +230,6 @@ export function resolveManifestProfile(manifest, requestedProfileName, {
         : {};
     const requestedProfile = String(requestedProfileName || 'default').trim().toLowerCase() || 'default';
     const hasProfiles = Object.keys(profiles).length > 0;
-    const resolveNetwork = (profileName) => source['lite-sandbox'] === true
-        ? deriveHostSandboxNetworkContract(source, { path: manifestPath })
-        : effectiveManifestNetwork(source, profileName, { path: manifestPath });
 
     if (!hasProfiles) {
         if (explicit && requestedProfile !== 'default') {
@@ -246,7 +239,7 @@ export function resolveManifestProfile(manifest, requestedProfileName, {
             requestedProfileName: requestedProfile,
             resolvedProfileName: 'default',
             profileConfig: null,
-            network: resolveNetwork('default'),
+            network: effectiveManifestNetwork(source, 'default', { path: manifestPath }),
         };
     }
 
@@ -261,7 +254,7 @@ export function resolveManifestProfile(manifest, requestedProfileName, {
     }
     const resolvedProfileName = requestedExists ? requestedProfile : 'default';
     const selectedProfile = profiles[resolvedProfileName];
-    const network = resolveNetwork(resolvedProfileName);
+    const network = effectiveManifestNetwork(source, resolvedProfileName, { path: manifestPath });
     const mergedProfile = resolvedProfileName === 'default'
         ? defaultProfile
         : mergeProfiles(defaultProfile, selectedProfile);

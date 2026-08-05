@@ -2,8 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
-import { stopExactRouterForLifecycle } from '../../cli/commands/cli.js';
-
 const cliSource = fs.readFileSync(new URL('../../cli/commands/cli.js', import.meta.url), 'utf8');
 const workspaceSource = fs.readFileSync(new URL('../../cli/commands/workspaceUtil.js', import.meta.url), 'utf8');
 
@@ -19,64 +17,29 @@ function assertOrdered(source, labels) {
 test('whole-workspace and Router lifecycle commands inactivate edge authorization before stopping processes', () => {
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-router-restart')",
-        "const routerStopResult = stopExactRouterForLifecycle('restart router')",
-        'killRouterIfRunning: () => routerStopResult',
+        'killRouterIfRunning();',
     ]);
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-restart')",
-        "const routerStopResult = stopExactRouterForLifecycle('restart')",
+        'killRouterIfRunning();',
         'const list = stopConfiguredAgents();',
         'await startWorkspace(',
-        'killRouterIfRunning: () => routerStopResult',
     ]);
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-shutdown')",
-        "stopExactRouterForLifecycle('shutdown')",
+        'killRouterIfRunning();',
         'const list = destroyWorkspaceContainers();',
     ]);
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-stop')",
-        "stopExactRouterForLifecycle('stop')",
+        'killRouterIfRunning();',
         'const list = stopConfiguredAgents();',
     ]);
     assertOrdered(cliSource, [
         "inactivateEdgeRoutingGeneration('cli-workspace-destroy')",
-        "stopExactRouterForLifecycle('destroy')",
+        'killRouterIfRunning();',
         'await destroyAll();',
     ]);
-    assert.doesNotMatch(cliSource, /killRouterIfRunning:\s*\(\)\s*=>\s*\{\s*\}/);
-});
-
-test('every CLI Router lifecycle accepts only an exact stop, absent owner, or cleared stale record', () => {
-    for (const result of [
-        { stopped: true, pid: 123, signal: 'SIGTERM' },
-        { stopped: false, reason: 'absent' },
-        { stopped: false, reason: 'stale-record', pid: 123 },
-    ]) {
-        let stopCalls = 0;
-        assert.equal(stopExactRouterForLifecycle('test lifecycle', {
-            stopRouter() {
-                stopCalls += 1;
-                return result;
-            },
-        }), result);
-        assert.equal(stopCalls, 1);
-    }
-
-    for (const result of [
-        { stopped: false, reason: 'ownership-unverified', error: new Error('corrupt owner') },
-        { stopped: false, reason: 'term-signal-failed' },
-        { stopped: false, reason: 'kill-signal-failed' },
-        { stopped: false, reason: 'kill-timeout' },
-        undefined,
-    ]) {
-        assert.throws(
-            () => stopExactRouterForLifecycle('test lifecycle', {
-                stopRouter: () => result,
-            }),
-            (error) => error?.code === 'PLOINKY_ROUTER_STOP_REFUSED',
-        );
-    }
 });
 
 test('start admits prepared repositories before persisting the fixed Router port in the inactive transaction', () => {
@@ -94,7 +57,7 @@ test('start admits prepared repositories before persisting the fixed Router port
         'prepareDefaultBootRepositories',
         'prepareManifestRepositories',
         'const admittedStart = preflightWorkspaceStartRuntimeCapabilities',
-        "await acquireWorkspaceMutationLease({\n    operation: 'workspace-start',\n  })",
+        'createWorkspaceStartLock()',
         'assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions)',
         "inactivateEdgeRoutingGeneration('workspace-start-prepare'",
         'resolveAndPersistStartRouterPort(staticAgentArg, portArg, {',
@@ -110,7 +73,7 @@ test('single restart and reinstall delegate physical replacement to the shared r
     assert.doesNotMatch(cliSource, /stopBwrapProcess/);
     assert.doesNotMatch(workspaceSource, /stopBwrapProcess/);
 
-    const reinstallStart = workspaceSource.indexOf('async function reinstallAgent(agentName');
+    const reinstallStart = workspaceSource.indexOf('async function reinstallAgent(agentName)');
     const reinstallEnd = workspaceSource.indexOf('\nexport {', reinstallStart);
     const reinstall = workspaceSource.slice(reinstallStart, reinstallEnd);
     const ensureIndex = reinstall.indexOf('await ensureAgentService(');
@@ -129,7 +92,6 @@ test('sandbox ownership checks use exact runtime keys rather than short agent na
     assert.match(cliSource, /isBwrapProcessRunning\(containerName, \{/);
     assert.match(workspaceSource, /isSandboxRunningImpl\(existing\.key, \{/);
     assert.match(workspaceSource, /isBwrapProcessRunning\(containerName, \{/);
-    assert.doesNotMatch(workspaceSource, /isBwrapProcessRunning\(containerName\);/);
     for (const source of [cliSource, workspaceSource]) {
         assert.match(source, /instanceId:/);
         assert.match(source, /enableGeneration:/);

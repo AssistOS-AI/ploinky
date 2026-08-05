@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 import {
-    abortPreparedRuntimeCandidateBeforeCleanup,
     appendExactManagedBindMount,
     assertPreparedRegistryRecordPreservation,
     buildBoxPodmanHostArgs,
@@ -36,88 +35,6 @@ function boxMarkerFs(contents = BOX_MARKER_CONTENT) {
     };
 }
 
-test('prepared runtime failure injection aborts before callers may clean the candidate', () => {
-    const preparationLease = Object.freeze({ transactionId: 'manager-abort-order' });
-    const candidate = Object.freeze({
-        containerName: 'prepared-manager-candidate',
-        preparationLease,
-        cleanupReceipt: Object.freeze({ operationId: 'manager-cleanup-receipt' }),
-    });
-    const events = [];
-    const recovered = abortPreparedRuntimeCandidateBeforeCleanup(
-        candidate,
-        new Error('injected launch failure'),
-        'manager-test-failure',
-        {
-            abortPreparation(lease, options) {
-                events.push('abort');
-                assert.equal(lease, preparationLease);
-                assert.deepEqual(options, { reason: 'manager-test-failure' });
-            },
-        },
-    );
-    events.push('caller-cleanup');
-
-    assert.deepEqual(events, ['abort', 'caller-cleanup']);
-    assert.equal(recovered.preparationAbortedBeforeCleanup, true);
-    assert.equal(recovered.preparationAbortFailed, false);
-});
-
-test('prepared runtime abort failure preserves immutable candidate evidence', () => {
-    const preparationLease = Object.freeze({ transactionId: 'manager-abort-failure' });
-    const candidate = Object.freeze({
-        containerName: 'preserved-manager-candidate',
-        containerId: 'immutable-candidate-id',
-        preparationLease,
-        cleanupReceipt: Object.freeze({ operationId: 'preserved-cleanup-receipt' }),
-    });
-    const originalFailure = new Error('injected launch failure');
-    const abortFailure = new Error('injected abort failure');
-
-    assert.throws(() => abortPreparedRuntimeCandidateBeforeCleanup(
-        candidate,
-        originalFailure,
-        'manager-test-abort-failure',
-        { abortPreparation() { throw abortFailure; } },
-    ), (error) => (
-        error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-        && error.cause === abortFailure
-        && error.originalFailure === originalFailure
-        && error.ploinkyRestartCandidate?.containerId === candidate.containerId
-        && error.ploinkyRestartCandidate?.preparationAbortFailed === true
-        && error.ploinkyRestartCandidate?.exactCleanupPerformed === false
-    ));
-});
-
-test('prepared runtime recovery failure is propagated without a second abort attempt', () => {
-    const recoveryFailure = new Error('exact preparation abort already failed');
-    recoveryFailure.code = 'PLOINKY_RECOVERY_ABORT_FAILED';
-    let abortCalls = 0;
-
-    assert.throws(() => abortPreparedRuntimeCandidateBeforeCleanup({
-        containerName: 'preserved-manager-candidate',
-        preparationLease: Object.freeze({ transactionId: 'already-failed-abort' }),
-    }, recoveryFailure, 'manager-must-not-retry', {
-        abortPreparation() { abortCalls += 1; },
-    }), (error) => error === recoveryFailure);
-    assert.equal(abortCalls, 0);
-});
-
-test('managed semantic-adoption preparation rejection uses canonical abort recovery', () => {
-    const source = ensureAgentService.toString();
-    const rejection = source.indexOf('managed semantic adoption for');
-    const abort = source.indexOf('abortPreparedRuntimeCandidateBeforeCleanup', rejection);
-    const throwInvalid = source.indexOf('throw invalidPreparation', abort);
-
-    assert.ok(rejection >= 0);
-    assert.ok(abort > rejection);
-    assert.ok(throwInvalid > abort);
-    assert.doesNotMatch(
-        source.slice(rejection, throwInvalid),
-        /abortEdgeRoutingPreparation\s*\(/,
-    );
-});
-
 test('Box host-gateway compatibility does not duplicate the managed network mapping', () => {
     const fsApi = boxMarkerFs();
     for (const network of [
@@ -145,13 +62,6 @@ test('Box host-gateway compatibility does not duplicate the managed network mapp
         markerPath: '/probe/ploinky-box',
         managedNetwork: true,
     }), /marker has invalid content/i);
-});
-
-test('service dispatch selects the strict runtime once and reuses that admission decision', () => {
-    const source = ensureAgentService.toString();
-    assert.equal(source.match(/getRuntimeForAgent\(manifest\)/g)?.length, 1);
-    assert.match(source, /const agentRuntime = preflightAgentRuntime/);
-    assert.match(source, /sandboxAdmission = options\.runtimeAdmission \|\| serviceAdmission/);
 });
 
 test('prepared graph launches suppress intermediate registry persistence only for the exact staged identity', () => {
@@ -189,7 +99,6 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     assert.match(source, /preserveRegistryRecord:\s*preserveRuntimeRegistryRecord/);
     assert.match(source, /if \(!preserveRuntimeRegistryRecord\) saveAgentsMap\(agents\)/);
     assert.match(source, /registryRecord:\s*structuredClone\(agents\[containerName\]\)/);
-    assert.match(source, /stagedRegistryRecord:\s*structuredClone\(stagedRegistryRecord\)/);
     assert.match(source, /returning early \(container exists\)[\s\S]*createdByThisLaunch:\s*false/);
     assert.match(source, /runtimeNetwork:\s*structuredClone\(manifestNetwork\),[\s\S]*createdByThisLaunch:\s*!adoptedExistingRuntime/);
     assert.match(source, /createdByThisLaunch:\s*started\?\.createdByThisLaunch !== false/);

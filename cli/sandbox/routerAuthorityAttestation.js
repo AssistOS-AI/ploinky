@@ -15,23 +15,8 @@ const REQUEST_TIMEOUT_MS = 3_000;
 const HELPER_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_BYTES = 8 * 1024;
 const LOOPBACK_LOGIN_BODY = '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}';
-const MACOS_REMOTE_LOOPBACK_BODY = '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}';
 const AUTHORITY_HELPER_USER = '65534:65534';
 export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
-export const ROUTER_AUTHORITY_EXTERNAL_PROBE_TIMEOUT = 'PLOINKY_ROUTER_ATTESTATION_EXTERNAL_PROBE_TIMEOUT';
-
-const BOUNDED_OPERATION = Object.freeze({
-    PRIVATE_REGISTRY_REQUEST: 'private-registry-request',
-    TARGET_IMAGE_ID: 'target-image-id',
-    TARGET_IMAGE_USER: 'target-image-user',
-    HELPER_IMAGE_ID: 'helper-image-id',
-    HELPER_CREATE: 'helper-create',
-    HELPER_INSPECT: 'helper-inspect',
-    EXTERNAL_HELPER_PROBE: 'external-helper-probe',
-    HELPER_STOP: 'helper-stop',
-    HELPER_REMOVE: 'helper-remove',
-    HELPER_EXISTS: 'helper-exists',
-});
 
 const PROBE_SCRIPT = String.raw`
 const fs = require('node:fs');
@@ -69,33 +54,15 @@ const run = (host) => new Promise((resolve, reject) => {
 `;
 
 export class RouterAuthorityAttestationError extends Error {
-    constructor(code, message, { cause, context } = {}) {
-        super(message, cause ? { cause } : undefined);
+    constructor(code, message, options) {
+        super(message, options);
         this.name = 'RouterAuthorityAttestationError';
-        Object.defineProperties(this, {
-            code: {
-                value: code,
-                enumerable: true,
-                writable: false,
-                configurable: false,
-            },
-            context: {
-                value: context && typeof context === 'object'
-                    ? Object.freeze({ ...context })
-                    : undefined,
-                enumerable: context !== undefined,
-                writable: false,
-                configurable: false,
-            },
-        });
+        this.code = code;
     }
 }
 
-function fail(code, message, cause, context) {
-    throw new RouterAuthorityAttestationError(code, message, {
-        ...(cause ? { cause } : {}),
-        ...(context ? { context } : {}),
-    });
+function fail(code, message, cause) {
+    throw new RouterAuthorityAttestationError(code, message, cause ? { cause } : undefined);
 }
 
 function digest(value) {
@@ -226,26 +193,7 @@ function isLoopbackAddress(value) {
     return net.isIP(address) === 4 && address.startsWith('127.');
 }
 
-function assertExactMacosRemoteSocketEvidence(intent, records) {
-    if (intent.listenerClass !== 'public'
-        || intent.socketLocalAddressClass !== 'public'
-        || intent.runtimeProof?.remote !== true) {
-        fail('PLOINKY_ROUTER_ATTESTATION_MISMATCH', 'macOS remote intent did not match the fixed public topology cell');
-    }
-    for (const record of records) {
-        if (record?.rawInterfaceClass !== 'loopback'
-            || record?.socketLocalAddress !== '127.0.0.1'
-            || record?.socketRemoteAddress !== '127.0.0.1') {
-            fail('PLOINKY_ROUTER_ATTESTATION_MISMATCH', 'macOS remote socket/interface evidence did not match the exact VM proxy cell');
-        }
-    }
-}
-
 function assertExactSocketEvidence(intent, records) {
-    if (intent.topology === 'macos-remote-public-loopback') {
-        assertExactMacosRemoteSocketEvidence(intent, records);
-        return;
-    }
     const expectedRawClass = intent.listenerClass === 'managed'
         ? 'managed'
         : (['host-public-loopback', 'bwrap-public-loopback', 'seatbelt-public-loopback'].includes(intent.topology)
@@ -317,10 +265,7 @@ export function validateRouterAuthorityObservation({ intent, nonce, records, ext
             hostSelectionKind: null,
             controlMiss: false,
         });
-        const loopbackBody = intent.topology === 'macos-remote-public-loopback'
-            ? MACOS_REMOTE_LOOPBACK_BODY
-            : LOOPBACK_LOGIN_BODY;
-        assertExternal(externalByHost(external, loopback), 401, loopbackBody);
+        assertExternal(externalByHost(external, loopback), 401, LOOPBACK_LOGIN_BODY);
         assertExternal(externalByHost(external, hci), 421, '{"error":"UNKNOWN_HOST"}');
     } else {
         assertRecord(hciRecord, {
@@ -347,10 +292,7 @@ export function validateRouterAuthorityObservation({ intent, nonce, records, ext
     return Object.freeze({ nonce, records: Object.freeze([...records]), external: Object.freeze([...external]) });
 }
 
-function runBounded(command, args, { timeout = HELPER_TIMEOUT_MS, operation } = {}) {
-    if (!Object.values(BOUNDED_OPERATION).includes(operation)) {
-        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'bounded helper operation requires an exact operation label');
-    }
+function runBounded(command, args, { timeout = HELPER_TIMEOUT_MS } = {}) {
     const result = spawnSync(command, args, {
         encoding: 'utf8',
         timeout,
@@ -358,30 +300,16 @@ function runBounded(command, args, { timeout = HELPER_TIMEOUT_MS, operation } = 
         killSignal: 'SIGKILL',
     });
     if (result.error || result.status !== 0) {
-        const stderr = String(result.stderr || '').trim();
-        const timedOut = result.error?.code === 'ETIMEDOUT'
-            || (operation === BOUNDED_OPERATION.EXTERNAL_HELPER_PROBE && stderr === 'request timed out');
-        const code = operation === BOUNDED_OPERATION.EXTERNAL_HELPER_PROBE && timedOut
-            ? ROUTER_AUTHORITY_EXTERNAL_PROBE_TIMEOUT
-            : 'PLOINKY_ROUTER_ATTESTATION_HELPER_OPERATION_FAILED';
         fail(
-            code,
-            `bounded helper operation '${operation}' failed (${String(result.stderr || result.error?.message || '').slice(0, 512)})`,
+            'PLOINKY_ROUTER_ATTESTATION_HELPER',
+            `bounded helper operation failed (${String(result.stderr || result.error?.message || '').slice(0, 512)})`,
             result.error,
-            {
-                operation,
-                timeoutMs: timeout,
-                timedOut,
-            },
         );
     }
     return String(result.stdout || '').trim();
 }
 
-function runStatusBounded(command, args, { timeout = HELPER_TIMEOUT_MS, operation } = {}) {
-    if (!Object.values(BOUNDED_OPERATION).includes(operation)) {
-        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'bounded helper status operation requires an exact operation label');
-    }
+function runStatusBounded(command, args, { timeout = HELPER_TIMEOUT_MS } = {}) {
     const result = spawnSync(command, args, {
         encoding: 'utf8',
         timeout,
@@ -389,16 +317,7 @@ function runStatusBounded(command, args, { timeout = HELPER_TIMEOUT_MS, operatio
         killSignal: 'SIGKILL',
     });
     if (result.error || !Number.isInteger(result.status)) {
-        fail(
-            'PLOINKY_ROUTER_ATTESTATION_HELPER_STATUS_OPERATION_FAILED',
-            `bounded helper status operation '${operation}' failed`,
-            result.error,
-            {
-                operation,
-                timeoutMs: timeout,
-                timedOut: result.error?.code === 'ETIMEDOUT',
-            },
-        );
+        fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'bounded helper status operation failed', result.error);
     }
     return Object.freeze({
         status: result.status,
@@ -414,10 +333,7 @@ const bytes=body ? Buffer.from(body) : Buffer.alloc(0);
 const req=http.request({socketPath,method,path,headers:bytes.length?{'content-type':'application/json','content-length':bytes.length}:{}},res=>{const chunks=[];let size=0;res.on('data',c=>{size+=c.length;if(size>8192)req.destroy(new Error('response too large'));else chunks.push(c)});res.on('end',()=>process.stdout.write(JSON.stringify({status:res.statusCode,body:Buffer.concat(chunks).toString('utf8')})))});
 req.setTimeout(3000,()=>req.destroy(new Error('request timed out')));req.on('error',e=>{process.stderr.write(String(e.message||e));process.exit(1)});req.end(bytes);
 `;
-    const raw = runBounded(process.execPath, ['-e', script, socketPath, method, requestPath, body || ''], {
-        timeout: REQUEST_TIMEOUT_MS + 1_000,
-        operation: BOUNDED_OPERATION.PRIVATE_REGISTRY_REQUEST,
-    });
+    const raw = runBounded(process.execPath, ['-e', script, socketPath, method, requestPath, body || ''], { timeout: REQUEST_TIMEOUT_MS + 1_000 });
     try { return JSON.parse(raw); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_REGISTRY', 'private attestation response was malformed', error); }
 }
 
@@ -452,7 +368,7 @@ const AUTHORITY_HELPER_INSPECT_FORMAT = String.raw`{"id":{{json .ID}},"image":{{
 function inspectAuthorityHelper(runtime, id) {
     const raw = runBounded(runtime, [
         'container', 'inspect', '--format', AUTHORITY_HELPER_INSPECT_FORMAT, id,
-    ], { operation: BOUNDED_OPERATION.HELPER_INSPECT });
+    ]);
     let parsed;
     try { parsed = JSON.parse(raw); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper projected inspection returned malformed JSON', error); }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -474,16 +390,10 @@ export function managedImageUserNamespace(imageUser) {
 
 export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce } = {}) {
     if (runtime !== 'podman') fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'container attestation requires verified Podman');
-    const targetImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image], {
-        operation: BOUNDED_OPERATION.TARGET_IMAGE_ID,
-    });
+    const targetImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image]);
     if (!targetImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(targetImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'actual agent image did not resolve to an immutable image ID');
-    const targetImageUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', targetImageId], {
-        operation: BOUNDED_OPERATION.TARGET_IMAGE_USER,
-    });
-    const helperImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', ROUTER_AUTHORITY_HELPER_IMAGE], {
-        operation: BOUNDED_OPERATION.HELPER_IMAGE_ID,
-    });
+    const targetImageUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', targetImageId]);
+    const helperImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', ROUTER_AUTHORITY_HELPER_IMAGE]);
     if (!helperImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(helperImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'authority helper image did not resolve to an immutable image ID');
     const helperName = `ploinky-authority-${nonce.slice(0, 16)}`;
     const firstHost = intent.requestAuthority;
@@ -515,7 +425,7 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
             ...additionalNetworkArgs,
             helperImageId, '-e', PROBE_SCRIPT,
             intent.physicalOrigin, firstHost, secondHost, nonce,
-        ], { operation: BOUNDED_OPERATION.HELPER_CREATE });
+        ]);
         if (!helperId) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper creation did not return an immutable ID');
         const inspected = inspectAuthorityHelper(runtime, helperId);
         const inspectedNetworks = Object.keys(inspected.networks || {}).sort();
@@ -550,9 +460,7 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
             || String(inspected.helperLabel || '') !== nonce) {
             fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper confinement inspection failed');
         }
-        const output = runBounded(runtime, ['start', '--attach', helperId], {
-            operation: BOUNDED_OPERATION.EXTERNAL_HELPER_PROBE,
-        });
+        const output = runBounded(runtime, ['start', '--attach', helperId]);
         let external;
         try { external = JSON.parse(output); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper probe output was malformed', error); }
         if (!Array.isArray(external) || external.length !== 2) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper did not produce exactly two observations');
@@ -573,10 +481,7 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
                 fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper cleanup could not prove exact immutable ID and nonce ownership');
             }
             if (inspected.running === true || inspected.status === 'running') {
-                runBounded(runtime, ['stop', '--time', '2', helperId], {
-                    timeout: 4_000,
-                    operation: BOUNDED_OPERATION.HELPER_STOP,
-                });
+                runBounded(runtime, ['stop', '--time', '2', helperId], { timeout: 4_000 });
                 const stopped = inspectAuthorityHelper(runtime, helperId);
                 if (String(stopped.id || '') !== helperId
                     || String(stopped.helperLabel || '') !== nonce
@@ -584,14 +489,8 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
                     fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper remained running after bounded exact-ID stop');
                 }
             }
-            runBounded(runtime, ['rm', helperId], {
-                timeout: 4_000,
-                operation: BOUNDED_OPERATION.HELPER_REMOVE,
-            });
-            const exists = runStatusBounded(runtime, ['container', 'exists', helperId], {
-                timeout: 4_000,
-                operation: BOUNDED_OPERATION.HELPER_EXISTS,
-            });
+            runBounded(runtime, ['rm', helperId], { timeout: 4_000 });
+            const exists = runStatusBounded(runtime, ['container', 'exists', helperId], { timeout: 4_000 });
             if (exists.status !== 1) {
                 fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper removal was not proven by immutable ID');
             }
@@ -609,46 +508,32 @@ export function attestRouterAuthority({
     if (!intent || !generationLease?.id || typeof generationLease.commit !== 'function' || typeof runProbe !== 'function') {
         fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'attestation requires fixed intent, generation lease, registry, and exact probe runner');
     }
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-        const nonce = crypto.randomBytes(32).toString('hex');
-        registryClient.register(nonce, generationLease.id);
-        let probe;
-        try {
-            probe = runProbe({ intent, nonce });
-        } catch (error) {
-            const retryableTransportTimeout = error instanceof RouterAuthorityAttestationError
-                && error.code === ROUTER_AUTHORITY_EXTERNAL_PROBE_TIMEOUT
-                && error.context?.operation === BOUNDED_OPERATION.EXTERNAL_HELPER_PROBE
-                && error.context?.timeoutMs === HELPER_TIMEOUT_MS
-                && error.context?.timedOut === true;
-            if (attempt === 0 && retryableTransportTimeout) continue;
-            throw error;
-        }
-        const records = registryClient.consume(nonce);
-        const evidence = validateRouterAuthorityObservation({
-            intent,
-            nonce,
-            records,
-            external: probe.external,
-            generationId: generationLease.id,
-        });
-        if (generationLease.commit() !== true) fail('PLOINKY_ROUTER_ATTESTATION_GENERATION', 'edge generation changed after authority observation');
-        const completeEvidence = Object.freeze({
-            nonce,
-            records: evidence.records,
-            external: evidence.external,
-            helper: probe.helper,
-            target: probe.target,
-            generationId: generationLease.id,
-            observedAtUnixMs: now(),
-        });
-        return Object.freeze({
-            ...intent,
-            attestationId: digest(completeEvidence),
-            evidence: completeEvidence,
-        });
-    }
-    fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority attestation exhausted without a terminal result');
+    const nonce = crypto.randomBytes(32).toString('hex');
+    registryClient.register(nonce, generationLease.id);
+    const probe = runProbe({ intent, nonce });
+    const records = registryClient.consume(nonce);
+    const evidence = validateRouterAuthorityObservation({
+        intent,
+        nonce,
+        records,
+        external: probe.external,
+        generationId: generationLease.id,
+    });
+    if (generationLease.commit() !== true) fail('PLOINKY_ROUTER_ATTESTATION_GENERATION', 'edge generation changed after authority observation');
+    const completeEvidence = Object.freeze({
+        nonce,
+        records: evidence.records,
+        external: evidence.external,
+        helper: probe.helper,
+        target: probe.target,
+        generationId: generationLease.id,
+        observedAtUnixMs: now(),
+    });
+    return Object.freeze({
+        ...intent,
+        attestationId: digest(completeEvidence),
+        evidence: completeEvidence,
+    });
 }
 
 export default {
@@ -657,7 +542,6 @@ export default {
     createPrivateAuthorityRegistryClient,
     managedImageUserNamespace,
     ROUTER_AUTHORITY_HELPER_IMAGE,
-    ROUTER_AUTHORITY_EXTERNAL_PROBE_TIMEOUT,
     runContainerAuthorityProbe,
     attestRouterAuthority,
 };

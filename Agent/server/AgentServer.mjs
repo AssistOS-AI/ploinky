@@ -5,23 +5,13 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import {
-    assertAgentCredentialContext,
-    createBwrapAgentCredentialContext,
-    createContainerAgentCredentialContext,
-} from '../lib/agentCredentialContext.mjs';
+import { zod } from 'mcp-sdk';
+import { TaskQueue } from './TaskQueue.mjs';
 import {
     createMemoryReplayCache
 } from '../lib/jwtVerify.mjs';
-import { runProviderSandboxReadiness } from '../lib/providerSandbox.mjs';
-import { createProviderTaskRuntime } from '../lib/providerTaskRuntime.mjs';
-import { startScopedSoulBrokerRegistry } from '../lib/scopedSoulBroker.mjs';
 import {
     hasInvocationTokenHeader,
-    MCP_READINESS_PROBE_HEADER,
-    MCP_READINESS_PROBE_PATH,
-    MCP_READINESS_PROBE_TOOL,
-    MCP_READINESS_PROBE_VALUE,
     verifyRouterRequestFromHeaders,
     verifyOpenAiServiceAuthInfoFromHeaders,
     verifyOpenAiModelsAuthInfoFromHeaders
@@ -33,28 +23,6 @@ import {
     buildDefaultStreamRejection
 } from './openAiDefaultResponder.mjs';
 import { buildLoopToolsFromMcp } from './mcpToolBridge.mjs';
-
-function bootstrapAgentCredentialContext(env = process.env) {
-    const runtimeKind = String(env?.PLOINKY_RUNTIME || '').trim().toLowerCase();
-    if (runtimeKind === 'bwrap') {
-        return assertAgentCredentialContext(createBwrapAgentCredentialContext());
-    }
-    if (env?.PLOINKY_ROUTER_DESCRIPTOR_FILE) {
-        return assertAgentCredentialContext(createContainerAgentCredentialContext(env));
-    }
-    return assertAgentCredentialContext(null);
-}
-
-// Credential validation is the first runtime bootstrap operation. In the
-// bwrap path it reads the pipe-materialized descriptor exactly once and fails
-// before SDK loading, queue construction, timers, or socket creation.
-const agentCredentialContext = bootstrapAgentCredentialContext();
-const agentPrincipalId = agentCredentialContext.identity.principalId;
-const agentRouteKey = agentCredentialContext.runtime.routeKey;
-const [{ zod }, { TaskQueue }] = await Promise.all([
-    import('mcp-sdk'),
-    import('./TaskQueue.mjs'),
-]);
 const { z } = zod;
 const require = createRequire(import.meta.url);
 const achillesAgentLibRoot = path.dirname(require.resolve('achillesAgentLib/package.json'));
@@ -71,72 +39,18 @@ const TASK_STATUS_PATHS = new Set(['/getTaskStatus', '/task']);
 const TASK_CANCEL_PATH = '/task/cancel';
 const TASK_CANCEL_TOOL = '__task_cancel__';
 const TAG_NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
-const PROVIDER_NAME_RE = /^(?:opencode|pi|codex)$/;
-const PROVIDER_EXPORT_RE = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
-
-let scopedSoulBrokerRegistryPromise = null;
-
-function providerPolicyError(code, message) {
-    const error = new Error(message);
-    error.code = code;
-    return error;
-}
-
-function normalizeProviderSandboxConfig(config) {
-    const value = config?.providerSandbox;
-    if (value === undefined) return null;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-        throw providerPolicyError('PLOINKY_PROVIDER_CONFIG_INVALID', 'providerSandbox config must be an object');
-    }
-    const keys = Object.keys(value);
-    if (keys.some((key) => !['provider', 'readiness'].includes(key))
-        || !PROVIDER_NAME_RE.test(String(value.provider || ''))
-        || value.readiness !== true) {
-        throw providerPolicyError('PLOINKY_PROVIDER_CONFIG_INVALID', 'providerSandbox config is not the exact provider/readiness contract');
-    }
-    return Object.freeze({ provider: value.provider, readiness: true });
-}
-
-async function ensureScopedSoulBrokerRegistry() {
-    if (!scopedSoulBrokerRegistryPromise) {
-        scopedSoulBrokerRegistryPromise = startScopedSoulBrokerRegistry({
-            credentialContext: agentCredentialContext,
-        });
-    }
-    return scopedSoulBrokerRegistryPromise;
-}
-
-function resolveAgentDisplayName(manifest, fallback = 'agent') {
-    const manifestName = typeof manifest?.name === 'string' ? manifest.name.trim() : '';
-    return manifestName || agentRouteKey || agentPrincipalId || fallback;
-}
 
 function verifyInvocationForRequest({ requestHeaders, method, path, tool, argumentsObj }) {
     // Recompute the request-content-hash from the actual request surface and
     // verify the router-minted token binds exactly this method/path/tool/rch.
     const rch = computeRchTool({ method, path, tool, arguments: argumentsObj || {} });
     return verifyRouterRequestFromHeaders(requestHeaders, {
-        credentialContext: agentCredentialContext,
+        env: process.env,
         replayCache: invocationReplayCache,
         method,
         path,
         tool,
         rch,
-    });
-}
-
-function isAuthenticatedReadinessInitialize(requestHeaders) {
-    const value = requestHeaders?.[MCP_READINESS_PROBE_HEADER];
-    return typeof value === 'string' && value === MCP_READINESS_PROBE_VALUE;
-}
-
-function verifyReadinessInitialize({ requestHeaders, params }) {
-    return verifyInvocationForRequest({
-        requestHeaders,
-        method: 'POST',
-        path: MCP_READINESS_PROBE_PATH,
-        tool: MCP_READINESS_PROBE_TOOL,
-        argumentsObj: params,
     });
 }
 
@@ -387,34 +301,6 @@ function resolveTaskLogTailBytes(config) {
 }
 
 function buildCommandSpec(entry, defaultCwd) {
-    if (entry?.providerExecution !== undefined) {
-        const execution = entry.providerExecution;
-        if (!execution || typeof execution !== 'object' || Array.isArray(execution)) {
-            throw providerPolicyError('PLOINKY_PROVIDER_EXECUTION_INVALID', 'providerExecution must be an object');
-        }
-        const keys = Object.keys(execution);
-        if (keys.some((key) => !['provider', 'module', 'export'].includes(key))
-            || !PROVIDER_NAME_RE.test(String(execution.provider || ''))
-            || typeof execution.module !== 'string'
-            || !execution.module.startsWith('/code/')
-            || !execution.module.endsWith('.mjs')
-            || path.normalize(execution.module) !== execution.module
-            || !PROVIDER_EXPORT_RE.test(String(execution.export || ''))
-            || entry.command !== undefined || entry.args !== undefined || entry.cwd !== undefined
-            || entry.env !== undefined) {
-            throw providerPolicyError(
-                'PLOINKY_PROVIDER_EXECUTION_INVALID',
-                'providerExecution must be an exact /code module export with no shell fallback',
-            );
-        }
-        return Object.freeze({
-            kind: 'provider-module',
-            provider: execution.provider,
-            module: execution.module,
-            exportName: execution.export,
-            timeoutMs: Number.isFinite(entry?.timeoutMs) ? entry.timeoutMs : undefined,
-        });
-    }
     const commandValue = typeof entry?.command === 'string' ? entry.command.trim() : null;
     if (!commandValue) return null;
     const needsResolution = commandValue.includes('/') || commandValue.includes('\\');
@@ -434,7 +320,7 @@ function buildCommandSpec(entry, defaultCwd) {
     const cwd = defaultCwd;
     const env = entry?.env && typeof entry.env === 'object' ? entry.env : {};
     const timeoutMs = Number.isFinite(entry?.timeoutMs) ? entry.timeoutMs : undefined;
-    return { kind: 'shell', command, args, cwd, env, timeoutMs };
+    return { command, args, cwd, env, timeoutMs };
 }
 
 function normalizeTagList(value) {
@@ -757,67 +643,6 @@ function executeShell(spec, payload, options = {}) {
     });
 }
 
-async function executeProviderModule(spec, payload, options = {}) {
-    const providerConfig = normalizeProviderSandboxConfig(initialConfig);
-    if (!providerConfig || providerConfig.provider !== spec.provider) {
-        throw providerPolicyError(
-            'PLOINKY_PROVIDER_EXECUTION_INVALID',
-            'provider execution does not match the admitted AgentServer provider',
-        );
-    }
-    const taskId = typeof payload?.taskId === 'string' ? payload.taskId.trim() : '';
-    const toolName = typeof payload?.tool === 'string' ? payload.tool.trim() : '';
-    if (!taskId || !toolName) {
-        throw providerPolicyError(
-            'PLOINKY_PROVIDER_EXECUTION_INVALID',
-            'provider execution requires an AgentServer task identity',
-        );
-    }
-    const brokerRegistry = await ensureScopedSoulBrokerRegistry();
-    const providerRuntime = createProviderTaskRuntime({
-        credentialContext: agentCredentialContext,
-        brokerRegistry,
-        provider: spec.provider,
-        taskId,
-        audience: `${agentPrincipalId}/${toolName}`,
-        signal: options.signal,
-        onSpawn: options.onSpawn,
-    });
-    try {
-        const imported = await import(pathToFileURL(spec.module).href);
-        const execute = imported?.[spec.exportName];
-        if (typeof execute !== 'function') {
-            throw providerPolicyError(
-                'PLOINKY_PROVIDER_EXECUTION_INVALID',
-                'provider module does not export the admitted execution function',
-            );
-        }
-        const result = await execute(payload, Object.freeze({
-            providerRuntime,
-            signal: options.signal,
-        }));
-        const normalized = result && typeof result === 'object'
-            ? result
-            : { ok: false, error: 'provider module returned an invalid result' };
-        const stdout = `${JSON.stringify(normalized)}\n`;
-        if (typeof options.onStdoutChunk === 'function') options.onStdoutChunk(Buffer.from(stdout));
-        return {
-            code: normalized.ok === true ? 0 : 1,
-            signal: null,
-            stdout,
-            stderr: '',
-        };
-    } finally {
-        await providerRuntime.close();
-    }
-}
-
-function executeCommand(spec, payload, options = {}) {
-    if (spec?.kind === 'provider-module') return executeProviderModule(spec, payload, options);
-    if (spec?.kind === 'shell') return executeShell(spec, payload, options);
-    throw providerPolicyError('PLOINKY_COMMAND_SPEC_INVALID', 'command specification kind is invalid');
-}
-
 function readJsonBody(req) {
     return new Promise((resolve) => {
         const chunks = [];
@@ -876,7 +701,7 @@ function rejectInvalidOpenAiRouterToken(req, res, rawBody) {
         return false;
     }
     const verified = verifyOpenAiServiceAuthInfoFromHeaders(req.headers, {
-        credentialContext: agentCredentialContext,
+        env: process.env,
         replayCache: invocationReplayCache,
         body: rawBody,
         bodyHash: sha256RawBodyHash(rawBody),
@@ -895,7 +720,7 @@ function rejectInvalidOpenAiModelsRouterToken(req, res) {
         return false;
     }
     const verified = verifyOpenAiModelsAuthInfoFromHeaders(req.headers, {
-        credentialContext: agentCredentialContext,
+        env: process.env,
         replayCache: invocationReplayCache,
     });
     if (!verified.ok) {
@@ -937,7 +762,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
             requestBody: body,
             manifest,
             toolNames: collectMcpToolNames(),
-            agentId: agentPrincipalId,
+            agentId: process.env.PLOINKY_AGENT_ID
         });
         const data = Buffer.from(JSON.stringify(response));
         res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': data.length });
@@ -953,7 +778,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
                 body,
                 manifest,
                 config: configResult ? configResult.config : null,
-                agentId: agentPrincipalId,
+                agentId: process.env.PLOINKY_AGENT_ID,
             });
         } catch (error) {
             sendOpenAiError(res, 502, `Default LLM responder failed: ${error.message}`, 'server_error');
@@ -981,7 +806,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
         endpoint: 'openai.chat.completions',
         request: body,
         metadata: {
-            agent: agentPrincipalId,
+            agent: process.env.AGENT_NAME || '',
             authInfo: parseAuthInfoHeader(req.headers)
         }
     };
@@ -1075,7 +900,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
 }
 
 function buildFallbackModelsResponse(manifest) {
-    const agentName = resolveAgentDisplayName(manifest);
+    const agentName = process.env.AGENT_NAME || manifest?.name || process.env.PLOINKY_AGENT_ID || 'agent';
     const declaredTags = normalizeTagList(manifest?.capabilities?.tags);
     const tags = declaredTags.length > 0 ? declaredTags : ['generic-agent'];
     const supportsStreaming = manifest?.endpoints?.chatCompletions?.stream === true
@@ -1100,7 +925,7 @@ function buildFallbackModelsResponse(manifest) {
                 },
                 metadata: {
                     fallback: true,
-                    agent: agentPrincipalId,
+                    agent: process.env.PLOINKY_AGENT_ID || null,
                 },
             },
         ],
@@ -1123,7 +948,7 @@ async function handleOpenAiModels(req, res) {
     const payload = {
         endpoint: 'openai.models',
         metadata: {
-            agent: agentPrincipalId,
+            agent: process.env.AGENT_NAME || '',
             authInfo: parseAuthInfoHeader(req.headers),
         },
     };
@@ -1243,7 +1068,7 @@ const taskQueue = new TaskQueue({
     maxConcurrent: resolveMaxConcurrent(initialConfig),
     maxLogTailBytes: resolveTaskLogTailBytes(initialConfig),
     storagePath: TASK_QUEUE_FILE,
-    executor: executeCommand
+    executor: executeShell
 });
 
 function extractTemplateParams(template) {
@@ -1277,12 +1102,6 @@ async function registerFromConfig(server, config, helpers) {
             };
 
             const isAsync = tool.async === true;
-            if (commandSpec.kind === 'provider-module' && !isAsync) {
-                throw providerPolicyError(
-                    'PLOINKY_PROVIDER_EXECUTION_INVALID',
-                    `provider tool ${name} must use the cancellable TaskQueue path`,
-                );
-            }
             const asyncTimeout = Number.isFinite(tool.timeoutMs)
                 ? tool.timeoutMs
                 : (Number.isFinite(tool.timeout) ? tool.timeout : undefined);
@@ -1327,7 +1146,7 @@ async function registerFromConfig(server, config, helpers) {
                     return {
                         content: [{ type: 'text', text: `Task '${name}' queued with id ${enqueued.id}` }],
                         metadata: {
-                            agent: agentPrincipalId,
+                            agent: process.env.AGENT_NAME || name,
                             taskId: enqueued.id,
                             toolName: enqueued.toolName,
                             status: enqueued.status,
@@ -1340,7 +1159,7 @@ async function registerFromConfig(server, config, helpers) {
                         }
                     };
                 }
-                const result = await executeCommand(commandSpec, payload);
+                const result = await executeShell(commandSpec, payload);
                 if (result.code !== 0) {
                     const message = describeShellFailure(result);
                     if (helpers && helpers.McpError && helpers.ErrorCode) {
@@ -1353,7 +1172,7 @@ async function registerFromConfig(server, config, helpers) {
                 if (result.stderr && result.stderr.trim()) {
                     content.push({ type: 'text', text: `stderr:\n${result.stderr}` });
                 }
-                return { content, metadata: { agent: agentPrincipalId } };
+                return { content, metadata: { agent: process.env.AGENT_NAME || name } };
             };
 
             const registeredTool = server.registerTool(name, definition, invocation);
@@ -1488,17 +1307,6 @@ async function createServerInstance() {
 
 async function main() {
     const { StreamableHTTPServerTransport, isInitializeRequest } = await loadSdkDeps();
-    const providerConfig = normalizeProviderSandboxConfig(initialConfig);
-    if (providerConfig) {
-        // This is deliberately before broker-listener creation and before the
-        // HTTP service binds: the fixed helper must prove the empty-workspace,
-        // private-proc provider boundary with the frozen credential context.
-        await runProviderSandboxReadiness({
-            provider: providerConfig.provider,
-            credentialContext: agentCredentialContext,
-        });
-        await ensureScopedSoulBrokerRegistry();
-    }
     taskQueue.initialize();
     const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 7000;
     const sessions = {};
@@ -1560,7 +1368,7 @@ async function main() {
                     return sendJson(404, { error: 'agent-card not configured' });
                 }
                 return sendJson(200, {
-                    agent: resolveAgentDisplayName(manifest, 'unknown-agent'),
+                    agent: process.env.AGENT_NAME || manifest?.name || 'unknown-agent',
                     about: typeof manifest?.about === 'string' ? manifest.about : '',
                     'agent-card': agentCard
                 });
@@ -1647,18 +1455,6 @@ async function main() {
                         if (!entry) {
                             if (!isInitializeRequest(body)) {
                                 return sendJson(400, { jsonrpc: '2.0', error: { code: -32000, message: 'Missing session; send initialize first' }, id: null });
-                            }
-                            if (isAuthenticatedReadinessInitialize(req.headers)) {
-                                const readinessAuth = verifyReadinessInitialize({
-                                    requestHeaders: req.headers,
-                                    params: body.params,
-                                });
-                                if (!readinessAuth.ok) {
-                                    return sendJson(401, {
-                                        error: 'invocation_rejected',
-                                        reason: readinessAuth.reason,
-                                    });
-                                }
                             }
                             // Build the per-session record outside the transport closures so
                             // its `server` field is the *only* strong reference to the McpServer.

@@ -11,7 +11,6 @@ import { debugLog } from '../../utils/utils.js';
 import { isHostSandboxDisabled } from '../../utils/runtime/sandboxRuntime.js';
 import { intervalsOverlap, parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
-import { IMAGE_CONTRACT } from '../../../ploinky-box/contract/image.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -701,24 +700,24 @@ function getRuntime(boxMarkerPath) {
     return requireContainerRuntime(boxMarkerPath);
 }
 
-function getHostSandboxInstallHint(platform = process.platform) {
-    if (platform === 'darwin') {
+function getHostSandboxInstallHint() {
+    if (process.platform === 'darwin') {
         return 'macOS lite sandbox requires Seatbelt via sandbox-exec. Check `command -v sandbox-exec`.';
     }
-    if (platform === 'linux') {
+    if (process.platform === 'linux') {
         return 'Linux lite sandbox requires bubblewrap. Install the `bwrap`/`bubblewrap` package and check `command -v bwrap`.';
     }
-    return `Host lite sandbox only supports macOS Seatbelt and Linux bubblewrap; current platform is ${platform}.`;
+    return `Host lite sandbox only supports macOS Seatbelt and Linux bubblewrap; current platform is ${process.platform}.`;
 }
 
 function getHostSandboxDisableHint() {
-    return 'lite-sandbox: true is strict. Remove that selector to use podman/docker, or clear the explicit host-sandbox disable policy.';
+    return 'To test the same agent with podman/docker instead, run `ploinky sandbox disable`, then restart or reinstall the running agents.';
 }
 
-function createHostSandboxError(reason, { platform = process.platform } = {}) {
+function createHostSandboxError(reason) {
     const message = [
         `lite-sandbox: true requested, but ${reason}.`,
-        getHostSandboxInstallHint(platform),
+        getHostSandboxInstallHint(),
         getHostSandboxDisableHint(),
     ].join('\n');
     const error = new Error(message);
@@ -730,7 +729,7 @@ function createHostSandboxStartupError(agentName, runtime, cause) {
     const detail = cause?.message || String(cause || 'unknown error');
     const message = [
         `[${runtime}] ${agentName}: lite-sandbox startup failed: ${detail}`,
-        getHostSandboxInstallHint(runtime === 'bwrap' ? 'linux' : (runtime === 'seatbelt' ? 'darwin' : process.platform)),
+        getHostSandboxInstallHint(),
         getHostSandboxDisableHint(),
     ].join('\n');
     const error = new Error(message);
@@ -750,69 +749,36 @@ function createLegacyRuntimeStringError(runtimeValue) {
     return error;
 }
 
-function createSandboxPolicyConflictError() {
-    const error = new Error('lite-sandbox: true conflicts with the explicit host-sandbox disable policy; container fallback is forbidden');
-    error.code = 'PLOINKY_SANDBOX_POLICY_CONFLICT';
-    return error;
-}
-
-function createSandboxContainerConflictError() {
-    const error = new Error("lite-sandbox: true cannot be combined with a manifest 'container' declaration");
-    error.code = 'PLOINKY_SANDBOX_CONTAINER_CONFLICT';
-    return error;
-}
-
-function probeBoxBwrapHelper(helperPath = IMAGE_CONTRACT.bwrapHelper, spawnSyncImpl = spawnSync) {
-    const result = spawnSyncImpl(helperPath, ['--capabilities'], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: CONTAINER_CONTROL_PLANE_TIMEOUT_MS,
-    });
-    const output = String(result.stdout || '');
-    return !result.error && result.status === 0
-        && output.includes('protocol=1 descriptor-fd=3')
-        && output.includes('path-resolution=openat2-beneath-no-magiclinks-no-symlinks')
-        && output.includes('bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms')
-        && output.includes('typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file')
-        && output.includes('ro-data-path-hardening=sealed-memfd-ro-bind-data');
-}
-
-function getRuntimeForAgent(manifest, {
-    boxMarkerPath,
-    platform = process.platform,
-    runtimeInstalled = isRuntimeInstalled,
-    bwrapHelperPath = IMAGE_CONTRACT.bwrapHelper,
-    spawnSyncImpl = spawnSync,
-} = {}) {
+function getRuntimeForAgent(manifest, { boxMarkerPath } = {}) {
+    if (isPloinkyBoxRuntime(boxMarkerPath)) {
+        return requireContainerRuntime(boxMarkerPath);
+    }
     if (typeof manifest?.runtime === 'string') {
         throw createLegacyRuntimeStringError(manifest.runtime);
     }
     if (manifest?.['lite-sandbox'] === true) {
-        if (Object.prototype.hasOwnProperty.call(manifest, 'container')) {
-            throw createSandboxContainerConflictError();
-        }
         if (isHostSandboxDisabled()) {
-            throw createSandboxPolicyConflictError();
+            return requireContainerRuntime();
         }
 
-        const insideBox = isPloinkyBoxRuntime(boxMarkerPath);
-        const effectivePlatform = insideBox ? 'linux' : platform;
-        if (effectivePlatform === 'darwin') {
-            if (!runtimeInstalled('sandbox-exec')) {
-                throw createHostSandboxError('sandbox-exec was not found or is not executable', { platform: effectivePlatform });
+        // lite-sandbox: true — auto-detect platform.
+        if (process.platform === 'darwin') {
+            try {
+                execSync('command -v sandbox-exec', { stdio: 'ignore' });
+                return 'seatbelt';
+            } catch {
+                throw createHostSandboxError('sandbox-exec was not found or is not executable');
             }
-            return 'seatbelt';
         }
-        if (effectivePlatform === 'linux') {
-            if (!runtimeInstalled('bwrap')) {
-                throw createHostSandboxError('bwrap was not found or is not executable', { platform: effectivePlatform });
+        if (process.platform === 'linux') {
+            try {
+                execSync('command -v bwrap', { stdio: 'ignore' });
+                return 'bwrap';
+            } catch {
+                throw createHostSandboxError('bwrap was not found or is not executable');
             }
-            if (insideBox && !probeBoxBwrapHelper(bwrapHelperPath, spawnSyncImpl)) {
-                throw createHostSandboxError('the Ploinky Box fd-pinned Bubblewrap launcher is missing or lacks required capabilities', { platform: effectivePlatform });
-            }
-            return 'bwrap';
         }
-        throw createHostSandboxError(`platform ${effectivePlatform} is not supported`, { platform: effectivePlatform });
+        throw createHostSandboxError(`platform ${process.platform} is not supported`);
     }
-    return requireContainerRuntime(boxMarkerPath);
+    return requireContainerRuntime();
 }

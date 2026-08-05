@@ -6,21 +6,6 @@ import os from 'node:os';
 
 import { TaskQueue } from '../../Agent/server/TaskQueue.mjs';
 
-const TEST_UID = typeof process.getuid === 'function' ? process.getuid() : 501;
-const TEST_IDENTITY = 'linux-proc:11111111-1111-4111-8111-111111111111:100';
-
-function processIdentityOptions(signals) {
-    return {
-        processIdentityInspector: () => ({
-            state: 'identified',
-            processIdentity: TEST_IDENTITY,
-            processUid: TEST_UID,
-        }),
-        signalProcessGroup: (_pid, signal) => signals.push(signal),
-        getUid: () => TEST_UID,
-    };
-}
-
 function makeTempStorage(t) {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'task-queue-test-'));
     const storagePath = path.join(dir, 'queue.json');
@@ -145,31 +130,6 @@ test('TaskQueue preserves async command args across queue persistence', async (t
 
     assert.deepEqual(restoredEntry?.commandSpec?.args, ['/tmp/script.mjs']);
     assert.equal(restoredEntry?.toolName, 'execute-task');
-});
-
-test('TaskQueue preserves the exact provider-module admission across queue persistence', async (t) => {
-    const storagePath = makeTempStorage(t);
-    const queue = new TaskQueue({
-        maxConcurrent: 1,
-        storagePath,
-        executor: async () => ({ code: 0, stdout: 'ok', stderr: '' }),
-    });
-    const commandSpec = {
-        kind: 'provider-module',
-        provider: 'opencode',
-        module: '/code/scripts/execute-task.mjs',
-        exportName: 'executeProviderTask',
-        timeoutMs: 30_000,
-    };
-    const { id } = queue.enqueueTask({
-        toolName: 'execute-task',
-        commandSpec,
-        payload: { prompt: 'test' },
-    });
-
-    const snapshot = JSON.parse(readFileSync(storagePath, 'utf8'));
-    const restoredEntry = snapshot.find((entry) => entry?.id === id);
-    assert.deepEqual(restoredEntry?.commandSpec, commandSpec);
 });
 
 test('TaskQueue exposes stderr as live logs without leaking stdout result payloads', async (t) => {
@@ -333,40 +293,6 @@ test('TaskQueue cancels queued work without starting it', async (t) => {
     assert.equal(queue.getTask(queuedId)?.status, 'cancelled');
 });
 
-test('TaskQueue aborts in-process provider bootstrap before a child is spawned', async (t) => {
-    const storagePath = makeTempStorage(t);
-    let observedSignal;
-    const queue = new TaskQueue({
-        maxConcurrent: 1,
-        storagePath,
-        executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
-            observedSignal = options.signal;
-            options.signal.addEventListener('abort', () => resolve({
-                code: 1,
-                signal: 'SIGTERM',
-                stdout: '',
-                stderr: '',
-            }), { once: true });
-        }),
-    });
-    const { id } = queue.enqueueTask({
-        toolName: 'execute-task',
-        commandSpec: {
-            kind: 'provider-module',
-            provider: 'pi',
-            module: '/code/scripts/execute-task.mjs',
-            exportName: 'executeProviderTask',
-        },
-        payload: { prompt: 'test' },
-    });
-    await waitFor(() => observedSignal);
-
-    assert.equal(observedSignal.aborted, false);
-    assert.equal(queue.cancelTask(id)?.status, 'cancelling');
-    await waitFor(() => queue.getTask(id)?.status === 'cancelled');
-    assert.equal(observedSignal.aborted, true);
-});
-
 test('TaskQueue keeps a running task in cancelling until cleanup returns its continuation', async (t) => {
     const storagePath = makeTempStorage(t);
     const signals = [];
@@ -374,11 +300,14 @@ test('TaskQueue keeps a running task in cancelling until cleanup returns its con
     const queue = new TaskQueue({
         maxConcurrent: 1,
         storagePath,
-        ...processIdentityOptions(signals),
         executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
             complete = resolve;
             options.onSpawn?.({
-                pid: 4242,
+                pid: null,
+                kill(signal) {
+                    signals.push(signal);
+                    return true;
+                },
             });
         }),
     });
@@ -419,11 +348,14 @@ test('TaskQueue force-kills cleanup that exceeds the cancellation grace period',
         maxConcurrent: 1,
         storagePath,
         cancelGraceMs: 10,
-        ...processIdentityOptions(signals),
         executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
             complete = resolve;
             options.onSpawn?.({
-                pid: 5252,
+                pid: null,
+                kill(signal) {
+                    signals.push(signal);
+                    return true;
+                },
             });
         }),
     });
@@ -435,84 +367,4 @@ test('TaskQueue force-kills cleanup that exceeds the cancellation grace period',
     await waitFor(() => queue.getTask(id)?.status === 'cancelled');
 
     assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
-});
-
-test('TaskQueue never signals PID-reused, unknown, or UID-diverged children', async (t) => {
-    const alternateIdentity = 'linux-proc:22222222-2222-4222-8222-222222222222:200';
-    for (const [state, expectedStatus] of [
-        [{ state: 'identified', processIdentity: alternateIdentity, processUid: TEST_UID }, 'cancelled'],
-        [{ state: 'unknown' }, 'failed'],
-        [{ state: 'uid-diverged', processUid: TEST_UID }, 'failed'],
-    ]) {
-        const storagePath = makeTempStorage(t);
-        const signals = [];
-        let complete;
-        let captured = false;
-        const queue = new TaskQueue({
-            maxConcurrent: 1,
-            storagePath,
-            cancelGraceMs: 10,
-            getUid: () => TEST_UID,
-            signalProcessGroup: (_pid, signal) => signals.push(signal),
-            processIdentityInspector: () => captured
-                ? state
-                : {
-                    state: 'identified',
-                    processIdentity: TEST_IDENTITY,
-                    processUid: TEST_UID,
-                },
-            executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
-                complete = resolve;
-                options.onSpawn?.({ pid: 6363, killed: false });
-                captured = true;
-            }),
-        });
-        const { id } = queue.enqueueTask(dummyTaskConfig());
-        await waitFor(() => queue.getTask(id)?.status === 'running');
-        assert.equal(queue.cancelTask(id)?.status, 'cancelling');
-        complete({ code: 1, signal: 'SIGTERM', stdout: '', stderr: '' });
-        await waitFor(() => queue.getTask(id)?.status === expectedStatus);
-        assert.deepEqual(signals, [], state.state);
-        if (expectedStatus === 'failed') {
-            assert.match(queue.getTask(id)?.error, /^PLOINKY_TASK_PROCESS_IDENTITY_UNVERIFIED:/);
-        }
-    }
-});
-
-test('TaskQueue treats identity-inspector exceptions as typed retained lifecycle failures', async (t) => {
-    const storagePath = makeTempStorage(t);
-    const signals = [];
-    let complete;
-    let captured = false;
-    const queue = new TaskQueue({
-        maxConcurrent: 1,
-        storagePath,
-        cancelGraceMs: 10,
-        getUid: () => TEST_UID,
-        signalProcessGroup: (_pid, signal) => signals.push(signal),
-        processIdentityInspector: () => {
-            if (captured) throw new Error('simulated identity inspector failure');
-            return {
-                state: 'identified',
-                processIdentity: TEST_IDENTITY,
-                processUid: TEST_UID,
-            };
-        },
-        executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
-            complete = resolve;
-            options.onSpawn?.({ pid: 7474, killed: false });
-            captured = true;
-        }),
-    });
-    const { id } = queue.enqueueTask(dummyTaskConfig());
-    await waitFor(() => queue.getTask(id)?.status === 'running');
-    assert.equal(queue.cancelTask(id)?.status, 'cancelling');
-    complete({ code: 1, signal: 'SIGTERM', stdout: '', stderr: '' });
-    await waitFor(() => queue.getTask(id)?.status === 'failed');
-    assert.deepEqual(signals, []);
-    assert.match(queue.getTask(id)?.error, /^PLOINKY_TASK_PROCESS_IDENTITY_UNVERIFIED:/);
-
-    const queued = queue.enqueueTask(dummyTaskConfig());
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(queue.getTask(queued.id)?.status, 'pending');
 });

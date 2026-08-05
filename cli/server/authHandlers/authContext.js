@@ -6,7 +6,6 @@ import { resolveEnabledAgentRecord } from '../../utils/agents.js';
 import { findAgent } from '../../utils/utils.js';
 import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt } from '../auth/localService.js';
 import { waitForAgentReady } from '../utils/agentReadiness.js';
-import { commitRoutePlan } from '../edgeRoutePlan.js';
 import { BROWSER_CSRF_COOKIE_NAME, mintBrowserCsrfToken } from '../browserMutationSecurity.js';
 import { HttpRouteAccessPath } from '../policy/HttpRouteAccessPath.js';
 import { HttpRouteAccessPolicy } from '../policy/HttpRouteAccessPolicy.js';
@@ -92,16 +91,7 @@ async function waitForAgentRedirectReady(agentName, options = {}) {
     }
     const snapshot = snapshotFromOptions(options);
     const route = snapshot?.routing?.routes?.[normalizedAgent] || normalizedAgent;
-    // A published bwrap route has already passed authenticated MCP readiness.
-    // Re-probing it here would create a second, anonymous root AgentServer dial.
-    // Revalidate the captured generation and its exact PID/start/port owner
-    // instead; commitRoutePlan performs both checks without opening a socket.
-    if (options.routePlan?.ownerAttestation) {
-        const commitCapturedPlan = options.commitRoutePlan || commitRoutePlan;
-        return commitCapturedPlan(options.routePlan) === true;
-    }
-    const waitForReady = options.waitForAgentReady || waitForAgentReady;
-    return waitForReady(route, {
+    return waitForAgentReady(route, {
         timeoutMs: 5000,
         intervalMs: 125,
         probeTimeoutMs: 250,

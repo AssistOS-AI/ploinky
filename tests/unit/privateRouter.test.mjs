@@ -1,57 +1,28 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
 import { signPrivateRouterAssertion } from '../../Agent/lib/agentAssertion.mjs';
-import { createContainerAgentCredentialContext } from '../../Agent/lib/agentCredentialContext.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
-
-const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
-const originalCwd = process.cwd();
-process.env.PLOINKY_MASTER_KEY = '4'.repeat(64);
-const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-private-router-'));
-process.chdir(tempDir);
-const moduleSuffix = `?test=${Date.now()}`;
-const { derivePrivateAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
-const {
+import { derivePrivateAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
+import {
     authorizePrivateRoutePlan,
     createTurnCredentialRateLimiter,
     mintTurnCredentials,
-} = await import(`../../cli/server/privateRouter.js${moduleSuffix}`);
-const { installGeneratedRouterRuntime } = await import(`../helpers/generatedRouterRuntime.mjs${moduleSuffix}`);
-const callerAgentId = 'agent:fixtures/beta';
-const generatedRuntime = installGeneratedRouterRuntime({
-    origin: 'http://127.0.0.1:8080',
-    publicAuthority: '127.0.0.1:8080',
-    tempDir,
-    agentPrincipal: callerAgentId,
+} from '../../cli/server/privateRouter.js';
+
+const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
+process.env.PLOINKY_MASTER_KEY = '4'.repeat(64);
+test.after(() => {
+    if (previousMasterKey === undefined) delete process.env.PLOINKY_MASTER_KEY;
+    else process.env.PLOINKY_MASTER_KEY = previousMasterKey;
 });
 
 const caller = Object.freeze({
-    agentId: callerAgentId,
-    instanceId: generatedRuntime.payload.instanceId,
-    enableGeneration: generatedRuntime.payload.generationId,
+    agentId: 'agent:fixtures/beta',
+    instanceId: 'beta-instance',
+    enableGeneration: 'beta-generation',
     routeKey: 'beta',
     containerName: 'beta-container',
-});
-const credentialContext = createContainerAgentCredentialContext({
-    ...generatedRuntime.env,
-    PLOINKY_RUNTIME: 'container',
-    PLOINKY_AGENT_SECRET: 'a'.repeat(64),
-    PLOINKY_AGENT_PRIVATE_SECRET: derivePrivateAgentRequestSecret(
-        caller.agentId,
-        caller.instanceId,
-        caller.enableGeneration,
-    ),
-});
-
-test.after(() => {
-    process.chdir(originalCwd);
-    if (previousMasterKey === undefined) delete process.env.PLOINKY_MASTER_KEY;
-    else process.env.PLOINKY_MASTER_KEY = previousMasterKey;
-    fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
 function snapshot() {
@@ -95,6 +66,19 @@ function privateRoutePlan() {
     };
 }
 
+function assertionEnv() {
+    return {
+        PLOINKY_AGENT_ID: caller.agentId,
+        PLOINKY_AGENT_INSTANCE_ID: caller.instanceId,
+        PLOINKY_AGENT_ENABLE_GENERATION: caller.enableGeneration,
+        PLOINKY_AGENT_PRIVATE_SECRET: derivePrivateAgentRequestSecret(
+            caller.agentId,
+            caller.instanceId,
+            caller.enableGeneration,
+        ),
+    };
+}
+
 function signedRequest(plan, body, overrides = {}) {
     const method = overrides.method || 'POST';
     const token = signPrivateRouterAssertion({
@@ -102,7 +86,7 @@ function signedRequest(plan, body, overrides = {}) {
         path: plan.pathname,
         query: plan.parsedUrl.search,
         body,
-        credentialContext: overrides.credentialContext || credentialContext,
+        env: { ...assertionEnv(), ...(overrides.env || {}) },
     });
     return {
         method,

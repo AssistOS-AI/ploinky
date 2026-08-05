@@ -5,12 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
-import { networkContractHash } from '../../cli/sandbox/networkContract.js';
 import {
     admitManifestRuntimeCapabilities,
-    assertRuntimeAdmissionCurrent,
     assertRuntimeCapabilitiesAllowed,
-    RUNTIME_ADMISSION_SCHEMA_VERSION,
     renderContainerSecurityArgs,
     renderRuntimePolicyArgs,
     resolveEffectiveRuntimeCapabilities,
@@ -115,7 +112,7 @@ test('argument renderers reject a forged public-version descriptor', () => {
     );
 });
 
-test('strict Box marker permits admitted bwrap host networking but rejects other unsupported capabilities', () => {
+test('strict Box marker rejects unsupported capabilities but defers host-network authority to the exact generation grant', () => {
     const fixture = markerFixture();
     try {
         const cases = [
@@ -133,100 +130,21 @@ test('strict Box marker permits admitted bwrap host networking but rejects other
                 (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
             );
         }
-        const hostNetwork = resolveEffectiveRuntimeCapabilities({}, { network: { mode: 'host' } });
+        const hostNetwork = resolveEffectiveRuntimeCapabilities({ network: { mode: 'host' } });
         assert.equal(hostNetwork.capabilities.hostNetwork, true);
         assert.doesNotThrow(() => assertRuntimeCapabilitiesAllowed(hostNetwork, {
             boxMarkerOptions: { markerPath: fixture.markerPath },
         }));
-        assert.doesNotThrow(() => assertRuntimeCapabilitiesAllowed(hostNetwork, {
-            runtimeKind: 'bwrap',
-            boxMarkerOptions: { markerPath: fixture.markerPath },
-        }));
+        assert.throws(
+            () => assertRuntimeCapabilitiesAllowed(hostNetwork, {
+                runtimeKind: 'bwrap',
+                boxMarkerOptions: { markerPath: fixture.markerPath },
+            }),
+            (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED'
+                && error.context.unsupported.includes('box-host-sandbox'),
+        );
     } finally {
         fs.rmSync(fixture.root, { recursive: true, force: true });
-    }
-});
-
-test('strict sandbox admission schema records absent declaration and effective network hash', () => {
-    const manifest = { 'lite-sandbox': true };
-    const admission = admitManifestRuntimeCapabilities(manifest, {
-        manifestBytes: Buffer.from(JSON.stringify(manifest)),
-        runtime: 'bwrap',
-        runtimeKind: 'bwrap',
-        network: { mode: 'host', source: 'platform-lite-sandbox' },
-        insideBox: false,
-    });
-    assert.equal(admission.schemaVersion, RUNTIME_ADMISSION_SCHEMA_VERSION);
-    assert.equal(admission.networkAdmission.declaration, 'absent');
-    assert.deepEqual(admission.networkAdmission.effectiveContract, {
-        mode: 'host',
-        source: 'platform-lite-sandbox',
-    });
-    assert.match(admission.networkAdmission.effectiveHash, /^[a-f0-9]{64}$/);
-    assert.equal(admission.descriptor.capabilities.hostNetwork, true);
-    assert.doesNotThrow(() => assertRuntimeAdmissionCurrent(admission, {
-        manifestBytes: Buffer.from(JSON.stringify(manifest)),
-        runtimeKind: 'bwrap',
-    }));
-
-    const staleSchema = structuredClone(admission);
-    staleSchema.schemaVersion = 1;
-    assert.throws(
-        () => assertRuntimeAdmissionCurrent(staleSchema),
-        { code: 'PLOINKY_RUNTIME_INPUT_CHANGED' },
-    );
-    const alteredNetwork = structuredClone(admission);
-    alteredNetwork.networkAdmission.effectiveHash = '0'.repeat(64);
-    assert.throws(
-        () => assertRuntimeAdmissionCurrent(alteredNetwork),
-        { code: 'PLOINKY_RUNTIME_INPUT_CHANGED' },
-    );
-    const malformedNetwork = structuredClone(admission);
-    delete malformedNetwork.networkAdmission.effectiveContract;
-    assert.throws(
-        () => assertRuntimeAdmissionCurrent(malformedNetwork),
-        { code: 'PLOINKY_RUNTIME_INPUT_CHANGED' },
-    );
-
-    assert.throws(
-        () => admitManifestRuntimeCapabilities(manifest, {
-            runtimeKind: 'container',
-            insideBox: false,
-        }),
-        { code: 'PLOINKY_SANDBOX_POLICY_CONFLICT' },
-    );
-    assert.throws(
-        () => admitManifestRuntimeCapabilities({
-            'lite-sandbox': true,
-            container: 'legacy-image',
-        }, { runtimeKind: 'bwrap', insideBox: false }),
-        { code: 'PLOINKY_SANDBOX_CONTAINER_CONFLICT' },
-    );
-});
-
-test('host runtime admission requires the exact derived platform network contract', () => {
-    const manifest = { 'lite-sandbox': true };
-    for (const runtimeKind of ['bwrap', 'seatbelt']) {
-        const admission = admitManifestRuntimeCapabilities(manifest, {
-            manifestBytes: Buffer.from(JSON.stringify(manifest)),
-            runtime: runtimeKind,
-            runtimeKind,
-            network: { mode: 'host', source: 'platform-lite-sandbox' },
-            insideBox: false,
-        });
-
-        for (const effectiveContract of [
-            { mode: 'none' },
-            { mode: 'host' },
-        ]) {
-            const forgedAdmission = structuredClone(admission);
-            forgedAdmission.networkAdmission.effectiveContract = effectiveContract;
-            forgedAdmission.networkAdmission.effectiveHash = networkContractHash(effectiveContract);
-            assert.throws(
-                () => assertRuntimeAdmissionCurrent(forgedAdmission),
-                { code: 'PLOINKY_RUNTIME_INPUT_CHANGED' },
-            );
-        }
     }
 });
 

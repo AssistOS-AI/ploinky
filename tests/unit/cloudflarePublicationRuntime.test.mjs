@@ -569,69 +569,6 @@ test('runtime startup replaces stale persisted readiness before scanning a gener
     await runtime.stop();
 });
 
-test('background publication scans audit invalid workspace locks without unhandled rejection', async (t) => {
-    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-lock-invalid-'));
-    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
-    const audits = [];
-    const unhandled = [];
-    const onUnhandled = (reason) => { unhandled.push(reason); };
-    process.on('unhandledRejection', onUnhandled);
-    t.after(() => process.removeListener('unhandledRejection', onUnhandled));
-    let resolveAudited;
-    const audited = new Promise((resolve) => { resolveAudited = resolve; });
-    const invalidLock = Object.assign(new Error('workspace lock store lineage is invalid'), {
-        code: 'PLOINKY_WORKSPACE_MUTATION_LOCK_INVALID',
-    });
-    const runtime = startCloudflarePublicationRuntime({
-        workspaceRoot: workspace,
-        statusFile: path.join(workspace, 'status.json'),
-        pollIntervalMs: 60_000,
-        loadActive: () => ({
-            selector: {
-                generation: GENERATION,
-                activationId: 'activation-invalid-lock',
-                publicationState: 'reconciling',
-            },
-            generation: { desired: { hosts: {} } },
-        }),
-        createWorkspaceLease: () => { throw invalidLock; },
-        routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
-        controllerFactory: () => ({
-            reconcile: async () => assert.fail('invalid workspace lock must prevent reconciliation'),
-            getStatus: () => ({ state: 'fixture' }),
-            stop: async () => {},
-        }),
-        probeHostname: async () => ({ ok: true }),
-        audit: (event, value) => {
-            audits.push({ event, value });
-            if (event === 'cloudflare-publication-scan-error') resolveAudited();
-        },
-    });
-
-    await Promise.race([
-        audited,
-        new Promise((_, reject) => setTimeout(
-            () => reject(new Error('invalid workspace lock scan was not audited')),
-            1_000,
-        )),
-    ]);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(unhandled, []);
-    assert.deepEqual(
-        audits.filter(({ event }) => event === 'cloudflare-publication-scan-error'),
-        [{
-            event: 'cloudflare-publication-scan-error',
-            value: {
-                code: 'PLOINKY_WORKSPACE_MUTATION_LOCK_INVALID',
-                message: 'workspace lock store lineage is invalid',
-                trigger: 'startup',
-            },
-        }],
-    );
-    await assert.rejects(runtime.scan(), (error) => error === invalidLock);
-    await runtime.stop();
-});
-
 test('publication runtime reconciles each successful selected activation once and stops its one controller', async (t) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-publication-runtime-'));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));

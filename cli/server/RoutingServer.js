@@ -97,7 +97,6 @@ import { deriveAgentRequestSecret } from '../utils/security/masterKey.js';
 import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflared/index.mjs';
 import { requestAgentCard } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
-import { createRootAgentDialContext } from './rootAgentDial.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -308,7 +307,7 @@ async function handleRoutedAggregateAgentCard(req, res, routePlan) {
         .filter(([, route]) => route && !route.disabled && route.hostPort);
     const results = await Promise.all(candidates.map(([agentName, route]) =>
         requestAgentCard(route, agentName, req.headers, {
-            routePlan,
+            beforeDial: () => routePlan?.lease?.commit?.() === true,
         })
             .catch(error => ({
                 ok: false,
@@ -437,10 +436,10 @@ async function processRequest(req, res) {
     }
 
     // DS014: any `__agent` segment is a router-owned agent control-plane path
-    // (e.g. the deferred share authorizer). The PUBLIC listener never serves
-    // them, and the deferred authorizer stays fail-closed until it has the same
-    // captured owner-attested root-dial contract. Refuse here before passthrough
-    // handling can forward one to an agent. Generic 404 so the reply
+    // (e.g. the share authorizer). The router reaches those itself over a direct
+    // loopback call carrying a minted Router Request — the PUBLIC listener never
+    // serves them. Refuse here before passthrough handling can forward one to an
+    // agent. Generic 404 so the reply
     // does not confirm the internal route exists.
     if (hasInternalAgentSegment(pathname)) {
         sendJsonResponse(res, 404, { error: 'not_found' });
@@ -493,12 +492,7 @@ async function processRequest(req, res) {
             res,
             route,
             agentName,
-            dialContext: createRootAgentDialContext({
-                routePlan,
-                routeKey: agentName,
-                route,
-                targetPort: route?.hostPort,
-            }),
+            beforeDial: () => commitRoutePlan(routePlan),
         });
         return;
     } else if (isDelegatedAgentTaskStatusRoute) {
@@ -565,18 +559,16 @@ async function processRequest(req, res) {
             sendJsonResponse(res, 400, { error: 'missing taskId' }, { 'Cache-Control': 'no-store' });
             return;
         }
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
         try {
             const task = await readAuthenticatedAgentTask({
                 req,
                 route,
                 agentName,
                 taskId,
-                dialContext: createRootAgentDialContext({
-                    routePlan,
-                    routeKey: agentName,
-                    route,
-                    targetPort: route?.hostPort,
-                }),
             });
             sendJsonResponse(res, 200, { task }, { 'Cache-Control': 'no-store' });
         } catch (error) {
@@ -690,23 +682,13 @@ async function processRequest(req, res) {
         }
         if (isAgentMcpRoute) {
             return handleAgentMcpRequest(req, res, route, agentName, {
-                dialContext: createRootAgentDialContext({
-                    routePlan,
-                    routeKey: agentName,
-                    route,
-                    targetPort: route.hostPort,
-                }),
+                beforeDial: () => commitRoutePlan(routePlan),
                 routePlan,
             });
         }
         if (isDelegatedAgentOpenAi) {
             return handleDelegatedAgentOpenAiCall(req, res, route, agentName, agentProxyPath, {
-                dialContext: createRootAgentDialContext({
-                    routePlan,
-                    routeKey: agentName,
-                    route,
-                    targetPort: route.hostPort,
-                }),
+                beforeDial: () => commitRoutePlan(routePlan),
             });
         }
         // `__agent` control-plane paths are already refused at the top of the
@@ -723,12 +705,7 @@ async function processRequest(req, res) {
             ...agentProxyExtraHeaders,
             ...buildTrustedForwardingHeaders(routePlan),
         }, {
-            dialContext: createRootAgentDialContext({
-                routePlan,
-                routeKey: agentName,
-                route,
-                targetPort: route.hostPort,
-            }),
+            beforeDial: () => commitRoutePlan(routePlan),
         });
     } else if (pathname === '/mcp' || pathname === '/mcp/') {
         return handleRouterMcp(req, res, routePlan);

@@ -11,15 +11,9 @@ import { spawn } from 'node:child_process';
 
 import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
 import { computeRchTool } from '../../Agent/lib/requestHash.mjs';
-import { createAgentServerContainerEnvironment } from '../helpers/agentServerCredentialRuntime.mjs';
 
 const REPO_ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
 const AGENT_SERVER = path.join(REPO_ROOT, 'Agent/server/AgentServer.mjs');
-const credentialWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-server-credential-workspace-'));
-
-test.after(async () => {
-    await fs.rm(credentialWorkspace, { recursive: true, force: true });
-});
 
 function isolatedAgentServerEnv() {
     const env = { ...process.env };
@@ -65,28 +59,16 @@ async function waitForHealth(port, output) {
     throw new Error(`AgentServer did not become healthy:\n${output()}`);
 }
 
-async function startAgentServer(t, {
-    tmp,
-    configPath,
-    env = {},
-    agentPrincipal = 'agent:test/agent-server',
-    agentSecret = 'a'.repeat(64),
-}) {
+async function startAgentServer(t, { tmp, configPath, env = {} }) {
     const port = await getFreePort();
-    const credentialEnv = await createAgentServerContainerEnvironment({
-        tempDir: credentialWorkspace,
-        agentPrincipal,
-        agentSecret,
-    });
     const child = spawn(process.execPath, [AGENT_SERVER], {
         cwd: tmp,
         env: {
             ...isolatedAgentServerEnv(),
-            ...env,
-            ...credentialEnv,
             PORT: String(port),
             PLOINKY_AGENT_BIND_HOST: '127.0.0.1',
             PLOINKY_AGENT_CONFIG: configPath,
+            ...env
         },
         stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -290,16 +272,16 @@ test('AgentServer idle GC does not close a session while a tool response is in f
     }, null, 2));
 
     const secret = crypto.randomBytes(32);
-    const audience = 'agent:test/test-agent';
+    const audience = 'agent:test-agent';
     const { port } = await startAgentServer(t, {
         tmp,
         configPath,
         env: {
             MCP_SESSION_IDLE_TIMEOUT_MS: '100',
             MCP_SESSION_GC_INTERVAL_MS: '25',
-        },
-        agentPrincipal: audience,
-        agentSecret: secret.toString('hex'),
+            PLOINKY_AGENT_SECRET: secret.toString('hex'),
+            PLOINKY_AGENT_ID: audience
+        }
     });
 
     const sessionId = await initializeSession(port);
@@ -352,12 +334,14 @@ test('AgentServer cancels an asynchronous task only with a matching Router Reque
     }, null, 2));
 
     const secret = crypto.randomBytes(32);
-    const audience = 'agent:test/test-agent';
+    const audience = 'agent:test-agent';
     const { port } = await startAgentServer(t, {
         tmp,
         configPath,
-        agentPrincipal: audience,
-        agentSecret: secret.toString('hex'),
+        env: {
+            PLOINKY_AGENT_SECRET: secret.toString('hex'),
+            PLOINKY_AGENT_ID: audience
+        }
     });
     const sessionId = await initializeSession(port);
     await mcpPost(port, {

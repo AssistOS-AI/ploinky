@@ -1,15 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
-import {
-    createContainerAgentCredentialContext,
-    __testables as credentialContextTestables,
-} from '../../Agent/lib/agentCredentialContext.mjs';
-import { computeAgentCredentialAdmissionDigest } from '../../Agent/lib/agentCredentialDescriptor.mjs';
 import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { computeRchHttp, computeRchTool } from '../../Agent/lib/requestHash.mjs';
@@ -17,13 +9,6 @@ import {
     verifyHttpRouteAuthInfoFromHeaders,
     verifyRouterRequestFromHeaders,
 } from '../../Agent/lib/invocationAuth.mjs';
-
-const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-invocation-auth-'));
-const originalCwd = process.cwd();
-const originalMasterKey = process.env.PLOINKY_MASTER_KEY;
-process.chdir(tempDir);
-process.env.PLOINKY_MASTER_KEY = '6'.repeat(64);
-const { installGeneratedRouterRuntime } = await import(`../helpers/generatedRouterRuntime.mjs?test=${Date.now()}`);
 
 // The agent verifies Router Request JWTs with its OWN per-agent secret. The test
 // treats that secret as opaque random bytes (its derivation is covered by
@@ -62,67 +47,9 @@ function mintRouterRequest(overrides = {}) {
     return signHmacJwt({ payload, secret: AGENT_SECRET });
 }
 
-function makeCredentialContext({
-    principalId = AGENT_ID,
-    agentSecret = AGENT_SECRET_HEX,
-} = {}) {
-    const runtime = installGeneratedRouterRuntime({
-        origin: 'http://127.0.0.1:8080',
-        publicAuthority: '127.0.0.1:8080',
-        tempDir,
-        agentPrincipal: principalId,
-    });
-    return createContainerAgentCredentialContext({
-        ...runtime.env,
-        PLOINKY_RUNTIME: 'container',
-        PLOINKY_AGENT_SECRET: agentSecret,
-        PLOINKY_AGENT_PRIVATE_SECRET: 'b'.repeat(64),
-    });
+function makeEnv(overrides = {}) {
+    return { PLOINKY_AGENT_ID: AGENT_ID, PLOINKY_AGENT_SECRET: AGENT_SECRET_HEX, ...overrides };
 }
-
-function makeExpiredCredentialContext() {
-    const admission = {
-        runtimeKind: 'bwrap',
-        manifestDigest: `sha256:${'1'.repeat(64)}`,
-        capabilityDigest: `sha256:${'2'.repeat(64)}`,
-        networkHash: `sha256:${'3'.repeat(64)}`,
-    };
-    return credentialContextTestables.createBwrapContextFromRead({
-        descriptor: {
-            schemaVersion: 1,
-            principalId: AGENT_ID,
-            instanceId: 'instance-expired',
-            enableGeneration: 'generation-expired',
-            runtimeKey: 'runtime-expired',
-            routeKey: 'dpuAgent',
-            router: {
-                physicalOrigin: 'http://127.0.0.1:8080',
-                requestAuthority: '127.0.0.1:8080',
-                host: '127.0.0.1',
-                port: 8080,
-            },
-            admission,
-            admissionDigest: computeAgentCredentialAdmissionDigest(admission),
-            nonce: Buffer.alloc(32, 9).toString('base64url'),
-            issuedAt: 1,
-            expiresAt: 86401,
-            credentials: {
-                agentSecret: AGENT_SECRET_HEX,
-                privateSecret: 'b'.repeat(64),
-                apiKey: `${AGENT_ID}|fixture`,
-                apiPublicKey: Buffer.alloc(32, 10).toString('base64url'),
-            },
-        },
-        publicAttestation: {},
-    });
-}
-
-test.after(() => {
-    process.chdir(originalCwd);
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    if (originalMasterKey === undefined) delete process.env.PLOINKY_MASTER_KEY;
-    else process.env.PLOINKY_MASTER_KEY = originalMasterKey;
-});
 
 function sha256BodyHash(body) {
     return crypto.createHash('sha256').update(Buffer.from(body)).digest('base64url');
@@ -173,7 +100,7 @@ function verify(token, opts = {}) {
     return verifyRouterRequestFromHeaders(
         { authorization: `Bearer ${token}` },
         {
-            credentialContext: opts.credentialContext ?? makeCredentialContext(),
+            env: opts.env ?? makeEnv(),
             replayCache: opts.replayCache ?? createMemoryReplayCache(),
             method,
             path: reqPath,
@@ -192,32 +119,21 @@ test('verifyRouterRequestFromHeaders accepts a valid router-request', () => {
 });
 
 test('rejects a missing bearer token', () => {
-    const result = verifyRouterRequestFromHeaders({}, {
-        credentialContext: makeCredentialContext(), method: METHOD, path: PATH, tool: TOOL, rch: 'x',
-    });
+    const result = verifyRouterRequestFromHeaders({}, { env: makeEnv(), method: METHOD, path: PATH, tool: TOOL, rch: 'x' });
     assert.equal(result.ok, false);
     assert.match(result.reason, /missing router-request token/);
 });
 
-test('rejects a missing credential context without consulting process.env', () => {
-    const result = verifyRouterRequestFromHeaders(
-        { authorization: `Bearer ${mintRouterRequest()}` },
-        { method: METHOD, path: PATH, tool: TOOL, rch: 'x' },
-    );
+test('rejects when PLOINKY_AGENT_SECRET is not configured (no master/shared fallback)', () => {
+    const result = verify(mintRouterRequest(), { env: { PLOINKY_AGENT_ID: AGENT_ID } });
     assert.equal(result.ok, false);
-    assert.match(result.reason, /trusted AgentCredentialContext is required/);
+    assert.match(result.reason, /PLOINKY_AGENT_SECRET not configured/);
 });
 
-test('rejects a fabricated credential context', () => {
-    const result = verify(mintRouterRequest(), { credentialContext: Object.freeze({ identity: { principalId: AGENT_ID } }) });
+test('rejects when PLOINKY_AGENT_ID is not configured', () => {
+    const result = verify(mintRouterRequest(), { env: { PLOINKY_AGENT_SECRET: AGENT_SECRET_HEX } });
     assert.equal(result.ok, false);
-    assert.match(result.reason, /trusted AgentCredentialContext is required/);
-});
-
-test('rejects an expired trusted credential context', () => {
-    const result = verify(mintRouterRequest(), { credentialContext: makeExpiredCredentialContext() });
-    assert.equal(result.ok, false);
-    assert.match(result.reason, /not active/);
+    assert.match(result.reason, /PLOINKY_AGENT_ID not configured/);
 });
 
 test('rejects a tampered body via request-content-hash', () => {
@@ -255,7 +171,7 @@ test('verifyHttpRouteAuthInfoFromHeaders accepts a body-bound HTTP route token',
     const result = verifyHttpRouteAuthInfoFromHeaders(
         { 'x-ploinky-auth-info': makeHttpRouteAuthInfoHeader(token, bodyHash) },
         {
-            credentialContext: makeCredentialContext(),
+            env: makeEnv(),
             replayCache: createMemoryReplayCache(),
             method: HTTP_METHOD,
             path: HTTP_PATH,
@@ -279,7 +195,7 @@ test('verifyHttpRouteAuthInfoFromHeaders rejects a changed HTTP body', () => {
     const result = verifyHttpRouteAuthInfoFromHeaders(
         { 'x-ploinky-auth-info': makeHttpRouteAuthInfoHeader(token, bodyHash) },
         {
-            credentialContext: makeCredentialContext(),
+            env: makeEnv(),
             replayCache: createMemoryReplayCache(),
             method: HTTP_METHOD,
             path: HTTP_PATH,
@@ -300,7 +216,7 @@ test('verifyHttpRouteAuthInfoFromHeaders rejects the external path for rewritten
     const result = verifyHttpRouteAuthInfoFromHeaders(
         { 'x-ploinky-auth-info': makeHttpRouteAuthInfoHeader(token, bodyHash) },
         {
-            credentialContext: makeCredentialContext(),
+            env: makeEnv(),
             replayCache: createMemoryReplayCache(),
             method: HTTP_METHOD,
             path: HTTP_EXTERNAL_PATH,
@@ -320,7 +236,7 @@ test('verifyHttpRouteAuthInfoFromHeaders rejects replay by default', () => {
     const headers = { 'x-ploinky-auth-info': makeHttpRouteAuthInfoHeader(token, bodyHash) };
 
     const first = verifyHttpRouteAuthInfoFromHeaders(headers, {
-        credentialContext: makeCredentialContext(),
+        env: makeEnv(),
         method: HTTP_METHOD,
         path: HTTP_PATH,
         query: HTTP_QUERY,
@@ -329,7 +245,7 @@ test('verifyHttpRouteAuthInfoFromHeaders rejects replay by default', () => {
     assert.equal(first.ok, true, first.reason);
 
     const second = verifyHttpRouteAuthInfoFromHeaders(headers, {
-        credentialContext: makeCredentialContext(),
+        env: makeEnv(),
         method: HTTP_METHOD,
         path: HTTP_PATH,
         query: HTTP_QUERY,

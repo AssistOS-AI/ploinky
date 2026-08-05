@@ -2,14 +2,14 @@ import crypto from 'node:crypto';
 
 import { signHmacJwt } from './jwtSign.mjs';
 import { computeRchTool, computeRchHttp, sha256RawBodyHash } from './requestHash.mjs';
-import { assertAgentCredentialContext } from './agentCredentialContext.mjs';
+import { readAgentSecret, expectedAudienceForSelf } from './invocationAuth.mjs';
 
 /**
  * agentAssertion.mjs — agent-side signer for the Agent Assertion JWT
  * (source agent → router, DS013 / Phase 3).
  *
  * A source agent proves its own identity to the router by signing a short-lived
- * assertion with its own explicit credential context. The assertion binds the
+ * assertion with its OWN `PLOINKY_AGENT_SECRET`. The assertion binds the
  * request surface (method, path, target agent, tool, `rch`) so the router can
  * apply MCP policy and mint a target-scoped Router Request. The router never
  * forwards this assertion onward; agent-to-agent calls are always router-mediated.
@@ -26,22 +26,13 @@ const PRIVATE_ROUTER_AUDIENCE = 'ploinky-private-router';
  * `tool`-optional behavior, and the empty-target/empty-secret guards stay
  * identical regardless of how `rch` was derived.
  */
-function requestCredentials(credentialContext) {
-    const context = assertAgentCredentialContext(credentialContext);
-    context.assertActive();
-    const encodedSecret = context.getAgentSecret();
-    if (!/^[a-f0-9]{64}$/.test(encodedSecret)) {
-        throw new Error('agentAssertion: credential context contains an invalid request secret');
+function signAgentAssertionWithRch({ secret, self, method, path, targetAgent, tool, rch }) {
+    if (!secret) {
+        throw new Error('agentAssertion: PLOINKY_AGENT_SECRET not configured');
     }
-    return {
-        context,
-        secret: Buffer.from(encodedSecret, 'hex'),
-        self: context.identity.principalId,
-    };
-}
-
-function signAgentAssertionWithRch({ credentialContext, method, path, targetAgent, tool, rch }) {
-    const { secret, self } = requestCredentials(credentialContext);
+    if (!self) {
+        throw new Error('agentAssertion: PLOINKY_AGENT_ID not configured');
+    }
     // The assertion MUST bind the addressed target (DS013). A target-less
     // assertion is not cryptographically tied to the agent it is sent to.
     const target = String(targetAgent ?? '').trim();
@@ -74,12 +65,13 @@ export function signAgentAssertion({
     targetAgent,
     tool,
     argumentsObj = {},
-    credentialContext,
+    env = process.env,
 }) {
     // MCP transport: the signed surface is {method, path, tool, arguments}.
     const rch = computeRchTool({ method, path, tool, arguments: argumentsObj });
     return signAgentAssertionWithRch({
-        credentialContext,
+        secret: readAgentSecret(env),
+        self: expectedAudienceForSelf(env),
         method,
         path,
         targetAgent,
@@ -102,12 +94,13 @@ export function signAgentHttpAssertion({
     body = Buffer.alloc(0),
     targetAgent,
     tool,
-    credentialContext,
+    env = process.env,
 }) {
     const bodyHash = sha256RawBodyHash(body);
     const rch = computeRchHttp({ method, path, query, bodyHash });
     return signAgentAssertionWithRch({
-        credentialContext,
+        secret: readAgentSecret(env),
+        self: expectedAudienceForSelf(env),
         method,
         path,
         targetAgent,
@@ -118,8 +111,8 @@ export function signAgentHttpAssertion({
 
 /**
  * Sign a box-private Router request. This capability deliberately does not
- * reuse the stable DS013 agent secret: disable/re-enable and instance
- * replacement rotate the private agent secret, while the bound instance
+ * reuse the stable DS013 PLOINKY_AGENT_SECRET: disable/re-enable and instance
+ * replacement rotate PLOINKY_AGENT_PRIVATE_SECRET, while the bound instance
  * and enable generation let the Router compare the assertion with its captured
  * current registry before dialing a private service.
  */
@@ -129,20 +122,21 @@ export function signPrivateRouterAssertion({
     query = '',
     body = Buffer.alloc(0),
     audience = PRIVATE_ROUTER_AUDIENCE,
-    credentialContext,
+    env = process.env,
 } = {}) {
-    const context = assertAgentCredentialContext(credentialContext);
-    context.assertActive();
-    const encodedSecret = context.getPrivateAgentSecret();
-    const self = context.identity.principalId;
-    const instanceId = context.identity.instanceId;
-    const enableGeneration = context.identity.enableGeneration;
+    const encodedSecret = String(env?.PLOINKY_AGENT_PRIVATE_SECRET || '').trim();
+    const self = String(env?.PLOINKY_AGENT_ID || '').trim();
+    const instanceId = String(env?.PLOINKY_AGENT_INSTANCE_ID || '').trim();
+    const enableGeneration = String(env?.PLOINKY_AGENT_ENABLE_GENERATION || '').trim();
     const normalizedPath = String(path || '').trim();
     const normalizedMethod = String(method || '').trim().toUpperCase();
     const normalizedAudience = String(audience || '').trim();
     if (!/^[a-f0-9]{64}$/i.test(encodedSecret)) {
-        throw new Error('agentAssertion: credential context contains an invalid private request secret');
+        throw new Error('agentAssertion: PLOINKY_AGENT_PRIVATE_SECRET must be a 32-byte hex secret');
     }
+    if (!self) throw new Error('agentAssertion: PLOINKY_AGENT_ID not configured');
+    if (!instanceId) throw new Error('agentAssertion: PLOINKY_AGENT_INSTANCE_ID not configured');
+    if (!enableGeneration) throw new Error('agentAssertion: PLOINKY_AGENT_ENABLE_GENERATION not configured');
     if (!normalizedPath.startsWith('/')) throw new Error('agentAssertion: private path is required');
     if (!normalizedMethod || !normalizedAudience) throw new Error('agentAssertion: private method and audience are required');
     const bodyHash = sha256RawBodyHash(body);

@@ -7,7 +7,6 @@ import {
 } from '../../container/runtime-supervisor.mjs';
 import {
     PATH_HASH_LABEL,
-    PLOINKY_SOURCE_SHA_LABEL,
     REQUESTED_IMAGE_LABEL,
     REQUIRED_IMAGE_ENTRYPOINT,
     REQUIRED_IMAGE_ENV,
@@ -18,8 +17,6 @@ import {
     VOLUME_ROLES,
     runtimeVolumeNames,
 } from '../../container/runtime-contract.mjs';
-
-const PLOINKY_SOURCE_SHA = '0123456789abcdef0123456789abcdef01234567';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '../..');
@@ -83,9 +80,7 @@ export function compatibleImage(id = 'sha256:runtime-current') {
             Entrypoint: [REQUIRED_IMAGE_ENTRYPOINT],
             Cmd: null,
             Volumes: null,
-            Labels: {
-                [PLOINKY_SOURCE_SHA_LABEL]: PLOINKY_SOURCE_SHA,
-            },
+            Labels: {},
         },
     };
 }
@@ -459,23 +454,7 @@ export function createFakeEngine({
                     '/usr/sbin/ip',
                     '/usr/bin/fuse-overlayfs',
                     '/usr/local/bin/cloudflared',
-                    '/usr/bin/bwrap',
-                    '/usr/bin/git',
-                    '/usr/bin/curl',
-                    '/usr/bin/ffmpeg',
-                    '/usr/bin/ssh',
-                    '/usr/bin/python3',
-                    '/usr/bin/script',
-                    '/usr/bin/unshare',
-                    '/usr/bin/ps',
-                    '/usr/bin/setsid',
-                    '/usr/bin/timeout',
-                    '/usr/local/bin/npm',
-                    '/usr/local/bin/npx',
-                    '/usr/sbin/getcap',
-                    '/usr/bin/rpm',
                     '/usr/local/bin/ploinky-box-entrypoint',
-                    '/usr/local/libexec/ploinky-bwrap-launch',
                     '/usr/bin/pasta',
                     '',
                 ].join('\n'));

@@ -24,44 +24,6 @@ test('router-owned mutations commit the exact generation without requiring a pro
     assert.equal(commitRouteGeneration(routerOwnedPlan), false);
 });
 
-test('bwrap root route commit verifies its immutable service owner after the generation lease', () => {
-    const events = [];
-    const ownerAttestation = Object.freeze({ runtimeKey: 'alpha-container' });
-    const plan = {
-        ok: true,
-        ownerAttestation,
-        lease: {
-            commit() {
-                events.push('lease');
-                return true;
-            },
-        },
-    };
-
-    assert.equal(commitRoutePlan(plan, {
-        assertServiceOwner(owner) {
-            events.push('owner');
-            assert.equal(owner, ownerAttestation);
-        },
-    }), true);
-    assert.deepEqual(events, ['lease', 'owner']);
-});
-
-test('bwrap root route commit fails closed when its service owner no longer matches', () => {
-    const mismatch = Object.assign(new Error('owner changed'), {
-        code: 'PLOINKY_SANDBOX_OWNER_ATTESTATION_MISMATCH',
-    });
-    assert.throws(() => commitRoutePlan({
-        ok: true,
-        ownerAttestation: { runtimeKey: 'alpha-container' },
-        lease: { commit: () => true },
-    }, {
-        assertServiceOwner() {
-            throw mismatch;
-        },
-    }), (error) => error === mismatch);
-});
-
 test('private listener class admits bridge-gateway requests without IP provenance', () => {
     const bridgeRequest = {
         ploinkyListenerClass: 'private',

@@ -606,12 +606,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     // Save PID (reuse bwrap PID management)
     try {
-        saveBwrapPid(containerName, child.pid, {
-            ...runtimeIdentity,
-            homeKey: containerName,
-            workdir: cwd,
-            logPath: logFile,
-        });
+        saveBwrapPid(containerName, child.pid, runtimeIdentity);
     } catch (error) {
         try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { }
         try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }

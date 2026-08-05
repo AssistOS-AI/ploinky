@@ -692,16 +692,10 @@ export function createNetworkLifecycleAdapter({
         });
     }
 
-    function ensureNetwork(logicalName, { deferFailureCleanup = false } = {}) {
+    function ensureNetwork(logicalName) {
         ensureManagedPodman();
         const name = physicalNetworkName(identity.hash, logicalName);
         const labels = expectedNetworkLabels(identity.hash, logicalName);
-        const cleanupReceipt = Object.freeze({
-            scope: 'managed-network-candidate',
-            name,
-            logicalName,
-            ownershipLabels: Object.freeze({ ...labels }),
-        });
         const existing = inspectNetwork(name);
         if (existing) {
             assertSupportedNetwork(existing, name, labels);
@@ -725,21 +719,6 @@ export function createNetworkLifecycleAdapter({
             if (!verified) throw new Error(`managed network '${name}' disappeared after creation`);
             assertSupportedNetwork(verified, name, labels);
         } catch (error) {
-            const createdResource = Object.freeze({
-                name,
-                logicalName,
-                created: true,
-                cleanupReceipt,
-            });
-            if (deferFailureCleanup) {
-                Object.defineProperty(error, 'ploinkyCreatedManagedNetwork', {
-                    configurable: false,
-                    enumerable: false,
-                    writable: false,
-                    value: createdResource,
-                });
-                throw error;
-            }
             const exactOwned = !verified || hasExactLabels(labelsOf(verified), labels);
             if (inspectionCompleted && exactOwned) {
                 const removed = execute(['network', 'rm', name]);
@@ -753,7 +732,7 @@ export function createNetworkLifecycleAdapter({
             }
             throw error;
         }
-        return { name, logicalName, created: true, cleanupReceipt };
+        return { name, logicalName, created: true };
     }
 
     function preflight(network, canonicalAgentId, { instanceKey = canonicalAgentId } = {}) {
@@ -785,15 +764,7 @@ export function createNetworkLifecycleAdapter({
             }
             if (!inspected) continue;
             try {
-                const receipt = entry.cleanupReceipt;
-                if (!receipt
-                    || receipt.scope !== 'managed-network-candidate'
-                    || receipt.name !== entry.name
-                    || receipt.logicalName !== entry.logicalName
-                    || !receipt.ownershipLabels) {
-                    throw new Error('exact managed-network cleanup receipt is missing or inconsistent');
-                }
-                assertExactLabels(entry.name, labelsOf(inspected), receipt.ownershipLabels);
+                assertSupportedNetwork(inspected, entry.name, expectedNetworkLabels(identity.hash, entry.logicalName));
             } catch (inspectionError) {
                 error.message += `; rollback preserved '${entry.name}': ${inspectionError.message}`;
                 continue;
@@ -808,15 +779,15 @@ export function createNetworkLifecycleAdapter({
         }
     }
 
-    function prepareFromPreflight(checked, { deferFailureCleanup = false } = {}) {
+    function prepareFromPreflight(checked) {
         if (!['default', 'bridge'].includes(checked.mode)) return { ...checked, created: [] };
-        const plan = { ...checked, attachments: [], created: [] };
+        const plan = { ...checked, created: [] };
         try {
-            for (const entry of checked.attachments) {
-                const ensured = ensureNetwork(entry.logicalName, { deferFailureCleanup });
+            plan.attachments = checked.attachments.map((entry) => {
+                const ensured = ensureNetwork(entry.logicalName);
                 if (ensured.created) plan.created.push(ensured);
-                plan.attachments.push({ ...ensured, primary: entry.primary });
-            }
+                return { ...ensured, primary: entry.primary };
+            });
             const primary = plan.attachments.find((entry) => entry.primary) || plan.attachments[0];
             plan.args = [
                 '--network', primary.name,
@@ -833,26 +804,7 @@ export function createNetworkLifecycleAdapter({
             });
             return plan;
         } catch (error) {
-            const partialResource = error?.ploinkyCreatedManagedNetwork;
-            if (partialResource
-                && !plan.created.some((entry) => entry.name === partialResource.name)) {
-                plan.created.push(partialResource);
-            }
-            if (deferFailureCleanup) {
-                const failurePlan = Object.freeze({
-                    ...plan,
-                    attachments: Object.freeze(plan.attachments.map((entry) => Object.freeze({ ...entry }))),
-                    created: Object.freeze(plan.created.map((entry) => Object.freeze({ ...entry }))),
-                });
-                Object.defineProperty(error, 'ploinkyManagedNetworkFailurePlan', {
-                    configurable: false,
-                    enumerable: false,
-                    writable: false,
-                    value: failurePlan,
-                });
-            } else {
-                rollbackResources(plan, error);
-            }
+            rollbackResources(plan, error);
             throw error;
         }
     }
@@ -914,7 +866,6 @@ export function createNetworkLifecycleAdapter({
         network = null,
         runtimeIdentity = null,
         beforeStart = null,
-        deferFailureCleanup = false,
     } = {}) {
         const exactLabels = expectedLabels || (network && runtimeIdentity
             ? expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity)
@@ -962,7 +913,7 @@ export function createNetworkLifecycleAdapter({
             }
             return ownedContainerId;
         } catch (error) {
-            if (!deferFailureCleanup && ownedContainerId) {
+            if (ownedContainerId) {
                 let current = null;
                 try { current = inspectContainer(ownedContainerId); } catch (_) {}
                 if (current
@@ -986,7 +937,6 @@ export function createNetworkLifecycleAdapter({
         prepareLaunch = null,
         preStartLaunch = null,
         finalizeLaunch = null,
-        beforeFailureCleanup = null,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
         networkLifecycleCapability,
     }) {
@@ -1002,9 +952,6 @@ export function createNetworkLifecycleAdapter({
         }
         if (finalizeLaunch !== null && typeof finalizeLaunch !== 'function') {
             throw new Error('managed container transaction finalizeLaunch must be a function');
-        }
-        if (beforeFailureCleanup !== null && typeof beforeFailureCleanup !== 'function') {
-            throw new Error('managed container transaction beforeFailureCleanup must be a function');
         }
         return withNetworkLifecycleLock(() => {
             const checked = preflight(network, canonicalAgentId, { instanceKey });
@@ -1023,9 +970,7 @@ export function createNetworkLifecycleAdapter({
             let plan = null;
             let launch = null;
             try {
-                plan = prepareFromPreflight(checked, {
-                    deferFailureCleanup: Boolean(beforeFailureCleanup),
-                });
+                plan = prepareFromPreflight(checked);
                 if (previous && inspectAdoption
                     && hasRequiredLabels(labelsOf(previous), agentLabels)
                     && (previous?.State?.Running === true || previous?.State?.Status === 'running')) {
@@ -1107,7 +1052,6 @@ export function createNetworkLifecycleAdapter({
                 const containerId = finalizeContainer(containerName, plan, {
                     expectedContainerId: candidateId,
                     expectedLabels: agentLabels,
-                    deferFailureCleanup: Boolean(beforeFailureCleanup),
                     beforeStart: preStartLaunch
                         ? (context) => preStartLaunch({ ...context, launch })
                         : null,
@@ -1119,60 +1063,21 @@ export function createNetworkLifecycleAdapter({
                 if (finalizeLaunch) finalizeLaunch({ plan, launch, containerId, record: finalRecord });
                 return { ...plan, containerId, launch };
             } catch (error) {
-                plan ||= error?.ploinkyManagedNetworkFailurePlan || null;
                 let candidate = null;
                 let candidateInspectionComplete = false;
-                let candidateId = '';
-                let candidateOwned = false;
                 let launchArtifactCleanupSafe = false;
-                const createdNetworks = Object.freeze((plan?.created || []).map((entry) => Object.freeze({
-                    name: entry.name,
-                    logicalName: entry.logicalName,
-                    cleanupReceipt: entry.cleanupReceipt,
-                })));
                 try {
                     candidate = inspectContainer(containerName);
                     candidateInspectionComplete = true;
-                    candidateId = String(candidate?.Id || candidate?.ID || '');
-                    candidateOwned = Boolean(candidate && hasRequiredLabels(labelsOf(candidate), agentLabels));
                 } catch (inspectError) {
                     error.message += `; failure cleanup could not inspect candidate '${containerName}': ${inspectError.message}`;
-                }
-                if (beforeFailureCleanup) {
-                    try {
-                        beforeFailureCleanup(Object.freeze({
-                            candidateCreationAttempted,
-                            candidateId,
-                            candidateInspectionComplete,
-                            candidateOwned,
-                            createdNetworks,
-                            error,
-                        }));
-                    } catch (recoveryError) {
-                        Object.defineProperty(recoveryError, 'ploinkyManagedFailureRecovery', {
-                            configurable: true,
-                            enumerable: false,
-                            writable: false,
-                            value: Object.freeze({
-                                candidateCreationAttempted,
-                                candidateId,
-                                candidateInspectionComplete,
-                                candidateOwned,
-                                exactCleanupPerformed: false,
-                                preparationAbortFailed: true,
-                                preparationAbortedBeforeCleanup: false,
-                                resourcesRolledBack: false,
-                                createdNetworks,
-                            }),
-                        });
-                        throw recoveryError;
-                    }
                 }
                 if (candidateCreationAttempted && candidateInspectionComplete && !candidate) {
                     launchArtifactCleanupSafe = true;
                 } else if (candidateCreationAttempted
                     && candidate
-                    && candidateOwned) {
+                    && hasRequiredLabels(labelsOf(candidate), agentLabels)) {
+                    const candidateId = String(candidate?.Id || candidate?.ID || '');
                     if (!candidateId) {
                         error.message += `; failure cleanup preserved candidate '${containerName}' because its immutable ID was unavailable`;
                     } else {
@@ -1202,22 +1107,6 @@ export function createNetworkLifecycleAdapter({
                     }
                 }
                 if (plan) rollbackResources(plan, error);
-                Object.defineProperty(error, 'ploinkyManagedFailureRecovery', {
-                    configurable: true,
-                    enumerable: false,
-                    writable: false,
-                    value: Object.freeze({
-                        candidateCreationAttempted,
-                        candidateId,
-                        candidateInspectionComplete,
-                        candidateOwned,
-                        exactCleanupPerformed: launchArtifactCleanupSafe,
-                        preparationAbortFailed: false,
-                        preparationAbortedBeforeCleanup: Boolean(beforeFailureCleanup),
-                        resourcesRolledBack: true,
-                        createdNetworks,
-                    }),
-                });
                 throw error;
             }
         }, {

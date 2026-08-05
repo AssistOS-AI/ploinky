@@ -31,7 +31,7 @@ function envForAgent(repoName, agentName) {
     return buildFullEnvMap(agentName, {}, {}, workDir, repoName, 'dev', 'bwrap', null, routerEndpoint);
 }
 
-test('bwrap exposes the fixed workspace and direct clean HOME ABI', () => {
+test('bwrap keeps the selected workspace separate from the persistent /root home', () => {
     const workspacePath = path.join(tempDir, 'workspace');
     const env = buildFullEnvMap(
         'codexAgent',
@@ -44,12 +44,9 @@ test('bwrap exposes the fixed workspace and direct clean HOME ABI', () => {
         null,
         routerEndpoint,
     );
-    assert.equal(env.WORKSPACE_PATH, '/workspace');
-    assert.equal(env.PLOINKY_WORKSPACE_ROOT, '/workspace');
-    assert.equal(env.HOME, '/home/agent');
-    assert.equal(env.XDG_CONFIG_HOME, '/home/agent/.config');
-    assert.equal(env.PATH, '/opt/ploinky-node/bin:/usr/bin:/bin');
-    assert.equal(env.PATH.includes('/home/agent'), false);
+    assert.equal(env.WORKSPACE_PATH, workspacePath);
+    assert.equal(env.HOME, '/root');
+    assert.match(env.PATH, /^\/opt\/ploinky-node\/bin:/);
 });
 
 test('uncertified bwrap env carries only the canonical non-secret principal', () => {
@@ -154,83 +151,40 @@ test('stripReservedAgentEnv drops master + identity names, keeps the rest', () =
 test('profile config cannot inject a master key or add an uncertified bwrap secret', () => {
     const workDir = path.join(tempDir, 'work', 'hardened');
     fs.mkdirSync(workDir, { recursive: true });
-    assert.throws(
-        () => buildFullEnvMap('dpuAgent', {}, {
-            env: { PLOINKY_MASTER_KEY: 'leak', PLOINKY_AGENT_SECRET: 'override', SAFE: 'ok' },
-        }, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint),
-        (error) => error?.code === 'PLOINKY_BWRAP_SERVICE_ENV_RESERVED'
-            && error.message.includes('PLOINKY_MASTER_KEY')
-            && !error.message.includes('leak'),
-    );
+    // A profile that maliciously tries to leak the master and override the secret.
+    const env = buildFullEnvMap('dpuAgent', {}, {
+        env: { PLOINKY_MASTER_KEY: 'leak', PLOINKY_AGENT_SECRET: 'override', SAFE: 'ok' },
+    }, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint);
+    assert.equal(env.SAFE, 'ok');                              // ordinary env survives
+    assert.equal(env.PLOINKY_MASTER_KEY, undefined);          // master never injected
+    assert.equal(env.PLOINKY_DERIVED_MASTER_KEY, undefined);
+    assert.equal(env.PLOINKY_AGENT_SECRET, undefined);
 });
 
 test('manifest/profile cannot add generated signed identity material to uncertified bwrap', () => {
     const workDir = path.join(tempDir, 'work', 'hardened-soul');
     fs.mkdirSync(workDir, { recursive: true });
-    assert.throws(
-        () => buildFullEnvMap('dpuAgent', {
-            env: { PLOINKY_AGENT_API_KEY: 'forged' },
-        }, {}, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint),
-        { code: 'PLOINKY_BWRAP_SERVICE_ENV_RESERVED' },
-    );
-    assert.throws(
-        () => buildFullEnvMap('dpuAgent', {}, {
-            env: { PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'manifest' },
-        }, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint),
-        { code: 'PLOINKY_BWRAP_SERVICE_ENV_RESERVED' },
-    );
-});
-
-test('manifest/profile cannot choose or forge the bwrap credential locator', () => {
-    const workDir = path.join(tempDir, 'work', 'credential-locator');
-    fs.mkdirSync(workDir, { recursive: true });
-    assert.throws(
-        () => buildFullEnvMap('dpuAgent', {
-            env: { PLOINKY_AGENT_CREDENTIAL_FILE: '/workspace/attacker.json' },
-        }, {}, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint),
-        { code: 'PLOINKY_BWRAP_SERVICE_ENV_RESERVED' },
-    );
-});
-
-test('all raw trusted-bwrap configuration sources reject reserved destinations and sources before resolution', () => {
-    const workDir = path.join(tempDir, 'work', 'raw-reserved');
-    fs.mkdirSync(workDir, { recursive: true });
-    const attempts = [
-        [{ env: { SAFE: { varName: 'PLOINKY_MASTER_KEY' } } }, {}, null],
-        [{ expose: { PLOINKY_RUNTIME: 'bwrap' } }, {}, null],
-        [{ expose: [{ name: 'SAFE', ref: 'PLOINKY_AGENT_PRIVATE_SECRET' }] }, {}, null],
-        [{ runtime: { resources: { env: { PLOINKY_AGENT_BIND_HOST: '127.0.0.1' } } } }, {}, null],
-        [{ runtime: { resources: { env: { SAFE: '{{var:PLOINKY_ROUTER_URL}}' } } } }, {}, null],
-        [{}, { secrets: ['PLOINKY_AGENT_PRIVATE_KEY'] }, null],
-        [{}, { env: { PLOINKY_CONTAINER_ID: 'fake' } }, null],
-        [{ env: { 'PLOINKY_*': 'wildcard' } }, {}, null],
-        [{}, {}, { env: { PLOINKY_ENV_SOURCE_PLOINKY_FUTURE: 'forged' } }],
-    ];
-    for (const [manifest, profile, runtimePlan] of attempts) {
-        assert.throws(
-            () => buildFullEnvMap(
-                'dpuAgent', manifest, profile, workDir, 'AssistOSExplorer', 'dev',
-                'bwrap', runtimePlan, routerEndpoint,
-            ),
-            (error) => error?.code === 'PLOINKY_BWRAP_SERVICE_ENV_RESERVED',
-        );
-    }
-});
-
-test('ordinary provider credentials remain admitted while bwrap owns bind and container identity', () => {
-    const workDir = path.join(tempDir, 'work', 'ordinary-provider-env');
-    fs.mkdirSync(workDir, { recursive: true });
+    // A manifest env and a profile env that both try to substitute their own signed
+    // key / public key and forge a provenance marker. The reserved-name
+    // strip runs before the authoritative identity is asserted, so all are dropped.
     const env = buildFullEnvMap('dpuAgent', {
         env: {
-            PLOINKY_AGENT_CLIENT_ID: 'client-id',
-            PLOINKY_AGENT_CLIENT_SECRET: 'client-secret',
+            PLOINKY_AGENT_API_KEY: 'agent:AssistOSExplorer/dpuAgent|forged',
+            PLOINKY_AGENT_API_PUBLIC_KEY: 'attacker-public-key',
         },
-    }, {}, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint);
-    assert.equal(env.PLOINKY_AGENT_CLIENT_ID, 'client-id');
-    assert.equal(env.PLOINKY_AGENT_CLIENT_SECRET, 'client-secret');
-    assert.equal(env.PLOINKY_AGENT_BIND_HOST, '127.0.0.1');
-    assert.equal(env.PLOINKY_CONTAINER_NAME, undefined);
-    assert.equal(env.PLOINKY_CONTAINER_ID, undefined);
+    }, {
+        env: {
+            PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'manifest',
+            SAFE: 'ok',
+        },
+    }, workDir, 'AssistOSExplorer', 'dev', 'bwrap', null, routerEndpoint);
+    assert.equal(env.SAFE, 'ok');                                     // ordinary env survives
+    assert.equal(env.PLOINKY_AGENT_API_KEY, undefined);
+    assert.equal(env.PLOINKY_AGENT_API_PUBLIC_KEY, undefined);
+    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY, undefined);
+    assert.equal(env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY, undefined);
+    assert.equal(env.SOUL_GATEWAY_API_KEY, undefined);
+    assert.equal(env.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, undefined);
 });
 
 test('the bwrap full env map matches the non-secret principal phase exactly', () => {

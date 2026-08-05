@@ -217,9 +217,8 @@ test('blocking none-mode launches pass explicit null without forwarding a raw ro
     assert.match(reinstall, /resolveManifestRouterEndpoint\(manifest, \{\s*explicitPort: routerPort,/);
     assert.match(reinstall, /routerEndpoint,/);
     assert.match(reinstall, /activatePreparedRuntimeAfterReadiness\(\{/);
-    assert.match(reinstall, /await waitForRouterReady\(routerPort, null, 300\)/);
-    assert.match(reinstall, /await launchManagedWatchdogImpl\(\{[\s\S]*?port: routerPort/);
-    assert.doesNotMatch(reinstall, /\blsof\b|\bss -ltnp\b|isRouterUp/);
+    assert.match(reinstall, /if \(!isRouterUp\(routerPort\)\)/);
+    assert.doesNotMatch(reinstall, /if \(routerEndpoint && !isRouterUp/);
 });
 
 test('coordinated graph topology precedes startup preinstall and config providers', () => {
@@ -258,13 +257,13 @@ test('static preinstall failure is fatal before startup providers can run', () =
     assert.doesNotMatch(source, /Preinstall failed:|Preinstall hook error:/);
 });
 
-test('exact-workspace Router readiness and both inactive graph preparations precede every agent startup', () => {
+test('workspace router TCP listener and both inactive graph preparations precede every agent startup', () => {
     const source = startWorkspace.toString();
     const routerIndex = source.indexOf('await ensureRouterReadyForStart({');
     const generationIndex = source.indexOf('ensureGraphNodesEnabled(dependencyGraph, reg, {');
     const finalPreparationIndex = source.indexOf('reprepareGraphAfterStartupProviders(');
     const launchIndex = source.indexOf('ensureAgentService(shortAgentName');
-    const lockIndex = source.indexOf('await acquireWorkspaceMutationLease({');
+    const lockIndex = source.indexOf('createWorkspaceStartLock()');
 
     assert.ok(lockIndex >= 0 && lockIndex < routerIndex, 'workspace start must suppress watchdog container reconciliation before router startup');
     assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');
@@ -278,8 +277,8 @@ test('exact-workspace Router readiness and both inactive graph preparations prec
             > source.indexOf('await waitForReadinessEntries(readinessEntries)'),
         'the graph selector must activate only after semantic readiness',
     );
-    assert.match(source, /Existing exact-workspace Router listener is ready/);
-    assert.match(source, /if \(error\?\.code !== 'PLOINKY_ROUTER_NOT_READY'\) throw error/);
+    assert.match(source, /Existing router TCP listener is ready/);
+    assert.doesNotMatch(source, /Unix socket|router\.sock/);
     assert.match(source, /finally\s*\{\s*releaseWorkspaceStartLock\(workspaceStartLock\)/);
 });
 
@@ -632,153 +631,6 @@ test('execution-mode removal failure leaves the fresh target-less generation sel
     ]);
 });
 
-test('an active graph preparation is aborted before the invalid selector is rejected', () => {
-    const lease = Object.freeze({ transactionId: 'active-graph-preparation' });
-    const events = [];
-
-    assert.throws(() => ensureGraphNodesEnabled({ nodes: new Map() }, {}, {
-        prepareAgentEnableBatch() {
-            events.push('prepare');
-            return {
-                plans: [],
-                preparedGeneration: {
-                    selector: { state: 'active' },
-                    preparationLease: lease,
-                },
-            };
-        },
-        abortPreparation(received, options) {
-            events.push('abort');
-            assert.equal(received, lease);
-            assert.deepEqual(options, { reason: 'workspace-graph-preparation-invalid' });
-        },
-    }), /unexpectedly became active/);
-
-    assert.deepEqual(events, ['prepare', 'abort']);
-});
-
-test('an active graph preparation abort failure preserves its exact lease evidence', () => {
-    const lease = Object.freeze({ transactionId: 'active-graph-abort-failure' });
-    const abortFailure = new Error('durable active-selector abort failed');
-    let abortCalls = 0;
-
-    assert.throws(() => ensureGraphNodesEnabled({ nodes: new Map() }, {}, {
-        prepareAgentEnableBatch() {
-            return {
-                plans: [],
-                preparedGeneration: {
-                    selector: { state: 'active' },
-                    preparationLease: lease,
-                },
-            };
-        },
-        abortPreparation() {
-            abortCalls += 1;
-            throw abortFailure;
-        },
-    }), (error) => (
-        error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-        && error.cause === abortFailure
-        && /unexpectedly became active/.test(error.originalFailure?.message)
-        && Object.isFrozen(error.ploinkyRecoveryPreparation)
-        && error.ploinkyRecoveryPreparation?.preparationLease === lease
-        && error.ploinkyRecoveryPreparation?.preparationAbortFailed === true
-    ));
-    assert.equal(abortCalls, 1);
-});
-
-test('a graph preparation missing its inactive selector aborts before runtime removal', () => {
-    const lease = Object.freeze({ transactionId: 'missing-selector-preparation' });
-    const events = [];
-
-    assert.throws(() => ensureGraphNodesEnabled({ nodes: new Map() }, {}, {
-        prepareAgentEnableBatch() {
-            events.push('prepare');
-            return {
-                plans: [],
-                preparedGeneration: {
-                    preparationLease: lease,
-                },
-            };
-        },
-        abortPreparation(received, options) {
-            events.push('abort');
-            assert.equal(received, lease);
-            assert.deepEqual(options, { reason: 'workspace-graph-preparation-invalid' });
-        },
-        removeAgentContainerForRecreate() {
-            assert.fail('runtime removal must not follow a missing selector');
-        },
-    }), /unexpectedly became active/);
-
-    assert.deepEqual(events, ['prepare', 'abort']);
-});
-
-test('execution-mode removal abort failure preserves the exact preparation and stops recovery mutation', () => {
-    const registry = {
-        retained_container: {
-            type: 'agent', repoName: 'demo', agentName: 'retained',
-            runMode: 'isolated', projectPath: path.join(tempDir, '.data', 'retained-abort-failure'),
-            profile: 'default',
-        },
-    };
-    const events = [];
-    const routing = { routes: { retained: {
-        container: 'retained_container', repo: 'demo', agent: 'retained', hostPort: 49101,
-    } } };
-    const abortFailure = new Error('durable graph abort failed');
-
-    assert.throws(
-        () => ensureGraphNodesEnabled({
-            nodes: new Map([['demo/retained', {
-                id: 'demo/retained', repoName: 'demo', shortAgentName: 'retained', alias: '',
-                agentRef: 'demo/retained', enableSpec: 'demo/retained global', profile: 'embedded', isStatic: false,
-            }]]),
-        }, registry, {
-            removeAgentContainerForRecreate() {
-                events.push('remove');
-                throw new Error('safe removal refused');
-            },
-            saveAgents() { events.push('save-agents'); },
-            inactivateGeneration() { events.push('inactivate'); },
-            loadRouting() { return routing; },
-            saveRouting() { events.push('save-routing'); },
-            prepareAgentEnableBatch() {
-                events.push('prepare-generation');
-                return {
-                    plans: [],
-                    preparedGeneration: {
-                        selector: { state: 'inactive' },
-                        preparationLease: { transactionId: 'removal-abort-failure-lease' },
-                    },
-                };
-            },
-            abortPreparation() {
-                events.push('abort');
-                throw abortFailure;
-            },
-            runtimeReplacementReason() { return ''; },
-            uuid: (() => {
-                const values = ['abort-failure-instance', 'abort-failure-enable'];
-                return () => values.shift();
-            })(),
-            executionRecordOptions: { workspaceRoot: tempDir },
-        }),
-        (error) => (
-            error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-            && error.cause === abortFailure
-            && error.originalFailure?.message === 'safe removal refused'
-            && Object.isFrozen(error.ploinkyRecoveryPreparation)
-            && error.ploinkyRecoveryPreparation?.preparationLease?.transactionId
-                === 'removal-abort-failure-lease'
-            && error.ploinkyRecoveryPreparation?.preparationAbortFailed === true
-        ),
-    );
-
-    assert.equal(events.filter((event) => event === 'abort').length, 1);
-    assert.equal(events.at(-1), 'abort');
-});
-
 test('an empty legacy develRepo field does not force recreation of an otherwise matching mode', () => {
     const registry = {
         retained_container: {
@@ -1003,189 +855,6 @@ test('post-provider preparation rotates only retained predecessor tuples and pre
     assert.equal(registry.already_container.enableGeneration, 'early-fresh-generation');
 });
 
-test('post-provider preparation abort failure preserves the early lease and prevents re-preparation', () => {
-    const initialLease = Object.freeze({ transactionId: 'early-abort-failure-lease' });
-    const abortFailure = new Error('durable provider abort failed');
-    let reprepareCalls = 0;
-    const initialPreparedGraph = {
-        plans: [{ containerName: 'already_container' }],
-        changedContainers: [],
-        preparedGeneration: {
-            selector: { state: 'inactive' },
-            preparationLease: initialLease,
-        },
-    };
-
-    assert.throws(
-        () => reprepareGraphAfterStartupProviders(
-            { nodes: new Map() },
-            {},
-            initialPreparedGraph,
-            {
-                abortPreparation(lease, options) {
-                    assert.equal(lease, initialLease);
-                    assert.deepEqual(options, { reason: 'workspace-start-provider-reprepare' });
-                    throw abortFailure;
-                },
-                ensureGraphNodesEnabledImpl() {
-                    reprepareCalls += 1;
-                    assert.fail('provider re-preparation must not run after abort failure');
-                },
-            },
-        ),
-        (error) => (
-            error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-            && error.cause === abortFailure
-            && /retire the early preparation/.test(error.originalFailure?.message)
-            && Object.isFrozen(error.ploinkyRecoveryPreparation)
-            && error.ploinkyRecoveryPreparation?.preparationLease === initialLease
-            && error.ploinkyRecoveryPreparation?.reason === 'workspace-start-provider-reprepare'
-        ),
-    );
-    assert.equal(reprepareCalls, 0);
-});
-
-test('post-provider reprepare failure marks the retired early lease before propagating', () => {
-    const initialLease = Object.freeze({ transactionId: 'retired-before-reprepare-failure' });
-    const events = [];
-    const initialPreparedGraph = {
-        plans: [],
-        changedContainers: [],
-        preparedGeneration: {
-            selector: { state: 'inactive' },
-            preparationLease: initialLease,
-        },
-    };
-
-    assert.throws(
-        () => reprepareGraphAfterStartupProviders(
-            { nodes: new Map() },
-            {},
-            initialPreparedGraph,
-            {
-                abortPreparation(lease) {
-                    assert.equal(lease, initialLease);
-                    events.push('abort');
-                },
-                onInitialPreparationAborted(lease) {
-                    assert.equal(lease, initialLease);
-                    events.push('mark-aborted');
-                },
-                ensureGraphNodesEnabledImpl() {
-                    events.push('reprepare');
-                    throw new Error('injected provider reprepare failure');
-                },
-            },
-        ),
-        /injected provider reprepare failure/,
-    );
-    assert.deepEqual(events, ['abort', 'mark-aborted', 'reprepare']);
-    assert.match(
-        startWorkspace.toString(),
-        /onInitialPreparationAborted\(abortedLease\)[\s\S]*?workspacePreparationLease = null/,
-    );
-});
-
-test('invalid post-provider generation aborts its new exact lease before rejection', () => {
-    const initialLease = Object.freeze({ transactionId: 'early-valid-lease' });
-    const replacementLease = Object.freeze({ transactionId: 'invalid-replacement-lease' });
-    const events = [];
-    const initialPreparedGraph = {
-        plans: [],
-        changedContainers: [],
-        preparedGeneration: {
-            selector: { state: 'inactive' },
-            preparationLease: initialLease,
-        },
-    };
-
-    assert.throws(
-        () => reprepareGraphAfterStartupProviders(
-            { nodes: new Map() },
-            {},
-            initialPreparedGraph,
-            {
-                abortPreparation(lease, options) {
-                    events.push(`abort:${lease.transactionId}:${options.reason}`);
-                },
-                ensureGraphNodesEnabledImpl(_graph, _registry, options) {
-                    events.push('reprepare');
-                    assert.equal(options.abortPreparation instanceof Function, true);
-                    return {
-                        plans: [],
-                        changedContainers: [],
-                        preparedGeneration: {
-                            selector: { state: 'active' },
-                            preparationLease: replacementLease,
-                        },
-                    };
-                },
-            },
-        ),
-        /post-provider graph generation did not remain inactive/,
-    );
-    assert.deepEqual(events, [
-        'abort:early-valid-lease:workspace-start-provider-reprepare',
-        'reprepare',
-        'abort:invalid-replacement-lease:workspace-start-provider-reprepare-invalid',
-    ]);
-});
-
-test('invalid post-provider generation abort failure preserves its new exact lease evidence', () => {
-    const initialLease = Object.freeze({ transactionId: 'early-valid-abort-failure-lease' });
-    const replacementLease = Object.freeze({ transactionId: 'invalid-replacement-abort-failure-lease' });
-    const abortFailure = new Error('durable replacement abort failed');
-    const abortCalls = [];
-    const initialPreparedGraph = {
-        plans: [],
-        changedContainers: [],
-        preparedGeneration: {
-            selector: { state: 'inactive' },
-            preparationLease: initialLease,
-        },
-    };
-
-    assert.throws(
-        () => reprepareGraphAfterStartupProviders(
-            { nodes: new Map() },
-            {},
-            initialPreparedGraph,
-            {
-                abortPreparation(lease, options) {
-                    abortCalls.push({ lease, reason: options.reason });
-                    if (lease === replacementLease) throw abortFailure;
-                },
-                ensureGraphNodesEnabledImpl() {
-                    return {
-                        plans: [],
-                        changedContainers: [],
-                        preparedGeneration: {
-                            preparationLease: replacementLease,
-                        },
-                    };
-                },
-            },
-        ),
-        (error) => (
-            error?.code === 'PLOINKY_RECOVERY_ABORT_FAILED'
-            && error.cause === abortFailure
-            && /post-provider graph generation did not remain inactive/.test(
-                error.originalFailure?.message,
-            )
-            && Object.isFrozen(error.ploinkyRecoveryPreparation)
-            && error.ploinkyRecoveryPreparation?.preparationLease === replacementLease
-            && error.ploinkyRecoveryPreparation?.reason
-                === 'workspace-start-provider-reprepare-invalid'
-            && error.ploinkyRecoveryPreparation?.preparationAbortFailed === true
-            && error.ploinkyRecoveryPreparation?.preparationAbortedBeforeCleanup === false
-        ),
-    );
-    assert.deepEqual(abortCalls, [
-        { lease: initialLease, reason: 'workspace-start-provider-reprepare' },
-        { lease: replacementLease, reason: 'workspace-start-provider-reprepare-invalid' },
-    ]);
-});
-
 test('missing static and dependency nodes are staged in one target-less identity generation', () => {
     const calls = [];
     const nodes = new Map([
@@ -1204,13 +873,7 @@ test('missing static and dependency nodes are staged in one target-less identity
     ensureGraphNodesEnabled({ nodes }, {}, {
         prepareAgentEnableBatch(requests, options) {
             calls.push({ requests: structuredClone(requests), options: structuredClone(options) });
-            return {
-                plans: requests,
-                preparedGeneration: {
-                    selector: { state: 'inactive' },
-                    preparationLease: Object.freeze({ transactionId: 'missing-nodes-preparation' }),
-                },
-            };
+            return { plans: requests };
         },
         saveAgents() {
             assert.fail('an empty retained registry does not need a separate save');
@@ -1287,12 +950,7 @@ test('an existing stopped no-wait node rotates identity and loses stale targets 
                 },
             };
         },
-        removeAgentContainerForRecreate(containerName, _reason, predecessorRecord) {
-            assert.equal(containerName, 'background_container');
-            assert.equal(predecessorRecord.instanceId, 'old-instance');
-            assert.equal(predecessorRecord.enableGeneration, 'old-enable');
-            assert.equal(predecessorRecord.projectPath, tempDir);
-            assert.notEqual(predecessorRecord, registry[containerName]);
+        removeAgentContainerForRecreate(containerName) {
             events.push(`removed:${containerName}`);
         },
         uuid: (() => {

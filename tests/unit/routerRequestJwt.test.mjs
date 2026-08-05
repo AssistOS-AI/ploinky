@@ -8,7 +8,6 @@ import { signHmacJwt } from '../../Agent/lib/jwtSign.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { computeRchTool } from '../../Agent/lib/requestHash.mjs';
 import { verifyRouterRequestFromHeaders } from '../../Agent/lib/invocationAuth.mjs';
-import { createContainerAgentCredentialContext } from '../../Agent/lib/agentCredentialContext.mjs';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-rrjwt-'));
 const originalCwd = process.cwd();
@@ -16,7 +15,6 @@ process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
 
 const moduleSuffix = `?test=${Date.now()}`;
-const { installGeneratedRouterRuntime } = await import(`../helpers/generatedRouterRuntime.mjs${moduleSuffix}`);
 const { buildRouterRequest } = await import(`../../cli/server/mcp-proxy/invocationMinter.js${moduleSuffix}`);
 const { deriveAgentRequestSecret } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
@@ -30,19 +28,11 @@ test.after(() => {
     fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-function contextFor(agentId, agentSecret = deriveAgentRequestSecret(agentId)) {
-    const runtime = installGeneratedRouterRuntime({
-        origin: 'http://127.0.0.1:8080',
-        publicAuthority: '127.0.0.1:8080',
-        tempDir,
-        agentPrincipal: agentId,
-    });
-    return createContainerAgentCredentialContext({
-        ...runtime.env,
-        PLOINKY_RUNTIME: 'container',
-        PLOINKY_AGENT_SECRET: agentSecret,
-        PLOINKY_AGENT_PRIVATE_SECRET: 'b'.repeat(64),
-    });
+function envFor(agentId) {
+    return {
+        PLOINKY_AGENT_ID: agentId,
+        PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId),
+    };
 }
 
 function mintFor({ targetAgentId = TARGET, method = 'POST', reqPath = '/mcp', tool = TOOL, args = ARGS } = {}) {
@@ -59,11 +49,11 @@ function mintFor({ targetAgentId = TARGET, method = 'POST', reqPath = '/mcp', to
 }
 
 // Mirror how AgentServer verifies: recompute rch from the actual request surface.
-function agentVerify({ token, credentialContext, method = 'POST', reqPath = '/mcp', tool = TOOL, args = ARGS, replayCache }) {
+function agentVerify({ token, env, method = 'POST', reqPath = '/mcp', tool = TOOL, args = ARGS, replayCache }) {
     const rch = computeRchTool({ method, path: reqPath, tool, arguments: args });
     return verifyRouterRequestFromHeaders(
         { authorization: `Bearer ${token}` },
-        { credentialContext, replayCache, method, path: reqPath, tool, rch },
+        { env, replayCache, method, path: reqPath, tool, rch },
     );
 }
 
@@ -72,7 +62,7 @@ test('round-trip: target agent verifies a router-request minted for it', () => {
     assert.equal(payload.typ, 'router-request');
     assert.equal(payload.iss, 'ploinky-router');
     assert.equal(payload.aud, TARGET);
-    const result = agentVerify({ token, credentialContext: contextFor(TARGET), replayCache: createMemoryReplayCache() });
+    const result = agentVerify({ token, env: envFor(TARGET), replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, true, result.reason);
     assert.equal(result.payload.tool, TOOL);
     assert.equal(result.payload.actor.kind, 'user');
@@ -81,7 +71,7 @@ test('round-trip: target agent verifies a router-request minted for it', () => {
 test('isolation: a different agent (its own secret) cannot verify another agent\'s token', () => {
     const { token } = mintFor({ targetAgentId: TARGET });
     // OTHER agent uses its own id + secret; signature was made with TARGET's secret.
-    const result = agentVerify({ token, credentialContext: contextFor(OTHER), replayCache: createMemoryReplayCache() });
+    const result = agentVerify({ token, env: envFor(OTHER), replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     // Audience mismatch is detected before signature here (aud=TARGET, self=OTHER).
     assert.match(result.reason, /audience mismatch|signature invalid/);
@@ -89,8 +79,8 @@ test('isolation: a different agent (its own secret) cannot verify another agent\
 
 test('wrong secret with right audience fails the signature check', () => {
     const { token } = mintFor({ targetAgentId: TARGET });
-    const credentialContext = contextFor(TARGET, deriveAgentRequestSecret(OTHER));
-    const result = agentVerify({ token, credentialContext, replayCache: createMemoryReplayCache() });
+    const env = { PLOINKY_AGENT_ID: TARGET, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(OTHER) };
+    const result = agentVerify({ token, env, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     assert.match(result.reason, /signature invalid/);
 });
@@ -103,7 +93,7 @@ test('wrong token type is rejected even with a valid signature', () => {
         payload: { typ: 'user-session', iss: 'ploinky-router', aud: TARGET, method: 'POST', path: '/mcp', tool: TOOL, rch, jti: 'x1', iat: now, exp: now + 30 },
         secret,
     });
-    const result = agentVerify({ token, credentialContext: contextFor(TARGET), replayCache: createMemoryReplayCache() });
+    const result = agentVerify({ token, env: envFor(TARGET), replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     assert.match(result.reason, /token type is not router-request/);
 });
@@ -116,29 +106,29 @@ test('wrong audience is rejected even with a valid signature for the wrong targe
         payload: { typ: 'router-request', iss: 'ploinky-router', aud: 'agent:explorer/elsewhere', method: 'POST', path: '/mcp', tool: TOOL, rch, jti: 'x2', iat: now, exp: now + 30 },
         secret,
     });
-    const result = agentVerify({ token, credentialContext: contextFor(TARGET), replayCache: createMemoryReplayCache() });
+    const result = agentVerify({ token, env: envFor(TARGET), replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     assert.match(result.reason, /audience mismatch/);
 });
 
 test('mutated method / path / tool are each rejected (claim binding)', () => {
     const { token } = mintFor();
-    const credentialContext = contextFor(TARGET);
-    assert.match(agentVerify({ token, credentialContext, method: 'GET', replayCache: createMemoryReplayCache() }).reason, /method mismatch/);
-    assert.match(agentVerify({ token, credentialContext, reqPath: '/other', replayCache: createMemoryReplayCache() }).reason, /path mismatch/);
-    assert.match(agentVerify({ token, credentialContext, tool: 'docs_delete', replayCache: createMemoryReplayCache() }).reason, /tool mismatch/);
+    const env = envFor(TARGET);
+    assert.match(agentVerify({ token, env, method: 'GET', replayCache: createMemoryReplayCache() }).reason, /method mismatch/);
+    assert.match(agentVerify({ token, env, reqPath: '/other', replayCache: createMemoryReplayCache() }).reason, /path mismatch/);
+    assert.match(agentVerify({ token, env, tool: 'docs_delete', replayCache: createMemoryReplayCache() }).reason, /tool mismatch/);
 });
 
 test('mutated arguments are rejected via the request-content-hash', () => {
     const { token } = mintFor({ args: { q: 'x', tags: ['a', 'b'] } });
-    const credentialContext = contextFor(TARGET);
+    const env = envFor(TARGET);
     // Same tool/method/path, but different arguments → rch mismatch.
-    const result = agentVerify({ token, credentialContext, args: { q: 'y', tags: ['a', 'b'] }, replayCache: createMemoryReplayCache() });
+    const result = agentVerify({ token, env, args: { q: 'y', tags: ['a', 'b'] }, replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     assert.match(result.reason, /request hash mismatch/);
     // Array-order change in an argument also moves the hash.
     assert.match(
-        agentVerify({ token, credentialContext, args: { q: 'x', tags: ['b', 'a'] }, replayCache: createMemoryReplayCache() }).reason,
+        agentVerify({ token, env, args: { q: 'x', tags: ['b', 'a'] }, replayCache: createMemoryReplayCache() }).reason,
         /request hash mismatch/,
     );
 });
@@ -151,18 +141,18 @@ test('expired token is rejected', () => {
         payload: { typ: 'router-request', iss: 'ploinky-router', aud: TARGET, method: 'POST', path: '/mcp', tool: TOOL, rch, jti: 'exp1', iat: now - 120, exp: now - 90 },
         secret,
     });
-    const result = agentVerify({ token, credentialContext: contextFor(TARGET), replayCache: createMemoryReplayCache() });
+    const result = agentVerify({ token, env: envFor(TARGET), replayCache: createMemoryReplayCache() });
     assert.equal(result.ok, false);
     assert.match(result.reason, /expired/);
 });
 
 test('replayed jti within the ttl window is rejected', () => {
     const { token } = mintFor();
-    const credentialContext = contextFor(TARGET);
+    const env = envFor(TARGET);
     const replayCache = createMemoryReplayCache();
-    const first = agentVerify({ token, credentialContext, replayCache });
+    const first = agentVerify({ token, env, replayCache });
     assert.equal(first.ok, true, first.reason);
-    const second = agentVerify({ token, credentialContext, replayCache });
+    const second = agentVerify({ token, env, replayCache });
     assert.equal(second.ok, false);
     assert.match(second.reason, /already been consumed/);
 });

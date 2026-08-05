@@ -42,7 +42,13 @@ test_info "Workspace root: $TEST_RUN_DIR"
 
 cd "$TEST_RUN_DIR"
 
-FAST_AGENT_RUNTIME="container"
+if command -v bwrap >/dev/null 2>&1; then
+  FAST_AGENT_RUNTIME="bwrap"
+elif [[ "$(uname -s)" == "Darwin" ]] && command -v sandbox-exec >/dev/null 2>&1; then
+  FAST_AGENT_RUNTIME="seatbelt"
+else
+  FAST_AGENT_RUNTIME="container"
+fi
 write_state_var "FAST_AGENT_RUNTIME" "$FAST_AGENT_RUNTIME"
 test_info "Agent runtime: $FAST_AGENT_RUNTIME"
 
@@ -148,6 +154,7 @@ EOF
 
 cat >"${openai_agent_root}/manifest.json" <<EOF
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "endpoints": {
     "chatCompletions": {
@@ -180,6 +187,7 @@ mkdir -p "$disable_agent_root"
 
 cat >"${disable_agent_root}/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "agent": "node -e \"setInterval(()=>{}, 1_000_000)\"",
   "readiness": {
@@ -194,6 +202,7 @@ write_state_var "TEST_HEALTH_AGENT_REPO_PATH" "$health_agent_root"
 
 cat >"${health_agent_root}/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node -e \"setInterval(()=>{}, 1_000_000)\"",
   "health": {
@@ -232,6 +241,7 @@ mkdir -p "$dep_agent_root"
 
 cat >"${dep_agent_root}/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "profiles": {
     "default": {
@@ -247,6 +257,7 @@ mkdir -p "$dep_devel_root"
 
 cat >"${dep_devel_root}/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye",
   "start": "node -e \"require('net').createServer(()=>{}).listen(Number(process.env.PORT||7000), '0.0.0.0'); setInterval(()=>{}, 1_000_000)\"",
   "readiness": {
@@ -262,6 +273,7 @@ mkdir -p "$enable_alias_agent_root"
 
 cat >"${enable_alias_agent_root}/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye"
 }
 EOF
@@ -279,12 +291,6 @@ enable_repo_with_branch "demo"
 preclone_manifest_repo "fileExplorer" "https://github.com/AssistOS-AI/AssistOSExplorer.git"
 preclone_manifest_repo "soplangBuilder" "https://github.com/AssistOS-AI/SOPLangBuilder.git"
 preclone_manifest_repo "webmeet" "https://github.com/AssistOS-AI/webmeet.git"
-
-# These external main-branch manifests are disposable fast-suite fixtures, not
-# selector-authority source checkouts. Keep the two exercised services on the
-# container path so strict true-plus-container admission is tested, not bypassed.
-set_fast_fixture_container_runtime ".ploinky/repos/demo/simulator/manifest.json"
-set_fast_fixture_container_runtime ".ploinky/repos/webmeet/moderator/manifest.json"
 
 # Trim cloned manifests to the minimum dependency surface required by
 # testsAfterStart.sh. Without this, dependency-gated startup (see
@@ -305,9 +311,20 @@ slim_manifest_enable ".ploinky/repos/webmeet/moderator/manifest.json" '[]'
 # does GET / over HTTP). Force the probe to TCP for the test workspace.
 set_manifest_readiness_protocol ".ploinky/repos/webmeet/moderator/manifest.json" "tcp"
 
-# Agent enables start their runtimes and synchronously attest the Router
-# authority. The real Router is launched by doStart.sh, so all non-static
-# enables are intentionally deferred until its private health socket is ready.
+test_info "Enabling agent ${TEST_AGENT_QUALIFIED}."
+ploinky enable agent "$TEST_AGENT_QUALIFIED"
+
+test_info "Enabling OpenAI test agent ${TEST_REPO_NAME}/${OPENAI_AGENT_NAME}."
+ploinky enable agent "${TEST_REPO_NAME}/${OPENAI_AGENT_NAME}"
+
+test_info "Enabling agent ${TEST_AGENT_TO_DISABLE_QUALIFIED}."
+ploinky enable agent "$TEST_AGENT_TO_DISABLE_QUALIFIED"
+
+test_info "Enabling agent ${TEST_REPO_NAME}/${HEALTH_AGENT_NAME}."
+ploinky enable agent "${TEST_REPO_NAME}/${HEALTH_AGENT_NAME}"
+
+test_info "Enabling alias test agent ${ENABLE_ALIAS_AGENT_NAME} as ${ENABLE_ALIAS_AGENT_ALIAS}."
+ploinky enable agent "${ENABLE_ALIAS_AGENT_NAME}" as "$ENABLE_ALIAS_AGENT_ALIAS"
 alias_agent_container=$(compute_container_name "$ENABLE_ALIAS_AGENT_ALIAS" "$TEST_REPO_NAME")
 write_state_var "TEST_ENABLE_ALIAS_AGENT_CONTAINER" "$alias_agent_container"
 
@@ -327,6 +344,7 @@ write_state_var "TEST_GLOBAL_AGENT_CONTAINER_PORT" "$global_agent_internal_port"
 
 cat >"${global_agent_root}/manifest.json" <<EOF
 {
+  "lite-sandbox": true,
   "container": "node:24.15.0-bullseye",
   "profiles": {
     "default": {
@@ -341,6 +359,8 @@ cat >"${global_agent_root}/manifest.json" <<EOF
 }
 EOF
 
+test_info "Enabling agent ${GLOBAL_AGENT_NAME} in global mode."
+ploinky enable agent "$GLOBAL_AGENT_NAME" global
 global_agent_container=$(compute_container_name "$GLOBAL_AGENT_NAME" "$TEST_REPO_NAME")
 write_state_var "TEST_GLOBAL_AGENT_CONT_NAME" "$global_agent_container"
 
@@ -354,6 +374,7 @@ mkdir -p "$global_alias_agent_root"
 
 cat >"${global_alias_agent_root}/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye"
 }
 EOF
@@ -367,9 +388,13 @@ mkdir -p "$devel_agent_root"
 
 cat >"${devel_agent_root}/manifest.json" <<'EOF'
 {
+  "lite-sandbox": true,
   "container": "node:20-bullseye"
 }
 EOF
+
+test_info "Enabling agent ${DEVEL_AGENT_NAME} in devel mode."
+ploinky enable agent "${DEVEL_AGENT_NAME}" devel "${TEST_REPO_NAME}"
 
 test_info "Setting workspace-only env var FAST_PLOINKY_ONLY"
 ploinky var FAST_PLOINKY_ONLY host-secret-value
@@ -389,14 +414,13 @@ health_agent_container_name=$(compute_container_name "$HEALTH_AGENT_NAME" "$TEST
 write_state_var "TEST_HEALTH_AGENT_CONT_NAME" "$health_agent_container_name"
 test_info "Health probe container will be named: $health_agent_container_name"
 
-runtime_workspace="$TEST_RUN_DIR"
-agent_dependency_storage="$TEST_RUN_DIR/.data/$TEST_AGENT_NAME"
-write_state_var "TEST_AGENT_WORKSPACE" "$runtime_workspace"
-write_state_var "TEST_PERSIST_FILE" "$runtime_workspace/data/fast-persist.txt"
-write_state_var "TEST_AGENT_LOG" "$runtime_workspace/fast-start.log"
-write_state_var "TEST_PERSIST_MARKER" "$runtime_workspace/data/manual-marker.txt"
+workspace_project="$TEST_RUN_DIR/.data/$TEST_AGENT_NAME"
+write_state_var "TEST_AGENT_WORKSPACE" "$workspace_project"
+write_state_var "TEST_PERSIST_FILE" "$workspace_project/data/fast-persist.txt"
+write_state_var "TEST_AGENT_LOG" "$workspace_project/fast-start.log"
+write_state_var "TEST_PERSIST_MARKER" "$workspace_project/data/manual-marker.txt"
 write_state_var "TEST_AGENT_CONTAINER_PORT" "7000"
 
-mkdir -p "$agent_dependency_storage"
+mkdir -p "$workspace_project/data"
 
 test_info "Preparation step complete."

@@ -63,12 +63,11 @@ import {
     cleanupSessionContainers,
     destroyAll,
     killRouterIfRunning,
-    requireRouterStopCompleted,
     shutdownSession,
 } from './sessionControl.js';
 import { handleSsoCommand } from './ssoCommands.js';
 import { handleDepsCommand } from './depsCommands.js';
-import { handleSandboxCommand, sandboxCommandUsageError } from './sandboxCommands.js';
+import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
 import {
     getValidProfiles,
@@ -89,12 +88,6 @@ const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
     password: '--password',
 });
 const ENABLE_AGENT_CLI_TOKEN_SET = new Set(Object.values(ENABLE_AGENT_CLI_TOKENS));
-
-function stopExactRouterForLifecycle(label, {
-    stopRouter = killRouterIfRunning,
-} = {}) {
-    return requireRouterStopCompleted(stopRouter(), label);
-}
 
 async function ensureLlmAgentsLoaded() {
     if (!llmAgentsLoadPromise) {
@@ -299,9 +292,6 @@ async function handleCommand(args) {
             break;
         }
         case 'enable':
-            if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
-                throw sandboxCommandUsageError(`enable ${options[0]}`);
-            }
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
                 enableRepo(parsed.repoName, parsed.branch);
@@ -309,6 +299,9 @@ async function handleCommand(args) {
             else if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
                 await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
+            }
+            else if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
+                enableHostSandbox();
             }
             else {
                 if (!options.length) {
@@ -331,10 +324,6 @@ async function handleCommand(args) {
                 break;
             }
 
-            if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
-                throw sandboxCommandUsageError(`disable ${options[0]}`);
-            }
-
             if (String(options[0] || '').toLowerCase() === 'agents-all') {
                 disableAllAgents();
                 break;
@@ -343,6 +332,11 @@ async function handleCommand(args) {
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
                 disableRepo(parsed.repoName);
+                break;
+            }
+
+            if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
+                disableHostSandbox();
                 break;
             }
 
@@ -474,10 +468,10 @@ async function handleCommand(args) {
                 inactivateEdgeRoutingGeneration('cli-router-restart');
                 console.log('[restart] Restarting RoutingServer (containers untouched)...');
                 resolvePersistedRouterPort();
-                const routerStopResult = stopExactRouterForLifecycle('restart router');
+                killRouterIfRunning();
                 await startWorkspace(undefined, undefined, {
                     enableAgent,
-                    killRouterIfRunning: () => routerStopResult,
+                    killRouterIfRunning: () => { },
                 });
                 console.log('[restart] RoutingServer restarted.');
                 break;
@@ -721,7 +715,7 @@ async function handleCommand(args) {
                 resolvePersistedRouterPort();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
                 console.log('[restart] Stopping Router and configured agents...');
-                const routerStopResult = stopExactRouterForLifecycle('restart');
+                killRouterIfRunning();
                 console.log('[restart] Stopping configured agent containers...');
                 const list = stopConfiguredAgents();
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
@@ -729,7 +723,7 @@ async function handleCommand(args) {
                 console.log('[restart] Starting workspace...');
                 await startWorkspace(undefined, undefined, {
                     enableAgent,
-                    killRouterIfRunning: () => routerStopResult,
+                    killRouterIfRunning,
                 });
                 console.log('[restart] Done.');
             }
@@ -741,7 +735,7 @@ async function handleCommand(args) {
         case 'shutdown': {
             inactivateEdgeRoutingGeneration('cli-workspace-shutdown');
             console.log('[shutdown] Stopping RoutingServer...');
-            stopExactRouterForLifecycle('shutdown');
+            killRouterIfRunning();
             console.log('[shutdown] Removing workspace containers...');
             const list = destroyWorkspaceContainers();
             if (list.length) {
@@ -758,7 +752,7 @@ async function handleCommand(args) {
             }
             inactivateEdgeRoutingGeneration('cli-workspace-stop');
             console.log('[stop] Stopping RoutingServer...');
-            stopExactRouterForLifecycle('stop');
+            killRouterIfRunning();
             console.log('[stop] Stopping configured agent containers...');
             const list = stopConfiguredAgents();
             if (list.length) {
@@ -771,7 +765,7 @@ async function handleCommand(args) {
         case 'destroy':
             inactivateEdgeRoutingGeneration('cli-workspace-destroy');
             console.log('[destroy] Stopping RoutingServer...');
-            stopExactRouterForLifecycle('destroy');
+            killRouterIfRunning();
             console.log('[destroy] Removing all workspace containers...');
             await destroyAll();
             break;
@@ -931,7 +925,6 @@ function disableAllAgents() {
 }
 
 export {
-    stopExactRouterForLifecycle,
     handleCommand,
     getAgentNames,
     getRepoNames,

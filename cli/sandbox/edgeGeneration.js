@@ -12,7 +12,6 @@ import {
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
-import { normalizeExactServiceOwnerAttestation } from './bwrap/bwrapFleet.js';
 import { parseRouterHostPort, selectedRouterHostPort } from './routerPort.js';
 
 export const EDGE_GENERATION_SCHEMA_VERSION = 1;
@@ -907,44 +906,10 @@ function compileAgentMcpRouteClosure(rootRouteKey, routing, manifests, agents) {
     return [...allowed].sort();
 }
 
-function validateBwrapRootOwnerBindings(routing, agents) {
-    for (const [routeKey, route] of Object.entries(routing.routes || {})) {
-        if (!route || route.disabled) continue;
-        const containerName = String(route.container || '').trim();
-        const record = agents?.[containerName];
-        if (!containerName || !isPlainObject(record) || record.type !== 'agent') continue;
-        if (String(record.runtime || '').trim() !== 'bwrap') continue;
-        let owner;
-        try {
-            owner = normalizeExactServiceOwnerAttestation(record.bwrapOwner);
-        } catch (cause) {
-            throw edgeError(
-                `bwrap route '${routeKey}' has no exact immutable service owner: ${cause?.message || cause}`,
-                'BWRAP_AGENT_OWNER_INVALID',
-            );
-        }
-        const hostPort = Number(route.hostPort);
-        if (String(record.repoName || '') !== String(route.repo || '')
-            || String(record.agentName || '') !== String(route.agent || '')
-            || owner.runtimeKey !== containerName
-            || owner.routeKey !== routeKey
-            || owner.rootPort !== hostPort
-            || owner.pid !== record.pid
-            || owner.instanceId !== String(record.instanceId || '').trim()
-            || owner.enableGeneration !== String(record.enableGeneration || '').trim()) {
-            throw edgeError(
-                `bwrap route '${routeKey}' service owner does not match its exact route and generation`,
-                'BWRAP_AGENT_OWNER_INVALID',
-            );
-        }
-    }
-}
-
 function compileGeneration({ routing, policy, desired, agents, manifests }) {
     validatePolicy(policy);
     validateRoutingShape(routing, manifests);
     assertObject(agents, 'agents registry');
-    validateBwrapRootOwnerBindings(routing, agents);
     const normalizedDesired = normalizeDesired(desired);
     const hostNetworkCapabilities = collectManifestHostNetworkCapabilities(routing, manifests, agents);
     const turnCredentialConsumers = (normalizedDesired.turn?.credentialConsumers || []).map((agentRef) => (
@@ -2353,21 +2318,16 @@ export function prepareAdditiveEdgeRoutingGeneration(options = {}) {
     };
 }
 
-function preparedRuntimeRegistryRecord(preparationLease, {
+export function assertAdditivePreparedRuntimeIdentity(preparationLease, {
     containerName,
     instanceId,
     enableGeneration,
     ...options
-} = {}, { requiredMode = null } = {}) {
+} = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const lease = assertPreparationLeaseForApply(paths, preparationLease);
-    if (!lease || (requiredMode && lease.mode !== requiredMode)) {
-        throw edgeError(
-            requiredMode
-                ? `prepared runtime identity requires one ${requiredMode} preparation lease`
-                : 'prepared runtime identity requires one preparation lease',
-            'EDGE_PREPARATION_STALE',
-        );
+    if (!lease || lease.mode !== 'additive') {
+        throw edgeError('prepared runtime identity requires one additive preparation lease', 'EDGE_PREPARATION_STALE');
     }
     assertPreparedSelectorStillSelected(paths, lease);
     const prepared = loadCapturedGeneration(paths, lease.preparedGeneration);
@@ -2377,19 +2337,11 @@ function preparedRuntimeRegistryRecord(preparationLease, {
         || String(record.instanceId || '') !== String(instanceId || '')
         || String(record.enableGeneration || '') !== String(enableGeneration || '')) {
         throw edgeError(
-            'preparation does not authorize the exact runtime identity',
+            'additive preparation does not authorize the exact runtime identity',
             'EDGE_PREPARATION_SOURCE_CHANGED',
         );
     }
     return Object.freeze(structuredClone(record));
-}
-
-export function assertPreparedRuntimeIdentity(preparationLease, options = {}) {
-    return preparedRuntimeRegistryRecord(preparationLease, options);
-}
-
-export function assertAdditivePreparedRuntimeIdentity(preparationLease, options = {}) {
-    return preparedRuntimeRegistryRecord(preparationLease, options, { requiredMode: 'additive' });
 }
 
 /**

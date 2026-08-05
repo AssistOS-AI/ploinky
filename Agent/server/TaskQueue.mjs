@@ -1,7 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import { describeShellFailure } from '../lib/toolError.mjs';
-import { inspectProcessIdentity, normalizeProcessIdentity } from '../lib/processIdentity.mjs';
 
 const DEFAULT_MAX_LOG_TAIL_BYTES = 128 * 1024;
 const DEFAULT_CANCEL_GRACE_MS = 2000;
@@ -44,26 +43,6 @@ function commandResult(stdout) {
     return { text: raw, continuation: null };
 }
 
-function cloneCommandSpec(commandSpec = {}) {
-    if (commandSpec.kind === 'provider-module') {
-        return {
-            kind: 'provider-module',
-            provider: commandSpec.provider,
-            module: commandSpec.module,
-            exportName: commandSpec.exportName,
-            timeoutMs: commandSpec.timeoutMs,
-        };
-    }
-    return {
-        kind: commandSpec.kind || 'shell',
-        command: commandSpec.command,
-        args: Array.isArray(commandSpec.args) ? [...commandSpec.args] : [],
-        cwd: commandSpec.cwd,
-        env: commandSpec.env ? { ...commandSpec.env } : {},
-        timeoutMs: commandSpec.timeoutMs,
-    };
-}
-
 export class TaskQueue {
     constructor({
         maxConcurrent = 10,
@@ -71,9 +50,6 @@ export class TaskQueue {
         executor,
         maxLogTailBytes = DEFAULT_MAX_LOG_TAIL_BYTES,
         cancelGraceMs = DEFAULT_CANCEL_GRACE_MS,
-        processIdentityInspector = inspectProcessIdentity,
-        signalProcessGroup = (pid, signal) => process.kill(-pid, signal),
-        getUid = () => (typeof process.getuid === 'function' ? process.getuid() : null),
     }) {
         if (typeof executor !== 'function') {
             throw new Error('TaskQueue requires an executor function');
@@ -83,22 +59,12 @@ export class TaskQueue {
         this.executor = executor;
         this.maxLogTailBytes = parsePositiveInt(maxLogTailBytes, DEFAULT_MAX_LOG_TAIL_BYTES);
         this.cancelGraceMs = parsePositiveInt(cancelGraceMs, DEFAULT_CANCEL_GRACE_MS);
-        if (typeof processIdentityInspector !== 'function'
-            || typeof signalProcessGroup !== 'function' || typeof getUid !== 'function') {
-            throw new Error('TaskQueue process identity dependencies are invalid');
-        }
-        this.processIdentityInspector = processIdentityInspector;
-        this.signalProcessGroup = signalProcessGroup;
-        this.getUid = getUid;
         this.tasks = new Map();
         this.taskLogs = new Map();
         this.pending = [];
         this.running = new Set();
         this.activeChildren = new Map();
-        this.activeProcessOwnership = new Map();
-        this.activeAbortControllers = new Map();
         this.cancelTimers = new Map();
-        this.lifecycleFailure = null;
         this.initialized = false;
     }
 
@@ -153,7 +119,13 @@ export class TaskQueue {
                     const task = {
                         id: entry.id,
                         toolName: entry.toolName,
-                        commandSpec: cloneCommandSpec(commandSpec),
+                        commandSpec: {
+                            command: commandSpec.command,
+                            args: Array.isArray(commandSpec.args) ? [...commandSpec.args] : [],
+                            cwd: commandSpec.cwd,
+                            env: commandSpec.env ? { ...(commandSpec.env) } : {},
+                            timeoutMs: commandSpec.timeoutMs,
+                        },
                         payload: entry.payload,
                         status: entry.status || 'pending',
                         timeoutMs: entry.timeoutMs ?? null,
@@ -298,7 +270,15 @@ export class TaskQueue {
         const task = {
             id,
             toolName,
-            commandSpec: cloneCommandSpec(commandSpec),
+            commandSpec: {
+                command: commandSpec.command,
+                args: Array.isArray(commandSpec.args)
+                    ? [...commandSpec.args]
+                    : [],
+                cwd: commandSpec.cwd,
+                env: { ...(commandSpec.env || {}) },
+                timeoutMs: commandSpec.timeoutMs
+            },
             payload: payloadWithId,
             timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : null,
             logRetention: logRetention === 'full' ? 'full' : 'bounded',
@@ -337,7 +317,6 @@ export class TaskQueue {
     }
 
     processQueue() {
-        if (this.lifecycleFailure) return;
         while (this.running.size < this.maxConcurrent && this.pending.length > 0) {
             const nextId = this.pending.shift();
             if (!nextId) {
@@ -354,105 +333,31 @@ export class TaskQueue {
         }
     }
 
-    inspectTaskProcess(pid) {
-        try {
-            return Object.freeze({ inspected: this.processIdentityInspector(pid), cause: null });
-        } catch (cause) {
-            return Object.freeze({ inspected: null, cause });
-        }
-    }
-
-    captureTaskProcessOwnership(child) {
+    signalTaskProcess(child, signal) {
+        if (!child) return false;
         const pid = Number(child.pid);
-        const uid = this.getUid();
-        const observation = this.inspectTaskProcess(pid);
-        const inspected = observation.inspected;
-        let processIdentity = null;
-        try { processIdentity = normalizeProcessIdentity(inspected?.processIdentity); } catch (_) { }
-        if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(uid) || uid < 0
-            || inspected?.state !== 'identified' || inspected.processUid !== uid || !processIdentity) {
-            const error = new Error('TaskQueue cannot capture a boot-bound same-UID child identity');
-            error.code = 'PLOINKY_TASK_PROCESS_IDENTITY_UNVERIFIED';
-            error.cause = observation.cause ?? undefined;
-            error.evidence = Object.freeze({
-                pid: Number.isSafeInteger(pid) ? pid : null,
-                state: observation.cause ? 'inspector-error' : (inspected?.state ?? 'invalid'),
-            });
-            throw error;
-        }
-        return Object.freeze({ pid, processIdentity, processUid: uid });
-    }
-
-    signalTaskProcess(taskId, signal) {
-        const ownership = this.activeProcessOwnership.get(taskId);
-        if (!ownership) {
-            const error = new Error('TaskQueue has no verified child identity to signal');
-            error.code = 'PLOINKY_TASK_PROCESS_IDENTITY_UNVERIFIED';
-            error.evidence = Object.freeze({ taskId, signal, state: 'missing' });
-            throw error;
-        }
-        const observation = this.inspectTaskProcess(ownership.pid);
-        const inspected = observation.inspected;
-        if (inspected?.state === 'dead') return false;
-        let processIdentity = null;
-        try { processIdentity = normalizeProcessIdentity(inspected?.processIdentity); } catch (_) { }
-        if (inspected?.state === 'identified' && processIdentity !== ownership.processIdentity) return false;
-        if (inspected?.state !== 'identified' || inspected.processUid !== ownership.processUid
-            || processIdentity !== ownership.processIdentity) {
-            const error = new Error(`TaskQueue refuses ${signal} for an unverified or UID-diverged child`);
-            error.code = 'PLOINKY_TASK_PROCESS_IDENTITY_UNVERIFIED';
-            error.cause = observation.cause ?? undefined;
-            error.evidence = Object.freeze({
-                taskId,
-                pid: ownership.pid,
-                signal,
-                state: observation.cause ? 'inspector-error' : (inspected?.state ?? 'invalid'),
-            });
-            throw error;
+        if (Number.isInteger(pid) && pid > 0 && process.platform !== 'win32') {
+            try {
+                process.kill(-pid, signal);
+                return true;
+            } catch (_) {
+            }
         }
         try {
-            this.signalProcessGroup(ownership.pid, signal);
-            return true;
-        } catch (cause) {
-            const afterObservation = this.inspectTaskProcess(ownership.pid);
-            const after = afterObservation.inspected;
-            if (after?.state === 'dead') return false;
-            let afterIdentity = null;
-            try { afterIdentity = normalizeProcessIdentity(after?.processIdentity); } catch (_) { }
-            if (after?.state === 'identified' && afterIdentity !== ownership.processIdentity) return false;
-            const error = new Error(`TaskQueue ${signal} delivery failed`);
-            error.code = 'PLOINKY_TASK_PROCESS_SIGNAL_FAILED';
-            error.cause = cause;
-            error.evidence = Object.freeze({
-                taskId,
-                pid: ownership.pid,
-                signal,
-                state: afterObservation.cause ? 'inspector-error' : (after?.state ?? 'invalid'),
-            });
-            throw error;
+            return child.kill(signal) !== false;
+        } catch (_) {
+            return false;
         }
     }
 
     requestRunningTaskCancellation(task, child) {
         if (!task || !child) return;
-        try { this.signalTaskProcess(task.id, 'SIGTERM'); } catch (error) {
-            task.terminationFailure = Object.freeze({
-                code: error.code || 'PLOINKY_TASK_PROCESS_SIGNAL_FAILED',
-                evidence: error.evidence ?? null,
-            });
-        }
+        this.signalTaskProcess(child, 'SIGTERM');
         if (this.cancelTimers.has(task.id)) return;
         const timer = setTimeout(() => {
             this.cancelTimers.delete(task.id);
             const activeChild = this.activeChildren.get(task.id);
-            if (activeChild) {
-                try { this.signalTaskProcess(task.id, 'SIGKILL'); } catch (error) {
-                    task.terminationFailure = Object.freeze({
-                        code: error.code || 'PLOINKY_TASK_PROCESS_SIGNAL_FAILED',
-                        evidence: error.evidence ?? null,
-                    });
-                }
-            }
+            if (activeChild) this.signalTaskProcess(activeChild, 'SIGKILL');
         }, this.cancelGraceMs);
         timer.unref?.();
         this.cancelTimers.set(task.id, timer);
@@ -475,7 +380,6 @@ export class TaskQueue {
         }
         task.status = 'cancelling';
         this.persistTasks();
-        this.activeAbortControllers.get(task.id)?.abort();
         const child = this.activeChildren.get(task.id);
         if (child) this.requestRunningTaskCancellation(task, child);
         return this.getTask(task.id);
@@ -506,12 +410,8 @@ export class TaskQueue {
     async executeTask(task) {
         let timer = null;
         let timedOut = false;
-        const abortController = new AbortController();
-        this.activeAbortControllers.set(task.id, abortController);
         try {
-            if (!task.commandSpec || (task.commandSpec.kind === 'provider-module'
-                ? !task.commandSpec.module
-                : !task.commandSpec.command)) {
+            if (!task.commandSpec || !task.commandSpec.command) {
                 throw new Error('Missing command specification for task');
             }
             const forwardToHostLog = (target, chunk) => {
@@ -524,13 +424,6 @@ export class TaskQueue {
             const result = await this.executor(task.commandSpec, task.payload, {
                 onSpawn: (child) => {
                     this.activeChildren.set(task.id, child);
-                    try {
-                        const ownership = this.captureTaskProcessOwnership(child);
-                        this.activeProcessOwnership.set(task.id, ownership);
-                    } catch (error) {
-                        this.lifecycleFailure = Object.freeze({ taskId: task.id, child, error });
-                        throw error;
-                    }
                     if (task.cancelRequested) {
                         this.requestRunningTaskCancellation(task, child);
                     }
@@ -538,7 +431,11 @@ export class TaskQueue {
                         timer = setTimeout(() => {
                             if (!child.killed) {
                                 timedOut = true;
-                                this.requestRunningTaskCancellation(task, child);
+                                try {
+                                    this.signalTaskProcess(child, 'SIGKILL');
+                                } catch (err) {
+                                    console.error('[AgentServer/MCP] Failed to kill timed-out task:', err);
+                                }
                             }
                         }, task.timeoutMs);
                     }
@@ -553,7 +450,6 @@ export class TaskQueue {
                     this.appendTaskLog(task.id, chunk);
                 },
                 detached: true,
-                signal: abortController.signal,
             });
 
             if (timer) {
@@ -566,16 +462,7 @@ export class TaskQueue {
                 && parsedResult.continuation?.toolName === task.continuationTool
                 ? parsedResult.continuation
                 : null;
-            if ((task.cancelRequested || task.status === 'cancelling') && task.terminationFailure) {
-                task.status = 'failed';
-                task.error = `${task.terminationFailure.code}: exact task termination was not proven`;
-                task.result = null;
-                this.lifecycleFailure ||= Object.freeze({
-                    taskId: task.id,
-                    child: this.activeChildren.get(task.id) ?? null,
-                    error: task.terminationFailure,
-                });
-            } else if (task.cancelRequested || task.status === 'cancelling') {
+            if (task.cancelRequested || task.status === 'cancelling') {
                 task.status = 'cancelled';
                 task.error = null;
                 task.result = continuation
@@ -618,32 +505,17 @@ export class TaskQueue {
             if (timer) {
                 clearTimeout(timer);
             }
-            if ((task.cancelRequested || task.status === 'cancelling') && task.terminationFailure) {
-                task.status = 'failed';
-                task.error = `${task.terminationFailure.code}: exact task termination was not proven`;
-                task.result = null;
-                this.lifecycleFailure ||= Object.freeze({
-                    taskId: task.id,
-                    child: this.activeChildren.get(task.id) ?? null,
-                    error: task.terminationFailure,
-                });
-            } else if (task.cancelRequested || task.status === 'cancelling') {
+            if (task.cancelRequested || task.status === 'cancelling') {
                 task.status = 'cancelled';
                 task.error = null;
                 task.result = null;
             } else {
                 task.status = 'failed';
-                task.error = err?.code
-                    ? `${err.code}: ${err.message || 'Task execution failed'}`
-                    : (err?.message || 'Task execution failed');
+                task.error = err?.message || 'Task execution failed';
                 task.result = null;
             }
         } finally {
-            if (this.lifecycleFailure?.taskId !== task.id) {
-                this.activeChildren.delete(task.id);
-                this.activeProcessOwnership.delete(task.id);
-            }
-            this.activeAbortControllers.delete(task.id);
+            this.activeChildren.delete(task.id);
             const cancelTimer = this.cancelTimers.get(task.id);
             if (cancelTimer) clearTimeout(cancelTimer);
             this.cancelTimers.delete(task.id);

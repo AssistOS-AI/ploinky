@@ -7,7 +7,6 @@ import {
     buildEnvMap,
     formatEnvFlag,
     getExposedNames,
-    getManifestEnvSpecs,
     getManifestEnvNames,
     resolveVarValue
 } from '../../utils/security/secretVars.js';
@@ -68,13 +67,11 @@ import {
 import {
     getAgentWorkDir,
     getAgentCodePath,
-    getAgentSkillsPath,
-    ensureAgentHomeAbi,
+    getAgentSkillsPath
 } from '../../utils/workspaceStructure.js';
 import { ensureAgentCacheForFamily } from '../../utils/dependencies/dependencyCache.js';
 import {
     assertBwrapPidSlotAvailable,
-    assertExactServiceOwner,
     isBwrapProcessRunning,
     normalizeSandboxRuntimeIdentity,
     stopBwrapProcess,
@@ -95,22 +92,8 @@ import {
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
-    runtimeCapabilityDigest,
 } from '../runtimeCapabilities.js';
 import { assertHostModeGenerationCapability } from '../edgeGeneration.js';
-import { buildRouterAuthorityTopologyIntent } from '../routerAuthorityAttestation.js';
-import { IMAGE_CONTRACT } from '../../../ploinky-box/contract/image.mjs';
-import {
-    TRUSTED_SERVICE_ENV,
-    buildTrustedServicePolicy,
-    encodeBwrapLaunchDescriptor,
-    isTrustedServiceReservedEnvName,
-} from '../../../Agent/lib/providerSandbox.mjs';
-import {
-    BWRAP_AGENT_CREDENTIAL_FILE,
-    BWRAP_AGENT_CREDENTIAL_MAX_BYTES,
-    buildBwrapAgentCredential,
-} from './bwrapAgentCredential.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -118,274 +101,8 @@ const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
 const AGENT_PRIVATE_KEY_CONTAINER_PATH = '/run/ploinky-agent.key';
 const BWRAP_RUNTIME_ROOT = path.join(DEPS_DIR, 'bwrap-runtime');
 const BWRAP_NODE_RUNTIME_PATH = '/opt/ploinky-node';
-const BWRAP_HELPER_PATH = IMAGE_CONTRACT.bwrapHelper;
 
 const BWRAP_PATH = '/usr/bin/bwrap';
-
-function trustedServicePolicyError(message, code = 'PLOINKY_BWRAP_SERVICE_POLICY_INVALID') {
-    const error = new Error(message);
-    error.code = code;
-    return error;
-}
-
-function assertTrustedServiceEnvName(name, source) {
-    const normalized = typeof name === 'string' ? name.trim() : '';
-    if (!normalized) return;
-    if (isTrustedServiceReservedEnvName(normalized)
-        || normalized === '*'
-        || normalized.startsWith('PLOINKY_') && normalized.includes('*')) {
-        throw trustedServicePolicyError(
-            `trusted coding service ${source} declares reserved environment name ${normalized}`,
-            'PLOINKY_BWRAP_SERVICE_ENV_RESERVED',
-        );
-    }
-}
-
-function inspectTrustedServiceEnvValue(value, source) {
-    if (typeof value !== 'string') return;
-    const references = value.matchAll(/\{\{(?:secret|var|generatedSecret):\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g);
-    for (const match of references) assertTrustedServiceEnvName(match[1], source);
-    if (/^\$[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
-        assertTrustedServiceEnvName(value.slice(1), source);
-    }
-}
-
-function assertTrustedServiceRawConfiguration(manifest, profileConfig, runtimeResourcePlan = null) {
-    for (const [source, env] of [
-        ['manifest env', manifest?.env],
-        ['profile env', profileConfig?.env],
-    ]) {
-        if (env === undefined || env === null) continue;
-        for (const spec of getManifestEnvSpecs({ env }, null)) {
-            assertTrustedServiceEnvName(spec.insideName, source);
-            assertTrustedServiceEnvName(spec.sourceName, `${source} source`);
-        }
-        if (Array.isArray(env)) {
-            for (const entry of env) {
-                if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
-                    inspectTrustedServiceEnvValue(entry.value ?? entry.default, source);
-                } else if (typeof entry === 'string') {
-                    inspectTrustedServiceEnvValue(entry.slice(entry.indexOf('=') + 1), source);
-                }
-            }
-        } else if (typeof env === 'object') {
-            for (const value of Object.values(env)) {
-                if (value && typeof value === 'object' && !Array.isArray(value)) {
-                    inspectTrustedServiceEnvValue(value.value ?? value.default, source);
-                } else {
-                    inspectTrustedServiceEnvValue(value, source);
-                }
-            }
-        }
-    }
-
-    for (const [source, expose] of [
-        ['manifest expose', manifest?.expose],
-        ['profile expose', profileConfig?.expose],
-    ]) {
-        if (Array.isArray(expose)) {
-            for (const spec of expose) {
-                assertTrustedServiceEnvName(spec?.name, source);
-                assertTrustedServiceEnvName(spec?.ref, `${source} source`);
-                inspectTrustedServiceEnvValue(spec?.value, source);
-            }
-        } else if (expose && typeof expose === 'object') {
-            for (const [name, value] of Object.entries(expose)) {
-                assertTrustedServiceEnvName(name, source);
-                inspectTrustedServiceEnvValue(value, source);
-            }
-        }
-    }
-
-    for (const secretName of profileConfig?.secrets || []) {
-        assertTrustedServiceEnvName(secretName, 'profile secrets');
-    }
-    for (const [name, value] of Object.entries(manifest?.runtime?.resources?.env || {})) {
-        assertTrustedServiceEnvName(name, 'runtime resource env');
-        inspectTrustedServiceEnvValue(value, 'runtime resource env source');
-    }
-    for (const name of Object.keys(runtimeResourcePlan?.env || {})) {
-        assertTrustedServiceEnvName(name, 'runtime resource plan env');
-    }
-}
-
-const TRUSTED_SERVICE_PLATFORM_PROJECTION_NAMES = new Set([
-    ...Object.keys(TRUSTED_SERVICE_ENV),
-    'AGENT_NAME',
-    'PORT',
-    'PLOINKY_AGENT_NAME',
-    'PLOINKY_REPO_NAME',
-    'PLOINKY_CWD',
-    'PLOINKY_AGENT_ID',
-    'PLOINKY_AGENT_PRINCIPAL',
-    'PLOINKY_AGENT_INSTANCE_ID',
-    'PLOINKY_AGENT_ENABLE_GENERATION',
-    'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_ID',
-    'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_PRINCIPAL',
-    'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_INSTANCE_ID',
-    'PLOINKY_ENV_SOURCE_PLOINKY_AGENT_ENABLE_GENERATION',
-]);
-
-function buildTrustedServiceDynamicEnvironment(envMap) {
-    const dynamicEnvironment = {};
-    for (const [name, value] of Object.entries(envMap || {})) {
-        if (value === undefined || value === null) continue;
-        if (isTrustedServiceReservedEnvName(name)) {
-            if (!TRUSTED_SERVICE_PLATFORM_PROJECTION_NAMES.has(name)) {
-                throw trustedServicePolicyError(
-                    `trusted coding service produced unowned reserved environment name ${name}`,
-                    'PLOINKY_BWRAP_SERVICE_ENV_RESERVED',
-                );
-            }
-            continue;
-        }
-        dynamicEnvironment[name] = String(value);
-    }
-    return dynamicEnvironment;
-}
-
-function assertTrustedServiceInputs(manifest, profileConfig, runtimeResourcePlan) {
-    assertTrustedServiceRawConfiguration(manifest, profileConfig, runtimeResourcePlan);
-    const manifestVolumes = manifest?.volumes && typeof manifest.volumes === 'object'
-        ? Object.keys(manifest.volumes)
-        : [];
-    const profileVolumes = profileConfig?.volumes && typeof profileConfig.volumes === 'object'
-        ? Object.keys(profileConfig.volumes)
-        : [];
-    if (manifestVolumes.length || profileVolumes.length) {
-        throw trustedServicePolicyError('trusted coding services do not admit manifest or profile volumes');
-    }
-    if (runtimeResourcePlan?.persistentStorage) {
-        throw trustedServicePolicyError('trusted coding services do not admit runtime persistent-storage mounts');
-    }
-}
-
-function assertTrustedBwrapHelper() {
-    let stat;
-    try {
-        stat = fs.lstatSync(BWRAP_HELPER_PATH);
-    } catch (cause) {
-        throw trustedServicePolicyError(
-            `trusted bwrap launcher is unavailable at ${BWRAP_HELPER_PATH}`,
-            'PLOINKY_BWRAP_HELPER_UNAVAILABLE',
-        );
-    }
-    if (stat.isSymbolicLink()
-        || !stat.isFile()
-        || stat.uid !== 0
-        || stat.gid !== 0
-        || (stat.mode & 0o7777) !== 0o755) {
-        throw trustedServicePolicyError(
-            'trusted bwrap launcher must be an immutable root-owned 0755 regular file',
-            'PLOINKY_BWRAP_HELPER_INVALID',
-        );
-    }
-    try {
-        fs.accessSync(BWRAP_HELPER_PATH, fs.constants.X_OK);
-    } catch (_) {
-        throw trustedServicePolicyError(
-            'trusted bwrap launcher is not executable',
-            'PLOINKY_BWRAP_HELPER_INVALID',
-        );
-    }
-}
-
-function buildTrustedServiceLaunch(options) {
-    const policy = buildTrustedServicePolicy(options);
-    return Object.freeze({
-        ...policy,
-        descriptor: encodeBwrapLaunchDescriptor(policy.records),
-        helperPath: BWRAP_HELPER_PATH,
-    });
-}
-
-function spawnTrustedServiceLaunch(launch, logFd, credentialBytes, dependencyOverrides = {}) {
-    const clearCredential = (() => {
-        let credentialCleared = false;
-        return () => {
-            if (credentialCleared || !Buffer.isBuffer(credentialBytes)) return;
-            credentialCleared = true;
-            credentialBytes.fill(0);
-        };
-    })();
-    if (!Buffer.isBuffer(credentialBytes)
-        || credentialBytes.length < 1
-        || credentialBytes.length > BWRAP_AGENT_CREDENTIAL_MAX_BYTES) {
-        clearCredential();
-        throw trustedServicePolicyError(
-            'trusted bwrap launcher credential bytes are missing or out of bounds',
-            'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
-        );
-    }
-    const assertHelper = dependencyOverrides.assertHelper || assertTrustedBwrapHelper;
-    const spawnProcess = dependencyOverrides.spawnProcess || spawn;
-    const killProcess = dependencyOverrides.killProcess || ((pid, signal) => process.kill(pid, signal));
-    try {
-        assertHelper();
-    } catch (error) {
-        clearCredential();
-        throw error;
-    }
-    let child;
-    try {
-        child = spawnProcess(BWRAP_HELPER_PATH, [], {
-            detached: true,
-            stdio: ['ignore', logFd, logFd, 'pipe', 'pipe'],
-        });
-    } catch (error) {
-        clearCredential();
-        throw error;
-    }
-    let spawnFailure = null;
-    const killExactChild = () => {
-        if (!Number.isSafeInteger(child?.pid) || child.pid < 1) return;
-        try { killProcess(-child.pid, 'SIGKILL'); } catch (_) { }
-        try { killProcess(child.pid, 'SIGKILL'); } catch (_) { }
-    };
-    const recordPipeFailure = (error) => {
-        if (spawnFailure) return;
-        spawnFailure = error instanceof Error ? error : new Error(String(error || 'pipe failure'));
-        clearCredential();
-        killExactChild();
-    };
-    if (!child || typeof child.once !== 'function') {
-        clearCredential();
-        killExactChild();
-        throw trustedServicePolicyError(
-            'trusted bwrap launcher did not return a child process',
-            'PLOINKY_BWRAP_SPAWN_FAILED',
-        );
-    }
-    child.once('error', recordPipeFailure);
-    const descriptorPipe = child.stdio?.[3];
-    const credentialPipe = child.stdio?.[4];
-    if (!descriptorPipe || typeof descriptorPipe.once !== 'function'
-        || typeof descriptorPipe.end !== 'function'
-        || !credentialPipe || typeof credentialPipe.once !== 'function'
-        || typeof credentialPipe.end !== 'function') {
-        const error = trustedServicePolicyError(
-            'trusted bwrap launcher descriptor and credential pipes were not created',
-            'PLOINKY_BWRAP_PIPE_FAILED',
-        );
-        recordPipeFailure(error);
-        throw error;
-    }
-    descriptorPipe.once('error', recordPipeFailure);
-    credentialPipe.once('error', recordPipeFailure);
-    try {
-        descriptorPipe.end(launch.descriptor);
-        if (!spawnFailure) {
-            credentialPipe.end(credentialBytes, (error) => {
-                if (error) recordPipeFailure(error);
-                else clearCredential();
-            });
-        }
-    } catch (error) {
-        recordPipeFailure(error);
-        throw error;
-    }
-    return Object.freeze({ child, getSpawnFailure: () => spawnFailure });
-}
 
 function admitBwrapBoundary(agentName, manifest, agentPath, options, profileResolution) {
     const repoName = path.basename(path.dirname(agentPath));
@@ -771,19 +488,14 @@ function buildBwrapArgs(options) {
  */
 function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null, routerEndpoint = undefined, runtimeIdentity = undefined) {
     const endpoint = assertRouterEndpoint(routerEndpoint, 'host');
-    if (runtimeName === 'bwrap') {
-        assertTrustedServiceRawConfiguration(manifest, profileConfig, runtimeResourcePlan);
-    }
     // Start with manifest env vars (resolved from secrets)
     const env = buildEnvMap(manifest, profileConfig, { agentName, repoName, forRuntime: true });
 
     // Ploinky internal vars
-    env.PLOINKY_MCP_CONFIG_PATH = runtimeName === 'bwrap'
-        ? '/home/agent/mcp-config.json'
-        : CONTAINER_CONFIG_PATH;
+    env.PLOINKY_MCP_CONFIG_PATH = CONTAINER_CONFIG_PATH;
     env.AGENT_NAME = agentName;
-    env.WORKSPACE_PATH = runtimeName === 'bwrap' ? '/workspace' : workspacePath;
-    env.PLOINKY_WORKSPACE_ROOT = runtimeName === 'bwrap' ? '/workspace' : PLOINKY_WORKSPACE_ROOT;
+    env.WORKSPACE_PATH = workspacePath;
+    env.PLOINKY_WORKSPACE_ROOT = PLOINKY_WORKSPACE_ROOT;
     env.PLOINKY_RUNTIME = runtimeName;
 
     // Manifest-declared runtime.resources.env (post template expansion).
@@ -808,7 +520,10 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
     }
 
     // System profile env vars
-    const profileEnvVars = getProfileEnvVars(agentName, repoName, activeProfile);
+    const profileEnvVars = getProfileEnvVars(agentName, repoName, activeProfile, {
+        containerName: `bwrap_${agentName}`,
+        containerId: `bwrap_${agentName}`
+    });
     if (profileEnvVars && typeof profileEnvVars === 'object') {
         for (const [key, value] of Object.entries(profileEnvVars)) {
             if (key) env[key] = value ?? '';
@@ -839,23 +554,8 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
 
     // Essential system vars
     env.NODE_PATH = '/code/node_modules';
-    env.HOME = runtimeName === 'bwrap' ? TRUSTED_SERVICE_ENV.HOME : workspacePath;
-    env.PATH = runtimeName === 'bwrap'
-        ? TRUSTED_SERVICE_ENV.PATH
-        : `${BWRAP_NODE_RUNTIME_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
-    if (runtimeName === 'bwrap') {
-        env.PLOINKY_MCP_CONFIG_PATH = '/home/agent/mcp-config.json';
-        env.WORKSPACE_PATH = '/workspace';
-        env.PLOINKY_WORKSPACE_ROOT = '/workspace';
-        env.XDG_CONFIG_HOME = TRUSTED_SERVICE_ENV.XDG_CONFIG_HOME;
-        env.XDG_CACHE_HOME = TRUSTED_SERVICE_ENV.XDG_CACHE_HOME;
-        env.XDG_DATA_HOME = TRUSTED_SERVICE_ENV.XDG_DATA_HOME;
-        env.XDG_STATE_HOME = TRUSTED_SERVICE_ENV.XDG_STATE_HOME;
-        env.TMPDIR = TRUSTED_SERVICE_ENV.TMPDIR;
-        env.PLOINKY_AGENT_BIND_HOST = TRUSTED_SERVICE_ENV.PLOINKY_AGENT_BIND_HOST;
-    }
-    env.AGENT_NAME = agentName;
-    env.PLOINKY_RUNTIME = runtimeName;
+    env.HOME = '/root';
+    env.PATH = `${BWRAP_NODE_RUNTIME_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
 
     // Exact final-runner equivalence is not yet available for bwrap/seatbelt.
     // Strip every reserved input and emit only non-secret principal fields;
@@ -872,10 +572,6 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
             exactRuntimeIdentity,
         ),
     );
-    if (runtimeName === 'bwrap') {
-        env.PLOINKY_AGENT_CREDENTIAL_FILE = BWRAP_AGENT_CREDENTIAL_FILE;
-        env.PLOINKY_ENV_SOURCE_PLOINKY_AGENT_CREDENTIAL_FILE = 'generated';
-    }
 
     return env;
 }
@@ -885,23 +581,32 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
  *
  * No runtime `npm install` — dependencies are prepared on the host
  * via `prepareAgentCache` and mounted read-only at /code/node_modules.
- * Provider install hooks are never admitted to the long-lived trusted service.
- * A later provider update phase runs them under its own exclusive HOME lease.
+ * Only manifest-declared install hooks run here.
  */
 function buildBwrapEntryCommand(agentName, manifest, profileConfig) {
     const { raw: explicitAgentCmd } = readManifestAgentCommand(manifest);
     const startCmd = readManifestStartCommand(manifest);
     const useStartEntry = Boolean(startCmd);
 
+    const manifestInstallCmd = String(profileConfig?.install || manifest?.install || '').trim();
+
     let entryCmd;
     if (useStartEntry && explicitAgentCmd) {
-        entryCmd = `cd /code && (${startCmd} &) && exec ${explicitAgentCmd}`;
+        entryCmd = manifestInstallCmd
+            ? `cd /code && ${manifestInstallCmd} && (${startCmd} &) && exec ${explicitAgentCmd}`
+            : `cd /code && (${startCmd} &) && exec ${explicitAgentCmd}`;
     } else if (useStartEntry) {
-        entryCmd = `cd /code && ${startCmd}`;
+        entryCmd = manifestInstallCmd
+            ? `cd /code && ${manifestInstallCmd} && ${startCmd}`
+            : `cd /code && ${startCmd}`;
     } else if (explicitAgentCmd) {
-        entryCmd = `cd /code && exec ${explicitAgentCmd}`;
+        entryCmd = manifestInstallCmd
+            ? `cd /code && ${manifestInstallCmd} && ${explicitAgentCmd}`
+            : `cd /code && ${explicitAgentCmd}`;
     } else {
-        entryCmd = 'exec /bin/sh /Agent/server/AgentServer.sh';
+        entryCmd = manifestInstallCmd
+            ? `${manifestInstallCmd} && sh /Agent/server/AgentServer.sh`
+            : 'sh /Agent/server/AgentServer.sh';
     }
 
     return entryCmd;
@@ -949,28 +654,20 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
     const alias = options.alias || existingRecord.alias;
-    const instanceName = containerName;
+    const instanceName = alias || agentName;
     const runtimeIdentity = normalizeSandboxRuntimeIdentity(options);
     const cwd = getConfiguredProjectPath(agentName, repoName, alias);
-    const workspacePath = '/workspace';
+    const isolatedHome = (existingRecord.runMode || 'isolated') === 'isolated';
+    const agentHomeDir = getAgentWorkDir(instanceName);
+    const cwdMountTarget = isolatedHome ? '/root' : cwd;
+    const workspacePath = isolatedHome ? '/root' : cwd;
 
     // Profile and network are resolved atomically before any sandbox work.
     const profileRecord = existingRecord;
     const profileResolution = resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options, profileRecord);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
-    // Reject reserved destinations and references before any admission,
-    // environment hashing/resolution, or existing-runtime inspection.  The
-    // already-running fast path must be subject to the same raw provenance
-    // boundary as a fresh launch.
-    assertTrustedServiceRawConfiguration(manifest, profileConfig);
-    const runtimeBoundary = admitBwrapBoundary(
-        agentName,
-        manifest,
-        agentPath,
-        options,
-        profileResolution,
-    );
+    admitBwrapBoundary(agentName, manifest, agentPath, options, profileResolution);
     assertHostModeGenerationCapability({
         agentId: deriveAgentPrincipalId(repoName, agentName),
         instanceId: runtimeIdentity.instanceId,
@@ -983,18 +680,14 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
 
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     const envHash = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
+    const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
+    const sharedDir = ensureSharedHostDir();
 
     // Resolve paths
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
-    assertTrustedServiceRawConfiguration(manifest, profileConfig);
+    const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
-    assertTrustedServiceInputs(manifest, profileConfig, runtimeResourcePlan);
     const nodeRuntime = resolveBwrapNodeRuntime();
-    const agentHomeState = ensureAgentHomeAbi(
-        containerName,
-        runtimeIdentity.enableGeneration,
-    );
-    const agentHomeDir = agentHomeState.homePath;
 
     // Pre-container lifecycle (workspace init, symlinks, preinstall HOST hook)
     const preLifecycle = runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile);
@@ -1003,6 +696,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     }
 
     // Ensure work directory and MCP config
+    fs.mkdirSync(agentHomeDir, { recursive: true });
     syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentHomeDir });
 
     // Prepare node dependencies via prepared cache (see dependencyCache.js).
@@ -1031,65 +725,11 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         const hostPort = options.preferredHostPort || existingRecord?.config?.ports?.[0]?.hostPort || (10000 + Math.floor(Math.random() * 50000));
         allPortMappings = [{ containerPort: hostPort, hostPort }];
     }
-    const hostPort = allPortMappings.find((mapping) => mapping.containerPort === 7000)?.hostPort
-        || allPortMappings[0]?.hostPort;
-    if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
-        throw trustedServicePolicyError(
-            'trusted coding service requires one exact root loopback port',
-            'PLOINKY_BWRAP_ROOT_PORT_INVALID',
-        );
-    }
-
-    const routeKey = alias || agentName;
-    const principalId = deriveAgentPrincipalId(repoName, agentName);
-    const routerIntent = buildRouterAuthorityTopologyIntent({
-        networkMode: profileResolution.network.mode,
-        runtimeKind: 'bwrap',
-    });
-    if (!routerIntent
-        || routerIntent.physicalOrigin !== routerEndpoint.url
-        || routerIntent.routerHost !== routerEndpoint.host
-        || Number(routerIntent.routerPort) !== routerEndpoint.port) {
-        throw trustedServicePolicyError(
-            'trusted coding service Router topology does not match the admitted host contract',
-            'PLOINKY_BWRAP_ROUTER_TOPOLOGY_INVALID',
-        );
-    }
-    const admittedNetworkHash = runtimeBoundary.admission.networkAdmission?.effectiveHash;
-    if (!/^[a-f0-9]{64}$/.test(String(admittedNetworkHash || ''))) {
-        throw trustedServicePolicyError(
-            'trusted coding service network admission hash is missing or malformed',
-            'PLOINKY_BWRAP_ROUTER_TOPOLOGY_INVALID',
-        );
-    }
-    const agentCredential = buildBwrapAgentCredential({
-        principalId,
-        instanceId: runtimeIdentity.instanceId,
-        enableGeneration: runtimeIdentity.enableGeneration,
-        runtimeKey: containerName,
-        routeKey,
-        router: {
-            physicalOrigin: routerIntent.physicalOrigin,
-            requestAuthority: routerIntent.requestAuthority,
-            host: routerEndpoint.host,
-            port: routerEndpoint.port,
-        },
-        admission: {
-            runtimeKind: 'bwrap',
-            manifestDigest: runtimeBoundary.admission.manifestDigest,
-            capabilityDigest: runtimeCapabilityDigest(runtimeBoundary.admission.descriptor),
-            networkHash: `sha256:${admittedNetworkHash}`,
-        },
-    });
+    const hostPort = allPortMappings[0]?.hostPort;
 
     // Build environment map
     const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
-    if (envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH) {
-        throw trustedServicePolicyError(
-            'trusted coding services do not admit a path-mounted agent credential',
-            'PLOINKY_BWRAP_CREDENTIAL_TRANSPORT_INVALID',
-        );
-    }
+    const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
 
     // Set PORT env var so the agent binds to the correct host port
@@ -1097,28 +737,31 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         envMap.PORT = String(hostPort);
     }
 
+    // Build bwrap arguments
+    const bwrapArgs = buildBwrapArgs({
+        agentCodePath,
+        agentLibPath,
+        nodeModulesDir,
+        sharedDir,
+        cwd,
+        cwdMountTarget,
+        agentHomeDir,
+        nodeRuntimePath: nodeRuntime.hostRuntimePath,
+        skillsPath: agentSkillsPath,
+        envMap,
+        codeReadOnly,
+        skillsReadOnly,
+        volumes: manifest.volumes,
+        volumeOptions: readManifestVolumeOptions(manifest),
+        runtimeResourcePlan,
+        agentPrivateKeyPath
+    });
+
     // Build the entry command
     const entryCmd = buildBwrapEntryCommand(agentName, manifest, profileConfig);
-    const trustedEnvironment = buildTrustedServiceDynamicEnvironment(envMap);
-    const trustedLaunch = buildTrustedServiceLaunch({
-        runtimeKey: containerName,
-        command: ['/bin/sh', '-c', entryCmd],
-        nodeRuntimePath: nodeRuntime.hostRuntimePath,
-        agentRuntimePath: agentLibPath,
-        codePath: agentCodePath,
-        codeDependenciesPath: nodeModulesDir,
-        agentDependenciesPath: nodeModulesDir,
-        environment: trustedEnvironment,
-        identity: {
-            principalId,
-            instanceId: runtimeIdentity.instanceId,
-            enableGeneration: runtimeIdentity.enableGeneration,
-        },
-        agentName,
-        repoName,
-        listenPort: hostPort,
-        credentialFd: 4,
-    });
+
+    // Add the command to run
+    bwrapArgs.push('--', 'sh', '-c', entryCmd);
 
     // Ensure logs directory exists
     const logsDir = LOGS_DIR;
@@ -1132,8 +775,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     debugLog(`[bwrap] ${agentName}: entry command: sh -c "${entryCmd}"`);
     debugLog(`[bwrap] ${agentName}: log file: ${logFile}`);
 
-    // Spawn the immutable launcher only. It reads the complete typed policy
-    // from fd 3, pins every source, and execs bwrap without a path fallback.
+    // Spawn detached bwrap process
     assertHostModeGenerationCapability({
         agentId: deriveAgentPrincipalId(repoName, agentName),
         instanceId: runtimeIdentity.instanceId,
@@ -1142,18 +784,15 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         containerName,
     }, { preparedCapability: options.preparedHostModeCapability });
     const logFd = fs.openSync(logFile, 'a');
-    let spawned;
-    try {
-        spawned = spawnTrustedServiceLaunch(trustedLaunch, logFd, agentCredential.bytes);
-    } finally {
-        fs.closeSync(logFd);
-    }
-    const { child, getSpawnFailure } = spawned;
+    const child = spawn(BWRAP_PATH, bwrapArgs, {
+        detached: true,
+        stdio: ['ignore', logFd, logFd]
+    });
     child.unref();
+    fs.closeSync(logFd);
 
     if (!child.pid) {
-        const spawnFailure = getSpawnFailure();
-        throw new Error(`[bwrap] ${agentName}: failed to spawn trusted launcher${spawnFailure ? `: ${spawnFailure.message}` : ''}`);
+        throw new Error(`[bwrap] ${agentName}: failed to spawn bwrap process`);
     }
 
     // Wait briefly and verify the process didn't crash immediately
@@ -1177,27 +816,12 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
             const recentLines = logContent.split('\n').slice(-12).join('\n');
             if (recentLines) reason = recentLines;
         } catch {}
-        const spawnFailure = getSpawnFailure();
-        if (spawnFailure) reason = spawnFailure.message;
-        throw new Error(`trusted bwrap launcher exited immediately: ${reason}`);
+        throw new Error(`bwrap process exited immediately: ${reason}`);
     }
 
-    // Save exact service ownership after helper->bwrap exec is known alive.
-    let bwrapOwner;
+    // Save PID
     try {
-        bwrapOwner = saveBwrapPid(containerName, child.pid, {
-            ...runtimeIdentity,
-            homeKey: containerName,
-            workdir: '/code',
-            logPath: logFile,
-            routeKey,
-            rootPort: hostPort,
-            credentialNonceDigest: agentCredential.publicAttestation.nonceDigest,
-            credentialExpiresAt: agentCredential.publicAttestation.expiresAt,
-            manifestDigest: agentCredential.publicAttestation.admission.manifestDigest,
-            admissionDigest: agentCredential.publicAttestation.admissionDigest,
-            networkHash: agentCredential.publicAttestation.admission.networkHash,
-        });
+        saveBwrapPid(containerName, child.pid, runtimeIdentity);
     } catch (error) {
         try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { }
         try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }
@@ -1229,19 +853,19 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         type: 'agent',
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
-        bwrapOwner,
         runtimeStaging: {
             agentLibPath
         },
         config: {
             binds: [
                 { source: agentLibPath, target: '/Agent', ro: true },
-                { source: agentCodePath, target: '/code', ro: true },
+                { source: agentCodePath, target: '/code', ro: codeReadOnly },
                 { source: nodeModulesDir, target: '/code/node_modules', ro: true },
                 { source: nodeModulesDir, target: '/Agent/node_modules', ro: true },
-                { source: nodeRuntime.hostRuntimePath, target: BWRAP_NODE_RUNTIME_PATH, ro: true },
-                { source: PLOINKY_WORKSPACE_ROOT, target: '/workspace' },
-                { source: agentHomeDir, target: '/home/agent' },
+                { source: sharedDir, target: '/shared' },
+                ...(fs.existsSync(agentSkillsPath) ? [{ source: agentSkillsPath, target: '/skills', ro: skillsReadOnly }] : []),
+                ...(!isolatedHome ? [{ source: cwd, target: cwd }] : []),
+                { source: agentHomeDir, target: '/root' }
             ],
             env: Array.from(new Set(declaredEnvNames)).map((name) => ({ name })),
             ports: allPortMappings,
@@ -1257,7 +881,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     if (options.preservePreparedRegistryRecord !== true) saveAgentsMap(agents);
 
     // Run profile lifecycle hooks (hosthook_aftercreation, postinstall HOST hooks)
-    // Provider install hooks are deferred to the leased trusted update phase.
+    // Note: install hooks run inside the bwrap entrypoint, not via podman exec
     try {
         if (profileConfig) {
             const lifecycleResult = runProfileLifecycle(agentName, activeProfile, {
@@ -1265,7 +889,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
                 agentPath,
                 repoName,
                 manifest,
-                skipInstallHooks: true
+                skipInstallHooks: true  // Install runs inside bwrap entrypoint
             });
             if (!lifecycleResult.success) {
                 const details = lifecycleResult.errors.join('; ');
@@ -1278,9 +902,10 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
 
     syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentHomeDir });
 
+    const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
     return {
         containerName,
-        hostPort,
+        hostPort: returnPort,
         createdByThisLaunch: true,
         registryRecord: structuredClone(agents[containerName]),
     };
@@ -1332,10 +957,6 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
     }, existingRecord);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
-    // This is deliberately before admission, hashing, and process inspection:
-    // the existing-service fast path must never resolve or reuse a raw
-    // reserved environment declaration.
-    assertTrustedServiceRawConfiguration(manifest, profileConfig);
     const runtimeBoundary = admitBwrapBoundary(
         agentName,
         manifest,
@@ -1373,18 +994,6 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         console.log(`[bwrap] ${agentName}: runtime generation changed, replacing stale sandbox...`);
     }
 
-    if (exactRuntimeRunning) {
-        try {
-            assertExactServiceOwner(existingRecord.bwrapOwner);
-        } catch (error) {
-            console.log(`[bwrap] ${agentName}: service ownership or credential generation changed, restarting...`);
-            if (!stopBwrapProcess(containerName, { expectedIdentity: runtimeIdentity })) {
-                throw error;
-            }
-            exactRuntimeRunning = false;
-        }
-    }
-
     // Check if already running
     if (exactRuntimeRunning) {
         // Compare env hash
@@ -1396,13 +1005,9 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         } else {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;
-            const instanceName = containerName;
-            const agentHomeState = ensureAgentHomeAbi(
-                containerName,
-                runtimeIdentity.enableGeneration,
-            );
+            const instanceName = aliasOverride || agentName;
             syncAgentMcpConfig(containerName, agentPath, instanceName, {
-                workDir: agentHomeState.homePath,
+                workDir: getAgentWorkDir(instanceName)
             });
             return {
                 containerName,
@@ -1493,7 +1098,6 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
 
     // Build environment (same as running agent)
-    assertTrustedServiceRawConfiguration(manifest, profileConfig);
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
     const nodeRuntime = resolveBwrapNodeRuntime();
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
@@ -1565,8 +1169,6 @@ export {
     ensureBwrapService,
     resolveBwrapRuntimeProfile,
     startBwrapProcess,
-    buildTrustedServiceLaunch,
-    spawnTrustedServiceLaunch,
     buildBwrapArgs,
     buildFullEnvMap,
     buildBwrapInteractiveCommand,
@@ -1574,6 +1176,5 @@ export {
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
     attachBwrapInteractive,
-    BWRAP_HELPER_PATH,
     BWRAP_PATH
 };
