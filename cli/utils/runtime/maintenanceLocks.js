@@ -9,6 +9,8 @@ const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_RETRY_INTERVAL_MS = 100;
 const CONCURRENT_ARTIFACT_RECOVERY_STABILITY_MS = 100;
+const MAX_DIRECTORY_SNAPSHOT_OBSERVATIONS = 8;
+const STALE_DIRECTORY_SNAPSHOT_EVIDENCE = Symbol('stale-directory-snapshot-evidence');
 const MAX_WORKSPACE_MUTATION_WAIT_MS = 15 * 60 * 1000;
 const MAX_WORKSPACE_MUTATION_RETRY_INTERVAL_MS = 1_000;
 // Locks are security-sensitive authority, unlike the other status and PID
@@ -845,6 +847,7 @@ function readLockSnapshotAt(filePath, expected, dependencies, {
         uid: stat.uid,
         nlink: stat.nlink,
         size: stat.size,
+        ctimeMs: stat.ctimeMs,
     });
 }
 
@@ -956,7 +959,7 @@ function readRecoveryTransactionSnapshots(filePath, artifacts, expected, depende
 }
 
 function recoverOperationArtifacts(filePath, expected, dependencies, {
-    directorySnapshotRetry = false,
+    directorySnapshotObservation = null,
 } = {}) {
     const names = operationArtifactNames(filePath, dependencies);
     if (names.length === 0) return false;
@@ -982,11 +985,13 @@ function recoverOperationArtifacts(filePath, expected, dependencies, {
             dependencies,
         ));
     } catch (error) {
-        if (error?.lockAdmissionDirectorySnapshotStale !== true || directorySnapshotRetry) {
-            throw error;
-        }
+        const nextObservation = advanceDirectorySnapshotObservation(
+            error,
+            directorySnapshotObservation,
+            expected,
+        );
         return recoverOperationArtifacts(filePath, expected, dependencies, {
-            directorySnapshotRetry: true,
+            directorySnapshotObservation: nextObservation,
         });
     }
     const operationSnapshot = claim || quarantine;
@@ -1237,7 +1242,7 @@ function restoreDisplacedPublicationPath(quarantinePath, filePath, displaced, ex
 
 function recoverPublicationArtifacts(filePath, expected, dependencies, {
     ownedContentId = null,
-    directorySnapshotRetry = false,
+    directorySnapshotObservation = null,
 } = {}) {
     const names = publicationArtifactNames(filePath, dependencies);
     if (names.length === 0) return false;
@@ -1266,12 +1271,14 @@ function recoverPublicationArtifacts(filePath, expected, dependencies, {
             dependencies,
         ));
     } catch (error) {
-        if (error?.lockAdmissionDirectorySnapshotStale !== true || directorySnapshotRetry) {
-            throw error;
-        }
+        const nextObservation = advanceDirectorySnapshotObservation(
+            error,
+            directorySnapshotObservation,
+            expected,
+        );
         return recoverPublicationArtifacts(filePath, expected, dependencies, {
             ownedContentId,
-            directorySnapshotRetry: true,
+            directorySnapshotObservation: nextObservation,
         });
     }
     const operationSnapshot = claim || quarantine;
@@ -1383,6 +1390,7 @@ function artifactEvidenceFingerprint(family, group, canonical) {
         uid: snapshot.uid,
         nlink: snapshot.nlink,
         size: snapshot.size,
+        ctimeMs: snapshot.ctimeMs,
         rawHash: createHash('sha256').update(snapshot.raw).digest('hex'),
     }));
     if (canonical) {
@@ -1395,6 +1403,7 @@ function artifactEvidenceFingerprint(family, group, canonical) {
             uid: canonical.uid,
             nlink: canonical.nlink,
             size: canonical.size,
+            ctimeMs: canonical.ctimeMs,
             rawHash: createHash('sha256').update(canonical.raw).digest('hex'),
         });
     }
@@ -1407,6 +1416,48 @@ function artifactEvidenceFingerprint(family, group, canonical) {
         entries,
     });
     return createHash('sha256').update(evidence).digest('hex');
+}
+
+function admissionDirectorySnapshotFingerprint(entries) {
+    const evidence = entries.map(({ role, snapshot }) => ({
+        role,
+        dev: String(snapshot.dev),
+        ino: String(snapshot.ino),
+        mode: snapshot.mode,
+        uid: snapshot.uid,
+        nlink: snapshot.nlink,
+        size: snapshot.size,
+        ctimeMs: snapshot.ctimeMs,
+        rawHash: createHash('sha256').update(snapshot.raw).digest('hex'),
+    }));
+    evidence.sort((left, right) => left.role.localeCompare(right.role)
+        || left.dev.localeCompare(right.dev)
+        || left.ino.localeCompare(right.ino));
+    return createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
+}
+
+function advanceDirectorySnapshotObservation(error, previous, expected) {
+    const fingerprint = error?.[STALE_DIRECTORY_SNAPSHOT_EVIDENCE];
+    if (!/^[a-f0-9]{64}$/.test(fingerprint || '')) {
+        throw error;
+    }
+    if (previous?.fingerprint === fingerprint) {
+        // The same fresh directory evidence twice proves this is not merely a
+        // readdir/open transition boundary. Preserve the exact INVALID result
+        // for a stable foreign or otherwise unaccounted hard link.
+        throw error;
+    }
+    const observations = (previous?.observations || 0) + 1;
+    if (observations >= MAX_DIRECTORY_SNAPSHOT_OBSERVATIONS) {
+        // A namespace that keeps changing under bounded fresh observations is
+        // live concurrent work. Admission and recovery both remain read-only
+        // and fail closed as BUSY instead of misclassifying one transient view.
+        throw concurrentArtifactBusy(expected);
+    }
+    return Object.freeze({
+        fingerprint,
+        observations,
+    });
 }
 
 function concurrentArtifactBusy(
@@ -1471,9 +1522,10 @@ function assertAdmissionLinksAccounted(entries, expected, dependencies) {
             );
             // readdir(2) can capture the transaction before its next durable
             // hard link is published while the later open/fstat observes that
-            // new alias. Reclassify exactly once from a fresh directory
-            // snapshot; a stable foreign link remains INVALID on the retry.
-            error.lockAdmissionDirectorySnapshotStale = true;
+            // new alias. Stabilize across a bounded series of fresh directory
+            // snapshots. Repeated identical evidence remains INVALID, while
+            // continuously changing exact evidence is live concurrent work.
+            error[STALE_DIRECTORY_SNAPSHOT_EVIDENCE] = admissionDirectorySnapshotFingerprint(entries);
             throw error;
         }
     }
@@ -1638,7 +1690,7 @@ function classifyRenewalArtifacts({ group, canonical, expected, dependencies }) 
 // exposed a transaction-private hard link after that inspection completed.
 function classifyConcurrentLockArtifacts(filePath, expected, dependencies, {
     ownedPublicationId = null,
-    directorySnapshotRetry = false,
+    directorySnapshotObservation = null,
 } = {}) {
     try {
         return classifyConcurrentLockArtifactsSnapshot(
@@ -1648,12 +1700,14 @@ function classifyConcurrentLockArtifacts(filePath, expected, dependencies, {
             ownedPublicationId,
         );
     } catch (error) {
-        if (error?.lockAdmissionDirectorySnapshotStale !== true || directorySnapshotRetry) {
-            throw error;
-        }
+        const nextObservation = advanceDirectorySnapshotObservation(
+            error,
+            directorySnapshotObservation,
+            expected,
+        );
         return classifyConcurrentLockArtifacts(filePath, expected, dependencies, {
             ownedPublicationId,
-            directorySnapshotRetry: true,
+            directorySnapshotObservation: nextObservation,
         });
     }
 }

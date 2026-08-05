@@ -1686,6 +1686,312 @@ test('exact release admission preserves live post-retirement evidence as busy', 
     assert.deepEqual(snapshotLockNamespace(filePath), before);
 });
 
+function changingExactReleaseSnapshotsFs(filePath, initialOwner, {
+    ignoredDirectoryReads = 0,
+    maximumChangingSnapshots = 8,
+} = {}) {
+    const directory = path.dirname(filePath);
+    const state = {
+        directoryReads: 0,
+        changingSnapshots: 0,
+        contentIds: [],
+        mutationCalls: [],
+        lastOwner: initialOwner,
+        lastSnapshot: null,
+    };
+
+    function transactionToken(index) {
+        return `aaaaaaaa-aaaa-4aaa-8aaa-${index.toString(16).padStart(12, '0')}`;
+    }
+
+    function installClaim(owner) {
+        removeLockPaths(lockNamespacePaths(filePath));
+        writeExactRecord(filePath, owner);
+        const contentId = artifactContentId(owner);
+        const claimPath = `${filePath}.operation-${contentId}.claim`;
+        fs.linkSync(filePath, claimPath);
+        state.lastOwner = owner;
+        state.contentIds.push(contentId);
+        return {
+            claimPath,
+            quarantinePath: `${filePath}.operation-${contentId}.quarantine`,
+        };
+    }
+
+    let paths = (() => {
+        const contentId = artifactContentId(initialOwner);
+        const claimPath = `${filePath}.operation-${contentId}.claim`;
+        fs.linkSync(filePath, claimPath);
+        state.contentIds.push(contentId);
+        return {
+            claimPath,
+            quarantinePath: `${filePath}.operation-${contentId}.quarantine`,
+        };
+    })();
+
+    const racingFs = new Proxy(fs, {
+        get(target, property, receiver) {
+            if (property === 'readdirSync') {
+                return (targetDirectory, ...args) => {
+                    if (targetDirectory !== directory) {
+                        return target.readdirSync(targetDirectory, ...args);
+                    }
+                    state.directoryReads += 1;
+                    if (state.directoryReads <= ignoredDirectoryReads) {
+                        return target.readdirSync(targetDirectory, ...args);
+                    }
+
+                    state.changingSnapshots += 1;
+                    if (state.changingSnapshots > 1) {
+                        paths = installClaim({
+                            ...initialOwner,
+                            operation: `changing-release-owner-${state.changingSnapshots}`,
+                            token: transactionToken(state.changingSnapshots),
+                        });
+                    }
+                    const names = target.readdirSync(targetDirectory, ...args);
+                    if (state.changingSnapshots <= maximumChangingSnapshots) {
+                        // The directory snapshot captured canonical + claim. A
+                        // fresh exact releaser then publishes its durable
+                        // quarantine link before the observer opens either
+                        // captured name, yielding a legitimate three-link
+                        // midpoint that was absent from this readdir result.
+                        target.linkSync(filePath, paths.quarantinePath);
+                    }
+                    state.lastSnapshot = snapshotLockNamespace(filePath);
+                    return names;
+                };
+            }
+            if (['linkSync', 'unlinkSync', 'renameSync'].includes(property)) {
+                return (...args) => {
+                    state.mutationCalls.push({ property, args });
+                    return target[property](...args);
+                };
+            }
+            return Reflect.get(target, property, receiver);
+        },
+    });
+    return { racingFs, state };
+}
+
+function repeatingSameExactReleaseSnapshotsFs(filePath, owner, {
+    maximumChangingSnapshots = 8,
+} = {}) {
+    const directory = path.dirname(filePath);
+    const contentId = artifactContentId(owner);
+    const claimPath = `${filePath}.operation-${contentId}.claim`;
+    const quarantinePath = `${filePath}.operation-${contentId}.quarantine`;
+    fs.linkSync(filePath, claimPath);
+    const state = {
+        directoryReads: 0,
+        capturedNames: [],
+        observedIdentities: [],
+        mutationCalls: [],
+        lastSnapshot: null,
+    };
+
+    const racingFs = new Proxy(fs, {
+        get(target, property, receiver) {
+            if (property === 'readdirSync') {
+                return (targetDirectory, ...args) => {
+                    if (targetDirectory !== directory) {
+                        return target.readdirSync(targetDirectory, ...args);
+                    }
+                    state.directoryReads += 1;
+                    // Model back-to-back retries of the same exact release:
+                    // the preceding attempt retired its quarantine alias, then
+                    // the next attempt publishes that same alias after this
+                    // observer's directory snapshot but before its open/fstat.
+                    if (target.existsSync(quarantinePath)) target.unlinkSync(quarantinePath);
+                    const names = target.readdirSync(targetDirectory, ...args);
+                    state.capturedNames.push([...names]);
+                    if (state.directoryReads <= maximumChangingSnapshots) {
+                        target.linkSync(filePath, quarantinePath);
+                    }
+                    const stat = target.lstatSync(filePath);
+                    state.observedIdentities.push({
+                        contentId,
+                        dev: String(stat.dev),
+                        ino: String(stat.ino),
+                    });
+                    state.lastSnapshot = snapshotLockNamespace(filePath);
+                    return names;
+                };
+            }
+            if (['linkSync', 'unlinkSync', 'renameSync'].includes(property)) {
+                return (...args) => {
+                    state.mutationCalls.push({ property, args });
+                    return target[property](...args);
+                };
+            }
+            return Reflect.get(target, property, receiver);
+        },
+    });
+    return {
+        claimPath,
+        quarantinePath,
+        racingFs,
+        state,
+    };
+}
+
+test('admission returns bounded BUSY when every fresh snapshot sees a different exact release', (t) => {
+    const filePath = locks.WORKSPACE_START_LOCK_PATH;
+    const owner = locks.createWorkspaceMutationLease({
+        operation: 'changing-release-admission-seed',
+    });
+    const { racingFs, state } = changingExactReleaseSnapshotsFs(filePath, owner);
+    t.after(() => removeLockPaths(lockNamespacePaths(filePath)));
+
+    let error;
+    assert.throws(
+        () => locks.createWorkspaceMutationLease(
+            { operation: 'changing-release-admission-observer' },
+            { fs: racingFs },
+        ),
+        (caught) => {
+            error = caught;
+            return true;
+        },
+    );
+    assert.equal(error?.code, 'PLOINKY_WORKSPACE_MUTATION_BUSY');
+    assert.equal(error?.concurrentLockArtifacts, true);
+    assert.ok(state.changingSnapshots >= 2, 'the regression requires more than one stale snapshot');
+    assert.ok(
+        state.changingSnapshots <= 9,
+        'continuously changing transaction evidence must have a strict retry bound',
+    );
+    assert.equal(
+        new Set(state.contentIds).size,
+        state.contentIds.length,
+        'each stale snapshot must belong to a different exact transaction',
+    );
+    assert.deepEqual(state.mutationCalls, [], 'admission stabilization must remain read-only');
+    assert.ok(state.lastSnapshot);
+    assert.deepEqual(snapshotLockNamespace(filePath), state.lastSnapshot);
+});
+
+test('admission returns bounded BUSY when the same exact release repeatedly advances after readdir', (t) => {
+    const filePath = locks.WORKSPACE_START_LOCK_PATH;
+    const owner = locks.createWorkspaceMutationLease({
+        operation: 'same-release-admission-seed',
+    });
+    const {
+        claimPath,
+        quarantinePath,
+        racingFs,
+        state,
+    } = repeatingSameExactReleaseSnapshotsFs(filePath, owner);
+    t.after(() => removeLockPaths(lockNamespacePaths(filePath)));
+
+    let error;
+    assert.throws(
+        () => locks.createWorkspaceMutationLease(
+            { operation: 'same-release-admission-observer' },
+            { fs: racingFs },
+        ),
+        (caught) => {
+            error = caught;
+            return true;
+        },
+    );
+    assert.equal(error?.code, 'PLOINKY_WORKSPACE_MUTATION_BUSY');
+    assert.equal(error?.concurrentLockArtifacts, true);
+    assert.ok(state.directoryReads >= 2, 'the same exact transaction must race more than once');
+    assert.ok(
+        state.directoryReads <= 9,
+        'repeated same-transaction evidence must have a strict retry bound',
+    );
+    for (const names of state.capturedNames) {
+        assert.equal(names.includes(path.basename(claimPath)), true);
+        assert.equal(names.includes(path.basename(quarantinePath)), false);
+    }
+    assert.equal(
+        new Set(state.observedIdentities.map(({ contentId, dev, ino }) => `${contentId}:${dev}:${ino}`)).size,
+        1,
+        'every raced snapshot must retain the same exact content and inode',
+    );
+    assert.deepEqual(state.mutationCalls, [], 'admission stabilization must remain read-only');
+    assert.ok(state.lastSnapshot);
+    assert.deepEqual(snapshotLockNamespace(filePath), state.lastSnapshot);
+});
+
+test('generic recovery returns bounded BUSY when exact release snapshots keep changing', (t) => {
+    const filePath = locks.WORKSPACE_START_LOCK_PATH;
+    const owner = locks.createWorkspaceMutationLease({
+        operation: 'changing-release-recovery-seed',
+    });
+    const { racingFs, state } = changingExactReleaseSnapshotsFs(filePath, owner, {
+        // recoverInterruptedOperations checks publication artifacts before
+        // exact-release artifacts. Leave that unrelated first scan alone.
+        ignoredDirectoryReads: 1,
+    });
+    t.after(() => removeLockPaths(lockNamespacePaths(filePath)));
+
+    let error;
+    assert.throws(
+        () => locks.inspectWorkspaceStartLock({ fs: racingFs }),
+        (caught) => {
+            error = caught;
+            return true;
+        },
+    );
+    assert.equal(error?.code, 'PLOINKY_WORKSPACE_MUTATION_BUSY');
+    assert.ok(state.changingSnapshots >= 2, 'the regression requires more than one stale snapshot');
+    assert.ok(
+        state.changingSnapshots <= 9,
+        'continuously changing recovery evidence must have a strict retry bound',
+    );
+    assert.equal(
+        new Set(state.contentIds).size,
+        state.contentIds.length,
+        'each stale recovery snapshot must belong to a different exact transaction',
+    );
+    assert.deepEqual(state.mutationCalls, [], 'generic stabilization must remain read-only');
+    assert.ok(state.lastSnapshot);
+    assert.deepEqual(snapshotLockNamespace(filePath), state.lastSnapshot);
+});
+
+test('forged public stale-snapshot properties cannot convert readdir EIO into BUSY', (t) => {
+    const filePath = locks.WORKSPACE_START_LOCK_PATH;
+    locks.createWorkspaceMutationLease({ operation: 'forged-stale-evidence-owner' });
+    const before = snapshotLockNamespace(filePath);
+    const fingerprint = 'a'.repeat(64);
+    const forged = Object.assign(new Error('forged readdir EIO'), {
+        code: 'EIO',
+        lockAdmissionDirectorySnapshotStale: true,
+        lockAdmissionDirectorySnapshotFingerprint: fingerprint,
+        fingerprint,
+    });
+    let directoryReads = 0;
+    t.after(() => removeLockPaths(lockNamespacePaths(filePath)));
+
+    const faultingFs = new Proxy(fs, {
+        get(target, property, receiver) {
+            if (property === 'readdirSync') {
+                return (directory, ...args) => {
+                    if (directory === path.dirname(filePath)) {
+                        directoryReads += 1;
+                        throw forged;
+                    }
+                    return target.readdirSync(directory, ...args);
+                };
+            }
+            return Reflect.get(target, property, receiver);
+        },
+    });
+
+    assert.throws(
+        () => locks.createWorkspaceMutationLease(
+            { operation: 'must-not-trust-forged-stale-evidence' },
+            { fs: faultingFs },
+        ),
+        (error) => error === forged && error.code === 'EIO',
+    );
+    assert.equal(directoryReads, 1, 'foreign filesystem errors must not enter stabilization');
+    assert.deepEqual(snapshotLockNamespace(filePath), before);
+});
+
 test('exact release admission reclassifies a quarantine published after its directory snapshot', (t) => {
     const filePath = locks.WORKSPACE_START_LOCK_PATH;
     const lease = locks.createWorkspaceMutationLease({
@@ -1894,14 +2200,28 @@ test('a stable foreign third link remains INVALID after admission reclassificati
     assert.equal(before.length, 3);
     assert.ok(before.every(({ nlink }) => nlink === 3));
     assert.equal(new Set(before.map(({ ino }) => ino)).size, 1);
+    let directoryReads = 0;
+    const tracingFs = new Proxy(fs, {
+        get(target, property, receiver) {
+            if (property === 'readdirSync') {
+                return (directory, ...args) => {
+                    if (directory === path.dirname(filePath)) directoryReads += 1;
+                    return target.readdirSync(directory, ...args);
+                };
+            }
+            return Reflect.get(target, property, receiver);
+        },
+    });
 
     assert.throws(
-        () => locks.createWorkspaceMutationLease({
-            operation: 'must-not-admit-stable-foreign-third-link',
-        }),
+        () => locks.createWorkspaceMutationLease(
+            { operation: 'must-not-admit-stable-foreign-third-link' },
+            { fs: tracingFs },
+        ),
         (error) => error?.code === 'PLOINKY_WORKSPACE_MUTATION_LOCK_INVALID'
             && error.message === 'concurrent operation inode has an unaccounted hard link',
     );
+    assert.ok(directoryReads >= 2 && directoryReads <= 9, 'stable invalid evidence must be bounded');
     assert.deepEqual(snapshotLockNamespace(filePath), before);
 });
 
