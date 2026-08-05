@@ -138,7 +138,20 @@ function parseDarwinPs(value) {
     });
 }
 
-function readDarwinSnapshot(pid, execFileSyncImpl) {
+function probeDarwinProcess(pid, probeProcessImpl) {
+    try {
+        probeProcessImpl(pid, 0);
+        return frozenState('present');
+    } catch (error) {
+        if (error?.code === 'ESRCH') return frozenState('dead');
+        if (error?.code === 'EPERM') return frozenState('present', { permissionDenied: true });
+        return frozenState('unknown');
+    }
+}
+
+function readDarwinSnapshot(pid, execFileSyncImpl, probeProcessImpl) {
+    const probe = probeDarwinProcess(pid, probeProcessImpl);
+    if (probe.state !== 'present') return probe;
     let bootTime;
     try {
         bootTime = parseDarwinBootTime(execFileSyncImpl('sysctl', ['-n', 'kern.boottime'], {
@@ -146,7 +159,9 @@ function readDarwinSnapshot(pid, execFileSyncImpl) {
             stdio: ['ignore', 'pipe', 'ignore'],
         }));
     } catch (_) {
-        return frozenState('unknown');
+        return probeDarwinProcess(pid, probeProcessImpl).state === 'dead'
+            ? frozenState('dead')
+            : frozenState('unknown');
     }
     if (!bootTime) return frozenState('unknown');
 
@@ -162,17 +177,19 @@ function readDarwinSnapshot(pid, execFileSyncImpl) {
             stdio: ['ignore', 'pipe', 'ignore'],
         }));
     } catch (_) {
-        return frozenState('unknown');
+        return probeDarwinProcess(pid, probeProcessImpl).state === 'dead'
+            ? frozenState('dead')
+            : frozenState('unknown');
     }
     if (psIdentity?.state === 'dead') return frozenState('dead');
     if (!psIdentity) return frozenState('unknown');
     return frozenState('identified', { ...bootTime, ...psIdentity });
 }
 
-function inspectDarwinProcessIdentity(pid, execFileSyncImpl) {
-    const first = readDarwinSnapshot(pid, execFileSyncImpl);
+function inspectDarwinProcessIdentity(pid, execFileSyncImpl, probeProcessImpl) {
+    const first = readDarwinSnapshot(pid, execFileSyncImpl, probeProcessImpl);
     if (first.state !== 'identified') return first;
-    const second = readDarwinSnapshot(pid, execFileSyncImpl);
+    const second = readDarwinSnapshot(pid, execFileSyncImpl, probeProcessImpl);
     if (second.state !== 'identified') return second;
     if (first.bootSeconds !== second.bootSeconds
         || first.bootMicroseconds !== second.bootMicroseconds
@@ -217,6 +234,7 @@ function inspectProcessIdentity(pid, {
     fsImpl,
     readFileSyncImpl,
     execFileSyncImpl,
+    probeProcessImpl = process.kill.bind(process),
 } = {}) {
     if (!Number.isSafeInteger(pid) || pid <= 0 || pid > MAX_PID) return frozenState('dead');
     if (platform === 'linux') {
@@ -226,7 +244,7 @@ function inspectProcessIdentity(pid, {
         return inspectLinuxProcessIdentity(pid, readFile);
     }
     if (platform === 'darwin') {
-        return inspectDarwinProcessIdentity(pid, execFileSyncImpl || execFileSync);
+        return inspectDarwinProcessIdentity(pid, execFileSyncImpl || execFileSync, probeProcessImpl);
     }
     return frozenState('unknown');
 }

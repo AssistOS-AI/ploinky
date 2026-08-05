@@ -80,8 +80,14 @@ test('process identity inspector is boot-bound, stable, canonical, and platform 
     }
 
     const darwinCalls = [];
+    let darwinProbeCalls = 0;
     const darwin = inspectProcessIdentity(42, {
         platform: 'darwin',
+        probeProcessImpl(pid, signal) {
+            darwinProbeCalls += 1;
+            assert.equal(pid, 42);
+            assert.equal(signal, 0);
+        },
         execFileSyncImpl(command, args) {
             darwinCalls.push([command, args]);
             if (command === 'sysctl') {
@@ -99,7 +105,30 @@ test('process identity inspector is boot-bound, stable, canonical, and platform 
         processUid: 501,
     });
     assert.equal(darwinCalls.length, 4);
+    assert.equal(darwinProbeCalls, 2);
     assert.equal(normalizeProcessIdentity(darwin.processIdentity), darwin.processIdentity);
+
+    const deadError = Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    assert.deepEqual(inspectProcessIdentity(42, {
+        platform: 'darwin',
+        probeProcessImpl() { throw deadError; },
+        execFileSyncImpl() { throw new Error('dead process must not reach ps or sysctl'); },
+    }), { state: 'dead' });
+
+    let exitingProbeCalls = 0;
+    assert.deepEqual(inspectProcessIdentity(42, {
+        platform: 'darwin',
+        probeProcessImpl() {
+            exitingProbeCalls += 1;
+            if (exitingProbeCalls > 1) throw deadError;
+        },
+        execFileSyncImpl(command) {
+            if (command === 'sysctl') {
+                return '{ sec = 1785220336, usec = 610367 } Tue Jul 28 09:32:16 2026\n';
+            }
+            throw Object.assign(new Error('process exited during ps'), { status: 1 });
+        },
+    }), { state: 'dead' });
 
     for (const malformed of [
         'linux-proc:987654',
