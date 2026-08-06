@@ -14,13 +14,22 @@ export const BOX_LABELS = Object.freeze({
 
 export const BOX_ROLES = Object.freeze({
     container: 'box',
+    // Kept only so an explicitly destroyed pre-bind-mount Box can safely
+    // recognize and remove its old workspace volume.
     workspace: 'workspace',
     containers: 'containers',
     dependencies: 'ploinky-deps',
 });
 
 export const BOX_VOLUME_KEYS = Object.freeze([
-    'workspace',
     'containers',
     'dependencies',
 ]);
+
+export const BOX_LEGACY_VOLUME_KEYS = Object.freeze([
+    'workspace',
+]);
+
+export const BOX_RUNTIME_UID = 1000;
+export const BOX_RUNTIME_GID = 1000;
+export const BOX_USERNS = `keep-id:uid=${BOX_RUNTIME_UID},gid=${BOX_RUNTIME_GID}`;

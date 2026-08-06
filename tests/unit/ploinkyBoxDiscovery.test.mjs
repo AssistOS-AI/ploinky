@@ -42,7 +42,7 @@ function podmanInfo({ rootless = true, osName = 'linux', serviceIsRemote = false
     };
 }
 
-function ownedRecords(identity, mountSuffix = 'one') {
+function ownedRecords(identity, mountSuffix = 'one', { includeLegacy = false } = {}) {
     const container = {
         Id: 'container-id-123',
         Name: identity.instance,
@@ -60,6 +60,17 @@ function ownedRecords(identity, mountSuffix = 'one') {
             Labels: labels(identity, role),
         }];
     }));
+    if (includeLegacy) {
+        volumes.workspace = {
+            Name: identity.legacyVolumes.workspace,
+            Driver: 'local',
+            Scope: 'local',
+            Options: {},
+            CreatedAt: '2026-07-20T00:00:00Z',
+            Mountpoint: `/private/${mountSuffix}/workspace`,
+            Labels: labels(identity, BOX_ROLES.workspace),
+        };
+    }
     return { container, volumes };
 }
 
@@ -189,7 +200,8 @@ test('discovery returns absent and owned handles with immutable IDs and private 
     });
     assert.equal(owned.state, 'owned');
     assert.equal(owned.handles.container.id, 'container-id-123');
-    assert.equal(owned.handles.volumes.workspace.fingerprint.mountpointHash.length, 64);
+    assert.equal(owned.handles.volumes.containers.fingerprint.mountpointHash.length, 64);
+    assert.equal(owned.handles.legacyVolumes.workspace, null);
     assert.equal(JSON.stringify(owned).includes('/private/'), false);
 
     const recreated = discoverBoxOwnership(identity, {
@@ -199,11 +211,30 @@ test('discovery returns absent and owned handles with immutable IDs and private 
     });
     assert.equal(
         volumeHandleMatches(
-            owned.handles.volumes.workspace,
-            recreated.handles.volumes.workspace,
+            owned.handles.volumes.containers,
+            recreated.handles.volumes.containers,
         ),
         false,
     );
+});
+
+test('discovery recognizes but does not require the legacy workspace volume', (t) => {
+    const identity = identityFixture(t);
+    const records = ownedRecords(identity, 'legacy', { includeLegacy: true });
+    const result = discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: fakeRunner(identity, { records }),
+    });
+    assert.equal(result.state, 'owned');
+    assert.equal(
+        result.handles.legacyVolumes.workspace.name,
+        identity.legacyVolumes.workspace,
+    );
+
+    delete records.volumes.dependencies;
+    const partial = discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: fakeRunner(identity, { records }),
+    });
+    assert.equal(partial.state, 'incompatible');
 });
 
 test('unlabeled exact names, wrong labels, and incomplete fingerprints fail closed', (t) => {
@@ -216,7 +247,7 @@ test('unlabeled exact names, wrong labels, and incomplete fingerprints fail clos
     extraLabel.container.Labels['io.assistos.ploinky-box.unexpected'] = 'present';
     variants.push(extraLabel);
     const wrongPath = ownedRecords(identity);
-    wrongPath.volumes.workspace.Labels[BOX_LABELS.pathHash] = '000000000000';
+    wrongPath.volumes.containers.Labels[BOX_LABELS.pathHash] = '000000000000';
     variants.push(wrongPath);
     const wrongRole = ownedRecords(identity);
     wrongRole.volumes.containers.Labels[BOX_LABELS.role] = 'workspace';

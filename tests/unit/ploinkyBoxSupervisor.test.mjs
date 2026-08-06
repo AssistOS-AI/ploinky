@@ -59,6 +59,7 @@ function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
                 runtime: { running, imageId: 'b'.repeat(64) },
             },
             volumes: {},
+            legacyVolumes: {},
         },
     };
 }
@@ -156,7 +157,12 @@ test('destructive volume reset removes the container before the locked owned-vol
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
     const events = [];
     const ownership = owned(identity);
-    ownership.handles.volumes = { workspace: { name: identity.volumes.workspace } };
+    ownership.handles.volumes = Object.fromEntries(Object.entries(identity.volumes).map(
+        ([key, name]) => [key, { name }],
+    ));
+    ownership.handles.legacyVolumes = {
+        workspace: { name: identity.legacyVolumes.workspace },
+    };
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
@@ -165,8 +171,12 @@ test('destructive volume reset removes the container before the locked owned-vol
         destroyNamedVolumes(options) {
             options.lock.assertHeld(identity.instance);
             assert.equal(options.knownHandles, ownership.handles.volumes);
+            assert.equal(options.knownLegacyHandles, ownership.handles.legacyVolumes);
             events.push('delete-named-volumes');
-            return Object.freeze(Object.values(identity.volumes));
+            return Object.freeze([
+                ...Object.values(identity.volumes),
+                identity.legacyVolumes.workspace,
+            ]);
         },
     });
     const result = await supervisor.runDestroyTransaction(
@@ -176,7 +186,10 @@ test('destructive volume reset removes the container before the locked owned-vol
     const containerRemoval = events.findIndex((value) => value.includes('container rm'));
     const volumeRemoval = events.indexOf('delete-named-volumes');
     assert.ok(containerRemoval >= 0 && containerRemoval < volumeRemoval);
-    assert.deepEqual(result.deletedVolumes, Object.values(identity.volumes));
+    assert.deepEqual(result.deletedVolumes, [
+        ...Object.values(identity.volumes),
+        identity.legacyVolumes.workspace,
+    ]);
 });
 
 test('destructive volume reset works when only the complete retained set remains', async (t) => {
@@ -186,7 +199,9 @@ test('destructive volume reset works when only the complete retained set remains
     const events = [];
     const ownership = owned(identity);
     ownership.handles.container = null;
-    ownership.handles.volumes = { workspace: { name: identity.volumes.workspace } };
+    ownership.handles.volumes = Object.fromEntries(Object.entries(identity.volumes).map(
+        ([key, name]) => [key, { name }],
+    ));
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
@@ -229,6 +244,7 @@ test('running status uses immutable-ID inbox inspection and allowlists its outpu
         resolveIdentity: () => identity,
         discover: () => ownership,
         validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        validateContainer: () => ({}),
         runner: {
             query(command, args) {
                 calls.push([command, ...args]);
@@ -258,6 +274,7 @@ test('running status allowlists and renders concise Cloudflare publication state
         resolveIdentity: () => identity,
         discover: () => ownership,
         validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        validateContainer: () => ({}),
         runner: {
             query() {
                 return { ok: true, stdout: JSON.stringify({
@@ -325,6 +342,38 @@ test('status reports an older owned image as incompatible while destroy remains 
 
     await supervisor.runDestroyTransaction(ownership.handles.container.id);
     assert.equal(events.some((value) => value.includes('container rm -f --volumes')), true);
+});
+
+test('status validates the complete mount contract before entering the Box', (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    let inboxQueried = false;
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        discover: () => ownership,
+        validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        validateContainer(_container, desired) {
+            assert.equal(desired.identity.workspaceRoot, state.workspace);
+            assert.equal(desired.repositoryRoot, state.root);
+            throw new Error(
+                "Owned Box mount /workspace is incompatible; back up legacy Box-only workspace data, then run 'ploinky stop' and 'ploinky destroy --delete-volumes' before retrying",
+            );
+        },
+        repositoryRoot: state.root,
+        runner: {
+            query() {
+                inboxQueried = true;
+                throw new Error('incompatible status must not enter the Box');
+            },
+        },
+    });
+
+    const status = supervisor.inspectBoxStatus();
+    assert.equal(status.state, 'incompatible');
+    assert.match(status.detail, /ploinky destroy/);
+    assert.equal(inboxQueried, false);
 });
 
 test('failed ploinky-local stop still stops the outer Box', async (t) => {

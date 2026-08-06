@@ -7,6 +7,8 @@ import {
     BOX_READY_LINE,
     BOX_ROUTER_CONTAINER_PORT,
     BOX_ROLES,
+    BOX_USERNS,
+    BOX_VOLUME_KEYS,
 } from '../constants.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
@@ -62,6 +64,7 @@ export function containerCreateArgs({
         '--init',
         '--name', identity.instance,
         '--user', 'podman',
+        '--userns', BOX_USERNS,
         '--device', '/dev/fuse',
         '--device', '/dev/net/tun',
         '--security-opt', 'unmask=ALL',
@@ -69,6 +72,7 @@ export function containerCreateArgs({
         '--publish', `127.0.0.1:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
         '--publish', `0.0.0.0:${BOX_MEDIA_PORT}:${BOX_MEDIA_PORT}/udp`,
         '--volume', `${source}:/opt/ploinky:ro`,
+        '--volume', `${identity.workspaceRoot}:/workspace`,
         ...volumeMountArgs(identity),
         '--env', 'PLOINKY_PUBLIC_BIND=0.0.0.0',
         '--env', `PLOINKY_PUBLIC_AUTHORITY=127.0.0.1:${hostPort}`,
@@ -110,7 +114,7 @@ export function readContainerIdFromCidfile(cidfile, { fsApi = fs } = {}) {
 }
 
 export function revalidateAllVolumes({ engine, identity, handles, runner, lock }) {
-    for (const key of ['workspace', 'containers', 'dependencies']) {
+    for (const key of BOX_VOLUME_KEYS) {
         revalidateVolumeHandle(handles[key], { engine, identity, key, runner, lock });
     }
 }

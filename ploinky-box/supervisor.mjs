@@ -2,6 +2,7 @@ import path from 'node:path';
 import http from 'node:http';
 
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from './constants.mjs';
+import { validateContainerConfiguration } from './contract/container.mjs';
 import { inspectAndValidateExistingImage } from './contract/image.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import {
@@ -48,6 +49,7 @@ export function createBoxSupervisor({
     repositoryRoot = path.resolve(import.meta.dirname, '..'),
     reconcile = reconcileBoxContainer,
     validateExistingImage = inspectAndValidateExistingImage,
+    validateContainer = validateContainerConfiguration,
     startCore = runBoundedCoreStart,
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
@@ -167,6 +169,7 @@ export function createBoxSupervisor({
         return lockedMutation(async (identity, lock, ownership) => {
             const container = ownership.handles?.container;
             const volumes = ownership.handles?.volumes;
+            const legacyVolumes = ownership.handles?.legacyVolumes;
             if (!container && expectedContainerId) {
                 throw supervisorError('Box changed before destroy; nothing was removed');
             }
@@ -186,6 +189,7 @@ export function createBoxSupervisor({
                     runner,
                     lock,
                     knownHandles: volumes,
+                    knownLegacyHandles: legacyVolumes,
                 })
                 : Object.freeze([]);
             return Object.freeze({
@@ -208,12 +212,21 @@ export function createBoxSupervisor({
             return Object.freeze({ identity, ownership, state: 'absent-retained-volumes' });
         }
         try {
-            validateExistingImage(
+            const imageRef = container.labels?.[BOX_LABELS.imageRef];
+            const image = validateExistingImage(
                 ownership.engine.name,
                 container.runtime?.imageId,
-                container.labels?.[BOX_LABELS.imageRef],
+                imageRef,
                 runner,
             );
+            validateContainer(container, {
+                identity,
+                hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
+                imageId: image.immutableId,
+                imageRef,
+                repositoryRoot,
+                hostKind: ownership.engine.hostKind,
+            });
         } catch (error) {
             return Object.freeze({
                 identity,

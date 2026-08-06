@@ -92,6 +92,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     const candidateReference = requirePodmanCandidate(t);
     if (!candidateReference) return;
     const harness = createPodmanHarness(t, candidateReference);
+    fs.writeFileSync(path.join(harness.workspace, 'host-visible.txt'), 'host-visible');
+    fs.mkdirSync(path.join(harness.workspace, 'host-visible-folder'));
     const graph = readSmokeGraphInputs(process.env, { runner: harness.runner });
     const startRoute = routeOuterCommand(parseOuterArguments(graph.args));
     assert.equal(startRoute.kind, 'start');
@@ -110,6 +112,12 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ]);
     assert.equal(prepared.ownership.handles.container.runtime.publications
         .some((entry) => entry.containerPort === '8081'), false);
+    assert.equal(execInBox(harness.runner, prepared.containerId, [
+        'cat', '/workspace/host-visible.txt',
+    ]), 'host-visible');
+    assert.equal(execInBox(harness.runner, prepared.containerId, [
+        'test', '-d', '/workspace/host-visible-folder',
+    ]), '');
     stageSmokeGraph({ graph, containerId: prepared.containerId, runner: harness.runner });
 
     harness.useChild();
@@ -202,6 +210,30 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(watchdogOptions.headers.Host, `127.0.0.1:${startRoute.hostPort}`);
 
     const agent = findNestedAgent(harness, started.containerId);
+    assert.equal(execInBox(harness.runner, started.containerId, [
+        'podman', 'container', 'exec', agent.id,
+        'cat', '/workspace/host-visible.txt',
+    ]), 'host-visible');
+    execInBox(harness.runner, started.containerId, [
+        'podman', 'container', 'exec', agent.id,
+        '/bin/sh', '-c', [
+            'mkdir -p /workspace/agent-created-folder',
+            'printf agent-created > /workspace/agent-created-folder/from-agent.txt',
+            'printf persisted > /workspace/.ploinky/from-agent.txt',
+        ].join('; '),
+    ]);
+    assert.equal(fs.readFileSync(
+        path.join(harness.workspace, 'agent-created-folder', 'from-agent.txt'),
+        'utf8',
+    ), 'agent-created');
+    assert.equal(
+        fs.statSync(path.join(harness.workspace, 'agent-created-folder', 'from-agent.txt')).uid,
+        process.getuid(),
+    );
+    assert.equal(fs.readFileSync(
+        path.join(harness.workspace, '.ploinky', 'from-agent.txt'),
+        'utf8',
+    ), 'persisted');
     const nestedImageId = execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'inspect', '--format', '{{.Image}}', agent.id,
     ]);
@@ -216,6 +248,10 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
             'chmod 500 /opt/ploinky/node_modules/achillesAgentLib',
         ].join('; '),
     ]);
+    assert.equal(fs.readFileSync(
+        path.join(harness.workspace, 't26-workspace-canary'),
+        'utf8',
+    ), 'workspace-retained');
 
     await harness.supervisor.runStopTransaction();
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'stopped');

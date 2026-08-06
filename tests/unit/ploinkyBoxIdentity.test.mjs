@@ -84,7 +84,10 @@ test('markerless resolution is read-only and produces opaque deterministic names
     assert.match(identity.instance, /^ploinky-box-a-secret-workspace-[a-f0-9]{12}$/);
     assert.equal(identity.pathHash, workspacePathHash(workspace));
     assert.equal(identity.instance.includes(root), false);
-    assert.deepEqual(Object.keys(identity.volumes), ['workspace', 'containers', 'dependencies']);
+    assert.deepEqual(Object.keys(identity.volumes), ['containers', 'dependencies']);
+    assert.deepEqual(identity.legacyVolumes, {
+        workspace: `${identity.instance}-workspace`,
+    });
 });
 
 test('invalid explicit roots and symlink strings retain current resolver semantics', (t) => {

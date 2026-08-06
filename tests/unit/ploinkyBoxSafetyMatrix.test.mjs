@@ -33,6 +33,7 @@ function owned(identity, { running = true } = {}) {
                 runtime: { running },
             },
             volumes: {},
+            legacyVolumes: {},
         },
     };
 }
@@ -80,6 +81,7 @@ function matrixSupervisor(identity, events) {
         lockManager,
         runner,
         validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
+        validateContainer: () => ({}),
         reconcile: async ({ lock }) => {
             lock.assertHeld(identity.instance);
             events.push('reconcile');
@@ -252,10 +254,13 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
     const identity = Object.freeze({
         instance: 'ploinky-box-workspace-123456789abc',
         pathHash: '123456789abc',
+        workspaceRoot: '/private/workspace',
         volumes: {
-            workspace: 'ploinky-box-workspace-123456789abc-workspace',
             containers: 'ploinky-box-workspace-123456789abc-containers',
             dependencies: 'ploinky-box-workspace-123456789abc-ploinky-deps',
+        },
+        legacyVolumes: {
+            workspace: 'ploinky-box-workspace-123456789abc-workspace',
         },
     });
     const createArgs = containerCreateArgs({

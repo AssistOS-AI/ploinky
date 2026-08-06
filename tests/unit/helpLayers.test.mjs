@@ -52,8 +52,9 @@ test('detailed lifecycle help preserves the selected host or core scope', () => 
 
     assert.match(hostStatus, /combined, read-only outer runtime and workspace status/i);
     assert.match(hostStop, /stop core services, then stop the outer runtime/i);
-    assert.match(hostDestroy, /retaining its three named volumes by default/i);
+    assert.match(hostDestroy, /retaining its two named storage volumes and host workspace by default/i);
     assert.match(hostDestroy, /destroy --delete-volumes/i);
+    assert.match(hostDestroy, /legacy named-workspace Box/i);
     assert.match(hostDestroy, /without prompting/i);
     assert.match(hostDestroy, /anonymous volumes are always cleaned/i);
     assert.match(coreStatus, /workspace\/router\/agent state/i);

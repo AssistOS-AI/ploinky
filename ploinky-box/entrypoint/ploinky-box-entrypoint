@@ -153,6 +153,8 @@ command -v ss >/dev/null 2>&1 || fail "ss not on PATH"
 command -v nsenter >/dev/null 2>&1 || fail "nsenter not on PATH"
 require_cloudflared_contract
 test "$(id -un 2>/dev/null)" = 'podman' || fail "process user must be podman"
+test "$(id -u 2>/dev/null)" = '1000' || fail "process UID must be 1000"
+test "$(id -g 2>/dev/null)" = '1000' || fail "process GID must be 1000"
 require_value USER podman
 require_value HOME /home/podman
 require_value PLOINKY_WORKSPACE_ROOT /workspace

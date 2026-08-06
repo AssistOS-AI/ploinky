@@ -1,5 +1,7 @@
 import {
     BOX_MARKER_CONTENT,
+    BOX_RUNTIME_GID,
+    BOX_RUNTIME_UID,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 
@@ -206,6 +208,8 @@ export function probeImageBinaries(engine, imageId, runner) {
         '-c',
         [
             'set -eu',
+            `test "$(id -u)" -eq ${BOX_RUNTIME_UID}`,
+            `test "$(id -g)" -eq ${BOX_RUNTIME_GID}`,
             "for name in node podman bash ip fuse-overlayfs cloudflared; do command -v \"$name\"; done",
             'test -x /usr/local/bin/ploinky-box-entrypoint',
             "printf '%s\\n' /usr/local/bin/ploinky-box-entrypoint",

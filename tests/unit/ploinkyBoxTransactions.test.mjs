@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
     BOX_LABELS,
     BOX_READY_LINE,
+    BOX_USERNS,
 } from '../../ploinky-box/constants.mjs';
 import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
@@ -55,6 +56,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
             createCommand: [
                 'podman', 'container', 'create',
                 '--init',
+                '--userns', BOX_USERNS,
                 '--device', '/dev/fuse', '--device', '/dev/net/tun',
             ],
             environment: {
@@ -71,6 +73,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
             running,
             status: running ? 'running' : 'exited',
             init: true,
+            usernsMode: 'private',
             privileged: false,
             securityOptions: ['label=disable', 'unmask=ALL'],
             devices: [
@@ -81,7 +84,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
                 { type: 'volume', name: identity.volumes.containers, source: '', destination: '/home/podman/.local/share/containers', rw: true },
                 { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
                 { type: 'volume', name: identity.volumes.dependencies, source: '', destination: '/opt/ploinky/node_modules', rw: true },
-                { type: 'volume', name: identity.volumes.workspace, source: '', destination: '/workspace', rw: true },
+                { type: 'bind', name: '', source: identity.workspaceRoot, destination: '/workspace', rw: true },
             ],
         },
     };
@@ -130,13 +133,17 @@ test('Podman Machine validation tolerates its omitted device inspection only', (
         imageRef: 'runtime',
         hostPort: 19090,
     };
-    handle.runtime.createCommand = null;
+    handle.runtime.createCommand = [
+        'podman', 'container', 'create',
+        '--userns', BOX_USERNS,
+    ];
     assert.throws(
         () => validateContainerConfiguration(handle, desired),
         /device set is incompatible/,
     );
     handle.runtime.createCommand = [
         'podman', 'container', 'create',
+        '--userns', BOX_USERNS,
         '--device', '/dev/fuse', '--device', '/dev/net/tun',
     ];
     assert.doesNotThrow(() => validateContainerConfiguration(handle, {
@@ -156,7 +163,10 @@ test('native device mismatch reports normalized observed and expected devices', 
         id: 'b'.repeat(64),
     });
     handle.runtime.devices = [];
-    handle.runtime.createCommand = null;
+    handle.runtime.createCommand = [
+        'podman', 'container', 'create',
+        '--userns', BOX_USERNS,
+    ];
 
     assert.throws(
         () => validateContainerConfiguration(handle, {
@@ -166,7 +176,7 @@ test('native device mismatch reports normalized observed and expected devices', 
             imageRef: 'runtime',
             hostPort: 19090,
         }),
-        /observed=\[\] recorded=null expected=\[\"\/dev\/fuse\",\"\/dev\/net\/tun\"\] hostKind=native-linux/,
+        /observed=\[\] recorded=\[\] expected=\[\"\/dev\/fuse\",\"\/dev\/net\/tun\"\] hostKind=native-linux/,
     );
 });
 
@@ -334,7 +344,56 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.includes('label=disable'), true);
     assert.equal(args.includes('/dev/fuse'), true);
     assert.equal(args.includes('/dev/net/tun'), true);
-    assert.equal(args.filter((value) => value.endsWith(':U')).length, 3);
+    assert.deepEqual(args.slice(args.indexOf('--userns'), args.indexOf('--userns') + 2), [
+        '--userns', BOX_USERNS,
+    ]);
+    assert.equal(args.filter((value) => value.endsWith(':U')).length, 2);
+    assert.equal(args.includes(`${state.identity.workspaceRoot}:/workspace`), true);
+    assert.equal(args.some((value) => value === `${state.identity.workspaceRoot}:/workspace:U`), false);
+});
+
+test('container validation rejects legacy workspace volumes and user-namespace drift', (t) => {
+    const state = fixture(t);
+    const desired = {
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'runtime',
+        hostPort: 19090,
+    };
+    const legacyMount = containerHandle({
+        ...desired,
+        id: 'b'.repeat(64),
+    });
+    legacyMount.runtime.mounts = legacyMount.runtime.mounts.map((mount) => (
+        mount.destination === '/workspace'
+            ? {
+                type: 'volume',
+                name: state.identity.legacyVolumes.workspace,
+                source: '',
+                destination: '/workspace',
+                rw: true,
+            }
+            : mount
+    ));
+    assert.throws(
+        () => validateContainerConfiguration(legacyMount, desired),
+        (error) => /mount \/workspace is incompatible/.test(error.message)
+            && /ploinky destroy/.test(error.message),
+    );
+
+    const changedUserns = containerHandle({
+        ...desired,
+        id: 'c'.repeat(64),
+    });
+    changedUserns.runtime.createCommand = changedUserns.runtime.createCommand.filter((value) => (
+        value !== '--userns' && value !== BOX_USERNS
+    ));
+    assert.throws(
+        () => validateContainerConfiguration(changedUserns, desired),
+        (error) => /user namespace is incompatible/.test(error.message)
+            && /ploinky destroy/.test(error.message),
+    );
 });
 
 test('container validation rejects a Box that cannot reap orphaned children', (t) => {

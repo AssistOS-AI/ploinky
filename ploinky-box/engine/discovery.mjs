@@ -327,10 +327,6 @@ function expectedResources(identity) {
             role: BOX_ROLES.container,
         },
         volumes: {
-            workspace: {
-                name: identity.volumes.workspace,
-                role: BOX_ROLES.workspace,
-            },
             containers: {
                 name: identity.volumes.containers,
                 role: BOX_ROLES.containers,
@@ -340,11 +336,18 @@ function expectedResources(identity) {
                 role: BOX_ROLES.dependencies,
             },
         },
+        legacyVolumes: {
+            workspace: {
+                name: identity.legacyVolumes.workspace,
+                role: BOX_ROLES.workspace,
+            },
+        },
     };
 }
 
 export function inspectOwnedVolumeHandle(engine, identity, key, runner = createProcessRunner()) {
-    const resource = expectedResources(identity).volumes[key];
+    const expected = expectedResources(identity);
+    const resource = expected.volumes[key] || expected.legacyVolumes[key];
     if (!resource) {
         throw discoveryError(`Unknown Box volume role ${key}`);
     }
@@ -377,6 +380,10 @@ export function inspectOwnedVolumeHandle(engine, identity, key, runner = createP
 
 function inspectEngineResources(engine, identity, runner) {
     const expected = expectedResources(identity);
+    const expectedVolumes = {
+        ...expected.volumes,
+        ...expected.legacyVolumes,
+    };
     const containerInventory = inventory(engine, 'container', identity.pathHash, runner);
     const volumeInventory = inventory(engine, 'volume', identity.pathHash, runner);
     if (containerInventory.state === 'unknown' || volumeInventory.state === 'unknown') {
@@ -388,7 +395,7 @@ function inspectEngineResources(engine, identity, runner) {
 
     const expectedNames = new Map([
         [expected.container.name, expected.container.role],
-        ...Object.values(expected.volumes).map((volume) => [volume.name, volume.role]),
+        ...Object.values(expectedVolumes).map((volume) => [volume.name, volume.role]),
     ]);
     for (const record of [...containerInventory.records, ...volumeInventory.records]) {
         const name = recordName(record);
@@ -412,7 +419,7 @@ function inspectEngineResources(engine, identity, runner) {
     }
 
     const volumeInspections = {};
-    for (const [key, volume] of Object.entries(expected.volumes)) {
+    for (const [key, volume] of Object.entries(expectedVolumes)) {
         volumeInspections[key] = inspectExact(engine, 'volume', volume.name, runner);
         if (volumeInspections[key].state === 'unknown') {
             return volumeInspections[key];
@@ -421,7 +428,7 @@ function inspectEngineResources(engine, identity, runner) {
 
     const entries = [
         ['container', expected.container, containerInspection],
-        ...Object.entries(expected.volumes).map(([key, volume]) => (
+        ...Object.entries(expectedVolumes).map(([key, volume]) => (
             [key, volume, volumeInspections[key]]
         )),
     ];
@@ -451,6 +458,7 @@ function inspectEngineResources(engine, identity, runner) {
                 ? containerHandle(engine, identity, expected.container.name, containerInspection.record)
                 : null,
             volumes: {},
+            legacyVolumes: {},
         };
         for (const [key, volume] of Object.entries(expected.volumes)) {
             handles.volumes[key] = volumeInspections[key].state === 'present'
@@ -463,9 +471,26 @@ function inspectEngineResources(engine, identity, runner) {
                 )
                 : null;
         }
-        const retainedVolumeSet = containerInspection.state === 'absent'
-            && Object.values(volumeInspections).every((inspection) => inspection.state === 'present');
-        if (presentCount !== entries.length && !retainedVolumeSet) {
+        for (const [key, volume] of Object.entries(expected.legacyVolumes)) {
+            handles.legacyVolumes[key] = volumeInspections[key].state === 'present'
+                ? volumeHandle(
+                    engine,
+                    identity,
+                    volume.role,
+                    volume.name,
+                    volumeInspections[key].record,
+                )
+                : null;
+        }
+        const activeVolumeInspections = Object.keys(expected.volumes)
+            .map((key) => volumeInspections[key]);
+        const activePresentCount = activeVolumeInspections.filter((inspection) => (
+            inspection.state === 'present'
+        )).length;
+        const activeVolumeSetComplete = activePresentCount === activeVolumeInspections.length;
+        const containerPresent = containerInspection.state === 'present';
+        if ((containerPresent && !activeVolumeSetComplete)
+            || (!containerPresent && activePresentCount > 0 && !activeVolumeSetComplete)) {
             return {
                 state: 'incompatible',
                 message: `${engine.name} has only part of the expected Box resource set`,

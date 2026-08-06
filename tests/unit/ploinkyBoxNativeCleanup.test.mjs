@@ -36,9 +36,11 @@ function handles(workspaceIdentity) {
             labels: { pathHash: workspaceIdentity.pathHash, role: 'box' },
         },
         volumes: {
-            workspace: volume(`${workspaceIdentity.instance}-workspace`, 'workspace', 'one'),
-            containers: volume(`${workspaceIdentity.instance}-containers`, 'containers', 'two'),
-            dependencies: volume(`${workspaceIdentity.instance}-ploinky-deps`, 'ploinky-deps', 'three'),
+            containers: volume(`${workspaceIdentity.instance}-containers`, 'containers', 'one'),
+            dependencies: volume(`${workspaceIdentity.instance}-ploinky-deps`, 'ploinky-deps', 'two'),
+        },
+        legacyVolumes: {
+            workspace: volume(`${workspaceIdentity.instance}-workspace`, 'workspace', 'three'),
         },
     };
 }
@@ -85,7 +87,7 @@ function harness(overrides = {}) {
         },
         inspectVolume: (_engine, _identity, key) => ({
             state: 'owned',
-            handle: capturedHandles.volumes[key],
+            handle: capturedHandles.volumes[key] || capturedHandles.legacyVolumes[key],
         }),
         withLock: async ({ execute }) => execute(expectedIdentity, lock),
         get discoverCalls() { return discoverCalls; },
@@ -176,7 +178,7 @@ test('changed volume fingerprint refuses named-volume deletion', async () => {
     state.inspectVolume = (_engine, _identity, key) => ({
         state: 'owned',
         handle: {
-            ...state.capturedHandles.volumes[key],
+            ...(state.capturedHandles.volumes[key] || state.capturedHandles.legacyVolumes[key]),
             fingerprint: { mountpoint: '/changed', createdAt: 'different' },
         },
     });

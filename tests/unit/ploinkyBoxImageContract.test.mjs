@@ -137,6 +137,8 @@ test('fresh image capability probes allow a cold rootless container start', () =
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.timeoutMs, IMAGE_PROBE_TIMEOUT_MS);
     assert.ok(IMAGE_PROBE_TIMEOUT_MS >= 60_000);
+    assert.match(calls[0].args.at(-1), /test "\$\(id -u\)" -eq 1000/);
+    assert.match(calls[0].args.at(-1), /test "\$\(id -g\)" -eq 1000/);
 });
 
 test('image contract requires cloudflared and entrypoint validates token-file support', () => {
@@ -148,6 +150,8 @@ test('image contract requires cloudflared and entrypoint validates token-file su
     assert.match(entrypoint, /cloudflared tunnel run --help/);
     assert.match(entrypoint, /--token-file/);
     assert.match(entrypoint, /EXPECTED_CLOUDFLARED_VERSION/);
+    assert.match(entrypoint, /process UID must be 1000/);
+    assert.match(entrypoint, /process GID must be 1000/);
 });
 
 test('entrypoint reports actionable device and SELinux diagnostics', () => {

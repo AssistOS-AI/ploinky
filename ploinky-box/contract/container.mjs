@@ -2,6 +2,7 @@ import {
     BOX_LABELS,
     BOX_MEDIA_PORT,
     BOX_ROUTER_CONTAINER_PORT,
+    BOX_USERNS,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { IMAGE_CONTRACT } from './image.mjs';
@@ -85,6 +86,7 @@ export function normalizeContainerRuntime(record) {
         running: state?.Running === true || String(state?.Status || '') === 'running',
         status: String(state?.Status ?? ''),
         init: hostConfig?.Init === true,
+        usernsMode: String(hostConfig?.UsernsMode ?? ''),
         privileged: hostConfig?.Privileged === true,
         securityOptions: Array.isArray(hostConfig?.SecurityOpt)
             ? hostConfig.SecurityOpt.map(String).sort()
@@ -171,6 +173,13 @@ export function validateContainerConfiguration(containerHandle, {
     if (runtime.user !== 'podman' || runtime.privileged || runtime.init !== true) {
         throw publicationError('Owned Box user, privilege, or init state is incompatible');
     }
+    const recordedUserNamespaces = repeatedOptionValues(runtime.createCommand, '--userns');
+    if (runtime.usernsMode !== 'private'
+        || JSON.stringify(recordedUserNamespaces) !== JSON.stringify([BOX_USERNS])) {
+        throw publicationError(
+            "Owned Box user namespace is incompatible; back up legacy Box-only workspace data, then run 'ploinky stop' and 'ploinky destroy --delete-volumes' before retrying",
+        );
+    }
     const expectedLabels = {
         [BOX_LABELS.pathHash]: identity.pathHash,
         [BOX_LABELS.role]: 'box',
@@ -230,7 +239,7 @@ export function validateContainerConfiguration(containerHandle, {
     }
     const expectedMounts = {
         '/opt/ploinky': { type: 'bind', source: repositoryRoot, rw: false },
-        '/workspace': { type: 'volume', name: identity.volumes.workspace, rw: true },
+        '/workspace': { type: 'bind', source: identity.workspaceRoot, rw: true },
         '/home/podman/.local/share/containers': {
             type: 'volume', name: identity.volumes.containers, rw: true,
         },
@@ -248,7 +257,10 @@ export function validateContainerConfiguration(containerHandle, {
             || observed.rw !== expected.rw
             || (expected.source && observed.source !== expected.source)
             || (expected.name && observed.name !== expected.name)) {
-            throw publicationError(`Owned Box mount ${destination} is incompatible`);
+            const guidance = destination === '/workspace'
+                ? "; back up legacy Box-only workspace data, then run 'ploinky stop' and 'ploinky destroy --delete-volumes' before retrying"
+                : '';
+            throw publicationError(`Owned Box mount ${destination} is incompatible${guidance}`);
         }
     }
     return Object.freeze({ ...publication, imageId, imageRef });

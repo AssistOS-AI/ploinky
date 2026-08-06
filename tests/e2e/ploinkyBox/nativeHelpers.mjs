@@ -105,8 +105,10 @@ export async function cleanupNativeHarnessResources({
             }
             const engine = captured.engine;
             const container = captured.handles?.container || null;
-            const volumes = Object.entries(captured.handles?.volumes || {})
-                .filter(([, handle]) => handle);
+            const volumes = [
+                ...Object.entries(captured.handles?.volumes || {}),
+                ...Object.entries(captured.handles?.legacyVolumes || {}),
+            ].filter(([, handle]) => handle);
 
             if (container) {
                 assertSameWorkspaceIdentity(expectedIdentity, resolveIdentity());

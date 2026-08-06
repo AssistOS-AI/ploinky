@@ -52,8 +52,12 @@ You can use Ploinky in two ways:
 
 By default, the public entrypoint reconciles and starts one managed outer
 runtime, then runs Ploinky core inside it. The runtime mounts the local checkout
-read-only at `/opt/ploinky`; its dependencies live in the instance's writable
-dependency volume. Ordinary agent containers run one level inside this runtime.
+read-only at `/opt/ploinky` and bind-mounts the canonical host launch directory
+read-write at `/workspace`. Ordinary agent containers run one level inside this
+runtime and receive that same `/workspace` bind, so host files are immediately
+visible to agents and files or directories created there by agents persist on
+the host. Dependencies and nested-container storage remain in two instance-owned
+named volumes.
 
 | Invocation | Documented effect |
 | --- | --- |
@@ -64,8 +68,8 @@ dependency volume. Ordinary agent containers run one level inside this runtime.
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky update` / `ploinky update all [PATH]` | Pull the cloned host Ploinky checkout from its configured upstream, refresh in-Box repositories/dependencies/skills, then restart an already configured running workspace |
-| `ploinky destroy` | Confirm and directly remove the outer container; retain its three named volumes |
-| `ploinky destroy --delete-volumes` | Directly remove the outer container and its three owned named volumes without prompting |
+| `ploinky destroy` | Confirm and directly remove the outer container; retain its two named storage volumes and the host workspace |
+| `ploinky destroy --delete-volumes` | Directly remove the outer container and its owned storage volumes without prompting; never delete the host workspace |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 The required outer image is the mutable
@@ -79,8 +83,14 @@ stopped-box start, status, stop, and destroy do not pull. Incompatible images or
 owned resources are rejected before pulling, volume creation, restart, upgrade,
 or replacement. Ploinky does not migrate, clean, relabel, adopt, or replace
 them: run `ploinky destroy` explicitly, then recreate the Box. Ordinary destroy
-retains the three named volumes; `--delete-volumes` performs an explicit full
-data reset.
+retains the two named storage volumes; `--delete-volumes` performs an explicit
+storage reset without deleting host workspace files. A Box created by a version
+that used a named workspace volume requires a one-time hard reset because its
+nested-container registry exists only in that legacy workspace. Back up any
+Box-only workspace data that must be retained, then run `ploinky stop` followed
+by `ploinky destroy --delete-volumes` before recreating it. This removes the
+exactly owned legacy workspace and nested-storage volumes, but never the host
+workspace.
 
 A compatible box is reused or started only when its creation configuration is
 an exact normalized match. Any port, image, mount, device, security, or other
@@ -88,15 +98,17 @@ creation drift fails before registry traffic or container mutation and requires
 an explicit `ploinky destroy` followed by recreation; there is no transactional
 replacement or rollback path.
 
-The outer container and its three explicitly labelled volumes are named from the
-canonical absolute current directory. Ploinky automatically discovers whether
-Podman or Docker owns those exact resources and fails closed on unreachable,
-split, or foreign state; there is no public `--name`, `--engine`, or
-`PLOINKY_BOX_ENGINE` override. Ordinary `destroy` removes only the selected
-outer container (and any attached anonymous volumes), preserving the workspace,
-nested-container-storage, and Ploinky dependency volumes for recreation. The
-explicit `destroy --delete-volumes` form revalidates and removes those three
-owned volumes as well.
+The outer container and its two explicitly labelled storage volumes are named
+from the canonical absolute current directory. That directory is mounted at
+`/workspace` rather than copied into engine storage. Ploinky automatically
+discovers whether Podman or Docker owns the exact managed resources and fails
+closed on unreachable, split, or foreign state; there is no public `--name`,
+`--engine`, or `PLOINKY_BOX_ENGINE` override. Ordinary `destroy` removes only the
+selected outer container (and any attached anonymous volumes), preserving the
+host workspace, nested-container storage, and Ploinky dependency volume for
+recreation. The explicit `destroy --delete-volumes` form revalidates and removes
+the two owned storage volumes plus any exactly owned legacy workspace volume;
+it never removes the host workspace.
 
 Every managed box has exactly two engine publications, independent of graph or
 workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and

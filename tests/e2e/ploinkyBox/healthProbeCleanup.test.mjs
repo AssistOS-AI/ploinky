@@ -68,7 +68,7 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
     assert.equal(
         stagedProbe.ok,
         true,
-        `failed to stage native probe fixtures in the Box workspace volume: ${stagedProbe.stderr}`,
+        `failed to stage native probe fixtures in the Box workspace bind: ${stagedProbe.stderr}`,
     );
     const containerName = `probe-cleanup-${process.pid}`;
     t.after(() => {
