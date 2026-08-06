@@ -47,6 +47,7 @@ function exactPodmanProbe(overrides = {}) {
                 containerId,
                 instanceId: 'instance-health',
                 enableGeneration: 'generation-health',
+                releaseGeneration: '',
             });
             return { identity };
         },

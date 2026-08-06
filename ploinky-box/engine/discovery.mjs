@@ -887,6 +887,7 @@ export function discoverBoxOwnership(identity, {
                             socketPath: machineConnection.socketPath,
                         },
                     },
+                    execEvidenceStore: outerJournal?.execSessions ?? null,
                 });
             } catch (error) {
                 return {

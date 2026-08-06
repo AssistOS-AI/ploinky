@@ -840,6 +840,12 @@ export function createBoxSupervisor({
         inspectBoxStatus,
         planDryRun,
         async executeCommand(prepared, argv, options = {}) {
+            if (options.interactive || options.shell || options.tty) {
+                throw supervisorError(
+                    'Interactive commands require the dedicated structured streaming path',
+                    'PLOINKY_BOX_HOST_CONTROL_INVALID',
+                );
+            }
             const result = await executeBoxCommand({
                 hostClient: prepared.hostClient || directClient(prepared.ownership),
                 containerId: prepared.containerId,
@@ -851,6 +857,24 @@ export function createBoxSupervisor({
                 ...options,
             });
             return result.exitCode;
+        },
+        async executeInteractiveCommand(prepared, argv, options = {}) {
+            if (options.interactive !== true || options.tty !== true) {
+                throw supervisorError(
+                    'Interactive commands require an admitted TTY session',
+                    'PLOINKY_BOX_HOST_CONTROL_INVALID',
+                );
+            }
+            return executeBoxCommand({
+                hostClient: prepared.hostClient || directClient(prepared.ownership),
+                containerId: prepared.containerId,
+                journal: prepared.journal || prepared.ownership?.journal,
+                argv,
+                hostPort: prepared.hostPort,
+                stdout,
+                stderr,
+                ...options,
+            });
         },
     });
 }

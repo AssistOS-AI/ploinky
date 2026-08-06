@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -32,6 +33,7 @@ import {
     BOX_VOLUME_KEYS as DIRECT_VOLUME_KEYS,
 } from '../ploinky-box/constants.mjs';
 import { inspectAndValidateDirectImage } from '../ploinky-box/contract/image.mjs';
+import { runOuterCli } from '../ploinky-box/bin/ploinky-box.mjs';
 import { buildWorkspaceIdentity } from '../ploinky-box/identity.mjs';
 import { ensureNamedVolumes } from '../ploinky-box/volumes.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
@@ -159,6 +161,27 @@ function writableBuffer() {
         stream: { isTTY: false, write(chunk) { value += String(chunk); return true; } },
         text: () => value,
     };
+}
+
+function nativeInteractiveTerminal() {
+    const stdin = new EventEmitter();
+    stdin.isTTY = true;
+    stdin.isRaw = false;
+    stdin.rawModes = [];
+    stdin.setRawMode = enabled => {
+        stdin.isRaw = enabled;
+        stdin.rawModes.push(enabled);
+        return stdin;
+    };
+    const output = writableBuffer();
+    output.stream.isTTY = true;
+    output.stream.rows = 28;
+    output.stream.columns = 96;
+    const errorOutput = writableBuffer();
+    errorOutput.stream.isTTY = true;
+    errorOutput.stream.rows = 28;
+    errorOutput.stream.columns = 96;
+    return { stdin, output, errorOutput, signals: new EventEmitter() };
 }
 
 function makeFakeNodeCapture() {
@@ -1415,6 +1438,66 @@ test('legacy in-Box runtime supervisor preserves TTY and non-TTY CLI behavior', 
     const agentShellExec = runCalls(agentShell, 'exec').at(-1).args;
     assert.ok(agentShellExec.includes('-i'));
     assert.ok(agentShellExec.includes('PLOINKY_NO_TTY=1'));
+});
+
+test('native outer terminal completes bare, Box shell, and agent CLI streaming paths', async () => {
+    const cases = [
+        {
+            argv: [], expected: ['/opt/ploinky/bin/ploinky-local'], shell: false, exitCode: 0,
+        },
+        { argv: ['cli'], expected: [], shell: true, exitCode: 0 },
+        {
+            argv: ['cli', 'Agent', '--workdir', 'project', '--', '--model', 'exact'],
+            expected: [
+                '/opt/ploinky/bin/ploinky-local', 'cli', 'Agent', '--workdir',
+                'project', '--', '--model', 'exact',
+            ],
+            shell: false,
+            exitCode: 19,
+        },
+    ];
+    for (const scenario of cases) {
+        const terminal = nativeInteractiveTerminal();
+        const calls = [];
+        const prepared = {
+            containerId: 'a'.repeat(64),
+            hostClient: { kind: 'native-direct-client' },
+            journal: { phase: 'committed', revision: 11 },
+            hostPort: 18080,
+        };
+        const code = await runOuterCli(scenario.argv, {
+            env: {},
+            input: terminal.stdin,
+            output: terminal.output.stream,
+            errorOutput: terminal.errorOutput.stream,
+            signalSource: terminal.signals,
+            detectInsideBox: () => false,
+            supervisor: {
+                async prepareBoxForCommand() { calls.push('prepare'); return prepared; },
+                async executeInteractiveCommand(selected, argv, options) {
+                    calls.push({ selected, argv, options });
+                    options.onSession(Object.freeze({
+                        sessionId: 'b'.repeat(64),
+                        async resize() {},
+                    }));
+                    options.stdout.write('native interactive output');
+                    return { exitCode: scenario.exitCode, detached: false };
+                },
+            },
+        });
+        assert.equal(code, scenario.exitCode);
+        assert.equal(calls[0], 'prepare');
+        assert.equal(calls[1].selected, prepared);
+        assert.deepEqual(calls[1].argv, scenario.expected);
+        assert.equal(calls[1].options.shell, scenario.shell);
+        assert.equal(calls[1].options.tty, true);
+        assert.equal(calls[1].options.rows, 28);
+        assert.equal(calls[1].options.columns, 96);
+        assert.equal(calls[1].options.stdin, terminal.stdin);
+        assert.equal(terminal.output.text(), 'native interactive output');
+        assert.deepEqual(terminal.stdin.rawModes, [true, false]);
+        assert.equal(terminal.signals.eventNames().length, 0);
+    }
 });
 
 test('compatible and stopped status preserve streaming health/core behavior without mutation', async () => {

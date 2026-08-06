@@ -632,6 +632,7 @@ function containerDefinition(record) {
 
 export function createOuterJournalStore({ workspaceRoot, filePath = null } = {}) {
     const root = canonicalWorkspaceRoot(workspaceRoot);
+    const execSessions = createOuterExecSessionStore({ workspaceRoot: root });
     const selectedPath = path.resolve(filePath || path.join(
         root,
         '.ploinky',
@@ -654,6 +655,7 @@ export function createOuterJournalStore({ workspaceRoot, filePath = null } = {})
     };
     return Object.freeze({
         path: selectedPath,
+        execSessions,
         read,
         create(value) {
             prepare();
@@ -963,6 +965,302 @@ export function createOuterJournalStore({ workspaceRoot, filePath = null } = {})
                 fs.unlinkSync(selectedPath);
                 fsyncDirectory(path.dirname(selectedPath));
                 return true;
+            });
+        },
+    });
+}
+
+const EXEC_EVIDENCE_STATES = new Set(['creating', 'created', 'ambiguous', 'detached']);
+const EXEC_EVIDENCE_KEYS = Object.freeze([
+    'attempts',
+    'binding',
+    'revision',
+    'schemaVersion',
+]);
+
+function normalizedExecBinding(value) {
+    if (!exactKeys(value, [
+        'connectionIdentity',
+        'containerId',
+        'engineIdentity',
+        'generation',
+    ])) {
+        throw journalError('Outer Box exec evidence has an invalid binding');
+    }
+    return {
+        connectionIdentity: safeString(
+            value.connectionIdentity,
+            'exec connection identity',
+            { maximum: 1024 },
+        ),
+        containerId: requireFullContainerId(value.containerId, 'exec evidence container ID'),
+        engineIdentity: safeString(
+            value.engineIdentity,
+            'exec engine identity',
+            { pattern: GENERATION },
+        ),
+        generation: safeString(
+            value.generation,
+            'exec generation',
+            { pattern: GENERATION },
+        ),
+    };
+}
+
+function normalizedExecAttempt(value) {
+    if (!exactKeys(value, [
+        'attemptId',
+        'commandHash',
+        'createdAt',
+        'sessionId',
+        'state',
+        'tty',
+        'updatedAt',
+    ])
+        || !EXEC_EVIDENCE_STATES.has(value.state)
+        || typeof value.tty !== 'boolean'
+        || !Number.isSafeInteger(value.createdAt)
+        || value.createdAt < 1
+        || !Number.isSafeInteger(value.updatedAt)
+        || value.updatedAt < value.createdAt) {
+        throw journalError('Outer Box exec evidence has an invalid attempt');
+    }
+    const sessionId = value.sessionId === null
+        ? null
+        : requireFullContainerId(value.sessionId, 'exec evidence session ID');
+    if ((value.state === 'created' || value.state === 'detached') && sessionId === null) {
+        throw journalError('Outer Box exec evidence state requires an exact session ID');
+    }
+    if (value.state === 'creating' && sessionId !== null) {
+        throw journalError('Outer Box creating evidence cannot already contain a session ID');
+    }
+    return {
+        attemptId: safeString(value.attemptId, 'exec attempt ID', { pattern: GENERATION }),
+        commandHash: safeString(value.commandHash, 'exec command hash', { pattern: GENERATION }),
+        createdAt: value.createdAt,
+        updatedAt: value.updatedAt,
+        tty: value.tty,
+        state: value.state,
+        sessionId,
+    };
+}
+
+function normalizeExecEvidenceRecord(value, binding) {
+    if (!exactKeys(value, EXEC_EVIDENCE_KEYS)
+        || value.schemaVersion !== 1
+        || !Number.isSafeInteger(value.revision)
+        || value.revision < 0
+        || !Array.isArray(value.attempts)
+        || value.attempts.length > 64) {
+        throw journalError('Outer Box exec evidence has an invalid contract');
+    }
+    const selectedBinding = normalizedExecBinding(value.binding);
+    if (!isDeepStrictEqual(selectedBinding, normalizedExecBinding(binding))) {
+        throw journalError('Outer Box exec evidence binding does not match the selected generation');
+    }
+    const attempts = value.attempts.map(normalizedExecAttempt);
+    if (new Set(attempts.map(({ attemptId }) => attemptId)).size !== attempts.length) {
+        throw journalError('Outer Box exec evidence contains duplicate attempt IDs');
+    }
+    return freezeDeep({
+        schemaVersion: 1,
+        binding: selectedBinding,
+        attempts,
+        revision: value.revision,
+    });
+}
+
+function readExecEvidenceFile(filePath, workspaceRoot, binding, { allowMissing = false } = {}) {
+    const maximumBytes = 1_048_576;
+    if (!Number.isInteger(fs.constants.O_NOFOLLOW)) {
+        throw journalError('Outer Box exec evidence no-follow reads are unavailable');
+    }
+    let descriptor;
+    try {
+        descriptor = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        const before = fs.fstatSync(descriptor, { bigint: true });
+        const expectedUid = typeof process.getuid === 'function'
+            ? BigInt(process.getuid())
+            : before.uid;
+        if (!before.isFile()
+            || before.nlink !== 1n
+            || before.uid !== expectedUid
+            || (before.mode & 0o777n) !== 0o600n
+            || before.size < 1n
+            || before.size > BigInt(maximumBytes)) {
+            throw journalError('Outer Box exec evidence is not one bounded private regular file');
+        }
+        const buffer = Buffer.allocUnsafe(maximumBytes + 1);
+        let length = 0;
+        while (length < buffer.length) {
+            const count = fs.readSync(descriptor, buffer, length, buffer.length - length, null);
+            if (count === 0) break;
+            length += count;
+        }
+        if (length > maximumBytes) throw journalError('Outer Box exec evidence exceeds its size bound');
+        const after = fs.fstatSync(descriptor, { bigint: true });
+        for (const key of ['dev', 'ino', 'mode', 'nlink', 'uid', 'size', 'mtimeNs', 'ctimeNs']) {
+            if (before[key] !== after[key]) {
+                throw journalError('Outer Box exec evidence changed during its exact-file read');
+            }
+        }
+        if (after.size !== BigInt(length)) {
+            throw journalError('Outer Box exec evidence size changed during its bounded read');
+        }
+        return normalizeExecEvidenceRecord(
+            JSON.parse(buffer.subarray(0, length).toString('utf8')),
+            binding,
+        );
+    } catch (error) {
+        if (error?.code === 'ENOENT' && allowMissing) return null;
+        if (error instanceof PloinkyBoxError) throw error;
+        throw journalError('Outer Box exec evidence is unreadable or corrupt', error);
+    } finally {
+        if (descriptor !== undefined) {
+            try { fs.closeSync(descriptor); } catch {}
+        }
+    }
+}
+
+/**
+ * Crash evidence is stored per exact container generation. It has no time-based
+ * expiry: only a separately proven container retirement may make an old file
+ * irrelevant, so ambiguous and detached sessions remain available for audit.
+ */
+export function createOuterExecSessionStore({ workspaceRoot } = {}) {
+    const root = canonicalWorkspaceRoot(workspaceRoot);
+    const select = (binding) => {
+        const selectedBinding = normalizedExecBinding(binding);
+        return {
+            binding: selectedBinding,
+            path: path.join(
+                root,
+                '.ploinky',
+                'private',
+                `outer-box-exec-${selectedBinding.containerId}.json`,
+            ),
+        };
+    };
+    const prepare = (selectedPath) => ensurePrivateParent(root, selectedPath);
+    const writeChanged = (selectedPath, current, attempts) => {
+        const next = normalizeExecEvidenceRecord({
+            ...current,
+            attempts,
+            revision: current.revision + 1,
+        }, current.binding);
+        atomicWrite(selectedPath, next);
+        return readExecEvidenceFile(selectedPath, root, current.binding);
+    };
+    return Object.freeze({
+        read(binding, { allowMissing = false } = {}) {
+            const selected = select(binding);
+            if (!privateParentExists(root, selected.path)) {
+                if (allowMissing) return null;
+                throw journalError('Outer Box exec evidence is missing');
+            }
+            return readExecEvidenceFile(selected.path, root, selected.binding, { allowMissing });
+        },
+        begin(binding, value) {
+            const selected = select(binding);
+            const now = value?.createdAt;
+            const attempt = normalizedExecAttempt({
+                attemptId: value?.attemptId,
+                commandHash: value?.commandHash,
+                createdAt: now,
+                updatedAt: now,
+                tty: value?.tty,
+                state: 'creating',
+                sessionId: null,
+            });
+            prepare(selected.path);
+            return withClaim(selected.path, () => {
+                const current = readExecEvidenceFile(
+                    selected.path,
+                    root,
+                    selected.binding,
+                    { allowMissing: true },
+                ) || normalizeExecEvidenceRecord({
+                    schemaVersion: 1,
+                    binding: selected.binding,
+                    attempts: [],
+                    revision: 0,
+                }, selected.binding);
+                if (current.attempts.length >= 64
+                    || current.attempts.some(({ attemptId }) => attemptId === attempt.attemptId)) {
+                    throw journalError('Outer Box exec evidence cannot admit another attempt');
+                }
+                return writeChanged(selected.path, current, [...current.attempts, attempt]);
+            });
+        },
+        created(binding, value) {
+            const selected = select(binding);
+            const sessionId = requireFullContainerId(value?.sessionId, 'exec evidence session ID');
+            return withClaim(selected.path, () => {
+                const current = readExecEvidenceFile(selected.path, root, selected.binding);
+                const index = current.attempts.findIndex(({ attemptId }) => (
+                    attemptId === value?.attemptId
+                ));
+                if (index < 0 || current.attempts[index].state !== 'creating') {
+                    throw journalError('Outer Box exec evidence create publication is invalid');
+                }
+                const attempts = [...current.attempts];
+                attempts[index] = normalizedExecAttempt({
+                    ...attempts[index],
+                    state: 'created',
+                    sessionId,
+                    updatedAt: value?.updatedAt,
+                });
+                return writeChanged(selected.path, current, attempts);
+            });
+        },
+        retain(binding, value) {
+            const selected = select(binding);
+            if (!['ambiguous', 'detached'].includes(value?.state)) {
+                throw journalError('Outer Box exec evidence retention state is invalid');
+            }
+            return withClaim(selected.path, () => {
+                const current = readExecEvidenceFile(selected.path, root, selected.binding);
+                const index = current.attempts.findIndex(({ attemptId }) => (
+                    attemptId === value?.attemptId
+                ));
+                if (index < 0) throw journalError('Outer Box exec evidence attempt is absent');
+                const previous = current.attempts[index];
+                const suppliedSession = value?.sessionId === null || value?.sessionId === undefined
+                    ? null
+                    : requireFullContainerId(value.sessionId, 'exec evidence session ID');
+                if (previous.sessionId && suppliedSession && previous.sessionId !== suppliedSession) {
+                    throw journalError('Outer Box exec evidence session substitution is forbidden');
+                }
+                const attempts = [...current.attempts];
+                attempts[index] = normalizedExecAttempt({
+                    ...previous,
+                    state: value.state,
+                    sessionId: previous.sessionId || suppliedSession,
+                    updatedAt: value?.updatedAt,
+                });
+                return writeChanged(selected.path, current, attempts);
+            });
+        },
+        removed(binding, value) {
+            const selected = select(binding);
+            const sessionId = requireFullContainerId(value?.sessionId, 'exec evidence session ID');
+            return withClaim(selected.path, () => {
+                const current = readExecEvidenceFile(selected.path, root, selected.binding);
+                const index = current.attempts.findIndex(({ attemptId }) => (
+                    attemptId === value?.attemptId
+                ));
+                if (index < 0
+                    || current.attempts[index].state !== 'created'
+                    || current.attempts[index].sessionId !== sessionId) {
+                    throw journalError('Outer Box exec evidence removal publication is invalid');
+                }
+                const attempts = current.attempts.filter((_, candidate) => candidate !== index);
+                if (attempts.length === 0) {
+                    fs.unlinkSync(selected.path);
+                    fsyncDirectory(path.dirname(selected.path));
+                    return null;
+                }
+                return writeChanged(selected.path, current, attempts);
             });
         },
     });

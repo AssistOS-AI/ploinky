@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
 
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 import { executeBoxCommand } from '../../ploinky-box/command/execute.mjs';
@@ -23,11 +24,16 @@ import { stripReservedAgentEnv } from '../../cli/utils/security/agentIdentityEnv
 
 function bufferStream(isTTY = false) {
     let bytes = '';
-    return {
+    const stream = new EventEmitter();
+    return Object.assign(stream, {
         isTTY,
+        isRaw: false,
+        rows: isTTY ? 24 : undefined,
+        columns: isTTY ? 80 : undefined,
+        setRawMode(value) { this.isRaw = Boolean(value); },
         write(chunk) { bytes += String(chunk); },
         value() { return bytes; },
-    };
+    });
 }
 
 function releaseDescriptor() {
@@ -96,6 +102,10 @@ function dispatchSupervisor(identity, events, { withContainer = false } = {}) {
             events.push(`execute:${argv.join(' ')}`);
             return 0;
         },
+        async executeInteractiveCommand(_prepared, argv) {
+            events.push(`execute:${argv.join(' ')}`);
+            return { exitCode: 0, detached: false };
+        },
     };
 }
 
@@ -132,11 +142,13 @@ test('every public verb dispatches one bounded supervisor operation without a ho
     for (const scenario of cases) {
         const events = [];
         const supervisor = dispatchSupervisor(identity, events, scenario);
+        const interactive = ['repl', 'bash', 'agent-cli'].includes(scenario.name);
         const code = await runOuterCli(scenario.argv, {
             env: {},
-            input: { isTTY: false },
-            output: bufferStream(),
-            errorOutput: bufferStream(),
+            input: bufferStream(interactive),
+            output: bufferStream(interactive),
+            errorOutput: bufferStream(interactive),
+            signalSource: new EventEmitter(),
             supervisor,
             confirmDestroy: async () => true,
             detectInsideBox: () => false,

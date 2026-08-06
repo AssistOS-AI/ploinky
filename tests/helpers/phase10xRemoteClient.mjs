@@ -34,12 +34,77 @@ function assertStandalone(journal, id) {
     }
 }
 
+function assertExecUser(user) {
+    const value = String(user || '');
+    const [name] = value.split(':', 1);
+    if (value.length === 0 || name === 'root' || /^0$/u.test(name)) {
+        throw new Error('fake refuses a privileged exec user');
+    }
+    return value;
+}
+
+function assertTerminalDimension(value, label) {
+    if (!Number.isSafeInteger(value) || value < 1 || value > 65535) {
+        throw new Error(`fake ${label} is outside terminal bounds`);
+    }
+    return value;
+}
+
+async function writeOutput(stream, value) {
+    const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value || ''));
+    if (bytes.length === 0) return;
+    if (!stream || typeof stream.write !== 'function') {
+        throw new Error('fake interactive exec output stream is unavailable');
+    }
+    if (!stream.write(bytes)) {
+        await new Promise((resolve, reject) => {
+            stream.once('drain', resolve);
+            stream.once('error', reject);
+        });
+    }
+}
+
+async function readInput(stream) {
+    if (stream === undefined || stream === null) return Buffer.alloc(0);
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+    return Buffer.concat(chunks);
+}
+
+function abortError() {
+    const error = new Error('fake interactive exec caller cancelled');
+    error.code = 'PLOINKY_BOX_HOST_CANCELLED';
+    return error;
+}
+
+function waitForAbort(signal) {
+    if (!signal || typeof signal.addEventListener !== 'function') {
+        throw new Error('fake wait-for-abort outcome requires an AbortSignal');
+    }
+    if (signal.aborted) return Promise.reject(abortError());
+    return new Promise((resolve, reject) => {
+        const aborted = () => reject(abortError());
+        signal.addEventListener('abort', aborted, { once: true });
+        void resolve;
+    });
+}
+
 export class Phase10xRemoteClient {
-    constructor({ containers = [], volumes = [], ownedIds = [], generatedIds = [] } = {}) {
+    constructor({
+        containers = [],
+        volumes = [],
+        ownedIds = [],
+        generatedIds = [],
+        generatedSessionIds = [],
+        execOutcomes = [],
+    } = {}) {
         this.containers = new Map(containers.map((entry) => [assertId(entry.Id ?? entry.ID), clone(entry)]));
         this.volumes = new Map(volumes.map((entry) => [String(entry.Name), clone(entry)]));
         this.ownedIds = new Set(ownedIds.map(assertId));
         this.generatedIds = [...generatedIds];
+        this.generatedSessionIds = [...generatedSessionIds];
+        this.execOutcomes = [...execOutcomes];
+        this.execSessions = new Map();
         this.requestJournal = [];
         this.stateJournal = [];
         this.eventJournal = [];
@@ -223,6 +288,226 @@ export class Phase10xRemoteClient {
         this.event(target, 'remove');
         this.snapshot('direct-delete');
         return { removed: true, id: target, absent: true };
+    }
+
+    async execContainerInteractive({
+        id,
+        argv,
+        user = 'podman',
+        workdir = '/workspace',
+        env = {},
+        journal,
+        tty = false,
+        detachKeys = '',
+        rows,
+        columns,
+        stdin,
+        stdout,
+        stderr,
+        signal,
+        onSession,
+    }) {
+        const target = assertId(id);
+        assertStandalone(journal, target);
+        if (!this.ownedIds.has(target)) throw new Error('fake exec target is not exact owned');
+        const selected = this.containers.get(target);
+        if (!selected || String(selected.State).toLowerCase() !== 'running') {
+            throw new Error('fake exec target is not proven running');
+        }
+        const nameCollision = [...this.containers.entries()].find(([containerId, entry]) => (
+            containerId !== target
+            && Array.isArray(entry.Names)
+            && entry.Names.some((name) => String(name).replace(/^\//u, '') === target)
+        ));
+        if (nameCollision) {
+            throw new Error('fake exec target full ID is shadowed by a foreign exact container name');
+        }
+        if (!Array.isArray(argv) || argv.length === 0
+            || argv.some((entry) => typeof entry !== 'string' || entry.length === 0)) {
+            throw new Error('fake exec argv is invalid');
+        }
+        const execUser = assertExecUser(user);
+        if (typeof workdir !== 'string' || !workdir.startsWith('/')) {
+            throw new Error('fake exec working directory must be absolute');
+        }
+        if (!env || typeof env !== 'object' || Array.isArray(env)) {
+            throw new Error('fake exec environment must be a map');
+        }
+        if (typeof tty !== 'boolean' || typeof detachKeys !== 'string') {
+            throw new Error('fake exec terminal configuration is invalid');
+        }
+        const initialRows = tty ? assertTerminalDimension(rows, 'terminal rows') : 0;
+        const initialColumns = tty ? assertTerminalDimension(columns, 'terminal columns') : 0;
+        if (onSession !== undefined && typeof onSession !== 'function') {
+            throw new Error('fake exec session callback must be a function');
+        }
+        if (signal?.aborted) throw abortError();
+
+        const sessionId = assertId(this.generatedSessionIds.shift() || '9'.repeat(64));
+        if (this.execSessions.has(sessionId)) throw new Error('duplicate generated fake exec session ID');
+        const outcome = this.execOutcomes.shift() || {};
+        const bindingId = assertId(outcome.containerId || target);
+        const reportedSessionId = assertId(outcome.sessionId || sessionId);
+        const session = {
+            id: sessionId,
+            containerId: bindingId,
+            running: false,
+            removed: false,
+            tty,
+        };
+        this.execSessions.set(sessionId, session);
+        this.requestJournal.push({
+            transport: 'direct',
+            method: 'POST',
+            operation: 'exec-create',
+            path: `/v6.0.1/libpod/containers/${target}%25/exec`,
+            actor: target,
+            id: target,
+            sessionId,
+            spec: {
+                AttachStdin: stdin !== undefined && stdin !== null,
+                AttachStdout: true,
+                AttachStderr: true,
+                DetachKeys: detachKeys,
+                Tty: tty,
+                Env: Object.entries(env).map(([key, value]) => `${key}=${value}`),
+                Cmd: [...argv],
+                Privileged: false,
+                User: execUser,
+                WorkingDir: workdir,
+            },
+        });
+        this.requestJournal.push({
+            transport: 'direct',
+            method: 'GET',
+            operation: 'exec-inspect-pre',
+            path: `/v6.0.1/libpod/exec/${reportedSessionId}/json`,
+            actor: reportedSessionId,
+            id: reportedSessionId,
+            sessionId: reportedSessionId,
+            observedContainerId: bindingId,
+        });
+        if (bindingId !== target || reportedSessionId !== sessionId) {
+            throw new Error('fake exec pre-start binding proof failed');
+        }
+
+        let live = false;
+        const controller = Object.freeze({
+            sessionId,
+            resize: async (nextRows, nextColumns) => {
+                if (!tty) throw new Error('fake cannot resize a non-TTY exec session');
+                if (!live || !session.running) throw new Error('fake cannot resize a non-running exec session');
+                const height = assertTerminalDimension(nextRows, 'terminal rows');
+                const width = assertTerminalDimension(nextColumns, 'terminal columns');
+                this.requestJournal.push({
+                    transport: 'direct',
+                    method: 'GET',
+                    operation: 'exec-inspect-resize',
+                    path: `/v6.0.1/libpod/exec/${sessionId}/json`,
+                    actor: sessionId,
+                    id: sessionId,
+                    sessionId,
+                    observedContainerId: target,
+                });
+                this.requestJournal.push({
+                    transport: 'direct',
+                    method: 'POST',
+                    operation: 'exec-resize',
+                    path: `/v6.0.1/libpod/exec/${sessionId}/resize?h=${height}&w=${width}&running=false`,
+                    actor: sessionId,
+                    id: sessionId,
+                    sessionId,
+                    containerId: target,
+                    rows: height,
+                    columns: width,
+                    running: false,
+                });
+                if (outcome.resizeError) throw outcome.resizeError;
+                return { rows: height, columns: width };
+            },
+        });
+        this.requestJournal.push({
+            transport: 'direct',
+            method: 'POST',
+            operation: 'exec-start',
+            path: `/v6.0.1/libpod/exec/${sessionId}/start`,
+            actor: sessionId,
+            id: sessionId,
+            sessionId,
+            containerId: target,
+            tty,
+            rows: initialRows,
+            columns: initialColumns,
+        });
+        if (outcome.startError) throw outcome.startError;
+        live = true;
+        session.running = true;
+        this.event(target, 'exec');
+        if (onSession) onSession(controller);
+
+        const inputBytes = await readInput(stdin);
+        this.requestJournal.push({
+            transport: 'direct',
+            method: 'STREAM',
+            operation: 'exec-stdin',
+            actor: sessionId,
+            id: sessionId,
+            sessionId,
+            containerId: target,
+            bytes: inputBytes,
+        });
+        this.requestJournal.push({
+            transport: 'direct',
+            method: 'STREAM',
+            operation: 'exec-write-half-close',
+            actor: sessionId,
+            id: sessionId,
+            sessionId,
+            containerId: target,
+        });
+        if (outcome.waitFor) await outcome.waitFor;
+        if (outcome.waitForAbort) await waitForAbort(signal);
+        if (outcome.error) throw outcome.error;
+        if (tty) {
+            await writeOutput(stdout, outcome.ttyBytes ?? outcome.stdout ?? Buffer.alloc(0));
+        } else {
+            await writeOutput(stdout, outcome.stdout ?? Buffer.alloc(0));
+            await writeOutput(stderr, outcome.stderr ?? Buffer.alloc(0));
+        }
+
+        const detached = outcome.detached === true;
+        session.running = detached;
+        live = detached;
+        this.requestJournal.push({
+            transport: 'direct',
+            method: 'GET',
+            operation: 'exec-inspect-final',
+            path: `/v6.0.1/libpod/exec/${sessionId}/json`,
+            actor: sessionId,
+            id: sessionId,
+            sessionId,
+            observedContainerId: target,
+            running: detached,
+        });
+        if (detached) return { exitCode: 0, detached: true };
+
+        const exitCode = outcome.exitCode ?? 0;
+        if (!Number.isSafeInteger(exitCode)) throw new Error('fake exec exit code is invalid');
+        this.requestJournal.push({
+            transport: 'direct',
+            method: 'POST',
+            operation: 'exec-remove',
+            path: `/v6.0.1/libpod/exec/${sessionId}/remove`,
+            actor: sessionId,
+            id: sessionId,
+            sessionId,
+            containerId: target,
+            force: false,
+        });
+        if (outcome.cleanupError) throw outcome.cleanupError;
+        session.removed = true;
+        this.execSessions.delete(sessionId);
+        return { exitCode, detached: false };
     }
 }
 

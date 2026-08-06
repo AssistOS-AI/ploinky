@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import { PloinkyBoxError } from '../errors.mjs';
 
@@ -10,6 +10,14 @@ const ENGINE_ID = /^[a-f0-9]{64}$/;
 const RESOURCE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
 const API_VERSION = 'v6.0.1';
 const JSON_TYPE = /^application\/json(?:\s*;|$)/i;
+const RAW_STREAM_TYPE = /^application\/vnd\.docker\.raw-stream(?:\s*;|$)/i;
+const MULTIPLEXED_STREAM_TYPE = /^application\/vnd\.docker\.multiplexed-stream(?:\s*;|$)/i;
+const DEFAULT_DETACH_KEYS = 'ctrl-p,ctrl-q';
+const MAX_TERMINAL_DIMENSION = 65_535;
+const EXEC_HANDSHAKE_LIMIT = 64 * 1024;
+const MAX_EXEC_FRAME_BYTES = 8 * 1024;
+const EXEC_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+const EXEC_USER = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/u;
 const TAR_TYPES = Object.freeze([
     /^application\/x-tar(?:\s*;|$)/i,
     /^application\/octet-stream(?:\s*;|$)/i,
@@ -82,6 +90,21 @@ const MUTATION_PHASES = new Set([
 export const PODMAN_V6_SOURCE_CLOSURE = Object.freeze({
     version: '6.0.2',
     commit: 'b28edb9ad70ce4317dc762ee9ce0a6d081d154e9',
+    archiveSha256: '0895a541aeb7aa8e99133ed2b328c1bb40fd397b7c3b01e083396c90e8628756',
+    execSources: Object.freeze([
+        'pkg/api/server/register_exec.go',
+        'pkg/api/handlers/compat/exec.go',
+        'libpod/container_exec.go',
+        'libpod/oci_conmon_attach_common.go',
+        'libpod/oci_conmon_exec_common.go',
+        'libpod/oci_conmon_exec_linux.go',
+        'libpod/define/container_inspect.go',
+        'pkg/bindings/containers/exec.go',
+        'pkg/bindings/containers/attach.go',
+        'pkg/bindings/containers/types.go',
+        'pkg/bindings/containers/types_execstartandattach_options.go',
+        'pkg/bindings/containers/types_resizeexectty_options.go',
+    ]),
     containers: Object.freeze({
         list: 'List(all=true,sync=false,size=false,namespace=false) skips Container.Sync()',
         create: 'CreateContainer -> CompleteSpec -> MakeContainer -> ExecuteCreate; pull-free raw image, explicit standalone podman network, no pod/dependencies/auto-remove/anonymous image volumes',
@@ -90,10 +113,12 @@ export const PODMAN_V6_SOURCE_CLOSURE = Object.freeze({
         remove: 'Remove(depend=false,force=false,ignore=false,timeout=<bounded>,volumes=false) after stopped proof and followed by sync=false absence proof',
     }),
     exec: Object.freeze({
-        create: 'LookupContainer(exact full ID) -> ExecCreate; sync is confined to the exact selected container',
-        start: 'GetExecSessionContainer(exact client-created session) -> ExecHTTPStartAndAttach; target-only sync and bounded upgraded stream',
-        inspect: 'GetExecSessionContainer(exact client-created session) -> ExecSession.Inspect; no container Inspect()',
-        remove: 'GetExecSessionContainer(exact client-created session) -> ExecRemove(force=false); target-only sync',
+        create: 'LookupContainer(canonical full ID plus URL-encoded trailing SQL-LIKE sentinel %25) -> ExecCreate; the sentinel selects only the 64-hex ID and cannot equal a source-valid name; sync is confined to the exact selected container',
+        start: 'GetExecSessionContainer(exact preflight-bound client-created session) -> ExecHTTPStartAndAttach -> ContainerExecStartAndAttach; lookup returns the session-owning container and only that container is locked/synced before the bounded upgraded stream',
+        resize: 'GetExecSessionContainer(exact live bound session) -> ExecResize -> ContainerExecResize with positive uint16 h/w and running=false; lookup returns and syncs only the session-owning container',
+        inspect: 'GetExecSessionContainer(exact client-created session) -> ExecSession.Inspect; exact session/container binding without container Inspect(), and lookup returns/syncs only the session-owning container',
+        remove: 'GetExecSessionContainer(exact client-created session) -> ExecRemove(force=false) -> ContainerExecRemove; lookup returns and syncs only the session-owning container',
+        detach: 'v6.0.2 server detach parsing is read-fragment-sensitive, so the client recognizes the exact local key sequence and accepts detach only after exact Running=true inspection',
     }),
     archive: Object.freeze({
         put: 'LookupContainer(exact full ID) -> CopyFromArchive; mount/sync is confined to the journal-owned target and its immutable named volumes',
@@ -252,15 +277,21 @@ function defaultUnixHttpRequest({
     body,
     timeoutMs,
     maxResponseBytes,
+    signal,
 }) {
     assertSelectedUnixSocket(socketPath);
     return new Promise((resolve, reject) => {
         let settled = false;
         let deadlineTimer;
+        let abortListener;
+        const cleanup = () => {
+            clearTimeout(deadlineTimer);
+            if (abortListener && signal) signal.removeEventListener('abort', abortListener);
+        };
         const fail = (error) => {
             if (settled) return;
             settled = true;
-            clearTimeout(deadlineTimer);
+            cleanup();
             reject(error instanceof PloinkyBoxError
                 ? error
                 : hostError('Podman host Unix-socket request failed', 'PLOINKY_BOX_HOST_REQUEST_FAILED', error));
@@ -289,7 +320,7 @@ function defaultUnixHttpRequest({
             response.once('end', () => {
                 if (settled) return;
                 settled = true;
-                clearTimeout(deadlineTimer);
+                cleanup();
                 resolve({
                     statusCode: response.statusCode,
                     headers: response.headers,
@@ -306,31 +337,256 @@ function defaultUnixHttpRequest({
             `Podman host request timed out at its overall deadline of ${timeoutMs}ms`,
             'PLOINKY_BOX_HOST_TIMEOUT',
         )), timeoutMs);
-        if (body.length > 0) request.write(body);
-        request.end();
+        if (signal) {
+            abortListener = () => {
+                const error = hostError(
+                    'Podman host request was cancelled by its caller',
+                    'PLOINKY_BOX_HOST_CANCELLED',
+                    signal.reason,
+                );
+                request.destroy(error);
+                fail(error);
+            };
+            signal.addEventListener('abort', abortListener, { once: true });
+            if (signal.aborted) abortListener();
+        }
+        if (!settled) {
+            if (body.length > 0) request.write(body);
+            request.end();
+        }
     });
 }
 
-function defaultUnixHttpUpgrade({
+function execUser(value) {
+    const user = boundedString(value, 'exec user', { maxBytes: 1024 });
+    if (!EXEC_USER.test(user) || user.toLowerCase() === 'root') {
+        throw hostError(
+            'Podman host exec user must be explicitly non-privileged',
+            'PLOINKY_BOX_HOST_INPUT_INVALID',
+        );
+    }
+    return user;
+}
+
+function execCommand(value) {
+    if (!Array.isArray(value) || value.length === 0 || value.length > 1024) {
+        throw hostError(
+            'Podman host exec argv must be one non-empty bounded string array',
+            'PLOINKY_BOX_HOST_INPUT_INVALID',
+        );
+    }
+    return value.map((entry, index) => boundedString(
+        entry,
+        `exec argv[${index}]`,
+        { allowEmpty: index > 0 },
+    ));
+}
+
+function terminalDimension(value, label, { tty }) {
+    if (!tty && (value === undefined || value === null || value === 0)) return 0;
+    return boundedInteger(value, label, { minimum: 1, maximum: MAX_TERMINAL_DIMENSION });
+}
+
+function detachBytes(value, { tty }) {
+    if (!tty && (value === '' || value === undefined || value === null)) return Buffer.alloc(0);
+    if (value !== DEFAULT_DETACH_KEYS) {
+        throw hostError(
+            `Podman host exec detach keys must be exactly ${DEFAULT_DETACH_KEYS}`,
+            'PLOINKY_BOX_HOST_INPUT_INVALID',
+        );
+    }
+    return Buffer.from([0x10, 0x11]);
+}
+
+function inputBuffer(value) {
+    if (value === undefined || value === null) return null;
+    if (Buffer.isBuffer(value)) return Buffer.from(value);
+    if (value instanceof Uint8Array) return Buffer.from(value);
+    if (typeof value === 'string') return Buffer.from(value);
+    return null;
+}
+
+async function writeSocket(socket, bytes) {
+    if (bytes.length === 0) return;
+    if (!socket.write(bytes)) {
+        await new Promise((resolve, reject) => {
+            const cleanup = () => {
+                socket.off('drain', onDrain);
+                socket.off('error', onError);
+                socket.off('close', onClose);
+            };
+            const onDrain = () => {
+                cleanup();
+                resolve();
+            };
+            const onError = (error) => {
+                cleanup();
+                reject(error);
+            };
+            const onClose = () => {
+                cleanup();
+                reject(hostError('Podman host exec stdin closed before backpressure drained'));
+            };
+            socket.once('drain', onDrain);
+            socket.once('error', onError);
+            socket.once('close', onClose);
+        });
+    }
+}
+
+async function writeSink(sink, bytes) {
+    if (bytes.length === 0 || !sink) return;
+    if (typeof sink.write !== 'function') {
+        throw hostError('Podman host exec output sink is invalid', 'PLOINKY_BOX_HOST_INPUT_INVALID');
+    }
+    if (!sink.write(bytes)) {
+        if (typeof sink.once !== 'function') {
+            throw hostError(
+                'Podman host exec output sink cannot report bounded backpressure settlement',
+                'PLOINKY_BOX_HOST_INPUT_INVALID',
+            );
+        }
+        await new Promise((resolve, reject) => {
+            const cleanup = () => {
+                sink.off?.('drain', onDrain);
+                sink.off?.('error', onError);
+                sink.off?.('close', onClose);
+            };
+            const onDrain = () => {
+                cleanup();
+                resolve();
+            };
+            const onError = (error) => {
+                cleanup();
+                reject(error);
+            };
+            const onClose = () => {
+                cleanup();
+                reject(hostError('Podman host exec output sink closed before backpressure drained'));
+            };
+            sink.once('drain', onDrain);
+            sink.once('error', onError);
+            sink.once('close', onClose);
+        });
+    }
+}
+
+function createOutputDecoder({ tty, stdout, stderr, maxOutputBytes, activity }) {
+    let total = 0;
+    let pending = Buffer.alloc(0);
+    const account = (size) => {
+        total += size;
+        if (total > maxOutputBytes) {
+            throw hostError(
+                'Podman host exec output exceeded its response limit',
+                'PLOINKY_BOX_HOST_RESPONSE_TOO_LARGE',
+            );
+        }
+        activity();
+    };
+    return Object.freeze({
+        async push(value) {
+            const chunk = Buffer.from(value);
+            if (tty) {
+                account(chunk.length);
+                await writeSink(stdout, chunk);
+                return;
+            }
+            if (chunk.length > 0) pending = Buffer.concat([pending, chunk]);
+            while (pending.length >= 8) {
+                const stream = pending[0];
+                if (![1, 2].includes(stream)
+                    || pending[1] !== 0 || pending[2] !== 0 || pending[3] !== 0) {
+                    throw hostError('Podman host exec returned an invalid multiplex frame');
+                }
+                const size = pending.readUInt32BE(4);
+                if (size > MAX_EXEC_FRAME_BYTES) {
+                    throw hostError(
+                        'Podman host exec returned an oversized multiplex frame',
+                        'PLOINKY_BOX_HOST_RESPONSE_TOO_LARGE',
+                    );
+                }
+                if (size > maxOutputBytes - total) {
+                    throw hostError(
+                        'Podman host exec output exceeded its response limit',
+                        'PLOINKY_BOX_HOST_RESPONSE_TOO_LARGE',
+                    );
+                }
+                if (pending.length < 8 + size) return;
+                const payload = pending.subarray(8, 8 + size);
+                pending = pending.subarray(8 + size);
+                account(size);
+                await writeSink(stream === 1 ? stdout : stderr, payload);
+            }
+            if (pending.length > maxOutputBytes + 8) {
+                throw hostError(
+                    'Podman host exec output exceeded its response limit',
+                    'PLOINKY_BOX_HOST_RESPONSE_TOO_LARGE',
+                );
+            }
+        },
+        finish() {
+            if (!tty && pending.length !== 0) {
+                throw hostError('Podman host exec returned a truncated multiplex frame');
+            }
+            return total;
+        },
+    });
+}
+
+function defaultUnixHttpDuplex({
     socketPath,
     method,
     path: requestPath,
     headers,
     body,
     timeoutMs,
-    maxResponseBytes,
+    inactivityTimeoutMs,
+    maxOutputBytes,
+    maxInputBytes,
+    maxHandshakeBytes = EXEC_HANDSHAKE_LIMIT,
+    tty,
+    stdin,
+    stdout,
+    stderr,
+    detachSequence,
+    signal,
+    onUpgraded,
 }) {
     assertSelectedUnixSocket(socketPath);
     return new Promise((resolve, reject) => {
         let settled = false;
-        let timer;
-        const fail = (error) => {
+        let upgradedSocket = null;
+        let overallTimer = null;
+        let inactivityTimer = null;
+        let signalListener = null;
+        let localDetach = false;
+
+        const cleanup = () => {
+            clearTimeout(overallTimer);
+            clearTimeout(inactivityTimer);
+            if (signalListener && signal) signal.removeEventListener('abort', signalListener);
+        };
+        const settle = (error, result) => {
             if (settled) return;
             settled = true;
-            clearTimeout(timer);
-            reject(error instanceof PloinkyBoxError
+            cleanup();
+            if (error) reject(error instanceof PloinkyBoxError
                 ? error
-                : hostError('Podman host upgraded request failed', 'PLOINKY_BOX_HOST_REQUEST_FAILED', error));
+                : hostError('Podman host upgraded exec request failed', 'PLOINKY_BOX_HOST_REQUEST_FAILED', error));
+            else resolve(result);
+        };
+        const fail = (error) => {
+            upgradedSocket?.destroy();
+            request.destroy();
+            settle(error);
+        };
+        const resetInactivity = () => {
+            clearTimeout(inactivityTimer);
+            inactivityTimer = setTimeout(() => fail(hostError(
+                `Podman host exec stream was inactive for ${inactivityTimeoutMs}ms`,
+                'PLOINKY_BOX_HOST_TIMEOUT',
+            )), inactivityTimeoutMs);
         };
         const request = http.request({
             socketPath,
@@ -339,55 +595,189 @@ function defaultUnixHttpUpgrade({
             path: requestPath,
             headers,
         });
+
         request.once('response', (response) => {
-            response.resume();
-            fail(hostError(`Podman host exec attach returned HTTP ${response.statusCode}, not 101 Upgrade`));
-        });
-        request.once('upgrade', (response, socket, head) => {
             const chunks = [];
             let total = 0;
-            const append = (chunk) => {
+            response.on('data', (chunk) => {
                 total += chunk.length;
-                if (total > maxResponseBytes) {
-                    socket.destroy(hostError(
-                        'Podman host exec output exceeded its response limit',
+                if (total > maxHandshakeBytes) {
+                    response.destroy(hostError(
+                        'Podman host exec upgrade error body exceeded its response limit',
                         'PLOINKY_BOX_HOST_RESPONSE_TOO_LARGE',
                     ));
                     return;
                 }
                 chunks.push(chunk);
-            };
-            if (head.length > 0) append(head);
-            socket.on('data', append);
-            socket.once('error', fail);
-            socket.once('end', () => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                resolve({
-                    statusCode: response.statusCode,
-                    headers: response.headers,
-                    body: Buffer.concat(chunks, total),
-                });
             });
-            socket.once('close', () => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                resolve({
-                    statusCode: response.statusCode,
-                    headers: response.headers,
-                    body: Buffer.concat(chunks, total),
-                });
-            });
+            response.once('error', (error) => settle(error));
+            response.once('end', () => settle(hostError(
+                `Podman host exec attach returned HTTP ${response.statusCode}, not 101 Upgrade: ${Buffer.concat(chunks, total).toString('utf8')}`,
+            )));
         });
-        request.once('error', fail);
-        timer = setTimeout(() => request.destroy(hostError(
-            `Podman host exec attach timed out after ${timeoutMs}ms`,
+        request.once('upgrade', (response, socket, head) => {
+            upgradedSocket = socket;
+            try {
+                if (response.statusCode !== 101
+                    || !/^upgrade$/i.test(header(response.headers, 'connection').trim())
+                    || !/^tcp$/i.test(header(response.headers, 'upgrade').trim())
+                    || !(tty ? RAW_STREAM_TYPE : MULTIPLEXED_STREAM_TYPE)
+                        .test(header(response.headers, 'content-type'))) {
+                    throw hostError('Podman host exec attach returned an invalid upgrade response');
+                }
+            } catch (error) {
+                fail(error);
+                return;
+            }
+
+            resetInactivity();
+            const decoder = createOutputDecoder({
+                tty,
+                stdout,
+                stderr,
+                maxOutputBytes,
+                activity: resetInactivity,
+            });
+
+            const consume = (async () => {
+                try {
+                    if (head.length > 0) await decoder.push(head);
+                    for await (const chunk of socket) await decoder.push(chunk);
+                    decoder.finish();
+                } catch (error) {
+                    if (!localDetach) throw error;
+                }
+            })();
+
+            const pump = new Promise((pumpResolve, pumpReject) => {
+                let inputBytes = 0;
+                let detachOffset = 0;
+                let pending = [];
+                let queue = Promise.resolve();
+                let inputDone = false;
+                const buffered = inputBuffer(stdin);
+                const stream = buffered === null ? stdin : null;
+                const detach = Buffer.from(detachSequence || Buffer.alloc(0));
+
+                const flushPending = async () => {
+                    if (pending.length > 0) {
+                        await writeSocket(socket, Buffer.from(pending));
+                        pending = [];
+                    }
+                    detachOffset = 0;
+                };
+                const send = async (value) => {
+                    const size = Buffer.byteLength(value);
+                    if (size > maxInputBytes - inputBytes) {
+                        throw hostError(
+                            'Podman host exec stdin exceeded its input limit',
+                            'PLOINKY_BOX_HOST_INPUT_INVALID',
+                        );
+                    }
+                    const bytes = Buffer.from(value);
+                    inputBytes += size;
+                    resetInactivity();
+                    if (detach.length === 0) {
+                        await writeSocket(socket, bytes);
+                        return;
+                    }
+                    for (const byte of bytes) {
+                        if (byte === detach[detachOffset]) {
+                            pending.push(byte);
+                            detachOffset += 1;
+                            if (detachOffset === detach.length) {
+                                localDetach = true;
+                                pending = [];
+                                socket.destroy();
+                                return;
+                            }
+                            continue;
+                        }
+                        await flushPending();
+                        if (byte === detach[0]) {
+                            pending.push(byte);
+                            detachOffset = 1;
+                        } else {
+                            await writeSocket(socket, Buffer.of(byte));
+                        }
+                    }
+                };
+                const finishInput = async () => {
+                    if (inputDone || localDetach) return;
+                    inputDone = true;
+                    await flushPending();
+                    socket.end();
+                };
+                const closePump = () => {
+                    stream?.off?.('data', onData);
+                    stream?.off?.('end', onEnd);
+                    stream?.off?.('error', onError);
+                    pumpResolve();
+                };
+                const onData = (chunk) => {
+                    stream.pause?.();
+                    queue = queue.then(() => send(chunk)).then(() => {
+                        if (!localDetach) stream.resume?.();
+                    });
+                    queue.catch(pumpReject);
+                };
+                const onEnd = () => {
+                    queue = queue.then(finishInput);
+                    queue.then(closePump, pumpReject);
+                };
+                const onError = (error) => pumpReject(error);
+                socket.once('close', closePump);
+
+                if (buffered !== null) {
+                    queue = queue.then(() => send(buffered)).then(finishInput);
+                    queue.then(closePump, pumpReject);
+                } else if (!stream) {
+                    queue = queue.then(finishInput);
+                    queue.then(closePump, pumpReject);
+                } else if (typeof stream.on !== 'function') {
+                    pumpReject(hostError(
+                        'Podman host exec stdin is not a supported bounded stream',
+                        'PLOINKY_BOX_HOST_INPUT_INVALID',
+                    ));
+                } else {
+                    stream.on('data', onData);
+                    stream.once('end', onEnd);
+                    stream.once('error', onError);
+                    stream.resume?.();
+                }
+            });
+
+            try {
+                onUpgraded?.();
+            } catch (error) {
+                fail(error);
+                return;
+            }
+            Promise.all([consume, pump]).then(() => settle(null, {
+                statusCode: response.statusCode,
+                headers: response.headers,
+                detached: localDetach,
+            }), fail);
+        });
+        request.once('error', (error) => settle(error));
+        request.setTimeout(timeoutMs, () => fail(hostError(
+            `Podman host exec upgrade handshake timed out after ${timeoutMs}ms`,
+            'PLOINKY_BOX_HOST_TIMEOUT',
+        )));
+        overallTimer = setTimeout(() => fail(hostError(
+            `Podman host exec stream timed out at its overall deadline of ${timeoutMs}ms`,
             'PLOINKY_BOX_HOST_TIMEOUT',
         )), timeoutMs);
-        if (body.length > 0) request.write(body);
-        request.end();
+        if (signal) {
+            signalListener = () => fail(hostError(
+                'Podman host exec stream was cancelled by its caller',
+                'PLOINKY_BOX_HOST_CANCELLED',
+                signal.reason,
+            ));
+            signal.addEventListener('abort', signalListener, { once: true });
+            if (signal.aborted) signalListener();
+        }
+        if (!settled) request.end(body);
     });
 }
 
@@ -862,37 +1252,60 @@ function validateJournalContainerRecord(record, proof) {
     return record;
 }
 
-function decodeDockerMultiplexed(body, maxOutputBytes) {
-    let offset = 0;
-    let outputBytes = 0;
-    const stdout = [];
-    const stderr = [];
-    while (offset < body.length) {
-        if (body.length - offset < 8) throw hostError('Podman host exec returned a truncated multiplex frame');
-        const stream = body[offset];
-        if (![1, 2].includes(stream) || body[offset + 1] !== 0 || body[offset + 2] !== 0 || body[offset + 3] !== 0) {
-            throw hostError('Podman host exec returned an invalid multiplex frame');
-        }
-        const size = body.readUInt32BE(offset + 4);
-        offset += 8;
-        if (size > body.length - offset) throw hostError('Podman host exec returned a truncated multiplex payload');
-        outputBytes += size;
-        if (outputBytes > maxOutputBytes) {
-            throw hostError('Podman host exec output exceeded its response limit', 'PLOINKY_BOX_HOST_RESPONSE_TOO_LARGE');
-        }
-        const payload = body.subarray(offset, offset + size);
-        (stream === 1 ? stdout : stderr).push(payload);
-        offset += size;
+function execLookupResource(containerId) {
+    // Gorilla preserves `%25`; GetName decodes it once to `%`. Podman v6.0.2
+    // then queries Name='<id>%' OR ID LIKE '<id>%%'. Canonical IDs are exactly
+    // 64 hex characters and `%` is forbidden by the libpod name grammar, so the
+    // token cannot be captured by the exact-name precedence in LookupContainer.
+    return `/containers/${fullId(containerId)}%25/exec`;
+}
+
+function validateExecInspection(value, {
+    sessionId,
+    containerId,
+    command,
+    user,
+    tty,
+    attachStdin,
+    phase,
+}) {
+    if (!exactObject(value)
+        || value.ID !== sessionId
+        || value.ContainerID !== containerId
+        || typeof value.Running !== 'boolean'
+        || !Number.isSafeInteger(value.ExitCode)
+        || !Number.isSafeInteger(value.Pid)
+        || typeof value.CanRemove !== 'boolean'
+        || value.OpenStdin !== attachStdin
+        || value.OpenStdout !== true
+        || value.OpenStderr !== true
+        || !exactObject(value.ProcessConfig)
+        || value.ProcessConfig.entrypoint !== command[0]
+        || (command.length === 1
+            ? value.ProcessConfig.arguments !== null
+            : (!Array.isArray(value.ProcessConfig.arguments)
+                || JSON.stringify(value.ProcessConfig.arguments) !== JSON.stringify(command.slice(1))))
+        || value.ProcessConfig.privileged !== false
+        || value.ProcessConfig.tty !== tty
+        || value.ProcessConfig.user !== user) {
+        throw hostError(`Podman host exec ${phase} inspection did not prove the exact session binding`);
     }
-    return {
-        stdout: Buffer.concat(stdout).toString('utf8'),
-        stderr: Buffer.concat(stderr).toString('utf8'),
-    };
+    return value;
+}
+
+function collectingSink(chunks) {
+    return Object.freeze({
+        write(value) {
+            chunks.push(Buffer.from(value));
+            return true;
+        },
+    });
 }
 
 export class PodmanHostClient {
     #requestImpl;
-    #upgradeImpl;
+    #duplexImpl;
+    #execEvidenceStore;
     #streamImpl;
     #putFileArchiveImpl;
 
@@ -909,7 +1322,8 @@ export class PodmanHostClient {
         maxRequestBytes = 32 * 1024 * 1024,
         maxArchiveBytes = 2 ** 31 - 1,
         requestImpl = defaultUnixHttpRequest,
-        upgradeImpl = defaultUnixHttpUpgrade,
+        duplexImpl = defaultUnixHttpDuplex,
+        execEvidenceStore = null,
         streamImpl = defaultUnixHttpStreamToFile,
         putFileArchiveImpl = defaultUnixHttpPutFileArchive,
     } = {}) {
@@ -932,13 +1346,21 @@ export class PodmanHostClient {
         this.maxRequestBytes = boundedInteger(maxRequestBytes, 'request limit', { minimum: 1, maximum: 2 ** 31 - 1 });
         this.maxArchiveBytes = boundedInteger(maxArchiveBytes, 'archive response limit', { minimum: 1, maximum: 2 ** 31 - 1 });
         if (typeof requestImpl !== 'function'
-            || typeof upgradeImpl !== 'function'
+            || typeof duplexImpl !== 'function'
             || typeof streamImpl !== 'function'
             || typeof putFileArchiveImpl !== 'function') {
             throw hostError('Podman host transport implementations must be functions');
         }
+        if (execEvidenceStore !== null
+            && (!exactObject(execEvidenceStore)
+                || ['begin', 'created', 'retain', 'removed'].some((name) => (
+                    typeof execEvidenceStore[name] !== 'function'
+                )))) {
+            throw hostError('Podman host exec evidence store is invalid');
+        }
         this.#requestImpl = requestImpl;
-        this.#upgradeImpl = upgradeImpl;
+        this.#duplexImpl = duplexImpl;
+        this.#execEvidenceStore = execEvidenceStore;
         this.#streamImpl = streamImpl;
         this.#putFileArchiveImpl = putFileArchiveImpl;
         this.identity = freeze({
@@ -963,6 +1385,8 @@ export class PodmanHostClient {
         body = Buffer.alloc(0),
         contentType,
         maxResponseBytes = this.maxResponseBytes,
+        timeoutMs = this.timeoutMs,
+        signal,
     } = {}) {
         if (!Buffer.isBuffer(body) || body.length > this.maxRequestBytes) {
             throw hostError('Podman host request body exceeded its request limit');
@@ -978,17 +1402,19 @@ export class PodmanHostClient {
             path: this.#apiPath(resource),
             headers,
             body,
-            timeoutMs: this.timeoutMs,
+            timeoutMs,
             maxResponseBytes,
+            signal,
         });
         return validateTransportResult(result, maxResponseBytes);
     }
 
-    async #requestJson(method, resource, body, status, label) {
+    async #requestJson(method, resource, body, status, label, options = {}) {
         const encoded = body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body));
         return parseJsonResponse(await this.#request(method, resource, {
             body: encoded,
             contentType: body === undefined ? undefined : 'application/json',
+            ...options,
         }), status, label);
     }
 
@@ -1106,6 +1532,344 @@ export class PodmanHostClient {
         return freeze({ removed: true, id: proof.id, absent: true });
     }
 
+    async #execSession({
+        id, argv, user, workdir, env, stdin, stdout, stderr, tty,
+        detachKeys, rows, columns, signal, timeoutMs, inactivityTimeoutMs,
+        maxOutputBytes, journal, onSession,
+    }) {
+        const proof = journalProof(this, journal, id, 'exec');
+        const inventory = await this.listContainers();
+        const matches = inventory.filter((entry) => entry.Id === proof.id);
+        if (matches.length !== 1) {
+            throw hostError('Podman host exec target is absent or ambiguous');
+        }
+        validateJournalContainerRecord(matches[0], proof);
+        if (String(matches[0].State).toLowerCase() !== 'running') {
+            throw hostError('Podman host exec target is not proven running');
+        }
+        for (const entry of inventory) {
+            for (const observed of entry.Names) {
+                const name = observed.replace(/^\//u, '');
+                if (name.includes('%')) {
+                    throw hostError('Podman host exec inventory contains a source-invalid container name');
+                }
+                if (entry.Id !== proof.id && name === proof.id) {
+                    throw hostError('Podman host exec target ID is shadowed by a foreign exact container name');
+                }
+            }
+        }
+        const command = execCommand(argv);
+        const selectedUser = execUser(user);
+        const execWorkdir = boundedString(workdir, 'exec working directory');
+        if (!path.posix.isAbsolute(execWorkdir)) throw hostError('Podman host exec working directory must be absolute');
+        const environment = stringMap(env, 'exec environment');
+        if (Object.keys(environment).some((key) => !EXEC_ENV_KEY.test(key))) {
+            throw hostError(
+                'Podman host exec environment contains an invalid variable name',
+                'PLOINKY_BOX_HOST_INPUT_INVALID',
+            );
+        }
+        if (typeof tty !== 'boolean') {
+            throw hostError('Podman host exec TTY selection must be explicit', 'PLOINKY_BOX_HOST_INPUT_INVALID');
+        }
+        const execTimeout = boundedInteger(timeoutMs, 'exec timeout', { minimum: 1, maximum: 1_800_000 });
+        const inactivity = boundedInteger(inactivityTimeoutMs, 'exec inactivity timeout', {
+            minimum: 1,
+            maximum: execTimeout,
+        });
+        const outputLimit = boundedInteger(maxOutputBytes, 'exec output limit', { minimum: 1, maximum: 512 * 1024 * 1024 });
+        const initialRows = terminalDimension(rows, 'exec terminal height', { tty });
+        const initialColumns = terminalDimension(columns, 'exec terminal width', { tty });
+        const detachSequence = detachBytes(detachKeys, { tty });
+        const attachStdin = stdin !== undefined && stdin !== null;
+        if ((Buffer.isBuffer(stdin) || stdin instanceof Uint8Array || typeof stdin === 'string')
+            && Buffer.byteLength(stdin) > this.maxRequestBytes) {
+            throw hostError(
+                'Podman host exec stdin exceeded its input limit',
+                'PLOINKY_BOX_HOST_INPUT_INVALID',
+            );
+        }
+        const bufferedInput = inputBuffer(stdin);
+        if (attachStdin && bufferedInput === null && typeof stdin?.on !== 'function') {
+            throw hostError(
+                'Podman host exec stdin is not a supported bounded stream',
+                'PLOINKY_BOX_HOST_INPUT_INVALID',
+            );
+        }
+        if (!stdout || typeof stdout.write !== 'function'
+            || !stderr || typeof stderr.write !== 'function') {
+            throw hostError(
+                'Podman host exec requires bounded stdout and stderr sinks',
+                'PLOINKY_BOX_HOST_INPUT_INVALID',
+            );
+        }
+        if (tty && (!attachStdin || !stdout || !stderr)) {
+            throw hostError('Podman host interactive exec requires stdin/stdout/stderr streams');
+        }
+        if (signal !== undefined && signal !== null
+            && typeof signal.addEventListener !== 'function') {
+            throw hostError('Podman host exec caller cancellation signal is invalid');
+        }
+        if (onSession !== undefined && onSession !== null && typeof onSession !== 'function') {
+            throw hostError('Podman host exec session observer is invalid');
+        }
+        const deadline = Date.now() + execTimeout;
+        const remaining = () => {
+            const value = deadline - Date.now();
+            if (value < 1) {
+                throw hostError(
+                    `Podman host exec timed out at its overall deadline of ${execTimeout}ms`,
+                    'PLOINKY_BOX_HOST_TIMEOUT',
+                );
+            }
+            return value;
+        };
+        const requestOptions = () => ({
+            timeoutMs: Math.min(this.timeoutMs, remaining()),
+            signal,
+        });
+        const createSpec = {
+            AttachStdin: attachStdin,
+            AttachStdout: true,
+            AttachStderr: true,
+            DetachKeys: tty ? detachKeys : '',
+            Tty: tty,
+            Env: Object.entries(environment).map(([key, value]) => `${key}=${value}`),
+            Cmd: command,
+            Privileged: false,
+            User: selectedUser,
+            WorkingDir: execWorkdir,
+        };
+        const evidenceBinding = freeze({
+            connectionIdentity: this.identity.connectionIdentity,
+            containerId: proof.id,
+            engineIdentity: this.identity.engineIdentity,
+            generation: journal.transaction.generation,
+        });
+        const attemptId = randomBytes(32).toString('hex');
+        const createdAt = Date.now();
+        const commandHash = createHash('sha256').update(JSON.stringify({
+            containerId: proof.id,
+            createSpec,
+        })).digest('hex');
+        let sessionId = null;
+        if (this.#execEvidenceStore) {
+            await this.#execEvidenceStore.begin(evidenceBinding, {
+                attemptId,
+                commandHash,
+                createdAt,
+                tty,
+            });
+        }
+        try {
+            const created = await this.#requestJson(
+                'POST',
+                execLookupResource(proof.id),
+                createSpec,
+                201,
+                'exec create',
+                requestOptions(),
+            );
+            if (!exactKeys(created, ['Id'])) throw hostError('Podman host exec create returned an invalid schema');
+            sessionId = fullId(created.Id, 'exec session ID');
+            if (this.#execEvidenceStore) {
+                await this.#execEvidenceStore.created(evidenceBinding, {
+                    attemptId,
+                    sessionId,
+                    updatedAt: Date.now(),
+                });
+            }
+            const preflight = validateExecInspection(await this.#requestJson(
+                'GET',
+                `/exec/${sessionId}/json`,
+                undefined,
+                200,
+                'exec pre-start inspect',
+                requestOptions(),
+            ), {
+                sessionId,
+                containerId: proof.id,
+                command,
+                user: selectedUser,
+                tty,
+                attachStdin,
+                phase: 'pre-start',
+            });
+            if (preflight.Running !== false
+                || preflight.ExitCode !== 0
+                || preflight.Pid !== 0
+                || preflight.CanRemove !== false) {
+                throw hostError('Podman host exec pre-start inspection returned an invalid Created state');
+            }
+            let live = false;
+            let streamSettled = false;
+            const resizeOperations = new Set();
+            const controller = Object.freeze({
+                sessionId,
+                resize: (height, width) => {
+                    if (!tty || !live || streamSettled) {
+                        throw hostError('Podman host exec resize requires the exact live TTY session');
+                    }
+                    const operation = (async () => {
+                    const selectedHeight = terminalDimension(height, 'exec resize height', { tty: true });
+                    const selectedWidth = terminalDimension(width, 'exec resize width', { tty: true });
+                    const inspected = validateExecInspection(await this.#requestJson(
+                        'GET',
+                        `/exec/${sessionId}/json`,
+                        undefined,
+                        200,
+                        'exec resize inspect',
+                        requestOptions(),
+                    ), {
+                        sessionId,
+                        containerId: proof.id,
+                        command,
+                        user: selectedUser,
+                        tty,
+                        attachStdin,
+                        phase: 'resize',
+                    });
+                    if (!inspected.Running || inspected.CanRemove) {
+                        throw hostError('Podman host exec resize did not prove the exact session live');
+                    }
+                    if (!live || streamSettled) {
+                        throw hostError('Podman host exec resize raced with stream settlement');
+                    }
+                    const resized = await this.#request(
+                        'POST',
+                        `/exec/${sessionId}/resize?h=${selectedHeight}&w=${selectedWidth}&running=false`,
+                        requestOptions(),
+                    );
+                    requireEmptyResponse(resized, 201, 'exec resize');
+                    return freeze({ rows: selectedHeight, columns: selectedWidth });
+                    })();
+                    resizeOperations.add(operation);
+                    operation.finally(() => resizeOperations.delete(operation)).catch(() => {});
+                    return operation;
+                },
+            });
+
+            try {
+                const body = Buffer.from(JSON.stringify({
+                Detach: false,
+                Tty: tty,
+                h: initialRows,
+                w: initialColumns,
+            }));
+            const upgraded = await this.#duplexImpl({
+                socketPath: this.identity.socketPath,
+                method: 'POST',
+                path: this.#apiPath(`/exec/${sessionId}/start`),
+                headers: {
+                    Accept: tty
+                        ? 'application/vnd.docker.raw-stream'
+                        : 'application/vnd.docker.multiplexed-stream',
+                    Connection: 'Upgrade',
+                    Upgrade: 'tcp',
+                    'Content-Type': 'application/json',
+                    'Content-Length': String(body.length),
+                },
+                body,
+                timeoutMs: remaining(),
+                inactivityTimeoutMs: Math.min(inactivity, remaining()),
+                maxOutputBytes: outputLimit,
+                maxInputBytes: this.maxRequestBytes,
+                maxHandshakeBytes: Math.min(EXEC_HANDSHAKE_LIMIT, this.maxResponseBytes),
+                tty,
+                stdin,
+                stdout,
+                stderr,
+                detachSequence,
+                signal,
+                onUpgraded: () => {
+                    live = true;
+                    onSession?.(controller);
+                },
+            });
+            streamSettled = true;
+            live = false;
+            if (resizeOperations.size > 0) {
+                await Promise.all([...resizeOperations]);
+            }
+            if (!exactObject(upgraded)
+                || upgraded.statusCode !== 101
+                || typeof upgraded.detached !== 'boolean') {
+                throw hostError('Podman host exec duplex transport returned an invalid settlement');
+            }
+            const inspected = validateExecInspection(await this.#requestJson(
+                'GET',
+                `/exec/${sessionId}/json`,
+                undefined,
+                200,
+                'exec final inspect',
+                requestOptions(),
+            ), {
+                sessionId,
+                containerId: proof.id,
+                command,
+                user: selectedUser,
+                tty,
+                attachStdin,
+                phase: 'final',
+            });
+            if (upgraded.detached) {
+                if (!inspected.Running || inspected.CanRemove) {
+                    throw hostError('Podman host exec detach did not prove the exact session still running');
+                }
+                if (this.#execEvidenceStore) {
+                    await this.#execEvidenceStore.retain(evidenceBinding, {
+                        attemptId,
+                        sessionId,
+                        state: 'detached',
+                        updatedAt: Date.now(),
+                    });
+                }
+                return freeze({ exitCode: 0, detached: true, sessionId });
+            }
+            if (inspected.Running || inspected.CanRemove !== true
+                || inspected.Pid !== 0
+                || inspected.ExitCode < 0 || inspected.ExitCode > 255) {
+                throw hostError('Podman host exec inspect did not prove the exact session completed');
+            }
+            const removed = await this.#request(
+                'POST',
+                `/exec/${sessionId}/remove`,
+                {
+                    body: Buffer.from('{"Force":false}'),
+                    contentType: 'application/json',
+                    ...requestOptions(),
+                },
+            );
+            requireEmptyResponse(removed, 200, 'exec remove');
+            if (this.#execEvidenceStore) {
+                await this.#execEvidenceStore.removed(evidenceBinding, {
+                    attemptId,
+                    sessionId,
+                });
+            }
+                return freeze({ exitCode: inspected.ExitCode, detached: false, sessionId });
+            } finally {
+                streamSettled = true;
+                live = false;
+            }
+        } catch (error) {
+            if (this.#execEvidenceStore) {
+                try {
+                    await this.#execEvidenceStore.retain(evidenceBinding, {
+                        attemptId,
+                        sessionId,
+                        state: 'ambiguous',
+                        updatedAt: Date.now(),
+                    });
+                } catch {
+                    // The earlier durable creating/created record is safer than
+                    // masking the transport failure with a second journal error.
+                }
+            }
+            throw error;
+        }
+    }
+
     async execContainer({
         id,
         argv,
@@ -1114,84 +1878,84 @@ export class PodmanHostClient {
         env = {},
         input,
         timeoutMs = this.timeoutMs,
+        inactivityTimeoutMs = Math.min(300_000, timeoutMs),
         maxOutputBytes = this.maxResponseBytes,
         journal,
+        signal,
     }) {
-        const proof = journalProof(this, journal, id, 'exec');
-        await this.#requireJournalTarget(proof, { running: true });
-        const command = stringArray(argv, 'exec argv', { allowEmpty: false, maxEntries: 1024 });
-        const execUser = boundedString(user, 'exec user', { maxBytes: 1024 });
-        const execWorkdir = boundedString(workdir, 'exec working directory');
-        if (!path.posix.isAbsolute(execWorkdir)) throw hostError('Podman host exec working directory must be absolute');
-        const environment = stringMap(env, 'exec environment');
-        if (input !== undefined && input !== null && Buffer.byteLength(input) !== 0) {
-            throw unsupported('exec stdin', 'does not have a bounded source-closed half-close protocol');
+        const stdout = [];
+        const stderr = [];
+        const result = await this.#execSession({
+            id,
+            argv,
+            user,
+            workdir,
+            env,
+            stdin: input,
+            stdout: collectingSink(stdout),
+            stderr: collectingSink(stderr),
+            tty: false,
+            detachKeys: '',
+            rows: 0,
+            columns: 0,
+            signal,
+            timeoutMs,
+            inactivityTimeoutMs,
+            maxOutputBytes,
+            journal,
+        });
+        return freeze({
+            stdout: Buffer.concat(stdout).toString('utf8'),
+            stderr: Buffer.concat(stderr).toString('utf8'),
+            exitCode: result.exitCode,
+            sessionId: result.sessionId,
+        });
+    }
+
+    async execContainerInteractive({
+        id,
+        argv,
+        user = 'podman',
+        workdir = '/workspace',
+        env = {},
+        journal,
+        tty = true,
+        detachKeys = DEFAULT_DETACH_KEYS,
+        rows,
+        columns,
+        stdin,
+        stdout,
+        stderr,
+        signal,
+        timeoutMs = this.timeoutMs,
+        inactivityTimeoutMs = Math.min(300_000, timeoutMs),
+        maxOutputBytes = this.maxResponseBytes,
+        onSession,
+    }) {
+        if (tty !== true) {
+            throw hostError('Podman host interactive exec requires TTY=true');
         }
-        const execTimeout = boundedInteger(timeoutMs, 'exec timeout', { minimum: 1, maximum: 1_800_000 });
-        const outputLimit = boundedInteger(maxOutputBytes, 'exec output limit', { minimum: 1, maximum: 512 * 1024 * 1024 });
-        const created = await this.#requestJson('POST', `/containers/${proof.id}/exec`, {
-            AttachStdin: false,
-            AttachStdout: true,
-            AttachStderr: true,
-            DetachKeys: '',
-            Tty: false,
-            Env: Object.entries(environment).map(([key, value]) => `${key}=${value}`),
-            Cmd: command,
-            Privileged: false,
-            User: execUser,
-            WorkingDir: execWorkdir,
-        }, 201, 'exec create');
-        if (!exactKeys(created, ['Id'])) throw hostError('Podman host exec create returned an invalid schema');
-        const sessionId = fullId(created.Id, 'exec session ID');
-        let completed = false;
-        try {
-            const body = Buffer.from(JSON.stringify({ Detach: false, Tty: false }));
-            const upgraded = validateTransportResult(await this.#upgradeImpl({
-                socketPath: this.identity.socketPath,
-                method: 'POST',
-                path: this.#apiPath(`/exec/${sessionId}/start`),
-                headers: {
-                    Accept: 'application/vnd.docker.multiplexed-stream',
-                    Connection: 'Upgrade',
-                    Upgrade: 'tcp',
-                    'Content-Type': 'application/json',
-                    'Content-Length': String(body.length),
-                },
-                body,
-                timeoutMs: execTimeout,
-                maxResponseBytes: Math.min(2 ** 31 - 1, outputLimit * 9 + 8),
-            }), Math.min(2 ** 31 - 1, outputLimit * 9 + 8));
-            if (upgraded.statusCode !== 101
-                || !/^tcp$/i.test(header(upgraded.headers, 'upgrade'))
-                || !/upgrade/i.test(header(upgraded.headers, 'connection'))
-                || !/^application\/vnd\.docker\.multiplexed-stream(?:\s*;|$)/i.test(header(upgraded.headers, 'content-type'))) {
-                throw hostError('Podman host exec attach returned an invalid upgrade response');
-            }
-            const output = decodeDockerMultiplexed(upgraded.body, outputLimit);
-            const inspected = await this.#requestJson('GET', `/exec/${sessionId}/json`, undefined, 200, 'exec inspect');
-            if (!exactObject(inspected)
-                || inspected.ID !== sessionId
-                || inspected.ContainerID !== proof.id
-                || typeof inspected.Running !== 'boolean'
-                || !Number.isSafeInteger(inspected.ExitCode)
-                || inspected.Running
-                || inspected.CanRemove !== true) {
-                throw hostError('Podman host exec inspect did not prove the exact session completed');
-            }
-            const removed = await this.#request(
-                'POST',
-                `/exec/${sessionId}/remove`,
-                { body: Buffer.from('{"Force":false}'), contentType: 'application/json' },
-            );
-            requireEmptyResponse(removed, 200, 'exec remove');
-            completed = true;
-            return freeze({ ...output, exitCode: inspected.ExitCode, sessionId });
-        } finally {
-            // A failed/ambiguous attached exec is deliberately not force-removed:
-            // Podman owns its bounded five-minute session cleanup, and killing an
-            // unproven session would violate exact actor containment.
-            void completed;
-        }
+        const result = await this.#execSession({
+            id,
+            argv,
+            user,
+            workdir,
+            env,
+            journal,
+            tty,
+            detachKeys,
+            rows,
+            columns,
+            stdin,
+            stdout,
+            stderr,
+            signal,
+            timeoutMs,
+            inactivityTimeoutMs,
+            maxOutputBytes,
+            onSession,
+        });
+        return freeze({ exitCode: result.exitCode, detached: result.detached });
     }
 
     async putArchive({ id, path: containerPath, body, journal }) {

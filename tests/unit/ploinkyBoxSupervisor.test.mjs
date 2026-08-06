@@ -332,6 +332,77 @@ test('prepare refuses absent, stopped, or uncommitted generations before direct 
     }
 });
 
+test('supervisor interactive execution passes only the prepared exact tuple to native exec', async () => {
+    const descriptor = releaseFixture();
+    const journal = committedJournal(descriptor);
+    const calls = [];
+    const stdin = { isTTY: true };
+    const stdout = { write() {} };
+    const stderr = { write() {} };
+    const signal = new AbortController().signal;
+    const hostClient = structuredClient({
+        async execContainerInteractive(request) {
+            calls.push(request);
+            return { exitCode: 23, detached: false };
+        },
+    });
+    const supervisor = createBoxSupervisor({
+        hostClient,
+        stdout: { write() { throw new Error('must use admitted stdout'); } },
+        stderr: { write() { throw new Error('must use admitted stderr'); } },
+    });
+    const result = await supervisor.executeInteractiveCommand({
+        containerId: CONTAINER_ID,
+        hostClient,
+        journal,
+        hostPort: descriptor.routerHostPort,
+        engine: { forbiddenCliSeam: true },
+    }, ['/opt/ploinky/bin/ploinky-local'], {
+        interactive: true,
+        tty: true,
+        stdin,
+        stdout,
+        stderr,
+        rows: 42,
+        columns: 132,
+        detachKeys: 'ctrl-p,ctrl-q',
+        signal,
+        timeoutMs: 12_345,
+        inactivityTimeoutMs: 2_345,
+        maxOutputBytes: 4_567,
+        onSession() {},
+    });
+    assert.deepEqual(result, { exitCode: 23, detached: false });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].id, CONTAINER_ID);
+    assert.equal(calls[0].journal, journal);
+    assert.equal(calls[0].stdin, stdin);
+    assert.equal(calls[0].stdout, stdout);
+    assert.equal(calls[0].stderr, stderr);
+    assert.equal(calls[0].signal, signal);
+    assert.deepEqual(calls[0].env, {
+        PLOINKY_ROUTER_HOST_PORT: String(descriptor.routerHostPort),
+    });
+    assert.equal(JSON.stringify(calls[0]).includes('forbiddenCliSeam'), false);
+});
+
+test('supervisor keeps non-interactive and interactive execution contracts separate', async () => {
+    const supervisor = createBoxSupervisor({ hostClient: structuredClient() });
+    const prepared = {
+        containerId: CONTAINER_ID,
+        hostClient: structuredClient(),
+        journal: committedJournal(releaseFixture()),
+        hostPort: 18081,
+    };
+    await assert.rejects(supervisor.executeCommand(prepared, [], {
+        interactive: true,
+    }), /dedicated structured streaming path/);
+    await assert.rejects(supervisor.executeInteractiveCommand(prepared, [], {
+        interactive: false,
+        tty: false,
+    }), /admitted TTY session/);
+});
+
 test('stop performs exact in-Box containment, verifies the inbox, then stops directly', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));

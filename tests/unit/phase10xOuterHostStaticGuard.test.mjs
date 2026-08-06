@@ -23,7 +23,7 @@ const OUTER_CONTROLLER_FILES = Object.freeze([
 ]);
 
 const FORBIDDEN_ORDINARY_CONTAINER_SUBCOMMAND = new RegExp(
-    String.raw`['"]container['"]\s*,\s*['"](?:create|inspect|start|stop|rm|restart|kill|wait|logs|exec|cp)['"]`,
+    String.raw`['"]container['"]\s*,\s*['"](?:create|inspect|start|stop|rm|restart|kill|wait|logs|exec|attach|cp)['"]`,
     'g',
 );
 
@@ -33,7 +33,7 @@ const FORBIDDEN_RUN_REMOVE = new RegExp(
 );
 
 const FORBIDDEN_RUNNER_CONTAINER_CONTROL = new RegExp(
-    String.raw`runner\.(?:query|run|stream|pipe)\([\s\S]{0,512}\[(?:[\s\S]{0,128})['"](?:container|run|inspect|start|stop|rm|restart|kill|wait|logs|exec|cp)['"]`,
+    String.raw`runner\.(?:query|run|stream|pipe)\([\s\S]{0,512}\[(?:[\s\S]{0,128})['"](?:container|run|inspect|start|stop|rm|restart|kill|wait|logs|exec|attach|cp)['"]`,
     'g',
 );
 
@@ -72,4 +72,18 @@ test('the only native discovery CLI inventory is unreachable from the macOS mach
 test('static guard excludes local Linux/in-Box lifecycle modules from the host transport policy', () => {
     assert.equal(OUTER_CONTROLLER_FILES.some((file) => file.startsWith('cli/sandbox/')), false);
     assert.equal(OUTER_CONTROLLER_FILES.some((file) => file.startsWith('ploinky-box/inbox/')), false);
+});
+
+test('interactive host execution is implemented only by the native Unix-socket client', () => {
+    const transport = fs.readFileSync(path.join(
+        repositoryRoot, 'ploinky-box/engine/libpodClient.mjs',
+    ), 'utf8');
+    const execution = fs.readFileSync(path.join(
+        repositoryRoot, 'ploinky-box/command/execute.mjs',
+    ), 'utf8');
+
+    assert.match(transport, /execContainerInteractive/u);
+    assert.doesNotMatch(transport, /node:child_process|\bspawn(?:Sync)?\(|\bexecFile(?:Sync)?\(/u);
+    assert.match(execution, /execContainerInteractive/u);
+    assert.doesNotMatch(execution, /['"](?:podman|docker|buildah)['"]\s*,\s*\[[\s\S]{0,256}['"](?:exec|attach|wait|logs|inspect|kill)['"]/u);
 });
