@@ -60,9 +60,9 @@ the host. Dependencies and nested-container storage remain in two instance-owned
 named volumes. Transient Unix sockets stay under the outer runtime's private
 `/run/ploinky` filesystem so the writable host bind remains portable through a
 macOS Podman Machine.
-Dependency-cache seeding inside the Box likewise uses portable copies instead
-of hard links because shared macOS bind mounts cannot preserve the required
-hard-link semantics reliably.
+Dependency-cache seeding inside the Box likewise uses `cp -a` copies instead
+of hard links or Node's recursive copy because shared macOS bind mounts cannot
+preserve those operations reliably across the outer and nested containers.
 
 | Invocation | Documented effect |
 | --- | --- |

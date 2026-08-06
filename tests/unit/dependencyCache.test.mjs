@@ -28,6 +28,8 @@ import {
     ensureAgentCacheForFamily,
     nodeModulesDir,
     shouldSeedAgentCacheWithHardlinks,
+    shouldSeedAgentCacheWithSystemCopy,
+    seedFromGlobalCache,
 } from '../../cli/utils/dependencies/dependencyCache.js';
 
 function tempDir(prefix = 'deps-cache-test-') {
@@ -100,11 +102,36 @@ test('container dependency install runs as root for non-root runtime images', ()
 
 test('Box dependency caches use portable copies instead of hard links', () => {
     assert.equal(shouldSeedAgentCacheWithHardlinks({ insideBox: true }), false);
+    assert.equal(shouldSeedAgentCacheWithSystemCopy({ insideBox: true }), true);
     assert.equal(shouldSeedAgentCacheWithHardlinks({ insideBox: false }), true);
+    assert.equal(shouldSeedAgentCacheWithSystemCopy({ insideBox: false }), false);
     assert.equal(shouldSeedAgentCacheWithHardlinks({
         insideBox: false,
         agentPackagePresent: true,
     }), false);
+});
+
+test('Box dependency cache system copy preserves a readable directory tree', () => {
+    const root = tempDir();
+    const globalCachePath = path.join(root, 'global');
+    const agentCachePath = path.join(root, 'agent');
+    try {
+        const sourceModule = path.join(nodeModulesDir(globalCachePath), 'example-module');
+        fs.mkdirSync(sourceModule, { recursive: true });
+        fs.writeFileSync(path.join(sourceModule, 'package.json'), '{"name":"example-module"}\n');
+
+        seedFromGlobalCache(globalCachePath, agentCachePath, {
+            allowHardlinks: false,
+            useSystemCopy: true,
+            log() {},
+        });
+
+        const copiedPackage = path.join(nodeModulesDir(agentCachePath), 'example-module', 'package.json');
+        assert.equal(fs.readFileSync(copiedPackage, 'utf8'), '{"name":"example-module"}\n');
+        assert.equal(fs.statSync(copiedPackage).mode & 0o444, 0o444);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test('writeStamp + readStamp round-trip', () => {

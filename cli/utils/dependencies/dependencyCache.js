@@ -477,6 +477,15 @@ export function shouldSeedAgentCacheWithHardlinks({
     return !agentPackagePresent && !insideBox;
 }
 
+export function shouldSeedAgentCacheWithSystemCopy({
+    insideBox = isInsideBox(),
+} = {}) {
+    // Node's fs.cpSync cannot recursively create some directories on a macOS
+    // Podman Machine bind mount. GNU cp works through that boundary and keeps
+    // the copied cache fully readable from nested containers.
+    return insideBox;
+}
+
 function assertHostMatchesRuntimeKey(runtimeKey) {
     const parsed = assertRuntimeKey(runtimeKey);
     if (parsed.family !== 'bwrap' && parsed.family !== 'seatbelt') {
@@ -745,6 +754,7 @@ export function prepareAgentCache({
             allowHardlinks: shouldSeedAgentCacheWithHardlinks({
                 agentPackagePresent: Boolean(agentPkg),
             }),
+            useSystemCopy: shouldSeedAgentCacheWithSystemCopy(),
         });
         fs.writeFileSync(
             path.join(cachePath, 'package.json'),
@@ -767,7 +777,11 @@ export function prepareAgentCache({
     }
 }
 
-function seedFromGlobalCache(globalCachePath, agentCachePath, { log = debugLog, allowHardlinks = true } = {}) {
+function seedFromGlobalCache(globalCachePath, agentCachePath, {
+    log = debugLog,
+    allowHardlinks = true,
+    useSystemCopy = false,
+} = {}) {
     const srcNm = nodeModulesDir(globalCachePath);
     const dstNm = nodeModulesDir(agentCachePath);
     if (!fs.existsSync(srcNm)) {
@@ -776,6 +790,7 @@ function seedFromGlobalCache(globalCachePath, agentCachePath, { log = debugLog, 
     if (fs.existsSync(dstNm)) {
         fs.rmSync(dstNm, { recursive: true, force: true });
     }
+    fs.mkdirSync(agentCachePath, { recursive: true });
     if (allowHardlinks) {
         const hardlinked = spawnSync('cp', ['-al', srcNm, dstNm], { stdio: 'ignore' });
         if (hardlinked.status === 0) {
@@ -784,10 +799,14 @@ function seedFromGlobalCache(globalCachePath, agentCachePath, { log = debugLog, 
         }
         log(`[deps-cache] hardlink seed failed (${hardlinked.status}); falling back to deep copy`);
     }
-    if (typeof fs.cpSync === 'function') {
-        fs.cpSync(srcNm, dstNm, { recursive: true });
+    if (useSystemCopy || typeof fs.cpSync !== 'function') {
+        const copied = spawnSync('cp', ['-a', srcNm, dstNm], { stdio: 'ignore' });
+        if (copied.status !== 0) {
+            throw new Error(`Dependency cache copy failed (${copied.status ?? 'unknown status'}) from ${srcNm}`);
+        }
+        log(`[deps-cache] seeded via portable system copy from ${srcNm}`);
     } else {
-        spawnSync('cp', ['-a', srcNm, dstNm], { stdio: 'inherit' });
+        fs.cpSync(srcNm, dstNm, { recursive: true });
     }
 }
 
