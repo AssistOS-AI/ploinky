@@ -14,6 +14,7 @@ import { debugLog } from '../utils.js';
 import { readGlobalDepsPackage, mergePackageJson } from './dependencyInstaller.js';
 import { getRuntime, managedContainerLabelArgs } from '../../sandbox/docker/common.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from '../../sandbox/docker/shellDetection.js';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
 export const STAMP_VERSION = 1;
 export const STAMP_FILENAME = 'stamp.json';
@@ -466,6 +467,16 @@ export function nodeModulesDir(cachePath) {
     return path.join(cachePath, 'node_modules');
 }
 
+export function shouldSeedAgentCacheWithHardlinks({
+    agentPackagePresent = false,
+    insideBox = isInsideBox(),
+} = {}) {
+    // macOS Podman Machine bind mounts can report a successful hard-link copy
+    // while exposing unreadable directory entries back to the outer process.
+    // A normal recursive copy is portable and keeps host-persisted caches usable.
+    return !agentPackagePresent && !insideBox;
+}
+
 function assertHostMatchesRuntimeKey(runtimeKey) {
     const parsed = assertRuntimeKey(runtimeKey);
     if (parsed.family !== 'bwrap' && parsed.family !== 'seatbelt') {
@@ -729,7 +740,12 @@ export function prepareAgentCache({
     const lock = acquireLock(cachePath);
     try {
         ensureCacheDir(cachePath);
-        seedFromGlobalCache(globalCachePath, cachePath, { log, allowHardlinks: !agentPkg });
+        seedFromGlobalCache(globalCachePath, cachePath, {
+            log,
+            allowHardlinks: shouldSeedAgentCacheWithHardlinks({
+                agentPackagePresent: Boolean(agentPkg),
+            }),
+        });
         fs.writeFileSync(
             path.join(cachePath, 'package.json'),
             JSON.stringify(mergedPkg, null, 2),

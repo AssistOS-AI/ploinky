@@ -27,6 +27,7 @@ import {
     ensureCacheDir,
     ensureAgentCacheForFamily,
     nodeModulesDir,
+    shouldSeedAgentCacheWithHardlinks,
 } from '../../cli/utils/dependencies/dependencyCache.js';
 
 function tempDir(prefix = 'deps-cache-test-') {
@@ -95,6 +96,15 @@ test('container dependency install runs as root for non-root runtime images', ()
     assert.deepEqual(args.slice(-3), ['example/image:tag', '-lc', 'echo ok']);
     assert.equal(args.includes('--network'), false, 'installer must use the managed Podman network default');
     assert.equal(args.some((arg) => String(arg).includes('slirp4netns')), false);
+});
+
+test('Box dependency caches use portable copies instead of hard links', () => {
+    assert.equal(shouldSeedAgentCacheWithHardlinks({ insideBox: true }), false);
+    assert.equal(shouldSeedAgentCacheWithHardlinks({ insideBox: false }), true);
+    assert.equal(shouldSeedAgentCacheWithHardlinks({
+        insideBox: false,
+        agentPackagePresent: true,
+    }), false);
 });
 
 test('writeStamp + readStamp round-trip', () => {
