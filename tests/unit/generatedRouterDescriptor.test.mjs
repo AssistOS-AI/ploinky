@@ -20,7 +20,6 @@ import {
     buildRouterAuthorityTopologyIntent,
     RouterAuthorityAttestationError,
     ROUTER_AUTHORITY_EXTERNAL_PROBE_TIMEOUT,
-    ROUTER_AUTHORITY_HELPER_IMAGE,
     runContainerAuthorityProbe,
     validateRouterAuthorityObservation,
 } from '../../cli/sandbox/routerAuthorityAttestation.js';
@@ -820,9 +819,9 @@ test('the exact podman start-attach request timeout has immutable retry classifi
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const stateFile = path.join(root, 'state.json');
     const fakePodman = path.join(root, 'podman');
-    const helperId = `sha256:${'3'.repeat(64)}`;
-    const helperImageId = `sha256:${'2'.repeat(64)}`;
-    const targetImageId = `sha256:${'1'.repeat(64)}`;
+    const helperId = '3'.repeat(64);
+    const helperImageId = '2'.repeat(64);
+    const targetImageId = '1'.repeat(64);
     fs.writeFileSync(fakePodman, `#!/usr/bin/env node
 const fs = require('node:fs');
 const args = process.argv.slice(2);
@@ -831,22 +830,28 @@ const helperId = ${JSON.stringify(helperId)};
 const helperImageId = ${JSON.stringify(helperImageId)};
 const targetImageId = ${JSON.stringify(targetImageId)};
 if (args[0] === 'image' && args[1] === 'inspect' && args[3] === '{{.Id}}') {
-  process.stdout.write(args[4] === ${JSON.stringify(ROUTER_AUTHORITY_HELPER_IMAGE)} ? helperImageId : targetImageId);
+  process.stdout.write(args[4] === helperImageId ? helperImageId : targetImageId);
 } else if (args[0] === 'image' && args[1] === 'inspect' && args[3] === '{{.Config.User}}') {
   process.stdout.write('1000:1000');
 } else if (args[0] === 'create') {
-  const label = args[args.indexOf('--label') + 1];
-  fs.writeFileSync(stateFile, JSON.stringify({ nonce: label.split('=')[1], createArgs: args }));
+  const labels = {};
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if (args[index] !== '--label') continue;
+    const [key, ...value] = args[index + 1].split('=');
+    labels[key] = value.join('=');
+  }
+  labels['org.opencontainers.image.source'] = 'fixture-image-provenance';
+  fs.writeFileSync(stateFile, JSON.stringify({ labels, createArgs: args }));
   process.stdout.write(helperId);
 } else if (args[0] === 'container' && args[1] === 'inspect') {
-  const { nonce } = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  const { labels } = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
   process.stdout.write(JSON.stringify({
     id: helperId, image: helperImageId, user: '65534:65534', entrypoint: ['node'],
     init: true, readonlyRootfs: true, pidsLimit: 32, memory: 67108864, nanoCpus: 250000000,
     networkMode: 'test-network', extraHosts: ['host.containers.internal:host-gateway'],
     mountCount: 0, bindCount: 0, tmpfsCount: 0, portBindingCount: 0,
     capDrop: ['ALL'], capAdd: [], securityOpt: ['no-new-privileges'], env: ['PATH=/usr/bin'],
-    helperLabel: nonce, networks: { 'test-network': {} }, running: false, status: 'exited',
+    labels, networks: { 'test-network': {} }, running: false, status: 'exited',
   }));
 } else if (args[0] === 'start' && args[1] === '--attach') {
   process.stderr.write('request timed out');
@@ -870,7 +875,12 @@ if (args[0] === 'image' && args[1] === 'inspect' && args[3] === '{{.Id}}') {
         runContainerAuthorityProbe({
             runtime: 'podman',
             image: 'example.test/agent@sha256:fixture',
+            helperImage: helperImageId,
             nonce,
+            probeOwnership: {
+                owner: 'tests/router-authority-timeout',
+                releaseGeneration: '4'.repeat(64),
+            },
             intent: {
                 physicalOrigin: 'http://host.containers.internal:8080',
                 requestAuthority: 'host.containers.internal:8080',

@@ -3,47 +3,12 @@ import test from 'node:test';
 
 import {
     isContainerRunning,
-    listRunningContainerNames,
     waitForContainerRunning,
 } from '../../cli/sandbox/docker/common.js';
 import {
     monitorTick,
     snapshotRunningContainerNames,
 } from '../../cli/server/containerMonitor.js';
-
-test('running-container inventory uses one argv-safe runtime list and normalizes names', () => {
-    const calls = [];
-    const names = listRunningContainerNames({
-        runtime: 'podman',
-        spawnSyncImpl(runtime, args, options) {
-            calls.push({ runtime, args, options });
-            return {
-                status: 0,
-                stdout: 'ploinky_alpha\n/ploinky_beta\n\n',
-                stderr: '',
-            };
-        },
-    });
-
-    assert.deepEqual([...names], ['ploinky_alpha', 'ploinky_beta']);
-    assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].args, ['ps', '--format', '{{.Names}}']);
-    assert.equal(calls[0].options.encoding, 'utf8');
-    assert.equal(calls[0].options.timeout, 5_000);
-    assert.equal(calls[0].options.killSignal, 'SIGKILL');
-});
-
-test('running-container inventory fails closed on runtime errors', () => {
-    assert.throws(
-        () => listRunningContainerNames({
-            runtime: 'podman',
-            spawnSyncImpl() {
-                return { status: 125, stdout: '', stderr: 'runtime unavailable' };
-            },
-        }),
-        /cannot list running containers: runtime unavailable/,
-    );
-});
 
 test('single-container status checks are argv-safe and bounded', () => {
     const calls = [];
@@ -54,7 +19,11 @@ test('single-container status checks are argv-safe and bounded', () => {
             calls.push({ runtime, args, options });
             return {
                 status: 0,
-                stdout: 'other-container\nexact-container\n',
+                stdout: JSON.stringify([{
+                    Id: 'a'.repeat(64),
+                    Name: '/exact-container',
+                    State: { Running: true, Status: 'running' },
+                }]),
                 stderr: '',
             };
         },
@@ -62,9 +31,31 @@ test('single-container status checks are argv-safe and bounded', () => {
 
     assert.equal(running, true);
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].args, ['ps', '--format', '{{.Names}}']);
+    assert.deepEqual(calls[0].args, ['container', 'inspect', 'exact-container']);
     assert.equal(calls[0].options.timeout, 321);
     assert.equal(calls[0].options.killSignal, 'SIGKILL');
+});
+
+test('single-container status never enumerates or synchronizes an unrelated shared-engine container', () => {
+    const calls = [];
+    assert.equal(isContainerRunning('owned-container', {
+        runtime: 'podman',
+        spawnSyncImpl(runtime, args) {
+            calls.push([runtime, ...args]);
+            assert.deepEqual(args, ['container', 'inspect', 'owned-container']);
+            return {
+                status: 0,
+                stdout: JSON.stringify([{
+                    Id: 'b'.repeat(64),
+                    Name: '/owned-container',
+                    State: { Running: true, Status: 'running' },
+                }]),
+                stderr: '',
+            };
+        },
+    }), true);
+    assert.deepEqual(calls, [['podman', 'container', 'inspect', 'owned-container']]);
+    assert.equal(calls.flat().includes('observe-only-unrelated'), false);
 });
 
 test('container startup inspection has per-call and aggregate deadlines', () => {

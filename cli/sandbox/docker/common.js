@@ -329,29 +329,31 @@ function isContainerRunning(containerName, options = {}) {
     if (!runtime) return false;
     debugLog(`Checking if container '${containerName}' is running via ${runtime}.`);
     try {
-        if (/^[a-f0-9]{64}$/.test(containerName)) {
-            const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
-            const result = spawnSyncImpl(
-                runtime,
-                ['container', 'inspect', containerName],
-                {
-                    encoding: 'utf8',
-                    stdio: ['ignore', 'pipe', 'pipe'],
-                    timeout: options.timeoutMs || CONTAINER_CONTROL_PLANE_TIMEOUT_MS,
-                    killSignal: 'SIGKILL',
-                },
-            );
-            if (result?.error || result?.status !== 0) return false;
-            const parsed = JSON.parse(String(result.stdout || ''));
-            const record = Array.isArray(parsed) ? parsed[0] : parsed;
-            return String(record?.Id || record?.ID || '') === containerName
-                && record?.State?.Running === true
-                && record?.State?.Status === 'running';
-        }
-        const running = listRunningContainerNames({
-            ...options,
+        const identifier = String(containerName || '');
+        if (!identifier || identifier !== identifier.trim()) return false;
+        const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
+        const result = spawnSyncImpl(
             runtime,
-        }).has(containerName);
+            ['container', 'inspect', identifier],
+            {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+                timeout: options.timeoutMs || CONTAINER_CONTROL_PLANE_TIMEOUT_MS,
+                killSignal: 'SIGKILL',
+            },
+        );
+        if (result?.error || result?.status !== 0) return false;
+        const parsed = JSON.parse(String(result.stdout || ''));
+        if (!Array.isArray(parsed) || parsed.length !== 1) return false;
+        const record = parsed[0];
+        const inspectedId = String(record?.Id || record?.ID || '');
+        const inspectedName = String(record?.Name || '').replace(/^\//, '');
+        const exactIdentity = /^[a-f0-9]{64}$/.test(identifier)
+            ? inspectedId === identifier
+            : inspectedName === identifier;
+        const running = exactIdentity
+            && record?.State?.Running === true
+            && record?.State?.Status === 'running';
         debugLog(`Container '${containerName}' is running: ${running}`);
         return running;
     } catch (error) {
@@ -360,47 +362,31 @@ function isContainerRunning(containerName, options = {}) {
     }
 }
 
-function listRunningContainerNames(options = {}) {
+function containerExists(containerName, options = {}) {
     const runtime = options.runtime || probeContainerRuntime();
-    if (!runtime) return new Set();
-    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
-    const result = spawnSyncImpl(
-        runtime,
-        ['ps', '--format', '{{.Names}}'],
-        {
+    if (!runtime) return false;
+    const identifier = String(containerName || '');
+    if (!identifier || identifier !== identifier.trim()) return false;
+    debugLog(`Checking if exact container '${identifier}' exists via ${runtime}.`);
+    try {
+        const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
+        const result = spawnSyncImpl(runtime, ['container', 'inspect', identifier], {
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'pipe'],
             timeout: options.timeoutMs || CONTAINER_CONTROL_PLANE_TIMEOUT_MS,
             killSignal: 'SIGKILL',
-        },
-    );
-    if (result.error || result.status !== 0) {
-        const detail = String(
-            result.error?.message
-            || result.stderr
-            || result.stdout
-            || `exit ${result.status ?? 'unknown'}`,
-        ).trim();
-        throw new Error(`cannot list running containers: ${detail}`);
-    }
-    return new Set(
-        String(result.stdout || '')
-            .split(/\r?\n/)
-            .map((name) => name.trim().replace(/^\//, ''))
-            .filter(Boolean),
-    );
-}
-
-function containerExists(containerName, options = {}) {
-    // Use inspect instead of grep - more reliable and avoids race conditions
-    const runtime = options.runtime || probeContainerRuntime();
-    if (!runtime) return false;
-    const command = `${runtime} inspect --format "{{.Name}}" "${containerName}"`;
-    debugLog(`Checking if container exists with command: ${command}`);
-    try {
-        execSync(command, { stdio: 'pipe' });
-        debugLog(`Container '${containerName}' exists: true`);
-        return true;
+        });
+        if (result?.error || result?.status !== 0) return false;
+        const parsed = JSON.parse(String(result.stdout || ''));
+        if (!Array.isArray(parsed) || parsed.length !== 1) return false;
+        const record = parsed[0];
+        const inspectedId = String(record?.Id || record?.ID || '');
+        const inspectedName = String(record?.Name || '').replace(/^\//, '');
+        const exists = /^[a-f0-9]{64}$/.test(identifier)
+            ? inspectedId === identifier
+            : inspectedName === identifier;
+        debugLog(`Container '${containerName}' exists: ${exists}`);
+        return exists;
     } catch (error) {
         debugLog(`Container '${containerName}' does not exist`);
         return false;
@@ -717,7 +703,6 @@ export {
     getHostSandboxDisableHint,
     getHostSandboxInstallHint,
     isContainerRunning,
-    listRunningContainerNames,
     isPloinkyBoxRuntime,
     isSandboxRuntime,
     probeContainerRuntime,

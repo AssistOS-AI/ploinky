@@ -274,6 +274,7 @@ function harness(state, {
     failCandidateReady = false,
     corruptCidfile = false,
     failLocalStop = false,
+    failNodeAdmissionGeneration = '',
 } = {}) {
     const calls = [];
     let current = initial;
@@ -338,12 +339,17 @@ function harness(state, {
         },
         validateReleaseImage(engine, kind, descriptor) {
             calls.push(['seam', 'validate-release-image', engine, kind, descriptor.boxImageId]);
-            if (candidateImage !== descriptor.boxImageId) {
-                const error = new Error('release image mismatch');
-                error.code = 'PLOINKY_RELEASE_IMAGE_STALE';
-                throw error;
-            }
             return descriptor;
+        },
+        async admitNodeImage(engine, containerId, descriptor) {
+            calls.push([
+                'seam', 'admit-node-image', engine.name, containerId,
+                descriptor.nodeImageId, descriptor.releaseGeneration,
+            ]);
+            if (descriptor.releaseGeneration === failNodeAdmissionGeneration) {
+                throw new Error('exact Node image admission failed');
+            }
+            return { imageId: descriptor.nodeImageId };
         },
         ensureVolumes() {
             calls.push(['seam', 'ensure-volumes']);
@@ -524,6 +530,112 @@ test('release admission validates the coupled exact Box ID without any pull', as
     const create = h.calls.find((call) => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
     assert.equal(create.includes('0.0.0.0:17882:7882/udp'), true);
     assert.equal(create.at(-1), imageId);
+    assert.deepEqual(
+        h.calls.find((call) => call[0] === 'seam' && call[1] === 'admit-node-image'),
+        [
+            'seam', 'admit-node-image', 'podman', 'a'.repeat(64),
+            releaseDescriptor.nodeImageId, releaseDescriptor.releaseGeneration,
+        ],
+    );
+});
+
+test('failed admission restores a reused stopped Box to its original stopped state', async (t) => {
+    const state = fixture(t);
+    const releaseDescriptor = exactRelease('c'.repeat(64));
+    const old = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: releaseDescriptor.boxImageId,
+        imageRef: releaseDescriptor.boxImageId,
+        hostPort: releaseDescriptor.routerHostPort,
+        mediaHostPort: releaseDescriptor.mediaHostPort,
+        id: '9'.repeat(64),
+        running: false,
+        releaseDescriptor,
+    });
+    const h = harness(state, {
+        initial: old,
+        candidateImage: releaseDescriptor.boxImageId,
+        failNodeAdmissionGeneration: releaseDescriptor.releaseGeneration,
+    });
+
+    await assert.rejects(() => reconcileBoxContainer({
+        identity: state.identity,
+        ownership: {
+            state: 'owned',
+            handles: { container: old, volumes: volumeHandles(state.identity) },
+        },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        releaseDescriptor,
+    }, h.seams), /Existing Box reuse transaction failed/);
+
+    assert.equal(h.current().runtime.running, false);
+    assert.deepEqual(
+        h.calls.filter((call) => call[0] === 'run' && call[2] === 'container'),
+        [
+            ['run', 'podman', 'container', 'start', old.id],
+            ['run', 'podman', 'container', 'stop', '--time', '30', old.id],
+        ],
+    );
+    assert.equal(h.calls.some((call) => call.includes('pull')), false);
+});
+
+test('Node admission failure restores and re-admits the prior exact release without pulling', async (t) => {
+    const state = fixture(t);
+    const { releaseGeneration: _discardedGeneration, ...previousInput } = exactRelease(
+        'e'.repeat(64),
+    );
+    const previous = createReleaseDescriptor({
+        ...previousInput,
+        boxImageId: 'e'.repeat(64),
+        boxImageDigest: `sha256:${'6'.repeat(64)}`,
+        nodeImageId: 'f'.repeat(64),
+        nodeImageDigest: `sha256:${'7'.repeat(64)}`,
+    });
+    const current = exactRelease('c'.repeat(64));
+    const old = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: previous.boxImageId,
+        imageRef: previous.boxImageId,
+        hostPort: previous.routerHostPort,
+        mediaHostPort: previous.mediaHostPort,
+        id: '9'.repeat(64),
+        releaseDescriptor: previous,
+    });
+    const h = harness(state, {
+        initial: old,
+        candidateImage: current.boxImageId,
+        failNodeAdmissionGeneration: current.releaseGeneration,
+    });
+
+    await assert.rejects(() => reconcileBoxContainer({
+        identity: state.identity,
+        ownership: {
+            state: 'owned',
+            handles: { container: old, volumes: volumeHandles(state.identity) },
+        },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        releaseDescriptor: current,
+    }, h.seams), /Box container transaction failed/);
+
+    assert.equal(h.current().runtime.imageId, previous.boxImageId);
+    assert.equal(h.current().runtime.running, true);
+    const admissions = h.calls.filter((call) => (
+        call[0] === 'seam' && call[1] === 'admit-node-image'
+    ));
+    assert.deepEqual(admissions.map((call) => call.slice(4)), [
+        [current.nodeImageId, current.releaseGeneration],
+        [previous.nodeImageId, previous.releaseGeneration],
+    ]);
+    assert.equal(h.calls.some((call) => call.includes('pull')), false);
+    assert.equal(JSON.stringify(h.calls).includes('24-bookworm-tools'), false);
 });
 
 test('release image mismatch fails before volume or container mutation', async (t) => {

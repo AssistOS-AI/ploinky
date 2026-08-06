@@ -6,6 +6,7 @@ export const BOX_MARKER_PATH = '/etc/ploinky-box';
 export const BOX_MARKER_CONTENT = 'assistos/ploinky-box\n';
 
 export const BOX_LABELS = Object.freeze({
+    owner: 'io.assistos.ploinky-box.owner',
     pathHash: 'io.assistos.ploinky-box.path-hash',
     role: 'io.assistos.ploinky-box.role',
     imageRef: 'io.assistos.ploinky-box.image-ref',
@@ -17,6 +18,7 @@ export const BOX_LABELS = Object.freeze({
 
 export const BOX_ROLES = Object.freeze({
     container: 'box',
+    imageProbe: 'image-probe',
     workspace: 'workspace',
     containers: 'containers',
     dependencies: 'ploinky-deps',

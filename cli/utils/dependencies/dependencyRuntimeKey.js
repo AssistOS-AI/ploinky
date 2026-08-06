@@ -1,7 +1,9 @@
 import { spawnSync } from 'child_process';
-import { getRuntime, getRuntimeForAgent, ensureImagePresent, managedContainerLabelArgs } from '../../sandbox/docker/common.js';
+import crypto from 'node:crypto';
+import { getRuntime, getRuntimeForAgent, ensureImagePresent } from '../../sandbox/docker/common.js';
 import { resolveManifestImage } from '../security/secretVars.js';
 import { assertExactReleaseNodeImageInspectionReceipt } from '../runtime/releaseRuntime.js';
+import { buildManagedProbeRunArgs } from '../../sandbox/docker/probeOwnership.js';
 
 const SUPPORTED_FAMILIES = new Set(['bwrap', 'seatbelt', 'container']);
 const NO_NODE_RUNTIME_KEY = 'container-no-node';
@@ -119,7 +121,7 @@ function isNodeMissingProbeFailure(status, stderr) {
     return /not found|no such file|not in \$?path|executable file/.test(text);
 }
 
-function buildContainerRuntimeKeyProbeRunArgs(image) {
+function buildContainerRuntimeKeyProbeRunArgs(image, probeOwnership) {
     const probeScript = [
         'const report = typeof process.report?.getReport === "function" ? process.report.getReport() : null;',
         'const header = report && report.header ? report.header : null;',
@@ -134,8 +136,11 @@ function buildContainerRuntimeKeyProbeRunArgs(image) {
     return [
         'run',
         '--rm',
-        ...managedContainerLabelArgs(),
-        '--pull=never',
+        ...buildManagedProbeRunArgs({
+            ...probeOwnership,
+            imageId: image,
+            purpose: 'runtime-key',
+        }),
         '--entrypoint',
         'node',
         image,
@@ -144,12 +149,12 @@ function buildContainerRuntimeKeyProbeRunArgs(image) {
     ];
 }
 
-function defaultContainerProbe({ image, runtime }) {
+function defaultContainerProbe({ image, runtime, probeOwnership }) {
     // --pull=never: the image must already be present locally (ensureImagePresent
     // pulls it as an explicit, progress-streamed step before we get here). This
     // keeps the probe fast and turns a missing image into an instant, clear error
     // instead of a silent multi-minute pull that trips the timeout.
-    const args = buildContainerRuntimeKeyProbeRunArgs(image);
+    const args = buildContainerRuntimeKeyProbeRunArgs(image, probeOwnership);
     const timeoutMs = probeTimeoutMs();
     const res = spawnSync(runtime, args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs });
     if (res.error) {
@@ -177,6 +182,17 @@ function defaultEnsureImage({ image, runtime }) {
     ensureImagePresent(image, { runtime });
 }
 
+function defaultResolveImage({ image, runtime }) {
+    const result = spawnSync(runtime, [
+        'image', 'inspect', '--format', '{{.Id}}', image,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const imageId = String(result.stdout || '').trim().replace(/^sha256:/, '');
+    if (result.error || result.status !== 0 || !/^[a-f0-9]{64}$/.test(imageId)) {
+        throw new Error(`Container runtime-key probe requires one exact local immutable image ID for '${image}'`);
+    }
+    return imageId;
+}
+
 export function detectContainerRuntimeKey({
     manifest = null,
     profileConfig = null,
@@ -186,6 +202,7 @@ export function detectContainerRuntimeKey({
     image = '',
     execProbe = defaultContainerProbe,
     ensureImage = defaultEnsureImage,
+    resolveImage = defaultResolveImage,
     releaseDescriptor = null,
     releaseImageInspection = null,
 } = {}) {
@@ -206,7 +223,36 @@ export function detectContainerRuntimeKey({
         // so the probe can safely run with --pull=never under a short timeout.
         ensureImage({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
     }
-    const output = execProbe({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
+    const exactImageId = exactReleaseAdmission
+        ? exactReleaseAdmission.imageId
+        : resolveImage({
+            image: resolvedImage,
+            runtime: resolvedRuntime,
+            manifest,
+            repoName,
+            agentName,
+        });
+    const releaseGeneration = String(
+        exactReleaseAdmission?.releaseGeneration
+        || releaseDescriptor?.releaseGeneration
+        || crypto.createHash('sha256')
+            .update(`unreleased-probe\0${exactImageId}`)
+            .digest('hex'),
+    );
+    if (!/^[a-f0-9]{64}$/.test(releaseGeneration)) {
+        throw new Error('Container runtime-key probe requires one exact managed release generation');
+    }
+    const output = execProbe({
+        image: exactImageId,
+        runtime: resolvedRuntime,
+        manifest,
+        repoName,
+        agentName,
+        probeOwnership: {
+            owner: `${repoName}/${agentName}`,
+            releaseGeneration,
+        },
+    });
     const probe = parseContainerProbeOutput(output);
     if (probe.noNode === true) {
         return NO_NODE_RUNTIME_KEY;

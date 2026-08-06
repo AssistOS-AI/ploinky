@@ -103,10 +103,12 @@ test('parseContainerProbeOutput validates libc-aware probe payloads', () => {
 });
 
 test('detectContainerRuntimeKey accepts injected probe executor', () => {
+    const imageId = 'a'.repeat(64);
     const key = detectContainerRuntimeKey({
         image: 'node:20-alpine',
         runtime: 'podman',
         ensureImage() {},
+        resolveImage: () => imageId,
         execProbe() {
             return '{"platform":"linux","arch":"x64","nodeMajor":20,"libc":"musl"}';
         },
@@ -116,18 +118,27 @@ test('detectContainerRuntimeKey accepts injected probe executor', () => {
 
 test('detectContainerRuntimeKey ensures the image is present before probing', () => {
     const calls = [];
+    const imageId = 'a'.repeat(64);
     const key = detectContainerRuntimeKey({
         image: 'node:20-alpine',
         runtime: 'podman',
         ensureImage({ image }) {
             calls.push(`ensure:${image}`);
         },
+        resolveImage({ image }) {
+            calls.push(`resolve:${image}`);
+            return imageId;
+        },
         execProbe({ image }) {
             calls.push(`probe:${image}`);
             return '{"platform":"linux","arch":"x64","nodeMajor":20,"libc":"musl"}';
         },
     });
-    assert.deepEqual(calls, ['ensure:node:20-alpine', 'probe:node:20-alpine']);
+    assert.deepEqual(calls, [
+        'ensure:node:20-alpine',
+        'resolve:node:20-alpine',
+        `probe:${imageId}`,
+    ]);
     assert.equal(key, 'container-linux-x64-musl-node20');
 });
 
@@ -145,18 +156,20 @@ test('detectContainerRuntimeKey resolves manifest image templates before probing
         },
         runtime: 'podman',
         ensureImage() {},
+        resolveImage: () => 'b'.repeat(64),
         execProbe({ image }) {
             probedImage = image;
             return '{"platform":"linux","arch":"x64","nodeMajor":20,"libc":"glibc"}';
         },
     });
 
-    assert.equal(probedImage, 'example/service:v9');
+    assert.equal(probedImage, 'b'.repeat(64));
     assert.equal(key, 'container-linux-x64-glibc-node20');
 });
 
 test('detectContainerRuntimeKey classifies a node-less container manifest without throwing', () => {
     const calls = [];
+    const imageId = 'c'.repeat(64);
     const key = detectContainerRuntimeKey({
         manifest: {
             container: 'alpine:latest',
@@ -165,13 +178,21 @@ test('detectContainerRuntimeKey classifies a node-less container manifest withou
         ensureImage({ image }) {
             calls.push(`ensure:${image}`);
         },
+        resolveImage({ image }) {
+            calls.push(`resolve:${image}`);
+            return imageId;
+        },
         execProbe({ image }) {
             calls.push(`probe:${image}`);
             return '{"noNode":true}';
         },
     });
 
-    assert.deepEqual(calls, ['ensure:alpine:latest', 'probe:alpine:latest']);
+    assert.deepEqual(calls, [
+        'ensure:alpine:latest',
+        'resolve:alpine:latest',
+        `probe:${imageId}`,
+    ]);
     assert.equal(key, NO_NODE_RUNTIME_KEY);
     assert.equal(isNoNodeRuntimeKey(key), true);
     assert.equal(parseRuntimeKey(key), null);

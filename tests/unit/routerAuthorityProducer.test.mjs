@@ -42,13 +42,15 @@ test('managed producer source enforces attestation, ordered generation checkpoin
     const preStartHook = source.indexOf('const preStartGeneratedRouterLaunch', credentialMint);
     const preRuntime = source.indexOf("launch.generationLease.checkpoint('pre-runtime')", preStartHook);
     const postInspection = source.indexOf("launch.generationLease.checkpoint('post-inspection')", preRuntime);
-    const imagePreparation = source.indexOf('ensureImagePresent(image, { runtime })');
-    const helperPreparation = source.indexOf('ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime })');
-    const managedTransaction = source.indexOf('networkLifecycle.runManagedContainerTransaction({', imagePreparation);
+    const helperSelection = source.indexOf(
+        'helperImage: options.releaseDescriptor?.nodeImageId || createImage',
+        attestation,
+    );
     assert.ok(attestation > 0 && attestation < preCredentials);
     assert.ok(preCredentials < signing && signing < credentialMint);
     assert.ok(credentialMint < preStartHook && preStartHook < preRuntime && preRuntime < postInspection);
-    assert.ok(imagePreparation > 0 && imagePreparation < helperPreparation && helperPreparation < managedTransaction);
+    assert.ok(helperSelection > attestation);
+    assert.doesNotMatch(source, /ensureImagePresent\(ROUTER_AUTHORITY_HELPER_IMAGE/);
     assert.match(source, /preStartLaunch: preStartGeneratedRouterLaunch/);
     assert.match(source, /managed generated-local launch state is required before container creation/);
     assert.match(source, /const userNamespace = managedUserNamespaceFromAttestation\(launch\.attested\)/);
@@ -57,7 +59,7 @@ test('managed producer source enforces attestation, ordered generation checkpoin
     assert.match(source, /managed candidate attestation lacks the image user projection/);
 });
 
-test('authority helper uses a pinned image, fixed non-root user, and mandatory immutable cleanup', () => {
+test('authority helper uses the descriptor raw image, complete ownership, and mandatory immutable cleanup', () => {
     const source = fs.readFileSync(
         new URL('../../cli/sandbox/routerAuthorityAttestation.js', import.meta.url),
         'utf8',
@@ -66,8 +68,11 @@ test('authority helper uses a pinned image, fixed non-root user, and mandatory i
     assert.match(source, /\['image', 'inspect', '--format', '\{\{\.Config\.User\}\}', targetImageId\]/);
     assert.doesNotMatch(source, /runBounded\(runtime, \['image', 'inspect', imageId\]\)/);
     assert.match(source, /const AUTHORITY_HELPER_USER = '65534:65534'/);
-    assert.match(source, /export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker\.io\/library\/node:24-bookworm-slim@sha256:[a-f0-9]{64}'/);
-    assert.match(source, /\['image', 'inspect', '--format', '\{\{\.Id\}\}', ROUTER_AUTHORITY_HELPER_IMAGE\]/);
+    assert.doesNotMatch(source, /ROUTER_AUTHORITY_HELPER_IMAGE/);
+    assert.match(source, /\['image', 'inspect', '--format', '\{\{\.Id\}\}', helperImage\]/);
+    assert.match(source, /helperImageId !== String\(helperImage \|\| ''\)\.replace/);
+    assert.match(source, /buildManagedProbeRunArgs\(\{/);
+    assert.match(source, /purpose: 'router-authority'/);
     assert.match(source, /'--user', AUTHORITY_HELPER_USER/);
     assert.match(source, /'--entrypoint', 'node'/);
     assert.match(source, /JSON\.stringify\(inspected\.entrypoint \|\| \[\]\) !== JSON\.stringify\(\['node'\]\)/);

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MANAGED_LABEL='io.assistos.ploinky.managed=1'
 EXPECTED_SUBORDINATE_IDS=65534
 EXPECTED_MAPPED_IDS=65535
 MINIMUM_PODMAN_VERSION=5.4
@@ -92,16 +91,6 @@ require_full_mapping() {
     mapped="$(printf '%s\n' "$mapping" | mapped_id_count)"
     test "$mapped" -eq "$EXPECTED_MAPPED_IDS" \
         || fail "Podman ${kind^^} mapping must contain exactly $EXPECTED_MAPPED_IDS IDs (observed $mapped)"
-}
-
-reject_retained_managed_containers() {
-    local managed_ids
-
-    if ! managed_ids="$(podman ps --all --quiet --filter "label=$MANAGED_LABEL" 2>&1)"; then
-        fail "cannot enumerate Ploinky-managed nested containers: ${managed_ids:-no diagnostic}"
-    fi
-    test -z "$managed_ids" || fail \
-        "retained Ploinky-managed nested containers were found; stop/remove them explicitly in the old box, destroy it, and recreate it"
 }
 
 require_managed_network_stack() {
@@ -248,7 +237,6 @@ test "$inner_rootless" = true \
 require_managed_network_stack
 require_full_mapping uid
 require_full_mapping gid
-reject_retained_managed_containers
 
 log "Runtime self-checks passed"
 echo "$READY_LINE"

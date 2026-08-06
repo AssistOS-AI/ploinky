@@ -14,6 +14,12 @@ import {
     probeImageBinaries,
     validateImageContract,
 } from '../../ploinky-box/contract/image.mjs';
+import { BOX_LABELS, BOX_ROLES } from '../../ploinky-box/constants.mjs';
+import {
+    REQUIRED_RELEASE_AGENTLIB_SHA,
+    createReleaseDescriptor,
+    serializeReleaseDescriptor,
+} from '../../ploinky-box/contract/release.mjs';
 
 const SOURCE_SHA = '0123456789abcdef0123456789abcdef01234567';
 const AGENTLIB_SHA = 'dd94929443033c0a43bf7569068ec1d2926dba35';
@@ -64,6 +70,21 @@ const binaries = [
     ...IMAGE_CONTRACT.requiredBinaries,
     IMAGE_CONTRACT.networkHelpers[0],
 ];
+
+function releaseFixture() {
+    return createReleaseDescriptor({
+        schema: 'ploinky-release-v1',
+        boxImageId: 'b'.repeat(64),
+        boxImageDigest: `sha256:${'1'.repeat(64)}`,
+        nodeImageId: 'c'.repeat(64),
+        nodeImageDigest: `sha256:${'2'.repeat(64)}`,
+        artifactSourceSha: SOURCE_SHA,
+        controllerSourceSha: '3'.repeat(40),
+        agentlibSha: REQUIRED_RELEASE_AGENTLIB_SHA,
+        routerHostPort: 18081,
+        mediaHostPort: 17883,
+    });
+}
 
 test('complete semantic image metadata validates to an immutable image handle', () => {
     const normalized = normalizeImageInspect(validRecord());
@@ -219,19 +240,44 @@ test('fresh image capability probes allow a cold rootless container start', () =
             };
         },
     };
-    probeImageBinaries('podman', 'sha256:image-id', runner, {
+    const releaseDescriptor = releaseFixture();
+    const identity = {
+        instance: 'ploinky-box-fixture-0123456789ab',
+        pathHash: '0123456789ab',
+    };
+    probeImageBinaries('podman', releaseDescriptor.boxImageId, runner, {
         expectedSourceSha: SOURCE_SHA,
+        identity,
+        releaseDescriptor,
     });
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.timeoutMs, IMAGE_PROBE_TIMEOUT_MS);
     assert.ok(IMAGE_PROBE_TIMEOUT_MS >= 60_000);
+    const args = calls[0].args;
+    assert.equal(args.includes('--pull=never'), true);
+    assert.deepEqual(args.slice(0, 7), [
+        'run', '--rm', '--pull=never', '--network=none', '--name',
+        `ploinky-box-probe-${identity.pathHash}-${releaseDescriptor.releaseGeneration.slice(0, 16)}`,
+        '--label',
+    ]);
+    const observedLabels = Object.fromEntries(args.flatMap((value, index) => (
+        value === '--label' ? [args[index + 1].split(/=(.*)/s).slice(0, 2)] : []
+    )));
+    assert.deepEqual(observedLabels, {
+        [BOX_LABELS.owner]: identity.instance,
+        [BOX_LABELS.pathHash]: identity.pathHash,
+        [BOX_LABELS.role]: BOX_ROLES.imageProbe,
+        [BOX_LABELS.imageRef]: releaseDescriptor.boxImageId,
+        [BOX_LABELS.releaseDescriptor]: serializeReleaseDescriptor(releaseDescriptor),
+        [BOX_LABELS.releaseGeneration]: releaseDescriptor.releaseGeneration,
+    });
     const probe = calls[0].args.at(-1);
     assert.match(probe, /bubblewrap-0:0\.11\.0-4\.fc44/);
     assert.match(probe, /--bind-fd FD DEST/);
     assert.match(probe, /ploinky-bwrap-launch-v2 source-sha=/);
     assert.match(probe, /openat2-beneath-no-magiclinks-no-symlinks/);
     assert.throws(
-        () => probeImageBinaries('podman', 'sha256:image-id', runner),
+        () => probeImageBinaries('podman', releaseDescriptor.boxImageId, runner),
         /Ploinky source SHA/,
     );
 });
@@ -253,7 +299,14 @@ test('fresh image validation binds the helper ABI probe to the exact source labe
             };
         },
     };
-    const image = inspectAndValidateImage('podman', 'runtime', runner);
+    const releaseDescriptor = releaseFixture();
+    const image = inspectAndValidateImage('podman', 'runtime', runner, {
+        identity: {
+            instance: 'ploinky-box-fixture-0123456789ab',
+            pathHash: '0123456789ab',
+        },
+        releaseDescriptor,
+    });
     assert.equal(image.sourceSha, SOURCE_SHA);
     const probe = calls.find(({ args }) => args[0] === 'run').args.at(-1);
     assert.match(probe, new RegExp(`helper_version.*${SOURCE_SHA}`));

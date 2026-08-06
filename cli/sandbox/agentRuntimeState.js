@@ -6,6 +6,7 @@ import {
 import { collectLiveAgentContainers, getAgentsRegistry } from './docker/containerRegistry.js';
 import { classifyProviderTaskOwnersReadOnly } from './providerTaskOwnership.js';
 import { loadActiveEdgeRoutingGeneration } from './edgeGeneration.js';
+import { resolvePodmanRuntimeOwnership } from './docker/runtimeOwnership.js';
 
 const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
 const AGENT_RUNTIME_STATE_INVALID_CODE = 'PLOINKY_AGENT_RUNTIME_STATE_INVALID';
@@ -184,9 +185,20 @@ function hostRuntimeOwnership(containerName, record, owner) {
 /** Return one backend-neutral state record for every enabled agent runtime. */
 function collectAgentRuntimeStates(options = {}) {
     const registry = options.registry || getAgentsRegistry() || {};
-    const managedRecords = Object.entries(registry).filter(([, record]) => (
-        record && record.type === 'agent'
-    ));
+    const resolvePodmanOwnership = options.resolvePodmanOwnership
+        || resolvePodmanRuntimeOwnership;
+    const managedRecords = Object.entries(registry)
+        .filter(([, record]) => record && record.type === 'agent')
+        .map(([containerName, record]) => [
+            containerName,
+            record.runtime === 'podman'
+                ? resolvePodmanOwnership(containerName, record)
+                : record,
+        ]);
+    const selectedRegistry = Object.freeze({
+        ...registry,
+        ...Object.fromEntries(managedRecords),
+    });
     const runtimeByName = new Map(managedRecords.map(([containerName, record]) => [
         containerName,
         validateRegistryRuntime(containerName, record),
@@ -195,7 +207,9 @@ function collectAgentRuntimeStates(options = {}) {
     const liveContainers = hasPodmanRuntime
         ? (Object.hasOwn(options, 'liveContainers')
             ? (options.liveContainers || [])
-            : (options.collectContainers || collectLiveAgentContainers)() || [])
+            : (options.collectContainers || collectLiveAgentContainers)({
+                registry: selectedRegistry,
+            }) || [])
         : [];
     const sandboxServiceOwners = options.readSandboxServiceOwner
         ? null
@@ -311,7 +325,7 @@ function collectAgentRuntimeStates(options = {}) {
         .map((state) => [state.runtimeKey, state]));
     for (const classified of providerClassifications) {
         const owner = classified.owner;
-        const record = registry?.[owner?.runtimeKey];
+        const record = selectedRegistry?.[owner?.runtimeKey];
         const exactHomeSelection = record?.runtime === 'podman'
             ? owner?.homeKey === owner?.runtimeKey
             : typeof record?.homeKey === 'string' && record.homeKey === owner?.homeKey;

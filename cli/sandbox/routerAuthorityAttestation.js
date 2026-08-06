@@ -9,6 +9,10 @@ import { PLOINKY_DIR } from '../utils/config.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { selectedRouterHostPort } from './routerPort.js';
 import { canonicalJsonBytes } from '../utils/security/generatedRouterDescriptor.js';
+import {
+    buildManagedProbeIdentity,
+    buildManagedProbeRunArgs,
+} from './docker/probeOwnership.js';
 
 const HEALTH_SOCKET = path.join(PLOINKY_DIR, 'run', 'router-health.sock');
 const REQUEST_TIMEOUT_MS = 3_000;
@@ -16,7 +20,6 @@ const HELPER_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_BYTES = 8 * 1024;
 const MACOS_REMOTE_LOOPBACK_BODY = '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}';
 const AUTHORITY_HELPER_USER = '65534:65534';
-export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
 export const ROUTER_AUTHORITY_EXTERNAL_PROBE_TIMEOUT = 'PLOINKY_ROUTER_ATTESTATION_EXTERNAL_PROBE_TIMEOUT';
 
 const BOUNDED_OPERATION = Object.freeze({
@@ -477,7 +480,7 @@ export function createPrivateAuthorityRegistryClient({
     });
 }
 
-const AUTHORITY_HELPER_INSPECT_FORMAT = String.raw`{"id":{{json .ID}},"image":{{json .Image}},"user":{{json .Config.User}},"entrypoint":{{json .Config.Entrypoint}},"init":{{json .HostConfig.Init}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"memory":{{json .HostConfig.Memory}},"nanoCpus":{{json .HostConfig.NanoCpus}},"networkMode":{{json .HostConfig.NetworkMode}},"extraHosts":{{json .HostConfig.ExtraHosts}},"mountCount":{{len .Mounts}},"bindCount":{{len .HostConfig.Binds}},"tmpfsCount":{{len .HostConfig.Tmpfs}},"portBindingCount":{{len .HostConfig.PortBindings}},"capDrop":{{json .HostConfig.CapDrop}},"capAdd":{{json .HostConfig.CapAdd}},"securityOpt":{{json .HostConfig.SecurityOpt}},"env":{{json .Config.Env}},"helperLabel":{{json (index .Config.Labels "io.assistos.ploinky.authority-helper")}},"networks":{{json .NetworkSettings.Networks}},"running":{{json .State.Running}},"status":{{json .State.Status}}}`;
+const AUTHORITY_HELPER_INSPECT_FORMAT = String.raw`{"id":{{json .ID}},"image":{{json .Image}},"user":{{json .Config.User}},"entrypoint":{{json .Config.Entrypoint}},"init":{{json .HostConfig.Init}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"memory":{{json .HostConfig.Memory}},"nanoCpus":{{json .HostConfig.NanoCpus}},"networkMode":{{json .HostConfig.NetworkMode}},"extraHosts":{{json .HostConfig.ExtraHosts}},"mountCount":{{len .Mounts}},"bindCount":{{len .HostConfig.Binds}},"tmpfsCount":{{len .HostConfig.Tmpfs}},"portBindingCount":{{len .HostConfig.PortBindings}},"capDrop":{{json .HostConfig.CapDrop}},"capAdd":{{json .HostConfig.CapAdd}},"securityOpt":{{json .HostConfig.SecurityOpt}},"env":{{json .Config.Env}},"labels":{{json .Config.Labels}},"networks":{{json .NetworkSettings.Networks}},"running":{{json .State.Running}},"status":{{json .State.Status}}}`;
 
 function inspectAuthorityHelper(runtime, id) {
     const raw = runBounded(runtime, [
@@ -502,27 +505,18 @@ export function managedImageUserNamespace(imageUser) {
     return `keep-id:uid=${match[1]},gid=${match[2]}`;
 }
 
-export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce } = {}) {
-    if (runtime !== 'podman') fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'container attestation requires verified Podman');
-    const targetImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image], {
-        operation: BOUNDED_OPERATION.TARGET_IMAGE_ID,
-    });
-    if (!targetImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(targetImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'actual agent image did not resolve to an immutable image ID');
-    const targetImageUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', targetImageId], {
-        operation: BOUNDED_OPERATION.TARGET_IMAGE_USER,
-    });
-    const helperImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', ROUTER_AUTHORITY_HELPER_IMAGE], {
-        operation: BOUNDED_OPERATION.HELPER_IMAGE_ID,
-    });
-    if (!helperImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(helperImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'authority helper image did not resolve to an immutable image ID');
-    const helperName = `ploinky-authority-${nonce.slice(0, 16)}`;
-    const firstHost = intent.requestAuthority;
-    const secondHost = firstHost === intent.publicAuthority ? 'host.containers.internal:8080' : intent.publicAuthority;
-    const expectedNetworks = (plan?.attachments || []).map((entry) => String(entry?.name || '')).filter(Boolean).sort();
+function authorityPlanContract(plan) {
+    const expectedNetworks = (plan?.attachments || [])
+        .map((entry) => String(entry?.name || ''))
+        .filter(Boolean)
+        .sort();
     if (expectedNetworks.length < 1 || !plan?.alias || !Array.isArray(plan?.args)) {
         fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper requires the exact prepared managed-network plan');
     }
-    const primaryNetwork = String((plan.attachments || []).find((entry) => entry.primary)?.name || expectedNetworks[0]);
+    const primaryNetwork = String(
+        (plan.attachments || []).find((entry) => entry.primary)?.name
+        || expectedNetworks[0],
+    );
     const additionalNetworkArgs = (plan.attachments || [])
         .filter((entry) => String(entry?.name || '') !== primaryNetwork)
         .flatMap((entry) => ['--network', String(entry.name), '--network-alias', String(plan.alias)]);
@@ -531,21 +525,103 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
     if (!expectedHostMapping.startsWith('host.containers.internal:')) {
         fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper managed-network plan lacks the exact HCI mapping');
     }
+    return Object.freeze({
+        expectedNetworks,
+        primaryNetwork,
+        additionalNetworkArgs,
+        expectedHostMapping,
+    });
+}
+
+export function buildContainerAuthorityHelperCreateArgs({
+    plan,
+    helperImageId,
+    intent,
+    nonce,
+    probeOwnership,
+} = {}) {
+    const exactHelperImageId = String(helperImageId || '').replace(/^sha256:/, '');
+    if (!/^[a-f0-9]{64}$/.test(exactHelperImageId)) {
+        fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'authority helper requires one exact raw image ID');
+    }
+    const firstHost = intent.requestAuthority;
+    const secondHost = firstHost === intent.publicAuthority ? 'host.containers.internal:8080' : intent.publicAuthority;
+    const { additionalNetworkArgs } = authorityPlanContract(plan);
+    return [
+        'create',
+        ...buildManagedProbeRunArgs({
+            ...probeOwnership,
+            purpose: 'router-authority',
+            imageId: exactHelperImageId,
+        }),
+        '--label', `io.assistos.ploinky.authority-helper=${nonce}`,
+        '--init',
+        '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+        '--pids-limit', '32', '--memory', '64m', '--cpus', '0.25',
+        '--user', AUTHORITY_HELPER_USER,
+        '--entrypoint', 'node',
+        ...(plan?.args || []),
+        ...additionalNetworkArgs,
+        exactHelperImageId, '-e', PROBE_SCRIPT,
+        intent.physicalOrigin, firstHost, secondHost, nonce,
+    ];
+}
+
+function exactProbeLabels(observed, expected, nonce) {
+    if (!observed || typeof observed !== 'object' || Array.isArray(observed)) return false;
+    const exact = {
+        ...expected,
+        'io.assistos.ploinky.authority-helper': nonce,
+    };
+    // Podman carries immutable image metadata labels into Config.Labels. Probe
+    // ownership is exact when every controller label is present with the
+    // expected value; inherited provenance labels are not ownership authority.
+    return Object.entries(exact)
+        .every(([key, value]) => String(observed[key]) === value);
+}
+
+export function runContainerAuthorityProbe({
+    runtime,
+    plan,
+    image,
+    helperImage,
+    intent,
+    nonce,
+    probeOwnership,
+} = {}) {
+    if (runtime !== 'podman') fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'container attestation requires verified Podman');
+    const targetImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image], {
+        operation: BOUNDED_OPERATION.TARGET_IMAGE_ID,
+    }).replace(/^sha256:/, '');
+    if (!/^[a-f0-9]{64}$/.test(targetImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'actual agent image did not resolve to an immutable image ID');
+    const targetImageUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', targetImageId], {
+        operation: BOUNDED_OPERATION.TARGET_IMAGE_USER,
+    });
+    const helperImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', helperImage], {
+        operation: BOUNDED_OPERATION.HELPER_IMAGE_ID,
+    }).replace(/^sha256:/, '');
+    if (!/^[a-f0-9]{64}$/.test(helperImageId) || helperImageId !== String(helperImage || '').replace(/^sha256:/, '')) {
+        fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'descriptor authority helper image did not resolve to its exact raw image ID');
+    }
+    const expectedProbeIdentity = buildManagedProbeIdentity({
+        ...probeOwnership,
+        purpose: 'router-authority',
+        imageId: helperImageId,
+    });
+    const {
+        expectedNetworks,
+        primaryNetwork,
+        expectedHostMapping,
+    } = authorityPlanContract(plan);
     let helperId = '';
     try {
-        helperId = runBounded(runtime, [
-            'create', '--pull=never', '--name', helperName,
-            '--label', `io.assistos.ploinky.authority-helper=${nonce}`,
-            '--init',
-            '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-            '--pids-limit', '32', '--memory', '64m', '--cpus', '0.25',
-            '--user', AUTHORITY_HELPER_USER,
-            '--entrypoint', 'node',
-            ...(plan?.args || []),
-            ...additionalNetworkArgs,
-            helperImageId, '-e', PROBE_SCRIPT,
-            intent.physicalOrigin, firstHost, secondHost, nonce,
-        ], { operation: BOUNDED_OPERATION.HELPER_CREATE });
+        helperId = runBounded(runtime, buildContainerAuthorityHelperCreateArgs({
+            plan,
+            helperImageId,
+            intent,
+            nonce,
+            probeOwnership,
+        }), { operation: BOUNDED_OPERATION.HELPER_CREATE }).replace(/^sha256:/, '');
         if (!helperId) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper creation did not return an immutable ID');
         const inspected = inspectAuthorityHelper(runtime, helperId);
         const inspectedNetworks = Object.keys(inspected.networks || {}).sort();
@@ -577,7 +653,7 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
             || capAdd.length !== 0
             || securityOpt.length !== 1 || !['no-new-privileges', 'no-new-privileges=true'].includes(securityOpt[0])
             || helperEnv.some((entry) => /^(?:PLOINKY_|AUTHORIZATION=|BEARER_)/i.test(entry))
-            || String(inspected.helperLabel || '') !== nonce) {
+            || !exactProbeLabels(inspected.labels, expectedProbeIdentity.labels, nonce)) {
             fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper confinement inspection failed');
         }
         const output = runBounded(runtime, ['start', '--attach', helperId], {
@@ -599,7 +675,7 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
         if (helperId) {
             const inspected = inspectAuthorityHelper(runtime, helperId);
             if (String(inspected.id || '') !== helperId
-                || String(inspected.helperLabel || '') !== nonce) {
+                || !exactProbeLabels(inspected.labels, expectedProbeIdentity.labels, nonce)) {
                 fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper cleanup could not prove exact immutable ID and nonce ownership');
             }
             if (inspected.running === true || inspected.status === 'running') {
@@ -609,7 +685,7 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
                 });
                 const stopped = inspectAuthorityHelper(runtime, helperId);
                 if (String(stopped.id || '') !== helperId
-                    || String(stopped.helperLabel || '') !== nonce
+                    || !exactProbeLabels(stopped.labels, expectedProbeIdentity.labels, nonce)
                     || stopped.running === true || stopped.status === 'running') {
                     fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper remained running after bounded exact-ID stop');
                 }
@@ -687,7 +763,6 @@ export default {
     validateRouterAuthorityObservation,
     createPrivateAuthorityRegistryClient,
     managedImageUserNamespace,
-    ROUTER_AUTHORITY_HELPER_IMAGE,
     ROUTER_AUTHORITY_EXTERNAL_PROBE_TIMEOUT,
     runContainerAuthorityProbe,
     attestRouterAuthority,

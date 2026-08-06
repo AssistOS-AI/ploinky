@@ -224,6 +224,7 @@ export async function reconcileBoxContainer({
     env = process.env,
     stdout = process.stdout,
     stderr = process.stderr,
+    admitNodeImage = null,
 }, seams = {}) {
     lock.assertHeld(identity.instance);
     if (!['absent', 'owned'].includes(ownership?.state)) {
@@ -246,6 +247,7 @@ export async function reconcileBoxContainer({
         readCidfile: seams.readCidfile || readContainerIdFromCidfile,
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
+        admitNodeImage: seams.admitNodeImage || admitNodeImage,
     };
     let selectedRelease = null;
     if (releaseDescriptor) {
@@ -286,6 +288,7 @@ export async function reconcileBoxContainer({
         dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
         if (old.releaseDescriptor) {
             dependencies.validateReleaseImage(engine.name, 'box', old.releaseDescriptor, runner);
+            dependencies.validateReleaseImage(engine.name, 'node', old.releaseDescriptor, runner);
         }
     }
     const requiresReplacement = Boolean(old) && (
@@ -304,21 +307,48 @@ export async function reconcileBoxContainer({
             runner,
             lock,
         });
-        if (!currentContainer.runtime.running) {
-            writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
-            runner.run(engine.name, ['container', 'start', currentContainer.id]);
-            await dependencies.waitReady(engine, currentContainer.id, runner, { stdout, stderr });
+        const startedForReuse = !currentContainer.runtime.running;
+        try {
+            if (startedForReuse) {
+                writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
+                runner.run(engine.name, ['container', 'start', currentContainer.id]);
+                await dependencies.waitReady(engine, currentContainer.id, runner, { stdout, stderr });
+            }
+            if (old.releaseDescriptor) {
+                if (typeof dependencies.admitNodeImage !== 'function') {
+                    throw transactionError('Release Node image admission is unavailable');
+                }
+                await dependencies.admitNodeImage(
+                    engine,
+                    currentContainer.id,
+                    old.releaseDescriptor,
+                    runner,
+                    { stdout, stderr },
+                );
+            }
+            const finalOwnership = dependencies.discover(identity, { runner });
+            validateCreatedContainer(finalOwnership, old);
+            return Object.freeze({
+                action: 'reused',
+                ownership: finalOwnership,
+                hostPort: old.hostPort,
+                mediaHostPort: old.mediaHostPort,
+                imageId: old.imageId,
+                releaseGeneration: old.releaseDescriptor?.releaseGeneration || null,
+            });
+        } catch (error) {
+            const rollbackFailures = [];
+            if (startedForReuse) {
+                try {
+                    runner.run(engine.name, [
+                        'container', 'stop', '--time', '30', currentContainer.id,
+                    ]);
+                } catch (rollbackError) {
+                    rollbackFailures.push(`reused Box stop: ${rollbackError.message}`);
+                }
+            }
+            throw transactionError('Existing Box reuse transaction failed', error, rollbackFailures);
         }
-        const finalOwnership = dependencies.discover(identity, { runner });
-        validateCreatedContainer(finalOwnership, old);
-        return Object.freeze({
-            action: 'reused',
-            ownership: finalOwnership,
-            hostPort: old.hostPort,
-            mediaHostPort: old.mediaHostPort,
-            imageId: old.imageId,
-            releaseGeneration: old.releaseDescriptor?.releaseGeneration || null,
-        });
     }
 
     await dependencies.preflight({
@@ -334,8 +364,12 @@ export async function reconcileBoxContainer({
     const selectedImageRef = selectedLocalImageId || imageRef;
     if (selectedRelease) {
         dependencies.validateReleaseImage(engine.name, 'box', selectedRelease, runner);
+        dependencies.validateReleaseImage(engine.name, 'node', selectedRelease, runner);
     }
-    const image = dependencies.validateImage(engine.name, selectedImageRef, runner);
+    const image = dependencies.validateImage(engine.name, selectedImageRef, runner, {
+        identity,
+        releaseDescriptor: selectedRelease,
+    });
     if (selectedLocalImageId !== null && image.immutableId !== selectedLocalImageId) {
         throw new PloinkyBoxError(
             'Release Box image inspection did not return the descriptor image ID',
@@ -398,6 +432,18 @@ export async function reconcileBoxContainer({
             releaseDescriptor: selectedRelease,
         });
         candidateId = created.containerId;
+        if (selectedRelease) {
+            if (typeof dependencies.admitNodeImage !== 'function') {
+                throw new Error('Release Node image admission is unavailable');
+            }
+            await dependencies.admitNodeImage(
+                engine,
+                candidateId,
+                selectedRelease,
+                runner,
+                { stdout, stderr },
+            );
+        }
         return Object.freeze({
             action: old ? 'replaced' : 'created',
             ownership: created.ownership,
@@ -424,7 +470,7 @@ export async function reconcileBoxContainer({
         }
         if (oldRemoved) {
             try {
-                await restoreOldContainer({
+                const restored = await restoreOldContainer({
                     engine,
                     identity,
                     old,
@@ -435,6 +481,18 @@ export async function reconcileBoxContainer({
                     stdout,
                     stderr,
                 });
+                if (old.releaseDescriptor) {
+                    if (typeof dependencies.admitNodeImage !== 'function') {
+                        throw new Error('Prior release Node image admission is unavailable');
+                    }
+                    await dependencies.admitNodeImage(
+                        engine,
+                        restored.containerId,
+                        old.releaseDescriptor,
+                        runner,
+                        { stdout, stderr },
+                    );
+                }
             } catch (restoreError) {
                 rollbackFailures.push(`old Box restoration: ${restoreError.message}`);
             }

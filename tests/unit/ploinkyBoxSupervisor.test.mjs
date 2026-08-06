@@ -7,11 +7,16 @@ import test from 'node:test';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
+    admitReleaseNodeImage,
     checkBoxHealth,
     createBoxSupervisor,
     formatBoxStatus,
     runBoundedCoreStart,
 } from '../../ploinky-box/supervisor.mjs';
+import {
+    REQUIRED_RELEASE_AGENTLIB_SHA,
+    createReleaseDescriptor,
+} from '../../ploinky-box/contract/release.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -62,6 +67,123 @@ function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
         },
     };
 }
+
+function releaseFixture() {
+    return createReleaseDescriptor({
+        schema: 'ploinky-release-v1',
+        boxImageId: 'b'.repeat(64),
+        boxImageDigest: `sha256:${'1'.repeat(64)}`,
+        nodeImageId: 'c'.repeat(64),
+        nodeImageDigest: `sha256:${'2'.repeat(64)}`,
+        artifactSourceSha: '4'.repeat(40),
+        controllerSourceSha: '5'.repeat(40),
+        agentlibSha: REQUIRED_RELEASE_AGENTLIB_SHA,
+        routerHostPort: 18081,
+        mediaHostPort: 17883,
+    });
+}
+
+function releaseNodeInspect(descriptor) {
+    return [{
+        Id: descriptor.nodeImageId,
+        RepoDigests: [`docker.io/assistos/ploinky-node@${descriptor.nodeImageDigest}`],
+        Config: { Labels: {
+            'io.assistos.ploinky.source-sha': descriptor.artifactSourceSha,
+            'io.assistos.ploinky.agentlib-sha': descriptor.agentlibSha,
+        } },
+    }];
+}
+
+test('exact release Node admission streams the raw image into the exact Box and re-inspects it', async () => {
+    const descriptor = releaseFixture();
+    const containerId = 'a'.repeat(64);
+    const calls = [];
+    let nestedInspections = 0;
+    const runner = {
+        query(engine, args) {
+            calls.push({ method: 'query', engine, args });
+            if (args[0] === 'image') {
+                return { ok: true, stdout: JSON.stringify(releaseNodeInspect(descriptor)) };
+            }
+            nestedInspections += 1;
+            return nestedInspections === 1
+                ? { ok: false, stdout: '', stderr: 'image not known' }
+                : { ok: true, stdout: JSON.stringify(releaseNodeInspect(descriptor)) };
+        },
+        async pipe(sourceCommand, sourceArgs, destinationCommand, destinationArgs) {
+            calls.push({ method: 'pipe', sourceCommand, sourceArgs, destinationCommand, destinationArgs });
+            return { ok: true, status: 0, stdout: '', stderr: '' };
+        },
+    };
+
+    const admitted = await admitReleaseNodeImage(
+        { name: 'podman' }, containerId, descriptor, runner,
+    );
+    assert.equal(admitted.imageId, descriptor.nodeImageId);
+    assert.deepEqual(calls[0], {
+        method: 'query', engine: 'podman',
+        args: ['image', 'inspect', descriptor.nodeImageId],
+    });
+    const transfer = calls.find((call) => call.method === 'pipe');
+    assert.deepEqual(transfer, {
+        method: 'pipe',
+        sourceCommand: 'podman',
+        sourceArgs: ['image', 'save', '--format', 'oci-archive', descriptor.nodeImageId],
+        destinationCommand: 'podman',
+        destinationArgs: [
+            'container', 'exec', '-i', '--user', 'podman', '--workdir', '/workspace',
+            containerId, 'podman', 'image', 'load',
+        ],
+    });
+    const nested = calls.filter((call) => call.method === 'query' && call.args[0] === 'container');
+    assert.equal(nested.length, 2);
+    assert.deepEqual(nested[1].args.slice(-4), [
+        'podman', 'image', 'inspect', descriptor.nodeImageId,
+    ]);
+    assert.equal(JSON.stringify(calls).includes('pull'), false);
+    assert.equal(JSON.stringify(calls).includes('24-bookworm-tools'), false);
+});
+
+test('managed start admits the exact release Node image before dependencies and core readiness', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const descriptor = releaseFixture();
+    const events = [];
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        validateReleaseAdmission: () => descriptor,
+        reconcile: async (options) => {
+            events.push('reconcile');
+            await options.admitNodeImage(
+                ownership.engine,
+                ownership.handles.container.id,
+                descriptor,
+            );
+            return { action: 'reused', ownership, hostPort: descriptor.routerHostPort };
+        },
+        admitNodeImage: async (engine, containerId, release) => {
+            assert.equal(engine, ownership.engine);
+            assert.equal(containerId, ownership.handles.container.id);
+            assert.equal(release, descriptor);
+            events.push('admit-node');
+        },
+        runner: {
+            run(command, args) { events.push(`run:${args.join(' ')}`); },
+        },
+        readEdgeDesired: () => null,
+        startCore: async () => { events.push('core'); },
+        healthCheck: async () => { events.push('health'); },
+    });
+
+    await supervisor.runStartTransaction(['start'], { releaseDescriptor: descriptor });
+    assert.ok(events.indexOf('reconcile') < events.indexOf('admit-node'));
+    assert.ok(events.indexOf('admit-node') < events.findIndex((entry) => entry.includes('ploinky-install-deps')));
+    assert.ok(events.indexOf('admit-node') < events.indexOf('core'));
+});
 
 test('unsupported discovery happens before markerless anchor materialization', async (t) => {
     const state = fixture(t);

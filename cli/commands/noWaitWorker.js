@@ -87,6 +87,10 @@ export function assertNoWaitStatusIdentity(status, expectedIdentity = null, {
         throw new Error(`${description} requires one exact status state`);
     }
     assertExactNoWaitIdentity(status, description);
+    if (status.runtime === 'podman'
+        && !IMMUTABLE_CONTAINER_ID_PATTERN.test(String(status.containerId || ''))) {
+        throw new Error(`${description} requires an immutable lowercase 64-hex Podman container ID`);
+    }
     if (!expectedIdentity) return status;
     assertExactNoWaitIdentity(expectedIdentity, `${description} expectation`);
     const fields = ['runtime', 'containerName', 'instanceId', 'enableGeneration'];
@@ -1154,7 +1158,9 @@ async function main() {
             waitForIdentity,
         } : {}),
     };
-    writeStatus(containerName, { ...baseStatus, state: 'starting' });
+    if (admittedRuntime !== 'podman') {
+        writeStatus(containerName, { ...baseStatus, state: 'starting' });
+    }
 
     console.log(`[no-wait] ${shortAgent}: starting background launch (pid ${process.pid})`);
 
@@ -1171,7 +1177,9 @@ async function main() {
             };
             delete baseStatus.waitForStatusFile;
             delete baseStatus.waitForIdentity;
-            writeStatus(containerName, { ...baseStatus, state: 'starting' });
+            if (admittedRuntime !== 'podman') {
+                writeStatus(containerName, { ...baseStatus, state: 'starting' });
+            }
         }
         const expectedIdentity = Object.freeze({
             containerName,
@@ -1239,6 +1247,14 @@ async function main() {
                 lifecycle,
                 dockerSvc.collectLiveAgentContainers(),
             );
+            baseStatus = {
+                ...baseStatus,
+                containerId: lifecycle.record.containerId,
+            };
+            writeStatus(containerName, {
+                ...baseStatus,
+                state: 'starting',
+            });
             const hostPort = Number(lifecycle.route.hostPort);
             await waitForNoWaitReadiness({
                 manifest,
@@ -1310,6 +1326,16 @@ async function main() {
         const hostPort = result && result.hostPort;
         const registryRecord = result && result.registryRecord;
         assertNoWaitRegistryRecord(registryRecord, lifecycle.record, expectedIdentity);
+        if (registryRecord.runtime === 'podman') {
+            baseStatus = {
+                ...baseStatus,
+                containerId: registryRecord.containerId,
+            };
+            writeStatus(containerName, {
+                ...baseStatus,
+                state: 'starting',
+            });
+        }
         const routedHostPort = profileResolution.network.mode === 'none'
             ? null
             : hostPort || null;
@@ -1373,6 +1399,12 @@ async function main() {
         let failure = err instanceof Error ? err : new Error(String(err));
         failure = await recoverNoWaitTaskOwnedCandidate(taskOwnedCandidate, failure);
         taskOwnedCandidate = null;
+        const failedCandidateId = failure?.ploinkyRestartCandidate?.registryRecord?.containerId;
+        if (admittedRuntime === 'podman'
+            && !IMMUTABLE_CONTAINER_ID_PATTERN.test(String(baseStatus.containerId || ''))
+            && IMMUTABLE_CONTAINER_ID_PATTERN.test(String(failedCandidateId || ''))) {
+            baseStatus = { ...baseStatus, containerId: failedCandidateId };
+        }
         const finishedAtMs = Date.now();
         const finishedAt = new Date(finishedAtMs).toISOString();
         const error = {
@@ -1380,13 +1412,20 @@ async function main() {
             stack: failure.stack || null,
             ...(failure.code ? { code: failure.code } : {}),
         };
-        writeStatus(containerName, {
-            ...baseStatus,
-            state: 'failed',
-            finishedAt,
-            finishedAtMs,
-            error
-        });
+        if (admittedRuntime !== 'podman'
+            || IMMUTABLE_CONTAINER_ID_PATTERN.test(String(baseStatus.containerId || ''))) {
+            writeStatus(containerName, {
+                ...baseStatus,
+                state: 'failed',
+                finishedAt,
+                finishedAtMs,
+                error
+            });
+        } else {
+            try { fs.unlinkSync(statusPathFor(containerName)); } catch (unlinkError) {
+                if (unlinkError?.code !== 'ENOENT') throw unlinkError;
+            }
+        }
         console.error(`[no-wait] ${shortAgent}: launch failed: ${error.message}`);
         if (failure.stack) console.error(failure.stack);
         process.exit(1);

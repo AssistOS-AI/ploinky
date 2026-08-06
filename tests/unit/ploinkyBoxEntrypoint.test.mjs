@@ -273,7 +273,6 @@ function retainedContainerFixture(t, {
     const runner = {
         query(command, args) {
             calls.push(['query', command, ...args]);
-            if (args[1] === 'ps') return { ok: true, stdout: `${containerId}\n`, stderr: '' };
             if (args[1] === 'inspect') {
                 return {
                     ok: true,
@@ -299,12 +298,35 @@ test('entrypoint retires only an exact stopped managed container without touchin
     const { paths, containerId, runner, calls } = retainedContainerFixture(t);
 
     assert.deepEqual(retireStoppedManagedContainers(paths, { runner }), [containerId]);
-    assert.equal(calls[0].includes('--no-trunc'), true);
+    assert.deepEqual(calls[0], ['query', 'podman', 'container', 'inspect', containerId]);
     assert.deepEqual(calls.at(-1), ['run', 'podman', 'container', 'rm', containerId]);
+    assert.equal(calls.some((call) => call.includes('ps') || call.includes('--filter')), false);
     assert.equal(calls.some((call) => call.includes('-f') || call.includes('--volumes')), false);
 });
 
-test('entrypoint retires a stopped pre-lifecycle-label container with exact legacy ownership', (t) => {
+test('entrypoint treats exact immutable-ID absence as contained without engine enumeration', (t) => {
+    const helper = retainedContainerFixture(t);
+    helper.runner.query = (command, args) => {
+        helper.calls.push(['query', command, ...args]);
+        return {
+            ok: false,
+            status: 125,
+            stdout: '',
+            stderr: `Error: no such container ${helper.containerId}`,
+            error: null,
+        };
+    };
+
+    assert.deepEqual(retireStoppedManagedContainers(helper.paths, {
+        runner: helper.runner,
+    }), []);
+    assert.deepEqual(helper.calls, [[
+        'query', 'podman', 'container', 'inspect', helper.containerId,
+    ]]);
+    assert.equal(helper.calls.some((call) => call.includes('ps') || call.includes('--filter')), false);
+});
+
+test('entrypoint rejects an incompletely labelled selected container without global recovery', (t) => {
     const legacy = retainedContainerFixture(t, {
         mutateLabels(labels) {
             const copy = { ...labels };
@@ -314,17 +336,15 @@ test('entrypoint retires a stopped pre-lifecycle-label container with exact lega
         },
     });
 
-    assert.deepEqual(
-        retireStoppedManagedContainers(legacy.paths, { runner: legacy.runner }),
-        [legacy.containerId],
+    assert.throws(
+        () => retireStoppedManagedContainers(legacy.paths, { runner: legacy.runner }),
+        /instance-ownership-label|enable-generation-ownership-label/,
     );
-    assert.deepEqual(
-        legacy.calls.at(-1),
-        ['run', 'podman', 'container', 'rm', legacy.containerId],
-    );
+    assert.equal(legacy.calls.some((call) => call[0] === 'run'), false);
+    assert.equal(legacy.calls.some((call) => call.includes('ps') || call.includes('--filter')), false);
 });
 
-test('entrypoint retires a stopped predecessor with a complete stale lifecycle pair', (t) => {
+test('entrypoint rejects stale lifecycle ownership instead of adopting a predecessor', (t) => {
     const predecessor = retainedContainerFixture(t, {
         mutateLabels(labels) {
             return {
@@ -335,17 +355,14 @@ test('entrypoint retires a stopped predecessor with a complete stale lifecycle p
         },
     });
 
-    assert.deepEqual(
-        retireStoppedManagedContainers(predecessor.paths, { runner: predecessor.runner }),
-        [predecessor.containerId],
+    assert.throws(
+        () => retireStoppedManagedContainers(predecessor.paths, { runner: predecessor.runner }),
+        /instance-ownership-label|enable-generation-ownership-label/,
     );
-    assert.deepEqual(
-        predecessor.calls.at(-1),
-        ['run', 'podman', 'container', 'rm', predecessor.containerId],
-    );
+    assert.equal(predecessor.calls.some((call) => call[0] === 'run'), false);
 });
 
-test('entrypoint retires only a fully superseded staged predecessor', (t) => {
+test('entrypoint rejects registry/container immutable-ID drift without name recovery', (t) => {
     const predecessor = retainedContainerFixture(t, {
         mutateRegistry(record) {
             return {
@@ -357,26 +374,14 @@ test('entrypoint retires only a fully superseded staged predecessor', (t) => {
         },
     });
 
-    assert.deepEqual(
-        retireStoppedManagedContainers(predecessor.paths, { runner: predecessor.runner }),
-        [predecessor.containerId],
-    );
-
-    const duplicateIdentity = retainedContainerFixture(t, {
-        mutateRegistry(record) {
-            return { ...record, containerId: 'c'.repeat(64) };
-        },
-    });
     assert.throws(
-        () => retireStoppedManagedContainers(duplicateIdentity.paths, {
-            runner: duplicateIdentity.runner,
-        }),
-        /registry-container-id/,
+        () => retireStoppedManagedContainers(predecessor.paths, { runner: predecessor.runner }),
+        /container-id/,
     );
-    assert.equal(duplicateIdentity.calls.some((call) => call[0] === 'run'), false);
+    assert.equal(predecessor.calls.some((call) => call[0] === 'run'), false);
 });
 
-test('entrypoint retires only a stopped legacy helper with the exact historical label', (t) => {
+test('entrypoint never enumerates or adopts an unregistered observe-only container', (t) => {
     const helper = retainedContainerFixture(t, {
         includeRegistry: false,
         mutateLabels() {
@@ -384,68 +389,8 @@ test('entrypoint retires only a stopped legacy helper with the exact historical 
         },
     });
 
-    assert.deepEqual(
-        retireStoppedManagedContainers(helper.paths, { runner: helper.runner }),
-        [helper.containerId],
-    );
-    assert.deepEqual(
-        helper.calls.at(-1),
-        ['run', 'podman', 'container', 'rm', helper.containerId],
-    );
-
-    const running = retainedContainerFixture(t, {
-        includeRegistry: false,
-        running: true,
-        status: 'running',
-        mutateLabels() {
-            return { 'io.assistos.ploinky.managed': '1' };
-        },
-    });
-    assert.throws(
-        () => retireStoppedManagedContainers(running.paths, { runner: running.runner }),
-        /exact non-running removable state/,
-    );
-    assert.equal(running.calls.some((call) => call[0] === 'run'), false);
-
-    const configured = retainedContainerFixture(t, {
-        includeRegistry: false,
-        status: 'configured',
-        mutateLabels() {
-            return { 'io.assistos.ploinky.managed': '1' };
-        },
-    });
-    assert.deepEqual(
-        retireStoppedManagedContainers(configured.paths, { runner: configured.runner }),
-        [configured.containerId],
-    );
-
-    const paused = retainedContainerFixture(t, {
-        includeRegistry: false,
-        status: 'paused',
-        mutateLabels() {
-            return { 'io.assistos.ploinky.managed': '1' };
-        },
-    });
-    assert.throws(
-        () => retireStoppedManagedContainers(paused.paths, { runner: paused.runner }),
-        /exact non-running removable state/,
-    );
-    assert.equal(paused.calls.some((call) => call[0] === 'run'), false);
-
-    const extraLabel = retainedContainerFixture(t, {
-        includeRegistry: false,
-        mutateLabels() {
-            return {
-                'io.assistos.ploinky.managed': '1',
-                'io.assistos.ploinky.unrecognized': '1',
-            };
-        },
-    });
-    assert.throws(
-        () => retireStoppedManagedContainers(extraLabel.paths, { runner: extraLabel.runner }),
-        /exact registry ownership/,
-    );
-    assert.equal(extraLabel.calls.some((call) => call[0] === 'run'), false);
+    assert.deepEqual(retireStoppedManagedContainers(helper.paths, { runner: helper.runner }), []);
+    assert.deepEqual(helper.calls, []);
 });
 
 test('entrypoint rejects running or ownership-drifted retained managed containers', (t) => {
@@ -478,7 +423,7 @@ test('entrypoint rejects running or ownership-drifted retained managed container
         () => retireStoppedManagedContainers(partiallyLabeled.paths, {
             runner: partiallyLabeled.runner,
         }),
-        /lifecycle-ownership-labels/,
+        /enable-generation-ownership-label/,
     );
     assert.equal(partiallyLabeled.calls.some((call) => call[0] === 'run'), false);
 

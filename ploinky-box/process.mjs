@@ -167,6 +167,123 @@ export function streamProcess(command, args, {
     });
 }
 
+export function pipeProcess(sourceCommand, sourceArgs, destinationCommand, destinationArgs, {
+    cwd,
+    env,
+    timeoutMs = 1_800_000,
+    stdout = process.stdout,
+    stderr = process.stderr,
+} = {}) {
+    assertProcessArguments(sourceArgs);
+    assertProcessArguments(destinationArgs);
+
+    return new Promise((resolve) => {
+        const stdoutChunks = [];
+        const stderrChunks = [];
+        let capturedBytes = 0;
+        let processError = null;
+        let sourceStatus = null;
+        let destinationStatus = null;
+        let sourceSignal = null;
+        let destinationSignal = null;
+        let settled = false;
+        let timeout = null;
+        let source;
+        let destination;
+
+        const capture = (chunk, chunks, output) => {
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+            capturedBytes += buffer.length;
+            output?.write?.(chunk);
+            if (capturedBytes > MAX_PROCESS_OUTPUT_BYTES) {
+                if (!processError) {
+                    processError = new Error('Image transfer output exceeded the process output limit');
+                    processError.code = 'ENOBUFS';
+                }
+                source?.kill('SIGKILL');
+                destination?.kill('SIGKILL');
+                return;
+            }
+            chunks.push(buffer);
+        };
+
+        const finish = () => {
+            if (settled || sourceStatus === null || destinationStatus === null) return;
+            settled = true;
+            if (timeout) clearTimeout(timeout);
+            resolve({
+                ok: sourceStatus === 0 && destinationStatus === 0 && !processError,
+                status: destinationStatus === 0 ? sourceStatus : destinationStatus,
+                sourceStatus,
+                destinationStatus,
+                stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+                stderr: Buffer.concat(stderrChunks).toString('utf8'),
+                error: processError,
+                signal: destinationSignal || sourceSignal || null,
+            });
+        };
+
+        const failStart = (error) => {
+            processError ||= error;
+            source?.kill('SIGKILL');
+            destination?.kill('SIGKILL');
+            if (!source) sourceStatus = 1;
+            if (!destination) destinationStatus = 1;
+            finish();
+        };
+
+        const failPipe = (error) => {
+            processError ||= error;
+            source?.kill('SIGKILL');
+            destination?.kill('SIGKILL');
+        };
+
+        try {
+            destination = spawn(destinationCommand, destinationArgs, {
+                cwd,
+                env,
+                stdio: ['pipe', 'pipe', 'pipe'],
+            });
+            source = spawn(sourceCommand, sourceArgs, {
+                cwd,
+                env,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+        } catch (error) {
+            failStart(error);
+            return;
+        }
+
+        destination.stdout.on('data', (chunk) => capture(chunk, stdoutChunks, stdout));
+        destination.stderr.on('data', (chunk) => capture(chunk, stderrChunks, stderr));
+        source.stderr.on('data', (chunk) => capture(chunk, stderrChunks, stderr));
+        source.stdout.on('error', failPipe);
+        destination.stdin.on('error', failPipe);
+        destination.once('error', failStart);
+        source.once('error', failStart);
+        source.once('close', (status, signal) => {
+            sourceStatus = Number.isInteger(status) ? status : 1;
+            sourceSignal = signal || null;
+            finish();
+        });
+        destination.once('close', (status, signal) => {
+            destinationStatus = Number.isInteger(status) ? status : 1;
+            destinationSignal = signal || null;
+            if (sourceStatus === null && destinationStatus !== 0) source?.kill('SIGKILL');
+            finish();
+        });
+        source.stdout.pipe(destination.stdin);
+
+        timeout = setTimeout(() => {
+            if (settled) return;
+            processError = new Error(`Image transfer timed out after ${timeoutMs}ms`);
+            processError.code = 'ETIMEDOUT';
+            source.kill('SIGKILL');
+            destination.kill('SIGKILL');
+        }, timeoutMs);
+    });
+}
+
 export function createProcessRunner(options = {}) {
     return {
         query(command, args, queryOptions = {}) {
@@ -186,6 +303,15 @@ export function createProcessRunner(options = {}) {
                 ...options,
                 ...streamOptions,
             });
+        },
+        pipe(sourceCommand, sourceArgs, destinationCommand, destinationArgs, pipeOptions = {}) {
+            return pipeProcess(
+                sourceCommand,
+                sourceArgs,
+                destinationCommand,
+                destinationArgs,
+                { ...options, ...pipeOptions },
+            );
         },
     };
 }

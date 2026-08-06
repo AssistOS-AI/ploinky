@@ -101,6 +101,7 @@ function lifecycleHarness({
             assert.deepEqual(options?.records, {
                 [containerName]: initialRegistry[containerName],
             });
+            assert.equal(options?.retireRuntimeOwnership, true);
             if (failRemoval) throw new Error('engine refused removal');
             existing.delete(containerName);
         },
@@ -110,6 +111,7 @@ function lifecycleHarness({
                 options?.records,
                 Object.fromEntries(containerNames.map((name) => [name, initialRegistry[name]])),
             );
+            assert.equal(options?.retireRuntimeOwnership, true);
             if (failRemoval) throw new Error('engine refused removal');
             containerNames.forEach((name) => existing.delete(name));
         },

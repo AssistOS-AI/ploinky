@@ -188,7 +188,7 @@ test('fleet bulk lifecycle contains no mutable-name signal/removal fallback', ()
     );
     assert.doesNotMatch(bulk, /execSync\(/);
     assert.doesNotMatch(bulk, /\['rm', '-f', name\]/);
-    assert.match(bulk, /removeExactContainerAndDescriptor\(name, record, 'podman'/);
+    assert.match(bulk, /removeContainer\(name, selectedRecord, 'podman'/);
     assert.doesNotMatch(bulk, /getRuntime\(|probeContainerRuntime\(/);
 });
 

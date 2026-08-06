@@ -6,6 +6,9 @@ import { fileURLToPath } from 'node:url';
 
 import { NETWORK_SCHEMA_VERSION } from '../../cli/sandbox/networkContract.js';
 import {
+    resolvePodmanRuntimeOwnership,
+} from '../../cli/sandbox/docker/runtimeOwnership.js';
+import {
     BOX_MARKER_CONTENT,
     BOX_READY_LINE,
 } from '../constants.mjs';
@@ -123,6 +126,12 @@ function readEntrypointAgentRegistry(workspaceRoot, fsApi) {
 
 function parseSingleContainerInspection(result, containerId) {
     if (!result?.ok) {
+        const diagnostic = String(result?.stderr || '').trim().toLowerCase();
+        if (!result?.error
+            && String(result?.stdout || '').trim() === ''
+            && /(?:no such container|no container with id or name)/.test(diagnostic)) {
+            return null;
+        }
         throw entrypointError(`Unable to inspect retained managed container ${containerId}`);
     }
     let records;
@@ -141,47 +150,68 @@ function parseSingleContainerInspection(result, containerId) {
 export function retireStoppedManagedContainers(paths, {
     fsApi = fs,
     runner = createProcessRunner(),
+    resolveRuntimeOwnership = resolvePodmanRuntimeOwnership,
 } = {}) {
     const registry = readEntrypointAgentRegistry(paths.workspace, fsApi);
     if (!registry) return Object.freeze([]);
-    const listed = runner.query('podman', [
-        'container', 'ps', '--all', '--quiet', '--no-trunc',
-        '--filter', 'label=io.assistos.ploinky.managed=1',
-    ]);
-    if (!listed.ok) {
-        throw entrypointError('Unable to enumerate retained Ploinky-managed containers');
-    }
-    const containerIds = String(listed.stdout || '')
-        .split(/\r?\n/)
-        .map((value) => value.trim().toLowerCase())
-        .filter(Boolean);
     const workspaceHash = crypto.createHash('sha256')
         .update(fsApi.realpathSync(paths.workspace))
         .digest('hex')
         .slice(0, 12);
     const removed = [];
-    for (const containerId of containerIds) {
-        if (!/^[a-f0-9]{64}$/.test(containerId)) {
-            throw entrypointError('Retained managed container enumeration returned a non-immutable ID');
+    const selected = Object.entries(registry)
+        .filter(([name, record]) => (
+            typeof name === 'string'
+            && !name.startsWith('_')
+            && record
+            && typeof record === 'object'
+            && !Array.isArray(record)
+            && ['agent', 'agentCore'].includes(record.type)
+            && record.runtime === 'podman'
+        ));
+    const seenContainerIds = new Set();
+    for (const [registeredName, recordedRegistry] of selected) {
+        let registered;
+        try {
+            registered = recordedRegistry.type === 'agent'
+                ? resolveRuntimeOwnership(registeredName, recordedRegistry)
+                : recordedRegistry;
+        } catch (error) {
+            throw entrypointError(
+                `Retained managed container registry identity is incomplete or ambiguous for ${registeredName || '<empty>'}`,
+                error,
+            );
         }
+        const containerId = String(registered.containerId || '');
+        const registeredInstanceId = String(registered.instanceId || '');
+        const registeredEnableGeneration = String(registered.enableGeneration || '');
+        const registeredReleaseGeneration = String(registered.releaseGeneration || '');
+        if (!registeredName || registeredName !== registeredName.trim()
+            || !/^[a-f0-9]{64}$/.test(containerId)
+            || seenContainerIds.has(containerId)
+            || !registeredInstanceId || registeredInstanceId !== registeredInstanceId.trim()
+            || !registeredEnableGeneration
+            || registeredEnableGeneration !== registeredEnableGeneration.trim()
+            || (registeredReleaseGeneration
+                && !/^[a-f0-9]{64}$/.test(registeredReleaseGeneration))) {
+            throw entrypointError(
+                `Retained managed container registry identity is incomplete or ambiguous for ${registeredName || '<empty>'}`,
+            );
+        }
+        seenContainerIds.add(containerId);
         const record = parseSingleContainerInspection(
             runner.query('podman', ['container', 'inspect', containerId]),
             containerId,
         );
+        if (!record) {
+            // Exact immutable-ID absence is already containment. Preserve the
+            // selected ownership journal for the upcoming atomic replacement;
+            // never enumerate the shared engine to look for a substitute.
+            continue;
+        }
         const observedId = String(record.Id ?? record.ID ?? '').trim().toLowerCase();
         const observedName = String(record.Name || '').replace(/^\//, '');
-        const registered = registry[observedName];
         const labels = record.Config?.Labels || record.Labels || {};
-        const ploinkyLabelKeys = Object.keys(labels)
-            .filter((key) => key.startsWith('io.assistos.ploinky.'));
-        const legacyHelperOwnership = !registered
-            && observedId === containerId
-            && labels[MANAGED_CONTAINER_LABELS.managed] === '1'
-            && ploinkyLabelKeys.length === 1;
-        const registeredInstanceId = String(registered?.instanceId || '');
-        const registeredEnableGeneration = String(registered?.enableGeneration || '');
-        const registeredReleaseGeneration = String(registered?.releaseGeneration || '');
-        const registeredContainerId = String(registered?.containerId || '').trim().toLowerCase();
         const observedInstanceId = String(labels[MANAGED_CONTAINER_LABELS.instanceId] || '');
         const observedEnableGeneration = String(
             labels[MANAGED_CONTAINER_LABELS.enableGeneration] || '',
@@ -189,56 +219,22 @@ export function retireStoppedManagedContainers(paths, {
         const observedReleaseGeneration = String(
             labels[MANAGED_CONTAINER_LABELS.releaseGeneration] || '',
         );
-        const validRegisteredReleaseGeneration = registeredReleaseGeneration === ''
-            || /^[a-f0-9]{64}$/.test(registeredReleaseGeneration);
-        const exactReleaseOwnership = validRegisteredReleaseGeneration
-            && observedReleaseGeneration === registeredReleaseGeneration;
-        const hasRegisteredLifecycleOwnership = Boolean(
-            registeredInstanceId && registeredEnableGeneration,
-        );
-        const exactLifecycleOwnership = hasRegisteredLifecycleOwnership
-            && observedInstanceId === registeredInstanceId
-            && observedEnableGeneration === registeredEnableGeneration;
-        // A stopped predecessor can have no lifecycle labels (older runtime)
-        // or a complete stale pair after the registry staged its successor.
-        // Partial or mixed pairs remain ownership drift and fail closed.
-        const absentLifecycleOwnership = hasRegisteredLifecycleOwnership
-            && observedInstanceId === ''
-            && observedEnableGeneration === '';
-        const staleLifecycleOwnership = hasRegisteredLifecycleOwnership
-            && observedInstanceId !== ''
-            && observedEnableGeneration !== ''
-            && observedInstanceId !== registeredInstanceId
-            && observedEnableGeneration !== registeredEnableGeneration;
         const ownershipMismatches = [
             observedId === containerId || 'container-id',
-            Boolean(registered) || 'registry-record',
-            ['agent', 'agentCore'].includes(registered?.type) || 'registry-type',
-            registered?.runtime === 'podman' || 'registry-runtime',
-            registeredContainerId === containerId || 'registry-container-id',
+            observedName === registeredName || 'container-name',
             labels[MANAGED_CONTAINER_LABELS.managed] === '1' || 'managed-label',
             labels[MANAGED_CONTAINER_LABELS.resource] === 'agent' || 'resource-label',
             labels[MANAGED_CONTAINER_LABELS.schema] === NETWORK_SCHEMA_VERSION || 'schema-label',
             labels[MANAGED_CONTAINER_LABELS.workspace] === workspaceHash || 'workspace-label',
             /^[a-f0-9]{64}$/.test(String(labels[MANAGED_CONTAINER_LABELS.contract] || ''))
                 || 'contract-label',
-            exactReleaseOwnership || 'release-ownership-label',
-            (
-                exactLifecycleOwnership
-                || absentLifecycleOwnership
-                || staleLifecycleOwnership
-            )
-                || 'lifecycle-ownership-labels',
+            observedReleaseGeneration === registeredReleaseGeneration
+                || 'release-ownership-label',
+            observedInstanceId === registeredInstanceId || 'instance-ownership-label',
+            observedEnableGeneration === registeredEnableGeneration
+                || 'enable-generation-ownership-label',
         ].filter((value) => value !== true);
-        const stagedPredecessorOwnership = staleLifecycleOwnership
-            && /^[a-f0-9]{64}$/.test(registeredContainerId)
-            && ownershipMismatches.length === 1
-            && ownershipMismatches[0] === 'registry-container-id';
-        if (
-            ownershipMismatches.length > 0
-            && !legacyHelperOwnership
-            && !stagedPredecessorOwnership
-        ) {
+        if (ownershipMismatches.length > 0) {
             throw entrypointError(
                 `Retained managed container ${containerId} does not match its exact registry ownership (${ownershipMismatches.join(', ')})`,
             );
@@ -250,6 +246,10 @@ export function retireStoppedManagedContainers(paths, {
             );
         }
         runner.run('podman', ['container', 'rm', containerId]);
+        // Keep the selected physical identity journal until either the next
+        // launch atomically replaces it or registry removal retires it. This
+        // prevents an incomplete selected record from becoming observable in
+        // the interval between retained-container cleanup and relaunch.
         removed.push(containerId);
     }
     return Object.freeze(removed);

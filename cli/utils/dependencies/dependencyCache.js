@@ -12,8 +12,9 @@ import {
 import { parseRuntimeKey, detectHostRuntimeKey } from './dependencyRuntimeKey.js';
 import { debugLog } from '../utils.js';
 import { readGlobalDepsPackage, mergePackageJson } from './dependencyInstaller.js';
-import { getRuntime, managedContainerLabelArgs } from '../../sandbox/docker/common.js';
+import { getRuntime } from '../../sandbox/docker/common.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from '../../sandbox/docker/shellDetection.js';
+import { buildManagedProbeRunArgs } from '../../sandbox/docker/probeOwnership.js';
 
 export const STAMP_VERSION = 1;
 export const STAMP_FILENAME = 'stamp.json';
@@ -552,7 +553,12 @@ export function buildContainerInstallScript({ installDir = '/install', heartbeat
     ].join(' ');
 }
 
-function resolveInstallBackend(runtimeKey, { image = '', runtime = null, log = debugLog } = {}) {
+function resolveInstallBackend(runtimeKey, {
+    image = '',
+    runtime = null,
+    log = debugLog,
+    probeOwnership = null,
+} = {}) {
     const parsed = assertRuntimeKey(runtimeKey);
     if (parsed.family === 'bwrap' || parsed.family === 'seatbelt') {
         assertHostMatchesRuntimeKey(runtimeKey);
@@ -571,7 +577,12 @@ function resolveInstallBackend(runtimeKey, { image = '', runtime = null, log = d
         }
         return {
             install(cwd) {
-                return runNpmInstallInContainer(cwd, { image: resolvedImage, runtime: resolvedRuntime, log });
+                return runNpmInstallInContainer(cwd, {
+                    image: resolvedImage,
+                    runtime: resolvedRuntime,
+                    log,
+                    probeOwnership,
+                });
             },
             installerRuntime: resolvedRuntime,
             image: resolvedImage,
@@ -586,11 +597,16 @@ export function buildContainerInstallRunArgs({
     runtime,
     shellPath,
     installScript = buildContainerInstallScript(),
+    probeOwnership,
 } = {}) {
     const resolvedRuntime = runtime || getRuntime();
     const volumeSuffix = resolvedRuntime === 'podman' ? ':z' : '';
     return [
-        'run', '--rm', ...managedContainerLabelArgs(),
+        'run', '--rm', ...buildManagedProbeRunArgs({
+            ...probeOwnership,
+            purpose: 'dependency-install',
+            imageId: image,
+        }),
         // Dependency-cache installation is a maintenance step against a writable
         // host cache, so it must not inherit non-root USER defaults from runtime
         // images.
@@ -604,20 +620,48 @@ export function buildContainerInstallRunArgs({
     ];
 }
 
-function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog } = {}) {
+function exactLocalImageId(image, runtime) {
+    const result = spawnSync(runtime, ['image', 'inspect', '--format', '{{.Id}}', image], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const imageId = String(result.stdout || '').trim().replace(/^sha256:/, '');
+    if (result.error || result.status !== 0 || !/^[a-f0-9]{64}$/.test(imageId)) {
+        throw new Error(`Container dependency install requires one exact local immutable image ID for '${image}'`);
+    }
+    return imageId;
+}
+
+function runNpmInstallInContainer(cwd, {
+    image,
+    runtime = null,
+    log = debugLog,
+    probeOwnership = null,
+} = {}) {
     if (!image) {
         throw new Error('Container dependency install requires an image.');
     }
     const resolvedRuntime = runtime || getRuntime();
-    const shellPath = detectShellForImage('deps-cache', image, resolvedRuntime);
+    const imageId = exactLocalImageId(image, resolvedRuntime);
+    const exactProbeOwnership = probeOwnership || {
+        owner: `dependency-cache:${path.resolve(cwd)}`,
+        releaseGeneration: sha256(`unreleased-probe\0${imageId}`),
+    };
+    const shellPath = detectShellForImage('deps-cache', imageId, resolvedRuntime, {
+        probeOwnership: {
+            ...exactProbeOwnership,
+            purpose: 'shell-detection',
+        },
+    });
     if (!shellPath || shellPath === SHELL_FALLBACK_DIRECT) {
         throw new Error(`Could not determine a shell for image ${image}.`);
     }
     const args = buildContainerInstallRunArgs({
         cwd,
-        image,
+        image: imageId,
         runtime: resolvedRuntime,
         shellPath,
+        probeOwnership: exactProbeOwnership,
     });
     log(`[deps-cache] npm install in container ${image} at ${cwd}`);
     const result = spawnSync(resolvedRuntime, args, { stdio: 'inherit', timeout: INSTALL_TIMEOUT_MS });
@@ -629,8 +673,16 @@ function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog }
     }
 }
 
-export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, image = '', runtime = null } = {}) {
-    const backend = resolveInstallBackend(runtimeKey, { image, runtime, log });
+export function prepareGlobalCache(runtimeKey, {
+    force = false,
+    log = debugLog,
+    image = '',
+    runtime = null,
+    probeOwnership = null,
+} = {}) {
+    const backend = resolveInstallBackend(runtimeKey, {
+        image, runtime, log, probeOwnership,
+    });
     const expectedInstaller = installerMetadata(runtimeKey, backend);
 
     const globalPackageFile = getGlobalPackagePath();
@@ -693,14 +745,19 @@ export function prepareAgentCache({
     log = debugLog,
     image = '',
     runtime = null,
+    probeOwnership = null,
 } = {}) {
-    const backend = resolveInstallBackend(runtimeKey, { image, runtime, log });
+    const backend = resolveInstallBackend(runtimeKey, {
+        image, runtime, log, probeOwnership,
+    });
     const expectedInstaller = installerMetadata(runtimeKey, backend);
     if (!repoName || !agentName) {
         throw new Error('prepareAgentCache requires repoName and agentName');
     }
 
-    const globalResult = prepareGlobalCache(runtimeKey, { force, log, image, runtime });
+    const globalResult = prepareGlobalCache(runtimeKey, {
+        force, log, image, runtime, probeOwnership,
+    });
     const globalCachePath = globalResult.cachePath;
 
     const globalPkg = readGlobalDepsPackage();

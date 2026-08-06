@@ -105,9 +105,10 @@ test('no-wait status publication rejects missing, coerced, and mixed runtime ide
         );
     }
     const { containerId: _unavailableContainerId, ...freshPodmanStatus } = exact;
-    assert.doesNotThrow(
+    assert.throws(
         () => writeStatusRaw(containerName, freshPodmanStatus, { runningDir }),
-        'a fresh Podman generation has no immutable container ID before its first launch',
+        /immutable lowercase 64-hex Podman container ID/,
+        'Podman status must remain invisible until physical identity is immutable',
     );
 });
 
@@ -135,13 +136,11 @@ test('no-wait predecessor permits only a fresh Podman running status to attach i
     const withContainerId = exactStatusIdentity(containerName);
     const { containerId: _unavailableContainerId, ...withoutContainerId } = withContainerId;
 
-    writeStatusRaw(containerName, { ...withoutContainerId, state: 'running' }, { runningDir });
-    await assert.rejects(
-        () => waitForPriorWorkerRaw(target, {
+    assert.throws(
+        () => writeStatusRaw(containerName, { ...withoutContainerId, state: 'running' }, {
             runningDir,
-            expectedIdentity: withContainerId,
         }),
-        /predecessor status identity mismatch/,
+        /immutable lowercase 64-hex Podman container ID/,
     );
 
     writeStatusRaw(containerName, { ...withContainerId, state: 'running' }, { runningDir });

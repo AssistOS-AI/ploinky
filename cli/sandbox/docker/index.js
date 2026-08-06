@@ -1,8 +1,6 @@
 export {
     attachInteractive,
-    buildExecArgs,
-    ensureAgentContainer,
-    runCommandInContainer
+    buildExecArgs
 } from './interactive.js';
 
 export {
@@ -40,7 +38,6 @@ export {
     getConfiguredProjectPath,
     getRuntime,
     isContainerRunning,
-    listRunningContainerNames,
     parseManifestPorts,
     waitForContainerRunning
 } from './common.js';

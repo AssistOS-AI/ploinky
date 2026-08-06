@@ -27,6 +27,10 @@ import {
     workspaceNetworkIdentity,
 } from '../networkLifecycle.js';
 import { NETWORK_SCHEMA_VERSION } from '../networkContract.js';
+import {
+    removePodmanRuntimeOwnership,
+    resolvePodmanRuntimeOwnership,
+} from './runtimeOwnership.js';
 
 const GENERATED_ROUTER_DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json';
 const GENERATED_ROUTER_DESCRIPTOR_ROOT = path.join(PLOINKY_DIR, 'run', 'router-descriptors');
@@ -183,6 +187,8 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     now = Date.now,
     workspaceIdentity = workspaceNetworkIdentity,
     listProviderOwners = listProviderTaskOwners,
+    networkLifecycleCapability,
+    networkLockWaitMs = 0,
 } = {}) {
     if (runtime !== 'podman' || record?.runtime !== 'podman') {
         throw new Error(`fleet lifecycle for '${name}' runtime must be exactly 'podman'`);
@@ -278,6 +284,9 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
             fs.unlinkSync(artifact.source);
         }
         return Object.freeze({ found: true, stopped: true, removed: true });
+    }, {
+        waitMs: networkLockWaitMs,
+        ...(networkLifecycleCapability ? { capability: networkLifecycleCapability } : {}),
     });
 }
 
@@ -285,7 +294,12 @@ function removeExactRegisteredContainer(name, record, options = {}) {
     if (options.runtime !== 'podman') {
         throw new Error(`fleet lifecycle for '${name}' runtime must be exactly 'podman'`);
     }
-    return removeExactContainerAndDescriptor(name, record, 'podman', {
+    const resolveRuntimeOwnership = options.resolveRuntimeOwnership
+        || resolvePodmanRuntimeOwnership;
+    const selectedRecord = record?.type === 'agent'
+        ? resolveRuntimeOwnership(name, record)
+        : record;
+    return removeExactContainerAndDescriptor(name, selectedRecord, 'podman', {
         ...options,
         remove: true,
     });
@@ -370,6 +384,12 @@ function stopConfiguredAgents({
     saveRegistry = saveAgents,
     runtimeReports = [],
     reconcileProviderOwnership = reconcileConfiguredProviderTaskOwnership,
+    withLifecycleLock = withNetworkLifecycleLock,
+    removeContainer = removeExactContainerAndDescriptor,
+    resolveRuntimeOwnership = resolvePodmanRuntimeOwnership,
+    removeRuntimeOwnership = removePodmanRuntimeOwnership,
+    clearContainerLiveness = clearLivenessState,
+    networkLockWaitMs = fast ? 5_000 : 30_000,
 } = {}) {
     const agents = loadRegistry();
     // Mixed-generation evidence has no exact parent authority that this fleet
@@ -389,9 +409,12 @@ function stopConfiguredAgents({
     const podmanEntries = [];
     for (const [name, rec] of entries) {
         try {
-            const runtime = classifyExactAgentRuntime(name, rec);
+            const selectedRecord = rec.runtime === 'podman' && rec.type === 'agent'
+                ? resolveRuntimeOwnership(name, rec)
+                : rec;
+            const runtime = classifyExactAgentRuntime(name, selectedRecord);
             if (runtime === 'podman') {
-                podmanEntries.push([name, rec]);
+                podmanEntries.push([name, selectedRecord, rec]);
                 continue;
             }
             const agentName = rec.agentName || name;
@@ -446,35 +469,60 @@ function stopConfiguredAgents({
     // signal targets a revalidated immutable container ID while the shared
     // network lifecycle lock is held.
     const stoppedContainers = [];
-    for (const [name, rec] of podmanEntries) {
+    if (podmanEntries.length) {
         try {
-            const result = removeExactContainerAndDescriptor(name, rec, 'podman', {
-                fast,
-                remove: removeContainers,
-            });
-            if (!result.found) {
-                console.log(`[stop] ${rec?.agentName || name}: no exact registered container found.`);
+            withLifecycleLock((networkLifecycleCapability) => {
+                for (const [name, rec, registryRecord] of podmanEntries) {
+                    try {
+                        const result = removeContainer(name, rec, 'podman', {
+                            fast,
+                            remove: removeContainers,
+                            withLock: withLifecycleLock,
+                            networkLifecycleCapability,
+                        });
+                        if (!result.found) {
+                            console.log(`[stop] ${rec?.agentName || name}: no exact registered container found.`);
+                            survivors.push(Object.freeze({
+                                runtimeKey: name,
+                                classification: 'container-containment-unproved',
+                            }));
+                            continue;
+                        }
+                        if (removeRegistry) {
+                            if (!removeContainers || result.removed !== true) {
+                                throw new Error(`nested container registry removal for '${name}' requires exact container removal`);
+                            }
+                            if (!removeRuntimeOwnership(name, rec.containerId)
+                                && !isDeepStrictEqual(rec, registryRecord)) {
+                                throw new Error(`physical ownership cleanup for '${name}' lost its exact journal record`);
+                            }
+                            removeExactStoppedRegistryRecord(name, registryRecord, {
+                                loadRegistry,
+                                saveRegistry,
+                            });
+                        }
+                        console.log(`[stop] Stopped ${name}`);
+                        clearContainerLiveness(name);
+                        stoppedContainers.push(name);
+                    } catch (error) {
+                        console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
+                        survivors.push(Object.freeze({
+                            runtimeKey: name,
+                            classification: 'container-containment-failed',
+                        }));
+                    }
+                }
+            }, { waitMs: networkLockWaitMs });
+        } catch (error) {
+            for (const [name] of podmanEntries) {
+                if (stoppedContainers.includes(name)
+                    || survivors.some((entry) => entry.runtimeKey === name)) continue;
+                console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
                 survivors.push(Object.freeze({
                     runtimeKey: name,
-                    classification: 'container-containment-unproved',
+                    classification: 'container-containment-failed',
                 }));
-                continue;
             }
-            if (removeRegistry) {
-                if (!removeContainers || result.removed !== true) {
-                    throw new Error(`nested container registry removal for '${name}' requires exact container removal`);
-                }
-                removeExactStoppedRegistryRecord(name, rec, { loadRegistry, saveRegistry });
-            }
-            console.log(`[stop] Stopped ${name}`);
-            clearLivenessState(name);
-            stoppedContainers.push(name);
-        } catch (error) {
-            console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
-            survivors.push(Object.freeze({
-                runtimeKey: name,
-                classification: 'container-containment-failed',
-            }));
         }
     }
     try {
@@ -499,7 +547,16 @@ function stopConfiguredAgents({
     return result;
 }
 
-function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
+function stopAndRemoveMany(names, {
+    fast = false,
+    records = null,
+    resolveRuntimeOwnership = resolvePodmanRuntimeOwnership,
+    retireRuntimeOwnership = false,
+    removeRuntimeOwnership = removePodmanRuntimeOwnership,
+    removeContainer = removeExactContainerAndDescriptor,
+    withLifecycleLock = withNetworkLifecycleLock,
+    networkLockWaitMs = fast ? 5_000 : 30_000,
+} = {}) {
     if (!Array.isArray(names) || !names.length) return [];
 
     const agents = {
@@ -509,6 +566,7 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
 
     const sandboxEntries = [];
     const podmanNames = [];
+    const selectedPodmanRecords = new Map();
     const prefix = fast ? '[destroy-fast]' : '[destroy]';
     for (const agentName of names) {
         if (!agentName) continue;
@@ -518,9 +576,16 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
             continue;
         }
         try {
-            const runtime = classifyExactAgentRuntime(agentName, rec);
+            const selectedRecord = rec.runtime === 'podman' && rec.type === 'agent'
+                ? resolveRuntimeOwnership(agentName, rec)
+                : rec;
+            const runtime = classifyExactAgentRuntime(agentName, selectedRecord);
             if (runtime === 'podman') {
                 podmanNames.push(agentName);
+                selectedPodmanRecords.set(agentName, Object.freeze({
+                    selectedRecord,
+                    registryRecord: rec,
+                }));
             } else {
                 sandboxEntries.push({
                     agentName,
@@ -551,20 +616,39 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
     }
 
     const removed = [];
-    for (const name of podmanNames) {
-        const record = agents?.[name];
+    if (podmanNames.length) {
         try {
-            const result = removeExactContainerAndDescriptor(name, record, 'podman', {
-                fast,
-                remove: true,
-            });
-            if (result.removed) {
-                console.log(`${prefix} ✓ removed ${name}`);
-                clearLivenessState(name);
-                removed.push(name);
-            }
+            withLifecycleLock((networkLifecycleCapability) => {
+                for (const name of podmanNames) {
+                    const { selectedRecord, registryRecord } = selectedPodmanRecords.get(name);
+                    try {
+                        const result = removeContainer(name, selectedRecord, 'podman', {
+                            fast,
+                            remove: true,
+                            withLock: withLifecycleLock,
+                            networkLifecycleCapability,
+                        });
+                        if (!result.removed) continue;
+                        if (retireRuntimeOwnership
+                            && !removeRuntimeOwnership(name, selectedRecord.containerId)
+                            && !isDeepStrictEqual(selectedRecord, registryRecord)) {
+                            throw new Error(
+                                `physical ownership cleanup for '${name}' lost its exact journal record`,
+                            );
+                        }
+                        console.log(`${prefix} ✓ removed ${name}`);
+                        clearLivenessState(name);
+                        removed.push(name);
+                    } catch (error) {
+                        console.log(`${prefix} Preserved ${name}: ${error?.message || error}`);
+                    }
+                }
+            }, { waitMs: networkLockWaitMs });
         } catch (error) {
-            console.log(`${prefix} Preserved ${name}: ${error?.message || error}`);
+            for (const name of podmanNames) {
+                if (removed.includes(name)) continue;
+                console.log(`${prefix} Preserved ${name}: ${error?.message || error}`);
+            }
         }
     }
 

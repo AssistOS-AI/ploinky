@@ -79,12 +79,17 @@ test('container dependency installer disables audit/fund and emits a heartbeat',
 });
 
 test('container dependency install runs as root for non-root runtime images', () => {
+    const imageId = 'a'.repeat(64);
     const args = buildContainerInstallRunArgs({
         cwd: '/tmp/cache',
-        image: 'example/image:tag',
+        image: imageId,
         runtime: 'podman',
         shellPath: '/bin/sh',
         installScript: 'echo ok',
+        probeOwnership: {
+            owner: 'test/dependency-cache',
+            releaseGeneration: 'b'.repeat(64),
+        },
     });
 
     const userIndex = args.indexOf('--user');
@@ -92,7 +97,7 @@ test('container dependency install runs as root for non-root runtime images', ()
     assert.notEqual(userIndex, -1);
     assert.equal(args[userIndex + 1], '0:0');
     assert.ok(userIndex < volumeIndex, 'user override should apply to the container run');
-    assert.deepEqual(args.slice(-3), ['example/image:tag', '-lc', 'echo ok']);
+    assert.deepEqual(args.slice(-3), [imageId, '-lc', 'echo ok']);
     assert.equal(args.includes('--network'), false, 'installer must use the managed Podman network default');
     assert.equal(args.some((arg) => String(arg).includes('slirp4netns')), false);
 });

@@ -1219,9 +1219,15 @@ function removeDisabledRuntimes(disabledRecords, {
     }
     const containerTargets = Object.keys(containerRecords);
     if (containerTargets.length === 1) {
-        stopAndRemoveImpl(containerTargets[0], { records: containerRecords });
+        stopAndRemoveImpl(containerTargets[0], {
+            records: containerRecords,
+            retireRuntimeOwnership: true,
+        });
     } else if (containerTargets.length > 1) {
-        stopAndRemoveManyImpl(containerTargets, { records: containerRecords });
+        stopAndRemoveManyImpl(containerTargets, {
+            records: containerRecords,
+            retireRuntimeOwnership: true,
+        });
     }
     const retained = containerTargets.filter((containerName) => (
         containerExistsImpl(containerName, { runtime: 'podman' })

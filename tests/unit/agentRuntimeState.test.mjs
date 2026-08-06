@@ -442,6 +442,7 @@ test('collectAgentRuntimeStates rejects incomplete Podman registry identities', 
                 registry: { incomplete: record },
                 liveContainers: [],
                 providerOwners: [],
+                resolvePodmanOwnership: (_containerName, candidate) => candidate,
             }),
             (error) => error?.code === 'PLOINKY_AGENT_RUNTIME_STATE_INVALID'
                 && error.message.includes(field),

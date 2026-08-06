@@ -1,7 +1,9 @@
 import { spawnSync } from 'child_process';
+import crypto from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
-import { getRuntime, managedContainerLabelArgs } from './common.js';
+import { getRuntime } from './common.js';
+import { buildManagedProbeRunArgs } from './probeOwnership.js';
 
 const SHELL_PROBE_PATHS = ['/bin/bash', '/bin/sh', '/bin/ash', '/bin/dash', '/bin/zsh', '/bin/fish', '/bin/ksh'];
 const SHELL_FALLBACK_DIRECT = Symbol('no-shell');
@@ -49,11 +51,15 @@ function detectShellViaImageMount(image, runtime) {
     }
 }
 
-function buildShellDetectionRunArgs(image, shellPath) {
+function buildShellDetectionRunArgs(image, shellPath, probeOwnership) {
     return [
         'run',
         '--rm',
-        ...managedContainerLabelArgs(),
+        ...buildManagedProbeRunArgs({
+            ...probeOwnership,
+            purpose: 'shell-detection',
+            imageId: image,
+        }),
         '--entrypoint',
         'test',
         image,
@@ -62,11 +68,15 @@ function buildShellDetectionRunArgs(image, shellPath) {
     ];
 }
 
-function detectShellViaContainerRun(image, runtime) {
+function detectShellViaContainerRun(image, runtime, probeOwnership) {
     for (const shellPath of SHELL_PROBE_PATHS) {
         // Use --entrypoint to bypass any custom ENTRYPOINT (e.g. Keycloak's
         // kc.sh) that would intercept the probe command.
-        const res = spawnSync(runtime, buildShellDetectionRunArgs(image, shellPath), { stdio: 'ignore' });
+        const res = spawnSync(
+            runtime,
+            buildShellDetectionRunArgs(image, shellPath, probeOwnership),
+            { stdio: 'ignore' },
+        );
         if (res.status === 0) {
             return shellPath;
         }
@@ -74,17 +84,41 @@ function detectShellViaContainerRun(image, runtime) {
     return '';
 }
 
-function detectShellForImage(agentName, image, runtime = null) {
+function exactLocalImageId(image, runtime) {
+    const result = spawnSync(runtime, ['image', 'inspect', '--format', '{{.Id}}', image], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const imageId = String(result.stdout || '').trim().replace(/^sha256:/, '');
+    return !result.error && result.status === 0 && /^[a-f0-9]{64}$/.test(imageId)
+        ? imageId
+        : '';
+}
+
+function detectShellForImage(agentName, image, runtime = null, {
+    probeOwnership = null,
+} = {}) {
     if (!agentName || !image) {
         throw new Error('[start] Missing agent or image for shell detection.');
     }
     const resolvedRuntime = runtime || getRuntime();
-    const cacheKey = `${resolvedRuntime}:${image}`;
+    const imageId = exactLocalImageId(image, resolvedRuntime);
+    if (!imageId) {
+        throw new Error(`[start] ${agentName}: image must resolve to one exact local immutable ID for shell detection.`);
+    }
+    const exactProbeOwnership = probeOwnership || {
+        owner: String(agentName),
+        releaseGeneration: crypto.createHash('sha256')
+            .update(`unreleased-probe\0${imageId}`)
+            .digest('hex'),
+    };
+    const cacheKey = `${resolvedRuntime}:${imageId}`;
     if (shellDetectionCache.has(cacheKey)) {
         return shellDetectionCache.get(cacheKey);
     }
-    const fromMount = detectShellViaImageMount(image, resolvedRuntime);
-    const shellPath = fromMount || detectShellViaContainerRun(image, resolvedRuntime);
+    const fromMount = detectShellViaImageMount(imageId, resolvedRuntime);
+    const shellPath = fromMount
+        || detectShellViaContainerRun(imageId, resolvedRuntime, exactProbeOwnership);
     const finalShell = shellPath || SHELL_FALLBACK_DIRECT;
     shellDetectionCache.set(cacheKey, finalShell);
     return finalShell;

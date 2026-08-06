@@ -1,6 +1,11 @@
+import crypto from 'node:crypto';
+
 import {
+    BOX_LABELS,
     BOX_MARKER_CONTENT,
+    BOX_ROLES,
 } from '../constants.mjs';
+import { serializeReleaseDescriptor } from './release.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 
 export const IMAGE_CONTRACT = Object.freeze({
@@ -243,6 +248,8 @@ export function validateImageBinaries(availableBinaries, imageRef) {
 
 export function probeImageBinaries(engine, imageId, runner, {
     expectedSourceSha,
+    identity,
+    releaseDescriptor,
 } = {}) {
     if (!/^[0-9a-f]{40}$/.test(expectedSourceSha ?? '')) {
         throw contractError(
@@ -252,12 +259,49 @@ export function probeImageBinaries(engine, imageId, runner, {
             expectedSourceSha,
         );
     }
+    if (identity && (
+        typeof identity.instance !== 'string'
+        || !/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(identity.instance)
+        || !/^[a-f0-9]{12}$/.test(identity.pathHash)
+    )) {
+        throw contractError(
+            imageId,
+            'probe ownership context',
+            'one exact Box identity',
+            identity,
+        );
+    }
+    const unmanagedGeneration = crypto.createHash('sha256')
+        .update(JSON.stringify([String(imageId), expectedSourceSha]))
+        .digest('hex');
+    const pathHash = identity?.pathHash || unmanagedGeneration.slice(0, 12);
+    const owner = identity?.instance || `ploinky-box-image-contract-${pathHash}`;
+    const releaseGeneration = releaseDescriptor?.releaseGeneration || unmanagedGeneration;
+    const serializedRelease = releaseDescriptor
+        ? serializeReleaseDescriptor(releaseDescriptor)
+        : `unmanaged-image-contract:${expectedSourceSha}:${imageId}`;
+    // Keep the engine identifier deterministic and bounded independently of
+    // user-controlled workspace path length. Full ownership remains in the
+    // immutable owner/path/release labels below.
+    const probeName = `ploinky-box-probe-${pathHash}-${releaseGeneration.slice(0, 16)}`;
+    const ownershipLabels = {
+        [BOX_LABELS.owner]: owner,
+        [BOX_LABELS.pathHash]: pathHash,
+        [BOX_LABELS.role]: BOX_ROLES.imageProbe,
+        [BOX_LABELS.imageRef]: imageId,
+        [BOX_LABELS.releaseDescriptor]: serializedRelease,
+        [BOX_LABELS.releaseGeneration]: releaseGeneration,
+    };
     const sourceMatch =
         `test "$helper_version" = 'ploinky-bwrap-launch-v2 source-sha=${expectedSourceSha}'`;
     const result = runner.query(engine, [
         'run',
         '--rm',
+        '--pull=never',
         '--network=none',
+        '--name', probeName,
+        ...Object.entries(ownershipLabels)
+            .flatMap(([key, value]) => ['--label', `${key}=${value}`]),
         '--entrypoint=/bin/bash',
         imageId,
         '-c',
@@ -307,7 +351,10 @@ export function probeImageBinaries(engine, imageId, runner, {
     return validateImageBinaries(available, imageId);
 }
 
-export function inspectAndValidateImage(engine, imageRef, runner) {
+export function inspectAndValidateImage(engine, imageRef, runner, {
+    identity,
+    releaseDescriptor,
+} = {}) {
     const result = runner.query(engine, ['image', 'inspect', imageRef]);
     if (!result.ok) {
         throw new PloinkyBoxError(`Unable to inspect runtime image '${imageRef}'`, {
@@ -318,6 +365,8 @@ export function inspectAndValidateImage(engine, imageRef, runner) {
     const validatedImage = validateImageContract(image, imageRef);
     const availableBinaries = probeImageBinaries(engine, image.id, runner, {
         expectedSourceSha: validatedImage.sourceSha,
+        identity,
+        releaseDescriptor,
     });
     return validateImageContract(image, imageRef, { availableBinaries });
 }

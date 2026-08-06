@@ -15,6 +15,11 @@ import { buildContainerInstallRunArgs } from '../../cli/utils/dependencies/depen
 import { buildContainerRuntimeKeyProbeRunArgs } from '../../cli/utils/dependencies/dependencyRuntimeKey.js';
 
 const managed = 'io.assistos.ploinky.managed=1';
+const probeOwnership = Object.freeze({
+    owner: 'tests/managed-container-labels',
+    releaseGeneration: 'b'.repeat(64),
+});
+const probeImageId = 'a'.repeat(64);
 
 function labelValues(args) {
     const values = [];
@@ -41,11 +46,9 @@ test('managed label helper emits the exact D12 ownership label', () => {
 
 test('dependency-install helper containers carry the exact managed label', () => {
     const args = buildContainerInstallRunArgs({
-        cwd: '/tmp/cache', image: 'example/image', runtime: 'podman', shellPath: '/bin/sh', installScript: 'true',
+        cwd: '/tmp/cache', image: probeImageId, runtime: 'podman', shellPath: '/bin/sh', installScript: 'true', probeOwnership,
     });
-    const index = args.indexOf('--label');
-    assert.notEqual(index, -1);
-    assert.equal(args[index + 1], managed);
+    assertExactManagedArgv(args);
 });
 
 test('persistent agent run builder carries the exact managed label', () => {
@@ -100,9 +103,16 @@ test('both interactive create/retry command families carry the exact managed lab
 });
 
 test('shell-detection probe builder carries the exact managed label', () => {
-    assertExactManagedArgv(buildShellDetectionRunArgs('example/image', '/bin/sh'));
+    assertExactManagedArgv(buildShellDetectionRunArgs(
+        probeImageId,
+        '/bin/sh',
+        probeOwnership,
+    ));
 });
 
 test('runtime-key probe builder carries the exact managed label', () => {
-    assertExactManagedArgv(buildContainerRuntimeKeyProbeRunArgs('example/image'));
+    assertExactManagedArgv(buildContainerRuntimeKeyProbeRunArgs(
+        probeImageId,
+        probeOwnership,
+    ));
 });

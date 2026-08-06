@@ -9,6 +9,7 @@ import {
     parseReleaseDescriptor,
     serializeReleaseDescriptor,
     validateReleaseControllerAdmission,
+    validateReleaseImageInspection,
 } from './contract/release.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import {
@@ -234,6 +235,7 @@ export function createBoxSupervisor({
     validateExistingImage = inspectAndValidateExistingImage,
     validateReleaseImage = inspectAndValidateReleaseImage,
     validateReleaseAdmission = validateReleaseControllerAdmission,
+    admitNodeImage = admitReleaseNodeImage,
     startCore = runBoundedCoreStart,
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
@@ -294,6 +296,7 @@ export function createBoxSupervisor({
                 env,
                 stdout,
                 stderr,
+                admitNodeImage,
             });
             const containerId = prepared.ownership.handles.container.id;
             await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
@@ -323,6 +326,7 @@ export function createBoxSupervisor({
                 env,
                 stdout,
                 stderr,
+                admitNodeImage,
             });
             const containerId = prepared.ownership.handles.container.id;
             await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
@@ -542,6 +546,78 @@ export function createBoxSupervisor({
         inspectBoxStatus,
         planDryRun,
     });
+}
+
+function parseNestedImageInspect(result, descriptor) {
+    let parsed;
+    try {
+        parsed = JSON.parse(String(result.stdout || ''));
+    } catch (cause) {
+        throw supervisorError(`Nested exact Node image inspection is malformed: ${cause.message}`);
+    }
+    const records = Array.isArray(parsed) ? parsed : [parsed];
+    if (records.length !== 1) {
+        throw supervisorError('Nested exact Node image inspection must contain one record');
+    }
+    return validateReleaseImageInspection('node', records[0], descriptor);
+}
+
+function inspectNestedReleaseNodeImage(engine, containerId, descriptor, runner) {
+    const result = runner.query(engine.name, [
+        'container', 'exec',
+        '--user', 'podman',
+        '--workdir', '/workspace',
+        containerId,
+        'podman', 'image', 'inspect', descriptor.nodeImageId,
+    ]);
+    if (!result?.ok) {
+        const diagnostic = `${result?.stderr || ''}\n${result?.stdout || ''}`;
+        if (/(?:image.*(?:not known|not found|does not exist)|no such image)/i.test(diagnostic)) {
+            return null;
+        }
+        throw supervisorError('Nested runtime could not inspect the exact release Node image');
+    }
+    return parseNestedImageInspect(result, descriptor);
+}
+
+export async function admitReleaseNodeImage(engine, containerId, descriptor, runner, {
+    stdout = process.stdout,
+    stderr = process.stderr,
+    timeoutMs = 1_800_000,
+} = {}) {
+    if (!/^[a-f0-9]{64}$/.test(String(containerId || ''))) {
+        throw supervisorError('Release Node image admission requires the exact Box container ID');
+    }
+    inspectAndValidateReleaseImage(engine.name, 'node', descriptor, runner);
+    const existing = inspectNestedReleaseNodeImage(engine, containerId, descriptor, runner);
+    if (existing) return existing;
+    if (typeof runner.pipe !== 'function') {
+        throw supervisorError('Release Node image admission requires bounded streaming transport');
+    }
+    stderr?.write?.(`[ploinky] Admitting exact release Node image ${descriptor.nodeImageId} into Box ${containerId}...\n`);
+    const result = await runner.pipe(
+        engine.name,
+        ['image', 'save', '--format', 'oci-archive', descriptor.nodeImageId],
+        engine.name,
+        [
+            'container', 'exec', '-i',
+            '--user', 'podman',
+            '--workdir', '/workspace',
+            containerId,
+            'podman', 'image', 'load',
+        ],
+        { timeoutMs, stdout, stderr },
+    );
+    if (!result?.ok) {
+        throw supervisorError(
+            `Exact release Node image admission failed with status ${result?.status ?? 1}`,
+        );
+    }
+    const admitted = inspectNestedReleaseNodeImage(engine, containerId, descriptor, runner);
+    if (!admitted) {
+        throw supervisorError('Exact release Node image is missing after nested admission');
+    }
+    return admitted;
 }
 
 export async function ensureBoxDependencies(engine, containerId, runner, {

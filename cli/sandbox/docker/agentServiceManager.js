@@ -55,6 +55,11 @@ import {
 import { clearLivenessState, runContainerScriptReadiness } from './healthProbes.js';
 import { removeExactRegisteredContainer, stopAndRemove } from './containerFleet.js';
 import {
+    publishPodmanRuntimeOwnership,
+    readPodmanRuntimeOwnership,
+    removePodmanRuntimeOwnership,
+} from './runtimeOwnership.js';
+import {
     collectProviderTaskOwnersReadOnly,
     removeProviderTaskOwnersAfterContainment,
 } from '../providerTaskOwnership.js';
@@ -161,7 +166,6 @@ import {
     attestRouterAuthority,
     buildRouterAuthorityTopologyIntent,
     managedImageUserNamespace,
-    ROUTER_AUTHORITY_HELPER_IMAGE,
     runContainerAuthorityProbe,
 } from '../routerAuthorityAttestation.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
@@ -1131,6 +1135,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
+    const existingPhysicalOwnership = readPodmanRuntimeOwnership(containerName);
+    if (existingPhysicalOwnership
+        && IMMUTABLE_CONTAINER_ID.test(String(existingRecord.containerId || ''))
+        && existingPhysicalOwnership.containerId !== existingRecord.containerId) {
+        const error = new Error(`startAgentContainer(${agentName}) physical ownership changed before launch`);
+        error.code = 'PLOINKY_RUNTIME_OWNERSHIP_CONFLICT';
+        throw error;
+    }
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
         existingRecord,
         options,
@@ -1378,6 +1390,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 agentPackagePath,
                 image,
                 runtime,
+                probeOwnership: {
+                    owner: `${repoName}/${agentName}`,
+                    releaseGeneration: String(runtimeIdentity.releaseGeneration || '')
+                        || createHash('sha256')
+                            .update(`unreleased-probe\0${image}`)
+                            .digest('hex'),
+                },
             });
             preparedNodeModulesDir = nodeModulesDir(prepared.cachePath);
             debugLog(`[deps] ${agentName}: prepared dependency cache ready at ${preparedNodeModulesDir}`);
@@ -1697,7 +1716,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             entrySummary = startArgs.join(' ');
         }
     } else if (explicitAgentCmd) {
-        const shellPath = detectShellForImage(agentName, image, runtime);
+        const shellPath = detectShellForImage(agentName, createImage, runtime, {
+            probeOwnership: {
+                owner: `${repoName}/${agentName}`,
+                releaseGeneration: String(runtimeIdentity.releaseGeneration || '')
+                    || createHash('sha256')
+                        .update(`unreleased-probe\0${createImage}`)
+                        .digest('hex'),
+            },
+        });
         if (shellPath === SHELL_FALLBACK_DIRECT) {
             throw new Error(`[start] ${agentName}: no supported shell found to execute agent command.`);
         }
@@ -1765,8 +1792,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 runtime,
                 plan,
                 image,
+                helperImage: options.releaseDescriptor?.nodeImageId || createImage,
                 intent: probeIntent,
                 nonce,
+                probeOwnership: {
+                    owner: `${repoName}/${agentName}`,
+                    releaseGeneration: String(runtimeIdentity.releaseGeneration || '')
+                        || createHash('sha256')
+                            .update(`unreleased-probe\0${createImage}`)
+                            .digest('hex'),
+                },
             }),
         });
         // The first commit is owned by attestRouterAuthority immediately after
@@ -2068,13 +2103,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
     try {
     if (runtimeNetworkPlan.requiresManagedNetwork) {
-        // Resolve both the target and fixed probe images before the network
-        // transaction. The helper never pulls and never executes target-image
-        // entrypoints, including start-only images without Node.js.
+        // The helper uses only the already-admitted descriptor Node image (or
+        // this exact immutable target outside a managed release). No distinct
+        // base image, pull, tag, or fallback is permitted.
         if (!exactReleaseImageInspection) {
             ensureImagePresent(image, { runtime });
         }
-        ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
         const launched = networkLifecycle.runManagedContainerTransaction({
             network: manifestNetwork,
             canonicalAgentId: agentName,
@@ -2238,7 +2272,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             containerId: launchedContainerId,
             agentName,
             repoName,
-            ...(options.alias ? { alias: options.alias } : {}),
+            ...(instanceName !== agentName ? { alias: instanceName } : {}),
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
             ...(runtimeIdentity.releaseGeneration
@@ -2302,12 +2336,50 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             appendExactCleanupFailure(error, 'descriptor preserved because exact candidate absence was not proven');
         }
         clearLivenessState(containerName);
+        if (exactCleanupPerformed) {
+            try {
+                removePodmanRuntimeOwnership(containerName, launchedContainerId);
+            } catch (cleanupError) {
+                appendExactCleanupFailure(error, `physical ownership cleanup: ${cleanupError?.message || cleanupError}`);
+            }
+        }
         throw attachRestartCandidate(error, {
             ...recoveryCandidate,
             cleanupReceipt: finalCleanupReceipt,
             exactCleanupPerformed,
         });
     };
+    try {
+        publishPodmanRuntimeOwnership({
+            containerName,
+            containerId: launchedContainerId,
+            runtime,
+            agentName,
+            repoName,
+            alias: instanceName,
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+            releaseGeneration: String(runtimeIdentity.releaseGeneration || ''),
+            projectPath: path.resolve(cwd),
+            profile: activeProfile,
+            imageId: createImage,
+            manifestSha256: `sha256:${createHash('sha256').update(exactManifestBytes).digest('hex')}`,
+            contractHash: runtimeCandidateContractHash(
+                runtimeAdmission,
+                runtimeIdentity,
+                manifestNetwork,
+                'container',
+            ),
+            networkContractHash: `sha256:${networkContractHash(manifestNetwork)}`,
+        }, {
+            expectedContainerId: existingPhysicalOwnership?.containerId
+                || (IMMUTABLE_CONTAINER_ID.test(String(existingRecord.containerId || ''))
+                    ? existingRecord.containerId
+                    : ''),
+        });
+    } catch (error) {
+        cleanupExactLaunch(error);
+    }
     const agents = loadAgentsMap();
     const declaredEnvNames2 = [
         ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),

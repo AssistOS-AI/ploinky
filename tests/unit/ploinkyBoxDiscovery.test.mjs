@@ -128,6 +128,21 @@ test('discovery accepts native Linux and the default macOS Podman Machine', (t) 
     assert.equal(linux.state, 'absent');
     assert.equal(linux.engine.hostKind, 'native-linux');
 
+    const sharedRunner = fakeRunner(identity);
+    discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: sharedRunner,
+    });
+    assert.equal(sharedRunner.calls.some((call) => call.includes('ls')), false);
+    assert.deepEqual(
+        sharedRunner.calls.filter((call) => call[2] === 'inspect').map((call) => call[3]),
+        [
+            identity.instance,
+            identity.volumes.workspace,
+            identity.volumes.containers,
+            identity.volumes.dependencies,
+        ],
+    );
+
     const machineRunner = fakeRunner(identity, {
         podman: podmanInfo({ serviceIsRemote: true }),
         connections: [{ Default: true, IsMachine: true }],
@@ -258,7 +273,7 @@ test('Docker exact-name conflicts and engine ambiguity fail closed', (t) => {
     assert.equal(unknown.state, 'unknown');
 });
 
-test('unexpected labeled inventory records are foreign even when exact names are absent', (t) => {
+test('unrelated labeled records are never inventoried or synchronized', (t) => {
     const identity = identityFixture(t);
     const runner = fakeRunner(identity, {
         inventoryRecords: {
@@ -268,6 +283,8 @@ test('unexpected labeled inventory records are foreign even when exact names are
         },
     });
     const result = discoverBoxOwnership(identity, { platform: 'linux', env: {}, runner });
-    assert.equal(result.state, 'foreign');
+    assert.equal(result.state, 'absent');
+    assert.equal(runner.calls.some((call) => call.includes('ls')), false);
+    assert.equal(runner.calls.flat().includes('attacker'), false);
     assert.equal(runner.calls.some((call) => ['exec', 'start', 'stop', 'rm'].includes(call[1])), false);
 });

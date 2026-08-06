@@ -178,11 +178,6 @@ function labelsFrom(value) {
     }));
 }
 
-function recordName(value) {
-    const raw = value?.Name ?? value?.Names ?? value?.name ?? '';
-    return String(Array.isArray(raw) ? raw[0] : raw).replace(/^\//, '');
-}
-
 function inspectExact(engine, kind, name, runner) {
     const result = query(runner, engine.name, [kind, 'inspect', name]);
     if (!result.ok) {
@@ -204,32 +199,6 @@ function inspectExact(engine, kind, name, runner) {
         return {
             state: 'unknown',
             message: `${engine.name} returned malformed ${kind} inspection for ${name}`,
-        };
-    }
-}
-
-function inventory(engine, kind, pathHash, runner) {
-    const result = query(runner, engine.name, [
-        kind,
-        'ls',
-        ...(kind === 'container' ? ['-a'] : []),
-        '--filter',
-        `label=${BOX_LABELS.pathHash}=${pathHash}`,
-        '--format',
-        '{{json .}}',
-    ]);
-    if (!result.ok) {
-        return {
-            state: 'unknown',
-            message: `${engine.name} could not inventory Box ${kind} ownership`,
-        };
-    }
-    try {
-        return { state: 'known', records: parseJsonRecords(result.stdout) };
-    } catch {
-        return {
-            state: 'unknown',
-            message: `${engine.name} returned malformed Box ${kind} inventory`,
         };
     }
 }
@@ -402,30 +371,6 @@ export function inspectOwnedVolumeHandle(engine, identity, key, runner = createP
 
 function inspectEngineResources(engine, identity, runner) {
     const expected = expectedResources(identity);
-    const containerInventory = inventory(engine, 'container', identity.pathHash, runner);
-    const volumeInventory = inventory(engine, 'volume', identity.pathHash, runner);
-    if (containerInventory.state === 'unknown' || volumeInventory.state === 'unknown') {
-        return {
-            state: 'unknown',
-            message: containerInventory.message || volumeInventory.message,
-        };
-    }
-
-    const expectedNames = new Map([
-        [expected.container.name, expected.container.role],
-        ...Object.values(expected.volumes).map((volume) => [volume.name, volume.role]),
-    ]);
-    for (const record of [...containerInventory.records, ...volumeInventory.records]) {
-        const name = recordName(record);
-        const role = labelsFrom(record)[BOX_LABELS.role];
-        if (!expectedNames.has(name) || expectedNames.get(name) !== role) {
-            return {
-                state: 'foreign',
-                message: `${engine.name} has an unexpected resource claiming this Box identity`,
-            };
-        }
-    }
-
     const containerInspection = inspectExact(
         engine,
         'container',

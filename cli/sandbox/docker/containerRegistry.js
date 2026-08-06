@@ -7,6 +7,7 @@ import {
 } from '../networkLifecycle.js';
 import { NETWORK_SCHEMA_VERSION } from '../networkContract.js';
 import { loadAgentsMap } from './common.js';
+import { resolvePodmanRuntimeOwnership } from './runtimeOwnership.js';
 
 const CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
 const WORKSPACE_HASH_PATTERN = /^[a-f0-9]{12}$/;
@@ -108,19 +109,18 @@ function collectLiveAgentContainers({
     registry = loadAgentsMap(),
     workspaceHash = workspaceNetworkIdentity().hash,
     spawnSyncImpl = spawnSync,
+    resolvePodmanOwnership = resolvePodmanRuntimeOwnership,
 } = {}) {
     if (!WORKSPACE_HASH_PATTERN.test(workspaceHash)) return [];
     const runtime = 'podman';
     const results = [];
-    for (const [name, record] of Object.entries(registry || {})) {
-        if (record?.type !== 'agent'
-            || record.runtime !== runtime
-            || !CONTAINER_ID_PATTERN.test(record.containerId)
-            || !exactLabelText(record.instanceId)
-            || !exactLabelText(record.enableGeneration)) {
-            continue;
-        }
+    for (const [name, selectedRecord] of Object.entries(registry || {})) {
+        if (selectedRecord?.type !== 'agent' || selectedRecord.runtime !== runtime) continue;
         try {
+            const record = resolvePodmanOwnership(name, selectedRecord);
+            if (!CONTAINER_ID_PATTERN.test(record.containerId)
+                || !exactLabelText(record.instanceId)
+                || !exactLabelText(record.enableGeneration)) continue;
             const inspected = spawnSyncImpl(
                 runtime,
                 ['container', 'inspect', record.containerId],
