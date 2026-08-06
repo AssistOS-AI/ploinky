@@ -30,7 +30,11 @@ function runModuleSnippet(source, env = {}, options = {}) {
     if (options.cwd && !Object.hasOwn(env, 'PLOINKY_WORKSPACE_ROOT')) {
         childEnv.PLOINKY_WORKSPACE_ROOT = options.cwd;
     }
-    return spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+    const nodeArgs = [
+        ...(options.loaderPath ? ['--experimental-loader', pathToFileURL(options.loaderPath).href] : []),
+        '--input-type=module', '-e', source,
+    ];
+    return spawnSync(process.execPath, nodeArgs, {
         cwd: options.cwd || repoRoot,
         env: childEnv,
         encoding: 'utf8',
@@ -501,7 +505,7 @@ process.stdout.write(getConfiguredProjectPath('demo', 'repo'));`,
     }
 });
 
-test('global enabled agents keep workspace projectPath and declare persistent /root home', () => {
+test('ordinary missing-selector managed service keeps workspace projectPath, persistent /root home, and pull-free create', () => {
     const workspaceDir = tempDir();
     const binDir = tempDir('ploinky-fake-runtime-');
     try {
@@ -510,6 +514,47 @@ test('global enabled agents keep workspace projectPath and declare persistent /r
         const argsFile = path.join(binDir, 'run-args.txt');
         const inspectHelper = path.join(binDir, 'inspect-helper.mjs');
         const podmanPath = path.join(binDir, 'podman');
+        const loaderPath = path.join(binDir, 'managed-network-loader.mjs');
+        const imageId = 'c'.repeat(64);
+        const managedNetworkLifecycleStub = `
+import { spawnSync } from 'node:child_process';
+export const NETWORK_LABELS = Object.freeze({});
+export function assertNetworkLifecycleCapability() { return true; }
+export function withNetworkLifecycleLock(callback) { return callback(); }
+export function createNetworkLifecycleAdapter({ runtime }) {
+  return Object.freeze({
+    agentIdentityLabelArgs() { return []; },
+    inspectContainerContract() { return Object.freeze({ state: 'absent' }); },
+    removeExactContainer() { return Object.freeze({ removed: true, state: 'absent' }); },
+    runManagedContainerTransaction({ createContainer }) {
+      const containerId = '${'a'.repeat(64)}';
+      createContainer({
+        mode: 'default',
+        args: ['--network', 'managed-test-network'],
+        attachments: [{ name: 'managed-test-network', primary: true }],
+      }, {
+        env: {},
+        envHash: '${'b'.repeat(64)}',
+        descriptorHostFile: '/tmp/managed-test-router-descriptor.json',
+        attested: { evidence: { target: { user: '1000:1000' } } },
+      });
+      const started = spawnSync(runtime, ['start', containerId]);
+      if (started.status !== 0) throw new Error('fake managed candidate did not start');
+      return Object.freeze({ containerId, launch: null, adopted: false });
+    },
+  });
+}
+`;
+        fs.writeFileSync(loaderPath, `
+const stubUrl = 'data:text/javascript;charset=utf-8,' + encodeURIComponent(${JSON.stringify(managedNetworkLifecycleStub)});
+export async function resolve(specifier, context, nextResolve) {
+  if (specifier === '../networkLifecycle.js'
+      && context.parentURL?.endsWith('/cli/sandbox/docker/agentServiceManager.js')) {
+    return { url: stubUrl, shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+`);
         fs.writeFileSync(inspectHelper, `
 import fs from 'node:fs';
 const [argsPath, statePath, runningPath] = process.argv.slice(2);
@@ -539,6 +584,9 @@ emit_inspect() {
 }
 case "$1" in
   image)
+    if [ "$2" = "inspect" ] && [ "$3" = "--format" ]; then
+      printf '%s\\n' '${imageId}'
+    fi
     exit 0
     ;;
   inspect)
@@ -583,9 +631,13 @@ esac
         fs.writeFileSync(path.join(agentDir, 'manifest.json'), JSON.stringify({
             container: 'example/demo:latest',
             start: 'sleep 3600',
-            network: { mode: 'none' },
+            network: { mode: 'default' },
             readiness: { protocol: 'none' },
         }));
+        assert.equal(
+            Object.hasOwn(JSON.parse(fs.readFileSync(path.join(agentDir, 'manifest.json'), 'utf8')), 'lite-sandbox'),
+            false,
+        );
         fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'routing.json'), JSON.stringify({ port: 8080, routes: {} }));
         fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'agents.json'), '{}');
         fs.mkdirSync(path.join(workspaceDir, '.ploinky', 'data', 'router-security'), { recursive: true });
@@ -617,7 +669,7 @@ const record = Object.values(agents).find((entry) => entry && entry.agentName ==
 const policyState = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ploinky', 'data', 'router-security', 'policy-state.json'), 'utf8'));
 console.log(JSON.stringify({ record, mcpTools: policyState.mcpTools }));`,
             { PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
-            { cwd: workspaceDir },
+            { cwd: workspaceDir, loaderPath },
         );
 
         assert.equal(result.status, 0, result.stderr);
@@ -626,6 +678,10 @@ console.log(JSON.stringify({ record, mcpTools: policyState.mcpTools }));`,
         assert.equal(record.projectPath, workspaceDir);
         assert.deepEqual(record.config.ports, []);
         const createArgs = fs.readFileSync(argsFile, 'utf8').trim().split('\n');
+        assert.equal(createArgs[0], 'create');
+        assert.equal(createArgs.filter((arg) => arg === '--pull=never').length, 1);
+        assert.equal(createArgs.includes('example/demo:latest'), false);
+        assert.ok(createArgs.indexOf('--pull=never') < createArgs.indexOf(imageId));
         assert.ok(createArgs.includes('--init'));
         assert.ok(createArgs.includes(`WORKSPACE_PATH=${workspaceDir}`));
         assert.doesNotMatch(createArgs.join('\n'), /(?:^|:)7000(?:$|\s)/);

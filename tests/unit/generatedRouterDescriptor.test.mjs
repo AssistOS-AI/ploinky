@@ -836,7 +836,7 @@ if (args[0] === 'image' && args[1] === 'inspect' && args[3] === '{{.Id}}') {
   process.stdout.write('1000:1000');
 } else if (args[0] === 'create') {
   const label = args[args.indexOf('--label') + 1];
-  fs.writeFileSync(stateFile, JSON.stringify({ nonce: label.split('=')[1] }));
+  fs.writeFileSync(stateFile, JSON.stringify({ nonce: label.split('=')[1], createArgs: args }));
   process.stdout.write(helperId);
 } else if (args[0] === 'container' && args[1] === 'inspect') {
   const { nonce } = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
@@ -891,6 +891,10 @@ if (args[0] === 'image' && args[1] === 'inspect' && args[3] === '{{.Id}}') {
         thrown = error;
     }
 
+    const { createArgs } = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert.equal(createArgs[0], 'create');
+    assert.equal(createArgs.filter((arg) => arg === '--pull=never').length, 1);
+    assert.ok(createArgs.indexOf('--pull=never') < createArgs.indexOf(helperImageId));
     assert.equal(thrown instanceof RouterAuthorityAttestationError, true);
     assert.equal(thrown.code, ROUTER_AUTHORITY_EXTERNAL_PROBE_TIMEOUT);
     assert.deepEqual(thrown.context, {

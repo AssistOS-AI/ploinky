@@ -55,6 +55,7 @@ function buildInteractiveCommandCreateCommand({
     return joinShellCommandParts([
         runtime,
         'create',
+        '--pull=never',
         '-it',
         '--name',
         containerName,
@@ -86,6 +87,7 @@ function buildInteractiveAgentCreateCommand({
     return joinShellCommandParts([
         runtime,
         'create',
+        '--pull=never',
         '-it',
         '--name',
         containerName,

@@ -268,6 +268,27 @@ test('an ordinary managed container does not inherit coding-image receipt admiss
     assert.match(source, /releaseImageInspection:\s*exactReleaseImageInspection/);
 });
 
+test('one pull-free service create boundary is shared by managed and unmanaged consumers', () => {
+    const source = startAgentContainer.toString();
+
+    assert.equal(
+        source.match(/spawnSync\(runtime, createArgs, \{ stdio: 'inherit' \}\)/g)?.length,
+        1,
+    );
+    assert.match(
+        source,
+        /const createArgs = \[\.\.\.args\];\s*createArgs\.splice\(1, 0, '--pull=never'\);/,
+    );
+    assert.match(
+        source,
+        /networkLifecycle\.runManagedContainerTransaction\(\{[\s\S]*?\bcreateContainer,/,
+    );
+    assert.match(
+        source,
+        /\} else \{[\s\S]*?createContainer\(unmanagedNetworkLifecyclePlan\);/,
+    );
+});
+
 test('effective generation capability requires the exact managed runtime to be running', () => {
     const containerId = 'a'.repeat(64);
     const owner = {

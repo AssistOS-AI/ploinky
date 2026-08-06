@@ -1664,7 +1664,21 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (manifestEntrypoint) {
         args.push('--entrypoint', manifestEntrypoint);
     }
-    args.push(image);
+    let createImage = String(image);
+    if (!/^[a-f0-9]{64}$/.test(createImage)) {
+        const inspected = spawnSync(runtime, ['image', 'inspect', '--format', '{{.Id}}', createImage], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        createImage = String(inspected.stdout || '').trim().replace(/^sha256:/, '');
+        if (inspected.error || inspected.status !== 0 || !/^[a-f0-9]{64}$/.test(createImage)) {
+            const detail = String(inspected.error?.message || inspected.stderr || '').trim();
+            const error = new Error(`[image] ${agentName}: '${image}' must resolve locally to one immutable raw image ID before create${detail ? `: ${detail}` : ''}`);
+            error.code = 'PLOINKY_EXACT_IMAGE_ID_UNAVAILABLE';
+            throw error;
+        }
+    }
+    args.push(createImage);
     let entrySummary = DEFAULT_AGENT_ENTRY;
     if (useStartEntry) {
         const startArgs = splitCommandArgs(startCmd);
@@ -1972,6 +1986,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     console.log(`[start] ${agentName}: ${runtime} create (cwd='${cwd}') -> ${entrySummary}`);
     const createContainer = (plan, launch) => {
         const createArgs = [...args];
+        createArgs.splice(1, 0, '--pull=never');
         if (plan?.args?.length) createArgs.splice(1, 0, ...plan.args);
         if (launch) {
             for (let index = 0; index < createArgs.length - 1; index += 1) {
@@ -1979,7 +1994,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     createArgs[index + 1] = `ploinky.envhash=${launch.envHash}`;
                 }
             }
-            const imageIndex = createArgs.indexOf(image);
+            const imageIndex = createArgs.indexOf(createImage);
             if (imageIndex < 1) throw new Error('managed candidate image position is unavailable');
             const userNamespace = managedUserNamespaceFromAttestation(launch.attested);
             createArgs.splice(imageIndex, 0,

@@ -534,7 +534,7 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
     let helperId = '';
     try {
         helperId = runBounded(runtime, [
-            'create', '--name', helperName,
+            'create', '--pull=never', '--name', helperName,
             '--label', `io.assistos.ploinky.authority-helper=${nonce}`,
             '--init',
             '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',

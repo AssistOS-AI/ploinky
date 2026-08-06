@@ -29,7 +29,9 @@ function assertExactManagedArgv(args) {
 }
 
 function assertExactManagedCommand(command) {
-    assertExactManagedArgv(String(command).trim().split(/\s+/));
+    const args = String(command).trim().split(/\s+/);
+    assertExactManagedArgv(args);
+    assert.equal(args.filter((value) => value === '--pull=never').length, 1);
 }
 
 test('managed label helper emits the exact D12 ownership label', () => {
