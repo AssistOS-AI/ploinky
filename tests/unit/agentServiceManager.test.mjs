@@ -256,6 +256,18 @@ test('an admitted release Node image has one sealed inspection and no generic se
     assert.match(source, /if \(!exactReleaseImageInspection\)\s*\{\s*ensureImagePresent\(image, \{ runtime \}\);\s*\}/);
 });
 
+test('an ordinary managed container does not inherit coding-image receipt admission', () => {
+    const source = fs.readFileSync(
+        new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url),
+        'utf8',
+    );
+    assert.match(
+        source,
+        /releaseDescriptor:\s*exactReleaseImageInspection\s*\?\s*options\.releaseDescriptor\s*:\s*null/,
+    );
+    assert.match(source, /releaseImageInspection:\s*exactReleaseImageInspection/);
+});
+
 test('effective generation capability requires the exact managed runtime to be running', () => {
     const containerId = 'a'.repeat(64);
     const owner = {

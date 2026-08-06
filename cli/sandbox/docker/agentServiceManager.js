@@ -1356,7 +1356,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             profileConfig,
             image,
             {
-                releaseDescriptor: options.releaseDescriptor,
+                releaseDescriptor: exactReleaseImageInspection ? options.releaseDescriptor : null,
                 releaseImageInspection: exactReleaseImageInspection,
             },
         );
