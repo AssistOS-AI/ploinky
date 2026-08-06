@@ -13,7 +13,6 @@ import {
     REQUESTED_IMAGE_LABEL,
     REQUIRED_IMAGE_ENV,
     REQUIRED_RUNTIME_IMAGE,
-    VOLUME_ROLE_LABEL,
     VOLUME_ROLES,
     assertFixedRuntimePublications,
     buildRuntimeRunArgs,
@@ -27,7 +26,14 @@ import {
     runtimeVolumeNames,
     validateImageContract,
 } from './runtime-contract.mjs';
-import { IMAGE_PROBE_TIMEOUT_MS } from '../ploinky-box/contract/image.mjs';
+import {
+    BOX_LABELS as DIRECT_BOX_LABELS,
+    BOX_ROLES as DIRECT_BOX_ROLES,
+    BOX_VOLUME_KEYS as DIRECT_VOLUME_KEYS,
+} from '../ploinky-box/constants.mjs';
+import { inspectAndValidateDirectImage } from '../ploinky-box/contract/image.mjs';
+import { buildWorkspaceIdentity } from '../ploinky-box/identity.mjs';
+import { ensureNamedVolumes } from '../ploinky-box/volumes.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
     assertStateCommandFlags,
@@ -67,7 +73,6 @@ const PSH = path.join(REPO_ROOT, 'bin', 'psh');
 const INSTALL_DEPS = path.join(REPO_ROOT, 'bin', 'ploinky-install-deps');
 const SUPERVISOR = path.join(REPO_ROOT, 'container', 'runtime-supervisor.mjs');
 const BOX_CLI_FROM_BIN = `${path.join(REPO_ROOT, 'bin')}/../ploinky-box/bin/ploinky-box.mjs`;
-const LOCAL_SHELL_FROM_BIN = `${path.join(REPO_ROOT, 'bin')}/../cli/shell.js`;
 const BOX_DEPENDENCY_INSTALLER = path.join(REPO_ROOT, 'ploinky-box', 'entrypoint', 'install-dependencies.mjs');
 
 function runCalls(harness, command) {
@@ -95,6 +100,57 @@ function invocationFor(cwd = '/workspace/demo') {
         sourceDirResolved: '/source/ploinky',
         mountDirResolved: '',
     };
+}
+
+function directVolumeHarness(t, {
+    existingKeys = [],
+    legacyNames = [],
+} = {}) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-direct-volumes-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const identity = buildWorkspaceIdentity(root, { markerFound: true });
+    const engine = { name: 'podman', identity: 'structured-engine-one' };
+    const records = new Map(legacyNames.map(name => [name, { Name: name, Labels: {} }]));
+    const calls = [];
+    const knownHandles = {};
+    const seed = key => {
+        const name = identity.volumes[key];
+        records.set(name, {
+            Name: name,
+            Driver: 'local',
+            MountCount: 0,
+            Labels: {
+                [DIRECT_BOX_LABELS.pathHash]: identity.pathHash,
+                [DIRECT_BOX_LABELS.role]: DIRECT_BOX_ROLES[key],
+            },
+        });
+        knownHandles[key] = {
+            name,
+            engineIdentity: engine.identity,
+        };
+    };
+    existingKeys.forEach(seed);
+    const hostClient = {
+        async findVolume({ name, labels }) {
+            calls.push({ operation: 'find', name, labels: { ...labels } });
+            return structuredClone(records.get(name) || null);
+        },
+        async createVolume({ name, labels }) {
+            calls.push({ operation: 'create', name, labels: { ...labels } });
+            assert.equal(records.has(name), false);
+            records.set(name, {
+                Name: name,
+                Driver: 'local',
+                MountCount: 0,
+                Labels: { ...labels },
+            });
+        },
+    };
+    const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
+    const ensure = (handles = knownHandles) => ensureNamedVolumes({
+        engine, identity, hostClient, lock, knownHandles: handles,
+    });
+    return { identity, engine, records, calls, knownHandles, ensure };
 }
 
 function writableBuffer() {
@@ -291,11 +347,14 @@ test('outer --port is strict and normalized before publication', async () => {
     assert.match(invalid.stderr, /exact unsigned decimal string/);
     assert.equal(mutationCalls(invalid).length, 0);
 
-    const normalized = createSupervisorHarness({ fetchResponse: { ok: true } });
-    assert.equal(await normalized.supervisor.run(['--port', '019192', 'start', 'explorer']), 0);
-    const creation = runCalls(normalized, 'run').at(-1);
-    assert.ok(creation.args.includes('127.0.0.1:19192:8080/tcp'));
-    assert.equal(creation.args.some(arg => String(arg).includes('019192')), false);
+    const invocation = parseHostInvocation(['--port', '019192', 'start', 'explorer']);
+    resolveInstanceIdentity(invocation, '/workspace/demo', value => path.resolve(value));
+    invocation.sourceDirResolved = '/source/ploinky';
+    const config = createDefaultRuntimeConfig(invocation);
+    config.imageId = 'sha256:validated';
+    const creation = buildRuntimeRunArgs(config, { engine: 'podman' });
+    assert.ok(creation.includes('127.0.0.1:19192:8080/tcp'));
+    assert.equal(creation.some(arg => String(arg).includes('019192')), false);
 });
 
 test('non-start post-command port tokens are forwarded byte-for-byte', async () => {
@@ -621,32 +680,56 @@ test('every outer mutation route is held by the exact-directory host lock while 
     }
 });
 
-test('missing create pulls despite a cached tag, validates, and runs the new ID', async () => {
+test('structured image inspection pins the new ID while retired CLI create fails closed', async () => {
     const oldImage = compatibleImage('sha256:old');
     const newImage = compatibleImage('sha256:new');
+    const inspected = [];
+    const validated = await inspectAndValidateDirectImage({
+        async inspectImage(imageId) {
+            inspected.push(imageId);
+            return newImage;
+        },
+    }, newImage.Id, REQUIRED_RUNTIME_IMAGE);
+    assert.equal(validated.immutableId, newImage.Id);
+    assert.deepEqual(inspected, [newImage.Id]);
+
     const harness = createSupervisorHarness({
         images: { [REQUIRED_RUNTIME_IMAGE]: oldImage, [oldImage.Id]: oldImage },
         pullImages: { [REQUIRED_RUNTIME_IMAGE]: newImage },
     });
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+    assert.match(harness.stderr, /implicit temporary-container lifecycle is forbidden/);
     assert.equal(runCalls(harness, 'pull').length, 1);
-    const create = runCalls(harness, 'run')[0];
-    assert.equal(create.args.at(-1), newImage.Id);
-    assert.ok(create.args.includes(`${REQUESTED_IMAGE_LABEL}=${REQUIRED_RUNTIME_IMAGE}`));
+    assert.equal(runCalls(harness, 'run').length, 0);
+    assert.equal(runCalls(harness, 'volume').length, 0);
 });
 
-test('a custom image is pulled, contract-validated, and pinned by ID', async () => {
+test('custom image acceptance uses structured inspection and immutable create arguments', async () => {
     const reference = 'registry.example/ploinky/custom:runtime';
     const image = compatibleImage('sha256:custom');
-    const harness = createSupervisorHarness({ pullImages: { [reference]: image } });
-    assert.equal(await harness.supervisor.run(['--image', reference, 'list']), 0);
-    assert.deepEqual(runCalls(harness, 'pull')[0].args, ['pull', reference]);
-    const create = runCalls(harness, 'run')[0].args;
+    const validated = await inspectAndValidateDirectImage({
+        async inspectImage(imageId) {
+            assert.equal(imageId, image.Id);
+            return image;
+        },
+    }, image.Id, reference);
+    const invocation = invocationFor();
+    invocation.image = reference;
+    const config = createDefaultRuntimeConfig(invocation);
+    config.imageId = validated.immutableId;
+    const create = buildRuntimeRunArgs(config, { engine: 'podman' });
     assert.equal(create.at(-1), image.Id);
     assert.ok(create.includes(`${REQUESTED_IMAGE_LABEL}=${reference}`));
+
+    const harness = createSupervisorHarness({ pullImages: { [reference]: image } });
+    assert.equal(await harness.supervisor.run(['--image', reference, 'list']), 1);
+    assert.match(harness.stderr, /implicit temporary-container lifecycle is forbidden/);
+    assert.deepEqual(runCalls(harness, 'pull')[0].args, ['pull', reference]);
+    assert.equal(runCalls(harness, 'run').length, 0);
+    assert.equal(runCalls(harness, 'volume').length, 0);
 });
 
-test('missing marker or runtime capabilities fail before volume or container creation', async () => {
+test('retired capability probing fails closed without a temporary container or source mutation', async () => {
     const source = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-invalid-image-source-'));
     try {
         for (const relative of ['bin/ploinky', 'cli/index.js', 'globalDeps/package.json']) {
@@ -656,10 +739,9 @@ test('missing marker or runtime capabilities fail before volume or container cre
         }
         const harness = createSupervisorHarness({
             env: { PLOINKY_BOX_SOURCE: source },
-            failures: { 'image capability probe': 1 },
         });
         assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
-        assert.match(harness.stderr, /runtime capabilities and marker/);
+        assert.match(harness.stderr, /capability probing.*unsupported.*temporary-container lifecycle is forbidden/);
         assert.equal(runCalls(harness, 'pull').length, 1);
         assert.equal(runCalls(harness, 'volume').length, 0);
         assert.equal(runCalls(harness, 'run').length, 0);
@@ -668,49 +750,40 @@ test('missing marker or runtime capabilities fail before volume or container cre
             && call.args[0] === 'run'
             && call.args.includes('--network=none')
         ));
-        assert.equal(probe?.options?.timeoutMs, IMAGE_PROBE_TIMEOUT_MS);
+        assert.equal(probe, undefined);
         assert.equal(fs.existsSync(path.join(source, 'node_modules')), false);
     } finally {
         fs.rmSync(source, { recursive: true, force: true });
     }
 });
 
-test('missing create explicitly creates and labels all named volumes before attachment', async () => {
-    const harness = createSupervisorHarness();
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-    const identity = identityFor();
-    const names = runtimeVolumeNames(identity.instance);
-    const creates = harness.calls.filter(call =>
-        call.kind === 'run' && call.args[0] === 'volume' && call.args[1] === 'create'
-    );
-    assert.equal(creates.length, 3);
-    for (const [role, expectedRole] of Object.entries(VOLUME_ROLES)) {
-        const call = creates.find(entry => entry.args.at(-1) === names[role]);
-        assert.ok(call, role);
-        assert.ok(call.args.includes(`${PATH_HASH_LABEL}=${identity.pathHash}`));
-        assert.ok(call.args.includes(`${VOLUME_ROLE_LABEL}=${expectedRole}`));
-        assert.deepEqual(harness.state.volumes.get(names[role]).Labels, {
-            [PATH_HASH_LABEL]: identity.pathHash,
-            [VOLUME_ROLE_LABEL]: expectedRole,
-        });
-    }
-    const createIndex = harness.calls.findIndex(call => call.kind === 'run' && call.args[0] === 'run');
-    assert.ok(creates.every(call => harness.calls.indexOf(call) < createIndex));
+test('structured preparation creates and labels all exact named volumes', async (t) => {
+    const harness = directVolumeHarness(t);
+    const result = await harness.ensure();
+    const creates = harness.calls.filter(({ operation }) => operation === 'create');
+    assert.deepEqual(result.created.map(({ key }) => key), DIRECT_VOLUME_KEYS);
+    assert.deepEqual(creates, DIRECT_VOLUME_KEYS.map(key => ({
+        operation: 'create',
+        name: harness.identity.volumes[key],
+        labels: {
+            [DIRECT_BOX_LABELS.pathHash]: harness.identity.pathHash,
+            [DIRECT_BOX_LABELS.role]: DIRECT_BOX_ROLES[key],
+        },
+    })));
 });
 
-test('partial labelled volume sets are reused and only missing roles are created', async () => {
-    const identity = identityFor();
-    const names = runtimeVolumeNames(identity.instance);
-    const harness = createSupervisorHarness({
-        volumes: {
-            [names.workspace]: ownedVolume(names.workspace, identity.pathHash, 'workspace'),
-        },
-    });
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-    const creates = harness.calls.filter(call =>
-        call.kind === 'run' && call.args[0] === 'volume' && call.args[1] === 'create'
-    );
-    assert.deepEqual(creates.map(call => call.args.at(-1)).sort(), [names.containers, names.deps].sort());
+test('structured preparation revalidates journal-owned volumes and creates only missing roles', async (t) => {
+    const harness = directVolumeHarness(t, { existingKeys: ['workspace'] });
+    const result = await harness.ensure();
+    const creates = harness.calls
+        .filter(({ operation }) => operation === 'create')
+        .map(({ name }) => name);
+    assert.deepEqual(creates, [
+        harness.identity.volumes.containers,
+        harness.identity.volumes.dependencies,
+    ]);
+    assert.equal(result.handles.workspace.name, harness.identity.volumes.workspace);
+    assert.equal(result.created.some(({ key }) => key === 'workspace'), false);
 });
 
 test('foreign volume discovery fails before pull or mutation', async () => {
@@ -736,18 +809,20 @@ test('foreign volume discovery fails before pull or mutation', async () => {
     assert.equal(mutationCalls(podman).length, 0);
 });
 
-test('new path-hashed create never attaches legacy basename-only volumes', async () => {
-    const harness = createSupervisorHarness({
-        volumes: {
-            'ploinky-box-demo-workspace': { Name: 'ploinky-box-demo-workspace', Labels: {} },
-            'ploinky-box-demo-containers': { Name: 'ploinky-box-demo-containers', Labels: {} },
-            'ploinky-box-demo-ploinky-deps': { Name: 'ploinky-box-demo-ploinky-deps', Labels: {} },
-        },
-    });
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-    const args = runCalls(harness, 'run')[0].args;
-    assert.equal(args.some(value => /^ploinky-box-demo-(workspace|containers|ploinky-deps):/.test(value)), false);
-    assert.equal(harness.state.volumes.has('ploinky-box-demo-workspace'), true);
+test('structured volume discovery ignores legacy basename-only names', async (t) => {
+    const legacyNames = [
+        'ploinky-box-demo-workspace',
+        'ploinky-box-demo-containers',
+        'ploinky-box-demo-ploinky-deps',
+    ];
+    const harness = directVolumeHarness(t, { legacyNames });
+    const result = await harness.ensure();
+    assert.deepEqual(
+        result.created.map(({ handle }) => handle.name),
+        DIRECT_VOLUME_KEYS.map(key => harness.identity.volumes[key]),
+    );
+    assert.equal(harness.calls.some(({ name }) => legacyNames.includes(name)), false);
+    for (const name of legacyNames) assert.equal(harness.records.has(name), true);
 });
 
 test('compatible running reuse and stopped start perform no registry pull', async t => {
@@ -903,19 +978,18 @@ test('status, stop, and destroy remain pull-free for incompatible boxes', async 
     }
 });
 
-test('failed initial run removes a partially created box and its anonymous volumes', async () => {
+test('retired initial CLI creation fails before a partial box or cleanup mutation exists', async () => {
     const harness = createSupervisorHarness({
         failures: { 'run create': 29 },
         createFailureCreatesContainer: true,
     });
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 29);
+    assert.equal(await harness.supervisor.run(['list', 'agents']), 1);
+    assert.match(harness.stderr, /implicit temporary-container lifecycle is forbidden/);
     assert.equal(harness.state.container, null);
     assert.equal(harness.state.anonymousVolumes.size, 0);
-    assert.equal(runCalls(harness, 'rm').length, 1);
-    assert.ok(runCalls(harness, 'rm')[0].args.includes('--volumes'));
-    for (const name of Object.values(runtimeVolumeNames(identityFor().instance))) {
-        assert.equal(harness.state.volumes.has(name), true, name);
-    }
+    assert.equal(runCalls(harness, 'run').length, 0);
+    assert.equal(runCalls(harness, 'rm').length, 0);
+    assert.equal(runCalls(harness, 'volume').length, 0);
 });
 
 test('destroy directly removes only the outer box, cleans anonymous volumes, and retains named volumes', async () => {
@@ -983,15 +1057,20 @@ test('destroy is idempotent with a missing box and retained volumes', async () =
     assert.equal(mutationCalls(harness).length, 0);
 });
 
-test('retained named volumes are reattached on recreation', async () => {
-    const fixture = ownedRuntimeFixture();
-    const harness = createSupervisorHarness({ ...fixture, answer: 'y' });
-    assert.equal(await harness.supervisor.run(['destroy']), 0);
-    assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
-    const create = runCalls(harness, 'run').at(-1);
-    for (const name of Object.values(runtimeVolumeNames(fixture.identity.instance))) {
-        assert.ok(create.args.some(value => value.startsWith(`${name}:`)), name);
-        assert.equal(harness.state.volumes.has(name), true);
+test('retained journal-owned volumes are revalidated without recreation', async (t) => {
+    const harness = directVolumeHarness(t);
+    const first = await harness.ensure();
+    const createCount = harness.calls.filter(({ operation }) => operation === 'create').length;
+    const retained = await harness.ensure(first.handles);
+
+    assert.deepEqual(retained.created, []);
+    assert.equal(
+        harness.calls.filter(({ operation }) => operation === 'create').length,
+        createCount,
+    );
+    for (const key of DIRECT_VOLUME_KEYS) {
+        assert.equal(retained.handles[key].name, harness.identity.volumes[key]);
+        assert.equal(harness.records.has(harness.identity.volumes[key]), true);
     }
 });
 
@@ -1018,7 +1097,11 @@ test('parameterless cli fails locally without a TTY', async () => {
 
 test('master key is inherited only by in-box execs and never persisted or placed in argv', async () => {
     const secret = 'test-master-key-never-log-this';
-    const harness = createSupervisorHarness({ env: { PLOINKY_MASTER_KEY: secret } });
+    const fixture = ownedRuntimeFixture();
+    const harness = createSupervisorHarness({
+        ...fixture,
+        env: { PLOINKY_MASTER_KEY: secret },
+    });
     assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
     const exec = runCalls(harness, 'exec').at(-1);
     assert.ok(exec.args.includes('PLOINKY_MASTER_KEY'));
@@ -1040,7 +1123,8 @@ test('the host walked-up .env master key preserves core resolution without enter
     fs.mkdirSync(child, { recursive: true });
     fs.writeFileSync(path.join(root, '.env'), `PLOINKY_MASTER_KEY=${secret}\n`);
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const harness = createSupervisorHarness({ cwd: child });
+    const fixture = ownedRuntimeFixture({ cwd: child });
+    const harness = createSupervisorHarness({ ...fixture, cwd: child });
     assert.equal(await harness.supervisor.run(['list', 'agents']), 0);
     const exec = runCalls(harness, 'exec').at(-1);
     assert.ok(exec.args.includes('PLOINKY_MASTER_KEY'));
@@ -1131,7 +1215,6 @@ test('public and local aliases route to their current entrypoints, including sym
     const cases = [
         { name: 'ploinky', executable: PLOINKY, args: ['status', '--dry-run'], expected: [BOX_CLI_FROM_BIN, 'status', '--dry-run'] },
         { name: 'p-cli', executable: PCLI, args: ['status'], expected: [BOX_CLI_FROM_BIN, 'status'] },
-        { name: 'psh', executable: PSH, args: ['--trace'], expected: [LOCAL_SHELL_FROM_BIN, '--trace'] },
     ];
     for (const scenario of cases) {
         await t.test(scenario.name, () => {
@@ -1155,6 +1238,27 @@ test('public and local aliases route to their current entrypoints, including sym
                 fs.rmSync(links, { recursive: true, force: true });
             }
         });
+    }
+});
+
+test('psh routes through ploinky-local and the Darwin host guard fails closed', () => {
+    const launcher = fs.readFileSync(PSH, 'utf8');
+    assert.match(launcher, /exec "\$SCRIPT_DIR\/ploinky-local" sh "\$@"/);
+    assert.doesNotMatch(launcher, /cli\/shell\.js/);
+    if (process.platform !== 'darwin') return;
+
+    const links = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-psh-link-'));
+    const link = path.join(links, 'psh');
+    try {
+        fs.symlinkSync(PSH, link);
+        const result = spawnSync(link, ['--trace'], {
+            encoding: 'utf8',
+            env: { ...process.env },
+        });
+        assert.equal(result.status, 78);
+        assert.match(result.stderr, /refuses execution outside its managed Linux Box boundary/);
+    } finally {
+        fs.rmSync(links, { recursive: true, force: true });
     }
 });
 
@@ -1288,7 +1392,7 @@ test('Podman-normalized outer devices and security options converge without drif
     assert.equal(diffRuntimeConfig(actual, desired).includes('securityOpts'), false);
 });
 
-test('interactive exec preserves TTY and non-TTY behavior for cli and shell routes', async () => {
+test('legacy in-Box runtime supervisor preserves TTY and non-TTY CLI behavior', async () => {
     const fixture = ownedRuntimeFixture();
     const tty = createSupervisorHarness({ ...fixture, stdoutIsTTY: true });
     assert.equal(await tty.supervisor.run(['cli', 'agent', '--field', 'value']), 0);
@@ -1348,8 +1452,9 @@ test('stop attempts the outer stop after a core shutdown failure and stays pull-
 });
 
 test('managed start probes the supervisor Unix health socket only after core start succeeds', async () => {
-    const success = createSupervisorHarness();
-    assert.equal(await success.supervisor.run(['--port', '19192', 'start', 'explorer']), 0);
+    const fixture = ownedRuntimeFixture();
+    const success = createSupervisorHarness(fixture);
+    assert.equal(await success.supervisor.run(['start', 'explorer']), 0);
     const coreIndex = success.calls.findIndex(call =>
         call.kind === 'run' && call.args.includes('ploinky') && call.args.includes('start')
     );
@@ -1362,9 +1467,10 @@ test('managed start probes the supervisor Unix health socket only after core sta
     assert.equal(success.calls.some(call => call.kind === 'fetch'), false);
 
     const failed = createSupervisorHarness({
+        ...ownedRuntimeFixture(),
         failures: { exec: 7 },
     });
-    assert.equal(await failed.supervisor.run(['--port', '19193', 'start', 'explorer']), 7);
+    assert.equal(await failed.supervisor.run(['start', 'explorer']), 7);
     assert.equal(failed.calls.some(call => call.kind === 'query'
         && call.args.includes('/workspace/.ploinky/run/router-health.sock')), false);
 });

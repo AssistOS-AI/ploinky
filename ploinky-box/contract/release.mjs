@@ -217,31 +217,11 @@ export function validateReleaseImageInspection(kind, inspection, descriptor) {
 export function inspectAndValidateReleaseImage(engine, kind, descriptor, runner) {
     const prefix = kind === 'box' ? 'box' : kind === 'node' ? 'node' : '';
     if (!prefix) throw releaseError(`Unknown release image kind ${kind}`);
-    const imageId = descriptor[`${prefix}ImageId`];
-    const result = runner.query(engine, ['image', 'inspect', imageId]);
-    if (!result?.ok) {
-        throw releaseError(
-            `Exact local ${kind} image ${imageId} is missing; pull, build, retag, and fallback are forbidden`,
-            'PLOINKY_RELEASE_IMAGE_STALE',
-        );
-    }
-    let parsed;
-    try {
-        parsed = JSON.parse(String(result.stdout || ''));
-    } catch (cause) {
-        throw releaseError(
-            `Exact local ${kind} image inspection is malformed: ${cause.message}`,
-            'PLOINKY_RELEASE_IMAGE_STALE',
-        );
-    }
-    const records = Array.isArray(parsed) ? parsed : [parsed];
-    if (records.length !== 1) {
-        throw releaseError(
-            `Exact local ${kind} image inspection must contain one record`,
-            'PLOINKY_RELEASE_IMAGE_STALE',
-        );
-    }
-    return validateReleaseImageInspection(kind, records[0], descriptor);
+    void engine; void descriptor; void runner;
+    throw releaseError(
+        `Ordinary host ${kind} image inspection is retired; use the structured exact-image client`,
+        'PLOINKY_RELEASE_IMAGE_INSPECT_UNSUPPORTED',
+    );
 }
 
 export function resolveReleaseManifestImage(manifest, descriptor, {

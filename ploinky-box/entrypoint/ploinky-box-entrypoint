@@ -9,6 +9,13 @@ EXPECTED_BUBBLEWRAP_NEVRA='bubblewrap-0:0.11.0-4.fc44'
 BWRAP_HELPER='/usr/local/libexec/ploinky-bwrap-launch'
 PREPARE_HELPER='/opt/ploinky/ploinky-box/entrypoint/entrypoint.mjs'
 READY_LINE='PLOINKY_BOX_READY'
+READY_DIRECTORY='/workspace/.ploinky'
+READY_MARKER="$READY_DIRECTORY/outer-box-ready"
+
+# A retained workspace must never make a later boot appear ready. The marker
+# is rebound below to the current VM boot and PID 1 start time only after every
+# startup self-check succeeds.
+rm -f -- "$READY_MARKER"
 
 fail() {
     echo "[ploinky-box] SELF-CHECK FAILED: $1" >&2
@@ -239,6 +246,14 @@ require_full_mapping uid
 require_full_mapping gid
 
 log "Runtime self-checks passed"
+mkdir -p -- "$READY_DIRECTORY"
+chmod 700 -- "$READY_DIRECTORY"
+ready_boot_id="$(cat /proc/sys/kernel/random/boot_id)"
+ready_pid_start="$(awk '{print $22}' /proc/1/stat)"
+ready_candidate="${READY_MARKER}.candidate.$$"
+printf '%s\n%s\n' "$ready_boot_id" "$ready_pid_start" > "$ready_candidate"
+chmod 600 -- "$ready_candidate"
+mv -f -- "$ready_candidate" "$READY_MARKER"
 echo "$READY_LINE"
 if [ "$#" -gt 0 ]; then
     exec "$@"

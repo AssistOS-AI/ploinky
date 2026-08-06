@@ -217,10 +217,12 @@ test('version and capability output expose the fixed source and fd ABI', () => {
     assert.match(capabilities.stdout, /home-revalidation=post-barrier-G/);
 });
 
-test('every Box runtime consumer requires the canonical helper protocol v2', () => {
+test('every source component that launches the helper requires its canonical protocol v2', () => {
+    // IMAGE_CONTRACT admits the helper binary's presence; it does not launch or
+    // negotiate with it. The compiled --capabilities test above is the
+    // functional acceptance proof, while this is only a launcher source guard.
     for (const relativePath of [
         'ploinky-box/entrypoint/ploinky-box-entrypoint',
-        'ploinky-box/contract/image.mjs',
         'cli/sandbox/docker/common.js',
         'cli/utils/runtime/sandboxRuntime.js',
     ]) {

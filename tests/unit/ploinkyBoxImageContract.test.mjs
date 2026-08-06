@@ -7,19 +7,13 @@ import test from 'node:test';
 
 import {
     IMAGE_CONTRACT,
-    IMAGE_PROBE_TIMEOUT_MS,
+    inspectAndValidateDirectImage,
     inspectAndValidateImage,
     inspectAndValidateExistingImage,
     normalizeImageInspect,
     probeImageBinaries,
     validateImageContract,
 } from '../../ploinky-box/contract/image.mjs';
-import { BOX_LABELS, BOX_ROLES } from '../../ploinky-box/constants.mjs';
-import {
-    REQUIRED_RELEASE_AGENTLIB_SHA,
-    createReleaseDescriptor,
-    serializeReleaseDescriptor,
-} from '../../ploinky-box/contract/release.mjs';
 
 const SOURCE_SHA = '0123456789abcdef0123456789abcdef01234567';
 const AGENTLIB_SHA = 'dd94929443033c0a43bf7569068ec1d2926dba35';
@@ -70,21 +64,6 @@ const binaries = [
     ...IMAGE_CONTRACT.requiredBinaries,
     IMAGE_CONTRACT.networkHelpers[0],
 ];
-
-function releaseFixture() {
-    return createReleaseDescriptor({
-        schema: 'ploinky-release-v1',
-        boxImageId: 'b'.repeat(64),
-        boxImageDigest: `sha256:${'1'.repeat(64)}`,
-        nodeImageId: 'c'.repeat(64),
-        nodeImageDigest: `sha256:${'2'.repeat(64)}`,
-        artifactSourceSha: SOURCE_SHA,
-        controllerSourceSha: '3'.repeat(40),
-        agentlibSha: REQUIRED_RELEASE_AGENTLIB_SHA,
-        routerHostPort: 18081,
-        mediaHostPort: 17883,
-    });
-}
 
 test('complete semantic image metadata validates to an immutable image handle', () => {
     const normalized = normalizeImageInspect(validRecord());
@@ -183,28 +162,36 @@ test('images with stale, missing, or unexpected source provenance hard-cut befor
     }
 });
 
-test('an existing owned image is inspected by immutable ID without a binary probe', () => {
+test('direct image inspection is awaited and bound to the exact immutable ID', async () => {
     const record = validRecord();
     const calls = [];
-    const runner = {
-        query(engine, args) {
-            calls.push([engine, ...args]);
-            return { ok: true, stdout: JSON.stringify(record), stderr: '' };
+    const hostClient = {
+        async inspectImage(imageId) {
+            calls.push(imageId);
+            return structuredClone(record);
         },
     };
-    const image = inspectAndValidateExistingImage(
-        'podman', 'sha256:image-id', 'runtime', runner,
+    const image = await inspectAndValidateDirectImage(
+        hostClient, 'sha256:image-id', 'runtime',
     );
     assert.equal(image.immutableId, 'sha256:image-id');
-    assert.deepEqual(calls, [['podman', 'image', 'inspect', 'sha256:image-id']]);
+    assert.deepEqual(calls, ['sha256:image-id']);
 
     record[0].Config.Labels['io.assistos.ploinky.unexpected'] = 'retired';
-    assert.throws(
-        () => inspectAndValidateExistingImage(
-            'podman', 'sha256:image-id', 'old-runtime', runner,
-        ),
+    await assert.rejects(
+        inspectAndValidateDirectImage(hostClient, 'sha256:image-id', 'old-runtime'),
         (error) => error.code === 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT'
             && /destroy and recreate/i.test(error.message),
+    );
+
+    const mismatched = validRecord();
+    mismatched[0].Id = 'sha256:other-image';
+    await assert.rejects(inspectAndValidateDirectImage({
+        async inspectImage() { return mismatched; },
+    }, 'sha256:image-id', 'runtime'), /invalid image ID/);
+    await assert.rejects(
+        inspectAndValidateDirectImage(null, 'sha256:image-id'),
+        /Structured image inspection is unavailable/,
     );
 });
 
@@ -226,91 +213,47 @@ test('required binaries and one rootless network helper are mandatory', () => {
     );
 });
 
-test('fresh image capability probes allow a cold rootless container start', () => {
+test('retired ordinary inspection and temporary-container probes fail closed', () => {
     const calls = [];
-    const runner = {
-        query(engine, args, options) {
-            calls.push({ engine, args, options });
-            return {
-                ok: true,
-                stdout: binaries.map((binary) => (
-                    binary.startsWith('/') ? binary : `/usr/bin/${binary}`
-                )).join('\n'),
-                stderr: '',
-            };
+    const forbiddenRunner = new Proxy({}, {
+        get(_target, property) {
+            calls.push(property);
+            throw new Error('ordinary host runner must not be accessed');
         },
-    };
-    const releaseDescriptor = releaseFixture();
-    const identity = {
-        instance: 'ploinky-box-fixture-0123456789ab',
-        pathHash: '0123456789ab',
-    };
-    probeImageBinaries('podman', releaseDescriptor.boxImageId, runner, {
-        expectedSourceSha: SOURCE_SHA,
-        identity,
-        releaseDescriptor,
     });
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].options.timeoutMs, IMAGE_PROBE_TIMEOUT_MS);
-    assert.ok(IMAGE_PROBE_TIMEOUT_MS >= 60_000);
-    const args = calls[0].args;
-    assert.equal(args.includes('--pull=never'), true);
-    assert.deepEqual(args.slice(0, 7), [
-        'run', '--rm', '--pull=never', '--network=none', '--name',
-        `ploinky-box-probe-${identity.pathHash}-${releaseDescriptor.releaseGeneration.slice(0, 16)}`,
-        '--label',
-    ]);
-    const observedLabels = Object.fromEntries(args.flatMap((value, index) => (
-        value === '--label' ? [args[index + 1].split(/=(.*)/s).slice(0, 2)] : []
-    )));
-    assert.deepEqual(observedLabels, {
-        [BOX_LABELS.owner]: identity.instance,
-        [BOX_LABELS.pathHash]: identity.pathHash,
-        [BOX_LABELS.role]: BOX_ROLES.imageProbe,
-        [BOX_LABELS.imageRef]: releaseDescriptor.boxImageId,
-        [BOX_LABELS.releaseDescriptor]: serializeReleaseDescriptor(releaseDescriptor),
-        [BOX_LABELS.releaseGeneration]: releaseDescriptor.releaseGeneration,
-    });
-    const probe = calls[0].args.at(-1);
-    assert.match(probe, /bubblewrap-0:0\.11\.0-4\.fc44/);
-    assert.match(probe, /--bind-fd FD DEST/);
-    assert.match(probe, /ploinky-bwrap-launch-v2 source-sha=/);
-    assert.match(probe, /openat2-beneath-no-magiclinks-no-symlinks/);
     assert.throws(
-        () => probeImageBinaries('podman', releaseDescriptor.boxImageId, runner),
-        /Ploinky source SHA/,
+        () => inspectAndValidateImage('podman', 'runtime', forbiddenRunner),
+        (error) => error.code === 'PLOINKY_BOX_IMAGE_INSPECT_UNSUPPORTED'
+            && /structured exact-image client/.test(error.message),
     );
+    assert.throws(
+        () => inspectAndValidateExistingImage(
+            'podman', 'sha256:image-id', 'runtime', forbiddenRunner,
+        ),
+        (error) => error.code === 'PLOINKY_BOX_EXISTING_IMAGE_INSPECT_UNSUPPORTED'
+            && /structured exact-image client/.test(error.message),
+    );
+    assert.throws(
+        () => probeImageBinaries('podman', 'sha256:image-id', forbiddenRunner),
+        (error) => error.code === 'PLOINKY_BOX_IMAGE_PROBE_UNSUPPORTED'
+            && /temporary-container lifecycle is forbidden/.test(error.message),
+    );
+    assert.deepEqual(calls, []);
 });
 
-test('fresh image validation binds the helper ABI probe to the exact source label', () => {
+test('direct image inspection rejects malformed records without a second host action', async () => {
     const calls = [];
-    const runner = {
-        query(engine, args) {
-            calls.push({ engine, args });
-            if (args[0] === 'image') {
-                return { ok: true, stdout: JSON.stringify(validRecord()), stderr: '' };
-            }
-            return {
-                ok: true,
-                stdout: binaries.map((binary) => (
-                    binary.startsWith('/') ? binary : `/usr/bin/${binary}`
-                )).join('\n'),
-                stderr: '',
-            };
+    const hostClient = {
+        async inspectImage(imageId) {
+            calls.push(imageId);
+            return [{ Id: imageId, Config: null }];
         },
     };
-    const releaseDescriptor = releaseFixture();
-    const image = inspectAndValidateImage('podman', 'runtime', runner, {
-        identity: {
-            instance: 'ploinky-box-fixture-0123456789ab',
-            pathHash: '0123456789ab',
-        },
-        releaseDescriptor,
-    });
-    assert.equal(image.sourceSha, SOURCE_SHA);
-    const probe = calls.find(({ args }) => args[0] === 'run').args.at(-1);
-    assert.match(probe, new RegExp(`helper_version.*${SOURCE_SHA}`));
-    assert.doesNotMatch(probe, /helper_version.*source-sha=\[0-9a-f\]/);
+    await assert.rejects(
+        inspectAndValidateDirectImage(hostClient, 'sha256:image-id', 'runtime'),
+        /invalid inspection/,
+    );
+    assert.deepEqual(calls, ['sha256:image-id']);
 });
 
 test('image contract requires cloudflared and entrypoint validates token-file support', () => {

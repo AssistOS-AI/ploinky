@@ -1,11 +1,3 @@
-import crypto from 'node:crypto';
-
-import {
-    BOX_LABELS,
-    BOX_MARKER_CONTENT,
-    BOX_ROLES,
-} from '../constants.mjs';
-import { serializeReleaseDescriptor } from './release.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 
 export const IMAGE_CONTRACT = Object.freeze({
@@ -251,142 +243,46 @@ export function probeImageBinaries(engine, imageId, runner, {
     identity,
     releaseDescriptor,
 } = {}) {
-    if (!/^[0-9a-f]{40}$/.test(expectedSourceSha ?? '')) {
-        throw contractError(
-            imageId,
-            'Ploinky source SHA',
-            'a 40-character lowercase hexadecimal commit',
-            expectedSourceSha,
-        );
+    void engine;
+    void runner;
+    void expectedSourceSha;
+    void identity;
+    void releaseDescriptor;
+    throw new PloinkyBoxError(
+        `Runtime capability probing for image '${imageId}' is unsupported on the outer host; implicit temporary-container lifecycle is forbidden`,
+        { code: 'PLOINKY_BOX_IMAGE_PROBE_UNSUPPORTED' },
+    );
+}
+
+export async function inspectAndValidateDirectImage(hostClient, imageId, imageRef = imageId) {
+    if (!hostClient || typeof hostClient.inspectImage !== 'function') {
+        throw new PloinkyBoxError('Structured image inspection is unavailable', {
+            code: 'PLOINKY_BOX_IMAGE_INSPECT_FAILED',
+        });
     }
-    if (identity && (
-        typeof identity.instance !== 'string'
-        || !/^ploinky-box-[a-z0-9-]+-[a-f0-9]{12}$/.test(identity.instance)
-        || !/^[a-f0-9]{12}$/.test(identity.pathHash)
-    )) {
-        throw contractError(
-            imageId,
-            'probe ownership context',
-            'one exact Box identity',
-            identity,
-        );
+    const inspection = await hostClient.inspectImage(imageId);
+    const image = validateImageContract(normalizeImageInspect(inspection), imageRef);
+    if (image.immutableId !== imageId) {
+        throw contractError(imageRef, 'image ID', JSON.stringify(imageId), image.immutableId);
     }
-    const unmanagedGeneration = crypto.createHash('sha256')
-        .update(JSON.stringify([String(imageId), expectedSourceSha]))
-        .digest('hex');
-    const pathHash = identity?.pathHash || unmanagedGeneration.slice(0, 12);
-    const owner = identity?.instance || `ploinky-box-image-contract-${pathHash}`;
-    const releaseGeneration = releaseDescriptor?.releaseGeneration || unmanagedGeneration;
-    const serializedRelease = releaseDescriptor
-        ? serializeReleaseDescriptor(releaseDescriptor)
-        : `unmanaged-image-contract:${expectedSourceSha}:${imageId}`;
-    // Keep the engine identifier deterministic and bounded independently of
-    // user-controlled workspace path length. Full ownership remains in the
-    // immutable owner/path/release labels below.
-    const probeName = `ploinky-box-probe-${pathHash}-${releaseGeneration.slice(0, 16)}`;
-    const ownershipLabels = {
-        [BOX_LABELS.owner]: owner,
-        [BOX_LABELS.pathHash]: pathHash,
-        [BOX_LABELS.role]: BOX_ROLES.imageProbe,
-        [BOX_LABELS.imageRef]: imageId,
-        [BOX_LABELS.releaseDescriptor]: serializedRelease,
-        [BOX_LABELS.releaseGeneration]: releaseGeneration,
-    };
-    const sourceMatch =
-        `test "$helper_version" = 'ploinky-bwrap-launch-v2 source-sha=${expectedSourceSha}'`;
-    const result = runner.query(engine, [
-        'run',
-        '--rm',
-        '--pull=never',
-        '--network=none',
-        '--name', probeName,
-        ...Object.entries(ownershipLabels)
-            .flatMap(([key, value]) => ['--label', `${key}=${value}`]),
-        '--entrypoint=/bin/bash',
-        imageId,
-        '-c',
-        [
-            'set -eu',
-            "for name in node podman bash ip fuse-overlayfs cloudflared bwrap git curl ffmpeg ssh python3 script unshare ps setsid timeout npm npx getcap rpm; do command -v \"$name\"; done",
-            'test -x /usr/local/bin/ploinky-box-entrypoint',
-            "printf '%s\\n' /usr/local/bin/ploinky-box-entrypoint",
-            `test -x ${IMAGE_CONTRACT.bwrapHelper}`,
-            `printf '%s\\n' ${IMAGE_CONTRACT.bwrapHelper}`,
-            `test "$(wc -c < /etc/ploinky-box)" -eq ${Buffer.byteLength(BOX_MARKER_CONTENT)}`,
-            `test "$(cat /etc/ploinky-box)" = '${BOX_MARKER_CONTENT.trim()}'`,
-            "case \"$(uname -m)\" in x86_64) rpm_arch=x86_64 ;; aarch64) rpm_arch=aarch64 ;; *) exit 18 ;; esac",
-            `test "$(rpm -q --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' bubblewrap)" = '${IMAGE_CONTRACT.bubblewrapNevra}.'"$rpm_arch"`,
-            "test \"$(stat -c '%a:%u:%g' /usr/bin/bwrap)\" = '755:0:0'",
-            "bwrap_capabilities=\"$(getcap /usr/bin/bwrap)\"",
-            "test -z \"$bwrap_capabilities\"",
-            "bwrap_help=\"$(bwrap --help 2>&1)\"",
-            "for option in '--bind-fd FD DEST' '--ro-bind-fd FD DEST' '--ro-bind-data FD DEST' '--perms OCTAL'; do printf '%s\\n' \"$bwrap_help\" | grep -F -- \"$option\" >/dev/null; done",
-            `test "$(stat -c '%a:%u:%g' ${IMAGE_CONTRACT.bwrapHelper})" = '755:0:0'`,
-            `helper_file_capabilities="$(getcap ${IMAGE_CONTRACT.bwrapHelper})"`,
-            'test -z "$helper_file_capabilities"',
-            `helper_version="$(${IMAGE_CONTRACT.bwrapHelper} --version)"`,
-            sourceMatch,
-            `helper_capabilities="$(${IMAGE_CONTRACT.bwrapHelper} --capabilities)"`,
-            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'protocol=2 descriptor-fd=3' >/dev/null",
-            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'path-resolution=openat2-beneath-no-magiclinks-no-symlinks' >/dev/null",
-            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'bwrap-fd-options=bind-fd,ro-bind-fd,ro-bind-data,perms' >/dev/null",
-            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'typed-fs=dir,tmpfs,proc,dev,system-symlink,ro-data-path-file' >/dev/null",
-            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'ro-data-path-hardening=sealed-memfd-ro-bind-data' >/dev/null",
-            "printf '%s\\n' \"$helper_capabilities\" | grep -F -- 'task-broker-transport=type13-sealed-memfd-ro-bind-data-0400' >/dev/null",
-            "if command -v pasta >/dev/null 2>&1; then command -v pasta; elif command -v slirp4netns >/dev/null 2>&1; then command -v slirp4netns; else exit 17; fi",
-        ].join('; '),
-    ], { timeoutMs: IMAGE_PROBE_TIMEOUT_MS });
-    if (!result.ok) {
-        throw contractError(
-            imageId,
-            'runtime capabilities and marker',
-            'all required tools and exact marker content',
-            'probe failed',
-        );
-    }
-    const observedPaths = String(result.stdout || '').split(/\r?\n/).filter(Boolean);
-    const available = observedPaths.map((value) => (
-        IMAGE_CONTRACT.requiredBinaries.includes(value) ? value : value.split('/').pop()
-    ));
-    return validateImageBinaries(available, imageId);
+    return image;
 }
 
 export function inspectAndValidateImage(engine, imageRef, runner, {
     identity,
     releaseDescriptor,
 } = {}) {
-    const result = runner.query(engine, ['image', 'inspect', imageRef]);
-    if (!result.ok) {
-        throw new PloinkyBoxError(`Unable to inspect runtime image '${imageRef}'`, {
-            code: 'PLOINKY_BOX_IMAGE_INSPECT_FAILED',
-        });
-    }
-    const image = normalizeImageInspect(result.stdout);
-    const validatedImage = validateImageContract(image, imageRef);
-    const availableBinaries = probeImageBinaries(engine, image.id, runner, {
-        expectedSourceSha: validatedImage.sourceSha,
-        identity,
-        releaseDescriptor,
-    });
-    return validateImageContract(image, imageRef, { availableBinaries });
+    void engine; void runner; void identity; void releaseDescriptor;
+    throw new PloinkyBoxError(
+        `Ordinary host image inspection for '${imageRef}' is retired; use the structured exact-image client`,
+        { code: 'PLOINKY_BOX_IMAGE_INSPECT_UNSUPPORTED' },
+    );
 }
 
 export function inspectAndValidateExistingImage(engine, imageId, imageRef, runner) {
-    const result = runner.query(engine, ['image', 'inspect', imageId]);
-    if (!result.ok) {
-        throw new PloinkyBoxError(
-            `Unable to verify the owned Box image '${imageId}'; destroy and recreate the Box`,
-            { code: 'PLOINKY_BOX_EXISTING_IMAGE_INSPECT_FAILED' },
-        );
-    }
-    const image = validateImageContract(normalizeImageInspect(result.stdout), imageRef);
-    if (image.immutableId !== imageId) {
-        throw contractError(
-            imageRef,
-            'image ID',
-            JSON.stringify(imageId),
-            image.immutableId,
-        );
-    }
-    return image;
+    void engine; void imageRef; void runner;
+    throw new PloinkyBoxError(
+        `Ordinary host image inspection for '${imageId}' is retired; use the structured exact-image client`,
+        { code: 'PLOINKY_BOX_EXISTING_IMAGE_INSPECT_UNSUPPORTED' },
+    );
 }

@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
-import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
+import { executeBoxCommand } from '../../ploinky-box/command/execute.mjs';
+import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import {
     RELEASE_DESCRIPTOR_SCHEMA,
     REQUIRED_RELEASE_AGENTLIB_SHA,
     createReleaseDescriptor,
     serializeReleaseDescriptor,
 } from '../../ploinky-box/contract/release.mjs';
+
+const CONTAINER_ID = 'a'.repeat(64);
 
 function releaseDescriptor(overrides = {}) {
     return createReleaseDescriptor({
@@ -36,10 +38,14 @@ function bufferStream(isTTY = false) {
     };
 }
 
-function fakeSupervisor(events, { statusState = 'absent' } = {}) {
+function fakeSupervisor(events, { statusState = 'absent', commandExitCode = 0 } = {}) {
+    const hostClient = { kind: 'structured-test-client' };
+    const journal = { phase: 'committed', revision: 7 };
     const prepared = {
-        containerId: 'a'.repeat(64),
+        containerId: CONTAINER_ID,
         engine: { name: 'podman' },
+        hostClient,
+        journal,
         hostPort: 19090,
     };
     const status = {
@@ -49,9 +55,11 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
             ? {
                 state: 'owned',
                 engine: prepared.engine,
+                hostClient,
+                journal,
                 handles: {
                     container: statusState === 'running-initialized' ? {
-                        id: prepared.containerId,
+                        id: CONTAINER_ID,
                         labels: { [BOX_LABELS.routerHostPort]: String(prepared.hostPort) },
                     } : null,
                     volumes: {},
@@ -60,30 +68,45 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
             : { state: statusState, handles: null },
     };
     return {
-        prepareBoxForCommand: async (options = {}) => {
+        async prepareBoxForCommand(options = {}) {
             events.push(Object.keys(options).length > 0 ? ['prepare', options] : 'prepare');
             return prepared;
         },
-        runStartTransaction: async (argv, options) => events.push(['start', argv, options]),
-        runStopTransaction: async () => events.push('stop'),
-        runDestroyTransaction: async (id, options) => events.push(['destroy', id, options]),
-        inspectBoxStatus: () => { events.push('status'); return status; },
-        planDryRun: (options) => { events.push(['dry-run', options]); return { mutationPerformed: false }; },
+        async runStartTransaction(argv, options) { events.push(['start', argv, options]); },
+        async runStopTransaction() { events.push('stop'); },
+        async runDestroyTransaction(id, options) { events.push(['destroy', id, options]); },
+        async inspectBoxStatus() { events.push('status'); return status; },
+        async planDryRun(options) {
+            events.push(['dry-run', options]);
+            return { mutationPerformed: false };
+        },
+        async executeCommand(selected, argv, options = {}) {
+            events.push(['execute-command', selected, argv, options]);
+            return commandExitCode;
+        },
     };
 }
 
-test('help, unavailable status, and stop never prepare or invoke current core', async () => {
+function invocation(supervisor, overrides = {}) {
+    return {
+        env: {},
+        input: { isTTY: false },
+        output: bufferStream(),
+        errorOutput: bufferStream(),
+        supervisor,
+        ...overrides,
+    };
+}
+
+test('help, unavailable status, and stop avoid preparation and command execution', async () => {
     for (const argv of [['help'], ['status'], ['--debug', 'stop']]) {
         const events = [];
         const output = bufferStream();
-        const code = await runOuterCli(argv, {
-            env: {}, output, errorOutput: bufferStream(), input: { isTTY: false },
-            supervisor: fakeSupervisor(events),
-            execute() { events.push('execute'); return 0; },
-        });
+        const code = await runOuterCli(argv, invocation(fakeSupervisor(events), { output }));
         assert.equal(code, 0);
-        assert.equal(events.includes('prepare'), false);
-        assert.equal(events.includes('execute'), false);
+        assert.equal(events.some((event) => event === 'prepare'), false);
+        assert.equal(events.some((event) => Array.isArray(event)
+            && event[0] === 'execute-command'), false);
         if (argv.includes('stop')) {
             assert.deepEqual(events, ['stop']);
             assert.equal(output.value().match(/Debug mode enabled/g)?.length, 1);
@@ -91,46 +114,34 @@ test('help, unavailable status, and stop never prepare or invoke current core', 
     }
 });
 
-test('running status uses the read-only core renderer without preparing the Box', async () => {
+test('running status uses the supervisor structured command path without preparing', async () => {
     const events = [];
     const output = bufferStream();
-    const code = await runOuterCli(['status'], {
-        env: {},
-        input: { isTTY: false },
-        output,
-        errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
-        execute(command, args) {
-            events.push(['execute', command, args]);
-            return 0;
-        },
-    });
+    const code = await runOuterCli(['status'], invocation(fakeSupervisor(events, {
+        statusState: 'running-initialized',
+    }), { output }));
+
     assert.equal(code, 0);
     assert.equal(events.includes('prepare'), false);
-    assert.deepEqual(events[0], 'status');
-    assert.equal(events[1][1], 'podman');
-    assert.deepEqual(events[1][2].slice(-2), [
-        '/opt/ploinky/bin/ploinky-local', 'status',
-    ]);
+    assert.equal(events[0], 'status');
+    assert.deepEqual(events[1][2], ['/opt/ploinky/bin/ploinky-local', 'status']);
+    assert.equal(events[1][1].hostClient.kind, 'structured-test-client');
+    assert.equal(events[1][1].journal.phase, 'committed');
     assert.equal(output.value(), '');
 });
 
-test('running status falls back to the Box summary when the core renderer fails', async () => {
+test('running status renders the safe Box summary when the core renderer fails', async () => {
     const events = [];
     const output = bufferStream();
-    const code = await runOuterCli(['status'], {
-        env: {},
-        input: { isTTY: false },
-        output,
-        errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
-        execute() { return 17; },
-    });
+    const code = await runOuterCli(['status'], invocation(fakeSupervisor(events, {
+        statusState: 'running-initialized',
+        commandExitCode: 17,
+    }), { output }));
     assert.equal(code, 17);
     assert.match(output.value(), /Ploinky Box: running-initialized/);
 });
 
-test('the image marker bypasses outer parsing and dispatches original argv directly', async () => {
+test('the image marker bypasses outer parsing and forwards original argv locally', async () => {
     const events = [];
     const argv = ['--image', 'must-be-forwarded', '--debug', 'status'];
     const env = { PATH: '/opt/ploinky/bin:/usr/local/bin:/usr/bin', BOX_VALUE: 'preserved' };
@@ -153,139 +164,151 @@ test('the image marker bypasses outer parsing and dispatches original argv direc
     ]]);
 });
 
-test('explicit start is reachable and retains normalized debug argv', async () => {
+test('explicit start preserves normalized argv and the exact release descriptor', async () => {
+    const descriptor = releaseDescriptor();
     const events = [];
-    const code = await runOuterCli(['--debug', '--port', '19090', 'start', 'Agent'], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events),
-    });
+    const code = await runOuterCli([
+        '--debug',
+        '--local-release-descriptor', serializeReleaseDescriptor(descriptor),
+        'start', 'Agent',
+    ], invocation(fakeSupervisor(events)));
     assert.equal(code, 0);
     assert.deepEqual(events, [[
         'start',
         ['--debug', 'start', 'Agent', '8080'],
-        { explicitPort: 19090 },
-    ]]);
-});
-
-test('outer start rejects every independent AgentLib override before supervisor mutation', async () => {
-    for (const invalid of ['b'.repeat(40), 'main', 'B'.repeat(40), `${'b'.repeat(40)}\nINJECTED=1`]) {
-        const invalidEvents = [];
-        await assert.rejects(
-            () => runOuterCli(['start', 'Agent'], {
-                env: { PLOINKY_AGENTLIB_REF: invalid },
-                input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-                supervisor: fakeSupervisor(invalidEvents),
-            }),
-            /PLOINKY_AGENTLIB_REF.*not an outer Box override/,
-        );
-        assert.deepEqual(invalidEvents, []);
-    }
-});
-
-test('local immutable release reaches start and agent CLI preparation as one coupled descriptor', async () => {
-    const descriptor = releaseDescriptor();
-    const prefix = [
-        '--local-release-descriptor', serializeReleaseDescriptor(descriptor),
-    ];
-    const startEvents = [];
-    await runOuterCli([...prefix, 'start', 'Agent'], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(startEvents),
-    });
-    assert.deepEqual(startEvents, [[
-        'start',
-        ['start', 'Agent', '8080'],
         {
             explicitPort: descriptor.routerHostPort,
             releaseDescriptor: descriptor,
         },
     ]]);
-
-    const cliEvents = [];
-    await runOuterCli([...prefix, 'cli', 'Agent', '--workdir', '/workspace/project', '--'], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(cliEvents),
-        execute() { return 0; },
-    });
-    assert.deepEqual(cliEvents[0], ['prepare', {
-        releaseDescriptor: descriptor,
-    }]);
 });
 
-test('generic forwarding prepares under the supervisor then execs the fixed target', async () => {
+test('outer start rejects every independent AgentLib override before mutation', async () => {
+    for (const invalid of ['b'.repeat(40), 'main', 'B'.repeat(40), `${'b'.repeat(40)}\nINJECTED=1`]) {
+        const events = [];
+        await assert.rejects(
+            runOuterCli(['start', 'Agent'], invocation(fakeSupervisor(events), {
+                env: { PLOINKY_AGENTLIB_REF: invalid },
+            })),
+            /PLOINKY_AGENTLIB_REF.*not an outer Box override/,
+        );
+        assert.deepEqual(events, []);
+    }
+});
+
+test('generic forwarding prepares once and delegates an exact argv to the structured path', async () => {
     const events = [];
-    const env = {
-        PATH: '/bin', HOME: '/tmp', PLOINKY_MASTER_KEY: 'HOST_CANARY',
-        UNRELATED_CANARY: 'NOPE',
-    };
-    const code = await runOuterCli(['logs', '--debug', 'tail'], {
-        env,
-        input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events),
-        execute(command, args, options) { events.push(['execute', command, args, options]); return 23; },
-    });
-    assert.equal(code, 23);
+    const code = await runOuterCli(['logs', '--debug', 'tail'], invocation(fakeSupervisor(events)));
+    assert.equal(code, 0);
     assert.equal(events[0], 'prepare');
-    assert.equal(events[1][1], 'podman');
-    assert.deepEqual(events[1][2].slice(-4), [
+    assert.equal(events[1][0], 'execute-command');
+    assert.deepEqual(events[1][2], [
         '/opt/ploinky/bin/ploinky-local', 'logs', '--debug', 'tail',
     ]);
-    assert.deepEqual(events[1][2].slice(0, 4), [
-        'container', 'exec', '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
-    ]);
-    assert.equal(JSON.stringify(events[1][3]).includes('HOST_CANARY'), false);
-    assert.equal(JSON.stringify(events[1][3]).includes('UNRELATED_CANARY'), false);
+    assert.equal(events[1][1].containerId, CONTAINER_ID);
+    assert.equal(events[1][1].hostClient.kind, 'structured-test-client');
+    assert.deepEqual(events[1][3], { interactive: false });
 });
 
-test('TTY flags appear only for interactive commands with both terminal ends', async () => {
-    assert.deepEqual(buildContainerExecArgs('a'.repeat(64), [], {
-        hostPort: 19090,
-        interactive: true, inputIsTty: true, outputIsTty: true, shell: true,
-    }).slice(0, 4), ['container', 'exec', '--interactive', '--tty']);
-    assert.equal(buildContainerExecArgs('a'.repeat(64), [], {
-        hostPort: 19090,
-        interactive: true, inputIsTty: false, outputIsTty: true,
-    }).includes('--tty'), false);
-
+test('interactive outer routes are safe fail-closed, not functional acceptance, until a direct TTY protocol exists', async () => {
     const events = [];
-    await runOuterCli(['cli'], {
-        env: {}, input: { isTTY: true }, output: bufferStream(true), errorOutput: bufferStream(true),
-        supervisor: fakeSupervisor(events),
-        execute(command, args) { events.push([command, args]); return 0; },
-    });
-    assert.equal(events[1][1].includes('--tty'), true);
-    assert.equal(events[1][1].includes('/bin/bash'), true);
+    await runOuterCli(['cli'], invocation(fakeSupervisor(events), {
+        input: { isTTY: true },
+        output: bufferStream(true),
+        errorOutput: bufferStream(true),
+    }));
+    assert.equal(events[1][0], 'execute-command');
+    assert.deepEqual(events[1][2], []);
+    assert.deepEqual(events[1][3], { shell: true, interactive: true });
+
+    await assert.rejects(executeBoxCommand({
+        hostClient: {
+            async execContainer() { throw new Error('must not reach direct execution'); },
+        },
+        containerId: CONTAINER_ID,
+        journal: { phase: 'committed' },
+        argv: [],
+        shell: true,
+        interactive: true,
+    }), /streaming TTY protocol.*no host CLI fallback/);
 });
 
-test('destroy confirmation occurs after read-only inspect and before its single lock transaction', async () => {
+test('direct command execution is bounded, exact-ID, and forwards only selected output', async () => {
+    const calls = [];
+    const stdout = bufferStream();
+    const stderr = bufferStream();
+    const journal = { phase: 'committed' };
+    const result = await executeBoxCommand({
+        hostClient: {
+            async execContainer(request) {
+                calls.push(request);
+                return { exitCode: 9, stdout: 'safe stdout', stderr: 'safe stderr' };
+            },
+        },
+        containerId: CONTAINER_ID,
+        journal,
+        argv: ['/opt/ploinky/bin/ploinky-local', 'logs'],
+        hostPort: 19090,
+        stdout,
+        stderr,
+        timeoutMs: 1234,
+        maxOutputBytes: 5678,
+    });
+    assert.equal(result.exitCode, 9);
+    assert.deepEqual(calls, [{
+        id: CONTAINER_ID,
+        argv: ['/opt/ploinky/bin/ploinky-local', 'logs'],
+        user: 'podman',
+        workdir: '/workspace',
+        env: { PLOINKY_ROUTER_HOST_PORT: '19090' },
+        input: null,
+        timeoutMs: 1234,
+        maxOutputBytes: 5678,
+        journal,
+    }]);
+    assert.equal(stdout.value(), 'safe stdout');
+    assert.equal(stderr.value(), 'safe stderr');
+
+    await assert.rejects(executeBoxCommand({
+        hostClient: { async execContainer() {} },
+        containerId: 'short-id',
+        argv: [],
+    }), /full 64-hex/);
+    await assert.rejects(executeBoxCommand({
+        containerId: CONTAINER_ID,
+        argv: [],
+    }), /structured Podman host client is unavailable/i);
+});
+
+test('destroy confirmation follows awaited inspection and precedes one transaction', async () => {
     const events = [];
     const supervisor = fakeSupervisor(events, { statusState: 'running-initialized' });
-    const code = await runOuterCli(['destroy'], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-        supervisor,
+    const code = await runOuterCli(['destroy'], invocation(supervisor, {
         confirmDestroy: async () => { events.push('confirm'); return true; },
-    });
+    }));
     assert.equal(code, 0);
     assert.deepEqual(events, [
         'status',
         'confirm',
-        ['destroy', 'a'.repeat(64), { deleteVolumes: false }],
+        ['destroy', CONTAINER_ID, { deleteVolumes: false }],
     ]);
 });
 
-test('destroy --delete-volumes skips confirmation and deletes retained-volume-only state', async () => {
+test('destroy --delete-volumes skips confirmation for retained-volume-only state', async () => {
     for (const statusState of ['running-initialized', 'absent-retained-volumes']) {
         const events = [];
         const output = bufferStream();
-        const code = await runOuterCli(['destroy', '--delete-volumes'], {
-            env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
-            supervisor: fakeSupervisor(events, { statusState }),
-            confirmDestroy: async () => { throw new Error('must not prompt'); },
-        });
+        const code = await runOuterCli(['destroy', '--delete-volumes'], invocation(
+            fakeSupervisor(events, { statusState }),
+            {
+                output,
+                confirmDestroy: async () => { throw new Error('must not prompt'); },
+            },
+        ));
         assert.equal(code, 0);
         assert.deepEqual(events, [
             'status',
-            ['destroy', statusState === 'running-initialized' ? 'a'.repeat(64) : null, {
+            ['destroy', statusState === 'running-initialized' ? CONTAINER_ID : null, {
                 deleteVolumes: true,
             }],
         ]);
@@ -293,35 +316,17 @@ test('destroy --delete-volumes skips confirmation and deletes retained-volume-on
     }
 });
 
-test('public help documents explicit no-prompt volume deletion', async () => {
-    const output = bufferStream();
-    const code = await runOuterCli(['help'], {
-        env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
-        supervisor: new Proxy({}, {
-            get() { throw new Error('help must not inspect the supervisor'); },
-        }),
-    });
-    assert.equal(code, 0);
-    assert.match(output.value(), /destroy --delete-volumes/);
-    assert.match(output.value(), /without prompting/);
-});
-
-test('dry-run and invalid arguments cause no preparation or execution', async () => {
+test('dry-run and invalid arguments perform no preparation or command execution', async () => {
     const events = [];
-    await runOuterCli(['--dry-run', 'start', 'Agent', '19090'], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events),
-    });
+    await runOuterCli(['--dry-run', 'start', 'Agent', '19090'], invocation(fakeSupervisor(events)));
     assert.deepEqual(events, [['dry-run', { explicitPort: 19090 }]]);
 
-    await assert.rejects(() => runOuterCli(['--port', '0', 'start', 'Agent'], {
+    await assert.rejects(runOuterCli(['--port', '0', 'start', 'Agent'], {
         env: {}, supervisor: fakeSupervisor(events),
     }), /range 1..65535/);
-    assert.equal(events.length, 1);
-
-    await assert.rejects(() => runOuterCli(['cli', 'futureAgent', '--help'], {
+    await assert.rejects(runOuterCli(['cli', 'futureAgent', '--help'], {
         env: {}, supervisor: fakeSupervisor(events),
-    }), error => error?.code === 'PLOINKY_WORKDIR_REQUIRED');
+    }), (error) => error?.code === 'PLOINKY_WORKDIR_REQUIRED');
     assert.equal(events.length, 1);
 });
 
@@ -336,12 +341,22 @@ test('dry-run carries the immutable release descriptor without preparing the Box
         '--dry-run',
         '--local-release-descriptor', serializeReleaseDescriptor(descriptor),
         'start', 'Agent',
-    ], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events),
-    });
+    ], invocation(fakeSupervisor(events)));
     assert.deepEqual(events, [['dry-run', {
         explicitPort: descriptor.routerHostPort,
         releaseDescriptor: descriptor,
     }]]);
+});
+
+test('public help documents explicit no-prompt volume deletion', async () => {
+    const output = bufferStream();
+    const code = await runOuterCli(['help'], {
+        env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
+        supervisor: new Proxy({}, {
+            get() { throw new Error('help must not inspect the supervisor'); },
+        }),
+    });
+    assert.equal(code, 0);
+    assert.match(output.value(), /destroy --delete-volumes/);
+    assert.match(output.value(), /without prompting/);
 });

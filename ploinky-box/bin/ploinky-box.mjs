@@ -5,9 +5,8 @@ import { createInterface } from 'node:readline/promises';
 
 import { parseOuterArguments } from '../command/parse.mjs';
 import { routeOuterCommand } from '../command/route.mjs';
-import { buildContainerExecArgs, executeProcess } from '../command/execute.mjs';
+import { executeProcess } from '../command/execute.mjs';
 import { BOX_LABELS } from '../constants.mjs';
-import { buildEngineProcessEnvironment } from '../process.mjs';
 import { createBoxSupervisor, formatBoxStatus } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
 
@@ -55,27 +54,6 @@ function outerDebug(parsed, route, stdout) {
     }
 }
 
-function executePrepared(prepared, coreArgv, {
-    execute,
-    input,
-    output,
-    shell = false,
-    interactive = false,
-    engineEnv,
-}) {
-    return execute(prepared.engine.name, buildContainerExecArgs(
-        prepared.containerId,
-        coreArgv,
-        {
-            hostPort: prepared.hostPort,
-            shell,
-            interactive,
-            inputIsTty: input.isTTY === true,
-            outputIsTty: output.isTTY === true,
-        },
-    ), { env: engineEnv });
-}
-
 export async function runOuterCli(argv, {
     env = process.env,
     input = process.stdin,
@@ -92,7 +70,6 @@ export async function runOuterCli(argv, {
     const selectedSupervisor = supervisor || createBoxSupervisor();
     const parsed = parseOuterArguments(argv);
     const route = routeOuterCommand(parsed);
-    const engineEnv = buildEngineProcessEnvironment(env);
     outerDebug(parsed, route, output);
 
     if (route.kind === 'help') {
@@ -100,19 +77,17 @@ export async function runOuterCli(argv, {
         return 0;
     }
     if (route.kind === 'status') {
-        const status = selectedSupervisor.inspectBoxStatus();
+        const status = await selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
         if (status.state === 'running-initialized' && container) {
-            const coreStatus = executePrepared({
+            const coreStatus = await selectedSupervisor.executeCommand({
                 containerId: container.id,
                 engine: status.ownership.engine,
+                ownership: status.ownership,
+                journal: status.ownership.journal,
+                hostClient: status.ownership.hostClient,
                 hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
-            }, ['status'], {
-                execute,
-                input,
-                output,
-                engineEnv,
-            });
+            }, ['/opt/ploinky/bin/ploinky-local', 'status']);
             if (coreStatus === 0) return 0;
             output.write(formatBoxStatus(status));
             return coreStatus;
@@ -125,7 +100,7 @@ export async function runOuterCli(argv, {
         return 0;
     }
     if (route.kind === 'destroy') {
-        const status = selectedSupervisor.inspectBoxStatus();
+        const status = await selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
         const volumes = status.ownership?.handles?.volumes;
         if (!container && !(route.deleteVolumes && volumes)) {
@@ -148,7 +123,7 @@ export async function runOuterCli(argv, {
         return 0;
     }
     if (route.kind === 'dry-run') {
-        const plan = selectedSupervisor.planDryRun({
+        const plan = await selectedSupervisor.planDryRun({
             explicitPort: route.hostPort,
             ...(route.localReleaseDescriptor
                 ? { releaseDescriptor: route.localReleaseDescriptor }
@@ -178,22 +153,18 @@ export async function runOuterCli(argv, {
             : {},
     );
     if (route.kind === 'bash') {
-        return executePrepared(prepared, [], {
-            execute,
-            input,
-            output,
+        return selectedSupervisor.executeCommand(prepared, [], {
             shell: true,
             interactive: true,
-            engineEnv,
         });
     }
-    return executePrepared(prepared, route.coreArgv, {
-        execute,
-        input,
-        output,
+    return selectedSupervisor.executeCommand(
+        prepared,
+        ['/opt/ploinky/bin/ploinky-local', ...route.coreArgv],
+        {
         interactive: ['repl', 'agent-cli'].includes(route.kind),
-        engineEnv,
-    });
+        },
+    );
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : '';

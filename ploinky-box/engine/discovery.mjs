@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import path from 'node:path';
 
 import {
     BOX_LABELS,
@@ -7,7 +8,13 @@ import {
 import { PloinkyBoxError } from '../errors.mjs';
 import { sha256 } from '../boundary/fingerprint.mjs';
 import { createProcessRunner } from '../process.mjs';
-import { normalizeContainerRuntime } from '../contract/container.mjs';
+import {
+    normalizeContainerRuntime,
+    requireFullContainerId,
+    runtimeFromOuterJournal,
+} from '../contract/container.mjs';
+import { createOuterJournalStore } from '../lifecycle/outerJournal.mjs';
+import { createPodmanHostClient } from './libpodClient.mjs';
 import {
     parseReleaseDescriptor,
     serializeReleaseDescriptor,
@@ -159,7 +166,71 @@ function podmanMachineConnection(runner) {
             message: 'Ploinky Box supports Podman Machine on macOS, not an arbitrary remote Podman engine',
         };
     }
-    return { state: 'supported' };
+    const name = String(selected.Name ?? selected.name ?? '').trim();
+    const uri = String(selected.URI ?? selected.Uri ?? selected.uri ?? '').trim();
+    let socketPath = null;
+    try {
+        const parsed = new URL(uri);
+        if (parsed.search || parsed.hash || parsed.protocol !== 'ssh:') {
+            throw new Error('not one supported local machine connection');
+        }
+        const remoteSocketPath = decodeURIComponent(parsed.pathname);
+        if (!['127.0.0.1', '::1', 'localhost'].includes(parsed.hostname)
+            || !parsed.username
+            || parsed.password
+            || !/^\/run\/user\/[1-9][0-9]*\/podman\/podman\.sock$/.test(remoteSocketPath)
+            || !pathIsCanonicalAbsolute(remoteSocketPath)) {
+            throw new Error('machine SSH connection is not loopback-local');
+        }
+    } catch {
+        return {
+            state: 'unsupported',
+            message: 'Ploinky Box requires one canonical local Podman Machine connection',
+        };
+    }
+    if (!name) {
+        return {
+            state: 'unsupported',
+            message: 'Ploinky Box requires a named Podman Machine connection',
+        };
+    }
+    return {
+        state: 'supported',
+        connection: Object.freeze({ name, uri, socketPath }),
+    };
+}
+
+function podmanMachineEngineIdentity(connection) {
+    return sha256(Buffer.from(JSON.stringify([
+        'podman-machine',
+        'v6.0.1',
+        connection.name,
+        connection.uri,
+    ])));
+}
+
+function forwardedMachineSocket(connection, env) {
+    if (connection.socketPath) return connection.socketPath;
+    const temporaryRoot = String(env.TMPDIR || '').replace(/\/+$/u, '');
+    if (!pathIsCanonicalAbsolute(temporaryRoot)
+        || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(connection.name)) {
+        throw discoveryError(
+            'Podman Machine forwarded Unix socket cannot be derived from the selected connection',
+        );
+    }
+    const selected = path.join(temporaryRoot, 'podman', `${connection.name}-api.sock`);
+    if (!pathIsCanonicalAbsolute(selected)) {
+        throw discoveryError('Podman Machine forwarded Unix socket path is not canonical');
+    }
+    return selected;
+}
+
+function pathIsCanonicalAbsolute(value) {
+    return typeof value === 'string'
+        && value.startsWith('/')
+        && value === value.replace(/\/+/g, '/')
+        && !value.split('/').includes('..')
+        && !value.split('/').includes('.');
 }
 
 function labelsFrom(value) {
@@ -178,15 +249,15 @@ function labelsFrom(value) {
     }));
 }
 
-function inspectExact(engine, kind, name, runner) {
-    const result = query(runner, engine.name, [kind, 'inspect', name]);
+function inspectExactVolume(engine, name, runner) {
+    const result = query(runner, engine.name, ['volume', 'inspect', name]);
     if (!result.ok) {
         if (ABSENT_PATTERN.test(`${result.stderr}\n${result.stdout}`)) {
             return { state: 'absent' };
         }
         return {
             state: 'unknown',
-            message: `${engine.name} could not determine whether ${kind} ${name} exists`,
+            message: `${engine.name} could not determine whether volume ${name} exists`,
         };
     }
     try {
@@ -198,7 +269,7 @@ function inspectExact(engine, kind, name, runner) {
     } catch {
         return {
             state: 'unknown',
-            message: `${engine.name} returned malformed ${kind} inspection for ${name}`,
+            message: `${engine.name} returned malformed volume inspection for ${name}`,
         };
     }
 }
@@ -272,6 +343,277 @@ function containerHandle(engine, identity, name, record) {
     });
 }
 
+function exactContainerNames(record) {
+    const source = record?.Names ?? record?.names ?? record?.Name ?? record?.name;
+    const values = Array.isArray(source) ? source : [source];
+    return values.map((value) => String(value || '').replace(/^\//, '')).filter(Boolean);
+}
+
+function directClientIdentity(hostClient, machineConnection, expectedEngineIdentity) {
+    const identity = hostClient?.identity || {};
+    const legacyConnection = hostClient?.connection || {};
+    const engineIdentityValue = String(
+        identity.engineIdentity ?? hostClient?.engineIdentity ?? '',
+    );
+    const connectionIdentity = String(
+        identity.connectionIdentity
+            ?? hostClient?.connectionIdentity
+            ?? legacyConnection.identity
+            ?? '',
+    );
+    const socketPath = String(
+        identity.socketPath ?? hostClient?.socketPath ?? legacyConnection.socketPath ?? '',
+    );
+    const apiVersion = String(identity.apiVersion ?? hostClient?.apiVersion ?? '');
+    const connectionUri = String(
+        identity.connectionUri ?? hostClient?.connectionUri ?? legacyConnection.uri ?? '',
+    );
+    if (!/^[a-f0-9]{64}$/.test(engineIdentityValue)
+        || engineIdentityValue !== expectedEngineIdentity
+        || apiVersion !== 'v6.0.1'
+        || connectionIdentity !== machineConnection.name
+        || connectionUri !== machineConnection.uri
+        || !pathIsCanonicalAbsolute(socketPath)
+        || (machineConnection.socketPath !== null
+            && socketPath !== machineConnection.socketPath)) {
+        throw discoveryError('Podman host client identity does not match the selected machine socket');
+    }
+    return Object.freeze({
+        name: machineConnection.name,
+        identity: connectionIdentity,
+        uri: machineConnection.uri,
+        socketPath,
+    });
+}
+
+function journalVolumeHandle(engine, identity, journal, key, role) {
+    const name = identity.volumes[key];
+    if (!journal.container.creation.volumes.includes(name)) {
+        throw discoveryError(`Outer Box journal does not contain exact ${key} volume identity`);
+    }
+    return Object.freeze({
+        kind: 'volume',
+        engine: engine.name,
+        engineIdentity: engine.identity,
+        name,
+        role,
+        labels: Object.freeze(expectedImmutableLabels(identity.pathHash, role)),
+        fingerprint: Object.freeze({
+            journalGeneration: journal.transaction.generation,
+            transactionId: journal.transaction.id,
+        }),
+        pathHash: identity.pathHash,
+    });
+}
+
+function journalVolumeHandles(engine, identity, journal) {
+    return Object.freeze({
+        workspace: journalVolumeHandle(engine, identity, journal, 'workspace', BOX_ROLES.workspace),
+        containers: journalVolumeHandle(engine, identity, journal, 'containers', BOX_ROLES.containers),
+        dependencies: journalVolumeHandle(
+            engine,
+            identity,
+            journal,
+            'dependencies',
+            BOX_ROLES.dependencies,
+        ),
+    });
+}
+
+function directContainerHandle(engine, identity, journal, record) {
+    const id = requireFullContainerId(record?.Id ?? record?.ID);
+    return Object.freeze({
+        kind: 'container',
+        engine: engine.name,
+        engineIdentity: engine.identity,
+        connectionIdentity: engine.connection.identity,
+        id,
+        name: journal.container.name,
+        labels: Object.freeze(labelsFrom(record)),
+        runtime: runtimeFromOuterJournal(record, journal),
+        pathHash: identity.pathHash,
+        journal: Object.freeze({
+            generation: journal.transaction.generation,
+            revision: journal.revision,
+            phase: journal.phase,
+        }),
+    });
+}
+
+async function inspectPodmanMachineResources({
+    podman,
+    identity,
+    hostClient,
+    machineConnection,
+    outerJournal,
+}) {
+    if (!hostClient || typeof hostClient.listContainers !== 'function') {
+        return {
+            state: 'unsupported',
+            message: 'Ploinky Box on macOS requires the structured Podman host client',
+        };
+    }
+    let connection;
+    try {
+        connection = directClientIdentity(hostClient, machineConnection, podman.identity);
+    } catch (error) {
+        return { state: 'incompatible', message: error.message };
+    }
+    const engine = Object.freeze({
+        name: 'podman',
+        identity: String(hostClient.identity?.engineIdentity ?? hostClient.engineIdentity),
+        apiVersion: String(hostClient.identity?.apiVersion ?? hostClient.apiVersion),
+        hostKind: 'podman-machine',
+        connection,
+    });
+    const journalStore = outerJournal || createOuterJournalStore({
+        workspaceRoot: identity.workspaceRoot,
+    });
+    let journal;
+    try {
+        journal = journalStore.read({ allowMissing: true });
+    } catch (error) {
+        return {
+            state: 'incompatible',
+            message: `Outer Box ownership journal is invalid: ${error.message}`,
+            engine,
+        };
+    }
+    if (journal && (journal.engine.identity !== engine.identity
+        || journal.engine.apiVersion !== engine.apiVersion
+        || !isDeepStrictEqual(journal.engine.connection, connection)
+        || journal.workspace.root !== identity.workspaceRoot
+        || journal.workspace.pathHash !== identity.pathHash
+        || journal.workspace.owner !== identity.instance)) {
+        return {
+            state: 'incompatible',
+            message: 'Outer Box ownership journal identity mismatch',
+            engine,
+        };
+    }
+    if (journal && (journal.container.creation.dependencies.length !== 0
+        || journal.container.creation.autoRemove !== false)) {
+        return {
+            state: 'incompatible',
+            message: 'Outer Box ownership journal has dependencies or auto-remove enabled',
+            engine,
+        };
+    }
+    let records;
+    try {
+        records = await hostClient.listContainers({
+            all: true,
+            sync: false,
+            size: false,
+            namespace: false,
+        });
+        if (!Array.isArray(records)) throw new Error('container list is not an array');
+    } catch (error) {
+        return {
+            state: 'unknown',
+            message: `Podman direct sync=false container discovery failed: ${error.message}`,
+            engine,
+        };
+    }
+    const stableNamed = records.filter((record) => exactContainerNames(record).includes(identity.instance));
+    const workspaceLabeled = records.filter((record) => {
+        const labels = labelsFrom(record);
+        return labels[BOX_LABELS.pathHash] === identity.pathHash
+            && labels[BOX_LABELS.role] === BOX_ROLES.container;
+    });
+    if (!journal) {
+        return stableNamed.length === 0 && workspaceLabeled.length === 0
+            ? { state: 'absent', handles: null, engine }
+            : {
+                state: 'incompatible',
+                message: 'Exact-name or ownership-labeled outer Box exists without its journal',
+                engine,
+            };
+    }
+    const named = records.filter((record) => (
+        exactContainerNames(record).includes(journal.container.name)
+    ));
+    const deletedGeneration = journal.container.id !== null
+        && !journal.createdResources.container
+        && ['container-deleted', 'retaining-resources'].includes(journal.phase);
+    if (deletedGeneration) {
+        const historicalIdPresent = records.some((record) => (
+            String(record?.Id ?? record?.ID ?? '') === journal.container.id
+        ));
+        if (named.length !== 0 || historicalIdPresent || workspaceLabeled.length !== 0) {
+            return {
+                state: 'incompatible',
+                message: 'Deleted-generation journal conflicts with a present outer Box container',
+                engine,
+            };
+        }
+        return {
+            state: 'owned',
+            handles: Object.freeze({
+                container: null,
+                volumes: journalVolumeHandles(engine, identity, journal),
+            }),
+            engine,
+            journal,
+        };
+    }
+    if (journal.container.id === null) {
+        return named.length === 0
+            ? {
+                state: 'owned',
+                handles: {
+                    container: null,
+                    volumes: journalVolumeHandles(engine, identity, journal),
+                },
+                engine,
+                journal,
+            }
+            : {
+                state: 'incompatible',
+                message: 'An unpublished outer Box intent cannot adopt an exact-name container',
+                engine,
+            };
+    }
+    try {
+        for (const record of named) requireFullContainerId(record?.Id ?? record?.ID);
+    } catch (error) {
+        return { state: 'incompatible', message: error.message, engine };
+    }
+    const byId = records.filter((record) => String(record?.Id ?? record?.ID ?? '') === journal.container.id);
+    if (byId.length !== 1 || named.length !== 1 || named[0] !== byId[0]) {
+        return {
+            state: 'incompatible',
+            message: 'Outer Box container discovery is missing, duplicate, stale, or ambiguous',
+            engine,
+        };
+    }
+    const record = byId[0];
+    if (!isDeepStrictEqual(labelsFrom(record), journal.container.labels)) {
+        return {
+            state: 'incompatible',
+            message: 'Outer Box list labels do not match the ownership journal labels',
+            engine,
+        };
+    }
+    try {
+        return {
+            state: 'owned',
+            handles: Object.freeze({
+                container: directContainerHandle(engine, identity, journal, record),
+                volumes: journalVolumeHandles(engine, identity, journal),
+            }),
+            engine,
+            journal,
+        };
+    } catch (error) {
+        return {
+            state: 'incompatible',
+            message: error.message,
+            engine,
+        };
+    }
+}
+
 function canonicalOptions(options) {
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
         return null;
@@ -342,7 +684,7 @@ export function inspectOwnedVolumeHandle(engine, identity, key, runner = createP
     if (!resource) {
         throw discoveryError(`Unknown Box volume role ${key}`);
     }
-    const inspection = inspectExact(engine, 'volume', resource.name, runner);
+    const inspection = inspectExactVolume(engine, resource.name, runner);
     if (inspection.state !== 'present') {
         return inspection;
     }
@@ -369,21 +711,43 @@ export function inspectOwnedVolumeHandle(engine, identity, key, runner = createP
     }
 }
 
-function inspectEngineResources(engine, identity, runner) {
+function inspectNativePodmanResources(engine, identity, runner) {
     const expected = expectedResources(identity);
-    const containerInspection = inspectExact(
-        engine,
-        'container',
-        expected.container.name,
-        runner,
-    );
-    if (containerInspection.state === 'unknown') {
-        return containerInspection;
+    const list = query(runner, engine.name, [
+        'container', 'ls', '--all', '--sync=false', '--no-trunc', '--format', 'json',
+    ]);
+    if (!list.ok) {
+        return {
+            state: 'unknown',
+            message: `${engine.name} direct sync=false container list failed`,
+        };
     }
+    let listed;
+    try {
+        listed = parseJsonRecords(list.stdout);
+        if (!Array.isArray(listed)) throw new Error('list is not an array');
+    } catch {
+        return {
+            state: 'unknown',
+            message: `${engine.name} returned malformed direct sync=false container list`,
+        };
+    }
+    const exactContainers = listed.filter((record) => (
+        exactContainerNames(record).includes(expected.container.name)
+    ));
+    if (exactContainers.length > 1) {
+        return {
+            state: 'incompatible',
+            message: `${engine.name} returned duplicate exact-name Box containers`,
+        };
+    }
+    const containerInspection = exactContainers.length === 0
+        ? { state: 'absent' }
+        : { state: 'present', record: exactContainers[0] };
 
     const volumeInspections = {};
     for (const [key, volume] of Object.entries(expected.volumes)) {
-        volumeInspections[key] = inspectExact(engine, 'volume', volume.name, runner);
+        volumeInspections[key] = inspectExactVolume(engine, volume.name, runner);
         if (volumeInspections[key].state === 'unknown') {
             return volumeInspections[key];
         }
@@ -455,6 +819,9 @@ export function discoverBoxOwnership(identity, {
     platform = process.platform,
     env = process.env,
     runner = createProcessRunner(),
+    hostClient = null,
+    hostClientFactory = createPodmanHostClient,
+    outerJournal = null,
 } = {}) {
     if (!['darwin', 'linux'].includes(platform)) {
         return {
@@ -470,6 +837,77 @@ export function discoverBoxOwnership(identity, {
             message: 'Ploinky Box does not support a remote Podman engine',
             engines: {},
         };
+    }
+
+    // Podman v6.0.2 `podman info` is not a state-free discovery probe: the
+    // server's Runtime.info -> storeInfo -> getContainerStoreInfo path calls
+    // GetAllContainers and State for every container.  On Darwin, select the
+    // configured local Machine connection without contacting the service, then
+    // use only the structured sync=false client below.
+    if (platform === 'darwin') {
+        const machine = podmanMachineConnection(runner);
+        if (machine.state !== 'supported') {
+            return {
+                state: machine.state,
+                message: machine.message,
+                engines: { podman: { name: 'podman', state: machine.state } },
+            };
+        }
+        let machineConnection;
+        try {
+            machineConnection = Object.freeze({
+                ...machine.connection,
+                socketPath: forwardedMachineSocket(machine.connection, env),
+            });
+        } catch (error) {
+            return {
+                state: 'unsupported',
+                message: `Structured Podman Machine socket transport is unavailable: ${error.message}`,
+                engines: { podman: { name: 'podman', state: 'unsupported' } },
+            };
+        }
+        const podman = Object.freeze({
+            name: 'podman',
+            state: 'reachable',
+            identity: podmanMachineEngineIdentity(machineConnection),
+        });
+        let selectedClient = hostClient;
+        if (!selectedClient) {
+            try {
+                selectedClient = hostClientFactory({
+                    engine: {
+                        name: 'podman',
+                        identity: podman.identity,
+                        apiVersion: 'v6.0.1',
+                        hostKind: 'podman-machine',
+                        connection: {
+                            name: machineConnection.name,
+                            identity: machineConnection.name,
+                            uri: machineConnection.uri,
+                            socketPath: machineConnection.socketPath,
+                        },
+                    },
+                });
+            } catch (error) {
+                return {
+                    state: 'unsupported',
+                    message: `Structured Podman Machine socket transport is unavailable: ${error.message}`,
+                    engines: { podman },
+                };
+            }
+        }
+        return inspectPodmanMachineResources({
+            podman,
+            identity,
+            hostClient: selectedClient,
+            machineConnection,
+            outerJournal,
+        }).then((result) => ({
+            ...result,
+            hostClient: selectedClient,
+            engines: { podman },
+            inventories: { podman: result },
+        }));
     }
 
     const podman = probeEngine('podman', runner);
@@ -498,25 +936,8 @@ export function discoverBoxOwnership(identity, {
             engines: { podman },
         };
     }
-    let hostKind = 'native-linux';
-    if (platform === 'darwin') {
-        if (!podmanServiceIsRemote(podman.info)) {
-            return {
-                state: 'unsupported',
-                message: 'Ploinky Box on macOS requires Podman Machine',
-                engines: { podman },
-            };
-        }
-        const machine = podmanMachineConnection(runner);
-        if (machine.state !== 'supported') {
-            return {
-                state: machine.state,
-                message: machine.message,
-                engines: { podman },
-            };
-        }
-        hostKind = 'podman-machine';
-    } else if (podmanServiceIsRemote(podman.info)) {
+    const hostKind = 'native-linux';
+    if (podmanServiceIsRemote(podman.info)) {
         return {
             state: 'unsupported',
             message: 'Ploinky Box on Linux requires a native Podman engine, not a remote engine',
@@ -533,7 +954,7 @@ export function discoverBoxOwnership(identity, {
         };
     }
 
-    const podmanInventory = inspectEngineResources(podman, identity, runner);
+    const podmanInventory = inspectNativePodmanResources(podman, identity, runner);
     if (podmanInventory.state === 'unknown') {
         return {
             state: 'unknown',
@@ -542,25 +963,7 @@ export function discoverBoxOwnership(identity, {
         };
     }
 
-    let dockerInventory = { state: 'absent', handles: null };
-    if (docker.state === 'reachable') {
-        dockerInventory = inspectEngineResources(docker, identity, runner);
-        if (dockerInventory.state === 'unknown') {
-            return {
-                state: 'unknown',
-                message: dockerInventory.message,
-                engines: { podman, docker },
-            };
-        }
-        if (dockerInventory.state !== 'absent') {
-            return {
-                state: 'foreign',
-                message: 'Docker has an exact-name or labeled resource conflicting with this Box',
-                engines: { podman, docker },
-                inventories: { podman: podmanInventory, docker: dockerInventory },
-            };
-        }
-    }
+    const dockerInventory = { state: 'not-selected', handles: null };
 
     return {
         state: podmanInventory.state,

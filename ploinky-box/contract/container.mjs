@@ -12,6 +12,247 @@ import {
 } from './release.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
+const FULL_CONTAINER_ID = /^[a-f0-9]{64}$/;
+const OUTER_CREATION_KEYS = Object.freeze([
+    'autoRemove',
+    'command',
+    'dependencies',
+    'devices',
+    'env',
+    'mounts',
+    'network',
+    'ports',
+    'security',
+    'tmpfs',
+    'volumes',
+]);
+
+function exactObject(value) {
+    return value !== null
+        && typeof value === 'object'
+        && !Array.isArray(value)
+        && (Object.getPrototypeOf(value) === Object.prototype
+            || Object.getPrototypeOf(value) === null);
+}
+
+function exactKeys(value, keys) {
+    return exactObject(value)
+        && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+}
+
+function boundedString(value, label, { allowEmpty = false, maximum = 131_072 } = {}) {
+    if (typeof value !== 'string'
+        || (!allowEmpty && value.length === 0)
+        || Buffer.byteLength(value, 'utf8') > maximum
+        || /\u0000/u.test(value)) {
+        throw publicationError(`Outer Box creation tuple has invalid ${label}`);
+    }
+    return value;
+}
+
+function uniqueStrings(value, label, { allowEmpty = false, nonEmpty = false } = {}) {
+    if (!Array.isArray(value) || (nonEmpty && value.length === 0)) {
+        throw publicationError(`Outer Box creation tuple has invalid ${label}`);
+    }
+    const normalized = value.map((entry, index) => boundedString(
+        entry,
+        `${label}[${index}]`,
+        { allowEmpty },
+    ));
+    if (new Set(normalized).size !== normalized.length) {
+        throw publicationError(`Outer Box creation tuple contains duplicate ${label}`);
+    }
+    return normalized;
+}
+
+function stringList(value, label, { allowEmpty = false, nonEmpty = false } = {}) {
+    if (!Array.isArray(value) || (nonEmpty && value.length === 0)) {
+        throw publicationError(`Outer Box creation tuple has invalid ${label}`);
+    }
+    return value.map((entry, index) => boundedString(
+        entry,
+        `${label}[${index}]`,
+        { allowEmpty },
+    ));
+}
+
+function canonicalJson(value, label, depth = 0) {
+    if (depth > 12) {
+        throw publicationError(`Outer Box creation tuple ${label} is too deeply nested`);
+    }
+    if (typeof value === 'string') return boundedString(value, label, { allowEmpty: true });
+    if (typeof value === 'boolean' || value === null) return value;
+    if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+    if (Array.isArray(value)) {
+        return value.map((entry, index) => canonicalJson(entry, `${label}[${index}]`, depth + 1));
+    }
+    if (!exactObject(value)) {
+        throw publicationError(`Outer Box creation tuple has invalid ${label}`);
+    }
+    const keys = Object.keys(value).sort();
+    if (new Set(keys).size !== keys.length) {
+        throw publicationError(`Outer Box creation tuple contains duplicate ${label} keys`);
+    }
+    return Object.fromEntries(keys.map((key) => [
+        boundedString(key, `${label} key`),
+        canonicalJson(value[key], `${label}.${key}`, depth + 1),
+    ]));
+}
+
+function uniqueStructured(value, label, normalize, { nonEmpty = false } = {}) {
+    if (!Array.isArray(value) || (nonEmpty && value.length === 0)) {
+        throw publicationError(`Outer Box creation tuple has invalid ${label}`);
+    }
+    const result = value.map(normalize);
+    const serialized = result.map((entry) => JSON.stringify(entry));
+    if (new Set(serialized).size !== serialized.length) {
+        throw publicationError(`Outer Box creation tuple contains duplicate ${label}`);
+    }
+    return result;
+}
+
+function deepFreeze(value) {
+    if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+        for (const child of Object.values(value)) deepFreeze(child);
+        Object.freeze(value);
+    }
+    return value;
+}
+
+export function requireFullContainerId(value, label = 'container ID') {
+    const id = String(value || '');
+    if (!FULL_CONTAINER_ID.test(id)) {
+        throw publicationError(`Outer Box ${label} must be a full 64-hex immutable ID`);
+    }
+    return id;
+}
+
+export function normalizeOuterContainerCreationTuple(value) {
+    if (!exactKeys(value, OUTER_CREATION_KEYS)) {
+        throw publicationError('Outer Box creation tuple has an invalid or incomplete key set');
+    }
+    const ports = uniqueStructured(value.ports, 'ports', (entry, index) => {
+        if (!exactKeys(entry, ['containerPort', 'hostIp', 'hostPort', 'protocol'])) {
+            throw publicationError(`Outer Box creation tuple has invalid ports[${index}]`);
+        }
+        const protocol = boundedString(entry.protocol, `ports[${index}].protocol`).toLowerCase();
+        if (!['tcp', 'udp'].includes(protocol)) {
+            throw publicationError(`Outer Box creation tuple has invalid ports[${index}].protocol`);
+        }
+        return {
+            containerPort: boundedString(entry.containerPort, `ports[${index}].containerPort`),
+            protocol,
+            hostIp: boundedString(entry.hostIp, `ports[${index}].hostIp`),
+            hostPort: boundedString(entry.hostPort, `ports[${index}].hostPort`),
+        };
+    }, { nonEmpty: true }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    const mounts = uniqueStructured(value.mounts, 'mounts', (entry, index) => {
+        if (!exactKeys(entry, ['destination', 'name', 'rw', 'source', 'type'])
+            || typeof entry.rw !== 'boolean') {
+            throw publicationError(`Outer Box creation tuple has invalid mounts[${index}]`);
+        }
+        return {
+            type: boundedString(entry.type, `mounts[${index}].type`).toLowerCase(),
+            source: boundedString(entry.source, `mounts[${index}].source`, { allowEmpty: true }),
+            name: boundedString(entry.name, `mounts[${index}].name`, { allowEmpty: true }),
+            destination: boundedString(entry.destination, `mounts[${index}].destination`),
+            rw: entry.rw,
+        };
+    }, { nonEmpty: true }).sort((left, right) => left.destination.localeCompare(right.destination));
+    const devices = uniqueStructured(value.devices, 'devices', (entry, index) => {
+        if (!exactKeys(entry, ['containerPath', 'hostPath', 'permissions'])) {
+            throw publicationError(`Outer Box creation tuple has invalid devices[${index}]`);
+        }
+        return {
+            hostPath: boundedString(entry.hostPath, `devices[${index}].hostPath`),
+            containerPath: boundedString(entry.containerPath, `devices[${index}].containerPath`),
+            permissions: boundedString(entry.permissions, `devices[${index}].permissions`),
+        };
+    }, { nonEmpty: true }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    if (!exactObject(value.tmpfs) || Object.keys(value.tmpfs).length === 0) {
+        throw publicationError('Outer Box creation tuple has invalid tmpfs');
+    }
+    if (!exactObject(value.env) || Object.keys(value.env).length === 0) {
+        throw publicationError('Outer Box creation tuple has invalid env');
+    }
+    if (!exactKeys(value.security, ['init', 'privileged', 'securityOptions', 'user'])
+        || value.security.init !== true
+        || value.security.privileged !== false) {
+        throw publicationError('Outer Box creation tuple has invalid security');
+    }
+    if (!Array.isArray(value.dependencies) || value.dependencies.length !== 0) {
+        throw publicationError('Outer Box creation tuple dependencies must be exactly []');
+    }
+    if (value.autoRemove !== false) {
+        throw publicationError('Outer Box creation tuple auto-remove must be false');
+    }
+    const result = {
+        ports,
+        network: canonicalJson(value.network, 'network'),
+        mounts,
+        volumes: uniqueStrings(value.volumes, 'volumes', { nonEmpty: true }),
+        devices,
+        tmpfs: canonicalJson(value.tmpfs, 'tmpfs'),
+        env: canonicalJson(value.env, 'env'),
+        security: {
+            user: boundedString(value.security.user, 'security.user'),
+            init: true,
+            privileged: false,
+            securityOptions: uniqueStrings(value.security.securityOptions, 'security options'),
+        },
+        // An explicit empty command is a complete immutable choice: it selects
+        // the admitted image's entrypoint/Cmd without a mutable host override.
+        command: stringList(value.command, 'command'),
+        dependencies: [],
+        autoRemove: false,
+    };
+    if (!exactObject(result.network) || Object.keys(result.network).length === 0) {
+        throw publicationError('Outer Box creation tuple has invalid network');
+    }
+    return deepFreeze(result);
+}
+
+export function runtimeFromOuterJournal(listRecord, journalRecord) {
+    const id = requireFullContainerId(listRecord?.Id ?? listRecord?.ID);
+    if (id !== journalRecord?.container?.id) {
+        throw publicationError('Outer Box list record ID does not match its journal');
+    }
+    const creation = normalizeOuterContainerCreationTuple(journalRecord.container.creation);
+    const rawImageId = requireFullContainerId(
+        journalRecord?.container?.image?.rawId,
+        'raw image ID',
+    );
+    const observedImageId = String(listRecord?.ImageID ?? listRecord?.ImageId ?? '').replace(/^sha256:/, '');
+    if (observedImageId !== rawImageId) {
+        throw publicationError('Outer Box list record image does not match its journal');
+    }
+    const state = String(listRecord?.State ?? listRecord?.state ?? '').toLowerCase();
+    if (!['configured', 'created', 'exited', 'paused', 'running', 'stopped'].includes(state)) {
+        throw publicationError('Outer Box list record has an invalid state');
+    }
+    return deepFreeze({
+        complete: true,
+        imageId: rawImageId,
+        configuredImage: journalRecord.container.image.reference,
+        user: creation.security.user,
+        environment: { ...creation.env, HOSTNAME: id.slice(0, 12) },
+        createCommand: [...creation.command],
+        publications: creation.ports.map((entry) => ({ ...entry })),
+        running: state === 'running',
+        status: state,
+        init: creation.security.init,
+        privileged: creation.security.privileged,
+        securityOptions: [...creation.security.securityOptions].sort(),
+        devices: creation.devices.map((entry) => ({ ...entry })),
+        tmpfs: { ...creation.tmpfs },
+        mounts: creation.mounts.map((entry) => ({ ...entry })),
+        network: creation.network,
+        volumes: [...creation.volumes],
+        dependencies: [],
+        autoRemove: false,
+        pid: Number(listRecord?.Pid ?? listRecord?.PID ?? 0),
+    });
+}
 
 function envMap(entries) {
     if (!Array.isArray(entries)) {

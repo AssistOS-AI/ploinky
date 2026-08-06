@@ -57,11 +57,14 @@ test('package metadata changes only the exact bin map and immutable postinstall'
     });
 });
 
-test('packaging binaries preserve baseline bytes and executable modes', () => {
-    assert.deepEqual(
-        fs.readFileSync(path.join(repositoryRoot, 'bin/ploinky-local')),
-        Buffer.from(run('git', ['show', `${BASE_SHA}:bin/ploinky`], { encoding: null }).stdout),
+test('packaging binaries preserve helper bytes, modes, and the local Darwin hard boundary', () => {
+    const localEntrypoint = fs.readFileSync(
+        path.join(repositoryRoot, 'bin/ploinky-local'),
+        'utf8',
     );
+    assert.match(localEntrypoint, /uname -s/);
+    assert.match(localEntrypoint, /refuses execution outside its managed Linux Box boundary/);
+    assert.match(localEntrypoint, /\/usr\/bin\/uname -s/);
     for (const name of ['p-cli', 'ploinky-shell']) {
         assert.deepEqual(
             fs.readFileSync(path.join(repositoryRoot, 'bin', name)),
@@ -104,14 +107,22 @@ test('npm pack exports working boxed and local commands without running postinst
 
     fs.mkdirSync(path.join(packageRoot, 'node_modules/achillesAgentLib'), { recursive: true });
     const controlled = controlledNodeFixture(root);
-    run(path.join(packageRoot, 'bin/ploinky-local'), ['status', '--fixture'], {
+    const local = spawnSync(path.join(packageRoot, 'bin/ploinky-local'), ['status', '--fixture'], {
         cwd: packageRoot,
         env: controlled.env,
+        encoding: 'utf8',
     });
-    const captured = fs.readFileSync(controlled.capture, 'utf8').trim().split('\n');
-    assert.equal(captured.at(-2), 'status');
-    assert.equal(captured.at(-1), '--fixture');
-    assert.match(captured[0], /cli\/index\.js$/);
+    if (process.platform === 'darwin') {
+        assert.equal(local.status, 78);
+        assert.match(local.stderr, /refuses execution outside its managed Linux Box boundary/);
+        assert.equal(fs.existsSync(controlled.capture), false);
+    } else {
+        assert.equal(local.status, 0, local.stderr);
+        const captured = fs.readFileSync(controlled.capture, 'utf8').trim().split('\n');
+        assert.equal(captured.at(-2), 'status');
+        assert.equal(captured.at(-1), '--fixture');
+        assert.match(captured[0], /cli\/index\.js$/);
+    }
 });
 
 test('repository aliases retain boxed versus local routing and helper rejects non-Box use', () => {
@@ -126,10 +137,19 @@ test('repository aliases retain boxed versus local routing and helper rejects no
             env: controlled.env,
         });
         assert.match(fs.readFileSync(controlled.capture, 'utf8'), /cli\/shell\.js/);
-        run(path.join(repositoryRoot, 'bin/psh'), ['psh-fixture'], { env: controlled.env });
-        const pshCapture = fs.readFileSync(controlled.capture, 'utf8');
-        assert.match(pshCapture, /cli\/shell\.js/);
-        assert.match(pshCapture, /psh-fixture/);
+        const psh = spawnSync(path.join(repositoryRoot, 'bin/psh'), ['psh-fixture'], {
+            env: controlled.env,
+            encoding: 'utf8',
+        });
+        if (process.platform === 'darwin') {
+            assert.equal(psh.status, 78);
+            assert.match(psh.stderr, /refuses execution outside its managed Linux Box boundary/);
+        } else {
+            assert.equal(psh.status, 0, psh.stderr);
+            const pshCapture = fs.readFileSync(controlled.capture, 'utf8');
+            assert.match(pshCapture, /cli\/shell\.js/);
+            assert.match(pshCapture, /psh-fixture/);
+        }
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }

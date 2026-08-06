@@ -4,1015 +4,530 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import {
-    BOX_LABELS,
-    BOX_READY_LINE,
-} from '../../ploinky-box/constants.mjs';
-import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
+    runtimeFromOuterJournal,
+    validateContainerConfiguration,
+} from '../../ploinky-box/contract/container.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
 import {
     REQUIRED_RELEASE_AGENTLIB_SHA,
     createReleaseDescriptor,
-    serializeReleaseDescriptor,
 } from '../../ploinky-box/contract/release.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
-    containerCreateArgs,
-    readContainerIdFromCidfile,
-    waitForReadyLine,
+    buildOuterContainerDefinition,
+    directContainerCreateSpec,
+    waitForReadySignal,
 } from '../../ploinky-box/lifecycle/container.mjs';
+import { createOuterJournalStore } from '../../ploinky-box/lifecycle/outerJournal.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
+import { createPhase10xRemoteClient } from '../helpers/phase10xRemoteClient.mjs';
 
-function fixture(t) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-transaction-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const workspace = path.join(root, 'workspace');
-    const lockPath = path.join(root, 'lock');
-    fs.mkdirSync(workspace);
-    fs.mkdirSync(lockPath);
-    const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
-    const lock = {
-        path: lockPath,
-        assertHeld(instance) { assert.equal(instance, identity.instance); },
-    };
-    return { root, identity, lock };
-}
+const CANDIDATE_ID = 'a'.repeat(64);
+const PROTECTED_ID = '9'.repeat(64);
+const ENGINE_ID = '1'.repeat(64);
 
-function volumeHandles(identity) {
-    return Object.fromEntries(Object.entries(identity.volumes).map(([key, name]) => [key, { name }]));
-}
-
-function containerHandle({
-    identity,
-    repositoryRoot,
-    imageId,
-    imageRef,
-    hostPort,
-    mediaHostPort = 7882,
-    id,
-    running = true,
-    hostKind = 'native-linux',
-    releaseDescriptor = null,
-}) {
-    return {
-        id,
-        labels: {
-            'io.buildah.version': '1.43.1',
-            [BOX_LABELS.pathHash]: identity.pathHash,
-            [BOX_LABELS.role]: 'box',
-            [BOX_LABELS.imageRef]: imageRef,
-            [BOX_LABELS.routerHostPort]: String(hostPort),
-            [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
-            ...(releaseDescriptor ? {
-                [BOX_LABELS.releaseDescriptor]: serializeReleaseDescriptor(releaseDescriptor),
-                [BOX_LABELS.releaseGeneration]: releaseDescriptor.releaseGeneration,
-            } : {}),
-        },
-        runtime: {
-            complete: true,
-            imageId,
-            configuredImage: imageId,
-            user: 'podman',
-            createCommand: [
-                'podman', 'container', 'create',
-                '--init',
-                '--device', '/dev/fuse', '--device', '/dev/net/tun',
-            ],
-            environment: {
-                ...IMAGE_CONTRACT.environment,
-                PLOINKY_PRIVATE_BIND: '0.0.0.0',
-                PLOINKY_PUBLIC_BIND: '0.0.0.0',
-                PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
-                ...(releaseDescriptor ? {
-                    PLOINKY_RELEASE_DESCRIPTOR: serializeReleaseDescriptor(releaseDescriptor),
-                } : {}),
-                HOSTNAME: id.slice(0, 12),
-            },
-            publications: [
-                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
-                { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: String(hostPort) },
-            ],
-            running,
-            status: running ? 'running' : 'exited',
-            init: true,
-            privileged: false,
-            securityOptions: [
-                'unmask=ALL',
-                ...(hostKind === 'podman-machine' ? ['label=disable'] : []),
-            ],
-            devices: [
-                { hostPath: '/dev/fuse', containerPath: '/dev/fuse', permissions: 'rwm' },
-                { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
-            ],
-            tmpfs: {
-                '/tmp': 'rw,nosuid,nodev,mode=1777,rprivate,tmpcopyup',
-            },
-            mounts: [
-                { type: 'volume', name: identity.volumes.containers, source: '', destination: '/home/podman/.local/share/containers', rw: true },
-                { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
-                { type: 'volume', name: identity.volumes.dependencies, source: '', destination: '/opt/ploinky/node_modules', rw: true },
-                { type: 'volume', name: identity.volumes.workspace, source: '', destination: '/workspace', rw: true },
-            ],
-        },
-    };
-}
-
-function exactRelease(boxImageId = 'c'.repeat(64)) {
+function releaseDescriptor(seed = 0) {
     return createReleaseDescriptor({
         schema: 'ploinky-release-v1',
-        boxImageId,
-        boxImageDigest: `sha256:${'1'.repeat(64)}`,
-        nodeImageId: 'd'.repeat(64),
-        nodeImageDigest: `sha256:${'2'.repeat(64)}`,
-        artifactSourceSha: '3'.repeat(40),
-        controllerSourceSha: '4'.repeat(40),
+        boxImageId: (seed + 2).toString(16).repeat(64),
+        boxImageDigest: `sha256:${(seed + 3).toString(16).repeat(64)}`,
+        nodeImageId: (seed + 4).toString(16).repeat(64),
+        nodeImageDigest: `sha256:${(seed + 5).toString(16).repeat(64)}`,
+        artifactSourceSha: (seed + 6).toString(16).repeat(40),
+        controllerSourceSha: (seed + 7).toString(16).repeat(40),
         agentlibSha: REQUIRED_RELEASE_AGENTLIB_SHA,
         routerHostPort: 18080,
         mediaHostPort: 17882,
     });
 }
 
-test('container validation ignores inherited image labels but rejects unknown ownership labels', (t) => {
-    const state = fixture(t);
-    const handle = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'runtime',
-        hostPort: 19090,
-        id: 'b'.repeat(64),
-    });
-    const desired = {
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'runtime',
-        hostPort: 19090,
-    };
-    assert.doesNotThrow(() => validateContainerConfiguration(handle, desired));
-    handle.labels['io.assistos.ploinky-box.unexpected'] = '1';
-    assert.throws(
-        () => validateContainerConfiguration(handle, desired),
-        /label set is incompatible/,
-    );
-});
-
-test('Podman Machine validation tolerates its omitted device inspection only', (t) => {
-    const state = fixture(t);
-    const handle = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'runtime',
-        hostPort: 19090,
-        id: 'b'.repeat(64),
+function fixture(t) {
+    const root = fs.realpathSync(fs.mkdtempSync(
+        path.join(os.tmpdir(), 'ploinky-box-transaction-'),
+    ));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const workspace = path.join(root, 'workspace');
+    const repositoryRoot = path.join(root, 'source');
+    fs.mkdirSync(workspace);
+    fs.mkdirSync(repositoryRoot);
+    fs.mkdirSync(path.join(workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
+    const engine = Object.freeze({
+        name: 'podman',
+        identity: ENGINE_ID,
+        apiVersion: 'v6.0.1',
         hostKind: 'podman-machine',
-    });
-    handle.runtime.devices = [];
-    const desired = {
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'runtime',
-        hostPort: 19090,
-        hostKind: 'podman-machine',
-    };
-    handle.runtime.createCommand = null;
-    assert.throws(
-        () => validateContainerConfiguration(handle, desired),
-        /device set is incompatible/,
-    );
-    handle.runtime.createCommand = [
-        'podman', 'container', 'create',
-        '--device', '/dev/fuse', '--device', '/dev/net/tun',
-    ];
-    assert.doesNotThrow(() => validateContainerConfiguration(handle, {
-        ...desired,
-    }));
-});
-
-test('native device mismatch reports normalized observed and expected devices', (t) => {
-    const state = fixture(t);
-    const handle = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'runtime',
-        hostPort: 19090,
-        id: 'b'.repeat(64),
-    });
-    handle.runtime.devices = [];
-    handle.runtime.createCommand = null;
-
-    assert.throws(
-        () => validateContainerConfiguration(handle, {
-            identity: state.identity,
-            repositoryRoot: state.root,
-            imageId: 'a'.repeat(64),
-            imageRef: 'runtime',
-            hostPort: 19090,
+        connection: Object.freeze({
+            name: 'phase10x-test-machine',
+            identity: 'phase10x-test-machine',
+            uri: `unix://${path.join(root, 'podman.sock')}`,
+            socketPath: path.join(root, 'podman.sock'),
         }),
-        /observed=\[\] recorded=null expected=\[\"\/dev\/fuse\",\"\/dev\/net\/tun\"\] hostKind=native-linux/,
-    );
-});
-
-test('omitted device inspection requires the exact recorded device arguments', (t) => {
-    const state = fixture(t);
-    const handle = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'runtime',
-        hostPort: 19090,
-        id: 'b'.repeat(64),
     });
-    handle.runtime.devices = [];
-    const desired = {
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'runtime',
-        hostPort: 19090,
+    const lock = {
+        path: path.join(root, 'lock'),
+        assertHeld(instance) { assert.equal(instance, identity.instance); },
     };
-
-    assert.doesNotThrow(() => validateContainerConfiguration(handle, desired));
-    handle.runtime.createCommand.push('--device', '/dev/kvm');
-    assert.throws(
-        () => validateContainerConfiguration(handle, desired),
-        /device set is incompatible/,
-    );
-});
-
-test('Box container argv disables outer SELinux label confinement only for Podman Machine', (t) => {
-    const state = fixture(t);
-    for (const [hostKind, expected] of [
-        ['native-linux', ['unmask=ALL']],
-        ['podman-machine', ['unmask=ALL', 'label=disable']],
-    ]) {
-        const args = containerCreateArgs({
-            identity: state.identity,
-            imageId: 'a'.repeat(64),
-            imageRef: 'runtime',
-            hostPort: 19090,
-            repositoryRoot: state.root,
-            cidfile: path.join(state.root, 'candidate.cid'),
-            hostKind,
-        });
-        assert.deepEqual(args.flatMap((value, index) => (
-            value === '--security-opt' ? [args[index + 1]] : []
-        )), expected);
-        assert.equal(args.includes('--privileged'), false);
-    }
-});
-
-function harness(state, {
-    initial = null,
-    candidateImage = 'c'.repeat(64),
-    failPreflight = false,
-    failPull = false,
-    failCreate = false,
-    failCandidateReady = false,
-    corruptCidfile = false,
-    failLocalStop = false,
-    failNodeAdmissionGeneration = '',
-} = {}) {
-    const calls = [];
-    let current = initial;
-    let createCount = 0;
-    const runner = {
-        run(command, args) {
-            calls.push(['run', command, ...args]);
-            if (args[0] === 'container' && args[1] === 'create') {
-                if (failCreate) throw new Error('create race');
-                createCount += 1;
-                const cid = createCount === 1 ? 'a'.repeat(64) : 'b'.repeat(64);
-                const cidfile = args[args.indexOf('--cidfile') + 1];
-                fs.writeFileSync(cidfile, corruptCidfile && createCount === 1 ? 'corrupt\n' : `${cid}\n`, { mode: 0o600 });
-                const imageId = args.at(-1);
-                const imageRefLabel = args.find((value) => value.startsWith(`${BOX_LABELS.imageRef}=`));
-                const portLabel = args.find((value) => value.startsWith(`${BOX_LABELS.routerHostPort}=`));
-                const mediaPortLabel = args.find((value) => value.startsWith(`${BOX_LABELS.mediaHostPort}=`));
-                const releaseLabel = args.find((value) => value.startsWith(`${BOX_LABELS.releaseDescriptor}=`));
-                current = containerHandle({
-                    identity: state.identity,
-                    repositoryRoot: state.root,
-                    imageId,
-                    imageRef: imageRefLabel.slice(imageRefLabel.indexOf('=') + 1),
-                    hostPort: Number(portLabel.slice(portLabel.indexOf('=') + 1)),
-                    mediaHostPort: Number(mediaPortLabel.slice(mediaPortLabel.indexOf('=') + 1)),
-                    id: cid,
-                    running: false,
-                    releaseDescriptor: releaseLabel
-                        ? JSON.parse(releaseLabel.slice(releaseLabel.indexOf('=') + 1))
-                        : null,
-                });
-            }
-            if (args[0] === 'container' && args[1] === 'start') current.runtime.running = true;
-            if (args[0] === 'container' && args[1] === 'stop') current.runtime.running = false;
-            if (args[0] === 'container' && args[1] === 'rm') current = null;
-        },
-        async stream(command, args) {
-            calls.push(['stream', command, ...args]);
-            if (args[0] === 'pull' && failPull) {
-                return { ok: false, status: 125, stdout: '', stderr: 'pull failed' };
-            }
-            return { ok: true, status: 0, stdout: 'pull complete\n', stderr: '' };
-        },
-        query(command, args) {
-            calls.push(['query', command, ...args]);
-            return { ok: true, stdout: `${BOX_READY_LINE}\n`, stderr: '' };
-        },
-    };
-    const handles = volumeHandles(state.identity);
-    const seams = {
-        async preflight(input) {
-            calls.push(['seam', 'preflight', input.hostPort, input.mediaHostPort]);
-            if (failPreflight) throw new Error('port conflict');
-        },
-        validateImage(engine, selectedImage) {
-            calls.push(['seam', 'validate-image', engine, selectedImage]);
-            return { immutableId: candidateImage };
-        },
-        validateExistingImage(engine, imageId, imageRef) {
-            calls.push(['seam', 'validate-existing-image', engine, imageId, imageRef]);
-            return { immutableId: imageId };
-        },
-        validateReleaseImage(engine, kind, descriptor) {
-            calls.push(['seam', 'validate-release-image', engine, kind, descriptor.boxImageId]);
-            return descriptor;
-        },
-        async admitNodeImage(engine, containerId, descriptor) {
-            calls.push([
-                'seam', 'admit-node-image', engine.name, containerId,
-                descriptor.nodeImageId, descriptor.releaseGeneration,
-            ]);
-            if (descriptor.releaseGeneration === failNodeAdmissionGeneration) {
-                throw new Error('exact Node image admission failed');
-            }
-            return { imageId: descriptor.nodeImageId };
-        },
-        ensureVolumes() {
-            calls.push(['seam', 'ensure-volumes']);
-            return {
-                handles,
-                created: initial ? [] : Object.entries(handles).map(([key, handle]) => ({ key, handle })),
-            };
-        },
-        revalidateVolumes() { calls.push(['seam', 'revalidate-volumes']); },
-        rollbackVolumes() { calls.push(['seam', 'rollback-volumes']); },
-        removeContainer(engine, id, selectedRunner) {
-            selectedRunner.run(engine.name, ['container', 'rm', '-f', '--volumes', id]);
-        },
-        stopPloinkyLocal(engine, id) {
-            calls.push(['seam', 'stop-ploinky-local', engine.name, id]);
-            if (failLocalStop) throw new Error('ploinky-local stop failed');
-        },
-        async waitReady(engine, id) {
-            calls.push(['seam', 'wait-ready', id]);
-            if (failCandidateReady && id === 'a'.repeat(64)) throw new Error('ready timeout');
-        },
-        discover() {
-            calls.push(['seam', 'discover']);
-            return current
-                ? { state: 'owned', handles: { container: current, volumes: handles } }
-                : { state: 'owned', handles: { container: null, volumes: handles } };
-        },
-        token(kind) { return kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24); },
-    };
-    return { runner, seams, calls, current: () => current };
+    return { root, workspace, repositoryRoot, identity, engine, lock };
 }
 
-test('container argv is exact, unprivileged, and ends with immutable image ID', (t) => {
-    const state = fixture(t);
-    const cidfile = path.join(state.lock.path, 'candidate.cid');
-    const args = containerCreateArgs({
+function definition(state, descriptor = releaseDescriptor()) {
+    return buildOuterContainerDefinition({
         identity: state.identity,
-        imageId: 'a'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 19090,
-        repositoryRoot: state.root,
-        cidfile,
+        imageId: descriptor.boxImageId,
+        imageRef: descriptor.boxImageId,
+        hostPort: descriptor.routerHostPort,
+        mediaHostPort: descriptor.mediaHostPort,
+        repositoryRoot: state.repositoryRoot,
+        hostKind: state.engine.hostKind,
+        releaseDescriptor: descriptor,
+        containerName: `${state.identity.instance}-g-${descriptor.releaseGeneration.slice(0, 16)}`,
     });
-    assert.equal(args.at(-1), 'a'.repeat(64));
-    assert.equal(args.filter((value) => value === '--init').length, 1);
-    assert.equal(args.includes('--privileged'), false);
-    assert.equal(args.some((value) => value.includes('docker.sock') || value.includes('podman.sock')), false);
-    assert.equal(args.filter((value) => value === '--publish').length, 2);
-    assert.equal(args.includes('127.0.0.1:19090:8080/tcp'), true);
-    assert.equal(args.includes('0.0.0.0:7882:7882/udp'), true);
-    assert.equal(args.includes('unmask=ALL'), true);
-    assert.equal(args.includes('label=disable'), false);
-    assert.equal(args.includes('/dev/fuse'), true);
-    assert.equal(args.includes('/dev/net/tun'), true);
-    assert.equal(args.filter((value) => value.endsWith(':U')).length, 3);
-});
+}
 
-test('Box /tmp is an ephemeral private tmpfs so nested rootless runtime state cannot poison restart', (t) => {
-    const state = fixture(t);
-    const args = containerCreateArgs({
-        identity: state.identity,
-        imageId: 'a'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 18080,
-        mediaHostPort: 17882,
-        repositoryRoot: state.root,
-        cidfile: path.join(state.lock.path, 'candidate.cid'),
-    });
-    assert.deepEqual(args.flatMap((value, index) => (
-        value === '--tmpfs' ? [args[index + 1]] : []
-    )), ['/tmp:rw,nosuid,nodev,mode=1777']);
-
-    const handle = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 18080,
-        mediaHostPort: 17882,
-        id: 'b'.repeat(64),
-    });
-    handle.runtime.tmpfs = {};
-    assert.throws(() => validateContainerConfiguration(handle, {
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'a'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 18080,
-        mediaHostPort: 17882,
-    }), /tmpfs contract is incompatible/);
-});
-
-test('container argv publishes an owned host UDP port to fixed container UDP 7882', (t) => {
-    const state = fixture(t);
-    const args = containerCreateArgs({
-        identity: state.identity,
-        imageId: 'a'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 18080,
-        mediaHostPort: 17882,
-        repositoryRoot: state.root,
-        cidfile: path.join(state.lock.path, 'candidate.cid'),
-    });
-    assert.equal(args.includes('0.0.0.0:17882:7882/udp'), true);
-    assert.equal(args.includes('0.0.0.0:7882:7882/udp'), false);
-    assert.equal(
-        args.includes(`${BOX_LABELS.mediaHostPort}=17882`),
-        true,
-    );
-});
-
-test('container validation rejects a Box that cannot reap orphaned children', (t) => {
-    const state = fixture(t);
-    const handle = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 8080,
-        id: 'e'.repeat(64),
-    });
-    handle.runtime.init = false;
-
-    assert.throws(() => validateContainerConfiguration(handle, {
-        identity: state.identity,
-        hostPort: 8080,
-        imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        repositoryRoot: state.root,
-    }), /init state is incompatible/);
-});
-
-test('initial transaction preflights before pull, volumes, and container creation', async (t) => {
-    const state = fixture(t);
-    const h = harness(state);
-    const result = await reconcileBoxContainer({
-        identity: state.identity,
-        ownership: { state: 'absent', handles: null },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-        explicitPort: 19090,
-    }, h.seams);
-    assert.equal(result.action, 'created');
-    const flat = h.calls.map((call) => call.join(' '));
-    assert.ok(flat.findIndex((value) => value.includes('preflight')) < flat.findIndex((value) => value.includes('stream podman pull')));
-    assert.ok(flat.findIndex((value) => value.includes('stream podman pull')) < flat.findIndex((value) => value.includes('ensure-volumes')));
-    assert.ok(flat.findIndex((value) => value.includes('ensure-volumes')) < flat.findIndex((value) => value.includes('container create')));
-});
-
-test('release admission validates the coupled exact Box ID without any pull', async (t) => {
-    const state = fixture(t);
-    const imageId = 'c'.repeat(64);
-    const releaseDescriptor = exactRelease(imageId);
-    const h = harness(state, { candidateImage: imageId });
-    const result = await reconcileBoxContainer({
-        identity: state.identity,
-        ownership: { state: 'absent', handles: null },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-        releaseDescriptor,
-    }, h.seams);
-    assert.equal(result.imageId, imageId);
-    assert.equal(result.hostPort, 18080);
-    assert.equal(result.mediaHostPort, 17882);
-    assert.equal(h.calls.some((call) => call.includes('pull')), false);
-    assert.deepEqual(
-        h.calls.find((call) => call[0] === 'seam' && call[1] === 'validate-image'),
-        ['seam', 'validate-image', 'podman', imageId],
-    );
-    assert.deepEqual(
-        h.calls.find((call) => call[0] === 'seam' && call[1] === 'validate-release-image'),
-        ['seam', 'validate-release-image', 'podman', 'box', imageId],
-    );
-    const create = h.calls.find((call) => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
-    assert.equal(create.includes('0.0.0.0:17882:7882/udp'), true);
-    assert.equal(create.at(-1), imageId);
-    assert.deepEqual(
-        h.calls.find((call) => call[0] === 'seam' && call[1] === 'admit-node-image'),
-        [
-            'seam', 'admit-node-image', 'podman', 'a'.repeat(64),
-            releaseDescriptor.nodeImageId, releaseDescriptor.releaseGeneration,
-        ],
-    );
-});
-
-test('failed admission restores a reused stopped Box to its original stopped state', async (t) => {
-    const state = fixture(t);
-    const releaseDescriptor = exactRelease('c'.repeat(64));
-    const old = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: releaseDescriptor.boxImageId,
-        imageRef: releaseDescriptor.boxImageId,
-        hostPort: releaseDescriptor.routerHostPort,
-        mediaHostPort: releaseDescriptor.mediaHostPort,
-        id: '9'.repeat(64),
-        running: false,
-        releaseDescriptor,
-    });
-    const h = harness(state, {
-        initial: old,
-        candidateImage: releaseDescriptor.boxImageId,
-        failNodeAdmissionGeneration: releaseDescriptor.releaseGeneration,
-    });
-
-    await assert.rejects(() => reconcileBoxContainer({
-        identity: state.identity,
-        ownership: {
-            state: 'owned',
-            handles: { container: old, volumes: volumeHandles(state.identity) },
+function journalFor(state, selectedDefinition, id = CANDIDATE_ID) {
+    return {
+        schemaVersion: 1,
+        engine: state.engine,
+        workspace: {
+            root: state.workspace,
+            owner: state.identity.instance,
+            pathHash: state.identity.pathHash,
         },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-        releaseDescriptor,
-    }, h.seams), /Existing Box reuse transaction failed/);
-
-    assert.equal(h.current().runtime.running, false);
-    assert.deepEqual(
-        h.calls.filter((call) => call[0] === 'run' && call[2] === 'container'),
-        [
-            ['run', 'podman', 'container', 'start', old.id],
-            ['run', 'podman', 'container', 'stop', '--time', '30', old.id],
-        ],
-    );
-    assert.equal(h.calls.some((call) => call.includes('pull')), false);
-});
-
-test('Node admission failure restores and re-admits the prior exact release without pulling', async (t) => {
-    const state = fixture(t);
-    const { releaseGeneration: _discardedGeneration, ...previousInput } = exactRelease(
-        'e'.repeat(64),
-    );
-    const previous = createReleaseDescriptor({
-        ...previousInput,
-        boxImageId: 'e'.repeat(64),
-        boxImageDigest: `sha256:${'6'.repeat(64)}`,
-        nodeImageId: 'f'.repeat(64),
-        nodeImageDigest: `sha256:${'7'.repeat(64)}`,
-    });
-    const current = exactRelease('c'.repeat(64));
-    const old = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: previous.boxImageId,
-        imageRef: previous.boxImageId,
-        hostPort: previous.routerHostPort,
-        mediaHostPort: previous.mediaHostPort,
-        id: '9'.repeat(64),
-        releaseDescriptor: previous,
-    });
-    const h = harness(state, {
-        initial: old,
-        candidateImage: current.boxImageId,
-        failNodeAdmissionGeneration: current.releaseGeneration,
-    });
-
-    await assert.rejects(() => reconcileBoxContainer({
-        identity: state.identity,
-        ownership: {
-            state: 'owned',
-            handles: { container: old, volumes: volumeHandles(state.identity) },
+        transaction: {
+            id: 'phase10x-transaction-test',
+            generation: selectedDefinition.image.releaseIdentity.generation,
         },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-        releaseDescriptor: current,
-    }, h.seams), /Box container transaction failed/);
+        container: { ...selectedDefinition, id },
+        predecessor: null,
+        createdResources: { container: true, volumes: [] },
+        phase: 'candidate-created',
+        revision: 1,
+    };
+}
 
-    assert.equal(h.current().runtime.imageId, previous.boxImageId);
-    assert.equal(h.current().runtime.running, true);
-    const admissions = h.calls.filter((call) => (
-        call[0] === 'seam' && call[1] === 'admit-node-image'
-    ));
-    assert.deepEqual(admissions.map((call) => call.slice(4)), [
-        [current.nodeImageId, current.releaseGeneration],
-        [previous.nodeImageId, previous.releaseGeneration],
+function listedRecord(selectedDefinition, id = CANDIDATE_ID, state = 'running') {
+    return {
+        Id: id,
+        Names: [selectedDefinition.name],
+        Image: selectedDefinition.image.rawId,
+        ImageID: selectedDefinition.image.rawId,
+        Labels: structuredClone(selectedDefinition.labels),
+        State: state,
+        Status: state,
+        Pid: state === 'running' ? 42 : 0,
+        AutoRemove: false,
+        Dependencies: [],
+    };
+}
+
+function handleFromDefinition(state, selectedDefinition, overrides = {}) {
+    const journal = journalFor(state, selectedDefinition);
+    const record = listedRecord(selectedDefinition);
+    return {
+        id: CANDIDATE_ID,
+        labels: { ...selectedDefinition.labels, ...(overrides.labels || {}) },
+        runtime: {
+            ...runtimeFromOuterJournal(record, journal),
+            ...(overrides.runtime || {}),
+        },
+    };
+}
+
+test('direct create spec is immutable, standalone, unprivileged, and preserves the fixed publication boundary', (t) => {
+    const state = fixture(t);
+    const descriptor = releaseDescriptor();
+    const spec = directContainerCreateSpec(definition(state, descriptor));
+
+    assert.equal(spec.image, descriptor.boxImageId);
+    assert.equal(spec.raw_image_name, descriptor.boxImageId);
+    assert.equal(spec.user, 'podman');
+    assert.equal(spec.work_dir, '/workspace');
+    assert.equal(spec.init, true);
+    assert.equal(spec.privileged, false);
+    assert.equal(spec.remove, false);
+    assert.equal(spec.removeImage, false);
+    assert.deepEqual(spec.dependencyContainers, []);
+    assert.equal(spec.pod, '');
+    assert.deepEqual(spec.netns, { nsmode: 'bridge' });
+    assert.deepEqual(spec.unmask, ['ALL']);
+    assert.deepEqual(spec.selinux_opts, ['disable']);
+    assert.deepEqual(spec.portmappings, [
+        {
+            host_ip: '0.0.0.0', host_port: descriptor.mediaHostPort,
+            container_port: 7882, range: 1, protocol: 'udp',
+        },
+        {
+            host_ip: '127.0.0.1', host_port: descriptor.routerHostPort,
+            container_port: 8080, range: 1, protocol: 'tcp',
+        },
     ]);
-    assert.equal(h.calls.some((call) => call.includes('pull')), false);
-    assert.equal(JSON.stringify(h.calls).includes('24-bookworm-tools'), false);
+    assert.equal(
+        JSON.stringify(spec).includes('docker.sock')
+            || JSON.stringify(spec).includes('podman.sock'),
+        false,
+    );
 });
 
-test('release image mismatch fails before volume or container mutation', async (t) => {
+test('direct definition makes /tmp private and mounts only exact workspace-owned volumes', (t) => {
     const state = fixture(t);
-    const h = harness(state, { candidateImage: 'd'.repeat(64) });
-    await assert.rejects(() => reconcileBoxContainer({
-        identity: state.identity,
-        ownership: { state: 'absent', handles: null },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-        releaseDescriptor: exactRelease('c'.repeat(64)),
-    }, h.seams), (error) => error.code === 'PLOINKY_RELEASE_IMAGE_STALE');
-    assert.equal(h.calls.some((call) => call.includes('pull')), false);
-    assert.equal(h.calls.some((call) => call.includes('ensure-volumes')), false);
-    assert.equal(h.calls.some((call) => call.includes('container') && call.includes('create')), false);
+    const spec = directContainerCreateSpec(definition(state));
+
+    assert.deepEqual(spec.mounts.find((entry) => entry.destination === '/tmp'), {
+        destination: '/tmp',
+        type: 'tmpfs',
+        source: 'tmpfs',
+      options: ['rw', 'nosuid', 'nodev', 'mode=1777', 'rprivate', 'tmpcopyup'],
+    });
+    assert.deepEqual(
+        spec.volumes.map(({ Name, Dest, IsAnonymous }) => ({ Name, Dest, IsAnonymous })),
+        [
+            {
+                Name: state.identity.volumes.containers,
+                Dest: '/home/podman/.local/share/containers',
+                IsAnonymous: false,
+            },
+            {
+                Name: state.identity.volumes.dependencies,
+                Dest: '/opt/ploinky/node_modules',
+                IsAnonymous: false,
+            },
+            {
+                Name: state.identity.volumes.workspace,
+                Dest: '/workspace',
+                IsAnonymous: false,
+            },
+        ],
+    );
 });
 
-test('retired loose local image and media inputs fail before mutation', async (t) => {
+test('SELinux label disabling is confined to Podman Machine definitions', (t) => {
+    const state = fixture(t);
+    const descriptor = releaseDescriptor();
+    const machine = directContainerCreateSpec(definition(state, descriptor));
+    const native = directContainerCreateSpec(buildOuterContainerDefinition({
+        identity: state.identity,
+        imageId: descriptor.boxImageId,
+        imageRef: descriptor.boxImageId,
+        hostPort: descriptor.routerHostPort,
+        mediaHostPort: descriptor.mediaHostPort,
+        repositoryRoot: state.repositoryRoot,
+        hostKind: 'native-linux',
+        releaseDescriptor: descriptor,
+    }));
+    assert.deepEqual(machine.selinux_opts, ['disable']);
+    assert.deepEqual(native.selinux_opts, []);
+});
+
+test('container validation accepts the journal-derived runtime and rejects ownership or init drift', (t) => {
+    const state = fixture(t);
+    const descriptor = releaseDescriptor();
+    const selected = definition(state, descriptor);
+    const desired = {
+        identity: state.identity,
+        hostPort: descriptor.routerHostPort,
+        mediaHostPort: descriptor.mediaHostPort,
+        imageId: descriptor.boxImageId,
+        imageRef: descriptor.boxImageId,
+        repositoryRoot: state.repositoryRoot,
+        hostKind: state.engine.hostKind,
+        releaseDescriptor: descriptor,
+    };
+    assert.doesNotThrow(() => validateContainerConfiguration(
+        handleFromDefinition(state, selected),
+        desired,
+    ));
+    assert.throws(() => validateContainerConfiguration(
+        handleFromDefinition(state, selected, {
+            labels: { 'io.assistos.ploinky-box.unexpected': '1' },
+        }),
+        desired,
+    ), /label set is incompatible/i);
+    assert.throws(() => validateContainerConfiguration(
+        handleFromDefinition(state, selected, { runtime: { init: false } }),
+        desired,
+    ), /user, privilege, or init/i);
+});
+
+test('functional structured transport mutates only the exact journal-owned actor', async (t) => {
+    const state = fixture(t);
+    const selected = definition(state);
+    const protectedRecord = {
+        ...listedRecord(selected, PROTECTED_ID),
+        Names: ['protected-unrelated'],
+        Labels: { protected: 'true' },
+    };
+    const client = createPhase10xRemoteClient({
+        containers: [protectedRecord],
+        generatedIds: [CANDIDATE_ID],
+    });
+    const before = structuredClone(client.containers.get(PROTECTED_ID));
+    const created = await client.createContainer(directContainerCreateSpec(selected));
+    const journal = journalFor(state, selected, created.id);
+
+    await client.startContainer({ id: created.id, journal });
+    await client.stopContainer({ id: created.id, timeout: 30, journal });
+    await client.deleteContainer({ id: created.id, timeout: 30, journal });
+
+    assert.equal(client.containers.has(CANDIDATE_ID), false);
+    assert.deepEqual(client.containers.get(PROTECTED_ID), before);
+    assert.equal(client.eventJournal.some(({ actor }) => actor === PROTECTED_ID), false);
+    assert.equal(client.requestJournal.some(({ transport }) => transport === 'cli'), false);
+});
+
+test('legacy fake run --rm is rejection characterization, never functional acceptance', async (t) => {
+    const state = fixture(t);
+    const selected = definition(state);
+    const protectedRecord = listedRecord(selected, PROTECTED_ID);
+    const client = createPhase10xRemoteClient({ containers: [protectedRecord] });
+    const before = structuredClone([...client.containers.values()]);
+
+    await assert.rejects(
+        () => client.cliContainer('run', PROTECTED_ID),
+        /ordinary remote CLI run.*forbidden/i,
+    );
+
+  assert.deepEqual([...client.containers.values()], before);
+  assert.deepEqual(client.eventJournal, [
+    { actor: '0'.repeat(64), status: 'create', transport: 'cli' },
+    { actor: '0'.repeat(64), status: 'start', transport: 'cli' },
+    { actor: '0'.repeat(64), status: 'wait', transport: 'cli' },
+    { actor: '0'.repeat(64), status: 'remove', transport: 'cli' },
+  ]);
+  assert.equal(client.stateJournal.length, 1);
+  assert.equal(client.stateJournal[0].reason, 'cli-run-remove');
+  assert.deepEqual(client.stateJournal[0].containers, before);
+  assert.deepEqual(client.stateJournal[0].volumes, []);
+    assert.deepEqual(client.requestJournal, [{
+        transport: 'cli', operation: 'run', id: PROTECTED_ID,
+    }]);
+});
+
+test('outer transaction sources contain no temporary run --rm or ordinary container CLI lifecycle', () => {
+    const transactionSource = fs.readFileSync(path.join(
+        import.meta.dirname, '../../ploinky-box/lifecycle/transactions.mjs',
+    ), 'utf8');
+    const containerSource = fs.readFileSync(path.join(
+        import.meta.dirname, '../../ploinky-box/lifecycle/container.mjs',
+    ), 'utf8');
+    const imageSource = fs.readFileSync(path.join(
+        import.meta.dirname, '../../ploinky-box/contract/image.mjs',
+    ), 'utf8');
+    const combined = `${transactionSource}\n${containerSource}\n${imageSource}`;
+
+    assert.doesNotMatch(combined, /['"]run['"]\s*,\s*['"]--rm['"]/);
+    assert.doesNotMatch(
+        combined,
+        /runner\.(?:run|query|stream)\s*\([^\n]*(?:container|image)\s+(?:create|run|start|stop|rm|inspect)/,
+    );
+    assert.match(imageSource, /implicit temporary-container lifecycle is forbidden/);
+});
+
+test('exact-ID ready signal uses only structured list and exec operations', async (t) => {
+    const state = fixture(t);
+    const selected = definition(state);
+    const record = listedRecord(selected);
+    const client = createPhase10xRemoteClient({
+        containers: [record],
+        ownedIds: [CANDIDATE_ID],
+    });
+    const journal = journalFor(state, selected);
+    client.execContainer = async (request) => {
+        assert.equal(request.id, CANDIDATE_ID);
+        assert.equal(request.journal, journal);
+        assert.deepEqual(request.argv.slice(0, 2), ['/bin/bash', '-ceu']);
+        client.requestJournal.push({
+            transport: 'direct', method: 'POST', operation: 'exec', id: request.id,
+        });
+        return { exitCode: 0, stdout: '', stderr: '' };
+    };
+
+    await waitForReadySignal(client, CANDIDATE_ID, journal, {
+        timeoutMs: 10,
+        intervalMs: 0,
+        delay: async () => undefined,
+    });
+
+    assert.deepEqual(client.requestJournal.map(({ transport, operation }) => ({
+        transport, operation: operation || 'list',
+    })), [
+        { transport: 'direct', operation: 'list' },
+        { transport: 'direct', operation: 'exec' },
+    ]);
+});
+
+test('ready signal fails closed when the exact candidate disappears among unrelated actors', async (t) => {
+    const state = fixture(t);
+    const selected = definition(state);
+    const client = createPhase10xRemoteClient({
+        containers: [listedRecord(selected, PROTECTED_ID)],
+    });
+    await assert.rejects(
+        () => waitForReadySignal(client, CANDIDATE_ID, journalFor(state, selected), {
+            timeoutMs: 10,
+            intervalMs: 0,
+            delay: async () => undefined,
+        }),
+        /disappeared/i,
+    );
+    assert.deepEqual(client.eventJournal, []);
+});
+
+test('transaction validates exact release images before publication and volume mutation', async (t) => {
+    const state = fixture(t);
+    const events = [];
+    const store = createOuterJournalStore({ workspaceRoot: state.workspace });
+    const hostClient = {
+        async createContainer() { events.push('create'); throw new Error('must not create'); },
+    };
+
+    await assert.rejects(
+        () => reconcileBoxContainer({
+            identity: state.identity,
+            ownership: {
+                state: 'absent',
+                engine: state.engine,
+                handles: { container: null, volumes: {} },
+            },
+            engine: state.engine,
+            runner: {},
+            hostClient,
+            lock: state.lock,
+            repositoryRoot: state.repositoryRoot,
+            releaseDescriptor: releaseDescriptor(),
+            outerJournal: store,
+            afterStart: async () => undefined,
+        }, {
+            validateImage: async (_client, kind) => {
+                events.push(`image:${kind}`);
+                if (kind === 'node') throw new Error('exact Node image is stale');
+            },
+            preflight: async () => { events.push('preflight'); },
+            ensureVolumes: async () => { events.push('volumes'); },
+        }),
+        /exact Node image is stale/i,
+    );
+
+    assert.deepEqual(events, ['image:box', 'image:node']);
+    assert.equal(store.read({ allowMissing: true }), null);
+});
+
+test('preflight precedes journaled volume work, and a volume failure abandons its empty intent', async (t) => {
+    const state = fixture(t);
+    const events = [];
+    const store = createOuterJournalStore({ workspaceRoot: state.workspace });
+    const hostClient = {
+        async createContainer() { events.push('create'); throw new Error('must not create'); },
+    };
+
+    await assert.rejects(
+        () => reconcileBoxContainer({
+            identity: state.identity,
+            ownership: {
+                state: 'absent',
+                engine: state.engine,
+                handles: { container: null, volumes: {} },
+            },
+            engine: state.engine,
+            runner: {},
+            hostClient,
+            lock: state.lock,
+            repositoryRoot: state.repositoryRoot,
+            releaseDescriptor: releaseDescriptor(),
+            outerJournal: store,
+            afterStart: async () => undefined,
+        }, {
+            validateImage: async (_client, kind) => { events.push(`image:${kind}`); },
+            preflight: async () => { events.push('preflight'); },
+            ensureVolumes: async () => {
+                events.push('volumes');
+                throw new Error('volume admission failed before creation');
+            },
+        }),
+        /volume admission failed/i,
+    );
+
+    assert.deepEqual(events, ['image:box', 'image:node', 'preflight', 'volumes']);
+    assert.equal(store.read({ allowMissing: true }), null);
+});
+
+test('retired loose image and media inputs fail before any structured host request', async (t) => {
     const state = fixture(t);
     for (const retired of [
-        { localBoxImageId: 'c'.repeat(64) },
-        { explicitMediaPort: 17882 },
+        { localBoxImageId: 'f'.repeat(64) },
+        { explicitMediaPort: 17883 },
     ]) {
-        const h = harness(state);
-        await assert.rejects(() => reconcileBoxContainer({
-            identity: state.identity,
-            ownership: { state: 'absent', handles: null },
-            engine: { name: 'podman', identity: 'engine' },
-            runner: h.runner,
-            lock: state.lock,
-            repositoryRoot: state.root,
-            ...retired,
-        }, h.seams), { code: 'PLOINKY_RELEASE_DESCRIPTOR_REQUIRED' });
-        assert.deepEqual(h.calls, []);
+        const requests = [];
+        await assert.rejects(
+            () => reconcileBoxContainer({
+                identity: state.identity,
+                ownership: {
+                    state: 'absent',
+                    engine: state.engine,
+                    handles: { container: null, volumes: {} },
+                },
+                engine: state.engine,
+                runner: {},
+                hostClient: new Proxy({}, {
+                    get(_target, key) {
+                        requests.push(String(key));
+                        return async () => undefined;
+                    },
+                }),
+                lock: state.lock,
+                repositoryRoot: state.repositoryRoot,
+                releaseDescriptor: releaseDescriptor(),
+                ...retired,
+            }),
+            /loose local Box image\/media inputs are retired/i,
+        );
+        assert.deepEqual(requests, []);
     }
 });
 
-test('validated reuse rechecks pre-existing volume handles without registry or volume mutation', async (t) => {
+test('missing structured transport fails closed without consulting an ordinary engine runner', async (t) => {
     const state = fixture(t);
-    const current = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 8080,
-        id: 'e'.repeat(64),
-    });
-    const h = harness(state, { initial: current });
-    const result = await reconcileBoxContainer({
-        identity: state.identity,
-        ownership: {
-            state: 'owned',
-            handles: { container: current, volumes: volumeHandles(state.identity) },
-        },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-    }, h.seams);
-    assert.equal(result.action, 'reused');
-    assert.equal(h.calls.some((call) => call.includes('validate-existing-image')), true);
-    assert.equal(h.calls.some((call) => call.includes('revalidate-volumes')), true);
-    assert.equal(h.calls.some((call) => call.includes('pull')), false);
-    assert.equal(h.calls.some((call) => call.includes('ensure-volumes')), false);
-    assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), false);
-    assert.equal(h.calls.some((call) => call.join(' ').includes('volume rm')), false);
-});
-
-test('an incompatible owned image hard-cuts before any engine mutation', async (t) => {
-    const state = fixture(t);
-    const current = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 8080,
-        id: 'e'.repeat(64),
-        running: false,
-    });
-    const h = harness(state, { initial: current });
-    h.seams.validateExistingImage = () => {
-        const error = new Error('image configuration is incompatible; destroy and recreate the Box');
-        error.code = 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT';
-        throw error;
-    };
-    await assert.rejects(() => reconcileBoxContainer({
-        identity: state.identity,
-        ownership: {
-            state: 'owned',
-            handles: { container: current, volumes: volumeHandles(state.identity) },
-        },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-    }, h.seams), (error) => (
-        error.code === 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT'
-            && /destroy and recreate/i.test(error.message)
-    ));
-    assert.deepEqual(h.calls, []);
-});
-
-test('preflight and pull failures produce zero resource mutation', async (t) => {
-    for (const scenario of [{ failPreflight: true }, { failPull: true }]) {
-        const state = fixture(t);
-        const h = harness(state, scenario);
-        await assert.rejects(() => reconcileBoxContainer({
-            identity: state.identity,
-            ownership: { state: 'absent', handles: null },
-            engine: { name: 'podman', identity: 'engine' },
-            runner: h.runner,
-            lock: state.lock,
-            repositoryRoot: state.root,
-        }, h.seams));
-        assert.equal(h.calls.some((call) => call.includes('ensure-volumes')), false);
-        assert.equal(h.calls.some((call) => call.includes('create')), false);
-        assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), false);
-    }
-});
-
-test('create races and ready timeouts remove candidates and transaction-created volumes', async (t) => {
-    for (const scenario of [{ failCreate: true }, { failCandidateReady: true }]) {
-        const state = fixture(t);
-        const h = harness(state, scenario);
-        await assert.rejects(() => reconcileBoxContainer({
-            identity: state.identity,
-            ownership: { state: 'absent', handles: null },
-            engine: { name: 'podman', identity: 'engine' },
-            runner: h.runner,
-            lock: state.lock,
-            repositoryRoot: state.root,
-        }, h.seams), /transaction failed/);
-        assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), true);
-        if (scenario.failCandidateReady) {
-            assert.equal(h.calls.some((call) => call.join(' ').includes('container rm -f --volumes')), true);
-        }
-    }
-});
-
-test('replacement failure removes the candidate and restores the validated old image', async (t) => {
-    const state = fixture(t);
-    const oldImage = 'd'.repeat(64);
-    const old = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: oldImage,
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 18080,
-        id: 'e'.repeat(64),
-    });
-    const h = harness(state, { initial: old, failCandidateReady: true });
-    await assert.rejects(() => reconcileBoxContainer({
-        identity: state.identity,
-        ownership: { state: 'owned', handles: { container: old, volumes: volumeHandles(state.identity) } },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-        explicitPort: 19090,
-    }, h.seams), /transaction failed/);
-    assert.equal(h.current().runtime.imageId, oldImage);
-    assert.equal(h.current().runtime.running, true);
-    assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), false);
-    const removals = h.calls.filter((call) => call.join(' ').includes('container rm -f --volumes'));
-    assert.equal(removals.length, 2);
-});
-
-test('successful replacement gracefully stops core before stopping and removing the old Box', async (t) => {
-    const state = fixture(t);
-    const old = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 18080,
-        id: 'e'.repeat(64),
-    });
-    const h = harness(state, { initial: old });
-    const result = await reconcileBoxContainer({
-        identity: state.identity,
-        ownership: { state: 'owned', handles: { container: old, volumes: volumeHandles(state.identity) } },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-        explicitPort: 19090,
-    }, h.seams);
-    assert.equal(result.action, 'replaced');
-    const events = h.calls.map((call) => call.join(' '));
-    const graceful = events.findIndex((value) => value.includes('seam stop-ploinky-local'));
-    const outerStop = events.findIndex((value) => value.includes('container stop --time 30'));
-    const removal = events.findIndex((value) => value.includes('container rm -f --volumes'));
-    const creation = events.findIndex((value) => value.includes('container create'));
-    assert.ok(graceful >= 0 && graceful < outerStop);
-    assert.ok(outerStop < removal && removal < creation);
-});
-
-test('ploinky-local replacement stop failure preserves the old same-image Box without candidate cleanup', async (t) => {
-    const state = fixture(t);
-    const oldImage = 'd'.repeat(64);
-    const old = containerHandle({
-        identity: state.identity,
-        repositoryRoot: state.root,
-        imageId: oldImage,
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
-        hostPort: 18080,
-        id: 'e'.repeat(64),
-    });
-    const h = harness(state, {
-        initial: old,
-        candidateImage: oldImage,
-        failLocalStop: true,
-    });
-    await assert.rejects(() => reconcileBoxContainer({
-        identity: state.identity,
-        ownership: { state: 'owned', handles: { container: old, volumes: volumeHandles(state.identity) } },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-        explicitPort: 19090,
-    }, h.seams), (error) => (
-        /Box container transaction failed/.test(error.message)
-            && /ploinky-local stop failed/.test(error.cause?.message || '')
-    ));
-    assert.equal(h.current(), old);
-    assert.equal(old.runtime.running, true);
-    assert.equal(h.calls.some((call) => call.join(' ').includes('container stop --time 30')), false);
-    assert.equal(h.calls.some((call) => call.join(' ').includes('container rm -f --volumes')), false);
-    assert.equal(h.calls.some((call) => call.join(' ').includes('container create')), false);
-});
-
-test('missing or corrupt cidfiles are fail-closed primitives', (t) => {
-    const state = fixture(t);
-    const missing = path.join(state.root, 'missing.cid');
-    assert.throws(() => readContainerIdFromCidfile(missing), /missing/);
-    const corrupt = path.join(state.root, 'corrupt.cid');
-    fs.writeFileSync(corrupt, 'not-an-id\n');
-    assert.throws(() => readContainerIdFromCidfile(corrupt), /corrupt/);
-});
-
-test('readiness failure rereads bounded container self-check diagnostics after exit', async () => {
-    let logReads = 0;
-    const runner = {
-        query(_command, args) {
-            if (args[1] === 'logs') {
-                logReads += 1;
-                if (logReads === 1) {
-                    return { ok: true, stdout: '', stderr: '' };
-                }
-                return {
-                    ok: true,
-                    stdout: '',
-                    stderr: '[ploinky-box] SELF-CHECK FAILED: inner runtime is unavailable\n',
-                };
-            }
-            return { ok: true, stdout: 'exited\n', stderr: '' };
-        },
-    };
+    let runnerCalls = 0;
     await assert.rejects(
-        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner),
-        /container logs: \[ploinky-box\] SELF-CHECK FAILED: inner runtime is unavailable/,
-    );
-    assert.equal(logReads, 2);
-});
-
-test('readiness explains legacy TUN self-check failures as an access problem', async () => {
-    const runner = {
-        query(_command, args) {
-            if (args[1] === 'logs') {
-                return {
-                    ok: true,
-                    stdout: '',
-                    stderr: '[ploinky-box] SELF-CHECK FAILED: /dev/net/tun not present\n',
-                };
-            }
-            return { ok: true, stdout: 'exited\n', stderr: '' };
-        },
-    };
-    await assert.rejects(
-        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
-            stdout: { write() {} },
-            stderr: { write() {} },
+        () => reconcileBoxContainer({
+            identity: state.identity,
+            ownership: {
+                state: 'absent',
+                engine: state.engine,
+                handles: { container: null, volumes: {} },
+            },
+            engine: state.engine,
+            runner: new Proxy({}, {
+                get() { runnerCalls += 1; throw new Error('ordinary engine fallback forbidden'); },
+            }),
+            hostClient: null,
+            lock: state.lock,
+            repositoryRoot: state.repositoryRoot,
+            releaseDescriptor: releaseDescriptor(),
         }),
-        /must exist on the host and be accessible inside the Box for nested networking.*label=disable/,
+        /structured Podman host transport is unavailable/i,
     );
+    assert.equal(runnerCalls, 0);
 });
 
-test('readiness streams each Box log line once before readiness', async () => {
-    const stdout = { value: '', write(chunk) { this.value += String(chunk); } };
-    const stderr = { value: '', write(chunk) { this.value += String(chunk); } };
-    let logReads = 0;
-    const runner = {
-        query(_command, args) {
-            if (args[1] === 'logs') {
-                logReads += 1;
-                return logReads === 1
-                    ? { ok: true, stdout: '[ploinky-box] Starting runtime self-checks\n', stderr: '' }
-                    : {
-                        ok: true,
-                        stdout: `[ploinky-box] Starting runtime self-checks\n${BOX_READY_LINE}\n`,
-                        stderr: '[ploinky-box] diagnostic\n',
-                    };
-            }
-            return { ok: true, stdout: 'running\n', stderr: '' };
-        },
-    };
-    await waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
-        stdout,
-        stderr,
-        intervalMs: 0,
-        delay: async () => {},
-    });
-    assert.equal(stdout.value, `[ploinky-box] Starting runtime self-checks\n${BOX_READY_LINE}\n`);
-    assert.equal(stderr.value, '[ploinky-box] diagnostic\n');
-});
-
-test('readiness streams only the non-overlapping suffix after log truncation or rotation', async () => {
-    const stdout = { value: '', write(chunk) { this.value += String(chunk); } };
-    const stderr = { value: '', write(chunk) { this.value += String(chunk); } };
-    const snapshots = [
-        {
-            stdout: '[ploinky-box] first\nshared-prefix',
-            stderr: '[ploinky-box] old diagnostic\nshared-error',
-        },
-        {
-            stdout: 'shared-prefix\n[ploinky-box] second\n',
-            stderr: 'shared-error\n[ploinky-box] new diagnostic\n',
-        },
-        {
-            stdout: `[ploinky-box] second\n${BOX_READY_LINE}\n`,
-            stderr: '[ploinky-box] new diagnostic\n',
-        },
-    ];
-    let logReads = 0;
-    const runner = {
-        query(_command, args) {
-            if (args[1] === 'logs') {
-                const snapshot = snapshots[Math.min(logReads, snapshots.length - 1)];
-                logReads += 1;
-                return { ok: true, ...snapshot };
-            }
-            return { ok: true, stdout: 'running\n', stderr: '' };
-        },
-    };
-
-    await waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
-        stdout,
-        stderr,
-        intervalMs: 0,
-        delay: async () => {},
-    });
-
-    assert.equal(
-        stdout.value,
-        `[ploinky-box] first\nshared-prefix\n[ploinky-box] second\n${BOX_READY_LINE}\n`,
-    );
-    assert.equal(
-        stderr.value,
-        '[ploinky-box] old diagnostic\nshared-error\n[ploinky-box] new diagnostic\n',
-    );
-    assert.equal(stdout.value.split(BOX_READY_LINE).length - 1, 1);
-});
-
-test('a corrupt cidfile can recover only through rediscovered immutable image identity', async (t) => {
+test('definition environment is exact and contains no independent release or credential side channel', (t) => {
     const state = fixture(t);
-    const h = harness(state, { corruptCidfile: true });
-    const result = await reconcileBoxContainer({
-        identity: state.identity,
-        ownership: { state: 'absent', handles: null },
-        engine: { name: 'podman', identity: 'engine' },
-        runner: h.runner,
-        lock: state.lock,
-        repositoryRoot: state.root,
-    }, h.seams);
-    assert.equal(result.action, 'created');
-    assert.equal(result.ownership.handles.container.id, 'a'.repeat(64));
+    const descriptor = releaseDescriptor();
+    const selected = definition(state, descriptor);
+    assert.deepEqual(selected.creation.env, {
+        ...IMAGE_CONTRACT.environment,
+        PLOINKY_PRIVATE_BIND: '0.0.0.0',
+        PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${descriptor.routerHostPort}`,
+        PLOINKY_PUBLIC_BIND: '0.0.0.0',
+        PLOINKY_RELEASE_DESCRIPTOR: JSON.stringify(descriptor),
+    });
+    assert.equal(Object.hasOwn(selected.creation.env, 'PLOINKY_RELEASE_GENERATION'), false);
+    assert.equal(Object.hasOwn(selected.creation.env, 'PLOINKY_AGENTLIB_REF'), false);
+    assert.equal(Object.hasOwn(selected.creation.env, 'PLOINKY_MASTER_KEY'), false);
+    assert.equal(
+        selected.labels[BOX_LABELS.releaseGeneration],
+        descriptor.releaseGeneration,
+    );
 });

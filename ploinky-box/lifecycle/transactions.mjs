@@ -1,34 +1,31 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 
-import { BOX_IMAGE_REFERENCE } from '../constants.mjs';
-import { validateContainerConfiguration } from '../contract/container.mjs';
+import { BOX_LABELS } from '../constants.mjs';
 import {
-    inspectAndValidateReleaseImage,
+    inspectAndValidateDirectImage,
+} from '../contract/image.mjs';
+import {
     parseReleaseDescriptor,
     serializeReleaseDescriptor,
+    validateReleaseImageInspection,
 } from '../contract/release.mjs';
-import {
-    inspectAndValidateExistingImage,
-    inspectAndValidateImage,
-} from '../contract/image.mjs';
 import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
-import { preflightPublications, resolveEffectiveHostPort } from '../ports.mjs';
+import { preflightPublications } from '../ports.mjs';
 import {
     ensureNamedVolumes,
+    revalidateVolumeHandle,
     rollbackCreatedVolumes,
 } from '../volumes.mjs';
 import {
-    containerCreateArgs,
-    readContainerIdFromCidfile,
+    buildOuterContainerDefinition,
+    directContainerCreateSpec,
     removeContainerById,
-    revalidateAllVolumes,
-    secureCidfilePath,
     stopPloinkyLocalByContainerId,
     validateCreatedContainer,
-    waitForReadyLine,
+    waitForReadySignal,
 } from './container.mjs';
+import { createOuterJournalStore } from './outerJournal.mjs';
 
 function transactionError(message, cause, rollbackFailures = []) {
     const causeSuffix = cause?.message ? `: ${cause.message}` : '';
@@ -43,169 +40,271 @@ function transactionError(message, cause, rollbackFailures = []) {
     });
 }
 
-function oldDesired(identity, ownership, repositoryRoot, engine) {
-    const container = ownership.handles.container;
-    const hostPort = Number(container.labels['io.assistos.ploinky-box.router-host-port']);
-    const mediaHostPort = Number(container.labels['io.assistos.ploinky-box.media-host-port']);
-    const imageRef = container.labels['io.assistos.ploinky-box.image-ref'];
-    const imageId = container.runtime.imageId;
-    const serializedRelease = String(
-        container.labels['io.assistos.ploinky-box.release-descriptor'] || '',
-    );
-    const releaseDescriptor = serializedRelease
-        ? parseReleaseDescriptor(serializedRelease)
-        : null;
-    const desired = {
-        identity,
-        hostPort,
-        mediaHostPort,
-        imageRef,
-        imageId,
-        repositoryRoot,
-        hostKind: engine.hostKind,
-        ...(releaseDescriptor ? { releaseDescriptor } : {}),
+function cas(record) {
+    return {
+        generation: record.transaction.generation,
+        containerId: record.container.id,
+        revision: record.revision,
     };
-    validateContainerConfiguration(container, desired);
-    return Object.freeze(desired);
-}
-
-function cleanCidfile(cidfile, fsApi) {
-    try { fsApi.unlinkSync(cidfile); } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-    }
 }
 
 function writeProgress(stderr, message) {
     stderr?.write?.(`[ploinky] ${message}\n`);
 }
 
-async function pullBoxImage(engine, imageRef, runner, {
-    stdout = process.stdout,
-    stderr = process.stderr,
-    timeoutMs = 1_800_000,
-} = {}) {
-    writeProgress(stderr, `Pulling Box image ${imageRef}...`);
-    if (typeof runner.stream !== 'function') {
-        runner.run(engine.name, ['pull', imageRef]);
-        return;
-    }
-    const result = await runner.stream(engine.name, ['pull', imageRef], {
-        timeoutMs,
-        stdout,
-        stderr,
-    });
-    if (!result.ok) {
+function exactRelease(value) {
+    if (!value) {
         throw new PloinkyBoxError(
-            `Box image pull failed with status ${result.status}`,
-            { code: 'PLOINKY_BOX_IMAGE_PULL_FAILED', cause: result.error || undefined },
+            'Managed outer Box creation requires one exact local release descriptor; mutable host pull is unsupported',
+            { code: 'PLOINKY_RELEASE_DESCRIPTOR_REQUIRED' },
         );
     }
+    return parseReleaseDescriptor(serializeReleaseDescriptor(value), {
+        expectedControllerSourceSha: value.controllerSourceSha,
+    });
 }
 
-async function createAndStart({
-    engine,
+function releaseFromHandle(container) {
+    const serialized = String(container?.labels?.[BOX_LABELS.releaseDescriptor] || '');
+    if (!serialized) {
+        throw transactionError('Owned outer Box lacks an exact release descriptor');
+    }
+    return parseReleaseDescriptor(serialized);
+}
+
+function desiredFromHandle(identity, ownership, repositoryRoot) {
+    const container = ownership.handles.container;
+    const descriptor = releaseFromHandle(container);
+    return Object.freeze({
+        identity,
+        hostPort: descriptor.routerHostPort,
+        mediaHostPort: descriptor.mediaHostPort,
+        imageRef: descriptor.boxImageId,
+        imageId: descriptor.boxImageId,
+        repositoryRoot,
+        hostKind: ownership.engine.hostKind,
+        releaseDescriptor: descriptor,
+    });
+}
+
+function containerDefinition(record) {
+    return {
+        name: record.container.name,
+        labels: record.container.labels,
+        image: record.container.image,
+        creation: record.container.creation,
+    };
+}
+
+function candidateName(identity, generation) {
+    const suffix = `-g-${generation.slice(0, 16)}`;
+    return `${identity.instance.slice(0, 255 - suffix.length)}${suffix}`;
+}
+
+function makeIntent({
     identity,
-    image,
-    imageRef,
-    hostPort,
-    mediaHostPort,
-    repositoryRoot,
-    runner,
-    lock,
-    volumeHandles,
-    discover,
-    waitReady,
-    revalidateVolumes,
-    readCidfile,
-    fsApi,
-    token,
-    stdout,
-    stderr,
+    engine,
+    definition,
     releaseDescriptor,
+    predecessor,
 }) {
-    lock.assertHeld(identity.instance);
-    revalidateVolumes({ engine, identity, handles: volumeHandles, runner, lock });
-    const cidfile = secureCidfilePath(lock, token);
-    cleanCidfile(cidfile, fsApi);
-    writeProgress(stderr, `Creating Box container ${identity.instance}...`);
-    runner.run(engine.name, containerCreateArgs({
-        identity,
-        imageId: image.immutableId,
-        imageRef,
-        hostPort,
-        mediaHostPort,
-        repositoryRoot,
-        cidfile,
-        hostKind: engine.hostKind,
-        releaseDescriptor,
-    }));
-    let containerId;
-    try {
-        containerId = readCidfile(cidfile, { fsApi });
-    } catch (cidfileError) {
-        const recovered = discover(identity, { runner });
-        const recoveredHandle = recovered?.state === 'owned'
-            ? recovered.handles?.container
-            : null;
-        if (!recoveredHandle || recoveredHandle.runtime?.imageId !== image.immutableId) {
-            throw cidfileError;
-        }
-        containerId = recoveredHandle.id;
-    } finally {
-        cleanCidfile(cidfile, fsApi);
-    }
-    writeProgress(stderr, `Starting Box container ${identity.instance}; streaming startup logs...`);
-    runner.run(engine.name, ['container', 'start', containerId]);
-    await waitReady(engine, containerId, runner, { stdout, stderr });
-    const finalOwnership = discover(identity, { runner });
-    const handle = validateCreatedContainer(finalOwnership, {
-        identity,
-        hostPort,
-        mediaHostPort,
-        imageId: image.immutableId,
-        imageRef,
-        repositoryRoot,
-        hostKind: engine.hostKind,
-        releaseDescriptor,
-    });
-    if (handle.id !== containerId) {
-        throw transactionError('Created Box immutable ID changed during final validation');
-    }
-    return { containerId, ownership: finalOwnership };
+    return {
+        schemaVersion: 1,
+        engine: {
+            name: 'podman',
+            identity: engine.identity,
+            apiVersion: engine.apiVersion,
+            hostKind: engine.hostKind,
+            connection: { ...engine.connection },
+        },
+        workspace: {
+            root: identity.workspaceRoot,
+            owner: identity.instance,
+            pathHash: identity.pathHash,
+        },
+        transaction: {
+            id: `phase10x-${crypto.randomBytes(16).toString('hex')}`,
+            generation: releaseDescriptor.releaseGeneration,
+        },
+        container: { ...definition, id: null },
+        predecessor,
+        createdResources: { container: false, volumes: [] },
+        phase: 'intent',
+        revision: 0,
+    };
 }
 
-async function restoreOldContainer({
+async function validateDirectReleaseImage(hostClient, kind, descriptor) {
+    const imageId = kind === 'box' ? descriptor.boxImageId : descriptor.nodeImageId;
+    const inspection = await hostClient.inspectImage(imageId);
+    validateReleaseImageInspection(kind, inspection, descriptor);
+    if (kind === 'box') await inspectAndValidateDirectImage(hostClient, imageId, imageId);
+    return Object.freeze({ immutableId: imageId, inspection });
+}
+
+async function discoverOwned(identity, {
+    platform,
+    env,
+    runner,
+    hostClient,
+    journalStore,
+    discover,
+}) {
+    return discover(identity, {
+        platform,
+        env,
+        runner,
+        hostClient,
+        outerJournal: journalStore,
+    });
+}
+
+async function revalidateAllVolumes({
     engine,
     identity,
-    old,
-    runner,
+    handles,
+    hostClient,
     lock,
-    volumeHandles,
-    dependencies,
-    stdout,
-    stderr,
 }) {
-    return createAndStart({
-        engine,
-        identity,
-        image: { immutableId: old.imageId },
-        imageRef: old.imageRef,
-        hostPort: old.hostPort,
-        mediaHostPort: old.mediaHostPort,
-        repositoryRoot: old.repositoryRoot,
-        runner,
-        lock,
-        volumeHandles,
-        discover: dependencies.discover,
-        waitReady: dependencies.waitReady,
-        revalidateVolumes: dependencies.revalidateVolumes,
-        readCidfile: dependencies.readCidfile,
-        fsApi: dependencies.fsApi,
-        token: dependencies.token('restore'),
-        stdout,
-        stderr,
-        releaseDescriptor: old.releaseDescriptor || null,
-    });
+    for (const key of ['workspace', 'containers', 'dependencies']) {
+        await revalidateVolumeHandle(handles[key], {
+            engine, identity, key, hostClient, lock,
+        });
+    }
+}
+
+function rollbackJournalFailure(store, journal, phase, rollbackFailures) {
+    try {
+        return store.update(cas(journal), { phase });
+    } catch (error) {
+        rollbackFailures.push(`journal ${phase}: ${error.message}`);
+        return journal;
+    }
+}
+
+async function rollbackCandidate({
+    store,
+    journal,
+    hostClient,
+    engine,
+    identity,
+    lock,
+    volumeResult,
+    candidateStarted,
+    predecessor,
+    restorePredecessorService,
+    waitReady,
+    afterRestore,
+}) {
+    const rollbackFailures = [];
+    let current = rollbackJournalFailure(store, journal, 'rolling-back', rollbackFailures);
+    let deletionProven = current.container.id === null;
+    if (current.container.id) {
+        try {
+            if (candidateStarted) {
+                await hostClient.stopContainer({
+                    id: current.container.id,
+                    timeout: 30,
+                    journal: current,
+                });
+            }
+            await removeContainerById(hostClient, current.container.id, current, { timeout: 30 });
+            deletionProven = true;
+        } catch (error) {
+            deletionProven = false;
+            rollbackFailures.push(`candidate deletion ambiguity: ${error.message}`);
+            current = rollbackJournalFailure(store, current, 'deletion-ambiguous', rollbackFailures);
+        }
+    }
+    if (!deletionProven) {
+        return { journal: current, rollbackFailures, retained: true };
+    }
+    try {
+        await rollbackCreatedVolumes({
+            engine,
+            identity,
+            hostClient,
+            lock,
+            created: volumeResult?.created || [],
+        });
+        if (current.container.id === null && current.createdResources.volumes.length > 0) {
+            current = store.update(cas(current), {
+                createdResources: { container: false, volumes: [] },
+                phase: 'rolling-back',
+            });
+        }
+    } catch (error) {
+        rollbackFailures.push(`volume rollback: ${error.message}`);
+        current = rollbackJournalFailure(store, current, 'retaining-resources', rollbackFailures);
+        return { journal: current, rollbackFailures, retained: true };
+    }
+    try {
+        if (predecessor?.state === 'deleted') {
+            if (typeof store.restorePredecessor !== 'function') {
+                throw new Error('journal deleted-predecessor restoration is unavailable');
+            }
+            current = store.restorePredecessor(cas(current));
+        } else if (predecessor) {
+            const record = await hostClient.findContainerById(predecessor.id);
+            if (!record) throw new Error('journaled predecessor is absent during rollback');
+            const state = String(record.State ?? record.state ?? '').toLowerCase();
+            const running = state === 'running';
+            const stopped = ['configured', 'created', 'exited', 'stopped'].includes(state);
+            if (!running && !stopped) {
+                throw new Error(`journaled predecessor state is ambiguous (${state || 'unknown'})`);
+            }
+            if (predecessor.state === 'running' && !running) {
+                await hostClient.startContainer({
+                    id: predecessor.id,
+                    journal: current,
+                });
+            } else if (predecessor.state === 'stopped' && running) {
+                await hostClient.stopContainer({
+                    id: predecessor.id,
+                    timeout: 30,
+                    journal: current,
+                });
+            }
+            if (predecessor.state === 'running' && restorePredecessorService) {
+                if (typeof waitReady !== 'function' || typeof afterRestore !== 'function') {
+                    throw new Error(
+                        'journaled predecessor service restoration is unavailable',
+                    );
+                }
+                await waitReady(hostClient, predecessor.id, current);
+                await afterRestore({
+                    action: 'restored-predecessor',
+                    containerId: predecessor.id,
+                    hostClient,
+                    journal: current,
+                });
+            }
+            if (typeof store.restorePredecessor !== 'function') {
+                throw new Error('journal predecessor restoration is unavailable');
+            }
+            current = store.restorePredecessor(cas(current));
+        } else if (current.container.id === null) {
+            if (typeof store.abandonIntent !== 'function') {
+                throw new Error('journal intent abandonment is unavailable');
+            }
+            store.abandonIntent(cas(current));
+        } else {
+            store.retire(cas(current));
+        }
+    } catch (error) {
+        rollbackFailures.push(`journal rollback: ${error.message}`);
+        return { journal: current, rollbackFailures, retained: true };
+    }
+    return { journal: current, rollbackFailures, retained: false };
+}
+
+async function runContinuation(afterStart, context) {
+    if (typeof afterStart !== 'function') {
+        throw transactionError(
+            'Outer Box transaction cannot commit before dependencies, edge, core, and final health verification',
+        );
+    }
+    return afterStart(context);
 }
 
 export async function reconcileBoxContainer({
@@ -213,120 +312,181 @@ export async function reconcileBoxContainer({
     ownership,
     engine,
     runner,
+    hostClient,
     lock,
     repositoryRoot,
     explicitPort,
     explicitMediaPort,
     localBoxImageId,
-    releaseDescriptor = null,
-    imageRef = BOX_IMAGE_REFERENCE,
+    releaseDescriptor,
     platform = process.platform,
     env = process.env,
-    stdout = process.stdout,
     stderr = process.stderr,
-    admitNodeImage = null,
+    afterStart,
+    afterRestore,
+    outerJournal,
 }, seams = {}) {
     lock.assertHeld(identity.instance);
     if (!['absent', 'owned'].includes(ownership?.state)) {
         throw transactionError(`Cannot mutate Box ownership state ${ownership?.state || 'unknown'}`);
     }
-    const dependencies = {
-        discover: seams.discover || ((selectedIdentity) => discoverBoxOwnership(selectedIdentity, {
-            platform, env, runner,
-        })),
-        preflight: seams.preflight || preflightPublications,
-        validateImage: seams.validateImage || inspectAndValidateImage,
-        validateExistingImage: seams.validateExistingImage || inspectAndValidateExistingImage,
-        validateReleaseImage: seams.validateReleaseImage || inspectAndValidateReleaseImage,
-        ensureVolumes: seams.ensureVolumes || ensureNamedVolumes,
-        rollbackVolumes: seams.rollbackVolumes || rollbackCreatedVolumes,
-        revalidateVolumes: seams.revalidateVolumes || revalidateAllVolumes,
-        removeContainer: seams.removeContainer || removeContainerById,
-        stopPloinkyLocal: seams.stopPloinkyLocal || stopPloinkyLocalByContainerId,
-        waitReady: seams.waitReady || waitForReadyLine,
-        readCidfile: seams.readCidfile || readContainerIdFromCidfile,
-        fsApi: seams.fsApi || fs,
-        token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
-        admitNodeImage: seams.admitNodeImage || admitNodeImage,
-    };
-    let selectedRelease = null;
-    if (releaseDescriptor) {
-        selectedRelease = parseReleaseDescriptor(serializeReleaseDescriptor(releaseDescriptor), {
-            expectedControllerSourceSha: releaseDescriptor.controllerSourceSha,
+    if (explicitMediaPort !== undefined || localBoxImageId !== undefined) {
+        throw new PloinkyBoxError(
+            'Loose local Box image/media inputs are retired; use one release descriptor',
+            { code: 'PLOINKY_RELEASE_DESCRIPTOR_REQUIRED' },
+        );
+    }
+    if (!hostClient) throw transactionError('Structured Podman host transport is unavailable');
+    const selectedRelease = exactRelease(releaseDescriptor);
+    if (explicitPort !== undefined && explicitPort !== null
+        && Number(explicitPort) !== selectedRelease.routerHostPort) {
+        throw new PloinkyBoxError('Release descriptor owns the exact Router host port', {
+            code: 'PLOINKY_RELEASE_DESCRIPTOR_INVALID',
         });
     }
-    if (localBoxImageId !== undefined && localBoxImageId !== null) {
-        throw new PloinkyBoxError(
-            'Loose local Box image admission is retired; use one release descriptor',
-            { code: 'PLOINKY_RELEASE_DESCRIPTOR_REQUIRED' },
-        );
-    }
-    if (explicitMediaPort !== undefined && explicitMediaPort !== null) {
-        throw new PloinkyBoxError(
-            'Loose media-port admission is retired; use one release descriptor',
-            { code: 'PLOINKY_RELEASE_DESCRIPTOR_REQUIRED' },
-        );
-    }
-    const selectedLocalImageId = selectedRelease?.boxImageId || null;
-    const desiredImageRef = selectedRelease?.boxImageId || imageRef;
-    if (selectedRelease
-        && explicitPort !== undefined && explicitPort !== null
-        && Number(explicitPort) !== selectedRelease.routerHostPort) {
-        throw new PloinkyBoxError(
-            'Release descriptor owns the exact Router and media host ports',
-            { code: 'PLOINKY_RELEASE_DESCRIPTOR_INVALID' },
-        );
-    }
-    const portPlan = resolveEffectiveHostPort({
-        explicitPort: selectedRelease?.routerHostPort ?? explicitPort,
-        explicitMediaPort: selectedRelease?.mediaHostPort,
-        ownership,
+    const dependencies = {
+        discover: seams.discover || discoverBoxOwnership,
+        preflight: seams.preflight || preflightPublications,
+        validateImage: seams.validateImage || validateDirectReleaseImage,
+        ensureVolumes: seams.ensureVolumes || ensureNamedVolumes,
+        revalidateVolumes: seams.revalidateVolumes || revalidateAllVolumes,
+        rollbackVolumes: seams.rollbackVolumes || rollbackCreatedVolumes,
+        waitReady: seams.waitReady || waitForReadySignal,
+    };
+    const journalStore = outerJournal || createOuterJournalStore({
+        workspaceRoot: identity.workspaceRoot,
     });
-    const currentContainer = ownership.handles?.container || null;
-    const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
-    if (old) {
-        dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
-        if (old.releaseDescriptor) {
-            dependencies.validateReleaseImage(engine.name, 'box', old.releaseDescriptor, runner);
-            dependencies.validateReleaseImage(engine.name, 'node', old.releaseDescriptor, runner);
+    let currentContainer = ownership.handles?.container || null;
+    let currentJournal = ownership.journal || journalStore.read({ allowMissing: true });
+    if (currentContainer
+        && ['predecessor-deleting', 'predecessor-deleted'].includes(currentJournal?.phase)) {
+        if (currentJournal.transaction.generation !== selectedRelease.releaseGeneration
+            || !currentJournal.predecessor) {
+            throw transactionError(
+                'Interrupted replacement recovery requires its exact candidate generation and predecessor journal',
+            );
         }
+        if (currentJournal.phase === 'predecessor-deleting') {
+            const predecessorRecord = await hostClient.findContainerById(
+                currentJournal.predecessor.id,
+            );
+            if (predecessorRecord) {
+                const predecessorState = String(
+                    predecessorRecord.State ?? predecessorRecord.state ?? '',
+                ).toLowerCase();
+                if (!['configured', 'created', 'exited', 'stopped'].includes(predecessorState)) {
+                    throw transactionError(
+                        `Interrupted replacement predecessor state is ambiguous (${predecessorState || 'unknown'})`,
+                    );
+                }
+                await removeContainerById(
+                    hostClient,
+                    currentJournal.predecessor.id,
+                    currentJournal,
+                    { timeout: 30 },
+                );
+            }
+            if (typeof journalStore.markPredecessorDeleted !== 'function') {
+                throw transactionError('Outer Box predecessor deletion publication is unavailable');
+            }
+            currentJournal = journalStore.markPredecessorDeleted(cas(currentJournal));
+        }
+        currentJournal = journalStore.commitCandidate(cas(currentJournal));
+        let recoveredOwnership = await discoverOwned(identity, {
+            platform, env, runner, hostClient, journalStore, discover: dependencies.discover,
+        });
+        const recovered = desiredFromHandle(identity, recoveredOwnership, repositoryRoot);
+        validateCreatedContainer(recoveredOwnership, recovered);
+        await dependencies.revalidateVolumes({
+            engine,
+            identity,
+            handles: recoveredOwnership.handles.volumes,
+            hostClient,
+            lock,
+        });
+        const recoveredContainer = recoveredOwnership.handles.container;
+        if (!recoveredContainer.runtime.running) {
+            await hostClient.startContainer({
+                id: recoveredContainer.id,
+                journal: recoveredOwnership.journal,
+            });
+            await dependencies.waitReady(
+                hostClient,
+                recoveredContainer.id,
+                recoveredOwnership.journal,
+            );
+        }
+        await runContinuation(afterStart, {
+            action: 'recovered',
+            containerId: recoveredContainer.id,
+            hostClient,
+            journal: recoveredOwnership.journal,
+            advance: async () => recoveredOwnership.journal,
+        });
+        recoveredOwnership = await discoverOwned(identity, {
+            platform, env, runner, hostClient, journalStore, discover: dependencies.discover,
+        });
+        validateCreatedContainer(recoveredOwnership, recovered);
+        return Object.freeze({
+            action: 'recovered',
+            ownership: recoveredOwnership,
+            hostPort: recovered.hostPort,
+            mediaHostPort: recovered.mediaHostPort,
+            imageId: recovered.imageId,
+            releaseGeneration: recovered.releaseDescriptor.releaseGeneration,
+        });
     }
-    const requiresReplacement = Boolean(old) && (
-        old.hostPort !== portPlan.hostPort
-        || old.mediaHostPort !== portPlan.mediaHostPort
-        || old.imageRef !== desiredImageRef
-        || (selectedLocalImageId !== null && old.imageId !== selectedLocalImageId)
-        || (selectedRelease !== null
-            && old.releaseDescriptor?.releaseGeneration !== selectedRelease.releaseGeneration)
-    );
+    if (currentContainer && (!currentJournal || currentJournal.phase !== 'committed')) {
+        throw transactionError('Owned Box mutation requires one committed exact-generation journal');
+    }
+    if (!currentContainer && currentJournal
+        && (!['container-deleted', 'retaining-resources'].includes(currentJournal.phase)
+            || currentJournal.createdResources.container
+            || !/^[a-f0-9]{64}$/.test(String(currentJournal.container.id || '')))) {
+        throw transactionError(
+            'Container-free Box mutation requires one exact deleted-generation journal',
+        );
+    }
+    const old = currentContainer
+        ? desiredFromHandle(identity, ownership, repositoryRoot)
+        : null;
+    if (old) {
+        validateCreatedContainer(ownership, old);
+        await dependencies.validateImage(hostClient, 'box', old.releaseDescriptor);
+    }
+    await dependencies.validateImage(hostClient, 'box', selectedRelease);
+    await dependencies.validateImage(hostClient, 'node', selectedRelease);
+
+    const requiresReplacement = Boolean(old)
+        && old.releaseDescriptor.releaseGeneration !== selectedRelease.releaseGeneration;
     if (old && !requiresReplacement) {
-        dependencies.revalidateVolumes({
+        await dependencies.revalidateVolumes({
             engine,
             identity,
             handles: ownership.handles.volumes,
-            runner,
+            hostClient,
             lock,
         });
         const startedForReuse = !currentContainer.runtime.running;
         try {
             if (startedForReuse) {
-                writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
-                runner.run(engine.name, ['container', 'start', currentContainer.id]);
-                await dependencies.waitReady(engine, currentContainer.id, runner, { stdout, stderr });
+                writeProgress(stderr, `Starting existing Box container ${currentJournal.container.name}...`);
+                await hostClient.startContainer({
+                    id: currentContainer.id,
+                    journal: currentJournal,
+                });
+                await dependencies.waitReady(hostClient, currentContainer.id, currentJournal);
             }
-            if (old.releaseDescriptor) {
-                if (typeof dependencies.admitNodeImage !== 'function') {
-                    throw transactionError('Release Node image admission is unavailable');
-                }
-                await dependencies.admitNodeImage(
-                    engine,
-                    currentContainer.id,
-                    old.releaseDescriptor,
-                    runner,
-                    { stdout, stderr },
-                );
-            }
-            const finalOwnership = dependencies.discover(identity, { runner });
+            await runContinuation(afterStart, {
+                action: 'reused',
+                containerId: currentContainer.id,
+                hostClient,
+                journal: currentJournal,
+                advance: async () => currentJournal,
+            });
+            const finalOwnership = await discoverOwned(identity, {
+                platform, env, runner, hostClient, journalStore, discover: dependencies.discover,
+            });
             validateCreatedContainer(finalOwnership, old);
             return Object.freeze({
                 action: 'reused',
@@ -334,15 +494,17 @@ export async function reconcileBoxContainer({
                 hostPort: old.hostPort,
                 mediaHostPort: old.mediaHostPort,
                 imageId: old.imageId,
-                releaseGeneration: old.releaseDescriptor?.releaseGeneration || null,
+                releaseGeneration: old.releaseDescriptor.releaseGeneration,
             });
         } catch (error) {
             const rollbackFailures = [];
             if (startedForReuse) {
                 try {
-                    runner.run(engine.name, [
-                        'container', 'stop', '--time', '30', currentContainer.id,
-                    ]);
+                    await hostClient.stopContainer({
+                        id: currentContainer.id,
+                        timeout: 30,
+                        journal: currentJournal,
+                    });
                 } catch (rollbackError) {
                     rollbackFailures.push(`reused Box stop: ${rollbackError.message}`);
                 }
@@ -352,159 +514,263 @@ export async function reconcileBoxContainer({
     }
 
     await dependencies.preflight({
-        hostPort: portPlan.hostPort,
-        mediaHostPort: portPlan.mediaHostPort,
-        existingPublication: portPlan.existingPublication,
+        hostPort: selectedRelease.routerHostPort,
+        mediaHostPort: selectedRelease.mediaHostPort,
+        existingPublication: old
+            ? { hostPort: old.hostPort, mediaHostPort: old.mediaHostPort }
+            : null,
     });
-    if (selectedLocalImageId === null) {
-        await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
-    } else {
-        writeProgress(stderr, `Validating release Box image ${selectedLocalImageId} without pulling...`);
-    }
-    const selectedImageRef = selectedLocalImageId || imageRef;
-    if (selectedRelease) {
-        dependencies.validateReleaseImage(engine.name, 'box', selectedRelease, runner);
-        dependencies.validateReleaseImage(engine.name, 'node', selectedRelease, runner);
-    }
-    const image = dependencies.validateImage(engine.name, selectedImageRef, runner, {
+    const definition = buildOuterContainerDefinition({
         identity,
+        imageId: selectedRelease.boxImageId,
+        imageRef: selectedRelease.boxImageId,
+        hostPort: selectedRelease.routerHostPort,
+        mediaHostPort: selectedRelease.mediaHostPort,
+        repositoryRoot,
+        hostKind: engine.hostKind,
         releaseDescriptor: selectedRelease,
+        containerName: candidateName(identity, selectedRelease.releaseGeneration),
     });
-    if (selectedLocalImageId !== null && image.immutableId !== selectedLocalImageId) {
-        throw new PloinkyBoxError(
-            'Release Box image inspection did not return the descriptor image ID',
-            { code: 'PLOINKY_RELEASE_IMAGE_STALE' },
-        );
-    }
-    let volumeResult;
+    const predecessor = currentJournal ? {
+        id: currentJournal.container.id,
+        state: old
+            ? (currentContainer.runtime.running ? 'running' : 'stopped')
+            : 'deleted',
+        transaction: currentJournal.transaction,
+        revision: currentJournal.revision,
+        container: containerDefinition(currentJournal),
+        createdResources: currentJournal.createdResources,
+    } : null;
+    const intent = makeIntent({
+        identity,
+        engine,
+        definition,
+        releaseDescriptor: selectedRelease,
+        predecessor,
+    });
+    let journal = currentJournal
+        ? journalStore.replaceIntent(cas(currentJournal), intent)
+        : journalStore.create(intent);
+    let volumeResult = { handles: {}, created: [] };
+    let candidateStarted = false;
+    let predecessorDeleted = false;
+    let predecessorDeleteAttempted = false;
+    let predecessorQuiesceAttempted = false;
+    let createAttempted = false;
     try {
-        volumeResult = dependencies.ensureVolumes({
+        volumeResult = await dependencies.ensureVolumes({
             engine,
             identity,
-            runner,
+            hostClient,
             lock,
             knownHandles: ownership.handles?.volumes || {},
         });
-    } catch (error) {
-        const rollbackFailures = [];
-        if (error.createdVolumes?.length) {
-            try {
-                dependencies.rollbackVolumes({
-                    engine, identity, runner, lock, created: error.createdVolumes,
-                });
-            } catch (rollbackError) {
-                rollbackFailures.push(rollbackError.message);
-            }
-        }
-        throw transactionError('Named-volume preparation failed', error, rollbackFailures);
-    }
-
-    let candidateId = '';
-    let oldRemoved = false;
-    try {
-        if (old) {
-            if (currentContainer.runtime.running) {
-                dependencies.stopPloinkyLocal(engine, currentContainer.id, runner);
-                runner.run(engine.name, ['container', 'stop', '--time', '30', currentContainer.id]);
-            }
-            dependencies.removeContainer(engine, currentContainer.id, runner);
-            oldRemoved = true;
-        }
-        const created = await createAndStart({
-            engine,
-            identity,
-            image,
-            imageRef: desiredImageRef,
-            hostPort: portPlan.hostPort,
-            mediaHostPort: portPlan.mediaHostPort,
-            repositoryRoot,
-            runner,
-            lock,
-            volumeHandles: volumeResult.handles,
-            discover: dependencies.discover,
-            waitReady: dependencies.waitReady,
-            revalidateVolumes: dependencies.revalidateVolumes,
-            readCidfile: dependencies.readCidfile,
-            fsApi: dependencies.fsApi,
-            token: dependencies.token('candidate'),
-            stdout,
-            stderr,
-            releaseDescriptor: selectedRelease,
+        journal = journalStore.update(cas(journal), {
+            createdResources: {
+                container: false,
+                volumes: [...new Set([
+                    ...(predecessor?.createdResources?.volumes || []),
+                    ...volumeResult.created.map((entry) => entry.handle.name),
+                ])],
+            },
+            phase: 'resources-created',
         });
-        candidateId = created.containerId;
-        if (selectedRelease) {
-            if (typeof dependencies.admitNodeImage !== 'function') {
-                throw new Error('Release Node image admission is unavailable');
-            }
-            await dependencies.admitNodeImage(
-                engine,
-                candidateId,
-                selectedRelease,
-                runner,
-                { stdout, stderr },
+        writeProgress(stderr, `Creating Box candidate ${journal.container.name}...`);
+        createAttempted = true;
+        const created = await hostClient.createContainer(directContainerCreateSpec(definition));
+        journal = journalStore.publishContainerId(cas(journal), created.id);
+        if (!Array.isArray(created.warnings) || created.warnings.length !== 0) {
+            throw transactionError(
+                'Direct Box creation returned warnings for the immutable creation tuple',
             );
         }
+        // Close the Specgen named-volume no-create gap before starting. Any
+        // missing-label implicit volume remains journaled and is never guessed
+        // safe for cleanup.
+        await dependencies.revalidateVolumes({
+            engine,
+            identity,
+            handles: volumeResult.handles,
+            hostClient,
+            lock,
+        });
+        if (predecessor?.state === 'running') {
+            journal = journalStore.update(cas(journal), {
+                phase: 'predecessor-quiescing',
+            });
+            predecessorQuiesceAttempted = true;
+            await stopPloinkyLocalByContainerId(hostClient, predecessor.id, journal);
+            await hostClient.stopContainer({
+                id: predecessor.id,
+                timeout: 30,
+                journal,
+            });
+            journal = journalStore.update(cas(journal), {
+                phase: 'predecessor-quiesced',
+            });
+        }
+        await hostClient.startContainer({ id: created.id, journal });
+        candidateStarted = true;
+        journal = journalStore.update(cas(journal), { phase: 'candidate-started' });
+        await dependencies.waitReady(hostClient, created.id, journal);
+        const advance = async (phase) => {
+            journal = journalStore.update(cas(journal), { phase });
+            return journal;
+        };
+        await runContinuation(afterStart, {
+            action: old ? 'replaced' : 'created',
+            containerId: created.id,
+            hostClient,
+            get journal() { return journal; },
+            advance,
+        });
+        if (journal.phase !== 'health-verified') {
+            throw transactionError('Outer Box continuation did not reach final health verification');
+        }
+        if (predecessor && predecessor.state !== 'deleted') {
+            journal = journalStore.update(cas(journal), {
+                phase: 'predecessor-deleting',
+            });
+            predecessorDeleteAttempted = true;
+            await removeContainerById(hostClient, predecessor.id, journal, { timeout: 30 });
+            predecessorDeleted = true;
+            if (typeof journalStore.markPredecessorDeleted !== 'function') {
+                throw transactionError('Outer Box predecessor deletion publication is unavailable');
+            }
+            journal = journalStore.markPredecessorDeleted(cas(journal));
+        }
+        if (typeof journalStore.commitCandidate !== 'function') {
+            throw transactionError('Outer Box journal candidate commit is unavailable');
+        }
+        journal = journalStore.commitCandidate(cas(journal));
+        const finalOwnership = await discoverOwned(identity, {
+            platform, env, runner, hostClient, journalStore, discover: dependencies.discover,
+        });
+        const desired = {
+            identity,
+            hostPort: selectedRelease.routerHostPort,
+            mediaHostPort: selectedRelease.mediaHostPort,
+            imageId: selectedRelease.boxImageId,
+            imageRef: selectedRelease.boxImageId,
+            repositoryRoot,
+            hostKind: engine.hostKind,
+            releaseDescriptor: selectedRelease,
+        };
+        validateCreatedContainer(finalOwnership, desired);
         return Object.freeze({
             action: old ? 'replaced' : 'created',
-            ownership: created.ownership,
-            hostPort: portPlan.hostPort,
-            mediaHostPort: portPlan.mediaHostPort,
-            imageId: image.immutableId,
-            releaseGeneration: selectedRelease?.releaseGeneration || null,
+            ownership: finalOwnership,
+            hostPort: selectedRelease.routerHostPort,
+            mediaHostPort: selectedRelease.mediaHostPort,
+            imageId: selectedRelease.boxImageId,
+            releaseGeneration: selectedRelease.releaseGeneration,
         });
     } catch (error) {
-        const rollbackFailures = [];
-        if (!candidateId && (!old || oldRemoved)) {
-            const recovered = dependencies.discover(identity, { runner });
-            const candidate = recovered?.state === 'owned'
-                ? recovered.handles?.container
-                : null;
-            if (candidate?.runtime?.imageId === image.immutableId) {
-                candidateId = candidate.id;
-            }
+        const createdFromError = Array.isArray(error?.createdVolumes)
+            ? [...error.createdVolumes]
+            : [];
+        const ambiguousVolumeNames = Array.isArray(error?.ambiguousVolumeNames)
+            ? [...error.ambiguousVolumeNames]
+            : [];
+        if (createdFromError.length > 0 && volumeResult.created.length === 0) {
+            volumeResult = {
+                handles: Object.fromEntries(createdFromError.map((entry) => [entry.key, entry.handle])),
+                created: createdFromError,
+            };
         }
-        if (candidateId) {
-            try { dependencies.removeContainer(engine, candidateId, runner); } catch (removeError) {
-                rollbackFailures.push(`candidate removal: ${removeError.message}`);
-            }
-        }
-        if (oldRemoved) {
+        if (journal.container.id === null
+            && (createdFromError.length > 0 || ambiguousVolumeNames.length > 0)
+            && journal.createdResources.volumes.length === 0) {
+            const possibleNames = [...new Set([
+                ...createdFromError.map((entry) => entry.handle.name),
+                ...ambiguousVolumeNames,
+            ])];
             try {
-                const restored = await restoreOldContainer({
-                    engine,
-                    identity,
-                    old,
-                    runner,
-                    lock,
-                    volumeHandles: volumeResult.handles,
-                    dependencies,
-                    stdout,
-                    stderr,
+                journal = journalStore.update(cas(journal), {
+                    createdResources: { container: false, volumes: possibleNames },
+                    phase: 'resources-created',
                 });
-                if (old.releaseDescriptor) {
-                    if (typeof dependencies.admitNodeImage !== 'function') {
-                        throw new Error('Prior release Node image admission is unavailable');
-                    }
-                    await dependencies.admitNodeImage(
-                        engine,
-                        restored.containerId,
-                        old.releaseDescriptor,
-                        runner,
-                        { stdout, stderr },
-                    );
+            } catch (journalError) {
+                throw transactionError(
+                    'Box resource creation failed and its ownership journal could not record possible resources',
+                    error,
+                    [journalError.message],
+                );
+            }
+        }
+        if (ambiguousVolumeNames.length > 0) {
+            const rollbackFailures = [
+                `ambiguous volume creation retained: ${ambiguousVolumeNames.join(', ')}`,
+            ];
+            journal = rollbackJournalFailure(
+                journalStore, journal, 'rolling-back', rollbackFailures,
+            );
+            rollbackJournalFailure(
+                journalStore, journal, 'retaining-resources', rollbackFailures,
+            );
+            throw transactionError(
+                'Box container transaction retained resources after ambiguous volume creation',
+                error,
+                rollbackFailures,
+            );
+        }
+        if (createAttempted && journal.container.id === null) {
+            const rollbackFailures = ['ambiguous container creation retained by exact name and labels'];
+            journal = rollbackJournalFailure(
+                journalStore, journal, 'rolling-back', rollbackFailures,
+            );
+            rollbackJournalFailure(
+                journalStore, journal, 'retaining-resources', rollbackFailures,
+            );
+            throw transactionError(
+                'Box container create outcome is ambiguous; journal and volumes were retained',
+                error,
+                rollbackFailures,
+            );
+        }
+        // Once predecessor deletion is proven, the fully health-verified
+        // candidate is the only recoverable generation: commit it rather than
+        // pretending the removed predecessor can be restored.
+        if (predecessorDeleted) {
+            try {
+                if (journal.phase === 'predecessor-deleting') {
+                    journal = journalStore.markPredecessorDeleted(cas(journal));
                 }
-            } catch (restoreError) {
-                rollbackFailures.push(`old Box restoration: ${restoreError.message}`);
-            }
-        } else if (!old && volumeResult.created.length > 0) {
-            try {
-                dependencies.rollbackVolumes({
-                    engine, identity, runner, lock, created: volumeResult.created,
-                });
-            } catch (volumeError) {
-                rollbackFailures.push(`named volumes: ${volumeError.message}`);
-            }
+                journalStore.commitCandidate(cas(journal));
+            } catch {}
         }
-        throw transactionError('Box container transaction failed', error, rollbackFailures);
+        if (predecessorDeleteAttempted && !predecessorDeleted) {
+            const rollbackFailures = [
+                'predecessor deletion outcome is ambiguous; candidate and journal retained',
+            ];
+            rollbackJournalFailure(
+                journalStore,
+                journal,
+                'deletion-ambiguous',
+                rollbackFailures,
+            );
+            throw transactionError(
+                'Box replacement retained its health-verified candidate after ambiguous predecessor deletion',
+                error,
+                rollbackFailures,
+            );
+        }
+        const rollback = predecessorDeleted
+            ? { rollbackFailures: ['predecessor was already proven deleted'], retained: true }
+            : await rollbackCandidate({
+                store: journalStore,
+                journal,
+                hostClient,
+                engine,
+                identity,
+                lock,
+                volumeResult,
+                candidateStarted,
+                predecessor,
+                restorePredecessorService: predecessorQuiesceAttempted,
+                waitReady: dependencies.waitReady,
+                afterRestore,
+            });
+        throw transactionError('Box container transaction failed', error, rollback.rollbackFailures);
     }
 }

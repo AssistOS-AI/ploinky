@@ -8,7 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
 import { routeOuterCommand } from '../../ploinky-box/command/route.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
-import { containerCreateArgs } from '../../ploinky-box/lifecycle/container.mjs';
+import {
+    buildOuterContainerDefinition,
+    directContainerCreateSpec,
+} from '../../ploinky-box/lifecycle/container.mjs';
 import { createBoxSupervisor, formatBoxStatus } from '../../ploinky-box/supervisor.mjs';
 import {
     CODING_NODE_IMAGE_REFERENCE,
@@ -573,9 +576,9 @@ test('public Box admission accepts one release descriptor and retires loose lega
 test('Box creation owns the canonical descriptor in its exact environment and labels', () => {
     const descriptor = release();
     const serialized = serializeReleaseDescriptor(descriptor);
-    const args = containerCreateArgs({
+    const definition = buildOuterContainerDefinition({
         identity: {
-            pathHash: 'a'.repeat(64),
+            pathHash: 'a'.repeat(12),
             instance: 'ploinky-box-test',
             volumes: {
                 workspace: 'ploinky-test-workspace',
@@ -588,25 +591,25 @@ test('Box creation owns the canonical descriptor in its exact environment and la
         hostPort: descriptor.routerHostPort,
         mediaHostPort: descriptor.mediaHostPort,
         repositoryRoot: repoRoot,
-        cidfile: '/tmp/phase10e-candidate.cid',
+        hostKind: 'podman-machine',
         releaseDescriptor: descriptor,
     });
-    const pairs = (flag) => args.flatMap((value, index) => (
-        value === flag ? [args[index + 1]] : []
-    ));
-    assert.ok(pairs('--env').includes(`${RELEASE_DESCRIPTOR_ENV}=${serialized}`));
-    assert.equal(pairs('--env').some((value) => value.startsWith('PLOINKY_RELEASE_GENERATION=')), false);
-    assert.equal(pairs('--env').some((value) => value.startsWith('PLOINKY_AGENTLIB_REF=')), false);
-    assert.ok(pairs('--label').includes(
-        `${BOX_LABELS.releaseGeneration}=${descriptor.releaseGeneration}`,
-    ));
-    assert.ok(pairs('--label').includes(
-        `${BOX_LABELS.releaseDescriptor}=${serialized}`,
-    ));
-    assert.equal(args.at(-1), descriptor.boxImageId);
+    const spec = directContainerCreateSpec(definition);
+    assert.equal(spec.env[RELEASE_DESCRIPTOR_ENV], serialized);
+    assert.equal(Object.hasOwn(spec.env, 'PLOINKY_RELEASE_GENERATION'), false);
+    assert.equal(Object.hasOwn(spec.env, 'PLOINKY_AGENTLIB_REF'), false);
+    assert.equal(
+        spec.labels[BOX_LABELS.releaseGeneration],
+        descriptor.releaseGeneration,
+    );
+    assert.equal(spec.labels[BOX_LABELS.releaseDescriptor], serialized);
+    assert.equal(spec.image, descriptor.boxImageId);
+    assert.equal(spec.raw_image_name, descriptor.boxImageId);
+    assert.equal(spec.remove, false);
+    assert.deepEqual(spec.dependencyContainers, []);
 });
 
-test('read-only status rejects a descriptor owned by stale controller source', () => {
+test('read-only status rejects a descriptor owned by stale controller source', async () => {
     const descriptor = release();
     const serialized = serializeReleaseDescriptor(descriptor);
     let admissionCalls = 0;
@@ -628,14 +631,12 @@ test('read-only status rejects a descriptor owned by stale controller source', (
                 volumes: {},
             },
         }),
-        validateExistingImage: () => ({ immutableId: descriptor.boxImageId }),
-        validateReleaseImage: () => ({}),
         validateReleaseAdmission() {
             admissionCalls += 1;
             throw new Error('controllerSourceSha is stale for the live outer controller');
         },
     });
-    const status = supervisor.inspectBoxStatus();
+    const status = await supervisor.inspectBoxStatus();
     assert.equal(admissionCalls, 1);
     assert.equal(status.state, 'incompatible');
     assert.match(status.detail, /controllerSourceSha.*stale/);
