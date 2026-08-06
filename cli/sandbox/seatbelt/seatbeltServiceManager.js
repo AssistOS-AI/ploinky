@@ -647,6 +647,9 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         type: 'agent',
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        ...(runtimeIdentity.releaseGeneration
+            ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+            : {}),
         config: {
             binds: [
                 { source: AGENT_LIB_PATH, target: AGENT_LIB_PATH, ro: true },
@@ -819,6 +822,9 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         routerEndpoint,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        ...(runtimeIdentity.releaseGeneration
+            ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+            : {}),
         preservePreparedRegistryRecord: options.preservePreparedRegistryRecord,
         runtimeAdmission: runtimeBoundary.admission,
         manifestBytes: runtimeBoundary.manifestBytes,

@@ -13,6 +13,7 @@ const MANAGED_LABELS = Object.freeze({
     'io.assistos.ploinky.network-contract': 'b'.repeat(64),
     'io.assistos.ploinky.instance-id': 'instance-current',
     'io.assistos.ploinky.enable-generation': 'generation-current',
+    'io.assistos.ploinky.release-generation': 'd'.repeat(64),
 });
 
 test('container inspection extracts only exact managed Podman ownership', () => {
@@ -26,11 +27,13 @@ test('container inspection extracts only exact managed Podman ownership', () => 
         containerId: 'c'.repeat(64),
         instanceId: 'instance-current',
         enableGeneration: 'generation-current',
+        releaseGeneration: 'd'.repeat(64),
     };
     assert.deepEqual(inspectOwnership(data, 'exactKey', expected), {
         containerId: 'c'.repeat(64),
         instanceId: 'instance-current',
         enableGeneration: 'generation-current',
+        releaseGeneration: 'd'.repeat(64),
         ownershipVerified: true,
     });
 
@@ -39,6 +42,7 @@ test('container inspection extracts only exact managed Podman ownership', () => 
         { ...data, Name: '/replacementKey' },
         { ...data, Config: { Labels: { ...MANAGED_LABELS, 'io.assistos.ploinky.managed': '0' } } },
         { ...data, Config: { Labels: { ...MANAGED_LABELS, 'io.assistos.ploinky.instance-id': ' stale ' } } },
+        { ...data, Config: { Labels: { ...MANAGED_LABELS, 'io.assistos.ploinky.release-generation': 'e'.repeat(64) } } },
     ]) {
         assert.equal(inspectOwnership(mutated, 'exactKey', expected).ownershipVerified, false);
     }
@@ -142,6 +146,7 @@ test('collectAgentRuntimeStates uses exact registry runtime ownership and surfac
         expected: {
             instanceId: 'instance-bwrap',
             enableGeneration: 'generation-bwrap',
+            releaseGeneration: '',
             role: 'service',
             runtimeKey: 'bwrapKey',
         },

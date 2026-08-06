@@ -15,7 +15,7 @@ export function publicUsageText() {
     return `ploinky - run Ploinky through its managed outer Box
 
 Usage: ploinky [--debug] [--dry-run] [--port PORT]
-               [--local-box-image-id ID --local-media-port PORT]
+               [--local-release-descriptor JSON]
                [--] COMMAND [ARGS]
 
 Commands:
@@ -32,9 +32,8 @@ Commands:
   ploinky help                    Show this help without engine discovery
 
 Public image, engine, instance-name, and master-key overrides are intentionally unsupported.
-The coupled local options admit one exact 64-hex image ID without pulling and publish
-container UDP 7882 on the selected owned host port. With this local pair, --port also
-selects the initial isolated TCP publication for REPL, Bash, agent CLI, and core commands.
+The local release descriptor admits one exact Box/Node/AgentLib generation without
+pulling, building, retagging, or falling back, and owns both host publications.
 If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/security authority.
 `;
 }
@@ -151,38 +150,32 @@ export async function runOuterCli(argv, {
     if (route.kind === 'dry-run') {
         const plan = selectedSupervisor.planDryRun({
             explicitPort: route.hostPort,
-            ...(route.localBoxImageId ? {
-                localBoxImageId: route.localBoxImageId,
-                explicitMediaPort: route.mediaHostPort,
-            } : {}),
+            ...(route.localReleaseDescriptor
+                ? { releaseDescriptor: route.localReleaseDescriptor }
+                : {}),
         });
         output.write(`${JSON.stringify(plan, null, 2)}\n`);
         return 0;
     }
     if (route.kind === 'start') {
-        const agentlibRef = String(env.PLOINKY_AGENTLIB_REF || '').trim();
-        if (agentlibRef && !/^[0-9a-f]{40}$/.test(agentlibRef)) {
+        if (String(env.PLOINKY_AGENTLIB_REF || '').trim()) {
             throw new Error(
-                'PLOINKY_AGENTLIB_REF at the outer Box boundary must be exactly 40 lowercase hexadecimal characters.',
+                'PLOINKY_AGENTLIB_REF is not an outer Box override; select AgentLib only through --local-release-descriptor.',
             );
         }
         await selectedSupervisor.runStartTransaction(route.coreArgv, {
             explicitPort: route.hostPort,
-            ...(agentlibRef ? { agentlibRef } : {}),
-            ...(route.localBoxImageId ? {
-                localBoxImageId: route.localBoxImageId,
-                explicitMediaPort: route.mediaHostPort,
-            } : {}),
+            ...(route.localReleaseDescriptor
+                ? { releaseDescriptor: route.localReleaseDescriptor }
+                : {}),
         });
         return 0;
     }
 
     const prepared = await selectedSupervisor.prepareBoxForCommand(
-        route.localBoxImageId ? {
-            localBoxImageId: route.localBoxImageId,
-            explicitMediaPort: route.mediaHostPort,
-            ...(route.hostPort ? { explicitPort: route.hostPort } : {}),
-        } : {},
+        route.localReleaseDescriptor
+            ? { releaseDescriptor: route.localReleaseDescriptor }
+            : {},
     );
     if (route.kind === 'bash') {
         return executePrepared(prepared, [], {

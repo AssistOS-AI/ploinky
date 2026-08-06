@@ -11,6 +11,8 @@ export const BOX_LABELS = Object.freeze({
     imageRef: 'io.assistos.ploinky-box.image-ref',
     routerHostPort: 'io.assistos.ploinky-box.router-host-port',
     mediaHostPort: 'io.assistos.ploinky-box.media-host-port',
+    releaseDescriptor: 'io.assistos.ploinky-box.release-descriptor',
+    releaseGeneration: 'io.assistos.ploinky-box.release-generation',
 });
 
 export const BOX_ROLES = Object.freeze({

@@ -228,7 +228,7 @@ test('provider task ownership is durable, exact, log-safe, and never signals inn
             ), { code: 'PLOINKY_PROVIDER_TASK_CONTAINMENT_REQUIRED' });
             ownership.removeProviderTaskOwnersAfterContainment(
                 ownership.listProviderTaskOwners(),
-                { contained: true, runtimeKey: common.runtimeKey, instanceId: 'instance-a', enableGeneration: 'generation-a' },
+                { contained: true, runtimeKey: common.runtimeKey, instanceId: 'instance-a', enableGeneration: 'generation-a', releaseGeneration: '' },
             );
             assert.equal(ownership.listProviderTaskOwners().length, 0);
             assert.doesNotThrow(() => process.kill(child.pid, 0));

@@ -77,11 +77,9 @@ export function hashMergedPackage(mergedPackage) {
 /**
  * Resolve the global dependency manifest used to build the shared cache.
  *
- * Goes through readGlobalDepsPackage so a PLOINKY_AGENTLIB_REF override
- * (`ploinky start --branch`) is reflected in both the installed package
- * and the cache key. The hash is over the resolved (post-override) contents so
- * switching the achillesAgentLib ref invalidates the shared cache instead of
- * serving the pinned #master to every agent that seeds from it.
+ * Goes through readGlobalDepsPackage so the immutable release descriptor's
+ * AgentLib pin (or the direct-core legacy pin outside a release) is reflected
+ * in both the installed package and cache key.
  *
  * @param {NodeJS.ProcessEnv} [env=process.env]
  * @returns {{ pkg: object, hash: string }}
@@ -639,10 +637,8 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
     if (!fs.existsSync(globalPackageFile)) {
         throw new Error(`globalDeps/package.json missing at ${globalPackageFile}`);
     }
-    // Resolve via readGlobalDepsPackage so a PLOINKY_AGENTLIB_REF override is
-    // reflected in BOTH the cache key and the installed package. Hashing/copying
-    // the raw file here would serve the pinned #master to every agent that seeds
-    // from this shared cache, regardless of the --branch override.
+    // Resolve via readGlobalDepsPackage so release-owned AgentLib identity is
+    // applied before deriving the canonical cache key and installed package.
     const { pkg: globalPkg, hash: globalPackageHash } = resolveGlobalCacheManifest();
     const cachePath = getGlobalCachePath(runtimeKey);
 

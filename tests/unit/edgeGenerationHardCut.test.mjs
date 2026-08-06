@@ -131,12 +131,13 @@ function sandboxOwnerAttestation({
     rootPort = 43101,
 } = {}) {
     return {
-        schemaVersion: 5,
+        schemaVersion: 6,
         role: 'service',
         runtimeKey,
         ownerKey: serviceOwnerKey(runtimeKey),
         instanceId: 'alpha-instance',
         enableGeneration: 'alpha-enable-generation',
+        releaseGeneration: '',
         homeKey: 'alpha',
         workdir: '/code',
         logPath: '/workspace/.ploinky/logs/alpha-sandbox.log',
@@ -1089,6 +1090,7 @@ test('prepared Router attestation remains inactive and binds exact lease, owner,
         principal: 'agent:fixtures/alpha',
         instanceId: 'alpha-instance',
         enableGeneration: 'alpha-enable-generation',
+        releaseGeneration: '',
     };
     const lease = createRouterAttestationGenerationLease({
         workspaceRoot: fixture.workspace,
@@ -1385,6 +1387,17 @@ test('runtime locator mutation remains bound to the launch generation lifecycle'
         workspaceRoot: fixture.workspace,
     });
     assert.match(candidate, /^sha256:[a-f0-9]{64}$/);
+
+    agents['alpha-container'].releaseGeneration = '1'.repeat(64);
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+    assert.throws(
+        () => captureEdgeRoutingLifecycleMutationGeneration(applied, {
+            workspaceRoot: fixture.workspace,
+        }),
+        { code: 'EDGE_GENERATION_SOURCE_CHANGED' },
+    );
+    agents['alpha-container'].releaseGeneration = '';
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
 
     fs.writeFileSync(path.join(fixture.alphaDir, 'manifest.json'), JSON.stringify({
         routerAccess: { httpRoutes: [] },

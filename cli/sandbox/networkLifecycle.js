@@ -24,6 +24,7 @@ export const NETWORK_LABELS = Object.freeze({
     contract: 'io.assistos.ploinky.network-contract',
     instanceId: 'io.assistos.ploinky.instance-id',
     enableGeneration: 'io.assistos.ploinky.enable-generation',
+    releaseGeneration: 'io.assistos.ploinky.release-generation',
 });
 
 const MANAGED_HOST_NAME = 'host.containers.internal';
@@ -113,7 +114,11 @@ function exactRuntimeIdentity(runtimeIdentity, description = 'managed agent runt
     if (!instanceId || !enableGeneration) {
         throw new Error(`${description} requires an exact instanceId and enableGeneration`);
     }
-    return Object.freeze({ instanceId, enableGeneration });
+    const releaseGeneration = String(runtimeIdentity?.releaseGeneration || '').trim();
+    if (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration)) {
+        throw new Error(`${description} releaseGeneration must be an exact 64-character lowercase digest`);
+    }
+    return Object.freeze({ instanceId, enableGeneration, releaseGeneration });
 }
 
 function expectedAgentLabels(workspaceHash, contractHash, runtimeIdentity) {
@@ -122,6 +127,9 @@ function expectedAgentLabels(workspaceHash, contractHash, runtimeIdentity) {
         ...expectedAgentOwnershipLabels(workspaceHash, contractHash),
         [NETWORK_LABELS.instanceId]: exactIdentity.instanceId,
         [NETWORK_LABELS.enableGeneration]: exactIdentity.enableGeneration,
+        ...(exactIdentity.releaseGeneration
+            ? { [NETWORK_LABELS.releaseGeneration]: exactIdentity.releaseGeneration }
+            : {}),
     };
 }
 
@@ -1386,6 +1394,7 @@ export function createNetworkLifecycleAdapter({
         contractHash,
         instanceId = '',
         enableGeneration = '',
+        releaseGeneration = '',
         requireRuntimeIdentity = false,
     } = {}) {
         const record = inspectContainer(containerName);
@@ -1403,9 +1412,11 @@ export function createNetworkLifecycleAdapter({
         if (requireRuntimeIdentity) {
             const expectedInstanceId = String(instanceId || '').trim();
             const expectedEnableGeneration = String(enableGeneration || '').trim();
+            const expectedReleaseGeneration = String(releaseGeneration || '').trim();
             if (!expectedInstanceId || !expectedEnableGeneration
                 || String(labels?.[NETWORK_LABELS.instanceId] || '') !== expectedInstanceId
-                || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration) {
+                || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration
+                || String(labels?.[NETWORK_LABELS.releaseGeneration] || '') !== expectedReleaseGeneration) {
                 return { state: 'owned-drift', id, reason: 'runtime-identity' };
             }
         }
@@ -1473,6 +1484,7 @@ export function createNetworkLifecycleAdapter({
         contractHash,
         instanceId,
         enableGeneration,
+        releaseGeneration,
     } = {}) {
         const exactContainerId = String(expectedContainerId || '').trim();
         if (!exactContainerId) {
@@ -1483,6 +1495,7 @@ export function createNetworkLifecycleAdapter({
             contractHash,
             instanceId,
             enableGeneration,
+            releaseGeneration,
             requireRuntimeIdentity: true,
         });
         if (inspection.state === 'absent') {

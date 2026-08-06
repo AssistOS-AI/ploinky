@@ -11,6 +11,7 @@ import {
 } from '../../cli/sandbox/bwrap/bwrapFleet.js';
 import { collectProviderTaskOwnersReadOnly } from '../../cli/sandbox/providerTaskOwnership.js';
 import { loadActiveEdgeRoutingGeneration } from '../../cli/sandbox/edgeGeneration.js';
+import { NETWORK_LABELS } from '../../cli/sandbox/networkLifecycle.js';
 
 const LOCAL_CLOUDFLARE_STATUS = serializeCloudflarePublicationStatus({
     mode: 'local-only',
@@ -85,7 +86,13 @@ function exactActiveReadiness(active, runtimeKey, record, running) {
     return selected?.type === 'agent'
         && selected.runtime === record.runtime
         && selected.instanceId === record.instanceId
-        && selected.enableGeneration === record.enableGeneration;
+        && selected.enableGeneration === record.enableGeneration
+        && String(selected.releaseGeneration || '') === String(record.releaseGeneration || '');
+}
+
+function exactReleaseGeneration(value) {
+    const selected = String(value || '');
+    return selected === '' || /^[a-f0-9]{64}$/.test(selected);
 }
 
 function exactContainerRecord(runtimeKey, record, containerId) {
@@ -94,6 +101,7 @@ function exactContainerRecord(runtimeKey, record, containerId) {
         && /^[a-f0-9]{64}$/.test(containerId)
         && exactText(record.instanceId)
         && exactText(record.enableGeneration)
+        && exactReleaseGeneration(record.releaseGeneration)
         && canonicalWorkspaceWorkdir(record.projectPath)
         // Container HOME is selected canonically by runtime key. If a newer
         // record stores the derived key explicitly, it must be exact.
@@ -135,6 +143,7 @@ function sandboxIdentityMatches(runtimeKey, record, owner) {
         && owner.runtimeKey === runtimeKey
         && owner.instanceId === record.instanceId
         && owner.enableGeneration === record.enableGeneration
+        && String(owner.releaseGeneration || '') === String(record.releaseGeneration || '')
         && owner.homeKey === expectedHomeKey(runtimeKey, record)
         && exactText(owner.ownerKey)
         && exactText(owner.processIdentity)
@@ -154,6 +163,7 @@ function sandboxStatusEntry(
         role: owner.role,
         effectiveInstance: effectiveInstance(runtimeKey, record),
         generation: owner.enableGeneration,
+        releaseGeneration: String(record.releaseGeneration || ''),
         state,
         ownerKey: owner.ownerKey,
         processIdentity: owner.processIdentity,
@@ -196,6 +206,7 @@ function configuredSandboxStatusEntry(ploinkyRoot, runtimeKey, record) {
         role: 'service',
         effectiveInstance: effectiveInstance(runtimeKey, record),
         generation: exactText(record.enableGeneration) ? record.enableGeneration : '',
+        releaseGeneration: String(record.releaseGeneration || ''),
         state: 'stopped',
         ownerKey: '',
         processIdentity: '',
@@ -213,6 +224,7 @@ function containerStatusEntry(runtimeKey, record, containerId, state, authentica
         role: 'service',
         effectiveInstance: effectiveInstance(runtimeKey, record),
         generation: exactText(record.enableGeneration) ? record.enableGeneration : '',
+        releaseGeneration: String(record.releaseGeneration || ''),
         state,
         ownerKey: exactText(containerId) ? `container:${containerId}` : '',
         processIdentity: exactText(containerId) ? `container:${containerId}` : '',
@@ -381,7 +393,16 @@ export function readInboxStatus({
             const value = Array.isArray(values) && values.length === 1 ? values[0] : null;
             const id = String(value?.Id ?? value?.ID ?? '').toLowerCase();
             const name = String(value?.Name ?? '').replace(/^\//, '');
-            if (id !== containerId || name !== recordedName) {
+            const labels = value?.Config?.Labels || value?.Labels || {};
+            const exactReleaseOwnership = String(labels[NETWORK_LABELS.releaseGeneration] || '')
+                === String(record.releaseGeneration || '')
+                && (!record.releaseGeneration || (
+                    labels[NETWORK_LABELS.managed] === '1'
+                    && labels[NETWORK_LABELS.resource] === 'agent'
+                    && String(labels[NETWORK_LABELS.instanceId] || '') === record.instanceId
+                    && String(labels[NETWORK_LABELS.enableGeneration] || '') === record.enableGeneration
+                ));
+            if (id !== containerId || name !== recordedName || !exactReleaseOwnership) {
                 warnings.push(`${recordedName} changed identity during status inspection`);
                 runtimes.push(containerStatusEntry(
                     recordedName,

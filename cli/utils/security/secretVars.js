@@ -5,6 +5,10 @@ import { findAgent } from '../utils.js';
 import { loadSecretsFile, loadEnvFile } from './secretInjector.js';
 import { deleteSecretValue, readSecretsFile, setSecretValue } from './encryptedSecretsFile.js';
 import { deriveAgentSecret, deriveWorkspaceSecret } from './masterKey.js';
+import {
+    isReleaseCodingManifest,
+    readInnerReleaseDescriptor,
+} from '../runtime/releaseRuntime.js';
 
 export function parseSecrets() {
     return readSecretsFile();
@@ -755,6 +759,12 @@ export function buildEnvMap(manifest, profileConfig, options = {}) {
 }
 
 export function resolveManifestImage(manifest, profileConfig, options = {}) {
+    const releaseDescriptor = readInnerReleaseDescriptor();
+    if (releaseDescriptor && isReleaseCodingManifest(manifest)) {
+        return manifest['lite-sandbox'] === true
+            ? manifest.container
+            : releaseDescriptor.nodeImageId;
+    }
     const raw = String(manifest?.container || manifest?.image || 'node:18-alpine');
     if (!raw.includes('${')) return raw;
 

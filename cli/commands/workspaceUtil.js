@@ -961,6 +961,7 @@ function graphNodeRuntimeReplacementReason(plan, {
     if (!isSandboxRunningImpl(existing.key, {
       instanceId: record.instanceId,
       enableGeneration: record.enableGeneration,
+      releaseGeneration: record.releaseGeneration,
     })) return 'sandboxRuntimeStopped';
     const desired = computeEnvHashImpl(
       node.manifest,
@@ -1044,6 +1045,7 @@ function graphNodeRuntimeReplacementReason(plan, {
       contractHash: networkContractHash(profileResolution.network),
       instanceId: record.instanceId,
       enableGeneration: record.enableGeneration,
+      releaseGeneration: record.releaseGeneration,
       requireRuntimeIdentity: true,
     },
   );

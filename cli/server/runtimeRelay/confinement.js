@@ -11,12 +11,16 @@ export function normalizeRelayDescriptor(input = {}) {
     const targetAgentId = String(input.targetAgentId || '').trim();
     const effectiveInstanceId = String(input.effectiveInstanceId || '').trim();
     const enableGeneration = String(input.enableGeneration || '').trim();
+    const releaseGeneration = String(input.releaseGeneration || '').trim();
     const networkMode = String(input.networkMode || '').trim().toLowerCase();
     if (kind !== 'container-exec-stdio') throw new Error('relayConfinement: unsupported relay kind');
     if (!RUNTIMES.has(runtime)) throw new Error('relayConfinement: docker or podman runtime required');
     if (!CONTAINER_ID_PATTERN.test(containerId)) throw new Error('relayConfinement: immutable full container id required');
     if (!containerName || !targetAgentId || !effectiveInstanceId || !enableGeneration) {
         throw new Error('relayConfinement: complete owner identity required');
+    }
+    if (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration)) {
+        throw new Error('relayConfinement: releaseGeneration must be empty or an exact lowercase 64-hex digest');
     }
     return Object.freeze({
         kind,
@@ -26,6 +30,7 @@ export function normalizeRelayDescriptor(input = {}) {
         targetAgentId,
         effectiveInstanceId,
         enableGeneration,
+        releaseGeneration,
         networkMode,
     });
 }
@@ -44,7 +49,8 @@ export function verifyInspectedContainer(descriptor, inspection) {
     if (String(labels[NETWORK_LABELS.managed] || '') !== '1'
         || String(labels[NETWORK_LABELS.resource] || '') !== 'agent'
         || String(labels[NETWORK_LABELS.instanceId] || '') !== relay.effectiveInstanceId
-        || String(labels[NETWORK_LABELS.enableGeneration] || '') !== relay.enableGeneration) {
+        || String(labels[NETWORK_LABELS.enableGeneration] || '') !== relay.enableGeneration
+        || String(labels[NETWORK_LABELS.releaseGeneration] || '') !== relay.releaseGeneration) {
         throw new Error('relayConfinement: managed runtime identity mismatch');
     }
     if (relay.networkMode && networkMode !== relay.networkMode) {

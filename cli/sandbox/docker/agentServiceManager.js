@@ -119,6 +119,13 @@ import {
     resolveLlmRuntimeAdmissionContext,
 } from './llmRuntimeIntegration.js';
 import {
+    assertExactReleaseNodeImageInspectionReceipt,
+    assertInnerReleaseRuntimeIdentity,
+    bindInnerReleaseRuntimeIdentity,
+    readInnerReleaseDescriptor,
+    resolveInnerReleaseManifestImage,
+} from '../../utils/runtime/releaseRuntime.js';
+import {
     assertHostSandboxNetworkCompatibility,
     assertNetworkStartupCompatibility,
     canonicalizeNetwork,
@@ -1227,6 +1234,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             agentId: deriveAgentPrincipalId(repoName, agentName),
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
+            releaseGeneration: String(runtimeIdentity.releaseGeneration || ''),
             routeKey: instanceName,
             containerName,
         }, { preparedCapability: options.preparedHostModeCapability });
@@ -1252,7 +1260,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     } catch (err) {
         if (!isLlmRuntimeManifest(manifest, profileConfig)) throw err;
     }
-    let image = manifestImage;
+    let image = options.releaseManifestImage || manifestImage;
+    const exactReleaseImageInspection = options.releaseManifestImage
+        ? assertExactReleaseNodeImageInspectionReceipt(
+            options.releaseImageInspection,
+            options.releaseDescriptor,
+            image,
+        )
+        : null;
     const useProfileLifecycle = Boolean(profileConfig);
     const routerEndpoint = assertRouterEndpoint(options.routerEndpoint, runtimeNetworkPlan.mode, {
         explicitPort: options.routerPort,
@@ -1269,7 +1284,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
     // Resolved BEFORE dependency cache prep so the cache uses the selected image.
-    const llmRuntimeManifest = isLlmRuntimeManifest(manifest, profileConfig);
+    // The release descriptor is the sole image authority for qualifying coding
+    // manifests. Catalog/LLM settings cannot redirect that exact selection.
+    const llmRuntimeManifest = !options.releaseManifestImage
+        && isLlmRuntimeManifest(manifest, profileConfig);
     let llmStartup = { enabled: false };
     if (llmRuntimeManifest) {
         const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
@@ -1331,7 +1349,17 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const needsCoreDeps = !useStartEntry || agentHasPackageJson || llmRuntimeManifest;
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
     if (needsCoreDeps) {
-        const runtimeKey = detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
+        const runtimeKey = detectRuntimeKeyForAgent(
+            manifest,
+            repoName,
+            agentName,
+            profileConfig,
+            image,
+            {
+                releaseDescriptor: options.releaseDescriptor,
+                releaseImageInspection: exactReleaseImageInspection,
+            },
+        );
         const dependencyPlan = resolveDependencyCachePreparation({
             needsCoreDeps,
             agentHasPackageJson,
@@ -1706,6 +1734,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 principal: principalId,
                 instanceId: runtimeIdentity.instanceId,
                 enableGeneration: runtimeIdentity.enableGeneration,
+                releaseGeneration: String(runtimeIdentity.releaseGeneration || ''),
             },
         });
         const intent = buildRouterAuthorityTopologyIntent({
@@ -1985,6 +2014,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         runtimeIdentity: {
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
+            ...(runtimeIdentity.releaseGeneration
+                ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+                : {}),
             profile: activeProfile,
             backend: runtime,
             network: manifestNetwork,
@@ -2000,10 +2032,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let predecessorProviderIdentity = null;
     if (predecessorProviderOwners.length) {
         const identities = new Map(predecessorProviderOwners.map((owner) => [
-            `${owner.instanceId}\0${owner.enableGeneration}`,
+            `${owner.instanceId}\0${owner.enableGeneration}\0${owner.releaseGeneration}`,
             Object.freeze({
                 instanceId: owner.instanceId,
                 enableGeneration: owner.enableGeneration,
+                releaseGeneration: owner.releaseGeneration,
             }),
         ]));
         if (identities.size !== 1 || predecessorProviderOwners.some((owner) => (
@@ -2023,7 +2056,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         // Resolve both the target and fixed probe images before the network
         // transaction. The helper never pulls and never executes target-image
         // entrypoints, including start-only images without Node.js.
-        ensureImagePresent(image, { runtime });
+        if (!exactReleaseImageInspection) {
+            ensureImagePresent(image, { runtime });
+        }
         ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
         const launched = networkLifecycle.runManagedContainerTransaction({
             network: manifestNetwork,
@@ -2041,7 +2076,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ? ({ record }) => {
                     const labels = record?.Config?.Labels || record?.Labels || record?.labels || {};
                     if (String(labels[NETWORK_LABELS.instanceId] || '') !== predecessorProviderIdentity.instanceId
-                        || String(labels[NETWORK_LABELS.enableGeneration] || '') !== predecessorProviderIdentity.enableGeneration) {
+                        || String(labels[NETWORK_LABELS.enableGeneration] || '') !== predecessorProviderIdentity.enableGeneration
+                        || String(labels[NETWORK_LABELS.releaseGeneration] || '')
+                            !== predecessorProviderIdentity.releaseGeneration) {
                         const error = new Error(`managed predecessor '${containerName}' provider identity does not match its immutable container labels`);
                         error.code = 'PLOINKY_PROVIDER_TASK_LIFECYCLE_UNRECONCILED';
                         throw error;
@@ -2051,6 +2088,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                         runtimeKey: containerName,
                         instanceId: predecessorProviderIdentity.instanceId,
                         enableGeneration: predecessorProviderIdentity.enableGeneration,
+                        releaseGeneration: predecessorProviderIdentity.releaseGeneration,
                     });
                 }
                 : null,
@@ -2130,6 +2168,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ...(options.alias ? { alias: options.alias } : {}),
                 instanceId: runtimeIdentity.instanceId,
                 enableGeneration: runtimeIdentity.enableGeneration,
+                ...(runtimeIdentity.releaseGeneration
+                    ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+                    : {}),
             },
             cleanupReceipt,
             exactCleanupPerformed: managedRecovery?.exactCleanupPerformed === true,
@@ -2185,6 +2226,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             ...(options.alias ? { alias: options.alias } : {}),
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
+            ...(runtimeIdentity.releaseGeneration
+                ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+                : {}),
         }),
         ...(runtimeIdentity.preparationLease
             ? { preparationLease: runtimeIdentity.preparationLease }
@@ -2209,6 +2253,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                     contractHash: networkContractHash(manifestNetwork),
                     instanceId: runtimeIdentity.instanceId,
                     enableGeneration: runtimeIdentity.enableGeneration,
+                    releaseGeneration: runtimeIdentity.releaseGeneration,
                 },
             );
             exactCleanupPerformed = cleanup.removed === true || cleanup.state === 'absent';
@@ -2284,6 +2329,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         containerId: launchedContainerId,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        ...(runtimeIdentity.releaseGeneration
+            ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+            : {}),
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
@@ -2515,8 +2563,12 @@ export function assertPreparedRegistryRecordPreservation(existingRecord, options
     if (options.preservePreparedRegistryRecord !== true) return false;
     const stagedInstanceId = String(existingRecord?.instanceId || '');
     const stagedEnableGeneration = String(existingRecord?.enableGeneration || '');
+    const stagedReleaseGeneration = String(existingRecord?.releaseGeneration || '');
     const requestedInstanceId = String(options.instanceId || stagedInstanceId);
     const requestedEnableGeneration = String(options.enableGeneration || stagedEnableGeneration);
+    const requestedReleaseGeneration = String(
+        options.releaseGeneration ?? options.runtimeIdentity?.releaseGeneration ?? stagedReleaseGeneration,
+    );
     if ((!stagedInstanceId || !stagedEnableGeneration)
         && options.preparationLease?.mode === 'additive'
         && requestedInstanceId
@@ -2525,6 +2577,7 @@ export function assertPreparedRegistryRecordPreservation(existingRecord, options
             containerName: options.containerName,
             instanceId: requestedInstanceId,
             enableGeneration: requestedEnableGeneration,
+            releaseGeneration: requestedReleaseGeneration,
         });
         const canonicalProvided = options.preparedRegistryRecord
             ? JSON.parse(JSON.stringify(options.preparedRegistryRecord))
@@ -2538,9 +2591,10 @@ export function assertPreparedRegistryRecordPreservation(existingRecord, options
     }
     if (!stagedInstanceId || !stagedEnableGeneration
         || requestedInstanceId !== stagedInstanceId
-        || requestedEnableGeneration !== stagedEnableGeneration) {
+        || requestedEnableGeneration !== stagedEnableGeneration
+        || requestedReleaseGeneration !== stagedReleaseGeneration) {
         throw new Error(
-            `preserving the prepared registry record for ${ownerRef} requires its exact staged instanceId/enableGeneration`,
+            `preserving the prepared registry record for ${ownerRef} requires its exact staged runtime/release identity`,
         );
     }
     return true;
@@ -2552,6 +2606,7 @@ function capturePreparedRegistryRecord(containerName, runtimeIdentity) {
         containerName,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        releaseGeneration: String(runtimeIdentity.releaseGeneration || ''),
     });
     // Additive preparation deliberately leaves the active predecessor's
     // mutable registry untouched. Its immutable candidate record is therefore
@@ -2571,7 +2626,7 @@ function capturePreparedRegistryRecord(containerName, runtimeIdentity) {
     return structuredClone(record);
 }
 
-function mintReplacementRuntimeIdentity(existingRecord, uuid = randomUUID) {
+function mintReplacementRuntimeIdentity(existingRecord, uuid = randomUUID, releaseDescriptor = null) {
     const instanceId = String(uuid() || '').trim();
     const enableGeneration = String(uuid() || '').trim();
     if (!instanceId || !enableGeneration
@@ -2582,7 +2637,7 @@ function mintReplacementRuntimeIdentity(existingRecord, uuid = randomUUID) {
         || enableGeneration === String(existingRecord?.enableGeneration || '')) {
         throw new Error('replacement runtime identity mint did not produce a fresh instanceId and enableGeneration');
     }
-    return Object.freeze({ instanceId, enableGeneration });
+    return bindInnerReleaseRuntimeIdentity({ instanceId, enableGeneration }, releaseDescriptor);
 }
 
 export function coordinateReplacementRuntimeIdentity({
@@ -2590,6 +2645,7 @@ export function coordinateReplacementRuntimeIdentity({
     existingRecord,
     reason = 'runtime-replacement',
     networkLifecycleCapability,
+    releaseDescriptor = null,
 } = {}, {
     assertNetworkCapability = assertNetworkLifecycleCapability,
     prepare = prepareEdgeRoutingGenerationRaw,
@@ -2618,15 +2674,17 @@ export function coordinateReplacementRuntimeIdentity({
             throw new Error(`runtime replacement for '${exactContainerName}' requires one exact registered agent record`);
         }
         if (String(current.instanceId || '') !== String(existingRecord?.instanceId || '')
-            || String(current.enableGeneration || '') !== String(existingRecord?.enableGeneration || '')) {
+            || String(current.enableGeneration || '') !== String(existingRecord?.enableGeneration || '')
+            || String(current.releaseGeneration || '') !== String(existingRecord?.releaseGeneration || '')) {
             throw new Error(`runtime identity for '${exactContainerName}' changed before coordinated replacement`);
         }
 
-        runtimeIdentity = mintReplacementRuntimeIdentity(current, uuid);
+        runtimeIdentity = mintReplacementRuntimeIdentity(current, uuid, releaseDescriptor);
         agents[exactContainerName] = {
             ...current,
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
+            releaseGeneration: String(runtimeIdentity.releaseGeneration || ''),
         };
         saveRegistry(agents, { coordinate: false, applyLockCapability });
 
@@ -2645,7 +2703,9 @@ export function coordinateReplacementRuntimeIdentity({
     const preparedRecord = prepared?.generation?.agents?.[exactContainerName];
     if (prepared?.selector?.state !== 'inactive'
         || String(preparedRecord?.instanceId || '') !== runtimeIdentity.instanceId
-        || String(preparedRecord?.enableGeneration || '') !== runtimeIdentity.enableGeneration) {
+        || String(preparedRecord?.enableGeneration || '') !== runtimeIdentity.enableGeneration
+        || String(preparedRecord?.releaseGeneration || '')
+            !== String(runtimeIdentity.releaseGeneration || '')) {
         const mismatch = new Error(
             `coordinated replacement candidate did not remain inactive with the fresh runtime identity for '${exactContainerName}'`,
         );
@@ -2680,6 +2740,7 @@ export function resolveReplacementRuntimeIdentity({
     requestedInstanceId = '',
     requestedEnableGeneration = '',
     networkLifecycleCapability,
+    releaseDescriptor = null,
 } = {}, dependencies = {}) {
     if (!targetedRestart && !preservePreparedRegistryRecord
         && existingRuntime && !recreateReason) {
@@ -2693,13 +2754,14 @@ export function resolveReplacementRuntimeIdentity({
             || enableGeneration !== enableGeneration.trim()) {
             throw new Error('runtime reuse requires the exact registered instanceId and enableGeneration');
         }
-        return Object.freeze({
+        assertInnerReleaseRuntimeIdentity(existingRecord, releaseDescriptor);
+        return bindInnerReleaseRuntimeIdentity({
             instanceId,
             enableGeneration,
             ...(dependencies.preparationLease
                 ? { preparationLease: dependencies.preparationLease }
                 : {}),
-        });
+        }, releaseDescriptor);
     }
     if (!targetedRestart && !preservePreparedRegistryRecord && (
         existingRuntime && recreateReason
@@ -2710,17 +2772,21 @@ export function resolveReplacementRuntimeIdentity({
             existingRecord,
             reason: recreateReason || 'registered-runtime-missing',
             networkLifecycleCapability,
+            releaseDescriptor,
         }, dependencies);
     }
     if (targetedRestart || preservePreparedRegistryRecord) {
-        return Object.freeze({
+        return bindInnerReleaseRuntimeIdentity({
             instanceId: String(requestedInstanceId || existingRecord?.instanceId || ''),
             enableGeneration: String(requestedEnableGeneration || existingRecord?.enableGeneration || ''),
             ...(dependencies.preparationLease ? { preparationLease: dependencies.preparationLease } : {}),
-        });
+            ...(existingRecord?.releaseGeneration
+                ? { releaseGeneration: existingRecord.releaseGeneration }
+                : {}),
+        }, releaseDescriptor);
     }
     const uuid = dependencies.uuid || randomUUID;
-    return mintReplacementRuntimeIdentity({}, uuid);
+    return mintReplacementRuntimeIdentity({}, uuid, releaseDescriptor);
 }
 
 function ensureAgentService(agentName, manifest, agentPath, options = {}) {
@@ -2763,6 +2829,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         path: `manifest(${preflightRepoName}/${agentName})`,
     });
     const preflightAgentRuntime = getRuntimeForAgent(manifest);
+    const releaseDescriptor = readInnerReleaseDescriptor();
+    let releaseImageInspection = null;
+    const releaseManifestImage = resolveInnerReleaseManifestImage(manifest, {
+        descriptor: releaseDescriptor,
+        runtime: preflightAgentRuntime,
+        captureInspection: (receipt) => {
+            releaseImageInspection = receipt;
+        },
+    });
     const preflightRuntimeKind = isSandboxRuntime(preflightAgentRuntime)
         ? preflightAgentRuntime
         : 'container';
@@ -2912,6 +2987,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 ? {
                     instanceId: String(existingRecord.instanceId),
                     enableGeneration: String(existingRecord.enableGeneration),
+                    ...(existingRecord.releaseGeneration
+                        ? { releaseGeneration: String(existingRecord.releaseGeneration) }
+                        : {}),
                 }
                 : null;
             const anyRuntimeRunning = isBwrapProcessRunning(containerName);
@@ -2922,11 +3000,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 repoName,
             });
             const currentEnvHash = String(existingRecord.envHash || '');
+            const staleReleaseGeneration = String(existingRecord.releaseGeneration || '')
+                !== String(releaseDescriptor?.releaseGeneration || '');
             const sandboxRecreateReason = forceRecreate
                 ? 'forceRecreate'
-                : (!runningAtEntry
+                : (staleReleaseGeneration
+                    ? 'releaseGenerationDrift'
+                    : (!runningAtEntry
                     ? (anyRuntimeRunning ? 'runtimeIdentityDrift' : 'sandboxRuntimeStopped')
-                    : (desiredEnvHash && desiredEnvHash !== currentEnvHash ? 'envHashChanged' : null));
+                    : (desiredEnvHash && desiredEnvHash !== currentEnvHash ? 'envHashChanged' : null)));
             const requiresEdgeActivation = Boolean(existingRecord?.type === 'agent' && sandboxRecreateReason);
             const runtimeIdentity = resolveReplacementRuntimeIdentity({
                 containerName,
@@ -2937,6 +3019,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 preservePreparedRegistryRecord,
                 requestedInstanceId: String(options.instanceId || existingRecord.instanceId || ''),
                 requestedEnableGeneration: String(options.enableGeneration || existingRecord.enableGeneration || ''),
+                releaseDescriptor,
             }, { preparationLease: options.preparationLease });
             sandboxRuntimeIdentity = runtimeIdentity;
             sandboxStagedRegistryRecord = capturePreparedRegistryRecord(containerName, runtimeIdentity);
@@ -2953,6 +3036,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 runtimeIdentity: {
                     instanceId: runtimeIdentity.instanceId,
                     enableGeneration: runtimeIdentity.enableGeneration,
+                    ...(runtimeIdentity.releaseGeneration
+                        ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+                        : {}),
                     profile: activeProfile,
                     backend: agentRuntime,
                     network: manifestNetwork,
@@ -2963,6 +3049,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 agentId: deriveAgentPrincipalId(repoName, agentName),
                 instanceId: runtimeIdentity.instanceId,
                 enableGeneration: runtimeIdentity.enableGeneration,
+                ...(runtimeIdentity.releaseGeneration
+                    ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+                    : {}),
                 routeKey: aliasOverride || agentName,
                 containerName,
             };
@@ -2982,6 +3071,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 forceRecreate: Boolean(sandboxRecreateReason),
                 instanceId: runtimeIdentity.instanceId,
                 enableGeneration: runtimeIdentity.enableGeneration,
+                ...(runtimeIdentity.releaseGeneration
+                    ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+                    : {}),
                 preservePreparedRegistryRecord: preservePreparedRegistryRecord || requiresEdgeActivation,
                 preparedHostModeCapability,
                 runtimeAdmission: sandboxAdmission,
@@ -3004,6 +3096,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     processIdentity: true,
                     instanceId: runtimeIdentity.instanceId,
                     enableGeneration: runtimeIdentity.enableGeneration,
+                    ...(runtimeIdentity.releaseGeneration
+                        ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+                        : {}),
                 },
             });
             return {
@@ -3021,6 +3116,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             const identity = {
                 instanceId: String(sandboxRuntimeIdentity?.instanceId || options.instanceId || existingRecord.instanceId || ''),
                 enableGeneration: String(sandboxRuntimeIdentity?.enableGeneration || options.enableGeneration || existingRecord.enableGeneration || ''),
+                ...(sandboxRuntimeIdentity?.releaseGeneration || existingRecord.releaseGeneration
+                    ? { releaseGeneration: String(sandboxRuntimeIdentity?.releaseGeneration || existingRecord.releaseGeneration) }
+                    : {}),
             };
             let recoveryCandidate = abortPreparedRuntimeCandidateBeforeCleanup({
                 containerName,
@@ -3092,9 +3190,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // LLM-runtime agents get their real image from the hardware-aware catalog in
     // startAgentContainer; tolerate an unresolved manifest container placeholder
     // here (this `image` is only a record fallback below).
-    let image = '';
+    let image = releaseManifestImage || '';
     try {
-        image = resolveManifestImage(manifest, profileConfig, { agentName, repoName });
+        image ||= resolveManifestImage(manifest, profileConfig, { agentName, repoName });
     } catch (err) {
         if (!isLlmRuntimeManifest(manifest, profileConfig)) throw err;
     }
@@ -3201,6 +3299,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             contractHash: networkContractHash(manifestNetwork),
             instanceId: existingRecord.instanceId,
             enableGeneration: existingRecord.enableGeneration,
+            releaseGeneration: releaseDescriptor?.releaseGeneration || '',
             requireRuntimeIdentity: true,
         });
         if (contractInspection.state === 'foreign') {
@@ -3235,6 +3334,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             contractHash: networkContractHash(manifestNetwork),
             instanceId: existingRecord.instanceId,
             enableGeneration: existingRecord.enableGeneration,
+            releaseGeneration: releaseDescriptor?.releaseGeneration || '',
             requireRuntimeIdentity: true,
         });
         if (reuseInspection.state === 'foreign') {
@@ -3263,7 +3363,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 if (prepared?.selector?.state !== 'inactive'
                     || !prepared?.preparationLease
                     || String(preparedRecord?.instanceId || '') !== String(existingRecord.instanceId || '')
-                    || String(preparedRecord?.enableGeneration || '') !== String(existingRecord.enableGeneration || '')) {
+                    || String(preparedRecord?.enableGeneration || '') !== String(existingRecord.enableGeneration || '')
+                    || String(preparedRecord?.releaseGeneration || '')
+                        !== String(existingRecord.releaseGeneration || '')) {
                     const invalidPreparation = new Error(
                         `managed semantic adoption for '${containerName}' did not prepare its exact inactive identity`,
                     );
@@ -3279,6 +3381,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                                 ...(aliasOverride ? { alias: aliasOverride } : {}),
                                 instanceId: String(preparedRecord?.instanceId || existingRecord.instanceId || ''),
                                 enableGeneration: String(preparedRecord?.enableGeneration || existingRecord.enableGeneration || ''),
+                                releaseGeneration: String(
+                                    preparedRecord?.releaseGeneration
+                                    ?? existingRecord.releaseGeneration
+                                    ?? '',
+                                ),
                             }),
                         }, invalidPreparation, `managed-semantic-adoption-invalid:${containerName}`);
                     }
@@ -3295,6 +3402,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     agentId: deriveAgentPrincipalId(repoName, agentName),
                     instanceId: String(existingRecord.instanceId || ''),
                     enableGeneration: String(existingRecord.enableGeneration || ''),
+                    releaseGeneration: String(existingRecord.releaseGeneration || ''),
                     routeKey: aliasOverride || agentName,
                     containerName,
                 }, { preparedCapability: options.preparedHostModeCapability });
@@ -3361,6 +3469,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         targetedRestart: Boolean(targetedRestart),
         requestedInstanceId,
         requestedEnableGeneration,
+        releaseDescriptor,
     }, { preparationLease: managedReconciliationPreparationLease });
     let started = null;
     let stagedRegistryRecord = null;
@@ -3375,6 +3484,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             agentId: deriveAgentPrincipalId(repoName, agentName),
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
+            releaseGeneration: String(runtimeIdentity.releaseGeneration || ''),
             routeKey: aliasOverride || agentName,
             containerName,
         };
@@ -3392,6 +3502,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             runtimeIdentity: Object.freeze({
                 instanceId: String(existingRecord.instanceId || ''),
                 enableGeneration: String(existingRecord.enableGeneration || ''),
+                releaseGeneration: String(existingRecord.releaseGeneration || ''),
             }),
             containerId: String(existingRecord.containerId || ''),
             reason: `coordinated-targeted-restart:${containerName}`,
@@ -3421,6 +3532,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             routerEndpoint,
             networkLockWaitMs,
             runtimeIdentity,
+            releaseDescriptor,
+            releaseManifestImage,
+            releaseImageInspection,
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
             preparedHostModeCapability,
@@ -3484,6 +3598,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         containerId: started.containerId,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        ...(runtimeIdentity.releaseGeneration
+            ? { releaseGeneration: runtimeIdentity.releaseGeneration }
+            : {}),
         config: {
             binds: hasStartedBinds ? startedRecord.config.binds : [
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
@@ -3658,6 +3775,7 @@ function removeExactGenerationCandidate({
             contractHash: networkContractHash(network),
             instanceId: record.instanceId,
             enableGeneration: record.enableGeneration,
+            releaseGeneration: record.releaseGeneration,
         },
     );
     if (cleanup.removed !== true && cleanup.state !== 'absent') {
@@ -3701,6 +3819,9 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
         runtimeIdentity: {
             instanceId: String(record.instanceId),
             enableGeneration: String(record.enableGeneration),
+            ...(record.releaseGeneration
+                ? { releaseGeneration: String(record.releaseGeneration) }
+                : {}),
         },
         ...(runtimeKind === 'container' && suppliedContainerId
             ? { candidateId: suppliedContainerId }
@@ -3719,6 +3840,9 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
         const identity = {
             instanceId: record.instanceId,
             enableGeneration: record.enableGeneration,
+            ...(record.releaseGeneration
+                ? { releaseGeneration: record.releaseGeneration }
+                : {}),
         };
         if (!isBwrapProcessRunning(containerName, identity)) {
             return { removed: false, state: 'absent' };
@@ -3775,6 +3899,7 @@ function restartGenerationCapabilityRuntime({
         entry.agentId === owner.agentId
         && entry.instanceId === owner.instanceId
         && entry.enableGeneration === owner.enableGeneration
+        && entry.releaseGeneration === String(owner.releaseGeneration || '')
         && entry.routeKey === owner.routeKey
         && entry.containerName === owner.containerName
     ));
@@ -3795,7 +3920,8 @@ function restartGenerationCapabilityRuntime({
         || String(route.container || '') !== owner.containerName
         || `agent:${record.repoName}/${record.agentName}` !== owner.agentId
         || String(record.instanceId || '') !== owner.instanceId
-        || String(record.enableGeneration || '') !== owner.enableGeneration) {
+        || String(record.enableGeneration || '') !== owner.enableGeneration
+        || String(record.releaseGeneration || '') !== String(owner.releaseGeneration || '')) {
         throw new Error('coordinated capability-runtime restart could not resolve one exact captured runtime record');
     }
     const agentPath = String(route.hostPath || '').trim();
@@ -3818,6 +3944,7 @@ function restartGenerationCapabilityRuntime({
         forceRecreate: true,
         instanceId: owner.instanceId,
         enableGeneration: owner.enableGeneration,
+        releaseGeneration: String(owner.releaseGeneration || ''),
         preparedHostModeCapability,
         targetedRestart: {
             acknowledgement: TARGETED_DRAIN_ACKNOWLEDGEMENT,
@@ -3837,6 +3964,7 @@ function restartGenerationCapabilityRuntime({
             || String(resultRecord.containerId || '') !== resultContainerId
             || String(resultRecord.instanceId || '') !== owner.instanceId
             || String(resultRecord.enableGeneration || '') !== owner.enableGeneration
+            || String(resultRecord.releaseGeneration || '') !== String(owner.releaseGeneration || '')
             || !isRunning(resultContainerId, { runtime: PODMAN_RUNTIME })) {
             throw new Error(`coordinated capability-runtime restart did not start exact container '${owner.containerName}' with an immutable ID`);
         }
@@ -3853,6 +3981,7 @@ function restartGenerationCapabilityRuntime({
                 containerId: resultContainerId,
                 instanceId: owner.instanceId,
                 enableGeneration: owner.enableGeneration,
+                releaseGeneration: String(owner.releaseGeneration || ''),
             },
         );
         if (readiness && typeof readiness.then === 'function') {
@@ -3898,6 +4027,7 @@ export function isGenerationCapabilityRuntimeEffective({
         entry.agentId === owner.agentId
         && entry.instanceId === owner.instanceId
         && entry.enableGeneration === owner.enableGeneration
+        && entry.releaseGeneration === String(owner.releaseGeneration || '')
         && entry.routeKey === owner.routeKey
         && entry.containerName === owner.containerName
     ));
@@ -3911,7 +4041,8 @@ export function isGenerationCapabilityRuntimeEffective({
         || String(route.container || '') !== owner.containerName
         || `agent:${record.repoName}/${record.agentName}` !== owner.agentId
         || String(record.instanceId || '') !== owner.instanceId
-        || String(record.enableGeneration || '') !== owner.enableGeneration) {
+        || String(record.enableGeneration || '') !== owner.enableGeneration
+        || String(record.releaseGeneration || '') !== String(owner.releaseGeneration || '')) {
         return false;
     }
     const profileResolution = resolveManifestRuntimeProfile(manifest, {
@@ -3931,6 +4062,7 @@ export function isGenerationCapabilityRuntimeEffective({
         contractHash: networkContractHash(profileResolution.network),
         instanceId: owner.instanceId,
         enableGeneration: owner.enableGeneration,
+        releaseGeneration: String(owner.releaseGeneration || ''),
         requireRuntimeIdentity: true,
     });
     return inspection?.state === 'exact'

@@ -5,17 +5,15 @@ function routeError(message) {
 }
 
 function localAdmission(parsed) {
-    return parsed.localBoxImageId === null
+    return parsed.localReleaseDescriptor === null
         ? {}
         : {
-            localBoxImageId: parsed.localBoxImageId,
-            mediaHostPort: parsed.explicitMediaPort,
-            ...(parsed.explicitPort === null ? {} : { hostPort: parsed.explicitPort }),
+            localReleaseDescriptor: parsed.localReleaseDescriptor,
         };
 }
 
 function requireNoLocalAdmission(parsed, command) {
-    if (parsed.localBoxImageId !== null) {
+    if (parsed.localReleaseDescriptor !== null) {
         throw routeError(`${command}: local Box admission is not supported`);
     }
 }

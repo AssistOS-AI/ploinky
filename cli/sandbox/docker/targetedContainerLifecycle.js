@@ -150,6 +150,7 @@ export function drainTargetedContainer(name, {
         containerId,
         instanceId: runtimeIdentity?.instanceId,
         enableGeneration: runtimeIdentity?.enableGeneration,
+        releaseGeneration: runtimeIdentity?.releaseGeneration,
     });
     const boundedTimeout = validateTimeout(timeoutMs);
     const boundedPoll = Math.max(1, Math.min(Number(pollMs) || TARGETED_DRAIN_POLL_MS, boundedTimeout));
@@ -190,12 +191,23 @@ export function drainTargetedContainer(name, {
         );
     }
     if (!exists(identity.containerId, { runtime: 'podman' })) {
-        return Object.freeze({ state: 'absent', containerName, affectedSelectors: selectors });
+        return Object.freeze({
+            state: 'absent',
+            containerName,
+            releaseGeneration: identity.releaseGeneration,
+            affectedSelectors: selectors,
+        });
     }
     inspectRuntimeIdentity(identity);
     if (!isRunning(identity.containerId, { runtime: 'podman' })) {
         const exitCode = assertCleanTermination(containerName, inspect('podman', identity.containerId));
-        return Object.freeze({ state: 'already-stopped', containerName, exitCode, affectedSelectors: selectors });
+        return Object.freeze({
+            state: 'already-stopped',
+            containerName,
+            releaseGeneration: identity.releaseGeneration,
+            exitCode,
+            affectedSelectors: selectors,
+        });
     }
 
     const signaled = signal('podman', identity.containerId);
@@ -217,7 +229,13 @@ export function drainTargetedContainer(name, {
     }
 
     const exitCode = assertCleanTermination(containerName, inspect('podman', identity.containerId));
-    return Object.freeze({ state: 'drained', containerName, exitCode, affectedSelectors: selectors });
+    return Object.freeze({
+        state: 'drained',
+        containerName,
+        releaseGeneration: identity.releaseGeneration,
+        exitCode,
+        affectedSelectors: selectors,
+    });
 }
 
 export function drainAndRemoveTargetedContainer(name, options = {}) {
@@ -228,6 +246,7 @@ export function drainAndRemoveTargetedContainer(name, options = {}) {
         containerId: options.containerId,
         instanceId: options.runtimeIdentity?.instanceId,
         enableGeneration: options.runtimeIdentity?.enableGeneration,
+        releaseGeneration: options.runtimeIdentity?.releaseGeneration,
     });
     const exists = options.exists || containerExists;
     const result = drainTargetedContainer(containerName, { ...options, ...identity, exists });

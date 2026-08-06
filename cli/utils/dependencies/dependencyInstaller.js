@@ -3,6 +3,7 @@ import path from 'path';
 import { spawnSync } from 'child_process';
 import { GLOBAL_DEPS_PATH } from '../config.js';
 import { debugLog } from '../utils.js';
+import { readInnerReleaseDescriptor } from '../runtime/releaseRuntime.js';
 
 const IMMUTABLE_GIT_COMMIT = /^[0-9a-f]{40}$/;
 const ACTIVE_AGENTLIB_REF_ENVIRONMENTS = new WeakSet();
@@ -125,13 +126,11 @@ function readGlobalDepsPackage(env = process.env) {
 }
 
 /**
- * Apply deploy-time overrides to the global dependency set.
+ * Apply the active release identity to the global dependency set.
  *
- * achillesAgentLib is normally pinned to a fixed git ref in
- * globalDeps/package.json. `PLOINKY_AGENTLIB_REF` (set by `ploinky start` from
- * the global --branch, or exported directly) points every agent's
- * achillesAgentLib at a resolved immutable commit for a single deploy without
- * editing tracked files.
+ * A managed release takes its sole AgentLib identity from
+ * PLOINKY_RELEASE_DESCRIPTOR. Legacy direct-core operation may still consume
+ * an immutable PLOINKY_AGENTLIB_REF, but the two sources can never coexist.
  *
  * A bare immutable commit is swapped onto the existing dependency URL. A full
  * npm git spec is used verbatim only when its ref is also an immutable commit.
@@ -148,7 +147,20 @@ function overrideGlobalDeps(pkg, env = process.env) {
         'The tracked achillesAgentLib dependency',
     );
 
+    const releaseDescriptor = readInnerReleaseDescriptor({ env });
     const ref = String(env.PLOINKY_AGENTLIB_REF || '').trim();
+    if (releaseDescriptor) {
+        if (ref) {
+            const error = new Error('PLOINKY_RELEASE_DESCRIPTOR is the sole release authority; independent PLOINKY_AGENTLIB_REF is forbidden');
+            error.code = 'PLOINKY_RELEASE_GENERATION_STALE';
+            throw error;
+        }
+        const current = String(deps.achillesAgentLib || '');
+        const hashIdx = current.indexOf('#');
+        const base = hashIdx >= 0 ? current.slice(0, hashIdx) : current;
+        deps.achillesAgentLib = `${base}#${releaseDescriptor.agentlibSha}`;
+        return pkg;
+    }
     if (!ref) {
         return pkg;
     }
@@ -241,7 +253,16 @@ function resolveAgentlibBranchRef(branchPolicy, {
     url,
     env = process.env,
 } = {}) {
+    const releaseDescriptor = readInnerReleaseDescriptor({ env });
     const explicitRef = String(env?.PLOINKY_AGENTLIB_REF || '').trim();
+    if (releaseDescriptor) {
+        if (explicitRef) {
+            const error = new Error('PLOINKY_RELEASE_DESCRIPTOR is the sole release authority; independent PLOINKY_AGENTLIB_REF is forbidden');
+            error.code = 'PLOINKY_RELEASE_GENERATION_STALE';
+            throw error;
+        }
+        return null;
+    }
     if (explicitRef) {
         if (IMMUTABLE_GIT_COMMIT.test(explicitRef)) {
             return explicitRef;

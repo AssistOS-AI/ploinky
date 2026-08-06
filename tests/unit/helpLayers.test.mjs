@@ -32,10 +32,11 @@ test('cli help documents outer and agent forms', () => {
     assert.match(text, /selected runtime is mandatory/i);
 });
 
-test('start help documents only immutable AgentLib overrides', () => {
+test('start help documents release-descriptor AgentLib authority without an override escape hatch', () => {
     const text = captureHelp(['start'], { surface: 'core' });
-    assert.match(text, /PLOINKY_AGENTLIB_REF=<40-hex-commit\|git\+https-spec#40-hex-commit>/);
-    assert.doesNotMatch(text, /PLOINKY_AGENTLIB_REF=<branch\|git\+\/file: spec>/);
+    assert.match(text, /solely from its immutable PLOINKY_RELEASE_DESCRIPTOR/);
+    assert.match(text, /PLOINKY_AGENTLIB_REF is not a managed release override/);
+    assert.doesNotMatch(text, /Advanced escape hatch/);
 });
 
 test('host and core lifecycle help have different scopes', () => {

@@ -5,6 +5,11 @@ import {
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { IMAGE_CONTRACT } from './image.mjs';
+import {
+    RELEASE_DESCRIPTOR_ENV,
+    parseReleaseDescriptor,
+    serializeReleaseDescriptor,
+} from './release.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
 
@@ -179,11 +184,35 @@ export function validateContainerConfiguration(containerHandle, {
     imageRef,
     repositoryRoot,
     hostKind = 'native-linux',
+    releaseDescriptor = null,
 }) {
     const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort);
     const runtime = containerHandle.runtime;
     if (containerHandle.id === '' || runtime.imageId !== imageId) {
         throw publicationError('Owned Box image ID does not match the validated immutable image');
+    }
+    let serializedRelease = null;
+    if (releaseDescriptor) {
+        serializedRelease = serializeReleaseDescriptor(releaseDescriptor);
+        if (imageId !== releaseDescriptor.boxImageId
+            || hostPort !== releaseDescriptor.routerHostPort
+            || mediaHostPort !== releaseDescriptor.mediaHostPort) {
+            throw publicationError('Owned Box release descriptor does not match image or publications');
+        }
+        let observedRelease;
+        try {
+            observedRelease = parseReleaseDescriptor(
+                containerHandle.labels?.[BOX_LABELS.releaseDescriptor],
+                { expectedControllerSourceSha: releaseDescriptor.controllerSourceSha },
+            );
+        } catch (error) {
+            throw publicationError(`Owned Box release descriptor label is incompatible: ${error.message}`);
+        }
+        if (serializeReleaseDescriptor(observedRelease) !== serializedRelease
+            || containerHandle.labels?.[BOX_LABELS.releaseGeneration]
+                !== releaseDescriptor.releaseGeneration) {
+            throw publicationError('Owned Box release generation label is incompatible');
+        }
     }
     if (runtime.user !== 'podman' || runtime.privileged || runtime.init !== true) {
         throw publicationError('Owned Box user, privilege, or init state is incompatible');
@@ -194,6 +223,10 @@ export function validateContainerConfiguration(containerHandle, {
         [BOX_LABELS.imageRef]: imageRef,
         [BOX_LABELS.routerHostPort]: String(hostPort),
         [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
+        ...(releaseDescriptor ? {
+            [BOX_LABELS.releaseDescriptor]: serializedRelease,
+            [BOX_LABELS.releaseGeneration]: releaseDescriptor.releaseGeneration,
+        } : {}),
     };
     const ownershipLabels = Object.fromEntries(Object.entries(containerHandle.labels)
         .filter(([key]) => key.startsWith(BOX_OWNERSHIP_LABEL_PREFIX))
@@ -207,6 +240,9 @@ export function validateContainerConfiguration(containerHandle, {
         PLOINKY_PUBLIC_BIND: '0.0.0.0',
         PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
         PLOINKY_PRIVATE_BIND: '0.0.0.0',
+        ...(releaseDescriptor ? {
+            [RELEASE_DESCRIPTOR_ENV]: serializedRelease,
+        } : {}),
     };
     const observedEnvironment = { ...runtime.environment };
     const runtimeHostname = observedEnvironment.HOSTNAME;

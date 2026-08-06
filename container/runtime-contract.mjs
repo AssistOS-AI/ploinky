@@ -8,6 +8,8 @@ export const VOLUME_ROLE_LABEL =
     'io.assistos.ploinky.volume-role';
 export const PLOINKY_SOURCE_SHA_LABEL =
     'io.assistos.ploinky.source-sha';
+export const PLOINKY_AGENTLIB_SHA_LABEL =
+    'io.assistos.ploinky.agentlib-sha';
 export const BOX_ROUTER_PORT = 8080;
 export const BOX_MEDIA_PORT = 7882;
 
@@ -151,18 +153,25 @@ export function validateImageContract(image, imageRef) {
         contractFailure(imageRef, 'image ID', 'a non-empty local image ID', image.id);
     }
     const labelKeys = isObjectRecord(image.labels) ? Object.keys(image.labels) : [];
-    const sourceSha = labelKeys.length === 1 && labelKeys[0] === PLOINKY_SOURCE_SHA_LABEL
-        ? String(image.labels[PLOINKY_SOURCE_SHA_LABEL] ?? '')
-        : '';
-    if (!/^[0-9a-f]{40}$/.test(sourceSha)) {
+    const allowedLabels = new Set([PLOINKY_SOURCE_SHA_LABEL, PLOINKY_AGENTLIB_SHA_LABEL]);
+    const sourceSha = String(image.labels?.[PLOINKY_SOURCE_SHA_LABEL] ?? '');
+    const rawAgentlibSha = image.labels?.[PLOINKY_AGENTLIB_SHA_LABEL];
+    const agentlibSha = String(rawAgentlibSha ?? '');
+    const exactLabels = labelKeys.length >= 1
+        && labelKeys.every((key) => allowedLabels.has(key));
+    const validAgentlibSha = rawAgentlibSha === undefined
+        || /^[0-9a-f]{40}$/.test(agentlibSha);
+    if (!exactLabels || !/^[0-9a-f]{40}$/.test(sourceSha) || !validAgentlibSha) {
         contractFailure(
             imageRef,
             'Config.Labels',
-            `exactly ${PLOINKY_SOURCE_SHA_LABEL}=<40 lowercase hexadecimal Ploinky commit>`,
+            `${PLOINKY_SOURCE_SHA_LABEL}=<40 lowercase hexadecimal Ploinky commit>`
+                + ` and optional ${PLOINKY_AGENTLIB_SHA_LABEL}=<40 lowercase hexadecimal AgentLib commit>`,
             image.labels,
         );
     }
     image.sourceSha = sourceSha;
+    image.agentlibSha = agentlibSha;
     if (image.user !== REQUIRED_IMAGE_USER) {
         contractFailure(imageRef, 'Config.User', JSON.stringify(REQUIRED_IMAGE_USER), image.user);
     }

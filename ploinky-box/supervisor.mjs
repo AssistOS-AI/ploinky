@@ -3,6 +3,13 @@ import http from 'node:http';
 
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from './constants.mjs';
 import { inspectAndValidateExistingImage } from './contract/image.mjs';
+import {
+    RELEASE_DESCRIPTOR_ENV,
+    inspectAndValidateReleaseImage,
+    parseReleaseDescriptor,
+    serializeReleaseDescriptor,
+    validateReleaseControllerAdmission,
+} from './contract/release.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import {
     readWorkspaceEdgeDesired,
@@ -225,6 +232,8 @@ export function createBoxSupervisor({
     repositoryRoot = path.resolve(import.meta.dirname, '..'),
     reconcile = reconcileBoxContainer,
     validateExistingImage = inspectAndValidateExistingImage,
+    validateReleaseImage = inspectAndValidateReleaseImage,
+    validateReleaseAdmission = validateReleaseControllerAdmission,
     startCore = runBoundedCoreStart,
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
@@ -235,6 +244,18 @@ export function createBoxSupervisor({
 } = {}) {
     function inspect(identity) {
         return discover(identity, runner, platform, env);
+    }
+
+    function admitMutationRelease(requested, ownership) {
+        let descriptor = requested || null;
+        if (!descriptor) {
+            const serialized = String(
+                ownership?.handles?.container?.labels?.[BOX_LABELS.releaseDescriptor] || '',
+            );
+            if (serialized) descriptor = parseReleaseDescriptor(serialized);
+        }
+        if (descriptor) validateReleaseAdmission(descriptor, { repositoryRoot });
+        return descriptor;
     }
 
     async function lockedMutation(execute) {
@@ -250,11 +271,15 @@ export function createBoxSupervisor({
 
     async function prepareBoxForCommand({
         explicitPort,
-        explicitMediaPort,
-        localBoxImageId,
+        releaseDescriptor,
         imageRef = BOX_IMAGE_REFERENCE,
+        ...retired
     } = {}) {
+        if (Object.hasOwn(retired, 'explicitMediaPort') || Object.hasOwn(retired, 'localBoxImageId')) {
+            throw supervisorError('Loose local image/media inputs are retired; use one release descriptor');
+        }
         return lockedMutation(async (identity, lock, ownership) => {
+            const admittedRelease = admitMutationRelease(releaseDescriptor, ownership);
             const prepared = await reconcile({
                 identity,
                 ownership,
@@ -263,8 +288,7 @@ export function createBoxSupervisor({
                 lock,
                 repositoryRoot,
                 explicitPort,
-                explicitMediaPort,
-                localBoxImageId,
+                releaseDescriptor: admittedRelease,
                 imageRef,
                 platform,
                 env,
@@ -278,7 +302,13 @@ export function createBoxSupervisor({
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
+        if (Object.hasOwn(options, 'explicitMediaPort')
+            || Object.hasOwn(options, 'localBoxImageId')
+            || Object.hasOwn(options, 'agentlibRef')) {
+            throw supervisorError('Loose release inputs are retired; use one release descriptor');
+        }
         return lockedMutation(async (identity, lock, ownership) => {
+            const admittedRelease = admitMutationRelease(options.releaseDescriptor, ownership);
             const prepared = await reconcile({
                 identity,
                 ownership,
@@ -287,8 +317,7 @@ export function createBoxSupervisor({
                 lock,
                 repositoryRoot,
                 explicitPort: options.explicitPort,
-                explicitMediaPort: options.explicitMediaPort,
-                localBoxImageId: options.localBoxImageId,
+                releaseDescriptor: admittedRelease,
                 imageRef: options.imageRef || BOX_IMAGE_REFERENCE,
                 platform,
                 env,
@@ -315,7 +344,9 @@ export function createBoxSupervisor({
                 {
                     stdout,
                     stderr,
-                    ...(options.agentlibRef ? { agentlibRef: options.agentlibRef } : {}),
+                    ...(admittedRelease
+                        ? { releaseDescriptor: admittedRelease }
+                        : {}),
                 },
             );
             await healthCheck(prepared.hostPort);
@@ -411,6 +442,31 @@ export function createBoxSupervisor({
         if (!container) {
             return Object.freeze({ identity, ownership, state: 'absent-retained-volumes' });
         }
+        let releaseDescriptor = null;
+        const serializedRelease = String(container.labels?.[BOX_LABELS.releaseDescriptor] || '');
+        if (serializedRelease) {
+            try {
+                releaseDescriptor = parseReleaseDescriptor(serializedRelease);
+                if (container.labels?.[BOX_LABELS.releaseGeneration]
+                    !== releaseDescriptor.releaseGeneration) {
+                    throw new Error('release generation label mismatch');
+                }
+                validateReleaseAdmission(releaseDescriptor, { repositoryRoot });
+                validateReleaseImage(
+                    ownership.engine.name,
+                    'box',
+                    releaseDescriptor,
+                    runner,
+                );
+            } catch (error) {
+                return Object.freeze({
+                    identity,
+                    ownership,
+                    state: 'incompatible',
+                    detail: `Owned Box release is incompatible: ${error.message}`,
+                });
+            }
+        }
         try {
             validateExistingImage(
                 ownership.engine.name,
@@ -427,7 +483,7 @@ export function createBoxSupervisor({
             });
         }
         if (!container.runtime.running) {
-            return Object.freeze({ identity, ownership, state: 'stopped' });
+            return Object.freeze({ identity, ownership, state: 'stopped', releaseDescriptor });
         }
         const checkedInbox = queryBoxInbox(ownership.engine, container.id, runner);
         if (!checkedInbox.ok) {
@@ -436,6 +492,7 @@ export function createBoxSupervisor({
                 ownership,
                 state: 'running-transient',
                 inbox: null,
+                releaseDescriptor,
             });
         }
         try {
@@ -445,6 +502,7 @@ export function createBoxSupervisor({
                 ownership,
                 state: allowlisted.initialized ? 'running-initialized' : 'running-uninitialized',
                 inbox: allowlisted,
+                releaseDescriptor,
             });
         } catch {
             return Object.freeze({
@@ -452,19 +510,26 @@ export function createBoxSupervisor({
                 ownership,
                 state: 'running-transient',
                 inbox: null,
+                releaseDescriptor,
             });
         }
     }
 
     function planDryRun(options = {}) {
+        if (Object.hasOwn(options, 'explicitMediaPort') || Object.hasOwn(options, 'localBoxImageId')) {
+            throw supervisorError('Loose local image/media inputs are retired; use one release descriptor');
+        }
         const { identity, ownership } = inspectBoxStatus();
         return Object.freeze({
             identity: identity.instance,
             ownership: ownership.state,
             desiredImage: BOX_IMAGE_REFERENCE,
-            desiredLocalImageId: options.localBoxImageId || null,
-            desiredHostPort: options.explicitPort || null,
-            desiredMediaHostPort: options.explicitMediaPort || null,
+            desiredReleaseGeneration: options.releaseDescriptor?.releaseGeneration || null,
+            desiredLocalImageId: options.releaseDescriptor?.boxImageId || null,
+            desiredHostPort: options.releaseDescriptor?.routerHostPort
+                || options.explicitPort
+                || null,
+            desiredMediaHostPort: options.releaseDescriptor?.mediaHostPort || null,
             mutationPerformed: false,
         });
     }
@@ -507,6 +572,10 @@ export function formatBoxStatus(status) {
         `Ploinky Box: ${status.state}`,
         `Workspace identity: ${status.identity.instance}`,
     ];
+    if (status.releaseDescriptor) {
+        lines.push(`Release generation: ${status.releaseDescriptor.releaseGeneration}`);
+        lines.push(`Node image: ${status.releaseDescriptor.nodeImageId}`);
+    }
     if (status.inbox) {
         lines.push(`Core initialized: ${status.inbox.initialized ? 'yes' : 'no'}`);
         lines.push(`Routing configured: ${status.inbox.routingConfigured ? 'yes' : 'no'}`);
@@ -539,21 +608,21 @@ export async function runBoundedCoreStart(
         stdout = process.stdout,
         stderr = process.stderr,
         timeoutMs = 1_800_000,
-        agentlibRef,
+        releaseDescriptor,
     } = {},
 ) {
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
         throw supervisorError('Bounded core start requires normalized start argv');
     }
-    if (agentlibRef !== undefined && !/^[0-9a-f]{40}$/.test(String(agentlibRef))) {
-        throw supervisorError(
-            'Bounded core start requires PLOINKY_AGENTLIB_REF to be exactly 40 lowercase hexadecimal characters',
-        );
-    }
+    const serializedRelease = releaseDescriptor
+        ? serializeReleaseDescriptor(releaseDescriptor)
+        : '';
     const result = await runner.stream(engine.name, [
         'container', 'exec',
         '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
-        ...(agentlibRef ? ['--env', `PLOINKY_AGENTLIB_REF=${agentlibRef}`] : []),
+        ...(releaseDescriptor ? [
+            '--env', `${RELEASE_DESCRIPTOR_ENV}=${serializedRelease}`,
+        ] : []),
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,

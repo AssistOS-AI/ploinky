@@ -30,8 +30,12 @@ export function requireExactPodmanRuntimeIdentity(input = {}) {
     }
     const instanceId = input.instanceId;
     const enableGeneration = input.enableGeneration;
+    const releaseGeneration = String(input.releaseGeneration || '');
     if (!exactText(instanceId) || !exactText(enableGeneration)) {
         throw identityError('requires exact instanceId and enableGeneration');
+    }
+    if (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration)) {
+        throw identityError('requires releaseGeneration to be empty or an exact lowercase 64-hex digest');
     }
     return Object.freeze({
         runtime: 'podman',
@@ -39,6 +43,7 @@ export function requireExactPodmanRuntimeIdentity(input = {}) {
         containerId,
         instanceId,
         enableGeneration,
+        releaseGeneration,
     });
 }
 
@@ -82,7 +87,8 @@ export function inspectExactPodmanRuntimeIdentity(input, {
         || labels[NETWORK_LABELS.resource] !== 'agent'
         || labels[NETWORK_LABELS.schema] !== NETWORK_SCHEMA_VERSION
         || labels[NETWORK_LABELS.instanceId] !== identity.instanceId
-        || labels[NETWORK_LABELS.enableGeneration] !== identity.enableGeneration) {
+        || labels[NETWORK_LABELS.enableGeneration] !== identity.enableGeneration
+        || String(labels[NETWORK_LABELS.releaseGeneration] || '') !== identity.releaseGeneration) {
         throw identityError(
             `does not match the exact managed record for '${identity.containerName}'`,
         );

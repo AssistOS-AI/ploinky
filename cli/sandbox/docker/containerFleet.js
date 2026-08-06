@@ -120,6 +120,7 @@ function sandboxRuntimeIdentity(record) {
     return Object.freeze({
         instanceId: record.instanceId,
         enableGeneration: record.enableGeneration,
+        releaseGeneration: String(record.releaseGeneration || ''),
     });
 }
 
@@ -134,6 +135,7 @@ function assertExactContainerOwnership(name, record, inspected, expectedId, work
     }
     const expectedInstanceId = record?.instanceId;
     const expectedEnableGeneration = record?.enableGeneration;
+    const expectedReleaseGeneration = String(record?.releaseGeneration || '');
     const labels = labelsOf(inspected);
     if (!expectedInstanceId || !expectedEnableGeneration
         || labels?.[NETWORK_LABELS.managed] !== '1'
@@ -143,6 +145,7 @@ function assertExactContainerOwnership(name, record, inspected, expectedId, work
         || !/^[a-f0-9]{64}$/.test(String(labels?.[NETWORK_LABELS.contract] || ''))
         || String(labels?.[NETWORK_LABELS.instanceId] || '') !== expectedInstanceId
         || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration
+        || String(labels?.[NETWORK_LABELS.releaseGeneration] || '') !== expectedReleaseGeneration
         || inspected?.HostConfig?.Init !== true) {
         throw new Error(`fleet lifecycle for '${name}' could not prove exact managed ownership labels and runtime identity`);
     }
@@ -179,16 +182,18 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     pause = defaultPause,
     now = Date.now,
     workspaceIdentity = workspaceNetworkIdentity,
+    listProviderOwners = listProviderTaskOwners,
 } = {}) {
     if (runtime !== 'podman' || record?.runtime !== 'podman') {
         throw new Error(`fleet lifecycle for '${name}' runtime must be exactly 'podman'`);
     }
     classifyExactAgentRuntime(name, record);
     const expectedId = record.containerId;
-    const providerOwners = listProviderTaskOwners({
+    const providerOwners = listProviderOwners({
         runtimeKey: name,
         instanceId: record.instanceId,
         enableGeneration: record.enableGeneration,
+        releaseGeneration: String(record.releaseGeneration || ''),
     });
     const clearContainedProviderOwners = () => removeProviderTaskOwnersAfterContainment(
         providerOwners,
@@ -197,6 +202,7 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
             runtimeKey: name,
             instanceId: record.instanceId,
             enableGeneration: record.enableGeneration,
+            releaseGeneration: String(record.releaseGeneration || ''),
         },
     );
     return withLock(() => {
@@ -422,6 +428,7 @@ function stopConfiguredAgents({
                     runtimeKey: entry.runtimeKey,
                     instanceId: entry.expectedIdentity.instanceId,
                     enableGeneration: entry.expectedIdentity.enableGeneration,
+                    releaseGeneration: entry.expectedIdentity.releaseGeneration,
                 }).length === 0;
                 if (!entry.running && noOwner && noProviderTasks) continue;
                 survivors.push(Object.freeze({

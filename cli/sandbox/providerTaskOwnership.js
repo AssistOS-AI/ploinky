@@ -6,7 +6,7 @@ import { PLOINKY_DIR } from '../utils/config.js';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import { normalizeProcessIdentity } from './processIdentity.js';
 
-const PROVIDER_TASK_OWNER_SCHEMA_VERSION = 6;
+const PROVIDER_TASK_OWNER_SCHEMA_VERSION = 7;
 const PROVIDER_TASK_REQUEST_SCHEMA_VERSION = 1;
 const PROVIDER_TASK_OWNER_DIR = path.join(PLOINKY_DIR, 'run', 'provider-task-owners');
 const PROVIDER_TASK_LOG_ROOT = path.join(PLOINKY_DIR, 'logs', 'agents');
@@ -41,7 +41,7 @@ const TERMINAL_PROOF_KEYS = Object.freeze([
 const OWNER_KEYS = Object.freeze([
     'agentId', 'alias', 'audience', 'brokerOwner', 'enableGeneration', 'homeKey', 'instanceId',
     'logPath', 'mode', 'ownerKey', 'pid', 'processGroupId', 'processIdentity',
-    'processUid', 'provider', 'readiness', 'role', 'runtime', 'runtimeKey',
+    'processUid', 'provider', 'readiness', 'releaseGeneration', 'role', 'runtime', 'runtimeKey',
     'runtimeKind', 'schemaVersion', 'state', 'taskId', 'workdir',
 ]);
 const sequenceByOwner = new Map();
@@ -161,6 +161,7 @@ function resolveSelectedProviderRuntime(snapshot, callerIdentity) {
         enableGeneration: record.enableGeneration,
         homeKey: expectedHomeKey,
         instanceId: record.instanceId,
+        releaseGeneration: String(record.releaseGeneration || ''),
         runtime: runtime === 'podman' ? 'container' : runtime,
         runtimeKey,
         runtimeKind: selectedRuntimeKind(runtime),
@@ -181,6 +182,13 @@ function normalizeContext({ snapshot, callerIdentity, selectedRuntime } = {}) {
         enableGeneration: exactText(selected.enableGeneration, 'enableGeneration'),
         homeKey: safeSegment(selected.homeKey, 'homeKey'),
         instanceId: exactText(selected.instanceId, 'instanceId'),
+        releaseGeneration: (() => {
+            const value = String(selected.releaseGeneration || '');
+            if (value && !/^[a-f0-9]{64}$/.test(value)) {
+                throw ownershipError('provider task releaseGeneration is invalid');
+            }
+            return value;
+        })(),
         runtime: exactText(selected.runtime, 'runtime'),
         runtimeKey: safeSegment(selected.runtimeKey, 'runtimeKey'),
         runtimeKind: selected.runtimeKind || selectedRuntimeKind(selected.runtime),
@@ -264,6 +272,7 @@ function expectedOwner(context, common) {
         alias: context.alias,
         instanceId: context.instanceId,
         enableGeneration: context.enableGeneration,
+        releaseGeneration: context.releaseGeneration,
         runtime: context.runtime,
         logPath,
         ...common,
@@ -780,6 +789,7 @@ function appendProviderTaskLog({ body, ...options } = {}) {
     if (!owner || owner.agentId !== context.agentId
         || owner.instanceId !== context.instanceId
         || owner.enableGeneration !== context.enableGeneration
+        || owner.releaseGeneration !== context.releaseGeneration
         || owner.provider !== request.provider
         || owner.processIdentity !== request.processIdentity) {
         throw ownershipError('provider task log does not match a published owner', 'PLOINKY_PROVIDER_TASK_NOT_FOUND', 404);
@@ -987,11 +997,15 @@ function enumerateStoreOwnerKeys({ recoverableOwnerKey = '' } = {}) {
     return [...new Set([...owners, ...reports])].sort();
 }
 
-function listProviderTaskOwners({ runtimeKey, instanceId, enableGeneration } = {}) {
+function listProviderTaskOwners({ runtimeKey, instanceId, enableGeneration, releaseGeneration } = {}) {
     ensureStore();
     const selectedRuntime = runtimeKey === undefined ? '' : safeSegment(runtimeKey, 'runtimeKey');
     const selectedInstance = instanceId === undefined ? '' : exactText(instanceId, 'instanceId');
     const selectedGeneration = enableGeneration === undefined ? '' : exactText(enableGeneration, 'enableGeneration');
+    const selectedRelease = releaseGeneration === undefined ? null : String(releaseGeneration || '');
+    if (selectedRelease && !/^[a-f0-9]{64}$/.test(selectedRelease)) {
+        throw ownershipError('provider task releaseGeneration is invalid');
+    }
     return Object.freeze(enumerateStoreOwnerKeys()
         .map((key) => {
             const report = readReport(key);
@@ -1004,15 +1018,20 @@ function listProviderTaskOwners({ runtimeKey, instanceId, enableGeneration } = {
         .filter((owner) => owner
             && (!selectedRuntime || owner.runtimeKey === selectedRuntime)
             && (!selectedInstance || owner.instanceId === selectedInstance)
-            && (!selectedGeneration || owner.enableGeneration === selectedGeneration))
+            && (!selectedGeneration || owner.enableGeneration === selectedGeneration)
+            && (selectedRelease === null || owner.releaseGeneration === selectedRelease))
         .sort((left, right) => left.ownerKey.localeCompare(right.ownerKey)));
 }
 
-function collectProviderTaskOwnersReadOnly({ runtimeKey, instanceId, enableGeneration } = {}) {
+function collectProviderTaskOwnersReadOnly({ runtimeKey, instanceId, enableGeneration, releaseGeneration } = {}) {
     if (!assertStoreReadOnly()) return Object.freeze([]);
     const selectedRuntime = runtimeKey === undefined ? '' : safeSegment(runtimeKey, 'runtimeKey');
     const selectedInstance = instanceId === undefined ? '' : exactText(instanceId, 'instanceId');
     const selectedGeneration = enableGeneration === undefined ? '' : exactText(enableGeneration, 'enableGeneration');
+    const selectedRelease = releaseGeneration === undefined ? null : String(releaseGeneration || '');
+    if (selectedRelease && !/^[a-f0-9]{64}$/.test(selectedRelease)) {
+        throw ownershipError('provider task releaseGeneration is invalid');
+    }
     return Object.freeze(enumerateStoreOwnerKeys()
         .map((key) => {
             const report = readReport(key, { initialize: false });
@@ -1025,7 +1044,8 @@ function collectProviderTaskOwnersReadOnly({ runtimeKey, instanceId, enableGener
         .filter((owner) => owner
             && (!selectedRuntime || owner.runtimeKey === selectedRuntime)
             && (!selectedInstance || owner.instanceId === selectedInstance)
-            && (!selectedGeneration || owner.enableGeneration === selectedGeneration))
+            && (!selectedGeneration || owner.enableGeneration === selectedGeneration)
+            && (selectedRelease === null || owner.releaseGeneration === selectedRelease))
         .sort((left, right) => left.ownerKey.localeCompare(right.ownerKey)));
 }
 
@@ -1033,6 +1053,7 @@ function classifyProviderTaskOwnersReadOnly({
     runtimeKey,
     instanceId,
     enableGeneration,
+    releaseGeneration,
     nowMs = Date.now(),
     staleAfterMs = PROVIDER_TASK_STALE_AFTER_MS,
 } = {}) {
@@ -1044,6 +1065,7 @@ function classifyProviderTaskOwnersReadOnly({
         runtimeKey,
         instanceId,
         enableGeneration,
+        releaseGeneration,
     }).map((owner) => {
         const report = readReport(owner.ownerKey, { initialize: false });
         const heartbeat = readHeartbeat(owner, { initialize: false });
@@ -1088,12 +1110,14 @@ function reconcileProviderTaskOwnershipReadOnly({
             const exactGeneration = Boolean(record?.type === 'agent'
                 && record.instanceId === owner.instanceId
                 && record.enableGeneration === owner.enableGeneration
+                && String(record.releaseGeneration || '') === owner.releaseGeneration
                 && exactHomeKey
                 && expectedRuntime === owner.runtime);
             const parent = parents.get(owner.runtimeKey);
             const exactParent = Boolean(exactGeneration && parent
                 && parent.instanceId === owner.instanceId
-                && parent.enableGeneration === owner.enableGeneration);
+                && parent.enableGeneration === owner.enableGeneration
+                && String(parent.releaseGeneration || '') === owner.releaseGeneration);
             const report = reports.get(`${owner.runtimeKey}\0${owner.taskId}`);
             const exactReport = Boolean(report
                 && report.processIdentity === owner.processIdentity
@@ -1117,6 +1141,7 @@ function reconcileProviderTaskOwnershipReadOnly({
                 ownerKey: owner.ownerKey,
                 instanceId: owner.instanceId,
                 enableGeneration: owner.enableGeneration,
+                releaseGeneration: owner.releaseGeneration,
                 effectiveInstance: owner.alias,
                 homeKey: owner.homeKey,
                 workdir: owner.workdir,
@@ -1136,7 +1161,8 @@ function reconcileProviderTaskOwnershipReadOnly({
 
 function removeProviderTaskOwnersAfterContainment(owners, proof = {}) {
     if (!Array.isArray(owners) || proof?.contained !== true
-        || !proof.runtimeKey || !proof.instanceId || !proof.enableGeneration) {
+        || !proof.runtimeKey || !proof.instanceId || !proof.enableGeneration
+        || !Object.hasOwn(proof, 'releaseGeneration')) {
         throw ownershipError('exact service/container containment proof is required', 'PLOINKY_PROVIDER_TASK_CONTAINMENT_REQUIRED', 409);
     }
     const removed = [];
@@ -1144,7 +1170,8 @@ function removeProviderTaskOwnersAfterContainment(owners, proof = {}) {
         const validated = validateStoredOwner(owner, owner?.ownerKey);
         if (validated.runtimeKey !== proof.runtimeKey
             || validated.instanceId !== proof.instanceId
-            || validated.enableGeneration !== proof.enableGeneration) {
+            || validated.enableGeneration !== proof.enableGeneration
+            || validated.releaseGeneration !== String(proof.releaseGeneration || '')) {
             throw ownershipError('containment proof does not match captured provider owner', 'PLOINKY_PROVIDER_TASK_CONTAINMENT_REQUIRED', 409);
         }
         writeReport(validated, 'contained');
@@ -1163,6 +1190,7 @@ function removeReportedTerminalProviderTaskOwner(entry) {
     if (!owner || owner.ownerKey !== entry.ownerKey
         || owner.instanceId !== entry.instanceId
         || owner.enableGeneration !== entry.enableGeneration
+        || owner.releaseGeneration !== String(entry.releaseGeneration || '')
         || owner.processIdentity !== entry.processIdentity
         || report?.state !== 'terminal'
         || !sameOwner(report.owner, owner)) {
@@ -1187,6 +1215,7 @@ function resolveRetiredProviderTaskCaller(body) {
         agentId: owner.agentId,
         instanceId: owner.instanceId,
         enableGeneration: owner.enableGeneration,
+        releaseGeneration: owner.releaseGeneration,
         routeKey: owner.alias,
         containerName: owner.runtimeKey,
         retired: true,

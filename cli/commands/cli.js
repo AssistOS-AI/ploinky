@@ -422,12 +422,9 @@ async function handleCommand(args) {
                     throw new Error(profileResult.message);
                 }
             }
-            // The global --branch also drives the achillesAgentLib used by agent
-            // containers (the branch must exist on the achillesAgentLib remote;
-            // missing AgentLib branches abort without a pinned-ref fallback).
-            // Propagated via PLOINKY_AGENTLIB_REF,
-            // read host-side by readGlobalDepsPackage and inherited by the
-            // Watchdog/router via buildRouterEnv.
+            // Managed releases take AgentLib solely from the immutable release
+            // descriptor. Legacy direct-core starts may still resolve --branch
+            // to an immutable AgentLib commit for their scoped process tree.
             const agentlibRef = resolveAgentlibBranchRef(startParsed.branchPolicy);
             reconcileConfiguredProviderTaskOwnership({ registry: workspaceSvc.loadAgents() });
             await withScopedAgentlibRef(agentlibRef, () => startWorkspace(

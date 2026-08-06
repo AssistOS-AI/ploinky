@@ -13,7 +13,7 @@ import {
 } from '../providerTaskOwnership.js';
 
 const BWRAP_PIDS_DIR = path.join(PLOINKY_DIR, 'bwrap-pids');
-const SANDBOX_OWNER_SCHEMA_VERSION = 5;
+const SANDBOX_OWNER_SCHEMA_VERSION = 6;
 const BWRAP_PID_SCHEMA_VERSION = SANDBOX_OWNER_SCHEMA_VERSION;
 const SANDBOX_OWNER_ROLES = Object.freeze({
     service: 'service',
@@ -40,6 +40,7 @@ const OWNER_RECORD_KEYS = Object.freeze([
     'processIdentity',
     'processUid',
     'provider',
+    'releaseGeneration',
     'role',
     'rootPort',
     'routeKey',
@@ -155,7 +156,13 @@ function normalizeSandboxRuntimeIdentity(identity) {
     }
     const instanceId = exactText(identity.instanceId, 'instanceId');
     const enableGeneration = exactText(identity.enableGeneration, 'enableGeneration');
-    return Object.freeze({ instanceId, enableGeneration });
+    const releaseGeneration = identity.releaseGeneration === undefined
+        ? ''
+        : exactText(identity.releaseGeneration, 'releaseGeneration', { allowEmpty: true });
+    if (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration)) {
+        throw ownerError('sandbox runtime releaseGeneration must be an exact 64-character lowercase digest');
+    }
+    return Object.freeze({ instanceId, enableGeneration, releaseGeneration });
 }
 
 function ownerDigest(namespace, fields) {
@@ -614,7 +621,8 @@ function ownerMatchesExpected(record, expected) {
     if (expected === undefined) return true;
     const identity = normalizeSandboxRuntimeIdentity(expected);
     if (record.instanceId !== identity.instanceId
-        || record.enableGeneration !== identity.enableGeneration) return false;
+        || record.enableGeneration !== identity.enableGeneration
+        || record.releaseGeneration !== identity.releaseGeneration) return false;
     for (const field of [
         'role',
         'runtimeKey',
@@ -994,12 +1002,14 @@ function stopSandboxOwner(ownerKey, {
         runtimeKey: record.runtimeKey,
         instanceId: record.instanceId,
         enableGeneration: record.enableGeneration,
+        releaseGeneration: record.releaseGeneration,
     });
     const clearProviderOwners = () => removeProviderTaskOwnersAfterContainment(providerOwners, {
         contained: true,
         runtimeKey: record.runtimeKey,
         instanceId: record.instanceId,
         enableGeneration: record.enableGeneration,
+        releaseGeneration: record.releaseGeneration,
     });
     if (!isExactSandboxOwnerProcess(record)) {
         clearProviderOwners();

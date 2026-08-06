@@ -68,6 +68,7 @@ function exactSandboxReadinessRoute({ route, manifest, runtimeResult, record }) 
     const routeContainer = routeDeclaresContainer ? exactNonEmptyString(route.container) : '';
     const effectiveInstanceId = exactNonEmptyString(record.instanceId);
     const enableGeneration = exactNonEmptyString(record.enableGeneration);
+    const releaseGeneration = String(record.releaseGeneration || '').trim();
     const repoName = exactNonEmptyString(record.repoName);
     const agentName = exactNonEmptyString(record.agentName);
     const owner = record.bwrapOwner;
@@ -82,6 +83,7 @@ function exactSandboxReadinessRoute({ route, manifest, runtimeResult, record }) 
         || (routeContainer && routeContainer !== containerName)
         || !effectiveInstanceId
         || !enableGeneration
+        || (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration))
         || !repoName
         || !agentName
         || !owner
@@ -93,6 +95,7 @@ function exactSandboxReadinessRoute({ route, manifest, runtimeResult, record }) 
         || !owner.routeKey
         || owner.instanceId !== effectiveInstanceId
         || owner.enableGeneration !== enableGeneration
+        || String(owner.releaseGeneration || '') !== releaseGeneration
         || !runtimeHostPort
         || !routeHostPort
         || !ownerHostPort
@@ -152,6 +155,7 @@ export function buildRelayReadinessRoute({
     const routeContainer = routeDeclaresContainer ? exactNonEmptyString(route.container) : '';
     const effectiveInstanceId = exactNonEmptyString(record.instanceId);
     const enableGeneration = exactNonEmptyString(record.enableGeneration);
+    const releaseGeneration = String(record.releaseGeneration || '').trim();
     const repoName = exactNonEmptyString(record.repoName);
     const agentName = exactNonEmptyString(record.agentName);
     if (typeof containerId !== 'string'
@@ -163,6 +167,7 @@ export function buildRelayReadinessRoute({
         || (routeContainer && routeContainer !== containerName)
         || !effectiveInstanceId
         || !enableGeneration
+        || (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration))
         || !repoName
         || !agentName) {
         throw readinessRuntimeError(runtime);
@@ -174,6 +179,7 @@ export function buildRelayReadinessRoute({
             targetAgentId,
             effectiveInstanceId,
             enableGeneration,
+            releaseGeneration,
             containerId,
             port,
         ]))
@@ -189,11 +195,13 @@ export function buildRelayReadinessRoute({
             targetAgentId,
             effectiveInstanceId,
             enableGeneration,
+            releaseGeneration,
             networkMode: hostNetwork ? 'host' : '',
         },
         owner: {
             effectiveInstanceId,
             enableGeneration,
+            releaseGeneration,
         },
         primaryService: { port },
         deniedPorts: hostNetwork ? [8080, 8081] : [],

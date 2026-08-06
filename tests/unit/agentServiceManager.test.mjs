@@ -209,13 +209,13 @@ test('prepared graph launches suppress intermediate registry persistence only fo
             instanceId: staged.instanceId,
             enableGeneration: 'stale-enable',
         }, { ownerRef: 'media/livekit' }),
-        /exact staged instanceId\/enableGeneration/,
+        /exact staged runtime\/release identity/,
     );
     assert.throws(
         () => assertPreparedRegistryRecordPreservation({}, {
             preservePreparedRegistryRecord: true,
         }, { ownerRef: 'repo/non-host-dependency' }),
-        /exact staged instanceId\/enableGeneration/,
+        /exact staged runtime\/release identity/,
     );
 
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
@@ -241,12 +241,28 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     }
 });
 
+test('an admitted release Node image has one sealed inspection and no generic second lookup', () => {
+    const source = fs.readFileSync(
+        new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url),
+        'utf8',
+    );
+    assert.match(source, /captureInspection:\s*\(receipt\)\s*=>/);
+    assert.match(source, /releaseImageInspection/);
+    assert.match(
+        source,
+        /detectRuntimeKeyForAgent\([\s\S]*?\{[\s\S]*?releaseDescriptor[\s\S]*?releaseImageInspection[\s\S]*?\}\)/,
+    );
+    assert.match(source, /assertExactReleaseNodeImageInspectionReceipt/);
+    assert.match(source, /if \(!exactReleaseImageInspection\)\s*\{\s*ensureImagePresent\(image, \{ runtime \}\);\s*\}/);
+});
+
 test('effective generation capability requires the exact managed runtime to be running', () => {
     const containerId = 'a'.repeat(64);
     const owner = {
         agentId: 'agent:repo/livekit',
         instanceId: 'instance-current',
         enableGeneration: 'enable-current',
+        releaseGeneration: '2'.repeat(64),
         routeKey: 'livekit',
         containerName: 'livekit-container',
     };
@@ -272,6 +288,7 @@ test('effective generation capability requires the exact managed runtime to be r
                 agentName: 'livekit',
                 instanceId: owner.instanceId,
                 enableGeneration: owner.enableGeneration,
+                releaseGeneration: owner.releaseGeneration,
             },
         },
     };
@@ -308,6 +325,7 @@ test('effective generation capability requires the exact managed runtime to be r
             assert.equal(agentName, 'livekit');
             assert.equal(options.instanceId, owner.instanceId);
             assert.equal(options.enableGeneration, owner.enableGeneration);
+            assert.equal(options.releaseGeneration, owner.releaseGeneration);
             assert.equal(options.requireRuntimeIdentity, true);
             return { state: 'exact', id: containerId };
         },
@@ -322,6 +340,14 @@ test('effective generation capability requires the exact managed runtime to be r
         exists: () => true,
         isRunning: () => true,
         inspectContainerContract: () => ({ state: 'owned-drift', reason: 'runtime-identity' }),
+    }), false);
+    assert.equal(isGenerationCapabilityRuntimeEffective({
+        generation,
+        owner: { ...owner, releaseGeneration: '1'.repeat(64) },
+    }, {
+        exists: () => assert.fail('stale release must fail before probing'),
+        isRunning: () => assert.fail('stale release must fail before probing'),
+        inspectContainerContract: () => assert.fail('stale release must fail before inspection'),
     }), false);
     assert.equal(isGenerationCapabilityRuntimeEffective({
         generation: {
@@ -374,6 +400,7 @@ test('targeted capability restart cannot activate before exact semantic readines
         agentId: 'agent:media/livekit',
         instanceId: 'instance-current',
         enableGeneration: 'enable-current',
+        releaseGeneration: '',
         routeKey: 'livekit',
         containerName: 'livekit-container',
     };
@@ -450,6 +477,7 @@ test('targeted capability restart cannot activate before exact semantic readines
             containerId: failedContainerId,
             instanceId: owner.instanceId,
             enableGeneration: owner.enableGeneration,
+            releaseGeneration: owner.releaseGeneration,
         }],
     ]);
     assert.equal(cleanupCalls.length, 1);
@@ -490,6 +518,7 @@ test('targeted capability restart cannot activate before exact semantic readines
                 containerId: readyContainerId,
                 instanceId: owner.instanceId,
                 enableGeneration: owner.enableGeneration,
+                releaseGeneration: owner.releaseGeneration,
             });
             return { status: 'success' };
         },

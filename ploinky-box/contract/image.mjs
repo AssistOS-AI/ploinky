@@ -47,6 +47,7 @@ export const IMAGE_CONTRACT = Object.freeze({
     ]),
     networkHelpers: Object.freeze(['pasta', 'slirp4netns']),
     sourceShaLabel: 'io.assistos.ploinky.source-sha',
+    agentlibShaLabel: 'io.assistos.ploinky.agentlib-sha',
     buildahVersionLabel: 'io.buildah.version',
     bubblewrapNevra: 'bubblewrap-0:0.11.0-4.fc44',
     bwrapHelper: '/usr/local/libexec/ploinky-bwrap-launch',
@@ -142,31 +143,38 @@ function sameRecord(left, right) {
         ));
 }
 
-function validateSourceLabel(labels, imageRef) {
+function validateProvenanceLabels(labels, imageRef) {
     const label = IMAGE_CONTRACT.sourceShaLabel;
+    const agentlibLabel = IMAGE_CONTRACT.agentlibShaLabel;
     const buildahLabel = IMAGE_CONTRACT.buildahVersionLabel;
     const keys = isRecord(labels) ? Object.keys(labels).sort() : [];
-    const allowedKeys = new Set([label, buildahLabel]);
+    const allowedKeys = new Set([label, agentlibLabel, buildahLabel]);
     const sourceSha = String(labels?.[label] ?? '');
+    const rawAgentlibSha = labels?.[agentlibLabel];
+    const agentlibSha = String(rawAgentlibSha ?? '');
     const buildahVersion = labels?.[buildahLabel];
     const hasOnlyAllowedLabels = keys.length >= 1
         && keys.every((key) => allowedKeys.has(key));
     const hasValidBuildahVersion = buildahVersion === undefined
         || /^[0-9]+(?:\.[0-9]+){1,3}$/.test(String(buildahVersion));
+    const hasValidAgentlibSha = rawAgentlibSha === undefined
+        || /^[0-9a-f]{40}$/.test(agentlibSha);
     if (!hasOnlyAllowedLabels
         || !/^[0-9a-f]{40}$/.test(sourceSha)
+        || !hasValidAgentlibSha
         || !hasValidBuildahVersion) {
         throw contractError(
             imageRef,
             'Config.Labels',
             `only ${label}=<40 lowercase hexadecimal Ploinky commit>`
+                + `, optional ${agentlibLabel}=<40 lowercase hexadecimal AgentLib commit>,`
                 + ` and optional ${buildahLabel}=<numeric dotted version>`,
             labels,
             'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT',
             '; destroy and recreate the Box with the current runtime image',
         );
     }
-    return sourceSha;
+    return Object.freeze({ sourceSha, agentlibSha });
 }
 
 export function validateImageContract(image, imageRef, {
@@ -178,7 +186,7 @@ export function validateImageContract(image, imageRef, {
     if (!image.id) {
         throw contractError(imageRef, 'image ID', 'a nonempty immutable ID', image.id);
     }
-    const sourceSha = validateSourceLabel(image.labels, imageRef);
+    const { sourceSha, agentlibSha } = validateProvenanceLabels(image.labels, imageRef);
     if (image.user !== IMAGE_CONTRACT.user) {
         throw contractError(imageRef, 'Config.User', JSON.stringify(IMAGE_CONTRACT.user), image.user);
     }
@@ -212,7 +220,7 @@ export function validateImageContract(image, imageRef, {
     if (availableBinaries !== undefined) {
         validateImageBinaries(availableBinaries, imageRef);
     }
-    return Object.freeze({ ...image, immutableId: image.id, sourceSha });
+    return Object.freeze({ ...image, immutableId: image.id, sourceSha, agentlibSha });
 }
 
 export function validateImageBinaries(availableBinaries, imageRef) {

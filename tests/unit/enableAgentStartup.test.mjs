@@ -282,6 +282,7 @@ test('verifyEnabledAgentStarted checks the sandbox PID for a bwrap agent', () =>
             assert.deepEqual(identity, {
                 instanceId: 'instance-current',
                 enableGeneration: 'generation-current',
+                releaseGeneration: '',
             });
             return true;
         },

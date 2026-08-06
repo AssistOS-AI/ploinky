@@ -128,6 +128,24 @@ test('compatible image normalizes and validates every required metadata field', 
     assert.equal(validateImageContract(normalized, REQUIRED_RUNTIME_IMAGE), normalized);
 });
 
+test('runtime image validation admits an exact optional AgentLib attestation only', () => {
+    const exact = compatibleImage();
+    exact.Config.Labels['io.assistos.ploinky.agentlib-sha'] =
+        'dd94929443033c0a43bf7569068ec1d2926dba35';
+    const normalized = normalizeImageInspect(exact);
+    assert.equal(
+        validateImageContract(normalized, REQUIRED_RUNTIME_IMAGE),
+        normalized,
+    );
+
+    const mutable = compatibleImage();
+    mutable.Config.Labels['io.assistos.ploinky.agentlib-sha'] = 'main';
+    assert.throws(
+        () => validateImageContract(normalizeImageInspect(mutable), REQUIRED_RUNTIME_IMAGE),
+        /Config\.Labels/,
+    );
+});
+
 test('image configuration validation emits field-specific failures', async t => {
     const cases = [
         ['image ID', raw => { raw.Id = ''; }, /image ID/],

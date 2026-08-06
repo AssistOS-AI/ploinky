@@ -23,6 +23,7 @@ function fixture({ runningChecks = [true, false], exitCode = 0 } = {}) {
             runtimeIdentity: Object.freeze({
                 instanceId: 'instance-exact',
                 enableGeneration: 'generation-exact',
+                releaseGeneration: '7'.repeat(64),
             }),
             timeoutMs: 10,
             pollMs: 1,
@@ -40,6 +41,7 @@ function fixture({ runningChecks = [true, false], exitCode = 0 } = {}) {
             },
             inspectRuntimeIdentity: (identity) => {
                 assert.equal(identity.containerId, CONTAINER_ID);
+                assert.equal(identity.releaseGeneration, '7'.repeat(64));
                 events.push(['identity', identity.containerId]);
                 return identity;
             },
@@ -62,6 +64,7 @@ test('targeted drain proves exact selectors inactive before SIGTERM and removes 
     assert.deepEqual(result, {
         state: 'drained',
         containerName: 'ploinky_agent',
+        releaseGeneration: '7'.repeat(64),
         exitCode: 0,
         affectedSelectors: ['service:route/editor'],
         removed: true,
@@ -142,6 +145,7 @@ test('targeted drain rejects generic runtime and incomplete immutable identity b
         { containerId: 'ploinky_agent' },
         { runtimeIdentity: { instanceId: '', enableGeneration: 'generation-exact' } },
         { runtimeIdentity: { instanceId: 'instance-exact', enableGeneration: ' padded ' } },
+        { runtimeIdentity: { instanceId: 'instance-exact', enableGeneration: 'generation-exact', releaseGeneration: 'main' } },
     ]) {
         state.events.length = 0;
         assert.throws(

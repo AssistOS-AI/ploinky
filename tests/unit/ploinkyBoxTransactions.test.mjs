@@ -10,6 +10,11 @@ import {
 } from '../../ploinky-box/constants.mjs';
 import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
+import {
+    REQUIRED_RELEASE_AGENTLIB_SHA,
+    createReleaseDescriptor,
+    serializeReleaseDescriptor,
+} from '../../ploinky-box/contract/release.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     containerCreateArgs,
@@ -47,6 +52,7 @@ function containerHandle({
     id,
     running = true,
     hostKind = 'native-linux',
+    releaseDescriptor = null,
 }) {
     return {
         id,
@@ -57,6 +63,10 @@ function containerHandle({
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: String(hostPort),
             [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
+            ...(releaseDescriptor ? {
+                [BOX_LABELS.releaseDescriptor]: serializeReleaseDescriptor(releaseDescriptor),
+                [BOX_LABELS.releaseGeneration]: releaseDescriptor.releaseGeneration,
+            } : {}),
         },
         runtime: {
             complete: true,
@@ -73,6 +83,9 @@ function containerHandle({
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
+                ...(releaseDescriptor ? {
+                    PLOINKY_RELEASE_DESCRIPTOR: serializeReleaseDescriptor(releaseDescriptor),
+                } : {}),
                 HOSTNAME: id.slice(0, 12),
             },
             publications: [
@@ -102,6 +115,21 @@ function containerHandle({
             ],
         },
     };
+}
+
+function exactRelease(boxImageId = 'c'.repeat(64)) {
+    return createReleaseDescriptor({
+        schema: 'ploinky-release-v1',
+        boxImageId,
+        boxImageDigest: `sha256:${'1'.repeat(64)}`,
+        nodeImageId: 'd'.repeat(64),
+        nodeImageDigest: `sha256:${'2'.repeat(64)}`,
+        artifactSourceSha: '3'.repeat(40),
+        controllerSourceSha: '4'.repeat(40),
+        agentlibSha: REQUIRED_RELEASE_AGENTLIB_SHA,
+        routerHostPort: 18080,
+        mediaHostPort: 17882,
+    });
 }
 
 test('container validation ignores inherited image labels but rejects unknown ownership labels', (t) => {
@@ -263,6 +291,7 @@ function harness(state, {
                 const imageRefLabel = args.find((value) => value.startsWith(`${BOX_LABELS.imageRef}=`));
                 const portLabel = args.find((value) => value.startsWith(`${BOX_LABELS.routerHostPort}=`));
                 const mediaPortLabel = args.find((value) => value.startsWith(`${BOX_LABELS.mediaHostPort}=`));
+                const releaseLabel = args.find((value) => value.startsWith(`${BOX_LABELS.releaseDescriptor}=`));
                 current = containerHandle({
                     identity: state.identity,
                     repositoryRoot: state.root,
@@ -272,6 +301,9 @@ function harness(state, {
                     mediaHostPort: Number(mediaPortLabel.slice(mediaPortLabel.indexOf('=') + 1)),
                     id: cid,
                     running: false,
+                    releaseDescriptor: releaseLabel
+                        ? JSON.parse(releaseLabel.slice(releaseLabel.indexOf('=') + 1))
+                        : null,
                 });
             }
             if (args[0] === 'container' && args[1] === 'start') current.runtime.running = true;
@@ -303,6 +335,15 @@ function harness(state, {
         validateExistingImage(engine, imageId, imageRef) {
             calls.push(['seam', 'validate-existing-image', engine, imageId, imageRef]);
             return { immutableId: imageId };
+        },
+        validateReleaseImage(engine, kind, descriptor) {
+            calls.push(['seam', 'validate-release-image', engine, kind, descriptor.boxImageId]);
+            if (candidateImage !== descriptor.boxImageId) {
+                const error = new Error('release image mismatch');
+                error.code = 'PLOINKY_RELEASE_IMAGE_STALE';
+                throw error;
+            }
+            return descriptor;
         },
         ensureVolumes() {
             calls.push(['seam', 'ensure-volumes']);
@@ -454,9 +495,10 @@ test('initial transaction preflights before pull, volumes, and container creatio
     assert.ok(flat.findIndex((value) => value.includes('ensure-volumes')) < flat.findIndex((value) => value.includes('container create')));
 });
 
-test('local immutable image admission validates the exact ID without any pull', async (t) => {
+test('release admission validates the coupled exact Box ID without any pull', async (t) => {
     const state = fixture(t);
     const imageId = 'c'.repeat(64);
+    const releaseDescriptor = exactRelease(imageId);
     const h = harness(state, { candidateImage: imageId });
     const result = await reconcileBoxContainer({
         identity: state.identity,
@@ -465,9 +507,7 @@ test('local immutable image admission validates the exact ID without any pull', 
         runner: h.runner,
         lock: state.lock,
         repositoryRoot: state.root,
-        explicitPort: 18080,
-        explicitMediaPort: 17882,
-        localBoxImageId: imageId,
+        releaseDescriptor,
     }, h.seams);
     assert.equal(result.imageId, imageId);
     assert.equal(result.hostPort, 18080);
@@ -477,12 +517,16 @@ test('local immutable image admission validates the exact ID without any pull', 
         h.calls.find((call) => call[0] === 'seam' && call[1] === 'validate-image'),
         ['seam', 'validate-image', 'podman', imageId],
     );
+    assert.deepEqual(
+        h.calls.find((call) => call[0] === 'seam' && call[1] === 'validate-release-image'),
+        ['seam', 'validate-release-image', 'podman', 'box', imageId],
+    );
     const create = h.calls.find((call) => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
     assert.equal(create.includes('0.0.0.0:17882:7882/udp'), true);
     assert.equal(create.at(-1), imageId);
 });
 
-test('local immutable image mismatch fails before volume or container mutation', async (t) => {
+test('release image mismatch fails before volume or container mutation', async (t) => {
     const state = fixture(t);
     const h = harness(state, { candidateImage: 'd'.repeat(64) });
     await assert.rejects(() => reconcileBoxContainer({
@@ -492,13 +536,31 @@ test('local immutable image mismatch fails before volume or container mutation',
         runner: h.runner,
         lock: state.lock,
         repositoryRoot: state.root,
-        explicitPort: 18080,
-        explicitMediaPort: 17882,
-        localBoxImageId: 'c'.repeat(64),
-    }, h.seams), (error) => error.code === 'PLOINKY_BOX_LOCAL_IMAGE_ID_MISMATCH');
+        releaseDescriptor: exactRelease('c'.repeat(64)),
+    }, h.seams), (error) => error.code === 'PLOINKY_RELEASE_IMAGE_STALE');
     assert.equal(h.calls.some((call) => call.includes('pull')), false);
     assert.equal(h.calls.some((call) => call.includes('ensure-volumes')), false);
     assert.equal(h.calls.some((call) => call.includes('container') && call.includes('create')), false);
+});
+
+test('retired loose local image and media inputs fail before mutation', async (t) => {
+    const state = fixture(t);
+    for (const retired of [
+        { localBoxImageId: 'c'.repeat(64) },
+        { explicitMediaPort: 17882 },
+    ]) {
+        const h = harness(state);
+        await assert.rejects(() => reconcileBoxContainer({
+            identity: state.identity,
+            ownership: { state: 'absent', handles: null },
+            engine: { name: 'podman', identity: 'engine' },
+            runner: h.runner,
+            lock: state.lock,
+            repositoryRoot: state.root,
+            ...retired,
+        }, h.seams), { code: 'PLOINKY_RELEASE_DESCRIPTOR_REQUIRED' });
+        assert.deepEqual(h.calls, []);
+    }
 });
 
 test('validated reuse rechecks pre-existing volume handles without registry or volume mutation', async (t) => {

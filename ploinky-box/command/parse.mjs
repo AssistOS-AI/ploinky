@@ -2,6 +2,7 @@ import { BOX_ROUTER_CONTAINER_PORT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { parseHostPort } from '../ports.mjs';
 import { parseAgentCliArguments } from './agent-cli.mjs';
+import { parseReleaseDescriptor } from '../contract/release.mjs';
 
 function argumentError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
@@ -13,13 +14,6 @@ function parseArgumentPort(value, source) {
     } catch (error) {
         throw argumentError(error.message);
     }
-}
-
-function parseLocalImageId(value) {
-    if (!/^[a-f0-9]{64}$/.test(String(value || ''))) {
-        throw argumentError('--local-box-image-id must be exactly 64 lowercase hexadecimal characters');
-    }
-    return value;
 }
 
 function consumeValue(tokens, index, flag) {
@@ -66,7 +60,7 @@ function analyzeStart(tokens, commandToken, explicitPort) {
     return { hostPort, positionalPortIndex };
 }
 
-export function parseOuterArguments(argv) {
+export function parseOuterArguments(argv, releaseOptions = {}) {
     if (!Array.isArray(argv) || argv.some((value) => typeof value !== 'string')) {
         throw new TypeError('Outer arguments must be an array of strings');
     }
@@ -80,8 +74,7 @@ export function parseOuterArguments(argv) {
         .filter((token) => token.rawIndex !== firstDebugIndex);
     const removedRawIndexes = new Set();
     let explicitPort = null;
-    let explicitMediaPort = null;
-    let localBoxImageId = null;
+    let localReleaseDescriptor = null;
     let dryRun = false;
     let help = false;
     let commandToken = null;
@@ -107,33 +100,31 @@ export function parseOuterArguments(argv) {
         if (token.text.startsWith('--port=')) {
             throw argumentError('--port=PORT is unsupported; use --port PORT before start');
         }
-        if (token.text === '--local-box-image-id') {
-            if (localBoxImageId !== null) {
-                throw argumentError('--local-box-image-id was supplied more than once');
+        if (token.text === '--local-release-descriptor') {
+            if (localReleaseDescriptor !== null) {
+                throw argumentError('--local-release-descriptor was supplied more than once');
             }
-            const value = consumeValue(tokens, index, '--local-box-image-id');
-            localBoxImageId = parseLocalImageId(value.text);
+            const value = consumeValue(tokens, index, '--local-release-descriptor');
+            try {
+                localReleaseDescriptor = parseReleaseDescriptor(value.text, releaseOptions);
+            } catch (error) {
+                throw argumentError(`--local-release-descriptor: ${error.message}`);
+            }
             removedRawIndexes.add(token.rawIndex);
             removedRawIndexes.add(value.rawIndex);
             index += 1;
             continue;
         }
-        if (token.text.startsWith('--local-box-image-id=')) {
-            throw argumentError('--local-box-image-id=ID is unsupported; use two arguments');
+        if (token.text.startsWith('--local-release-descriptor=')) {
+            throw argumentError('--local-release-descriptor=JSON is unsupported; use two arguments');
         }
-        if (token.text === '--local-media-port') {
-            if (explicitMediaPort !== null) {
-                throw argumentError('--local-media-port was supplied more than once');
-            }
-            const value = consumeValue(tokens, index, '--local-media-port');
-            explicitMediaPort = parseArgumentPort(value.text, '--local-media-port');
-            removedRawIndexes.add(token.rawIndex);
-            removedRawIndexes.add(value.rawIndex);
-            index += 1;
-            continue;
-        }
-        if (token.text.startsWith('--local-media-port=')) {
-            throw argumentError('--local-media-port=PORT is unsupported; use two arguments');
+        if (token.text === '--local-box-image-id'
+            || token.text.startsWith('--local-box-image-id=')
+            || token.text === '--local-node-image-id'
+            || token.text.startsWith('--local-node-image-id=')
+            || token.text === '--local-media-port'
+            || token.text.startsWith('--local-media-port=')) {
+            throw argumentError(`${token.text.split('=')[0]} is retired; use --local-release-descriptor JSON`);
         }
         if (token.text === '--dry-run') {
             if (dryRun) throw argumentError('--dry-run was supplied more than once');
@@ -157,18 +148,15 @@ export function parseOuterArguments(argv) {
         break;
     }
 
-    if ((localBoxImageId === null) !== (explicitMediaPort === null)) {
-        throw argumentError(
-            '--local-box-image-id and --local-media-port must be supplied together',
-        );
-    }
-
     if (explicitPort !== null
         && commandToken?.text !== 'start'
-        && localBoxImageId === null) {
+        && localReleaseDescriptor === null) {
         throw argumentError(
             '--port outside start requires the coupled local Box image and media-port options',
         );
+    }
+    if (localReleaseDescriptor !== null && explicitPort !== null) {
+        throw argumentError('Release descriptor owns the Router host port; --port is not supported');
     }
     const classificationArgv = tokens.map((token) => token.text);
     const command = commandToken?.text || '';
@@ -180,6 +168,9 @@ export function parseOuterArguments(argv) {
     let agentCli = null;
     if (command === 'start') {
         const analyzed = analyzeStart(tokens, commandToken, explicitPort);
+        if (localReleaseDescriptor && analyzed.hostPort !== null) {
+            throw argumentError('Release descriptor owns the Router host port; do not also supply a start port');
+        }
         const normalized = raw.flatMap((token, rawIndex) => {
             if (removedRawIndexes.has(rawIndex)) return [];
             if (rawIndex === analyzed.positionalPortIndex) return [String(BOX_ROUTER_CONTAINER_PORT)];
@@ -189,7 +180,7 @@ export function parseOuterArguments(argv) {
             normalized.push(String(BOX_ROUTER_CONTAINER_PORT));
         }
         start = Object.freeze({
-            hostPort: analyzed.hostPort,
+            hostPort: localReleaseDescriptor?.routerHostPort ?? analyzed.hostPort,
             coreArgv: Object.freeze(normalized),
         });
     } else if (command === 'cli' && commandArgs.length > 0) {
@@ -210,8 +201,7 @@ export function parseOuterArguments(argv) {
         help,
         terminated,
         explicitPort,
-        explicitMediaPort,
-        localBoxImageId,
+        localReleaseDescriptor,
         start,
         agentCli,
     });

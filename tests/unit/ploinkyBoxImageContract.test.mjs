@@ -16,6 +16,7 @@ import {
 } from '../../ploinky-box/contract/image.mjs';
 
 const SOURCE_SHA = '0123456789abcdef0123456789abcdef01234567';
+const AGENTLIB_SHA = 'dd94929443033c0a43bf7569068ec1d2926dba35';
 const ENTRYPOINT_PATH = path.resolve(
     import.meta.dirname,
     '../../ploinky-box/entrypoint/ploinky-box-entrypoint',
@@ -69,6 +70,26 @@ test('complete semantic image metadata validates to an immutable image handle', 
     const result = validateImageContract(normalized, 'runtime', { availableBinaries: binaries });
     assert.equal(result.immutableId, 'sha256:image-id');
     assert.equal(result.sourceSha, SOURCE_SHA);
+});
+
+test('new candidates accept one exact AgentLib label while Phase 10C remains an explicit pre-label rollback', () => {
+    const rollback = validateImageContract(normalizeImageInspect(validRecord()), 'phase-10c');
+    assert.equal(rollback.agentlibSha, '');
+
+    const candidateRecord = validRecord();
+    candidateRecord[0].Config.Labels[IMAGE_CONTRACT.agentlibShaLabel] = AGENTLIB_SHA;
+    const candidate = validateImageContract(normalizeImageInspect(candidateRecord), 'candidate');
+    assert.equal(candidate.agentlibSha, AGENTLIB_SHA);
+
+    for (const invalidSha of ['', 'main', AGENTLIB_SHA.toUpperCase()]) {
+        const invalid = validRecord();
+        invalid[0].Config.Labels[IMAGE_CONTRACT.agentlibShaLabel] = invalidSha;
+        assert.throws(
+            () => validateImageContract(normalizeImageInspect(invalid), 'candidate'),
+            (error) => error.code === 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT'
+                && error.message.includes('Config.Labels'),
+        );
+    }
 });
 
 test('a narrowly validated Buildah provenance label is accepted without opening arbitrary labels', () => {

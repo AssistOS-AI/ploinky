@@ -744,13 +744,18 @@ function resolveEnabledIdentity(routeSelection, agents) {
     const [containerName, record] = selected;
     const instanceId = String(record.instanceId || '').trim();
     const enableGeneration = String(record.enableGeneration || '').trim();
+    const releaseGeneration = String(record.releaseGeneration || '').trim();
     if (!instanceId || !enableGeneration) {
         throw edgeError(`agent '${routeSelection.agent}' lacks current instanceId/enableGeneration`);
+    }
+    if (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration)) {
+        throw edgeError(`agent '${routeSelection.agent}' has a malformed release generation`);
     }
     return {
         agentId: `agent:${routeSelection.agent}`,
         instanceId,
         enableGeneration,
+        releaseGeneration,
         routeKey: routeSelection.routeKey,
         containerName,
     };
@@ -971,7 +976,8 @@ function validateSandboxRootOwnerBindings(routing, agents, {
             || owner.rootPort !== hostPort
             || owner.pid !== record.pid
             || owner.instanceId !== record.instanceId
-            || owner.enableGeneration !== record.enableGeneration) {
+            || owner.enableGeneration !== record.enableGeneration
+            || owner.releaseGeneration !== String(record.releaseGeneration || '')) {
             throw edgeError(
                 `sandbox route '${routeKey}' service owner does not match its exact route and generation`,
                 'SANDBOX_AGENT_OWNER_INVALID',
@@ -1425,7 +1431,7 @@ function exactCapabilityOwner(generation, label) {
 }
 
 function sameCapabilityOwner(left, right) {
-    return ['agentId', 'instanceId', 'enableGeneration', 'routeKey', 'containerName']
+    return ['agentId', 'instanceId', 'enableGeneration', 'releaseGeneration', 'routeKey', 'containerName']
         .every((field) => left?.[field] === right?.[field]);
 }
 
@@ -1456,7 +1462,7 @@ function mediaRestartOwner(previous, next) {
 function affectedSelectorIds(generation, owner) {
     const selectors = new Set([
         `runtime:${owner.containerName}`,
-        `capability:${owner.agentId}:${owner.instanceId}:${owner.enableGeneration}`,
+        `capability:${owner.agentId}:${owner.instanceId}:${owner.enableGeneration}:${owner.releaseGeneration}`,
         `media:${owner.agentId}`,
         `agent-root:${owner.routeKey}`,
     ]);
@@ -1526,6 +1532,7 @@ export function prepareHostModeCapabilityForInactiveGeneration(owner, options = 
         entry.agentId === String(owner?.agentId || '')
         && entry.instanceId === String(owner?.instanceId || '')
         && entry.enableGeneration === String(owner?.enableGeneration || '')
+        && entry.releaseGeneration === String(owner?.releaseGeneration || '')
         && entry.routeKey === String(owner?.routeKey || '')
         && entry.containerName === String(owner?.containerName || '')
     ));
@@ -1601,6 +1608,7 @@ function lifecycleAgentProjection(agents) {
             alias: String(record.alias || ''),
             instanceId: String(record.instanceId || ''),
             enableGeneration: String(record.enableGeneration || ''),
+            releaseGeneration: String(record.releaseGeneration || ''),
             authMode: String(record.auth?.mode || ''),
             profile: String(record.profile || ''),
             runMode: String(record.runMode || ''),
@@ -2425,6 +2433,7 @@ function preparedRuntimeRegistryRecord(preparationLease, {
     containerName,
     instanceId,
     enableGeneration,
+    releaseGeneration = '',
     ...options
 } = {}, { requiredMode = null } = {}) {
     const paths = resolveEdgeGenerationPaths(options);
@@ -2443,7 +2452,8 @@ function preparedRuntimeRegistryRecord(preparationLease, {
     if (!record
         || record.type !== 'agent'
         || String(record.instanceId || '') !== String(instanceId || '')
-        || String(record.enableGeneration || '') !== String(enableGeneration || '')) {
+        || String(record.enableGeneration || '') !== String(enableGeneration || '')
+        || String(record.releaseGeneration || '') !== String(releaseGeneration || '')) {
         throw edgeError(
             'preparation does not authorize the exact runtime identity',
             'EDGE_PREPARATION_SOURCE_CHANGED',
@@ -2877,8 +2887,11 @@ function preparedRouterAttestationSnapshot(paths, preparationLease, expectedOwne
         principal: String(expectedOwner?.principal || '').trim(),
         instanceId: String(expectedOwner?.instanceId || '').trim(),
         enableGeneration: String(expectedOwner?.enableGeneration || '').trim(),
+        releaseGeneration: String(expectedOwner?.releaseGeneration || '').trim(),
     });
-    if (Object.values(owner).some((value) => !value)) {
+    if ([owner.containerName, owner.principal, owner.instanceId, owner.enableGeneration]
+        .some((value) => !value)
+        || (owner.releaseGeneration && !/^[a-f0-9]{64}$/.test(owner.releaseGeneration))) {
         throw edgeError(
             'prepared Router attestation requires one complete exact runtime owner',
             'EDGE_GENERATION_INVALID',
@@ -2891,7 +2904,8 @@ function preparedRouterAttestationSnapshot(paths, preparationLease, expectedOwne
     if (!record || record.type !== 'agent'
         || recordPrincipal !== owner.principal
         || String(record.instanceId || '') !== owner.instanceId
-        || String(record.enableGeneration || '') !== owner.enableGeneration) {
+        || String(record.enableGeneration || '') !== owner.enableGeneration
+        || String(record.releaseGeneration || '') !== owner.releaseGeneration) {
         throw edgeError(
             'prepared Router attestation owner does not match its immutable generation record',
             'EDGE_PREPARATION_STALE',
@@ -3019,6 +3033,7 @@ export function assertHostModeGenerationCapability({
     agentId,
     instanceId,
     enableGeneration,
+    releaseGeneration = '',
     routeKey,
     containerName,
 }, options = {}) {
@@ -3026,10 +3041,14 @@ export function assertHostModeGenerationCapability({
         agentId: String(agentId || ''),
         instanceId: String(instanceId || ''),
         enableGeneration: String(enableGeneration || ''),
+        releaseGeneration: String(releaseGeneration || ''),
         routeKey: String(routeKey || ''),
         containerName: String(containerName || ''),
     });
-    if (Object.values(requestedOwner).some((value) => !value)) {
+    if ([requestedOwner.agentId, requestedOwner.instanceId, requestedOwner.enableGeneration,
+        requestedOwner.routeKey, requestedOwner.containerName].some((value) => !value)
+        || (requestedOwner.releaseGeneration
+            && !/^[a-f0-9]{64}$/.test(requestedOwner.releaseGeneration))) {
         throw edgeError('host network mode requires a complete exact runtime owner', 'HOST_MODE_CAPABILITY_DENIED');
     }
     if (options.preparedCapability !== undefined) {
@@ -3048,6 +3067,7 @@ export function assertHostModeGenerationCapability({
             && prepared.owner.agentId === requestedOwner.agentId
             && prepared.owner.instanceId === requestedOwner.instanceId
             && prepared.owner.enableGeneration === requestedOwner.enableGeneration
+            && prepared.owner.releaseGeneration === requestedOwner.releaseGeneration
             && prepared.owner.routeKey === requestedOwner.routeKey
             && prepared.owner.containerName === requestedOwner.containerName
             && selectorCurrent;
@@ -3061,6 +3081,7 @@ export function assertHostModeGenerationCapability({
         entry.agentId === requestedOwner.agentId
         && entry.instanceId === requestedOwner.instanceId
         && entry.enableGeneration === requestedOwner.enableGeneration
+        && entry.releaseGeneration === requestedOwner.releaseGeneration
         && entry.routeKey === requestedOwner.routeKey
         && entry.containerName === requestedOwner.containerName
     ));

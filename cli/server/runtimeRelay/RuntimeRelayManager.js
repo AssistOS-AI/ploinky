@@ -317,6 +317,7 @@ export class RuntimeRelayManager {
             relay.targetAgentId,
             relay.effectiveInstanceId,
             relay.enableGeneration,
+            relay.releaseGeneration,
             relay.networkMode,
             normalizeCanonicalPortSet(plan.deniedPorts || []),
         ]);
@@ -439,7 +440,8 @@ export class RuntimeRelayManager {
         const relay = normalizeRelayDescriptor(plan?.relay);
         if (relay.containerId !== plan.relay.containerId
             || relay.effectiveInstanceId !== plan.owner.effectiveInstanceId
-            || relay.enableGeneration !== plan.owner.enableGeneration) {
+            || relay.enableGeneration !== plan.owner.enableGeneration
+            || relay.releaseGeneration !== String(plan.owner.releaseGeneration || '')) {
             throw new Error('runtimeRelay: plan owner/relay identity mismatch');
         }
         const release = this._reserve(relay.targetAgentId, plan.limits);

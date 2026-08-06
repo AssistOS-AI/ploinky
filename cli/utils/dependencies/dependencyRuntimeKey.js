@@ -1,6 +1,7 @@
 import { spawnSync } from 'child_process';
 import { getRuntime, getRuntimeForAgent, ensureImagePresent, managedContainerLabelArgs } from '../../sandbox/docker/common.js';
 import { resolveManifestImage } from '../security/secretVars.js';
+import { assertExactReleaseNodeImageInspectionReceipt } from '../runtime/releaseRuntime.js';
 
 const SUPPORTED_FAMILIES = new Set(['bwrap', 'seatbelt', 'container']);
 const NO_NODE_RUNTIME_KEY = 'container-no-node';
@@ -56,11 +57,30 @@ export function detectHostRuntimeKey(runtimeFamily) {
     });
 }
 
-export function detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig = null, image = '') {
+export function detectRuntimeKeyForAgent(
+    manifest,
+    repoName,
+    agentName,
+    profileConfig = null,
+    image = '',
+    {
+        releaseDescriptor = null,
+        releaseImageInspection = null,
+    } = {},
+) {
     const runtime = getRuntimeForAgent(manifest);
     const family = normalizeRuntimeFamily(runtime);
     if (family === 'container') {
-        return detectContainerRuntimeKey({ manifest, profileConfig, repoName, agentName, runtime, image });
+        return detectContainerRuntimeKey({
+            manifest,
+            profileConfig,
+            repoName,
+            agentName,
+            runtime,
+            image,
+            releaseDescriptor,
+            releaseImageInspection,
+        });
     }
     return detectHostRuntimeKey(family);
 }
@@ -166,15 +186,26 @@ export function detectContainerRuntimeKey({
     image = '',
     execProbe = defaultContainerProbe,
     ensureImage = defaultEnsureImage,
+    releaseDescriptor = null,
+    releaseImageInspection = null,
 } = {}) {
     const resolvedImage = String(image || (manifest ? resolveManifestImage(manifest, profileConfig, { repoName, agentName }) : '')).trim();
     if (!resolvedImage) {
         throw new Error(`Container runtime-key detection requires an image${repoName || agentName ? ` for ${repoName}/${agentName}` : ''}.`);
     }
     const resolvedRuntime = runtime || getRuntime();
-    // Explicit pull step (streamed progress, generous timeout) BEFORE the probe,
-    // so the probe can safely run with --pull=never under a short timeout.
-    ensureImage({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
+    const exactReleaseAdmission = releaseDescriptor !== null || releaseImageInspection !== null
+        ? assertExactReleaseNodeImageInspectionReceipt(
+            releaseImageInspection,
+            releaseDescriptor,
+            resolvedImage,
+        )
+        : null;
+    if (!exactReleaseAdmission) {
+        // Explicit pull step (streamed progress, generous timeout) BEFORE the probe,
+        // so the probe can safely run with --pull=never under a short timeout.
+        ensureImage({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
+    }
     const output = execProbe({ image: resolvedImage, runtime: resolvedRuntime, manifest, repoName, agentName });
     const probe = parseContainerProbeOutput(output);
     if (probe.noNode === true) {

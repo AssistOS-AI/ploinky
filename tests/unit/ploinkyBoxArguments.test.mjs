@@ -3,6 +3,28 @@ import test from 'node:test';
 
 import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
 import { routeOuterCommand } from '../../ploinky-box/command/route.mjs';
+import {
+    RELEASE_DESCRIPTOR_SCHEMA,
+    REQUIRED_RELEASE_AGENTLIB_SHA,
+    createReleaseDescriptor,
+    serializeReleaseDescriptor,
+} from '../../ploinky-box/contract/release.mjs';
+
+function releaseDescriptor(overrides = {}) {
+    return createReleaseDescriptor({
+        schema: RELEASE_DESCRIPTOR_SCHEMA,
+        boxImageId: 'a'.repeat(64),
+        boxImageDigest: `sha256:${'b'.repeat(64)}`,
+        nodeImageId: 'c'.repeat(64),
+        nodeImageDigest: `sha256:${'d'.repeat(64)}`,
+        artifactSourceSha: 'e'.repeat(40),
+        controllerSourceSha: 'f'.repeat(40),
+        agentlibSha: REQUIRED_RELEASE_AGENTLIB_SHA,
+        routerHostPort: 18080,
+        mediaHostPort: 17882,
+        ...overrides,
+    });
+}
 
 test('first debug token is removed only from classification and preserved for core forwarding', () => {
     const stop = parseOuterArguments(['--debug', 'stop']);
@@ -115,56 +137,50 @@ test('unsupported public override surfaces reject before routing', () => {
     }
 });
 
-test('local immutable Box admission requires an exact ID and owned media port pair', () => {
-    const imageId = 'a'.repeat(64);
+test('local immutable release admission accepts one coupled exact descriptor', () => {
+    const descriptor = releaseDescriptor();
     const parsed = parseOuterArguments([
-        '--local-box-image-id', imageId,
-        '--local-media-port', '17882',
-        '--port', '18080',
+        '--local-release-descriptor', serializeReleaseDescriptor(descriptor),
         'start', 'Agent',
     ]);
-    assert.equal(parsed.localBoxImageId, imageId);
-    assert.equal(parsed.explicitMediaPort, 17882);
+    assert.deepEqual(parsed.localReleaseDescriptor, descriptor);
     assert.deepEqual(parsed.start.coreArgv, ['start', 'Agent', '8080']);
     assert.deepEqual(routeOuterCommand(parsed), {
         kind: 'start',
         hostPort: 18080,
-        localBoxImageId: imageId,
-        mediaHostPort: 17882,
+        localReleaseDescriptor: descriptor,
         coreArgv: ['start', 'Agent', '8080'],
     });
 
     const isolatedCli = routeOuterCommand(parseOuterArguments([
-        '--local-box-image-id', imageId,
-        '--local-media-port', '17882',
-        '--port', '18080',
+        '--local-release-descriptor', serializeReleaseDescriptor(descriptor),
         'cli',
     ]));
     assert.deepEqual(isolatedCli, {
         kind: 'bash',
-        localBoxImageId: imageId,
-        mediaHostPort: 17882,
-        hostPort: 18080,
+        localReleaseDescriptor: descriptor,
     });
 
     for (const argv of [
-        ['--local-box-image-id', imageId, 'start', 'Agent'],
+        ['--local-release-descriptor', 'not-json', 'start', 'Agent'],
+        ['--local-release-descriptor=' + serializeReleaseDescriptor(descriptor), 'start', 'Agent'],
+        ['--local-release-descriptor', serializeReleaseDescriptor(descriptor), '--port', '18080', 'start', 'Agent'],
+        ['--local-release-descriptor', serializeReleaseDescriptor(descriptor), 'start', 'Agent', '18080'],
+        ['--local-release-descriptor', serializeReleaseDescriptor(descriptor), '--local-release-descriptor', serializeReleaseDescriptor(descriptor), 'start', 'Agent'],
+        ['--local-box-image-id', descriptor.boxImageId, 'start', 'Agent'],
+        ['--local-node-image-id', descriptor.nodeImageId, 'start', 'Agent'],
         ['--local-media-port', '17882', 'start', 'Agent'],
-        ['--local-box-image-id', 'sha256:' + imageId, '--local-media-port', '17882', 'start', 'Agent'],
-        ['--local-box-image-id', 'A'.repeat(64), '--local-media-port', '17882', 'start', 'Agent'],
-        ['--local-box-image-id', 'a'.repeat(63), '--local-media-port', '17882', 'start', 'Agent'],
-        ['--local-box-image-id=' + imageId, '--local-media-port', '17882', 'start', 'Agent'],
-        ['--local-box-image-id', imageId, '--local-media-port=17882', 'start', 'Agent'],
-        ['--local-box-image-id', imageId, '--local-box-image-id', imageId, '--local-media-port', '17882', 'start', 'Agent'],
-        ['--local-box-image-id', imageId, '--local-media-port', '0', 'start', 'Agent'],
         ['--port', '18080', 'cli'],
     ]) {
         assert.throws(() => parseOuterArguments(argv), { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
     }
 });
 
-test('read-only and destructive routes reject local Box admission options', () => {
-    const prefix = ['--local-box-image-id', 'b'.repeat(64), '--local-media-port', '17883'];
+test('read-only and destructive routes reject release admission options', () => {
+    const prefix = [
+        '--local-release-descriptor',
+        serializeReleaseDescriptor(releaseDescriptor()),
+    ];
     for (const tail of [['help'], ['status'], ['stop'], ['destroy']]) {
         assert.throws(
             () => routeOuterCommand(parseOuterArguments([...prefix, ...tail])),

@@ -7,6 +7,7 @@ import path from 'node:path';
 const originalCwd = process.cwd();
 const originalWorkspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT;
 const originalRouterHostPort = process.env.PLOINKY_ROUTER_HOST_PORT;
+const originalReleaseDescriptor = process.env.PLOINKY_RELEASE_DESCRIPTOR;
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-enable-batch-'));
 process.chdir(workspace);
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
@@ -41,6 +42,7 @@ const agents = await import(new URL('../../cli/utils/agents.js', import.meta.url
 const manager = await import(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url).href);
 const coordinated = await import(new URL('../../cli/sandbox/coordinatedEdgeApply.js', import.meta.url).href);
 const passwordStore = await import(new URL('../../cli/utils/security/encryptedPasswordStore.js', import.meta.url).href);
+const releaseContract = await import(new URL('../../ploinky-box/contract/release.mjs', import.meta.url).href);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -48,7 +50,51 @@ test.after(() => {
     else process.env.PLOINKY_WORKSPACE_ROOT = originalWorkspaceRoot;
     if (originalRouterHostPort === undefined) delete process.env.PLOINKY_ROUTER_HOST_PORT;
     else process.env.PLOINKY_ROUTER_HOST_PORT = originalRouterHostPort;
+    if (originalReleaseDescriptor === undefined) delete process.env.PLOINKY_RELEASE_DESCRIPTOR;
+    else process.env.PLOINKY_RELEASE_DESCRIPTOR = originalReleaseDescriptor;
     fs.rmSync(workspace, { recursive: true, force: true });
+});
+
+test('release preparation binds one generation into the registry, plan, lease, and host capability', () => {
+    const descriptor = releaseContract.createReleaseDescriptor({
+        schema: releaseContract.RELEASE_DESCRIPTOR_SCHEMA,
+        boxImageId: '1'.repeat(64),
+        boxImageDigest: `sha256:${'2'.repeat(64)}`,
+        nodeImageId: '3'.repeat(64),
+        nodeImageDigest: `sha256:${'4'.repeat(64)}`,
+        artifactSourceSha: '5'.repeat(40),
+        controllerSourceSha: '6'.repeat(40),
+        agentlibSha: releaseContract.REQUIRED_RELEASE_AGENTLIB_SHA,
+        routerHostPort: 18080,
+        mediaHostPort: 17884,
+    });
+    process.env.PLOINKY_RELEASE_DESCRIPTOR = releaseContract.serializeReleaseDescriptor(descriptor);
+    try {
+        const initialized = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+        routing.writeRoutingConfig({ port: 8080, routes: {} }, { coordinate: false });
+        fs.writeFileSync(initialized.paths.desiredFile, JSON.stringify({ hosts: {} }));
+        const prepared = agents.prepareAgentEnableBatch([{
+            agentName: 'media/livekit',
+            mode: 'global',
+            aliasParam: 'release-livekit',
+        }], { reason: 'test-release-preparation-ownership' });
+        const [plan] = prepared.plans;
+        const staged = prepared.preparedGeneration.generation.agents[plan.containerName];
+        assert.equal(plan.releaseGeneration, descriptor.releaseGeneration);
+        assert.equal(plan.record.releaseGeneration, descriptor.releaseGeneration);
+        assert.equal(staged.releaseGeneration, descriptor.releaseGeneration);
+        assert.equal(
+            prepared.preparedGeneration.generation.compiled.security.hostNetworkCapabilities[0]
+                .releaseGeneration,
+            descriptor.releaseGeneration,
+        );
+        edge.abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease, {
+            reason: 'test-release-preparation-ownership-complete',
+        });
+    } finally {
+        if (originalReleaseDescriptor === undefined) delete process.env.PLOINKY_RELEASE_DESCRIPTOR;
+        else process.env.PLOINKY_RELEASE_DESCRIPTOR = originalReleaseDescriptor;
+    }
 });
 
 test('one batch stages a non-host dependency and exact host owner before either can launch', () => {
@@ -116,6 +162,7 @@ test('one batch stages a non-host dependency and exact host owner before either 
         agentId: 'agent:media/livekit',
         instanceId: hostPlan.instanceId,
         enableGeneration: hostPlan.enableGeneration,
+        releaseGeneration: '',
         routeKey: hostPlan.routeKey,
         containerName: hostPlan.containerName,
     }]);

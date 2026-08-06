@@ -99,6 +99,7 @@ export function formatAgentRuntimeStatus(entry = {}) {
     }
     const details = [
         ['generation', entry.enableGeneration],
+        ['release', entry.releaseGeneration],
         ['owner', entry.ownerKey],
         ['process', entry.processIdentity],
         ['workdir', entry.workdir || entry.projectPath],

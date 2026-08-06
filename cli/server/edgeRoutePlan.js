@@ -137,11 +137,13 @@ function exactAgentRuntime(snapshot, routeKey, route) {
     const containerId = record.containerId;
     const effectiveInstanceId = exactNonEmptyString(record.instanceId);
     const enableGeneration = exactNonEmptyString(record.enableGeneration);
+    const releaseGeneration = String(record.releaseGeneration || '').trim();
     if (!['docker', 'podman'].includes(runtime)
         || typeof containerId !== 'string'
         || !/^[a-f0-9]{64}$/.test(containerId)
         || !effectiveInstanceId
-        || !enableGeneration) return null;
+        || !enableGeneration
+        || (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration))) return null;
     let targetAgentId;
     try {
         targetAgentId = deriveAgentPrincipalId(record.repoName, record.agentName);
@@ -162,6 +164,7 @@ function exactAgentRuntime(snapshot, routeKey, route) {
         targetAgentId,
         effectiveInstanceId,
         enableGeneration,
+        releaseGeneration,
         networkMode,
         routeKey,
     };
@@ -370,6 +373,7 @@ function agentPortPlan({
         owner: {
             effectiveInstanceId: runtime.effectiveInstanceId,
             enableGeneration: runtime.enableGeneration,
+            releaseGeneration: runtime.releaseGeneration,
         },
         port: selector.port,
         policyPath: selector.policyPath,
@@ -384,6 +388,7 @@ function agentPortPlan({
             targetAgentId: runtime.targetAgentId,
             effectiveInstanceId: runtime.effectiveInstanceId,
             enableGeneration: runtime.enableGeneration,
+            releaseGeneration: runtime.releaseGeneration,
             networkMode: runtime.networkMode === 'host' ? 'host' : '',
         },
         deniedPorts,

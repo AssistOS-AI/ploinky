@@ -11,6 +11,7 @@ import { loadAgentsMap } from './common.js';
 const CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
 const WORKSPACE_HASH_PATTERN = /^[a-f0-9]{12}$/;
 const CONTRACT_HASH_PATTERN = /^[a-f0-9]{64}$/;
+const RELEASE_GENERATION_PATTERN = /^[a-f0-9]{64}$/;
 
 function exactLabelText(value) {
     return typeof value === 'string' && value !== '' && value === value.trim();
@@ -26,14 +27,18 @@ function inspectOwnership(data, expectedName, expectedIdentity = {}) {
         : rawName;
     const instanceId = labels[NETWORK_LABELS.instanceId];
     const enableGeneration = labels[NETWORK_LABELS.enableGeneration];
+    const releaseGeneration = String(labels[NETWORK_LABELS.releaseGeneration] || '');
     const workspaceHash = expectedIdentity?.workspaceHash;
     const expectedContainerId = expectedIdentity?.containerId;
     const expectedInstanceId = expectedIdentity?.instanceId;
     const expectedEnableGeneration = expectedIdentity?.enableGeneration;
+    const expectedReleaseGeneration = String(expectedIdentity?.releaseGeneration || '');
     const exactExpectedIdentity = WORKSPACE_HASH_PATTERN.test(workspaceHash)
         && CONTAINER_ID_PATTERN.test(expectedContainerId)
         && exactLabelText(expectedInstanceId)
-        && exactLabelText(expectedEnableGeneration);
+        && exactLabelText(expectedEnableGeneration)
+        && (expectedReleaseGeneration === ''
+            || RELEASE_GENERATION_PATTERN.test(expectedReleaseGeneration));
     const ownershipVerified = exactExpectedIdentity
         && CONTAINER_ID_PATTERN.test(containerId)
         && containerId === expectedContainerId
@@ -44,11 +49,13 @@ function inspectOwnership(data, expectedName, expectedIdentity = {}) {
         && labels[NETWORK_LABELS.workspace] === workspaceHash
         && CONTRACT_HASH_PATTERN.test(labels[NETWORK_LABELS.contract])
         && instanceId === expectedInstanceId
-        && enableGeneration === expectedEnableGeneration;
+        && enableGeneration === expectedEnableGeneration
+        && releaseGeneration === expectedReleaseGeneration;
     return {
         containerId,
         instanceId: exactLabelText(instanceId) ? instanceId : '',
         enableGeneration: exactLabelText(enableGeneration) ? enableGeneration : '',
+        releaseGeneration,
         ownershipVerified,
     };
 }
@@ -128,6 +135,7 @@ function collectLiveAgentContainers({
                 containerId: record.containerId,
                 instanceId: record.instanceId,
                 enableGeneration: record.enableGeneration,
+                releaseGeneration: record.releaseGeneration,
             });
             if (!ownership.ownershipVerified || data?.State?.Running !== true) continue;
             const mounts = Array.isArray(data.Mounts) ? data.Mounts : [];

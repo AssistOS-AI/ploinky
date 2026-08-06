@@ -10,6 +10,7 @@ import { loadActiveEdgeRoutingGeneration } from './edgeGeneration.js';
 const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
 const AGENT_RUNTIME_STATE_INVALID_CODE = 'PLOINKY_AGENT_RUNTIME_STATE_INVALID';
 const CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
+const RELEASE_GENERATION_PATTERN = /^[a-f0-9]{64}$/;
 
 function invalidRuntimeState(containerName, message) {
     const error = new Error(`agent runtime state '${containerName}' ${message}`);
@@ -34,6 +35,10 @@ function validateRegistryRuntime(containerName, record) {
             throw invalidRuntimeState(containerName, `requires exact ${field}`);
         }
     }
+    const releaseGeneration = String(record?.releaseGeneration || '');
+    if (releaseGeneration && !RELEASE_GENERATION_PATTERN.test(releaseGeneration)) {
+        throw invalidRuntimeState(containerName, 'requires an exact releaseGeneration');
+    }
     if (runtime === 'podman' && !CONTAINER_ID_PATTERN.test(String(record?.containerId || ''))) {
         throw invalidRuntimeState(containerName, 'requires an immutable lowercase 64-hex containerId');
     }
@@ -49,7 +54,9 @@ function validLivePodmanIdentity(entry) {
         && entry?.ownershipVerified === true
         && CONTAINER_ID_PATTERN.test(String(entry?.containerId || ''))
         && exactIdentityText(entry?.instanceId)
-        && exactIdentityText(entry?.enableGeneration);
+        && exactIdentityText(entry?.enableGeneration)
+        && (String(entry?.releaseGeneration || '') === ''
+            || RELEASE_GENERATION_PATTERN.test(String(entry.releaseGeneration)));
 }
 
 function podmanIdentityKey(containerName, identity) {
@@ -58,6 +65,7 @@ function podmanIdentityKey(containerName, identity) {
         identity.containerId,
         identity.instanceId,
         identity.enableGeneration,
+        String(identity.releaseGeneration || ''),
     ].join('\0');
 }
 
@@ -66,6 +74,7 @@ function publicLiveRuntimeEntry(entry) {
         containerId: _containerId,
         enableGeneration: _enableGeneration,
         instanceId: _instanceId,
+        releaseGeneration: _releaseGeneration,
         ownershipVerified: _ownershipVerified,
         ...visible
     } = entry;
@@ -91,6 +100,7 @@ function exactAuthenticatedReadiness(active, containerName, record, running) {
         && selected.runtime === record.runtime
         && selected.instanceId === record.instanceId
         && selected.enableGeneration === record.enableGeneration
+        && String(selected.releaseGeneration || '') === String(record.releaseGeneration || '')
         ? 'ready'
         : 'not-ready';
 }
@@ -105,6 +115,7 @@ function stoppedRuntimeEntry(containerName, record, runtime) {
             : serviceOwnerKey(containerName),
         instanceId: String(record?.instanceId || ''),
         enableGeneration: String(record?.enableGeneration || ''),
+        releaseGeneration: String(record?.releaseGeneration || ''),
         homeKey: String(record?.homeKey || containerName),
         workdir: String(record?.workdir || record?.projectPath || '-'),
         logPath: runtime === 'podman'
@@ -140,13 +151,17 @@ function registryRuntimeIdentity(record) {
     const enableGeneration = typeof record?.enableGeneration === 'string'
         ? record.enableGeneration
         : '';
+    const releaseGeneration = typeof record?.releaseGeneration === 'string'
+        ? record.releaseGeneration
+        : '';
     if (!instanceId
         || !enableGeneration
         || instanceId !== instanceId.trim()
-        || enableGeneration !== enableGeneration.trim()) {
+        || enableGeneration !== enableGeneration.trim()
+        || (releaseGeneration && !RELEASE_GENERATION_PATTERN.test(releaseGeneration))) {
         return null;
     }
-    return Object.freeze({ instanceId, enableGeneration });
+    return Object.freeze({ instanceId, enableGeneration, releaseGeneration });
 }
 
 function hostRuntimeOwnership(containerName, record, owner) {
@@ -156,6 +171,7 @@ function hostRuntimeOwnership(containerName, record, owner) {
         ownerKey: owner?.ownerKey || serviceOwnerKey(containerName),
         instanceId: owner?.instanceId || String(record?.instanceId || ''),
         enableGeneration: owner?.enableGeneration || String(record?.enableGeneration || ''),
+        releaseGeneration: owner?.releaseGeneration || String(record?.releaseGeneration || ''),
         homeKey: owner?.homeKey || record.homeKey,
         workdir: owner?.workdir || String(record?.workdir || record?.projectPath || '-'),
         logPath: owner?.logPath || String(record?.logPath || '-'),
@@ -223,6 +239,7 @@ function collectAgentRuntimeStates(options = {}) {
                 && runtimeIdentity
                 && owner.instanceId === runtimeIdentity.instanceId
                 && owner.enableGeneration === runtimeIdentity.enableGeneration
+                && String(owner.releaseGeneration || '') === runtimeIdentity.releaseGeneration
                 && owner.homeKey === record.homeKey);
             const running = identityMatches && Boolean(sandboxOwnerRunning(owner.ownerKey, {
                 ...runtimeIdentity,
@@ -257,6 +274,7 @@ function collectAgentRuntimeStates(options = {}) {
                 ownerKey: `container:${record.containerId}`,
                 instanceId: record.instanceId,
                 enableGeneration: record.enableGeneration,
+                releaseGeneration: String(record.releaseGeneration || ''),
                 homeKey: containerName,
                 workdir: String(record.workdir || record.projectPath || '-'),
                 logPath: podmanLogSource(record),
@@ -300,6 +318,7 @@ function collectAgentRuntimeStates(options = {}) {
         const exactSelection = Boolean(record && record.type === 'agent'
             && record.instanceId === owner.instanceId
             && record.enableGeneration === owner.enableGeneration
+            && String(record.releaseGeneration || '') === String(owner.releaseGeneration || '')
             && exactHomeSelection);
         let selectionValid = exactSelection;
         if (exactSelection) {
@@ -331,6 +350,7 @@ function collectAgentRuntimeStates(options = {}) {
             effectiveInstance: owner.alias,
             instanceId: owner.instanceId,
             enableGeneration: owner.enableGeneration,
+            releaseGeneration: String(owner.releaseGeneration || ''),
             homeKey: owner.homeKey,
             workdir: owner.workdir,
             logPath: owner.logPath,

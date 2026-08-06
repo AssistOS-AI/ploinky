@@ -183,6 +183,7 @@ test('status exposes allowlisted counts and treats disappearing containers as tr
         role: 'service',
         effectiveInstance: 'alpha',
         generation: 'generation-alpha',
+        releaseGeneration: '',
         state: 'running',
         ownerKey: `container:${'a'.repeat(64)}`,
         processIdentity: `container:${'a'.repeat(64)}`,
@@ -195,6 +196,7 @@ test('status exposes allowlisted counts and treats disappearing containers as tr
         role: 'service',
         effectiveInstance: 'beta',
         generation: 'generation-beta',
+        releaseGeneration: '',
         state: 'failed',
         ownerKey: `container:${'b'.repeat(64)}`,
         processIdentity: `container:${'b'.repeat(64)}`,
@@ -204,6 +206,82 @@ test('status exposes allowlisted counts and treats disappearing containers as tr
         logPath: `podman://${'b'.repeat(64)}`,
     }]);
     assert.equal(treeHash(root), before);
+});
+
+test('Box status refuses a running container from a different release generation', (t) => {
+    const root = fixture(t);
+    const ploinky = path.join(root, '.ploinky');
+    fs.mkdirSync(ploinky);
+    const containerId = 'e'.repeat(64);
+    const releaseGeneration = '4'.repeat(64);
+    const record = {
+        type: 'agent',
+        runtime: 'podman',
+        containerId,
+        instanceId: 'release-instance',
+        enableGeneration: 'release-enable',
+        releaseGeneration,
+        projectPath: '/workspace/projects/release',
+    };
+    fs.writeFileSync(path.join(ploinky, 'agents.json'), JSON.stringify({ release_agent: record }));
+    const inspect = (observedRelease) => ({
+        ok: true,
+        stdout: JSON.stringify([{
+            Id: containerId,
+            Name: 'release_agent',
+            Config: { Labels: {
+                'io.assistos.ploinky.managed': '1',
+                'io.assistos.ploinky.resource': 'agent',
+                'io.assistos.ploinky.instance-id': record.instanceId,
+                'io.assistos.ploinky.enable-generation': record.enableGeneration,
+                'io.assistos.ploinky.release-generation': observedRelease,
+            } },
+            State: { Running: true },
+        }]),
+    });
+
+    const stale = readInboxStatus({
+        workspaceRoot: root,
+        runner: { query: () => inspect('5'.repeat(64)) },
+        loadActiveGeneration: () => ({
+            selector: { state: 'active', publicationState: 'ready' },
+            generation: { agents: { release_agent: record } },
+        }),
+    });
+    assert.equal(stale.runningAgents, 0);
+    assert.equal(stale.runtimes[0].state, 'failed');
+    assert.equal(stale.runtimes[0].releaseGeneration, releaseGeneration);
+    assert.equal(stale.warnings.some((value) => value.includes('release_agent changed identity')), true);
+
+    const exact = readInboxStatus({
+        workspaceRoot: root,
+        runner: { query: () => inspect(releaseGeneration) },
+        loadActiveGeneration: () => ({
+            selector: { state: 'active', publicationState: 'ready' },
+            generation: { agents: { release_agent: record } },
+        }),
+    });
+    assert.equal(exact.runningAgents, 1);
+    assert.equal(exact.runtimes[0].state, 'running');
+    assert.equal(exact.runtimes[0].readiness, 'ready');
+    assert.equal(exact.runtimes[0].releaseGeneration, releaseGeneration);
+
+    const nonReleaseRecord = { ...record, releaseGeneration: '' };
+    fs.writeFileSync(
+        path.join(ploinky, 'agents.json'),
+        JSON.stringify({ release_agent: nonReleaseRecord }),
+    );
+    const injected = readInboxStatus({
+        workspaceRoot: root,
+        runner: { query: () => inspect('5'.repeat(64)) },
+        loadActiveGeneration: () => ({
+            selector: { state: 'active', publicationState: 'ready' },
+            generation: { agents: { release_agent: nonReleaseRecord } },
+        }),
+    });
+    assert.equal(injected.runningAgents, 0);
+    assert.equal(injected.runtimes[0].state, 'failed');
+    assert.equal(injected.runtimes[0].releaseGeneration, '');
 });
 
 test('Box status fails closed before inspecting an incomplete selected container identity', (t) => {
@@ -229,6 +307,7 @@ test('Box status fails closed before inspecting an incomplete selected container
         role: 'service',
         effectiveInstance: 'coding_alias',
         generation: '',
+        releaseGeneration: '',
         state: 'failed',
         ownerKey: `container:${containerId}`,
         processIdentity: `container:${containerId}`,
@@ -367,6 +446,7 @@ test('Box status labels selected sandbox services and inner provider tasks witho
             role: 'service',
             effectiveInstance: 'writer',
             generation: 'generation-phase9',
+            releaseGeneration: '',
             state: 'running',
             ownerKey: 'service-owner-phase9',
             processIdentity: serviceOwner.processIdentity,
@@ -379,6 +459,7 @@ test('Box status labels selected sandbox services and inner provider tasks witho
             role: 'provider-task',
             effectiveInstance: 'writer',
             generation: 'generation-phase9',
+            releaseGeneration: '',
             state: 'running',
             ownerKey: 'provider-task-owner-phase9',
             processIdentity: taskOwner.processIdentity,
@@ -433,6 +514,7 @@ test('Box status fails closed on corrupt or mixed-generation sandbox ownership',
         role: 'service',
         effectiveInstance: 'coding_alias',
         generation: 'generation-current',
+        releaseGeneration: '',
         state: 'stopped',
         ownerKey: '',
         processIdentity: '',
@@ -586,6 +668,7 @@ test('Box status includes exact provider tasks owned by a selected coding contai
         role: 'provider-task',
         effectiveInstance: 'container-writer',
         generation: 'container-generation',
+        releaseGeneration: '',
         state: 'running',
         ownerKey: 'container-task-owner',
         processIdentity: taskOwner.processIdentity,

@@ -4,6 +4,28 @@ import test from 'node:test';
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
 import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
+import {
+    RELEASE_DESCRIPTOR_SCHEMA,
+    REQUIRED_RELEASE_AGENTLIB_SHA,
+    createReleaseDescriptor,
+    serializeReleaseDescriptor,
+} from '../../ploinky-box/contract/release.mjs';
+
+function releaseDescriptor(overrides = {}) {
+    return createReleaseDescriptor({
+        schema: RELEASE_DESCRIPTOR_SCHEMA,
+        boxImageId: 'c'.repeat(64),
+        boxImageDigest: `sha256:${'d'.repeat(64)}`,
+        nodeImageId: 'e'.repeat(64),
+        nodeImageDigest: `sha256:${'f'.repeat(64)}`,
+        artifactSourceSha: '1'.repeat(40),
+        controllerSourceSha: '2'.repeat(40),
+        agentlibSha: REQUIRED_RELEASE_AGENTLIB_SHA,
+        routerHostPort: 18080,
+        mediaHostPort: 17882,
+        ...overrides,
+    });
+}
 
 function bufferStream(isTTY = false) {
     let value = '';
@@ -145,23 +167,8 @@ test('explicit start is reachable and retains normalized debug argv', async () =
     ]]);
 });
 
-test('outer start forwards only a validated immutable AgentLib deploy ref', async () => {
-    const agentlibRef = 'b'.repeat(40);
-    const events = [];
-    const code = await runOuterCli(['start', 'Agent'], {
-        env: { PLOINKY_AGENTLIB_REF: agentlibRef },
-        input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events),
-    });
-    assert.equal(code, 0);
-    assert.deepEqual(events, [[
-        'start',
-        ['start', 'Agent', '8080'],
-        { explicitPort: null, agentlibRef },
-    ]]);
-
-    for (const invalid of ['', 'main', 'B'.repeat(40), `${agentlibRef}\nINJECTED=1`]) {
-        if (!invalid) continue;
+test('outer start rejects every independent AgentLib override before supervisor mutation', async () => {
+    for (const invalid of ['b'.repeat(40), 'main', 'B'.repeat(40), `${'b'.repeat(40)}\nINJECTED=1`]) {
         const invalidEvents = [];
         await assert.rejects(
             () => runOuterCli(['start', 'Agent'], {
@@ -169,20 +176,19 @@ test('outer start forwards only a validated immutable AgentLib deploy ref', asyn
                 input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
                 supervisor: fakeSupervisor(invalidEvents),
             }),
-            /PLOINKY_AGENTLIB_REF.*40 lowercase hexadecimal/,
+            /PLOINKY_AGENTLIB_REF.*not an outer Box override/,
         );
         assert.deepEqual(invalidEvents, []);
     }
 });
 
-test('local immutable admission reaches start and agent CLI preparation as one coupled pair', async () => {
-    const imageId = 'c'.repeat(64);
+test('local immutable release reaches start and agent CLI preparation as one coupled descriptor', async () => {
+    const descriptor = releaseDescriptor();
     const prefix = [
-        '--local-box-image-id', imageId,
-        '--local-media-port', '17882',
+        '--local-release-descriptor', serializeReleaseDescriptor(descriptor),
     ];
     const startEvents = [];
-    await runOuterCli([...prefix, '--port', '18080', 'start', 'Agent'], {
+    await runOuterCli([...prefix, 'start', 'Agent'], {
         env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(startEvents),
     });
@@ -190,22 +196,19 @@ test('local immutable admission reaches start and agent CLI preparation as one c
         'start',
         ['start', 'Agent', '8080'],
         {
-            explicitPort: 18080,
-            localBoxImageId: imageId,
-            explicitMediaPort: 17882,
+            explicitPort: descriptor.routerHostPort,
+            releaseDescriptor: descriptor,
         },
     ]]);
 
     const cliEvents = [];
-    await runOuterCli([...prefix, '--port', '18080', 'cli', 'Agent', '--workdir', '/workspace/project', '--'], {
+    await runOuterCli([...prefix, 'cli', 'Agent', '--workdir', '/workspace/project', '--'], {
         env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(cliEvents),
         execute() { return 0; },
     });
     assert.deepEqual(cliEvents[0], ['prepare', {
-        localBoxImageId: imageId,
-        explicitMediaPort: 17882,
-        explicitPort: 18080,
+        releaseDescriptor: descriptor,
     }]);
 });
 
@@ -322,22 +325,23 @@ test('dry-run and invalid arguments cause no preparation or execution', async ()
     assert.equal(events.length, 1);
 });
 
-test('dry-run carries local immutable admission without preparing the Box', async () => {
+test('dry-run carries the immutable release descriptor without preparing the Box', async () => {
     const events = [];
-    const imageId = 'd'.repeat(64);
+    const descriptor = releaseDescriptor({
+        boxImageId: 'd'.repeat(64),
+        routerHostPort: 18081,
+        mediaHostPort: 17883,
+    });
     await runOuterCli([
         '--dry-run',
-        '--local-box-image-id', imageId,
-        '--local-media-port', '17883',
-        '--port', '18081',
+        '--local-release-descriptor', serializeReleaseDescriptor(descriptor),
         'start', 'Agent',
     ], {
         env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
     });
     assert.deepEqual(events, [['dry-run', {
-        explicitPort: 18081,
-        localBoxImageId: imageId,
-        explicitMediaPort: 17883,
+        explicitPort: descriptor.routerHostPort,
+        releaseDescriptor: descriptor,
     }]]);
 });

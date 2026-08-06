@@ -105,6 +105,7 @@ function exactTarget(index) {
         containerId: index.toString(16).padStart(64, '0'),
         instanceId: `instance-${index}`,
         enableGeneration: `generation-${index}`,
+        releaseGeneration: index.toString(16).padStart(64, 'f'),
         agentName: `agent-${index}`,
         repoName: 'demo-repo',
         probeState: 'pending',
@@ -120,6 +121,7 @@ function exactLiveEntry(target) {
         containerId: target.containerId,
         instanceId: target.instanceId,
         enableGeneration: target.enableGeneration,
+        releaseGeneration: target.releaseGeneration,
         ownershipVerified: true,
         state: { running: true },
     };
@@ -155,6 +157,22 @@ test('sixteen exact Podman targets share one ownership-verified status snapshot 
     assert.equal(calls, 1);
     assert.equal(probeStarts.length, 16);
     assert.deepEqual(logs, []);
+});
+
+test('the shared Podman snapshot key carries exact release ownership', () => {
+    const target = exactTarget(7);
+    const snapshot = snapshotRunningContainerNames({
+        targets: new Map([[target.containerName, target]]),
+        collectLiveAgentContainers: () => [exactLiveEntry(target)],
+    });
+
+    assert.deepEqual([...snapshot], [[
+        target.containerName,
+        target.containerId,
+        target.instanceId,
+        target.enableGeneration,
+        target.releaseGeneration,
+    ].join('\0')]);
 });
 
 test('snapshot failure defers every exact Podman target without per-target amplification or false restart', () => {

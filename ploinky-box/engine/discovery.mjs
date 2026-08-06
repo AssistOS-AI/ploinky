@@ -8,6 +8,10 @@ import { PloinkyBoxError } from '../errors.mjs';
 import { sha256 } from '../boundary/fingerprint.mjs';
 import { createProcessRunner } from '../process.mjs';
 import { normalizeContainerRuntime } from '../contract/container.mjs';
+import {
+    parseReleaseDescriptor,
+    serializeReleaseDescriptor,
+} from '../contract/release.mjs';
 
 const ABSENT_PATTERN = /(?:no such|not found|does not exist|no volume with name)/i;
 
@@ -252,6 +256,22 @@ function hasExactResourceLabels(labels, pathHash, role) {
     const hostPort = String(labels?.[BOX_LABELS.routerHostPort] || '');
     const mediaHostPort = String(labels?.[BOX_LABELS.mediaHostPort] || '');
     const imageRef = String(labels?.[BOX_LABELS.imageRef] || '');
+    const serializedRelease = String(labels?.[BOX_LABELS.releaseDescriptor] || '');
+    const releaseGeneration = String(labels?.[BOX_LABELS.releaseGeneration] || '');
+    let releaseLabels = {};
+    if (serializedRelease || releaseGeneration) {
+        try {
+            const descriptor = parseReleaseDescriptor(serializedRelease);
+            if (releaseGeneration !== descriptor.releaseGeneration
+                || serializeReleaseDescriptor(descriptor) !== serializedRelease) return false;
+            releaseLabels = {
+                [BOX_LABELS.releaseDescriptor]: serializedRelease,
+                [BOX_LABELS.releaseGeneration]: releaseGeneration,
+            };
+        } catch {
+            return false;
+        }
+    }
     return /^[1-9][0-9]{0,4}$/.test(hostPort)
         && Number(hostPort) <= 65535
         && /^[1-9][0-9]{0,4}$/.test(mediaHostPort)
@@ -262,6 +282,7 @@ function hasExactResourceLabels(labels, pathHash, role) {
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: hostPort,
             [BOX_LABELS.mediaHostPort]: mediaHostPort,
+            ...releaseLabels,
         });
 }
 

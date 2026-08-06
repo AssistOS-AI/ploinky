@@ -9,6 +9,10 @@ import {
     BOX_ROLES,
 } from '../constants.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
+import {
+    RELEASE_DESCRIPTOR_ENV,
+    serializeReleaseDescriptor,
+} from '../contract/release.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { revalidateVolumeHandle, volumeMountArgs } from '../volumes.mjs';
 
@@ -72,6 +76,7 @@ export function containerCreateArgs({
     repositoryRoot,
     cidfile,
     hostKind = 'native-linux',
+    releaseDescriptor = null,
 }) {
     const source = path.resolve(repositoryRoot);
     const labels = {
@@ -80,6 +85,10 @@ export function containerCreateArgs({
         [BOX_LABELS.imageRef]: imageRef,
         [BOX_LABELS.routerHostPort]: String(hostPort),
         [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
+        ...(releaseDescriptor ? {
+            [BOX_LABELS.releaseDescriptor]: serializeReleaseDescriptor(releaseDescriptor),
+            [BOX_LABELS.releaseGeneration]: releaseDescriptor.releaseGeneration,
+        } : {}),
     };
     return [
         'container', 'create',
@@ -98,6 +107,9 @@ export function containerCreateArgs({
         '--env', 'PLOINKY_PUBLIC_BIND=0.0.0.0',
         '--env', `PLOINKY_PUBLIC_AUTHORITY=127.0.0.1:${hostPort}`,
         '--env', 'PLOINKY_PRIVATE_BIND=0.0.0.0',
+        ...(releaseDescriptor ? [
+            '--env', `${RELEASE_DESCRIPTOR_ENV}=${serializeReleaseDescriptor(releaseDescriptor)}`,
+        ] : []),
         ...Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
         '--cidfile', cidfile,
         imageId,

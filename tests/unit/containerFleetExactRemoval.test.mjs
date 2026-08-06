@@ -76,6 +76,7 @@ function runExact(record = registryRecord(), initial = inspectedRecord()) {
         },
         pause() {},
         workspaceIdentity: () => ({ hash: WORKSPACE_HASH }),
+        listProviderOwners: () => [],
     });
     return { result, controls };
 }
@@ -130,6 +131,7 @@ test('fleet removal refuses identity, ownership, init, and descriptor provenance
                     control: () => { controls += 1; return { status: 0 }; },
                     withLock: (callback) => callback(),
                     workspaceIdentity: () => ({ hash: WORKSPACE_HASH }),
+                    listProviderOwners: () => [],
                 },
             ),
             /could not prove|unrecorded generated Router descriptor mount/,
@@ -145,6 +147,7 @@ test('fleet removal preserves absent, incomplete, and legacy registry targets', 
         control: () => { controls += 1; return { status: 0 }; },
         withLock: (callback) => callback(),
         workspaceIdentity: () => ({ hash: WORKSPACE_HASH }),
+        listProviderOwners: () => [],
     });
     assert.deepEqual(absent, { found: false, stopped: false, removed: false });
     assert.equal(controls, 0);

@@ -235,6 +235,7 @@ function retainedContainerFixture(t, {
     includeRegistry = true,
     mutateRegistry = (record) => record,
     mutateLabels = (labels) => labels,
+    releaseGeneration = '',
 } = {}) {
     const { paths } = fixture(t);
     const containerId = 'a'.repeat(64);
@@ -251,6 +252,7 @@ function retainedContainerFixture(t, {
         containerId,
         instanceId,
         enableGeneration,
+        ...(releaseGeneration ? { releaseGeneration } : {}),
     });
     fs.writeFileSync(path.join(paths.workspace, '.ploinky', 'agents.json'), JSON.stringify(
         includeRegistry ? { ploinky_demo: registryRecord } : {},
@@ -263,6 +265,9 @@ function retainedContainerFixture(t, {
         'io.assistos.ploinky.network-contract': 'b'.repeat(64),
         'io.assistos.ploinky.instance-id': instanceId,
         'io.assistos.ploinky.enable-generation': enableGeneration,
+        ...(releaseGeneration
+            ? { 'io.assistos.ploinky.release-generation': releaseGeneration }
+            : {}),
     });
     const calls = [];
     const runner = {
@@ -487,6 +492,21 @@ test('entrypoint rejects running or ownership-drifted retained managed container
         /schema-label/,
     );
     assert.equal(statusSchema.calls.some((call) => call[0] === 'run'), false);
+
+    const staleRelease = retainedContainerFixture(t, {
+        releaseGeneration: '6'.repeat(64),
+        mutateLabels(labels) {
+            return {
+                ...labels,
+                'io.assistos.ploinky.release-generation': '7'.repeat(64),
+            };
+        },
+    });
+    assert.throws(
+        () => retireStoppedManagedContainers(staleRelease.paths, { runner: staleRelease.runner }),
+        /release-ownership-label/,
+    );
+    assert.equal(staleRelease.calls.some((call) => call[0] === 'run'), false);
 });
 
 test('entrypoint failure diagnostics preserve a bounded normalized cause chain', () => {

@@ -145,6 +145,7 @@ function requireAgentPodmanRuntime({ boxMarkerPath, runtimeInstalled = isRuntime
 const DEFAULT_IMAGE_PULL_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_IMAGE_BUILD_TIMEOUT_MS = 30 * 60 * 1000;
 const LOCAL_IMAGE_BUILD_DEFINITIONS = Object.freeze({});
+const EXACT_RAW_IMAGE_ID = /^[a-f0-9]{64}$/;
 
 function imagePullTimeoutMs() {
     const raw = Number(process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS);
@@ -265,6 +266,13 @@ function ensureImagePresent(image, options = {}) {
     const img = String(image || '').trim();
     if (!img) throw new Error('ensureImagePresent: image is required');
     if (imageExists(img, rt)) return false;
+    if (EXACT_RAW_IMAGE_ID.test(img)) {
+        const error = new Error(
+            `Exact raw image ID '${img}' is not present locally; pull, build, tag, and fallback are forbidden`,
+        );
+        error.code = 'PLOINKY_EXACT_IMAGE_ID_UNAVAILABLE';
+        throw error;
+    }
     const log = typeof options.log === 'function' ? options.log : ((msg) => console.log(msg));
     log(`[pull] image '${img}' not present locally — pulling before runtime probe...`);
     try {

@@ -58,6 +58,7 @@ import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import { withWorkspaceMutationLease } from './runtime/maintenanceLocks.js';
+import { readInnerReleaseDescriptor } from './runtime/releaseRuntime.js';
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
@@ -249,6 +250,7 @@ function buildDefaultLocalAuthVars(routeKey) {
 export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
     runtime,
     runtimeRecord,
+    releaseGeneration = '',
     isRunning = isContainerRunning,
     waitRunning = waitForContainerRunning,
     isSandboxRunning = isBwrapProcessRunning,
@@ -270,7 +272,8 @@ export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
         && runtimeRecord.instanceId === runtimeRecord.instanceId.trim()
         && typeof runtimeRecord.enableGeneration === 'string'
         && runtimeRecord.enableGeneration !== ''
-        && runtimeRecord.enableGeneration === runtimeRecord.enableGeneration.trim();
+        && runtimeRecord.enableGeneration === runtimeRecord.enableGeneration.trim()
+        && String(runtimeRecord.releaseGeneration || '') === String(releaseGeneration || '');
     const exactPodmanIdentity = runtime !== 'podman'
         || (typeof runtimeInstanceName === 'string'
             && /^[a-f0-9]{64}$/.test(runtimeInstanceName)
@@ -285,6 +288,7 @@ export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
         ? isSandboxRunning(runtimeInstanceName, {
             instanceId: runtimeRecord.instanceId,
             enableGeneration: runtimeRecord.enableGeneration,
+            releaseGeneration: String(runtimeRecord.releaseGeneration || ''),
         })
         : isRunning(runtimeInstanceName, { runtime: 'podman' })
             || waitRunning(runtimeInstanceName, 40, 250, { runtime: 'podman' });
@@ -301,6 +305,7 @@ async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
     networkMode = '',
     generationDigest = '',
     selectedRuntime,
+    releaseGeneration = '',
 } = {}) {
     const protocol = resolveAgentReadinessProtocol(manifest);
     if (protocol === 'none') return;
@@ -320,7 +325,8 @@ async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
             || record.instanceId !== record.instanceId.trim()
             || typeof record.enableGeneration !== 'string'
             || !record.enableGeneration
-            || record.enableGeneration !== record.enableGeneration.trim()) {
+            || record.enableGeneration !== record.enableGeneration.trim()
+            || String(record.releaseGeneration || '') !== String(releaseGeneration || '')) {
             const error = new Error('container script readiness requires one exact admitted Podman runtime identity');
             error.code = 'PLOINKY_PODMAN_RUNTIME_IDENTITY_INVALID';
             throw error;
@@ -335,6 +341,7 @@ async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
                 containerId: record.containerId,
                 instanceId: record.instanceId,
                 enableGeneration: record.enableGeneration,
+                releaseGeneration: String(record.releaseGeneration || ''),
             },
         ));
         if (result?.status !== 'success') {
@@ -556,7 +563,7 @@ function planAgentEnable({
     aliasParam,
     authModeParam,
     authOptions = {},
-}, map, routing, resolvedInput = undefined) {
+}, map, routing, resolvedInput = undefined, releaseDescriptor = null) {
     const {
         agentPath,
         manifest,
@@ -665,6 +672,7 @@ function planAgentEnable({
         runtime: selectedRuntime,
         instanceId,
         enableGeneration,
+        releaseGeneration: releaseDescriptor?.releaseGeneration || '',
         config: {
             binds: [
                 { source: projectPath, target: projectMountTarget },
@@ -754,6 +762,7 @@ function planAgentEnable({
         enableGeneration,
         existingRoute,
         instanceId,
+        releaseGeneration: releaseDescriptor?.releaseGeneration || '',
         instanceName,
         manifest,
         manifestBytes,
@@ -809,6 +818,8 @@ export function prepareAgentEnableBatch(requests, {
         throw new Error('prepare agent enable batch: requests must be an array');
     }
 
+    const releaseDescriptor = readInnerReleaseDescriptor();
+
     const resolvedRequests = requests.map((request) => {
         if (!request || typeof request !== 'object' || Array.isArray(request)) {
             throw new Error('prepare agent enable batch: each enable batch request must be an object');
@@ -846,7 +857,7 @@ export function prepareAgentEnableBatch(requests, {
 
     try {
         for (const { request, input } of resolvedRequests) {
-            plans.push(planAgentEnable(request, map, routing, input));
+            plans.push(planAgentEnable(request, map, routing, input, releaseDescriptor));
         }
         const effectiveAvailabilityMode = availabilityMode === 'additive'
             && plans.some((plan) => previousAgents?.[plan.containerName]?.type === 'agent')
@@ -899,6 +910,7 @@ export function prepareAgentEnableBatch(requests, {
                     agentId: `agent:${plan.repoName}/${plan.shortAgentName}`,
                     instanceId: plan.instanceId,
                     enableGeneration: plan.enableGeneration,
+                    releaseGeneration: plan.releaseGeneration,
                     routeKey: plan.routeKey,
                     containerName: plan.containerName,
                 }, {
@@ -983,6 +995,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 routerEndpoint,
                 instanceId,
                 enableGeneration,
+                releaseGeneration: plan.releaseGeneration,
                 forceRecreate: true,
                 preservePreparedRegistryRecord: true,
                 preparedRegistryRecord: record,
@@ -996,11 +1009,13 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                 : (started?.containerName || containerName), {
                 runtime: selectedRuntime,
                 runtimeRecord: started?.registryRecord,
+                releaseGeneration: plan.releaseGeneration,
             });
             await waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
                 networkMode: profileResolution.network.mode,
                 generationDigest: prepared.preparedGeneration?.preparationLease?.preparedGeneration || '',
                 selectedRuntime,
+                releaseGeneration: plan.releaseGeneration,
             });
 
             const hostPort = profileResolution.network.mode === 'none'

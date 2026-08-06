@@ -91,6 +91,7 @@ const MANAGED_CONTAINER_LABELS = Object.freeze({
     contract: 'io.assistos.ploinky.network-contract',
     instanceId: 'io.assistos.ploinky.instance-id',
     enableGeneration: 'io.assistos.ploinky.enable-generation',
+    releaseGeneration: 'io.assistos.ploinky.release-generation',
 });
 const REMOVABLE_RETAINED_STATES = new Set(['configured', 'created', 'exited', 'stopped']);
 
@@ -179,11 +180,19 @@ export function retireStoppedManagedContainers(paths, {
             && ploinkyLabelKeys.length === 1;
         const registeredInstanceId = String(registered?.instanceId || '');
         const registeredEnableGeneration = String(registered?.enableGeneration || '');
+        const registeredReleaseGeneration = String(registered?.releaseGeneration || '');
         const registeredContainerId = String(registered?.containerId || '').trim().toLowerCase();
         const observedInstanceId = String(labels[MANAGED_CONTAINER_LABELS.instanceId] || '');
         const observedEnableGeneration = String(
             labels[MANAGED_CONTAINER_LABELS.enableGeneration] || '',
         );
+        const observedReleaseGeneration = String(
+            labels[MANAGED_CONTAINER_LABELS.releaseGeneration] || '',
+        );
+        const validRegisteredReleaseGeneration = registeredReleaseGeneration === ''
+            || /^[a-f0-9]{64}$/.test(registeredReleaseGeneration);
+        const exactReleaseOwnership = validRegisteredReleaseGeneration
+            && observedReleaseGeneration === registeredReleaseGeneration;
         const hasRegisteredLifecycleOwnership = Boolean(
             registeredInstanceId && registeredEnableGeneration,
         );
@@ -213,6 +222,7 @@ export function retireStoppedManagedContainers(paths, {
             labels[MANAGED_CONTAINER_LABELS.workspace] === workspaceHash || 'workspace-label',
             /^[a-f0-9]{64}$/.test(String(labels[MANAGED_CONTAINER_LABELS.contract] || ''))
                 || 'contract-label',
+            exactReleaseOwnership || 'release-ownership-label',
             (
                 exactLifecycleOwnership
                 || absentLifecycleOwnership

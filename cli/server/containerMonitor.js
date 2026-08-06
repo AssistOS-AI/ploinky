@@ -182,6 +182,13 @@ function validateWatchdogRuntimeRecord(containerName, record) {
             throw invalidRuntimeState(containerName, `requires exact ${field}`);
         }
     }
+    const releaseGeneration = String(record?.releaseGeneration || '');
+    if (releaseGeneration && !/^[a-f0-9]{64}$/.test(releaseGeneration)) {
+        throw invalidRuntimeState(
+            containerName,
+            'requires releaseGeneration to be empty or an exact lowercase 64-hex digest',
+        );
+    }
     if (runtime === 'podman' && !PODMAN_CONTAINER_ID_PATTERN.test(String(record?.containerId || ''))) {
         throw invalidRuntimeState(
             containerName,
@@ -193,6 +200,7 @@ function validateWatchdogRuntimeRecord(containerName, record) {
         containerId: runtime === 'podman' ? record.containerId : null,
         instanceId: record.instanceId,
         enableGeneration: record.enableGeneration,
+        releaseGeneration,
     });
 }
 
@@ -202,6 +210,7 @@ function podmanRuntimeIdentityKey(target) {
         target.containerId,
         target.instanceId,
         target.enableGeneration,
+        String(target.releaseGeneration || ''),
     ].join('\0');
 }
 
@@ -273,6 +282,7 @@ function createContainerTarget(info, monitor) {
         containerId: info.containerId || null,
         instanceId: info.instanceId || null,
         enableGeneration: info.enableGeneration || null,
+        releaseGeneration: info.releaseGeneration || '',
         type: info.type,
         manifestPath: info.manifestPath,
         restartHistory: [],
@@ -356,6 +366,7 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         network: profileResolution.network,
         instanceId: info.instanceId,
         enableGeneration: info.enableGeneration,
+        releaseGeneration: info.releaseGeneration,
         alias: info.alias,
         containerName: info.containerName,
         retainedNodeIdentity: String(record.retainedNodeIdentity || ''),
@@ -378,6 +389,7 @@ function resolveWatchdogRestartInput(record, info, monitor) {
             containerId: info.containerId || null,
             instanceId: info.instanceId || null,
             enableGeneration: info.enableGeneration || null,
+            releaseGeneration: info.releaseGeneration || '',
             manifestPath: info.manifestPath,
         },
     });
@@ -696,6 +708,7 @@ export function syncManagedContainers(monitor) {
                 containerId: runtimeIdentity.containerId,
                 instanceId: runtimeIdentity.instanceId,
                 enableGeneration: runtimeIdentity.enableGeneration,
+                releaseGeneration: runtimeIdentity.releaseGeneration,
                 manifestPath,
                 routing,
             }, monitorRef);
@@ -716,6 +729,7 @@ export function syncManagedContainers(monitor) {
                 containerId: record.containerId,
                 instanceId: String(record.instanceId || ''),
                 enableGeneration: String(record.enableGeneration || ''),
+                releaseGeneration: String(record.releaseGeneration || ''),
             });
             if (terminal) {
                 const info = {
@@ -753,6 +767,7 @@ export function syncManagedContainers(monitor) {
         const containerId = runtime === 'podman' ? record.containerId : null;
         const instanceId = record.instanceId;
         const enableGeneration = record.enableGeneration;
+        const releaseGeneration = String(record.releaseGeneration || '');
         const info = {
             containerName,
             type,
@@ -765,6 +780,7 @@ export function syncManagedContainers(monitor) {
             containerId,
             instanceId,
             enableGeneration,
+            releaseGeneration,
             restartInputDigest: restartInput.restartInputDigest,
             runtimeAdmission: restartInput.runtimeAdmission,
             restartSnapshot: restartInput.restartSnapshot,
@@ -817,6 +833,7 @@ export function syncManagedContainers(monitor) {
             target.containerId = containerId;
             target.instanceId = instanceId;
             target.enableGeneration = enableGeneration;
+            target.releaseGeneration = releaseGeneration;
             target.type = type;
             target.manifestPath = manifestPath;
             target.runtime = runtime;
@@ -1359,6 +1376,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                     activationCommitted = true;
                     target.instanceId = String(result?.registryRecord?.instanceId || '') || null;
                     target.enableGeneration = String(result?.registryRecord?.enableGeneration || '') || null;
+                    target.releaseGeneration = String(result?.registryRecord?.releaseGeneration || '');
                     target.containerId = target.runtime === 'podman'
                         ? String(result?.registryRecord?.containerId || '') || null
                         : null;
@@ -1486,6 +1504,7 @@ export function monitorTick(monitor) {
                     && isBwrapProcessRunning(target.containerName, {
                         instanceId: target.instanceId,
                         enableGeneration: target.enableGeneration,
+                        releaseGeneration: String(target.releaseGeneration || ''),
                     });
             } else if (target.runtime === 'podman' && runningContainerNames) {
                 running = runningContainerNames.has(podmanRuntimeIdentityKey(target));

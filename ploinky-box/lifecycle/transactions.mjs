@@ -4,6 +4,11 @@ import fs from 'node:fs';
 import { BOX_IMAGE_REFERENCE } from '../constants.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import {
+    inspectAndValidateReleaseImage,
+    parseReleaseDescriptor,
+    serializeReleaseDescriptor,
+} from '../contract/release.mjs';
+import {
     inspectAndValidateExistingImage,
     inspectAndValidateImage,
 } from '../contract/image.mjs';
@@ -44,6 +49,12 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
     const mediaHostPort = Number(container.labels['io.assistos.ploinky-box.media-host-port']);
     const imageRef = container.labels['io.assistos.ploinky-box.image-ref'];
     const imageId = container.runtime.imageId;
+    const serializedRelease = String(
+        container.labels['io.assistos.ploinky-box.release-descriptor'] || '',
+    );
+    const releaseDescriptor = serializedRelease
+        ? parseReleaseDescriptor(serializedRelease)
+        : null;
     const desired = {
         identity,
         hostPort,
@@ -52,6 +63,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         imageId,
         repositoryRoot,
         hostKind: engine.hostKind,
+        ...(releaseDescriptor ? { releaseDescriptor } : {}),
     };
     validateContainerConfiguration(container, desired);
     return Object.freeze(desired);
@@ -109,6 +121,7 @@ async function createAndStart({
     token,
     stdout,
     stderr,
+    releaseDescriptor,
 }) {
     lock.assertHeld(identity.instance);
     revalidateVolumes({ engine, identity, handles: volumeHandles, runner, lock });
@@ -124,6 +137,7 @@ async function createAndStart({
         repositoryRoot,
         cidfile,
         hostKind: engine.hostKind,
+        releaseDescriptor,
     }));
     let containerId;
     try {
@@ -152,6 +166,7 @@ async function createAndStart({
         imageRef,
         repositoryRoot,
         hostKind: engine.hostKind,
+        releaseDescriptor,
     });
     if (handle.id !== containerId) {
         throw transactionError('Created Box immutable ID changed during final validation');
@@ -189,6 +204,7 @@ async function restoreOldContainer({
         token: dependencies.token('restore'),
         stdout,
         stderr,
+        releaseDescriptor: old.releaseDescriptor || null,
     });
 }
 
@@ -202,6 +218,7 @@ export async function reconcileBoxContainer({
     explicitPort,
     explicitMediaPort,
     localBoxImageId,
+    releaseDescriptor = null,
     imageRef = BOX_IMAGE_REFERENCE,
     platform = process.platform,
     env = process.env,
@@ -219,6 +236,7 @@ export async function reconcileBoxContainer({
         preflight: seams.preflight || preflightPublications,
         validateImage: seams.validateImage || inspectAndValidateImage,
         validateExistingImage: seams.validateExistingImage || inspectAndValidateExistingImage,
+        validateReleaseImage: seams.validateReleaseImage || inspectAndValidateReleaseImage,
         ensureVolumes: seams.ensureVolumes || ensureNamedVolumes,
         rollbackVolumes: seams.rollbackVolumes || rollbackCreatedVolumes,
         revalidateVolumes: seams.revalidateVolumes || revalidateAllVolumes,
@@ -229,25 +247,54 @@ export async function reconcileBoxContainer({
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
-    if (localBoxImageId !== undefined && localBoxImageId !== null
-        && !/^[a-f0-9]{64}$/.test(String(localBoxImageId))) {
+    let selectedRelease = null;
+    if (releaseDescriptor) {
+        selectedRelease = parseReleaseDescriptor(serializeReleaseDescriptor(releaseDescriptor), {
+            expectedControllerSourceSha: releaseDescriptor.controllerSourceSha,
+        });
+    }
+    if (localBoxImageId !== undefined && localBoxImageId !== null) {
         throw new PloinkyBoxError(
-            'Local Box image ID must be exactly 64 lowercase hexadecimal characters',
-            { code: 'PLOINKY_BOX_LOCAL_IMAGE_ID_INVALID' },
+            'Loose local Box image admission is retired; use one release descriptor',
+            { code: 'PLOINKY_RELEASE_DESCRIPTOR_REQUIRED' },
         );
     }
-    const selectedLocalImageId = localBoxImageId ? String(localBoxImageId) : null;
-    const portPlan = resolveEffectiveHostPort({ explicitPort, explicitMediaPort, ownership });
+    if (explicitMediaPort !== undefined && explicitMediaPort !== null) {
+        throw new PloinkyBoxError(
+            'Loose media-port admission is retired; use one release descriptor',
+            { code: 'PLOINKY_RELEASE_DESCRIPTOR_REQUIRED' },
+        );
+    }
+    const selectedLocalImageId = selectedRelease?.boxImageId || null;
+    const desiredImageRef = selectedRelease?.boxImageId || imageRef;
+    if (selectedRelease
+        && explicitPort !== undefined && explicitPort !== null
+        && Number(explicitPort) !== selectedRelease.routerHostPort) {
+        throw new PloinkyBoxError(
+            'Release descriptor owns the exact Router and media host ports',
+            { code: 'PLOINKY_RELEASE_DESCRIPTOR_INVALID' },
+        );
+    }
+    const portPlan = resolveEffectiveHostPort({
+        explicitPort: selectedRelease?.routerHostPort ?? explicitPort,
+        explicitMediaPort: selectedRelease?.mediaHostPort,
+        ownership,
+    });
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
     if (old) {
         dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
+        if (old.releaseDescriptor) {
+            dependencies.validateReleaseImage(engine.name, 'box', old.releaseDescriptor, runner);
+        }
     }
     const requiresReplacement = Boolean(old) && (
         old.hostPort !== portPlan.hostPort
         || old.mediaHostPort !== portPlan.mediaHostPort
-        || old.imageRef !== imageRef
+        || old.imageRef !== desiredImageRef
         || (selectedLocalImageId !== null && old.imageId !== selectedLocalImageId)
+        || (selectedRelease !== null
+            && old.releaseDescriptor?.releaseGeneration !== selectedRelease.releaseGeneration)
     );
     if (old && !requiresReplacement) {
         dependencies.revalidateVolumes({
@@ -270,6 +317,7 @@ export async function reconcileBoxContainer({
             hostPort: old.hostPort,
             mediaHostPort: old.mediaHostPort,
             imageId: old.imageId,
+            releaseGeneration: old.releaseDescriptor?.releaseGeneration || null,
         });
     }
 
@@ -281,14 +329,17 @@ export async function reconcileBoxContainer({
     if (selectedLocalImageId === null) {
         await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
     } else {
-        writeProgress(stderr, `Validating local Box image ${selectedLocalImageId} without pulling...`);
+        writeProgress(stderr, `Validating release Box image ${selectedLocalImageId} without pulling...`);
     }
     const selectedImageRef = selectedLocalImageId || imageRef;
+    if (selectedRelease) {
+        dependencies.validateReleaseImage(engine.name, 'box', selectedRelease, runner);
+    }
     const image = dependencies.validateImage(engine.name, selectedImageRef, runner);
     if (selectedLocalImageId !== null && image.immutableId !== selectedLocalImageId) {
         throw new PloinkyBoxError(
-            'Local Box image inspection did not return the exact requested immutable ID',
-            { code: 'PLOINKY_BOX_LOCAL_IMAGE_ID_MISMATCH' },
+            'Release Box image inspection did not return the descriptor image ID',
+            { code: 'PLOINKY_RELEASE_IMAGE_STALE' },
         );
     }
     let volumeResult;
@@ -329,7 +380,7 @@ export async function reconcileBoxContainer({
             engine,
             identity,
             image,
-            imageRef,
+            imageRef: desiredImageRef,
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
             repositoryRoot,
@@ -344,6 +395,7 @@ export async function reconcileBoxContainer({
             token: dependencies.token('candidate'),
             stdout,
             stderr,
+            releaseDescriptor: selectedRelease,
         });
         candidateId = created.containerId;
         return Object.freeze({
@@ -352,6 +404,7 @@ export async function reconcileBoxContainer({
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
             imageId: image.immutableId,
+            releaseGeneration: selectedRelease?.releaseGeneration || null,
         });
     } catch (error) {
         const rollbackFailures = [];
