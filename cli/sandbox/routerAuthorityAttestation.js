@@ -14,7 +14,6 @@ const HEALTH_SOCKET = path.join(PLOINKY_DIR, 'run', 'router-health.sock');
 const REQUEST_TIMEOUT_MS = 3_000;
 const HELPER_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_BYTES = 8 * 1024;
-const LOOPBACK_LOGIN_BODY = '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}';
 const MACOS_REMOTE_LOOPBACK_BODY = '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}';
 const AUTHORITY_HELPER_USER = '65534:65534';
 export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
@@ -220,6 +219,30 @@ function assertExternal(record, status, body) {
     }
 }
 
+function exactStaticRouteIdentity(generationSnapshot, generationId) {
+    if (!generationSnapshot || typeof generationSnapshot !== 'object' || Array.isArray(generationSnapshot)) {
+        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'public-loopback attestation requires its immutable generation snapshot');
+    }
+    if (generationSnapshot.generation !== generationId) {
+        fail('PLOINKY_ROUTER_ATTESTATION_GENERATION', 'authority attestation snapshot generation changed');
+    }
+    const routeIdentity = generationSnapshot.routing?.static?.agent;
+    if (typeof routeIdentity !== 'string' || !routeIdentity || routeIdentity !== routeIdentity.trim()) {
+        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'public-loopback attestation requires one exact static route identity');
+    }
+    return routeIdentity;
+}
+
+function exactLoopbackLoginBody(generationSnapshot, generationId) {
+    const query = new URLSearchParams({ returnTo: '/health' });
+    query.set('agent', exactStaticRouteIdentity(generationSnapshot, generationId));
+    return JSON.stringify({
+        ok: false,
+        error: 'not_authenticated',
+        login: `/auth/login?${query.toString()}`,
+    });
+}
+
 function isLoopbackAddress(value) {
     const address = String(value || '').toLowerCase();
     if (address === '::1') return true;
@@ -283,7 +306,14 @@ function assertExactSocketEvidence(intent, records) {
     }
 }
 
-export function validateRouterAuthorityObservation({ intent, nonce, records, external, generationId } = {}) {
+export function validateRouterAuthorityObservation({
+    intent,
+    nonce,
+    records,
+    external,
+    generationId,
+    generationSnapshot,
+} = {}) {
     if (!intent || !/^[a-f0-9]{64}$/.test(String(nonce || ''))
         || !Array.isArray(records) || records.length !== 2
         || !Array.isArray(external) || external.length !== 2
@@ -319,7 +349,7 @@ export function validateRouterAuthorityObservation({ intent, nonce, records, ext
         });
         const loopbackBody = intent.topology === 'macos-remote-public-loopback'
             ? MACOS_REMOTE_LOOPBACK_BODY
-            : LOOPBACK_LOGIN_BODY;
+            : exactLoopbackLoginBody(generationSnapshot, generationId);
         assertExternal(externalByHost(external, loopback), 401, loopbackBody);
         assertExternal(externalByHost(external, hci), 421, '{"error":"UNKNOWN_HOST"}');
     } else {
@@ -631,6 +661,7 @@ export function attestRouterAuthority({
             records,
             external: probe.external,
             generationId: generationLease.id,
+            generationSnapshot: generationLease.snapshot,
         });
         if (generationLease.commit() !== true) fail('PLOINKY_ROUTER_ATTESTATION_GENERATION', 'edge generation changed after authority observation');
         const completeEvidence = Object.freeze({

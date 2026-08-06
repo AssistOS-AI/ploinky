@@ -30,6 +30,13 @@ function intent(fsApi, runtimeProof = proof, platform = 'linux') {
     });
 }
 
+function generationSnapshot(fixture) {
+    return Object.freeze({
+        generation: fixture.evidence.generationId,
+        routing: Object.freeze({ static: Object.freeze({ agent: 'explorer' }) }),
+    });
+}
+
 test('Box/remote select public+loopback authority while native managed selects HCI:8080', () => {
     const box = intent(presentBox);
     const remote = intent(missingBox, { ...proof, remote: true });
@@ -53,6 +60,7 @@ test('AppleHV remote uses its dedicated exact loopback proxy evidence cell', () 
         records: macosFixture.evidence.records,
         external: macosFixture.evidence.external,
         generationId: macosFixture.evidence.generationId,
+        generationSnapshot: generationSnapshot(macosFixture),
     }));
 
     const linuxRemote = intent(missingBox, { ...proof, remote: true }, 'linux');
@@ -62,6 +70,7 @@ test('AppleHV remote uses its dedicated exact loopback proxy evidence cell', () 
         records: macosFixture.evidence.records,
         external: macosFixture.evidence.external,
         generationId: macosFixture.evidence.generationId,
+        generationSnapshot: generationSnapshot(macosFixture),
     }), /fixed topology cell/);
 });
 
@@ -74,6 +83,7 @@ test('frozen public and managed two-Host evidence validates only in its intended
         records: fixture.evidence.records,
         external: fixture.evidence.external,
         generationId: fixture.evidence.generationId,
+        generationSnapshot: generationSnapshot(fixture),
     });
     assert.doesNotThrow(() => validate(intent(presentBox), publicFixture));
     assert.doesNotThrow(() => validate(intent(missingBox), managedFixture));

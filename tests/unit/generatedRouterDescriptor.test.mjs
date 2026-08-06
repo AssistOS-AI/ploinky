@@ -38,6 +38,13 @@ function fixtureJson(name) {
     return JSON.parse(fixtureBytes(name).toString('utf8'));
 }
 
+function generationSnapshot(fixture, agent = 'explorer') {
+    return Object.freeze({
+        generation: fixture.evidence.generationId,
+        routing: Object.freeze({ static: Object.freeze({ agent }) }),
+    });
+}
+
 function sha256(bytes) {
     return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
 }
@@ -352,6 +359,7 @@ test('fixed public and managed attestation fixtures validate only in their exact
         records: publicFixture.evidence.records,
         external: publicFixture.evidence.external,
         generationId: publicFixture.evidence.generationId,
+        generationSnapshot: generationSnapshot(publicFixture),
     }));
     assert.doesNotThrow(() => validateRouterAuthorityObservation({
         intent: managedIntent,
@@ -382,6 +390,7 @@ test('fixed public and managed attestation fixtures validate only in their exact
             records: ambiguousRecords,
             external: publicFixture.evidence.external,
             generationId: publicFixture.evidence.generationId,
+            generationSnapshot: generationSnapshot(publicFixture),
         }), /socket\/interface evidence|socket address class/);
     }
 
@@ -395,6 +404,7 @@ test('fixed public and managed attestation fixtures validate only in their exact
         records: nestedBoxHairpinRecords,
         external: publicFixture.evidence.external,
         generationId: publicFixture.evidence.generationId,
+        generationSnapshot: generationSnapshot(publicFixture),
     }));
     assert.throws(() => validateRouterAuthorityObservation({
         intent: managedIntent,
@@ -484,6 +494,7 @@ test('attestation registers, probes, consumes, then commits the generation befor
         intent,
         generationLease: {
             id: fixture.evidence.generationId,
+            snapshot: generationSnapshot(fixture),
             commit() { order.push('commit'); return true; },
         },
         registryClient: {
@@ -509,6 +520,72 @@ test('attestation registers, probes, consumes, then commits the generation befor
     assert.match(result.attestationId, /^sha256:[a-f0-9]{64}$/);
     assert.equal(result.evidence.generationId, fixture.evidence.generationId);
     assert.deepEqual(result.evidence.target, { image: 'sha256:target', user: 'root' });
+});
+
+test('public-loopback attestation derives the encoded login owner from its immutable generation', () => {
+    const fixture = fixtureJson('public-attestation.json');
+    const intent = buildRouterAuthorityTopologyIntent({
+        networkMode: 'default',
+        runtimeProof,
+        networkFingerprint,
+        routerHostPort: 18080,
+        edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
+        platform: 'linux',
+        fsApi: presentBoxFs(),
+    });
+    const staticAgent = 'AchillesIDE/explorer';
+    const external = fixture.evidence.external.map((record) => (
+        record.host === intent.publicAuthority
+            ? {
+                ...record,
+                body: '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=AchillesIDE%2Fexplorer"}',
+            }
+            : record
+    ));
+
+    assert.doesNotThrow(() => attestRouterAuthority({
+        intent,
+        generationLease: {
+            id: fixture.evidence.generationId,
+            snapshot: generationSnapshot(fixture, staticAgent),
+            commit() { return true; },
+        },
+        registryClient: {
+            register() {},
+            consume() { return fixture.evidence.records; },
+        },
+        runProbe() {
+            return {
+                external,
+                helper: fixture.evidence.helper,
+                target: { image: 'sha256:target', user: '1000:1000' },
+            };
+        },
+    }));
+
+    assert.throws(() => validateRouterAuthorityObservation({
+        intent,
+        nonce: fixture.evidence.nonce,
+        records: fixture.evidence.records,
+        external: external.map((record) => (
+            record.host === intent.publicAuthority
+                ? { ...record, body: record.body.replace('AchillesIDE%2Fexplorer', 'AchillesIDE/explorer') }
+                : record
+        )),
+        generationId: fixture.evidence.generationId,
+        generationSnapshot: generationSnapshot(fixture, staticAgent),
+    }), /external status\/body/);
+    assert.throws(() => validateRouterAuthorityObservation({
+        intent,
+        nonce: fixture.evidence.nonce,
+        records: fixture.evidence.records,
+        external,
+        generationId: fixture.evidence.generationId,
+        generationSnapshot: {
+            ...generationSnapshot(fixture, staticAgent),
+            generation: `sha256:${'f'.repeat(64)}`,
+        },
+    }), /snapshot generation changed/);
 });
 
 function externalProbeTimeoutError({
@@ -549,6 +626,7 @@ test('external helper timeout retries the entire fresh-nonce transaction once be
         intent,
         generationLease: {
             id: fixture.evidence.generationId,
+            snapshot: generationSnapshot(fixture),
             commit() {
                 commitCalls += 1;
                 order.push('commit');
@@ -609,6 +687,7 @@ test('a second external helper timeout fails closed without consume or generatio
             intent,
             generationLease: {
                 id: fixture.evidence.generationId,
+                snapshot: generationSnapshot(fixture),
                 commit() { commitCalls += 1; return true; },
             },
             registryClient: {
@@ -638,6 +717,7 @@ test('registry, validation, generation, cleanup, wrong-operation, and generic fa
                 intent,
                 generationLease: {
                     id: fixture.evidence.generationId,
+                    snapshot: generationSnapshot(fixture),
                     commit() {
                         counts.commit += 1;
                         return commit ? commit() : true;
