@@ -2,6 +2,7 @@ import {
     BOX_LABELS,
     BOX_MEDIA_PORT,
     BOX_ROUTER_CONTAINER_PORT,
+    BOX_ROUTER_HEALTH_SOCKET,
     BOX_USERNS,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
@@ -198,6 +199,7 @@ export function validateContainerConfiguration(containerHandle, {
         PLOINKY_PUBLIC_BIND: '0.0.0.0',
         PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
         PLOINKY_PRIVATE_BIND: '0.0.0.0',
+        PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET,
     };
     const observedEnvironment = { ...runtime.environment };
     const runtimeHostname = observedEnvironment.HOSTNAME;

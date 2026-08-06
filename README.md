@@ -57,7 +57,9 @@ read-write at `/workspace`. Ordinary agent containers run one level inside this
 runtime and receive that same `/workspace` bind, so host files are immediately
 visible to agents and files or directories created there by agents persist on
 the host. Dependencies and nested-container storage remain in two instance-owned
-named volumes.
+named volumes. Transient Unix sockets stay under the outer runtime's private
+`/run/ploinky` filesystem so the writable host bind remains portable through a
+macOS Podman Machine.
 
 | Invocation | Documented effect |
 | --- | --- |

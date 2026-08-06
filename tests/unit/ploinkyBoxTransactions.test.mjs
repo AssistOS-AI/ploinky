@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
     BOX_LABELS,
     BOX_READY_LINE,
+    BOX_ROUTER_HEALTH_SOCKET,
     BOX_USERNS,
 } from '../../ploinky-box/constants.mjs';
 import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
@@ -64,6 +65,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
+                PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET,
                 HOSTNAME: id.slice(0, 12),
             },
             publications: [
@@ -342,6 +344,7 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.includes('0.0.0.0:7882:7882/udp'), true);
     assert.equal(args.includes('unmask=ALL'), true);
     assert.equal(args.includes('label=disable'), true);
+    assert.equal(args.includes(`PLOINKY_ROUTER_HEALTH_SOCKET=${BOX_ROUTER_HEALTH_SOCKET}`), true);
     assert.equal(args.includes('/dev/fuse'), true);
     assert.equal(args.includes('/dev/net/tun'), true);
     assert.deepEqual(args.slice(args.indexOf('--userns'), args.indexOf('--userns') + 2), [

@@ -4,6 +4,7 @@ export const BOX_MEDIA_PORT = 7882;
 export const BOX_READY_LINE = 'PLOINKY_BOX_READY';
 export const BOX_MARKER_PATH = '/etc/ploinky-box';
 export const BOX_MARKER_CONTENT = 'assistos/ploinky-box\n';
+export const BOX_ROUTER_HEALTH_SOCKET = '/run/ploinky/router-health.sock';
 
 export const BOX_LABELS = Object.freeze({
     pathHash: 'io.assistos.ploinky-box.path-hash',
