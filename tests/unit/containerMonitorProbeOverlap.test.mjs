@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 
 import {
     monitorTick,
+    readNoWaitStatus,
     startProbeWorker,
 } from '../../cli/server/containerMonitor.js';
 
@@ -111,6 +112,92 @@ test('a running no-wait container is not probed until activation readiness publi
 
     assert.deepEqual(probeStarts, [target.containerName]);
     assert.equal(target.noWaitDeferredState, null);
+});
+
+test('malformed no-wait status remains fail-closed while ENOENT remains absent', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-status-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const statusDir = path.join(workspace, 'no-wait');
+    const statusPath = path.join(statusDir, 'malformed-container.json');
+    fs.mkdirSync(statusDir, { recursive: true });
+    fs.writeFileSync(statusPath, '{"state":');
+
+    assert.deepEqual(
+        readNoWaitStatus('malformed-container', { runningDir: workspace }),
+        { state: 'unreadable' },
+    );
+    fs.unlinkSync(statusPath);
+    assert.equal(
+        readNoWaitStatus('malformed-container', { runningDir: workspace }),
+        null,
+    );
+});
+
+test('a current no-wait run marker rejects stale canonical status and missing publication', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-run-id-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const statusDir = path.join(workspace, 'no-wait');
+    const statusPath = path.join(statusDir, 'run-scoped-container.json');
+    const markerPath = path.join(statusDir, 'run-scoped-container.current.json');
+    const currentRunId = '12345678-1234-4234-8234-123456789abc';
+    fs.mkdirSync(statusDir, { recursive: true });
+    fs.writeFileSync(markerPath, JSON.stringify({
+        runId: currentRunId,
+        statusFile: `run-scoped-container.${currentRunId}.json`,
+    }));
+
+    assert.deepEqual(
+        readNoWaitStatus('run-scoped-container', { runningDir: workspace }),
+        { state: 'unreadable' },
+        'a marker without this run status must remain fail-closed',
+    );
+    fs.writeFileSync(statusPath, JSON.stringify({
+        state: 'running',
+        runId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    }));
+    assert.deepEqual(
+        readNoWaitStatus('run-scoped-container', { runningDir: workspace }),
+        { state: 'unreadable' },
+        'a late status from an older run must not reopen monitor probing',
+    );
+    fs.writeFileSync(statusPath, JSON.stringify({ state: 'running', runId: currentRunId }));
+    assert.deepEqual(
+        readNoWaitStatus('run-scoped-container', { runningDir: workspace }),
+        { state: 'running', runId: currentRunId },
+    );
+});
+
+test('a malformed no-wait status defers probing instead of becoming no status', () => {
+    const { monitor, events } = monitorRecorder();
+    const target = {
+        containerName: 'malformed-container',
+        agentName: 'malformed-agent',
+        repoName: 'demo-repo',
+        runtime: 'container',
+        probeWorker: null,
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+    monitor.targets.set(target.containerName, target);
+    monitor.inspectWorkspaceStartLock = () => ({ active: false, stale: false });
+    monitor.syncManagedContainers = () => {};
+    monitor.listRunningContainerNames = () => [target.containerName];
+    monitor.readNoWaitStatus = () => ({ state: 'unreadable' });
+    const probeStarts = [];
+    monitor.startProbeWorker = (_monitor, current) => {
+        probeStarts.push(current.containerName);
+    };
+
+    monitorTick(monitor);
+
+    assert.deepEqual(probeStarts, []);
+    assert.equal(target.probeState, 'pending');
+    assert.equal(target.noWaitDeferredState, 'unreadable');
+    assert.ok(events.some(({ event, data }) => (
+        event === 'container_no_wait_restart_deferred'
+        && data.state === 'unreadable'
+    )));
 });
 
 test('a fresh success blocks re-probing until the monitor tick resets probe state', () => {

@@ -39,7 +39,13 @@ import {
     captureEdgeRoutingLifecycleMutationGeneration,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
-import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
+import {
+    createNetworkLifecycleAdapter,
+    withNetworkLifecycleLock,
+} from '../sandbox/networkLifecycle.js';
+import { networkContractHash } from '../sandbox/networkContract.js';
+import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
+import { effectiveInstanceKey } from '../utils/workspaceDependencyGraph.js';
 import { withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 
 function parseArgs(argv) {
@@ -63,8 +69,7 @@ function statusPathFor(containerName, { runningDir = RUNNING_DIR } = {}) {
     return path.join(runningDir, 'no-wait', `${containerName}.json`);
 }
 
-export function writeStatus(containerName, payload, { runningDir = RUNNING_DIR } = {}) {
-    const target = statusPathFor(containerName, { runningDir });
+function writeStatusFile(target, payload) {
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     try {
@@ -80,6 +85,122 @@ export function writeStatus(containerName, payload, { runningDir = RUNNING_DIR }
     }
 }
 
+export function writeStatus(containerName, payload, { runningDir = RUNNING_DIR } = {}) {
+    writeStatusFile(statusPathFor(containerName, { runningDir }), payload);
+}
+
+export function writeNoWaitWorkerStatus(containerName, payload, {
+    runId = '',
+    statusFile = '',
+    runningDir = RUNNING_DIR,
+} = {}) {
+    if (Boolean(runId) !== Boolean(statusFile)) {
+        throw new Error('run-scoped no-wait status requires both a run id and coordination file');
+    }
+    const normalizedRunId = runId ? exactRunId(runId) : '';
+    const coordinationStatusFile = statusFile
+        ? exactNoWaitCoordinationStatusPath(statusFile, {
+            containerName,
+            runId: normalizedRunId,
+            runningDir,
+        })
+        : '';
+    const document = normalizedRunId
+        ? { ...payload, runId: normalizedRunId }
+        : payload;
+    const canonicalStatusFile = statusPathFor(containerName, { runningDir });
+
+    // The unique coordination file is the final handoff. Publish the public
+    // canonical view first so a completed wave barrier never exposes an older
+    // canonical phase to monitors or operators.
+    writeStatusFile(canonicalStatusFile, document);
+    if (coordinationStatusFile && coordinationStatusFile !== canonicalStatusFile) {
+        writeStatusFile(coordinationStatusFile, document);
+    }
+    return document;
+}
+
+function exactNoWaitStatusPath(rawStatusPath, {
+    runningDir = RUNNING_DIR,
+    label = 'no-wait status',
+} = {}) {
+    const statusPath = path.resolve(String(rawStatusPath || ''));
+    const statusRoot = path.resolve(runningDir, 'no-wait');
+    if (!path.isAbsolute(String(rawStatusPath || ''))
+        || path.dirname(statusPath) !== statusRoot
+        || path.extname(statusPath) !== '.json') {
+        throw new Error(`${label} must be an absolute JSON file in the workspace no-wait status directory`);
+    }
+    return statusPath;
+}
+
+function exactRunId(value, label = 'no-wait run id') {
+    const runId = String(value || '').trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) {
+        throw new Error(`${label} must be one exact UUID`);
+    }
+    return runId.toLowerCase();
+}
+
+function exactNoWaitCoordinationStatusPath(rawStatusPath, {
+    containerName,
+    runId,
+    runningDir = RUNNING_DIR,
+} = {}) {
+    const statusPath = exactNoWaitStatusPath(rawStatusPath, {
+        runningDir,
+        label: 'no-wait coordination status',
+    });
+    const expectedName = `${String(containerName || '')}.${exactRunId(runId)}.json`;
+    if (path.basename(statusPath) !== expectedName) {
+        throw new Error(
+            `no-wait coordination status must be the exact run-scoped file '${expectedName}'`,
+        );
+    }
+    return statusPath;
+}
+
+export function parseNoWaitStatusBarrier(rawBarrier, {
+    runId,
+    runningDir = RUNNING_DIR,
+} = {}) {
+    if (!rawBarrier) return Object.freeze([]);
+    const expectedRunId = exactRunId(runId);
+    let parsed;
+    try {
+        parsed = JSON.parse(String(rawBarrier));
+    } catch (error) {
+        throw new Error(`no-wait status barrier is invalid JSON: ${error?.message || error}`);
+    }
+    if (!Array.isArray(parsed) || parsed.length > 1024) {
+        throw new Error('no-wait status barrier must be an array with at most 1024 entries');
+    }
+    const seen = new Set();
+    return Object.freeze(parsed.map((entry, index) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)
+            || typeof entry.directDependency !== 'boolean') {
+            throw new Error(`no-wait status barrier entry ${index} is invalid`);
+        }
+        const entryRunId = exactRunId(entry.runId, `no-wait status barrier entry ${index} run id`);
+        if (entryRunId !== expectedRunId) {
+            throw new Error(`no-wait status barrier entry ${index} belongs to a different run`);
+        }
+        const statusPath = exactNoWaitStatusPath(entry.path, {
+            runningDir,
+            label: `no-wait status barrier entry ${index}`,
+        });
+        if (seen.has(statusPath)) {
+            throw new Error(`no-wait status barrier repeats '${path.basename(statusPath)}'`);
+        }
+        seen.add(statusPath);
+        return Object.freeze({
+            path: statusPath,
+            runId: entryRunId,
+            directDependency: entry.directDependency,
+        });
+    }));
+}
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -91,6 +212,17 @@ function parseSequenceTimestamp(status, numericField, isoField) {
     return Number.isFinite(parsed) ? parsed : NaN;
 }
 
+function readSequenceStatus(statusPath) {
+    try {
+        return {
+            status: JSON.parse(fs.readFileSync(statusPath, 'utf8')),
+        };
+    } catch (error) {
+        if (error?.code === 'ENOENT') return { missing: true };
+        return { readFault: error };
+    }
+}
+
 function resolveSequenceObservation(statusPath, status, {
     statusRoot,
     timeoutMs,
@@ -98,6 +230,7 @@ function resolveSequenceObservation(statusPath, status, {
     legacyDeadline,
     nowMs,
     maxDepth = 128,
+    retainFailedWaitingChain = true,
 } = {}) {
     let currentPath = statusPath;
     let current = status;
@@ -109,7 +242,16 @@ function resolveSequenceObservation(statusPath, status, {
         }
         visited.add(currentPath);
 
-        if (current?.state === 'running' || current?.state === 'failed') {
+        // A worker that failed before it became active did not complete the
+        // serialized launch slot. Keep following its retained predecessor
+        // reference so its successor cannot overlap the still-active worker.
+        // Once that predecessor settles, this chain remains fail-closed and
+        // expires at the predecessor's bounded publication deadline.
+        const failedWhileWaiting = retainFailedWaitingChain
+            && current?.state === 'failed'
+            && current?.sequencePhase === 'waiting-predecessor';
+        if ((current?.state === 'running' || current?.state === 'failed')
+            && !failedWhileWaiting) {
             if (currentPath === statusPath) return { terminal: current.state };
             const finishedAtMs = parseSequenceTimestamp(current, 'finishedAtMs', 'finishedAt');
             if (!Number.isFinite(finishedAtMs) || finishedAtMs > nowMs + terminalPublicationGraceMs) {
@@ -117,7 +259,7 @@ function resolveSequenceObservation(statusPath, status, {
             }
             return { deadline: finishedAtMs + terminalPublicationGraceMs };
         }
-        if (current?.state && current.state !== 'starting') {
+        if (current?.state && current.state !== 'starting' && !failedWhileWaiting) {
             throw new Error(`no-wait predecessor has invalid state '${current.state}'`);
         }
         if (!current?.state) {
@@ -151,12 +293,15 @@ function resolveSequenceObservation(statusPath, status, {
             throw new Error('no-wait predecessor waiting phase has an invalid status reference');
         }
         currentPath = path.join(statusRoot, predecessorFile);
-        try {
-            current = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
-        } catch (error) {
-            if (error?.code === 'ENOENT') return { deadline: legacyDeadline };
-            throw new Error(`no-wait predecessor status chain is invalid: ${error?.message || error}`);
+        const readResult = readSequenceStatus(currentPath);
+        if (readResult.missing) return { deadline: legacyDeadline };
+        if (readResult.readFault) {
+            return {
+                deadline: legacyDeadline,
+                readFault: readResult.readFault,
+            };
         }
+        current = readResult.status;
     }
     throw new Error('no-wait predecessor status chain exceeds the maximum depth');
 }
@@ -171,9 +316,15 @@ export async function waitForPriorWorker(rawStatusPath, {
         process.env.PLOINKY_NO_WAIT_SEQUENCE_TERMINAL_GRACE_MS || '60000',
         10,
     ),
+    readRetryTimeoutMs = Number.parseInt(
+        process.env.PLOINKY_NO_WAIT_STATUS_READ_RETRY_MS || '5000',
+        10,
+    ),
     pollIntervalMs = 100,
     sleepFn = sleep,
     nowFn = Date.now,
+    expectedRunId = '',
+    retainFailedWaitingChain = true,
 } = {}) {
     if (!rawStatusPath) return;
     const statusPath = path.resolve(rawStatusPath);
@@ -187,32 +338,96 @@ export async function waitForPriorWorker(rawStatusPath, {
     const boundedTerminalPublicationGraceMs = Number.isFinite(terminalPublicationGraceMs)
         ? Math.min(Math.max(0, terminalPublicationGraceMs), 300000)
         : 60000;
+    const boundedReadRetryTimeoutMs = Number.isFinite(readRetryTimeoutMs)
+        ? Math.min(Math.max(100, readRetryTimeoutMs), 30000)
+        : 5000;
     const legacyDeadline = nowFn() + boundedTimeoutMs + boundedTerminalPublicationGraceMs;
     const statusRoot = path.resolve(runningDir, 'no-wait');
+    let readFaultStartedAtMs = null;
+    let lastReadFault = null;
     while (true) {
         const nowMs = nowFn();
         let observation = { deadline: legacyDeadline };
-        try {
-            const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
-            observation = resolveSequenceObservation(statusPath, status, {
-                statusRoot,
-                timeoutMs: boundedTimeoutMs,
-                terminalPublicationGraceMs: boundedTerminalPublicationGraceMs,
-                legacyDeadline,
-                nowMs,
-            });
-        } catch (error) {
-            if (error?.code !== 'ENOENT') {
+        const readResult = readSequenceStatus(statusPath);
+        if (readResult.readFault) {
+            observation = {
+                deadline: legacyDeadline,
+                readFault: readResult.readFault,
+            };
+        } else if (!readResult.missing) {
+            try {
+                if (expectedRunId
+                    && String(readResult.status?.runId || '').trim().toLowerCase()
+                        !== String(expectedRunId).trim().toLowerCase()) {
+                    throw new Error('no-wait predecessor status belongs to a different run');
+                }
+                observation = resolveSequenceObservation(statusPath, readResult.status, {
+                    statusRoot,
+                    timeoutMs: boundedTimeoutMs,
+                    terminalPublicationGraceMs: boundedTerminalPublicationGraceMs,
+                    legacyDeadline,
+                    nowMs,
+                    retainFailedWaitingChain,
+                });
+            } catch (error) {
                 throw new Error(`no-wait predecessor status is invalid: ${error?.message || error}`);
             }
         }
         if (observation.terminal) {
             return Object.freeze({ state: observation.terminal });
         }
-        if (nowMs >= observation.deadline) break;
-        await sleepFn(Math.min(pollIntervalMs, observation.deadline - nowMs));
+        let deadline = observation.deadline;
+        if (observation.readFault) {
+            if (readFaultStartedAtMs === null) readFaultStartedAtMs = nowMs;
+            lastReadFault = observation.readFault;
+            deadline = Math.min(
+                deadline,
+                readFaultStartedAtMs + boundedReadRetryTimeoutMs,
+            );
+        } else {
+            readFaultStartedAtMs = null;
+            lastReadFault = null;
+        }
+        if (nowMs >= deadline) {
+            if (lastReadFault) {
+                throw new Error(
+                    `no-wait predecessor status remained unreadable after bounded retries: ${lastReadFault?.message || lastReadFault}`,
+                );
+            }
+            break;
+        }
+        await sleepFn(Math.min(pollIntervalMs, deadline - nowMs));
     }
     throw new Error(`timed out waiting for no-wait predecessor status '${statusPath}'`);
+}
+
+export async function waitForNoWaitStatusBarrier(entries, {
+    waitFn = waitForPriorWorker,
+    waitOptions = {},
+} = {}) {
+    const barrier = Array.isArray(entries) ? entries : [];
+    const observed = await Promise.all(barrier.map(async (entry) => Object.freeze({
+        entry,
+        status: await waitFn(entry.path, {
+            ...waitOptions,
+            expectedRunId: entry.runId,
+            // Run-scoped waves wait every immediately prior-wave member
+            // directly. A failed queued member is therefore terminal for this
+            // barrier and must not inherit the legacy single-chain stall rule.
+            retainFailedWaitingChain: false,
+        }),
+    })));
+    const failedDependency = observed.find(({ entry, status }) => (
+        entry.directDependency && status?.state === 'failed'
+    ));
+    if (failedDependency) {
+        const error = new Error(
+            `no-wait direct dependency '${path.basename(failedDependency.entry.path, '.json')}' failed in this run`,
+        );
+        error.code = 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED';
+        throw error;
+    }
+    return Object.freeze(observed);
 }
 
 async function upsertRoute(routeKey, route, {
@@ -332,6 +547,293 @@ export async function cleanupNoWaitTaskOwnedCandidate(candidate, {
     }
     if (cleanupFailure) throw cleanupFailure;
     return true;
+}
+
+function boundedPositiveInteger(value, fallback, maximum) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isSafeInteger(parsed) && parsed > 0
+        ? Math.min(parsed, maximum)
+        : fallback;
+}
+
+export function assertNoWaitRuntimeStillExact(result, {
+    profileResolution,
+    expectedIdentity,
+} = {}, {
+    createAdapter = createNetworkLifecycleAdapter,
+    getRuntime = dockerSvc.getRuntime,
+    isContainerRunning = dockerSvc.isContainerRunning,
+    isSandboxRunning = isBwrapProcessRunning,
+} = {}) {
+    const containerName = String(result?.containerName || '').trim();
+    const record = result?.registryRecord;
+    if (!containerName || containerName !== String(expectedIdentity?.containerName || '')
+        || !record || record.type !== 'agent') {
+        throw new Error('no-wait runtime reinspection requires its exact returned identity');
+    }
+    assertNoWaitRegistryRecord(record, record, expectedIdentity);
+    const runtime = String(record.runtime || '').trim();
+    const runtimeIdentity = {
+        instanceId: String(record.instanceId || '').trim(),
+        enableGeneration: String(record.enableGeneration || '').trim(),
+    };
+    if (!runtimeIdentity.instanceId || !runtimeIdentity.enableGeneration) {
+        throw new Error(`no-wait runtime '${containerName}' lost its immutable identity before publication`);
+    }
+    if (isSandboxRuntime(runtime)) {
+        if (!isSandboxRunning(containerName, runtimeIdentity)) {
+            throw new Error(`no-wait sandbox '${containerName}' changed identity before publication`);
+        }
+        return result;
+    }
+    const returnedContainerId = String(result?.containerId || '').trim().toLowerCase();
+    const recordedContainerId = String(record.containerId || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(returnedContainerId)
+        || !/^[a-f0-9]{64}$/.test(recordedContainerId)
+        || returnedContainerId !== recordedContainerId) {
+        throw new Error(`no-wait runtime '${containerName}' lacks one consistent immutable container ID`);
+    }
+    const network = profileResolution?.network;
+    if (!network || typeof network !== 'object' || Array.isArray(network)) {
+        throw new Error(`no-wait runtime '${containerName}' lacks its admitted network contract`);
+    }
+    const adapter = createAdapter({ runtime: getRuntime() });
+    const inspection = adapter.inspectContainerContract(
+        containerName,
+        network,
+        expectedIdentity.shortAgent,
+        {
+            instanceKey: effectiveInstanceKey(
+                expectedIdentity.repoName,
+                expectedIdentity.shortAgent,
+                expectedIdentity.alias || '',
+            ),
+            contractHash: networkContractHash(network),
+            ...runtimeIdentity,
+            requireRuntimeIdentity: true,
+        },
+    );
+    if (inspection?.state !== 'exact'
+        || String(inspection.id || '').trim().toLowerCase() !== returnedContainerId
+        || !isContainerRunning(containerName)) {
+        throw new Error(`no-wait runtime '${containerName}' changed immutable identity before publication`);
+    }
+    return result;
+}
+
+function appendNoWaitCleanupFailure(error, cleanupError) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    failure.message = `${failure.message}; exact task-owned runtime cleanup failed: ${cleanupError?.message || cleanupError}`;
+    return failure;
+}
+
+function noWaitLifecyclePublishesCandidate(lifecycle, candidate) {
+    if (lifecycle?.targetState !== 'ready') return false;
+    const activeRecord = lifecycle.record;
+    const candidateRecord = candidate?.registryRecord;
+    if (!activeRecord || !candidateRecord
+        || String(lifecycle.route?.container || '') !== String(candidate?.containerName || '')
+        || String(activeRecord.instanceId || '') !== String(candidateRecord.instanceId || '')
+        || String(activeRecord.enableGeneration || '') !== String(candidateRecord.enableGeneration || '')
+        || String(activeRecord.runtime || '') !== String(candidateRecord.runtime || '')) {
+        return false;
+    }
+    if (isSandboxRuntime(activeRecord.runtime)) return true;
+    const activeContainerId = String(activeRecord.containerId || '').trim().toLowerCase();
+    const candidateContainerId = String(
+        candidate?.containerId || candidateRecord.containerId || '',
+    ).trim().toLowerCase();
+    return /^[a-f0-9]{64}$/.test(activeContainerId)
+        && /^[a-f0-9]{64}$/.test(candidateContainerId)
+        && activeContainerId === candidateContainerId;
+}
+
+export async function runNoWaitLifecycleTransaction(identity, {
+    capture,
+    ensure,
+    readiness,
+    revalidate,
+    inspectRuntime,
+    activate,
+    cleanupCandidate = cleanupNoWaitTaskOwnedCandidate,
+    withLifecycleLease = withActiveNoWaitWorkerLifecycleLease,
+    withNetworkLock = withNetworkLifecycleLock,
+    loadCurrentLifecycle = loadNoWaitWorkerLifecycle,
+    networkWaitMs = boundedPositiveInteger(
+        process.env.PLOINKY_NO_WAIT_NETWORK_LOCK_TIMEOUT_MS,
+        180000,
+        300000,
+    ),
+    networkPollMs = boundedPositiveInteger(
+        process.env.PLOINKY_NO_WAIT_NETWORK_LOCK_POLL_MS,
+        50,
+        1000,
+    ),
+} = {}) {
+    for (const [name, callback] of Object.entries({
+        capture,
+        ensure,
+        readiness,
+        revalidate,
+        inspectRuntime,
+        activate,
+    })) {
+        if (typeof callback !== 'function') {
+            throw new TypeError(`no-wait lifecycle transaction requires a ${name} callback`);
+        }
+    }
+
+    let initialLifecycle = null;
+    let context = null;
+    let result = null;
+    let cleanupRequired = false;
+    let cleanupAttempted = false;
+
+    const runWithNetworkLock = (callback) => withNetworkLock(callback, {
+        waitMs: boundedPositiveInteger(networkWaitMs, 180000, 300000),
+        pollMs: boundedPositiveInteger(networkPollMs, 50, 1000),
+    });
+    const isTaskOwned = (candidate) => candidate?.createdByThisLaunch === true
+        || (candidate?.requiresEdgeActivation === true && candidate?.preparationLease);
+
+    const cleanupWhileWorkspaceLocked = async (
+        activeLifecycle,
+        existingNetworkLifecycleCapability = null,
+    ) => {
+        if (!cleanupRequired || cleanupAttempted || !result) return;
+        cleanupAttempted = true;
+
+        let currentLifecycle = activeLifecycle;
+        try {
+            // Activation can commit a new ready selector before a later step
+            // throws. Re-read while the workspace lease is still held instead
+            // of trusting the pre-activation callback snapshot.
+            currentLifecycle = loadCurrentLifecycle(identity);
+            if (currentLifecycle && typeof currentLifecycle.then === 'function') {
+                throw new Error('no-wait cleanup lifecycle reinspection must be synchronous');
+            }
+        } catch (error) {
+            if (error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
+        }
+
+        // A peer may have adopted and published this exact immutable runtime
+        // while readiness ran without the workspace lease. That publication
+        // transfers ownership to the active lifecycle; deleting it here would
+        // tear down a valid route. Preserve it and let the original failure
+        // remain fail-closed.
+        if (noWaitLifecyclePublishesCandidate(currentLifecycle, result)) {
+            cleanupRequired = false;
+            return;
+        }
+
+        const cleanupWithCapability = async (networkLifecycleCapability) => {
+            // Reinspection binds a cleanup receipt to the same live immutable
+            // runtime that readiness observed. Never remove by name alone.
+            await inspectRuntime(result, context, initialLifecycle, networkLifecycleCapability, {
+                cleanup: true,
+            });
+            await cleanupCandidate(result, { networkLifecycleCapability });
+        };
+        if (existingNetworkLifecycleCapability) {
+            await cleanupWithCapability(existingNetworkLifecycleCapability);
+        } else {
+            await runWithNetworkLock(cleanupWithCapability);
+        }
+        cleanupRequired = false;
+    };
+
+    const cleanupAfterWorkspaceRelease = async () => {
+        if (!cleanupRequired || cleanupAttempted || !result) return;
+        await withLifecycleLease(identity, cleanupWhileWorkspaceLocked, {
+            operation: `no-wait-cleanup:${String(identity?.containerName || identity?.routeKey || 'unknown')}`,
+        });
+    };
+
+    try {
+        const initialPhase = await withLifecycleLease(identity, async (lifecycle) => {
+            initialLifecycle = lifecycle;
+            context = await capture(lifecycle);
+            if (context?.requiresEnsure === false) {
+                result = context.runtimeResult;
+                cleanupRequired = isTaskOwned(result);
+                return { completed: false };
+            }
+
+            return runWithNetworkLock(async (networkLifecycleCapability) => {
+                result = await ensure(lifecycle, context, networkLifecycleCapability);
+                cleanupRequired = isTaskOwned(result);
+                try {
+                    if (result?.requiresEdgeActivation === true && !result?.preparationLease) {
+                        throw new Error('no-wait runtime replacement requires its exact preparation lease');
+                    }
+                    if (!result?.preparationLease) return { completed: false };
+
+                    // A preparation lease selected an inactive generation.
+                    // Retain both workspace and network locks through readiness
+                    // and activation; releasing either can deadlock or expose a
+                    // replacement whose selector is not active yet.
+                    await readiness(lifecycle, context, result);
+                    await inspectRuntime(result, context, lifecycle, networkLifecycleCapability, {
+                        cleanup: false,
+                    });
+                    const value = await activate(lifecycle, context, result, {
+                        networkLifecycleCapability,
+                        onCommitted() { cleanupRequired = false; },
+                    });
+                    return { completed: true, value };
+                } catch (error) {
+                    try {
+                        await cleanupWhileWorkspaceLocked(
+                            lifecycle,
+                            networkLifecycleCapability,
+                        );
+                    } catch (cleanupError) {
+                        throw appendNoWaitCleanupFailure(error, cleanupError);
+                    }
+                    throw error;
+                }
+            });
+        });
+        if (initialPhase.completed) return initialPhase.value;
+
+        // The expensive semantic readiness wait is intentionally outside both
+        // mutation locks for ordinary fresh/adoptable runtimes.
+        await readiness(initialLifecycle, context, result);
+
+        return await withLifecycleLease(identity, async (currentLifecycle) => {
+            try {
+                const rebasedLifecycle = await revalidate(
+                    initialLifecycle,
+                    currentLifecycle,
+                    context,
+                    result,
+                );
+                return await runWithNetworkLock(async (networkLifecycleCapability) => {
+                    await inspectRuntime(result, context, rebasedLifecycle, networkLifecycleCapability, {
+                        cleanup: false,
+                    });
+                    return activate(rebasedLifecycle, context, result, {
+                        networkLifecycleCapability,
+                        onCommitted() { cleanupRequired = false; },
+                    });
+                });
+            } catch (error) {
+                try {
+                    await cleanupWhileWorkspaceLocked(currentLifecycle);
+                } catch (cleanupError) {
+                    throw appendNoWaitCleanupFailure(error, cleanupError);
+                }
+                throw error;
+            }
+        });
+    } catch (error) {
+        try {
+            await cleanupAfterWorkspaceRelease();
+        } catch (cleanupError) {
+            throw appendNoWaitCleanupFailure(error, cleanupError);
+        }
+        throw error;
+    }
 }
 
 function assertNoWaitLifecycleIdentity(active, {
@@ -729,6 +1231,20 @@ async function main() {
     const routerPort = args.routerPort || '';
     const profileName = args.profile || '';
     const waitForStatus = args.waitForStatus || '';
+    const runId = args.runId ? exactRunId(args.runId) : '';
+    if (Boolean(runId) !== Boolean(args.statusFile)) {
+        throw new Error('run-scoped no-wait launch requires both --run-id and --status-file');
+    }
+    const coordinationStatusFile = args.statusFile
+        ? exactNoWaitCoordinationStatusPath(args.statusFile, {
+            containerName,
+            runId,
+        })
+        : '';
+    const waitForStatuses = parseNoWaitStatusBarrier(args.waitForStatuses || '', { runId });
+    if (waitForStatuses.length && !runId) {
+        throw new Error('run-scoped no-wait status barriers require --run-id');
+    }
 
     if (!containerName || !shortAgent || !repoName || !manifestPath || !agentPath) {
         console.error('[no-wait] missing required arguments; refusing to run.');
@@ -776,6 +1292,11 @@ async function main() {
         runtimeKind: admittedRuntimeKind,
     });
 
+    const publishStatus = (payload) => writeNoWaitWorkerStatus(containerName, payload, {
+        runId,
+        statusFile: coordinationStatusFile,
+    });
+    const hasPredecessorBarrier = Boolean(waitForStatus || waitForStatuses.length);
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
     let baseStatus = {
@@ -789,19 +1310,25 @@ async function main() {
         pid: process.pid,
         startedAt,
         startedAtMs,
-        sequencePhase: waitForStatus ? 'waiting-predecessor' : 'active',
+        ...(runId ? { runId } : {}),
+        sequencePhase: hasPredecessorBarrier ? 'waiting-predecessor' : 'active',
         sequencePhaseStartedAt: startedAt,
         sequencePhaseStartedAtMs: startedAtMs,
         ...(waitForStatus ? { waitForStatusFile: path.basename(waitForStatus) } : {}),
+        ...(waitForStatuses.length ? {
+            waitForStatusFiles: waitForStatuses.map((entry) => path.basename(entry.path)),
+        } : {}),
     };
-    writeStatus(containerName, { ...baseStatus, state: 'starting' });
+    publishStatus({ ...baseStatus, state: 'starting' });
 
     console.log(`[no-wait] ${shortAgent}: starting background launch (pid ${process.pid})`);
 
-    let taskOwnedCandidate = null;
     try {
-        await waitForPriorWorker(waitForStatus);
-        if (waitForStatus) {
+        await Promise.all([
+            waitForPriorWorker(waitForStatus),
+            waitForNoWaitStatusBarrier(waitForStatuses),
+        ]);
+        if (hasPredecessorBarrier) {
             const sequencePhaseStartedAtMs = Date.now();
             baseStatus = {
                 ...baseStatus,
@@ -810,7 +1337,8 @@ async function main() {
                 sequencePhaseStartedAtMs,
             };
             delete baseStatus.waitForStatusFile;
-            writeStatus(containerName, { ...baseStatus, state: 'starting' });
+            delete baseStatus.waitForStatusFiles;
+            publishStatus({ ...baseStatus, state: 'starting' });
         }
         const expectedIdentity = Object.freeze({
             containerName,
@@ -820,173 +1348,172 @@ async function main() {
             routeKey,
             agentPath,
         });
-        // The parent start may still own this lease while detached workers are
-        // spawned, and Cloudflare publication uses the same lease afterward.
-        // Observe inactive publication recovery without a lease, then capture
-        // one exact active selector under the lease and retain it through
-        // Router attestation, runtime readiness, and route activation.
-        await withActiveNoWaitWorkerLifecycleLease(expectedIdentity, async (lifecycle) => {
-        // The workspace graph has already committed this exact target-less
-        // identity. Keep that active generation serving while the detached
-        // runtime starts; host-network launches are authorized by the exact
-        // active-generation capability already compiled for this owner.
-        const manifest = lifecycle.manifest;
-        const activeProfile = String(lifecycle.record.profile || '');
-        if (profileName && activeProfile && profileName !== activeProfile) {
-            throw new Error(`no-wait lifecycle profile changed before launch for '${routeKey}'`);
-        }
-        if (routerPort && Number(routerPort) !== lifecycle.routerPort) {
-            throw new Error(`no-wait lifecycle Router port changed before launch for '${routeKey}'`);
-        }
-        const profileResolution = resolveManifestRuntimeProfile(manifest, {
-            agentName: `${repoName}/${shortAgent}`,
-            profileName: activeProfile || profileName || undefined,
-            path: `manifest(${repoName}/${shortAgent})`,
-        });
-        if (!isDeepStrictEqual(manifest, admittedManifest)
-            || profileResolution.resolvedProfileName !== admittedProfileResolution.resolvedProfileName) {
-            const changed = new Error(`no-wait runtime input changed before launch for '${routeKey}'`);
-            changed.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
-            changed.status = 409;
-            throw changed;
-        }
-        assertRuntimeAdmissionCurrent(runtimeAdmission, {
-            manifestBytes: fs.readFileSync(manifestPath),
-            profileName: profileResolution.resolvedProfileName,
-            runtimeKind: admittedRuntimeKind,
-        });
-        const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
-            explicitPort: lifecycle.routerPort || undefined,
-        });
-        if (lifecycle.targetState === 'ready'
-            && !['default', 'bridge'].includes(profileResolution.network.mode)) {
-            const hostPort = Number(lifecycle.route.hostPort);
-            await waitForNoWaitReadiness({
-                manifest,
-                shortAgent,
-                containerName,
-                hostPort,
-                runtimeResult: {
-                    containerName,
-                    containerId: lifecycle.record.containerId,
-                    registryRecord: lifecycle.record,
-                },
-                networkMode: profileResolution.network.mode,
-                generationDigest: lifecycle.generationDigest,
-            });
-            const currentLifecycle = loadNoWaitWorkerLifecycle(expectedIdentity);
-            assertNoWaitAdoptionStillCurrent(lifecycle, currentLifecycle, expectedIdentity);
-            const finishedAtMs = Date.now();
-            const finishedAt = new Date(finishedAtMs).toISOString();
-            writeStatus(containerName, {
-                ...baseStatus,
-                state: 'running',
-                finishedAt,
-                finishedAtMs,
-                container: containerName,
-                hostPort,
-                adopted: true,
-            });
-            console.log(
-                `[no-wait] ${shortAgent}: adopted existing ready runtime (container=${containerName}, hostPort=${hostPort})`,
-            );
-            return;
-        }
-        await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
-        try {
-        const ensureOptions = {
-            containerName,
-            alias: alias || undefined,
-            profileName: profileResolution.resolvedProfileName,
-            profileResolution,
-            routerEndpoint,
-            forceRecreate: args.forceRecreate === '1',
-            preservePreparedRegistryRecord: true,
-            instanceId: lifecycle.record.instanceId,
-            enableGeneration: lifecycle.record.enableGeneration,
-            networkLifecycleCapability,
-        };
-        const launch = () => dockerSvc.ensureAgentService(shortAgent, manifest, agentPath, ensureOptions);
-        const result = profileResolution.network.mode === 'host'
-            ? await launchNoWaitHostRuntime(expectedIdentity, lifecycle, launch)
-            : await launch();
-        if (result?.createdByThisLaunch === true
-            || (result?.requiresEdgeActivation === true && result?.preparationLease)) {
-            taskOwnedCandidate = result;
-        }
-        const resolvedContainerName = (result && result.containerName) || containerName;
-        if (resolvedContainerName !== containerName) {
-            throw new Error(`no-wait runtime resolved an unexpected container identity for '${routeKey}'`);
-        }
-        const hostPort = result && result.hostPort;
-        const registryRecord = result && result.registryRecord;
-        assertNoWaitRegistryRecord(registryRecord, lifecycle.record, expectedIdentity);
-        const routedHostPort = profileResolution.network.mode === 'none'
-            ? null
-            : hostPort || null;
-
-        await waitForNoWaitReadiness({
-            manifest,
-            shortAgent,
-            containerName: resolvedContainerName,
-            hostPort,
-            runtimeResult: result,
-            networkMode: profileResolution.network.mode,
-            generationDigest: lifecycle.generationDigest,
-        });
-
-        await upsertRoute(routeKey, {
-            container: resolvedContainerName,
-            hostPath: agentPath,
-            repo: repoName,
-            agent: shortAgent,
-            ...(alias ? { alias } : {}),
-            hostPort: routedHostPort,
-        }, {
-            containerName: resolvedContainerName,
-            registryRecord,
-            expectedIdentity,
-            expectedLifecycle: lifecycle,
-            expectedSelector: {
-                generation: lifecycle.generationDigest,
-                activationId: lifecycle.selectorActivationId,
+        await runNoWaitLifecycleTransaction(expectedIdentity, {
+            capture(lifecycle) {
+                const manifest = lifecycle.manifest;
+                const activeProfile = String(lifecycle.record.profile || '');
+                if (profileName && activeProfile && profileName !== activeProfile) {
+                    throw new Error(`no-wait lifecycle profile changed before launch for '${routeKey}'`);
+                }
+                if (routerPort && Number(routerPort) !== lifecycle.routerPort) {
+                    throw new Error(`no-wait lifecycle Router port changed before launch for '${routeKey}'`);
+                }
+                const profileResolution = resolveManifestRuntimeProfile(manifest, {
+                    agentName: `${repoName}/${shortAgent}`,
+                    profileName: activeProfile || profileName || undefined,
+                    path: `manifest(${repoName}/${shortAgent})`,
+                });
+                if (!isDeepStrictEqual(manifest, admittedManifest)
+                    || profileResolution.resolvedProfileName
+                        !== admittedProfileResolution.resolvedProfileName) {
+                    const changed = new Error(
+                        `no-wait runtime input changed before launch for '${routeKey}'`,
+                    );
+                    changed.code = 'PLOINKY_RUNTIME_INPUT_CHANGED';
+                    changed.status = 409;
+                    throw changed;
+                }
+                assertRuntimeAdmissionCurrent(runtimeAdmission, {
+                    manifestBytes: fs.readFileSync(manifestPath),
+                    profileName: profileResolution.resolvedProfileName,
+                    runtimeKind: admittedRuntimeKind,
+                });
+                const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
+                    explicitPort: lifecycle.routerPort || undefined,
+                });
+                const adopted = lifecycle.targetState === 'ready'
+                    && !['default', 'bridge'].includes(profileResolution.network.mode);
+                return {
+                    manifest,
+                    profileResolution,
+                    routerEndpoint,
+                    adopted,
+                    requiresEnsure: !adopted,
+                    ...(adopted ? {
+                        runtimeResult: {
+                            containerName,
+                            containerId: lifecycle.record.containerId,
+                            hostPort: Number(lifecycle.route.hostPort),
+                            registryRecord: lifecycle.record,
+                        },
+                    } : {}),
+                };
             },
-            preparationLease: result?.preparationLease,
-        });
-        taskOwnedCandidate = null;
-
-        const finishedAtMs = Date.now();
-        const finishedAt = new Date(finishedAtMs).toISOString();
-        writeStatus(containerName, {
-            ...baseStatus,
-            state: 'running',
-            finishedAt,
-            finishedAtMs,
-            container: resolvedContainerName,
-            hostPort: routedHostPort
-        });
-        console.log(`[no-wait] ${shortAgent}: launch succeeded (container=${resolvedContainerName}${hostPort ? `, hostPort=${hostPort}` : ''})`);
-        } catch (error) {
-            await cleanupNoWaitTaskOwnedCandidate(taskOwnedCandidate);
-            taskOwnedCandidate = null;
-            throw error;
-        }
-        });
+            async ensure(lifecycle, context, networkLifecycleCapability) {
+                const ensureOptions = {
+                    containerName,
+                    alias: alias || undefined,
+                    profileName: context.profileResolution.resolvedProfileName,
+                    profileResolution: context.profileResolution,
+                    routerEndpoint: context.routerEndpoint,
+                    forceRecreate: args.forceRecreate === '1',
+                    preservePreparedRegistryRecord: true,
+                    instanceId: lifecycle.record.instanceId,
+                    enableGeneration: lifecycle.record.enableGeneration,
+                    networkLifecycleCapability,
+                };
+                const launch = () => dockerSvc.ensureAgentService(
+                    shortAgent,
+                    context.manifest,
+                    agentPath,
+                    ensureOptions,
+                );
+                return context.profileResolution.network.mode === 'host'
+                    ? launchNoWaitHostRuntime(expectedIdentity, lifecycle, launch)
+                    : launch();
+            },
+            readiness(lifecycle, context, result) {
+                return waitForNoWaitReadiness({
+                    manifest: context.manifest,
+                    shortAgent,
+                    containerName: result?.containerName || containerName,
+                    hostPort: result?.hostPort,
+                    runtimeResult: result,
+                    networkMode: context.profileResolution.network.mode,
+                    generationDigest: lifecycle.generationDigest,
+                });
+            },
+            revalidate(initialLifecycle, currentLifecycle) {
+                return initialLifecycle.targetState === 'ready'
+                    ? assertNoWaitAdoptionStillCurrent(
+                        initialLifecycle,
+                        currentLifecycle,
+                        expectedIdentity,
+                    )
+                    : assertNoWaitLifecycleRebase(
+                        initialLifecycle,
+                        currentLifecycle,
+                        expectedIdentity,
+                    );
+            },
+            inspectRuntime(result, context, lifecycle) {
+                const resolvedContainerName = result?.containerName || containerName;
+                if (resolvedContainerName !== containerName) {
+                    throw new Error(
+                        `no-wait runtime resolved an unexpected container identity for '${routeKey}'`,
+                    );
+                }
+                assertNoWaitRegistryRecord(
+                    result?.registryRecord,
+                    lifecycle.record,
+                    expectedIdentity,
+                );
+                return assertNoWaitRuntimeStillExact(result, {
+                    profileResolution: context.profileResolution,
+                    expectedIdentity,
+                });
+            },
+            async activate(lifecycle, context, result, { onCommitted }) {
+                const resolvedContainerName = result?.containerName || containerName;
+                const hostPort = result?.hostPort;
+                const routedHostPort = context.profileResolution.network.mode === 'none'
+                    ? null
+                    : hostPort || null;
+                if (!context.adopted) {
+                    await upsertRoute(routeKey, {
+                        container: resolvedContainerName,
+                        hostPath: agentPath,
+                        repo: repoName,
+                        agent: shortAgent,
+                        ...(alias ? { alias } : {}),
+                        hostPort: routedHostPort,
+                    }, {
+                        containerName: resolvedContainerName,
+                        registryRecord: result.registryRecord,
+                        expectedIdentity,
+                        expectedLifecycle: lifecycle,
+                        expectedSelector: {
+                            generation: lifecycle.generationDigest,
+                            activationId: lifecycle.selectorActivationId,
+                        },
+                        preparationLease: result?.preparationLease,
+                    });
+                }
+                onCommitted();
+                const finishedAtMs = Date.now();
+                publishStatus({
+                    ...baseStatus,
+                    state: 'running',
+                    finishedAt: new Date(finishedAtMs).toISOString(),
+                    finishedAtMs,
+                    container: resolvedContainerName,
+                    hostPort: routedHostPort,
+                    ...(context.adopted ? { adopted: true } : {}),
+                });
+                console.log(context.adopted
+                    ? `[no-wait] ${shortAgent}: adopted existing ready runtime (container=${containerName}, hostPort=${routedHostPort})`
+                    : `[no-wait] ${shortAgent}: launch succeeded (container=${resolvedContainerName}${hostPort ? `, hostPort=${hostPort}` : ''})`);
+            },
         });
     } catch (err) {
         const failure = err instanceof Error ? err : new Error(String(err));
-        try {
-            await cleanupNoWaitTaskOwnedCandidate(taskOwnedCandidate);
-        } catch (_) {
-            failure.message = `${failure.message}; exact task-owned runtime cleanup failed`;
-        }
         const finishedAtMs = Date.now();
         const finishedAt = new Date(finishedAtMs).toISOString();
         const error = {
             message: failure.message,
             stack: failure.stack || null
         };
-        writeStatus(containerName, {
+        publishStatus({
             ...baseStatus,
             state: 'failed',
             finishedAt,

@@ -21,6 +21,7 @@ import {
   buildRuntimeRouterEnv,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
+import { removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
@@ -46,6 +47,7 @@ import {
   AGENTS_DATA_DIR,
   LOGS_DIR,
   PLOINKY_CWD,
+  PLOINKY_DIR,
   PLOINKY_WORKSPACE_ROOT,
   REPOS_DIR,
   RUNNING_DIR,
@@ -87,6 +89,11 @@ import {
   formatAgentAttachmentBanner,
   resolveAgentAttachmentIdentity,
 } from '../sandbox/layerIdentification.js';
+import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
+import {
+  GENERATED_ROUTER_DESCRIPTOR_CONTAINER_FILE,
+  readVerifiedGeneratedRouterDescriptorFile,
+} from '../utils/security/generatedRouterDescriptor.js';
 import {
   assertRouterEndpoint,
   parseRouterPort,
@@ -153,7 +160,9 @@ function spawnNoWaitWorker({
   registryAlias,
   routerPort,
   forceRecreate = false,
-  waitForStatusFile = '',
+  runId = '',
+  statusFile = '',
+  waitForStatuses = [],
 }) {
   const containerName = registryName;
   const noWaitLogDir = path.join(LOGS_DIR, 'no-wait');
@@ -161,7 +170,8 @@ function spawnNoWaitWorker({
   fs.mkdirSync(noWaitLogDir, { recursive: true });
   fs.mkdirSync(noWaitStatusDir, { recursive: true });
   const logFile = path.join(noWaitLogDir, `${containerName}.log`);
-  const statusFile = path.join(noWaitStatusDir, `${containerName}.json`);
+  const canonicalStatusFile = path.join(noWaitStatusDir, `${containerName}.json`);
+  const resolvedStatusFile = statusFile || canonicalStatusFile;
   const workerScript = path.resolve(__dirname, 'noWaitWorker.js');
   const args = [
     workerScript,
@@ -172,6 +182,15 @@ function spawnNoWaitWorker({
     '--agent-path', node.agentPath,
     '--route-key', String(routeKey || registryAlias || node.shortAgentName),
   ];
+  if (runId) {
+    args.push('--run-id', runId);
+  }
+  if (resolvedStatusFile !== canonicalStatusFile) {
+    args.push('--status-file', resolvedStatusFile);
+  }
+  if (waitForStatuses.length) {
+    args.push('--wait-for-statuses', JSON.stringify(waitForStatuses));
+  }
   if (registryAlias) {
     args.push('--alias', registryAlias);
   }
@@ -184,13 +203,12 @@ function spawnNoWaitWorker({
   if (forceRecreate) {
     args.push('--force-recreate', '1');
   }
-  if (waitForStatusFile) {
-    args.push('--wait-for-status', waitForStatusFile);
-  }
   // A successor must never mistake a terminal status from an earlier start
   // invocation for completion of this worker.
-  try { fs.unlinkSync(statusFile); } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+  for (const target of new Set([canonicalStatusFile, resolvedStatusFile])) {
+    try { fs.unlinkSync(target); } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
   }
   const logStdio = createAppendLogStdio(logFile);
   const child = spawn(process.execPath, args, {
@@ -200,7 +218,136 @@ function spawnNoWaitWorker({
   });
   logStdio.closeParentFds();
   child.unref();
-  return { pid: child.pid, logFile, statusFile };
+  return {
+    pid: child.pid,
+    logFile,
+    statusFile: resolvedStatusFile,
+    canonicalStatusFile,
+  };
+}
+
+function noWaitCoordinationStatusPath(containerName, runId, {
+  runningDir = RUNNING_DIR,
+} = {}) {
+  if (!containerName || path.basename(containerName) !== containerName
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(runId || ''))) {
+    throw new Error('no-wait coordination status requires an exact container name and run id');
+  }
+  return path.join(runningDir, 'no-wait', `${containerName}.${runId}.json`);
+}
+
+export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
+  runId,
+  runningDir = RUNNING_DIR,
+} = {}) {
+  const waves = (Array.isArray(deferredNoWaitWaves) ? deferredNoWaitWaves : [])
+    .map((entries) => (Array.isArray(entries) ? entries.filter(Boolean) : []))
+    .filter((entries) => entries.length > 0);
+  const statusByNodeId = new Map();
+  const nodeIdByStatus = new Map();
+  for (const entries of waves) {
+    for (const entry of entries) {
+      if (!entry?.node?.id || !entry.registryName) continue;
+      if (statusByNodeId.has(entry.node.id)) {
+        throw new Error(`no-wait launch schedule repeats graph node '${entry.node.id}'`);
+      }
+      const statusPath = noWaitCoordinationStatusPath(entry.registryName, runId, { runningDir });
+      if (nodeIdByStatus.has(statusPath)) {
+        throw new Error(
+          `no-wait launch schedule maps '${entry.node.id}' and '${nodeIdByStatus.get(statusPath)}' to one status file`,
+        );
+      }
+      nodeIdByStatus.set(statusPath, entry.node.id);
+      statusByNodeId.set(entry.node.id, Object.freeze({
+        nodeId: entry.node.id,
+        path: statusPath,
+        runId,
+      }));
+    }
+  }
+
+  let previousWave = [];
+  return waves.map((entries, waveIndex) => {
+    const scheduled = entries.map((entry) => {
+      const directDependencyIds = new Set(entry.node?.dependencies || []);
+      const references = new Map();
+      const addReference = (reference, directDependency) => {
+        if (!reference) return;
+        const existing = references.get(reference.path);
+        references.set(reference.path, {
+          ...reference,
+          directDependency: Boolean(directDependency || existing?.directDependency),
+        });
+      };
+      for (const reference of previousWave) {
+        addReference(reference, directDependencyIds.has(reference.nodeId));
+      }
+      for (const dependencyId of directDependencyIds) {
+        addReference(statusByNodeId.get(dependencyId), true);
+      }
+      return Object.freeze({
+        ...entry,
+        waveIndex,
+        runId,
+        statusFile: statusByNodeId.get(entry.node.id)?.path || '',
+        waitForStatuses: Object.freeze(Array.from(references.values(), Object.freeze)),
+      });
+    });
+    previousWave = scheduled
+      .map(({ node }) => statusByNodeId.get(node.id))
+      .filter(Boolean);
+    return Object.freeze(scheduled);
+  });
+}
+
+function writeNoWaitAtomicJson(target, payload) {
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, target);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+function writeNoWaitRunMarker(entry, { runningDir = RUNNING_DIR } = {}) {
+  const target = path.join(runningDir, 'no-wait', `${entry.registryName}.current.json`);
+  writeNoWaitAtomicJson(target, {
+    runId: entry.runId,
+    statusFile: path.basename(entry.statusFile),
+    waveIndex: entry.waveIndex,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+function writeNoWaitSpawnFailure(entry, error, {
+  runningDir = RUNNING_DIR,
+} = {}) {
+  const finishedAtMs = Date.now();
+  const payload = {
+    state: 'failed',
+    sequencePhase: 'active',
+    phase: 'spawn',
+    runId: entry.runId,
+    containerName: entry.registryName,
+    shortAgent: entry.node.shortAgentName,
+    repoName: entry.node.repoName,
+    waveIndex: entry.waveIndex,
+    startedAt: new Date(finishedAtMs).toISOString(),
+    startedAtMs: finishedAtMs,
+    finishedAt: new Date(finishedAtMs).toISOString(),
+    finishedAtMs,
+    error: { message: error?.message || String(error) },
+  };
+  const canonical = path.join(runningDir, 'no-wait', `${entry.registryName}.json`);
+  // Match the worker's publication protocol: the canonical monitor view must
+  // be durable before the run-scoped file releases a dependent wave.
+  for (const target of new Set([canonical, entry.statusFile])) {
+    writeNoWaitAtomicJson(target, payload);
+  }
 }
 
 function spawnWatchdog(routerPath, port, routerPidFile) {
@@ -499,6 +646,88 @@ function effectiveGraphInstanceKey(node) {
     : `${node.repoName}/${node.shortAgentName}#canonical`;
 }
 
+function retainedManagedDescriptorBind(record) {
+  const binds = (record?.config?.binds || []).filter((bind) => (
+    String(bind?.target || '') === GENERATED_ROUTER_DESCRIPTOR_CONTAINER_FILE
+  ));
+  if (binds.length !== 1
+      || binds[0]?.generatedRouterDescriptor !== true
+      || binds[0]?.ro !== true) {
+    return null;
+  }
+  return binds[0];
+}
+
+function computeRetainedManagedEnvHash(node, record, profileConfig, runtimeNetworkPlan, {
+  computeEnvHashImpl = computeEnvHash,
+  descriptorRoot = path.join(PLOINKY_DIR, 'run', 'router-descriptors'),
+  deriveAgentPrincipalIdImpl = deriveAgentPrincipalId,
+  readDescriptorFileImpl = readVerifiedGeneratedRouterDescriptorFile,
+} = {}) {
+  try {
+    const bind = retainedManagedDescriptorBind(record);
+    if (!bind) return '';
+    const root = path.resolve(descriptorRoot);
+    const source = path.resolve(String(bind.source || ''));
+    const relative = path.relative(root, source);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i.test(relative)
+        || relative.startsWith('..')
+        || path.isAbsolute(relative)
+        || relative.includes(path.sep)) {
+      return '';
+    }
+    const realRoot = fs.realpathSync.native(root);
+    const realSource = fs.realpathSync.native(source);
+    if (realSource !== path.join(realRoot, relative)) return '';
+
+    const payload = readDescriptorFileImpl(source)?.payload;
+    const principalId = deriveAgentPrincipalIdImpl(node.repoName, node.shortAgentName);
+    if (payload?.agentPrincipal !== principalId
+        || payload?.instanceId !== String(record.instanceId || '')
+        || payload?.generationId !== String(record.enableGeneration || '')) {
+      return '';
+    }
+    return computeEnvHashImpl(node.manifest, profileConfig, {
+      ...runtimeNetworkPlan.hashEnv,
+      PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
+      PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
+      PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
+      PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
+      PLOINKY_AGENT_PRINCIPAL: principalId,
+      PLOINKY_AGENT_INSTANCE_ID: record.instanceId,
+      PLOINKY_AGENT_ENABLE_GENERATION: record.enableGeneration,
+    }, { agentName: node.shortAgentName, repoName: node.repoName });
+  } catch (_) {
+    return '';
+  }
+}
+
+function removeGraphContainerForRecreate(containerName, label, predecessorRecord, {
+  clearLivenessStateImpl = dockerSvc.clearLivenessState,
+  containerExistsImpl = dockerSvc.containerExists,
+  getRuntimeImpl = dockerSvc.getRuntime,
+  removeExactRegisteredContainerImpl = removeExactRegisteredContainer,
+} = {}) {
+  if (!containerExistsImpl(containerName)) return { removed: false, state: 'absent' };
+  try {
+    const result = removeExactRegisteredContainerImpl(containerName, predecessorRecord, {
+      runtime: getRuntimeImpl(),
+    });
+    if (result?.removed !== true) {
+      throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
+    }
+    clearLivenessStateImpl(containerName);
+    return result;
+  } catch (cause) {
+    const error = new Error(
+      `[${label}] preserved container '${containerName}' because exact immutable ownership/removal was not proven`,
+      { cause },
+    );
+    error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+    throw error;
+  }
+}
+
 function graphNodeRuntimeReplacementReason(plan, {
   containerExistsImpl = dockerSvc.containerExists,
   isContainerRunningImpl = dockerSvc.isContainerRunning,
@@ -513,6 +742,8 @@ function graphNodeRuntimeReplacementReason(plan, {
   prepareLlmStartupImpl = prepareLlmStartup,
   getManifestEnvNamesImpl = getManifestEnvNames,
   getExposedNamesImpl = getExposedNames,
+  computeRetainedManagedEnvHashImpl = computeRetainedManagedEnvHash,
+  retainedManagedEnvHashOptions,
 } = {}) {
   const { node, existing } = plan;
   const record = existing.rec;
@@ -555,12 +786,24 @@ function graphNodeRuntimeReplacementReason(plan, {
     routerEndpoint,
     networkMode: profileResolution.network.mode,
   });
-  const desiredEnvHash = computeEnvHashImpl(
+  const baseEnvHash = computeEnvHashImpl(
     node.manifest,
     profileResolution.profileConfig,
     { ...runtimeRouterEnv, ...runtimeNetworkPlan.hashEnv },
     { agentName: node.shortAgentName, repoName: node.repoName },
   );
+  const desiredEnvHash = runtimeNetworkPlan.requiresManagedNetwork
+    ? computeRetainedManagedEnvHashImpl(
+        node,
+        record,
+        profileResolution.profileConfig,
+        runtimeNetworkPlan,
+        retainedManagedEnvHashOptions,
+      )
+    : baseEnvHash;
+  if (runtimeNetworkPlan.requiresManagedNetwork && !desiredEnvHash) {
+    return 'managedRouterDescriptorDrift';
+  }
   if (desiredEnvHash && desiredEnvHash !== getContainerLabelImpl(existing.key, 'ploinky.envhash')) {
     return 'envHashChanged';
   }
@@ -577,7 +820,7 @@ function graphNodeRuntimeReplacementReason(plan, {
         ...getManifestEnvNamesImpl(node.manifest, profileResolution.profileConfig, { forRuntime: true }),
         ...getExposedNamesImpl(node.manifest, profileResolution.profileConfig, { forRuntime: true }),
       ],
-      envHash: desiredEnvHash,
+      envHash: baseEnvHash,
       effectiveNetwork: profileResolution.profileConfig?.network ?? node.manifest?.network ?? null,
       writeState: false,
     });
@@ -735,7 +978,7 @@ export function assertWorkspaceGraphAdmissionsCurrent(admissions) {
 
 function ensureGraphNodesEnabled(graph, reg, {
   prepareAgentEnableBatch = agentsSvc.prepareAgentEnableBatch,
-  removeAgentContainerForRecreate = dockerSvc.removeAgentContainerForRecreate,
+  removeAgentContainerForRecreate = removeGraphContainerForRecreate,
   saveAgents = workspaceSvc.saveAgents,
   loadRouting = readRoutingConfig,
   saveRouting = (routing) => writeRoutingConfig(routing, { coordinate: false }),
@@ -781,7 +1024,14 @@ function ensureGraphNodesEnabled(graph, reg, {
     const runtimeReason = executionChanged || profileChanged
       ? ''
       : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
-    existingPlans.push({ ...preliminary, runtimeReason });
+    existingPlans.push({
+      ...preliminary,
+      runtimeReason,
+      // The desired registry receives a fresh candidate tuple before removal
+      // so the inactive generation can be compiled. Keep a detached snapshot
+      // as the only ownership proof authorized to remove the predecessor.
+      predecessorRecord: structuredClone(existing.rec),
+    });
   }
 
   const changedPlans = existingPlans
@@ -870,6 +1120,7 @@ function ensureGraphNodesEnabled(graph, reg, {
       removeAgentContainerForRecreate(
         plan.existing.key,
         `workspaceGraph:${plan.node.id}:${reasons.join('+')}`,
+        plan.predecessorRecord,
       );
     }
   } catch (error) {
@@ -1786,7 +2037,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       return { failedAgents, routeResults: routeResults.filter((result) => result?.ok) };
     };
 
-    const deferredNoWaitLaunches = [];
+    const deferredNoWaitWaves = [];
     for (let waveIndex = 0; waveIndex < graphWaves.length; waveIndex += 1) {
       const waveNodeIds = graphWaves[waveIndex];
       const waveNodes = waveNodeIds
@@ -1822,7 +2073,9 @@ async function startWorkspace(staticAgentArg, portArg, {
         : blockingLabel;
       console.log(`[start] Dependency wave ${waveIndex + 1}/${graphWaves.length}: ${waveSummary}`);
 
-      deferredNoWaitLaunches.push(...noWaitWaveNodes);
+      if (noWaitWaveNodes.length) {
+        deferredNoWaitWaves.push(noWaitWaveNodes);
+      }
 
       const blockingLaunch = blockingNames.length
         ? await updateRoutes(blockingNames)
@@ -1902,28 +2155,49 @@ async function startWorkspace(staticAgentArg, portArg, {
     workspacePreparationLease = null;
     workspaceRuntimeCandidates.length = 0;
 
-    let previousNoWaitStatusFile = '';
-    for (const { node, registryName } of deferredNoWaitLaunches) {
-      if (!registryName) {
-        console.warn(`[start] no-wait node '${formatGraphNodeLabel(node, staticAgent)}' missing registry entry; skipping background launch.`);
-        continue;
+    const noWaitRunId = randomUUID();
+    const noWaitSchedule = buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
+      runId: noWaitRunId,
+    });
+    // Clear every public and run-scoped status before spawning any worker.
+    // The UUID-scoped coordination paths prevent a late writer from an older
+    // detached invocation from satisfying this run's wave barrier.
+    for (const entry of noWaitSchedule.flat()) {
+      if (!entry.registryName || !entry.statusFile) continue;
+      const canonicalStatusFile = path.join(RUNNING_DIR, 'no-wait', `${entry.registryName}.json`);
+      for (const target of new Set([canonicalStatusFile, entry.statusFile])) {
+        try { fs.unlinkSync(target); } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+        }
       }
-      const rec = reg[registryName] || {};
-      const routeKey = rec.alias || node.shortAgentName;
-      try {
-        const { pid, logFile, statusFile } = spawnNoWaitWorker({
-          node,
-          registryName,
-          routeKey,
-          registryAlias: rec.alias || node.alias || '',
-          routerPort: staticPort,
-          forceRecreate: newlyPreparedContainers.has(registryName),
-          waitForStatusFile: previousNoWaitStatusFile,
-        });
-        previousNoWaitStatusFile = statusFile;
-        console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
-      } catch (spawnErr) {
-        console.error(`[start] no-wait launch for '${formatGraphNodeLabel(node, staticAgent)}' failed to spawn: ${spawnErr?.message || spawnErr}`);
+      writeNoWaitRunMarker(entry);
+    }
+    for (const wave of noWaitSchedule) {
+      for (const entry of wave) {
+        const { node, registryName } = entry;
+        if (!registryName) {
+          console.warn(`[start] no-wait node '${formatGraphNodeLabel(node, staticAgent)}' missing registry entry; skipping background launch.`);
+          continue;
+        }
+        const rec = reg[registryName] || {};
+        const routeKey = rec.alias || node.shortAgentName;
+        try {
+          const { pid, logFile, statusFile } = spawnNoWaitWorker({
+            node,
+            registryName,
+            routeKey,
+            registryAlias: rec.alias || node.alias || '',
+            routerPort: staticPort,
+            forceRecreate: newlyPreparedContainers.has(registryName),
+            runId: entry.runId,
+            statusFile: entry.statusFile,
+            waitForStatuses: entry.waitForStatuses,
+          });
+          console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait wave ${entry.waveIndex + 1}/${noWaitSchedule.length} launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
+        } catch (spawnErr) {
+          writeNoWaitSpawnFailure(entry, spawnErr);
+          console.error(`[start] no-wait launch for '${formatGraphNodeLabel(node, staticAgent)}' failed to spawn: ${spawnErr?.message || spawnErr}`);
+        }
       }
     }
 
@@ -2533,8 +2807,10 @@ export {
   assertStaticPreinstallSucceeded,
   buildDashboardUrl,
   buildBlockingReadinessEntryFromNode,
+  computeRetainedManagedEnvHash,
   activatePreparedRuntimeAfterReadiness,
   ensureGraphNodesEnabled,
+  removeGraphContainerForRecreate,
   reprepareGraphAfterStartupProviders,
   resolveExtraEnabledRuntimeNodes,
   resolveManifestRouterEndpoint,

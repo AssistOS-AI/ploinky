@@ -471,22 +471,58 @@ export function startProbeWorker(monitor, target) {
     });
 }
 
-function readNoWaitStatus(containerName) {
+const UNREADABLE_NO_WAIT_STATUS = Object.freeze({ state: 'unreadable' });
+
+export function readNoWaitStatus(containerName, { runningDir = RUNNING_DIR } = {}) {
     if (!containerName) return null;
-    const statusPath = path.join(RUNNING_DIR, 'no-wait', `${containerName}.json`);
+    if (path.basename(containerName) !== containerName) return UNREADABLE_NO_WAIT_STATUS;
+    const markerPath = path.join(runningDir, 'no-wait', `${containerName}.current.json`);
+    const statusPath = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    let currentRun = null;
+    try {
+        const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+            || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+                .test(String(parsed.runId || ''))
+            || String(parsed.statusFile || '') !== `${containerName}.${parsed.runId}.json`) {
+            return UNREADABLE_NO_WAIT_STATUS;
+        }
+        currentRun = parsed;
+    } catch (error) {
+        if (error?.code !== 'ENOENT') return UNREADABLE_NO_WAIT_STATUS;
+    }
     try {
         const parsed = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
-        return parsed && typeof parsed === 'object' ? parsed : null;
-    } catch (_) {
-        return null;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return UNREADABLE_NO_WAIT_STATUS;
+        }
+        if (currentRun && String(parsed.runId || '') !== currentRun.runId) {
+            return UNREADABLE_NO_WAIT_STATUS;
+        }
+        const state = String(parsed.state || '').trim().toLowerCase();
+        return ['starting', 'running', 'failed'].includes(state)
+            ? parsed
+            : UNREADABLE_NO_WAIT_STATUS;
+    } catch (error) {
+        return error?.code === 'ENOENT' && !currentRun
+            ? null
+            : UNREADABLE_NO_WAIT_STATUS;
     }
 }
 
 function shouldDeferNoWaitRestart(monitor, target) {
     const readStatus = monitor?.readNoWaitStatus || readNoWaitStatus;
-    const status = readStatus(target?.containerName || '');
-    const state = String(status?.state || '').trim().toLowerCase();
-    if (state !== 'starting' && state !== 'failed') {
+    let status;
+    try {
+        status = readStatus(target?.containerName || '');
+    } catch (_) {
+        status = UNREADABLE_NO_WAIT_STATUS;
+    }
+    const observedState = String(status?.state || '').trim().toLowerCase();
+    const state = ['starting', 'failed'].includes(observedState)
+        ? observedState
+        : (status && observedState !== 'running' ? 'unreadable' : observedState);
+    if (!['starting', 'failed', 'unreadable'].includes(state)) {
         target.noWaitDeferredState = null;
         return false;
     }

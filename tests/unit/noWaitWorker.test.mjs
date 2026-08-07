@@ -10,13 +10,18 @@ import {
     assertNoWaitLifecycleRebase,
     assertNoWaitLifecycleSnapshot,
     assertNoWaitRegistryRecord,
+    assertNoWaitRuntimeStillExact,
     cleanupNoWaitTaskOwnedCandidate,
     launchNoWaitHostRuntime,
+    parseNoWaitStatusBarrier,
     resolveNoWaitWorkerLifecycleSnapshot,
+    runNoWaitLifecycleTransaction,
     waitForNoWaitLifecycle,
+    waitForNoWaitStatusBarrier,
     waitForNoWaitRouteActivation,
     waitForPriorWorker,
     withActiveNoWaitWorkerLifecycleLease,
+    writeNoWaitWorkerStatus,
     writeStatus,
 } from '../../cli/commands/noWaitWorker.js';
 
@@ -77,6 +82,206 @@ test('no-wait predecessor returns a terminal failure without exposing its detail
     const status = await waitForPriorWorker(target, { runningDir });
 
     assert.deepEqual(status, { state: 'failed' });
+});
+
+test('no-wait predecessor retries a transient direct JSON read fault', async (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_transient_direct';
+    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, '{"state":');
+    let polls = 0;
+
+    const status = await waitForPriorWorker(target, {
+        runningDir,
+        readRetryTimeoutMs: 500,
+        pollIntervalMs: 10,
+        async sleepFn() {
+            polls += 1;
+            writeStatus(containerName, { state: 'running' }, { runningDir });
+        },
+    });
+
+    assert.equal(polls, 1);
+    assert.deepEqual(status, { state: 'running' });
+});
+
+test('no-wait predecessor retries a transient direct filesystem read fault', async (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'ploinky_demo_transient_read';
+    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
+    fs.mkdirSync(target, { recursive: true });
+    let polls = 0;
+
+    const status = await waitForPriorWorker(target, {
+        runningDir,
+        readRetryTimeoutMs: 500,
+        pollIntervalMs: 10,
+        async sleepFn() {
+            polls += 1;
+            fs.rmSync(target, { recursive: true });
+            writeStatus(containerName, { state: 'running' }, { runningDir });
+        },
+    });
+
+    assert.equal(polls, 1);
+    assert.deepEqual(status, { state: 'running' });
+});
+
+test('no-wait predecessor retries a transient nested JSON read fault', async (t) => {
+    const { runningDir } = fixture(t);
+    const statusDir = path.join(runningDir, 'no-wait');
+    const target = path.join(statusDir, 'nested-target.json');
+    writeStatus('nested-target', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'nested-active.json',
+    }, { runningDir });
+    fs.writeFileSync(path.join(statusDir, 'nested-active.json'), '{"state":');
+    let now = 0;
+    let polls = 0;
+
+    const status = await waitForPriorWorker(target, {
+        runningDir,
+        timeoutMs: 1_000,
+        terminalPublicationGraceMs: 100,
+        readRetryTimeoutMs: 500,
+        pollIntervalMs: 100,
+        nowFn: () => now,
+        async sleepFn(intervalMs) {
+            now += intervalMs;
+            polls += 1;
+            if (polls === 1) {
+                writeStatus('nested-active', {
+                    state: 'starting',
+                    sequencePhase: 'active',
+                    sequencePhaseStartedAtMs: 0,
+                }, { runningDir });
+            } else if (polls === 2) {
+                writeStatus('nested-target', { state: 'running' }, { runningDir });
+            }
+        },
+    });
+
+    assert.equal(polls, 2);
+    assert.deepEqual(status, { state: 'running' });
+});
+
+test('no-wait predecessor bounds persistent direct status corruption', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'persistently-corrupt.json');
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, '{"state":');
+    let now = 0;
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, {
+            runningDir,
+            timeoutMs: 1_000,
+            readRetryTimeoutMs: 250,
+            pollIntervalMs: 100,
+            nowFn: () => now,
+            async sleepFn(intervalMs) { now += intervalMs; },
+        }),
+        /remained unreadable after bounded retries/,
+    );
+    assert.equal(now, 250);
+});
+
+test('no-wait predecessor bounds persistent nested status corruption', async (t) => {
+    const { runningDir } = fixture(t);
+    const statusDir = path.join(runningDir, 'no-wait');
+    const target = path.join(statusDir, 'nested-corrupt-target.json');
+    writeStatus('nested-corrupt-target', {
+        state: 'starting',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'nested-corrupt-active.json',
+    }, { runningDir });
+    fs.writeFileSync(path.join(statusDir, 'nested-corrupt-active.json'), '{"state":');
+    let now = 0;
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, {
+            runningDir,
+            timeoutMs: 1_000,
+            readRetryTimeoutMs: 250,
+            pollIntervalMs: 100,
+            nowFn: () => now,
+            async sleepFn(intervalMs) { now += intervalMs; },
+        }),
+        /remained unreadable after bounded retries/,
+    );
+    assert.equal(now, 250);
+});
+
+test('no-wait predecessor semantic invalidity remains immediately fail-closed', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'invalid-semantic.json');
+    writeStatus('invalid-semantic', { sequencePhase: 'active' }, { runningDir });
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, {
+            runningDir,
+            async sleepFn() {
+                assert.fail('semantic invalidity must not consume the read-retry budget');
+            },
+        }),
+        /status is missing its state/,
+    );
+});
+
+test('a failed waiting predecessor never releases its successor into the active phase', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'failed-waiting.json');
+    writeStatus('active-predecessor', {
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: 0,
+    }, { runningDir });
+    writeStatus('failed-waiting', {
+        state: 'failed',
+        sequencePhase: 'waiting-predecessor',
+        waitForStatusFile: 'active-predecessor.json',
+        finishedAtMs: 0,
+    }, { runningDir });
+    let now = 0;
+
+    await assert.rejects(
+        () => waitForPriorWorker(target, {
+            runningDir,
+            timeoutMs: 1_000,
+            terminalPublicationGraceMs: 100,
+            pollIntervalMs: 100,
+            nowFn: () => now,
+            async sleepFn(intervalMs) {
+                now += intervalMs;
+                if (now === 200) {
+                    writeStatus('active-predecessor', {
+                        state: 'running',
+                        finishedAtMs: now,
+                    }, { runningDir });
+                }
+            },
+        }),
+        /timed out waiting for no-wait predecessor status/,
+    );
+    assert.equal(now, 300);
+});
+
+test('an active-phase failure remains a valid serialized handoff', async (t) => {
+    const { runningDir } = fixture(t);
+    const target = path.join(runningDir, 'no-wait', 'failed-active.json');
+    writeStatus('failed-active', {
+        state: 'failed',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: 0,
+        finishedAtMs: 100,
+    }, { runningDir });
+
+    assert.deepEqual(
+        await waitForPriorWorker(target, { runningDir }),
+        { state: 'failed' },
+    );
 });
 
 test('no-wait predecessor permits one bounded terminal-publication grace window', async (t) => {
@@ -305,19 +510,19 @@ test('no-wait predecessor rejects a path outside the status directory', async (t
     );
 });
 
-test('no-wait runtime holds the workspace mutation lease through route activation', () => {
+test('no-wait main delegates route activation to the serialized lifecycle transaction', () => {
     const source = fs.readFileSync(
         path.resolve('cli/commands/noWaitWorker.js'),
         'utf8',
     );
-    const acquire = source.indexOf(
-        'await withActiveNoWaitWorkerLifecycleLease(expectedIdentity, async (lifecycle) => {',
-    );
-    const activation = source.indexOf('await upsertRoute(', acquire);
-    const release = source.indexOf('\n        });\n    } catch (err)', activation);
-    assert.ok(acquire > 0, 'no-wait worker must acquire the shared workspace mutation lease');
-    assert.ok(activation > acquire, 'route activation must remain in the same critical section');
-    assert.ok(release > activation, 'the workspace mutation callback must close only after route activation');
+    const transaction = source.indexOf('await runNoWaitLifecycleTransaction(expectedIdentity, {');
+    const activation = source.indexOf('async activate(lifecycle, context, result, { onCommitted })', transaction);
+    const routeMutation = source.indexOf('await upsertRoute(', activation);
+    const transactionEnd = source.indexOf('\n        });\n    } catch (err)', routeMutation);
+    assert.ok(transaction > 0, 'no-wait worker must enter the serialized lifecycle transaction');
+    assert.ok(activation > transaction, 'route activation must be owned by the transaction callback');
+    assert.ok(routeMutation > activation, 'route mutation must occur only within activation');
+    assert.ok(transactionEnd > routeMutation, 'activation must finish before the transaction releases');
 });
 
 test('no-wait worker never owns the workspace lease while waiting for an active generation', async () => {
@@ -1136,6 +1341,48 @@ test('queued no-wait launch rejects incomplete or foreign published targets', ()
     );
 });
 
+test('no-wait immutable reinspection rejects disagreement with its registry receipt', () => {
+    const expectedIdentity = {
+        containerName: 'ploinky_demo_worker',
+        repoName: 'demo',
+        shortAgent: 'worker',
+        alias: '',
+    };
+    const registryRecord = {
+        type: 'agent',
+        runtime: 'podman',
+        repoName: 'demo',
+        agentName: 'worker',
+        alias: '',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
+        containerId: 'b'.repeat(64),
+    };
+    let inspected = false;
+
+    assert.throws(
+        () => assertNoWaitRuntimeStillExact({
+            containerName: expectedIdentity.containerName,
+            containerId: 'a'.repeat(64),
+            registryRecord,
+        }, {
+            profileResolution: { network: { mode: 'default' } },
+            expectedIdentity,
+        }, {
+            createAdapter: () => ({
+                inspectContainerContract() {
+                    inspected = true;
+                    return { state: 'exact', id: 'a'.repeat(64) };
+                },
+            }),
+            getRuntime: () => 'podman',
+            isContainerRunning: () => true,
+        }),
+        /consistent immutable container ID/,
+    );
+    assert.equal(inspected, false, 'a contradictory receipt must fail before runtime inspection');
+});
+
 test('no-wait failure cleanup removes only a runtime created by this launch', async () => {
     const cleaned = [];
     const aborted = [];
@@ -1197,4 +1444,366 @@ test('no-wait cleanup still aborts preparation when exact candidate removal fail
         },
     }), /cleanup failed/);
     assert.deepEqual(events, ['cleanup', 'abort']);
+});
+
+test('run-scoped no-wait status publishes canonical and unique files with one run id', (t) => {
+    const { runningDir } = fixture(t);
+    const runId = '11111111-1111-4111-8111-111111111111';
+    const statusDir = path.join(runningDir, 'no-wait');
+    const statusFile = path.join(statusDir, `ploinky_demo_worker.${runId}.json`);
+
+    writeNoWaitWorkerStatus('ploinky_demo_worker', { state: 'running' }, {
+        runId,
+        statusFile,
+        runningDir,
+    });
+
+    const canonical = JSON.parse(fs.readFileSync(
+        path.join(statusDir, 'ploinky_demo_worker.json'),
+        'utf8',
+    ));
+    const coordination = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    assert.deepEqual(canonical, { state: 'running', runId });
+    assert.deepEqual(coordination, canonical);
+    assert.deepEqual(
+        fs.readdirSync(statusDir).sort(),
+        [`ploinky_demo_worker.${runId}.json`, 'ploinky_demo_worker.json'].sort(),
+    );
+    assert.throws(
+        () => writeNoWaitWorkerStatus('ploinky_demo_worker', { state: 'failed' }, {
+            runId,
+            statusFile: path.join(statusDir, `another-worker.${runId}.json`),
+            runningDir,
+        }),
+        /exact run-scoped file/,
+    );
+});
+
+test('run-scoped no-wait barrier validates exact paths and waits the entire prior wave', async (t) => {
+    const { runningDir } = fixture(t);
+    const runId = '22222222-2222-4222-8222-222222222222';
+    const statusDir = path.join(runningDir, 'no-wait');
+    const firstPath = path.join(statusDir, `first.${runId}.json`);
+    const secondPath = path.join(statusDir, `second.${runId}.json`);
+    const barrier = parseNoWaitStatusBarrier(JSON.stringify([
+        { path: firstPath, runId, directDependency: false },
+        { path: secondPath, runId, directDependency: true },
+    ]), { runId, runningDir });
+    const started = [];
+    let releaseFirst;
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+
+    const waiting = waitForNoWaitStatusBarrier(barrier, {
+        async waitFn(statusPath, options) {
+            started.push(path.basename(statusPath));
+            assert.equal(options.expectedRunId, runId);
+            assert.equal(options.retainFailedWaitingChain, false);
+            if (statusPath === firstPath) await firstGate;
+            return { state: statusPath === firstPath ? 'failed' : 'running' };
+        },
+    });
+    await Promise.resolve();
+    assert.deepEqual(started.sort(), [path.basename(firstPath), path.basename(secondPath)].sort());
+    releaseFirst();
+    const observed = await waiting;
+    assert.equal(observed.length, 2);
+    assert.equal(observed[0].status.state, 'failed');
+
+    await assert.rejects(
+        () => waitForNoWaitStatusBarrier([
+            { path: firstPath, runId, directDependency: true },
+        ], { waitFn: async () => ({ state: 'failed' }) }),
+        (error) => error?.code === 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED',
+    );
+    assert.throws(
+        () => parseNoWaitStatusBarrier(JSON.stringify([
+            {
+                path: firstPath,
+                runId: '33333333-3333-4333-8333-333333333333',
+                directDependency: false,
+            },
+        ]), { runId, runningDir }),
+        /different run/,
+    );
+});
+
+function noWaitTransactionFixture() {
+    const lifecycle = {
+        targetState: 'staged',
+        generationDigest: 'generation-one',
+        selectorActivationId: 'activation-one',
+        record: {
+            type: 'agent',
+            runtime: 'podman',
+            instanceId: 'instance-one',
+            enableGeneration: 'enable-one',
+        },
+        route: { container: 'ploinky_demo_worker' },
+    };
+    const candidate = {
+        containerName: 'ploinky_demo_worker',
+        containerId: 'a'.repeat(64),
+        createdByThisLaunch: true,
+        registryRecord: {
+            ...lifecycle.record,
+            containerId: 'a'.repeat(64),
+        },
+    };
+    return { lifecycle, candidate };
+}
+
+test('ordinary no-wait readiness runs outside locks and activation is exactly reserialized', async () => {
+    const { lifecycle, candidate } = noWaitTransactionFixture();
+    let workspaceHeld = false;
+    let networkHeld = false;
+    let lifecycleLeases = 0;
+    const networkOptions = [];
+
+    const value = await runNoWaitLifecycleTransaction({ containerName: candidate.containerName }, {
+        capture() {
+            assert.equal(workspaceHeld, true);
+            assert.equal(networkHeld, false);
+            return {};
+        },
+        ensure() {
+            assert.equal(workspaceHeld, true);
+            assert.equal(networkHeld, true);
+            return candidate;
+        },
+        readiness() {
+            assert.equal(workspaceHeld, false);
+            assert.equal(networkHeld, false);
+        },
+        revalidate(initial, current) {
+            assert.equal(workspaceHeld, true);
+            assert.equal(networkHeld, false);
+            assert.equal(initial, lifecycle);
+            assert.equal(current, lifecycle);
+            return current;
+        },
+        inspectRuntime() {
+            assert.equal(workspaceHeld, true);
+            assert.equal(networkHeld, true);
+        },
+        activate(_current, _context, _result, { onCommitted }) {
+            assert.equal(workspaceHeld, true);
+            assert.equal(networkHeld, true);
+            onCommitted();
+            return 'activated';
+        },
+        async withLifecycleLease(_identity, callback) {
+            lifecycleLeases += 1;
+            assert.equal(workspaceHeld, false);
+            workspaceHeld = true;
+            try { return await callback(lifecycle); } finally { workspaceHeld = false; }
+        },
+        async withNetworkLock(callback, options) {
+            networkOptions.push(options);
+            assert.equal(networkHeld, false);
+            networkHeld = true;
+            try { return await callback({ lock: 'network' }); } finally { networkHeld = false; }
+        },
+        networkWaitMs: 999999,
+        networkPollMs: 999999,
+    });
+
+    assert.equal(value, 'activated');
+    assert.equal(lifecycleLeases, 2);
+    assert.deepEqual(networkOptions, [
+        { waitMs: 300000, pollMs: 1000 },
+        { waitMs: 300000, pollMs: 1000 },
+    ]);
+});
+
+test('stale no-wait lifecycle cleans only after locked immutable reinspection', async () => {
+    const { lifecycle, candidate } = noWaitTransactionFixture();
+    const changedLifecycle = {
+        ...lifecycle,
+        generationDigest: 'generation-two',
+    };
+    let workspaceHeld = false;
+    let networkHeld = false;
+    let leaseCall = 0;
+    let cleanupCalls = 0;
+    const inspections = [];
+
+    await assert.rejects(
+        () => runNoWaitLifecycleTransaction({ containerName: candidate.containerName }, {
+            capture: () => ({}),
+            ensure: () => candidate,
+            readiness() {
+                assert.equal(workspaceHeld, false);
+                assert.equal(networkHeld, false);
+            },
+            revalidate() { throw new Error('stale lifecycle'); },
+            inspectRuntime(_result, _context, inspectedLifecycle, _capability, options) {
+                assert.equal(workspaceHeld, true);
+                assert.equal(networkHeld, true);
+                inspections.push({ inspectedLifecycle, options });
+            },
+            activate() { assert.fail('stale lifecycle must not publish'); },
+            cleanupCandidate(received) {
+                assert.equal(workspaceHeld, true);
+                assert.equal(networkHeld, true);
+                assert.equal(received, candidate);
+                cleanupCalls += 1;
+            },
+            async withLifecycleLease(_identity, callback) {
+                const current = leaseCall++ === 0 ? lifecycle : changedLifecycle;
+                workspaceHeld = true;
+                try { return await callback(current); } finally { workspaceHeld = false; }
+            },
+            async withNetworkLock(callback) {
+                networkHeld = true;
+                try { return await callback({ lock: 'network' }); } finally { networkHeld = false; }
+            },
+            loadCurrentLifecycle: () => changedLifecycle,
+        }),
+        /stale lifecycle/,
+    );
+    assert.equal(cleanupCalls, 1);
+    assert.equal(inspections.length, 1);
+    assert.equal(inspections[0].inspectedLifecycle, lifecycle);
+    assert.deepEqual(inspections[0].options, { cleanup: true });
+});
+
+test('peer publication during readiness preserves the now-active exact candidate', async () => {
+    const { lifecycle, candidate } = noWaitTransactionFixture();
+    const publishedLifecycle = {
+        ...lifecycle,
+        targetState: 'ready',
+        record: candidate.registryRecord,
+        route: {
+            container: candidate.containerName,
+            hostPort: 43123,
+        },
+    };
+    let leaseCall = 0;
+    let networkCalls = 0;
+    let cleanupCalls = 0;
+    let cleanupInspections = 0;
+
+    await assert.rejects(
+        () => runNoWaitLifecycleTransaction({ containerName: candidate.containerName }, {
+            capture: () => ({}),
+            ensure: () => candidate,
+            readiness: () => undefined,
+            revalidate() { throw new Error('peer published candidate'); },
+            inspectRuntime(_result, _context, _lifecycle, _capability, options) {
+                if (options.cleanup) cleanupInspections += 1;
+            },
+            activate() { assert.fail('stale worker must not republish'); },
+            cleanupCandidate() { cleanupCalls += 1; },
+            async withLifecycleLease(_identity, callback) {
+                const current = leaseCall++ === 0 ? lifecycle : publishedLifecycle;
+                return callback(current);
+            },
+            async withNetworkLock(callback) {
+                networkCalls += 1;
+                return callback({ lock: 'network' });
+            },
+            loadCurrentLifecycle: () => publishedLifecycle,
+        }),
+        /peer published candidate/,
+    );
+    assert.equal(leaseCall, 2);
+    assert.equal(networkCalls, 1);
+    assert.equal(cleanupInspections, 0);
+    assert.equal(cleanupCalls, 0);
+});
+
+test('preparation lease retains workspace and network locks through readiness and activation', async () => {
+    const { lifecycle, candidate } = noWaitTransactionFixture();
+    candidate.requiresEdgeActivation = true;
+    candidate.preparationLease = { leaseId: 'preparation-one' };
+    let workspaceHeld = false;
+    let networkHeld = false;
+    let lifecycleLeases = 0;
+    let networkLeases = 0;
+
+    const value = await runNoWaitLifecycleTransaction({ containerName: candidate.containerName }, {
+        capture: () => ({}),
+        ensure() {
+            assert.equal(workspaceHeld && networkHeld, true);
+            return candidate;
+        },
+        readiness() {
+            assert.equal(workspaceHeld && networkHeld, true);
+        },
+        revalidate() { assert.fail('preparation must not reacquire/rebase'); },
+        inspectRuntime() {
+            assert.equal(workspaceHeld && networkHeld, true);
+        },
+        activate(_current, _context, _result, { onCommitted }) {
+            assert.equal(workspaceHeld && networkHeld, true);
+            onCommitted();
+            return 'prepared-activation';
+        },
+        async withLifecycleLease(_identity, callback) {
+            lifecycleLeases += 1;
+            workspaceHeld = true;
+            try { return await callback(lifecycle); } finally { workspaceHeld = false; }
+        },
+        async withNetworkLock(callback) {
+            networkLeases += 1;
+            networkHeld = true;
+            try { return await callback({ lock: 'network' }); } finally { networkHeld = false; }
+        },
+    });
+
+    assert.equal(value, 'prepared-activation');
+    assert.equal(lifecycleLeases, 1);
+    assert.equal(networkLeases, 1);
+});
+
+test('concurrent no-wait lifecycle apply callbacks remain workspace-serialized', async () => {
+    const { lifecycle } = noWaitTransactionFixture();
+    let leaseTail = Promise.resolve();
+    let releaseReadiness;
+    const readinessGate = new Promise((resolve) => { releaseReadiness = resolve; });
+    let readinessArrivals = 0;
+    let maxWorkspaceHolders = 0;
+    let workspaceHolders = 0;
+    let activeApplies = 0;
+    let maxActiveApplies = 0;
+
+    const withLifecycleLease = async (_identity, callback) => {
+        const predecessor = leaseTail;
+        let releaseLease;
+        leaseTail = new Promise((resolve) => { releaseLease = resolve; });
+        await predecessor;
+        workspaceHolders += 1;
+        maxWorkspaceHolders = Math.max(maxWorkspaceHolders, workspaceHolders);
+        try { return await callback(lifecycle); } finally {
+            workspaceHolders -= 1;
+            releaseLease();
+        }
+    };
+    const run = (suffix) => runNoWaitLifecycleTransaction({ containerName: `worker-${suffix}` }, {
+        capture: () => ({}),
+        ensure: () => ({ containerName: `worker-${suffix}`, createdByThisLaunch: false }),
+        async readiness() {
+            readinessArrivals += 1;
+            await readinessGate;
+        },
+        revalidate: (_initial, current) => current,
+        inspectRuntime: () => undefined,
+        async activate(_current, _context, _result, { onCommitted }) {
+            activeApplies += 1;
+            maxActiveApplies = Math.max(maxActiveApplies, activeApplies);
+            await new Promise((resolve) => setImmediate(resolve));
+            activeApplies -= 1;
+            onCommitted();
+        },
+        withLifecycleLease,
+        withNetworkLock: (callback) => callback({ lock: 'network' }),
+    });
+
+    const first = run('first');
+    const second = run('second');
+    while (readinessArrivals < 2) await new Promise((resolve) => setImmediate(resolve));
+    releaseReadiness();
+    await Promise.all([first, second]);
+    assert.equal(maxWorkspaceHolders, 1);
+    assert.equal(maxActiveApplies, 1);
 });

@@ -26,6 +26,12 @@ function clearEnabledRepos() {
     fs.rmSync(path.join(tempDir, '.ploinky', 'enabled_repos.json'), { force: true });
 }
 
+function writePersistedRouterPort(port = 8080) {
+    const file = path.join(tempDir, '.ploinky', 'routing.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ port, routes: {} }, null, 2));
+}
+
 process.chdir(tempDir);
 
 const moduleSuffix = `?test=${Date.now()}`;
@@ -48,6 +54,8 @@ const {
     admitWorkspaceGraphRuntimeCapabilities,
     assertWorkspaceGraphAdmissionsCurrent,
     buildBlockingReadinessEntryFromNode,
+    buildNoWaitLaunchSchedule,
+    computeRetainedManagedEnvHash,
     ensureGraphNodesEnabled,
     reprepareGraphAfterStartupProviders,
     reinstallAgent,
@@ -67,6 +75,73 @@ test('parseManifestDependencyRef strips mode and alias syntax down to the agent 
     assert.equal(parseManifestDependencyRef('gitAgent global'), 'gitAgent');
     assert.equal(parseManifestDependencyRef('basic/keycloak as auth'), 'basic/keycloak');
     assert.equal(parseManifestDependencyRef('repo/agent:dev'), 'repo/agent');
+});
+
+test('no-wait scheduling preserves concurrent waves, direct dependencies, and run-scoped barriers', () => {
+    const runId = '12345678-1234-4234-8234-123456789abc';
+    const runningDir = path.join(tempDir, '.ploinky', 'schedule-running');
+    const entry = (id, registryName, dependencies = []) => ({
+        registryName,
+        node: { id, dependencies: new Set(dependencies) },
+    });
+    const schedule = buildNoWaitLaunchSchedule([
+        [entry('demo/a', 'container-a'), entry('demo/b', 'container-b')],
+        [entry('demo/c', 'container-c', ['demo/a']), entry('demo/d', 'container-d')],
+        [entry('demo/e', 'container-e', ['demo/a'])],
+    ], { runId, runningDir });
+
+    assert.equal(schedule.length, 3);
+    assert.deepEqual(schedule[0].map(({ waitForStatuses }) => waitForStatuses), [[], []],
+        'same-wave workers must not serialize behind one another');
+    assert.deepEqual(
+        schedule[1][0].waitForStatuses.map(({ nodeId, directDependency }) => [nodeId, directDependency]),
+        [['demo/a', true], ['demo/b', false]],
+        'the next wave waits for every prior-wave member and marks its direct dependency',
+    );
+    assert.deepEqual(
+        schedule[1][1].waitForStatuses.map(({ nodeId, directDependency }) => [nodeId, directDependency]),
+        [['demo/a', false], ['demo/b', false]],
+        'an independent branch retains the wave barrier without inventing dependency failures',
+    );
+    assert.deepEqual(
+        schedule[2][0].waitForStatuses.map(({ nodeId, directDependency }) => [nodeId, directDependency]),
+        [['demo/c', false], ['demo/d', false], ['demo/a', true]],
+        'a direct dependency from an older wave remains an explicit failure barrier',
+    );
+    for (const wave of schedule) {
+        for (const scheduled of wave) {
+            assert.match(scheduled.statusFile, new RegExp(`${scheduled.registryName}\\.${runId}\\.json$`));
+            assert.equal(scheduled.runId, runId);
+        }
+    }
+});
+
+test('no-wait scheduling rejects non-exact coordination identities', () => {
+    const node = { id: 'demo/a', dependencies: new Set() };
+    assert.throws(
+        () => buildNoWaitLaunchSchedule([[{ node, registryName: '../escape' }]], {
+            runId: '12345678-1234-4234-8234-123456789abc',
+            runningDir: tempDir,
+        }),
+        /exact container name and run id/,
+    );
+    assert.throws(
+        () => buildNoWaitLaunchSchedule([[{ node, registryName: 'container-a' }]], {
+            runId: 'stale-run',
+            runningDir: tempDir,
+        }),
+        /exact container name and run id/,
+    );
+    assert.throws(
+        () => buildNoWaitLaunchSchedule([[
+            { node, registryName: 'container-a' },
+            { node: { id: 'demo/b', dependencies: new Set() }, registryName: 'container-a' },
+        ]], {
+            runId: '12345678-1234-4234-8234-123456789abc',
+            runningDir: tempDir,
+        }),
+        /to one status file/,
+    );
 });
 
 test('workspace graph admission retains exact manifest bytes for under-lock revalidation', () => {
@@ -334,8 +409,16 @@ test('prepared runtime records and routes commit together before activation, inc
         /writeRoutingConfig\(next, \{ coordinate: false \}\);[\s\S]*captureExpectedGeneration\(validatedActiveGeneration\)[\s\S]*expectedGeneration/,
         'the exact post-mutation generation must be captured and bound to the coordinated apply',
     );
-    assert.match(noWaitSource, /await waitForPriorWorker\(waitForStatus\)/);
+    assert.match(
+        noWaitSource,
+        /await Promise\.all\(\[\s*waitForPriorWorker\(waitForStatus\),\s*waitForNoWaitStatusBarrier\(waitForStatuses\)/,
+        'workers must retain the legacy predecessor gate while enforcing the run-scoped wave barrier',
+    );
     assert.doesNotMatch(source, /await waitForPriorWorker|Waiting for .*background route activation/);
+    assert.match(source, /buildNoWaitLaunchSchedule\(deferredNoWaitWaves/);
+    assert.match(source, /waitForStatuses: entry\.waitForStatuses/);
+    assert.doesNotMatch(source, /previousNoWaitStatusFile/,
+        'same-wave no-wait workers must not be flattened into one global predecessor chain');
     assert.ok(
         source.indexOf('spawnNoWaitWorker({')
             < source.indexOf('Watchdog will automatically restart the server'),
@@ -741,6 +824,218 @@ test('a healthy retained blocking runtime is target-less before hooks without ro
     assert.deepEqual(prepared.changedContainers, []);
     assert.equal(registry.healthy_container.instanceId, 'retained-instance');
     assert.equal(registry.healthy_container.enableGeneration, 'retained-generation');
+});
+
+test('managed runtime hash reconstruction uses the retained signed semantic topology and identity', () => {
+    const descriptorRoot = path.join(tempDir, '.ploinky', 'run', 'semantic-hash-descriptors');
+    const descriptorFile = path.join(descriptorRoot, '12345678-1234-4234-8234-123456789abc.json');
+    fs.mkdirSync(descriptorRoot, { recursive: true });
+    fs.writeFileSync(descriptorFile, '{}', { mode: 0o600 });
+    fs.chmodSync(descriptorFile, 0o600);
+    const node = {
+        repoName: 'demo',
+        shortAgentName: 'managed',
+        manifest: { container: 'node:20-alpine', network: { mode: 'default' } },
+    };
+    const record = {
+        instanceId: 'retained-instance',
+        enableGeneration: 'retained-generation',
+        config: { binds: [{
+            source: descriptorFile,
+            target: '/run/ploinky/router-descriptor.json',
+            ro: true,
+            generatedRouterDescriptor: true,
+        }] },
+    };
+    let hashInput = null;
+    const result = computeRetainedManagedEnvHash(
+        node,
+        record,
+        {},
+        { hashEnv: { PLOINKY_NETWORK_MODE: 'default' } },
+        {
+            descriptorRoot,
+            readDescriptorFileImpl() {
+                return { payload: {
+                    agentPrincipal: 'agent:demo/managed',
+                    instanceId: 'retained-instance',
+                    generationId: 'retained-generation',
+                    semanticTopologyDigest: 'sha256:semantic-topology',
+                    schema: 'ploinky.generated-local-router.v1',
+                    transportVersion: 'node-authority-v1',
+                    localStreaming: 'disabled',
+                } };
+            },
+            computeEnvHashImpl(manifest, profile, extraEnv, identity) {
+                hashInput = { manifest, profile, extraEnv, identity };
+                return 'semantic-managed-hash';
+            },
+        },
+    );
+
+    assert.equal(result, 'semantic-managed-hash');
+    assert.deepEqual(hashInput, {
+        manifest: node.manifest,
+        profile: {},
+        extraEnv: {
+            PLOINKY_NETWORK_MODE: 'default',
+            PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: 'sha256:semantic-topology',
+            PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: 'ploinky.generated-local-router.v1',
+            PLOINKY_ROUTER_TRANSPORT_VERSION: 'node-authority-v1',
+            PLOINKY_ROUTER_LOCAL_STREAMING: 'disabled',
+            PLOINKY_AGENT_PRINCIPAL: 'agent:demo/managed',
+            PLOINKY_AGENT_INSTANCE_ID: 'retained-instance',
+            PLOINKY_AGENT_ENABLE_GENERATION: 'retained-generation',
+        },
+        identity: { agentName: 'managed', repoName: 'demo' },
+    });
+});
+
+test('a healthy managed runtime reuses its semantic env hash instead of rotating on the ordinary hash', () => {
+    writePersistedRouterPort();
+    const node = {
+        id: 'demo/managed',
+        repoName: 'demo',
+        shortAgentName: 'managed',
+        alias: '',
+        agentRef: 'demo/managed',
+        enableSpec: 'demo/managed global',
+        profile: '',
+        isStatic: false,
+        manifest: { container: 'node:20-alpine', network: { mode: 'default' } },
+    };
+    const registry = {
+        managed_container: {
+            type: 'agent',
+            repoName: 'demo',
+            agentName: 'managed',
+            runMode: 'global',
+            projectPath: tempDir,
+            instanceId: 'retained-instance',
+            enableGeneration: 'retained-generation',
+        },
+    };
+    const routing = { routes: { managed: {
+        container: 'managed_container', repo: 'demo', agent: 'managed', hostPort: 43111,
+    } } };
+    const runtimeReplacementOptions = {
+        containerExistsImpl() { return true; },
+        isContainerRunningImpl() { return true; },
+        getRuntimeForAgentImpl() { return 'podman'; },
+        getRuntimeImpl() { return 'podman'; },
+        computeEnvHashImpl() { return 'ordinary-env-hash'; },
+        computeRetainedManagedEnvHashImpl() { return 'semantic-managed-hash'; },
+        getContainerLabelImpl(containerName, label) {
+            assert.equal(containerName, 'managed_container');
+            assert.equal(label, 'ploinky.envhash');
+            return 'semantic-managed-hash';
+        },
+        isLlmRuntimeManifestImpl() { return false; },
+        createNetworkLifecycleAdapterImpl() {
+            return { inspectContainerContract() { return { state: 'exact' }; } };
+        },
+    };
+
+    const prepared = ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, registry, {
+        runtimeReplacementOptions,
+        inactivateGeneration() {},
+        loadRouting() { return routing; },
+        saveRouting() {},
+        saveAgents() { assert.fail('healthy managed reuse must not rotate the registry tuple'); },
+        prepareAgentEnableBatch() {
+            return { plans: [], preparedGeneration: { selector: { state: 'inactive' } } };
+        },
+        removeAgentContainerForRecreate() {
+            assert.fail('healthy managed reuse must not remove the predecessor');
+        },
+        executionRecordOptions: { workspaceRoot: tempDir },
+    });
+
+    assert.deepEqual(prepared.changedContainers, []);
+    assert.equal(registry.managed_container.instanceId, 'retained-instance');
+    assert.equal(registry.managed_container.enableGeneration, 'retained-generation');
+});
+
+test('managed runtime change removes with the exact predecessor proof after staging a fresh candidate tuple', () => {
+    writePersistedRouterPort();
+    const node = {
+        id: 'demo/managed-change',
+        repoName: 'demo',
+        shortAgentName: 'managed-change',
+        alias: '',
+        agentRef: 'demo/managed-change',
+        enableSpec: 'demo/managed-change global',
+        profile: '',
+        isStatic: false,
+        manifest: { container: 'node:20-alpine', network: { mode: 'default' } },
+    };
+    const predecessor = {
+        type: 'agent',
+        repoName: 'demo',
+        agentName: 'managed-change',
+        runMode: 'global',
+        projectPath: tempDir,
+        instanceId: 'predecessor-instance',
+        enableGeneration: 'predecessor-generation',
+        containerId: 'a'.repeat(64),
+        config: { binds: [{ source: '/predecessor', target: '/code', ro: true }] },
+    };
+    const registry = { managed_change_container: predecessor };
+    const routing = { routes: { 'managed-change': {
+        container: 'managed_change_container', repo: 'demo', agent: 'managed-change', hostPort: 43121,
+    } } };
+    const events = [];
+
+    const prepared = ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, registry, {
+        runtimeReplacementOptions: {
+            containerExistsImpl() { return true; },
+            isContainerRunningImpl() { return true; },
+            getRuntimeForAgentImpl() { return 'podman'; },
+            getRuntimeImpl() { return 'podman'; },
+            computeEnvHashImpl() { return 'ordinary-env-hash'; },
+            computeRetainedManagedEnvHashImpl() { return 'new-semantic-hash'; },
+            getContainerLabelImpl() { return 'old-semantic-hash'; },
+            isLlmRuntimeManifestImpl() { return false; },
+            createNetworkLifecycleAdapterImpl() {
+                return { inspectContainerContract() { return { state: 'exact' }; } };
+            },
+        },
+        inactivateGeneration() { events.push('inactive'); },
+        loadRouting() { return routing; },
+        saveRouting() { events.push('routing'); },
+        saveAgents() { events.push('candidate-registry'); },
+        prepareAgentEnableBatch() {
+            events.push('prepared');
+            assert.equal(registry.managed_change_container.instanceId, 'candidate-instance');
+            assert.equal(registry.managed_change_container.enableGeneration, 'candidate-generation');
+            return { plans: [], preparedGeneration: { selector: { state: 'inactive' } } };
+        },
+        removeAgentContainerForRecreate(containerName, label, predecessorRecord) {
+            events.push('removed-predecessor');
+            assert.equal(containerName, 'managed_change_container');
+            assert.match(label, /envHashChanged/);
+            assert.notStrictEqual(predecessorRecord, predecessor);
+            assert.equal(predecessorRecord.containerId, 'a'.repeat(64));
+            assert.equal(predecessorRecord.instanceId, 'predecessor-instance');
+            assert.equal(predecessorRecord.enableGeneration, 'predecessor-generation');
+            assert.equal(registry.managed_change_container.instanceId, 'candidate-instance');
+            assert.equal(registry.managed_change_container.enableGeneration, 'candidate-generation');
+        },
+        uuid: (() => {
+            const ids = ['candidate-instance', 'candidate-generation'];
+            return () => ids.shift();
+        })(),
+        executionRecordOptions: { workspaceRoot: tempDir },
+    });
+
+    assert.deepEqual(events, [
+        'inactive',
+        'candidate-registry',
+        'routing',
+        'prepared',
+        'removed-predecessor',
+    ]);
+    assert.deepEqual(prepared.changedContainers, ['managed_change_container']);
 });
 
 test('post-provider preparation rotates only retained predecessor tuples and preserves early fresh tuples', () => {
