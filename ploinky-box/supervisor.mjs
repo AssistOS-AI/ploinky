@@ -1,7 +1,10 @@
 import path from 'node:path';
 import http from 'node:http';
 
-import { BOX_IMAGE_REFERENCE, BOX_LABELS } from './constants.mjs';
+import {
+    BOX_LABELS,
+    resolveBoxImageReference,
+} from './constants.mjs';
 import { validateContainerConfiguration } from './contract/container.mjs';
 import { inspectAndValidateExistingImage } from './contract/image.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
@@ -82,7 +85,7 @@ export function createBoxSupervisor({
     async function prepareBoxForCommand({
         explicitPort,
         explicitMediaPort,
-        imageRef = BOX_IMAGE_REFERENCE,
+        imageRef = resolveBoxImageReference(env),
     } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             const prepared = await reconcile({
@@ -117,7 +120,7 @@ export function createBoxSupervisor({
                 repositoryRoot,
                 explicitPort: options.explicitPort,
                 explicitMediaPort: options.explicitMediaPort,
-                imageRef: options.imageRef || BOX_IMAGE_REFERENCE,
+                imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
                 stdout,
@@ -302,7 +305,7 @@ export function createBoxSupervisor({
         return Object.freeze({
             identity: identity.instance,
             ownership: ownership.state,
-            desiredImage: BOX_IMAGE_REFERENCE,
+            desiredImage: options.imageRef || resolveBoxImageReference(env),
             desiredHostPort: options.explicitPort || null,
             desiredMediaHostPort: options.explicitMediaPort || null,
             mutationPerformed: false,

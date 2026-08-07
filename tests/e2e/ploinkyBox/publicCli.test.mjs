@@ -6,7 +6,6 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-import { BOX_IMAGE_REFERENCE } from '../../../ploinky-box/constants.mjs';
 import { parseOuterArguments } from '../../../ploinky-box/command/parse.mjs';
 import { routeOuterCommand } from '../../../ploinky-box/command/route.mjs';
 import { readSmokeGraphInputs, stageSmokeGraph } from '../../../ploinky-box/smoke/graph.mjs';
@@ -107,7 +106,7 @@ function assertNestedRoutingAndSecretBoundary(containerId, harness) {
     return agent;
 }
 
-test('installed public shims use only the fixed logical image through the candidate proxy', {
+test('installed public shims honor only the environment image override through the candidate proxy', {
     timeout: 30 * 60_000,
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
@@ -147,12 +146,14 @@ test('installed public shims use only the fixed logical image through the candid
     );
     assert.equal(path.isAbsolute(realPodmanInput), true);
     const realPodman = fs.realpathSync(realPodmanInput);
+    const logicalReference = 'docker.io/assistos/ploinky-box:e2e-override';
     const proxyDirectory = path.join(artifactRoot, 'candidate-proxy');
     const tracePath = path.join(artifactRoot, 'candidate-proxy.trace');
     const proxy = writeCandidatePodmanProxy({
         directory: proxyDirectory,
         realPodman,
         candidateReference,
+        logicalReference,
         tracePath,
     });
     const publicEnvironment = {
@@ -163,7 +164,7 @@ test('installed public shims use only the fixed logical image through the candid
             : {}),
         PATH: `${proxy.directory}:${process.env.PATH}`,
         PLOINKY_MASTER_KEY: 'HOST_MASTER_KEY_CANARY',
-        PLOINKY_BOX_IMAGE: 'docker.io/attacker/override:latest',
+        PLOINKY_BOX_IMAGE: logicalReference,
         PLOINKY_BOX_ENGINE: 'attacker-engine',
         PLOINKY_BOX_INSTANCE: 'attacker-instance',
     };
@@ -317,17 +318,17 @@ test('installed public shims use only the fixed logical image through the candid
     const rewrites = trace.filter((record) => record[0] === 'rewrite');
     assert.ok(rewrites.length >= 2);
     for (const rewrite of rewrites) {
-        assert.deepEqual(rewrite, ['rewrite', BOX_IMAGE_REFERENCE, candidateReference]);
+        assert.deepEqual(rewrite, ['rewrite', logicalReference, candidateReference]);
     }
     assert.equal(trace.some((record) => record[0] === 'reject'), false);
-    const logicalCalls = argvTrace.filter((argv) => argv.includes(BOX_IMAGE_REFERENCE));
+    const logicalCalls = argvTrace.filter((argv) => argv.includes(logicalReference));
     assert.ok(logicalCalls.length >= 2);
     for (const argv of logicalCalls) {
         const allowed = (
-            argv.length === 2 && argv[0] === 'pull' && argv[1] === BOX_IMAGE_REFERENCE
+            argv.length === 2 && argv[0] === 'pull' && argv[1] === logicalReference
         ) || (
             argv.length === 3 && argv[0] === 'image' && argv[1] === 'inspect'
-            && argv[2] === BOX_IMAGE_REFERENCE
+            && argv[2] === logicalReference
         );
         assert.equal(allowed, true, `unexpected logical-ref call: ${argv.join(' ')}`);
     }

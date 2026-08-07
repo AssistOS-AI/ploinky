@@ -1,5 +1,6 @@
-export const REQUIRED_RUNTIME_IMAGE =
-    'docker.io/assistos/ploinky-box:runtime';
+import { BOX_IMAGE_REFERENCE } from '../ploinky-box/constants.mjs';
+
+export const REQUIRED_RUNTIME_IMAGE = BOX_IMAGE_REFERENCE;
 export const REQUESTED_IMAGE_LABEL =
     'io.assistos.ploinky.requested-image';
 export const PATH_HASH_LABEL =

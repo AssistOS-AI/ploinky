@@ -46,8 +46,9 @@ different scopes. Exit the REPL before operating on the outer runtime.
 
 ## Runtime image configuration and reconciliation
 
-The required multi-architecture release channel is the mutable reference
-`docker.io/assistos/ploinky-box:runtime`. Its image must satisfy the exact
+The default multi-architecture release channel is the mutable reference
+`docker.io/assistos/ploinky-box:latest`. `PLOINKY_BOX_IMAGE` selects a different
+image reference when needed. The selected image must satisfy the exact
 source-owned configuration, including an empty image-label set and this exact
 marker content at `/etc/ploinky-box`:
 
@@ -66,7 +67,7 @@ its complete configuration, resolves its local image ID, and creates the box fro
 that ID rather than from the mutable tag.
 Pull failure never falls back to a cached tag. A running compatible box is
 reused, and a stopped compatible box is started, without registry traffic.
-Consequently, publishing a new `:runtime` manifest does not roll existing
+Consequently, publishing a new `:latest` manifest does not roll existing
 boxes forward. Explicitly destroy the outer box and run an ordinary command to
 pull a refreshed image while reusing its retained named state.
 

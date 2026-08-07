@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     checkBoxHealth,
@@ -54,7 +54,7 @@ function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
             container: {
                 id,
                 labels: {
-                    [BOX_LABELS.imageRef]: 'docker.io/assistos/ploinky-box:runtime',
+                    [BOX_LABELS.imageRef]: BOX_IMAGE_REFERENCE,
                 },
                 runtime: { running, imageId: 'b'.repeat(64) },
             },
@@ -86,14 +86,17 @@ test('prepare acquires once, reconciles under lock, validates dependencies, then
     const events = [];
     const lockManager = fakeLockManager(state.root, events);
     const ownership = owned(identity);
+    const imageOverride = 'registry.example.test/ploinky-box:dev';
     const runner = { run(command, args) { events.push(`run:${args.join(' ')}`); } };
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         lockManager,
         discover: () => ownership,
+        env: { PLOINKY_BOX_IMAGE: imageOverride },
         runner,
-        reconcile: async ({ lock }) => {
+        reconcile: async ({ lock, imageRef }) => {
             lock.assertHeld(identity.instance);
+            assert.equal(imageRef, imageOverride);
             events.push('reconcile');
             return { action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882 };
         },

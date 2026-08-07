@@ -12,6 +12,7 @@ export function writeCandidatePodmanProxy({
     directory,
     realPodman,
     candidateReference,
+    logicalReference = BOX_IMAGE_REFERENCE,
     tracePath,
     fsApi = fs,
 } = {}) {
@@ -21,6 +22,9 @@ export function writeCandidatePodmanProxy({
     if (!/^docker\.io\/assistos\/ploinky-box@sha256:[a-f0-9]{64}$/.test(candidateReference)) {
         throw proxyError('Candidate proxy requires one immutable Ploinky Box digest reference');
     }
+    if (typeof logicalReference !== 'string' || !logicalReference || /\s/u.test(logicalReference)) {
+        throw proxyError('Candidate proxy requires one logical Ploinky Box image reference');
+    }
     const podman = path.join(directory, 'podman');
     fsApi.mkdirSync(directory, { recursive: false, mode: 0o700 });
     fsApi.chmodSync(directory, 0o700);
@@ -28,7 +32,7 @@ export function writeCandidatePodmanProxy({
 const fs = require('node:fs');
 const child = require('node:child_process');
 const real = ${JSON.stringify(realPodman)};
-const logical = ${JSON.stringify(BOX_IMAGE_REFERENCE)};
+const logical = ${JSON.stringify(logicalReference)};
 const candidate = ${JSON.stringify(candidateReference)};
 const trace = ${JSON.stringify(tracePath)};
 const original = process.argv.slice(2);

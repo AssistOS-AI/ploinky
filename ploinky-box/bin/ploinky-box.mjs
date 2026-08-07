@@ -7,7 +7,7 @@ import { parseOuterArguments } from '../command/parse.mjs';
 import { routeOuterCommand } from '../command/route.mjs';
 import { buildContainerExecArgs, executeProcess } from '../command/execute.mjs';
 import { updateHostPloinkySource } from '../command/hostUpdate.mjs';
-import { BOX_LABELS } from '../constants.mjs';
+import { BOX_IMAGE_OVERRIDE_ENV, BOX_IMAGE_REFERENCE, BOX_LABELS } from '../constants.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { createBoxSupervisor, formatBoxStatus } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
@@ -33,7 +33,9 @@ Commands:
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
   ploinky help                    Show this help without engine discovery
 
-Public image, engine, instance-name, and master-key overrides are intentionally unsupported.
+The default Box image is ${BOX_IMAGE_REFERENCE}.
+Set ${BOX_IMAGE_OVERRIDE_ENV} to pull a different Box image reference.
+Public CLI image options, engine, instance-name, and master-key overrides are unsupported.
 If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/security authority.
 `;
 }
@@ -93,7 +95,7 @@ export async function runOuterCli(argv, {
     if (detectInsideBox()) {
         return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
     }
-    const selectedSupervisor = supervisor || createBoxSupervisor();
+    const selectedSupervisor = supervisor || createBoxSupervisor({ env });
     const parsed = parseOuterArguments(argv);
     const route = routeOuterCommand(parsed);
     const engineEnv = buildEngineProcessEnvironment(env);

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
+import { BOX_IMAGE_REFERENCE } from '../../ploinky-box/constants.mjs';
 import {
     readSmokeGraphInputs,
     SMOKE_GRAPH_REPOSITORIES,
@@ -144,7 +145,7 @@ test('generated candidate proxy embeds one digest outside the repository and wri
     assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
     assert.equal(fs.statSync(proxy.podman).mode & 0o777, 0o700);
     assert.match(fs.readFileSync(proxy.podman, 'utf8'), new RegExp(candidateReference));
-    const logical = 'docker.io/assistos/ploinky-box:runtime';
+    const logical = BOX_IMAGE_REFERENCE;
     const allowed = spawnSync(proxy.podman, ['pull', logical], { encoding: 'utf8' });
     assert.equal(allowed.status, 0, allowed.stderr);
     assert.deepEqual(fs.readFileSync(delegated, 'utf8').trim().split('\n'), [

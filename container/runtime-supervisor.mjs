@@ -13,6 +13,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { showHelp } from '../cli/commands/help.js';
 import { loadEnvFile } from '../cli/utils/security/masterKey.js';
 import { probeImageBinaries } from '../ploinky-box/contract/image.mjs';
+import { resolveBoxImageReference } from '../ploinky-box/constants.mjs';
 import { createEngineClient } from './runtime-engine.mjs';
 import {
     BOX_MEDIA_PORT,
@@ -105,11 +106,11 @@ function optionAssignment(token, name) {
     return token.startsWith(prefix) ? token.slice(prefix.length) : null;
 }
 
-export function parseHostInvocation(argv, _env = process.env) {
+export function parseHostInvocation(argv, env = process.env) {
     const invocation = {
         engine: '',
         port: String(BOX_ROUTER_PORT),
-        image: DEFAULT_IMAGE,
+        image: resolveBoxImageReference(env),
         mountDir: '',
         mountDirResolved: '',
         sourceDirResolved: '',

@@ -1,4 +1,16 @@
-export const BOX_IMAGE_REFERENCE = 'docker.io/assistos/ploinky-box:runtime';
+export const BOX_IMAGE_REFERENCE = 'docker.io/assistos/ploinky-box:latest';
+export const BOX_IMAGE_OVERRIDE_ENV = 'PLOINKY_BOX_IMAGE';
+
+export function resolveBoxImageReference(env = process.env) {
+    const configured = env?.[BOX_IMAGE_OVERRIDE_ENV];
+    if (configured === undefined || configured === '') return BOX_IMAGE_REFERENCE;
+    if (typeof configured !== 'string' || configured.trim() !== configured || /\s/u.test(configured)) {
+        throw new TypeError(
+            `${BOX_IMAGE_OVERRIDE_ENV} must be a nonempty image reference without whitespace`,
+        );
+    }
+    return configured;
+}
 export const BOX_ROUTER_CONTAINER_PORT = 8080;
 export const BOX_MEDIA_PORT = 7882;
 export const BOX_READY_LINE = 'PLOINKY_BOX_READY';
@@ -16,19 +28,22 @@ export const BOX_LABELS = Object.freeze({
 
 export const BOX_ROLES = Object.freeze({
     container: 'box',
-    // Kept only so an explicitly destroyed pre-bind-mount Box can safely
-    // recognize and remove its old workspace volume.
-    workspace: 'workspace',
-    containers: 'containers',
+    images: 'images',
     dependencies: 'ploinky-deps',
+    // Historical roles. Their exact label values must never change: existing
+    // volumes carry them, and exact-label matching is how an explicitly
+    // destroyed Box still recognizes and removes its own old resources.
+    containers: 'containers',
+    workspace: 'workspace',
 });
 
 export const BOX_VOLUME_KEYS = Object.freeze([
-    'containers',
+    'images',
     'dependencies',
 ]);
 
 export const BOX_LEGACY_VOLUME_KEYS = Object.freeze([
+    'containers',
     'workspace',
 ]);
 

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+    BOX_IMAGE_REFERENCE,
     BOX_LABELS,
     BOX_READY_LINE,
     BOX_ROUTER_HEALTH_SOCKET,
@@ -342,7 +343,7 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     const args = containerCreateArgs({
         identity: state.identity,
         imageId: 'a'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 19090,
         mediaHostPort: 17891,
         repositoryRoot: state.root,
@@ -419,7 +420,7 @@ test('container validation rejects a Box that cannot reap orphaned children', (t
         identity: state.identity,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 8080,
         id: 'e'.repeat(64),
     });
@@ -429,7 +430,7 @@ test('container validation rejects a Box that cannot reap orphaned children', (t
         identity: state.identity,
         hostPort: 8080,
         imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        imageRef: BOX_IMAGE_REFERENCE,
         repositoryRoot: state.root,
     }), /init state is incompatible/);
 });
@@ -462,7 +463,7 @@ test('validated reuse rechecks pre-existing volume handles without registry or v
         identity: state.identity,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 8080,
         id: 'e'.repeat(64),
     });
@@ -493,7 +494,7 @@ test('an incompatible owned image hard-cuts before any engine mutation', async (
         identity: state.identity,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 8080,
         id: 'e'.repeat(64),
         running: false,
@@ -565,7 +566,7 @@ test('replacement failure removes the candidate and restores the validated old i
         identity: state.identity,
         repositoryRoot: state.root,
         imageId: oldImage,
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 18080,
         mediaHostPort: 17880,
         id: 'e'.repeat(64),
@@ -598,7 +599,7 @@ test('successful replacement gracefully stops core before stopping and removing 
         identity: state.identity,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 18080,
         id: 'e'.repeat(64),
     });
@@ -629,7 +630,7 @@ test('ploinky-local replacement stop failure preserves the old same-image Box wi
         identity: state.identity,
         repositoryRoot: state.root,
         imageId: oldImage,
-        imageRef: 'docker.io/assistos/ploinky-box:runtime',
+        imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 18080,
         id: 'e'.repeat(64),
     });

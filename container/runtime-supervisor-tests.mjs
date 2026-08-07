@@ -183,6 +183,12 @@ test('outer options stop at the first command and downstream argv remains exact'
     assert.deepEqual(routeHostInvocation(parsed).forwardedArgs, ['client', ...argv.slice(3)]);
 });
 
+test('the environment selects the default image when no outer image option is present', () => {
+    const image = 'registry.example.test/ploinky-box:canary';
+    assert.equal(parseHostInvocation([], { PLOINKY_BOX_IMAGE: image }).image, image);
+    assert.equal(parseHostInvocation([], {}).image, REQUIRED_RUNTIME_IMAGE);
+});
+
 test('double dash permits a downstream command beginning with an option', () => {
     const parsed = parseHostInvocation(['--port', '9192', '--', '--agent-field', 'x']);
     assert.equal(parsed.command, '--agent-field');

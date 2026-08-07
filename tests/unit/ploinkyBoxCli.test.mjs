@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
-import { BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import {
+    BOX_IMAGE_OVERRIDE_ENV,
+    BOX_IMAGE_REFERENCE,
+    BOX_LABELS,
+    resolveBoxImageReference,
+} from '../../ploinky-box/constants.mjs';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
 
 function bufferStream(isTTY = false) {
@@ -50,6 +55,21 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
         planDryRun: (options) => { events.push(['dry-run', options]); return { mutationPerformed: false }; },
     };
 }
+
+test('the Box image defaults to latest and accepts one environment override', () => {
+    const overridden = 'registry.example.test/ploinky-box@sha256:' + 'a'.repeat(64);
+    assert.equal(BOX_IMAGE_REFERENCE, 'docker.io/assistos/ploinky-box:latest');
+    assert.equal(resolveBoxImageReference({}), BOX_IMAGE_REFERENCE);
+    assert.equal(resolveBoxImageReference({ [BOX_IMAGE_OVERRIDE_ENV]: '' }), BOX_IMAGE_REFERENCE);
+    assert.equal(
+        resolveBoxImageReference({ [BOX_IMAGE_OVERRIDE_ENV]: overridden }),
+        overridden,
+    );
+    assert.throws(
+        () => resolveBoxImageReference({ [BOX_IMAGE_OVERRIDE_ENV]: ' invalid ref ' }),
+        new RegExp(BOX_IMAGE_OVERRIDE_ENV),
+    );
+});
 
 test('help, unavailable status, and stop never prepare or invoke current core', async () => {
     for (const argv of [['help'], ['status'], ['--debug', 'stop']]) {
@@ -343,6 +363,8 @@ test('public help documents explicit no-prompt volume deletion', async () => {
     assert.equal(code, 0);
     assert.match(output.value(), /destroy --delete-volumes/);
     assert.match(output.value(), /without prompting/);
+    assert.match(output.value(), /docker\.io\/assistos\/ploinky-box:latest/);
+    assert.match(output.value(), /PLOINKY_BOX_IMAGE/);
 });
 
 test('dry-run and invalid arguments cause no preparation or execution', async () => {

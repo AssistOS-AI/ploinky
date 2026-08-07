@@ -84,31 +84,35 @@ utility. Success still depends on the executable being present in the image.
 Optional system tools such as `ps` are not part of the Box image contract, while
 `ploinky cli` retains the dedicated shell and agent-CLI behavior shown above.
 
-The required outer image is the mutable
-`docker.io/assistos/ploinky-box:runtime` reference. Its image labels must be
-empty, its `/etc/ploinky-box` marker must contain exactly
+The default outer image is the mutable
+`docker.io/assistos/ploinky-box:latest` reference. Set `PLOINKY_BOX_IMAGE` to a
+different tag or immutable digest reference when an alternate Box image is
+needed; the public `--image` option remains unsupported. The selected image's
+labels must be empty, its `/etc/ploinky-box` marker must contain exactly
 `assistos/ploinky-box`, and its complete image configuration and capabilities
-must match the source-owned allowlist. Ploinky pulls that reference only when
-creating a missing box, validates the complete image metadata, and starts the
-captured image ID rather than racing the mutable tag. Compatible reuse,
-stopped-box start, status, stop, and destroy do not pull. Incompatible images or
-owned resources are rejected before pulling, volume creation, restart, upgrade,
-or replacement. Ploinky does not migrate, clean, relabel, adopt, or replace
-them: run `ploinky destroy` explicitly, then recreate the Box. Ordinary destroy
-retains the two named storage volumes; `--delete-volumes` performs an explicit
-storage reset without deleting host workspace files. A Box created by a version
-that used a named workspace volume requires a one-time hard reset because its
-nested-container registry exists only in that legacy workspace. Back up any
-Box-only workspace data that must be retained, then run `ploinky stop` followed
-by `ploinky destroy --delete-volumes` before recreating it. This removes the
-exactly owned legacy workspace and nested-storage volumes, but never the host
-workspace.
+must match the source-owned allowlist. Ploinky pulls the selected reference only
+when creating a missing Box or preparing a validated replacement, validates the
+complete image metadata, and starts the captured image ID rather than racing the
+mutable tag. Compatible reuse, stopped-box start, status, stop, and destroy do
+not pull. Incompatible images or foreign owned resources are rejected before
+pulling, volume creation, restart, upgrade, or replacement. Ploinky does not
+migrate, clean, relabel, or adopt them: run `ploinky destroy` explicitly, then
+recreate the Box. Ordinary destroy retains the two named storage volumes;
+`--delete-volumes` performs an explicit storage reset without deleting host
+workspace files. A Box created by a version that used a named workspace volume
+requires a one-time hard reset because its nested-container registry exists only
+in that legacy workspace. Back up any Box-only workspace data that must be
+retained, then run `ploinky stop` followed by
+`ploinky destroy --delete-volumes` before recreating it. This removes the exactly
+owned legacy workspace and nested-storage volumes, but never the host workspace.
 
-A compatible box is reused or started only when its creation configuration is
-an exact normalized match. Any port, image, mount, device, security, or other
-creation drift fails before registry traffic or container mutation and requires
-an explicit `ploinky destroy` followed by recreation; there is no transactional
-replacement or rollback path.
+A compatible Box is reused or started when its creation configuration is an
+exact normalized match. Changing the selected image reference or requested host
+ports performs a transactional replacement after the candidate image and ports
+validate; failure restores the previous immutable image and container. Other
+mount, device, security, or creation drift fails before registry traffic or
+container mutation and requires an explicit `ploinky destroy` followed by
+recreation.
 
 The outer container and its two explicitly labelled storage volumes are named
 from the canonical absolute current directory. That directory is mounted at
