@@ -26,9 +26,9 @@ Commands:
   ploinky stop                    Stop core services and the outer Box
   ploinky update [all [PATH]]     Update host core, in-Box repos/deps/skills,
                                   then restart a configured running workspace
-  ploinky destroy                 Remove the outer Box after confirmation; retain data volumes
-  ploinky destroy --delete-volumes
-                                  Remove the outer Box and its data volumes without prompting
+  ploinky destroy                 Remove the outer Box after confirmation; retain .ploinky/box
+  ploinky destroy --delete-cache  Remove the outer Box and delete .ploinky/box/dependencies
+                                  and .ploinky/box/images without prompting
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
   ploinky help                    Show this help without engine discovery
@@ -43,7 +43,7 @@ If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/
 async function defaultConfirmDestroy(instance, { input, output }) {
     const terminal = createInterface({ input, output });
     try {
-        const answer = await terminal.question(`Destroy outer Box ${instance} and retain its named volumes? [y/N] `);
+        const answer = await terminal.question(`Destroy outer Box ${instance} and retain its .ploinky/box cache data? [y/N] `);
         return /^y(?:es)?$/i.test(answer.trim());
     } finally {
         terminal.close();
@@ -134,24 +134,28 @@ export async function runOuterCli(argv, {
     if (route.kind === 'destroy') {
         const status = selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
-        const hasOwnedVolumes = Object.values(status.ownership?.handles?.volumes || {})
-            .some(Boolean);
-        if (!container && !(route.deleteVolumes && hasOwnedVolumes)) {
+        // Cache deletion is workspace-backed, so it stays available even when
+        // the outer container is already gone.
+        if (!container && !route.deleteCache) {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }
-        if (!route.deleteVolumes) {
+        if (!route.deleteCache) {
             const confirmed = await confirmDestroy(status.identity.instance, { input, output });
             if (!confirmed) {
                 output.write('Destroy cancelled; no resources changed.\n');
                 return 0;
             }
         }
-        await selectedSupervisor.runDestroyTransaction(container?.id || null, {
-            deleteVolumes: route.deleteVolumes,
+        const destroyed = await selectedSupervisor.runDestroyTransaction(container?.id || null, {
+            deleteCache: route.deleteCache,
         });
-        if (route.deleteVolumes) {
-            output.write(`Ploinky Box ${status.identity.instance} and its named volumes were deleted.\n`);
+        if (route.deleteCache) {
+            const deletedPaths = destroyed?.deletedPaths || [];
+            output.write(
+                `Ploinky Box ${status.identity.instance} was destroyed and its cache data was deleted: `
+                + `${deletedPaths.length > 0 ? deletedPaths.join(', ') : 'nothing remained to delete'}.\n`,
+            );
         }
         return 0;
     }

@@ -36,8 +36,9 @@ test('host and core lifecycle help have different scopes', () => {
     const core = captureHelp([], { surface: 'core' });
     assert.match(host, /combined, read-only outer runtime and workspace status/i);
     assert.match(host, /stop core services, then stop the outer runtime/i);
-    assert.match(host, /destroy \[--delete-volumes\]/i);
-    assert.match(host, /delete named volumes without prompting/i);
+    assert.match(host, /destroy \[--delete-cache\]/i);
+    assert.match(host, /delete \.ploinky\/box cache data without prompting/i);
+    assert.doesNotMatch(host, /--delete-volumes/i);
     assert.match(core, /leave the outer runtime running/i);
     assert.match(core, /exit the REPL before running host ploinky stop or ploinky destroy/i);
 });
@@ -54,16 +55,19 @@ test('detailed lifecycle help preserves the selected host or core scope', () => 
     assert.match(hostStop, /stop core services, then stop the outer runtime/i);
     assert.match(
         hostDestroy,
-        /retaining its dependency and image cache volumes and host workspace by default/i,
+        /retaining the host workspace and its \.ploinky\/box dependency and image cache directories by default/i,
     );
-    assert.match(hostDestroy, /destroy --delete-volumes/i);
+    assert.match(hostDestroy, /destroy --delete-cache/i);
     assert.match(hostDestroy, /without prompting/i);
-    assert.match(hostDestroy, /anonymous volumes are always cleaned/i);
+    assert.match(hostDestroy, /\.ploinky\/box\/dependencies and \.ploinky\/box\/images/i);
+    assert.match(hostDestroy, /\.ploinky\/master-key.*are never deleted/i);
     // Nested state is disposable now; help must not promise it is retained.
     assert.match(hostDestroy, /nested agents are stopped through the in-box helper/i);
     assert.match(hostDestroy, /persistent agent data must use workspace binds/i);
-    assert.doesNotMatch(hostDestroy, /two named storage volumes/i);
-    assert.doesNotMatch(hostDestroy, /legacy workspace volume/i);
+    // The retired outer named-volume design must not survive in active help.
+    assert.doesNotMatch(hostDestroy, /--delete-volumes/i);
+    assert.doesNotMatch(hostDestroy, /cache volumes/i);
+    assert.doesNotMatch(hostDestroy, /anonymous volumes/i);
     assert.match(coreStatus, /workspace\/router\/agent state/i);
     assert.match(coreStop, /leave the outer runtime running/i);
     assert.match(coreDestroy, /leave the outer runtime running/i);

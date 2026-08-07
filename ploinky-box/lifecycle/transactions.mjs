@@ -1,7 +1,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 
-import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../constants.mjs';
+import {
+    BOX_DATA_FINGERPRINT_LABELS,
+    BOX_DATA_KEYS,
+    BOX_IMAGE_REFERENCE,
+    BOX_LABELS,
+} from '../constants.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import {
     inspectAndValidateExistingImage,
@@ -11,14 +17,14 @@ import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { preflightPublications, resolveEffectiveHostPort } from '../ports.mjs';
 import {
-    ensureNamedVolumes,
-    rollbackCreatedVolumes,
-} from '../volumes.mjs';
+    ensureWorkspaceDataPaths,
+    inspectWorkspaceDataPaths,
+} from '../workspace-data.mjs';
 import {
     containerCreateArgs,
     readContainerIdFromCidfile,
     removeContainerById,
-    revalidateAllVolumes,
+    revalidateBoxDataPaths,
     secureCidfilePath,
     stopPloinkyLocalByContainerId,
     validateCreatedContainer,
@@ -44,6 +50,10 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
     const mediaHostPort = Number(container.labels[BOX_LABELS.mediaHostPort]);
     const imageRef = container.labels[BOX_LABELS.imageRef];
     const imageId = container.runtime.imageId;
+    const dataFingerprints = Object.freeze(Object.fromEntries(BOX_DATA_KEYS.map((key) => [
+        key,
+        String(container.labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
+    ])));
     const desired = {
         identity,
         hostPort,
@@ -52,6 +62,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         imageId,
         repositoryRoot,
         hostKind: engine.hostKind,
+        dataFingerprints,
     };
     validateContainerConfiguration(container, desired);
     return Object.freeze(desired);
@@ -100,10 +111,9 @@ async function createAndStart({
     repositoryRoot,
     runner,
     lock,
-    volumeHandles,
     discover,
     waitReady,
-    revalidateVolumes,
+    revalidateDataPaths,
     readCidfile,
     fsApi,
     token,
@@ -111,12 +121,13 @@ async function createAndStart({
     stderr,
 }) {
     lock.assertHeld(identity.instance);
-    revalidateVolumes({ engine, identity, handles: volumeHandles, runner, lock });
+    const dataState = revalidateDataPaths({ identity, lock, fsApi });
     const cidfile = secureCidfilePath(lock, token);
     cleanCidfile(cidfile, fsApi);
     writeProgress(stderr, `Creating Box container ${identity.instance}...`);
     runner.run(engine.name, containerCreateArgs({
         identity,
+        dataFingerprints: dataState.fingerprints,
         imageId: image.immutableId,
         imageRef,
         hostPort,
@@ -152,6 +163,7 @@ async function createAndStart({
         imageRef,
         repositoryRoot,
         hostKind: engine.hostKind,
+        dataFingerprints: dataState.fingerprints,
     });
     if (handle.id !== containerId) {
         throw transactionError('Created Box immutable ID changed during final validation');
@@ -165,7 +177,6 @@ async function restoreOldContainer({
     old,
     runner,
     lock,
-    volumeHandles,
     dependencies,
     stdout,
     stderr,
@@ -180,10 +191,9 @@ async function restoreOldContainer({
         repositoryRoot: old.repositoryRoot,
         runner,
         lock,
-        volumeHandles,
         discover: dependencies.discover,
         waitReady: dependencies.waitReady,
-        revalidateVolumes: dependencies.revalidateVolumes,
+        revalidateDataPaths: dependencies.revalidateDataPaths,
         readCidfile: dependencies.readCidfile,
         fsApi: dependencies.fsApi,
         token: dependencies.token('restore'),
@@ -218,9 +228,9 @@ export async function reconcileBoxContainer({
         preflight: seams.preflight || preflightPublications,
         validateImage: seams.validateImage || inspectAndValidateImage,
         validateExistingImage: seams.validateExistingImage || inspectAndValidateExistingImage,
-        ensureVolumes: seams.ensureVolumes || ensureNamedVolumes,
-        rollbackVolumes: seams.rollbackVolumes || rollbackCreatedVolumes,
-        revalidateVolumes: seams.revalidateVolumes || revalidateAllVolumes,
+        ensureDataPaths: seams.ensureDataPaths || ensureWorkspaceDataPaths,
+        inspectDataPaths: seams.inspectDataPaths || inspectWorkspaceDataPaths,
+        revalidateDataPaths: seams.revalidateDataPaths || revalidateBoxDataPaths,
         removeContainer: seams.removeContainer || removeContainerById,
         stopPloinkyLocal: seams.stopPloinkyLocal || stopPloinkyLocalByContainerId,
         waitReady: seams.waitReady || waitForReadyLine,
@@ -234,19 +244,35 @@ export async function reconcileBoxContainer({
     if (old) {
         dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
     }
+    let currentDataState = null;
+    if (old) {
+        try {
+            currentDataState = dependencies.inspectDataPaths({
+                identity,
+                fsApi: dependencies.fsApi,
+            });
+        } catch {
+            // Missing, unsafe, or non-writable bind sources require replacement.
+            // Preparation below revalidates the precise cause before removing
+            // the existing Box, so unsafe parents still fail without mutation.
+            currentDataState = null;
+        }
+    }
+    const dataPathsChanged = Boolean(old) && (
+        !currentDataState
+        || !isDeepStrictEqual(currentDataState.fingerprints, old.dataFingerprints)
+    );
     const requiresReplacement = Boolean(old) && (
         old.hostPort !== portPlan.hostPort
         || old.mediaHostPort !== portPlan.mediaHostPort
         || old.imageRef !== imageRef
+        || dataPathsChanged
     );
     if (old && !requiresReplacement) {
-        dependencies.revalidateVolumes({
-            engine,
-            identity,
-            handles: ownership.handles.volumes,
-            runner,
-            lock,
-        });
+        // Reuse is valid only while the host directories are the exact bind
+        // sources captured at creation. Revalidation immediately before start
+        // rejects any later parent or directory substitution.
+        dependencies.revalidateDataPaths({ identity, lock, fsApi: dependencies.fsApi });
         if (!currentContainer.runtime.running) {
             writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
             runner.run(engine.name, ['container', 'start', currentContainer.id]);
@@ -269,27 +295,10 @@ export async function reconcileBoxContainer({
     });
     await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
     const image = dependencies.validateImage(engine.name, imageRef, runner);
-    let volumeResult;
     try {
-        volumeResult = dependencies.ensureVolumes({
-            engine,
-            identity,
-            runner,
-            lock,
-            knownHandles: ownership.handles?.volumes || {},
-        });
+        dependencies.ensureDataPaths({ identity, lock, fsApi: dependencies.fsApi });
     } catch (error) {
-        const rollbackFailures = [];
-        if (error.createdVolumes?.length) {
-            try {
-                dependencies.rollbackVolumes({
-                    engine, identity, runner, lock, created: error.createdVolumes,
-                });
-            } catch (rollbackError) {
-                rollbackFailures.push(rollbackError.message);
-            }
-        }
-        throw transactionError('Named-volume preparation failed', error, rollbackFailures);
+        throw transactionError('Workspace Box data preparation failed', error);
     }
 
     let candidateId = '';
@@ -313,10 +322,9 @@ export async function reconcileBoxContainer({
             repositoryRoot,
             runner,
             lock,
-            volumeHandles: volumeResult.handles,
             discover: dependencies.discover,
             waitReady: dependencies.waitReady,
-            revalidateVolumes: dependencies.revalidateVolumes,
+            revalidateDataPaths: dependencies.revalidateDataPaths,
             readCidfile: dependencies.readCidfile,
             fsApi: dependencies.fsApi,
             token: dependencies.token('candidate'),
@@ -355,7 +363,6 @@ export async function reconcileBoxContainer({
                     old,
                     runner,
                     lock,
-                    volumeHandles: volumeResult.handles,
                     dependencies,
                     stdout,
                     stderr,
@@ -363,15 +370,9 @@ export async function reconcileBoxContainer({
             } catch (restoreError) {
                 rollbackFailures.push(`old Box restoration: ${restoreError.message}`);
             }
-        } else if (!old && volumeResult.created.length > 0) {
-            try {
-                dependencies.rollbackVolumes({
-                    engine, identity, runner, lock, created: volumeResult.created,
-                });
-            } catch (volumeError) {
-                rollbackFailures.push(`named volumes: ${volumeError.message}`);
-            }
         }
+        // The workspace-backed cache directories are durable state, not
+        // transaction-owned resources: a failed create never rolls them back.
         throw transactionError('Box container transaction failed', error, rollbackFailures);
     }
 }

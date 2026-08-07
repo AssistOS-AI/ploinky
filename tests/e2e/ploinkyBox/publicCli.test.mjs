@@ -225,13 +225,17 @@ test('installed public shims honor only the environment image override through t
     assert.doesNotMatch(innerHelp, /managed outer Box/);
 
     // The staging Box is mounted from this source checkout. Hand the retained
-    // volumes to the packed CLI so its Box is mounted from the installed tree
-    // and the exact /opt/ploinky source invariant remains fail-closed.
+    // workspace-backed cache directories to the packed CLI so its Box is
+    // mounted from the installed tree and the exact /opt/ploinky source
+    // invariant remains fail-closed.
     const stagingDestroyed = publicCommand(['destroy'], { input: 'yes\n' });
     assert.equal(stagingDestroyed.status, 0, stagingDestroyed.stderr);
     const retained = publicCommand(['status']);
     assert.equal(retained.status, 0, retained.stderr);
-    assert.match(retained.stdout, /absent-retained-volumes/);
+    assert.match(retained.stdout, /Ploinky Box: absent/);
+    for (const target of Object.values(harness.identity.dataPaths)) {
+        assert.equal(fs.statSync(target).isDirectory(), true, target);
+    }
 
     const started = publicCommand(['--debug', ...graph.args]);
     assert.equal(started.status, 0, started.stderr);
@@ -342,6 +346,12 @@ test('installed public shims honor only the environment image override through t
         assert.deepEqual(rewrite, ['rewrite', logicalReference, candidateReference]);
     }
     assert.equal(trace.some((record) => record[0] === 'reject'), false);
+    // The outer supervisor owns no engine volume: no volume subcommand may
+    // ever reach the candidate engine from the host side.
+    assert.equal(argvTrace.some((argv) => argv[0] === 'volume'), false);
+    assert.equal(argvTrace.some((argv) => (
+        argv.includes('--volumes') || argv.some((value) => String(value).endsWith(':U'))
+    )), false);
     const logicalCalls = argvTrace.filter((argv) => argv.includes(logicalReference));
     assert.ok(logicalCalls.length >= 2);
     for (const argv of logicalCalls) {

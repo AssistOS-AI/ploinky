@@ -6,10 +6,7 @@ import test from 'node:test';
 
 import { BOX_LABELS, BOX_ROLES } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
-import {
-    discoverBoxOwnership,
-    volumeHandleMatches,
-} from '../../ploinky-box/engine/discovery.mjs';
+import { discoverBoxOwnership } from '../../ploinky-box/engine/discovery.mjs';
 
 function identityFixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-discovery-'));
@@ -26,6 +23,8 @@ function labels(identity, role) {
         result[BOX_LABELS.imageRef] = 'runtime';
         result[BOX_LABELS.routerHostPort] = '18080';
         result[BOX_LABELS.mediaHostPort] = '17891';
+        result[BOX_LABELS.dependenciesFingerprint] = 'd'.repeat(64);
+        result[BOX_LABELS.imagesFingerprint] = 'f'.repeat(64);
     }
     return result;
 }
@@ -43,51 +42,40 @@ function podmanInfo({ rootless = true, osName = 'linux', serviceIsRemote = false
     };
 }
 
-function ownedRecords(identity, mountSuffix = 'one', { includeLegacy = false } = {}) {
-    const container = {
+function ownedContainer(identity) {
+    return {
         Id: 'container-id-123',
         Name: identity.instance,
         Labels: labels(identity, BOX_ROLES.container),
     };
-    const volumes = Object.fromEntries(Object.entries(identity.volumes).map(([key, name]) => {
-        const role = key === 'dependencies' ? BOX_ROLES.dependencies : BOX_ROLES[key];
-        return [key, {
-            Name: name,
-            Driver: 'local',
-            Scope: 'local',
-            Options: {},
-            CreatedAt: '2026-07-21T00:00:00Z',
-            Mountpoint: `/private/${mountSuffix}/${key}`,
-            Labels: labels(identity, role),
-        }];
+}
+
+// Records left behind by the retired named-volume design. They are returned by
+// this fake only if discovery asks for them, which it must never do.
+function retiredVolumeRecords(identity) {
+    return ['images', 'ploinky-deps', 'containers', 'workspace'].map((role) => ({
+        Name: `${identity.instance}-${role}`,
+        Driver: 'local',
+        Scope: 'local',
+        Options: {},
+        CreatedAt: '2026-07-21T00:00:00Z',
+        Mountpoint: `/private/retired/${role}`,
+        Labels: {
+            [BOX_LABELS.pathHash]: identity.pathHash,
+            [BOX_LABELS.role]: role,
+        },
     }));
-    if (includeLegacy) {
-        volumes.containers = {
-            Name: `${identity.instance}-containers`,
-            Driver: 'local',
-            Scope: 'local',
-            Options: {},
-            CreatedAt: '2026-07-20T00:00:00Z',
-            Mountpoint: `/private/${mountSuffix}/containers`,
-            Labels: {
-                [BOX_LABELS.pathHash]: identity.pathHash,
-                [BOX_LABELS.role]: 'containers',
-            },
-        };
-    }
-    return { container, volumes };
 }
 
 function fakeRunner(identity, {
     podman = podmanInfo(),
     docker = 'absent',
-    records = null,
+    container = null,
     inventoryRecords = null,
     connections = [],
     failures = new Map(),
 } = {}) {
     const calls = [];
-    const selected = records || { container: null, volumes: {} };
     return {
         calls,
         query(command, args) {
@@ -119,9 +107,7 @@ function fakeRunner(identity, {
                 const [kind, , name] = args;
                 let record = null;
                 if (command === 'podman') {
-                    record = kind === 'container'
-                        ? selected.container
-                        : Object.values(selected.volumes).find((item) => item.Name === name);
+                    record = kind === 'container' && container?.Name === name ? container : null;
                 } else if (docker && docker !== 'absent') {
                     record = docker[kind]?.[name] || null;
                 }
@@ -134,13 +120,19 @@ function fakeRunner(identity, {
     };
 }
 
+function assertNoVolumeCommand(runner) {
+    assert.equal(runner.calls.some((call) => call[1] === 'volume'), false);
+}
+
 test('discovery accepts native Linux and the default macOS Podman Machine', (t) => {
     const identity = identityFixture(t);
+    const linuxRunner = fakeRunner(identity);
     const linux = discoverBoxOwnership(identity, {
-        platform: 'linux', env: {}, runner: fakeRunner(identity),
+        platform: 'linux', env: {}, runner: linuxRunner,
     });
     assert.equal(linux.state, 'absent');
     assert.equal(linux.engine.hostKind, 'native-linux');
+    assertNoVolumeCommand(linuxRunner);
 
     const machineRunner = fakeRunner(identity, {
         podman: podmanInfo({ serviceIsRemote: true }),
@@ -154,6 +146,7 @@ test('discovery accepts native Linux and the default macOS Podman Machine', (t) 
     assert.equal(machineRunner.calls.some((call) => (
         call[1] === 'system' && call[2] === 'connection'
     )), true);
+    assertNoVolumeCommand(machineRunner);
 });
 
 test('discovery rejects unsupported, rootful, and arbitrary remote engines before inventory', (t) => {
@@ -191,95 +184,112 @@ test('discovery rejects unsupported, rootful, and arbitrary remote engines befor
     assert.match(arbitraryResult.message, /not an arbitrary remote/i);
 });
 
-test('discovery returns absent and owned handles with immutable IDs and private fingerprints', (t) => {
+test('ownership handles carry only the outer container and no volume state', (t) => {
     const identity = identityFixture(t);
+    const absentRunner = fakeRunner(identity);
     const absent = discoverBoxOwnership(identity, {
-        platform: 'linux', env: {}, runner: fakeRunner(identity),
+        platform: 'linux', env: {}, runner: absentRunner,
     });
     assert.equal(absent.state, 'absent');
+    assert.equal(absent.handles, null);
 
-    const records = ownedRecords(identity);
-    const owned = discoverBoxOwnership(identity, {
-        platform: 'linux', env: {}, runner: fakeRunner(identity, { records }),
-    });
+    const runner = fakeRunner(identity, { container: ownedContainer(identity) });
+    const owned = discoverBoxOwnership(identity, { platform: 'linux', env: {}, runner });
     assert.equal(owned.state, 'owned');
     assert.equal(owned.handles.container.id, 'container-id-123');
-    assert.equal(owned.handles.volumes.images.fingerprint.mountpointHash.length, 64);
-    assert.equal(owned.handles.volumes.images.name, identity.volumes.images);
+    assert.deepEqual(Object.keys(owned.handles), ['container']);
+    assert.equal(owned.handles.volumes, undefined);
     assert.equal(owned.handles.legacyVolumes, undefined);
-    assert.equal(JSON.stringify(owned).includes('/private/'), false);
-
-    const recreated = discoverBoxOwnership(identity, {
-        platform: 'linux', env: {}, runner: fakeRunner(identity, {
-            records: ownedRecords(identity, 'two'),
-        }),
-    });
-    assert.equal(
-        volumeHandleMatches(
-            owned.handles.volumes.images,
-            recreated.handles.volumes.images,
-        ),
-        false,
-    );
+    assert.equal(JSON.stringify(owned).includes('mountpointHash'), false);
+    assertNoVolumeCommand(runner);
 });
 
-test('a superseded storage volume is no longer a recognized Box resource', (t) => {
+test('discovery never issues a volume command in any reachable-engine path', (t) => {
     const identity = identityFixture(t);
-    const records = ownedRecords(identity, 'legacy', { includeLegacy: true });
-    const result = discoverBoxOwnership(identity, {
-        platform: 'linux', env: {}, runner: fakeRunner(identity, {
-            records,
+    for (const container of [null, ownedContainer(identity)]) {
+        const runner = fakeRunner(identity, {
+            container,
             inventoryRecords: {
-                podman: { volume: [records.volumes.containers], container: [] },
+                podman: {
+                    container: container ? [container] : [],
+                    volume: retiredVolumeRecords(identity),
+                },
             },
-        }),
-    });
-    assert.equal(result.state, 'foreign');
-    assert.match(result.message, /unexpected resource claiming this Box identity/);
+        });
+        discoverBoxOwnership(identity, { platform: 'linux', env: {}, runner });
+        assertNoVolumeCommand(runner);
+        assert.equal(runner.calls.some((call) => call.includes('volume')), false);
+    }
 });
 
-test('a partial cache-volume set fails closed instead of being reused', (t) => {
+test('retired labelled named volumes neither establish ownership nor block a Box', (t) => {
     const identity = identityFixture(t);
-    const records = ownedRecords(identity);
-    delete records.volumes.dependencies;
-    assert.equal(discoverBoxOwnership(identity, {
-        platform: 'linux', env: {}, runner: fakeRunner(identity, { records }),
-    }).state, 'incompatible');
+    const retired = retiredVolumeRecords(identity);
 
-    const orphaned = ownedRecords(identity);
-    orphaned.container = null;
-    delete orphaned.volumes.images;
-    assert.equal(discoverBoxOwnership(identity, {
-        platform: 'linux', env: {}, runner: fakeRunner(identity, { records: orphaned }),
-    }).state, 'incompatible');
+    // Only the retired volumes still exist: the workspace is simply absent.
+    const absentRunner = fakeRunner(identity, {
+        inventoryRecords: { podman: { container: [], volume: retired } },
+    });
+    const absent = discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: absentRunner,
+    });
+    assert.equal(absent.state, 'absent');
+    assert.equal(absent.handles, null);
+
+    // The same retired volumes alongside a current Box change nothing.
+    const container = ownedContainer(identity);
+    const ownedRunner = fakeRunner(identity, {
+        container,
+        inventoryRecords: { podman: { container: [container], volume: retired } },
+    });
+    const owned = discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: ownedRunner,
+    });
+    assert.equal(owned.state, 'owned');
+    assert.equal(JSON.stringify(owned).includes('-ploinky-deps'), false);
 });
 
-test('unlabeled exact names, wrong labels, and incomplete fingerprints fail closed', (t) => {
+test('unlabeled exact names and label drift fail closed', (t) => {
     const identity = identityFixture(t);
     const variants = [];
-    const unlabeled = ownedRecords(identity);
-    unlabeled.container.Labels = {};
+    const unlabeled = ownedContainer(identity);
+    unlabeled.Labels = {};
     variants.push(unlabeled);
-    const extraLabel = ownedRecords(identity);
-    extraLabel.container.Labels['io.assistos.ploinky-box.unexpected'] = 'present';
+    const extraLabel = ownedContainer(identity);
+    extraLabel.Labels['io.assistos.ploinky-box.unexpected'] = 'present';
     variants.push(extraLabel);
-    const wrongPath = ownedRecords(identity);
-    wrongPath.volumes.images.Labels[BOX_LABELS.pathHash] = '000000000000';
+    const wrongPath = ownedContainer(identity);
+    wrongPath.Labels[BOX_LABELS.pathHash] = '000000000000';
     variants.push(wrongPath);
-    const wrongRole = ownedRecords(identity);
-    wrongRole.volumes.images.Labels[BOX_LABELS.role] = 'containers';
+    const wrongRole = ownedContainer(identity);
+    wrongRole.Labels[BOX_LABELS.role] = 'images';
     variants.push(wrongRole);
-    const incomplete = ownedRecords(identity);
-    delete incomplete.volumes.dependencies.Mountpoint;
-    variants.push(incomplete);
+    const missingPort = ownedContainer(identity);
+    delete missingPort.Labels[BOX_LABELS.mediaHostPort];
+    variants.push(missingPort);
+    const partialFingerprint = ownedContainer(identity);
+    delete partialFingerprint.Labels[BOX_LABELS.imagesFingerprint];
+    variants.push(partialFingerprint);
 
-    for (const records of variants) {
+    for (const container of variants) {
         const result = discoverBoxOwnership(identity, {
-            platform: 'linux', env: {}, runner: fakeRunner(identity, { records }),
+            platform: 'linux', env: {}, runner: fakeRunner(identity, { container }),
         });
         assert.equal(result.state, 'foreign');
-        assert.equal(JSON.stringify(result).includes('/private/'), false);
     }
+});
+
+test('a container without an immutable ID is foreign rather than owned', (t) => {
+    const identity = identityFixture(t);
+    const container = ownedContainer(identity);
+    delete container.Id;
+
+    const result = discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: fakeRunner(identity, { container }),
+    });
+
+    assert.equal(result.state, 'foreign');
+    assert.match(result.message, /no immutable ID/);
 });
 
 test('Docker exact-name conflicts and engine ambiguity fail closed', (t) => {
@@ -317,4 +327,17 @@ test('unexpected labeled inventory records are foreign even when exact names are
     const result = discoverBoxOwnership(identity, { platform: 'linux', env: {}, runner });
     assert.equal(result.state, 'foreign');
     assert.equal(runner.calls.some((call) => ['exec', 'start', 'stop', 'rm'].includes(call[1])), false);
+});
+
+test('an unreadable container inventory is unknown rather than absent', (t) => {
+    const identity = identityFixture(t);
+    const failures = new Map([[
+        ['podman', 'container', 'ls', '-a', '--filter', `label=${BOX_LABELS.pathHash}=${identity.pathHash}`, '--format', '{{json .}}'].join('\0'),
+        { ok: false, stdout: '', stderr: 'engine busy', error: null },
+    ]]);
+    const result = discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: fakeRunner(identity, { failures }),
+    });
+    assert.equal(result.state, 'unknown');
+    assert.match(result.message, /could not inventory Box container ownership/);
 });

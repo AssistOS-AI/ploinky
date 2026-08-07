@@ -263,7 +263,10 @@ export function validateEntrypointMounts(paths, fsApi = fs) {
         fsApi.accessSync(paths.ploinky, fsApi.constants.R_OK | fsApi.constants.X_OK);
     } catch (error) {
         if (error instanceof PloinkyBoxError) throw error;
-        throw entrypointError('Required Box mount is missing or not writable by podman', error);
+        throw entrypointError(
+            'A required Box mount target is missing or is not a writable directory for podman',
+            error,
+        );
     }
 }
 

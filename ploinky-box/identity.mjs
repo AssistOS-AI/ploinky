@@ -2,6 +2,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import {
+    BOX_DATA_KEYS,
+    BOX_DATA_RELATIVE_NAMES,
+    BOX_DATA_ROOT_NAME,
+} from './constants.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 
 const MISSING_CWD_MESSAGE = [
@@ -77,10 +82,11 @@ export function buildWorkspaceIdentity(workspaceRoot, {
         slug,
         instance,
         anchorPath: path.join(selectedRoot, '.ploinky'),
-        volumes: Object.freeze({
-            images: `${instance}-images`,
-            dependencies: `${instance}-ploinky-deps`,
-        }),
+        boxDataRoot: path.join(selectedRoot, '.ploinky', BOX_DATA_ROOT_NAME),
+        dataPaths: Object.freeze(Object.fromEntries(BOX_DATA_KEYS.map((key) => [
+            key,
+            path.join(selectedRoot, '.ploinky', BOX_DATA_ROOT_NAME, BOX_DATA_RELATIVE_NAMES[key]),
+        ]))),
         rootFingerprint: Object.freeze(captureRootFingerprint(
             selectedRoot,
             lstatSync,

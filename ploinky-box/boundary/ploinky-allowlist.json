@@ -15,9 +15,11 @@
   "package.json",
   "cli/server/Watchdog.js",
   "cli/commands/workspaceUtil.js",
+  "cli/commands/help.js",
   "README.md",
   "docs/index.html",
   "docs/runtime.html",
   "docs/operations.html",
-  "docs/superpowers/plans/2026-07-21-ploinky-box-implementation-plan-revised.md"
+  "docs/superpowers/plans/2026-07-21-ploinky-box-implementation-plan-revised.md",
+  "docs/superpowers/plans/2026-08-07-ploinky-box-workspace-backed-persistence.md"
 ]

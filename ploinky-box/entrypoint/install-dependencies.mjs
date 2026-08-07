@@ -74,10 +74,10 @@ export function readDependencyLock({ fsApi = fs, lockPath = LOCK_PATH } = {}) {
 function assertRealDirectory(directory, fsApi) {
     const stat = fsApi.lstatSync(directory);
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw dependencyError(`Dependency volume target is not a real directory: ${directory}`);
+        throw dependencyError(`Dependency directory target is not a real directory: ${directory}`);
     }
     if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-        throw dependencyError(`Dependency volume target is not owned by the current user: ${directory}`);
+        throw dependencyError(`Dependency directory target is not owned by the current user: ${directory}`);
     }
 }
 

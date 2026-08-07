@@ -16,11 +16,15 @@ import {
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
 import { readSmokeGraphInputs, stageSmokeGraph } from '../../ploinky-box/smoke/graph.mjs';
 import { checkBoxHealth } from '../../ploinky-box/supervisor.mjs';
+import { inspectWorkspaceDataPaths } from '../../ploinky-box/workspace-data.mjs';
 import {
     createPodmanHarness,
     execInBox,
     requirePodmanCandidate,
 } from '../e2e/ploinkyBox/nativeHelpers.mjs';
+
+// The supervisor defaults its read-only source bind to the repository root.
+const repositoryRoot = path.resolve(import.meta.dirname, '../..');
 
 function queryInBox(harness, containerId, argv) {
     return harness.runner.query('podman', [
@@ -48,15 +52,68 @@ function exactResourceExists(harness, kind, name) {
 
 function assertIdentityResourcesAbsent(harness) {
     assert.equal(exactResourceExists(harness, 'container', harness.identity.instance), false);
-    for (const name of Object.values(harness.identity.volumes)) {
-        assert.equal(exactResourceExists(harness, 'volume', name), false);
-    }
     const claimed = harness.runner.query('podman', [
         'container', 'ls', '--all', '--quiet', '--filter',
         `label=io.assistos.ploinky-box.path-hash=${harness.identity.pathHash}`,
     ]);
     assert.equal(claimed.ok, true, claimed.stderr);
     assert.equal(String(claimed.stdout || '').trim(), '');
+}
+
+// The workspace-backed design owns no engine volume at all, so any labelled
+// volume for this identity would be a hard-cut regression.
+function assertNoOwnedNamedVolume(harness) {
+    const labelled = harness.runner.query('podman', [
+        'volume', 'ls', '--quiet', '--filter',
+        `label=io.assistos.ploinky-box.path-hash=${harness.identity.pathHash}`,
+    ]);
+    assert.equal(labelled.ok, true, labelled.stderr);
+    assert.equal(String(labelled.stdout || '').trim(), '');
+    for (const suffix of ['images', 'ploinky-deps', 'containers', 'workspace']) {
+        assert.equal(
+            exactResourceExists(harness, 'volume', `${harness.identity.instance}-${suffix}`),
+            false,
+        );
+    }
+}
+
+function boxMounts(harness, containerId) {
+    const inspected = harness.runner.query('podman', ['container', 'inspect', containerId]);
+    assert.equal(inspected.ok, true, inspected.stderr);
+    return JSON.parse(inspected.stdout)[0].Mounts;
+}
+
+function assertExactBindMounts(harness, containerId, repositoryRoot) {
+    const observed = boxMounts(harness, containerId)
+        .map((mount) => ({
+            type: String(mount.Type || '').toLowerCase(),
+            source: String(mount.Source || ''),
+            destination: String(mount.Destination || ''),
+            rw: mount.RW === true,
+        }))
+        .sort((left, right) => left.destination.localeCompare(right.destination));
+    assert.deepEqual(observed, [
+        {
+            type: 'bind',
+            source: harness.identity.dataPaths.images,
+            destination: '/home/podman/.local/share/ploinky-images',
+            rw: true,
+        },
+        { type: 'bind', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
+        {
+            type: 'bind',
+            source: harness.identity.dataPaths.dependencies,
+            destination: '/opt/ploinky/node_modules',
+            rw: true,
+        },
+        { type: 'bind', source: harness.identity.workspaceRoot, destination: '/workspace', rw: true },
+    ]);
+}
+
+function assertBoxCacheDirectoriesExist(harness) {
+    for (const target of Object.values(harness.identity.dataPaths)) {
+        assert.equal(fs.statSync(target).isDirectory(), true, target);
+    }
 }
 
 function writeNestedVolumeCanary(harness, containerId, volumeName, value) {
@@ -111,16 +168,13 @@ function assertIntendedNestedStorage(harness, containerId) {
     ]), '');
 }
 
-function readDependencyVolumeFile(harness, relativePath) {
-    const result = harness.runner.query('podman', [
-        'run', '--rm', '--network=none',
-        '--entrypoint', '/bin/cat',
-        '--volume', `${harness.identity.volumes.dependencies}:/deps:ro`,
-        harness.candidateReference,
-        `/deps/${relativePath}`,
-    ], { timeoutMs: 120_000 });
-    assert.equal(result.ok, true, result.stderr);
-    return String(result.stdout || '').trim();
+// The dependency cache is a plain host directory now, so the host can read it
+// directly without borrowing a container.
+function readDependencyCacheFile(harness, relativePath) {
+    return fs.readFileSync(
+        path.join(harness.identity.dataPaths.dependencies, relativePath),
+        'utf8',
+    ).trim();
 }
 
 test('rootless Podman exercises the complete public lifecycle on one workspace identity', {
@@ -144,9 +198,19 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
 
     const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky')), true);
-    assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')), ['master-key'],
-        'the host identity anchor must retain only the Box master key');
+    assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')).sort(),
+        ['box', 'master-key'],
+        'the host identity anchor must retain only the Box master key and cache root');
     assert.equal(fs.existsSync(path.join(harness.child, '.ploinky')), false);
+    // Workspace-backed persistence: both cache directories exist on the real
+    // host, back the Box through exact bind mounts, and no named volume exists.
+    assertBoxCacheDirectoriesExist(harness);
+    assert.deepEqual(
+        fs.readdirSync(harness.identity.boxDataRoot).sort(),
+        ['dependencies', 'images'],
+    );
+    assertExactBindMounts(harness, prepared.containerId, repositoryRoot);
+    assertNoOwnedNamedVolume(harness);
     assert.equal(prepared.ownership.handles.container.runtime.running, true);
     assert.deepEqual(prepared.ownership.handles.container.runtime.publications, [
         { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
@@ -340,14 +404,26 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         'utf8',
     ), 'workspace-retained');
 
-    assert.equal(readDependencyVolumeFile(
+    assert.equal(readDependencyCacheFile(
         harness,
         '.ploinky-box-dependencies.json',
     ), 'corrupt');
     // Destroy the live Box directly. The supervisor must stop the nested graph
     // before stopping and removing the outer container.
-    await harness.supervisor.runDestroyTransaction(started.containerId);
-    assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent-retained-volumes');
+    const destroyed = await harness.supervisor.runDestroyTransaction(started.containerId);
+    assert.equal(destroyed.deletedCache, false);
+    assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent');
+    // Default destroy retains every byte of workspace-backed cache data.
+    assertBoxCacheDirectoriesExist(harness);
+    assertNoOwnedNamedVolume(harness);
+    assert.equal(
+        fs.readFileSync(path.join(
+            harness.identity.dataPaths.dependencies, 't26-dependencies-canary',
+        ), 'utf8'),
+        'dependencies-retained',
+    );
+    assert.ok(fs.readdirSync(harness.identity.dataPaths.images).length > 0,
+        'the workspace-backed image store must retain content across destroy');
     const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     const recreatedKeyEvidence = execInBox(harness.runner, recreated.containerId, [
         'sha256sum', '/workspace/.ploinky/master-key',
@@ -371,10 +447,47 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         'podman', 'image', 'inspect', nestedImageId,
     ]).ok, true);
     assertIntendedNestedStorage(harness, recreated.containerId);
-    for (const volume of Object.values(harness.identity.volumes)) {
-        assert.equal(exactResourceExists(harness, 'volume', volume), true);
+    assertExactBindMounts(harness, recreated.containerId, repositoryRoot);
+    assertNoOwnedNamedVolume(harness);
+
+    // Explicit cache reset deletes exactly the two Box directories and leaves
+    // every other workspace and .ploinky file untouched.
+    fs.writeFileSync(path.join(harness.workspace, '.ploinky', 'unrelated.json'), '{"kept":true}');
+    const reset = await harness.supervisor.runDestroyTransaction(recreated.containerId, {
+        deleteCache: true,
+    });
+    assert.equal(reset.deletedCache, true);
+    assert.deepEqual(reset.deletedPaths, [
+        harness.identity.dataPaths.dependencies,
+        harness.identity.dataPaths.images,
+    ]);
+    assert.equal(fs.existsSync(harness.identity.boxDataRoot), false);
+    // Only `box` disappears. The anchor holds workspace state written by the
+    // graph and by nested agents, so assert the property rather than an exact
+    // listing: `box` is gone and every other named entry survives.
+    const anchorEntries = fs.readdirSync(path.join(harness.workspace, '.ploinky'));
+    assert.equal(anchorEntries.includes('box'), false);
+    for (const kept of ['master-key', 'unrelated.json', 'from-agent.txt']) {
+        assert.equal(anchorEntries.includes(kept), true, `.ploinky/${kept} must survive`);
     }
-    await harness.supervisor.runDestroyTransaction(recreated.containerId);
+    assert.equal(fs.readFileSync(
+        path.join(harness.workspace, 't26-workspace-canary'), 'utf8',
+    ), 'workspace-retained');
+    assertNoOwnedNamedVolume(harness);
+
+    // A clean rebuild recreates both cache directories and reinstalls the
+    // pinned dependencies from scratch.
+    const rebuilt = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    assertBoxCacheDirectoriesExist(harness);
+    assertExactBindMounts(harness, rebuilt.containerId, repositoryRoot);
+    assert.equal(fs.existsSync(path.join(
+        harness.identity.dataPaths.dependencies, 't26-dependencies-canary',
+    )), false);
+    assert.match(readDependencyCacheFile(harness, '.ploinky-box-dependencies.json'), /^\{/);
+    assert.equal(execInBox(harness.runner, rebuilt.containerId, [
+        'test', '-d', '/opt/ploinky/node_modules/achillesAgentLib',
+    ]), '');
+    await harness.supervisor.runDestroyTransaction(rebuilt.containerId);
 
     const udp = dgram.createSocket('udp4');
     await new Promise((resolve, reject) => {
@@ -410,40 +523,165 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
             }),
             new RegExp(`UDP|${selectedMediaHostPort}|already reserved`, 'i'),
         );
-        assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent-retained-volumes');
+        assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent');
     } finally {
         await new Promise((resolve) => selectedUdp.close(resolve));
     }
 
     await harness.cleanup();
-    const foreignResources = [
-        ['container', harness.identity.instance],
-        ...Object.values(harness.identity.volumes).map((name) => ['volume', name]),
-    ];
-    for (const [kind, name] of foreignResources) {
-        const created = kind === 'container'
-            ? harness.runner.query('podman', [
-                'container', 'create', '--name', name, '--entrypoint', '/bin/true',
-                candidateReference,
-            ])
-            : harness.runner.query('podman', ['volume', 'create', name]);
-        assert.equal(created.ok, true, created.stderr);
-        await assert.rejects(
-            harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference }),
-            /exact-name resource .* is not owned by this Box/,
-        );
-        if (kind === 'container') {
-            const record = JSON.parse(harness.runner.query('podman', [
-                'container', 'inspect', name,
-            ]).stdout)[0];
-            removeContainerById({ name: 'podman' }, record.Id, harness.runner);
-        } else {
-            harness.runner.run('podman', ['volume', 'rm', name]);
-        }
+    // A foreign exact-name container still fails closed.
+    const foreignName = harness.identity.instance;
+    const createdForeign = harness.runner.query('podman', [
+        'container', 'create', '--name', foreignName, '--entrypoint', '/bin/true',
+        candidateReference,
+    ]);
+    assert.equal(createdForeign.ok, true, createdForeign.stderr);
+    await assert.rejects(
+        harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference }),
+        /exact-name resource .* is not owned by this Box/,
+    );
+    const foreignRecord = JSON.parse(harness.runner.query('podman', [
+        'container', 'inspect', foreignName,
+    ]).stdout)[0];
+    removeContainerById({ name: 'podman' }, foreignRecord.Id, harness.runner);
+
+    // Retired labelled named volumes are inert: they neither claim ownership
+    // nor block a new Box, and nothing removes them automatically.
+    const retiredVolume = `${harness.identity.instance}-ploinky-deps`;
+    const createdRetired = harness.runner.query('podman', [
+        'volume', 'create',
+        '--label', `io.assistos.ploinky-box.path-hash=${harness.identity.pathHash}`,
+        '--label', 'io.assistos.ploinky-box.role=ploinky-deps',
+        retiredVolume,
+    ]);
+    assert.equal(createdRetired.ok, true, createdRetired.stderr);
+    try {
+        const ignoring = await harness.supervisor.prepareBoxForCommand({
+            imageRef: candidateReference,
+        });
+        assertExactBindMounts(harness, ignoring.containerId, repositoryRoot);
+        await harness.supervisor.runDestroyTransaction(ignoring.containerId, {
+            deleteCache: true,
+        });
+        // Destroy never touches the retired volume either.
+        assert.equal(exactResourceExists(harness, 'volume', retiredVolume), true);
+    } finally {
+        harness.runner.run('podman', ['volume', 'rm', retiredVolume]);
     }
 });
 
-test('failed candidate create removes the container and every transaction-created volume', {
+// The discriminating constraint of workspace-backed persistence: the inner
+// Podman store must be able to unpack image layers onto the physical host
+// directory, including macOS Podman Machine's virtiofs bind. This gate needs no
+// smoke-graph inputs, so it runs anywhere the candidate image is available.
+test('the workspace-backed image store unpacks and reuses layers on the physical host', {
+    timeout: 20 * 60_000,
+}, async (t) => {
+    const candidateReference = requirePodmanCandidate(t);
+    if (!candidateReference) return;
+    const nestedImageRef = String(
+        process.env.PLOINKY_BOX_NESTED_PROBE_IMAGE || 'docker.io/library/alpine:latest',
+    );
+    const harness = createPodmanHarness(t, candidateReference);
+
+    const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    assertExactBindMounts(harness, prepared.containerId, repositoryRoot);
+    assertNoOwnedNamedVolume(harness);
+    assertIntendedNestedStorage(harness, prepared.containerId);
+
+    // Unpacking a layer is what fails on an unconfigured host bind.
+    execInBox(harness.runner, prepared.containerId, [
+        'podman', 'pull', nestedImageRef,
+    ], { timeoutMs: 600_000 });
+    const nestedImageId = execInBox(harness.runner, prepared.containerId, [
+        'podman', 'image', 'inspect', '--format', '{{.Id}}', nestedImageRef,
+    ]);
+    assert.match(nestedImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
+
+    // The layer content is on the real host, not in engine-managed storage.
+    const layerRoot = path.join(harness.identity.dataPaths.images, 'overlay');
+    assert.equal(fs.statSync(layerRoot).isDirectory(), true);
+    assert.ok(fs.readdirSync(layerRoot).some((entry) => /^[a-f0-9]{64}$/.test(entry)),
+        'the workspace-backed image store must hold unpacked layer directories');
+
+    // force_mask records the real mode in an xattr; fuse-overlayfs must restore
+    // it, so an executable stays executable inside a nested container.
+    const nestedRun = execInBox(harness.runner, prepared.containerId, [
+        'podman', 'run', '--rm', '--network=none', nestedImageRef,
+        'sh', '-c', 'test -x /bin/sh && echo NESTED_EXEC_OK',
+    ], { timeoutMs: 300_000 });
+    assert.equal(nestedRun, 'NESTED_EXEC_OK');
+
+    await harness.supervisor.runDestroyTransaction(prepared.containerId);
+    assertBoxCacheDirectoriesExist(harness);
+
+    const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    // The image survives outer recreation and needs no second pull.
+    assert.equal(execInBox(harness.runner, recreated.containerId, [
+        'podman', 'image', 'inspect', '--format', '{{.Id}}', nestedImageId,
+    ]), nestedImageId);
+    assertIntendedNestedStorage(harness, recreated.containerId);
+    assertNoOwnedNamedVolume(harness);
+
+    // An explicit cache reset really empties the store.
+    await harness.supervisor.runDestroyTransaction(recreated.containerId, { deleteCache: true });
+    assert.equal(fs.existsSync(harness.identity.boxDataRoot), false);
+    const rebuilt = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    assertBoxCacheDirectoriesExist(harness);
+    assert.equal(queryInBox(harness, rebuilt.containerId, [
+        'podman', 'image', 'inspect', nestedImageId,
+    ]).ok, false, 'a reset image store must not still resolve the previous image');
+});
+
+test('a replaced live bind source recreates the outer Box before further writes', {
+    timeout: 15 * 60_000,
+}, async (t) => {
+    const candidateReference = requirePodmanCandidate(t);
+    if (!candidateReference) return;
+    const harness = createPodmanHarness(t, candidateReference);
+    const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const originalState = inspectWorkspaceDataPaths({ identity: harness.identity });
+    const displaced = path.join(harness.root, 'displaced-dependencies');
+
+    // Renaming a live bind source preserves the old container's mount inode.
+    // Recreate the canonical host path to reproduce the stale-bind condition.
+    fs.renameSync(harness.identity.dataPaths.dependencies, displaced);
+    fs.mkdirSync(harness.identity.dataPaths.dependencies);
+    const replacementState = inspectWorkspaceDataPaths({ identity: harness.identity });
+    assert.notEqual(
+        replacementState.fingerprints.dependencies,
+        originalState.fingerprints.dependencies,
+    );
+    const staleStatus = harness.supervisor.inspectBoxStatus();
+    assert.equal(staleStatus.state, 'incompatible');
+    assert.match(staleStatus.detail, /label set is incompatible/);
+
+    const replaced = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    assert.equal(replaced.action, 'replaced');
+    assert.notEqual(replaced.containerId, prepared.containerId);
+    assertExactBindMounts(harness, replaced.containerId, repositoryRoot);
+    const record = JSON.parse(harness.runner.query('podman', [
+        'container', 'inspect', replaced.containerId,
+    ]).stdout)[0];
+    assert.equal(
+        record.Config.Labels['io.assistos.ploinky-box.dependencies-fingerprint'],
+        replacementState.fingerprints.dependencies,
+    );
+
+    execInBox(harness.runner, replaced.containerId, [
+        'bash', '-c', 'printf canonical-write > /opt/ploinky/node_modules/live-bind-canary',
+    ]);
+    assert.equal(
+        fs.readFileSync(path.join(
+            harness.identity.dataPaths.dependencies,
+            'live-bind-canary',
+        ), 'utf8'),
+        'canonical-write',
+    );
+    assert.equal(fs.existsSync(path.join(displaced, 'live-bind-canary')), false);
+});
+
+test('failed candidate create removes the container and retains workspace cache data', {
     timeout: 10 * 60_000,
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
@@ -466,6 +704,9 @@ test('failed candidate create removes the container and every transaction-create
     );
     assert.equal(injected, true);
     assertIdentityResourcesAbsent(harness);
+    assertNoOwnedNamedVolume(harness);
+    // Durable workspace state survives a failed transaction.
+    assertBoxCacheDirectoriesExist(harness);
 });
 
 test('failed candidate replacement restores the validated old Box', {
@@ -490,9 +731,11 @@ test('failed candidate replacement restores the validated old Box', {
     execInBox(harness.runner, original.containerId, [
         'bash', '-c', 'printf replacement-retained > /workspace/replacement-canary',
     ]);
-    const volumeFingerprints = Object.fromEntries(Object.entries(
-        original.ownership.handles.volumes,
-    ).map(([key, handle]) => [key, handle.fingerprint]));
+    execInBox(harness.runner, original.containerId, [
+        'bash', '-c', 'printf cache-retained > /opt/ploinky/node_modules/replacement-cache-canary',
+    ]);
+    const cacheInodes = Object.fromEntries(Object.entries(harness.identity.dataPaths)
+        .map(([key, target]) => [key, String(fs.statSync(target).ino)]));
     armed = true;
     await assert.rejects(
         harness.supervisor.prepareBoxForCommand({
@@ -511,12 +754,18 @@ test('failed candidate replacement restores the validated old Box', {
     assert.equal(restored.ownership.handles.container.runtime.publications.some((entry) => (
         entry.protocol === 'udp' && entry.hostPort === '7882' && entry.containerPort === '7882'
     )), true);
-    assert.deepEqual(Object.fromEntries(Object.entries(
-        restored.ownership.handles.volumes,
-    ).map(([key, handle]) => [key, handle.fingerprint])), volumeFingerprints);
+    // The restored Box binds the very same cache directories; nothing about
+    // the durable workspace state was rolled back.
+    assert.deepEqual(Object.fromEntries(Object.entries(harness.identity.dataPaths)
+        .map(([key, target]) => [key, String(fs.statSync(target).ino)])), cacheInodes);
+    assertExactBindMounts(harness, restored.ownership.handles.container.id, repositoryRoot);
+    assertNoOwnedNamedVolume(harness);
     assert.equal(execInBox(harness.runner, restored.ownership.handles.container.id, [
         'cat', '/workspace/replacement-canary',
     ]), 'replacement-retained');
+    assert.equal(execInBox(harness.runner, restored.ownership.handles.container.id, [
+        'cat', '/opt/ploinky/node_modules/replacement-cache-canary',
+    ]), 'cache-retained');
     const claimed = harness.runner.query('podman', [
         'container', 'ls', '--all', '--quiet', '--filter',
         `label=io.assistos.ploinky-box.path-hash=${harness.identity.pathHash}`,
@@ -524,7 +773,7 @@ test('failed candidate replacement restores the validated old Box', {
     assert.equal(String(claimed.stdout || '').trim().split(/\s+/).filter(Boolean).length, 1);
 });
 
-test('immutable-ID removal cleans an attached anonymous volume', {
+test('immutable-ID removal removes only the container and never a volume', {
     timeout: 5 * 60_000,
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
@@ -536,6 +785,9 @@ test('immutable-ID removal cleans an attached anonymous volume', {
     assert.equal(imageInspection.ok, true, imageInspection.stderr);
     const candidateImageId = String(JSON.parse(imageInspection.stdout)[0]?.Id || '');
     assert.match(candidateImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
+    // A deliberately volume-attached container proves removal is scoped to the
+    // container record: Box removal no longer passes a volume flag, and the
+    // Box image contract forbids anonymous volumes in the first place.
     const created = harness.runner.query('podman', [
         'container', 'create', '--volume', '/anonymous', '--entrypoint', '/bin/true',
         candidateImageId,
@@ -553,5 +805,6 @@ test('immutable-ID removal cleans an attached anonymous volume', {
     assert.equal(exactResourceExists(harness, 'volume', volumeName), true);
     removeContainerById({ name: 'podman' }, containerId, harness.runner);
     assert.equal(exactResourceExists(harness, 'container', containerId), false);
-    assert.equal(exactResourceExists(harness, 'volume', volumeName), false);
+    assert.equal(exactResourceExists(harness, 'volume', volumeName), true);
+    harness.runner.run('podman', ['volume', 'rm', volumeName]);
 });

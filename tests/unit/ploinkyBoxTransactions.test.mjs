@@ -15,11 +15,20 @@ import { validateContainerConfiguration } from '../../ploinky-box/contract/conta
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
+    ensureWorkspaceDataPaths,
+    inspectWorkspaceDataPaths,
+} from '../../ploinky-box/workspace-data.mjs';
+import {
     containerCreateArgs,
     readContainerIdFromCidfile,
     waitForReadyLine,
 } from '../../ploinky-box/lifecycle/container.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
+
+const DATA_FINGERPRINTS = Object.freeze({
+    dependencies: 'd'.repeat(64),
+    images: 'f'.repeat(64),
+});
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-transaction-'));
@@ -27,6 +36,7 @@ function fixture(t) {
     const workspace = path.join(root, 'workspace');
     const lockPath = path.join(root, 'lock');
     fs.mkdirSync(workspace);
+    fs.mkdirSync(path.join(workspace, '.ploinky'));
     fs.mkdirSync(lockPath);
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const lock = {
@@ -36,8 +46,8 @@ function fixture(t) {
     return { root, identity, lock };
 }
 
-function volumeHandles(identity) {
-    return Object.fromEntries(Object.entries(identity.volumes).map(([key, name]) => [key, { name }]));
+function dataDirectoriesExist(identity) {
+    return Object.values(identity.dataPaths).every((target) => fs.existsSync(target));
 }
 
 function containerHandle({
@@ -49,6 +59,7 @@ function containerHandle({
     mediaHostPort = 7882,
     id,
     running = true,
+    dataFingerprints = DATA_FINGERPRINTS,
 }) {
     return {
         id,
@@ -59,6 +70,8 @@ function containerHandle({
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: String(hostPort),
             [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
+            [BOX_LABELS.dependenciesFingerprint]: dataFingerprints.dependencies,
+            [BOX_LABELS.imagesFingerprint]: dataFingerprints.images,
         },
         runtime: {
             complete: true,
@@ -94,9 +107,9 @@ function containerHandle({
                 { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
             ],
             mounts: [
-                { type: 'volume', name: identity.volumes.images, source: '', destination: '/home/podman/.local/share/ploinky-images', rw: true },
+                { type: 'bind', name: '', source: identity.dataPaths.images, destination: '/home/podman/.local/share/ploinky-images', rw: true },
                 { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
-                { type: 'volume', name: identity.volumes.dependencies, source: '', destination: '/opt/ploinky/node_modules', rw: true },
+                { type: 'bind', name: '', source: identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: identity.workspaceRoot, destination: '/workspace', rw: true },
             ],
         },
@@ -225,6 +238,7 @@ test('Box container argv disables outer SELinux label confinement on every suppo
     for (const hostKind of ['native-linux', 'podman-machine']) {
         const args = containerCreateArgs({
             identity: state.identity,
+            dataFingerprints: DATA_FINGERPRINTS,
             imageId: 'a'.repeat(64),
             imageRef: 'runtime',
             hostPort: 19090,
@@ -248,6 +262,7 @@ function harness(state, {
     failCandidateReady = false,
     corruptCidfile = false,
     failLocalStop = false,
+    realDataPaths = false,
 } = {}) {
     const calls = [];
     let current = initial;
@@ -265,6 +280,12 @@ function harness(state, {
                 const imageRefLabel = args.find((value) => value.startsWith(`${BOX_LABELS.imageRef}=`));
                 const portLabel = args.find((value) => value.startsWith(`${BOX_LABELS.routerHostPort}=`));
                 const mediaPortLabel = args.find((value) => value.startsWith(`${BOX_LABELS.mediaHostPort}=`));
+                const dependenciesLabel = args.find((value) => (
+                    value.startsWith(`${BOX_LABELS.dependenciesFingerprint}=`)
+                ));
+                const imagesLabel = args.find((value) => (
+                    value.startsWith(`${BOX_LABELS.imagesFingerprint}=`)
+                ));
                 current = containerHandle({
                     identity: state.identity,
                     repositoryRoot: state.root,
@@ -274,6 +295,10 @@ function harness(state, {
                     mediaHostPort: Number(mediaPortLabel.slice(mediaPortLabel.indexOf('=') + 1)),
                     id: cid,
                     running: false,
+                    dataFingerprints: {
+                        dependencies: dependenciesLabel.slice(dependenciesLabel.indexOf('=') + 1),
+                        images: imagesLabel.slice(imagesLabel.indexOf('=') + 1),
+                    },
                 });
             }
             if (args[0] === 'container' && args[1] === 'start') current.runtime.running = true;
@@ -292,7 +317,6 @@ function harness(state, {
             return { ok: true, stdout: `${BOX_READY_LINE}\n`, stderr: '' };
         },
     };
-    const handles = volumeHandles(state.identity);
     const seams = {
         async preflight() {
             calls.push(['seam', 'preflight']);
@@ -306,17 +330,8 @@ function harness(state, {
             calls.push(['seam', 'validate-existing-image', engine, imageId, imageRef]);
             return { immutableId: imageId };
         },
-        ensureVolumes() {
-            calls.push(['seam', 'ensure-volumes']);
-            return {
-                handles,
-                created: initial ? [] : Object.entries(handles).map(([key, handle]) => ({ key, handle })),
-            };
-        },
-        revalidateVolumes() { calls.push(['seam', 'revalidate-volumes']); },
-        rollbackVolumes() { calls.push(['seam', 'rollback-volumes']); },
         removeContainer(engine, id, selectedRunner) {
-            selectedRunner.run(engine.name, ['container', 'rm', '-f', '--volumes', id]);
+            selectedRunner.run(engine.name, ['container', 'rm', '-f', id]);
         },
         stopPloinkyLocal(engine, id) {
             calls.push(['seam', 'stop-ploinky-local', engine.name, id]);
@@ -328,13 +343,33 @@ function harness(state, {
         },
         discover() {
             calls.push(['seam', 'discover']);
-            return current
-                ? { state: 'owned', handles: { container: current, volumes: handles } }
-                : { state: 'owned', handles: { container: null, volumes: handles } };
+            return { state: 'owned', handles: { container: current } };
         },
         token(kind) { return kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24); },
     };
+    if (!realDataPaths) {
+        seams.ensureDataPaths = () => {
+            calls.push(['seam', 'ensure-data-paths']);
+            return {
+                paths: state.identity.dataPaths,
+                fingerprints: DATA_FINGERPRINTS,
+                created: [],
+            };
+        };
+        seams.inspectDataPaths = () => ({
+            paths: state.identity.dataPaths,
+            fingerprints: DATA_FINGERPRINTS,
+        });
+        seams.revalidateDataPaths = () => {
+            calls.push(['seam', 'revalidate-data-paths']);
+            return { paths: state.identity.dataPaths, fingerprints: DATA_FINGERPRINTS };
+        };
+    }
     return { runner, seams, calls, current: () => current };
+}
+
+function assertNoEngineVolumeCommand(calls) {
+    assert.equal(calls.some((call) => call.includes('volume')), false);
 }
 
 test('container argv is exact, unprivileged, and ends with immutable image ID', (t) => {
@@ -342,6 +377,7 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     const cidfile = path.join(state.lock.path, 'candidate.cid');
     const args = containerCreateArgs({
         identity: state.identity,
+        dataFingerprints: DATA_FINGERPRINTS,
         imageId: 'a'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 19090,
@@ -365,12 +401,27 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.deepEqual(args.slice(args.indexOf('--userns'), args.indexOf('--userns') + 2), [
         '--userns', BOX_USERNS,
     ]);
-    assert.equal(args.filter((value) => value.endsWith(':U')).length, 2);
+    assert.equal(args.filter((value) => value.endsWith(':U')).length, 0);
     assert.equal(args.includes(`${state.identity.workspaceRoot}:/workspace`), true);
     assert.equal(args.some((value) => value === `${state.identity.workspaceRoot}:/workspace:U`), false);
+
+    // Exactly four mounts, all host binds, and no named-volume source name.
+    const mountArgs = args.flatMap((value, index) => (
+        value === '--volume' ? [args[index + 1]] : []
+    ));
+    assert.deepEqual(mountArgs, [
+        `${state.root}:/opt/ploinky:ro`,
+        `${state.identity.workspaceRoot}:/workspace`,
+        `${state.identity.dataPaths.dependencies}:/opt/ploinky/node_modules`,
+        `${state.identity.dataPaths.images}:/home/podman/.local/share/ploinky-images`,
+    ]);
+    for (const mount of mountArgs) {
+        assert.equal(path.isAbsolute(mount.split(':')[0]), true);
+        assert.equal(mount.includes(state.identity.instance), false);
+    }
 });
 
-test('container validation rejects legacy workspace volumes and user-namespace drift', (t) => {
+test('container validation rejects retired named-volume mounts and user-namespace drift', (t) => {
     const state = fixture(t);
     const desired = {
         identity: state.identity,
@@ -379,25 +430,42 @@ test('container validation rejects legacy workspace volumes and user-namespace d
         imageRef: 'runtime',
         hostPort: 19090,
     };
-    const legacyMount = containerHandle({
-        ...desired,
-        id: 'b'.repeat(64),
-    });
-    legacyMount.runtime.mounts = legacyMount.runtime.mounts.map((mount) => (
-        mount.destination === '/workspace'
-            ? {
-                type: 'volume',
-                name: `${state.identity.instance}-workspace`,
-                source: '',
-                destination: '/workspace',
-                rw: true,
-            }
+    // A Box created by the retired design is never adopted; the operator is
+    // told to destroy it, and the guidance must not name a removed flag.
+    for (const destination of [
+        '/workspace',
+        '/opt/ploinky/node_modules',
+        '/home/podman/.local/share/ploinky-images',
+    ]) {
+        const retiredMount = containerHandle({ ...desired, id: 'b'.repeat(64) });
+        retiredMount.runtime.mounts = retiredMount.runtime.mounts.map((mount) => (
+            mount.destination === destination
+                ? {
+                    type: 'volume',
+                    name: `${state.identity.instance}-workspace`,
+                    source: '',
+                    destination,
+                    rw: true,
+                }
+                : mount
+        ));
+        assert.throws(
+            () => validateContainerConfiguration(retiredMount, desired),
+            (error) => new RegExp(`mount ${destination} is incompatible`).test(error.message)
+                && /ploinky destroy/.test(error.message)
+                && !/--delete-volumes/.test(error.message),
+        );
+    }
+
+    const wrongSource = containerHandle({ ...desired, id: 'b'.repeat(64) });
+    wrongSource.runtime.mounts = wrongSource.runtime.mounts.map((mount) => (
+        mount.destination === '/opt/ploinky/node_modules'
+            ? { ...mount, source: '/somewhere/else' }
             : mount
     ));
     assert.throws(
-        () => validateContainerConfiguration(legacyMount, desired),
-        (error) => /mount \/workspace is incompatible/.test(error.message)
-            && /ploinky destroy/.test(error.message),
+        () => validateContainerConfiguration(wrongSource, desired),
+        /mount \/opt\/ploinky\/node_modules is incompatible/,
     );
 
     const changedUserns = containerHandle({
@@ -435,7 +503,7 @@ test('container validation rejects a Box that cannot reap orphaned children', (t
     }), /init state is incompatible/);
 });
 
-test('initial transaction preflights before pull, volumes, and container creation', async (t) => {
+test('initial transaction preflights before pull, workspace data, and container creation', async (t) => {
     const state = fixture(t);
     const h = harness(state);
     const result = await reconcileBoxContainer({
@@ -453,12 +521,33 @@ test('initial transaction preflights before pull, volumes, and container creatio
     assert.equal(h.calls.some((call) => call.includes('0.0.0.0:17891:7882/udp')), true);
     const flat = h.calls.map((call) => call.join(' '));
     assert.ok(flat.findIndex((value) => value.includes('preflight')) < flat.findIndex((value) => value.includes('stream podman pull')));
-    assert.ok(flat.findIndex((value) => value.includes('stream podman pull')) < flat.findIndex((value) => value.includes('ensure-volumes')));
-    assert.ok(flat.findIndex((value) => value.includes('ensure-volumes')) < flat.findIndex((value) => value.includes('container create')));
+    assert.ok(flat.findIndex((value) => value.includes('stream podman pull')) < flat.findIndex((value) => value.includes('ensure-data-paths')));
+    assert.ok(flat.findIndex((value) => value.includes('ensure-data-paths')) < flat.findIndex((value) => value.includes('revalidate-data-paths')));
+    assert.ok(flat.findIndex((value) => value.includes('revalidate-data-paths')) < flat.findIndex((value) => value.includes('container create')));
+    assertNoEngineVolumeCommand(h.calls);
 });
 
-test('validated reuse rechecks pre-existing volume handles without registry or volume mutation', async (t) => {
+test('a real create materializes the workspace data directories before the container', async (t) => {
     const state = fixture(t);
+    const h = harness(state, { realDataPaths: true });
+
+    const result = await reconcileBoxContainer({
+        identity: state.identity,
+        ownership: { state: 'absent', handles: null },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+    }, h.seams);
+
+    assert.equal(result.action, 'created');
+    assert.equal(dataDirectoriesExist(state.identity), true);
+    assertNoEngineVolumeCommand(h.calls);
+});
+
+test('validated reuse retains the exact workspace data bind sources without engine volume commands', async (t) => {
+    const state = fixture(t);
+    const data = ensureWorkspaceDataPaths({ identity: state.identity, lock: state.lock });
     const current = containerHandle({
         identity: state.identity,
         repositoryRoot: state.root,
@@ -466,14 +555,12 @@ test('validated reuse rechecks pre-existing volume handles without registry or v
         imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 8080,
         id: 'e'.repeat(64),
+        dataFingerprints: data.fingerprints,
     });
-    const h = harness(state, { initial: current });
+    const h = harness(state, { initial: current, realDataPaths: true });
     const result = await reconcileBoxContainer({
         identity: state.identity,
-        ownership: {
-            state: 'owned',
-            handles: { container: current, volumes: volumeHandles(state.identity) },
-        },
+        ownership: { state: 'owned', handles: { container: current } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
         lock: state.lock,
@@ -481,11 +568,50 @@ test('validated reuse rechecks pre-existing volume handles without registry or v
     }, h.seams);
     assert.equal(result.action, 'reused');
     assert.equal(h.calls.some((call) => call.includes('validate-existing-image')), true);
-    assert.equal(h.calls.some((call) => call.includes('revalidate-volumes')), true);
     assert.equal(h.calls.some((call) => call.includes('pull')), false);
-    assert.equal(h.calls.some((call) => call.includes('ensure-volumes')), false);
-    assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), false);
-    assert.equal(h.calls.some((call) => call.join(' ').includes('volume rm')), false);
+    assert.equal(dataDirectoriesExist(state.identity), true);
+    assertNoEngineVolumeCommand(h.calls);
+});
+
+test('a replaced live bind source forces outer-container replacement', async (t) => {
+    const state = fixture(t);
+    const original = ensureWorkspaceDataPaths({ identity: state.identity, lock: state.lock });
+    const current = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+        dataFingerprints: original.fingerprints,
+    });
+    const displaced = path.join(state.root, 'displaced-dependencies');
+    fs.renameSync(state.identity.dataPaths.dependencies, displaced);
+    fs.mkdirSync(state.identity.dataPaths.dependencies);
+    const replacementState = inspectWorkspaceDataPaths({ identity: state.identity });
+    assert.notEqual(
+        replacementState.fingerprints.dependencies,
+        original.fingerprints.dependencies,
+    );
+
+    const h = harness(state, { initial: current, realDataPaths: true });
+    const result = await reconcileBoxContainer({
+        identity: state.identity,
+        ownership: { state: 'owned', handles: { container: current } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+    }, h.seams);
+
+    assert.equal(result.action, 'replaced');
+    assert.notEqual(result.ownership.handles.container.id, current.id);
+    assert.equal(
+        h.current().labels[BOX_LABELS.dependenciesFingerprint],
+        replacementState.fingerprints.dependencies,
+    );
+    assert.equal(h.calls.some((call) => call.join(' ').includes('container rm -f')), true);
+    assert.equal(h.calls.some((call) => call.join(' ').includes('container create')), true);
 });
 
 test('an incompatible owned image hard-cuts before any engine mutation', async (t) => {
@@ -509,7 +635,7 @@ test('an incompatible owned image hard-cuts before any engine mutation', async (
         identity: state.identity,
         ownership: {
             state: 'owned',
-            handles: { container: current, volumes: volumeHandles(state.identity) },
+            handles: { container: current },
         },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -522,10 +648,10 @@ test('an incompatible owned image hard-cuts before any engine mutation', async (
     assert.deepEqual(h.calls, []);
 });
 
-test('preflight and pull failures produce zero resource mutation', async (t) => {
+test('preflight and pull failures create no workspace data and no container', async (t) => {
     for (const scenario of [{ failPreflight: true }, { failPull: true }]) {
         const state = fixture(t);
-        const h = harness(state, scenario);
+        const h = harness(state, { ...scenario, realDataPaths: true });
         await assert.rejects(() => reconcileBoxContainer({
             identity: state.identity,
             ownership: { state: 'absent', handles: null },
@@ -534,16 +660,16 @@ test('preflight and pull failures produce zero resource mutation', async (t) => 
             lock: state.lock,
             repositoryRoot: state.root,
         }, h.seams));
-        assert.equal(h.calls.some((call) => call.includes('ensure-volumes')), false);
+        assert.equal(fs.existsSync(state.identity.boxDataRoot), false);
         assert.equal(h.calls.some((call) => call.includes('create')), false);
-        assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), false);
+        assertNoEngineVolumeCommand(h.calls);
     }
 });
 
-test('create races and ready timeouts remove candidates and transaction-created volumes', async (t) => {
+test('create races and ready timeouts remove the candidate but retain workspace data', async (t) => {
     for (const scenario of [{ failCreate: true }, { failCandidateReady: true }]) {
         const state = fixture(t);
-        const h = harness(state, scenario);
+        const h = harness(state, { ...scenario, realDataPaths: true });
         await assert.rejects(() => reconcileBoxContainer({
             identity: state.identity,
             ownership: { state: 'absent', handles: null },
@@ -552,9 +678,11 @@ test('create races and ready timeouts remove candidates and transaction-created 
             lock: state.lock,
             repositoryRoot: state.root,
         }, h.seams), /transaction failed/);
-        assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), true);
+        // Durable workspace state is never rolled back by a failed attempt.
+        assert.equal(dataDirectoriesExist(state.identity), true);
+        assertNoEngineVolumeCommand(h.calls);
         if (scenario.failCandidateReady) {
-            assert.equal(h.calls.some((call) => call.join(' ').includes('container rm -f --volumes')), true);
+            assert.equal(h.calls.some((call) => call.join(' ').includes('container rm -f')), true);
         }
     }
 });
@@ -574,7 +702,7 @@ test('replacement failure removes the candidate and restores the validated old i
     const h = harness(state, { initial: old, failCandidateReady: true });
     await assert.rejects(() => reconcileBoxContainer({
         identity: state.identity,
-        ownership: { state: 'owned', handles: { container: old, volumes: volumeHandles(state.identity) } },
+        ownership: { state: 'owned', handles: { container: old } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
         lock: state.lock,
@@ -588,8 +716,8 @@ test('replacement failure removes the candidate and restores the validated old i
     assert.equal(h.current().runtime.publications.some((entry) => (
         entry.protocol === 'udp' && entry.hostPort === '17880'
     )), true);
-    assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), false);
-    const removals = h.calls.filter((call) => call.join(' ').includes('container rm -f --volumes'));
+    assertNoEngineVolumeCommand(h.calls);
+    const removals = h.calls.filter((call) => call.join(' ').includes('container rm -f'));
     assert.equal(removals.length, 2);
 });
 
@@ -606,7 +734,7 @@ test('successful replacement gracefully stops core before stopping and removing 
     const h = harness(state, { initial: old });
     const result = await reconcileBoxContainer({
         identity: state.identity,
-        ownership: { state: 'owned', handles: { container: old, volumes: volumeHandles(state.identity) } },
+        ownership: { state: 'owned', handles: { container: old } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
         lock: state.lock,
@@ -617,10 +745,11 @@ test('successful replacement gracefully stops core before stopping and removing 
     const events = h.calls.map((call) => call.join(' '));
     const graceful = events.findIndex((value) => value.includes('seam stop-ploinky-local'));
     const outerStop = events.findIndex((value) => value.includes('container stop --time 30'));
-    const removal = events.findIndex((value) => value.includes('container rm -f --volumes'));
+    const removal = events.findIndex((value) => value.includes('container rm -f'));
     const creation = events.findIndex((value) => value.includes('container create'));
     assert.ok(graceful >= 0 && graceful < outerStop);
     assert.ok(outerStop < removal && removal < creation);
+    assertNoEngineVolumeCommand(h.calls);
 });
 
 test('ploinky-local replacement stop failure preserves the old same-image Box without candidate cleanup', async (t) => {
@@ -641,7 +770,7 @@ test('ploinky-local replacement stop failure preserves the old same-image Box wi
     });
     await assert.rejects(() => reconcileBoxContainer({
         identity: state.identity,
-        ownership: { state: 'owned', handles: { container: old, volumes: volumeHandles(state.identity) } },
+        ownership: { state: 'owned', handles: { container: old } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
         lock: state.lock,
@@ -654,8 +783,9 @@ test('ploinky-local replacement stop failure preserves the old same-image Box wi
     assert.equal(h.current(), old);
     assert.equal(old.runtime.running, true);
     assert.equal(h.calls.some((call) => call.join(' ').includes('container stop --time 30')), false);
-    assert.equal(h.calls.some((call) => call.join(' ').includes('container rm -f --volumes')), false);
+    assert.equal(h.calls.some((call) => call.join(' ').includes('container rm -f')), false);
     assert.equal(h.calls.some((call) => call.join(' ').includes('container create')), false);
+    assertNoEngineVolumeCommand(h.calls);
 });
 
 test('missing or corrupt cidfiles are fail-closed primitives', (t) => {

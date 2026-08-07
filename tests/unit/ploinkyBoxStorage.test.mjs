@@ -76,6 +76,10 @@ test('the rendered storage configuration is the exact intended TOML', () => {
         '',
         '[storage.options.overlay]',
         'mount_program = "/usr/bin/fuse-overlayfs"',
+        // Required by the workspace-backed image store: unpacking a layer onto
+        // the macOS Podman Machine host bind (virtiofs) otherwise fails with
+        // "setting up pivot dir: mkdir ./.pivot_root…: permission denied".
+        'force_mask = "0700"',
         '',
     ].join('\n'));
 

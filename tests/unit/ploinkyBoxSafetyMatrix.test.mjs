@@ -35,7 +35,6 @@ function owned(identity, { running = true } = {}) {
                 },
                 runtime: { running },
             },
-            volumes: {},
         },
     };
 }
@@ -258,13 +257,19 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         instance: 'ploinky-box-workspace-123456789abc',
         pathHash: '123456789abc',
         workspaceRoot: '/private/workspace',
-        volumes: {
-            images: 'ploinky-box-workspace-123456789abc-images',
-            dependencies: 'ploinky-box-workspace-123456789abc-ploinky-deps',
-        },
+        anchorPath: '/private/workspace/.ploinky',
+        boxDataRoot: '/private/workspace/.ploinky/box',
+        dataPaths: Object.freeze({
+            dependencies: '/private/workspace/.ploinky/box/dependencies',
+            images: '/private/workspace/.ploinky/box/images',
+        }),
     });
     const createArgs = containerCreateArgs({
         identity,
+        dataFingerprints: {
+            dependencies: 'd'.repeat(64),
+            images: 'f'.repeat(64),
+        },
         imageId: 'b'.repeat(64),
         imageRef: 'docker.io/assistos/ploinky-box:runtime',
         hostPort: 8080,
@@ -311,5 +316,6 @@ test('first parent mutation makes every child resolution reuse one identity', as
     assert.equal(fromParent.instance, initial.instance);
     assert.equal(fromChild.instance, initial.instance);
     assert.equal(fromChild.workspaceRoot, parent);
-    assert.deepEqual(fromChild.volumes, initial.volumes);
+    assert.deepEqual(fromChild.dataPaths, initial.dataPaths);
+    assert.equal(fromChild.volumes, undefined);
 });

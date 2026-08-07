@@ -14,30 +14,15 @@ function identity(overrides = {}) {
 }
 
 function handles(workspaceIdentity) {
-    const common = {
-        engine: 'podman',
-        engineIdentity: 'rootless-engine-1',
-        pathHash: workspaceIdentity.pathHash,
-    };
-    const volume = (name, role, fingerprint) => ({
-        kind: 'volume',
-        ...common,
-        name,
-        role,
-        labels: { pathHash: workspaceIdentity.pathHash, role },
-        fingerprint: { mountpoint: `/volumes/${name}`, createdAt: fingerprint },
-    });
     return {
         container: {
             kind: 'container',
-            ...common,
+            engine: 'podman',
+            engineIdentity: 'rootless-engine-1',
+            pathHash: workspaceIdentity.pathHash,
             id: 'a'.repeat(64),
             name: workspaceIdentity.instance,
             labels: { pathHash: workspaceIdentity.pathHash, role: 'box' },
-        },
-        volumes: {
-            images: volume(`${workspaceIdentity.instance}-images`, 'images', 'one'),
-            dependencies: volume(`${workspaceIdentity.instance}-ploinky-deps`, 'ploinky-deps', 'two'),
         },
     };
 }
@@ -52,12 +37,6 @@ function harness(overrides = {}) {
             calls.push({ engine, argv });
             if (argv[0] === 'container' && argv[1] === 'inspect') {
                 return { ok: false, stdout: '', stderr: 'no such container' };
-            }
-            if (argv[0] === 'volume' && argv[1] === 'inspect') {
-                return { ok: false, stdout: '', stderr: 'no such volume' };
-            }
-            if (argv[0] === 'container' && argv[1] === 'ls') {
-                return { ok: true, stdout: '[]', stderr: '' };
             }
             return { ok: true, stdout: '', stderr: '' };
         },
@@ -82,10 +61,6 @@ function harness(overrides = {}) {
                 handles: capturedHandles,
             };
         },
-        inspectVolume: (_engine, _identity, key) => ({
-            state: 'owned',
-            handle: capturedHandles.volumes[key],
-        }),
         withLock: async ({ execute }) => execute(expectedIdentity, lock),
         get discoverCalls() { return discoverCalls; },
         ...overrides,
@@ -99,44 +74,40 @@ function cleanupInput(state) {
         runner: state.runner,
         lockManager: state.lockManager,
         discover: state.discover,
-        inspectVolume: state.inspectVolume,
         withLock: state.withLock,
     };
 }
 
-test('transactional cleanup uses immutable ID and non-forced named-volume removal', async () => {
+test('transactional cleanup removes the outer container by immutable ID only', async () => {
     const state = harness();
     const result = await cleanupNativeHarnessResources(cleanupInput(state));
     assert.equal(result.removedContainerId, 'a'.repeat(64));
-    assert.equal(result.removedVolumes.length, 2);
+    assert.equal(result.removedVolumes, undefined);
     const removalCalls = state.calls.filter(({ argv }) => argv[1] === 'rm');
+    assert.equal(removalCalls.length, 1);
     assert.deepEqual(removalCalls[0].argv.slice(0, 2), ['container', 'rm']);
     assert.equal(removalCalls[0].argv.at(-1), 'a'.repeat(64));
     assert.equal(removalCalls[0].argv.includes('--volumes'), false);
     assert.equal(removalCalls[0].argv.includes('-v'), false);
-    for (const call of removalCalls.slice(1)) {
-        assert.deepEqual(call.argv.slice(0, 2), ['volume', 'rm']);
-        assert.equal(call.argv.includes('--force'), false);
-        assert.equal(call.argv.includes('-f'), false);
-    }
 });
 
-test('transactional cleanup accepts an exactly owned partial cache set', async () => {
+test('cleanup issues no engine volume command at all', async () => {
     const state = harness();
-    state.capturedHandles.container = null;
-    state.capturedHandles.volumes.images = null;
-    state.discover = () => ({
-        state: 'incompatible',
-        message: 'partial current cache set',
-        engine: { name: 'podman', identity: 'rootless-engine-1' },
-        handles: state.capturedHandles,
-    });
+    await cleanupNativeHarnessResources(cleanupInput(state));
+    assert.equal(state.calls.some(({ argv }) => argv[0] === 'volume'), false);
+    assert.equal(state.calls.some(({ argv }) => argv.some(
+        (value) => String(value).startsWith('volume='),
+    )), false);
+});
 
+test('an absent Box needs no removal at all', async () => {
+    const state = harness({
+        discover: () => ({ state: 'absent', handles: null }),
+    });
     const result = await cleanupNativeHarnessResources(cleanupInput(state));
+    assert.equal(result.action, 'absent');
     assert.equal(result.removedContainerId, null);
-    assert.deepEqual(result.removedVolumes, [
-        `${state.expectedIdentity.instance}-ploinky-deps`,
-    ]);
+    assert.deepEqual(state.calls, []);
 });
 
 test('lock contention performs no discovery or destructive operation', async () => {
@@ -188,62 +159,39 @@ test('container replacement refuses immutable-ID deletion', async () => {
     assert.equal(state.calls.some(({ argv }) => argv[1] === 'rm'), false);
 });
 
-test('changed volume fingerprint refuses named-volume deletion', async () => {
+test('an engine handoff between discovery and removal refuses deletion', async () => {
     const state = harness();
-    state.inspectVolume = (_engine, _identity, key) => ({
-        state: 'owned',
-        handle: {
-            ...state.capturedHandles.volumes[key],
-            fingerprint: { mountpoint: '/changed', createdAt: 'different' },
-        },
-    });
+    let discovery = 0;
+    state.discover = () => {
+        discovery += 1;
+        return {
+            state: 'owned',
+            engine: {
+                name: 'podman',
+                identity: discovery === 1 ? 'rootless-engine-1' : 'rootless-engine-2',
+            },
+            handles: state.capturedHandles,
+        };
+    };
     await assert.rejects(
         cleanupNativeHarnessResources(cleanupInput(state)),
-        /volume .* changed/,
+        /engine or ownership changed before container removal/,
     );
-    assert.equal(state.calls.some(({ argv }) => argv[0] === 'volume' && argv[1] === 'rm'), false);
+    assert.equal(state.calls.some(({ argv }) => argv[1] === 'rm'), false);
 });
 
-test('foreign consumer and malformed inventory both preserve named volumes', async (t) => {
-    for (const [name, stdout, pattern] of [
-        ['foreign consumer', '[{"Id":"foreign"}]', /active or foreign consumers/],
-        ['malformed inventory', '{not-json', /inventory .* malformed/],
-    ]) {
-        await t.test(name, async () => {
-            const state = harness();
-            const baseQuery = state.runner.query.bind(state.runner);
-            state.runner.query = (engine, argv) => {
-                if (argv[0] === 'container' && argv[1] === 'ls') {
-                    state.calls.push({ engine, argv });
-                    return { ok: true, stdout, stderr: '' };
-                }
-                return baseQuery(engine, argv);
-            };
-            await assert.rejects(cleanupNativeHarnessResources(cleanupInput(state)), pattern);
-            assert.equal(
-                state.calls.some(({ argv }) => argv[0] === 'volume' && argv[1] === 'rm'),
-                false,
-            );
-        });
-    }
-});
-
-test('attach-after-inventory race becomes a safe in-use failure without force', async () => {
+test('an unproven container absence after removal fails closed', async () => {
     const state = harness();
     const baseQuery = state.runner.query.bind(state.runner);
     state.runner.query = (engine, argv) => {
-        if (argv[0] === 'volume' && argv[1] === 'rm') {
+        if (argv[0] === 'container' && argv[1] === 'inspect') {
             state.calls.push({ engine, argv });
-            return { ok: false, stdout: '', stderr: 'volume is being used' };
+            return { ok: true, stdout: '[{"Id":"still-here"}]', stderr: '' };
         }
         return baseQuery(engine, argv);
     };
     await assert.rejects(
         cleanupNativeHarnessResources(cleanupInput(state)),
-        /became in-use/,
+        /absence could not be proven/,
     );
-    const volumeRemoval = state.calls.find(({ argv }) => argv[0] === 'volume' && argv[1] === 'rm');
-    assert.ok(volumeRemoval);
-    assert.equal(volumeRemoval.argv.includes('--force'), false);
-    assert.equal(volumeRemoval.argv.includes('-f'), false);
 });

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 
 import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
@@ -11,23 +14,31 @@ import {
     waitForRouterHealth,
 } from '../e2e/ploinkyBox/nativeHelpers.mjs';
 
-const TREE_HASH_SCRIPT = `
-const c=require('node:crypto');const f=require('node:fs');const p=require('node:path');
-const h=c.createHash('sha256');function w(d,r=''){for(const n of f.readdirSync(d).sort()){
-const x=p.join(d,n),q=p.join(r,n),s=f.lstatSync(x);h.update(q+'\\0'+s.mode+'\\0');
-if(s.isDirectory())w(x,q);else if(s.isFile())h.update(f.readFileSync(x));}}
-w('/deps');process.stdout.write(h.digest('hex'));
-`;
+// The dependency cache is a host directory now, so its tree hash is computed
+// directly on the host rather than through a borrowed container.
+function hashTree(root, hash = crypto.createHash('sha256'), relative = '') {
+    for (const name of fs.readdirSync(root).sort()) {
+        const absolute = path.join(root, name);
+        const key = path.join(relative, name);
+        const stat = fs.lstatSync(absolute);
+        hash.update(`${key}\0${stat.mode}\0`);
+        if (stat.isDirectory()) hashTree(absolute, hash, key);
+        else if (stat.isFile()) hash.update(fs.readFileSync(absolute));
+    }
+    return hash;
+}
 
 function dependencyTreeHash(harness) {
-    const result = harness.runner.query('podman', [
-        'run', '--rm', '--network=none', '--entrypoint', '/usr/local/bin/node',
-        '--volume', `${harness.identity.volumes.dependencies}:/deps`,
-        harness.candidateReference, '-e', TREE_HASH_SCRIPT,
-    ], { timeoutMs: 120_000 });
-    assert.equal(result.ok, true, result.stderr);
-    assert.match(String(result.stdout).trim(), /^[a-f0-9]{64}$/);
-    return String(result.stdout).trim();
+    const digest = hashTree(harness.identity.dataPaths.dependencies).digest('hex');
+    assert.match(digest, /^[a-f0-9]{64}$/);
+    return digest;
+}
+
+function nestedResourceExists(harness, containerId, kind, name) {
+    return harness.runner.query('podman', [
+        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
+        containerId, 'podman', kind, 'inspect', name,
+    ], { timeoutMs: 120_000 }).ok;
 }
 
 test('pinned seven-repository graph starts through one immutable Box candidate', {
@@ -182,17 +193,24 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     assert.equal(execInBox(harness.runner, recreated.containerId, [
         'cat', '/opt/ploinky/node_modules/t27-dependencies-canary',
     ]), 'dependencies-retained');
-    assert.equal(execInBox(harness.runner, recreated.containerId, [
-        'bash', '-lc',
-        'mountpoint="$(podman volume inspect --format "{{.Mountpoint}}" "$1")"; cat "$mountpoint/canary"',
-        'bash', nestedVolume,
-    ]), 'nested-store-retained');
+    // Inner Podman named volumes live under the disposable graphroot, so they
+    // must NOT survive outer recreation; only image content and Box
+    // dependencies do.
+    assert.equal(nestedResourceExists(
+        harness, recreated.containerId, 'volume', nestedVolume,
+    ), false);
     const nestedImage = harness.runner.query('podman', [
         'container', 'exec', '--user', 'podman', recreated.containerId,
         'podman', 'image', 'inspect', nestedImageId,
     ]);
     assert.equal(nestedImage.ok, true, nestedImage.stderr);
-    for (const volume of Object.values(harness.identity.volumes)) {
-        assert.equal(harness.runner.query('podman', ['volume', 'inspect', volume]).ok, true);
+    for (const target of Object.values(harness.identity.dataPaths)) {
+        assert.equal(fs.statSync(target).isDirectory(), true, target);
     }
+    const labelledVolumes = harness.runner.query('podman', [
+        'volume', 'ls', '--quiet', '--filter',
+        `label=io.assistos.ploinky-box.path-hash=${harness.identity.pathHash}`,
+    ]);
+    assert.equal(labelledVolumes.ok, true, labelledVolumes.stderr);
+    assert.equal(String(labelledVolumes.stdout || '').trim(), '');
 });

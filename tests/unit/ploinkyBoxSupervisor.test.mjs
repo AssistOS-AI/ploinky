@@ -58,9 +58,20 @@ function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
                 },
                 runtime: { running, imageId: 'b'.repeat(64) },
             },
-            volumes: {},
         },
     };
+}
+
+function seedBoxCache(identity) {
+    fs.mkdirSync(identity.dataPaths.dependencies, { recursive: true });
+    fs.mkdirSync(identity.dataPaths.images, { recursive: true });
+    fs.writeFileSync(path.join(identity.dataPaths.images, 'layer'), 'image data');
+    fs.writeFileSync(path.join(identity.anchorPath, 'master-key'), 'secret');
+    return identity.dataPaths;
+}
+
+function boxCacheExists(identity) {
+    return Object.values(identity.dataPaths).some((target) => fs.existsSync(target));
 }
 
 test('destroying a running Box stops nested agents before the outer Box is removed', async (t) => {
@@ -82,7 +93,8 @@ test('destroying a running Box stops nested agents before the outer Box is remov
     assert.equal(ordered.length, 3);
     assert.match(ordered[0], /ploinky-local stop$/);
     assert.match(ordered[1], /^container stop --time 30/);
-    assert.match(ordered[2], /^container rm -f --volumes/);
+    assert.match(ordered[2], /^container rm -f [a-f0-9]{64}$/);
+    assert.equal(events.some((value) => value.includes('volume')), false);
 });
 
 test('destroy revalidates the exact container after stopping it', async (t) => {
@@ -140,6 +152,7 @@ test('a failed nested stop halts the Box but removes nothing', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    seedBoxCache(identity);
     const events = [];
     const ownership = owned(identity, { running: true });
     const supervisor = createBoxSupervisor({
@@ -154,19 +167,49 @@ test('a failed nested stop halts the Box but removes nothing', async (t) => {
                 }
             },
         },
-        destroyNamedVolumes() { throw new Error('volumes must survive a failed inner stop'); },
     });
 
     await assert.rejects(
         () => supervisor.runDestroyTransaction(ownership.handles.container.id, {
-            deleteVolumes: true,
+            deleteCache: true,
         }),
         /inner stop refused/,
     );
     // The outer Box is stopped so nothing mutates further, but it is retained.
     assert.equal(events.some((value) => value.startsWith('container stop')), true);
     assert.equal(events.some((value) => value.includes('container rm')), false);
-    assert.equal(events.some((value) => value.includes('volume rm')), false);
+    assert.equal(events.some((value) => value.includes('volume')), false);
+    assert.equal(fs.existsSync(identity.dataPaths.images), true);
+    assert.equal(fs.existsSync(identity.dataPaths.dependencies), true);
+});
+
+test('a failed outer removal retains the workspace cache data', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    seedBoxCache(identity);
+    const events = [];
+    const ownership = owned(identity, { running: false });
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: {
+            run(command, args) {
+                events.push(args.join(' '));
+                if (args[1] === 'rm') throw new Error('outer removal refused');
+            },
+        },
+    });
+
+    await assert.rejects(
+        () => supervisor.runDestroyTransaction(ownership.handles.container.id, {
+            deleteCache: true,
+        }),
+        /outer removal refused/,
+    );
+    assert.equal(fs.existsSync(identity.dataPaths.images), true);
+    assert.equal(fs.existsSync(identity.dataPaths.dependencies), true);
 });
 
 test('unsupported discovery happens before markerless anchor materialization', async (t) => {
@@ -238,12 +281,13 @@ test('stop relays to ploinky-local before stopping the outer Box without depende
     assert.ok(localStop >= 0 && localStop < outerStop);
 });
 
-test('destroy revalidates the confirmed immutable ID and retains named volumes', async (t) => {
+test('destroy revalidates the confirmed immutable ID and retains cache data by default', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    seedBoxCache(identity);
     const events = [];
-    const ownership = owned(identity);
+    const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
@@ -253,103 +297,82 @@ test('destroy revalidates the confirmed immutable ID and retains named volumes',
     await assert.rejects(() => supervisor.runDestroyTransaction('b'.repeat(64)), /changed after destroy confirmation/);
     assert.equal(events.some((value) => value.includes('container rm')), false);
 
-    await supervisor.runDestroyTransaction(ownership.handles.container.id);
+    const result = await supervisor.runDestroyTransaction(ownership.handles.container.id);
     const removal = events.find((value) => value.includes('container rm'));
-    assert.match(removal, /container rm -f --volumes/);
-    assert.equal(events.some((value) => value.includes('volume rm')), false);
+    assert.match(removal, /container rm -f [a-f0-9]{64}$/);
+    assert.equal(events.some((value) => value.includes('volume')), false);
+    assert.equal(result.action, 'destroyed');
+    assert.equal(result.deletedCache, false);
+    assert.deepEqual(result.deletedPaths, []);
+    assert.equal(fs.existsSync(identity.dataPaths.images), true);
+    assert.equal(fs.existsSync(identity.dataPaths.dependencies), true);
 });
 
-test('destructive volume reset removes the container before the locked owned-volume set', async (t) => {
+test('explicit cache deletion happens only after the outer container is removed', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    seedBoxCache(identity);
     const events = [];
-    const ownership = owned(identity);
-    ownership.handles.volumes = Object.fromEntries(Object.entries(identity.volumes).map(
-        ([key, name]) => [key, { name }],
-    ));
+    const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
-        runner: { run(command, args) { events.push(args.join(' ')); } },
-        destroyNamedVolumes(options) {
-            options.lock.assertHeld(identity.instance);
-            assert.equal(options.knownHandles, ownership.handles.volumes);
-            assert.equal(options.knownLegacyHandles, undefined);
-            events.push('delete-named-volumes');
-            return Object.freeze(Object.values(identity.volumes));
+        runner: {
+            run(command, args) {
+                events.push(args.join(' '));
+                if (args[1] === 'rm') {
+                    // Cache data must still be present at removal time.
+                    assert.equal(boxCacheExists(identity), true);
+                }
+            },
         },
     });
+
     const result = await supervisor.runDestroyTransaction(
         ownership.handles.container.id,
-        { deleteVolumes: true },
+        { deleteCache: true },
     );
-    const containerRemoval = events.findIndex((value) => value.includes('container rm'));
-    const volumeRemoval = events.indexOf('delete-named-volumes');
-    assert.ok(containerRemoval >= 0 && containerRemoval < volumeRemoval);
-    assert.deepEqual(result.deletedVolumes, [
-        ...Object.values(identity.volumes),
+
+    assert.equal(result.action, 'destroyed');
+    assert.equal(result.deletedCache, true);
+    assert.deepEqual(result.deletedPaths, [
+        identity.dataPaths.dependencies,
+        identity.dataPaths.images,
     ]);
+    assert.equal(boxCacheExists(identity), false);
+    assert.equal(fs.existsSync(identity.boxDataRoot), false);
+    // Unrelated workspace state is never touched.
+    assert.equal(fs.readFileSync(path.join(identity.anchorPath, 'master-key'), 'utf8'), 'secret');
+    assert.equal(events.some((value) => value.includes('volume')), false);
 });
 
-test('destructive volume reset works when only the complete retained set remains', async (t) => {
+test('cache deletion works when the outer container is already absent', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    seedBoxCache(identity);
     const events = [];
-    const ownership = owned(identity);
-    ownership.handles.container = null;
-    ownership.handles.volumes = Object.fromEntries(Object.entries(identity.volumes).map(
-        ([key, name]) => [key, { name }],
-    ));
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
-        discover: () => ownership,
+        discover: () => ({
+            state: 'absent',
+            engine: { name: 'podman', identity: 'engine' },
+            handles: null,
+        }),
         runner: { run(command, args) { events.push(args.join(' ')); } },
-        destroyNamedVolumes() {
-            events.push('delete-named-volumes');
-            return Object.freeze(Object.values(identity.volumes));
-        },
     });
-    const result = await supervisor.runDestroyTransaction(null, { deleteVolumes: true });
-    assert.equal(result.action, 'deleted-retained-volumes');
+
+    const result = await supervisor.runDestroyTransaction(null, { deleteCache: true });
+
+    assert.equal(result.action, 'deleted-cache');
+    assert.equal(result.containerId, null);
+    assert.equal(result.deletedCache, true);
+    assert.equal(boxCacheExists(identity), false);
     assert.equal(events.some((value) => value.includes('container rm')), false);
-    assert.equal(events.includes('delete-named-volumes'), true);
-});
-
-test('destructive volume reset recovers an exactly owned partial cache set', async (t) => {
-    const state = fixture(t);
-    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
-    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
-    const events = [];
-    const dependencies = { name: identity.volumes.dependencies };
-    const ownership = {
-        state: 'incompatible',
-        message: 'podman has only part of the expected Box resource set',
-        engine: { name: 'podman', identity: 'engine' },
-        handles: {
-            container: null,
-            volumes: { images: null, dependencies },
-        },
-    };
-    const supervisor = createBoxSupervisor({
-        resolveIdentity: () => identity,
-        lockManager: fakeLockManager(state.root, events),
-        discover: () => ownership,
-        runner: { run(command, args) { events.push(args.join(' ')); } },
-        destroyNamedVolumes(options) {
-            options.lock.assertHeld(identity.instance);
-            assert.deepEqual(options.knownHandles, ownership.handles.volumes);
-            events.push('delete-partial-volume-set');
-            return Object.freeze([identity.volumes.dependencies]);
-        },
-    });
-
-    const result = await supervisor.runDestroyTransaction(null, { deleteVolumes: true });
-    assert.deepEqual(result.deletedVolumes, [identity.volumes.dependencies]);
-    assert.equal(events.includes('delete-partial-volume-set'), true);
+    assert.equal(events.some((value) => value.includes('volume')), false);
 });
 
 test('status and dry-run inspect without acquiring a lock or creating an anchor', (t) => {
@@ -475,7 +498,7 @@ test('status reports an older owned image as incompatible while destroy remains 
     assert.equal(lockManager.acquisitions, 0);
 
     await supervisor.runDestroyTransaction(ownership.handles.container.id);
-    assert.equal(events.some((value) => value.includes('container rm -f --volumes')), true);
+    assert.equal(events.some((value) => /container rm -f [a-f0-9]{64}$/.test(value)), true);
 });
 
 test('status validates the complete mount contract before entering the Box', (t) => {
@@ -492,7 +515,7 @@ test('status validates the complete mount contract before entering the Box', (t)
             assert.equal(desired.identity.workspaceRoot, state.workspace);
             assert.equal(desired.repositoryRoot, state.root);
             throw new Error(
-                "Owned Box mount /workspace is incompatible; back up legacy Box-only workspace data, then run 'ploinky stop' and 'ploinky destroy --delete-volumes' before retrying",
+                "Owned Box mount /workspace is incompatible; back up any Box-only data, then run 'ploinky stop' and 'ploinky destroy' before retrying",
             );
         },
         repositoryRoot: state.root,

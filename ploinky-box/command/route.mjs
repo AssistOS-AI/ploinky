@@ -27,18 +27,18 @@ function routeDestroy(parsed) {
         throw routeError('destroy: --udp-port is not supported');
     }
     if (parsed.commandArgs.length === 0) {
-        return Object.freeze({ kind: 'destroy', deleteVolumes: false });
+        return Object.freeze({ kind: 'destroy', deleteCache: false });
     }
-    if (parsed.commandArgs[0] !== '--delete-volumes') {
+    if (parsed.commandArgs[0] !== '--delete-cache') {
         throw routeError(`destroy: unexpected trailing argument '${parsed.commandArgs[0]}'`);
     }
     if (parsed.commandArgs.length > 1) {
-        const message = parsed.commandArgs[1] === '--delete-volumes'
-            ? 'destroy: --delete-volumes was supplied more than once'
+        const message = parsed.commandArgs[1] === '--delete-cache'
+            ? 'destroy: --delete-cache was supplied more than once'
             : `destroy: unexpected trailing argument '${parsed.commandArgs[1]}'`;
         throw routeError(message);
     }
-    return Object.freeze({ kind: 'destroy', deleteVolumes: true });
+    return Object.freeze({ kind: 'destroy', deleteCache: true });
 }
 
 function routeUpdate(parsed) {

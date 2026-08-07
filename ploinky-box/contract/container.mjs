@@ -1,4 +1,7 @@
 import {
+    BOX_DATA_FINGERPRINT_LABELS,
+    BOX_DATA_KEYS,
+    BOX_DATA_MOUNTS,
     BOX_LABELS,
     BOX_MEDIA_PORT,
     BOX_ROUTER_CONTAINER_PORT,
@@ -9,6 +12,8 @@ import { PloinkyBoxError } from '../errors.mjs';
 import { IMAGE_CONTRACT } from './image.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
+const INCOMPATIBLE_BOX_GUIDANCE = "; back up any Box-only data, then run 'ploinky stop'"
+    + " and 'ploinky destroy' before retrying";
 
 function envMap(entries) {
     if (!Array.isArray(entries)) {
@@ -169,6 +174,7 @@ export function validateContainerPublications(
 
 export function validateContainerConfiguration(containerHandle, {
     identity,
+    dataFingerprints,
     hostPort,
     mediaHostPort = BOX_MEDIA_PORT,
     imageId,
@@ -188,7 +194,7 @@ export function validateContainerConfiguration(containerHandle, {
     if (runtime.usernsMode !== 'private'
         || JSON.stringify(recordedUserNamespaces) !== JSON.stringify([BOX_USERNS])) {
         throw publicationError(
-            "Owned Box user namespace is incompatible; back up legacy Box-only workspace data, then run 'ploinky stop' and 'ploinky destroy --delete-volumes' before retrying",
+            `Owned Box user namespace is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`,
         );
     }
     const expectedLabels = {
@@ -198,6 +204,20 @@ export function validateContainerConfiguration(containerHandle, {
         [BOX_LABELS.routerHostPort]: String(hostPort),
         [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
     };
+    const selectedFingerprints = dataFingerprints || Object.fromEntries(BOX_DATA_KEYS.map((key) => [
+        key,
+        String(containerHandle.labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
+    ]));
+    const fingerprintValues = BOX_DATA_KEYS.map((key) => String(selectedFingerprints?.[key] || ''));
+    const hasFingerprints = fingerprintValues.some(Boolean);
+    if (hasFingerprints && !fingerprintValues.every((value) => /^[a-f0-9]{64}$/.test(value))) {
+        throw publicationError('Owned Box directory fingerprint set is incompatible');
+    }
+    if (hasFingerprints) {
+        for (const key of BOX_DATA_KEYS) {
+            expectedLabels[BOX_DATA_FINGERPRINT_LABELS[key]] = String(selectedFingerprints[key]);
+        }
+    }
     const ownershipLabels = Object.fromEntries(Object.entries(containerHandle.labels)
         .filter(([key]) => key.startsWith(BOX_OWNERSHIP_LABEL_PREFIX))
         .sort());
@@ -250,15 +270,13 @@ export function validateContainerConfiguration(containerHandle, {
             + `expected=${JSON.stringify(expectedDevices)} hostKind=${hostKind}`,
         );
     }
+    // Every mount is a host bind. A Box created by the retired named-volume
+    // design fails here and is never adopted; `ploinky destroy` removes it.
     const expectedMounts = {
-        '/opt/ploinky': { type: 'bind', source: repositoryRoot, rw: false },
-        '/workspace': { type: 'bind', source: identity.workspaceRoot, rw: true },
-        '/home/podman/.local/share/ploinky-images': {
-            type: 'volume', name: identity.volumes.images, rw: true,
-        },
-        '/opt/ploinky/node_modules': {
-            type: 'volume', name: identity.volumes.dependencies, rw: true,
-        },
+        '/opt/ploinky': { source: repositoryRoot, rw: false },
+        '/workspace': { source: identity.workspaceRoot, rw: true },
+        [BOX_DATA_MOUNTS.dependencies]: { source: identity.dataPaths.dependencies, rw: true },
+        [BOX_DATA_MOUNTS.images]: { source: identity.dataPaths.images, rw: true },
     };
     if (!Array.isArray(runtime.mounts) || runtime.mounts.length !== 4) {
         throw publicationError('Owned Box mount set is incompatible');
@@ -266,14 +284,12 @@ export function validateContainerConfiguration(containerHandle, {
     for (const [destination, expected] of Object.entries(expectedMounts)) {
         const observed = runtime.mounts.find((mount) => mount.destination === destination);
         if (!observed
-            || observed.type !== expected.type
+            || observed.type !== 'bind'
             || observed.rw !== expected.rw
-            || (expected.source && observed.source !== expected.source)
-            || (expected.name && observed.name !== expected.name)) {
-            const guidance = destination === '/workspace'
-                ? "; back up legacy Box-only workspace data, then run 'ploinky stop' and 'ploinky destroy --delete-volumes' before retrying"
-                : '';
-            throw publicationError(`Owned Box mount ${destination} is incompatible${guidance}`);
+            || observed.source !== expected.source) {
+            throw publicationError(
+                `Owned Box mount ${destination} is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`,
+            );
         }
     }
     return Object.freeze({ ...publication, imageId, imageRef });

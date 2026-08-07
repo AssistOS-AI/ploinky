@@ -6,6 +6,14 @@ import { PloinkyBoxError } from '../errors.mjs';
 
 const OVERLAY_MOUNT_PROGRAM = '/usr/bin/fuse-overlayfs';
 
+// The image store is a host bind now, so on macOS it is virtiofs. Unpacking a
+// layer there fails without this ("setting up pivot dir: mkdir ./.pivot_root…:
+// permission denied"): containers/storage cannot create the layer's pivot
+// directory with the permissions it wants. force_mask makes it create private
+// entries and record the real mode in an xattr, which fuse-overlayfs restores
+// when the layer is mounted, so in-container file modes are unchanged.
+const OVERLAY_FORCE_MASK = '0700';
+
 // containers/storage lays this directory out under the configured imagestore as
 // soon as the first Podman command initializes the store.
 const IMAGE_STORE_MARKER = 'overlay-images';
@@ -28,7 +36,8 @@ function currentGid() {
 /**
  * Only reusable image content is meant to outlive one outer Box, so the
  * graphroot stays on the Box writable layer, the runroot is a per-boot
- * tmpfs path, and only the imagestore is a durable named volume.
+ * tmpfs path, and only the imagestore is the workspace-backed image store
+ * bound from `.ploinky/box/images` on the host.
  */
 export function renderStorageConf({ graphRoot, runRoot, imageStore }) {
     for (const [name, value] of Object.entries({ graphRoot, runRoot, imageStore })) {
@@ -46,6 +55,7 @@ export function renderStorageConf({ graphRoot, runRoot, imageStore }) {
         '',
         '[storage.options.overlay]',
         `mount_program = "${OVERLAY_MOUNT_PROGRAM}"`,
+        `force_mask = "${OVERLAY_FORCE_MASK}"`,
         '',
     ].join('\n');
 }

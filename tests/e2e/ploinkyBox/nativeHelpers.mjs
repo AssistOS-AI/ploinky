@@ -8,14 +8,10 @@ import { buildEngineProcessEnvironment, createProcessRunner } from '../../../plo
 import { resolveWorkspaceIdentity } from '../../../ploinky-box/identity.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from '../../../ploinky-box/locks.mjs';
 import { createBoxSupervisor } from '../../../ploinky-box/supervisor.mjs';
-import {
-    discoverBoxOwnership,
-    inspectOwnedVolumeHandle,
-    volumeHandleMatches,
-} from '../../../ploinky-box/engine/discovery.mjs';
+import { discoverBoxOwnership } from '../../../ploinky-box/engine/discovery.mjs';
 import { writeCandidatePodmanProxy } from './candidatePodmanProxy.mjs';
 
-const ABSENT_RESOURCE = /(?:no such|not found|does not exist|no volume with name)/i;
+const ABSENT_RESOURCE = /(?:no such|not found|does not exist)/i;
 
 function cleanupError(message) {
     const error = new Error(message);
@@ -52,25 +48,8 @@ function confirmResourceAbsent(runner, engineName, kind, identifier) {
     }
 }
 
-function listVolumeConsumers(runner, engineName, volumeName) {
-    const result = runner.query(engineName, [
-        'container', 'ls', '--all', '--filter', `volume=${volumeName}`, '--format', 'json',
-    ]);
-    if (!result.ok) {
-        throw cleanupError(`Unable to inventory consumers of volume ${volumeName}`);
-    }
-    let records;
-    try {
-        records = JSON.parse(String(result.stdout || ''));
-    } catch {
-        throw cleanupError(`Consumer inventory for volume ${volumeName} is malformed`);
-    }
-    if (!Array.isArray(records)) {
-        throw cleanupError(`Consumer inventory for volume ${volumeName} is not an array`);
-    }
-    return records;
-}
-
+// Box persistence is workspace-backed, so the outer container is the only
+// engine resource a native harness can own and therefore must clean up.
 export async function cleanupNativeHarnessResources({
     resolveIdentity,
     expectedIdentity,
@@ -79,12 +58,6 @@ export async function cleanupNativeHarnessResources({
     platform = process.platform,
     env = {},
     discover = (identity) => discoverBoxOwnership(identity, { runner, platform, env }),
-    inspectVolume = (engine, identity, key) => inspectOwnedVolumeHandle(
-        engine,
-        identity,
-        key,
-        runner,
-    ),
     withLock = withWorkspaceMutationLock,
 } = {}) {
     if (!expectedIdentity || typeof resolveIdentity !== 'function' || !runner || !lockManager) {
@@ -99,15 +72,13 @@ export async function cleanupNativeHarnessResources({
             lock.assertHeld(lockedIdentity.instance);
             const captured = discover(lockedIdentity);
             if (captured.state === 'absent') {
-                return Object.freeze({ action: 'absent', removedContainerId: null, removedVolumes: [] });
+                return Object.freeze({ action: 'absent', removedContainerId: null });
             }
             if (!['owned', 'incompatible'].includes(captured.state) || !captured.engine) {
                 throw cleanupError(captured.message || `Native Box ownership is ${captured.state}`);
             }
             const engine = captured.engine;
             const container = captured.handles?.container || null;
-            const volumes = Object.entries(captured.handles?.volumes || {})
-                .filter(([, handle]) => handle);
 
             if (container) {
                 assertSameWorkspaceIdentity(expectedIdentity, resolveIdentity());
@@ -128,35 +99,9 @@ export async function cleanupNativeHarnessResources({
                 confirmResourceAbsent(runner, engine.name, 'container', container.id);
             }
 
-            const removedVolumes = [];
-            for (const [key, handle] of volumes) {
-                assertSameWorkspaceIdentity(expectedIdentity, resolveIdentity());
-                lock.assertHeld(lockedIdentity.instance);
-                const current = inspectVolume(engine, lockedIdentity, key);
-                if (current.state !== 'owned' || !volumeHandleMatches(handle, current.handle)) {
-                    throw cleanupError(`Native Box volume ${handle.name} changed before removal`);
-                }
-                const consumers = listVolumeConsumers(runner, engine.name, handle.name);
-                if (consumers.length !== 0) {
-                    throw cleanupError(`Native Box volume ${handle.name} has active or foreign consumers`);
-                }
-                assertSameWorkspaceIdentity(expectedIdentity, resolveIdentity());
-                lock.assertHeld(lockedIdentity.instance);
-                const finalCurrent = inspectVolume(engine, lockedIdentity, key);
-                if (finalCurrent.state !== 'owned' || !volumeHandleMatches(handle, finalCurrent.handle)) {
-                    throw cleanupError(`Native Box volume ${handle.name} changed after consumer inventory`);
-                }
-                const removed = runner.query(engine.name, ['volume', 'rm', handle.name]);
-                if (!removed.ok) {
-                    throw cleanupError(`Native Box volume ${handle.name} became in-use or could not be removed`);
-                }
-                confirmResourceAbsent(runner, engine.name, 'volume', handle.name);
-                removedVolumes.push(handle.name);
-            }
             return Object.freeze({
                 action: 'removed',
                 removedContainerId: container?.id || null,
-                removedVolumes: Object.freeze(removedVolumes),
             });
         },
     });

@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import {
+    BOX_DATA_FINGERPRINT_LABELS,
+    BOX_DATA_KEYS,
     BOX_LABELS,
     BOX_MEDIA_PORT,
     BOX_READY_LINE,
@@ -9,11 +11,13 @@ import {
     BOX_ROUTER_HEALTH_SOCKET,
     BOX_ROLES,
     BOX_USERNS,
-    BOX_VOLUME_KEYS,
 } from '../constants.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
-import { revalidateVolumeHandle, volumeMountArgs } from '../volumes.mjs';
+import {
+    revalidateWorkspaceDataPaths,
+    workspaceDataMountArgs,
+} from '../workspace-data.mjs';
 
 function lifecycleError(message, code = 'PLOINKY_BOX_LIFECYCLE_FAILED', cause) {
     return new PloinkyBoxError(message, { code, cause });
@@ -46,6 +50,7 @@ function writeLogDelta(output, currentValue, previousValue) {
 
 export function containerCreateArgs({
     identity,
+    dataFingerprints,
     imageId,
     imageRef,
     hostPort,
@@ -62,6 +67,13 @@ export function containerCreateArgs({
         [BOX_LABELS.routerHostPort]: String(hostPort),
         [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
     };
+    for (const key of BOX_DATA_KEYS) {
+        const value = String(dataFingerprints?.[key] || '');
+        if (!/^[a-f0-9]{64}$/.test(value)) {
+            throw lifecycleError(`Container creation requires a valid ${key} directory fingerprint`);
+        }
+        labels[BOX_DATA_FINGERPRINT_LABELS[key]] = value;
+    }
     return [
         'container', 'create',
         '--init',
@@ -76,7 +88,7 @@ export function containerCreateArgs({
         '--publish', `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
         '--volume', `${source}:/opt/ploinky:ro`,
         '--volume', `${identity.workspaceRoot}:/workspace`,
-        ...volumeMountArgs(identity),
+        ...workspaceDataMountArgs(identity),
         '--env', 'PLOINKY_PUBLIC_BIND=0.0.0.0',
         '--env', `PLOINKY_PUBLIC_AUTHORITY=127.0.0.1:${hostPort}`,
         '--env', 'PLOINKY_PRIVATE_BIND=0.0.0.0',
@@ -117,17 +129,15 @@ export function readContainerIdFromCidfile(cidfile, { fsApi = fs } = {}) {
     return value;
 }
 
-export function revalidateAllVolumes({ engine, identity, handles, runner, lock }) {
-    for (const key of BOX_VOLUME_KEYS) {
-        revalidateVolumeHandle(handles[key], { engine, identity, key, runner, lock });
-    }
+export function revalidateBoxDataPaths({ identity, lock, fsApi }) {
+    return revalidateWorkspaceDataPaths({ identity, lock, fsApi });
 }
 
 export function removeContainerById(engine, containerId, runner) {
     if (!/^[a-f0-9]{12,64}$/.test(String(containerId))) {
         throw lifecycleError('Refusing to remove a container without an immutable ID');
     }
-    runner.run(engine.name, ['container', 'rm', '-f', '--volumes', String(containerId)]);
+    runner.run(engine.name, ['container', 'rm', '-f', String(containerId)]);
 }
 
 export function stopPloinkyLocalByContainerId(engine, containerId, runner) {

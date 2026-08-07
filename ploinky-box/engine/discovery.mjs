@@ -1,16 +1,17 @@
 import { isDeepStrictEqual } from 'node:util';
 
 import {
+    BOX_DATA_FINGERPRINT_LABELS,
+    BOX_DATA_KEYS,
     BOX_LABELS,
     BOX_ROLES,
-    BOX_VOLUME_KEYS,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { sha256 } from '../boundary/fingerprint.mjs';
 import { createProcessRunner } from '../process.mjs';
 import { normalizeContainerRuntime } from '../contract/container.mjs';
 
-const ABSENT_PATTERN = /(?:no such|not found|does not exist|no volume with name)/i;
+const ABSENT_PATTERN = /(?:no such|not found|does not exist)/i;
 
 function discoveryError(message, code = 'PLOINKY_BOX_DISCOVERY_FAILED') {
     return new PloinkyBoxError(message, { code });
@@ -247,22 +248,34 @@ function hasExactLabels(labels, expected) {
 }
 
 function hasExactResourceLabels(labels, pathHash, role) {
-    if (role !== BOX_ROLES.container) {
-        return hasExactLabels(labels, expectedImmutableLabels(pathHash, role));
-    }
     const hostPort = String(labels?.[BOX_LABELS.routerHostPort] || '');
     const mediaHostPort = String(labels?.[BOX_LABELS.mediaHostPort] || '');
     const imageRef = String(labels?.[BOX_LABELS.imageRef] || '');
+    const dataFingerprints = Object.fromEntries(BOX_DATA_KEYS.map((key) => [
+        key,
+        String(labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
+    ]));
+    const fingerprintValues = Object.values(dataFingerprints);
+    const hasNoFingerprints = fingerprintValues.every((value) => value === '');
+    const hasCompleteFingerprints = fingerprintValues.every((value) => /^[a-f0-9]{64}$/.test(value));
+    const expectedFingerprints = hasCompleteFingerprints
+        ? Object.fromEntries(BOX_DATA_KEYS.map((key) => [
+            BOX_DATA_FINGERPRINT_LABELS[key],
+            dataFingerprints[key],
+        ]))
+        : {};
     return /^[1-9][0-9]{0,4}$/.test(hostPort)
         && Number(hostPort) <= 65535
         && /^[1-9][0-9]{0,4}$/.test(mediaHostPort)
         && Number(mediaHostPort) <= 65535
         && imageRef.length > 0
+        && (hasNoFingerprints || hasCompleteFingerprints)
         && hasExactLabels(labels, {
             ...expectedImmutableLabels(pathHash, role),
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: hostPort,
             [BOX_LABELS.mediaHostPort]: mediaHostPort,
+            ...expectedFingerprints,
         });
 }
 
@@ -283,120 +296,30 @@ function containerHandle(engine, identity, name, record) {
     });
 }
 
-function canonicalOptions(options) {
-    if (!options || typeof options !== 'object' || Array.isArray(options)) {
-        return null;
-    }
-    return Object.fromEntries(Object.entries(options).sort(([left], [right]) => (
-        left.localeCompare(right)
-    )));
-}
-
-export function normalizeVolumeFingerprint(record) {
-    const name = String(record.Name ?? record.name ?? '').trim();
-    const driver = String(record.Driver ?? record.driver ?? '').trim();
-    const scope = String(record.Scope ?? record.scope ?? '').trim();
-    const createdAt = String(record.CreatedAt ?? record.createdAt ?? '').trim();
-    const mountpoint = String(record.Mountpoint ?? record.mountpoint ?? '').trim();
-    const options = canonicalOptions(record.Options ?? record.options);
-    if (!name || !driver || !scope || !createdAt || !mountpoint || options === null) {
-        throw discoveryError(`Named volume ${name || '<unknown>'} has an incomplete ownership fingerprint`);
-    }
-    return Object.freeze({
-        name,
-        driver,
-        scope,
-        options: Object.freeze(options),
-        createdAt,
-        mountpointHash: sha256(Buffer.from(mountpoint)),
-    });
-}
-
-function volumeHandle(engine, identity, role, name, record) {
-    return Object.freeze({
-        kind: 'volume',
-        engine: engine.name,
-        engineIdentity: engine.identity,
-        name,
-        role,
-        labels: Object.freeze(labelsFrom(record)),
-        fingerprint: normalizeVolumeFingerprint(record),
-        pathHash: identity.pathHash,
-    });
-}
-
-function expectedResources(identity) {
+function expectedContainer(identity) {
     return {
-        container: {
-            name: identity.instance,
-            role: BOX_ROLES.container,
-        },
-        volumes: {
-            images: {
-                name: identity.volumes.images,
-                role: BOX_ROLES.images,
-            },
-            dependencies: {
-                name: identity.volumes.dependencies,
-                role: BOX_ROLES.dependencies,
-            },
-        },
+        name: identity.instance,
+        role: BOX_ROLES.container,
     };
 }
 
-export function inspectOwnedVolumeHandle(engine, identity, key, runner = createProcessRunner()) {
-    const expected = expectedResources(identity);
-    const resource = expected.volumes[key];
-    if (!resource) {
-        throw discoveryError(`Unknown Box volume role ${key}`);
-    }
-    const inspection = inspectExact(engine, 'volume', resource.name, runner);
-    if (inspection.state !== 'present') {
-        return inspection;
-    }
-    const labels = labelsFrom(inspection.record);
-    if (!hasExactResourceLabels(labels, identity.pathHash, resource.role)) {
-        return {
-            state: 'foreign',
-            message: `${engine.name} exact-name resource ${resource.name} is not owned by this Box`,
-        };
-    }
-    try {
-        return {
-            state: 'owned',
-            handle: volumeHandle(
-                engine,
-                identity,
-                resource.role,
-                resource.name,
-                inspection.record,
-            ),
-        };
-    } catch (error) {
-        return { state: 'foreign', message: error.message };
-    }
-}
-
+// Box persistence is workspace-backed, so the outer container is the only
+// engine resource this Box owns. Labelled named volumes left behind by the
+// retired design are inert: they neither establish ownership nor block a Box.
 function inspectEngineResources(engine, identity, runner) {
-    const expected = expectedResources(identity);
-    const expectedVolumes = expected.volumes;
+    const expected = expectedContainer(identity);
     const containerInventory = inventory(engine, 'container', identity.pathHash, runner);
-    const volumeInventory = inventory(engine, 'volume', identity.pathHash, runner);
-    if (containerInventory.state === 'unknown' || volumeInventory.state === 'unknown') {
+    if (containerInventory.state === 'unknown') {
         return {
             state: 'unknown',
-            message: containerInventory.message || volumeInventory.message,
+            message: containerInventory.message,
         };
     }
 
-    const expectedNames = new Map([
-        [expected.container.name, expected.container.role],
-        ...Object.values(expectedVolumes).map((volume) => [volume.name, volume.role]),
-    ]);
-    for (const record of [...containerInventory.records, ...volumeInventory.records]) {
+    for (const record of containerInventory.records) {
         const name = recordName(record);
         const role = labelsFrom(record)[BOX_LABELS.role];
-        if (!expectedNames.has(name) || expectedNames.get(name) !== role) {
+        if (name !== expected.name || role !== expected.role) {
             return {
                 state: 'foreign',
                 message: `${engine.name} has an unexpected resource claiming this Box identity`,
@@ -404,82 +327,36 @@ function inspectEngineResources(engine, identity, runner) {
         }
     }
 
-    const containerInspection = inspectExact(
-        engine,
-        'container',
-        expected.container.name,
-        runner,
-    );
+    const containerInspection = inspectExact(engine, 'container', expected.name, runner);
     if (containerInspection.state === 'unknown') {
         return containerInspection;
     }
-
-    const volumeInspections = {};
-    for (const [key, volume] of Object.entries(expectedVolumes)) {
-        volumeInspections[key] = inspectExact(engine, 'volume', volume.name, runner);
-        if (volumeInspections[key].state === 'unknown') {
-            return volumeInspections[key];
-        }
-    }
-
-    const entries = [
-        ['container', expected.container, containerInspection],
-        ...Object.entries(expectedVolumes).map(([key, volume]) => (
-            [key, volume, volumeInspections[key]]
-        )),
-    ];
-    for (const [, resource, inspection] of entries) {
-        if (inspection.state !== 'present') {
-            continue;
-        }
-        const labels = labelsFrom(inspection.record);
-        if (!hasExactResourceLabels(labels, identity.pathHash, resource.role)) {
-            return {
-                state: 'foreign',
-                message: `${engine.name} exact-name resource ${resource.name} is not owned by this Box`,
-            };
-        }
-    }
-
-    const presentCount = entries.filter(([, , inspection]) => (
-        inspection.state === 'present'
-    )).length;
-    if (presentCount === 0) {
+    if (containerInspection.state !== 'present') {
         return { state: 'absent', handles: null };
+    }
+    if (!hasExactResourceLabels(
+        labelsFrom(containerInspection.record),
+        identity.pathHash,
+        expected.role,
+    )) {
+        return {
+            state: 'foreign',
+            message: `${engine.name} exact-name resource ${expected.name} is not owned by this Box`,
+        };
     }
 
     try {
-        const handles = {
-            container: containerInspection.state === 'present'
-                ? containerHandle(engine, identity, expected.container.name, containerInspection.record)
-                : null,
-            volumes: {},
-        };
-        for (const [key, volume] of Object.entries(expected.volumes)) {
-            handles.volumes[key] = volumeInspections[key].state === 'present'
-                ? volumeHandle(
+        return {
+            state: 'owned',
+            handles: {
+                container: containerHandle(
                     engine,
                     identity,
-                    volume.role,
-                    volume.name,
-                    volumeInspections[key].record,
-                )
-                : null;
-        }
-        // The cache volumes are created as one set, so a partial set always
-        // means an earlier creation failed and must not be treated as usable.
-        const presentVolumeCount = Object.values(handles.volumes)
-            .filter(Boolean).length;
-        const volumeSetComplete = presentVolumeCount === BOX_VOLUME_KEYS.length;
-        const containerPresent = containerInspection.state === 'present';
-        if (!volumeSetComplete && (containerPresent || presentVolumeCount > 0)) {
-            return {
-                state: 'incompatible',
-                message: `${engine.name} has only part of the expected Box resource set`,
-                handles,
-            };
-        }
-        return { state: 'owned', handles };
+                    expected.name,
+                    containerInspection.record,
+                ),
+            },
+        };
     } catch (error) {
         return {
             state: 'foreign',
@@ -607,16 +484,4 @@ export function discoverBoxOwnership(identity, {
         engines: { podman, docker },
         inventories: { podman: podmanInventory, docker: dockerInventory },
     };
-}
-
-export function volumeHandleMatches(left, right) {
-    return left?.kind === 'volume'
-        && right?.kind === 'volume'
-        && left.engine === right.engine
-        && left.engineIdentity === right.engineIdentity
-        && left.name === right.name
-        && left.role === right.role
-        && left.pathHash === right.pathHash
-        && isDeepStrictEqual(left.labels, right.labels)
-        && isDeepStrictEqual(left.fingerprint, right.fingerprint);
 }

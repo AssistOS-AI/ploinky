@@ -56,8 +56,10 @@ read-only at `/opt/ploinky` and bind-mounts the canonical host launch directory
 read-write at `/workspace`. Ordinary agent containers run one level inside this
 runtime and receive that same `/workspace` bind, so host files are immediately
 visible to agents and files or directories created there by agents persist on
-the host. The dependency cache and nested image cache remain in two
-instance-owned named volumes; nested container state does not. Transient Unix
+the host. The dependency cache and nested image cache are bind-mounted from
+`<workspace>/.ploinky/box/dependencies` and `<workspace>/.ploinky/box/images`,
+so they survive destroy and recreate; nested container state does not. The outer
+runtime has exactly four mounts and owns no named volume. Transient Unix
 sockets stay under the outer runtime's private
 `/run/ploinky` filesystem so the writable host bind remains portable through a
 macOS Podman Machine.
@@ -73,10 +75,10 @@ preserve those operations reliably across the outer and nested containers.
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
-| `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
+| `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
 | `ploinky update` / `ploinky update all [PATH]` | Pull the cloned host Ploinky checkout from its configured upstream, refresh in-Box repositories/dependencies/skills, then restart an already configured running workspace |
-| `ploinky destroy` | Stop nested agents, then remove the outer container; retain its two named cache volumes and the host workspace |
-| `ploinky destroy --delete-volumes` | Directly remove the outer container and its owned storage volumes without prompting; never delete the host workspace |
+| `ploinky destroy` | Stop nested agents, then remove the outer container; retain the host workspace and `.ploinky/box` |
+| `ploinky destroy --delete-cache` | Remove the outer container without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 When REPL input is not a Ploinky command, Ploinky attempts that executable
@@ -96,37 +98,40 @@ when creating a missing Box or preparing a validated replacement, validates the
 complete image metadata, and starts the captured image ID rather than racing the
 mutable tag. Compatible reuse, stopped-box start, status, stop, and destroy do
 not pull. Incompatible images or foreign owned resources are rejected before
-pulling, volume creation, restart, upgrade, or replacement. Ploinky does not
+pulling, cache preparation, restart, upgrade, or replacement. Ploinky does not
 migrate, clean, relabel, or adopt them: run `ploinky destroy` explicitly, then
-recreate the Box. Ordinary destroy retains the two named cache volumes;
-`--delete-volumes` performs an explicit storage reset without deleting host
-workspace files.
+recreate the Box. Ordinary destroy retains `.ploinky/box`;
+`--delete-cache` performs an explicit storage reset of exactly those two cache
+directories without deleting any other workspace file.
 
 Only reusable content survives replacing the outer Box:
 
 | State | Where it lives | Survives destroy? |
 | --- | --- | --- |
 | Workspace data | Host bind at `/workspace` | Yes, and no destroy path ever deletes it |
-| Pinned dependency cache | Named volume at `/opt/ploinky/node_modules` | Yes, unless `--delete-volumes` |
-| Nested image cache | Named volume at `/home/podman/.local/share/ploinky-images` | Yes, unless `--delete-volumes` |
+| Pinned dependency cache | Host bind from `.ploinky/box/dependencies` at `/opt/ploinky/node_modules` | Yes, unless `--delete-cache` |
+| Nested image cache | Host bind from `.ploinky/box/images` at `/home/podman/.local/share/ploinky-images` | Yes, unless `--delete-cache` |
 | Nested container records and writable layers | Box writable layer under `/home/podman/.local/share/containers/storage` | No |
 | Inner Podman named volumes | Under the same disposable graphroot | No |
 | Transient runtime metadata | `/tmp/storage-run-1000` | No, reset every startup |
 
 Nested container records, writable layers, networks, and inner Podman named
 volumes are discarded with the outer Box, so persistent agent data must use
-explicit `/workspace` binds. A Box created by an older layout is not
-recognized and is not migrated. To remove it manually, first identify its exact
-owning engine and outer container, stop and remove only that container, back up
-any data that exists only in its `-workspace` volume, and then remove only its
-exact `-containers` and `-workspace` volumes:
+explicit `/workspace` binds. A Box created by an older layout is not recognized
+and is not migrated: `ploinky start` reports it as incompatible, and
+`ploinky stop` followed by `ploinky destroy` removes it.
+
+Ploinky no longer creates, inspects, or deletes any outer named volume. Named
+volumes left over from an earlier layout (`-images`, `-ploinky-deps`,
+`-containers`, `-workspace`) are inert: they neither establish ownership nor
+block a new Box, and nothing removes them automatically. If you want the disk
+space back, back up anything that exists only there, identify the exact owning
+engine, and remove only those exact volumes by name:
 
 ```bash
 ENGINE=podman # or docker, after exact inspection
 OLD_INSTANCE=ploinky-box-OLDNAME
-$ENGINE container stop "$OLD_INSTANCE"
-$ENGINE container rm "$OLD_INSTANCE"
-$ENGINE volume rm "$OLD_INSTANCE-containers" "$OLD_INSTANCE-workspace"
+$ENGINE volume rm "$OLD_INSTANCE-images" "$OLD_INSTANCE-ploinky-deps"
 ```
 
 Do not use a broad container or volume prune for this cleanup.
@@ -139,16 +144,18 @@ mount, device, security, or creation drift fails before registry traffic or
 container mutation and requires an explicit `ploinky destroy` followed by
 recreation.
 
-The outer container and its two explicitly labelled cache volumes are named
-from the canonical absolute current directory. That directory is mounted at
-`/workspace` rather than copied into engine storage. Ploinky automatically
-discovers whether Podman or Docker owns the exact managed resources and fails
-closed on unreachable, split, or foreign state; there is no public `--name`,
-`--engine`, or `PLOINKY_BOX_ENGINE` override. Ordinary `destroy` removes only the
-selected outer container (and any attached anonymous volumes), preserving the
-host workspace, nested image cache, and Ploinky dependency volume for
-recreation. The explicit `destroy --delete-volumes` form revalidates and removes
-exactly those two owned cache volumes; it never removes the host workspace.
+The outer container is named from the canonical absolute current directory, and
+its cache directories live under that directory's `.ploinky/box`. The workspace
+is mounted at `/workspace` rather than copied into engine storage. Ploinky
+automatically discovers whether Podman or Docker owns the exact managed
+container and fails closed on unreachable, split, or foreign state; there is no
+public `--name`, `--engine`, or `PLOINKY_BOX_ENGINE` override. Ordinary
+`destroy` removes only the selected outer container, preserving the host
+workspace, the nested image cache, and the Ploinky dependency cache for
+recreation. The explicit `destroy --delete-cache` form deletes exactly
+`.ploinky/box/dependencies` and `.ploinky/box/images` after the outer container
+is gone; it never removes the workspace, `.ploinky/master-key`, repositories,
+agents, routing state, or secrets.
 
 Every managed box has exactly two engine publications, independent of graph or
 workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and

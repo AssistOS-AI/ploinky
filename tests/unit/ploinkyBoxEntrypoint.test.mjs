@@ -249,6 +249,7 @@ test('full preparation creates one stable key, resets only transient runtime, an
         '',
         '[storage.options.overlay]',
         'mount_program = "/usr/bin/fuse-overlayfs"',
+        'force_mask = "0700"',
         '',
     ].join('\n'));
     assert.equal(mode(paths.storageConf), 0o600);

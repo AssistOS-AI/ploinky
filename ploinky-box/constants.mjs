@@ -24,18 +24,38 @@ export const BOX_LABELS = Object.freeze({
     imageRef: 'io.assistos.ploinky-box.image-ref',
     routerHostPort: 'io.assistos.ploinky-box.router-host-port',
     mediaHostPort: 'io.assistos.ploinky-box.media-host-port',
+    dependenciesFingerprint: 'io.assistos.ploinky-box.dependencies-fingerprint',
+    imagesFingerprint: 'io.assistos.ploinky-box.images-fingerprint',
 });
 
 export const BOX_ROLES = Object.freeze({
     container: 'box',
-    images: 'images',
-    dependencies: 'ploinky-deps',
 });
 
-export const BOX_VOLUME_KEYS = Object.freeze([
-    'images',
+// Box persistence lives in the workspace itself, under `.ploinky/box`. The
+// keys, host-relative names, and in-Box mount destinations are one contract so
+// identity, mount rendering, and the entrypoint cannot drift apart.
+export const BOX_DATA_KEYS = Object.freeze([
     'dependencies',
+    'images',
 ]);
+
+export const BOX_DATA_ROOT_NAME = 'box';
+
+export const BOX_DATA_RELATIVE_NAMES = Object.freeze({
+    dependencies: 'dependencies',
+    images: 'images',
+});
+
+export const BOX_DATA_MOUNTS = Object.freeze({
+    dependencies: '/opt/ploinky/node_modules',
+    images: '/home/podman/.local/share/ploinky-images',
+});
+
+export const BOX_DATA_FINGERPRINT_LABELS = Object.freeze({
+    dependencies: BOX_LABELS.dependenciesFingerprint,
+    images: BOX_LABELS.imagesFingerprint,
+});
 
 export const BOX_RUNTIME_UID = 1000;
 export const BOX_RUNTIME_GID = 1000;

@@ -118,25 +118,28 @@ test('full update routes through the host while targeted update forms remain gen
     assert.equal(routeOuterCommand(parseOuterArguments(['--dry-run', 'update'])).kind, 'dry-run');
 });
 
-test('destroy accepts only one explicit trailing volume-deletion flag', () => {
+test('destroy accepts only one explicit trailing cache-deletion flag', () => {
     assert.deepEqual(routeOuterCommand(parseOuterArguments(['destroy'])), {
         kind: 'destroy',
-        deleteVolumes: false,
+        deleteCache: false,
     });
-    assert.deepEqual(routeOuterCommand(parseOuterArguments(['destroy', '--delete-volumes'])), {
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['destroy', '--delete-cache'])), {
         kind: 'destroy',
-        deleteVolumes: true,
+        deleteCache: true,
     });
     assert.throws(
-        () => routeOuterCommand(parseOuterArguments(['destroy', '--delete-volumes', '--delete-volumes'])),
+        () => routeOuterCommand(parseOuterArguments(['destroy', '--delete-cache', '--delete-cache'])),
         /supplied more than once/,
     );
+    // The retired named-volume flag is rejected, not silently accepted.
+    for (const retired of ['--delete-volumes', '--volumes']) {
+        assert.throws(
+            () => routeOuterCommand(parseOuterArguments(['destroy', retired])),
+            new RegExp(`unexpected trailing argument '${retired}'`),
+        );
+    }
     assert.throws(
-        () => routeOuterCommand(parseOuterArguments(['destroy', '--volumes'])),
-        /unexpected trailing argument/,
-    );
-    assert.throws(
-        () => routeOuterCommand(parseOuterArguments(['--dry-run', 'destroy', '--delete-volumes'])),
+        () => routeOuterCommand(parseOuterArguments(['--dry-run', 'destroy', '--delete-cache'])),
         /--dry-run is not supported/,
     );
 });

@@ -3,7 +3,6 @@ import http from 'node:http';
 
 import {
     BOX_LABELS,
-    BOX_VOLUME_KEYS,
     resolveBoxImageReference,
 } from './constants.mjs';
 import { validateContainerConfiguration } from './contract/container.mjs';
@@ -28,7 +27,10 @@ import {
 } from './lifecycle/container.mjs';
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
 import { serializeCloudflarePublicationStatus } from './cloudflared/status.mjs';
-import { removeOwnedNamedVolumes } from './volumes.mjs';
+import {
+    inspectWorkspaceDataPaths,
+    removeWorkspaceDataPaths,
+} from './workspace-data.mjs';
 
 function supervisorError(message, code = 'PLOINKY_BOX_SUPERVISOR_FAILED') {
     return new PloinkyBoxError(message, { code });
@@ -42,18 +44,6 @@ function assertMutableOwnership(ownership) {
         );
     }
     return ownership;
-}
-
-function assertDestroyableOwnership(ownership) {
-    const volumeKeys = Object.keys(ownership?.handles?.volumes || {});
-    if (ownership?.state === 'incompatible'
-        && ownership.engine
-        && ownership.handles
-        && volumeKeys.length === BOX_VOLUME_KEYS.length
-        && volumeKeys.every((key) => BOX_VOLUME_KEYS.includes(key))) {
-        return ownership;
-    }
-    return assertMutableOwnership(ownership);
 }
 
 function defaultDiscovery(identity, runner, platform, env) {
@@ -76,7 +66,8 @@ export function createBoxSupervisor({
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
-    destroyNamedVolumes = removeOwnedNamedVolumes,
+    destroyBoxCache = removeWorkspaceDataPaths,
+    inspectBoxData = inspectWorkspaceDataPaths,
     stdout = process.stdout,
     stderr = process.stderr,
 } = {}) {
@@ -192,14 +183,13 @@ export function createBoxSupervisor({
         });
     }
 
-    async function runDestroyTransaction(expectedContainerId, { deleteVolumes = false } = {}) {
+    async function runDestroyTransaction(expectedContainerId, { deleteCache = false } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             const container = ownership.handles?.container;
-            const volumes = ownership.handles?.volumes;
             if (!container && expectedContainerId) {
                 throw supervisorError('Box changed before destroy; nothing was removed');
             }
-            if (!container && !deleteVolumes) {
+            if (!container && !deleteCache) {
                 return Object.freeze({ identity, action: 'absent' });
             }
             if (container && (!expectedContainerId || container.id !== expectedContainerId)) {
@@ -209,7 +199,7 @@ export function createBoxSupervisor({
                 // Quiesce nested agents before the outer Box disappears. If the
                 // inner stop fails we still stop the outer Box to halt further
                 // mutation, then fail without removing anything, leaving a
-                // stopped Box and its volumes intact for inspection and retry.
+                // stopped Box and its cache data intact for inspection and retry.
                 if (container.runtime.running) {
                     let innerStopError = null;
                     try {
@@ -240,22 +230,19 @@ export function createBoxSupervisor({
                 }
                 removeContainerById(ownership.engine, container.id, runner);
             }
-            const deletedVolumes = deleteVolumes
-                ? destroyNamedVolumes({
-                    engine: ownership.engine,
-                    identity,
-                    runner,
-                    lock,
-                    knownHandles: volumes,
-                })
+            // Cache deletion is explicit and runs only after the outer Box is
+            // proven gone, so a failed stop or removal always retains the data.
+            const deletedPaths = deleteCache
+                ? destroyBoxCache({ identity, lock })
                 : Object.freeze([]);
             return Object.freeze({
                 identity,
-                action: container ? 'destroyed' : 'deleted-retained-volumes',
+                action: container ? 'destroyed' : 'deleted-cache',
                 containerId: container?.id || null,
-                deletedVolumes,
+                deletedCache: deleteCache,
+                deletedPaths,
             });
-        }, assertDestroyableOwnership);
+        });
     }
 
     function inspectBoxStatus() {
@@ -266,7 +253,7 @@ export function createBoxSupervisor({
         }
         const container = ownership.handles?.container;
         if (!container) {
-            return Object.freeze({ identity, ownership, state: 'absent-retained-volumes' });
+            return Object.freeze({ identity, ownership, state: 'absent' });
         }
         try {
             const imageRef = container.labels?.[BOX_LABELS.imageRef];
@@ -276,8 +263,12 @@ export function createBoxSupervisor({
                 imageRef,
                 runner,
             );
+            const dataState = validateContainer === validateContainerConfiguration
+                ? inspectBoxData({ identity })
+                : null;
             validateContainer(container, {
                 identity,
+                dataFingerprints: dataState?.fingerprints,
                 hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
                 mediaHostPort: Number(container.labels?.[BOX_LABELS.mediaHostPort]),
                 imageId: image.immutableId,

@@ -29,23 +29,16 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
     const status = {
         state: statusState,
         identity: { instance: 'ploinky-box-workspace-123456789abc' },
-        ownership: ['running-initialized', 'absent-retained-volumes'].includes(statusState)
+        ownership: statusState === 'running-initialized'
             ? {
                 state: 'owned',
                 engine: prepared.engine,
                 handles: {
-                    container: statusState === 'running-initialized' ? {
+                    container: {
                         id: prepared.containerId,
                         labels: {
                             [BOX_LABELS.routerHostPort]: String(prepared.hostPort),
                             [BOX_LABELS.mediaHostPort]: String(prepared.mediaHostPort),
-                        },
-                    } : null,
-                    volumes: {
-                        images: { kind: 'volume', name: 'ploinky-box-workspace-123456789abc-images' },
-                        dependencies: {
-                            kind: 'volume',
-                            name: 'ploinky-box-workspace-123456789abc-ploinky-deps',
                         },
                     },
                 },
@@ -56,7 +49,17 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
         prepareBoxForCommand: async () => { events.push('prepare'); return prepared; },
         runStartTransaction: async (argv, options) => events.push(['start', argv, options]),
         runStopTransaction: async () => events.push('stop'),
-        runDestroyTransaction: async (id, options) => events.push(['destroy', id, options]),
+        runDestroyTransaction: async (id, options) => {
+            events.push(['destroy', id, options]);
+            return {
+                action: id ? 'destroyed' : 'deleted-cache',
+                containerId: id,
+                deletedCache: options?.deleteCache === true,
+                deletedPaths: options?.deleteCache
+                    ? ['/workspace/.ploinky/box/dependencies', '/workspace/.ploinky/box/images']
+                    : [],
+            };
+        },
         inspectBoxStatus: () => { events.push('status'); return status; },
         planDryRun: (options) => { events.push(['dry-run', options]); return { mutationPerformed: false }; },
     };
@@ -334,15 +337,15 @@ test('destroy confirmation occurs after read-only inspect and before its single 
     assert.deepEqual(events, [
         'status',
         'confirm',
-        ['destroy', 'a'.repeat(64), { deleteVolumes: false }],
+        ['destroy', 'a'.repeat(64), { deleteCache: false }],
     ]);
 });
 
-test('destroy --delete-volumes skips confirmation and deletes retained-volume-only state', async () => {
-    for (const statusState of ['running-initialized', 'absent-retained-volumes']) {
+test('destroy --delete-cache skips confirmation and works without a container', async () => {
+    for (const statusState of ['running-initialized', 'absent']) {
         const events = [];
         const output = bufferStream();
-        const code = await runOuterCli(['destroy', '--delete-volumes'], {
+        const code = await runOuterCli(['destroy', '--delete-cache'], {
             env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
             supervisor: fakeSupervisor(events, { statusState }),
             confirmDestroy: async () => { throw new Error('must not prompt'); },
@@ -351,14 +354,32 @@ test('destroy --delete-volumes skips confirmation and deletes retained-volume-on
         assert.deepEqual(events, [
             'status',
             ['destroy', statusState === 'running-initialized' ? 'a'.repeat(64) : null, {
-                deleteVolumes: true,
+                deleteCache: true,
             }],
         ]);
-        assert.match(output.value(), /named volumes were deleted/);
+        assert.match(output.value(), /cache data was deleted/);
+        assert.match(output.value(), /\.ploinky\/box\/dependencies/);
+        assert.match(output.value(), /\.ploinky\/box\/images/);
+        assert.doesNotMatch(output.value(), /named volumes/);
     }
 });
 
-test('public help documents explicit no-prompt volume deletion', async () => {
+test('the default destroy confirmation states that cache data is retained', async () => {
+    const events = [];
+    const output = bufferStream();
+    let prompt = '';
+    const code = await runOuterCli(['destroy'], {
+        env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
+        confirmDestroy: async (instance) => { prompt = instance; return false; },
+    });
+    assert.equal(code, 0);
+    assert.equal(prompt, 'ploinky-box-workspace-123456789abc');
+    assert.match(output.value(), /Destroy cancelled; no resources changed/);
+    assert.equal(events.some((event) => Array.isArray(event) && event[0] === 'destroy'), false);
+});
+
+test('public help documents explicit no-prompt cache deletion', async () => {
     const output = bufferStream();
     const code = await runOuterCli(['help'], {
         env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
@@ -367,7 +388,9 @@ test('public help documents explicit no-prompt volume deletion', async () => {
         }),
     });
     assert.equal(code, 0);
-    assert.match(output.value(), /destroy --delete-volumes/);
+    assert.match(output.value(), /destroy --delete-cache/);
+    assert.doesNotMatch(output.value(), /--delete-volumes/);
+    assert.match(output.value(), /\.ploinky\/box/);
     assert.match(output.value(), /without prompting/);
     assert.match(output.value(), /docker\.io\/assistos\/ploinky-box:latest/);
     assert.match(output.value(), /PLOINKY_BOX_IMAGE/);
