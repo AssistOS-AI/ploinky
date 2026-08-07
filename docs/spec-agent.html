@@ -227,7 +227,7 @@
                             <tr>
                                 <td><code>cli</code></td>
                                 <td>No</td>
-                                <td>Interactive command for <code>ploinky cli</code> (runs inside the agent container). When omitted, Ploinky now falls back to <code>/Agent/default_cli.sh</code>, a safe helper that exposes basic inspection commands such as <code>whoami</code>, <code>pwd</code>, <code>ls</code>, <code>env</code>, <code>date</code>, and <code>uname</code>.</td>
+                                <td>Interactive command for <code>ploinky cli &lt;agent&gt; --workdir &lt;path&gt; -- ...</code>. It runs inside the backend selected by <code>lite-sandbox</code>; coding providers use a policy-constrained interactive adapter rather than a raw provider binary. When omitted, Ploinky falls back to <code>/Agent/default_cli.sh</code>.</td>
                             </tr>
                             <tr>
                                 <td><code>agent</code></td>
@@ -641,7 +641,7 @@ client tool health.check --agent MyAgent</code></pre>
   "about": "Alpine Linux shell with curl and jq"
 }</code></pre>
 
-                        <p><strong>Tip:</strong> If you omit the <code>cli</code> field entirely, Ploinky will attach the bundled <code>/Agent/default_cli.sh</code> script so you still have access to safe inspection commands via <code>ploinky cli &lt;agent&gt; &lt;command&gt;</code>. Launching <code>ploinky cli &lt;agent&gt;</code> with no arguments drops you into an interactive prompt; type <code>help</code> to see the allowed commands and <code>exit</code> when you are finished.</p>
+                        <p><strong>Tip:</strong> If you omit the <code>cli</code> field entirely, Ploinky attaches the bundled <code>/Agent/default_cli.sh</code> through the same strict grammar. Use <code>ploinky cli &lt;agent&gt; --workdir projects/demo -- &lt;command&gt;</code>, or omit provider arguments after <code>--</code> for its interactive prompt. The selected directory must already exist and cannot be the workspace root.</p>
 
                         <h3>Node.js Development Agent</h3>
                         <pre><code>{

@@ -26,7 +26,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky list routes`: inspect the current `.ploinky/routing.json` route table.
 - `ploinky restart`: restart enabled agents and the router.
 - `ploinky shell <agent>`: open `/bin/sh` inside the running agent backend.
-- `ploinky cli <agent> [args...]`: run the manifest CLI command interactively.
+- `ploinky cli <agent> --workdir <path> -- [provider-args...]`: run the manifest CLI through the selected runtime in an existing real non-root workspace directory; there is no cwd inference or cross-runtime fallback.
 - `ploinky stop`: stop enabled agents and the router without removing runtime state. Host-sandboxed agents are signaled in a batch before Ploinky waits.
 - `ploinky shutdown`: stop the router and remove runtimes recorded for this workspace in `.ploinky/agents.json`.
 - `ploinky destroy`: stop the router, remove all Ploinky runtimes for the workspace, and clear the regenerated dependency cache under `.ploinky/deps/` without deleting `.data/<agent-or-alias>/`.
@@ -44,9 +44,10 @@ Ploinky is a workspace-local runtime for repository-backed agents.
   existing messages through `Click to load session history`, and sends
   `/session`, `/session new`, or `/session resume <id>` for session controls.
   Ploinky does not persist conversation files or hydrate the CLI's agent. When opened as
-  `/webchat?agent=<name>&...`, the router forwards additional query parameters
-  except router-owned `tabId` to `ploinky cli <name>` as
-  long-form CLI flags encoded as `--key=value`.
+  `/webchat?agent=<name>&workspace-dir=<path>&...`, the router validates the
+  workdir and dispatches `ploinky cli <name> --workdir <path> -- ...`.
+  Ordinary parameters become long-form provider flags; agent/workspace selectors
+  and router-owned tab, session, and page identifiers are not forwarded.
 - `/dashboard`: operational management surface for status, logs, agents, and runtime control.
 - `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.
 - `/api/marketplace`: JSON endpoint for the first-party agent marketplace. Authenticated local or SSO users may read repository, agent, enabled-record, recorded backend, and runtime state; Bubblewrap and Seatbelt liveness comes from tracked PIDs, while Docker and Podman use OCI state. Local admins may perform the complete `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` action set. A running agent may use a request-bound Agent Assertion to read state and submit only `enable_agent`, which supports on-demand dependency startup without granting repository or disable operations. Client helpers check status first and forward `mode` only when the caller supplies it; an omitted mode retains Marketplace's isolated default. Repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime so the watchdog does not restart it during the operation.

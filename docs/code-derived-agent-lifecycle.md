@@ -60,7 +60,7 @@ to `bin/ploinky`; `bin/psh` is an alias to `ploinky sh`.
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
-| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky cli <agent> --workdir <path> -- <provider-args>` | Reconcile/start the selected runtime and attach the policy-constrained manifest CLI in the exact non-root workdir |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
@@ -189,7 +189,7 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `list repos` | Lists predefined, installed, and remembered source repos. |
 | `list routes` | Prints `.ploinky/routing.json`. |
 | `shell <agent>` | Ensures the agent service is running, then attaches an interactive shell. |
-| `cli <agent> [args]` | Ensures the agent service is running, then attaches the manifest CLI command or default CLI script. |
+| `cli <agent> --workdir <path> -- [provider-args]` | Ensures the selected agent service is running, then attaches the manifest CLI through its provider policy; the exact pre-separator workdir is mandatory. |
 | `webchat` | Prints the `/webchat` URL for the router login flow. Positional config arguments are rejected as removed. |
 | `client status|list|tool` | Talks to the local router MCP endpoint. `call`, `methods`, `task`, and `task-status` are old forms that print migration guidance. |
 | `/settings` / `settings` | Opens the settings menu and refreshes the LLM suggestion cache when env changes. |
@@ -309,7 +309,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `install` | No | Used when active profile has no `install`; inserted before the selected runtime command. |
 | `entrypoint` | No | Passed as container `--entrypoint`. |
 | `workdir` | No | Container working directory fallback is `/code`. |
-| `cli` | No | Command used by `ploinky cli <agent>`. |
+| `cli` | No | Command used by `ploinky cli <agent> --workdir <path> -- ...` through the selected runtime. |
 | `commands.cli` | No | CLI command fallback after `cli`. |
 | `readiness.protocol` | No | Explicit startup readiness protocol: `tcp`, `mcp`, or `none`. It takes precedence over inferred TCP/MCP and over `health.readiness.script`. Without it, start-only containers prefer a declared health script, otherwise TCP when a private or published route exists; execution modes with AgentServer default to MCP. |
 | `health.liveness` | No | Watchdog container monitor script probe. Script name must be local to agent root, with no slash or `..`. Failure can restart the container with backoff. |

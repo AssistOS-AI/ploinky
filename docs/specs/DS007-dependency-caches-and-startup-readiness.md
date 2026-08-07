@@ -22,7 +22,7 @@ The managed public-entrypoint boundary is:
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
-| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky cli <agent> --workdir <path> -- <provider-args>` | Reconcile/start the selected agent runtime; attach its policy-constrained manifest CLI in the exact non-root workdir |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |

@@ -14,7 +14,7 @@ Ploinky runs agents through multiple backend styles, but it must present one coh
 
 ## Core Content
 
-Container execution is the default backend. The public host supervisor automatically selects the sole Podman or Docker engine that owns the exact-directory outer runtime identity; when no identity resources exist it selects Podman first. Inside that outer box, every Ploinky-managed agent and helper path is forced through nested Podman and Docker fallback is forbidden. Agent container names must be derived from the repository name, the agent or alias name, and a workspace hash so that multiple workspaces can run the same agent names without collisions.
+The public host supervisor still selects the sole Podman or Docker engine that owns the exact-directory outer Box identity. Inside Ploinky, `lite-sandbox` is the universal per-agent runtime selector: exact `true` requires Bubblewrap on Linux/inside Box or Seatbelt on macOS; false or missing requires Podman. A selected backend admission or start failure fails closed with no cross-runtime fallback. A manifest may retain a container declaration while sandbox-selected; that declaration is dormant and must not be inspected, pulled, started, or required until container mode is selected. Agent runtime identities remain workspace- and alias-scoped so generations cannot be mixed.
 
 The managed public-entrypoint boundary is:
 
@@ -22,7 +22,7 @@ The managed public-entrypoint boundary is:
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
-| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky cli <agent> --workdir <path> -- <provider-args>` | Reconcile/start the selected agent runtime; attach its policy-constrained manifest CLI in the exact non-root workdir |
 | `ploinky start ...` | Reconcile/start outer runtime; start the selected graph behind the fixed boundary |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
@@ -251,7 +251,7 @@ Runtime lifecycle checks must dispatch by the actual backend recorded in `.ploin
 
 Runtime reporting must use the same backend-aware state model. Marketplace and CLI status surfaces must report every enabled agent from `.ploinky/agents.json`, identify its recorded runtime, and determine liveness from the tracked process PID for Bubblewrap or Seatbelt and from OCI inspection for Docker or Podman. An enabled runtime with no live process or container must remain visible as `stopped`; host-sandbox agents must not be classified as stopped merely because no OCI container exists.
 
-The Linux Bubblewrap backend must keep the selected project path separate from the persistent agent home. It must bind `.data/<agent-or-alias>/` read-write at `/root`, set `HOME=/root`, and use the alias when one identifies the enabled instance. Isolated mode must use `/root` for both the project mount and `WORKSPACE_PATH`; global and development modes must bind their selected project independently and keep `WORKSPACE_PATH` at that project path. Daemon startup and interactive CLI or shell attachment must use the same home and project mapping.
+The trusted Linux Bubblewrap coding-service profile binds the workspace read-write for the AgentServer and uses separate versioned `.data/<runtime-key>.sandbox-v2` state at `/home/agent` with `HOME=/home/agent`. Container mode preserves its established image, `/root` HOME, volume, RuntimeRelay, and lifecycle ABI. There is no `/root` shim or cross-mode state reader. Every actual provider process, including interactive CLI, runs inside the narrower provider Bubblewrap policy with only its selected workdir writable.
 
 Before Bubblewrap mounts the shared Agent runtime read-only at `/Agent`, Ploinky must stage a regenerated copy under `.ploinky/deps/bwrap-runtime/<agent-or-alias>/`. The staged copy must exclude source `Agent/node_modules` content and must contain an empty `node_modules` directory that exists before sandbox construction. The prepared dependency cache must then be mounted read-only at both `/code/node_modules` and `/Agent/node_modules`. Bubblewrap startup must not depend on modifying the installed Ploinky source tree to create this nested mount point.
 

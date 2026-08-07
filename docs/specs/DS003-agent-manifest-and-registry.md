@@ -30,7 +30,7 @@ The manifest surface may define startup commands, CLI commands, readiness hints,
 
 The optional `providesConfig` manifest field declares a startup config provider. It must contain a host-side `command` and an `outputs` allowlist whose entries name environment variables and their sensitivity. The optional `configProviders` field on a static or consumer manifest opts a profile into one or more provider agents. Profile-level `configProviders` replace the default profile list. Startup first prepares the recursive manifest repository graph without starting processes and resolves a planning graph from those manifests. It captures an early inactive targetless generation before static preinstall and provider preflight, then reloads the registry after providers, re-evaluates retained predecessor hashes, and captures the final inactive targetless generation before any graph process starts. Provider output therefore participates in first-launch env resolution without allowing a provider process to race dependency startup or reuse a stale predecessor identity tuple. See DS015 for the output schema, persistence rules, and security boundaries.
 
-The `ploinky cli <agent>` command path must remain generic: if the requested agent is not yet enabled, it resolves the manifest in workspace repositories and auto-enables the agent in global mode before starting/attaching to the runtime container. This allows direct operator intent to work without pre-enabling product-specific agents and keeps dependency resolution and branch policy aligned with standard manifest bootstrap semantics.
+The `ploinky cli <agent> --workdir <path> -- <provider-args>` path must remain generic: if the requested agent is not yet enabled, it resolves the manifest in workspace repositories and auto-enables the agent in global mode before starting/attaching to the runtime selected universally by `lite-sandbox`. The exact workdir is mandatory and provider arguments begin only after the separator.
 
 The managed public-entrypoint boundary is:
 
@@ -38,7 +38,7 @@ The managed public-entrypoint boundary is:
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
-| `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
+| `ploinky cli <agent> --workdir <path> -- <provider-args>` | Reconcile/start the selected runtime; attach its policy-constrained manifest CLI in the exact non-root workdir |
 | `ploinky start ...` | Reconcile/start outer runtime; start the selected graph behind the fixed box boundary |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |

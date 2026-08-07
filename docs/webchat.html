@@ -73,23 +73,23 @@ ploinky webchat --rotate # show the same login URL</code></pre>
 
                 <div class="doc-section">
                     <h2>How Commands Are Chosen</h2>
-                    <p>WebChat derives its runtime command from the static workspace agent:</p>
+                    <p>WebChat resolves a request-specific direct-CLI launch for the selected or static workspace agent:</p>
                     <ol>
                         <li><strong>Static agent</strong> – Configure one with <code>ploinky start &lt;agent&gt; &lt;port&gt;</code>. The router records the agent’s manifest path.</li>
-                        <li><strong>Manifest CLI</strong> – When the agent’s <code>manifest.json</code> defines a <code>cli</code> command, WebChat runs it inside the agent container.</li>
-                        <li><strong>No CLI?</strong> – Sessions still open, but the chat will display a notice that no command is bound.</li>
+                        <li><strong>Manifest capability</strong> – The agent’s <code>manifest.json</code> must define a <code>cli</code> command. Ploinky then launches its selected sandbox or container runtime through the canonical direct CLI path.</li>
+                        <li><strong>No CLI?</strong> – Runtime admission fails closed with a structured unavailable error; WebChat never executes the manifest command directly as a fallback.</li>
                     </ol>
-                    <p>This flow depends entirely on the static workspace agent: keep its manifest updated to control which CLI the chat session runs.</p>
+                    <p>The same selected-runtime and provider-policy boundary applies to the static default and explicit <code>?agent=</code> overrides.</p>
                 </div>
 
                 <div class="doc-section">
                     <h2>URL Parameters and CLI Arguments</h2>
-                    <p>WebChat accepts arbitrary query parameters in its URL. When an explicit <code>agent</code> query parameter is present, the router keeps the remaining query parameters attached to the WebChat session and forwards them to that agent's CLI command as long-form CLI flags encoded as single tokens.</p>
-                    <pre><code>/webchat?agent=achilles-cli&amp;path=/absolute/path
+                    <p>WebChat requires exactly one <code>workspace-dir</code> or <code>workspaceDir</code> selector naming an existing real non-root directory below the workspace. The router validates it before factory or process creation, then forwards ordinary query parameters to the selected agent as long-form provider flags encoded as single tokens.</p>
+                    <pre><code>/webchat?agent=achilles-cli&amp;workspace-dir=projects/demo&amp;model=o3
 
 # launches the selected agent as:
-ploinky cli achilles-cli --path=/absolute/path</code></pre>
-                    <p>The router reserves <code>agent</code> for agent selection and <code>tabId</code> for the browser client. These internal values are not forwarded as agent CLI flags. Agent CLIs remain responsible for interpreting ordinary forwarded flags and values.</p>
+ploinky cli achilles-cli --workdir projects/demo -- --dir=/workspace/projects/demo --model=o3</code></pre>
+                    <p>The router reserves <code>agent</code>, the workspace selector, <code>tabId</code>, <code>sessionId</code>, and <code>pageInstanceId</code>. These internal values are not forwarded as provider arguments or used to create a different runtime identity.</p>
                 </div>
 
                 <div class="doc-section">

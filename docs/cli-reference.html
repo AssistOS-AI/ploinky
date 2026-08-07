@@ -263,14 +263,14 @@ ploinky shell codexAgent</code></pre>
                         </div>
 
                         <h3>cli</h3>
-                        <p>Run the agent's CLI command interactively. The manifest command is launched through the WebChat wrapper for a consistent chat-enabled TTY.</p>
-                        <pre><code>cli &lt;agentName&gt; [args...]</code></pre>
+                        <p>Run the agent's CLI command interactively through the runtime selected by <code>lite-sandbox</code>. The workdir must be an existing real non-root directory below <code>/workspace</code>; Ploinky consumes it before the required separator and forwards every later argument unchanged.</p>
+                        <pre><code>cli &lt;agentName&gt; --workdir &lt;path&gt; -- [provider-args...]</code></pre>
                         <pre><code># Examples
-cli MyAPI --help
-cli PyBot --version
-ploinky cli codexAgent</code></pre>
+cli MyAPI --workdir projects/demo -- --help
+cli PyBot --workdir /workspace/projects/demo -- --version
+ploinky cli codexAgent --workdir projects/demo --</code></pre>
                         <div class="alert alert-info">
-                            Any extra arguments after <code>cli &lt;agentName&gt;</code> are appended directly to the manifest CLI command. For coding agents such as <code>codexAgent</code>, this lets you use the coding CLI inside the agent's containerized runtime instead of running it directly on the host.
+                            There is no legacy grammar or cwd inference. The selected sandbox or container backend is mandatory and launch failure does not fall back to the other runtime.
                         </div>
 
                         <h3>status</h3>
@@ -352,7 +352,7 @@ webchat --rotate     # accepted for compatibility; still uses router login</code
                         <div class="alert alert-info">
                             Access at: http://127.0.0.1:8080/webchat
                         </div>
-                        <p>When opening WebChat with an explicit agent selection such as <code>/webchat?agent=achilles-cli&amp;path=/absolute/path</code>, the router forwards every additional query parameter except its internal session parameters to <code>ploinky cli achilles-cli</code> as single-token long-form CLI arguments such as <code>--path=/absolute/path</code>.</p>
+                        <p>WebChat requires one workspace selection such as <code>/webchat?agent=achilles-cli&amp;workspace-dir=projects/demo</code>. The router validates that non-root directory and dispatches <code>ploinky cli achilles-cli --workdir projects/demo -- ...</code>. Ordinary query parameters after reserved agent/workspace/tab/session/page fields become single-token provider flags.</p>
 
                         <h4>Slash Command Autocomplete</h4>
                         <p>Inside WebChat, typing <code>/</code> opens a command suggestion menu populated from the agent's MCP tool catalog. Navigate with Arrow Up/Down, insert with Enter or Tab. The menu filters as you continue typing. If the agent exposes no MCP tools, the menu stays silent (no error).</p>
