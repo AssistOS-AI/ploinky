@@ -59,10 +59,115 @@ function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
                 runtime: { running, imageId: 'b'.repeat(64) },
             },
             volumes: {},
-            legacyVolumes: {},
         },
     };
 }
+
+test('destroying a running Box stops nested agents before the outer Box is removed', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const ownership = owned(identity, { running: true });
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: { run(command, args) { events.push(args.join(' ')); } },
+    });
+
+    await supervisor.runDestroyTransaction(ownership.handles.container.id);
+
+    const ordered = events.filter((value) => /ploinky-local|container stop|container rm/.test(value));
+    assert.equal(ordered.length, 3);
+    assert.match(ordered[0], /ploinky-local stop$/);
+    assert.match(ordered[1], /^container stop --time 30/);
+    assert.match(ordered[2], /^container rm -f --volumes/);
+});
+
+test('destroy revalidates the exact container after stopping it', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const before = owned(identity, { running: true });
+
+    // A replaced container between stop and remove must abort the removal.
+    const replacedRoot = path.join(state.root, 'replaced');
+    fs.mkdirSync(replacedRoot);
+    const replacedEvents = [];
+    const replaced = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(replacedRoot, replacedEvents),
+        discover: (() => {
+            let calls = 0;
+            return () => {
+                calls += 1;
+                return calls === 1 ? before : owned(identity, { id: 'c'.repeat(64) });
+            };
+        })(),
+        runner: { run(command, args) { replacedEvents.push(args.join(' ')); } },
+    });
+    await assert.rejects(
+        () => replaced.runDestroyTransaction(before.handles.container.id),
+        /Box changed while stopping; nothing was removed/,
+    );
+    assert.equal(replacedEvents.some((value) => value.includes('container rm')), false);
+
+    // An incidentally incompatible resource set must NOT block destroy: it is
+    // the documented recovery path.
+    const recoveryRoot = path.join(state.root, 'recovery');
+    fs.mkdirSync(recoveryRoot);
+    const recoveryEvents = [];
+    const recovery = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(recoveryRoot, recoveryEvents),
+        discover: (() => {
+            let calls = 0;
+            return () => {
+                calls += 1;
+                return calls === 1
+                    ? before
+                    : { ...owned(identity, { running: false }), state: 'incompatible' };
+            };
+        })(),
+        runner: { run(command, args) { recoveryEvents.push(args.join(' ')); } },
+    });
+    await recovery.runDestroyTransaction(before.handles.container.id);
+    assert.equal(recoveryEvents.some((value) => value.includes('container rm -f')), true);
+});
+
+test('a failed nested stop halts the Box but removes nothing', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const ownership = owned(identity, { running: true });
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: {
+            run(command, args) {
+                events.push(args.join(' '));
+                if (args.some((value) => String(value).endsWith('/ploinky-local'))) {
+                    throw new Error('inner stop refused');
+                }
+            },
+        },
+        destroyNamedVolumes() { throw new Error('volumes must survive a failed inner stop'); },
+    });
+
+    await assert.rejects(
+        () => supervisor.runDestroyTransaction(ownership.handles.container.id, {
+            deleteVolumes: true,
+        }),
+        /inner stop refused/,
+    );
+    // The outer Box is stopped so nothing mutates further, but it is retained.
+    assert.equal(events.some((value) => value.startsWith('container stop')), true);
+    assert.equal(events.some((value) => value.includes('container rm')), false);
+    assert.equal(events.some((value) => value.includes('volume rm')), false);
+});
 
 test('unsupported discovery happens before markerless anchor materialization', async (t) => {
     const state = fixture(t);
@@ -163,9 +268,6 @@ test('destructive volume reset removes the container before the locked owned-vol
     ownership.handles.volumes = Object.fromEntries(Object.entries(identity.volumes).map(
         ([key, name]) => [key, { name }],
     ));
-    ownership.handles.legacyVolumes = {
-        workspace: { name: identity.legacyVolumes.workspace },
-    };
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
@@ -174,12 +276,9 @@ test('destructive volume reset removes the container before the locked owned-vol
         destroyNamedVolumes(options) {
             options.lock.assertHeld(identity.instance);
             assert.equal(options.knownHandles, ownership.handles.volumes);
-            assert.equal(options.knownLegacyHandles, ownership.handles.legacyVolumes);
+            assert.equal(options.knownLegacyHandles, undefined);
             events.push('delete-named-volumes');
-            return Object.freeze([
-                ...Object.values(identity.volumes),
-                identity.legacyVolumes.workspace,
-            ]);
+            return Object.freeze(Object.values(identity.volumes));
         },
     });
     const result = await supervisor.runDestroyTransaction(
@@ -191,7 +290,6 @@ test('destructive volume reset removes the container before the locked owned-vol
     assert.ok(containerRemoval >= 0 && containerRemoval < volumeRemoval);
     assert.deepEqual(result.deletedVolumes, [
         ...Object.values(identity.volumes),
-        identity.legacyVolumes.workspace,
     ]);
 });
 
@@ -219,6 +317,39 @@ test('destructive volume reset works when only the complete retained set remains
     assert.equal(result.action, 'deleted-retained-volumes');
     assert.equal(events.some((value) => value.includes('container rm')), false);
     assert.equal(events.includes('delete-named-volumes'), true);
+});
+
+test('destructive volume reset recovers an exactly owned partial cache set', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const dependencies = { name: identity.volumes.dependencies };
+    const ownership = {
+        state: 'incompatible',
+        message: 'podman has only part of the expected Box resource set',
+        engine: { name: 'podman', identity: 'engine' },
+        handles: {
+            container: null,
+            volumes: { images: null, dependencies },
+        },
+    };
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: { run(command, args) { events.push(args.join(' ')); } },
+        destroyNamedVolumes(options) {
+            options.lock.assertHeld(identity.instance);
+            assert.deepEqual(options.knownHandles, ownership.handles.volumes);
+            events.push('delete-partial-volume-set');
+            return Object.freeze([identity.volumes.dependencies]);
+        },
+    });
+
+    const result = await supervisor.runDestroyTransaction(null, { deleteVolumes: true });
+    assert.deepEqual(result.deletedVolumes, [identity.volumes.dependencies]);
+    assert.equal(events.includes('delete-partial-volume-set'), true);
 });
 
 test('status and dry-run inspect without acquiring a lock or creating an anchor', (t) => {

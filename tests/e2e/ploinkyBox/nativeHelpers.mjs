@@ -13,6 +13,7 @@ import {
     inspectOwnedVolumeHandle,
     volumeHandleMatches,
 } from '../../../ploinky-box/engine/discovery.mjs';
+import { writeCandidatePodmanProxy } from './candidatePodmanProxy.mjs';
 
 const ABSENT_RESOURCE = /(?:no such|not found|does not exist|no volume with name)/i;
 
@@ -100,21 +101,19 @@ export async function cleanupNativeHarnessResources({
             if (captured.state === 'absent') {
                 return Object.freeze({ action: 'absent', removedContainerId: null, removedVolumes: [] });
             }
-            if (captured.state !== 'owned' || !captured.engine) {
+            if (!['owned', 'incompatible'].includes(captured.state) || !captured.engine) {
                 throw cleanupError(captured.message || `Native Box ownership is ${captured.state}`);
             }
             const engine = captured.engine;
             const container = captured.handles?.container || null;
-            const volumes = [
-                ...Object.entries(captured.handles?.volumes || {}),
-                ...Object.entries(captured.handles?.legacyVolumes || {}),
-            ].filter(([, handle]) => handle);
+            const volumes = Object.entries(captured.handles?.volumes || {})
+                .filter(([, handle]) => handle);
 
             if (container) {
                 assertSameWorkspaceIdentity(expectedIdentity, resolveIdentity());
                 lock.assertHeld(lockedIdentity.instance);
                 const current = discover(lockedIdentity);
-                if (current.state !== 'owned'
+                if (!['owned', 'incompatible'].includes(current.state)
                     || current.engine?.name !== engine.name
                     || current.engine?.identity !== engine.identity) {
                     throw cleanupError('Native Box engine or ownership changed before container removal');
@@ -186,9 +185,28 @@ export function createPodmanHarness(t, candidateReference, {
     const lockHome = path.join(root, 'lock-home');
     fs.mkdirSync(child, { recursive: true });
     fs.mkdirSync(lockHome);
+    const lookupRunner = createProcessRunner({
+        env: buildEngineProcessEnvironment(process.env),
+    });
+    const podmanLookup = lookupRunner.query('which', ['podman']);
+    assert.equal(podmanLookup.ok, true, podmanLookup.stderr);
+    const realPodmanInput = String(
+        process.env.PLOINKY_BOX_REAL_PODMAN || podmanLookup.stdout.trim(),
+    );
+    assert.equal(path.isAbsolute(realPodmanInput), true);
+    const realPodman = fs.realpathSync(realPodmanInput);
+    const candidateProxy = writeCandidatePodmanProxy({
+        directory: path.join(root, 'candidate-engine-proxy'),
+        realPodman,
+        candidateReference,
+        logicalReference: candidateReference,
+        localCandidate: true,
+        tracePath: path.join(root, 'candidate-engine-proxy.trace'),
+    });
     const environmentInput = {
         ...process.env,
         HOME: lockHome,
+        PATH: `${candidateProxy.directory}${path.delimiter}${process.env.PATH}`,
     };
     if (process.platform === 'darwin') {
         environmentInput.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME
@@ -240,6 +258,7 @@ export function createPodmanHarness(t, candidateReference, {
         identity,
         output,
         engineEnvironment,
+        candidateProxy,
         candidateReference,
         useParent() { launchDirectory = workspace; },
         useChild() { launchDirectory = child; },

@@ -94,7 +94,7 @@ function containerHandle({
                 { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
             ],
             mounts: [
-                { type: 'volume', name: identity.volumes.containers, source: '', destination: '/home/podman/.local/share/containers', rw: true },
+                { type: 'volume', name: identity.volumes.images, source: '', destination: '/home/podman/.local/share/ploinky-images', rw: true },
                 { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
                 { type: 'volume', name: identity.volumes.dependencies, source: '', destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: identity.workspaceRoot, destination: '/workspace', rw: true },
@@ -387,7 +387,7 @@ test('container validation rejects legacy workspace volumes and user-namespace d
         mount.destination === '/workspace'
             ? {
                 type: 'volume',
-                name: state.identity.legacyVolumes.workspace,
+                name: `${state.identity.instance}-workspace`,
                 source: '',
                 destination: '/workspace',
                 rw: true,

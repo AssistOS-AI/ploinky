@@ -90,7 +90,7 @@ reject_retained_managed_containers() {
         fail "cannot enumerate Ploinky-managed nested containers: ${managed_ids:-no diagnostic}"
     fi
     test -z "$managed_ids" || fail \
-        "retained Ploinky-managed nested containers were found; stop/remove them explicitly in the old box, destroy it, and recreate it"
+        "retained Ploinky-managed nested containers were found; nested container records live on the disposable Box graphroot, so retained records mean storage isolation failed unexpectedly rather than a normal leftover. Inspect the storage configuration before recreating this box"
 }
 
 require_managed_network_stack() {

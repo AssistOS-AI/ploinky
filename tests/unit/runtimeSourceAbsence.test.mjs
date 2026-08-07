@@ -169,21 +169,20 @@ test('retired Box version detection is case-insensitive', () => {
     }
 });
 
-test('outer supervisor contains no automatic replacement or rollback transaction', () => {
-    const source = fs.readFileSync(
-        path.join(repositoryRoot, 'container', 'runtime-supervisor.mjs'),
-        'utf8',
-    );
-    const forbidden = [
-        'replaceRuntimeTransaction',
-        ['-roll', 'back-'].join(''),
-        ['previous runtime ', 'restored'].join(''),
-        "['rename', existing.instance",
+test('retired outer runtime implementation is absent', () => {
+    const retired = [
+        'container/runtime-contract.mjs',
+        'container/runtime-engine.mjs',
+        'container/runtime-supervisor.mjs',
+        'container/runtime-supervisor-tests.mjs',
+        'container/smoke-runtime.mjs',
+        'tests/helpers/runtimeSupervisorHarness.mjs',
+        'tests/unit/runtimeSupervisor.test.mjs',
+        'tests/unit/smokeFullGraphPrerequisites.test.mjs',
     ];
-    assert.deepEqual(
-        forbidden.filter(token => source.includes(token)),
-        [],
-    );
+    assert.deepEqual(retired.filter(relativePath => (
+        fs.existsSync(path.join(repositoryRoot, relativePath))
+    )), []);
 });
 
 test('coordinated edge apply has no missing-source fallback', () => {

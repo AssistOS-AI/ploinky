@@ -177,4 +177,24 @@ test('generated candidate proxy embeds one digest outside the repository and wri
     assert.deepEqual(readProxyTrace(tracePath).at(-1), [
         'reject', 'pull', 'docker.io/attacker/image:latest',
     ]);
+
+    const localDirectory = path.join(root, 'local-proxy');
+    const localTracePath = path.join(root, 'local-trace.bin');
+    const localProxy = writeCandidatePodmanProxy({
+        directory: localDirectory,
+        realPodman,
+        candidateReference,
+        localCandidate: true,
+        tracePath: localTracePath,
+    });
+    const localPull = spawnSync(localProxy.podman, ['pull', logical], { encoding: 'utf8' });
+    assert.equal(localPull.status, 0, localPull.stderr);
+    assert.deepEqual(fs.readFileSync(delegated, 'utf8').trim().split('\n'), [
+        'image', 'inspect', candidateReference,
+    ]);
+    assert.deepEqual(readProxyTrace(localTracePath), [
+        ['argv', 'pull', logical],
+        ['local-candidate', candidateReference],
+        ['rewrite', logical, candidateReference],
+    ]);
 });

@@ -41,7 +41,13 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
                             [BOX_LABELS.mediaHostPort]: String(prepared.mediaHostPort),
                         },
                     } : null,
-                    volumes: {},
+                    volumes: {
+                        images: { kind: 'volume', name: 'ploinky-box-workspace-123456789abc-images' },
+                        dependencies: {
+                            kind: 'volume',
+                            name: 'ploinky-box-workspace-123456789abc-ploinky-deps',
+                        },
+                    },
                 },
             }
             : { state: statusState, handles: null },

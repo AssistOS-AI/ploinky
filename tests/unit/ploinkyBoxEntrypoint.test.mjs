@@ -9,6 +9,7 @@ import { NETWORK_SCHEMA_VERSION } from '../../cli/sandbox/networkContract.js';
 import {
     BOX_MARKER_CONTENT,
     BOX_READY_LINE,
+    BOX_RUNTIME_UID,
 } from '../../ploinky-box/constants.mjs';
 import {
     entrypointPaths,
@@ -31,7 +32,8 @@ function fixture(t) {
         path.dirname(paths.marker),
         paths.workspace,
         paths.dependencies,
-        paths.nestedStore,
+        paths.imageStore,
+        paths.graphRoot,
         path.dirname(paths.ploinky),
         paths.tmp,
     ]) fs.mkdirSync(directory, { recursive: true });
@@ -40,18 +42,49 @@ function fixture(t) {
     return { root, paths };
 }
 
+// Shaped from real `podman info --format json` output captured against the
+// pinned Podman 5.8.2 Box image; see
+// tests/fixtures/ploinky-box/podman-info-storage-5.8.2.json.
+function podmanStorageInfo(paths, overrides = {}) {
+    return {
+        store: {
+            configFile: paths.storageConf,
+            graphDriverName: 'overlay',
+            graphRoot: paths.graphRoot,
+            runRoot: paths.storageRunRoot,
+            volumePath: path.join(paths.graphRoot, 'volumes'),
+            imageCopyTmpDir: '/var/tmp',
+            imageStore: { number: 0 },
+            transientStore: true,
+            ...overrides,
+        },
+    };
+}
+
 function routeRunner({
     routes = [{ dst: '198.51.100.1', prefsrc: '10.88.0.17', dev: 'eth0' }],
     addresses = [{
         ifname: 'eth0',
         addr_info: [{ family: 'inet', local: '10.88.0.17', prefixlen: 16 }],
     }],
+    paths = null,
+    storeOverrides = {},
 } = {}) {
     const calls = [];
     return {
         calls,
         query(command, args) {
             calls.push([command, ...args]);
+            if (command === 'podman' && args[0] === 'info') {
+                if (!paths) throw new Error('Unexpected podman info query');
+                // Real Podman lays the image store out on first contact.
+                fs.mkdirSync(path.join(paths.imageStore, 'overlay-images'), { recursive: true });
+                return {
+                    ok: true,
+                    stdout: JSON.stringify(podmanStorageInfo(paths, storeOverrides)),
+                    stderr: '',
+                };
+            }
             if (args[2] === 'route') {
                 return { ok: true, stdout: JSON.stringify(routes), stderr: '' };
             }
@@ -170,21 +203,23 @@ test('entrypoint validates its marker and mounts before its first persistent wri
 
 test('full preparation creates one stable key, resets only transient runtime, and initializes pins', (t) => {
     const { root, paths } = fixture(t);
-    const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+    // Keyed to the Box runtime UID, not the live process UID, so the reset that
+    // is proven here is the exact runroot storage.conf configures.
     const transient = [
-        path.join(paths.tmp, `storage-run-${uid}`),
-        path.join(paths.tmp, `podman-run-${uid}`),
+        paths.storageRunRoot,
+        path.join(paths.tmp, `podman-run-${BOX_RUNTIME_UID}`),
     ];
+    assert.equal(transient[0], path.join(paths.tmp, `storage-run-${BOX_RUNTIME_UID}`));
     for (const directory of transient) {
         fs.mkdirSync(directory, { recursive: true });
         fs.writeFileSync(path.join(directory, 'stale'), 'stale');
     }
-    const persistent = path.join(paths.nestedStore, 'persistent-canary');
+    const persistent = path.join(paths.imageStore, 'persistent-canary');
     fs.writeFileSync(persistent, 'retain');
     const events = [];
     const options = {
         root,
-        runner: routeRunner(),
+        runner: routeRunner({ paths }),
         installDependencies({ targetRoot, markerPath }) {
             events.push('install');
             assert.equal(targetRoot, paths.dependencies);
@@ -204,6 +239,19 @@ test('full preparation creates one stable key, resets only transient runtime, an
     assert.deepEqual(events, ['install']);
     assert.equal(transient.some((target) => fs.existsSync(target)), false);
     assert.equal(fs.readFileSync(persistent, 'utf8'), 'retain');
+    assert.equal(fs.readFileSync(paths.storageConf, 'utf8'), [
+        '[storage]',
+        'driver = "overlay"',
+        `graphroot = "${paths.graphRoot}"`,
+        `runroot = "${paths.storageRunRoot}"`,
+        `imagestore = "${paths.imageStore}"`,
+        'transient_store = true',
+        '',
+        '[storage.options.overlay]',
+        'mount_program = "/usr/bin/fuse-overlayfs"',
+        '',
+    ].join('\n'));
+    assert.equal(mode(paths.storageConf), 0o600);
 
     prepareEntrypoint(options);
     assert.deepEqual(fs.readFileSync(keyPath), keyBytes);
@@ -224,15 +272,21 @@ test('ready line is emitted exactly once and only after every required stage', (
             events.push('transport');
             return { address: '10.88.0.17', interface: 'eth0' };
         },
+        configureStorage() {
+            events.push('storage');
+            return { storageConf: '/home/podman/.config/containers/storage.conf' };
+        },
         resetRuntime() { events.push('reset'); },
         retireContainers() { events.push('retire-containers'); },
         installDependencies() { events.push('dependencies'); },
         selfCheck() { events.push('self-check'); },
         output,
     });
+    // Storage configuration must precede every stage that can reach inner
+    // Podman, and the transient runroot is reset before it is configured.
     assert.deepEqual(events, [
-        'initialize', 'transport', 'reset', 'retire-containers', 'dependencies', 'self-check',
-        `output:${BOX_READY_LINE}`,
+        'reset', 'storage', 'initialize', 'transport', 'retire-containers', 'dependencies',
+        'self-check', `output:${BOX_READY_LINE}`,
     ]);
 });
 

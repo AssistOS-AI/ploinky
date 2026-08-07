@@ -8,11 +8,13 @@ import { NETWORK_SCHEMA_VERSION } from '../../cli/sandbox/networkContract.js';
 import {
     BOX_MARKER_CONTENT,
     BOX_READY_LINE,
+    BOX_RUNTIME_UID,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
 import { initializeWorkspaceMasterKey } from './initialize-workspace.mjs';
 import { installPinnedDependencies } from './install-dependencies.mjs';
+import { configureBoxStorage } from './storage.mjs';
 import { configureBoxTransport } from './transport.mjs';
 
 function entrypointError(message, cause) {
@@ -53,7 +55,10 @@ export function entrypointPaths(root = '/') {
         workspace: rooted(root, '/workspace'),
         dependencies: rooted(root, '/opt/ploinky/node_modules'),
         ploinky: rooted(root, '/opt/ploinky/bin/ploinky'),
-        nestedStore: rooted(root, '/home/podman/.local/share/containers'),
+        imageStore: rooted(root, '/home/podman/.local/share/ploinky-images'),
+        graphRoot: rooted(root, '/home/podman/.local/share/containers/storage'),
+        storageRunRoot: rooted(root, `/tmp/storage-run-${BOX_RUNTIME_UID}`),
+        storageConf: rooted(root, '/home/podman/.config/containers/storage.conf'),
         transport: rooted(root, '/run/ploinky/box-transport.json'),
         containersConf: rooted(root, '/home/podman/.config/containers/containers.conf'),
         tmp: rooted(root, '/tmp'),
@@ -249,7 +254,8 @@ export function validateEntrypointMounts(paths, fsApi = fs) {
     try {
         assertDirectory(paths.workspace, { writable: true }, fsApi);
         assertDirectory(paths.dependencies, { writable: true }, fsApi);
-        assertDirectory(paths.nestedStore, { writable: true }, fsApi);
+        assertDirectory(paths.imageStore, { writable: true }, fsApi);
+        assertDirectory(paths.graphRoot, { writable: true }, fsApi);
         const source = fsApi.lstatSync(paths.ploinky);
         if (source.isSymbolicLink() || !source.isFile()) {
             throw entrypointError(`Ploinky source entrypoint is not a regular file: ${paths.ploinky}`);
@@ -261,9 +267,12 @@ export function validateEntrypointMounts(paths, fsApi = fs) {
     }
 }
 
+// Keyed to the Box runtime UID rather than the live process UID so the reset
+// always covers the exact runroot that storage.conf configures. The two are
+// identical inside the Box; deriving both from one constant keeps them so.
 export function resetTransientNestedRuntime(paths, {
     fsApi = fs,
-    uid = typeof process.getuid === 'function' ? process.getuid() : 0,
+    uid = BOX_RUNTIME_UID,
 } = {}) {
     for (const name of [`storage-run-${uid}`, `podman-run-${uid}`]) {
         const target = path.join(paths.tmp, name);
@@ -277,14 +286,29 @@ export function prepareEntrypoint({
     runner = createProcessRunner(),
     initialize = initializeWorkspaceMasterKey,
     configureTransport = configureBoxTransport,
+    configureStorage = configureBoxStorage,
     resetRuntime = resetTransientNestedRuntime,
     retireContainers = retireStoppedManagedContainers,
     installDependencies = installPinnedDependencies,
     transportOptions = {},
+    storageOptions = {},
 } = {}) {
     const paths = entrypointPaths(root);
     verifyEntrypointMarker(paths.marker, fsApi);
     validateEntrypointMounts(paths, fsApi);
+    resetRuntime(paths, { fsApi });
+    // Nothing may initialize or query the inner Podman store before its
+    // configuration exists, or Podman would adopt the inherited defaults and
+    // persist nested container state into the image cache.
+    const storage = configureStorage({
+        runner,
+        storageConf: paths.storageConf,
+        graphRoot: paths.graphRoot,
+        runRoot: paths.storageRunRoot,
+        imageStore: paths.imageStore,
+        fsApi,
+        ...storageOptions,
+    });
     initialize({ workspaceRoot: paths.workspace, fsApi });
     const transport = configureTransport({
         runner,
@@ -293,7 +317,6 @@ export function prepareEntrypoint({
         fsApi,
         ...transportOptions,
     });
-    resetRuntime(paths, { fsApi });
     retireContainers(paths, { fsApi, runner });
     installDependencies({
         targetRoot: paths.dependencies,
@@ -301,7 +324,7 @@ export function prepareEntrypoint({
         fsApi,
         runner,
     });
-    return Object.freeze({ paths, transport });
+    return Object.freeze({ paths, storage, transport });
 }
 
 export function runEntrypoint({

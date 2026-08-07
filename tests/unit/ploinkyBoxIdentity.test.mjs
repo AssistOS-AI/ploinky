@@ -84,10 +84,16 @@ test('markerless resolution is read-only and produces opaque deterministic names
     assert.match(identity.instance, /^ploinky-box-a-secret-workspace-[a-f0-9]{12}$/);
     assert.equal(identity.pathHash, workspacePathHash(workspace));
     assert.equal(identity.instance.includes(root), false);
-    assert.deepEqual(Object.keys(identity.volumes), ['containers', 'dependencies']);
-    assert.deepEqual(identity.legacyVolumes, {
-        workspace: `${identity.instance}-workspace`,
+    assert.deepEqual(identity.volumes, {
+        images: `${identity.instance}-images`,
+        dependencies: `${identity.instance}-ploinky-deps`,
     });
+    // Versionless semantic identity: the storage split adds no generation or
+    // schema suffix to any public volume name.
+    for (const name of Object.values(identity.volumes)) {
+        assert.doesNotMatch(name, /-v[0-9]+$|-gen[0-9]*$/);
+    }
+    assert.equal(identity.legacyVolumes, undefined);
 });
 
 test('invalid explicit roots and symlink strings retain current resolver semantics', (t) => {

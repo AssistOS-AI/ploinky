@@ -30,21 +30,11 @@ export const BOX_ROLES = Object.freeze({
     container: 'box',
     images: 'images',
     dependencies: 'ploinky-deps',
-    // Historical roles. Their exact label values must never change: existing
-    // volumes carry them, and exact-label matching is how an explicitly
-    // destroyed Box still recognizes and removes its own old resources.
-    containers: 'containers',
-    workspace: 'workspace',
 });
 
 export const BOX_VOLUME_KEYS = Object.freeze([
     'images',
     'dependencies',
-]);
-
-export const BOX_LEGACY_VOLUME_KEYS = Object.freeze([
-    'containers',
-    'workspace',
 ]);
 
 export const BOX_RUNTIME_UID = 1000;

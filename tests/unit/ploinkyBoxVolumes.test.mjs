@@ -22,10 +22,10 @@ function setup(t) {
     const identity = buildWorkspaceIdentity(root, { markerFound: true });
     const records = new Map();
     const calls = [];
+    const failRemovals = new Set();
     let counter = 0;
     const roles = {
-        workspace: BOX_ROLES.workspace,
-        containers: BOX_ROLES.containers,
+        images: BOX_ROLES.images,
         dependencies: BOX_ROLES.dependencies,
     };
     const runner = {
@@ -55,29 +55,40 @@ function setup(t) {
                     },
                 });
             } else if (args[0] === 'volume' && args[1] === 'rm') {
+                if (failRemovals.has(args[2])) {
+                    throw new Error(`injected removal failure for ${args[2]}`);
+                }
                 records.delete(args[2]);
             }
         },
     };
     const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
-    return { identity, records, calls, runner, lock };
+    return { identity, records, calls, failRemovals, runner, lock };
 }
 
-test('volume create and mount arguments cover only nested storage and dependencies', (t) => {
+test('volume create and mount arguments cover only the image cache and dependencies', (t) => {
     const { identity } = setup(t);
-    const args = volumeCreateArgs(identity, 'containers');
+    const args = volumeCreateArgs(identity, 'images');
     assert.deepEqual(args, [
         'volume', 'create',
         '--label', `${BOX_LABELS.pathHash}=${identity.pathHash}`,
-        '--label', `${BOX_LABELS.role}=containers`,
-        identity.volumes.containers,
+        '--label', `${BOX_LABELS.role}=images`,
+        identity.volumes.images,
     ]);
     assert.equal(args.some((value) => value.includes('image-ref') || value.includes('host-port')), false);
-    assert.deepEqual(volumeMountArgs(identity), [
-        '--volume', `${identity.volumes.containers}:/home/podman/.local/share/containers:U`,
+    const mounts = volumeMountArgs(identity);
+    assert.deepEqual(mounts, [
+        '--volume', `${identity.volumes.images}:/home/podman/.local/share/ploinky-images:U`,
         '--volume', `${identity.volumes.dependencies}:/opt/ploinky/node_modules:U`,
     ]);
-    assert.throws(() => volumeCreateArgs(identity, 'workspace'), /Unknown Box volume key/);
+    // The broad inner Podman store must never be a named volume again.
+    assert.equal(
+        mounts.some((value) => /:\/home\/podman\/\.local\/share\/containers:/.test(value)),
+        false,
+    );
+    for (const retired of ['containers', 'workspace']) {
+        assert.throws(() => volumeCreateArgs(identity, retired), /Unknown Box volume key/);
+    }
 });
 
 test('exactly two volumes are created before the caller can create a container', (t) => {
@@ -89,7 +100,7 @@ test('exactly two volumes are created before the caller can create a container',
         lock: state.lock,
     });
     assert.equal(result.created.length, 2);
-    assert.deepEqual(result.created.map(({ key }) => key), ['containers', 'dependencies']);
+    assert.deepEqual(result.created.map(({ key }) => key), ['images', 'dependencies']);
     assert.equal(state.calls.some((call) => call.includes('container')), false);
 });
 
@@ -121,16 +132,16 @@ test('same-name recreation is caught before attach or removal', (t) => {
         runner: state.runner,
         lock: state.lock,
     });
-    const containers = state.records.get(state.identity.volumes.containers);
-    state.records.set(state.identity.volumes.containers, {
-        ...containers,
+    const images = state.records.get(state.identity.volumes.images);
+    state.records.set(state.identity.volumes.images, {
+        ...images,
         CreatedAt: '2026-07-22T00:00:00Z',
         Mountpoint: '/private/recreated',
     });
-    assert.throws(() => revalidateVolumeHandle(first.handles.containers, {
+    assert.throws(() => revalidateVolumeHandle(first.handles.images, {
         engine: { name: 'podman', identity: 'engine-one' },
         identity: state.identity,
-        key: 'containers',
+        key: 'images',
         runner: state.runner,
         lock: state.lock,
     }), /changed before mutation/);
@@ -143,13 +154,13 @@ test('same-name recreation is caught before attach or removal', (t) => {
         created: first.created,
     }), /rollback failed/);
     assert.equal(state.calls.filter((call) => call[0] === 'run').length, runCount + 1);
-    assert.equal(state.records.has(state.identity.volumes.containers), true);
+    assert.equal(state.records.has(state.identity.volumes.images), true);
 });
 
 test('foreign exact-name volumes cause zero volume mutation', (t) => {
     const state = setup(t);
-    state.records.set(state.identity.volumes.containers, {
-        Name: state.identity.volumes.containers,
+    state.records.set(state.identity.volumes.images, {
+        Name: state.identity.volumes.images,
         Driver: 'local', Scope: 'local', Options: {},
         CreatedAt: '2026-07-21T00:00:00Z', Mountpoint: '/secret/mount', Labels: {},
     });
@@ -187,7 +198,7 @@ test('owned named volumes are revalidated as a complete set before exact-name de
     );
 });
 
-test('changed or incomplete named-volume sets fail before any deletion', (t) => {
+test('changed named-volume handles fail before any deletion', (t) => {
     const state = setup(t);
     const created = ensureNamedVolumes({
         engine: { name: 'podman', identity: 'engine-one' },
@@ -196,9 +207,9 @@ test('changed or incomplete named-volume sets fail before any deletion', (t) => 
         lock: state.lock,
     });
     state.calls.length = 0;
-    const containers = state.records.get(state.identity.volumes.containers);
-    state.records.set(state.identity.volumes.containers, {
-        ...containers,
+    const images = state.records.get(state.identity.volumes.images);
+    state.records.set(state.identity.volumes.images, {
+        ...images,
         CreatedAt: '2026-07-22T00:00:00Z',
     });
     assert.throws(() => removeOwnedNamedVolumes({
@@ -210,17 +221,9 @@ test('changed or incomplete named-volume sets fail before any deletion', (t) => 
     }), /changed before mutation/);
     assert.equal(state.calls.some((call) => call[0] === 'run'), false);
 
-    assert.throws(() => removeOwnedNamedVolumes({
-        engine: { name: 'podman', identity: 'engine-one' },
-        identity: state.identity,
-        runner: state.runner,
-        lock: state.lock,
-        knownHandles: { containers: created.handles.containers },
-    }), /incomplete named-volume set/);
-    assert.equal(state.calls.some((call) => call[0] === 'run'), false);
 });
 
-test('an explicitly requested reset also removes an exactly owned legacy workspace volume', (t) => {
+test('an explicit reset removes an exactly owned partial volume set', (t) => {
     const state = setup(t);
     const created = ensureNamedVolumes({
         engine: { name: 'podman', identity: 'engine-one' },
@@ -228,25 +231,61 @@ test('an explicitly requested reset also removes an exactly owned legacy workspa
         runner: state.runner,
         lock: state.lock,
     });
-    state.records.set(state.identity.legacyVolumes.workspace, {
-        Name: state.identity.legacyVolumes.workspace,
-        Driver: 'local',
-        Scope: 'local',
-        Options: {},
-        CreatedAt: '2026-07-20T00:00:00Z',
-        Mountpoint: '/private/legacy-workspace',
-        Labels: {
-            [BOX_LABELS.pathHash]: state.identity.pathHash,
-            [BOX_LABELS.role]: BOX_ROLES.workspace,
-        },
+    state.records.delete(state.identity.volumes.images);
+    state.calls.length = 0;
+
+    const deleted = removeOwnedNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+        knownHandles: { dependencies: created.handles.dependencies },
     });
-    const legacy = inspectOwnedVolumeHandle(
-        { name: 'podman', identity: 'engine-one' },
-        state.identity,
-        'workspace',
-        state.runner,
-    );
-    assert.equal(legacy.state, 'owned');
+
+    assert.deepEqual(deleted, [state.identity.volumes.dependencies]);
+    assert.equal(state.records.size, 0);
+});
+
+test('a failed multi-volume reset can be retried with the remaining owned volume', (t) => {
+    const state = setup(t);
+    const created = ensureNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+    });
+    state.failRemovals.add(state.identity.volumes.dependencies);
+
+    assert.throws(() => removeOwnedNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+        knownHandles: created.handles,
+    }), /injected removal failure/);
+    assert.equal(state.records.has(state.identity.volumes.images), false);
+    assert.equal(state.records.has(state.identity.volumes.dependencies), true);
+
+    state.failRemovals.clear();
+    const deleted = removeOwnedNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+        knownHandles: { dependencies: created.handles.dependencies },
+    });
+    assert.deepEqual(deleted, [state.identity.volumes.dependencies]);
+    assert.equal(state.records.size, 0);
+});
+
+test('an explicitly requested reset removes exactly the owned cache volumes', (t) => {
+    const state = setup(t);
+    const created = ensureNamedVolumes({
+        engine: { name: 'podman', identity: 'engine-one' },
+        identity: state.identity,
+        runner: state.runner,
+        lock: state.lock,
+    });
     state.calls.length = 0;
 
     const deleted = removeOwnedNamedVolumes({
@@ -255,12 +294,21 @@ test('an explicitly requested reset also removes an exactly owned legacy workspa
         runner: state.runner,
         lock: state.lock,
         knownHandles: created.handles,
-        knownLegacyHandles: { workspace: legacy.handle },
     });
 
-    assert.deepEqual(deleted, [
-        ...Object.values(state.identity.volumes),
-        state.identity.legacyVolumes.workspace,
-    ]);
+    assert.deepEqual(deleted, Object.values(state.identity.volumes));
     assert.equal(state.records.size, 0);
+});
+
+test('retired storage and workspace volumes are no longer inspectable roles', (t) => {
+    const state = setup(t);
+    for (const retired of ['containers', 'workspace']) {
+        assert.throws(() => inspectOwnedVolumeHandle(
+            { name: 'podman', identity: 'engine-one' },
+            state.identity,
+            retired,
+            state.runner,
+        ), /Unknown Box volume role/);
+    }
+    assert.equal(state.identity.legacyVolumes, undefined);
 });

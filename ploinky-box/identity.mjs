@@ -78,11 +78,8 @@ export function buildWorkspaceIdentity(workspaceRoot, {
         instance,
         anchorPath: path.join(selectedRoot, '.ploinky'),
         volumes: Object.freeze({
-            containers: `${instance}-containers`,
+            images: `${instance}-images`,
             dependencies: `${instance}-ploinky-deps`,
-        }),
-        legacyVolumes: Object.freeze({
-            workspace: `${instance}-workspace`,
         }),
         rootFingerprint: Object.freeze(captureRootFingerprint(
             selectedRoot,

@@ -36,7 +36,6 @@ function owned(identity, { running = true } = {}) {
                 runtime: { running },
             },
             volumes: {},
-            legacyVolumes: {},
         },
     };
 }
@@ -260,11 +259,8 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         pathHash: '123456789abc',
         workspaceRoot: '/private/workspace',
         volumes: {
-            containers: 'ploinky-box-workspace-123456789abc-containers',
+            images: 'ploinky-box-workspace-123456789abc-images',
             dependencies: 'ploinky-box-workspace-123456789abc-ploinky-deps',
-        },
-        legacyVolumes: {
-            workspace: 'ploinky-box-workspace-123456789abc-workspace',
         },
     });
     const createArgs = containerCreateArgs({

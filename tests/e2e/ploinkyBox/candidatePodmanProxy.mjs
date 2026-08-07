@@ -13,6 +13,7 @@ export function writeCandidatePodmanProxy({
     realPodman,
     candidateReference,
     logicalReference = BOX_IMAGE_REFERENCE,
+    localCandidate = false,
     tracePath,
     fsApi = fs,
 } = {}) {
@@ -25,6 +26,9 @@ export function writeCandidatePodmanProxy({
     if (typeof logicalReference !== 'string' || !logicalReference || /\s/u.test(logicalReference)) {
         throw proxyError('Candidate proxy requires one logical Ploinky Box image reference');
     }
+    if (typeof localCandidate !== 'boolean') {
+        throw proxyError('Candidate proxy local-candidate mode must be boolean');
+    }
     const podman = path.join(directory, 'podman');
     fsApi.mkdirSync(directory, { recursive: false, mode: 0o700 });
     fsApi.chmodSync(directory, 0o700);
@@ -34,6 +38,7 @@ const child = require('node:child_process');
 const real = ${JSON.stringify(realPodman)};
 const logical = ${JSON.stringify(logicalReference)};
 const candidate = ${JSON.stringify(candidateReference)};
+const localCandidate = ${JSON.stringify(localCandidate)};
 const trace = ${JSON.stringify(tracePath)};
 const original = process.argv.slice(2);
 const append = (record) => fs.appendFileSync(trace, Buffer.from(record.join('\\0') + '\\0\\0'));
@@ -51,7 +56,10 @@ if (!allowedPull && !allowedInspect && !allowedImmutableInspect && unsupportedIm
     process.stderr.write('candidate proxy rejected unsupported image-bearing Podman argv\\n');
     process.exit(64);
 }
-if (allowedPull) args[1] = candidate;
+if (allowedPull && localCandidate) {
+    args.splice(0, args.length, 'image', 'inspect', candidate);
+    append(['local-candidate', candidate]);
+} else if (allowedPull) args[1] = candidate;
 if (allowedInspect) args[2] = candidate;
 if (allowedPull || allowedInspect) append(['rewrite', logical, candidate]);
 const result = child.spawnSync(real, args, { stdio: 'inherit', env: process.env });
@@ -61,7 +69,13 @@ process.exit(1);
 `;
     fsApi.writeFileSync(podman, source, { flag: 'wx', mode: 0o700 });
     fsApi.chmodSync(podman, 0o700);
-    return Object.freeze({ directory, podman, tracePath, candidateReference });
+    return Object.freeze({
+        directory,
+        podman,
+        tracePath,
+        candidateReference,
+        localCandidate,
+    });
 }
 
 export function readProxyTrace(tracePath, fsApi = fs) {

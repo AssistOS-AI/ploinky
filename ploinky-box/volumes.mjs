@@ -1,5 +1,4 @@
 import {
-    BOX_LEGACY_VOLUME_KEYS,
     BOX_LABELS,
     BOX_ROLES,
     BOX_VOLUME_KEYS,
@@ -11,12 +10,12 @@ import {
 } from './engine/discovery.mjs';
 
 export const BOX_VOLUME_MOUNTS = Object.freeze({
-    containers: '/home/podman/.local/share/containers',
+    images: '/home/podman/.local/share/ploinky-images',
     dependencies: '/opt/ploinky/node_modules',
 });
 
 const ROLE_BY_KEY = Object.freeze({
-    containers: BOX_ROLES.containers,
+    images: BOX_ROLES.images,
     dependencies: BOX_ROLES.dependencies,
 });
 
@@ -25,7 +24,7 @@ function volumeError(message, code = 'PLOINKY_BOX_VOLUME_FAILED') {
 }
 
 function volumeName(identity, key) {
-    return identity.volumes[key] || identity.legacyVolumes?.[key] || '';
+    return identity.volumes[key] || '';
 }
 
 export function volumeCreateArgs(identity, key) {
@@ -164,41 +163,29 @@ export function removeOwnedNamedVolumes({
     runner,
     lock,
     knownHandles,
-    knownLegacyHandles = {},
 }) {
     assertLock(lock, identity);
     const handles = {};
-    const legacyHandles = {};
-    const presentKeys = BOX_VOLUME_KEYS.filter((key) => Boolean(knownHandles?.[key]));
-    if (presentKeys.length !== 0 && presentKeys.length !== BOX_VOLUME_KEYS.length) {
-        throw volumeError(
-            `Cannot delete an incomplete named-volume set for Box ${identity.instance}`,
-            'PLOINKY_BOX_VOLUME_SET_INCOMPLETE',
-        );
-    }
     for (const key of BOX_VOLUME_KEYS) {
-        if (!knownHandles?.[key]) continue;
-        handles[key] = revalidateVolumeHandle(knownHandles[key], {
-            engine, identity, key, runner, lock,
-        });
-    }
-    for (const key of BOX_LEGACY_VOLUME_KEYS) {
-        if (!knownLegacyHandles?.[key]) continue;
-        legacyHandles[key] = revalidateVolumeHandle(knownLegacyHandles[key], {
-            engine, identity, key, runner, lock,
-        });
-    }
-    if (Object.keys(handles).length === 0 && Object.keys(legacyHandles).length === 0) {
-        throw volumeError(
-            `Cannot delete an empty named-volume set for Box ${identity.instance}`,
-            'PLOINKY_BOX_VOLUME_SET_INCOMPLETE',
-        );
+        const known = knownHandles?.[key];
+        if (known) {
+            handles[key] = revalidateVolumeHandle(known, {
+                engine, identity, key, runner, lock,
+            });
+            continue;
+        }
+        const current = inspectOwnedVolumeHandle(engine, identity, key, runner);
+        if (current.state !== 'absent') {
+            throw volumeError(
+                `Named volume ${volumeName(identity, key)} changed before mutation`,
+                'PLOINKY_BOX_VOLUME_CHANGED',
+            );
+        }
     }
 
-    const ordered = [
-        ...BOX_VOLUME_KEYS.map((key) => [key, handles[key]]),
-        ...BOX_LEGACY_VOLUME_KEYS.map((key) => [key, legacyHandles[key]]),
-    ].filter(([, handle]) => Boolean(handle));
+    const ordered = BOX_VOLUME_KEYS
+        .filter((key) => Boolean(handles[key]))
+        .map((key) => [key, handles[key]]);
     for (const [key, recordedHandle] of ordered) {
         const handle = revalidateVolumeHandle(recordedHandle, {
             engine, identity, key, runner, lock,

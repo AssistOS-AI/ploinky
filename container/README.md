@@ -37,8 +37,8 @@ outer runtime.
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
-| `ploinky destroy` | Confirm exact instance and directly remove its outer container; retain all named volumes |
-| `ploinky destroy --delete-volumes` | Directly remove the exact outer container and its three owned named volumes without prompting |
+| `ploinky destroy` | Stop nested agents, confirm exact instance, and remove its outer container; retain its named cache volumes |
+| `ploinky destroy --delete-volumes` | Remove the exact outer container and its two owned named volumes without prompting |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
 Host lifecycle commands and same-named REPL commands intentionally have
@@ -58,9 +58,9 @@ assistos/ploinky-box
 
 The configuration also requires user `podman`, working directory `/workspace`, the
 `/usr/local/bin/ploinky-box-entrypoint` entrypoint, the exact runtime
-environment validated by `runtime-contract.mjs`, and no default command or
-image-declared volumes. The image is source-free; the selected Ploinky checkout
-is mounted read-only at `/opt/ploinky`.
+environment validated by `ploinky-box/contract/image.mjs`, and no default
+command or image-declared volumes. The image is source-free; the selected
+Ploinky checkout is mounted read-only at `/opt/ploinky`.
 
 Creating a missing box unconditionally pulls the selected reference, validates
 its complete configuration, resolves its local image ID, and creates the box from
@@ -69,7 +69,7 @@ Pull failure never falls back to a cached tag. A running compatible box is
 reused, and a stopped compatible box is started, without registry traffic.
 Consequently, publishing a new `:latest` manifest does not roll existing
 boxes forward. Explicitly destroy the outer box and run an ordinary command to
-pull a refreshed image while reusing its retained named state.
+pull a refreshed image while reusing its retained cache volumes.
 
 Compatibility is exact after canonical inspection. Any current
 creation drift, including a changed Router host port, image, mount, device, or
@@ -81,7 +81,7 @@ Every incompatible or malformed Box fails before pulling, volume creation,
 restart, upgrade, or replacement. The supervisor does not read it as compatible state or
 automatically migrate, clean, relabel, adopt, or replace it. Run `ploinky
 destroy` explicitly, then run an ordinary command to recreate the box from
-the validated runtime image while retaining all three named volumes. Legacy basename-only boxes
+the validated runtime image while retaining both named cache volumes. Legacy basename-only boxes
 and volumes are not discoverable through the current identity and remain
 untouched for manual inspection or removal.
 
@@ -99,45 +99,53 @@ The readable basename component replaces characters outside
 characters. The path hash distinguishes same-named directories. There is no
 public `--name`, `--engine`, or `PLOINKY_BOX_ENGINE` override.
 
-Each instance owns exactly three persistent volumes:
+Each instance owns exactly two persistent volumes; the workspace itself is a
+host bind rather than a volume:
 
 | Suffix | Purpose |
 | --- | --- |
-| `-workspace` | Ploinky workspace and core state |
-| `-containers` | Nested agent image and container storage |
+| `-images` | Nested agent image cache at `/home/podman/.local/share/ploinky-images` |
 | `-ploinky-deps` | Dependencies mounted at `/opt/ploinky/node_modules` |
+
+Nested container records, writable layers, networks, and inner Podman named
+volumes are deliberately not persisted. They live on the outer container's
+writable layer under `/home/podman/.local/share/containers/storage` and are
+discarded when the outer container is removed, so persistent agent data must use
+explicit `/workspace` binds.
 
 Each named volume carries these ownership labels; no absolute path is stored:
 
 | Label | Value |
 | --- | --- |
-| `io.assistos.ploinky.path-hash` | The identity's 12-character path hash |
-| `io.assistos.ploinky.volume-role` | `workspace`, `containers`, or `ploinky-deps`, matching the exact volume name |
+| `io.assistos.ploinky-box.path-hash` | The identity's 12-character path hash |
+| `io.assistos.ploinky-box.role` | `images` or `ploinky-deps`, matching the exact volume name |
 
 Existing exact-named volumes without matching labels are foreign and are never
 attached, rewritten, or removed automatically.
 
 Ploinky discovers every Podman or Docker executable on `PATH` and requires
 each installed engine to answer before mutation. It inventories the exact box
-and all three labelled volumes on every answering engine, then selects the sole
-resource owner. A partial valid set remains on that engine and missing roles
-are created only on a later permitted create path. Split ownership, duplicate
-boxes, foreign volumes, or an engine whose health/inspection result is unknown
-fail closed. Only when neither engine owns any identity resource does Ploinky
-prefer Podman over Docker. An engine whose executable is not installed cannot
-be inventoried; reinstalling it can expose a split on the next command.
+and both labelled volumes on every answering engine, then selects the sole
+resource owner. A partial current-layout cache set fails closed for ordinary
+start and create operations, but remains eligible for the explicit
+`destroy --delete-volumes` recovery path so an interrupted reset can be safely
+retried. Split ownership, duplicate boxes, foreign volumes, or an engine whose
+health/inspection result is unknown fail closed. Only when neither engine owns
+any identity resource does Ploinky prefer Podman over Docker. An engine whose
+executable is not installed cannot be inventoried; reinstalling it can expose a
+split on the next command.
 
 `ploinky help` remains host-local and performs no engine discovery. `ploinky
 status` reports partial discovery and exits nonzero when ownership is
 unresolved; other commands make no change.
-`ploinky stop` preserves the box and all three volumes. `ploinky destroy`
-confirms and directly removes only the box, using engine volume cleanup to
-remove attached anonymous volumes while retaining all explicitly named
-volumes. If the box is absent, destroy reports any retained named volumes and
-succeeds without prompting or deleting them. `ploinky destroy --delete-volumes`
-uses the same workspace lock and fail-closed ownership checks, skips the prompt,
-and removes the exact three owned named volumes even when only retained volumes
-remain.
+`ploinky stop` preserves the box and both volumes. `ploinky destroy` stops
+nested agents through the in-box helper, confirms, then removes only the box,
+using engine volume cleanup to remove attached anonymous volumes while retaining
+both explicitly named volumes. If the box is absent, destroy reports any
+retained named volumes and succeeds without prompting or deleting them.
+`ploinky destroy --delete-volumes` uses the same workspace lock and fail-closed
+ownership checks, skips the prompt, and removes the exact two owned named
+volumes even when only retained volumes remain.
 
 ## Fixed targets and graph-independent start
 
@@ -216,11 +224,13 @@ untouched. Enumeration failure also fails the self-check. Manual containers are
 outside Ploinky lifecycle ownership and are not promised automatic restart or
 repair.
 
-Before Podman opens the retained graph root, the entrypoint removes only its
-transient `/tmp/storage-run-<uid>` and `/tmp/podman-run-<uid>` process/lock
-state from the outer container filesystem. These paths are not the named
-nested-storage volume; container records, images, and nested named volumes stay
-retained. Failure to clear stale run state aborts boot.
+Before the first inner Podman call, the entrypoint resets transient
+`/tmp/storage-run-<uid>` and `/tmp/podman-run-<uid>` state and writes the exact
+user `storage.conf`. Downloaded image content uses the named
+`/home/podman/.local/share/ploinky-images` cache. The graphroot remains on the
+outer container writable layer, so nested container records, writable layers,
+networks, and inner named volumes are discarded when the outer container is
+removed. Failure to configure or validate this separation aborts boot.
 
 Box boot requires rootless Podman 5.4 or newer, the Netavark network
 backend, and an operational `pasta` executable. Any failed prerequisite aborts
@@ -279,10 +289,11 @@ does not pull, create, start, stop, remove, refresh, or reconcile.
 `ploinky stop` skips reconciliation. It attempts core shutdown first and then
 stops the outer runtime even when core shutdown fails, reporting both phases.
 Repeated stop is an idempotent success. `ploinky destroy` also skips
-reconciliation, directly removes the selected outer container and its attached
-anonymous volumes, and retains the three managed named volumes. The explicit
-`--delete-volumes` form revalidates and deletes those volumes after removing the
-outer container.
+reconciliation, stops nested agents when the Box is running, and then removes
+the selected outer container and its attached anonymous volumes while retaining
+the two named cache volumes. The explicit `--delete-volumes` form revalidates
+and deletes every remaining exactly owned cache volume after removing the outer
+container; retrying it completes an interrupted partial deletion.
 
 Commands entered in the Ploinky REPL stay at core workspace/router/agent scope.
 REPL `stop` leaves outer runtime state and volumes in place; REPL `destroy`
@@ -297,11 +308,11 @@ ploinky destroy --delete-volumes
 
 A failed first create may leave only labelled instance volumes. The same command
 removes that complete retained set after revalidating its ownership.
-If boot cleanup repeatedly fails because nested storage is corrupt, inspect and
-back up the instance's `-containers` volume, remove the outer box, and
-remove only that volume when its cached images, container records, and nested
-volumes may be lost; ordinary destroy/recreate deliberately preserves it and
-can repeat the failure.
+If boot cleanup fails because nested storage is corrupt, destroy and recreate
+the outer box: nested container records and inner volumes live on its writable
+layer and are discarded with it, so the failure cannot repeat across a
+recreation. Only the `-images` cache and `-ploinky-deps` volume survive, and
+`--delete-volumes` discards those too.
 
 The path-hashed supervisor does not target a legacy basename-only box. To
 release its ports while preserving its volumes, identify its owning engine and
@@ -333,22 +344,19 @@ reader for it. Do not use a broad container, image, volume, or network prune.
 
 ## Smoke and release ordering
 
-`node container/smoke-runtime.mjs` is the real engine-backed public-entrypoint
-smoke. After initial create and explicit recreate it normalizes exhaustive
-`HostConfig.PortBindings` and `podman port` output and requires exactly loopback
-selected-port to `8080/tcp` plus wildcard `7882:7882/udp`. It also proves
-loopback Router reachability, LAN refusal, absence of private `8081` and all
-forbidden third mappings, actionable UDP-owner conflict, and profile-specific
-in-box `ss -H -lntup` ownership. The script accepts
-`SMOKE_IMAGE` and `SMOKE_PORT` overrides; engine selection remains automatic.
+The real engine-backed candidate gates are
+`tests/integration/ploinkyBoxNative.test.mjs` and
+`tests/e2e/ploinkyBox/publicCli.test.mjs`. With
+`PLOINKY_BOX_REQUIRE_PODMAN=1` and one immutable
+`PLOINKY_BOX_CANDIDATE_DIGEST`, they exercise the public entrypoints, exact
+publications, rootless nested Podman, running destroy, recreation, disposable
+nested state, and durable image and dependency caches.
 
-The publication workflow moves the mutable `:runtime` channel only after
-native amd64 and arm64 candidates both pass contract, integrated pinned
-cloudflared, exact-port, network-isolation, router-restart, and nested-Podman
-gates. Each native job
-emits its Podman, Netavark, and `pasta` evidence before release promotion.
-The supervisor consults that channel only for create and keeps
-existing boxes pinned to their inspected IDs.
+Publication may move the mutable `:latest` channel only after native amd64 and
+arm64 candidates pass the contract and runtime gates. Each native job emits its
+Podman, Netavark, and `pasta` evidence before release promotion. The supervisor
+consults that channel only for create and keeps existing boxes pinned to their
+inspected IDs.
 
 The principal functional release gate runs the existing Explorer two-account
 WebMeet smoke against a freshly built Box:

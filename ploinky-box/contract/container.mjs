@@ -253,8 +253,8 @@ export function validateContainerConfiguration(containerHandle, {
     const expectedMounts = {
         '/opt/ploinky': { type: 'bind', source: repositoryRoot, rw: false },
         '/workspace': { type: 'bind', source: identity.workspaceRoot, rw: true },
-        '/home/podman/.local/share/containers': {
-            type: 'volume', name: identity.volumes.containers, rw: true,
+        '/home/podman/.local/share/ploinky-images': {
+            type: 'volume', name: identity.volumes.images, rw: true,
         },
         '/opt/ploinky/node_modules': {
             type: 'volume', name: identity.volumes.dependencies, rw: true,

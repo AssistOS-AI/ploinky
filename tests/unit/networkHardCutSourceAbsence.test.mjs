@@ -37,8 +37,7 @@ const activeRuntimeFiles = [
     ...sourceFiles('Agent'),
     ...sourceFiles('bin'),
     ...sourceFiles('cli'),
-    path.join(repoRoot, 'container/runtime-contract.mjs'),
-    path.join(repoRoot, 'container/runtime-supervisor.mjs'),
+    ...sourceFiles('ploinky-box'),
 ];
 
 function assertAbsent(files, pattern, description) {

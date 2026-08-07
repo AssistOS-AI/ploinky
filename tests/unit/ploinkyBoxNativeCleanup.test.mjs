@@ -36,11 +36,8 @@ function handles(workspaceIdentity) {
             labels: { pathHash: workspaceIdentity.pathHash, role: 'box' },
         },
         volumes: {
-            containers: volume(`${workspaceIdentity.instance}-containers`, 'containers', 'one'),
+            images: volume(`${workspaceIdentity.instance}-images`, 'images', 'one'),
             dependencies: volume(`${workspaceIdentity.instance}-ploinky-deps`, 'ploinky-deps', 'two'),
-        },
-        legacyVolumes: {
-            workspace: volume(`${workspaceIdentity.instance}-workspace`, 'workspace', 'three'),
         },
     };
 }
@@ -87,7 +84,7 @@ function harness(overrides = {}) {
         },
         inspectVolume: (_engine, _identity, key) => ({
             state: 'owned',
-            handle: capturedHandles.volumes[key] || capturedHandles.legacyVolumes[key],
+            handle: capturedHandles.volumes[key],
         }),
         withLock: async ({ execute }) => execute(expectedIdentity, lock),
         get discoverCalls() { return discoverCalls; },
@@ -111,7 +108,7 @@ test('transactional cleanup uses immutable ID and non-forced named-volume remova
     const state = harness();
     const result = await cleanupNativeHarnessResources(cleanupInput(state));
     assert.equal(result.removedContainerId, 'a'.repeat(64));
-    assert.equal(result.removedVolumes.length, 3);
+    assert.equal(result.removedVolumes.length, 2);
     const removalCalls = state.calls.filter(({ argv }) => argv[1] === 'rm');
     assert.deepEqual(removalCalls[0].argv.slice(0, 2), ['container', 'rm']);
     assert.equal(removalCalls[0].argv.at(-1), 'a'.repeat(64));
@@ -122,6 +119,24 @@ test('transactional cleanup uses immutable ID and non-forced named-volume remova
         assert.equal(call.argv.includes('--force'), false);
         assert.equal(call.argv.includes('-f'), false);
     }
+});
+
+test('transactional cleanup accepts an exactly owned partial cache set', async () => {
+    const state = harness();
+    state.capturedHandles.container = null;
+    state.capturedHandles.volumes.images = null;
+    state.discover = () => ({
+        state: 'incompatible',
+        message: 'partial current cache set',
+        engine: { name: 'podman', identity: 'rootless-engine-1' },
+        handles: state.capturedHandles,
+    });
+
+    const result = await cleanupNativeHarnessResources(cleanupInput(state));
+    assert.equal(result.removedContainerId, null);
+    assert.deepEqual(result.removedVolumes, [
+        `${state.expectedIdentity.instance}-ploinky-deps`,
+    ]);
 });
 
 test('lock contention performs no discovery or destructive operation', async () => {
@@ -178,7 +193,7 @@ test('changed volume fingerprint refuses named-volume deletion', async () => {
     state.inspectVolume = (_engine, _identity, key) => ({
         state: 'owned',
         handle: {
-            ...(state.capturedHandles.volumes[key] || state.capturedHandles.legacyVolumes[key]),
+            ...state.capturedHandles.volumes[key],
             fingerprint: { mountpoint: '/changed', createdAt: 'different' },
         },
     });

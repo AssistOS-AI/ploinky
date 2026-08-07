@@ -1,0 +1,40 @@
+{
+  "store": {
+    "configFile": "/home/podman/.config/containers/storage.conf",
+    "containerStore": {
+      "number": 0,
+      "paused": 0,
+      "running": 0,
+      "stopped": 0
+    },
+    "graphDriverName": "overlay",
+    "graphOptions": {
+      "overlay.mount_program": {
+        "Executable": "/usr/bin/fuse-overlayfs",
+        "Package": "fuse-overlayfs-1.16-2.fc44.aarch64",
+        "Version": "fusermount3 version: 3.18.2\nfuse-overlayfs: version 1.16\nFUSE library version 3.18.2\nusing FUSE kernel interface version 7.45"
+      }
+    },
+    "graphRoot": "/home/podman/.local/share/containers/storage",
+    "graphRootAllocated": 106769133568,
+    "graphRootUsed": 94948859904,
+    "graphStatus": {
+      "Backing Filesystem": "overlayfs",
+      "Native Overlay Diff": "false",
+      "Supports d_type": "true",
+      "Supports shifting": "true",
+      "Supports volatile": "true",
+      "Using metacopy": "false"
+    },
+    "imageCopyTmpDir": "/var/tmp",
+    "imageStore": {
+      "number": 0
+    },
+    "runRoot": "/tmp/storage-run-1000",
+    "volumePath": "/home/podman/.local/share/containers/storage/volumes",
+    "transientStore": true
+  },
+  "version": {
+    "Version": "5.8.2"
+  }
+}

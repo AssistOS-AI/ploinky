@@ -154,6 +154,7 @@ test('installed public shims honor only the environment image override through t
         realPodman,
         candidateReference,
         logicalReference,
+        localCandidate: true,
         tracePath,
     });
     const publicEnvironment = {
@@ -262,6 +263,10 @@ test('installed public shims honor only the environment image override through t
         'podman', 'container', 'inspect', '--format', '{{.Image}}', agent.id,
     ]);
     assert.match(nestedImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
+    const nestedContainerId = execInBox(harness.runner, runningId, [
+        'podman', 'container', 'inspect', '--format', '{{.Id}}', agent.id,
+    ]);
+    assert.match(nestedContainerId, /^[a-f0-9]{64}$/);
     const nestedVolume = `ploinky-box-t28-${harness.identity.pathHash.slice(0, 12)}`;
     execInBox(harness.runner, runningId, ['podman', 'volume', 'create', nestedVolume]);
     execInBox(harness.runner, runningId, [
@@ -275,13 +280,11 @@ test('installed public shims honor only the environment image override through t
             'printf dependencies-retained > /opt/ploinky/node_modules/t28-dependencies-canary',
         ].join('; '),
     ]);
-    const stopped = publicCommand(['--debug', 'stop']);
-    assert.equal(stopped.status, 0, stopped.stderr);
-    assert.equal(stopped.stdout.match(/Debug mode enabled/g)?.length, 1);
-    const stoppedStatus = publicCommand(['status']);
-    assert.match(stoppedStatus.stdout, /stopped/);
-    const destroyed = publicCommand(['destroy'], { input: 'yes\n' });
+    // Exercise the public running-destroy path: it must stop the nested graph
+    // itself before removing the outer Box.
+    const destroyed = publicCommand(['--debug', 'destroy'], { input: 'yes\n' });
     assert.equal(destroyed.status, 0, destroyed.stderr);
+    assert.equal(destroyed.stdout.match(/Debug mode enabled/g)?.length, 1);
 
     const recreated = publicCommand(graph.args);
     assert.equal(recreated.status, 0, recreated.stderr);
@@ -300,16 +303,34 @@ test('installed public shims honor only the environment image override through t
     assert.equal(execInBox(harness.runner, currentId, [
         'cat', '/opt/ploinky/node_modules/t28-dependencies-canary',
     ]), 'dependencies-retained');
-    assert.equal(execInBox(harness.runner, currentId, [
-        'bash', '-lc',
-        'mountpoint="$(podman volume inspect --format "{{.Mountpoint}}" "$1")"; cat "$mountpoint/canary"',
-        'bash', nestedVolume,
-    ]), 'nested-retained');
+    // Generation-specific nested state must not survive outer replacement.
+    for (const [kind, name] of [
+        ['volume', nestedVolume],
+        ['container', nestedContainerId],
+    ]) {
+        const survivor = harness.runner.query('podman', [
+            'container', 'exec', '--user', 'podman', currentId,
+            'podman', kind, 'inspect', name,
+        ]);
+        assert.equal(survivor.ok, false, `nested ${kind} ${name} must not survive recreate`);
+    }
+    // Reusable image content is exactly what does survive.
     const retainedImage = harness.runner.query('podman', [
         'container', 'exec', '--user', 'podman', currentId,
         'podman', 'image', 'inspect', nestedImageId,
     ]);
     assert.equal(retainedImage.ok, true, retainedImage.stderr);
+    const effectiveStore = JSON.parse(execInBox(harness.runner, currentId, [
+        'podman', 'info', '--format', 'json',
+    ])).store;
+    assert.equal(effectiveStore.configFile, '/home/podman/.config/containers/storage.conf');
+    assert.equal(effectiveStore.graphRoot, '/home/podman/.local/share/containers/storage');
+    assert.equal(effectiveStore.runRoot, '/tmp/storage-run-1000');
+    assert.equal(
+        effectiveStore.volumePath,
+        '/home/podman/.local/share/containers/storage/volumes',
+    );
+    assert.equal(effectiveStore.transientStore, true);
     assertNestedRoutingAndSecretBoundary(currentId, harness);
 
     const trace = readProxyTrace(tracePath);

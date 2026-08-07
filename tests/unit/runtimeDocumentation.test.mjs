@@ -39,6 +39,37 @@ test('active runtime documentation describes the semantic Box configuration', ()
         assert.doesNotMatch(content, /io\.assistos\.ploinky\.runtime-contract/, relativePath);
         assert.doesNotMatch(content, /io\.assistos\.ploinky\.identity-schema/, relativePath);
         assert.doesNotMatch(content, /contract[- ](?:v)?[56]|runtime[- ]v[56]/i, relativePath);
+        assert.doesNotMatch(
+            content,
+            /container\/(?:runtime-(?:supervisor|contract|engine)|smoke-runtime)\.mjs/,
+            relativePath,
+        );
+        assert.doesNotMatch(content, /three (?:managed |explicitly )?named volumes/i, relativePath);
+        assert.doesNotMatch(content, /retained workspace-volume/i, relativePath);
+    }
+});
+
+test('active runtime documentation separates durable caches from disposable nested state', () => {
+    for (const relativePath of [
+        'README.md',
+        'docs/code-derived-agent-lifecycle.md',
+        'container/README.md',
+    ]) {
+        // Match against unwrapped prose so line breaks cannot hide a claim.
+        const content = read(relativePath).replace(/\s+/g, ' ');
+        // The image cache is the only reusable nested storage.
+        assert.match(content, /ploinky-images/, relativePath);
+        assert.match(content, /\/opt\/ploinky\/node_modules/, relativePath);
+        // Nested container state is disposable, so agent data belongs in binds.
+        assert.match(
+            content,
+            /persistent agent data must use explicit `\/workspace` binds/i,
+            relativePath,
+        );
+        assert.match(content, /discarded (?:with|when) the outer/i, relativePath);
+        // No active document may still promise the broad nested store survives.
+        assert.doesNotMatch(content, /two named storage volumes/i, relativePath);
+        assert.doesNotMatch(content, /deliberately preserves it/i, relativePath);
     }
 });
 

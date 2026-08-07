@@ -62,14 +62,17 @@ function ownedRecords(identity, mountSuffix = 'one', { includeLegacy = false } =
         }];
     }));
     if (includeLegacy) {
-        volumes.workspace = {
-            Name: identity.legacyVolumes.workspace,
+        volumes.containers = {
+            Name: `${identity.instance}-containers`,
             Driver: 'local',
             Scope: 'local',
             Options: {},
             CreatedAt: '2026-07-20T00:00:00Z',
-            Mountpoint: `/private/${mountSuffix}/workspace`,
-            Labels: labels(identity, BOX_ROLES.workspace),
+            Mountpoint: `/private/${mountSuffix}/containers`,
+            Labels: {
+                [BOX_LABELS.pathHash]: identity.pathHash,
+                [BOX_LABELS.role]: 'containers',
+            },
         };
     }
     return { container, volumes };
@@ -201,8 +204,9 @@ test('discovery returns absent and owned handles with immutable IDs and private 
     });
     assert.equal(owned.state, 'owned');
     assert.equal(owned.handles.container.id, 'container-id-123');
-    assert.equal(owned.handles.volumes.containers.fingerprint.mountpointHash.length, 64);
-    assert.equal(owned.handles.legacyVolumes.workspace, null);
+    assert.equal(owned.handles.volumes.images.fingerprint.mountpointHash.length, 64);
+    assert.equal(owned.handles.volumes.images.name, identity.volumes.images);
+    assert.equal(owned.handles.legacyVolumes, undefined);
     assert.equal(JSON.stringify(owned).includes('/private/'), false);
 
     const recreated = discoverBoxOwnership(identity, {
@@ -212,30 +216,42 @@ test('discovery returns absent and owned handles with immutable IDs and private 
     });
     assert.equal(
         volumeHandleMatches(
-            owned.handles.volumes.containers,
-            recreated.handles.volumes.containers,
+            owned.handles.volumes.images,
+            recreated.handles.volumes.images,
         ),
         false,
     );
 });
 
-test('discovery recognizes but does not require the legacy workspace volume', (t) => {
+test('a superseded storage volume is no longer a recognized Box resource', (t) => {
     const identity = identityFixture(t);
     const records = ownedRecords(identity, 'legacy', { includeLegacy: true });
     const result = discoverBoxOwnership(identity, {
-        platform: 'linux', env: {}, runner: fakeRunner(identity, { records }),
+        platform: 'linux', env: {}, runner: fakeRunner(identity, {
+            records,
+            inventoryRecords: {
+                podman: { volume: [records.volumes.containers], container: [] },
+            },
+        }),
     });
-    assert.equal(result.state, 'owned');
-    assert.equal(
-        result.handles.legacyVolumes.workspace.name,
-        identity.legacyVolumes.workspace,
-    );
+    assert.equal(result.state, 'foreign');
+    assert.match(result.message, /unexpected resource claiming this Box identity/);
+});
 
+test('a partial cache-volume set fails closed instead of being reused', (t) => {
+    const identity = identityFixture(t);
+    const records = ownedRecords(identity);
     delete records.volumes.dependencies;
-    const partial = discoverBoxOwnership(identity, {
+    assert.equal(discoverBoxOwnership(identity, {
         platform: 'linux', env: {}, runner: fakeRunner(identity, { records }),
-    });
-    assert.equal(partial.state, 'incompatible');
+    }).state, 'incompatible');
+
+    const orphaned = ownedRecords(identity);
+    orphaned.container = null;
+    delete orphaned.volumes.images;
+    assert.equal(discoverBoxOwnership(identity, {
+        platform: 'linux', env: {}, runner: fakeRunner(identity, { records: orphaned }),
+    }).state, 'incompatible');
 });
 
 test('unlabeled exact names, wrong labels, and incomplete fingerprints fail closed', (t) => {
@@ -248,10 +264,10 @@ test('unlabeled exact names, wrong labels, and incomplete fingerprints fail clos
     extraLabel.container.Labels['io.assistos.ploinky-box.unexpected'] = 'present';
     variants.push(extraLabel);
     const wrongPath = ownedRecords(identity);
-    wrongPath.volumes.containers.Labels[BOX_LABELS.pathHash] = '000000000000';
+    wrongPath.volumes.images.Labels[BOX_LABELS.pathHash] = '000000000000';
     variants.push(wrongPath);
     const wrongRole = ownedRecords(identity);
-    wrongRole.volumes.containers.Labels[BOX_LABELS.role] = 'workspace';
+    wrongRole.volumes.images.Labels[BOX_LABELS.role] = 'containers';
     variants.push(wrongRole);
     const incomplete = ownedRecords(identity);
     delete incomplete.volumes.dependencies.Mountpoint;

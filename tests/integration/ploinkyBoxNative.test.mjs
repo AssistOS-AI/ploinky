@@ -76,6 +76,41 @@ function readNestedVolumeCanary(harness, containerId, volumeName) {
     ]);
 }
 
+function nestedResourceExists(harness, containerId, kind, name) {
+    return queryInBox(harness, containerId, ['podman', kind, 'inspect', name]).ok;
+}
+
+function effectiveNestedStorage(harness, containerId) {
+    const raw = execInBox(harness.runner, containerId, [
+        'podman', 'info', '--format', 'json',
+    ]);
+    const store = JSON.parse(raw).store;
+    return {
+        configFile: String(store.configFile || ''),
+        driver: String(store.graphDriverName || ''),
+        graphRoot: String(store.graphRoot || ''),
+        runRoot: String(store.runRoot || ''),
+        volumePath: String(store.volumePath || ''),
+        transientStore: store.transientStore === true,
+    };
+}
+
+function assertIntendedNestedStorage(harness, containerId) {
+    assert.deepEqual(effectiveNestedStorage(harness, containerId), {
+        configFile: '/home/podman/.config/containers/storage.conf',
+        driver: 'overlay',
+        graphRoot: '/home/podman/.local/share/containers/storage',
+        runRoot: '/tmp/storage-run-1000',
+        volumePath: '/home/podman/.local/share/containers/storage/volumes',
+        transientStore: true,
+    });
+    // The durable cache must be the imagestore, proven on disk because
+    // podman info reports store.imageStore as an image count, not a path.
+    assert.equal(execInBox(harness.runner, containerId, [
+        'test', '-d', '/home/podman/.local/share/ploinky-images/overlay-images',
+    ]), '');
+}
+
 function readDependencyVolumeFile(harness, relativePath) {
     const result = harness.runner.query('podman', [
         'run', '--rm', '--network=none',
@@ -109,8 +144,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
 
     const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky')), true);
-    assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')), [],
-        'the host identity anchor must remain empty');
+    assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')), ['master-key'],
+        'the host identity anchor must retain only the Box master key');
     assert.equal(fs.existsSync(path.join(harness.child, '.ploinky')), false);
     assert.equal(prepared.ownership.handles.container.runtime.running, true);
     assert.deepEqual(prepared.ownership.handles.container.runtime.publications, [
@@ -182,7 +217,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.match(keyEvidence[1], /^[a-f0-9]{64}\s/);
     for (const [repository, revision] of [
         ['mcp-sdk', '7efe9d17f52a625743e411089d3a6879f6f89156'],
-        ['achillesAgentLib', '42894def87b4fd2d59a8ce01fea7e25cdc7881ba'],
+        ['achillesAgentLib', '975e7a318e1c8c8d1792ec96fe7b820fc465d1f5'],
     ]) {
         assert.equal(execInBox(harness.runner, prepared.containerId, [
             'git', '-C', `/opt/ploinky/node_modules/${repository}`, 'rev-parse', 'HEAD',
@@ -282,8 +317,16 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         'podman', 'container', 'inspect', '--format', '{{.Image}}', agent.id,
     ]);
     assert.match(nestedImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
+    assertIntendedNestedStorage(harness, started.containerId);
+    const nestedContainerId = execInBox(harness.runner, started.containerId, [
+        'podman', 'container', 'inspect', '--format', '{{.Id}}', agent.id,
+    ]);
+    assert.match(nestedContainerId, /^[a-f0-9]{64}$/);
     const nestedVolume = `ploinky-box-t26-${harness.identity.pathHash.slice(0, 12)}`;
     writeNestedVolumeCanary(harness, started.containerId, nestedVolume, 'nested-retained');
+    assert.equal(readNestedVolumeCanary(
+        harness, started.containerId, nestedVolume,
+    ), 'nested-retained');
     execInBox(harness.runner, started.containerId, [
         'bash', '-c', [
             "printf workspace-retained > /workspace/t26-workspace-canary",
@@ -297,14 +340,13 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         'utf8',
     ), 'workspace-retained');
 
-    await harness.supervisor.runStopTransaction();
-    assert.equal(harness.supervisor.inspectBoxStatus().state, 'stopped');
-    const stoppedContainer = harness.supervisor.inspectBoxStatus().ownership.handles.container.id;
     assert.equal(readDependencyVolumeFile(
         harness,
         '.ploinky-box-dependencies.json',
     ), 'corrupt');
-    await harness.supervisor.runDestroyTransaction(stoppedContainer);
+    // Destroy the live Box directly. The supervisor must stop the nested graph
+    // before stopping and removing the outer container.
+    await harness.supervisor.runDestroyTransaction(started.containerId);
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent-retained-volumes');
     const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     const recreatedKeyEvidence = execInBox(harness.runner, recreated.containerId, [
@@ -317,12 +359,18 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(execInBox(harness.runner, recreated.containerId, [
         'cat', '/opt/ploinky/node_modules/t26-dependencies-canary',
     ]), 'dependencies-retained');
-    assert.equal(readNestedVolumeCanary(
-        harness, recreated.containerId, nestedVolume,
-    ), 'nested-retained');
+    // Generation-specific nested state must not cross the outer Box boundary.
+    assert.equal(nestedResourceExists(
+        harness, recreated.containerId, 'volume', nestedVolume,
+    ), false);
+    assert.equal(nestedResourceExists(
+        harness, recreated.containerId, 'container', nestedContainerId,
+    ), false);
+    // Reusable image content is exactly what does survive.
     assert.equal(queryInBox(harness, recreated.containerId, [
         'podman', 'image', 'inspect', nestedImageId,
     ]).ok, true);
+    assertIntendedNestedStorage(harness, recreated.containerId);
     for (const volume of Object.values(harness.identity.volumes)) {
         assert.equal(exactResourceExists(harness, 'volume', volume), true);
     }
@@ -482,9 +530,15 @@ test('immutable-ID removal cleans an attached anonymous volume', {
     const candidateReference = requirePodmanCandidate(t);
     if (!candidateReference) return;
     const harness = createPodmanHarness(t, candidateReference);
+    const imageInspection = harness.runner.query('podman', [
+        'image', 'inspect', candidateReference,
+    ]);
+    assert.equal(imageInspection.ok, true, imageInspection.stderr);
+    const candidateImageId = String(JSON.parse(imageInspection.stdout)[0]?.Id || '');
+    assert.match(candidateImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
     const created = harness.runner.query('podman', [
         'container', 'create', '--volume', '/anonymous', '--entrypoint', '/bin/true',
-        candidateReference,
+        candidateImageId,
     ], { timeoutMs: 120_000 });
     assert.equal(created.ok, true, created.stderr);
     const containerId = String(created.stdout || '').trim();

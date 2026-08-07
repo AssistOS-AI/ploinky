@@ -3,6 +3,7 @@ import http from 'node:http';
 
 import {
     BOX_LABELS,
+    BOX_VOLUME_KEYS,
     resolveBoxImageReference,
 } from './constants.mjs';
 import { validateContainerConfiguration } from './contract/container.mjs';
@@ -43,6 +44,18 @@ function assertMutableOwnership(ownership) {
     return ownership;
 }
 
+function assertDestroyableOwnership(ownership) {
+    const volumeKeys = Object.keys(ownership?.handles?.volumes || {});
+    if (ownership?.state === 'incompatible'
+        && ownership.engine
+        && ownership.handles
+        && volumeKeys.length === BOX_VOLUME_KEYS.length
+        && volumeKeys.every((key) => BOX_VOLUME_KEYS.includes(key))) {
+        return ownership;
+    }
+    return assertMutableOwnership(ownership);
+}
+
 function defaultDiscovery(identity, runner, platform, env) {
     return discoverBoxOwnership(identity, { runner, platform, env });
 }
@@ -71,12 +84,12 @@ export function createBoxSupervisor({
         return discover(identity, runner, platform, env);
     }
 
-    async function lockedMutation(execute) {
+    async function lockedMutation(execute, authorize = assertMutableOwnership) {
         return withWorkspaceMutationLock({
             resolveIdentity,
             lockManager,
             beforeAnchor(identity) {
-                return assertMutableOwnership(inspect(identity));
+                return authorize(inspect(identity));
             },
             execute,
         });
@@ -183,7 +196,6 @@ export function createBoxSupervisor({
         return lockedMutation(async (identity, lock, ownership) => {
             const container = ownership.handles?.container;
             const volumes = ownership.handles?.volumes;
-            const legacyVolumes = ownership.handles?.legacyVolumes;
             if (!container && expectedContainerId) {
                 throw supervisorError('Box changed before destroy; nothing was removed');
             }
@@ -194,6 +206,38 @@ export function createBoxSupervisor({
                 throw supervisorError('Box changed after destroy confirmation; nothing was removed');
             }
             if (container) {
+                // Quiesce nested agents before the outer Box disappears. If the
+                // inner stop fails we still stop the outer Box to halt further
+                // mutation, then fail without removing anything, leaving a
+                // stopped Box and its volumes intact for inspection and retry.
+                if (container.runtime.running) {
+                    let innerStopError = null;
+                    try {
+                        stopPloinkyLocalByContainerId(ownership.engine, container.id, runner);
+                    } catch (error) {
+                        innerStopError = error;
+                    } finally {
+                        runner.run(ownership.engine.name, [
+                            'container', 'stop', '--time', '30', container.id,
+                        ]);
+                    }
+                    if (innerStopError) {
+                        throw supervisorError(
+                            'Outer Box stopped after ploinky-local stop reported: '
+                            + `${innerStopError.message}; nothing was removed`,
+                        );
+                    }
+                    // Revalidate exact ownership rather than the broad mutable
+                    // state: destroy is the recovery path, so it must not be
+                    // blocked by an incidentally incompatible resource set.
+                    const revalidated = inspect(identity);
+                    if (revalidated.handles?.container?.id !== container.id
+                        || revalidated.engine?.identity !== ownership.engine.identity) {
+                        throw supervisorError(
+                            'Box changed while stopping; nothing was removed',
+                        );
+                    }
+                }
                 removeContainerById(ownership.engine, container.id, runner);
             }
             const deletedVolumes = deleteVolumes
@@ -203,7 +247,6 @@ export function createBoxSupervisor({
                     runner,
                     lock,
                     knownHandles: volumes,
-                    knownLegacyHandles: legacyVolumes,
                 })
                 : Object.freeze([]);
             return Object.freeze({
@@ -212,7 +255,7 @@ export function createBoxSupervisor({
                 containerId: container?.id || null,
                 deletedVolumes,
             });
-        });
+        }, assertDestroyableOwnership);
     }
 
     function inspectBoxStatus() {

@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {
     BOX_LABELS,
     BOX_ROLES,
+    BOX_VOLUME_KEYS,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { sha256 } from '../boundary/fingerprint.mjs';
@@ -331,19 +332,13 @@ function expectedResources(identity) {
             role: BOX_ROLES.container,
         },
         volumes: {
-            containers: {
-                name: identity.volumes.containers,
-                role: BOX_ROLES.containers,
+            images: {
+                name: identity.volumes.images,
+                role: BOX_ROLES.images,
             },
             dependencies: {
                 name: identity.volumes.dependencies,
                 role: BOX_ROLES.dependencies,
-            },
-        },
-        legacyVolumes: {
-            workspace: {
-                name: identity.legacyVolumes.workspace,
-                role: BOX_ROLES.workspace,
             },
         },
     };
@@ -351,7 +346,7 @@ function expectedResources(identity) {
 
 export function inspectOwnedVolumeHandle(engine, identity, key, runner = createProcessRunner()) {
     const expected = expectedResources(identity);
-    const resource = expected.volumes[key] || expected.legacyVolumes[key];
+    const resource = expected.volumes[key];
     if (!resource) {
         throw discoveryError(`Unknown Box volume role ${key}`);
     }
@@ -384,10 +379,7 @@ export function inspectOwnedVolumeHandle(engine, identity, key, runner = createP
 
 function inspectEngineResources(engine, identity, runner) {
     const expected = expectedResources(identity);
-    const expectedVolumes = {
-        ...expected.volumes,
-        ...expected.legacyVolumes,
-    };
+    const expectedVolumes = expected.volumes;
     const containerInventory = inventory(engine, 'container', identity.pathHash, runner);
     const volumeInventory = inventory(engine, 'volume', identity.pathHash, runner);
     if (containerInventory.state === 'unknown' || volumeInventory.state === 'unknown') {
@@ -462,7 +454,6 @@ function inspectEngineResources(engine, identity, runner) {
                 ? containerHandle(engine, identity, expected.container.name, containerInspection.record)
                 : null,
             volumes: {},
-            legacyVolumes: {},
         };
         for (const [key, volume] of Object.entries(expected.volumes)) {
             handles.volumes[key] = volumeInspections[key].state === 'present'
@@ -475,26 +466,13 @@ function inspectEngineResources(engine, identity, runner) {
                 )
                 : null;
         }
-        for (const [key, volume] of Object.entries(expected.legacyVolumes)) {
-            handles.legacyVolumes[key] = volumeInspections[key].state === 'present'
-                ? volumeHandle(
-                    engine,
-                    identity,
-                    volume.role,
-                    volume.name,
-                    volumeInspections[key].record,
-                )
-                : null;
-        }
-        const activeVolumeInspections = Object.keys(expected.volumes)
-            .map((key) => volumeInspections[key]);
-        const activePresentCount = activeVolumeInspections.filter((inspection) => (
-            inspection.state === 'present'
-        )).length;
-        const activeVolumeSetComplete = activePresentCount === activeVolumeInspections.length;
+        // The cache volumes are created as one set, so a partial set always
+        // means an earlier creation failed and must not be treated as usable.
+        const presentVolumeCount = Object.values(handles.volumes)
+            .filter(Boolean).length;
+        const volumeSetComplete = presentVolumeCount === BOX_VOLUME_KEYS.length;
         const containerPresent = containerInspection.state === 'present';
-        if ((containerPresent && !activeVolumeSetComplete)
-            || (!containerPresent && activePresentCount > 0 && !activeVolumeSetComplete)) {
+        if (!volumeSetComplete && (containerPresent || presentVolumeCount > 0)) {
             return {
                 state: 'incompatible',
                 message: `${engine.name} has only part of the expected Box resource set`,

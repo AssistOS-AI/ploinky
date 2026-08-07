@@ -722,10 +722,10 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 notes: 'This host-level command preserves the outer runtime volumes.',
             },
             destroy: {
-                description: 'Remove the outer runtime, retaining its two named storage volumes and host workspace by default.',
+                description: 'Stop nested agents and remove the outer runtime, retaining its dependency and image cache volumes and host workspace by default.',
                 syntax: 'destroy [--delete-volumes]',
                 examples: ['destroy', 'destroy --delete-volumes'],
-                notes: 'Attached anonymous volumes are always cleaned. Without the flag, this host-level command asks for confirmation and retains the host workspace plus dependency and nested-container-storage named volumes. With --delete-volumes, it deletes the outer runtime, those exact owned storage volumes, and any exactly owned legacy workspace volume without prompting; host workspace files are never deleted. Before recreating a legacy named-workspace Box, back up any Box-only data, run stop, then use destroy --delete-volumes.',
+                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Attached anonymous volumes are always cleaned. Without the flag, this host-level command asks for confirmation and retains the host workspace plus the dependency cache and nested image cache named volumes. With --delete-volumes, it deletes the outer runtime and those exact owned cache volumes without prompting; host workspace files are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
             },
         }
         : {

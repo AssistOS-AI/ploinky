@@ -134,8 +134,9 @@ export async function runOuterCli(argv, {
     if (route.kind === 'destroy') {
         const status = selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
-        const volumes = status.ownership?.handles?.volumes;
-        if (!container && !(route.deleteVolumes && volumes)) {
+        const hasOwnedVolumes = Object.values(status.ownership?.handles?.volumes || {})
+            .some(Boolean);
+        if (!container && !(route.deleteVolumes && hasOwnedVolumes)) {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }
