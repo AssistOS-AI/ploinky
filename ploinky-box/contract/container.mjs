@@ -117,9 +117,14 @@ function publicationError(message) {
     });
 }
 
-export function validateContainerPublications(containerHandle, expectedHostPort) {
+export function validateContainerPublications(
+    containerHandle,
+    expectedHostPort,
+    expectedMediaHostPort = BOX_MEDIA_PORT,
+) {
     const runtime = containerHandle?.runtime;
     const port = String(expectedHostPort);
+    const mediaPort = String(expectedMediaHostPort);
     if (!runtime?.complete || !Array.isArray(runtime.publications) || !runtime.environment) {
         throw publicationError('Owned Box has incomplete runtime publication state');
     }
@@ -134,7 +139,7 @@ export function validateContainerPublications(containerHandle, expectedHostPort)
             containerPort: String(BOX_MEDIA_PORT),
             protocol: 'udp',
             hostIp: '0.0.0.0',
-            hostPort: String(BOX_MEDIA_PORT),
+            hostPort: mediaPort,
         },
     ].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
     if (JSON.stringify(runtime.publications) !== JSON.stringify(expected)) {
@@ -147,11 +152,15 @@ export function validateContainerPublications(containerHandle, expectedHostPort)
     if (containerHandle.labels?.[BOX_LABELS.routerHostPort] !== port) {
         throw publicationError('Owned Box host-port label does not match its publication');
     }
+    if (containerHandle.labels?.[BOX_LABELS.mediaHostPort] !== mediaPort) {
+        throw publicationError('Owned Box media host-port label does not match its publication');
+    }
     if (runtime.environment.PLOINKY_PUBLIC_AUTHORITY !== `127.0.0.1:${port}`) {
         throw publicationError('Owned Box public authority does not match its publication');
     }
     return Object.freeze({
         hostPort: Number(port),
+        mediaHostPort: Number(mediaPort),
         tcp: expected.find((item) => item.protocol === 'tcp'),
         udp: expected.find((item) => item.protocol === 'udp'),
         running: runtime.running,
@@ -161,12 +170,13 @@ export function validateContainerPublications(containerHandle, expectedHostPort)
 export function validateContainerConfiguration(containerHandle, {
     identity,
     hostPort,
+    mediaHostPort = BOX_MEDIA_PORT,
     imageId,
     imageRef,
     repositoryRoot,
     hostKind = 'native-linux',
 }) {
-    const publication = validateContainerPublications(containerHandle, hostPort);
+    const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort);
     const runtime = containerHandle.runtime;
     if (containerHandle.id === '' || runtime.imageId !== imageId) {
         throw publicationError('Owned Box image ID does not match the validated immutable image');
@@ -186,6 +196,7 @@ export function validateContainerConfiguration(containerHandle, {
         [BOX_LABELS.role]: 'box',
         [BOX_LABELS.imageRef]: imageRef,
         [BOX_LABELS.routerHostPort]: String(hostPort),
+        [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
     };
     const ownershipLabels = Object.fromEntries(Object.entries(containerHandle.labels)
         .filter(([key]) => key.startsWith(BOX_OWNERSHIP_LABEL_PREFIX))

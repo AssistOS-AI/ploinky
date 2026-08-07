@@ -39,7 +39,16 @@ function volumeHandles(identity) {
     return Object.fromEntries(Object.entries(identity.volumes).map(([key, name]) => [key, { name }]));
 }
 
-function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort, id, running = true }) {
+function containerHandle({
+    identity,
+    repositoryRoot,
+    imageId,
+    imageRef,
+    hostPort,
+    mediaHostPort = 7882,
+    id,
+    running = true,
+}) {
     return {
         id,
         labels: {
@@ -48,6 +57,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
             [BOX_LABELS.role]: 'box',
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: String(hostPort),
+            [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
         },
         runtime: {
             complete: true,
@@ -69,7 +79,7 @@ function containerHandle({ identity, repositoryRoot, imageId, imageRef, hostPort
                 HOSTNAME: id.slice(0, 12),
             },
             publications: [
-                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
+                { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaHostPort) },
                 { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: String(hostPort) },
             ],
             running,
@@ -253,12 +263,14 @@ function harness(state, {
                 const imageId = args.at(-1);
                 const imageRefLabel = args.find((value) => value.startsWith(`${BOX_LABELS.imageRef}=`));
                 const portLabel = args.find((value) => value.startsWith(`${BOX_LABELS.routerHostPort}=`));
+                const mediaPortLabel = args.find((value) => value.startsWith(`${BOX_LABELS.mediaHostPort}=`));
                 current = containerHandle({
                     identity: state.identity,
                     repositoryRoot: state.root,
                     imageId,
                     imageRef: imageRefLabel.slice(imageRefLabel.indexOf('=') + 1),
                     hostPort: Number(portLabel.slice(portLabel.indexOf('=') + 1)),
+                    mediaHostPort: Number(mediaPortLabel.slice(mediaPortLabel.indexOf('=') + 1)),
                     id: cid,
                     running: false,
                 });
@@ -332,6 +344,7 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
         imageId: 'a'.repeat(64),
         imageRef: 'docker.io/assistos/ploinky-box:runtime',
         hostPort: 19090,
+        mediaHostPort: 17891,
         repositoryRoot: state.root,
         cidfile,
     });
@@ -341,7 +354,8 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.some((value) => value.includes('docker.sock') || value.includes('podman.sock')), false);
     assert.equal(args.filter((value) => value === '--publish').length, 2);
     assert.equal(args.includes('127.0.0.1:19090:8080/tcp'), true);
-    assert.equal(args.includes('0.0.0.0:7882:7882/udp'), true);
+    assert.equal(args.includes('0.0.0.0:17891:7882/udp'), true);
+    assert.equal(args.includes(`${BOX_LABELS.mediaHostPort}=17891`), true);
     assert.equal(args.includes('unmask=ALL'), true);
     assert.equal(args.includes('label=disable'), true);
     assert.equal(args.includes(`PLOINKY_ROUTER_HEALTH_SOCKET=${BOX_ROUTER_HEALTH_SOCKET}`), true);
@@ -431,8 +445,11 @@ test('initial transaction preflights before pull, volumes, and container creatio
         lock: state.lock,
         repositoryRoot: state.root,
         explicitPort: 19090,
+        explicitMediaPort: 17891,
     }, h.seams);
     assert.equal(result.action, 'created');
+    assert.equal(result.mediaHostPort, 17891);
+    assert.equal(h.calls.some((call) => call.includes('0.0.0.0:17891:7882/udp')), true);
     const flat = h.calls.map((call) => call.join(' '));
     assert.ok(flat.findIndex((value) => value.includes('preflight')) < flat.findIndex((value) => value.includes('stream podman pull')));
     assert.ok(flat.findIndex((value) => value.includes('stream podman pull')) < flat.findIndex((value) => value.includes('ensure-volumes')));
@@ -550,6 +567,7 @@ test('replacement failure removes the candidate and restores the validated old i
         imageId: oldImage,
         imageRef: 'docker.io/assistos/ploinky-box:runtime',
         hostPort: 18080,
+        mediaHostPort: 17880,
         id: 'e'.repeat(64),
     });
     const h = harness(state, { initial: old, failCandidateReady: true });
@@ -561,9 +579,14 @@ test('replacement failure removes the candidate and restores the validated old i
         lock: state.lock,
         repositoryRoot: state.root,
         explicitPort: 19090,
+        explicitMediaPort: 17891,
     }, h.seams), /transaction failed/);
     assert.equal(h.current().runtime.imageId, oldImage);
     assert.equal(h.current().runtime.running, true);
+    assert.equal(h.current().labels[BOX_LABELS.mediaHostPort], '17880');
+    assert.equal(h.current().runtime.publications.some((entry) => (
+        entry.protocol === 'udp' && entry.hostPort === '17880'
+    )), true);
     assert.equal(h.calls.some((call) => call.includes('rollback-volumes')), false);
     const removals = h.calls.filter((call) => call.join(' ').includes('container rm -f --volumes'));
     assert.equal(removals.length, 2);

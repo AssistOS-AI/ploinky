@@ -22,7 +22,7 @@ function consumeValue(tokens, index, flag) {
     return next;
 }
 
-function analyzeStart(tokens, commandToken, explicitPort) {
+function analyzeStart(tokens, commandToken, explicitPort, explicitMediaPort) {
     const tail = tokens.filter((token) => token.rawIndex > commandToken.rawIndex);
     const positional = [];
     const policyWithValue = new Set(['--branch', '--repo-branch', '--branch-fallback']);
@@ -30,6 +30,9 @@ function analyzeStart(tokens, commandToken, explicitPort) {
         const token = tail[index];
         if (token.text === '--port' || token.text.startsWith('--port=')) {
             throw argumentError('--port is accepted only before start and only as two arguments');
+        }
+        if (token.text === '--udp-port' || token.text.startsWith('--udp-port=')) {
+            throw argumentError('--udp-port is accepted only before start and only as two arguments');
         }
         if (policyWithValue.has(token.text)) {
             if (!tail[index + 1]) throw argumentError(`${token.text} requires a value`);
@@ -55,7 +58,7 @@ function analyzeStart(tokens, commandToken, explicitPort) {
     }
     const hostPort = explicitPort ?? positionalPort ?? null;
     const positionalPortIndex = positional.length === 2 ? positional[1].rawIndex : -1;
-    return { hostPort, positionalPortIndex };
+    return { hostPort, mediaHostPort: explicitMediaPort, positionalPortIndex };
 }
 
 export function parseOuterArguments(argv) {
@@ -68,6 +71,7 @@ export function parseOuterArguments(argv) {
         .filter((token) => token.rawIndex !== firstDebugIndex);
     const removedRawIndexes = new Set();
     let explicitPort = null;
+    let explicitMediaPort = null;
     let dryRun = false;
     let help = false;
     let commandToken = null;
@@ -92,6 +96,20 @@ export function parseOuterArguments(argv) {
         }
         if (token.text.startsWith('--port=')) {
             throw argumentError('--port=PORT is unsupported; use --port PORT before start');
+        }
+        if (token.text === '--udp-port') {
+            if (explicitMediaPort !== null) {
+                throw argumentError('--udp-port was supplied more than once');
+            }
+            const value = consumeValue(tokens, index, '--udp-port');
+            explicitMediaPort = parseArgumentPort(value.text, '--udp-port');
+            removedRawIndexes.add(token.rawIndex);
+            removedRawIndexes.add(value.rawIndex);
+            index += 1;
+            continue;
+        }
+        if (token.text.startsWith('--udp-port=')) {
+            throw argumentError('--udp-port=PORT is unsupported; use --udp-port PORT before start');
         }
         if (token.text === '--dry-run') {
             if (dryRun) throw argumentError('--dry-run was supplied more than once');
@@ -118,6 +136,9 @@ export function parseOuterArguments(argv) {
     if (explicitPort !== null && commandToken?.text !== 'start') {
         throw argumentError('--port is valid only before start');
     }
+    if (explicitMediaPort !== null && commandToken?.text !== 'start') {
+        throw argumentError('--udp-port is valid only before start');
+    }
     const classificationArgv = tokens.map((token) => token.text);
     const command = commandToken?.text || '';
     const commandArgs = commandToken
@@ -126,7 +147,7 @@ export function parseOuterArguments(argv) {
     const forwarding = raw.filter((_, index) => !removedRawIndexes.has(index));
     let start = null;
     if (command === 'start') {
-        const analyzed = analyzeStart(tokens, commandToken, explicitPort);
+        const analyzed = analyzeStart(tokens, commandToken, explicitPort, explicitMediaPort);
         const normalized = raw.flatMap((token, rawIndex) => {
             if (removedRawIndexes.has(rawIndex)) return [];
             if (rawIndex === analyzed.positionalPortIndex) return [String(BOX_ROUTER_CONTAINER_PORT)];
@@ -137,6 +158,7 @@ export function parseOuterArguments(argv) {
         }
         start = Object.freeze({
             hostPort: analyzed.hostPort,
+            mediaHostPort: analyzed.mediaHostPort,
             coreArgv: Object.freeze(normalized),
         });
     }
@@ -155,6 +177,7 @@ export function parseOuterArguments(argv) {
         help,
         terminated,
         explicitPort,
+        explicitMediaPort,
         start,
     });
 }

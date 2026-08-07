@@ -11,6 +11,7 @@ function signalExitCode(signal) {
 
 export function buildContainerExecArgs(containerId, commandArgv, {
     hostPort,
+    mediaHostPort,
     interactive = false,
     inputIsTty = false,
     outputIsTty = false,
@@ -23,6 +24,9 @@ export function buildContainerExecArgs(containerId, commandArgv, {
     args.push(
         '--env', `PLOINKY_ROUTER_HOST_PORT=${parseHostPort(hostPort, {
             source: 'prepared Box host port',
+        })}`,
+        '--env', `PLOINKY_MEDIA_HOST_PORT=${parseHostPort(mediaHostPort, {
+            source: 'prepared Box media host port',
         })}`,
         '--user', 'podman',
         '--workdir', '/workspace',

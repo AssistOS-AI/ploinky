@@ -95,7 +95,7 @@ test('prepare acquires once, reconciles under lock, validates dependencies, then
         reconcile: async ({ lock }) => {
             lock.assertHeld(identity.instance);
             events.push('reconcile');
-            return { action: 'reused', ownership, hostPort: 8080 };
+            return { action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882 };
         },
     });
     const result = await supervisor.prepareBoxForCommand();
@@ -402,6 +402,40 @@ test('failed ploinky-local stop still stops the outer Box', async (t) => {
     assert.equal(events.some((value) => value.includes('container stop --time 30')), true);
 });
 
+test('start passes the native host address into the bounded in-box runtime', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const events = [];
+    let boundedOptions;
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        platform: 'darwin',
+        runner: { run(_command, args) { events.push(args.join(' ')); } },
+        reconcile: async () => ({
+            action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882,
+        }),
+        readEdgeDesired: () => null,
+        resolveHostReachableIpv4: async ({ platform }) => {
+            assert.equal(platform, 'darwin');
+            return '192.168.1.12';
+        },
+        startCore: async (_engine, _containerId, coreArgs, hostPort, mediaHostPort, _runner, options) => {
+            assert.deepEqual(coreArgs, ['start', 'explorer']);
+            assert.equal(hostPort, 8080);
+            assert.equal(mediaHostPort, 7882);
+            boundedOptions = options;
+        },
+        healthCheck: async (hostPort) => assert.equal(hostPort, 8080),
+    });
+
+    await supervisor.runStartTransaction(['start', 'explorer']);
+    assert.equal(boundedOptions.hostReachableIpv4, '192.168.1.12');
+});
+
 test('bounded start requires the external Dashboard URL and preserves normalized argv', async () => {
     const output = { value: '', write(chunk) { this.value += String(chunk); } };
     const calls = [];
@@ -410,6 +444,7 @@ test('bounded start requires the external Dashboard URL and preserves normalized
         'a'.repeat(64),
         ['--debug', 'start', 'Agent', '8080'],
         19090,
+        17891,
         {
             async stream(command, args, options) {
                 calls.push([command, args, options]);
@@ -423,12 +458,21 @@ test('bounded start requires the external Dashboard URL and preserves normalized
                 };
             },
         },
-        { stdout: output, stderr: output, timeoutMs: 1000 },
+        {
+            stdout: output,
+            stderr: output,
+            timeoutMs: 1000,
+            hostReachableIpv4: '192.168.1.12',
+        },
     );
     assert.equal(status, 0);
     assert.deepEqual(calls[0][1].slice(-4), ['--debug', 'start', 'Agent', '8080']);
-    assert.deepEqual(calls[0][1].slice(0, 5), [
-        'container', 'exec', '--env', 'PLOINKY_ROUTER_HOST_PORT=19090', '--user',
+    assert.deepEqual(calls[0][1].slice(0, 12), [
+        'container', 'exec',
+        '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
+        '--env', 'PLOINKY_MEDIA_HOST_PORT=17891',
+        '--env', 'PLOINKY_HOST_REACHABLE_IPV4=192.168.1.12',
+        '--user', 'podman', '--workdir', '/workspace',
     ]);
     assert.equal(calls[0][2].stdout, output);
     assert.equal(calls[0][2].stderr, output);
@@ -436,7 +480,7 @@ test('bounded start requires the external Dashboard URL and preserves normalized
 
     const defaultTimeoutCalls = [];
     await runBoundedCoreStart(
-        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 8080,
+        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 8080, 7882,
         {
             async stream(command, args, options) {
                 defaultTimeoutCalls.push(options);
@@ -451,9 +495,23 @@ test('bounded start requires the external Dashboard URL and preserves normalized
         { stdout: { write() {} }, stderr: { write() {} } },
     );
     assert.equal(defaultTimeoutCalls[0].timeoutMs, 1_800_000);
+    assert.equal(
+        calls[0][1].includes('PLOINKY_HOST_REACHABLE_IPV4=192.168.1.12'),
+        true,
+    );
 
     await assert.rejects(() => runBoundedCoreStart(
-        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090,
+        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 8080, 7882,
+        { stream: async () => { throw new Error('invalid address must fail before Podman'); } },
+        {
+            stdout: { write() {} },
+            stderr: { write() {} },
+            hostReachableIpv4: '192.168.001.12',
+        },
+    ), /usable canonical literal IPv4 address/);
+
+    await assert.rejects(() => runBoundedCoreStart(
+        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090, 17891,
         { stream: async () => ({ ok: true, status: 0, stdout: '[start] Dashboard: http://127.0.0.1:8080/dashboard\n', stderr: '' }) },
         { stdout: { write() {} }, stderr: { write() {} } },
     ), /public Dashboard URL/);

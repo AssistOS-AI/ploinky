@@ -29,7 +29,10 @@ function owned(identity, { running = true } = {}) {
         handles: {
             container: {
                 id: 'a'.repeat(64),
-                labels: { [BOX_LABELS.routerHostPort]: '8080' },
+                labels: {
+                    [BOX_LABELS.routerHostPort]: '8080',
+                    [BOX_LABELS.mediaHostPort]: '7882',
+                },
                 runtime: { running },
             },
             volumes: {},
@@ -85,7 +88,7 @@ function matrixSupervisor(identity, events) {
         reconcile: async ({ lock }) => {
             lock.assertHeld(identity.instance);
             events.push('reconcile');
-            return { ownership, hostPort: 8080, action: 'reused' };
+            return { ownership, hostPort: 8080, mediaHostPort: 7882, action: 'reused' };
         },
         startCore: async () => { events.push('start-core'); },
         healthCheck: async () => { events.push('health'); },
@@ -180,6 +183,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
         reconcile: async () => ({
             ownership: owned(identity),
             hostPort: 8080,
+            mediaHostPort: 7882,
             action: 'reused',
         }),
         readEdgeDesired(selectedIdentity) {
@@ -271,7 +275,10 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         repositoryRoot: '/opt/source',
         cidfile: '/private/lock/candidate.cid',
     });
-    const execArgs = buildContainerExecArgs('a'.repeat(64), ['status'], { hostPort: 8080 });
+    const execArgs = buildContainerExecArgs('a'.repeat(64), ['status'], {
+        hostPort: 8080,
+        mediaHostPort: 7882,
+    });
     for (const canary of Object.values(host).filter((value) => /CANARY/.test(value))) {
         assert.equal(JSON.stringify(engineEnvironment).includes(canary), false);
         assert.equal(JSON.stringify(createArgs).includes(canary), false);

@@ -31,7 +31,11 @@ test('active runtime documentation describes the semantic Box configuration', ()
         const content = read(relativePath);
         assert.match(content, /assistos\/ploinky-box/, relativePath);
         assert.match(content, /127\.0\.0\.1:[^`\n]*:8080\/tcp/, relativePath);
-        assert.match(content, /0\.0\.0\.0:7882:7882\/udp/, relativePath);
+        assert.match(
+            content,
+            /0\.0\.0\.0:<(?:selectedMediaHostPort|selected-media-host-port)>:7882\/udp/,
+            relativePath,
+        );
         assert.doesNotMatch(content, /io\.assistos\.ploinky\.runtime-contract/, relativePath);
         assert.doesNotMatch(content, /io\.assistos\.ploinky\.identity-schema/, relativePath);
         assert.doesNotMatch(content, /contract[- ](?:v)?[56]|runtime[- ]v[56]/i, relativePath);

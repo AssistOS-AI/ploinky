@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 
-import { BOX_IMAGE_REFERENCE } from '../constants.mjs';
+import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../constants.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import {
     inspectAndValidateExistingImage,
@@ -40,12 +40,14 @@ function transactionError(message, cause, rollbackFailures = []) {
 
 function oldDesired(identity, ownership, repositoryRoot, engine) {
     const container = ownership.handles.container;
-    const hostPort = Number(container.labels['io.assistos.ploinky-box.router-host-port']);
-    const imageRef = container.labels['io.assistos.ploinky-box.image-ref'];
+    const hostPort = Number(container.labels[BOX_LABELS.routerHostPort]);
+    const mediaHostPort = Number(container.labels[BOX_LABELS.mediaHostPort]);
+    const imageRef = container.labels[BOX_LABELS.imageRef];
     const imageId = container.runtime.imageId;
     const desired = {
         identity,
         hostPort,
+        mediaHostPort,
         imageRef,
         imageId,
         repositoryRoot,
@@ -94,6 +96,7 @@ async function createAndStart({
     image,
     imageRef,
     hostPort,
+    mediaHostPort,
     repositoryRoot,
     runner,
     lock,
@@ -117,6 +120,7 @@ async function createAndStart({
         imageId: image.immutableId,
         imageRef,
         hostPort,
+        mediaHostPort,
         repositoryRoot,
         cidfile,
         hostKind: engine.hostKind,
@@ -143,6 +147,7 @@ async function createAndStart({
     const handle = validateCreatedContainer(finalOwnership, {
         identity,
         hostPort,
+        mediaHostPort,
         imageId: image.immutableId,
         imageRef,
         repositoryRoot,
@@ -171,6 +176,7 @@ async function restoreOldContainer({
         image: { immutableId: old.imageId },
         imageRef: old.imageRef,
         hostPort: old.hostPort,
+        mediaHostPort: old.mediaHostPort,
         repositoryRoot: old.repositoryRoot,
         runner,
         lock,
@@ -194,6 +200,7 @@ export async function reconcileBoxContainer({
     lock,
     repositoryRoot,
     explicitPort,
+    explicitMediaPort,
     imageRef = BOX_IMAGE_REFERENCE,
     platform = process.platform,
     env = process.env,
@@ -221,14 +228,16 @@ export async function reconcileBoxContainer({
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
-    const portPlan = resolveEffectiveHostPort({ explicitPort, ownership });
+    const portPlan = resolveEffectiveHostPort({ explicitPort, explicitMediaPort, ownership });
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
     if (old) {
         dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
     }
     const requiresReplacement = Boolean(old) && (
-        old.hostPort !== portPlan.hostPort || old.imageRef !== imageRef
+        old.hostPort !== portPlan.hostPort
+        || old.mediaHostPort !== portPlan.mediaHostPort
+        || old.imageRef !== imageRef
     );
     if (old && !requiresReplacement) {
         dependencies.revalidateVolumes({
@@ -245,11 +254,17 @@ export async function reconcileBoxContainer({
         }
         const finalOwnership = dependencies.discover(identity, { runner });
         validateCreatedContainer(finalOwnership, old);
-        return Object.freeze({ action: 'reused', ownership: finalOwnership, hostPort: old.hostPort });
+        return Object.freeze({
+            action: 'reused',
+            ownership: finalOwnership,
+            hostPort: old.hostPort,
+            mediaHostPort: old.mediaHostPort,
+        });
     }
 
     await dependencies.preflight({
         hostPort: portPlan.hostPort,
+        mediaHostPort: portPlan.mediaHostPort,
         existingPublication: portPlan.existingPublication,
     });
     await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
@@ -294,6 +309,7 @@ export async function reconcileBoxContainer({
             image,
             imageRef,
             hostPort: portPlan.hostPort,
+            mediaHostPort: portPlan.mediaHostPort,
             repositoryRoot,
             runner,
             lock,
@@ -312,6 +328,7 @@ export async function reconcileBoxContainer({
             action: old ? 'replaced' : 'created',
             ownership: created.ownership,
             hostPort: portPlan.hostPort,
+            mediaHostPort: portPlan.mediaHostPort,
             imageId: image.immutableId,
         });
     } catch (error) {

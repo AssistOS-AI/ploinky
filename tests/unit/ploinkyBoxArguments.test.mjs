@@ -20,9 +20,13 @@ test('first debug token is removed only from classification and preserved for co
 });
 
 test('prefix and positional start ports normalize only the in-box port', () => {
-    const prefix = parseOuterArguments(['--debug', '--port', '9090', 'start', 'Agent']);
+    const prefix = parseOuterArguments([
+        '--debug', '--port', '9090', '--udp-port', '17891', 'start', 'Agent',
+    ]);
     assert.equal(prefix.start.hostPort, 9090);
+    assert.equal(prefix.start.mediaHostPort, 17891);
     assert.deepEqual(prefix.start.coreArgv, ['--debug', 'start', 'Agent', '8080']);
+    assert.equal(routeOuterCommand(prefix).mediaHostPort, 17891);
 
     const positional = parseOuterArguments(['start', 'Agent', '--debug', '9090']);
     assert.equal(positional.start.hostPort, 9090);
@@ -33,6 +37,10 @@ test('prefix and positional start ports normalize only the in-box port', () => {
 test('port boundaries are accepted and malformed or ambiguous forms reject', () => {
     for (const value of ['1', '65535']) {
         assert.equal(parseOuterArguments(['--port', value, 'start', 'Agent']).start.hostPort, Number(value));
+        assert.equal(
+            parseOuterArguments(['--udp-port', value, 'start', 'Agent']).start.mediaHostPort,
+            Number(value),
+        );
         assert.equal(parseOuterArguments(['start', 'Agent', value]).start.hostPort, Number(value));
     }
     const invalid = [
@@ -44,6 +52,13 @@ test('port boundaries are accepted and malformed or ambiguous forms reject', () 
         ['--port', '65536', 'start', 'Agent'],
         ['--port=9090', 'start', 'Agent'],
         ['--port', '9090', '--port', '9091', 'start', 'Agent'],
+        ['--udp-port'],
+        ['--udp-port', '0', 'start', 'Agent'],
+        ['--udp-port=17891', 'start', 'Agent'],
+        ['--udp-port', '17891', '--udp-port', '17892', 'start', 'Agent'],
+        ['--udp-port', '17891', 'status'],
+        ['--media-port', '17891', 'start', 'Agent'],
+        ['start', 'Agent', '--udp-port', '17891'],
         ['--port', '9090', 'start', 'Agent', '9091'],
         ['start', 'Agent', '9090', 'tail'],
         ['start', 'Agent', 'not-a-port'],
@@ -54,8 +69,10 @@ test('port boundaries are accepted and malformed or ambiguous forms reject', () 
 });
 
 test('post-command lookalikes and terminator-led commands retain spelling and order', () => {
-    const ordinary = parseOuterArguments(['run', '--port', '9090', '--image=inside']);
-    assert.deepEqual(ordinary.forwardingArgv, ['run', '--port', '9090', '--image=inside']);
+    const ordinary = parseOuterArguments(['run', '--port', '9090', '--udp-port', '17891', '--image=inside']);
+    assert.deepEqual(ordinary.forwardingArgv, [
+        'run', '--port', '9090', '--udp-port', '17891', '--image=inside',
+    ]);
     assert.equal(routeOuterCommand(ordinary).kind, 'generic');
 
     const terminated = parseOuterArguments(['--', '--help', 'topic']);

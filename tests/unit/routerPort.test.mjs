@@ -7,12 +7,14 @@ import path from 'node:path';
 import {
     assertRouterEndpoint,
     buildRouterEndpoint,
+    parseMediaHostPort,
     parseRouterHostPort,
     parseRouterPort,
     resolveInitialRouterPort,
     resolvePersistedRouterPort,
     resolveRouterEndpoint,
     selectedRouterHostPort,
+    selectedMediaHostPort,
 } from '../../cli/sandbox/routerPort.js';
 
 function tempRouting(contents) {
@@ -37,6 +39,17 @@ test('selected physical Router host port comes only from the supervisor environm
     for (const value of ['019194', ' 19194', '19194 ', '19194x', '', null, true, 0, 65536, 1.5]) {
         assert.throws(() => parseRouterHostPort(value), {
             code: 'PLOINKY_ROUTER_HOST_PORT_INVALID',
+        });
+    }
+});
+
+test('selected physical media host port validates the supervisor environment and defaults to 7882', () => {
+    assert.equal(selectedMediaHostPort({ PLOINKY_MEDIA_HOST_PORT: '17891' }), 17891);
+    assert.equal(selectedMediaHostPort({}), 7882);
+    assert.equal(parseMediaHostPort(65535), 65535);
+    for (const value of ['017891', ' 17891', '17891 ', '17891x', '', null, true, 0, 65536, 1.5]) {
+        assert.throws(() => selectedMediaHostPort({ PLOINKY_MEDIA_HOST_PORT: value }), {
+            code: 'PLOINKY_MEDIA_HOST_PORT_INVALID',
         });
     }
 });

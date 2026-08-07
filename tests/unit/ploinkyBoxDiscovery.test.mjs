@@ -25,6 +25,7 @@ function labels(identity, role) {
     if (role === BOX_ROLES.container) {
         result[BOX_LABELS.imageRef] = 'runtime';
         result[BOX_LABELS.routerHostPort] = '18080';
+        result[BOX_LABELS.mediaHostPort] = '17891';
     }
     return result;
 }

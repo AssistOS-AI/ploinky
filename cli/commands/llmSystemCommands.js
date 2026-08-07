@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createRequire } from 'module';
 import { debugLog } from '../utils/utils.js';
@@ -211,17 +211,6 @@ async function suggestCommandWithLLM(commandLabel, options = []) {
     }
 }
 
-function commandExistsSync(cmd) {
-    if (!cmd) return false;
-    const checker = process.platform === 'win32' ? 'where' : 'which';
-    try {
-        execSync(`${checker} ${cmd}`, { stdio: 'ignore' });
-        return true;
-    } catch {
-        return false;
-    }
-}
-
 function resolveCdTarget(target) {
     const homeDir = os.homedir() || process.cwd();
     if (!target || target === '~') {
@@ -244,10 +233,6 @@ export async function handleSystemCommand(command, options = []) {
             console.error(`cd: ${error?.message || error}`);
         }
         return true;
-    }
-
-    if (!commandExistsSync(command)) {
-        return false;
     }
 
     return await new Promise((resolve) => {

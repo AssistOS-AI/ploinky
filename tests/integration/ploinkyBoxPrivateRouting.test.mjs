@@ -124,6 +124,7 @@ test('one nested rootless-Podman container reaches the unpublished private liste
                 .sort(),
             [
                 'io.assistos.ploinky-box.image-ref',
+                'io.assistos.ploinky-box.media-host-port',
                 'io.assistos.ploinky-box.path-hash',
                 'io.assistos.ploinky-box.role',
                 'io.assistos.ploinky-box.router-host-port',

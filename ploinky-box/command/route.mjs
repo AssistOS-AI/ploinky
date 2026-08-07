@@ -11,6 +11,9 @@ function requireNoArgs(parsed, command) {
     if (parsed.explicitPort !== null) {
         throw routeError(`${command}: --port is not supported`);
     }
+    if (parsed.explicitMediaPort !== null) {
+        throw routeError(`${command}: --udp-port is not supported`);
+    }
 }
 
 function routeDestroy(parsed) {
@@ -19,6 +22,9 @@ function routeDestroy(parsed) {
     }
     if (parsed.explicitPort !== null) {
         throw routeError('destroy: --port is not supported');
+    }
+    if (parsed.explicitMediaPort !== null) {
+        throw routeError('destroy: --udp-port is not supported');
     }
     if (parsed.commandArgs.length === 0) {
         return Object.freeze({ kind: 'destroy', deleteVolumes: false });
@@ -74,6 +80,7 @@ export function routeOuterCommand(parsed) {
         return Object.freeze({
             kind: parsed.dryRun ? 'dry-run' : 'start',
             hostPort: parsed.start.hostPort,
+            mediaHostPort: parsed.start.mediaHostPort,
             coreArgv: parsed.start.coreArgv,
         });
     }

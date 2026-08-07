@@ -70,12 +70,19 @@ preserve those operations reliably across the outer and nested containers.
 | `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
+| `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep volumes |
 | `ploinky update` / `ploinky update all [PATH]` | Pull the cloned host Ploinky checkout from its configured upstream, refresh in-Box repositories/dependencies/skills, then restart an already configured running workspace |
 | `ploinky destroy` | Confirm and directly remove the outer container; retain its two named storage volumes and the host workspace |
 | `ploinky destroy --delete-volumes` | Directly remove the outer container and its owned storage volumes without prompting; never delete the host workspace |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
+
+When REPL input is not a Ploinky command, Ploinky attempts that executable
+directly using the runtime `PATH`; it does not depend on a separate `which`
+utility. Success still depends on the executable being present in the image.
+Optional system tools such as `ps` are not part of the Box image contract, while
+`ploinky cli` retains the dedicated shell and agent-CLI behavior shown above.
 
 The required outer image is the mutable
 `docker.io/assistos/ploinky-box:runtime` reference. Its image labels must be
@@ -117,7 +124,11 @@ it never removes the host workspace.
 
 Every managed box has exactly two engine publications, independent of graph or
 workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and
-`0.0.0.0:7882:7882/udp`. `--port` changes only the physical Router port;
+`0.0.0.0:<selectedMediaHostPort>:7882/udp`. `--port` changes only the physical
+Router port. `--udp-port` changes only the physical media UDP port and defaults
+to `7882`; the in-Box LiveKit listener remains fixed on wildcard UDP `7882`.
+For example, `ploinky --port 9090 --udp-port 12345 start explorer` publishes
+host TCP `9090` to in-Box TCP `8080` and host UDP `12345` to in-Box UDP `7882`.
 `--publish`, `--expose`, and `--listen-lan` are rejected. Agent `openPorts`,
 HTTP-service targets, readiness, profiles, manifests, labels, and retained state
 remain private and cannot add a third mapping. A managed Box creates its sole

@@ -593,7 +593,7 @@ The sole outer `-p` emission constructs exactly two publications for every box:
 | Mapping | Meaning |
 | --- | --- |
 | `127.0.0.1:<selectedRouterHostPort>:8080/tcp` | Loopback-only physical Router access. `--port` selects only the host side. |
-| `0.0.0.0:7882:7882/udp` | Unconditional reserved LiveKit UDP slot; idle when no capability owner runs. |
+| `0.0.0.0:<selectedMediaHostPort>:7882/udp` | Unconditional reserved LiveKit UDP slot. `--udp-port` selects only the physical-host side and defaults to `7882`; the in-Box listener remains fixed. |
 
 `--publish`, `--expose`, and `--listen-lan` are rejected before engine
 discovery. Workspace, graph, profile, manifest, `openPorts`, readiness,

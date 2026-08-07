@@ -107,13 +107,17 @@ function createFixture(t, {
 
     const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
     const previousRouterHostPort = process.env.PLOINKY_ROUTER_HOST_PORT;
+    const previousMediaHostPort = process.env.PLOINKY_MEDIA_HOST_PORT;
     process.env.PLOINKY_WORKSPACE_ROOT = workspace;
     process.env.PLOINKY_ROUTER_HOST_PORT = '18080';
+    process.env.PLOINKY_MEDIA_HOST_PORT = '17891';
     t.after(() => {
         if (previousRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
         else process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
         if (previousRouterHostPort === undefined) delete process.env.PLOINKY_ROUTER_HOST_PORT;
         else process.env.PLOINKY_ROUTER_HOST_PORT = previousRouterHostPort;
+        if (previousMediaHostPort === undefined) delete process.env.PLOINKY_MEDIA_HOST_PORT;
+        else process.env.PLOINKY_MEDIA_HOST_PORT = previousMediaHostPort;
         fs.rmSync(workspace, { recursive: true, force: true });
     });
     return { workspace, ploinkyDir, edgeDir, alphaDir };
@@ -147,6 +151,39 @@ test('active topology publishes routes and readiness without service locators or
     assert.deepEqual(readCurrentEdgeTopology({
         workspaceRoot: fixture.workspace,
     }), applied.topology);
+});
+
+test('media topology advertises the captured physical UDP host port', (t) => {
+    const fixture = createFixture(t, {
+        desired: localDesired({
+            media: {
+                publicIPv4: '8.8.8.8',
+                addressMode: 'nat-forward',
+            },
+        }),
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'media-host-port-generation',
+    });
+
+    assert.equal(applied.generation.mediaHostPort, 17891);
+    assert.equal(applied.topology.media.udpPort, 17891);
+    const generationDocument = JSON.parse(fs.readFileSync(path.join(
+        fixture.edgeDir,
+        'generations',
+        `${applied.selector.generation.replace(/^sha256:/, '')}.json`,
+    ), 'utf8'));
+    assert.equal(Buffer.from(generationDocument.sources.mediaHostPort, 'base64').toString('utf8'), '17891');
+    assert.match(generationDocument.sourceDigests.mediaHostPort, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(loadActiveEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+    }).generation.mediaHostPort, 17891);
+
+    process.env.PLOINKY_MEDIA_HOST_PORT = '17892';
+    assert.throws(() => loadActiveEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+    }), { code: 'EDGE_GENERATION_RUNTIME_MISMATCH' });
 });
 
 test('additive preparation and failed commit preserve the exact active predecessor', (t) => {

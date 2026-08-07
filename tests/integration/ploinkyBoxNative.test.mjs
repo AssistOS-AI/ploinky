@@ -29,13 +29,15 @@ function queryInBox(harness, containerId, argv) {
     ], { timeoutMs: 120_000 });
 }
 
-function findNestedAgent(harness, containerId) {
+function findNestedExplorer(harness, containerId) {
     return JSON.parse(execInBox(harness.runner, containerId, [
         '/usr/local/bin/node', '-e', [
             "const f=require('node:fs');",
             "const a=JSON.parse(f.readFileSync('/workspace/.ploinky/agents.json'));",
-            "const e=Object.entries(a).find(([,v])=>v&&v.runtime==='podman'&&/^[a-f0-9]{64}$/.test(v.containerId||''));",
-            "if(!e)process.exit(4);process.stdout.write(JSON.stringify({name:e[0],id:e[1].containerId}));",
+            "const r=JSON.parse(f.readFileSync('/workspace/.ploinky/routing.json'));",
+            "const name=r.static&&r.static.container;const v=name&&a[name];",
+            "if(!v||v.repoName!=='AchillesIDE'||v.agentName!=='explorer'||v.runtime!=='podman'||!(/^[a-f0-9]{64}$/.test(v.containerId||'')))process.exit(4);",
+            "process.stdout.write(JSON.stringify({name,id:v.containerId,repoName:v.repoName,agentName:v.agentName}));",
         ].join(''),
     ]));
 }
@@ -94,11 +96,16 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     const harness = createPodmanHarness(t, candidateReference);
     fs.writeFileSync(path.join(harness.workspace, 'host-visible.txt'), 'host-visible');
     fs.mkdirSync(path.join(harness.workspace, 'host-visible-folder'));
+    fs.writeFileSync(path.join(harness.child, 'host-visible-child.txt'), 'host-visible-child');
     const graph = readSmokeGraphInputs(process.env, { runner: harness.runner });
-    const startRoute = routeOuterCommand(parseOuterArguments(graph.args));
+    const selectedMediaHostPort = 17891;
+    const startRoute = routeOuterCommand(parseOuterArguments([
+        '--udp-port', String(selectedMediaHostPort), ...graph.args,
+    ]));
     assert.equal(startRoute.kind, 'start');
     assert.ok(startRoute.hostPort && startRoute.hostPort !== 8080,
         'candidate lifecycle start must exercise a custom public port');
+    assert.equal(startRoute.mediaHostPort, selectedMediaHostPort);
 
     const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky')), true);
@@ -136,7 +143,10 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     const genericResult = harness.runner.query('podman', buildContainerExecArgs(
         genericPrepared.containerId,
         generic.coreArgv,
-        { hostPort: genericPrepared.hostPort },
+        {
+            hostPort: genericPrepared.hostPort,
+            mediaHostPort: genericPrepared.mediaHostPort,
+        },
     ), { timeoutMs: 120_000 });
     assert.equal(genericResult.ok, true, genericResult.stderr);
 
@@ -147,12 +157,23 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     });
     const replArgs = buildContainerExecArgs(replPrepared.containerId, repl.coreArgv, {
         hostPort: replPrepared.hostPort,
+        mediaHostPort: replPrepared.mediaHostPort,
         interactive: true,
         inputIsTty: false,
         outputIsTty: false,
     });
     assert.deepEqual(replArgs.slice(-2), [replPrepared.containerId, '/opt/ploinky/bin/ploinky-local']);
     assert.equal(replArgs.includes('--tty'), false);
+
+    const directExternal = queryInBox(harness, replPrepared.containerId, [
+        'bash', '-c', [
+            'mkdir -p /tmp/ploinky-repl-no-which-path',
+            'ln -sf /usr/bin/ls /tmp/ploinky-repl-no-which-path/ls',
+            "PATH=/tmp/ploinky-repl-no-which-path /usr/local/bin/node --input-type=module -e \"const m=await import('/opt/ploinky/cli/commands/llmSystemCommands.js');const ok=await m.handleSystemCommand('ls',['/workspace/host-visible.txt']);if(!ok)process.exit(42)\"",
+        ].join(' && '),
+    ]);
+    assert.equal(directExternal.ok, true, directExternal.stderr);
+    assert.match(directExternal.stdout, /host-visible\.txt/);
 
     const keyEvidence = execInBox(harness.runner, prepared.containerId, [
         'bash', '-c', 'stat -c %a /workspace/.ploinky/master-key; sha256sum /workspace/.ploinky/master-key',
@@ -180,6 +201,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
 
     const started = await harness.supervisor.runStartTransaction(startRoute.coreArgv, {
         explicitPort: startRoute.hostPort,
+        explicitMediaPort: startRoute.mediaHostPort,
         imageRef: candidateReference,
     });
     await checkBoxHealth(startRoute.hostPort);
@@ -191,6 +213,11 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         entry.protocol === 'tcp'
         && entry.hostPort === String(startRoute.hostPort)
         && entry.containerPort === '8080'
+    )), true);
+    assert.equal(started.ownership.handles.container.runtime.publications.some((entry) => (
+        entry.protocol === 'udp'
+        && entry.hostPort === String(selectedMediaHostPort)
+        && entry.containerPort === String(BOX_MEDIA_PORT)
     )), true);
     assert.equal(started.ownership.handles.container.runtime.publications
         .some((entry) => entry.containerPort === '8081'), false);
@@ -209,16 +236,24 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(Number(watchdogOptions.port), 8080);
     assert.equal(watchdogOptions.headers.Host, `127.0.0.1:${startRoute.hostPort}`);
 
-    const agent = findNestedAgent(harness, started.containerId);
+    const agent = findNestedExplorer(harness, started.containerId);
+    assert.equal(agent.repoName, 'AchillesIDE');
+    assert.equal(agent.agentName, 'explorer');
     assert.equal(execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'exec', agent.id,
         'cat', '/workspace/host-visible.txt',
     ]), 'host-visible');
+    assert.equal(execInBox(harness.runner, started.containerId, [
+        'podman', 'container', 'exec', agent.id,
+        'cat', '/workspace/child/host-visible-child.txt',
+    ]), 'host-visible-child');
     execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'exec', agent.id,
         '/bin/sh', '-c', [
             'mkdir -p /workspace/agent-created-folder',
             'printf agent-created > /workspace/agent-created-folder/from-agent.txt',
+            'mkdir -p /workspace/child/agent-created-nested',
+            'printf nested-agent-created > /workspace/child/agent-created-nested/from-agent.txt',
             'printf persisted > /workspace/.ploinky/from-agent.txt',
         ].join('; '),
     ]);
@@ -226,14 +261,23 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         path.join(harness.workspace, 'agent-created-folder', 'from-agent.txt'),
         'utf8',
     ), 'agent-created');
-    assert.equal(
-        fs.statSync(path.join(harness.workspace, 'agent-created-folder', 'from-agent.txt')).uid,
-        process.getuid(),
-    );
+    assert.equal(fs.readFileSync(
+        path.join(harness.child, 'agent-created-nested', 'from-agent.txt'),
+        'utf8',
+    ), 'nested-agent-created');
     assert.equal(fs.readFileSync(
         path.join(harness.workspace, '.ploinky', 'from-agent.txt'),
         'utf8',
     ), 'persisted');
+    for (const createdPath of [
+        path.join(harness.workspace, 'agent-created-folder'),
+        path.join(harness.workspace, 'agent-created-folder', 'from-agent.txt'),
+        path.join(harness.child, 'agent-created-nested'),
+        path.join(harness.child, 'agent-created-nested', 'from-agent.txt'),
+        path.join(harness.workspace, '.ploinky', 'from-agent.txt'),
+    ]) {
+        assert.equal(fs.statSync(createdPath).uid, process.getuid());
+    }
     const nestedImageId = execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'inspect', '--format', '{{.Image}}', agent.id,
     ]);
@@ -290,13 +334,37 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         udp.bind(BOX_MEDIA_PORT, '0.0.0.0', resolve);
     });
     try {
+        const remapped = await harness.supervisor.prepareBoxForCommand({
+            explicitMediaPort: selectedMediaHostPort,
+            imageRef: candidateReference,
+        });
+        assert.equal(remapped.mediaHostPort, selectedMediaHostPort);
+        assert.equal(remapped.ownership.handles.container.runtime.publications.some((entry) => (
+            entry.protocol === 'udp'
+            && entry.hostPort === String(selectedMediaHostPort)
+            && entry.containerPort === String(BOX_MEDIA_PORT)
+        )), true);
+        await harness.supervisor.runDestroyTransaction(remapped.containerId);
+    } finally {
+        await new Promise((resolve) => udp.close(resolve));
+    }
+
+    const selectedUdp = dgram.createSocket('udp4');
+    await new Promise((resolve, reject) => {
+        selectedUdp.once('error', reject);
+        selectedUdp.bind(selectedMediaHostPort, '0.0.0.0', resolve);
+    });
+    try {
         await assert.rejects(
-            harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference }),
-            /UDP|7882|already reserved/i,
+            harness.supervisor.prepareBoxForCommand({
+                explicitMediaPort: selectedMediaHostPort,
+                imageRef: candidateReference,
+            }),
+            new RegExp(`UDP|${selectedMediaHostPort}|already reserved`, 'i'),
         );
         assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent-retained-volumes');
     } finally {
-        await new Promise((resolve) => udp.close(resolve));
+        await new Promise((resolve) => selectedUdp.close(resolve));
     }
 
     await harness.cleanup();
@@ -381,6 +449,7 @@ test('failed candidate replacement restores the validated old Box', {
     await assert.rejects(
         harness.supervisor.prepareBoxForCommand({
             explicitPort: 19091,
+            explicitMediaPort: 17892,
             imageRef: candidateReference,
         }),
         /transaction failed/i,
@@ -390,6 +459,9 @@ test('failed candidate replacement restores the validated old Box', {
     assert.match(restored.state, /^running-/);
     assert.equal(restored.ownership.handles.container.runtime.publications.some((entry) => (
         entry.protocol === 'tcp' && entry.hostPort === '8080' && entry.containerPort === '8080'
+    )), true);
+    assert.equal(restored.ownership.handles.container.runtime.publications.some((entry) => (
+        entry.protocol === 'udp' && entry.hostPort === '7882' && entry.containerPort === '7882'
     )), true);
     assert.deepEqual(Object.fromEntries(Object.entries(
         restored.ownership.handles.volumes,

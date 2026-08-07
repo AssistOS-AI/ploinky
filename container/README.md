@@ -138,22 +138,24 @@ uses the same workspace lock and fail-closed ownership checks, skips the prompt,
 and removes the exact three owned named volumes even when only retained volumes
 remain.
 
-## Fixed ports and graph-independent start
+## Fixed targets and graph-independent start
 
 The outer wrapper constructs the complete physical-host boundary before a
 workspace exists. Every create and recreate emits exactly:
 
 ```text
 127.0.0.1:<selected-host-port>:8080/tcp
-0.0.0.0:7882:7882/udp
+0.0.0.0:<selected-media-host-port>:7882/udp
 ```
 
-`--port` changes only `<selected-host-port>`. Outer `--publish`, `--expose`, and
+`--port` changes only `<selected-host-port>` and `--udp-port` changes only
+`<selected-media-host-port>`; they default to `8080` and `7882`, respectively.
+The in-Box Router and LiveKit targets remain fixed. Outer `--publish`, `--expose`, and
 `--listen-lan` fail before engine discovery. No workspace, graph, profile,
 manifest, readiness result, environment value, label, CLI escape hatch, or
-persisted state can add a third physical-host mapping. A pre-existing host owner
-of UDP `7882` makes creation fail with an actionable owner diagnostic; Ploinky
-does not auto-remap it.
+persisted state can add a third physical-host mapping. A pre-existing owner of
+the selected UDP host port makes creation fail with an actionable diagnostic;
+Ploinky never auto-remaps it.
 
 After core starts, physical loopback reaches Router public/control `8080`.
 Cloudflared inside the box also uses fixed origin `http://127.0.0.1:8080`,

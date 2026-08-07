@@ -15,11 +15,13 @@ import { isInsideBox } from '../lib/boxMarker.mjs';
 export function publicUsageText() {
     return `ploinky - run Ploinky through its managed outer Box
 
-Usage: ploinky [--debug] [--dry-run] [--port PORT] [--] COMMAND [ARGS]
+Usage: ploinky [--debug] [--dry-run] [--port PORT] [--udp-port PORT] [--] COMMAND [ARGS]
 
 Commands:
   ploinky                         Prepare the Box and open the Ploinky REPL
-  ploinky start AGENT [PORT]      Start the graph; the host port defaults to 8080
+  ploinky start AGENT [PORT]      Start the graph; the Router host port defaults to 8080
+  ploinky --udp-port PORT start AGENT [PORT]
+                                  Select the media host UDP port; defaults to 7882
   ploinky status                  Inspect Box and core state without mutation
   ploinky stop                    Stop core services and the outer Box
   ploinky update [all [PATH]]     Update host core, in-Box repos/deps/skills,
@@ -66,6 +68,7 @@ function executePrepared(prepared, coreArgv, {
         coreArgv,
         {
             hostPort: prepared.hostPort,
+            mediaHostPort: prepared.mediaHostPort,
             shell,
             interactive,
             inputIsTty: input.isTTY === true,
@@ -108,6 +111,7 @@ export async function runOuterCli(argv, {
                 containerId: container.id,
                 engine: status.ownership.engine,
                 hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
+                mediaHostPort: Number(container.labels?.[BOX_LABELS.mediaHostPort]),
             }, ['status'], {
                 execute,
                 input,
@@ -149,13 +153,17 @@ export async function runOuterCli(argv, {
         return 0;
     }
     if (route.kind === 'dry-run') {
-        const plan = selectedSupervisor.planDryRun({ explicitPort: route.hostPort });
+        const plan = selectedSupervisor.planDryRun({
+            explicitPort: route.hostPort,
+            explicitMediaPort: route.mediaHostPort,
+        });
         output.write(`${JSON.stringify(plan, null, 2)}\n`);
         return 0;
     }
     if (route.kind === 'start') {
         await selectedSupervisor.runStartTransaction(route.coreArgv, {
             explicitPort: route.hostPort,
+            explicitMediaPort: route.mediaHostPort,
         });
         return 0;
     }

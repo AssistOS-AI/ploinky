@@ -8,18 +8,28 @@ import {
     resolveEffectiveHostPort,
 } from '../../ploinky-box/ports.mjs';
 
-function owned(port = 19090, { running = true, publications, authority, labelPort } = {}) {
+function owned(port = 19090, {
+    running = true,
+    publications,
+    authority,
+    labelPort,
+    mediaPort = 17891,
+    mediaLabelPort,
+} = {}) {
     return {
         state: 'owned',
         handles: {
             container: {
-                labels: { [BOX_LABELS.routerHostPort]: String(labelPort ?? port) },
+                labels: {
+                    [BOX_LABELS.routerHostPort]: String(labelPort ?? port),
+                    [BOX_LABELS.mediaHostPort]: String(mediaLabelPort ?? mediaPort),
+                },
                 runtime: {
                     complete: true,
                     running,
                     environment: { PLOINKY_PUBLIC_AUTHORITY: authority ?? `127.0.0.1:${port}` },
                     publications: publications ?? [
-                        { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
+                        { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: String(mediaPort) },
                         { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: String(port) },
                     ],
                 },
@@ -29,14 +39,34 @@ function owned(port = 19090, { running = true, publications, authority, labelPor
 }
 
 test('port selection honors explicit, existing, then default precedence', () => {
-    assert.equal(resolveEffectiveHostPort({ explicitPort: '20000', ownership: { state: 'absent' } }).hostPort, 20000);
-    assert.equal(resolveEffectiveHostPort({ ownership: owned(19090) }).hostPort, 19090);
-    assert.equal(resolveEffectiveHostPort({ ownership: { state: 'absent' } }).hostPort, 8080);
+    assert.deepEqual(resolveEffectiveHostPort({
+        explicitPort: '20000',
+        explicitMediaPort: '20001',
+        ownership: { state: 'absent' },
+    }), {
+        hostPort: 20000,
+        mediaHostPort: 20001,
+        source: 'explicit',
+        existingPublication: null,
+    });
+    const existing = resolveEffectiveHostPort({ ownership: owned(19090) });
+    assert.equal(existing.hostPort, 19090);
+    assert.equal(existing.mediaHostPort, 17891);
+    const defaults = resolveEffectiveHostPort({ ownership: { state: 'absent' } });
+    assert.equal(defaults.hostPort, 8080);
+    assert.equal(defaults.mediaHostPort, 7882);
+    const mediaOnly = resolveEffectiveHostPort({
+        explicitMediaPort: 20002,
+        ownership: owned(19090),
+    });
+    assert.equal(mediaOnly.hostPort, 19090);
+    assert.equal(mediaOnly.mediaHostPort, 20002);
 });
 
 test('existing label, publication, and authority must agree exactly', () => {
     assert.throws(() => resolveEffectiveHostPort({ ownership: owned(19090, { labelPort: 19091 }) }), /publication/);
     assert.throws(() => resolveEffectiveHostPort({ ownership: owned(19090, { authority: '127.0.0.1:8080' }) }), /authority/);
+    assert.throws(() => resolveEffectiveHostPort({ ownership: owned(19090, { mediaLabelPort: 17892 }) }), /publication/);
     assert.throws(() => resolveEffectiveHostPort({ ownership: owned(19090, {
         publications: [
             { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
@@ -107,18 +137,37 @@ test('only a validated running current Box receives the self-reservation excepti
     const existingPublication = resolveEffectiveHostPort({ ownership: owned(19090) }).existingPublication;
     const result = await preflightPublications({
         hostPort: 19090,
+        mediaHostPort: 17891,
         existingPublication,
         checkTcp: async () => false,
         checkUdp: async () => false,
     });
     assert.equal(result.reusedSelfReservation, true);
     assert.equal(result.tcp, '127.0.0.1:19090:8080/tcp');
-    assert.equal(result.udp, '0.0.0.0:7882:7882/udp');
+    assert.equal(result.udp, '0.0.0.0:17891:7882/udp');
 
     await assert.rejects(() => preflightPublications({
         hostPort: 19090,
+        mediaHostPort: 17891,
         existingPublication: { ...existingPublication, running: false },
         checkTcp: async () => false,
         checkUdp: async () => false,
     }), /TCP/);
+
+    await assert.rejects(() => preflightPublications({
+        hostPort: 19091,
+        mediaHostPort: 17892,
+        existingPublication,
+        checkTcp: async () => true,
+        checkUdp: async () => false,
+    }), /UDP.*17892/);
+
+    const udpOnlyReuse = await preflightPublications({
+        hostPort: 19091,
+        mediaHostPort: 17891,
+        existingPublication,
+        checkTcp: async () => true,
+        checkUdp: async () => false,
+    });
+    assert.equal(udpOnlyReuse.reusedSelfReservation, true);
 });

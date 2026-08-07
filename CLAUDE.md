@@ -10,7 +10,7 @@ Treat executable code and tests as the only source of truth for current Ploinky 
 
 1. Keep Ploinky generic. Core routing, lifecycle code, and WebChat must not hardcode optional agent identifiers, model/provider tags, or agent-owned tool names.
 2. Resolve one exact workspace identity per Box. A Box must never discover, adopt, mutate, or report another workspace's state.
-3. Preserve the outer Box network boundary: publish only the loopback Router TCP surface and wildcard LiveKit UDP `7882`. Do not add a third publication, expose agent/Soul/port `7000` services directly, or expose the Router's private `8081` surface outside the Box.
+3. Preserve the outer Box network boundary: publish only the loopback Router TCP surface and one wildcard LiveKit UDP surface targeting the in-Box listener on `7882`; the physical-host UDP port may be selected independently. Do not add a third publication, expose agent/Soul/port `7000` services directly, or expose the Router's private `8081` surface outside the Box.
 4. Preserve the rootless, unprivileged runtime. Enforce the expected immutable image identity, read-only source mounts, and an init/reaper. Do not use privileged mode, SUID/setuid, file capabilities, or relaxed confinement to make a deployment pass.
 5. The host `ploinky` process owns the outer Box. The in-Box `ploinky-local` process owns nested agents and must never recursively create another Box.
 6. Serialize workspace mutations with the workspace lock. Revalidate immutable identity immediately before mutation, bound rollback, and declare readiness only when the complete manifest graph is ready or has reached its declared no-wait terminal state and every required external health check passes.

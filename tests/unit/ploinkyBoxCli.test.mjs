@@ -19,6 +19,7 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
         containerId: 'a'.repeat(64),
         engine: { name: 'podman' },
         hostPort: 19090,
+        mediaHostPort: 17891,
     };
     const status = {
         state: statusState,
@@ -30,7 +31,10 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
                 handles: {
                     container: statusState === 'running-initialized' ? {
                         id: prepared.containerId,
-                        labels: { [BOX_LABELS.routerHostPort]: String(prepared.hostPort) },
+                        labels: {
+                            [BOX_LABELS.routerHostPort]: String(prepared.hostPort),
+                            [BOX_LABELS.mediaHostPort]: String(prepared.mediaHostPort),
+                        },
                     } : null,
                     volumes: {},
                 },
@@ -130,7 +134,9 @@ test('the image marker bypasses outer parsing and dispatches original argv direc
 
 test('explicit start is reachable and retains normalized debug argv', async () => {
     const events = [];
-    const code = await runOuterCli(['--debug', '--port', '19090', 'start', 'Agent'], {
+    const code = await runOuterCli([
+        '--debug', '--port', '19090', '--udp-port', '17891', 'start', 'Agent',
+    ], {
         env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
     });
@@ -138,7 +144,7 @@ test('explicit start is reachable and retains normalized debug argv', async () =
     assert.deepEqual(events, [[
         'start',
         ['--debug', 'start', 'Agent', '8080'],
-        { explicitPort: 19090 },
+        { explicitPort: 19090, explicitMediaPort: 17891 },
     ]]);
 });
 
@@ -160,8 +166,11 @@ test('generic forwarding prepares under the supervisor then execs the fixed targ
     assert.deepEqual(events[1][2].slice(-4), [
         '/opt/ploinky/bin/ploinky-local', 'logs', '--debug', 'tail',
     ]);
-    assert.deepEqual(events[1][2].slice(0, 4), [
-        'container', 'exec', '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
+    assert.deepEqual(events[1][2].slice(0, 8), [
+        'container', 'exec',
+        '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
+        '--env', 'PLOINKY_MEDIA_HOST_PORT=17891',
+        '--user', 'podman',
     ]);
     assert.equal(JSON.stringify(events[1][3]).includes('HOST_CANARY'), false);
     assert.equal(JSON.stringify(events[1][3]).includes('UNRELATED_CANARY'), false);
@@ -268,10 +277,12 @@ test('targeted update forms retain generic forwarding without a host pull', asyn
 test('TTY flags appear only for interactive commands with both terminal ends', async () => {
     assert.deepEqual(buildContainerExecArgs('a'.repeat(64), [], {
         hostPort: 19090,
+        mediaHostPort: 17891,
         interactive: true, inputIsTty: true, outputIsTty: true, shell: true,
     }).slice(0, 4), ['container', 'exec', '--interactive', '--tty']);
     assert.equal(buildContainerExecArgs('a'.repeat(64), [], {
         hostPort: 19090,
+        mediaHostPort: 17891,
         interactive: true, inputIsTty: false, outputIsTty: true,
     }).includes('--tty'), false);
 
@@ -336,11 +347,13 @@ test('public help documents explicit no-prompt volume deletion', async () => {
 
 test('dry-run and invalid arguments cause no preparation or execution', async () => {
     const events = [];
-    await runOuterCli(['--dry-run', 'start', 'Agent', '19090'], {
+    await runOuterCli(['--dry-run', '--udp-port', '17891', 'start', 'Agent', '19090'], {
         env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
     });
-    assert.deepEqual(events, [['dry-run', { explicitPort: 19090 }]]);
+    assert.deepEqual(events, [[
+        'dry-run', { explicitPort: 19090, explicitMediaPort: 17891 },
+    ]]);
 
     await assert.rejects(() => runOuterCli(['--port', '0', 'start', 'Agent'], {
         env: {}, supervisor: fakeSupervisor(events),

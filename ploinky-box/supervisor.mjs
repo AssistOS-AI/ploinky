@@ -10,6 +10,11 @@ import {
     stageWorkspaceEdgeDesired,
 } from './edgeDesired.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import {
+    HOST_REACHABLE_IPV4_ENV,
+    detectHostReachableIpv4,
+    isUsableHostIpv4,
+} from './hostNetwork.mjs';
 import { resolveWorkspaceIdentity } from './identity.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
@@ -51,6 +56,7 @@ export function createBoxSupervisor({
     validateExistingImage = inspectAndValidateExistingImage,
     validateContainer = validateContainerConfiguration,
     startCore = runBoundedCoreStart,
+    resolveHostReachableIpv4 = detectHostReachableIpv4,
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
@@ -75,6 +81,7 @@ export function createBoxSupervisor({
 
     async function prepareBoxForCommand({
         explicitPort,
+        explicitMediaPort,
         imageRef = BOX_IMAGE_REFERENCE,
     } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
@@ -86,6 +93,7 @@ export function createBoxSupervisor({
                 lock,
                 repositoryRoot,
                 explicitPort,
+                explicitMediaPort,
                 imageRef,
                 platform,
                 env,
@@ -108,6 +116,7 @@ export function createBoxSupervisor({
                 lock,
                 repositoryRoot,
                 explicitPort: options.explicitPort,
+                explicitMediaPort: options.explicitMediaPort,
                 imageRef: options.imageRef || BOX_IMAGE_REFERENCE,
                 platform,
                 env,
@@ -125,13 +134,15 @@ export function createBoxSupervisor({
                     runner,
                 });
             }
+            const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
             await startCore(
                 ownership.engine,
                 containerId,
                 coreArgs,
                 prepared.hostPort,
+                prepared.mediaHostPort,
                 runner,
-                { stdout, stderr },
+                { stdout, stderr, hostReachableIpv4 },
             );
             await healthCheck(prepared.hostPort);
             return Object.freeze({ identity, ...prepared, containerId });
@@ -222,6 +233,7 @@ export function createBoxSupervisor({
             validateContainer(container, {
                 identity,
                 hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
+                mediaHostPort: Number(container.labels?.[BOX_LABELS.mediaHostPort]),
                 imageId: image.immutableId,
                 imageRef,
                 repositoryRoot,
@@ -292,6 +304,7 @@ export function createBoxSupervisor({
             ownership: ownership.state,
             desiredImage: BOX_IMAGE_REFERENCE,
             desiredHostPort: options.explicitPort || null,
+            desiredMediaHostPort: options.explicitMediaPort || null,
             mutationPerformed: false,
         });
     }
@@ -356,19 +369,35 @@ export async function runBoundedCoreStart(
     containerId,
     coreArgv,
     hostPort,
+    mediaHostPort,
     runner,
     {
         stdout = process.stdout,
         stderr = process.stderr,
         timeoutMs = 1_800_000,
+        hostReachableIpv4 = '',
     } = {},
 ) {
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
         throw supervisorError('Bounded core start requires normalized start argv');
     }
-    const result = await runner.stream(engine.name, [
+    const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
+    if (normalizedHostReachableIpv4 && !isUsableHostIpv4(normalizedHostReachableIpv4)) {
+        throw supervisorError(
+            `${HOST_REACHABLE_IPV4_ENV} must be a usable canonical literal IPv4 address`,
+            'PLOINKY_BOX_HOST_REACHABLE_IPV4_INVALID',
+        );
+    }
+    const runtimeEnvironment = [
         'container', 'exec',
         '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
+        '--env', `PLOINKY_MEDIA_HOST_PORT=${mediaHostPort}`,
+        ...(normalizedHostReachableIpv4
+            ? ['--env', `${HOST_REACHABLE_IPV4_ENV}=${normalizedHostReachableIpv4}`]
+            : []),
+    ];
+    const result = await runner.stream(engine.name, [
+        ...runtimeEnvironment,
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,
