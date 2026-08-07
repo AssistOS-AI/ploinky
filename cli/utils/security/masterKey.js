@@ -2,9 +2,11 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { readWorkspaceMasterKey } from '../../../ploinky-box/entrypoint/initialize-workspace.mjs';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+
 const MASTER_KEY_VAR = 'PLOINKY_MASTER_KEY';
 const GENERATED_MASTER_KEY_FILE = 'master-key';
-const BUILT_IN_FALLBACK_MASTER_KEY_SEED = 'ploinky-default-master-key-v1';
 
 let generatedFallbackWarningEmitted = false;
 
@@ -148,31 +150,45 @@ function resolveGeneratedMasterKeySeed(startDir = process.cwd()) {
             source: 'generated fallback',
         };
     } catch (error) {
-        return {
-            seed: BUILT_IN_FALLBACK_MASTER_KEY_SEED,
-            filePath,
-            source: 'built-in fallback',
-            error,
-        };
+        throw new Error(
+            `Unable to persist generated workspace master key at ${filePath}: ${error?.message || String(error)}`,
+            { cause: error },
+        );
     }
 }
 
-function warnGeneratedFallback({ purpose, source, filePath, error }) {
+function warnGeneratedFallback({ purpose, source, filePath }) {
     if (generatedFallbackWarningEmitted) {
         return;
     }
     generatedFallbackWarningEmitted = true;
-    const using = source === 'built-in fallback'
-        ? `using insecure built-in fallback seed because generated fallback could not be persisted at ${filePath}.`
-        : `using ${source} at ${filePath}.`;
-    const detail = error ? ` Could not persist ${filePath}: ${error?.message || String(error)}.` : '';
     console.error(
-        `[ploinky] ${MASTER_KEY_VAR} is not set for ${purpose}; ${using}`
-        + `${detail} Set ${MASTER_KEY_VAR} in the process environment or a walked-up .env for an operator-managed key.`
+        `[ploinky] ${MASTER_KEY_VAR} is not set for ${purpose}; using ${source} at ${filePath}.`
+        + ` Set ${MASTER_KEY_VAR} in the process environment or a walked-up .env for an operator-managed key.`
     );
 }
 
-function resolveMasterKeySeed({ purpose = 'Ploinky encrypted storage', startDir = process.cwd() } = {}) {
+function usesManagedWorkspaceMasterKey(managedBox) {
+    return managedBox === undefined ? isInsideBox() : Boolean(managedBox);
+}
+
+function sanitizeManagedMasterKeyEnvironment(environment, { managedBox } = {}) {
+    const resolved = { ...environment };
+    if (usesManagedWorkspaceMasterKey(managedBox)) delete resolved[MASTER_KEY_VAR];
+    return resolved;
+}
+
+function resolveMasterKeySeed({
+    purpose = 'Ploinky encrypted storage',
+    startDir = process.cwd(),
+    managedBox,
+    workspaceRoot,
+} = {}) {
+    if (usesManagedWorkspaceMasterKey(managedBox)) {
+        // The managed Box owns one fixed workspace mount. Never walk from cwd:
+        // a nested application directory must not be able to shadow this key.
+        return readWorkspaceMasterKey({ workspaceRoot: workspaceRoot || '/workspace' }).key;
+    }
     let raw = String(process.env[MASTER_KEY_VAR] || '').trim();
     if (!raw) {
         // Walk up from cwd looking for a .env that defines the master key.
@@ -188,8 +204,13 @@ function resolveMasterKeySeed({ purpose = 'Ploinky encrypted storage', startDir 
     return raw;
 }
 
-function resolveMasterKey({ purpose = 'Ploinky encrypted storage', startDir = process.cwd() } = {}) {
-    const raw = resolveMasterKeySeed({ purpose, startDir });
+function resolveMasterKey({
+    purpose = 'Ploinky encrypted storage',
+    startDir = process.cwd(),
+    managedBox,
+    workspaceRoot,
+} = {}) {
+    const raw = resolveMasterKeySeed({ purpose, startDir, managedBox, workspaceRoot });
     return crypto.createHash('sha256').update(raw, 'utf8').digest();
 }
 
@@ -336,4 +357,6 @@ export {
     parseKeyValueText,
     resolveMasterKey,
     resolveMasterKeySeed,
+    sanitizeManagedMasterKeyEnvironment,
+    usesManagedWorkspaceMasterKey,
 };

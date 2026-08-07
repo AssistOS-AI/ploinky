@@ -2,8 +2,9 @@
 // after `startWorkspace` has finished gating on its blocking dependencies.
 //
 // The script is invoked via `node noWaitWorker.js --container <name> ...` from
-// `startWorkspace`, inherits the workspace cwd, env, and `PLOINKY_MASTER_KEY`,
-// and writes:
+// `startWorkspace` and inherits the workspace cwd and environment. In a managed
+// Box, cryptographic operations resolve the key from `.ploinky/master-key`; the
+// key is not inherited as an environment variable. The worker writes:
 //   - a single log stream at .ploinky/logs/no-wait/<container>.log (stdout+stderr)
 //   - a structured status JSON at .ploinky/running/no-wait/<container>.json
 // Failures here must never bubble up to the main start command; they are

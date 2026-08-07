@@ -155,7 +155,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(replArgs.includes('--tty'), false);
 
     const keyEvidence = execInBox(harness.runner, prepared.containerId, [
-        'bash', '-c', 'stat -c %a /workspace/.env; sha256sum /workspace/.env',
+        'bash', '-c', 'stat -c %a /workspace/.ploinky/master-key; sha256sum /workspace/.ploinky/master-key',
     ]).split(/\n/);
     assert.equal(keyEvidence[0], '600');
     assert.match(keyEvidence[1], /^[a-f0-9]{64}\s/);
@@ -264,7 +264,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent-retained-volumes');
     const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     const recreatedKeyEvidence = execInBox(harness.runner, recreated.containerId, [
-        'sha256sum', '/workspace/.env',
+        'sha256sum', '/workspace/.ploinky/master-key',
     ]);
     assert.equal(recreatedKeyEvidence.split(/\s/)[0], keyEvidence[1].split(/\s/)[0]);
     assert.equal(execInBox(harness.runner, recreated.containerId, [

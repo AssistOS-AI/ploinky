@@ -119,12 +119,12 @@ test('installed public shims use only the fixed logical image through the candid
 
     const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     const initialKeyHash = execInBox(harness.runner, prepared.containerId, [
-        'sha256sum', '/workspace/.env',
+        'sha256sum', '/workspace/.ploinky/master-key',
     ]).split(/\s/)[0];
     const initialKeyFile = execInBox(harness.runner, prepared.containerId, [
-        'cat', '/workspace/.env',
+        'cat', '/workspace/.ploinky/master-key',
     ]);
-    assert.match(initialKeyFile, /^PLOINKY_MASTER_KEY=[a-f0-9]{64}$/);
+    assert.match(initialKeyFile, /^[a-f0-9]{64}$/);
     assert.equal(initialKeyFile.includes('HOST_MASTER_KEY_CANARY'), false);
 
     const artifactRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-public-artifact-'));
@@ -290,7 +290,7 @@ test('installed public shims use only the fixed logical image through the candid
     const currentId = String(JSON.parse(inspected.stdout)[0]?.Id || '');
     assert.match(currentId, /^[a-f0-9]{64}$/);
     const recreatedKeyHash = execInBox(harness.runner, currentId, [
-        'sha256sum', '/workspace/.env',
+        'sha256sum', '/workspace/.ploinky/master-key',
     ]).split(/\s/)[0];
     assert.equal(recreatedKeyHash, initialKeyHash);
     assert.equal(execInBox(harness.runner, currentId, [

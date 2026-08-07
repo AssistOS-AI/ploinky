@@ -159,13 +159,13 @@ test('entrypoint validates its marker and mounts before its first persistent wri
         installDependencies() { throw new Error('must not install'); },
     }), /marker has invalid content/i);
     assert.equal(initialized, false);
-    assert.equal(fs.existsSync(path.join(paths.workspace, '.env')), false);
+    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'master-key')), false);
 
     fs.writeFileSync(paths.marker, BOX_MARKER_CONTENT);
     fs.rmSync(paths.dependencies, { recursive: true });
     fs.symlinkSync(paths.workspace, paths.dependencies);
     assert.throws(() => prepareEntrypoint({ root }), /mount target|mount is missing/);
-    assert.equal(fs.existsSync(path.join(paths.workspace, '.env')), false);
+    assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'master-key')), false);
 });
 
 test('full preparation creates one stable key, resets only transient runtime, and initializes pins', (t) => {
@@ -191,16 +191,23 @@ test('full preparation creates one stable key, resets only transient runtime, an
             assert.equal(markerPath, paths.marker);
         },
     };
+    const envPath = path.join(paths.workspace, '.env');
+    fs.writeFileSync(envPath, 'APPLICATION_SETTING=preserve-me\n', { mode: 0o640 });
+    const envBytes = fs.readFileSync(envPath);
     prepareEntrypoint(options);
-    const keyBytes = fs.readFileSync(path.join(paths.workspace, '.env'));
-    assert.match(keyBytes.toString('utf8'), /^PLOINKY_MASTER_KEY=[a-f0-9]{64}\n$/);
-    assert.equal(mode(path.join(paths.workspace, '.env')), 0o600);
+    const keyPath = path.join(paths.workspace, '.ploinky', 'master-key');
+    const keyBytes = fs.readFileSync(keyPath);
+    assert.match(keyBytes.toString('utf8'), /^[a-f0-9]{64}\n$/);
+    assert.equal(mode(keyPath), 0o600);
+    assert.deepEqual(fs.readFileSync(envPath), envBytes);
+    assert.equal(mode(envPath), 0o640);
     assert.deepEqual(events, ['install']);
     assert.equal(transient.some((target) => fs.existsSync(target)), false);
     assert.equal(fs.readFileSync(persistent, 'utf8'), 'retain');
 
     prepareEntrypoint(options);
-    assert.deepEqual(fs.readFileSync(path.join(paths.workspace, '.env')), keyBytes);
+    assert.deepEqual(fs.readFileSync(keyPath), keyBytes);
+    assert.deepEqual(fs.readFileSync(envPath), envBytes);
 });
 
 test('ready line is emitted exactly once and only after every required stage', (t) => {

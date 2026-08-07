@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { PloinkyBoxError } from '../errors.mjs';
 
 const MASTER_KEY_PATTERN = /^[a-f0-9]{64}$/;
+const MASTER_KEY_FILE = 'master-key';
+const PLOINKY_DIRECTORY = '.ploinky';
 
 function initializerError(message, cause) {
     return new PloinkyBoxError(message, {
@@ -31,10 +33,21 @@ function sameFingerprint(left, right) {
         && left.links === right.links;
 }
 
-function sameRootFingerprint(left, right) {
+function sameDirectoryFingerprint(left, right) {
     return left.device === right.device
         && left.inode === right.inode
         && left.mode === right.mode;
+}
+
+function assertOwnedDirectory(target, fsApi) {
+    const stat = fsApi.lstatSync(target);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw initializerError(`Workspace master-key directory is not a real directory: ${target}`);
+    }
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+        throw initializerError(`Workspace master-key directory is not owned by the current user: ${target}`);
+    }
+    return fingerprint(stat);
 }
 
 function assertSecureRegular(stat, target) {
@@ -46,7 +59,17 @@ function assertSecureRegular(stat, target) {
     }
 }
 
-function readExisting(target, fsApi) {
+function decodeMasterKey(bytes, target) {
+    const text = bytes.toString('utf8');
+    if (!/^([a-f0-9]{64})\n$/.test(text)) {
+        throw initializerError(
+            `Existing ${target} must contain exactly one 64-character lowercase hexadecimal key; its content was not changed`,
+        );
+    }
+    return text.slice(0, -1);
+}
+
+function readExisting(target, fsApi, { normalizeMode = false } = {}) {
     const before = fsApi.lstatSync(target);
     assertSecureRegular(before, target);
     const flags = fsApi.constants.O_RDONLY | (fsApi.constants.O_NOFOLLOW || 0);
@@ -58,28 +81,79 @@ function readExisting(target, fsApi) {
             throw initializerError(`Workspace master-key target changed while opening: ${target}`);
         }
         const bytes = fsApi.readFileSync(descriptor);
-        const matches = [...bytes.toString('utf8').matchAll(/^PLOINKY_MASTER_KEY=([^\r\n]*)$/gm)];
-        if (matches.length !== 1 || !MASTER_KEY_PATTERN.test(matches[0][1])) {
-            throw initializerError(
-                `Existing ${target} must contain exactly one valid nonempty PLOINKY_MASTER_KEY; its content was not changed`,
-            );
+        const key = decodeMasterKey(bytes, target);
+        if (normalizeMode) fsApi.fchmodSync(descriptor, 0o600);
+        else if ((opened.mode & 0o777) !== 0o600) {
+            throw initializerError(`Workspace master-key target must have mode 0600: ${target}`);
         }
-        fsApi.fchmodSync(descriptor, 0o600);
-        return { bytes, created: false };
+        return { bytes, key, created: false };
     } finally {
         fsApi.closeSync(descriptor);
     }
 }
 
-function assertWorkspaceRoot(workspaceRoot, fsApi) {
-    const stat = fsApi.lstatSync(workspaceRoot);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw initializerError(`Workspace root is not a real directory: ${workspaceRoot}`);
+function ensurePloinkyDirectory(root, fsApi) {
+    const target = path.join(root, PLOINKY_DIRECTORY);
+    try {
+        return { path: target, fingerprint: assertOwnedDirectory(target, fsApi) };
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
     }
-    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-        throw initializerError(`Workspace root is not owned by the current user: ${workspaceRoot}`);
+    try {
+        fsApi.mkdirSync(target, { mode: 0o700 });
+    } catch (error) {
+        if (error.code !== 'EEXIST') {
+            throw initializerError(`Unable to create workspace state directory: ${target}`, error);
+        }
     }
-    return fingerprint(stat);
+    return { path: target, fingerprint: assertOwnedDirectory(target, fsApi) };
+}
+
+function assertStableDirectories(root, rootBefore, ploinkyDirectory, ploinkyBefore, fsApi) {
+    const rootAfter = assertOwnedDirectory(root, fsApi);
+    const ploinkyAfter = assertOwnedDirectory(ploinkyDirectory, fsApi);
+    if (!sameDirectoryFingerprint(rootBefore, rootAfter)) {
+        throw initializerError('Workspace root changed while initializing its master key');
+    }
+    if (!sameDirectoryFingerprint(ploinkyBefore, ploinkyAfter)) {
+        throw initializerError('Workspace state directory changed while initializing its master key');
+    }
+}
+
+function removeCreatedTargetIfUnchanged(target, descriptor, openedFingerprint, fsApi) {
+    if (!openedFingerprint) return;
+    try {
+        const opened = fingerprint(fsApi.fstatSync(descriptor));
+        const current = fingerprint(fsApi.lstatSync(target));
+        if (sameFingerprint(openedFingerprint, opened) && sameFingerprint(opened, current)) {
+            fsApi.unlinkSync(target);
+        }
+    } catch {
+        // Never remove a path that cannot be proven to still be the file we created.
+    }
+}
+
+export function workspaceMasterKeyPath(workspaceRoot = '/workspace') {
+    return path.join(path.resolve(workspaceRoot), PLOINKY_DIRECTORY, MASTER_KEY_FILE);
+}
+
+export function readWorkspaceMasterKey({
+    workspaceRoot = '/workspace',
+    fsApi = fs,
+} = {}) {
+    const root = path.resolve(workspaceRoot);
+    const ploinkyDirectory = path.join(root, PLOINKY_DIRECTORY);
+    const target = path.join(ploinkyDirectory, MASTER_KEY_FILE);
+    try {
+        const rootBefore = assertOwnedDirectory(root, fsApi);
+        const ploinkyBefore = assertOwnedDirectory(ploinkyDirectory, fsApi);
+        const existing = readExisting(target, fsApi);
+        assertStableDirectories(root, rootBefore, ploinkyDirectory, ploinkyBefore, fsApi);
+        return Object.freeze({ path: target, key: existing.key });
+    } catch (error) {
+        if (error instanceof PloinkyBoxError) throw error;
+        throw initializerError(`Unable to read managed workspace master key: ${target}`, error);
+    }
 }
 
 export function initializeWorkspaceMasterKey({
@@ -88,19 +162,21 @@ export function initializeWorkspaceMasterKey({
     randomBytes = crypto.randomBytes,
 } = {}) {
     const root = path.resolve(workspaceRoot);
-    const rootBefore = assertWorkspaceRoot(root, fsApi);
-    const target = path.join(root, '.env');
+    const rootBefore = assertOwnedDirectory(root, fsApi);
+    const stateDirectory = ensurePloinkyDirectory(root, fsApi);
+    const target = path.join(stateDirectory.path, MASTER_KEY_FILE);
     try {
-        const existing = readExisting(target, fsApi);
-        const rootAfter = assertWorkspaceRoot(root, fsApi);
-        if (!sameRootFingerprint(rootBefore, rootAfter)) {
-            throw initializerError('Workspace root changed while validating its master key');
-        }
-        return Object.freeze({ created: false, path: target, keyPresent: true });
+        const existing = readExisting(target, fsApi, { normalizeMode: true });
+        assertStableDirectories(
+            root,
+            rootBefore,
+            stateDirectory.path,
+            stateDirectory.fingerprint,
+            fsApi,
+        );
+        return Object.freeze({ created: false, path: target, keyPresent: Boolean(existing.key) });
     } catch (error) {
-        if (error.code !== 'ENOENT') {
-            throw error;
-        }
+        if (error.code !== 'ENOENT') throw error;
     }
 
     const key = randomBytes(32).toString('hex');
@@ -116,31 +192,41 @@ export function initializeWorkspaceMasterKey({
         descriptor = fsApi.openSync(target, flags, 0o600);
     } catch (error) {
         if (error.code === 'EEXIST') {
-            readExisting(target, fsApi);
+            readExisting(target, fsApi, { normalizeMode: true });
+            assertStableDirectories(
+                root,
+                rootBefore,
+                stateDirectory.path,
+                stateDirectory.fingerprint,
+                fsApi,
+            );
             return Object.freeze({ created: false, path: target, keyPresent: true });
         }
         throw initializerError(`Unable to create workspace master-key file: ${target}`, error);
     }
+    let openedFingerprint;
     try {
         const opened = fsApi.fstatSync(descriptor);
         assertSecureRegular(opened, target);
-        fsApi.writeFileSync(descriptor, `PLOINKY_MASTER_KEY=${key}\n`, { encoding: 'utf8' });
+        openedFingerprint = fingerprint(opened);
+        fsApi.writeFileSync(descriptor, `${key}\n`, { encoding: 'utf8' });
         fsApi.fsyncSync(descriptor);
         fsApi.fchmodSync(descriptor, 0o600);
     } catch (error) {
+        removeCreatedTargetIfUnchanged(target, descriptor, openedFingerprint, fsApi);
         try { fsApi.closeSync(descriptor); } catch {}
         descriptor = undefined;
-        try { fsApi.unlinkSync(target); } catch {}
         throw initializerError(`Unable to initialize workspace master-key file: ${target}`, error);
     } finally {
-        if (descriptor !== undefined) {
-            fsApi.closeSync(descriptor);
-        }
+        if (descriptor !== undefined) fsApi.closeSync(descriptor);
     }
-    const rootAfter = assertWorkspaceRoot(root, fsApi);
-    if (!sameRootFingerprint(rootBefore, rootAfter)) {
-        throw initializerError('Workspace root changed while creating its master key');
-    }
+    assertStableDirectories(
+        root,
+        rootBefore,
+        stateDirectory.path,
+        stateDirectory.fingerprint,
+        fsApi,
+    );
     return Object.freeze({ created: true, path: target, keyPresent: true });
 }
 

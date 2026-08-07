@@ -50,11 +50,11 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
         runner: harness.runner,
     });
     const keyHash = execInBox(harness.runner, prepared.containerId, [
-        'sha256sum', '/workspace/.env',
+        'sha256sum', '/workspace/.ploinky/master-key',
     ]).split(/\s/)[0];
     const keyValue = execInBox(harness.runner, prepared.containerId, [
         '/usr/local/bin/node', '-e',
-        "process.stdout.write(require('node:fs').readFileSync('/workspace/.env','utf8').trim().split('=')[1])",
+        "process.stdout.write(require('node:fs').readFileSync('/workspace/.ploinky/master-key','utf8').trim())",
     ]);
     assert.match(keyValue, /^[a-f0-9]{64}$/);
     harness.useChild();
@@ -173,7 +173,7 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     await harness.supervisor.runDestroyTransaction(started.containerId);
     const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     const recreatedKeyHash = execInBox(harness.runner, recreated.containerId, [
-        'sha256sum', '/workspace/.env',
+        'sha256sum', '/workspace/.ploinky/master-key',
     ]).split(/\s/)[0];
     assert.equal(recreatedKeyHash, keyHash);
     assert.equal(execInBox(harness.runner, recreated.containerId, [

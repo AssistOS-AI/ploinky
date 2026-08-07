@@ -282,7 +282,7 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
     assert.equal(agentEnvironment.PLOINKY_MASTER_KEY, undefined);
 });
 
-test('generated workspace key has one trusted Watchdog-to-Router inheritance path and is never logged', () => {
+test('managed workspace key is removed from Router inheritance and is never logged', () => {
     const workspaceUtil = fs.readFileSync(path.join(
         import.meta.dirname, '../../cli/commands/workspaceUtil.js',
     ), 'utf8');
@@ -290,6 +290,7 @@ test('generated workspace key has one trusted Watchdog-to-Router inheritance pat
         import.meta.dirname, '../../cli/server/Watchdog.js',
     ), 'utf8');
     assert.match(workspaceUtil, /env:\s*\{\s*\.\.\.buildRouterEnv\(\),/);
+    assert.match(workspaceUtil, /sanitizeManagedMasterKeyEnvironment/);
     assert.match(watchdog, /const env = \{\s*\.\.\.restEnv,\s*MANAGED_BY_PROCESS_MANAGER:/);
     assert.doesNotMatch(workspaceUtil, /console\.(?:log|error)\([^\n]*PLOINKY_MASTER_KEY/);
     assert.doesNotMatch(watchdog, /(?:log|safeConsole)\([^\n]*PLOINKY_MASTER_KEY/);

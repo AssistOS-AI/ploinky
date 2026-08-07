@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { initializeWorkspaceMasterKey } from '../../ploinky-box/entrypoint/initialize-workspace.mjs';
+
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-'));
 const originalCwd = process.cwd();
 process.chdir(tempDir);
@@ -15,6 +17,8 @@ const {
     deriveSubkey,
     deriveDerivedMasterKey,
     resolveMasterKey,
+    resolveMasterKeySeed,
+    sanitizeManagedMasterKeyEnvironment,
     MASTER_KEY_VAR,
 } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 
@@ -56,13 +60,10 @@ test('resolveMasterKey creates a persistent fallback when neither process.env no
     }
 });
 
-test('resolveMasterKey warns when using the built-in fallback seed', async () => {
+test('resolveMasterKey fails when a generated fallback cannot be securely persisted', async () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-builtin-'));
     const previousCwd = process.cwd();
     const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
-    const errors = [];
-    const originalError = console.error;
-    console.error = (msg) => { errors.push(String(msg)); };
     try {
         const blockedPath = path.join(workspace, '.ploinky', 'master-key');
         fs.mkdirSync(blockedPath, { recursive: true });
@@ -70,25 +71,11 @@ test('resolveMasterKey warns when using the built-in fallback seed', async () =>
         process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 
         const freshModule = await importFreshMasterKeyModule('built-in-fallback-warning');
-        const key = freshModule.resolveMasterKey({ purpose: 'test encrypted storage' });
-        const expected = crypto
-            .createHash('sha256')
-            .update('ploinky-default-master-key-v1', 'utf8')
-            .digest();
-
-        assert.deepEqual(key, expected);
-        assert.ok(
-            errors.some((m) => (
-                m.includes('[ploinky]')
-                && m.includes(MASTER_KEY_VAR)
-                && m.includes('insecure built-in fallback seed')
-                && m.includes('Could not persist')
-                && m.includes('Set PLOINKY_MASTER_KEY')
-            )),
-            'expected a built-in fallback warning to be logged via console.error'
+        assert.throws(
+            () => freshModule.resolveMasterKey({ purpose: 'test encrypted storage' }),
+            /Unable to persist generated workspace master key/,
         );
     } finally {
-        console.error = originalError;
         process.chdir(previousCwd);
         if (previousRoot === undefined) {
             delete process.env.PLOINKY_WORKSPACE_ROOT;
@@ -124,7 +111,7 @@ test('resolveMasterKey ignores stale explicit workspace roots that are not direc
     }
 });
 
-test('resolveMasterKey does not overwrite an empty generated key file', async () => {
+test('resolveMasterKey does not overwrite or bypass an empty generated key file', async () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-empty-'));
     const previousCwd = process.cwd();
     const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
@@ -136,13 +123,10 @@ test('resolveMasterKey does not overwrite an empty generated key file', async ()
         process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 
         const freshModule = await importFreshMasterKeyModule('empty-generated-key');
-        const key = freshModule.resolveMasterKey();
-        const expected = crypto
-            .createHash('sha256')
-            .update('ploinky-default-master-key-v1', 'utf8')
-            .digest();
-
-        assert.deepEqual(key, expected);
+        assert.throws(
+            () => freshModule.resolveMasterKey(),
+            /Generated master key file exists but is empty/,
+        );
         assert.equal(fs.readFileSync(keyPath, 'utf8'), '');
     } finally {
         process.chdir(previousCwd);
@@ -179,6 +163,63 @@ test('process.env value takes precedence over .env value when both define the ke
     } finally {
         fs.rmSync(path.join(tempDir, '.env'), { force: true });
     }
+});
+
+test('managed Box resolution uses only .ploinky/master-key', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-managed-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    initializeWorkspaceMasterKey({
+        workspaceRoot: workspace,
+        randomBytes: () => Buffer.from('c'.repeat(64), 'hex'),
+    });
+    fs.writeFileSync(
+        path.join(workspace, '.env'),
+        `${MASTER_KEY_VAR}=${'a'.repeat(64)}\nAPPLICATION_VALUE=untouched\n`,
+    );
+    const nested = path.join(workspace, 'nested');
+    fs.mkdirSync(path.join(nested, '.ploinky'), { recursive: true });
+    fs.writeFileSync(path.join(nested, '.ploinky', 'master-key'), `${'d'.repeat(64)}\n`, {
+        mode: 0o600,
+    });
+    process.env[MASTER_KEY_VAR] = 'b'.repeat(64);
+
+    assert.equal(resolveMasterKeySeed({
+        startDir: nested,
+        managedBox: true,
+        workspaceRoot: workspace,
+    }), 'c'.repeat(64));
+    assert.deepEqual(
+        resolveMasterKey({ startDir: nested, managedBox: true, workspaceRoot: workspace }),
+        crypto.createHash('sha256').update('c'.repeat(64), 'utf8').digest(),
+    );
+});
+
+test('managed Box resolution never lazily generates a missing key', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-mkey-managed-missing-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(workspace, '.env'), `${MASTER_KEY_VAR}=${'a'.repeat(64)}\n`);
+    process.env[MASTER_KEY_VAR] = 'b'.repeat(64);
+
+    assert.throws(
+        () => resolveMasterKeySeed({ managedBox: true, workspaceRoot: workspace }),
+        /Unable to read managed workspace master key/i,
+    );
+    assert.equal(fs.existsSync(path.join(workspace, '.ploinky')), false);
+});
+
+test('managed environments retain application values but remove master-key overrides', () => {
+    const source = {
+        APPLICATION_SETTING: 'preserved',
+        [MASTER_KEY_VAR]: 'must-not-be-inherited',
+    };
+    assert.deepEqual(sanitizeManagedMasterKeyEnvironment(source, { managedBox: true }), {
+        APPLICATION_SETTING: 'preserved',
+    });
+    assert.deepEqual(source, {
+        APPLICATION_SETTING: 'preserved',
+        [MASTER_KEY_VAR]: 'must-not-be-inherited',
+    });
+    assert.deepEqual(sanitizeManagedMasterKeyEnvironment(source, { managedBox: false }), source);
 });
 
 test('resolveMasterKey accepts arbitrary strings as seeds and derives via SHA-256', () => {

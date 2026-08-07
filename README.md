@@ -120,10 +120,11 @@ workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and
 `0.0.0.0:7882:7882/udp`. `--port` changes only the physical Router port;
 `--publish`, `--expose`, and `--listen-lan` are rejected. Agent `openPorts`,
 HTTP-service targets, readiness, profiles, manifests, labels, and retained state
-remain private and cannot add a third mapping. The host `PLOINKY_MASTER_KEY`,
-including the normal walked-up `.env` source, is inherited only by in-box core
-executions; its value is not stored in container arguments, labels, or persistent
-image configuration.
+remain private and cannot add a third mapping. A managed Box creates its sole
+core master key at `.ploinky/master-key` with mode `0600`. Host environment and
+`.env` values cannot override that key; `.env` remains application-owned and is
+never created, changed, or consulted for managed-key resolution. Missing,
+malformed, or unsafe managed-key state fails closed before core readiness.
 
 The box image includes pinned multi-architecture `cloudflared`, supervised by
 Ploinky core. No Cloudflare credentials selects explicit `local-only` mode: the

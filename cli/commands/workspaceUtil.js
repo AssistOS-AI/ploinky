@@ -29,6 +29,9 @@ import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, res
 import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
+import {
+  sanitizeManagedMasterKeyEnvironment,
+} from '../utils/security/masterKey.js';
 import { getExposedNames, getManifestEnvNames } from '../utils/security/secretVars.js';
 import {
   isLlmRuntimeManifest,
@@ -126,13 +129,21 @@ function createAppendLogStdio(logFile) {
 // secretInjector.getSecret(): walked-up `.env` -> `.ploinky/.secrets` ->
 // `process.env`, with operator-exported values winning. This way the router
 // stays able to forward LLM/auth secrets to handlers across crash-restart
-// cycles without depending on the operator having `export`'d each one.
-function buildRouterEnv() {
+// cycles without depending on the operator having `export`'d each one. Managed
+// Boxes then remove PLOINKY_MASTER_KEY because core reads its owned key file.
+export function sanitizeRouterEnvironment(environment, { managedBox } = {}) {
+  return sanitizeManagedMasterKeyEnvironment(environment, { managedBox });
+}
+
+export function buildRouterEnv({ managedBox } = {}) {
   let envFile = {};
   try { envFile = loadEnvFile() || {}; } catch (_) { envFile = {}; }
   let secrets = {};
   try { secrets = readSecretsFile() || {}; } catch (_) { secrets = {}; }
-  return { ...envFile, ...secrets, ...process.env };
+  return sanitizeRouterEnvironment(
+    { ...envFile, ...secrets, ...process.env },
+    { managedBox },
+  );
 }
 
 function spawnNoWaitWorker({

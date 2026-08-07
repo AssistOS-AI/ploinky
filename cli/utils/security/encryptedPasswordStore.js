@@ -15,7 +15,7 @@ const ALGORITHM = 'aes-256-gcm';
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const SUBKEY_PURPOSE = 'storage/passwords';
-const KEY_MISMATCH_HINT = 'Check PLOINKY_MASTER_KEY, any walked-up .env, and .ploinky/master-key; this store may have been written with a different master seed.';
+const KEY_MISMATCH_HINT = 'Check PLOINKY_MASTER_KEY, a walked-up .env, or .ploinky/master-key as appropriate; managed Boxes use only .ploinky/master-key, and this store may have been written with a different master seed.';
 
 function defaultStore() {
     return {
