@@ -1631,6 +1631,55 @@ test('no-wait immutable reinspection rejects disagreement with its registry rece
     assert.equal(inspected, false, 'a contradictory receipt must fail before runtime inspection');
 });
 
+test('no-wait cleanup accepts an exited container only when its immutable contract stays exact', () => {
+    const expectedIdentity = {
+        containerName: 'ploinky_demo_worker',
+        repoName: 'demo',
+        shortAgent: 'worker',
+        alias: '',
+    };
+    const containerId = 'a'.repeat(64);
+    const result = {
+        containerName: expectedIdentity.containerName,
+        containerId,
+        registryRecord: {
+            type: 'agent',
+            runtime: 'podman',
+            repoName: 'demo',
+            agentName: 'worker',
+            alias: '',
+            instanceId: 'instance-one',
+            enableGeneration: 'enable-one',
+            containerId,
+        },
+    };
+    const dependencies = {
+        createAdapter: () => ({
+            inspectContainerContract: () => ({ state: 'exact', id: containerId }),
+        }),
+        getRuntime: () => 'podman',
+        isContainerRunning: () => false,
+    };
+    const context = {
+        profileResolution: { network: { mode: 'default' } },
+        expectedIdentity,
+    };
+
+    assert.throws(
+        () => assertNoWaitRuntimeStillExact(result, context, dependencies),
+        /changed immutable identity/,
+        'publication must still reject an exited runtime',
+    );
+    assert.equal(
+        assertNoWaitRuntimeStillExact(result, context, {
+            ...dependencies,
+            requireRunning: false,
+        }),
+        result,
+        'cleanup may remove the exact stopped task-owned container',
+    );
+});
+
 test('no-wait failure cleanup removes only a runtime created by this launch', async () => {
     const cleaned = [];
     const aborted = [];

@@ -800,6 +800,7 @@ export function assertNoWaitRuntimeStillExact(result, {
     getRuntime = dockerSvc.getRuntime,
     isContainerRunning = dockerSvc.isContainerRunning,
     isSandboxRunning = isBwrapProcessRunning,
+    requireRunning = true,
 } = {}) {
     const containerName = String(result?.containerName || '').trim();
     const record = result?.registryRecord;
@@ -851,7 +852,7 @@ export function assertNoWaitRuntimeStillExact(result, {
     );
     if (inspection?.state !== 'exact'
         || String(inspection.id || '').trim().toLowerCase() !== returnedContainerId
-        || !isContainerRunning(containerName)) {
+        || (requireRunning && !isContainerRunning(containerName))) {
         throw new Error(`no-wait runtime '${containerName}' changed immutable identity before publication`);
     }
     return result;
@@ -1971,7 +1972,9 @@ async function main() {
                         expectedIdentity,
                     );
             },
-            inspectRuntime(result, context, lifecycle) {
+            inspectRuntime(result, context, lifecycle, _networkLifecycleCapability, {
+                cleanup = false,
+            } = {}) {
                 const resolvedContainerName = result?.containerName || containerName;
                 if (resolvedContainerName !== containerName) {
                     throw new Error(
@@ -1986,6 +1989,12 @@ async function main() {
                 return assertNoWaitRuntimeStillExact(result, {
                     profileResolution: context.profileResolution,
                     expectedIdentity,
+                }, {
+                    // A failed runtime may have exited before readiness can
+                    // initiate cleanup. Its immutable container contract and
+                    // ID still authorize exact task-owned removal; liveness is
+                    // required only on the publication path.
+                    requireRunning: !cleanup,
                 });
             },
             async activate(lifecycle, context, result, { onCommitted }) {
