@@ -13,10 +13,13 @@ import {
     assertNoWaitLifecycleSnapshot,
     assertNoWaitRegistryRecord,
     assertNoWaitRuntimeStillExact,
+    captureNoWaitRuntimeLogTail,
     cleanupNoWaitTaskOwnedCandidate,
     launchNoWaitHostRuntime,
+    isNoWaitWorkerAlive,
     noWaitQueuedStatusDeadline,
     parseNoWaitStatusBarrier,
+    redactNoWaitDiagnostics,
     prefetchNoWaitRuntimeImage,
     resolveNoWaitBarrierTimeouts,
     resolveNoWaitRunScopedArguments,
@@ -31,6 +34,11 @@ import {
     writeNoWaitWorkerStatus,
     writeStatus,
 } from '../../cli/commands/noWaitWorker.js';
+import {
+    imageBuildTimeoutMs,
+    imagePullTimeoutMs,
+    MAX_IMAGE_OPERATION_TIMEOUT_MS,
+} from '../../cli/sandbox/docker/common.js';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-no-wait-worker-'));
@@ -96,6 +104,7 @@ function publishRunScoped(runningDir, containerName, {
     state = 'starting',
     sequencePhase = 'active',
     sequencePhaseStartedAtMs = runStartedAtMs,
+    pid = process.pid,
     ...rest
 }) {
     const target = coordinationPath(runningDir, containerName, runId);
@@ -105,6 +114,7 @@ function publishRunScoped(runningDir, containerName, {
         runStartedAtMs,
         waveIndex,
         state,
+        pid,
         sequencePhase,
         sequencePhaseStartedAtMs,
         ...rest,
@@ -473,14 +483,37 @@ test('a deep wave keeps its cumulative queued budget while each input stays clam
         + timeouts.startupGraceMs);
     assert.ok(budgetMs > 3_600_000, 'a wave-three target must exceed the single active-timeout maximum');
 
+    // The active window has to cover a sanctioned image pull, otherwise an
+    // observer expires while its prerequisite is still pulling legitimately.
+    // One launch may perform more than one permitted pull, so the window must
+    // cover all of them rather than a single budget.
+    const defaults = resolveNoWaitBarrierTimeouts();
+    assert.equal(defaults.sanctionedPullBudgetMs, defaults.imagePullBudgetMs * 3);
+    assert.equal(defaults.sanctionedBuildBudgetMs, defaults.imageBuildBudgetMs);
+    assert.equal(
+        defaults.activeTimeoutMs,
+        defaults.phaseTimeoutMs + defaults.sanctionedPullBudgetMs + defaults.sanctionedBuildBudgetMs,
+    );
+    assert.ok(
+        defaults.activeTimeoutMs > defaults.imagePullBudgetMs * 3,
+        'the active window must exceed prefetch, authoritative retry, and helper pull combined',
+    );
+
     const clamped = resolveNoWaitBarrierTimeouts({
         activeTimeoutMs: 99_999_999,
         terminalPublicationGraceMs: 99_999_999,
         readRetryTimeoutMs: 99_999_999,
         startupGraceMs: 99_999_999,
+        imagePullBudgetMs: 99_999_999,
+        imageBuildBudgetMs: 99_999_999,
     });
     assert.deepEqual({ ...clamped }, {
-        activeTimeoutMs: 3_600_000,
+        phaseTimeoutMs: 3_600_000,
+        imagePullBudgetMs: 86_400_000,
+        imageBuildBudgetMs: 86_400_000,
+        sanctionedPullBudgetMs: 259_200_000,
+        sanctionedBuildBudgetMs: 86_400_000,
+        activeTimeoutMs: 349_200_000,
         terminalPublicationGraceMs: 300_000,
         readRetryTimeoutMs: 30_000,
         startupGraceMs: 300_000,
@@ -490,8 +523,15 @@ test('a deep wave keeps its cumulative queued budget while each input stays clam
         terminalPublicationGraceMs: -5,
         readRetryTimeoutMs: -5,
         startupGraceMs: -5,
+        imagePullBudgetMs: -5,
+        imageBuildBudgetMs: -5,
     });
     assert.deepEqual({ ...floored }, {
+        phaseTimeoutMs: 1000,
+        imagePullBudgetMs: 0,
+        imageBuildBudgetMs: 0,
+        sanctionedPullBudgetMs: 0,
+        sanctionedBuildBudgetMs: 0,
         activeTimeoutMs: 1000,
         terminalPublicationGraceMs: 0,
         readRetryTimeoutMs: 100,
@@ -2227,4 +2267,227 @@ test('barrier status identities must be real JSON numbers, not coercible values'
         );
     }
     assert.throws(() => observe({ runStartedAtMs: String(runStartedAtMs) }), /different run start/);
+});
+
+test('a readiness failure preserves the probe output and a bounded runtime log tail', () => {
+    const calls = [];
+    const tail = captureNoWaitRuntimeLogTail('demo-container', {
+        runtime: 'podman',
+        lines: 12,
+        spawnSyncImpl: (bin, args) => {
+            calls.push([bin, args]);
+            return { stdout: 'boot line 1\nboot line 2\n', stderr: 'fatal: nope\n' };
+        },
+    });
+    assert.deepEqual(calls, [['podman', ['logs', '--tail', '12', 'demo-container']]]);
+    assert.match(tail, /boot line 2/);
+    assert.match(tail, /fatal: nope/);
+
+    // Diagnostics must never replace the failure they describe.
+    assert.equal(
+        captureNoWaitRuntimeLogTail('demo-container', {
+            runtime: 'podman',
+            spawnSyncImpl: () => { throw new Error('runtime unavailable'); },
+        }),
+        '',
+    );
+    // A non-exact container name is never handed to the runtime.
+    assert.equal(
+        captureNoWaitRuntimeLogTail('../escape', {
+            runtime: 'podman',
+            spawnSyncImpl: () => { throw new Error('must not be called'); },
+        }),
+        '',
+    );
+    // The tail is bounded so a chatty container cannot bloat the status file.
+    const huge = captureNoWaitRuntimeLogTail('demo-container', {
+        runtime: 'podman',
+        spawnSyncImpl: () => ({ stdout: 'x'.repeat(50_000), stderr: '' }),
+    });
+    assert.ok(huge.length < 5_000, 'the captured tail must stay bounded');
+    assert.match(huge, /truncated to the last/);
+});
+
+test('the worker publishes readiness detail into its terminal status', () => {
+    const source = fs.readFileSync(
+        path.resolve('cli/commands/noWaitWorker.js'),
+        'utf8',
+    );
+    assert.match(
+        source,
+        /readinessDetail: failure\.readinessDetail/,
+        'the probe output must reach the published failure',
+    );
+    assert.match(
+        source,
+        /runtimeLogTail: failure\.runtimeLogTail/,
+        'the runtime log tail must reach the published failure',
+    );
+    // The tail has to be captured while the container still exists.
+    assert.ok(
+        source.indexOf('function readinessFailure') < source.indexOf('async function waitForNoWaitReadiness'),
+        'readiness failures are enriched before exact cleanup removes the runtime',
+    );
+});
+
+test('a sandbox readiness failure never resolves a container engine', () => {
+    // getRuntime() calls process.exit(1) on a host without podman or docker.
+    // Reaching it here would kill the worker before cleanup or a terminal
+    // status could run, stalling every dependent until its own timeout.
+    let resolved = 0;
+    const exploding = () => { resolved += 1; throw new Error('process.exit(1) would happen here'); };
+    for (const runtimeKind of ['bwrap', 'seatbelt', 'sandbox']) {
+        assert.equal(
+            captureNoWaitRuntimeLogTail('demo-container', {
+                runtimeKind,
+                getRuntime: exploding,
+                spawnSyncImpl: () => { throw new Error('must not be called'); },
+            }),
+            '',
+            `${runtimeKind} must not reach a container engine`,
+        );
+    }
+    assert.equal(resolved, 0, 'no sandbox path may resolve a container runtime');
+
+    // A container runtime still captures normally.
+    assert.match(
+        captureNoWaitRuntimeLogTail('demo-container', {
+            runtimeKind: 'container',
+            runtime: 'podman',
+            spawnSyncImpl: () => ({ stdout: 'container line\n', stderr: '' }),
+        }),
+        /container line/,
+    );
+});
+
+test('diagnostics are redacted before they reach a status file or a log', () => {
+    const manifest = { env: ['AGENT_TOKEN'] };
+    const env = {
+        AGENT_TOKEN: 'super-secret-token-value',
+        SHORT: 'ab',
+    };
+    const redacted = redactNoWaitDiagnostics(
+        'connecting with super-secret-token-value then failing\nshort ab is also secret',
+        {
+            manifest,
+            profileConfig: null,
+            env,
+            manifestEnvNames: () => ['AGENT_TOKEN', 'SHORT'],
+            exposedNames: () => [],
+        },
+    );
+    assert.ok(!redacted.includes('super-secret-token-value'), 'an injected secret must never survive');
+    assert.match(redacted, /\[redacted:AGENT_TOKEN\]/);
+    assert.ok(!redacted.includes('short ab is also secret'), 'short injected values must not survive');
+    assert.match(redacted, /short \[redacted:SHORT\] is also secret/);
+
+    // Secret shapes are masked regardless of which variable carried them.
+    const shaped = redactNoWaitDiagnostics(
+        'auth: Bearer abcdefghijklmnopqrstuvwxyz012345\ntoken eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhYmNkZWZnIn0.c2lnbmF0dXJlLXZhbHVl',
+        { manifest: null, profileConfig: null, env: {}, manifestEnvNames: () => [], exposedNames: () => [] },
+    );
+    assert.match(shaped, /\[redacted:authorization\]/);
+    assert.match(shaped, /\[redacted:jwt\]/);
+    assert.ok(!shaped.includes('eyJhbGciOiJIUzI1NiJ9'), 'a JWT must never survive');
+
+    // Redaction must not throw when a manifest cannot enumerate its names.
+    assert.equal(
+        redactNoWaitDiagnostics('plain text', {
+            manifest: null,
+            profileConfig: null,
+            env: {},
+            manifestEnvNames: () => { throw new Error('unreadable manifest'); },
+            exposedNames: () => { throw new Error('unreadable manifest'); },
+        }),
+        'plain text',
+    );
+});
+
+test('runtime diagnostic truncation never cuts a secret before redaction', () => {
+    const secret = 'secret-prefix-ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    const raw = `${'p'.repeat(50)}${secret}${'z'.repeat(3980)}`;
+    const tail = captureNoWaitRuntimeLogTail('demo-container', {
+        runtime: 'podman',
+        spawnSyncImpl: () => ({ stdout: raw, stderr: '' }),
+        redact: (value) => redactNoWaitDiagnostics(value, {
+            manifest: {},
+            profileConfig: null,
+            env: { DEMO_SECRET: secret },
+            manifestEnvNames: () => ['DEMO_SECRET'],
+            exposedNames: () => [],
+        }),
+    });
+    assert.ok(!tail.includes(secret));
+    assert.ok(!tail.includes(secret.slice(-20)), 'a suffix crossing the tail boundary must not leak');
+    assert.match(tail, /DEMO_SECRET\]/, 'the retained boundary must contain only the redaction marker');
+});
+
+test('a dead no-wait worker gets only terminal-publication grace, not the image budget', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = 1_700_000_000_000;
+    publishRunScoped(runningDir, 'dead-worker', {
+        runStartedAtMs,
+        waveIndex: 0,
+        state: 'starting',
+        pid: 424242,
+    });
+    const timeouts = resolveNoWaitBarrierTimeouts({
+        activeTimeoutMs: 3_600_000,
+        imagePullBudgetMs: 86_400_000,
+        imageBuildBudgetMs: 86_400_000,
+        terminalPublicationGraceMs: 100,
+        startupGraceMs: 1000,
+    });
+    const clock = virtualClock(runStartedAtMs);
+    await assert.rejects(
+        () => waitForRunScopedStatus(
+            barrierEntry(runningDir, 'dead-worker', { waveIndex: 0 }),
+            {
+                runningDir,
+                expectedRunId: RUN_ID,
+                runStartedAtMs,
+                timeouts,
+                isWorkerAlive: () => false,
+                ...clock,
+            },
+        ),
+        /exited before publishing a terminal status/,
+    );
+    assert.ok(
+        clock.nowFn() < runStartedAtMs + 1000,
+        'dead-worker detection must not consume any pull or build allowance',
+    );
+});
+
+test('worker liveness treats EPERM as alive and only ESRCH as absent', () => {
+    assert.equal(isNoWaitWorkerAlive(123, { killImpl: () => {} }), true);
+    assert.equal(isNoWaitWorkerAlive(123, {
+        killImpl: () => { const error = new Error('denied'); error.code = 'EPERM'; throw error; },
+    }), true);
+    assert.equal(isNoWaitWorkerAlive(123, {
+        killImpl: () => { const error = new Error('gone'); error.code = 'ESRCH'; throw error; },
+    }), false);
+    assert.equal(isNoWaitWorkerAlive(0), false);
+    assert.equal(isNoWaitWorkerAlive(Number.MAX_SAFE_INTEGER + 1), false);
+});
+
+test('image-operation environment timeouts are exact and bounded', () => {
+    const previousPull = process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS;
+    const previousBuild = process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS;
+    try {
+        process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS = String(MAX_IMAGE_OPERATION_TIMEOUT_MS + 1);
+        process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS = String(Number.MAX_SAFE_INTEGER);
+        assert.equal(imagePullTimeoutMs(), MAX_IMAGE_OPERATION_TIMEOUT_MS);
+        assert.equal(imageBuildTimeoutMs(), MAX_IMAGE_OPERATION_TIMEOUT_MS);
+
+        process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS = '1234.5';
+        process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS = 'Infinity';
+        assert.equal(imagePullTimeoutMs(), 30 * 60 * 1000);
+        assert.equal(imageBuildTimeoutMs(), 30 * 60 * 1000);
+    } finally {
+        if (previousPull === undefined) delete process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS;
+        else process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS = previousPull;
+        if (previousBuild === undefined) delete process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS;
+        else process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS = previousBuild;
+    }
 });

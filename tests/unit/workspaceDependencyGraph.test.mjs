@@ -107,21 +107,19 @@ test('no-wait scheduling preserves concurrent waves, direct dependencies, and ru
         schedule[1][0].waitForStatuses.map(({ nodeId, waveIndex, directDependency }) => (
             [nodeId, waveIndex, directDependency]
         )),
-        [['demo/a', 0, true], ['demo/b', 0, false]],
-        'the next wave waits for every prior-wave member and marks its direct dependency',
+        [['demo/a', 0, true]],
+        'a worker waits for its own dependency and nothing else in that wave',
     );
     assert.deepEqual(
-        schedule[1][1].waitForStatuses.map(({ nodeId, waveIndex, directDependency }) => (
-            [nodeId, waveIndex, directDependency]
-        )),
-        [['demo/a', 0, false], ['demo/b', 0, false]],
-        'an independent branch retains the wave barrier without inventing dependency failures',
+        schedule[1][1].waitForStatuses,
+        [],
+        'an independent worker must not be gated behind unrelated prior-wave peers',
     );
     assert.deepEqual(
         schedule[2][0].waitForStatuses.map(({ nodeId, waveIndex, directDependency }) => (
             [nodeId, waveIndex, directDependency]
         )),
-        [['demo/c', 1, false], ['demo/d', 1, false], ['demo/a', 0, true]],
+        [['demo/a', 0, true]],
         'a direct dependency from an older wave remains an explicit failure barrier',
     );
     for (const [waveIndex, wave] of schedule.entries()) {
@@ -2251,18 +2249,21 @@ test('no-wait scheduling rejects a graph deeper than the worker wave-index contr
 
 test('no-wait scheduling rejects a barrier larger than the worker contract accepts', () => {
     const runStartedAtMs = SCHEDULE_RUN_STARTED_AT_MS;
-    // One oversized wave makes every member of the next wave exceed the
-    // worker's barrier limit.
+    // Barriers now carry only direct dependencies, so the limit is reached by
+    // one worker declaring more dependencies than the worker contract accepts.
     const wideWave = Array.from({ length: 1025 }, (_, index) => ({
         registryName: `wide-${index}`,
         node: { id: `demo/wide-${index}`, dependencies: new Set() },
     }));
-    const dependent = [{
+    const dependentOn = (count) => [{
         registryName: 'dependent',
-        node: { id: 'demo/dependent', dependencies: new Set() },
+        node: {
+            id: 'demo/dependent',
+            dependencies: new Set(wideWave.slice(0, count).map(({ node }) => node.id)),
+        },
     }];
     assert.throws(
-        () => buildNoWaitLaunchSchedule([wideWave, dependent], {
+        () => buildNoWaitLaunchSchedule([wideWave, dependentOn(1025)], {
             runId: SCHEDULE_RUN_ID,
             runStartedAtMs,
             runningDir: tempDir,
@@ -2271,8 +2272,7 @@ test('no-wait scheduling rejects a barrier larger than the worker contract accep
     );
 
     // The largest supported barrier still schedules.
-    const okWave = wideWave.slice(0, 1024);
-    const schedule = buildNoWaitLaunchSchedule([okWave, dependent], {
+    const schedule = buildNoWaitLaunchSchedule([wideWave, dependentOn(1024)], {
         runId: SCHEDULE_RUN_ID,
         runStartedAtMs,
         runningDir: tempDir,
@@ -2300,5 +2300,38 @@ test('no-wait scheduling rejects a barrier reference that is not in an earlier w
             runningDir: tempDir,
         }),
         /in wave 1 at 'demo\/peer' in wave 1/,
+    );
+});
+
+test('a no-wait worker is never gated behind a prior-wave peer it does not depend on', () => {
+    // Regression for a measured deployment stall: soul-gateway, whose only
+    // dependency is default-local-llm, waited on an unrelated onlyOffice launch
+    // in the same prior wave and lost minutes to it.
+    const entry = (id, registryName, dependencies = []) => ({
+        registryName,
+        node: { id, dependencies: new Set(dependencies) },
+    });
+    const schedule = buildNoWaitLaunchSchedule([
+        [entry('demo/llm', 'container-llm'), entry('demo/office', 'container-office')],
+        [entry('demo/gateway', 'container-gateway', ['demo/llm'])],
+    ], {
+        runId: SCHEDULE_RUN_ID,
+        runStartedAtMs: SCHEDULE_RUN_STARTED_AT_MS,
+        runningDir: tempDir,
+    });
+
+    const gatewayBarrier = schedule[1][0].waitForStatuses;
+    assert.deepEqual(
+        gatewayBarrier.map(({ nodeId }) => nodeId),
+        ['demo/llm'],
+        'only the declared dependency may gate the launch',
+    );
+    assert.ok(
+        !gatewayBarrier.some(({ nodeId }) => nodeId === 'demo/office'),
+        'an unrelated prior-wave peer must never appear in the barrier',
+    );
+    assert.ok(
+        gatewayBarrier.every(({ directDependency }) => directDependency === true),
+        'every remaining barrier entry is a real dependency',
     );
 });

@@ -131,16 +131,28 @@ function requireContainerRuntime(boxMarkerPath) {
 
 const DEFAULT_IMAGE_PULL_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_IMAGE_BUILD_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_IMAGE_OPERATION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const LOCAL_IMAGE_BUILD_DEFINITIONS = Object.freeze({});
 
+function boundedImageOperationTimeout(value, fallback) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0
+        ? Math.min(parsed, MAX_IMAGE_OPERATION_TIMEOUT_MS)
+        : fallback;
+}
+
 function imagePullTimeoutMs() {
-    const raw = Number(process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS);
-    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_IMAGE_PULL_TIMEOUT_MS;
+    return boundedImageOperationTimeout(
+        process.env.PLOINKY_IMAGE_PULL_TIMEOUT_MS,
+        DEFAULT_IMAGE_PULL_TIMEOUT_MS,
+    );
 }
 
 function imageBuildTimeoutMs() {
-    const raw = Number(process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS);
-    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_IMAGE_BUILD_TIMEOUT_MS;
+    return boundedImageOperationTimeout(
+        process.env.PLOINKY_IMAGE_BUILD_TIMEOUT_MS,
+        DEFAULT_IMAGE_BUILD_TIMEOUT_MS,
+    );
 }
 
 function imageExists(image, runtime) {
@@ -669,6 +681,9 @@ export {
     buildLocalImage,
     ensureImagePresent,
     imageExists,
+    imageBuildTimeoutMs,
+    imagePullTimeoutMs,
+    MAX_IMAGE_OPERATION_TIMEOUT_MS,
     pullImage,
     resolveLocalImageBuildSource,
     computeEnvHash,

@@ -301,7 +301,11 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
     }
   });
 
-  let previousWave = [];
+  // A worker waits for its own dependencies and nothing else. Gating on every
+  // member of the immediately preceding wave made an agent wait on peers it has
+  // no relationship with: in a measured run soul-gateway, whose only dependency
+  // is default-local-llm, sat idle behind an unrelated onlyOffice launch. The
+  // dependency graph already expresses the ordering that correctness needs.
   return waves.map((entries, waveIndex) => {
     const scheduled = entries.map((entry) => {
       const directDependencyIds = new Set(entry.node?.dependencies || []);
@@ -329,9 +333,6 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
           directDependency: Boolean(directDependency || existing?.directDependency),
         });
       };
-      for (const reference of previousWave) {
-        addReference(reference, directDependencyIds.has(reference.nodeId));
-      }
       for (const dependencyId of directDependencyIds) {
         addReference(statusByNodeId.get(dependencyId), true);
       }
@@ -352,9 +353,6 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
         waitForStatuses: Object.freeze(Array.from(references.values(), Object.freeze)),
       });
     });
-    previousWave = scheduled
-      .map(({ node }) => statusByNodeId.get(node.id))
-      .filter(Boolean);
     return Object.freeze(scheduled);
   });
 }

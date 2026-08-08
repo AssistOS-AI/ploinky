@@ -12,14 +12,26 @@
 // already-running blocking stack.
 import fs from 'fs';
 import path from 'path';
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import * as dockerSvc from '../sandbox/docker/index.js';
 import { RUNNING_DIR } from '../utils/config.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
-import { ensureImagePresent, getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
-import { resolveManifestImage } from '../utils/security/secretVars.js';
+import {
+    ensureImagePresent,
+    getRuntimeForAgent,
+    imageBuildTimeoutMs,
+    imagePullTimeoutMs,
+    isSandboxRuntime,
+    MAX_IMAGE_OPERATION_TIMEOUT_MS,
+} from '../sandbox/docker/common.js';
+import {
+    getExposedNames,
+    getManifestEnvNames,
+    resolveManifestImage,
+} from '../utils/security/secretVars.js';
 import {
     isLlmRuntimeManifest,
     resolveLlmRuntimeAdmissionContext,
@@ -328,18 +340,52 @@ function boundedTimeoutInput(value, { fallback, minimum, maximum }) {
         : fallback;
 }
 
+// The active phase starts before the unlocked target prefetch. If that attempt
+// fails, the authoritative managed-network transaction may retry the target
+// and then resolve the fixed router-authority helper. The target retry may also
+// fall back to one local build. Every permitted blocking image operation must
+// be covered by the observer's deadline.
+const SANCTIONED_IMAGE_PULLS_PER_LAUNCH = 3;
+const SANCTIONED_IMAGE_BUILDS_PER_LAUNCH = 1;
+
 export function resolveNoWaitBarrierTimeouts({
     activeTimeoutMs = process.env.PLOINKY_NO_WAIT_SEQUENCE_TIMEOUT_MS,
     terminalPublicationGraceMs = process.env.PLOINKY_NO_WAIT_SEQUENCE_TERMINAL_GRACE_MS,
     readRetryTimeoutMs = process.env.PLOINKY_NO_WAIT_STATUS_READ_RETRY_MS,
     startupGraceMs = process.env.PLOINKY_NO_WAIT_STARTUP_GRACE_MS,
+    imagePullBudgetMs = imagePullTimeoutMs(),
+    imageBuildBudgetMs = imageBuildTimeoutMs(),
 } = {}) {
+    // An active worker may spend a sanctioned image-pull budget before it can
+    // publish anything terminal, and that budget is far larger than the launch
+    // and readiness work around it. Fold it into the active window so an
+    // observer cannot expire while its prerequisite is still doing permitted
+    // work; without it a healthy cold pull fails every dependent.
+    //
+    // One launch may perform more than one permitted pull: a managed-network
+    // launch resolves the target image and the fixed router-authority helper
+    // separately, and each is allowed the full pull timeout. Budget every one
+    // of them, or two individually valid pulls still expire the dependents.
+    const boundedPhaseTimeoutMs = boundedTimeoutInput(activeTimeoutMs, {
+        fallback: 900000, minimum: 1000, maximum: 3600000,
+    });
+    const boundedPullBudgetMs = boundedTimeoutInput(imagePullBudgetMs, {
+        fallback: 1800000, minimum: 0, maximum: MAX_IMAGE_OPERATION_TIMEOUT_MS,
+    });
+    const boundedBuildBudgetMs = boundedTimeoutInput(imageBuildBudgetMs, {
+        fallback: 1800000, minimum: 0, maximum: MAX_IMAGE_OPERATION_TIMEOUT_MS,
+    });
+    const sanctionedPullBudgetMs = boundedPullBudgetMs * SANCTIONED_IMAGE_PULLS_PER_LAUNCH;
+    const sanctionedBuildBudgetMs = boundedBuildBudgetMs * SANCTIONED_IMAGE_BUILDS_PER_LAUNCH;
     // Every individual input is clamped here. The cumulative queued budget
     // derived from them is deliberately not clamped back to these maxima.
     return Object.freeze({
-        activeTimeoutMs: boundedTimeoutInput(activeTimeoutMs, {
-            fallback: 900000, minimum: 1000, maximum: 3600000,
-        }),
+        phaseTimeoutMs: boundedPhaseTimeoutMs,
+        imagePullBudgetMs: boundedPullBudgetMs,
+        imageBuildBudgetMs: boundedBuildBudgetMs,
+        sanctionedPullBudgetMs,
+        sanctionedBuildBudgetMs,
+        activeTimeoutMs: boundedPhaseTimeoutMs + sanctionedPullBudgetMs + sanctionedBuildBudgetMs,
         terminalPublicationGraceMs: boundedTimeoutInput(terminalPublicationGraceMs, {
             fallback: 60000, minimum: 0, maximum: 300000,
         }),
@@ -352,10 +398,10 @@ export function resolveNoWaitBarrierTimeouts({
     });
 }
 
-// A queued worker legitimately waits for every earlier wave to drain, so its
-// budget accumulates one active window per wave up to and including its
-// target. A single run-wide deadline would expire later waves early; an
-// unbounded queued phase would hide a dead worker.
+// A queued worker may wait through a direct-dependency chain whose maximum
+// depth is represented by its topological wave. A single run-wide deadline
+// would expire a deep dependency early; an unbounded queued phase would hide a
+// dead worker.
 export function noWaitQueuedStatusDeadline(runStartedAtMs, targetWaveIndex, timeouts) {
     const exactRunStartedAtMs = exactEpochMs(runStartedAtMs, 'no-wait run start');
     const waveIndex = exactWaveIndex(targetWaveIndex, 'no-wait barrier target wave index');
@@ -406,8 +452,8 @@ export function resolveRunScopedObservation(status, {
     }
     // A failure is terminal in every phase, including 'waiting-barrier'. The
     // legacy failed-while-waiting chain-following rule is deliberately gone:
-    // this worker waits for every prior-wave member directly, so it never
-    // needs another worker's barrier to stay ordered.
+    // this worker waits for each explicitly listed dependency directly, so it
+    // never needs another worker's barrier to stay ordered.
     if (state === 'failed') return { terminal: 'failed' };
     if (state === 'running') {
         if (sequencePhase !== 'active') {
@@ -431,9 +477,22 @@ export function resolveRunScopedObservation(status, {
             deadline: phaseStartedAtMs
                 + timeouts.activeTimeoutMs
                 + timeouts.terminalPublicationGraceMs,
+            workerPid: publishedInteger(status.pid),
         };
     }
-    return { queued: true };
+    return { queued: true, workerPid: publishedInteger(status.pid) };
+}
+
+export function isNoWaitWorkerAlive(pid, { killImpl = process.kill } = {}) {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+    try {
+        killImpl(pid, 0);
+        return true;
+    } catch (error) {
+        // EPERM proves that a process owns the PID even when this caller cannot
+        // signal it. ESRCH is the only portable proof that the PID is absent.
+        return error?.code !== 'ESRCH';
+    }
 }
 
 // Polls exactly one barrier status file. It never inspects the observed
@@ -447,6 +506,7 @@ export async function waitForRunScopedStatus(entry, {
     pollIntervalMs = 100,
     sleepFn = sleep,
     nowFn = Date.now,
+    isWorkerAlive = isNoWaitWorkerAlive,
 } = {}) {
     const target = exactNoWaitBarrierEntry(entry, {
         runningDir,
@@ -460,12 +520,14 @@ export async function waitForRunScopedStatus(entry, {
         timeouts,
     );
     const statusLabel = path.basename(target.path);
+    const publicationDeadline = exactRunStartedAtMs + timeouts.startupGraceMs;
     let readFaultStartedAtMs = null;
     let lastReadFault = null;
+    let workerExitObservedAtMs = null;
 
     while (true) {
         const nowMs = nowFn();
-        let deadline = queuedDeadline;
+        let deadline = publicationDeadline;
         const readResult = readSequenceStatus(target.path);
         if (readResult.readFault) {
             // Malformed JSON and transient filesystem faults share one bounded
@@ -494,13 +556,32 @@ export async function waitForRunScopedStatus(entry, {
                 if (observation.terminal) {
                     return Object.freeze({ state: observation.terminal });
                 }
-                if (!observation.queued) deadline = observation.deadline;
+                deadline = observation.queued ? queuedDeadline : observation.deadline;
+                if (!Number.isSafeInteger(observation.workerPid) || observation.workerPid <= 0) {
+                    throw new Error(
+                        `no-wait barrier status '${statusLabel}' is invalid: non-terminal status has no exact worker pid`,
+                    );
+                }
+                if (isWorkerAlive(observation.workerPid)) {
+                    workerExitObservedAtMs = null;
+                } else {
+                    if (workerExitObservedAtMs === null) workerExitObservedAtMs = nowMs;
+                    deadline = Math.min(
+                        deadline,
+                        workerExitObservedAtMs + timeouts.terminalPublicationGraceMs,
+                    );
+                }
             }
         }
         if (nowMs >= deadline) {
             if (lastReadFault) {
                 throw new Error(
                     `no-wait barrier status '${statusLabel}' remained unreadable after bounded retries: ${lastReadFault?.message || lastReadFault}`,
+                );
+            }
+            if (workerExitObservedAtMs !== null) {
+                throw new Error(
+                    `no-wait worker for barrier status '${statusLabel}' exited before publishing a terminal status`,
                 );
             }
             throw new Error(`timed out waiting for no-wait barrier status '${statusLabel}'`);
@@ -525,8 +606,8 @@ export async function waitForNoWaitStatusBarrier(entries, {
     const expectedRunStartedAtMs = exactEpochMs(runStartedAtMs, 'no-wait run start');
     exactWaveIndex(waveIndex, 'no-wait barrier owner wave index');
     // Settle-all, never fail-fast: an early invalid status, timeout, or
-    // dependency failure must not release this worker while another member of
-    // the preceding wave is still active.
+    // dependency failure must not release this worker while another explicitly
+    // listed dependency is still active.
     const settled = await Promise.all(barrier.map(async (entry) => {
         try {
             return {
@@ -1374,14 +1455,123 @@ export function prefetchNoWaitRuntimeImage({
     }
 }
 
+// Readiness runs immediately before exact task-owned cleanup removes the
+// runtime, so this is the last moment its own output can be preserved. The
+// tail is bounded and attached to the error, which the worker publishes into
+// its terminal status.
+export const NO_WAIT_FAILURE_LOG_LINES = 40;
+const NO_WAIT_FAILURE_DETAIL_CHARS = 4000;
+
+function boundedFailureText(value) {
+    const text = String(value || '').trim();
+    return text.length > NO_WAIT_FAILURE_DETAIL_CHARS
+        ? `${text.slice(-NO_WAIT_FAILURE_DETAIL_CHARS)}\n[truncated to the last ${NO_WAIT_FAILURE_DETAIL_CHARS} characters]`
+        : text;
+}
+
+// Runtime output is arbitrary and may echo an injected credential. Diagnostics
+// are never allowed to move a secret into a persisted status file or a log, so
+// every value this agent could have been given is masked before the text is
+// kept. Bounding the length alone would not prevent disclosure.
+export function redactNoWaitDiagnostics(value, {
+    manifest,
+    profileConfig,
+    env = process.env,
+    manifestEnvNames = getManifestEnvNames,
+    exposedNames = getExposedNames,
+} = {}) {
+    let text = String(value || '');
+    if (!text) return '';
+    const names = new Set();
+    for (const resolve of [manifestEnvNames, exposedNames]) {
+        try {
+            for (const name of resolve(manifest, profileConfig, { forRuntime: true }) || []) {
+                names.add(String(name));
+            }
+        } catch (_) {
+            // A manifest that cannot enumerate its names must not defeat
+            // redaction; the generic sweep below still applies.
+        }
+    }
+    for (const name of names) {
+        const secret = String(env?.[name] ?? '');
+        // Even a short configured value is still an injected value. Losing a
+        // little diagnostic context is safer than making credential handling
+        // depend on an arbitrary minimum length.
+        if (!secret) continue;
+        text = text.split(secret).join(`[redacted:${name}]`);
+    }
+    // Catch shapes that are secret regardless of which variable carried them.
+    return text
+        .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[redacted:jwt]')
+        .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, '[redacted:authorization]');
+}
+
+export function captureNoWaitRuntimeLogTail(containerName, {
+    runtime = null,
+    runtimeKind = 'container',
+    lines = NO_WAIT_FAILURE_LOG_LINES,
+    getRuntime: resolveRuntime = dockerSvc.getRuntime,
+    spawnSyncImpl = spawnSync,
+    redact = (value) => String(value || ''),
+} = {}) {
+    // Only a container runtime has logs to read, and resolving an engine on a
+    // host without one calls process.exit. That would kill the worker before it
+    // could clean up or publish a terminal status, turning a readiness failure
+    // into a silent stall for every dependent.
+    if (runtimeKind !== 'container') return '';
+    const container = String(containerName || '').trim();
+    if (!container || path.basename(container) !== container) return '';
+    try {
+        const engine = runtime || resolveRuntime();
+        if (!engine) return '';
+        const result = spawnSyncImpl(
+            engine,
+            ['logs', '--tail', String(lines), container],
+            { encoding: 'utf8', timeout: 15000 },
+        );
+        // Redact the complete captured value before retaining a suffix. If a
+        // truncation boundary cuts through a secret first, exact-value masking
+        // can no longer recognize it and would persist the remaining suffix.
+        return boundedFailureText(redact(`${result?.stdout || ''}${result?.stderr || ''}`));
+    } catch (_) {
+        // Diagnostics must never replace the failure they are describing.
+        return '';
+    }
+}
+
+function readinessFailure(message, {
+    detail,
+    containerName,
+    runtime,
+    runtimeKind,
+    manifest,
+    profileConfig,
+} = {}) {
+    const redact = (text) => redactNoWaitDiagnostics(text, { manifest, profileConfig });
+    const failure = new Error(redact(message));
+    const probeDetail = boundedFailureText(redact(detail));
+    if (probeDetail) failure.readinessDetail = probeDetail;
+    const logTail = captureNoWaitRuntimeLogTail(containerName, {
+        runtime,
+        runtimeKind,
+        redact,
+    });
+    if (logTail) failure.runtimeLogTail = logTail;
+    return failure;
+}
+
 async function waitForNoWaitReadiness({
     manifest,
+    profileConfig,
     shortAgent,
     containerName,
     hostPort,
     runtimeResult,
     networkMode,
     generationDigest,
+    runtime,
+    runtimeKind,
 }) {
     const protocol = resolveAgentReadinessProtocol(manifest);
     if (protocol === 'none') return;
@@ -1389,7 +1579,21 @@ async function waitForNoWaitReadiness({
         const probe = normalizeProbeConfig('readiness', manifest?.health?.readiness);
         const result = await Promise.resolve(runContainerScriptReadiness(shortAgent, containerName, probe));
         if (result?.status !== 'success') {
-            throw new Error(`readiness script failed (${result?.reason || 'unknown failure'})`);
+            // The probe already carries the script's own output, and exact
+            // cleanup removes the container moments from now. Attach both here
+            // so the published failure explains itself instead of leaving only
+            // an exit code and no way left to ask.
+            throw readinessFailure(
+                `readiness script failed (${result?.reason || 'unknown failure'})`,
+                {
+                    detail: result?.detail,
+                    containerName,
+                    runtime,
+                    runtimeKind,
+                    manifest,
+                    profileConfig,
+                },
+            );
         }
         return;
     }
@@ -1409,7 +1613,12 @@ async function waitForNoWaitReadiness({
         probeTimeoutMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_PROBE_TIMEOUT_MS || '1000', 10),
         protocol,
     });
-    if (!ready) throw new Error(`readiness protocol '${protocol}' did not succeed`);
+    if (!ready) {
+        throw readinessFailure(
+            `readiness protocol '${protocol}' did not succeed`,
+            { containerName, runtime, runtimeKind, manifest, profileConfig },
+        );
+    }
 }
 
 async function main() {
@@ -1710,12 +1919,18 @@ async function main() {
             readiness(lifecycle, context, result) {
                 return waitForNoWaitReadiness({
                     manifest: context.manifest,
+                    profileConfig: context.profileResolution.profileConfig,
                     shortAgent,
                     containerName: result?.containerName || containerName,
                     hostPort: result?.hostPort,
                     runtimeResult: result,
                     networkMode: context.profileResolution.network.mode,
                     generationDigest: lifecycle.generationDigest,
+                    // A sandbox runtime has no container logs, and resolving a
+                    // container engine on a host without one would exit the
+                    // process before cleanup or a terminal status could run.
+                    runtime: admittedRuntime,
+                    runtimeKind: admittedRuntimeKind,
                 });
             },
             revalidate(initialLifecycle, currentLifecycle) {
@@ -1794,9 +2009,18 @@ async function main() {
         const failure = err instanceof Error ? err : new Error(String(err));
         const finishedAtMs = Date.now();
         const finishedAt = new Date(finishedAtMs).toISOString();
+        const redactFailure = (value) => boundedFailureText(redactNoWaitDiagnostics(value, {
+            manifest: admittedManifest,
+            profileConfig: admittedProfileResolution.profileConfig,
+        }));
+        // Carry the readiness probe's own output and the runtime log tail into
+        // the terminal status. Cleanup has already removed the container by
+        // now, so this is the only surviving explanation of the failure.
         const error = {
-            message: failure.message,
-            stack: failure.stack || null
+            message: redactFailure(failure.message),
+            stack: failure.stack ? redactFailure(failure.stack) : null,
+            ...(failure.readinessDetail ? { readinessDetail: failure.readinessDetail } : {}),
+            ...(failure.runtimeLogTail ? { runtimeLogTail: failure.runtimeLogTail } : {}),
         };
         publishStatus({
             ...baseStatus,
@@ -1805,8 +2029,14 @@ async function main() {
             finishedAtMs,
             error
         });
+        if (failure.readinessDetail) {
+            console.error(`[no-wait] ${shortAgent}: readiness output:\n${failure.readinessDetail}`);
+        }
+        if (failure.runtimeLogTail) {
+            console.error(`[no-wait] ${shortAgent}: runtime log tail:\n${failure.runtimeLogTail}`);
+        }
         console.error(`[no-wait] ${shortAgent}: launch failed: ${error.message}`);
-        if (err?.stack) console.error(err.stack);
+        if (error.stack) console.error(error.stack);
         process.exit(1);
     }
 }
