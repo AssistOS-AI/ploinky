@@ -2364,16 +2364,21 @@ export function prepareAdditiveEdgeRoutingGeneration(options = {}) {
     };
 }
 
-export function assertAdditivePreparedRuntimeIdentity(preparationLease, {
+function preparedRuntimeRegistryRecord(preparationLease, {
     containerName,
     instanceId,
     enableGeneration,
     ...options
-} = {}) {
+} = {}, { requiredMode = null } = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const lease = assertPreparationLeaseForApply(paths, preparationLease);
-    if (!lease || lease.mode !== 'additive') {
-        throw edgeError('prepared runtime identity requires one additive preparation lease', 'EDGE_PREPARATION_STALE');
+    if (!lease || (requiredMode && lease.mode !== requiredMode)) {
+        throw edgeError(
+            requiredMode
+                ? `prepared runtime identity requires one ${requiredMode} preparation lease`
+                : 'prepared runtime identity requires one preparation lease',
+            'EDGE_PREPARATION_STALE',
+        );
     }
     assertPreparedSelectorStillSelected(paths, lease);
     const prepared = loadCapturedGeneration(paths, lease.preparedGeneration);
@@ -2383,11 +2388,19 @@ export function assertAdditivePreparedRuntimeIdentity(preparationLease, {
         || String(record.instanceId || '') !== String(instanceId || '')
         || String(record.enableGeneration || '') !== String(enableGeneration || '')) {
         throw edgeError(
-            'additive preparation does not authorize the exact runtime identity',
+            'preparation does not authorize the exact runtime identity',
             'EDGE_PREPARATION_SOURCE_CHANGED',
         );
     }
     return Object.freeze(structuredClone(record));
+}
+
+export function assertPreparedRuntimeIdentity(preparationLease, options = {}) {
+    return preparedRuntimeRegistryRecord(preparationLease, options);
+}
+
+export function assertAdditivePreparedRuntimeIdentity(preparationLease, options = {}) {
+    return preparedRuntimeRegistryRecord(preparationLease, options, { requiredMode: 'additive' });
 }
 
 /**

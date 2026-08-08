@@ -133,3 +133,104 @@ test('watchdog restart attempt rejects concurrent registry drift before runtime 
     );
     assert.equal(ensureCalls, 0);
 });
+
+test('watchdog restart attempt preserves its staged successor across monitor sync and commits the enriched record', async () => {
+    fs.writeFileSync(manifestFile, JSON.stringify({
+        container: 'node:20-alpine',
+        readiness: { protocol: 'mcp' },
+    }));
+    const originalRecord = {
+        type: 'agent',
+        repoName: 'demo',
+        agentName: 'unsafe',
+        instanceId: 'instance-old',
+        enableGeneration: 'enable-old',
+        runtime: 'container',
+    };
+    const stagedRecord = {
+        ...originalRecord,
+        instanceId: 'instance-new',
+        enableGeneration: 'enable-new',
+    };
+    const finalRecord = {
+        ...stagedRecord,
+        containerId: 'container-new',
+        config: { ports: [{ containerPort: 7000, hostPort: 43123 }] },
+    };
+    const agentsFile = path.join(ploinkyDir, 'agents.json');
+    fs.writeFileSync(agentsFile, JSON.stringify({ unsafe_runtime: originalRecord }, null, 2));
+    const monitor = createContainerMonitor({
+        terminalLedgerFile: path.join(ploinkyDir, 'running', 'staged-attempt-ledger.json'),
+    });
+    syncManagedContainers(monitor);
+    const target = monitor.targets.get('unsafe_runtime');
+    assert.ok(target?.restartSnapshot);
+    target.attemptEpoch = 1;
+    target.isRestarting = true;
+    const attempt = Object.freeze({
+        target,
+        epoch: 1,
+        digest: target.restartInputDigest,
+        snapshot: target.restartSnapshot,
+    });
+    const events = [];
+    monitor.createWorkspaceMutationLease = () => Object.freeze({ operation: 'watchdog' });
+    monitor.releaseWorkspaceMutationLease = () => {};
+    monitor.withNetworkLifecycleLock = (callback) => callback(Object.freeze({ network: true }));
+    monitor.resolveRouterEndpoint = () => Object.freeze({
+        mode: 'default',
+        host: 'host.containers.internal',
+        port: 8080,
+        url: 'http://host.containers.internal:8080',
+    });
+    monitor.ensureAgentService = () => {
+        events.push('ensure');
+        fs.writeFileSync(agentsFile, JSON.stringify({ unsafe_runtime: stagedRecord }, null, 2));
+        return {
+            containerName: 'unsafe_runtime',
+            hostPort: 43123,
+            registryRecord: structuredClone(finalRecord),
+            stagedRegistryRecord: structuredClone(stagedRecord),
+            requiresEdgeActivation: true,
+            preparationLease: Object.freeze({ transactionId: 'staged-attempt' }),
+        };
+    };
+    monitor.resolveAgentReadinessProtocol = () => 'mcp';
+    monitor.waitForAgentReady = () => {
+        events.push('readiness');
+        syncManagedContainers(monitor);
+        assert.equal(target.attemptEpoch, attempt.epoch);
+        assert.equal(target.isRestarting, true);
+        assert.equal(target.restartInputDigest, attempt.digest);
+        return true;
+    };
+    monitor.loadAgents = () => JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    monitor.saveAgents = (agents, options) => {
+        assert.deepEqual(options, { coordinate: false });
+        fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+        events.push('registry-save');
+    };
+    monitor.mergeRoutingConfig = async (mutator, options) => {
+        assert.deepEqual(options, { coordinate: false });
+        const routingFile = path.join(ploinkyDir, 'routing.json');
+        const next = await mutator(JSON.parse(fs.readFileSync(routingFile, 'utf8')));
+        fs.writeFileSync(routingFile, JSON.stringify(next, null, 2));
+        events.push('route-save');
+    };
+    monitor.withEdgeGenerationApplyLock = (callback) => callback(Object.freeze({ apply: true }));
+    monitor.applyEdgeRoutingGeneration = (options) => {
+        events.push('apply');
+        options.testHooks.beforeSelectorCommit();
+        return { selector: { state: 'active' } };
+    };
+    monitor.abortEdgeRoutingPreparation = () => assert.fail('successful restart must not abort');
+    monitor.cleanupFailedRuntime = () => assert.fail('successful restart must not clean its candidate');
+
+    await performContainerRestart(monitor, target, 'not_running', attempt);
+
+    assert.deepEqual(JSON.parse(fs.readFileSync(agentsFile, 'utf8')).unsafe_runtime, finalRecord);
+    assert.deepEqual(events, ['ensure', 'readiness', 'registry-save', 'route-save', 'apply']);
+    assert.equal(target.instanceId, 'instance-new');
+    assert.equal(target.enableGeneration, 'enable-new');
+    assert.equal(target.isRestarting, false);
+});
