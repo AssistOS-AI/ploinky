@@ -17,6 +17,35 @@ const fallbackAppPath = path.join(__dirname, '../', appName);
 const MAX_COMMAND_LENGTH = 4096;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
+const RESTART_COMMAND_TIMEOUT_MS = 16 * 60_000;
+
+export function resolveDashboardCommandTimeoutMs(args) {
+    return args?.[0] === 'restart' ? RESTART_COMMAND_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
+}
+
+export function shouldDetachDashboardCommand(platform = process.platform) {
+    return platform !== 'win32';
+}
+
+export function terminateDashboardCommand(proc, {
+    platform = process.platform,
+    killProcess = process.kill,
+} = {}) {
+    const pid = Number(proc?.pid);
+    if (shouldDetachDashboardCommand(platform) && Number.isSafeInteger(pid) && pid > 1) {
+        try {
+            killProcess(-pid, 'SIGTERM');
+            return 'group';
+        } catch (_) {}
+    }
+    if (typeof proc?.kill !== 'function') return 'failed';
+    try {
+        proc.kill('SIGTERM');
+        return 'process';
+    } catch (_) {
+        return 'failed';
+    }
+}
 
 function renderTemplate(filenames, replacements) {
     const target = staticSrv.resolveFirstAvailable(appName, fallbackAppPath, filenames);
@@ -72,17 +101,21 @@ function handleDashboard(req, res, appConfig, appState) {
                     return;
                 }
                 const args = cmd.split(/\s+/).filter(Boolean);
-                const proc = spawn(DIRECT_CLI_PATH, args, { cwd: PLOINKY_WORKSPACE_ROOT, env: { ...process.env, PLOINKY_CWD: PLOINKY_WORKSPACE_ROOT } });
+                const proc = spawn(DIRECT_CLI_PATH, args, {
+                    cwd: PLOINKY_WORKSPACE_ROOT,
+                    env: { ...process.env, PLOINKY_CWD: PLOINKY_WORKSPACE_ROOT },
+                    detached: shouldDetachDashboardCommand(),
+                });
                 let out = ''; let err = '';
                 let outputBytes = 0;
                 let finished = false;
                 const timer = setTimeout(() => {
                     if (finished) return;
                     finished = true;
-                    try { proc.kill('SIGTERM'); } catch (_) {}
+                    terminateDashboardCommand(proc);
                     res.writeHead(504, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
                     res.end(JSON.stringify({ ok: false, error: 'command_timeout' }));
-                }, COMMAND_TIMEOUT_MS);
+                }, resolveDashboardCommandTimeoutMs(args));
                 timer.unref?.();
                 const collect = (target) => (chunk) => {
                     outputBytes += chunk.length;
@@ -90,7 +123,7 @@ function handleDashboard(req, res, appConfig, appState) {
                         if (!finished) {
                             finished = true;
                             clearTimeout(timer);
-                            try { proc.kill('SIGTERM'); } catch (_) {}
+                            terminateDashboardCommand(proc);
                             res.writeHead(413, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
                             res.end(JSON.stringify({ ok: false, error: 'command_output_limit' }));
                         }

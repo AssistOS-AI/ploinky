@@ -178,12 +178,18 @@ export async function executeWebSocketPlan({
                 if (settled) return;
                 settled = true;
                 clearTimers();
-                try { socket.destroy(error); } catch (_) {}
-                try { upstreamSocket?.destroy(error); } catch (_) {}
-                try { upstream.destroy(error); } catch (_) {}
+                // The rejection below retains the causal error for audit and
+                // response classification. Passing it to destroy() would emit
+                // a second asynchronous 'error' after the request's one-shot
+                // listener had already handled the first failure. On upgraded
+                // sockets that duplicate can escape as an uncaught exception.
+                try { socket.destroy(); } catch (_) {}
+                try { upstreamSocket?.destroy(); } catch (_) {}
+                try { upstream.destroy(); } catch (_) {}
                 reject(error);
             };
             const resetIdleTimer = () => {
+                if (settled) return;
                 clearTimeout(idleTimer);
                 idleTimer = setTimeout(() => fail(new Error('proxy: WebSocket idle timeout')), finalized.limits.idleTimeoutMs);
                 idleTimer.unref?.();

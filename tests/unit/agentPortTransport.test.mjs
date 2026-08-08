@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import http from 'node:http';
-import { Readable, Writable } from 'node:stream';
+import { Duplex, Readable, Writable } from 'node:stream';
 
 import { executeHttpPlan } from '../../cli/server/proxy/executeHttpPlan.js';
 import { executeWebSocketPlan } from '../../cli/server/proxy/executeWebSocketPlan.js';
@@ -75,6 +75,26 @@ class UpgradeSocket extends Writable {
     _write(chunk, _encoding, callback) {
         this.body = Buffer.concat([this.body, Buffer.from(chunk)]);
         callback();
+    }
+}
+
+class TeardownSocket extends Duplex {
+    constructor() {
+        super();
+        this.body = Buffer.alloc(0);
+        this.destroyErrors = [];
+    }
+
+    _read() {}
+
+    _write(chunk, _encoding, callback) {
+        this.body = Buffer.concat([this.body, Buffer.from(chunk)]);
+        callback();
+    }
+
+    destroy(error) {
+        this.destroyErrors.push(error);
+        return super.destroy();
     }
 }
 
@@ -309,6 +329,71 @@ test('a stale per-OPEN generation lease rejects a WebSocket upgrade with 503', a
     });
     assert.equal(handled, false);
     assert.match(socket.body.toString('utf8'), /^HTTP\/1\.1 503 Service Unavailable\r\n/);
+    assert.equal(released, true);
+});
+
+test('WebSocket failure teardown does not re-emit the handled error through destroyed sockets', {
+    concurrency: false,
+}, async t => {
+    const originalRequest = http.request;
+    t.after(() => { http.request = originalRequest; });
+
+    const upgraded = deferred();
+    const upstreamRequest = new EventEmitter();
+    const targetSocket = new TeardownSocket();
+    upstreamRequest.destroyErrors = [];
+    upstreamRequest.end = () => {
+        setImmediate(() => {
+            upstreamRequest.emit('upgrade', {
+                statusCode: 101,
+                statusMessage: 'Switching Protocols',
+                headers: {},
+            }, targetSocket, Buffer.alloc(0));
+            upgraded.resolve();
+        });
+    };
+    upstreamRequest.destroy = error => {
+        upstreamRequest.destroyErrors.push(error);
+    };
+    http.request = () => upstreamRequest;
+
+    const request = {
+        method: 'GET',
+        headers: {
+            host: '127.0.0.1:8080',
+            origin: 'http://127.0.0.1:8080',
+            connection: 'Upgrade',
+            upgrade: 'websocket',
+            'sec-websocket-version': '13',
+            'sec-websocket-key': Buffer.alloc(16, 8).toString('base64'),
+        },
+    };
+    const socket = new TeardownSocket();
+    let channelClosed = false;
+    let released = false;
+    const handling = executeWebSocketPlan({
+        req: request,
+        socket,
+        plan: routePlan({ method: 'GET', transport: 'websocket' }),
+        lease: { release() { released = true; } },
+        relayManager: {
+            checkout: async () => ({
+                openRequest: async () => new ApplicationRelayStream(),
+                close() { channelClosed = true; },
+            }),
+        },
+        authorized: true,
+    });
+
+    await upgraded.promise;
+    const relayFailure = new Error('runtime relay exited (137)');
+    upstreamRequest.emit('error', relayFailure);
+
+    assert.equal(await settleWithin(handling), false);
+    assert.deepEqual(socket.destroyErrors, [undefined]);
+    assert.deepEqual(targetSocket.destroyErrors, [undefined]);
+    assert.deepEqual(upstreamRequest.destroyErrors, [undefined]);
+    assert.equal(channelClosed, true);
     assert.equal(released, true);
 });
 
