@@ -35,16 +35,16 @@ Use only `~/work/testExplorerFresh`. Positively identify that exact path and the
 
 Do not reuse a prior Box, generation, repository checkout, volume, release manifest, browser profile, or E2E artifact directory. Preserve evidence outside tracked source directories.
 
-### 3. Deploy the exact branch
+### 3. Deploy Explorer with the canonical command
 
 The deployment command is literal:
 
 ```sh
 cd ~/work/testExplorerFresh
-ploinky start explorer --branch=ploinky-proxy
+ploinky start explorer
 ```
 
-Do not add `--branch-fallback`, `--repo-branch`, or `--reset-repos`. Do not substitute a manual compose/podman launch or an already-running deployment.
+Do not add arguments or flags to this deployment command, including `--branch`, `--branch-fallback`, `--repo-branch`, or `--reset-repos`. Branch selection, checkout updates, and candidate pinning are separate preparation steps and must not be encoded as `ploinky start explorer` arguments. Do not substitute a manual compose/podman launch or an already-running deployment.
 
 Before testing, prove all of the following:
 
