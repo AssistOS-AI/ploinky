@@ -147,6 +147,7 @@ export function handleWebchatUploadPost(req, res, parsedUrl, context, { policy, 
         timers,
         replaceExisting: overwrite,
         includeEntry: isAdmissibleWorkspaceEntry,
+        includeDirectory: isAdmissibleWorkspaceEntry,
         finalize: ({ size }) => {
             responseDetails = {
                 filename: path.basename(target.absolutePath),

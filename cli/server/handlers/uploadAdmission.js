@@ -109,7 +109,12 @@ function activeTotals(storageRoot, excludedReservation = null) {
     }
     return { files, bytes, ignoredPaths };
 }
-function inspectStorage(storageRoot, { ignoredPaths, includeEntry, policy } = {}) {
+function inspectStorage(storageRoot, {
+    ignoredPaths,
+    includeEntry,
+    includeDirectory,
+    policy,
+} = {}) {
     let rootStat;
     try {
         rootStat = fs.lstatSync(storageRoot);
@@ -142,6 +147,12 @@ function inspectStorage(storageRoot, { ignoredPaths, includeEntry, policy } = {}
                 throw uploadError(507, 'storage_inventory_unavailable');
             }
             if (stat.isDirectory() && !stat.isSymbolicLink()) {
+                const relativePath = path.relative(storageRoot, absolutePath);
+                if (includeDirectory && !includeDirectory({
+                    absolutePath,
+                    relativePath,
+                    stat,
+                })) continue;
                 stack.push(absolutePath);
                 continue;
             }
@@ -210,7 +221,15 @@ function assertQuota(policy, inventory, active, fileDelta, byteDelta) {
     }
 }
 
-function reserveUpload({ req, storageRoot, targetPath, policy, replaceExisting, includeEntry }) {
+function reserveUpload({
+    req,
+    storageRoot,
+    targetPath,
+    policy,
+    replaceExisting,
+    includeEntry,
+    includeDirectory,
+}) {
     const normalizedPolicy = validatePolicy(policy);
     let normalizedRoot;
     try {
@@ -251,6 +270,7 @@ function reserveUpload({ req, storageRoot, targetPath, policy, replaceExisting, 
     const inventory = inspectStorage(normalizedRoot, {
         ignoredPaths: active.ignoredPaths,
         includeEntry,
+        includeDirectory,
         policy: normalizedPolicy,
     });
     assertQuota(normalizedPolicy, inventory, active, fileDelta, reservedBytes);
@@ -264,6 +284,7 @@ function reserveUpload({ req, storageRoot, targetPath, policy, replaceExisting, 
         contentLength,
         policy: normalizedPolicy,
         includeEntry,
+        includeDirectory,
         temporaryPath: null,
     };
     activeState(normalizedRoot).add(reservation);
@@ -285,6 +306,7 @@ function verifyFinalQuota(reservation, size) {
     const inventory = inspectStorage(reservation.storageRoot, {
         ignoredPaths: active.ignoredPaths,
         includeEntry: reservation.includeEntry,
+        includeDirectory: reservation.includeDirectory,
         policy: reservation.policy,
     });
     assertQuota(reservation.policy, inventory, active, reservation.fileDelta, size);
@@ -325,6 +347,7 @@ export function streamAdmittedUpload(req, {
     policy,
     replaceExisting = false,
     includeEntry,
+    includeDirectory,
     timers = {},
     finalize,
     onSuccess,
@@ -341,6 +364,7 @@ export function streamAdmittedUpload(req, {
             policy,
             replaceExisting,
             includeEntry,
+            includeDirectory,
         });
     } catch (error) {
         try { req.resume?.(); } catch (_) { /* ignore */ }

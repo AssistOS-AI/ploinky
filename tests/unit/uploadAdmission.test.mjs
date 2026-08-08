@@ -395,6 +395,43 @@ test('webchat upload quota ignores workspace paths that direct uploads cannot ta
     assert.equal(fs.readFileSync(path.join(root, 'new.txt'), 'utf8'), 'a');
 });
 
+test('webchat upload quota does not traverse reserved workspace directories', async (t) => {
+    const root = temporaryDirectory(t, 'webchat-reserved-prune');
+    const context = webchatContext(root);
+    const reservedDirectory = path.join(root, '.ploinky');
+    fs.mkdirSync(reservedDirectory, { recursive: true });
+    fs.writeFileSync(path.join(reservedDirectory, 'runtime-state.txt'), 'not upload storage');
+    const originalReaddirSync = fs.readdirSync;
+    t.mock.method(fs, 'readdirSync', (directory, ...args) => {
+        if (path.resolve(directory) === reservedDirectory) {
+            throw new Error('reserved directory was traversed');
+        }
+        return originalReaddirSync(directory, ...args);
+    });
+    const request = endedRequest({
+        url: '/webchat/uploads',
+        headers: {
+            'content-length': '1',
+            'x-file-name': 'new.txt',
+        },
+        chunks: ['a'],
+    });
+    const response = new MockResponse();
+
+    handleWebchatUploadPost(
+        request,
+        response,
+        new URL('/webchat/uploads', 'http://127.0.0.1'),
+        context,
+        { policy: testPolicy('/webchat/uploads', { maxFiles: 1 }) },
+    );
+    await responseFinished(response);
+
+    assert.equal(response.statusCode, 201);
+    assert.equal(JSON.parse(response.bodyText()).relativePath, 'new.txt');
+    assert.equal(fs.readFileSync(path.join(root, 'new.txt'), 'utf8'), 'a');
+});
+
 test('webchat upload rejects stored-byte exhaustion without changing existing files', async (t) => {
     const root = temporaryDirectory(t, 'webchat-storage-quota');
     const context = webchatContext(root);
