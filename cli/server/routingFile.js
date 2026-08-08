@@ -8,6 +8,7 @@ import {
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
+import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 
 const ROUTING_LOCK_FILE = `${ROUTING_FILE}.lock`;
 
@@ -62,6 +63,7 @@ function writeRoutingConfig(config, {
     coordinate = true,
     reason = 'routing-write',
     preparationLease,
+    networkLifecycleCapability,
 } = {}) {
     const target = config && typeof config === 'object' ? config : {};
     target.routes = target.routes && typeof target.routes === 'object' ? target.routes : {};
@@ -73,20 +75,30 @@ function writeRoutingConfig(config, {
         return target;
     };
     if (!coordinate) return write();
-    const expectedGeneration = withEdgeGenerationApplyLock((applyLockCapability) => {
-        // A lifecycle preparation lease is bound to one exact inactive
-        // selector. Re-inactivating here would rotate that selector before the
-        // prepared apply can validate it. The preparation phase has already
-        // installed the fail-closed selector; ordinary unprepared writes still
-        // have to inactivate before mutating candidate bytes.
-        if (!preparationLease) {
-            inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
-        }
-        write();
-        return captureEdgeRoutingCandidateGeneration({ applyLockCapability });
-    }, { preparationLease });
-    applyEdgeRoutingGeneration({ reason, preparationLease, expectedGeneration });
-    return target;
+    return withNetworkLifecycleLock((liveNetworkLifecycleCapability) => (
+        withEdgeGenerationApplyLock((applyLockCapability) => {
+            // A lifecycle preparation lease is bound to one exact inactive
+            // selector. Re-inactivating here would rotate that selector before
+            // the prepared apply can validate it. The preparation phase has
+            // already installed the fail-closed selector; ordinary unprepared
+            // writes still have to inactivate before mutating candidate bytes.
+            if (!preparationLease) {
+                inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
+            }
+            write();
+            const expectedGeneration = captureEdgeRoutingCandidateGeneration({ applyLockCapability });
+            applyEdgeRoutingGeneration({
+                reason,
+                preparationLease,
+                expectedGeneration,
+                applyLockCapability,
+                networkLifecycleCapability: liveNetworkLifecycleCapability,
+            });
+            return target;
+        }, { preparationLease })
+    ), networkLifecycleCapability === undefined
+        ? {}
+        : { capability: networkLifecycleCapability });
 }
 
 async function mergeRoutingConfig(mutator, {
@@ -95,41 +107,52 @@ async function mergeRoutingConfig(mutator, {
     preparationLease,
     validateActiveGeneration,
     captureExpectedGeneration,
+    networkLifecycleCapability,
 } = {}) {
-    const release = await acquireRoutingLock();
-    try {
-        const mutate = async (applyLockCapability = undefined) => {
-            let validatedActiveGeneration;
-            if (coordinate && typeof validateActiveGeneration === 'function') {
-                validatedActiveGeneration = await validateActiveGeneration();
-            }
-            if (coordinate && !preparationLease) {
-                inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
-            }
-            const current = readRoutingConfig();
-            const next = await mutator(current) || current;
-            writeRoutingConfig(next, { coordinate: false });
-            const expectedGeneration = coordinate
-                ? (typeof captureExpectedGeneration === 'function'
-                    ? await captureExpectedGeneration(validatedActiveGeneration)
-                    : captureEdgeRoutingCandidateGeneration({ applyLockCapability }))
-                : undefined;
-            return { next, expectedGeneration };
-        };
-        const { next, expectedGeneration } = coordinate
-            ? await withEdgeGenerationApplyLock(mutate, { preparationLease })
-            : await mutate();
-        if (coordinate) {
-            applyEdgeRoutingGeneration({
-                reason,
-                preparationLease,
-                expectedGeneration,
-            });
+    const mutate = async (applyLockCapability = undefined) => {
+        let validatedActiveGeneration;
+        if (coordinate && typeof validateActiveGeneration === 'function') {
+            validatedActiveGeneration = await validateActiveGeneration();
         }
-        return next;
-    } finally {
-        release();
-    }
+        if (coordinate && !preparationLease) {
+            inactivateEdgeRoutingGeneration(reason, { applyLockCapability });
+        }
+        const current = readRoutingConfig();
+        const next = await mutator(current) || current;
+        writeRoutingConfig(next, { coordinate: false });
+        const expectedGeneration = coordinate
+            ? (typeof captureExpectedGeneration === 'function'
+                ? await captureExpectedGeneration(validatedActiveGeneration)
+                : captureEdgeRoutingCandidateGeneration({ applyLockCapability }))
+            : undefined;
+        return { next, expectedGeneration };
+    };
+    const mergeUnderRoutingLock = async (liveNetworkLifecycleCapability = undefined) => {
+        const release = await acquireRoutingLock();
+        try {
+            if (!coordinate) return (await mutate()).next;
+            return await withEdgeGenerationApplyLock(async (applyLockCapability) => {
+                const { next, expectedGeneration } = await mutate(applyLockCapability);
+                await applyEdgeRoutingGeneration({
+                    reason,
+                    preparationLease,
+                    expectedGeneration,
+                    applyLockCapability,
+                    networkLifecycleCapability: liveNetworkLifecycleCapability,
+                });
+                return next;
+            }, { preparationLease });
+        } finally {
+            release();
+        }
+    };
+    if (!coordinate) return await mergeUnderRoutingLock();
+    return await withNetworkLifecycleLock(
+        mergeUnderRoutingLock,
+        networkLifecycleCapability === undefined
+            ? {}
+            : { capability: networkLifecycleCapability },
+    );
 }
 
 function mergeRuntimeRoute(existingRoute, route, {

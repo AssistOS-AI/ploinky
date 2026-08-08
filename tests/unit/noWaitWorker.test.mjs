@@ -738,13 +738,18 @@ test('no-wait main delegates route activation to the serialized lifecycle transa
         'utf8',
     );
     const transaction = source.indexOf('await runNoWaitLifecycleTransaction(expectedIdentity, {');
-    const activation = source.indexOf('async activate(lifecycle, context, result, { onCommitted })', transaction);
+    const activation = source.indexOf('async activate(lifecycle, context, result, {', transaction);
     const routeMutation = source.indexOf('await upsertRoute(', activation);
     const transactionEnd = source.indexOf('\n        });\n    } catch (err)', routeMutation);
     assert.ok(transaction > 0, 'no-wait worker must enter the serialized lifecycle transaction');
     assert.ok(activation > transaction, 'route activation must be owned by the transaction callback');
     assert.ok(routeMutation > activation, 'route mutation must occur only within activation');
     assert.ok(transactionEnd > routeMutation, 'activation must finish before the transaction releases');
+    assert.match(
+        source.slice(activation, transactionEnd),
+        /networkLifecycleCapability[\s\S]*await upsertRoute\([\s\S]*networkLifecycleCapability/,
+        'activation must pass its exact live network capability into the route transaction',
+    );
 });
 
 test('no-wait worker never owns the workspace lease while waiting for an active generation', async () => {

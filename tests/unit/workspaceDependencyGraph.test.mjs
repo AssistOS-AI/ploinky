@@ -503,6 +503,11 @@ test('prepared runtime records and routes commit together before activation, inc
         'the exact post-mutation generation must be captured and bound to the coordinated apply',
     );
     assert.match(
+        routingFileSource,
+        /withEdgeGenerationApplyLock\(async \(applyLockCapability\)[\s\S]*await mutate\(applyLockCapability\)[\s\S]*applyEdgeRoutingGeneration\([\s\S]*applyLockCapability/,
+        'route mutation and publication must retain one edge apply capability through commit',
+    );
+    assert.match(
         noWaitSource,
         /await waitForNoWaitStatusBarrier\(waitForStatuses, \{\s*runId,\s*runStartedAtMs,\s*waveIndex,\s*\}\);/,
         'one mandatory run-scoped wave barrier is the only coordination gate a worker may use',

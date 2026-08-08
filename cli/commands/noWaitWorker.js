@@ -673,6 +673,7 @@ async function upsertRoute(routeKey, route, {
     expectedLifecycle,
     expectedSelector,
     preparationLease,
+    networkLifecycleCapability,
 } = {}) {
     if (!containerName || !registryRecord || !expectedIdentity || !expectedLifecycle
         || !expectedSelector?.generation || !expectedSelector?.activationId) {
@@ -714,6 +715,7 @@ async function upsertRoute(routeKey, route, {
         return cfg;
     }, {
         reason: `no-wait-runtime-ready:${routeKey}`,
+        networkLifecycleCapability,
         ...(preparationLease ? { preparationLease } : {}),
         ...(preparationLease ? {} : { validateActiveGeneration() {
             const active = assertActiveEdgeRoutingSourcesCurrent();
@@ -1997,7 +1999,10 @@ async function main() {
                     requireRunning: !cleanup,
                 });
             },
-            async activate(lifecycle, context, result, { onCommitted }) {
+            async activate(lifecycle, context, result, {
+                networkLifecycleCapability,
+                onCommitted,
+            }) {
                 const resolvedContainerName = result?.containerName || containerName;
                 const hostPort = result?.hostPort;
                 const routedHostPort = context.profileResolution.network.mode === 'none'
@@ -2021,6 +2026,7 @@ async function main() {
                             activationId: lifecycle.selectorActivationId,
                         },
                         preparationLease: result?.preparationLease,
+                        networkLifecycleCapability,
                     });
                 }
                 onCommitted();
