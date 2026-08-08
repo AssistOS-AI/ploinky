@@ -398,6 +398,23 @@ export function resolveNoWaitBarrierTimeouts({
     });
 }
 
+// A cold no-wait launch can legitimately retain the workspace mutation lease
+// while it installs native dependencies or prepares a replacement runtime.
+// The former 180-second edge timeout was only suitable for short selector
+// transitions and caused healthy peers to fail while one cold launch was
+// still inside its sanctioned active window. Keep the lease wait bounded by
+// that same active window so observation and mutation use one timeout model.
+export function resolveNoWaitLifecycleLeaseTimeoutMs({
+    timeoutMs = process.env.PLOINKY_NO_WAIT_LIFECYCLE_LEASE_TIMEOUT_MS,
+    timeouts = resolveNoWaitBarrierTimeouts(),
+} = {}) {
+    return boundedTimeoutInput(timeoutMs, {
+        fallback: timeouts.activeTimeoutMs,
+        minimum: 1000,
+        maximum: timeouts.activeTimeoutMs,
+    });
+}
+
 // A queued worker may wait through a direct-dependency chain whose maximum
 // depth is represented by its topological wave. A single run-wide deadline
 // would expire a deep dependency early; an unbounded queued phase would hide a
@@ -878,6 +895,7 @@ export async function runNoWaitLifecycleTransaction(identity, {
     withLifecycleLease = withActiveNoWaitWorkerLifecycleLease,
     withNetworkLock = withNetworkLifecycleLock,
     loadCurrentLifecycle = loadNoWaitWorkerLifecycle,
+    lifecycleLeaseTimeoutMs = resolveNoWaitLifecycleLeaseTimeoutMs(),
     networkWaitMs = boundedPositiveInteger(
         process.env.PLOINKY_NO_WAIT_NETWORK_LOCK_TIMEOUT_MS,
         180000,
@@ -907,6 +925,18 @@ export async function runNoWaitLifecycleTransaction(identity, {
     let result = null;
     let cleanupRequired = false;
     let cleanupAttempted = false;
+    const boundedLifecycleLeaseTimeoutMs = resolveNoWaitLifecycleLeaseTimeoutMs({
+        timeoutMs: lifecycleLeaseTimeoutMs,
+    });
+
+    const runWithLifecycleLease = (callback, operation) => withLifecycleLease(
+        identity,
+        callback,
+        {
+            operation,
+            timeoutMs: boundedLifecycleLeaseTimeoutMs,
+        },
+    );
 
     const runWithNetworkLock = (callback) => withNetworkLock(callback, {
         waitMs: boundedPositiveInteger(networkWaitMs, 180000, 300000),
@@ -963,13 +993,14 @@ export async function runNoWaitLifecycleTransaction(identity, {
 
     const cleanupAfterWorkspaceRelease = async () => {
         if (!cleanupRequired || cleanupAttempted || !result) return;
-        await withLifecycleLease(identity, cleanupWhileWorkspaceLocked, {
-            operation: `no-wait-cleanup:${String(identity?.containerName || identity?.routeKey || 'unknown')}`,
-        });
+        await runWithLifecycleLease(
+            cleanupWhileWorkspaceLocked,
+            `no-wait-cleanup:${String(identity?.containerName || identity?.routeKey || 'unknown')}`,
+        );
     };
 
     try {
-        const initialPhase = await withLifecycleLease(identity, async (lifecycle) => {
+        const initialPhase = await runWithLifecycleLease(async (lifecycle) => {
             initialLifecycle = lifecycle;
             context = await capture(lifecycle);
             if (context?.requiresEnsure === false) {
@@ -1012,14 +1043,14 @@ export async function runNoWaitLifecycleTransaction(identity, {
                     throw error;
                 }
             });
-        });
+        }, `no-wait-runtime:${String(identity?.containerName || identity?.routeKey || 'unknown')}`);
         if (initialPhase.completed) return initialPhase.value;
 
         // The expensive semantic readiness wait is intentionally outside both
         // mutation locks for ordinary fresh/adoptable runtimes.
         await readiness(initialLifecycle, context, result);
 
-        return await withLifecycleLease(identity, async (currentLifecycle) => {
+        return await runWithLifecycleLease(async (currentLifecycle) => {
             try {
                 const rebasedLifecycle = await revalidate(
                     initialLifecycle,
@@ -1044,7 +1075,7 @@ export async function runNoWaitLifecycleTransaction(identity, {
                 }
                 throw error;
             }
-        });
+        }, `no-wait-activate:${String(identity?.containerName || identity?.routeKey || 'unknown')}`);
     } catch (error) {
         try {
             await cleanupAfterWorkspaceRelease();
@@ -1219,10 +1250,7 @@ export async function waitForNoWaitWorkerLifecycle(identity, {
 }
 
 export async function withActiveNoWaitWorkerLifecycleLease(identity, callback, {
-    timeoutMs = Number.parseInt(
-        process.env.PLOINKY_NO_WAIT_EDGE_TIMEOUT_MS || '180000',
-        10,
-    ),
+    timeoutMs = resolveNoWaitLifecycleLeaseTimeoutMs(),
     pollIntervalMs = 250,
     loadFn = loadNoWaitWorkerLifecycle,
     withLeaseFn = withWorkspaceMutationLease,
@@ -1233,10 +1261,7 @@ export async function withActiveNoWaitWorkerLifecycleLease(identity, callback, {
     if (typeof callback !== 'function') {
         throw new TypeError('no-wait lifecycle lease requires a callback');
     }
-    const parsedTimeoutMs = Number(timeoutMs);
-    const boundedTimeoutMs = Number.isFinite(parsedTimeoutMs)
-        ? Math.max(1000, parsedTimeoutMs)
-        : 180000;
+    const boundedTimeoutMs = resolveNoWaitLifecycleLeaseTimeoutMs({ timeoutMs });
     const parsedPollIntervalMs = Number(pollIntervalMs);
     const boundedPollIntervalMs = Number.isFinite(parsedPollIntervalMs)
         ? Math.max(1, parsedPollIntervalMs)

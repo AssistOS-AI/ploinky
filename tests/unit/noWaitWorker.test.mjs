@@ -22,6 +22,7 @@ import {
     redactNoWaitDiagnostics,
     prefetchNoWaitRuntimeImage,
     resolveNoWaitBarrierTimeouts,
+    resolveNoWaitLifecycleLeaseTimeoutMs,
     resolveNoWaitRunScopedArguments,
     resolveNoWaitWorkerLifecycleSnapshot,
     resolveRunScopedObservation,
@@ -793,6 +794,32 @@ test('no-wait worker never owns the workspace lease while waiting for an active 
     assert.equal(result, 'launched');
     assert.equal(leaseCalls, 1);
     assert.equal(leaseHeld, false);
+});
+
+test('cold no-wait peers may wait for the full sanctioned active lifecycle budget', async () => {
+    const identity = { containerName: 'ploinky_demo_worker', routeKey: 'background' };
+    const lifecycle = {
+        generationDigest: 'sha256:active',
+        selectorActivationId: 'activation-ready',
+    };
+    const expectedTimeoutMs = resolveNoWaitBarrierTimeouts().activeTimeoutMs;
+    assert.equal(resolveNoWaitLifecycleLeaseTimeoutMs(), expectedTimeoutMs);
+    assert.ok(expectedTimeoutMs > 180_000);
+
+    let now = 0;
+    const value = await withActiveNoWaitWorkerLifecycleLease(identity, () => 'launched', {
+        nowFn: () => now,
+        loadFn: () => lifecycle,
+        async withLeaseFn(options, callback) {
+            assert.equal(options.waitTimeoutMs, expectedTimeoutMs);
+            // Reproduce the previously fatal condition without making the
+            // unit suite sleep: a cold peer owns the lease for over 180s.
+            now = 181_000;
+            return callback();
+        },
+    });
+
+    assert.equal(value, 'launched');
 });
 
 test('retryable publication recovery reacquires between exact worker lease attempts', async () => {
@@ -1791,6 +1818,7 @@ test('ordinary no-wait readiness runs outside locks and activation is exactly re
     let workspaceHeld = false;
     let networkHeld = false;
     let lifecycleLeases = 0;
+    const lifecycleOptions = [];
     const networkOptions = [];
 
     const value = await runNoWaitLifecycleTransaction({ containerName: candidate.containerName }, {
@@ -1825,8 +1853,9 @@ test('ordinary no-wait readiness runs outside locks and activation is exactly re
             onCommitted();
             return 'activated';
         },
-        async withLifecycleLease(_identity, callback) {
+        async withLifecycleLease(_identity, callback, options) {
             lifecycleLeases += 1;
+            lifecycleOptions.push(options);
             assert.equal(workspaceHeld, false);
             workspaceHeld = true;
             try { return await callback(lifecycle); } finally { workspaceHeld = false; }
@@ -1839,10 +1868,15 @@ test('ordinary no-wait readiness runs outside locks and activation is exactly re
         },
         networkWaitMs: 999999,
         networkPollMs: 999999,
+        lifecycleLeaseTimeoutMs: 4321,
     });
 
     assert.equal(value, 'activated');
     assert.equal(lifecycleLeases, 2);
+    assert.deepEqual(lifecycleOptions, [
+        { operation: `no-wait-runtime:${candidate.containerName}`, timeoutMs: 4321 },
+        { operation: `no-wait-activate:${candidate.containerName}`, timeoutMs: 4321 },
+    ]);
     assert.deepEqual(networkOptions, [
         { waitMs: 300000, pollMs: 1000 },
         { waitMs: 300000, pollMs: 1000 },
