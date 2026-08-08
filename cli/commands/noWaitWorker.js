@@ -151,6 +151,13 @@ function exactRunId(value, label = 'no-wait run id') {
     return runId.toLowerCase();
 }
 
+// A published identity field must be an actual JSON number. Returning null for
+// anything else keeps a coercible value (null, '', false, []) from comparing
+// equal to a legitimate zero.
+function publishedInteger(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 function exactEpochMs(value, label = 'no-wait timestamp') {
     const epochMs = Number(value);
     if (!Number.isSafeInteger(epochMs) || epochMs < 0) {
@@ -378,10 +385,15 @@ export function resolveRunScopedObservation(status, {
     if (String(status.runId || '').trim().toLowerCase() !== exactRunId(expectedRunId)) {
         throw new Error('no-wait barrier status belongs to a different run');
     }
-    if (Number(status.runStartedAtMs) !== exactEpochMs(runStartedAtMs, 'no-wait run start')) {
+    // Compare published integers by type, never by coercion: Number(null),
+    // Number('') and Number(false) are all 0 and would let a malformed status
+    // match a wave-zero target. The monitor's marker binding is strict for the
+    // same reason.
+    if (publishedInteger(status.runStartedAtMs) !== exactEpochMs(runStartedAtMs, 'no-wait run start')) {
         throw new Error('no-wait barrier status belongs to a different run start');
     }
-    if (Number(status.waveIndex) !== exactWaveIndex(targetWaveIndex, 'no-wait barrier target wave index')) {
+    if (publishedInteger(status.waveIndex)
+        !== exactWaveIndex(targetWaveIndex, 'no-wait barrier target wave index')) {
         throw new Error('no-wait barrier status belongs to a different dependency wave');
     }
     const state = String(status.state || '');
@@ -1348,7 +1360,13 @@ export function prefetchNoWaitRuntimeImage({
     }
     if (!image) return Object.freeze({ prefetched: false, reason: 'unresolved-image' });
     try {
-        const pulled = ensureImage(image, runtime ? { runtime } : {});
+        // Pull only. Same-wave workers run this concurrently and unlocked, so
+        // the local-build fallback stays with the serialized in-lease path
+        // rather than racing several builds of one tag.
+        const pulled = ensureImage(image, {
+            ...(runtime ? { runtime } : {}),
+            allowLocalBuild: false,
+        });
         return Object.freeze({ prefetched: Boolean(pulled), image });
     } catch (error) {
         log(`[no-wait] ${agentName}: image prefetch for '${image}' failed (${error?.message || error}); the lifecycle transaction will resolve it.`);

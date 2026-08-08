@@ -308,6 +308,14 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
       const references = new Map();
       const addReference = (reference, directDependency) => {
         if (!reference) return;
+        // The worker rejects a barrier entry that does not name a strictly
+        // earlier wave, exiting before it can publish a status while the parent
+        // still reports a successful spawn. Reject it here instead.
+        if (reference.waveIndex >= waveIndex) {
+          throw new Error(
+            `no-wait launch schedule points '${entry.node.id}' in wave ${waveIndex} at '${reference.nodeId}' in wave ${reference.waveIndex}`,
+          );
+        }
         const existing = references.get(reference.path);
         if (existing && (existing.nodeId !== reference.nodeId
           || existing.runId !== reference.runId
@@ -379,6 +387,13 @@ export function writeNoWaitSpawnFailure(entry, error, {
   runningDir = RUNNING_DIR,
 } = {}) {
   const finishedAtMs = Date.now();
+  // This runs inside the spawn loop's catch. Without an exact coordination
+  // path there is nothing to publish, and throwing here would replace the
+  // original spawn failure with an unrelated rename error and abort the start.
+  const coordinationStatusFile = String(entry?.statusFile || '');
+  if (!coordinationStatusFile || !entry?.registryName) {
+    throw new Error('no-wait spawn failure requires the exact run-scoped status identity');
+  }
   // A spawn failure has to be a valid terminal member of a wave barrier so a
   // dependent worker can make a deterministic dependency decision instead of
   // stalling on a status that never arrives.
@@ -2257,7 +2272,14 @@ async function startWorkspace(staticAgentArg, portArg, {
           });
           console.log(`[start] ${formatGraphNodeLabel(node, staticAgent)}: no-wait wave ${entry.waveIndex + 1}/${noWaitSchedule.length} launch started (pid ${pid}). log=${logFile} status=${statusFile}`);
         } catch (spawnErr) {
-          writeNoWaitSpawnFailure(entry, spawnErr);
+          // Publishing the terminal status is best-effort here. Letting it
+          // throw would replace the real spawn failure with a publication
+          // error and abort the whole start instead of reporting this node.
+          try {
+            writeNoWaitSpawnFailure(entry, spawnErr);
+          } catch (publishErr) {
+            console.error(`[start] no-wait spawn failure status for '${formatGraphNodeLabel(node, staticAgent)}' could not be published: ${publishErr?.message || publishErr}`);
+          }
           console.error(`[start] no-wait launch for '${formatGraphNodeLabel(node, staticAgent)}' failed to spawn: ${spawnErr?.message || spawnErr}`);
         }
       }

@@ -666,6 +666,29 @@ test('run-scoped worker status publishes the canonical view before the coordinat
         }),
         /wave index must be an integer/,
     );
+
+    // Content equality alone cannot detect a swapped write order, so fault the
+    // coordination write and prove the canonical file was already replaced.
+    // Coordination-first would release a dependent while monitors still saw an
+    // older canonical phase.
+    fs.rmSync(coordination);
+    fs.mkdirSync(coordination);
+    fs.writeFileSync(path.join(coordination, 'occupied'), 'x');
+    assert.throws(() => writeNoWaitWorkerStatus(containerName, {
+        state: 'running',
+        sequencePhase: 'active',
+    }, {
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 2,
+        statusFile: coordination,
+        runningDir,
+    }));
+    assert.equal(
+        JSON.parse(fs.readFileSync(canonical, 'utf8')).state,
+        'running',
+        'the canonical view must already be durable when the coordination handoff fails',
+    );
 });
 
 test('no-wait main delegates route activation to the serialized lifecycle transaction', () => {
@@ -2060,8 +2083,12 @@ test('the runtime image is prefetched outside every lifecycle lock', () => {
         prefetchNoWaitRuntimeImage(base),
         { prefetched: true, image: 'demo/image:1' },
     );
-    assert.deepEqual(calls, [['demo/image:1', { runtime: 'podman' }]],
-        'the prefetch must target the agent-resolved runtime, not the ambient default');
+    assert.deepEqual(
+        calls,
+        [['demo/image:1', { runtime: 'podman', allowLocalBuild: false }]],
+        'the prefetch must target the agent-resolved runtime and stay pull-only,'
+        + ' leaving the local-build fallback to the serialized in-lease path',
+    );
 
     // A sandbox runtime never resolves a container image.
     assert.deepEqual(
@@ -2163,4 +2190,41 @@ test('the worker re-asserts its admission immediately before prefetching an imag
         prefetch < source.indexOf('await runNoWaitLifecycleTransaction(expectedIdentity'),
         'the prefetch must still precede the workspace mutation lease',
     );
+});
+
+test('barrier status identities must be real JSON numbers, not coercible values', () => {
+    const runStartedAtMs = Date.now();
+    const observe = (overrides) => resolveRunScopedObservation({
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 0,
+        state: 'running',
+        sequencePhase: 'active',
+        ...overrides,
+    }, {
+        expectedRunId: RUN_ID,
+        runStartedAtMs,
+        targetWaveIndex: 0,
+        timeouts: FAST_TIMEOUTS,
+        nowMs: runStartedAtMs,
+    });
+
+    assert.deepEqual(observe({}), { terminal: 'running' });
+    // Number(null), Number('') and Number(false) are all 0, so a coercing check
+    // would accept these against a wave-zero target.
+    for (const coercible of [null, '', false, [], '0']) {
+        assert.throws(
+            () => observe({ waveIndex: coercible }),
+            /different dependency wave/,
+            `a waveIndex of ${JSON.stringify(coercible)} must be rejected`,
+        );
+    }
+    for (const coercible of [null, '', false, []]) {
+        assert.throws(
+            () => observe({ runStartedAtMs: coercible }),
+            /different run start/,
+            `a runStartedAtMs of ${JSON.stringify(coercible)} must be rejected`,
+        );
+    }
+    assert.throws(() => observe({ runStartedAtMs: String(runStartedAtMs) }), /different run start/);
 });

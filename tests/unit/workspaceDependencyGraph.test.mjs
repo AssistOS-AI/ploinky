@@ -2279,3 +2279,26 @@ test('no-wait scheduling rejects a barrier larger than the worker contract accep
     });
     assert.equal(schedule[1][0].waitForStatuses.length, 1024);
 });
+
+test('no-wait scheduling rejects a barrier reference that is not in an earlier wave', () => {
+    // A direct dependency recorded in the same or a later wave would make the
+    // worker exit during argument parsing without publishing a status.
+    const waves = [
+        [{ registryName: 'first', node: { id: 'demo/first', dependencies: new Set() } }],
+        [
+            { registryName: 'peer', node: { id: 'demo/peer', dependencies: new Set() } },
+            {
+                registryName: 'same-wave-dep',
+                node: { id: 'demo/same-wave-dep', dependencies: new Set(['demo/peer']) },
+            },
+        ],
+    ];
+    assert.throws(
+        () => buildNoWaitLaunchSchedule(waves, {
+            runId: SCHEDULE_RUN_ID,
+            runStartedAtMs: SCHEDULE_RUN_STARTED_AT_MS,
+            runningDir: tempDir,
+        }),
+        /in wave 1 at 'demo\/peer' in wave 1/,
+    );
+});

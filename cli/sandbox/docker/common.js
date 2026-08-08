@@ -257,6 +257,10 @@ function ensureImagePresent(image, options = {}) {
     try {
         pullImage(img, { runtime: rt, log, timeoutMs: options.pullTimeoutMs });
     } catch (pullError) {
+        // A local build is far more expensive than a pull and is not safe to
+        // run concurrently for one tag. Callers that resolve images outside the
+        // serializing lock opt out and leave the build to the locked path.
+        if (options.allowLocalBuild === false) throw pullError;
         const source = resolveLocalImageBuildSource(img, options);
         if (!source) throw pullError;
         log(`[pull] ${img} could not be pulled (${pullError.message}); building from ${source.repoName}/${source.context}...`);
