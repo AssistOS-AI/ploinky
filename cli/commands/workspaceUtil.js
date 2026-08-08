@@ -24,6 +24,7 @@ import {
 import { removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
+import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
@@ -160,8 +161,10 @@ function spawnNoWaitWorker({
   registryAlias,
   routerPort,
   forceRecreate = false,
-  runId = '',
-  statusFile = '',
+  runId,
+  runStartedAtMs,
+  waveIndex,
+  statusFile,
   waitForStatuses = [],
 }) {
   const containerName = registryName;
@@ -171,8 +174,19 @@ function spawnNoWaitWorker({
   fs.mkdirSync(noWaitStatusDir, { recursive: true });
   const logFile = path.join(noWaitLogDir, `${containerName}.log`);
   const canonicalStatusFile = path.join(noWaitStatusDir, `${containerName}.json`);
-  const resolvedStatusFile = statusFile || canonicalStatusFile;
+  const resolvedStatusFile = noWaitCoordinationStatusPath(containerName, runId);
+  if (statusFile && path.resolve(statusFile) !== resolvedStatusFile) {
+    throw new Error(`no-wait worker '${containerName}' was scheduled with a foreign coordination status file`);
+  }
+  if (!Number.isSafeInteger(waveIndex) || waveIndex < 0
+      || waveIndex > MAX_NO_WAIT_WAVE_INDEX) {
+    throw new Error(
+      `no-wait worker '${containerName}' requires one exact wave index between 0 and ${MAX_NO_WAIT_WAVE_INDEX}`,
+    );
+  }
   const workerScript = path.resolve(__dirname, 'noWaitWorker.js');
+  // Every run-scoped argument is mandatory and unconditional. An omitted flag
+  // must never let a worker silently select another coordination protocol.
   const args = [
     workerScript,
     '--container', containerName,
@@ -181,16 +195,12 @@ function spawnNoWaitWorker({
     '--manifest-path', node.manifestPath,
     '--agent-path', node.agentPath,
     '--route-key', String(routeKey || registryAlias || node.shortAgentName),
+    '--run-id', runId,
+    '--run-started-at-ms', String(exactNoWaitRunStartedAtMs(runStartedAtMs)),
+    '--wave-index', String(waveIndex),
+    '--status-file', resolvedStatusFile,
+    '--wait-for-statuses', JSON.stringify(waitForStatuses || []),
   ];
-  if (runId) {
-    args.push('--run-id', runId);
-  }
-  if (resolvedStatusFile !== canonicalStatusFile) {
-    args.push('--status-file', resolvedStatusFile);
-  }
-  if (waitForStatuses.length) {
-    args.push('--wait-for-statuses', JSON.stringify(waitForStatuses));
-  }
   if (registryAlias) {
     args.push('--alias', registryAlias);
   }
@@ -236,16 +246,37 @@ function noWaitCoordinationStatusPath(containerName, runId, {
   return path.join(runningDir, 'no-wait', `${containerName}.${runId}.json`);
 }
 
+// One run start is shared by every worker in the run. Queued workers derive
+// their cumulative wave budget from it, so it must be an exact epoch integer
+// rather than a per-worker clock sample.
+function exactNoWaitRunStartedAtMs(value) {
+  const runStartedAtMs = Number(value);
+  if (!Number.isSafeInteger(runStartedAtMs) || runStartedAtMs < 0) {
+    throw new Error('no-wait run start must be one exact non-negative epoch millisecond integer');
+  }
+  return runStartedAtMs;
+}
+
 export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
   runId,
+  runStartedAtMs,
   runningDir = RUNNING_DIR,
 } = {}) {
+  const exactRunStartedAtMs = exactNoWaitRunStartedAtMs(runStartedAtMs);
   const waves = (Array.isArray(deferredNoWaitWaves) ? deferredNoWaitWaves : [])
     .map((entries) => (Array.isArray(entries) ? entries.filter(Boolean) : []))
     .filter((entries) => entries.length > 0);
+  // The worker rejects any wave index beyond this bound. Fail in the
+  // foreground rather than reporting detached launches whose workers would
+  // exit before publishing a status and stall every later wave.
+  if (waves.length > MAX_NO_WAIT_WAVE_INDEX + 1) {
+    throw new Error(
+      `no-wait launch schedule has ${waves.length} waves, which exceeds the supported maximum of ${MAX_NO_WAIT_WAVE_INDEX + 1}`,
+    );
+  }
   const statusByNodeId = new Map();
   const nodeIdByStatus = new Map();
-  for (const entries of waves) {
+  waves.forEach((entries, waveIndex) => {
     for (const entry of entries) {
       if (!entry?.node?.id || !entry.registryName) continue;
       if (statusByNodeId.has(entry.node.id)) {
@@ -258,13 +289,17 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
         );
       }
       nodeIdByStatus.set(statusPath, entry.node.id);
+      // The recorded wave index belongs to the referenced target, not to the
+      // worker that will wait for it. A waiter needs the target's wave to bind
+      // the observed status and to size its cumulative queued budget.
       statusByNodeId.set(entry.node.id, Object.freeze({
         nodeId: entry.node.id,
         path: statusPath,
         runId,
+        waveIndex,
       }));
     }
-  }
+  });
 
   let previousWave = [];
   return waves.map((entries, waveIndex) => {
@@ -274,6 +309,13 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
       const addReference = (reference, directDependency) => {
         if (!reference) return;
         const existing = references.get(reference.path);
+        if (existing && (existing.nodeId !== reference.nodeId
+          || existing.runId !== reference.runId
+          || existing.waveIndex !== reference.waveIndex)) {
+          throw new Error(
+            `no-wait launch schedule maps two distinct barrier identities to '${path.basename(reference.path)}'`,
+          );
+        }
         references.set(reference.path, {
           ...reference,
           directDependency: Boolean(directDependency || existing?.directDependency),
@@ -285,10 +327,19 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
       for (const dependencyId of directDependencyIds) {
         addReference(statusByNodeId.get(dependencyId), true);
       }
+      // The worker rejects a barrier larger than this, and would exit during
+      // argument parsing without publishing a terminal status while the parent
+      // reported a successful spawn. Fail in the foreground instead.
+      if (references.size > MAX_NO_WAIT_BARRIER_ENTRIES) {
+        throw new Error(
+          `no-wait launch schedule gives '${entry.node.id}' ${references.size} barrier entries, which exceeds the supported maximum of ${MAX_NO_WAIT_BARRIER_ENTRIES}`,
+        );
+      }
       return Object.freeze({
         ...entry,
         waveIndex,
         runId,
+        runStartedAtMs: exactRunStartedAtMs,
         statusFile: statusByNodeId.get(entry.node.id)?.path || '',
         waitForStatuses: Object.freeze(Array.from(references.values(), Object.freeze)),
       });
@@ -317,27 +368,34 @@ function writeNoWaitRunMarker(entry, { runningDir = RUNNING_DIR } = {}) {
   const target = path.join(runningDir, 'no-wait', `${entry.registryName}.current.json`);
   writeNoWaitAtomicJson(target, {
     runId: entry.runId,
+    runStartedAtMs: exactNoWaitRunStartedAtMs(entry.runStartedAtMs),
     statusFile: path.basename(entry.statusFile),
     waveIndex: entry.waveIndex,
     createdAt: new Date().toISOString(),
   });
 }
 
-function writeNoWaitSpawnFailure(entry, error, {
+export function writeNoWaitSpawnFailure(entry, error, {
   runningDir = RUNNING_DIR,
 } = {}) {
   const finishedAtMs = Date.now();
+  // A spawn failure has to be a valid terminal member of a wave barrier so a
+  // dependent worker can make a deterministic dependency decision instead of
+  // stalling on a status that never arrives.
   const payload = {
     state: 'failed',
     sequencePhase: 'active',
     phase: 'spawn',
     runId: entry.runId,
+    runStartedAtMs: exactNoWaitRunStartedAtMs(entry.runStartedAtMs),
     containerName: entry.registryName,
     shortAgent: entry.node.shortAgentName,
     repoName: entry.node.repoName,
     waveIndex: entry.waveIndex,
     startedAt: new Date(finishedAtMs).toISOString(),
     startedAtMs: finishedAtMs,
+    sequencePhaseStartedAt: new Date(finishedAtMs).toISOString(),
+    sequencePhaseStartedAtMs: finishedAtMs,
     finishedAt: new Date(finishedAtMs).toISOString(),
     finishedAtMs,
     error: { message: error?.message || String(error) },
@@ -2156,8 +2214,10 @@ async function startWorkspace(staticAgentArg, portArg, {
     workspaceRuntimeCandidates.length = 0;
 
     const noWaitRunId = randomUUID();
+    const noWaitRunStartedAtMs = Date.now();
     const noWaitSchedule = buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
       runId: noWaitRunId,
+      runStartedAtMs: noWaitRunStartedAtMs,
     });
     // Clear every public and run-scoped status before spawning any worker.
     // The UUID-scoped coordination paths prevent a late writer from an older
@@ -2190,6 +2250,8 @@ async function startWorkspace(staticAgentArg, portArg, {
             routerPort: staticPort,
             forceRecreate: newlyPreparedContainers.has(registryName),
             runId: entry.runId,
+            runStartedAtMs: entry.runStartedAtMs,
+            waveIndex: entry.waveIndex,
             statusFile: entry.statusFile,
             waitForStatuses: entry.waitForStatuses,
           });

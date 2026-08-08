@@ -64,7 +64,13 @@ const {
     resolveManifestRouterEndpoint,
     startWorkspace,
     waitForReadinessEntries,
+    writeNoWaitSpawnFailure,
 } = await import(`${workspaceUtilModuleUrl.href}${moduleSuffix}`);
+const noWaitWorkerModuleUrl = new URL('../../cli/commands/noWaitWorker.js', import.meta.url);
+const {
+    waitForNoWaitStatusBarrier,
+    waitForRunScopedStatus,
+} = await import(`${noWaitWorkerModuleUrl.href}${moduleSuffix}`);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -77,8 +83,12 @@ test('parseManifestDependencyRef strips mode and alias syntax down to the agent 
     assert.equal(parseManifestDependencyRef('repo/agent:dev'), 'repo/agent');
 });
 
+const SCHEDULE_RUN_ID = '12345678-1234-4234-8234-123456789abc';
+const SCHEDULE_RUN_STARTED_AT_MS = 1_700_000_000_000;
+
 test('no-wait scheduling preserves concurrent waves, direct dependencies, and run-scoped barriers', () => {
-    const runId = '12345678-1234-4234-8234-123456789abc';
+    const runId = SCHEDULE_RUN_ID;
+    const runStartedAtMs = SCHEDULE_RUN_STARTED_AT_MS;
     const runningDir = path.join(tempDir, '.ploinky', 'schedule-running');
     const entry = (id, registryName, dependencies = []) => ({
         registryName,
@@ -88,39 +98,56 @@ test('no-wait scheduling preserves concurrent waves, direct dependencies, and ru
         [entry('demo/a', 'container-a'), entry('demo/b', 'container-b')],
         [entry('demo/c', 'container-c', ['demo/a']), entry('demo/d', 'container-d')],
         [entry('demo/e', 'container-e', ['demo/a'])],
-    ], { runId, runningDir });
+    ], { runId, runStartedAtMs, runningDir });
 
     assert.equal(schedule.length, 3);
     assert.deepEqual(schedule[0].map(({ waitForStatuses }) => waitForStatuses), [[], []],
         'same-wave workers must not serialize behind one another');
     assert.deepEqual(
-        schedule[1][0].waitForStatuses.map(({ nodeId, directDependency }) => [nodeId, directDependency]),
-        [['demo/a', true], ['demo/b', false]],
+        schedule[1][0].waitForStatuses.map(({ nodeId, waveIndex, directDependency }) => (
+            [nodeId, waveIndex, directDependency]
+        )),
+        [['demo/a', 0, true], ['demo/b', 0, false]],
         'the next wave waits for every prior-wave member and marks its direct dependency',
     );
     assert.deepEqual(
-        schedule[1][1].waitForStatuses.map(({ nodeId, directDependency }) => [nodeId, directDependency]),
-        [['demo/a', false], ['demo/b', false]],
+        schedule[1][1].waitForStatuses.map(({ nodeId, waveIndex, directDependency }) => (
+            [nodeId, waveIndex, directDependency]
+        )),
+        [['demo/a', 0, false], ['demo/b', 0, false]],
         'an independent branch retains the wave barrier without inventing dependency failures',
     );
     assert.deepEqual(
-        schedule[2][0].waitForStatuses.map(({ nodeId, directDependency }) => [nodeId, directDependency]),
-        [['demo/c', false], ['demo/d', false], ['demo/a', true]],
+        schedule[2][0].waitForStatuses.map(({ nodeId, waveIndex, directDependency }) => (
+            [nodeId, waveIndex, directDependency]
+        )),
+        [['demo/c', 1, false], ['demo/d', 1, false], ['demo/a', 0, true]],
         'a direct dependency from an older wave remains an explicit failure barrier',
     );
-    for (const wave of schedule) {
+    for (const [waveIndex, wave] of schedule.entries()) {
         for (const scheduled of wave) {
             assert.match(scheduled.statusFile, new RegExp(`${scheduled.registryName}\\.${runId}\\.json$`));
             assert.equal(scheduled.runId, runId);
+            assert.equal(scheduled.runStartedAtMs, runStartedAtMs);
+            assert.equal(scheduled.waveIndex, waveIndex);
+            for (const reference of scheduled.waitForStatuses) {
+                assert.ok(
+                    reference.waveIndex < waveIndex,
+                    'a barrier may only reference a strictly earlier wave',
+                );
+                assert.equal(reference.runId, runId);
+            }
         }
     }
 });
 
 test('no-wait scheduling rejects non-exact coordination identities', () => {
     const node = { id: 'demo/a', dependencies: new Set() };
+    const runStartedAtMs = SCHEDULE_RUN_STARTED_AT_MS;
     assert.throws(
         () => buildNoWaitLaunchSchedule([[{ node, registryName: '../escape' }]], {
-            runId: '12345678-1234-4234-8234-123456789abc',
+            runId: SCHEDULE_RUN_ID,
+            runStartedAtMs,
             runningDir: tempDir,
         }),
         /exact container name and run id/,
@@ -128,6 +155,7 @@ test('no-wait scheduling rejects non-exact coordination identities', () => {
     assert.throws(
         () => buildNoWaitLaunchSchedule([[{ node, registryName: 'container-a' }]], {
             runId: 'stale-run',
+            runStartedAtMs,
             runningDir: tempDir,
         }),
         /exact container name and run id/,
@@ -137,11 +165,72 @@ test('no-wait scheduling rejects non-exact coordination identities', () => {
             { node, registryName: 'container-a' },
             { node: { id: 'demo/b', dependencies: new Set() }, registryName: 'container-a' },
         ]], {
-            runId: '12345678-1234-4234-8234-123456789abc',
+            runId: SCHEDULE_RUN_ID,
+            runStartedAtMs,
             runningDir: tempDir,
         }),
         /to one status file/,
     );
+    for (const invalidRunStart of [undefined, -1, 1.5, Number.NaN, '2026-08-07']) {
+        assert.throws(
+            () => buildNoWaitLaunchSchedule([[{ node, registryName: 'container-a' }]], {
+                runId: SCHEDULE_RUN_ID,
+                runStartedAtMs: invalidRunStart,
+                runningDir: tempDir,
+            }),
+            /non-negative epoch millisecond integer/,
+            `a run start of '${invalidRunStart}' must be rejected`,
+        );
+    }
+});
+
+test('a no-wait spawn failure is a valid terminal member of a wave barrier', async (t) => {
+    const runningDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-spawn-failure-'));
+    t.after(() => fs.rmSync(runningDir, { recursive: true, force: true }));
+    const runId = SCHEDULE_RUN_ID;
+    const runStartedAtMs = Date.now();
+    const [[scheduled]] = buildNoWaitLaunchSchedule([[{
+        registryName: 'spawn-failure-container',
+        node: {
+            id: 'demo/spawn-failure',
+            dependencies: new Set(),
+            shortAgentName: 'spawnFailure',
+            repoName: 'demo',
+        },
+    }]], { runId, runStartedAtMs, runningDir });
+
+    writeNoWaitSpawnFailure(scheduled, new Error('spawn refused'), { runningDir });
+
+    // A dependent must reach a deterministic decision from the spawn failure
+    // alone, through the real poller against the real published files.
+    const barrier = [{
+        path: scheduled.statusFile,
+        runId,
+        waveIndex: 0,
+        directDependency: true,
+    }];
+    assert.deepEqual(
+        await waitForRunScopedStatus(barrier[0], {
+            runningDir,
+            expectedRunId: runId,
+            runStartedAtMs,
+        }),
+        { state: 'failed' },
+    );
+    await assert.rejects(
+        () => waitForNoWaitStatusBarrier(barrier, {
+            runId, runStartedAtMs, waveIndex: 1, runningDir,
+        }),
+        (error) => error?.code === 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED',
+    );
+
+    const canonical = JSON.parse(fs.readFileSync(
+        path.join(runningDir, 'no-wait', 'spawn-failure-container.json'),
+        'utf8',
+    ));
+    assert.equal(canonical.runStartedAtMs, runStartedAtMs);
+    assert.equal(canonical.waveIndex, 0);
+    assert.equal(canonical.sequencePhase, 'active');
 });
 
 test('workspace graph admission retains exact manifest bytes for under-lock revalidation', () => {
@@ -376,6 +465,12 @@ test('prepared runtime records and routes commit together before activation, inc
         new URL('../../cli/server/routingFile.js', import.meta.url),
         'utf8',
     );
+    // startWorkspace.toString() is only one function body; the legacy-protocol
+    // sweep has to read the whole scheduler file.
+    const workspaceUtilSource = fs.readFileSync(
+        new URL('../../cli/commands/workspaceUtil.js', import.meta.url),
+        'utf8',
+    );
     assert.match(noWaitSource, /agents\[containerName\] = registryRecord;\s*saveAgents\(agents, \{ coordinate: false \}\)/);
     assert.match(noWaitSource, /forceRecreate:\s*args\.forceRecreate === '1'/);
     assert.match(noWaitSource, /assertActiveEdgeRoutingSourcesCurrent\(\)/);
@@ -411,12 +506,48 @@ test('prepared runtime records and routes commit together before activation, inc
     );
     assert.match(
         noWaitSource,
-        /await Promise\.all\(\[\s*waitForPriorWorker\(waitForStatus\),\s*waitForNoWaitStatusBarrier\(waitForStatuses\)/,
-        'workers must retain the legacy predecessor gate while enforcing the run-scoped wave barrier',
+        /await waitForNoWaitStatusBarrier\(waitForStatuses, \{\s*runId,\s*runStartedAtMs,\s*waveIndex,\s*\}\);/,
+        'one mandatory run-scoped wave barrier is the only coordination gate a worker may use',
     );
-    assert.doesNotMatch(source, /await waitForPriorWorker|Waiting for .*background route activation/);
+    // The legacy singular-chain protocol must be gone from executable code.
+    // The negative flag check deliberately excludes the plural flag.
+    for (const [legacySymbol, pattern] of [
+        ['resolveSequenceObservation', /resolveSequenceObservation/],
+        ['waitForPriorWorker', /waitForPriorWorker/],
+        ['waitForStatusFile', /waitForStatusFile/],
+        ['waiting-predecessor', /waiting-predecessor/],
+        ['retainFailedWaitingChain', /retainFailedWaitingChain/],
+        ['--wait-for-status', /--wait-for-status(?!es)/],
+    ]) {
+        for (const [label, text] of [
+            ['noWaitWorker.js', noWaitSource],
+            ['workspaceUtil.js', workspaceUtilSource],
+        ]) {
+            assert.doesNotMatch(
+                text,
+                pattern,
+                `${label} must not retain the legacy no-wait element '${legacySymbol}'`,
+            );
+        }
+    }
+    assert.match(
+        workspaceUtilSource,
+        /'--wait-for-statuses'/,
+        'the plural run-scoped spawn flag must remain',
+    );
+    assert.match(
+        noWaitSource,
+        /\['waitForStatuses', 'wait-for-statuses'\]/,
+        'the worker must keep the plural flag in its mandatory argument contract',
+    );
+    assert.doesNotMatch(source, /Waiting for .*background route activation/);
     assert.match(source, /buildNoWaitLaunchSchedule\(deferredNoWaitWaves/);
     assert.match(source, /waitForStatuses: entry\.waitForStatuses/);
+    assert.match(
+        workspaceUtilSource,
+        /'--run-id', runId,\s*'--run-started-at-ms',[\s\S]*'--wave-index',[\s\S]*'--status-file',[\s\S]*'--wait-for-statuses', JSON\.stringify\(waitForStatuses \|\| \[\]\)/,
+        'every run-scoped spawn argument must be unconditional',
+    );
     assert.doesNotMatch(source, /previousNoWaitStatusFile/,
         'same-wave no-wait workers must not be flattened into one global predecessor chain');
     assert.ok(
@@ -2088,4 +2219,63 @@ test('resolveWorkspaceDependencyGraph still truncates cycles instead of throwing
 
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Dependency cycle detected/);
+});
+
+test('no-wait scheduling rejects a graph deeper than the worker wave-index contract', () => {
+    const runStartedAtMs = SCHEDULE_RUN_STARTED_AT_MS;
+    const buildWaves = (count) => Array.from({ length: count }, (_, index) => [{
+        registryName: `container-${index}`,
+        node: {
+            id: `demo/${index}`,
+            dependencies: new Set(index ? [`demo/${index - 1}`] : []),
+        },
+    }]);
+    const deepest = buildNoWaitLaunchSchedule(buildWaves(1024), {
+        runId: SCHEDULE_RUN_ID,
+        runStartedAtMs,
+        runningDir: tempDir,
+    });
+    assert.equal(deepest[1023][0].waveIndex, 1023, 'the last supported wave must still schedule');
+
+    // The parent must fail loudly instead of spawning a worker that would
+    // exit before publishing any status and stall every later wave.
+    assert.throws(
+        () => buildNoWaitLaunchSchedule(buildWaves(1025), {
+            runId: SCHEDULE_RUN_ID,
+            runStartedAtMs,
+            runningDir: tempDir,
+        }),
+        /exceeds the supported maximum of 1024/,
+    );
+});
+
+test('no-wait scheduling rejects a barrier larger than the worker contract accepts', () => {
+    const runStartedAtMs = SCHEDULE_RUN_STARTED_AT_MS;
+    // One oversized wave makes every member of the next wave exceed the
+    // worker's barrier limit.
+    const wideWave = Array.from({ length: 1025 }, (_, index) => ({
+        registryName: `wide-${index}`,
+        node: { id: `demo/wide-${index}`, dependencies: new Set() },
+    }));
+    const dependent = [{
+        registryName: 'dependent',
+        node: { id: 'demo/dependent', dependencies: new Set() },
+    }];
+    assert.throws(
+        () => buildNoWaitLaunchSchedule([wideWave, dependent], {
+            runId: SCHEDULE_RUN_ID,
+            runStartedAtMs,
+            runningDir: tempDir,
+        }),
+        /barrier entries, which exceeds the supported maximum of 1024/,
+    );
+
+    // The largest supported barrier still schedules.
+    const okWave = wideWave.slice(0, 1024);
+    const schedule = buildNoWaitLaunchSchedule([okWave, dependent], {
+        runId: SCHEDULE_RUN_ID,
+        runStartedAtMs,
+        runningDir: tempDir,
+    });
+    assert.equal(schedule[1][0].waitForStatuses.length, 1024);
 });

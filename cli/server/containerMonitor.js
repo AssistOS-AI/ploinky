@@ -473,6 +473,18 @@ export function startProbeWorker(monitor, target) {
 
 const UNREADABLE_NO_WAIT_STATUS = Object.freeze({ state: 'unreadable' });
 
+// Must be an actual JSON number. Number() would coerce null, '' and false to
+// zero, so a malformed wave-zero marker would compare equal to a wave-zero
+// status and reopen probing instead of failing closed.
+const MAX_NO_WAIT_MARKER_WAVE_INDEX = 1023;
+
+function exactNoWaitMarkerInteger(value, { minimum = 0, maximum = Number.MAX_SAFE_INTEGER } = {}) {
+    return typeof value === 'number' && Number.isSafeInteger(value)
+        && value >= minimum && value <= maximum
+        ? value
+        : null;
+}
+
 export function readNoWaitStatus(containerName, { runningDir = RUNNING_DIR } = {}) {
     if (!containerName) return null;
     if (path.basename(containerName) !== containerName) return UNREADABLE_NO_WAIT_STATUS;
@@ -481,13 +493,18 @@ export function readNoWaitStatus(containerName, { runningDir = RUNNING_DIR } = {
     let currentRun = null;
     try {
         const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+        const runStartedAtMs = exactNoWaitMarkerInteger(parsed?.runStartedAtMs);
+        const waveIndex = exactNoWaitMarkerInteger(parsed?.waveIndex, {
+            maximum: MAX_NO_WAIT_MARKER_WAVE_INDEX,
+        });
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
             || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
                 .test(String(parsed.runId || ''))
-            || String(parsed.statusFile || '') !== `${containerName}.${parsed.runId}.json`) {
+            || String(parsed.statusFile || '') !== `${containerName}.${parsed.runId}.json`
+            || runStartedAtMs === null || waveIndex === null) {
             return UNREADABLE_NO_WAIT_STATUS;
         }
-        currentRun = parsed;
+        currentRun = { runId: String(parsed.runId), runStartedAtMs, waveIndex };
     } catch (error) {
         if (error?.code !== 'ENOENT') return UNREADABLE_NO_WAIT_STATUS;
     }
@@ -496,7 +513,15 @@ export function readNoWaitStatus(containerName, { runningDir = RUNNING_DIR } = {
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             return UNREADABLE_NO_WAIT_STATUS;
         }
-        if (currentRun && String(parsed.runId || '') !== currentRun.runId) {
+        // The marker binds the canonical status to one exact run identity,
+        // run start, and wave. Carrying the fields without cross-checking all
+        // three would let a late writer from an earlier run or wave reopen
+        // monitor probing.
+        if (currentRun && (String(parsed.runId || '') !== currentRun.runId
+            || exactNoWaitMarkerInteger(parsed.runStartedAtMs) !== currentRun.runStartedAtMs
+            || exactNoWaitMarkerInteger(parsed.waveIndex, {
+                maximum: MAX_NO_WAIT_MARKER_WAVE_INDEX,
+            }) !== currentRun.waveIndex)) {
             return UNREADABLE_NO_WAIT_STATUS;
         }
         const state = String(parsed.state || '').trim().toLowerCase();

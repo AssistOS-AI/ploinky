@@ -18,8 +18,12 @@ import { isDeepStrictEqual } from 'node:util';
 import * as dockerSvc from '../sandbox/docker/index.js';
 import { RUNNING_DIR } from '../utils/config.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
-import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
-import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
+import { ensureImagePresent, getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
+import { resolveManifestImage } from '../utils/security/secretVars.js';
+import {
+    isLlmRuntimeManifest,
+    resolveLlmRuntimeAdmissionContext,
+} from '../sandbox/docker/llmRuntimeIntegration.js';
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
@@ -90,33 +94,35 @@ export function writeStatus(containerName, payload, { runningDir = RUNNING_DIR }
 }
 
 export function writeNoWaitWorkerStatus(containerName, payload, {
-    runId = '',
-    statusFile = '',
+    runId,
+    runStartedAtMs,
+    waveIndex,
+    statusFile,
     runningDir = RUNNING_DIR,
 } = {}) {
-    if (Boolean(runId) !== Boolean(statusFile)) {
-        throw new Error('run-scoped no-wait status requires both a run id and coordination file');
-    }
-    const normalizedRunId = runId ? exactRunId(runId) : '';
-    const coordinationStatusFile = statusFile
-        ? exactNoWaitCoordinationStatusPath(statusFile, {
-            containerName,
-            runId: normalizedRunId,
-            runningDir,
-        })
-        : '';
-    const document = normalizedRunId
-        ? { ...payload, runId: normalizedRunId }
-        : payload;
+    const normalizedRunId = exactRunId(runId);
+    const coordinationStatusFile = exactNoWaitCoordinationStatusPath(statusFile, {
+        containerName,
+        runId: normalizedRunId,
+        runningDir,
+    });
+    const document = {
+        ...payload,
+        runId: normalizedRunId,
+        runStartedAtMs: exactEpochMs(runStartedAtMs, 'no-wait run start'),
+        waveIndex: exactWaveIndex(waveIndex, 'no-wait worker wave index'),
+    };
     const canonicalStatusFile = statusPathFor(containerName, { runningDir });
-
-    // The unique coordination file is the final handoff. Publish the public
-    // canonical view first so a completed wave barrier never exposes an older
-    // canonical phase to monitors or operators.
-    writeStatusFile(canonicalStatusFile, document);
-    if (coordinationStatusFile && coordinationStatusFile !== canonicalStatusFile) {
-        writeStatusFile(coordinationStatusFile, document);
+    if (coordinationStatusFile === canonicalStatusFile) {
+        throw new Error('no-wait coordination status must differ from the canonical status file');
     }
+
+    // There is no cross-file atomic transaction. Publish the public canonical
+    // view first so a completed wave barrier never exposes an older canonical
+    // phase to monitors, then release the run-scoped coordination file last as
+    // the final barrier handoff.
+    writeStatusFile(canonicalStatusFile, document);
+    writeStatusFile(coordinationStatusFile, document);
     return document;
 }
 
@@ -134,12 +140,38 @@ function exactNoWaitStatusPath(rawStatusPath, {
     return statusPath;
 }
 
+// The scheduler mints run identities with randomUUID(). Every reader in this
+// protocol validates the same v4 shape so a stale-run rejection cannot depend
+// on which file performed the check.
 function exactRunId(value, label = 'no-wait run id') {
     const runId = String(value || '').trim();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) {
         throw new Error(`${label} must be one exact UUID`);
     }
     return runId.toLowerCase();
+}
+
+function exactEpochMs(value, label = 'no-wait timestamp') {
+    const epochMs = Number(value);
+    if (!Number.isSafeInteger(epochMs) || epochMs < 0) {
+        throw new Error(`${label} must be one exact non-negative epoch millisecond integer`);
+    }
+    return epochMs;
+}
+
+// The wave bound matches the maximum barrier size so a cumulative queued
+// budget can never overflow a safe integer. The scheduler imports both so it
+// can reject an over-deep graph or an oversized barrier in the foreground,
+// instead of spawning a worker that would exit before publishing any status.
+export const MAX_NO_WAIT_WAVE_INDEX = 1023;
+export const MAX_NO_WAIT_BARRIER_ENTRIES = 1024;
+
+function exactWaveIndex(value, label = 'no-wait wave index') {
+    const waveIndex = Number(value);
+    if (!Number.isSafeInteger(waveIndex) || waveIndex < 0 || waveIndex > MAX_NO_WAIT_WAVE_INDEX) {
+        throw new Error(`${label} must be an integer between 0 and ${MAX_NO_WAIT_WAVE_INDEX}`);
+    }
+    return waveIndex;
 }
 
 function exactNoWaitCoordinationStatusPath(rawStatusPath, {
@@ -160,45 +192,104 @@ function exactNoWaitCoordinationStatusPath(rawStatusPath, {
     return statusPath;
 }
 
+export function exactNoWaitBarrierEntry(entry, {
+    runningDir = RUNNING_DIR,
+    expectedRunId = '',
+    label = 'no-wait status barrier entry',
+} = {}) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)
+        || typeof entry.directDependency !== 'boolean') {
+        throw new Error(`${label} is invalid`);
+    }
+    const entryRunId = exactRunId(entry.runId, `${label} run id`);
+    if (expectedRunId && entryRunId !== exactRunId(expectedRunId)) {
+        throw new Error(`${label} belongs to a different run`);
+    }
+    return Object.freeze({
+        path: exactNoWaitStatusPath(entry.path, { runningDir, label }),
+        runId: entryRunId,
+        waveIndex: exactWaveIndex(entry.waveIndex, `${label} wave index`),
+        directDependency: entry.directDependency,
+    });
+}
+
 export function parseNoWaitStatusBarrier(rawBarrier, {
     runId,
+    waveIndex,
     runningDir = RUNNING_DIR,
 } = {}) {
-    if (!rawBarrier) return Object.freeze([]);
+    if (typeof rawBarrier !== 'string' || rawBarrier === '') {
+        throw new Error('no-wait status barrier must be one JSON array argument');
+    }
     const expectedRunId = exactRunId(runId);
+    const ownerWaveIndex = exactWaveIndex(waveIndex, 'no-wait status barrier owner wave index');
     let parsed;
     try {
-        parsed = JSON.parse(String(rawBarrier));
+        parsed = JSON.parse(rawBarrier);
     } catch (error) {
         throw new Error(`no-wait status barrier is invalid JSON: ${error?.message || error}`);
     }
-    if (!Array.isArray(parsed) || parsed.length > 1024) {
-        throw new Error('no-wait status barrier must be an array with at most 1024 entries');
+    if (!Array.isArray(parsed) || parsed.length > MAX_NO_WAIT_BARRIER_ENTRIES) {
+        throw new Error(`no-wait status barrier must be an array with at most ${MAX_NO_WAIT_BARRIER_ENTRIES} entries`);
     }
     const seen = new Set();
     return Object.freeze(parsed.map((entry, index) => {
-        if (!entry || typeof entry !== 'object' || Array.isArray(entry)
-            || typeof entry.directDependency !== 'boolean') {
-            throw new Error(`no-wait status barrier entry ${index} is invalid`);
-        }
-        const entryRunId = exactRunId(entry.runId, `no-wait status barrier entry ${index} run id`);
-        if (entryRunId !== expectedRunId) {
-            throw new Error(`no-wait status barrier entry ${index} belongs to a different run`);
-        }
-        const statusPath = exactNoWaitStatusPath(entry.path, {
+        const barrierEntry = exactNoWaitBarrierEntry(entry, {
             runningDir,
+            expectedRunId,
             label: `no-wait status barrier entry ${index}`,
         });
-        if (seen.has(statusPath)) {
-            throw new Error(`no-wait status barrier repeats '${path.basename(statusPath)}'`);
+        // A barrier only ever references strictly earlier waves. Same-wave and
+        // forward references would deadlock the run instead of ordering it.
+        if (barrierEntry.waveIndex >= ownerWaveIndex) {
+            throw new Error(
+                `no-wait status barrier entry ${index} references wave ${barrierEntry.waveIndex} from wave ${ownerWaveIndex}`,
+            );
         }
-        seen.add(statusPath);
-        return Object.freeze({
-            path: statusPath,
-            runId: entryRunId,
-            directDependency: entry.directDependency,
-        });
+        if (seen.has(barrierEntry.path)) {
+            throw new Error(`no-wait status barrier repeats '${path.basename(barrierEntry.path)}'`);
+        }
+        seen.add(barrierEntry.path);
+        return barrierEntry;
     }));
+}
+
+// Every one of these is mandatory. A missing flag must be rejected outright so
+// an incomplete invocation can never silently select another protocol.
+const REQUIRED_RUN_SCOPED_ARGUMENTS = Object.freeze([
+    ['runId', 'run-id'],
+    ['runStartedAtMs', 'run-started-at-ms'],
+    ['waveIndex', 'wave-index'],
+    ['statusFile', 'status-file'],
+    ['waitForStatuses', 'wait-for-statuses'],
+]);
+
+export function resolveNoWaitRunScopedArguments(args, {
+    containerName,
+    runningDir = RUNNING_DIR,
+} = {}) {
+    for (const [key, flag] of REQUIRED_RUN_SCOPED_ARGUMENTS) {
+        if (typeof args?.[key] !== 'string' || args[key] === '') {
+            throw new Error(`run-scoped no-wait launch requires --${flag}`);
+        }
+    }
+    const runId = exactRunId(args.runId);
+    const waveIndex = exactWaveIndex(args.waveIndex, 'no-wait worker wave index');
+    return Object.freeze({
+        runId,
+        runStartedAtMs: exactEpochMs(args.runStartedAtMs, 'no-wait run start'),
+        waveIndex,
+        statusFile: exactNoWaitCoordinationStatusPath(args.statusFile, {
+            containerName,
+            runId,
+            runningDir,
+        }),
+        waitForStatuses: parseNoWaitStatusBarrier(args.waitForStatuses, {
+            runId,
+            waveIndex,
+            runningDir,
+        }),
+    });
 }
 
 function sleep(ms) {
@@ -223,211 +314,246 @@ function readSequenceStatus(statusPath) {
     }
 }
 
-function resolveSequenceObservation(statusPath, status, {
-    statusRoot,
-    timeoutMs,
-    terminalPublicationGraceMs,
-    legacyDeadline,
-    nowMs,
-    maxDepth = 128,
-    retainFailedWaitingChain = true,
-} = {}) {
-    let currentPath = statusPath;
-    let current = status;
-    const visited = new Set();
-
-    for (let depth = 0; depth < maxDepth; depth += 1) {
-        if (visited.has(currentPath)) {
-            throw new Error('no-wait predecessor status chain contains a cycle');
-        }
-        visited.add(currentPath);
-
-        // A worker that failed before it became active did not complete the
-        // serialized launch slot. Keep following its retained predecessor
-        // reference so its successor cannot overlap the still-active worker.
-        // Once that predecessor settles, this chain remains fail-closed and
-        // expires at the predecessor's bounded publication deadline.
-        const failedWhileWaiting = retainFailedWaitingChain
-            && current?.state === 'failed'
-            && current?.sequencePhase === 'waiting-predecessor';
-        if ((current?.state === 'running' || current?.state === 'failed')
-            && !failedWhileWaiting) {
-            if (currentPath === statusPath) return { terminal: current.state };
-            const finishedAtMs = parseSequenceTimestamp(current, 'finishedAtMs', 'finishedAt');
-            if (!Number.isFinite(finishedAtMs) || finishedAtMs > nowMs + terminalPublicationGraceMs) {
-                throw new Error('no-wait predecessor terminal status has an invalid completion timestamp');
-            }
-            return { deadline: finishedAtMs + terminalPublicationGraceMs };
-        }
-        if (current?.state && current.state !== 'starting' && !failedWhileWaiting) {
-            throw new Error(`no-wait predecessor has invalid state '${current.state}'`);
-        }
-        if (!current?.state) {
-            throw new Error('no-wait predecessor status is missing its state');
-        }
-
-        // Legacy workers did not publish a sequence phase. Keep their original
-        // single bounded window so mixed-version state fails closed.
-        if (!current.sequencePhase) return { deadline: legacyDeadline };
-
-        if (current.sequencePhase === 'active') {
-            const phaseStartedAtMs = parseSequenceTimestamp(
-                current,
-                'sequencePhaseStartedAtMs',
-                'sequencePhaseStartedAt',
-            );
-            if (!Number.isFinite(phaseStartedAtMs)
-                || phaseStartedAtMs > nowMs + terminalPublicationGraceMs) {
-                throw new Error('no-wait predecessor active phase has an invalid start timestamp');
-            }
-            return { deadline: phaseStartedAtMs + timeoutMs + terminalPublicationGraceMs };
-        }
-
-        if (current.sequencePhase !== 'waiting-predecessor') {
-            throw new Error(`no-wait predecessor has invalid sequence phase '${current.sequencePhase}'`);
-        }
-        const predecessorFile = String(current.waitForStatusFile || '');
-        if (!predecessorFile
-            || path.basename(predecessorFile) !== predecessorFile
-            || path.extname(predecessorFile) !== '.json') {
-            throw new Error('no-wait predecessor waiting phase has an invalid status reference');
-        }
-        currentPath = path.join(statusRoot, predecessorFile);
-        const readResult = readSequenceStatus(currentPath);
-        if (readResult.missing) return { deadline: legacyDeadline };
-        if (readResult.readFault) {
-            return {
-                deadline: legacyDeadline,
-                readFault: readResult.readFault,
-            };
-        }
-        current = readResult.status;
-    }
-    throw new Error('no-wait predecessor status chain exceeds the maximum depth');
+function boundedTimeoutInput(value, { fallback, minimum, maximum }) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isSafeInteger(parsed)
+        ? Math.min(Math.max(minimum, parsed), maximum)
+        : fallback;
 }
 
-export async function waitForPriorWorker(rawStatusPath, {
+export function resolveNoWaitBarrierTimeouts({
+    activeTimeoutMs = process.env.PLOINKY_NO_WAIT_SEQUENCE_TIMEOUT_MS,
+    terminalPublicationGraceMs = process.env.PLOINKY_NO_WAIT_SEQUENCE_TERMINAL_GRACE_MS,
+    readRetryTimeoutMs = process.env.PLOINKY_NO_WAIT_STATUS_READ_RETRY_MS,
+    startupGraceMs = process.env.PLOINKY_NO_WAIT_STARTUP_GRACE_MS,
+} = {}) {
+    // Every individual input is clamped here. The cumulative queued budget
+    // derived from them is deliberately not clamped back to these maxima.
+    return Object.freeze({
+        activeTimeoutMs: boundedTimeoutInput(activeTimeoutMs, {
+            fallback: 900000, minimum: 1000, maximum: 3600000,
+        }),
+        terminalPublicationGraceMs: boundedTimeoutInput(terminalPublicationGraceMs, {
+            fallback: 60000, minimum: 0, maximum: 300000,
+        }),
+        readRetryTimeoutMs: boundedTimeoutInput(readRetryTimeoutMs, {
+            fallback: 5000, minimum: 100, maximum: 30000,
+        }),
+        startupGraceMs: boundedTimeoutInput(startupGraceMs, {
+            fallback: 60000, minimum: 0, maximum: 300000,
+        }),
+    });
+}
+
+// A queued worker legitimately waits for every earlier wave to drain, so its
+// budget accumulates one active window per wave up to and including its
+// target. A single run-wide deadline would expire later waves early; an
+// unbounded queued phase would hide a dead worker.
+export function noWaitQueuedStatusDeadline(runStartedAtMs, targetWaveIndex, timeouts) {
+    const exactRunStartedAtMs = exactEpochMs(runStartedAtMs, 'no-wait run start');
+    const waveIndex = exactWaveIndex(targetWaveIndex, 'no-wait barrier target wave index');
+    const perWaveMs = timeouts.activeTimeoutMs + timeouts.terminalPublicationGraceMs;
+    const deadline = exactRunStartedAtMs
+        + ((waveIndex + 1) * perWaveMs)
+        + timeouts.startupGraceMs;
+    if (!Number.isSafeInteger(deadline)) {
+        throw new Error('no-wait queued status deadline overflowed its cumulative wave budget');
+    }
+    return deadline;
+}
+
+const NO_WAIT_STATUS_STATES = Object.freeze(['starting', 'running', 'failed']);
+const NO_WAIT_SEQUENCE_PHASES = Object.freeze(['waiting-barrier', 'active']);
+
+export function resolveRunScopedObservation(status, {
+    expectedRunId,
+    runStartedAtMs,
+    targetWaveIndex,
+    timeouts,
+    nowMs,
+} = {}) {
+    if (!status || typeof status !== 'object' || Array.isArray(status)) {
+        throw new Error('no-wait barrier status must be one JSON object');
+    }
+    if (String(status.runId || '').trim().toLowerCase() !== exactRunId(expectedRunId)) {
+        throw new Error('no-wait barrier status belongs to a different run');
+    }
+    if (Number(status.runStartedAtMs) !== exactEpochMs(runStartedAtMs, 'no-wait run start')) {
+        throw new Error('no-wait barrier status belongs to a different run start');
+    }
+    if (Number(status.waveIndex) !== exactWaveIndex(targetWaveIndex, 'no-wait barrier target wave index')) {
+        throw new Error('no-wait barrier status belongs to a different dependency wave');
+    }
+    const state = String(status.state || '');
+    if (!NO_WAIT_STATUS_STATES.includes(state)) {
+        throw new Error(`no-wait barrier status has invalid state '${state}'`);
+    }
+    const sequencePhase = String(status.sequencePhase || '');
+    if (!NO_WAIT_SEQUENCE_PHASES.includes(sequencePhase)) {
+        throw new Error(`no-wait barrier status has invalid sequence phase '${sequencePhase}'`);
+    }
+    // A failure is terminal in every phase, including 'waiting-barrier'. The
+    // legacy failed-while-waiting chain-following rule is deliberately gone:
+    // this worker waits for every prior-wave member directly, so it never
+    // needs another worker's barrier to stay ordered.
+    if (state === 'failed') return { terminal: 'failed' };
+    if (state === 'running') {
+        if (sequencePhase !== 'active') {
+            throw new Error("no-wait barrier status reports 'running' outside its active phase");
+        }
+        return { terminal: 'running' };
+    }
+    if (sequencePhase === 'active') {
+        const phaseStartedAtMs = parseSequenceTimestamp(
+            status,
+            'sequencePhaseStartedAtMs',
+            'sequencePhaseStartedAt',
+        );
+        if (!Number.isFinite(phaseStartedAtMs)
+            || phaseStartedAtMs > nowMs + timeouts.terminalPublicationGraceMs) {
+            throw new Error('no-wait barrier active phase has an invalid start timestamp');
+        }
+        // An active member gets a fresh full window regardless of how long it
+        // spent queued behind earlier waves.
+        return {
+            deadline: phaseStartedAtMs
+                + timeouts.activeTimeoutMs
+                + timeouts.terminalPublicationGraceMs,
+        };
+    }
+    return { queued: true };
+}
+
+// Polls exactly one barrier status file. It never inspects the observed
+// worker's own barrier list and never opens another status path, so no worker
+// can traverse a peer's coordination state.
+export async function waitForRunScopedStatus(entry, {
     runningDir = RUNNING_DIR,
-    timeoutMs = Number.parseInt(
-        process.env.PLOINKY_NO_WAIT_SEQUENCE_TIMEOUT_MS || '900000',
-        10,
-    ),
-    terminalPublicationGraceMs = Number.parseInt(
-        process.env.PLOINKY_NO_WAIT_SEQUENCE_TERMINAL_GRACE_MS || '60000',
-        10,
-    ),
-    readRetryTimeoutMs = Number.parseInt(
-        process.env.PLOINKY_NO_WAIT_STATUS_READ_RETRY_MS || '5000',
-        10,
-    ),
+    expectedRunId = '',
+    runStartedAtMs,
+    timeouts = resolveNoWaitBarrierTimeouts(),
     pollIntervalMs = 100,
     sleepFn = sleep,
     nowFn = Date.now,
-    expectedRunId = '',
-    retainFailedWaitingChain = true,
 } = {}) {
-    if (!rawStatusPath) return;
-    const statusPath = path.resolve(rawStatusPath);
-    const allowedRoot = `${path.resolve(runningDir, 'no-wait')}${path.sep}`;
-    if (!statusPath.startsWith(allowedRoot) || path.extname(statusPath) !== '.json') {
-        throw new Error('no-wait predecessor status must be an exact file in the workspace no-wait status directory');
-    }
-    const boundedTimeoutMs = Number.isFinite(timeoutMs)
-        ? Math.min(Math.max(1000, timeoutMs), 3600000)
-        : 900000;
-    const boundedTerminalPublicationGraceMs = Number.isFinite(terminalPublicationGraceMs)
-        ? Math.min(Math.max(0, terminalPublicationGraceMs), 300000)
-        : 60000;
-    const boundedReadRetryTimeoutMs = Number.isFinite(readRetryTimeoutMs)
-        ? Math.min(Math.max(100, readRetryTimeoutMs), 30000)
-        : 5000;
-    const legacyDeadline = nowFn() + boundedTimeoutMs + boundedTerminalPublicationGraceMs;
-    const statusRoot = path.resolve(runningDir, 'no-wait');
+    const target = exactNoWaitBarrierEntry(entry, {
+        runningDir,
+        expectedRunId,
+        label: 'no-wait barrier entry',
+    });
+    const exactRunStartedAtMs = exactEpochMs(runStartedAtMs, 'no-wait run start');
+    const queuedDeadline = noWaitQueuedStatusDeadline(
+        exactRunStartedAtMs,
+        target.waveIndex,
+        timeouts,
+    );
+    const statusLabel = path.basename(target.path);
     let readFaultStartedAtMs = null;
     let lastReadFault = null;
+
     while (true) {
         const nowMs = nowFn();
-        let observation = { deadline: legacyDeadline };
-        const readResult = readSequenceStatus(statusPath);
+        let deadline = queuedDeadline;
+        const readResult = readSequenceStatus(target.path);
         if (readResult.readFault) {
-            observation = {
-                deadline: legacyDeadline,
-                readFault: readResult.readFault,
-            };
-        } else if (!readResult.missing) {
-            try {
-                if (expectedRunId
-                    && String(readResult.status?.runId || '').trim().toLowerCase()
-                        !== String(expectedRunId).trim().toLowerCase()) {
-                    throw new Error('no-wait predecessor status belongs to a different run');
-                }
-                observation = resolveSequenceObservation(statusPath, readResult.status, {
-                    statusRoot,
-                    timeoutMs: boundedTimeoutMs,
-                    terminalPublicationGraceMs: boundedTerminalPublicationGraceMs,
-                    legacyDeadline,
-                    nowMs,
-                    retainFailedWaitingChain,
-                });
-            } catch (error) {
-                throw new Error(`no-wait predecessor status is invalid: ${error?.message || error}`);
-            }
-        }
-        if (observation.terminal) {
-            return Object.freeze({ state: observation.terminal });
-        }
-        let deadline = observation.deadline;
-        if (observation.readFault) {
+            // Malformed JSON and transient filesystem faults share one bounded
+            // retry window. Persisting past it is a rejected barrier outcome.
             if (readFaultStartedAtMs === null) readFaultStartedAtMs = nowMs;
-            lastReadFault = observation.readFault;
-            deadline = Math.min(
-                deadline,
-                readFaultStartedAtMs + boundedReadRetryTimeoutMs,
-            );
+            lastReadFault = readResult.readFault;
+            deadline = readFaultStartedAtMs + timeouts.readRetryTimeoutMs;
         } else {
             readFaultStartedAtMs = null;
             lastReadFault = null;
+            if (!readResult.missing) {
+                let observation;
+                try {
+                    observation = resolveRunScopedObservation(readResult.status, {
+                        expectedRunId: target.runId,
+                        runStartedAtMs: exactRunStartedAtMs,
+                        targetWaveIndex: target.waveIndex,
+                        timeouts,
+                        nowMs,
+                    });
+                } catch (error) {
+                    throw new Error(
+                        `no-wait barrier status '${statusLabel}' is invalid: ${error?.message || error}`,
+                    );
+                }
+                if (observation.terminal) {
+                    return Object.freeze({ state: observation.terminal });
+                }
+                if (!observation.queued) deadline = observation.deadline;
+            }
         }
         if (nowMs >= deadline) {
             if (lastReadFault) {
                 throw new Error(
-                    `no-wait predecessor status remained unreadable after bounded retries: ${lastReadFault?.message || lastReadFault}`,
+                    `no-wait barrier status '${statusLabel}' remained unreadable after bounded retries: ${lastReadFault?.message || lastReadFault}`,
                 );
             }
-            break;
+            throw new Error(`timed out waiting for no-wait barrier status '${statusLabel}'`);
         }
         await sleepFn(Math.min(pollIntervalMs, deadline - nowMs));
     }
-    throw new Error(`timed out waiting for no-wait predecessor status '${statusPath}'`);
 }
 
 export async function waitForNoWaitStatusBarrier(entries, {
-    waitFn = waitForPriorWorker,
+    runId = '',
+    runStartedAtMs,
+    waveIndex,
+    runningDir = RUNNING_DIR,
+    waitFn = waitForRunScopedStatus,
     waitOptions = {},
 } = {}) {
     const barrier = Array.isArray(entries) ? entries : [];
-    const observed = await Promise.all(barrier.map(async (entry) => Object.freeze({
-        entry,
-        status: await waitFn(entry.path, {
-            ...waitOptions,
-            expectedRunId: entry.runId,
-            // Run-scoped waves wait every immediately prior-wave member
-            // directly. A failed queued member is therefore terminal for this
-            // barrier and must not inherit the legacy single-chain stall rule.
-            retainFailedWaitingChain: false,
-        }),
-    })));
-    const failedDependency = observed.find(({ entry, status }) => (
+    if (!barrier.length) return Object.freeze([]);
+    // The run identity is never inferred from the entries being validated; an
+    // entry must be checked against the owner's run, not against itself.
+    const expectedRunId = exactRunId(runId, 'no-wait barrier owner run id');
+    const expectedRunStartedAtMs = exactEpochMs(runStartedAtMs, 'no-wait run start');
+    exactWaveIndex(waveIndex, 'no-wait barrier owner wave index');
+    // Settle-all, never fail-fast: an early invalid status, timeout, or
+    // dependency failure must not release this worker while another member of
+    // the preceding wave is still active.
+    const settled = await Promise.all(barrier.map(async (entry) => {
+        try {
+            return {
+                entry,
+                status: await waitFn(entry, {
+                    // Caller overrides may tune polling and timeouts, never the
+                    // identity this barrier is bound to.
+                    ...waitOptions,
+                    runningDir,
+                    expectedRunId,
+                    runStartedAtMs: expectedRunStartedAtMs,
+                }),
+            };
+        } catch (error) {
+            return { entry, error };
+        }
+    }));
+
+    const statusIdentity = (entry) => path.basename(String(entry?.path || 'unknown'), '.json');
+    const firstInvalid = settled.find(({ error }) => error);
+    if (firstInvalid) {
+        const error = new Error(
+            `no-wait wave barrier member '${statusIdentity(firstInvalid.entry)}' did not settle: ${firstInvalid.error?.message || firstInvalid.error}`,
+        );
+        error.code = 'PLOINKY_NO_WAIT_BARRIER_STATUS_INVALID';
+        error.cause = firstInvalid.error;
+        throw error;
+    }
+    const failedDependency = settled.find(({ entry, status }) => (
         entry.directDependency && status?.state === 'failed'
     ));
     if (failedDependency) {
         const error = new Error(
-            `no-wait direct dependency '${path.basename(failedDependency.entry.path, '.json')}' failed in this run`,
+            `no-wait direct dependency '${statusIdentity(failedDependency.entry)}' failed in this run`,
         );
         error.code = 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED';
         throw error;
     }
-    return Object.freeze(observed);
+    return Object.freeze(settled.map(({ entry, status }) => Object.freeze({ entry, status })));
 }
 
 async function upsertRoute(routeKey, route, {
@@ -1180,6 +1306,56 @@ export async function launchNoWaitHostRuntime(identity, initialLifecycle, launch
     throw error;
 }
 
+// Warms the local image cache outside every lifecycle lock.
+//
+// `ensureAgentService` calls ensureImagePresent() while the worker holds the
+// workspace mutation lease, so a cold multi-gigabyte pull there starves every
+// peer worker until its own lease timeout expires. Doing the same idempotent
+// resolution here first makes the in-lease call a cache hit.
+//
+// This is an optimisation, never an authority: the transaction still resolves
+// the definitive image (the hardware catalog picks it for LLM runtimes) and
+// still owns the local-build fallback, so every failure here is swallowed.
+export function prefetchNoWaitRuntimeImage({
+    manifest,
+    profileConfig,
+    runtime,
+    runtimeKind,
+    agentName,
+    repoName,
+    ensureImage = ensureImagePresent,
+    resolveImage = resolveManifestImage,
+    isLlmRuntime = isLlmRuntimeManifest,
+    log = console.log,
+} = {}) {
+    if (runtimeKind !== 'container') {
+        return Object.freeze({ prefetched: false, reason: 'sandbox-runtime' });
+    }
+    // An LLM runtime takes its image from the hardware-aware catalog, which
+    // can differ from the manifest's. Prefetching the manifest image there
+    // would download gigabytes that are never used and still leave the real
+    // catalog pull inside the lease.
+    if (isLlmRuntime(manifest, profileConfig)) {
+        return Object.freeze({ prefetched: false, reason: 'llm-runtime-catalog-image' });
+    }
+    let image = '';
+    try {
+        image = String(resolveImage(manifest, profileConfig, { agentName, repoName }) || '').trim();
+    } catch (error) {
+        // A manifest placeholder that cannot resolve here is left to the
+        // transaction rather than guessed at.
+        return Object.freeze({ prefetched: false, reason: 'unresolved-image' });
+    }
+    if (!image) return Object.freeze({ prefetched: false, reason: 'unresolved-image' });
+    try {
+        const pulled = ensureImage(image, runtime ? { runtime } : {});
+        return Object.freeze({ prefetched: Boolean(pulled), image });
+    } catch (error) {
+        log(`[no-wait] ${agentName}: image prefetch for '${image}' failed (${error?.message || error}); the lifecycle transaction will resolve it.`);
+        return Object.freeze({ prefetched: false, image, reason: 'prefetch-failed' });
+    }
+}
+
 async function waitForNoWaitReadiness({
     manifest,
     shortAgent,
@@ -1230,21 +1406,6 @@ async function main() {
     const agentPath = args.agentPath || (manifestPath ? path.dirname(manifestPath) : '');
     const routerPort = args.routerPort || '';
     const profileName = args.profile || '';
-    const waitForStatus = args.waitForStatus || '';
-    const runId = args.runId ? exactRunId(args.runId) : '';
-    if (Boolean(runId) !== Boolean(args.statusFile)) {
-        throw new Error('run-scoped no-wait launch requires both --run-id and --status-file');
-    }
-    const coordinationStatusFile = args.statusFile
-        ? exactNoWaitCoordinationStatusPath(args.statusFile, {
-            containerName,
-            runId,
-        })
-        : '';
-    const waitForStatuses = parseNoWaitStatusBarrier(args.waitForStatuses || '', { runId });
-    if (waitForStatuses.length && !runId) {
-        throw new Error('run-scoped no-wait status barriers require --run-id');
-    }
 
     if (!containerName || !shortAgent || !repoName || !manifestPath || !agentPath) {
         console.error('[no-wait] missing required arguments; refusing to run.');
@@ -1252,51 +1413,128 @@ async function main() {
         process.exit(2);
     }
 
-    // Detached workers write status immediately so predecessor workers can
-    // sequence behind them. Admission therefore has to precede even that
-    // first status write, not merely the eventual physical start boundary.
-    const admittedManifestBytes = fs.readFileSync(manifestPath);
-    const admittedManifest = JSON.parse(admittedManifestBytes.toString('utf8'));
-    const admittedProfileResolution = resolveManifestRuntimeProfile(admittedManifest, {
-        agentName: `${repoName}/${shortAgent}`,
-        profileName: profileName || undefined,
-        path: `manifest(${repoName}/${shortAgent})`,
-    });
-    const admittedRuntime = getRuntimeForAgent(admittedManifest);
-    const admittedRuntimeKind = isSandboxRuntime(admittedRuntime) ? admittedRuntime : 'container';
-    const llmAdmissionContext = admittedRuntimeKind === 'container'
-        ? resolveLlmRuntimeAdmissionContext({
-            runtime: admittedRuntime,
-            manifest: admittedManifest,
-            profileConfig: admittedProfileResolution.profileConfig,
-            agentName: shortAgent,
-            alias,
-            env: process.env,
-        })
-        : { catalogPolicy: null, catalogIdentity: null };
-    const runtimeAdmission = admitManifestRuntimeCapabilities(admittedManifest, {
-        manifestBytes: admittedManifestBytes,
-        manifestPath,
-        agentId: `${repoName}/${shortAgent}`,
-        profileName: admittedProfileResolution.resolvedProfileName,
-        profileConfig: admittedProfileResolution.profileConfig,
-        network: admittedProfileResolution.network,
-        runtime: admittedRuntime,
-        runtimeKind: admittedRuntimeKind,
-        catalogPolicy: llmAdmissionContext.catalogPolicy,
-        catalogIdentity: llmAdmissionContext.catalogIdentity,
-    });
-    assertRuntimeAdmissionCurrent(runtimeAdmission, {
-        manifestBytes: fs.readFileSync(manifestPath),
-        profileName: admittedProfileResolution.resolvedProfileName,
-        runtimeKind: admittedRuntimeKind,
-    });
+    let runScoped;
+    try {
+        runScoped = resolveNoWaitRunScopedArguments(args, { containerName });
+    } catch (error) {
+        console.error(`[no-wait] ${error?.message || error}; refusing to run.`);
+        process.exit(2);
+    }
+    const {
+        runId,
+        runStartedAtMs,
+        waveIndex,
+        statusFile: coordinationStatusFile,
+        waitForStatuses,
+    } = runScoped;
 
     const publishStatus = (payload) => writeNoWaitWorkerStatus(containerName, payload, {
         runId,
+        runStartedAtMs,
+        waveIndex,
         statusFile: coordinationStatusFile,
     });
-    const hasPredecessorBarrier = Boolean(waitForStatus || waitForStatuses.length);
+
+    // A failure before the first live status write must still leave a valid
+    // terminal member of this wave barrier. Otherwise a dependent waits out
+    // its entire cumulative queued budget for a status that never arrives,
+    // exactly the stall the spawn-failure path already avoids.
+    const publishPreStartFailure = (failure) => {
+        const finishedAtMs = Date.now();
+        const finishedAt = new Date(finishedAtMs).toISOString();
+        try {
+            publishStatus({
+                containerName,
+                shortAgent,
+                repoName,
+                alias: alias || null,
+                routeKey,
+                manifestPath,
+                agentPath,
+                pid: process.pid,
+                state: 'failed',
+                sequencePhase: 'active',
+                phase: 'admission',
+                startedAt: finishedAt,
+                startedAtMs: finishedAtMs,
+                sequencePhaseStartedAt: finishedAt,
+                sequencePhaseStartedAtMs: finishedAtMs,
+                finishedAt,
+                finishedAtMs,
+                error: { message: failure?.message || String(failure) },
+            });
+        } catch (publishFailure) {
+            console.error(`[no-wait] ${shortAgent}: could not publish the pre-start failure status: ${publishFailure?.message || publishFailure}`);
+        }
+    };
+
+    // Detached workers write status immediately so predecessor workers can
+    // sequence behind them. Admission therefore has to precede even that
+    // first live status write, not merely the eventual physical start
+    // boundary; only a terminal failure may be published before it succeeds.
+    const admitRuntime = () => {
+        const admittedManifestBytes = fs.readFileSync(manifestPath);
+        const admittedManifest = JSON.parse(admittedManifestBytes.toString('utf8'));
+        const admittedProfileResolution = resolveManifestRuntimeProfile(admittedManifest, {
+            agentName: `${repoName}/${shortAgent}`,
+            profileName: profileName || undefined,
+            path: `manifest(${repoName}/${shortAgent})`,
+        });
+        const admittedRuntime = getRuntimeForAgent(admittedManifest);
+        const admittedRuntimeKind = isSandboxRuntime(admittedRuntime) ? admittedRuntime : 'container';
+        const llmAdmissionContext = admittedRuntimeKind === 'container'
+            ? resolveLlmRuntimeAdmissionContext({
+                runtime: admittedRuntime,
+                manifest: admittedManifest,
+                profileConfig: admittedProfileResolution.profileConfig,
+                agentName: shortAgent,
+                alias,
+                env: process.env,
+            })
+            : { catalogPolicy: null, catalogIdentity: null };
+        const runtimeAdmission = admitManifestRuntimeCapabilities(admittedManifest, {
+            manifestBytes: admittedManifestBytes,
+            manifestPath,
+            agentId: `${repoName}/${shortAgent}`,
+            profileName: admittedProfileResolution.resolvedProfileName,
+            profileConfig: admittedProfileResolution.profileConfig,
+            network: admittedProfileResolution.network,
+            runtime: admittedRuntime,
+            runtimeKind: admittedRuntimeKind,
+            catalogPolicy: llmAdmissionContext.catalogPolicy,
+            catalogIdentity: llmAdmissionContext.catalogIdentity,
+        });
+        assertRuntimeAdmissionCurrent(runtimeAdmission, {
+            manifestBytes: fs.readFileSync(manifestPath),
+            profileName: admittedProfileResolution.resolvedProfileName,
+            runtimeKind: admittedRuntimeKind,
+        });
+        return Object.freeze({
+            admittedManifest,
+            admittedProfileResolution,
+            admittedRuntime,
+            admittedRuntimeKind,
+            runtimeAdmission,
+        });
+    };
+
+    let admission;
+    try {
+        admission = admitRuntime();
+    } catch (error) {
+        publishPreStartFailure(error);
+        console.error(`[no-wait] ${shortAgent}: runtime admission failed: ${error?.message || error}`);
+        if (error?.stack) console.error(error.stack);
+        process.exit(1);
+    }
+    const {
+        admittedManifest,
+        admittedProfileResolution,
+        admittedRuntime,
+        admittedRuntimeKind,
+        runtimeAdmission,
+    } = admission;
+    const hasWaveBarrier = waitForStatuses.length > 0;
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
     let baseStatus = {
@@ -1310,25 +1548,30 @@ async function main() {
         pid: process.pid,
         startedAt,
         startedAtMs,
-        ...(runId ? { runId } : {}),
-        sequencePhase: hasPredecessorBarrier ? 'waiting-predecessor' : 'active',
+        runId,
+        runStartedAtMs,
+        waveIndex,
+        sequencePhase: hasWaveBarrier ? 'waiting-barrier' : 'active',
         sequencePhaseStartedAt: startedAt,
         sequencePhaseStartedAtMs: startedAtMs,
-        ...(waitForStatus ? { waitForStatusFile: path.basename(waitForStatus) } : {}),
-        ...(waitForStatuses.length ? {
-            waitForStatusFiles: waitForStatuses.map((entry) => path.basename(entry.path)),
-        } : {}),
+        // Diagnostic only. A status reader must never follow these references.
+        barrierStatuses: waitForStatuses.map((entry) => ({
+            file: path.basename(entry.path),
+            waveIndex: entry.waveIndex,
+            directDependency: entry.directDependency,
+        })),
     };
     publishStatus({ ...baseStatus, state: 'starting' });
 
     console.log(`[no-wait] ${shortAgent}: starting background launch (pid ${process.pid})`);
 
     try {
-        await Promise.all([
-            waitForPriorWorker(waitForStatus),
-            waitForNoWaitStatusBarrier(waitForStatuses),
-        ]);
-        if (hasPredecessorBarrier) {
+        await waitForNoWaitStatusBarrier(waitForStatuses, {
+            runId,
+            runStartedAtMs,
+            waveIndex,
+        });
+        if (hasWaveBarrier) {
             const sequencePhaseStartedAtMs = Date.now();
             baseStatus = {
                 ...baseStatus,
@@ -1336,10 +1579,34 @@ async function main() {
                 sequencePhaseStartedAt: new Date(sequencePhaseStartedAtMs).toISOString(),
                 sequencePhaseStartedAtMs,
             };
-            delete baseStatus.waitForStatusFile;
-            delete baseStatus.waitForStatusFiles;
             publishStatus({ ...baseStatus, state: 'starting' });
         }
+        // Warm the image cache before any lifecycle lock is taken.
+        // `ensureAgentService` resolves the same image under the workspace
+        // mutation lease, so a cold pull there blocks every peer worker until
+        // its lease timeout. Pulling here is idempotent and lock-free; the
+        // authoritative resolution (including the catalog image for LLM
+        // runtimes and the local-build fallback) still happens inside the
+        // transaction, so a failure here is never fatal on its own.
+        //
+        // A pull is still a cache mutation, and the manifest can change while
+        // this worker sits behind its wave barrier. Re-assert the admission
+        // immediately before pulling so a superseded or denied launch cannot
+        // fetch an image on the strength of a stale admission.
+        assertRuntimeAdmissionCurrent(runtimeAdmission, {
+            manifestBytes: fs.readFileSync(manifestPath),
+            profileName: admittedProfileResolution.resolvedProfileName,
+            runtimeKind: admittedRuntimeKind,
+        });
+        prefetchNoWaitRuntimeImage({
+            manifest: admittedManifest,
+            profileConfig: admittedProfileResolution.profileConfig,
+            runtime: admittedRuntime,
+            runtimeKind: admittedRuntimeKind,
+            agentName: shortAgent,
+            repoName,
+        });
+
         const expectedIdentity = Object.freeze({
             containerName,
             repoName,

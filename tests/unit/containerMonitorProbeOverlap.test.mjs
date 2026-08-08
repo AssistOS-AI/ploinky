@@ -140,11 +140,16 @@ test('a current no-wait run marker rejects stale canonical status and missing pu
     const statusPath = path.join(statusDir, 'run-scoped-container.json');
     const markerPath = path.join(statusDir, 'run-scoped-container.current.json');
     const currentRunId = '12345678-1234-4234-8234-123456789abc';
-    fs.mkdirSync(statusDir, { recursive: true });
-    fs.writeFileSync(markerPath, JSON.stringify({
+    const runStartedAtMs = 1_700_000_000_000;
+    const waveIndex = 2;
+    const currentMarker = {
         runId: currentRunId,
+        runStartedAtMs,
         statusFile: `run-scoped-container.${currentRunId}.json`,
-    }));
+        waveIndex,
+    };
+    fs.mkdirSync(statusDir, { recursive: true });
+    fs.writeFileSync(markerPath, JSON.stringify(currentMarker));
 
     assert.deepEqual(
         readNoWaitStatus('run-scoped-container', { runningDir: workspace }),
@@ -154,17 +159,91 @@ test('a current no-wait run marker rejects stale canonical status and missing pu
     fs.writeFileSync(statusPath, JSON.stringify({
         state: 'running',
         runId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        runStartedAtMs,
+        waveIndex,
     }));
     assert.deepEqual(
         readNoWaitStatus('run-scoped-container', { runningDir: workspace }),
         { state: 'unreadable' },
         'a late status from an older run must not reopen monitor probing',
     );
-    fs.writeFileSync(statusPath, JSON.stringify({ state: 'running', runId: currentRunId }));
+    const currentStatus = {
+        state: 'running', runId: currentRunId, runStartedAtMs, waveIndex,
+    };
+    fs.writeFileSync(statusPath, JSON.stringify(currentStatus));
     assert.deepEqual(
         readNoWaitStatus('run-scoped-container', { runningDir: workspace }),
-        { state: 'running', runId: currentRunId },
+        currentStatus,
     );
+});
+
+test('the no-wait run marker binds run id, run start, and wave together', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-marker-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const statusDir = path.join(workspace, 'no-wait');
+    const statusPath = path.join(statusDir, 'bound-container.json');
+    const markerPath = path.join(statusDir, 'bound-container.current.json');
+    const runId = '12345678-1234-4234-8234-123456789abc';
+    const runStartedAtMs = 1_700_000_000_000;
+    const waveIndex = 2;
+    fs.mkdirSync(statusDir, { recursive: true });
+    const writeMarker = (marker) => fs.writeFileSync(markerPath, JSON.stringify({
+        runId, runStartedAtMs, statusFile: `bound-container.${runId}.json`, waveIndex, ...marker,
+    }));
+    const writeStatus = (status) => fs.writeFileSync(statusPath, JSON.stringify({
+        state: 'running', runId, runStartedAtMs, waveIndex, ...status,
+    }));
+
+    writeMarker({});
+    writeStatus({});
+    assert.equal(
+        readNoWaitStatus('bound-container', { runningDir: workspace }).state,
+        'running',
+        'a status matching every marker field is current',
+    );
+
+    // A matching run id is not sufficient on its own.
+    writeStatus({ runStartedAtMs: runStartedAtMs - 1 });
+    assert.deepEqual(
+        readNoWaitStatus('bound-container', { runningDir: workspace }),
+        { state: 'unreadable' },
+        'a status from another run start of the same run id must be rejected',
+    );
+    writeStatus({ waveIndex: waveIndex + 1 });
+    assert.deepEqual(
+        readNoWaitStatus('bound-container', { runningDir: workspace }),
+        { state: 'unreadable' },
+        'a status from another wave must be rejected',
+    );
+    writeStatus({ runStartedAtMs: undefined });
+    assert.deepEqual(
+        readNoWaitStatus('bound-container', { runningDir: workspace }),
+        { state: 'unreadable' },
+        'a status without a run start must be rejected',
+    );
+
+    // A marker missing or corrupting either new field is itself fail-closed.
+    writeStatus({});
+    for (const invalidMarker of [
+        { runStartedAtMs: undefined },
+        { runStartedAtMs: -1 },
+        { runStartedAtMs: 'yesterday' },
+        { waveIndex: undefined },
+        { waveIndex: -1 },
+        { waveIndex: 1.5 },
+    ]) {
+        writeMarker(invalidMarker);
+        assert.deepEqual(
+            readNoWaitStatus('bound-container', { runningDir: workspace }),
+            { state: 'unreadable' },
+            `a marker with ${JSON.stringify(invalidMarker)} must be fail-closed`,
+        );
+    }
+
+    // With no marker at all, an absent status stays "no status" as before.
+    fs.unlinkSync(markerPath);
+    fs.unlinkSync(statusPath);
+    assert.equal(readNoWaitStatus('bound-container', { runningDir: workspace }), null);
 });
 
 test('a malformed no-wait status defers probing instead of becoming no status', () => {
@@ -320,4 +399,47 @@ test('a probe worker error inactivates routing and schedules managed recovery', 
     clearTimeout(target.pendingRestartTimer);
     target.pendingRestartTimer = null;
     target.isRestarting = false;
+});
+
+test('no-wait marker identities must be real JSON numbers, not coercible values', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-coerce-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const statusDir = path.join(workspace, 'no-wait');
+    const runId = '12345678-1234-4234-8234-123456789abc';
+    fs.mkdirSync(statusDir, { recursive: true });
+    const write = (marker, status) => {
+        fs.writeFileSync(path.join(statusDir, 'coerce-container.current.json'), JSON.stringify({
+            runId, runStartedAtMs: 1_700_000_000_000,
+            statusFile: `coerce-container.${runId}.json`, waveIndex: 0, ...marker,
+        }));
+        fs.writeFileSync(path.join(statusDir, 'coerce-container.json'), JSON.stringify({
+            state: 'running', runId, runStartedAtMs: 1_700_000_000_000, waveIndex: 0, ...status,
+        }));
+    };
+
+    write({}, {});
+    assert.equal(readNoWaitStatus('coerce-container', { runningDir: workspace }).state, 'running');
+
+    // Number(null) and Number('') are both 0, so a coercing check would match a
+    // wave-zero status and reopen probing instead of failing closed.
+    for (const coercible of [null, '', false, '0', []]) {
+        write({ waveIndex: coercible }, {});
+        assert.deepEqual(
+            readNoWaitStatus('coerce-container', { runningDir: workspace }),
+            { state: 'unreadable' },
+            `a marker waveIndex of ${JSON.stringify(coercible)} must fail closed`,
+        );
+        write({}, { waveIndex: coercible });
+        assert.deepEqual(
+            readNoWaitStatus('coerce-container', { runningDir: workspace }),
+            { state: 'unreadable' },
+            `a status waveIndex of ${JSON.stringify(coercible)} must fail closed`,
+        );
+    }
+    write({ waveIndex: 1024 }, { waveIndex: 1024 });
+    assert.deepEqual(
+        readNoWaitStatus('coerce-container', { runningDir: workspace }),
+        { state: 'unreadable' },
+        'a wave index beyond the worker contract must fail closed',
+    );
 });

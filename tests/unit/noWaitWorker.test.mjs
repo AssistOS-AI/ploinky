@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import {
     assertNoWaitAdoptableLifecycleSnapshot,
@@ -13,13 +15,18 @@ import {
     assertNoWaitRuntimeStillExact,
     cleanupNoWaitTaskOwnedCandidate,
     launchNoWaitHostRuntime,
+    noWaitQueuedStatusDeadline,
     parseNoWaitStatusBarrier,
+    prefetchNoWaitRuntimeImage,
+    resolveNoWaitBarrierTimeouts,
+    resolveNoWaitRunScopedArguments,
     resolveNoWaitWorkerLifecycleSnapshot,
+    resolveRunScopedObservation,
     runNoWaitLifecycleTransaction,
     waitForNoWaitLifecycle,
     waitForNoWaitStatusBarrier,
     waitForNoWaitRouteActivation,
-    waitForPriorWorker,
+    waitForRunScopedStatus,
     withActiveNoWaitWorkerLifecycleLease,
     writeNoWaitWorkerStatus,
     writeStatus,
@@ -49,464 +56,615 @@ test('no-wait status replacement is atomic and leaves no temporary file', (t) =>
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
 });
 
-test('no-wait predecessor observes a complete atomically published terminal state', async (t) => {
-    const { runningDir } = fixture(t);
-    const containerName = 'ploinky_demo_predecessor';
-    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, { state: 'starting' }, { runningDir });
-    let polls = 0;
+const RUN_ID = '11111111-1111-4111-8111-111111111111';
+const FOREIGN_RUN_ID = '99999999-9999-4999-8999-999999999999';
 
-    const status = await waitForPriorWorker(target, {
-        runningDir,
-        timeoutMs: 1_000,
-        pollIntervalMs: 1,
-        async sleepFn() {
-            polls += 1;
-            writeStatus(containerName, { state: 'running' }, { runningDir });
-        },
-    });
-
-    assert.equal(polls, 1);
-    assert.deepEqual(status, { state: 'running' });
+const FAST_TIMEOUTS = resolveNoWaitBarrierTimeouts({
+    activeTimeoutMs: 1000,
+    terminalPublicationGraceMs: 0,
+    readRetryTimeoutMs: 100,
+    startupGraceMs: 0,
 });
 
-test('no-wait predecessor returns a terminal failure without exposing its details', async (t) => {
+function statusDirOf(runningDir) {
+    const statusDir = path.join(runningDir, 'no-wait');
+    fs.mkdirSync(statusDir, { recursive: true, mode: 0o700 });
+    return statusDir;
+}
+
+function coordinationPath(runningDir, containerName, runId = RUN_ID) {
+    return path.join(statusDirOf(runningDir), `${containerName}.${runId}.json`);
+}
+
+function barrierEntry(runningDir, containerName, {
+    waveIndex,
+    directDependency = false,
+    runId = RUN_ID,
+} = {}) {
+    return {
+        path: coordinationPath(runningDir, containerName, runId),
+        runId,
+        waveIndex,
+        directDependency,
+    };
+}
+
+function publishRunScoped(runningDir, containerName, {
+    runId = RUN_ID,
+    runStartedAtMs,
+    waveIndex,
+    state = 'starting',
+    sequencePhase = 'active',
+    sequencePhaseStartedAtMs = runStartedAtMs,
+    ...rest
+}) {
+    const target = coordinationPath(runningDir, containerName, runId);
+    fs.writeFileSync(target, JSON.stringify({
+        containerName,
+        runId,
+        runStartedAtMs,
+        waveIndex,
+        state,
+        sequencePhase,
+        sequencePhaseStartedAtMs,
+        ...rest,
+    }, null, 2));
+    return target;
+}
+
+// A deterministic clock: every simulated sleep advances it, so bounded
+// deadlines are exercised without real elapsed time.
+function virtualClock(startMs) {
+    let now = startMs;
+    return {
+        nowFn: () => now,
+        sleepFn: async (ms) => { now += Math.max(1, Math.ceil(ms)); },
+    };
+}
+
+async function settlesWithin(promise, ms) {
+    const pendingMarker = Symbol('pending');
+    const outcome = await Promise.race([
+        promise.then(() => 'settled', () => 'settled'),
+        new Promise((resolve) => { setTimeout(() => resolve(pendingMarker), ms); }),
+    ]);
+    return outcome !== pendingMarker;
+}
+
+test('three real waves settle through prior-wave statuses that are still waiting', async (t) => {
     const { runningDir } = fixture(t);
-    const containerName = 'ploinky_demo_failed';
-    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, {
+    const runStartedAtMs = Date.now();
+    for (const containerName of ['wave0-a', 'wave0-b']) {
+        publishRunScoped(runningDir, containerName, {
+            runStartedAtMs, waveIndex: 0, state: 'running',
+        });
+    }
+    // The exact shape that broke the deployed run: a prior-wave member sitting
+    // in its waiting phase while publishing an array of barrier references.
+    for (const containerName of ['wave1-a', 'wave1-b']) {
+        publishRunScoped(runningDir, containerName, {
+            runStartedAtMs,
+            waveIndex: 1,
+            state: 'starting',
+            sequencePhase: 'waiting-barrier',
+            barrierStatuses: [
+                { file: `wave0-a.${RUN_ID}.json`, waveIndex: 0, directDependency: true },
+                { file: `wave0-b.${RUN_ID}.json`, waveIndex: 0, directDependency: false },
+            ],
+        });
+    }
+
+    const barrier = [
+        barrierEntry(runningDir, 'wave1-a', { waveIndex: 1, directDependency: true }),
+        barrierEntry(runningDir, 'wave1-b', { waveIndex: 1 }),
+        barrierEntry(runningDir, 'wave0-a', { waveIndex: 0, directDependency: true }),
+    ];
+    const waiting = waitForNoWaitStatusBarrier(barrier, {
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 2,
+        runningDir,
+        waitOptions: { timeouts: FAST_TIMEOUTS, pollIntervalMs: 10 },
+    });
+
+    assert.equal(
+        await settlesWithin(waiting, 80),
+        false,
+        'a wave-two member still in its waiting phase must not release wave three',
+    );
+
+    for (const containerName of ['wave1-a', 'wave1-b']) {
+        publishRunScoped(runningDir, containerName, {
+            runStartedAtMs, waveIndex: 1, state: 'running',
+        });
+    }
+
+    const observed = await waiting;
+    assert.equal(observed.length, 3);
+    assert.deepEqual(observed.map(({ status }) => status.state), ['running', 'running', 'running']);
+});
+
+test('same-wave workers enter active concurrently without observing each other', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = Date.now();
+    const observed = await Promise.all([0, 1].map(() => waitForNoWaitStatusBarrier([], {
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 0,
+        runningDir,
+        waitFn: () => { throw new Error('an empty barrier must never poll a status file'); },
+    })));
+    assert.deepEqual(observed, [[], []]);
+    assert.deepEqual(fs.readdirSync(statusDirOf(runningDir)), []);
+});
+
+test('a wave barrier holds until every prior-wave member is terminal', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = Date.now();
+    publishRunScoped(runningDir, 'prior-a', {
+        runStartedAtMs, waveIndex: 0, state: 'running',
+    });
+    publishRunScoped(runningDir, 'prior-b', {
+        runStartedAtMs, waveIndex: 0, state: 'starting', sequencePhase: 'active',
+    });
+
+    const waiting = waitForNoWaitStatusBarrier([
+        barrierEntry(runningDir, 'prior-a', { waveIndex: 0 }),
+        barrierEntry(runningDir, 'prior-b', { waveIndex: 0 }),
+    ], {
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 1,
+        runningDir,
+        waitOptions: { timeouts: FAST_TIMEOUTS, pollIntervalMs: 10 },
+    });
+    assert.equal(await settlesWithin(waiting, 60), false);
+
+    publishRunScoped(runningDir, 'prior-b', {
+        runStartedAtMs, waveIndex: 0, state: 'running',
+    });
+    assert.equal((await waiting).length, 2);
+});
+
+test('a direct dependency failure is raised only after the whole barrier settles', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = Date.now();
+    publishRunScoped(runningDir, 'dependency', {
+        runStartedAtMs, waveIndex: 0, state: 'failed',
+    });
+    publishRunScoped(runningDir, 'peer', {
+        runStartedAtMs, waveIndex: 0, state: 'starting', sequencePhase: 'active',
+    });
+
+    const waiting = waitForNoWaitStatusBarrier([
+        barrierEntry(runningDir, 'dependency', { waveIndex: 0, directDependency: true }),
+        barrierEntry(runningDir, 'peer', { waveIndex: 0 }),
+    ], {
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 1,
+        runningDir,
+        waitOptions: { timeouts: FAST_TIMEOUTS, pollIntervalMs: 10 },
+    });
+    assert.equal(
+        await settlesWithin(waiting, 60),
+        false,
+        'a failed dependency must not release the worker while a peer is still active',
+    );
+
+    publishRunScoped(runningDir, 'peer', {
+        runStartedAtMs, waveIndex: 0, state: 'running',
+    });
+    await assert.rejects(
+        () => waiting,
+        (error) => error?.code === 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED',
+    );
+});
+
+test('an unrelated failed prior-wave worker satisfies the barrier without failing this worker', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = Date.now();
+    publishRunScoped(runningDir, 'unrelated', {
+        runStartedAtMs, waveIndex: 0, state: 'failed',
+    });
+    publishRunScoped(runningDir, 'dependency', {
+        runStartedAtMs, waveIndex: 0, state: 'running',
+    });
+
+    const observed = await waitForNoWaitStatusBarrier([
+        barrierEntry(runningDir, 'unrelated', { waveIndex: 0 }),
+        barrierEntry(runningDir, 'dependency', { waveIndex: 0, directDependency: true }),
+    ], {
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 1,
+        runningDir,
+        waitOptions: { timeouts: FAST_TIMEOUTS, pollIntervalMs: 10 },
+    });
+    assert.deepEqual(observed.map(({ status }) => status.state), ['failed', 'running']);
+});
+
+test('a failed prior-wave worker is terminal while it is still in its waiting phase', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = Date.now();
+    publishRunScoped(runningDir, 'failed-while-waiting', {
+        runStartedAtMs,
+        waveIndex: 0,
         state: 'failed',
-        error: { message: 'sensitive worker detail' },
-    }, { runningDir });
-
-    const status = await waitForPriorWorker(target, { runningDir });
-
+        sequencePhase: 'waiting-barrier',
+        barrierStatuses: [{ file: 'ignored.json', waveIndex: 0, directDependency: true }],
+    });
+    const status = await waitForRunScopedStatus(
+        barrierEntry(runningDir, 'failed-while-waiting', { waveIndex: 0 }),
+        { runningDir, expectedRunId: RUN_ID, runStartedAtMs, timeouts: FAST_TIMEOUTS },
+    );
     assert.deepEqual(status, { state: 'failed' });
 });
 
-test('no-wait predecessor retries a transient direct JSON read fault', async (t) => {
+test('run-scoped status binding rejects a foreign run, wave, or run start', async (t) => {
     const { runningDir } = fixture(t);
-    const containerName = 'ploinky_demo_transient_direct';
-    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, '{"state":');
-    let polls = 0;
+    const runStartedAtMs = Date.now();
+    const waitFor = (containerName, entryOverrides = {}) => waitForRunScopedStatus(
+        barrierEntry(runningDir, containerName, { waveIndex: 0, ...entryOverrides }),
+        { runningDir, expectedRunId: RUN_ID, runStartedAtMs, timeouts: FAST_TIMEOUTS },
+    );
 
-    const status = await waitForPriorWorker(target, {
-        runningDir,
-        readRetryTimeoutMs: 500,
-        pollIntervalMs: 10,
-        async sleepFn() {
-            polls += 1;
-            writeStatus(containerName, { state: 'running' }, { runningDir });
-        },
+    publishRunScoped(runningDir, 'stale-run', {
+        runStartedAtMs, waveIndex: 0, state: 'running', runId: FOREIGN_RUN_ID,
     });
+    // The file name still carries this run, so only the payload identity can
+    // reject a status left behind by another detached invocation.
+    fs.renameSync(
+        coordinationPath(runningDir, 'stale-run', FOREIGN_RUN_ID),
+        coordinationPath(runningDir, 'stale-run'),
+    );
+    await assert.rejects(() => waitFor('stale-run'), /different run/);
 
-    assert.equal(polls, 1);
-    assert.deepEqual(status, { state: 'running' });
+    publishRunScoped(runningDir, 'wrong-wave', {
+        runStartedAtMs, waveIndex: 7, state: 'running',
+    });
+    await assert.rejects(() => waitFor('wrong-wave'), /different dependency wave/);
+
+    publishRunScoped(runningDir, 'wrong-start', {
+        runStartedAtMs: runStartedAtMs - 1, waveIndex: 0, state: 'running',
+    });
+    await assert.rejects(() => waitFor('wrong-start'), /different run start/);
+
+    publishRunScoped(runningDir, 'bad-phase', {
+        runStartedAtMs, waveIndex: 0, state: 'starting', sequencePhase: 'waiting-predecessor',
+    });
+    await assert.rejects(() => waitFor('bad-phase'), /invalid sequence phase/);
+
+    publishRunScoped(runningDir, 'running-while-waiting', {
+        runStartedAtMs, waveIndex: 0, state: 'running', sequencePhase: 'waiting-barrier',
+    });
+    await assert.rejects(() => waitFor('running-while-waiting'), /outside its active phase/);
 });
 
-test('no-wait predecessor retries a transient direct filesystem read fault', async (t) => {
+test('a missing status expires at its bounded cumulative queued deadline', async (t) => {
     const { runningDir } = fixture(t);
-    const containerName = 'ploinky_demo_transient_read';
-    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    fs.mkdirSync(target, { recursive: true });
-    let polls = 0;
-
-    const status = await waitForPriorWorker(target, {
-        runningDir,
-        readRetryTimeoutMs: 500,
-        pollIntervalMs: 10,
-        async sleepFn() {
-            polls += 1;
-            fs.rmSync(target, { recursive: true });
-            writeStatus(containerName, { state: 'running' }, { runningDir });
-        },
-    });
-
-    assert.equal(polls, 1);
-    assert.deepEqual(status, { state: 'running' });
-});
-
-test('no-wait predecessor retries a transient nested JSON read fault', async (t) => {
-    const { runningDir } = fixture(t);
-    const statusDir = path.join(runningDir, 'no-wait');
-    const target = path.join(statusDir, 'nested-target.json');
-    writeStatus('nested-target', {
-        state: 'starting',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: 'nested-active.json',
-    }, { runningDir });
-    fs.writeFileSync(path.join(statusDir, 'nested-active.json'), '{"state":');
-    let now = 0;
-    let polls = 0;
-
-    const status = await waitForPriorWorker(target, {
-        runningDir,
-        timeoutMs: 1_000,
-        terminalPublicationGraceMs: 100,
-        readRetryTimeoutMs: 500,
-        pollIntervalMs: 100,
-        nowFn: () => now,
-        async sleepFn(intervalMs) {
-            now += intervalMs;
-            polls += 1;
-            if (polls === 1) {
-                writeStatus('nested-active', {
-                    state: 'starting',
-                    sequencePhase: 'active',
-                    sequencePhaseStartedAtMs: 0,
-                }, { runningDir });
-            } else if (polls === 2) {
-                writeStatus('nested-target', { state: 'running' }, { runningDir });
-            }
-        },
-    });
-
-    assert.equal(polls, 2);
-    assert.deepEqual(status, { state: 'running' });
-});
-
-test('no-wait predecessor bounds persistent direct status corruption', async (t) => {
-    const { runningDir } = fixture(t);
-    const target = path.join(runningDir, 'no-wait', 'persistently-corrupt.json');
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, '{"state":');
-    let now = 0;
-
+    const runStartedAtMs = 1_700_000_000_000;
+    const clock = virtualClock(runStartedAtMs);
     await assert.rejects(
-        () => waitForPriorWorker(target, {
+        () => waitForRunScopedStatus(
+            barrierEntry(runningDir, 'never-published', { waveIndex: 0 }),
+            {
+                runningDir,
+                expectedRunId: RUN_ID,
+                runStartedAtMs,
+                timeouts: FAST_TIMEOUTS,
+                ...clock,
+            },
+        ),
+        /timed out waiting for no-wait barrier status/,
+    );
+});
+
+test('a transient malformed status recovers on the next valid read', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = Date.now();
+    const target = coordinationPath(runningDir, 'transient');
+    fs.writeFileSync(target, '{"state":');
+    setTimeout(() => {
+        publishRunScoped(runningDir, 'transient', {
+            runStartedAtMs, waveIndex: 0, state: 'running',
+        });
+    }, 20);
+
+    const status = await waitForRunScopedStatus(
+        barrierEntry(runningDir, 'transient', { waveIndex: 0 }),
+        {
             runningDir,
-            timeoutMs: 1_000,
-            readRetryTimeoutMs: 250,
-            pollIntervalMs: 100,
-            nowFn: () => now,
-            async sleepFn(intervalMs) { now += intervalMs; },
-        }),
+            expectedRunId: RUN_ID,
+            runStartedAtMs,
+            timeouts: FAST_TIMEOUTS,
+            pollIntervalMs: 5,
+        },
+    );
+    assert.deepEqual(status, { state: 'running' });
+});
+
+test('a persistently malformed status fails closed after its bounded retry window', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = Date.now();
+    fs.writeFileSync(coordinationPath(runningDir, 'corrupt'), '{"state":');
+    await assert.rejects(
+        () => waitForRunScopedStatus(
+            barrierEntry(runningDir, 'corrupt', { waveIndex: 0 }),
+            {
+                runningDir,
+                expectedRunId: RUN_ID,
+                runStartedAtMs,
+                timeouts: FAST_TIMEOUTS,
+                pollIntervalMs: 5,
+            },
+        ),
         /remained unreadable after bounded retries/,
     );
-    assert.equal(now, 250);
 });
 
-test('no-wait predecessor bounds persistent nested status corruption', async (t) => {
+test('a malformed barrier member never releases the worker while a peer is still active', async (t) => {
     const { runningDir } = fixture(t);
-    const statusDir = path.join(runningDir, 'no-wait');
-    const target = path.join(statusDir, 'nested-corrupt-target.json');
-    writeStatus('nested-corrupt-target', {
-        state: 'starting',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: 'nested-corrupt-active.json',
-    }, { runningDir });
-    fs.writeFileSync(path.join(statusDir, 'nested-corrupt-active.json'), '{"state":');
-    let now = 0;
-
-    await assert.rejects(
-        () => waitForPriorWorker(target, {
-            runningDir,
-            timeoutMs: 1_000,
-            readRetryTimeoutMs: 250,
-            pollIntervalMs: 100,
-            nowFn: () => now,
-            async sleepFn(intervalMs) { now += intervalMs; },
-        }),
-        /remained unreadable after bounded retries/,
-    );
-    assert.equal(now, 250);
-});
-
-test('no-wait predecessor semantic invalidity remains immediately fail-closed', async (t) => {
-    const { runningDir } = fixture(t);
-    const target = path.join(runningDir, 'no-wait', 'invalid-semantic.json');
-    writeStatus('invalid-semantic', { sequencePhase: 'active' }, { runningDir });
-
-    await assert.rejects(
-        () => waitForPriorWorker(target, {
-            runningDir,
-            async sleepFn() {
-                assert.fail('semantic invalidity must not consume the read-retry budget');
-            },
-        }),
-        /status is missing its state/,
-    );
-});
-
-test('a failed waiting predecessor never releases its successor into the active phase', async (t) => {
-    const { runningDir } = fixture(t);
-    const target = path.join(runningDir, 'no-wait', 'failed-waiting.json');
-    writeStatus('active-predecessor', {
-        state: 'starting',
-        sequencePhase: 'active',
-        sequencePhaseStartedAtMs: 0,
-    }, { runningDir });
-    writeStatus('failed-waiting', {
-        state: 'failed',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: 'active-predecessor.json',
-        finishedAtMs: 0,
-    }, { runningDir });
-    let now = 0;
-
-    await assert.rejects(
-        () => waitForPriorWorker(target, {
-            runningDir,
-            timeoutMs: 1_000,
-            terminalPublicationGraceMs: 100,
-            pollIntervalMs: 100,
-            nowFn: () => now,
-            async sleepFn(intervalMs) {
-                now += intervalMs;
-                if (now === 200) {
-                    writeStatus('active-predecessor', {
-                        state: 'running',
-                        finishedAtMs: now,
-                    }, { runningDir });
-                }
-            },
-        }),
-        /timed out waiting for no-wait predecessor status/,
-    );
-    assert.equal(now, 300);
-});
-
-test('an active-phase failure remains a valid serialized handoff', async (t) => {
-    const { runningDir } = fixture(t);
-    const target = path.join(runningDir, 'no-wait', 'failed-active.json');
-    writeStatus('failed-active', {
-        state: 'failed',
-        sequencePhase: 'active',
-        sequencePhaseStartedAtMs: 0,
-        finishedAtMs: 100,
-    }, { runningDir });
-
-    assert.deepEqual(
-        await waitForPriorWorker(target, { runningDir }),
-        { state: 'failed' },
-    );
-});
-
-test('no-wait predecessor permits one bounded terminal-publication grace window', async (t) => {
-    const { runningDir } = fixture(t);
-    const containerName = 'ploinky_demo_slow_predecessor';
-    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, { state: 'starting' }, { runningDir });
-    let now = 0;
-
-    const status = await waitForPriorWorker(target, {
-        runningDir,
-        timeoutMs: 1_000,
-        terminalPublicationGraceMs: 500,
-        pollIntervalMs: 100,
-        nowFn: () => now,
-        async sleepFn(intervalMs) {
-            now += intervalMs;
-            if (now === 1_200) {
-                writeStatus(containerName, { state: 'running' }, { runningDir });
-            }
-        },
+    const runStartedAtMs = Date.now();
+    fs.writeFileSync(coordinationPath(runningDir, 'corrupt-member'), '{"state":');
+    publishRunScoped(runningDir, 'active-member', {
+        runStartedAtMs, waveIndex: 0, state: 'starting', sequencePhase: 'active',
     });
 
-    assert.equal(now, 1_200);
-    assert.deepEqual(status, { state: 'running' });
-});
-
-test('no-wait predecessor terminal-publication grace remains bounded and fail-closed', async (t) => {
-    const { runningDir } = fixture(t);
-    const containerName = 'ploinky_demo_stuck_predecessor';
-    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, { state: 'starting' }, { runningDir });
-    let now = 0;
-
-    await assert.rejects(
-        () => waitForPriorWorker(target, {
-            runningDir,
-            timeoutMs: 1_000,
-            terminalPublicationGraceMs: 500,
-            pollIntervalMs: 100,
-            nowFn: () => now,
-            async sleepFn(intervalMs) {
-                now += intervalMs;
-            },
-        }),
-        /timed out waiting for no-wait predecessor status/,
-    );
-    assert.equal(now, 1_500);
-});
-
-test('no-wait predecessor reports failure published during the bounded grace window', async (t) => {
-    const { runningDir } = fixture(t);
-    const containerName = 'ploinky_demo_late_failed_predecessor';
-    const target = path.join(runningDir, 'no-wait', `${containerName}.json`);
-    writeStatus(containerName, { state: 'starting' }, { runningDir });
-    let now = 0;
-
-    const status = await waitForPriorWorker(target, {
+    const waiting = waitForNoWaitStatusBarrier([
+        barrierEntry(runningDir, 'corrupt-member', { waveIndex: 0 }),
+        barrierEntry(runningDir, 'active-member', { waveIndex: 0 }),
+    ], {
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 1,
         runningDir,
-        timeoutMs: 1_000,
-        terminalPublicationGraceMs: 500,
-        pollIntervalMs: 100,
-        nowFn: () => now,
-        async sleepFn(intervalMs) {
-            now += intervalMs;
-            if (now === 1_100) {
-                writeStatus(containerName, { state: 'failed' }, { runningDir });
-            }
-        },
+        waitOptions: { timeouts: FAST_TIMEOUTS, pollIntervalMs: 5 },
     });
+    assert.equal(
+        await settlesWithin(waiting, 250),
+        false,
+        'the corrupt member expires early but must not propagate before the active peer settles',
+    );
 
-    assert.equal(now, 1_100);
-    assert.deepEqual(status, { state: 'failed' });
+    publishRunScoped(runningDir, 'active-member', {
+        runStartedAtMs, waveIndex: 0, state: 'running',
+    });
+    await assert.rejects(
+        () => waiting,
+        (error) => error?.code === 'PLOINKY_NO_WAIT_BARRIER_STATUS_INVALID'
+            && /corrupt-member/.test(error.message),
+    );
 });
 
-test('no-wait predecessor budget follows the one active worker across a cumulative sequence', async (t) => {
-    const { runningDir } = fixture(t);
-    const statusDir = path.join(runningDir, 'no-wait');
-    const target = path.join(statusDir, 'target.json');
-    writeStatus('first', {
+test('an active member receives a fresh full budget after a long queued wait', () => {
+    const runStartedAtMs = 1_700_000_000_000;
+    const timeouts = resolveNoWaitBarrierTimeouts();
+    const queuedDeadline = noWaitQueuedStatusDeadline(runStartedAtMs, 0, timeouts);
+    // The member entered its active phase long after the queued budget for its
+    // own wave would have expired; the active window must restart from there.
+    const sequencePhaseStartedAtMs = queuedDeadline + 5 * 60_000;
+    const observation = resolveRunScopedObservation({
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 0,
         state: 'starting',
         sequencePhase: 'active',
-        sequencePhaseStartedAtMs: 0,
-    }, { runningDir });
-    writeStatus('second', {
-        state: 'starting',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: 'first.json',
-    }, { runningDir });
-    writeStatus('target', {
-        state: 'starting',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: 'second.json',
-    }, { runningDir });
-    let now = 0;
+        sequencePhaseStartedAtMs,
+    }, {
+        expectedRunId: RUN_ID,
+        runStartedAtMs,
+        targetWaveIndex: 0,
+        timeouts,
+        nowMs: sequencePhaseStartedAtMs,
+    });
+    assert.equal(
+        observation.deadline,
+        sequencePhaseStartedAtMs + timeouts.activeTimeoutMs + timeouts.terminalPublicationGraceMs,
+    );
+    assert.ok(observation.deadline > queuedDeadline);
+});
 
-    const status = await waitForPriorWorker(target, {
-        runningDir,
-        timeoutMs: 1_000,
-        terminalPublicationGraceMs: 500,
-        pollIntervalMs: 100,
-        nowFn: () => now,
-        async sleepFn(intervalMs) {
-            now += intervalMs;
-            if (now === 900) {
-                writeStatus('first', { state: 'running', finishedAtMs: now }, { runningDir });
-            }
-            if (now === 1_000) {
-                writeStatus('second', {
-                    state: 'starting',
-                    sequencePhase: 'active',
-                    sequencePhaseStartedAtMs: now,
-                }, { runningDir });
-            }
-            if (now === 1_800) {
-                writeStatus('second', { state: 'running', finishedAtMs: now }, { runningDir });
-            }
-            if (now === 1_900) {
-                writeStatus('target', {
-                    state: 'starting',
-                    sequencePhase: 'active',
-                    sequencePhaseStartedAtMs: now,
-                }, { runningDir });
-            }
-            if (now === 2_700) {
-                writeStatus('target', { state: 'running', finishedAtMs: now }, { runningDir });
-            }
-        },
+test('a deep wave keeps its cumulative queued budget while each input stays clamped', () => {
+    const timeouts = resolveNoWaitBarrierTimeouts();
+    const runStartedAtMs = 1_700_000_000_000;
+    const budgetMs = noWaitQueuedStatusDeadline(runStartedAtMs, 3, timeouts) - runStartedAtMs;
+    assert.equal(budgetMs, 4 * (timeouts.activeTimeoutMs + timeouts.terminalPublicationGraceMs)
+        + timeouts.startupGraceMs);
+    assert.ok(budgetMs > 3_600_000, 'a wave-three target must exceed the single active-timeout maximum');
+
+    const clamped = resolveNoWaitBarrierTimeouts({
+        activeTimeoutMs: 99_999_999,
+        terminalPublicationGraceMs: 99_999_999,
+        readRetryTimeoutMs: 99_999_999,
+        startupGraceMs: 99_999_999,
+    });
+    assert.deepEqual({ ...clamped }, {
+        activeTimeoutMs: 3_600_000,
+        terminalPublicationGraceMs: 300_000,
+        readRetryTimeoutMs: 30_000,
+        startupGraceMs: 300_000,
+    });
+    const floored = resolveNoWaitBarrierTimeouts({
+        activeTimeoutMs: -5,
+        terminalPublicationGraceMs: -5,
+        readRetryTimeoutMs: -5,
+        startupGraceMs: -5,
+    });
+    assert.deepEqual({ ...floored }, {
+        activeTimeoutMs: 1000,
+        terminalPublicationGraceMs: 0,
+        readRetryTimeoutMs: 100,
+        startupGraceMs: 0,
+    });
+    assert.throws(
+        () => noWaitQueuedStatusDeadline(runStartedAtMs, 1024, timeouts),
+        /wave index must be an integer between 0 and 1023/,
+    );
+});
+
+test('invalid run and phase timestamps fail closed', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = Date.now();
+    const timeouts = FAST_TIMEOUTS;
+    const observe = (status, overrides = {}) => resolveRunScopedObservation(status, {
+        expectedRunId: RUN_ID,
+        runStartedAtMs,
+        targetWaveIndex: 0,
+        timeouts,
+        nowMs: runStartedAtMs,
+        ...overrides,
     });
 
-    assert.equal(now, 2_700, 'the common spawn-time legacy deadline must not truncate valid progress');
-    assert.deepEqual(status, { state: 'running' });
+    assert.throws(() => observe({
+        runId: RUN_ID, runStartedAtMs, waveIndex: 0, state: 'starting', sequencePhase: 'active',
+        sequencePhaseStartedAtMs: runStartedAtMs + 60_000,
+    }), /invalid start timestamp/);
+    assert.throws(() => observe({
+        runId: RUN_ID, runStartedAtMs, waveIndex: 0, state: 'starting', sequencePhase: 'active',
+    }), /invalid start timestamp/);
+    assert.throws(() => observe({
+        runId: RUN_ID, runStartedAtMs, waveIndex: 0, state: 'starting', sequencePhase: 'active',
+        sequencePhaseStartedAtMs: -1,
+    }), /invalid start timestamp/);
+    assert.throws(
+        () => observe({ runId: RUN_ID, waveIndex: 0, state: 'running', sequencePhase: 'active' }),
+        /different run start/,
+    );
+    await assert.rejects(
+        () => waitForRunScopedStatus(
+            barrierEntry(runningDir, 'bad-run-start', { waveIndex: 0 }),
+            { runningDir, expectedRunId: RUN_ID, runStartedAtMs: -1, timeouts },
+        ),
+        /non-negative epoch millisecond integer/,
+    );
+    assert.throws(
+        () => noWaitQueuedStatusDeadline(Number.MAX_SAFE_INTEGER, 3, timeouts),
+        /overflowed its cumulative wave budget/,
+    );
 });
 
-test('no-wait predecessor active phase remains independently bounded and fail-closed', async (t) => {
+test('the run-scoped argument contract rejects every missing mandatory flag', (t) => {
     const { runningDir } = fixture(t);
-    const target = path.join(runningDir, 'no-wait', 'stuck-active.json');
-    writeStatus('stuck-active', {
-        state: 'starting',
-        sequencePhase: 'active',
-        sequencePhaseStartedAtMs: 0,
-    }, { runningDir });
-    let now = 0;
+    const containerName = 'contract-container';
+    const complete = {
+        container: containerName,
+        runId: RUN_ID,
+        runStartedAtMs: '1700000000000',
+        waveIndex: '1',
+        statusFile: coordinationPath(runningDir, containerName),
+        waitForStatuses: JSON.stringify([
+            barrierEntry(runningDir, 'prior', { waveIndex: 0, directDependency: true }),
+        ]),
+    };
+    const resolved = resolveNoWaitRunScopedArguments(complete, { containerName, runningDir });
+    assert.equal(resolved.runId, RUN_ID);
+    assert.equal(resolved.runStartedAtMs, 1700000000000);
+    assert.equal(resolved.waveIndex, 1);
+    assert.equal(resolved.waitForStatuses.length, 1);
+    assert.equal(resolved.waitForStatuses[0].directDependency, true);
 
-    await assert.rejects(
-        () => waitForPriorWorker(target, {
-            runningDir,
-            timeoutMs: 1_000,
-            terminalPublicationGraceMs: 500,
-            pollIntervalMs: 100,
-            nowFn: () => now,
-            async sleepFn(intervalMs) { now += intervalMs; },
+    for (const [key, flag] of [
+        ['runId', 'run-id'],
+        ['runStartedAtMs', 'run-started-at-ms'],
+        ['waveIndex', 'wave-index'],
+        ['statusFile', 'status-file'],
+        ['waitForStatuses', 'wait-for-statuses'],
+    ]) {
+        const missing = { ...complete };
+        delete missing[key];
+        assert.throws(
+            () => resolveNoWaitRunScopedArguments(missing, { containerName, runningDir }),
+            new RegExp(`requires --${flag}$`),
+            `a launch without --${flag} must be rejected`,
+        );
+    }
+
+    // Wave zero is uniform: the flag is still mandatory and carries '[]'.
+    const waveZero = resolveNoWaitRunScopedArguments({
+        ...complete, waveIndex: '0', waitForStatuses: '[]',
+    }, { containerName, runningDir });
+    assert.deepEqual(waveZero.waitForStatuses, []);
+    assert.throws(
+        () => resolveNoWaitRunScopedArguments({
+            ...complete, waveIndex: '0',
+        }, { containerName, runningDir }),
+        /references wave 0 from wave 0/,
+        'wave zero must never carry a barrier reference',
+    );
+});
+
+test('a barrier reference must name an earlier wave inside this run', (t) => {
+    const { runningDir } = fixture(t);
+    const parse = (entries, waveIndex = 2) => parseNoWaitStatusBarrier(
+        JSON.stringify(entries),
+        { runId: RUN_ID, waveIndex, runningDir },
+    );
+    assert.equal(parse([]).length, 0);
+    assert.throws(
+        () => parse([barrierEntry(runningDir, 'peer', { waveIndex: 2 })]),
+        /references wave 2 from wave 2/,
+    );
+    assert.throws(
+        () => parse([barrierEntry(runningDir, 'foreign', { waveIndex: 0, runId: FOREIGN_RUN_ID })]),
+        /different run/,
+    );
+    assert.throws(
+        () => parse([
+            barrierEntry(runningDir, 'twice', { waveIndex: 0 }),
+            barrierEntry(runningDir, 'twice', { waveIndex: 1 }),
+        ]),
+        /repeats/,
+    );
+    assert.throws(
+        () => parse([{ path: path.join(runningDir, 'foreign.json'), runId: RUN_ID, waveIndex: 0, directDependency: false }]),
+        /must be an absolute JSON file/,
+    );
+    assert.throws(() => parse(''), /must be an array/);
+    assert.throws(
+        () => parseNoWaitStatusBarrier('', { runId: RUN_ID, waveIndex: 1, runningDir }),
+        /must be one JSON array argument/,
+    );
+});
+
+test('run-scoped worker status publishes the canonical view before the coordination handoff', (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'publish-order';
+    const runStartedAtMs = 1_700_000_000_000;
+    const canonical = path.join(statusDirOf(runningDir), `${containerName}.json`);
+    const coordination = coordinationPath(runningDir, containerName);
+
+    const document = writeNoWaitWorkerStatus(containerName, {
+        state: 'starting',
+        sequencePhase: 'waiting-barrier',
+    }, {
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 2,
+        statusFile: coordination,
+        runningDir,
+    });
+    assert.deepEqual(document, {
+        state: 'starting',
+        sequencePhase: 'waiting-barrier',
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 2,
+    });
+    for (const target of [canonical, coordination]) {
+        assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), document);
+    }
+    assert.throws(
+        () => writeNoWaitWorkerStatus(containerName, {}, {
+            runId: RUN_ID, runStartedAtMs, waveIndex: 0, statusFile: canonical, runningDir,
         }),
-        /timed out waiting for no-wait predecessor status/,
+        /must be the exact run-scoped file/,
     );
-    assert.equal(now, 1_500);
-});
-
-test('no-wait predecessor chain rejects cycles instead of extending a wait', async (t) => {
-    const { runningDir } = fixture(t);
-    const target = path.join(runningDir, 'no-wait', 'cycle-a.json');
-    writeStatus('cycle-a', {
-        state: 'starting',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: 'cycle-b.json',
-    }, { runningDir });
-    writeStatus('cycle-b', {
-        state: 'starting',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: 'cycle-a.json',
-    }, { runningDir });
-
-    await assert.rejects(
-        () => waitForPriorWorker(target, { runningDir }),
-        /status chain contains a cycle/,
-    );
-});
-
-test('no-wait predecessor chain rejects traversal references', async (t) => {
-    const { runningDir } = fixture(t);
-    const target = path.join(runningDir, 'no-wait', 'traversal.json');
-    writeStatus('traversal', {
-        state: 'starting',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: '../foreign.json',
-    }, { runningDir });
-
-    await assert.rejects(
-        () => waitForPriorWorker(target, { runningDir }),
-        /waiting phase has an invalid status reference/,
-    );
-});
-
-test('no-wait predecessor chain rejects a stale terminal handoff', async (t) => {
-    const { runningDir } = fixture(t);
-    const target = path.join(runningDir, 'no-wait', 'waiting.json');
-    writeStatus('finished', {
-        state: 'running',
-        finishedAtMs: 0,
-    }, { runningDir });
-    writeStatus('waiting', {
-        state: 'starting',
-        sequencePhase: 'waiting-predecessor',
-        waitForStatusFile: 'finished.json',
-    }, { runningDir });
-    let now = 600;
-
-    await assert.rejects(
-        () => waitForPriorWorker(target, {
-            runningDir,
-            timeoutMs: 1_000,
-            terminalPublicationGraceMs: 500,
-            nowFn: () => now,
-            async sleepFn(intervalMs) { now += intervalMs; },
+    assert.throws(
+        () => writeNoWaitWorkerStatus(containerName, {}, {
+            runId: RUN_ID, runStartedAtMs, statusFile: coordination, runningDir,
         }),
-        /timed out waiting for no-wait predecessor status/,
-    );
-    assert.equal(now, 600);
-});
-
-test('no-wait predecessor rejects a path outside the status directory', async (t) => {
-    const { root, runningDir } = fixture(t);
-    await assert.rejects(
-        () => waitForPriorWorker(path.join(root, 'foreign.json'), { runningDir }),
-        /must be an exact file/,
+        /wave index must be an integer/,
     );
 });
 
@@ -1446,14 +1604,17 @@ test('no-wait cleanup still aborts preparation when exact candidate removal fail
     assert.deepEqual(events, ['cleanup', 'abort']);
 });
 
-test('run-scoped no-wait status publishes canonical and unique files with one run id', (t) => {
+test('run-scoped no-wait status publishes canonical and unique files with one run identity', (t) => {
     const { runningDir } = fixture(t);
     const runId = '11111111-1111-4111-8111-111111111111';
+    const runStartedAtMs = 1_700_000_000_000;
     const statusDir = path.join(runningDir, 'no-wait');
     const statusFile = path.join(statusDir, `ploinky_demo_worker.${runId}.json`);
 
     writeNoWaitWorkerStatus('ploinky_demo_worker', { state: 'running' }, {
         runId,
+        runStartedAtMs,
+        waveIndex: 3,
         statusFile,
         runningDir,
     });
@@ -1463,7 +1624,9 @@ test('run-scoped no-wait status publishes canonical and unique files with one ru
         'utf8',
     ));
     const coordination = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
-    assert.deepEqual(canonical, { state: 'running', runId });
+    assert.deepEqual(canonical, {
+        state: 'running', runId, runStartedAtMs, waveIndex: 3,
+    });
     assert.deepEqual(coordination, canonical);
     assert.deepEqual(
         fs.readdirSync(statusDir).sort(),
@@ -1472,6 +1635,8 @@ test('run-scoped no-wait status publishes canonical and unique files with one ru
     assert.throws(
         () => writeNoWaitWorkerStatus('ploinky_demo_worker', { state: 'failed' }, {
             runId,
+            runStartedAtMs,
+            waveIndex: 3,
             statusFile: path.join(statusDir, `another-worker.${runId}.json`),
             runningDir,
         }),
@@ -1479,51 +1644,57 @@ test('run-scoped no-wait status publishes canonical and unique files with one ru
     );
 });
 
-test('run-scoped no-wait barrier validates exact paths and waits the entire prior wave', async (t) => {
+test('the run-scoped barrier dispatches every member concurrently and settles all of them', async (t) => {
     const { runningDir } = fixture(t);
     const runId = '22222222-2222-4222-8222-222222222222';
+    const runStartedAtMs = 1_700_000_000_000;
     const statusDir = path.join(runningDir, 'no-wait');
     const firstPath = path.join(statusDir, `first.${runId}.json`);
     const secondPath = path.join(statusDir, `second.${runId}.json`);
     const barrier = parseNoWaitStatusBarrier(JSON.stringify([
-        { path: firstPath, runId, directDependency: false },
-        { path: secondPath, runId, directDependency: true },
-    ]), { runId, runningDir });
+        { path: firstPath, runId, waveIndex: 0, directDependency: false },
+        { path: secondPath, runId, waveIndex: 0, directDependency: true },
+    ]), { runId, waveIndex: 1, runningDir });
     const started = [];
     let releaseFirst;
     const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
 
     const waiting = waitForNoWaitStatusBarrier(barrier, {
-        async waitFn(statusPath, options) {
-            started.push(path.basename(statusPath));
+        runId,
+        runStartedAtMs,
+        waveIndex: 1,
+        runningDir,
+        async waitFn(entry, options) {
+            started.push(path.basename(entry.path));
             assert.equal(options.expectedRunId, runId);
-            assert.equal(options.retainFailedWaitingChain, false);
-            if (statusPath === firstPath) await firstGate;
-            return { state: statusPath === firstPath ? 'failed' : 'running' };
+            assert.equal(options.runStartedAtMs, runStartedAtMs);
+            assert.equal(options.runningDir, runningDir);
+            if (entry.path === firstPath) await firstGate;
+            return { state: entry.path === firstPath ? 'failed' : 'running' };
         },
     });
     await Promise.resolve();
-    assert.deepEqual(started.sort(), [path.basename(firstPath), path.basename(secondPath)].sort());
+    assert.deepEqual(
+        started.sort(),
+        [path.basename(firstPath), path.basename(secondPath)].sort(),
+        'every barrier member must be polled concurrently',
+    );
     releaseFirst();
     const observed = await waiting;
     assert.equal(observed.length, 2);
     assert.equal(observed[0].status.state, 'failed');
 
     await assert.rejects(
-        () => waitForNoWaitStatusBarrier([
-            { path: firstPath, runId, directDependency: true },
-        ], { waitFn: async () => ({ state: 'failed' }) }),
+        () => waitForNoWaitStatusBarrier(barrier, {
+            runId,
+            runStartedAtMs,
+            waveIndex: 1,
+            runningDir,
+            waitFn: async (entry) => ({
+                state: entry.path === secondPath ? 'failed' : 'running',
+            }),
+        }),
         (error) => error?.code === 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED',
-    );
-    assert.throws(
-        () => parseNoWaitStatusBarrier(JSON.stringify([
-            {
-                path: firstPath,
-                runId: '33333333-3333-4333-8333-333333333333',
-                directDependency: false,
-            },
-        ]), { runId, runningDir }),
-        /different run/,
     );
 });
 
@@ -1806,4 +1977,190 @@ test('concurrent no-wait lifecycle apply callbacks remain workspace-serialized',
     await Promise.all([first, second]);
     assert.equal(maxWorkspaceHolders, 1);
     assert.equal(maxActiveApplies, 1);
+});
+
+test('a pre-start failure still publishes a terminal member of the wave barrier', async (t) => {
+    // Spawns the real detached worker so the pre-publish failure path is
+    // exercised end to end, not simulated.
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-pre-start-'));
+    t.after(() => fs.rmSync(workspaceRoot, { recursive: true, force: true }));
+    const runningDir = path.join(workspaceRoot, '.ploinky', 'running');
+    fs.mkdirSync(path.join(workspaceRoot, '.ploinky'), { recursive: true });
+    const containerName = 'pre-start-container';
+    const runStartedAtMs = Date.now();
+    // An unparseable manifest fails admission, which runs before the first
+    // live status write.
+    const manifestPath = path.join(workspaceRoot, 'manifest.json');
+    fs.writeFileSync(manifestPath, '{ not json');
+    const statusFile = coordinationPath(runningDir, containerName);
+    const workerScript = fileURLToPath(new URL('../../cli/commands/noWaitWorker.js', import.meta.url));
+    const baseArgs = [
+        workerScript,
+        '--container', containerName,
+        '--short-agent', 'preStart',
+        '--repo', 'demo',
+        '--manifest-path', manifestPath,
+        '--agent-path', workspaceRoot,
+        '--run-id', RUN_ID,
+        '--run-started-at-ms', String(runStartedAtMs),
+        '--wave-index', '1',
+        '--status-file', statusFile,
+        '--wait-for-statuses', '[]',
+    ];
+    const env = { ...process.env, PLOINKY_WORKSPACE_ROOT: workspaceRoot };
+
+    const failed = spawnSync(process.execPath, baseArgs, { env, encoding: 'utf8' });
+    assert.equal(failed.status, 1, failed.stderr);
+
+    const published = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    assert.equal(published.state, 'failed');
+    assert.equal(published.sequencePhase, 'active');
+    assert.equal(published.runId, RUN_ID);
+    assert.equal(published.runStartedAtMs, runStartedAtMs);
+    assert.equal(published.waveIndex, 1);
+    assert.deepEqual(
+        JSON.parse(fs.readFileSync(path.join(runningDir, 'no-wait', `${containerName}.json`), 'utf8')),
+        published,
+        'the canonical monitor view must carry the same terminal document',
+    );
+
+    // A dependent must reach a terminal decision immediately instead of
+    // waiting out its cumulative queued budget.
+    assert.deepEqual(
+        await waitForRunScopedStatus(
+            barrierEntry(runningDir, containerName, { waveIndex: 1, directDependency: true }),
+            { runningDir, expectedRunId: RUN_ID, runStartedAtMs },
+        ),
+        { state: 'failed' },
+    );
+
+    // A launch missing a mandatory run-scoped flag is still rejected outright.
+    const missingFlag = baseArgs.filter((token, index) => (
+        token !== '--wave-index' && baseArgs[index - 1] !== '--wave-index'
+    ));
+    const rejected = spawnSync(process.execPath, missingFlag, { env, encoding: 'utf8' });
+    assert.equal(rejected.status, 2);
+    assert.match(rejected.stderr, /requires --wave-index/);
+});
+
+test('the runtime image is prefetched outside every lifecycle lock', () => {
+    const calls = [];
+    const base = {
+        manifest: { container: 'demo/image:1' },
+        profileConfig: null,
+        runtime: 'podman',
+        runtimeKind: 'container',
+        agentName: 'demoAgent',
+        repoName: 'demo',
+        resolveImage: (manifest) => manifest.container,
+        ensureImage: (image, options) => { calls.push([image, options]); return true; },
+    };
+
+    assert.deepEqual(
+        prefetchNoWaitRuntimeImage(base),
+        { prefetched: true, image: 'demo/image:1' },
+    );
+    assert.deepEqual(calls, [['demo/image:1', { runtime: 'podman' }]],
+        'the prefetch must target the agent-resolved runtime, not the ambient default');
+
+    // A sandbox runtime never resolves a container image.
+    assert.deepEqual(
+        prefetchNoWaitRuntimeImage({ ...base, runtimeKind: 'bwrap' }),
+        { prefetched: false, reason: 'sandbox-runtime' },
+    );
+    // An LLM-runtime placeholder is resolved by the catalog inside the
+    // transaction, so an unresolvable manifest image is not an error.
+    assert.deepEqual(
+        prefetchNoWaitRuntimeImage({
+            ...base,
+            resolveImage: () => { throw new Error('unresolved placeholder'); },
+        }),
+        { prefetched: false, reason: 'unresolved-image' },
+    );
+    assert.deepEqual(
+        prefetchNoWaitRuntimeImage({ ...base, resolveImage: () => '  ' }),
+        { prefetched: false, reason: 'unresolved-image' },
+    );
+    // A prefetch failure must never be fatal on its own; the transaction still
+    // owns the authoritative resolution and the local-build fallback.
+    const logged = [];
+    assert.deepEqual(
+        prefetchNoWaitRuntimeImage({
+            ...base,
+            ensureImage: () => { throw new Error('registry unreachable'); },
+            log: (message) => logged.push(message),
+        }),
+        { prefetched: false, image: 'demo/image:1', reason: 'prefetch-failed' },
+    );
+    assert.match(logged[0], /image prefetch for 'demo\/image:1' failed/);
+});
+
+test('the no-wait worker prefetches the image before taking any lifecycle lock', () => {
+    const source = fs.readFileSync(
+        path.resolve('cli/commands/noWaitWorker.js'),
+        'utf8',
+    );
+    // lastIndexOf targets the call site in main(); indexOf would match the
+    // exported definition earlier in the file.
+    const prefetchCall = source.lastIndexOf('prefetchNoWaitRuntimeImage({');
+    assert.ok(prefetchCall > 0);
+    assert.ok(
+        prefetchCall < source.indexOf('await runNoWaitLifecycleTransaction(expectedIdentity'),
+        'the image cache must be warmed before the workspace mutation lease is taken',
+    );
+    assert.ok(
+        source.indexOf('await waitForNoWaitStatusBarrier(waitForStatuses') < prefetchCall,
+        'the wave barrier still orders the launch; prefetch must not bypass it',
+    );
+});
+
+test('an LLM runtime never prefetches the manifest image the catalog will replace', () => {
+    const pulls = [];
+    const base = {
+        manifest: { container: 'demo/manifest-image:1' },
+        profileConfig: null,
+        runtime: 'podman',
+        runtimeKind: 'container',
+        agentName: 'llmAgent',
+        repoName: 'demo',
+        resolveImage: (manifest) => manifest.container,
+        ensureImage: (image) => { pulls.push(image); return true; },
+    };
+
+    assert.deepEqual(
+        prefetchNoWaitRuntimeImage({ ...base, isLlmRuntime: () => true }),
+        { prefetched: false, reason: 'llm-runtime-catalog-image' },
+    );
+    assert.deepEqual(pulls, [], 'a catalog-selected runtime must not pull the manifest image');
+
+    assert.deepEqual(
+        prefetchNoWaitRuntimeImage({ ...base, isLlmRuntime: () => false }),
+        { prefetched: true, image: 'demo/manifest-image:1' },
+    );
+    assert.deepEqual(pulls, ['demo/manifest-image:1']);
+});
+
+test('the worker re-asserts its admission immediately before prefetching an image', () => {
+    const source = fs.readFileSync(
+        path.resolve('cli/commands/noWaitWorker.js'),
+        'utf8',
+    );
+    const prefetch = source.lastIndexOf('prefetchNoWaitRuntimeImage({');
+    const barrier = source.indexOf('await waitForNoWaitStatusBarrier(waitForStatuses');
+    assert.ok(prefetch > 0 && barrier > 0);
+    // Search backwards from the prefetch so this binds to the revalidation
+    // that guards it, not the later one inside capture().
+    const revalidate = source.lastIndexOf('assertRuntimeAdmissionCurrent(runtimeAdmission, {', prefetch);
+    assert.ok(
+        revalidate > barrier,
+        'the admission must be revalidated after the wave barrier releases the worker',
+    );
+    assert.ok(
+        revalidate < prefetch,
+        'a pull is a cache mutation, so the admission must be revalidated first',
+    );
+    assert.ok(
+        prefetch < source.indexOf('await runNoWaitLifecycleTransaction(expectedIdentity'),
+        'the prefetch must still precede the workspace mutation lease',
+    );
 });
