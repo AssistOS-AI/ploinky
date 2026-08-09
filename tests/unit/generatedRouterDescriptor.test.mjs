@@ -302,6 +302,17 @@ test('topology selection freezes public and managed request-authority rules', ()
         ['remote-public-loopback', 'public', '127.0.0.1:18080'],
     );
 
+    const macosRemote = buildRouterAuthorityTopologyIntent({
+        ...base,
+        platform: 'darwin',
+        runtimeProof: { ...runtimeProof, remote: true },
+        fsApi: missingBoxFs(),
+    });
+    assert.deepEqual(
+        [macosRemote.topology, macosRemote.listenerClass, macosRemote.requestAuthority],
+        ['macos-remote-public-loopback', 'public', '127.0.0.1:18080'],
+    );
+
     const host = buildRouterAuthorityTopologyIntent({
         ...base,
         networkMode: 'host',
@@ -350,6 +361,22 @@ test('fixed public and managed attestation fixtures validate only in their exact
         external: managedFixture.evidence.external,
         generationId: managedFixture.evidence.generationId,
     }));
+    const secretBody = 'SECRET_CANARY_90817\n\u001b[31m';
+    const secretExternal = publicFixture.evidence.external.map((record, index) => (
+        index === 0 ? { ...record, body: secretBody } : record
+    ));
+    assert.throws(() => validateRouterAuthorityObservation({
+        intent: publicIntent,
+        nonce: publicFixture.evidence.nonce,
+        records: publicFixture.evidence.records,
+        external: secretExternal,
+        generationId: publicFixture.evidence.generationId,
+    }), (error) => {
+        assert.match(error.message, /actualBodyBytes/);
+        assert.doesNotMatch(error.message, /SECRET_CANARY_90817/);
+        assert.doesNotMatch(error.message, /\\u001b|\u001b/);
+        return true;
+    });
     assert.throws(() => validateRouterAuthorityObservation({
         intent: managedIntent,
         nonce: publicFixture.evidence.nonce,
@@ -384,6 +411,33 @@ test('fixed public and managed attestation fixtures validate only in their exact
         nonce: publicFixture.evidence.nonce,
         records: nestedBoxHairpinRecords,
         external: publicFixture.evidence.external,
+        generationId: publicFixture.evidence.generationId,
+    }));
+    const macosRemoteIntent = buildRouterAuthorityTopologyIntent({
+        networkMode: 'default',
+        runtimeProof: { ...runtimeProof, remote: true },
+        networkFingerprint,
+        routerHostPort: 18080,
+        edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
+        platform: 'darwin',
+        fsApi: missingBoxFs(),
+    });
+    const macosLoopbackRecords = publicFixture.evidence.records.map((record) => ({
+        ...record,
+        rawInterfaceClass: 'loopback',
+        socketLocalAddress: '127.0.0.1',
+        socketRemoteAddress: '127.0.0.1',
+    }));
+    const macosExternal = publicFixture.evidence.external.map((record) => (
+        record.host === macosRemoteIntent.publicAuthority
+            ? { ...record, body: '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}' }
+            : record
+    ));
+    assert.doesNotThrow(() => validateRouterAuthorityObservation({
+        intent: macosRemoteIntent,
+        nonce: publicFixture.evidence.nonce,
+        records: macosLoopbackRecords,
+        external: macosExternal,
         generationId: publicFixture.evidence.generationId,
     }));
     assert.throws(() => validateRouterAuthorityObservation({

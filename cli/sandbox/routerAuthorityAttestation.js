@@ -14,8 +14,18 @@ const HEALTH_SOCKET = path.join(PLOINKY_DIR, 'run', 'router-health.sock');
 const REQUEST_TIMEOUT_MS = 3_000;
 const HELPER_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_BYTES = 8 * 1024;
-const LOOPBACK_LOGIN_BODY = '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}';
+const LOOPBACK_AUTH_BODIES = Object.freeze([
+    '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}',
+    '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}',
+]);
 const AUTHORITY_HELPER_USER = '65534:65534';
+const AUTHORITY_HELPER_LABEL = 'io.assistos.ploinky.authority-helper';
+const AUTHORITY_HELPER_NAME_PREFIX = 'ploinky-authority-';
+export const ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS = 60_000;
+const AUTHORITY_HELPER_STALE_GRACE_MS = 15_000;
+const AUTHORITY_HELPER_RECONCILE_ATTEMPTS = 5;
+const AUTHORITY_HELPER_RECONCILE_DELAY_MS = 250;
+const AUTHORITY_HELPER_IDLE_SCRIPT = `setTimeout(() => process.exit(0), ${ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS});`;
 export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
 
 const PROBE_SCRIPT = String.raw`
@@ -181,9 +191,35 @@ function assertRecord(record, expected) {
     }
 }
 
+function externalBodyMetadata(value) {
+    const bytes = Buffer.from(String(value ?? ''), 'utf8');
+    return {
+        actualBodyBytes: bytes.length,
+        actualBodySha256: `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`,
+    };
+}
+
+function boundedFailureMetadata(result) {
+    const stderr = Buffer.from(String(result?.stderr || ''), 'utf8');
+    return JSON.stringify({
+        status: Number.isInteger(result?.status) ? result.status : null,
+        stderrBytes: stderr.length,
+        stderrSha256: `sha256:${crypto.createHash('sha256').update(stderr).digest('hex')}`,
+    });
+}
+
 function assertExternal(record, status, body) {
-    if (record?.status !== status || record?.body !== body) {
-        fail('PLOINKY_ROUTER_ATTESTATION_MISMATCH', 'external status/body did not match the fixed topology cell');
+    const expectedBodies = Array.isArray(body) ? body : [body];
+    if (record?.status !== status || !expectedBodies.includes(record?.body)) {
+        fail(
+            'PLOINKY_ROUTER_ATTESTATION_MISMATCH',
+            `external status/body did not match the fixed topology cell (${JSON.stringify({
+                host: record?.host,
+                expectedStatus: status,
+                actualStatus: record?.status,
+                ...externalBodyMetadata(record?.body),
+            })})`,
+        );
     }
 }
 
@@ -196,7 +232,7 @@ function isLoopbackAddress(value) {
 function assertExactSocketEvidence(intent, records) {
     const expectedRawClass = intent.listenerClass === 'managed'
         ? 'managed'
-        : (['host-public-loopback', 'bwrap-public-loopback', 'seatbelt-public-loopback'].includes(intent.topology)
+        : (['host-public-loopback', 'bwrap-public-loopback', 'seatbelt-public-loopback', 'macos-remote-public-loopback'].includes(intent.topology)
             ? 'loopback'
             : 'unmanaged');
     const first = records[0];
@@ -208,7 +244,17 @@ function assertExactSocketEvidence(intent, records) {
             || net.isIP(remote) === 0
             || local !== first.socketLocalAddress
             || remote !== first.socketRemoteAddress) {
-            fail('PLOINKY_ROUTER_ATTESTATION_MISMATCH', 'internal socket/interface evidence did not match the fixed topology cell');
+            fail(
+                'PLOINKY_ROUTER_ATTESTATION_MISMATCH',
+                `internal socket/interface evidence did not match the fixed topology cell (${JSON.stringify({
+                    expectedRawClass,
+                    records: records.map((entry) => ({
+                        rawInterfaceClass: entry?.rawInterfaceClass,
+                        socketLocalAddress: entry?.socketLocalAddress,
+                        socketRemoteAddress: entry?.socketRemoteAddress,
+                    })),
+                })})`,
+            );
         }
         const expectsLoopback = expectedRawClass === 'loopback';
         const exactBoxNatHairpin = intent.topology === 'box-public-loopback'
@@ -217,7 +263,7 @@ function assertExactSocketEvidence(intent, records) {
             && local === remote;
         if (isLoopbackAddress(local) !== expectsLoopback
             || (expectsLoopback ? !isLoopbackAddress(remote) : isLoopbackAddress(remote))
-            || (local === remote && !exactBoxNatHairpin)) {
+            || (local === remote && !expectsLoopback && !exactBoxNatHairpin)) {
             fail(
                 'PLOINKY_ROUTER_ATTESTATION_MISMATCH',
                 `internal socket address class did not match the fixed topology cell (${JSON.stringify({
@@ -265,7 +311,7 @@ export function validateRouterAuthorityObservation({ intent, nonce, records, ext
             hostSelectionKind: null,
             controlMiss: false,
         });
-        assertExternal(externalByHost(external, loopback), 401, LOOPBACK_LOGIN_BODY);
+        assertExternal(externalByHost(external, loopback), 401, LOOPBACK_AUTH_BODIES);
         assertExternal(externalByHost(external, hci), 421, '{"error":"UNKNOWN_HOST"}');
     } else {
         assertRecord(hciRecord, {
@@ -292,30 +338,73 @@ export function validateRouterAuthorityObservation({ intent, nonce, records, ext
     return Object.freeze({ nonce, records: Object.freeze([...records]), external: Object.freeze([...external]) });
 }
 
-function runBounded(command, args, { timeout = HELPER_TIMEOUT_MS } = {}) {
-    const result = spawnSync(command, args, {
-        encoding: 'utf8',
-        timeout,
-        maxBuffer: MAX_OUTPUT_BYTES,
-        killSignal: 'SIGKILL',
+const DEFAULT_AUTHORITY_COMMAND_RUNNER = Object.freeze({
+    run(command, args, options) {
+        return spawnSync(command, args, options);
+    },
+    now() {
+        return Date.now();
+    },
+    sleep(milliseconds) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+    },
+});
+
+function resolveAuthorityCommandRunner(commandRunner) {
+    if (commandRunner === undefined) return DEFAULT_AUTHORITY_COMMAND_RUNNER;
+    if (!commandRunner || typeof commandRunner.run !== 'function') {
+        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority helper command runner must be callable');
+    }
+    return Object.freeze({
+        run: commandRunner.run.bind(commandRunner),
+        now: typeof commandRunner.now === 'function'
+            ? commandRunner.now.bind(commandRunner)
+            : DEFAULT_AUTHORITY_COMMAND_RUNNER.now,
+        sleep: typeof commandRunner.sleep === 'function'
+            ? commandRunner.sleep.bind(commandRunner)
+            : DEFAULT_AUTHORITY_COMMAND_RUNNER.sleep,
     });
+}
+
+function runBounded(commandRunner, command, args, { timeout = HELPER_TIMEOUT_MS } = {}) {
+    let result;
+    try {
+        result = commandRunner.run(command, args, {
+            encoding: 'utf8',
+            timeout,
+            maxBuffer: MAX_OUTPUT_BYTES,
+            killSignal: 'SIGKILL',
+        });
+    } catch (_) {
+        fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'bounded helper operation failed');
+    }
+    if (!result || typeof result !== 'object') {
+        fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'bounded helper operation returned no result');
+    }
     if (result.error || result.status !== 0) {
         fail(
             'PLOINKY_ROUTER_ATTESTATION_HELPER',
-            `bounded helper operation failed (${String(result.stderr || result.error?.message || '').slice(0, 512)})`,
-            result.error,
+            `bounded helper operation failed (${boundedFailureMetadata(result)})`,
         );
     }
     return String(result.stdout || '').trim();
 }
 
-function runStatusBounded(command, args, { timeout = HELPER_TIMEOUT_MS } = {}) {
-    const result = spawnSync(command, args, {
-        encoding: 'utf8',
-        timeout,
-        maxBuffer: MAX_OUTPUT_BYTES,
-        killSignal: 'SIGKILL',
-    });
+function runStatusBounded(commandRunner, command, args, { timeout = HELPER_TIMEOUT_MS } = {}) {
+    let result;
+    try {
+        result = commandRunner.run(command, args, {
+            encoding: 'utf8',
+            timeout,
+            maxBuffer: MAX_OUTPUT_BYTES,
+            killSignal: 'SIGKILL',
+        });
+    } catch (_) {
+        fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'bounded helper status operation failed');
+    }
+    if (!result || typeof result !== 'object') {
+        fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'bounded helper status operation returned no result');
+    }
     if (result.error || !Number.isInteger(result.status)) {
         fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'bounded helper status operation failed', result.error);
     }
@@ -326,6 +415,22 @@ function runStatusBounded(command, args, { timeout = HELPER_TIMEOUT_MS } = {}) {
     });
 }
 
+function runProcessBounded(command, args, { timeout = HELPER_TIMEOUT_MS } = {}) {
+    const result = spawnSync(command, args, {
+        encoding: 'utf8',
+        timeout,
+        maxBuffer: MAX_OUTPUT_BYTES,
+        killSignal: 'SIGKILL',
+    });
+    if (result.error || result.status !== 0) {
+        fail(
+            'PLOINKY_ROUTER_ATTESTATION_HELPER',
+            `bounded helper operation failed (${boundedFailureMetadata(result)})`,
+        );
+    }
+    return String(result.stdout || '').trim();
+}
+
 function privateSocketRequest(socketPath, method, requestPath, body = null) {
     const script = String.raw`
 const http=require('node:http'); const [socketPath,method,path,body]=process.argv.slice(1);
@@ -333,7 +438,7 @@ const bytes=body ? Buffer.from(body) : Buffer.alloc(0);
 const req=http.request({socketPath,method,path,headers:bytes.length?{'content-type':'application/json','content-length':bytes.length}:{}},res=>{const chunks=[];let size=0;res.on('data',c=>{size+=c.length;if(size>8192)req.destroy(new Error('response too large'));else chunks.push(c)});res.on('end',()=>process.stdout.write(JSON.stringify({status:res.statusCode,body:Buffer.concat(chunks).toString('utf8')})))});
 req.setTimeout(3000,()=>req.destroy(new Error('request timed out')));req.on('error',e=>{process.stderr.write(String(e.message||e));process.exit(1)});req.end(bytes);
 `;
-    const raw = runBounded(process.execPath, ['-e', script, socketPath, method, requestPath, body || ''], { timeout: REQUEST_TIMEOUT_MS + 1_000 });
+    const raw = runProcessBounded(process.execPath, ['-e', script, socketPath, method, requestPath, body || ''], { timeout: REQUEST_TIMEOUT_MS + 1_000 });
     try { return JSON.parse(raw); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_REGISTRY', 'private attestation response was malformed', error); }
 }
 
@@ -388,10 +493,10 @@ export function createPrivateAuthorityRegistryClient({
     });
 }
 
-const AUTHORITY_HELPER_INSPECT_FORMAT = String.raw`{"id":{{json .ID}},"image":{{json .Image}},"user":{{json .Config.User}},"entrypoint":{{json .Config.Entrypoint}},"init":{{json .HostConfig.Init}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"memory":{{json .HostConfig.Memory}},"nanoCpus":{{json .HostConfig.NanoCpus}},"networkMode":{{json .HostConfig.NetworkMode}},"extraHosts":{{json .HostConfig.ExtraHosts}},"mountCount":{{len .Mounts}},"bindCount":{{len .HostConfig.Binds}},"tmpfsCount":{{len .HostConfig.Tmpfs}},"portBindingCount":{{len .HostConfig.PortBindings}},"capDrop":{{json .HostConfig.CapDrop}},"capAdd":{{json .HostConfig.CapAdd}},"securityOpt":{{json .HostConfig.SecurityOpt}},"env":{{json .Config.Env}},"helperLabel":{{json (index .Config.Labels "io.assistos.ploinky.authority-helper")}},"networks":{{json .NetworkSettings.Networks}},"running":{{json .State.Running}},"status":{{json .State.Status}}}`;
+const AUTHORITY_HELPER_INSPECT_FORMAT = String.raw`{"id":{{json .ID}},"name":{{json .Name}},"created":{{json .Created}},"image":{{json .Image}},"user":{{json .Config.User}},"entrypoint":{{json .Config.Entrypoint}},"init":{{json .HostConfig.Init}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"memory":{{json .HostConfig.Memory}},"nanoCpus":{{json .HostConfig.NanoCpus}},"networkMode":{{json .HostConfig.NetworkMode}},"extraHosts":{{json .HostConfig.ExtraHosts}},"mountCount":{{len .Mounts}},"bindCount":{{len .HostConfig.Binds}},"tmpfsCount":{{len .HostConfig.Tmpfs}},"portBindingCount":{{len .HostConfig.PortBindings}},"capDrop":{{json .HostConfig.CapDrop}},"capAdd":{{json .HostConfig.CapAdd}},"securityOpt":{{json .HostConfig.SecurityOpt}},"env":{{json .Config.Env}},"helperLabel":{{json (index .Config.Labels "io.assistos.ploinky.authority-helper")}},"networks":{{json .NetworkSettings.Networks}},"running":{{json .State.Running}},"status":{{json .State.Status}}}`;
 
-function inspectAuthorityHelper(runtime, id) {
-    const raw = runBounded(runtime, [
+function inspectAuthorityHelper(commandRunner, runtime, id) {
+    const raw = runBounded(commandRunner, runtime, [
         'container', 'inspect', '--format', AUTHORITY_HELPER_INSPECT_FORMAT, id,
     ]);
     let parsed;
@@ -413,6 +518,172 @@ export function managedImageUserNamespace(imageUser) {
     return `keep-id:uid=${match[1]},gid=${match[2]}`;
 }
 
+function normalizedContainerName(value) {
+    return String(value || '').replace(/^\/+/, '');
+}
+
+function proveAuthorityHelperIdentity(inspected, {
+    expectedId = '',
+    expectedName,
+    expectedNonce,
+    expectedImageId,
+    expectedNetworks = null,
+    expectedPrimaryNetwork = '',
+    expectedHostMapping = '',
+    failureCode = 'PLOINKY_ROUTER_ATTESTATION_HELPER',
+} = {}) {
+    const id = String(inspected?.id || '');
+    const name = normalizedContainerName(inspected?.name);
+    const helperLabel = String(inspected?.helperLabel || '');
+    const inspectedNetworks = Object.keys(inspected?.networks || {}).sort();
+    const extraHosts = [...(inspected?.extraHosts || [])].map(String);
+    const capDrop = [...(inspected?.capDrop || [])].map((value) => String(value).toUpperCase());
+    const capAdd = [...(inspected?.capAdd || [])];
+    const securityOpt = [...(inspected?.securityOpt || [])].map(String);
+    const helperEnv = [...(inspected?.env || [])].map(String);
+    const portableCapDrop = capDrop.length > 0 && capDrop.every((value) => (
+        value === 'ALL' || /^CAP_[A-Z0-9_]+$/.test(value)
+    ));
+    const expectedNetworkList = Array.isArray(expectedNetworks)
+        ? [...expectedNetworks].map(String).sort()
+        : null;
+    const exactNetworkPlan = !expectedNetworkList
+        || (JSON.stringify(inspectedNetworks) === JSON.stringify(expectedNetworkList)
+            && ['bridge', expectedPrimaryNetwork].includes(String(inspected?.networkMode || ''))
+            && extraHosts.length === 1
+            && extraHosts[0] === expectedHostMapping);
+    const genericNetworkPlan = expectedNetworkList
+        || (inspectedNetworks.length > 0
+            && extraHosts.length === 1
+            && extraHosts[0].startsWith('host.containers.internal:'));
+
+    if (!/^[a-f0-9]{64}$/.test(id)
+        || (expectedId && id !== expectedId)
+        || name !== expectedName
+        || !/^[a-f0-9]{64}$/.test(helperLabel)
+        || helperLabel !== expectedNonce
+        || String(inspected?.image || '') !== expectedImageId
+        || String(inspected?.user || '') !== AUTHORITY_HELPER_USER
+        || JSON.stringify(inspected?.entrypoint || []) !== JSON.stringify(['node'])
+        || inspected?.init !== true
+        || inspected?.readonlyRootfs !== true
+        || Number(inspected?.pidsLimit) !== 32
+        || Number(inspected?.memory) !== 64 * 1024 * 1024
+        || Number(inspected?.nanoCpus) !== 250_000_000
+        || Number(inspected?.mountCount) !== 0
+        || Number(inspected?.bindCount) !== 0
+        || Number(inspected?.tmpfsCount) !== 0
+        || Number(inspected?.portBindingCount) !== 0
+        || !portableCapDrop
+        || capAdd.length !== 0
+        || securityOpt.length !== 1
+        || !['no-new-privileges', 'no-new-privileges=true'].includes(securityOpt[0])
+        || helperEnv.some((entry) => /^(?:PLOINKY_|AUTHORIZATION=|BEARER_)/i.test(entry))
+        || !genericNetworkPlan
+        || !exactNetworkPlan) {
+        fail(failureCode, 'authority helper identity or confinement could not be proven');
+    }
+    return Object.freeze({ id, name, helperLabel });
+}
+
+function removeProvenAuthorityHelper(commandRunner, runtime, expected) {
+    let inspected = inspectAuthorityHelper(commandRunner, runtime, expected.expectedId || expected.expectedName);
+    const identity = proveAuthorityHelperIdentity(inspected, {
+        ...expected,
+        failureCode: 'PLOINKY_ROUTER_ATTESTATION_CLEANUP',
+    });
+    if (inspected.running === true || inspected.status === 'running') {
+        runBounded(commandRunner, runtime, ['stop', '--time', '2', identity.id], { timeout: 4_000 });
+        inspected = inspectAuthorityHelper(commandRunner, runtime, identity.id);
+        proveAuthorityHelperIdentity(inspected, {
+            ...expected,
+            expectedId: identity.id,
+            failureCode: 'PLOINKY_ROUTER_ATTESTATION_CLEANUP',
+        });
+        if (inspected.running === true || inspected.status === 'running') {
+            fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper remained running after bounded exact-ID stop');
+        }
+    }
+    runBounded(commandRunner, runtime, ['rm', identity.id], { timeout: 4_000 });
+    const exists = runStatusBounded(commandRunner, runtime, ['container', 'exists', identity.id], { timeout: 4_000 });
+    const nameExists = runStatusBounded(commandRunner, runtime, ['container', 'exists', expected.expectedName], { timeout: 4_000 });
+    if (exists.status !== 1 || nameExists.status !== 1) {
+        fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper removal was not proven by immutable ID and exact name');
+    }
+}
+
+function reconcileAuthorityHelperByName(commandRunner, runtime, helperName) {
+    for (let attempt = 0; attempt < AUTHORITY_HELPER_RECONCILE_ATTEMPTS; attempt += 1) {
+        const named = runStatusBounded(
+            commandRunner,
+            runtime,
+            ['container', 'exists', helperName],
+            { timeout: 4_000 },
+        );
+        if (named.status === 0) return inspectAuthorityHelper(commandRunner, runtime, helperName);
+        if (named.status !== 1) {
+            fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper name reconciliation returned an ambiguous status');
+        }
+        if (attempt + 1 < AUTHORITY_HELPER_RECONCILE_ATTEMPTS) {
+            commandRunner.sleep(AUTHORITY_HELPER_RECONCILE_DELAY_MS);
+        }
+    }
+    return null;
+}
+
+function cleanupAuthorityHelper(commandRunner, runtime, helperId, expected) {
+    let resolvedId = helperId;
+    if (!resolvedId) {
+        const inspected = reconcileAuthorityHelperByName(commandRunner, runtime, expected.expectedName);
+        if (!inspected) return;
+        resolvedId = proveAuthorityHelperIdentity(inspected, {
+            ...expected,
+            failureCode: 'PLOINKY_ROUTER_ATTESTATION_CLEANUP',
+        }).id;
+    }
+    removeProvenAuthorityHelper(commandRunner, runtime, {
+        ...expected,
+        expectedId: resolvedId,
+    });
+}
+
+function reapStaleAuthorityHelpers(commandRunner, runtime, helperImageId) {
+    const raw = runBounded(commandRunner, runtime, [
+        'ps', '-a', '--no-trunc',
+        '--filter', `label=${AUTHORITY_HELPER_LABEL}`,
+        '--format', '{{.ID}}',
+    ], { timeout: 4_000 });
+    const ids = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    for (const id of ids) {
+        if (!/^[a-f0-9]{64}$/.test(id)) {
+            fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'stale helper listing returned a non-immutable ID');
+        }
+        const inspected = inspectAuthorityHelper(commandRunner, runtime, id);
+        const nonce = String(inspected?.helperLabel || '');
+        const expectedName = `${AUTHORITY_HELPER_NAME_PREFIX}${nonce.slice(0, 16)}`;
+        proveAuthorityHelperIdentity(inspected, {
+            expectedId: id,
+            expectedName,
+            expectedNonce: nonce,
+            expectedImageId: helperImageId,
+            failureCode: 'PLOINKY_ROUTER_ATTESTATION_CLEANUP',
+        });
+        const createdAt = Date.parse(String(inspected?.created || ''));
+        if (!Number.isFinite(createdAt) || createdAt > commandRunner.now()) {
+            fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'stale helper creation time could not be proven');
+        }
+        const oldEnough = commandRunner.now() - createdAt
+            > ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS + AUTHORITY_HELPER_STALE_GRACE_MS;
+        if ((inspected.running === true || inspected.status === 'running') && !oldEnough) continue;
+        removeProvenAuthorityHelper(commandRunner, runtime, {
+            expectedId: id,
+            expectedName,
+            expectedNonce: nonce,
+            expectedImageId: helperImageId,
+        });
+    }
+}
+
 export function runContainerAuthorityProbe({
     runtime,
     plan,
@@ -421,17 +692,19 @@ export function runContainerAuthorityProbe({
     nonce,
     registerObservation,
     consumeObservation,
+    commandRunner: commandRunnerInput,
 } = {}) {
     if (runtime !== 'podman') fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'container attestation requires verified Podman');
     if (typeof registerObservation !== 'function' || typeof consumeObservation !== 'function') {
         fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'container attestation requires an exact observation lifecycle');
     }
-    const targetImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image]);
+    const commandRunner = resolveAuthorityCommandRunner(commandRunnerInput);
+    const targetImageId = runBounded(commandRunner, runtime, ['image', 'inspect', '--format', '{{.Id}}', image]);
     if (!targetImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(targetImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'actual agent image did not resolve to an immutable image ID');
-    const targetImageUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', targetImageId]);
-    const helperImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', ROUTER_AUTHORITY_HELPER_IMAGE]);
+    const targetImageUser = runBounded(commandRunner, runtime, ['image', 'inspect', '--format', '{{.Config.User}}', targetImageId]);
+    const helperImageId = runBounded(commandRunner, runtime, ['image', 'inspect', '--format', '{{.Id}}', ROUTER_AUTHORITY_HELPER_IMAGE]);
     if (!helperImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(helperImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'authority helper image did not resolve to an immutable image ID');
-    const helperName = `ploinky-authority-${nonce.slice(0, 16)}`;
+    const helperName = `${AUTHORITY_HELPER_NAME_PREFIX}${nonce.slice(0, 16)}`;
     const firstHost = intent.requestAuthority;
     const secondHost = firstHost === intent.publicAuthority ? 'host.containers.internal:8080' : intent.publicAuthority;
     const expectedNetworks = (plan?.attachments || []).map((entry) => String(entry?.name || '')).filter(Boolean).sort();
@@ -447,11 +720,20 @@ export function runContainerAuthorityProbe({
     if (!expectedHostMapping.startsWith('host.containers.internal:')) {
         fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper managed-network plan lacks the exact HCI mapping');
     }
+    const expectedIdentity = Object.freeze({
+        expectedName: helperName,
+        expectedNonce: nonce,
+        expectedImageId: helperImageId,
+        expectedNetworks,
+        expectedPrimaryNetwork: primaryNetwork,
+        expectedHostMapping,
+    });
+    reapStaleAuthorityHelpers(commandRunner, runtime, helperImageId);
     let helperId = '';
     try {
-        helperId = runBounded(runtime, [
+        helperId = runBounded(commandRunner, runtime, [
             'create', '--name', helperName,
-            '--label', `io.assistos.ploinky.authority-helper=${nonce}`,
+            '--label', `${AUTHORITY_HELPER_LABEL}=${nonce}`,
             '--init',
             '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
             '--pids-limit', '32', '--memory', '64m', '--cpus', '0.25',
@@ -459,48 +741,28 @@ export function runContainerAuthorityProbe({
             '--entrypoint', 'node',
             ...(plan?.args || []),
             ...additionalNetworkArgs,
-            helperImageId, '-e', PROBE_SCRIPT,
+            helperImageId, '-e', AUTHORITY_HELPER_IDLE_SCRIPT,
+        ]);
+        if (!/^[a-f0-9]{64}$/.test(helperId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper creation did not return an immutable ID');
+        const inspected = inspectAuthorityHelper(commandRunner, runtime, helperId);
+        proveAuthorityHelperIdentity(inspected, { ...expectedIdentity, expectedId: helperId });
+        // Starting a cold remote Podman container can exceed the Router's
+        // deliberately short nonce lifetime. Start the already inspected,
+        // idle helper before registration, then execute only the confined live
+        // observations inside that window. The probe independently verifies
+        // its zero capability bounding/effective sets and no-new-privileges.
+        runBounded(commandRunner, runtime, ['start', helperId]);
+        const running = inspectAuthorityHelper(commandRunner, runtime, helperId);
+        proveAuthorityHelperIdentity(running, { ...expectedIdentity, expectedId: helperId });
+        if (running.running !== true || running.status !== 'running') {
+            fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper did not enter the exact inspected running state');
+        }
+        registerObservation();
+        const output = runBounded(commandRunner, runtime, [
+            'exec', '--user', AUTHORITY_HELPER_USER,
+            helperId, 'node', '-e', PROBE_SCRIPT,
             intent.physicalOrigin, firstHost, secondHost, nonce,
         ]);
-        if (!helperId) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper creation did not return an immutable ID');
-        const inspected = inspectAuthorityHelper(runtime, helperId);
-        const inspectedNetworks = Object.keys(inspected.networks || {}).sort();
-        const extraHosts = [...(inspected.extraHosts || [])].map(String);
-        const capDrop = [...(inspected.capDrop || [])].map((value) => String(value).toUpperCase());
-        const capAdd = [...(inspected.capAdd || [])];
-        const securityOpt = [...(inspected.securityOpt || [])].map(String);
-        const helperEnv = [...(inspected.env || [])].map(String);
-        const portableCapDrop = capDrop.length > 0 && capDrop.every((value) => (
-            value === 'ALL' || /^CAP_[A-Z0-9_]+$/.test(value)
-        ));
-        if (String(inspected.id || '') !== helperId
-            || String(inspected.image || '') !== helperImageId
-            || String(inspected.user || '') !== AUTHORITY_HELPER_USER
-            || JSON.stringify(inspected.entrypoint || []) !== JSON.stringify(['node'])
-            || inspected.init !== true
-            || inspected.readonlyRootfs !== true
-            || Number(inspected.pidsLimit) !== 32
-            || Number(inspected.memory) !== 64 * 1024 * 1024
-            || Number(inspected.nanoCpus) !== 250_000_000
-            || JSON.stringify(inspectedNetworks) !== JSON.stringify(expectedNetworks)
-            || !['bridge', primaryNetwork].includes(String(inspected.networkMode || ''))
-            || extraHosts.length !== 1 || extraHosts[0] !== expectedHostMapping
-            || Number(inspected.mountCount) !== 0
-            || Number(inspected.bindCount) !== 0
-            || Number(inspected.tmpfsCount) !== 0
-            || Number(inspected.portBindingCount) !== 0
-            || !portableCapDrop
-            || capAdd.length !== 0
-            || securityOpt.length !== 1 || !['no-new-privileges', 'no-new-privileges=true'].includes(securityOpt[0])
-            || helperEnv.some((entry) => /^(?:PLOINKY_|AUTHORIZATION=|BEARER_)/i.test(entry))
-            || String(inspected.helperLabel || '') !== nonce) {
-            fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper confinement inspection failed');
-        }
-        // Keep slow image inspection, helper preparation, and immutable cleanup
-        // outside the short-lived Router nonce. Only the confined helper start
-        // and its two HTTP observations are inside the registered window.
-        registerObservation();
-        const output = runBounded(runtime, ['start', '--attach', helperId]);
         consumeObservation();
         let external;
         try { external = JSON.parse(output); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper probe output was malformed', error); }
@@ -515,27 +777,7 @@ export function runContainerAuthorityProbe({
             target: Object.freeze({ image: targetImageId, user: targetImageUser }),
         });
     } finally {
-        if (helperId) {
-            const inspected = inspectAuthorityHelper(runtime, helperId);
-            if (String(inspected.id || '') !== helperId
-                || String(inspected.helperLabel || '') !== nonce) {
-                fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper cleanup could not prove exact immutable ID and nonce ownership');
-            }
-            if (inspected.running === true || inspected.status === 'running') {
-                runBounded(runtime, ['stop', '--time', '2', helperId], { timeout: 4_000 });
-                const stopped = inspectAuthorityHelper(runtime, helperId);
-                if (String(stopped.id || '') !== helperId
-                    || String(stopped.helperLabel || '') !== nonce
-                    || stopped.running === true || stopped.status === 'running') {
-                    fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper remained running after bounded exact-ID stop');
-                }
-            }
-            runBounded(runtime, ['rm', helperId], { timeout: 4_000 });
-            const exists = runStatusBounded(runtime, ['container', 'exists', helperId], { timeout: 4_000 });
-            if (exists.status !== 1) {
-                fail('PLOINKY_ROUTER_ATTESTATION_CLEANUP', 'helper removal was not proven by immutable ID');
-            }
-        }
+        cleanupAuthorityHelper(commandRunner, runtime, helperId, expectedIdentity);
     }
 }
 
