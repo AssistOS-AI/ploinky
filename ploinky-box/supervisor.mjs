@@ -149,7 +149,12 @@ export function createBoxSupervisor({
                 prepared.hostPort,
                 prepared.mediaHostPort,
                 runner,
-                { stdout, stderr, hostReachableIpv4 },
+                {
+                    stdout,
+                    stderr,
+                    hostReachableIpv4,
+                    agentlibRef: env.PLOINKY_AGENTLIB_REF,
+                },
             );
             await healthCheck(prepared.hostPort);
             return Object.freeze({ identity, ...prepared, containerId });
@@ -413,12 +418,14 @@ export async function runBoundedCoreStart(
         stderr = process.stderr,
         timeoutMs = 1_800_000,
         hostReachableIpv4 = '',
+        agentlibRef = '',
     } = {},
 ) {
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
         throw supervisorError('Bounded core start requires normalized start argv');
     }
     const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
+    const normalizedAgentlibRef = String(agentlibRef || '').trim();
     if (normalizedHostReachableIpv4 && !isUsableHostIpv4(normalizedHostReachableIpv4)) {
         throw supervisorError(
             `${HOST_REACHABLE_IPV4_ENV} must be a usable canonical literal IPv4 address`,
@@ -431,6 +438,9 @@ export async function runBoundedCoreStart(
         '--env', `PLOINKY_MEDIA_HOST_PORT=${mediaHostPort}`,
         ...(normalizedHostReachableIpv4
             ? ['--env', `${HOST_REACHABLE_IPV4_ENV}=${normalizedHostReachableIpv4}`]
+            : []),
+        ...(normalizedAgentlibRef
+            ? ['--env', `PLOINKY_AGENTLIB_REF=${normalizedAgentlibRef}`]
             : []),
     ];
     const result = await runner.stream(engine.name, [

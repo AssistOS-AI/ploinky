@@ -567,6 +567,7 @@ test('start passes the native host address into the bounded in-box runtime', asy
     const events = [];
     let boundedOptions;
     const supervisor = createBoxSupervisor({
+        env: { PLOINKY_AGENTLIB_REF: 'master' },
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
@@ -591,6 +592,7 @@ test('start passes the native host address into the bounded in-box runtime', asy
 
     await supervisor.runStartTransaction(['start', 'explorer']);
     assert.equal(boundedOptions.hostReachableIpv4, '192.168.1.12');
+    assert.equal(boundedOptions.agentlibRef, 'master');
 });
 
 test('bounded start requires the external Dashboard URL and preserves normalized argv', async () => {
@@ -620,15 +622,17 @@ test('bounded start requires the external Dashboard URL and preserves normalized
             stderr: output,
             timeoutMs: 1000,
             hostReachableIpv4: '192.168.1.12',
+            agentlibRef: 'master',
         },
     );
     assert.equal(status, 0);
     assert.deepEqual(calls[0][1].slice(-4), ['--debug', 'start', 'Agent', '8080']);
-    assert.deepEqual(calls[0][1].slice(0, 12), [
+    assert.deepEqual(calls[0][1].slice(0, 14), [
         'container', 'exec',
         '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
         '--env', 'PLOINKY_MEDIA_HOST_PORT=17891',
         '--env', 'PLOINKY_HOST_REACHABLE_IPV4=192.168.1.12',
+        '--env', 'PLOINKY_AGENTLIB_REF=master',
         '--user', 'podman', '--workdir', '/workspace',
     ]);
     assert.equal(calls[0][2].stdout, output);
