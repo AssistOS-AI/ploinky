@@ -18,8 +18,13 @@ import {
 import {
     attestRouterAuthority,
     buildRouterAuthorityTopologyIntent,
+    createPrivateAuthorityRegistryClient,
     validateRouterAuthorityObservation,
 } from '../../cli/sandbox/routerAuthorityAttestation.js';
+import {
+    AUTHORITY_ATTESTATION_TTL_MS,
+    createRouterAuthorityAttestationRegistry,
+} from '../../cli/server/routerAuthorityAttestationRegistry.js';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 
 const FIXTURE_ROOT = path.resolve('tests/fixtures/router-descriptor');
@@ -393,7 +398,7 @@ test('fixed public and managed attestation fixtures validate only in their exact
     }), /socket address class/);
 });
 
-test('attestation registers, probes, consumes, then commits the generation before returning', () => {
+test('attestation brackets only live observations with registration and consumption', () => {
     const fixture = fixtureJson('public-attestation.json');
     const intent = buildRouterAuthorityTopologyIntent({
         networkMode: 'default',
@@ -419,8 +424,12 @@ test('attestation registers, probes, consumes, then commits the generation befor
             },
             consume() { order.push('consume'); return fixture.evidence.records; },
         },
-        runProbe() {
+        runProbe({ registerObservation, consumeObservation }) {
+            order.push('prepare');
+            registerObservation();
             order.push('probe');
+            consumeObservation();
+            order.push('cleanup');
             return {
                 external: fixture.evidence.external,
                 helper: fixture.evidence.helper,
@@ -430,8 +439,125 @@ test('attestation registers, probes, consumes, then commits the generation befor
         now: () => fixture.evidence.observedAtUnixMs,
     });
 
-    assert.deepEqual(order, ['register', 'probe', 'consume', 'commit']);
+    assert.deepEqual(order, ['prepare', 'register', 'probe', 'consume', 'cleanup', 'commit']);
     assert.match(result.attestationId, /^sha256:[a-f0-9]{64}$/);
     assert.equal(result.evidence.generationId, fixture.evidence.generationId);
     assert.deepEqual(result.evidence.target, { image: 'sha256:target', user: 'root' });
+});
+
+test('slow helper preparation and cleanup do not consume the ten-second observation lifetime', () => {
+    const fixture = fixtureJson('public-attestation.json');
+    const intent = buildRouterAuthorityTopologyIntent({
+        networkMode: 'default',
+        runtimeProof,
+        networkFingerprint,
+        routerHostPort: 18080,
+        edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
+        platform: 'linux',
+        fsApi: presentBoxFs(),
+    });
+    let monotonicNow = 0;
+    const registry = createRouterAuthorityAttestationRegistry({ now: () => monotonicNow });
+    const order = [];
+    const result = attestRouterAuthority({
+        intent,
+        generationLease: {
+            id: fixture.evidence.generationId,
+            commit() { order.push('commit'); return true; },
+        },
+        registryClient: {
+            register(nonceValue, generationValue) {
+                order.push('register');
+                assert.deepEqual(registry.register(nonceValue, generationValue), {
+                    ok: true,
+                    status: 'registered',
+                });
+            },
+            consume(nonceValue) {
+                order.push('consume');
+                const consumed = registry.consume(nonceValue);
+                assert.equal(consumed.ok, true);
+                return consumed.records;
+            },
+        },
+        runProbe({ nonce, registerObservation, consumeObservation }) {
+            monotonicNow += AUTHORITY_ATTESTATION_TTL_MS * 3;
+            order.push('prepared');
+            registerObservation();
+            for (const record of fixture.evidence.records) {
+                assert.equal(registry.record(nonce, record), true);
+            }
+            monotonicNow += AUTHORITY_ATTESTATION_TTL_MS - 1;
+            order.push('observed');
+            consumeObservation();
+            monotonicNow += AUTHORITY_ATTESTATION_TTL_MS * 3;
+            order.push('cleaned');
+            return {
+                external: fixture.evidence.external,
+                helper: fixture.evidence.helper,
+                target: { image: 'sha256:target', user: 'root' },
+            };
+        },
+        now: () => fixture.evidence.observedAtUnixMs,
+    });
+
+    assert.deepEqual(order, ['prepared', 'register', 'observed', 'consume', 'cleaned', 'commit']);
+    assert.match(result.attestationId, /^sha256:[a-f0-9]{64}$/);
+});
+
+test('attestation rejects missing and repeated observation lifecycle transitions', () => {
+    const fixture = fixtureJson('public-attestation.json');
+    const intent = buildRouterAuthorityTopologyIntent({
+        networkMode: 'default',
+        runtimeProof,
+        networkFingerprint,
+        routerHostPort: 18080,
+        edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
+        platform: 'linux',
+        fsApi: presentBoxFs(),
+    });
+    const generationLease = { id: fixture.evidence.generationId, commit: () => true };
+    const registryClient = {
+        register() {},
+        consume() { return fixture.evidence.records; },
+    };
+
+    assert.throws(() => attestRouterAuthority({
+        intent,
+        generationLease,
+        registryClient,
+        runProbe: () => ({
+            external: fixture.evidence.external,
+            helper: fixture.evidence.helper,
+            target: { image: 'sha256:target', user: 'root' },
+        }),
+    }), /did not complete its exact observation lifecycle/);
+    assert.throws(() => attestRouterAuthority({
+        intent,
+        generationLease,
+        registryClient,
+        runProbe({ registerObservation }) {
+            registerObservation();
+            registerObservation();
+        },
+    }), /registration must occur exactly once/);
+});
+
+test('private registry client preserves only sanitized HTTP rejection details', () => {
+    const responses = [
+        { status: 409, body: '{"ok":false,"error":"AUTHORITY_ATTESTATION_INCOMPLETE"}' },
+        { status: 503, body: '{"error":"secret bearer value"}' },
+    ];
+    const client = createPrivateAuthorityRegistryClient({
+        socketPath: '/unused/test.sock',
+        request() { return responses.shift(); },
+    });
+    assert.throws(
+        () => client.consume('a'.repeat(64)),
+        /authority observation consumption failed \(HTTP 409 AUTHORITY_ATTESTATION_INCOMPLETE\)/,
+    );
+    assert.throws(
+        () => client.register('b'.repeat(64), fixtureJson('public-attestation.json').evidence.generationId),
+        (error) => error.message === 'authority nonce registration failed (HTTP 503)',
+    );
 });

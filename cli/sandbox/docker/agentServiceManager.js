@@ -1582,12 +1582,19 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const attested = attestRouterAuthority({
             intent,
             generationLease,
-            runProbe: ({ intent: probeIntent, nonce }) => runContainerAuthorityProbe({
+            runProbe: ({
+                intent: probeIntent,
+                nonce,
+                registerObservation,
+                consumeObservation,
+            }) => runContainerAuthorityProbe({
                 runtime,
                 plan,
                 image,
                 intent: probeIntent,
                 nonce,
+                registerObservation,
+                consumeObservation,
             }),
         });
         // The first commit is owned by attestRouterAuthority immediately after

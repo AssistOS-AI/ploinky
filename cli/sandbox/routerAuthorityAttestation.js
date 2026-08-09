@@ -339,20 +339,45 @@ req.setTimeout(3000,()=>req.destroy(new Error('request timed out')));req.on('err
 
 export function createPrivateAuthorityRegistryClient({
     socketPath = process.env.PLOINKY_ROUTER_HEALTH_SOCKET || HEALTH_SOCKET,
+    request = privateSocketRequest,
 } = {}) {
+    if (typeof request !== 'function') {
+        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'private authority registry request transport must be callable');
+    }
+    const rejectionDetail = (result) => {
+        const status = Number.isInteger(result?.status) ? String(result.status) : 'unknown';
+        let code = '';
+        try {
+            const parsed = JSON.parse(String(result?.body || ''));
+            if (typeof parsed?.error === 'string' && /^[A-Z0-9_]{1,128}$/.test(parsed.error)) {
+                code = parsed.error;
+            }
+        } catch (_) {}
+        return `HTTP ${status}${code ? ` ${code}` : ''}`;
+    };
     return Object.freeze({
         register(nonce, generationLeaseId) {
-            const result = privateSocketRequest(
+            const result = request(
                 socketPath,
                 'POST',
                 '/authority-attestations',
                 JSON.stringify({ nonce, generationLeaseId }),
             );
-            if (result.status !== 201) fail('PLOINKY_ROUTER_ATTESTATION_REGISTRY', 'authority nonce registration failed');
+            if (result.status !== 201) {
+                fail(
+                    'PLOINKY_ROUTER_ATTESTATION_REGISTRY',
+                    `authority nonce registration failed (${rejectionDetail(result)})`,
+                );
+            }
         },
         consume(nonce) {
-            const result = privateSocketRequest(socketPath, 'GET', `/authority-attestations/${nonce}`);
-            if (result.status !== 200) fail('PLOINKY_ROUTER_ATTESTATION_REGISTRY', 'authority observation consumption failed');
+            const result = request(socketPath, 'GET', `/authority-attestations/${nonce}`);
+            if (result.status !== 200) {
+                fail(
+                    'PLOINKY_ROUTER_ATTESTATION_REGISTRY',
+                    `authority observation consumption failed (${rejectionDetail(result)})`,
+                );
+            }
             let parsed;
             try { parsed = JSON.parse(result.body); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_REGISTRY', 'authority observation response was malformed', error); }
             if (parsed?.ok !== true || parsed?.nonce !== nonce || !Array.isArray(parsed.records)) {
@@ -388,8 +413,19 @@ export function managedImageUserNamespace(imageUser) {
     return `keep-id:uid=${match[1]},gid=${match[2]}`;
 }
 
-export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce } = {}) {
+export function runContainerAuthorityProbe({
+    runtime,
+    plan,
+    image,
+    intent,
+    nonce,
+    registerObservation,
+    consumeObservation,
+} = {}) {
     if (runtime !== 'podman') fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'container attestation requires verified Podman');
+    if (typeof registerObservation !== 'function' || typeof consumeObservation !== 'function') {
+        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'container attestation requires an exact observation lifecycle');
+    }
     const targetImageId = runBounded(runtime, ['image', 'inspect', '--format', '{{.Id}}', image]);
     if (!targetImageId || !/^(sha256:)?[a-f0-9]{64}$/.test(targetImageId)) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'actual agent image did not resolve to an immutable image ID');
     const targetImageUser = runBounded(runtime, ['image', 'inspect', '--format', '{{.Config.User}}', targetImageId]);
@@ -460,7 +496,12 @@ export function runContainerAuthorityProbe({ runtime, plan, image, intent, nonce
             || String(inspected.helperLabel || '') !== nonce) {
             fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper confinement inspection failed');
         }
+        // Keep slow image inspection, helper preparation, and immutable cleanup
+        // outside the short-lived Router nonce. Only the confined helper start
+        // and its two HTTP observations are inside the registered window.
+        registerObservation();
         const output = runBounded(runtime, ['start', '--attach', helperId]);
+        consumeObservation();
         let external;
         try { external = JSON.parse(output); } catch (error) { fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper probe output was malformed', error); }
         if (!Array.isArray(external) || external.length !== 2) fail('PLOINKY_ROUTER_ATTESTATION_HELPER', 'helper did not produce exactly two observations');
@@ -509,9 +550,32 @@ export function attestRouterAuthority({
         fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'attestation requires fixed intent, generation lease, registry, and exact probe runner');
     }
     const nonce = crypto.randomBytes(32).toString('hex');
-    registryClient.register(nonce, generationLease.id);
-    const probe = runProbe({ intent, nonce });
-    const records = registryClient.consume(nonce);
+    let observationState = 'prepared';
+    let records = null;
+    const registerObservation = () => {
+        if (observationState !== 'prepared') {
+            fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority observation registration must occur exactly once');
+        }
+        registryClient.register(nonce, generationLease.id);
+        observationState = 'registered';
+    };
+    const consumeObservation = () => {
+        if (observationState !== 'registered') {
+            fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority observation consumption must follow registration exactly once');
+        }
+        records = registryClient.consume(nonce);
+        observationState = 'consumed';
+        return records;
+    };
+    const probe = runProbe({
+        intent,
+        nonce,
+        registerObservation,
+        consumeObservation,
+    });
+    if (observationState !== 'consumed' || !Array.isArray(records)) {
+        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority probe did not complete its exact observation lifecycle');
+    }
     const evidence = validateRouterAuthorityObservation({
         intent,
         nonce,

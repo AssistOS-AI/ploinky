@@ -83,6 +83,13 @@ test('authority helper uses a pinned image, fixed non-root user, and mandatory i
     assert.match(source, /statusField\('NoNewPrivs'\) !== '1'/);
     assert.match(source, /helper cleanup could not prove exact immutable ID and nonce ownership/);
     assert.match(source, /\['container', 'exists', helperId\]/);
+    const confinement = source.indexOf('helper confinement inspection failed');
+    const registration = source.indexOf('registerObservation();', confinement);
+    const probe = source.indexOf("runBounded(runtime, ['start', '--attach', helperId])", registration);
+    const consumption = source.indexOf('consumeObservation();', probe);
+    const cleanup = source.indexOf('} finally {', consumption);
+    assert.ok(confinement > 0 && confinement < registration);
+    assert.ok(registration < probe && probe < consumption && consumption < cleanup);
 });
 
 test('descriptor cleanup is confined to an immutable container ID and exact recorded inode', () => {
