@@ -25,6 +25,10 @@ import { removeExactRegisteredContainer } from '../sandbox/docker/containerFleet
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
+import {
+  noWaitRunScopedLogPath,
+  noWaitRunScopedStatusPath,
+} from './noWaitPaths.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
@@ -95,6 +99,12 @@ import {
   GENERATED_ROUTER_DESCRIPTOR_CONTAINER_FILE,
   readVerifiedGeneratedRouterDescriptorFile,
 } from '../utils/security/generatedRouterDescriptor.js';
+import { sanitizeDiagnosticText } from '../utils/diagnosticText.js';
+import { waitForChildSpawn } from '../utils/childSpawn.js';
+import {
+  assertSafeRelativeSegment,
+  ensureVerifiedProducerDirectory,
+} from '../utils/verifiedReadOnlyFile.js';
 import {
   assertRouterEndpoint,
   parseRouterPort,
@@ -105,6 +115,51 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// One run-scoped log per detached worker. Two starts of the same agent must
+// never share a file: interleaved output from a superseded run is unreadable,
+// and a follower bound to the current run would show a predecessor's lines.
+// Exclusive creation makes a collision a spawn failure instead of an append.
+function createRunScopedLogStdio(logFile) {
+  ensureVerifiedProducerDirectory({
+    trustedRoot: PLOINKY_WORKSPACE_ROOT,
+    relativeSegments: ['.ploinky', 'logs', 'no-wait'],
+    mode: 0o700,
+  });
+  // A single descriptor carries both streams so interleaved worker output
+  // keeps one append offset.
+  let descriptor;
+  let opened;
+  try {
+    descriptor = fs.openSync(logFile, 'wx', 0o600);
+    opened = fs.fstatSync(descriptor);
+    if (!opened.isFile()) throw new Error('no-wait log producer did not open one regular file');
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch (_) {}
+    }
+    if (opened) {
+      try {
+        const current = fs.lstatSync(logFile);
+        if (current.dev === opened.dev && current.ino === opened.ino) fs.unlinkSync(logFile);
+      } catch (_) {}
+    }
+    throw error;
+  }
+  return {
+    stdio: ['ignore', descriptor, descriptor],
+    closeParentFds() {
+      try { fs.closeSync(descriptor); } catch (_) {}
+    },
+    discard() {
+      try { fs.closeSync(descriptor); } catch (_) {}
+      try {
+        const current = fs.lstatSync(logFile);
+        if (current.dev === opened.dev && current.ino === opened.ino) fs.unlinkSync(logFile);
+      } catch (_) {}
+    },
+  };
+}
 
 function createAppendLogStdio(logFile) {
   const opened = [];
@@ -154,7 +209,7 @@ export function buildRouterEnv({ managedBox } = {}) {
   );
 }
 
-function spawnNoWaitWorker({
+async function spawnNoWaitWorker({
   node,
   registryName,
   routeKey,
@@ -168,11 +223,11 @@ function spawnNoWaitWorker({
   waitForStatuses = [],
 }) {
   const containerName = registryName;
-  const noWaitLogDir = path.join(LOGS_DIR, 'no-wait');
   const noWaitStatusDir = path.join(RUNNING_DIR, 'no-wait');
-  fs.mkdirSync(noWaitLogDir, { recursive: true });
-  fs.mkdirSync(noWaitStatusDir, { recursive: true });
-  const logFile = path.join(noWaitLogDir, `${containerName}.log`);
+  // Derived from the same validated container name and run UUID as the
+  // run-scoped status, so a marker, a status, and a log always agree on which
+  // run they describe.
+  const logFile = noWaitRunScopedLogPath(containerName, runId);
   const canonicalStatusFile = path.join(noWaitStatusDir, `${containerName}.json`);
   const resolvedStatusFile = noWaitCoordinationStatusPath(containerName, runId);
   if (statusFile && path.resolve(statusFile) !== resolvedStatusFile) {
@@ -213,20 +268,37 @@ function spawnNoWaitWorker({
   if (forceRecreate) {
     args.push('--force-recreate', '1');
   }
-  // A successor must never mistake a terminal status from an earlier start
-  // invocation for completion of this worker.
-  for (const target of new Set([canonicalStatusFile, resolvedStatusFile])) {
-    try { fs.unlinkSync(target); } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
+  // An open or spawn failure must surface as a spawn failure so the caller
+  // publishes the bounded, redacted terminal status. Silently downgrading to
+  // ignored stdio would leave a valid-looking worker with no diagnostics.
+  const logStdio = createRunScopedLogStdio(logFile);
+  try {
+    writeNoWaitRunMarker({
+      registryName,
+      runId,
+      runStartedAtMs,
+      waveIndex,
+      statusFile: resolvedStatusFile,
+    });
+  } catch (error) {
+    // The marker was not published, so this task-owned, unexposed log can be
+    // removed. A spawn failure after publication deliberately retains it.
+    logStdio.discard();
+    throw error;
   }
-  const logStdio = createAppendLogStdio(logFile);
-  const child = spawn(process.execPath, args, {
-    detached: true,
-    stdio: logStdio.stdio,
-    env: { ...process.env }
-  });
-  logStdio.closeParentFds();
+  let child;
+  try {
+    child = spawn(process.execPath, args, {
+      detached: true,
+      stdio: logStdio.stdio,
+      env: { ...process.env }
+    });
+    await waitForChildSpawn(child, {
+      label: `no-wait worker '${containerName}'`,
+    });
+  } finally {
+    logStdio.closeParentFds();
+  }
   child.unref();
   return {
     pid: child.pid,
@@ -236,14 +308,12 @@ function spawnNoWaitWorker({
   };
 }
 
+// The run identity and its derived file names live in `noWaitPaths.js` so the
+// read-only `logs` observer can share them without importing this pipeline.
 function noWaitCoordinationStatusPath(containerName, runId, {
   runningDir = RUNNING_DIR,
 } = {}) {
-  if (!containerName || path.basename(containerName) !== containerName
-      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(runId || ''))) {
-    throw new Error('no-wait coordination status requires an exact container name and run id');
-  }
-  return path.join(runningDir, 'no-wait', `${containerName}.${runId}.json`);
+  return noWaitRunScopedStatusPath(containerName, runId, { runningDir });
 }
 
 // One run start is shared by every worker in the run. Queued workers derive
@@ -358,11 +428,32 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
 }
 
 function writeNoWaitAtomicJson(target, payload) {
-  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  const resolvedTarget = path.resolve(String(target || ''));
+  const targetDirectory = path.dirname(resolvedTarget);
+  if (path.basename(targetDirectory) !== 'no-wait') {
+    throw new Error('no-wait status publication requires a file in the workspace no-wait directory');
+  }
+  assertSafeRelativeSegment(path.basename(resolvedTarget), 'no-wait status filename');
+  let targetRunningDirectory;
+  let workspaceRunningDirectory;
+  try {
+    targetRunningDirectory = fs.realpathSync(path.dirname(targetDirectory));
+    workspaceRunningDirectory = fs.realpathSync(RUNNING_DIR);
+  } catch (_) {
+    throw new Error('no-wait status publication requires the existing workspace running directory');
+  }
+  if (targetRunningDirectory !== workspaceRunningDirectory) {
+    throw new Error('no-wait status publication requires a file in the workspace no-wait directory');
+  }
+  ensureVerifiedProducerDirectory({
+    trustedRoot: PLOINKY_WORKSPACE_ROOT,
+    relativeSegments: ['.ploinky', 'running', 'no-wait'],
+    mode: 0o700,
+  });
+  const temporary = `${resolvedTarget}.${process.pid}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), { flag: 'wx', mode: 0o600 });
-    fs.renameSync(temporary, target);
+    fs.renameSync(temporary, resolvedTarget);
   } finally {
     try { fs.unlinkSync(temporary); } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
@@ -370,8 +461,8 @@ function writeNoWaitAtomicJson(target, payload) {
   }
 }
 
-function writeNoWaitRunMarker(entry, { runningDir = RUNNING_DIR } = {}) {
-  const target = path.join(runningDir, 'no-wait', `${entry.registryName}.current.json`);
+function writeNoWaitRunMarker(entry) {
+  const target = path.join(RUNNING_DIR, 'no-wait', `${entry.registryName}.current.json`);
   writeNoWaitAtomicJson(target, {
     runId: entry.runId,
     runStartedAtMs: exactNoWaitRunStartedAtMs(entry.runStartedAtMs),
@@ -381,9 +472,7 @@ function writeNoWaitRunMarker(entry, { runningDir = RUNNING_DIR } = {}) {
   });
 }
 
-export function writeNoWaitSpawnFailure(entry, error, {
-  runningDir = RUNNING_DIR,
-} = {}) {
+export function writeNoWaitSpawnFailure(entry, error) {
   const finishedAtMs = Date.now();
   // This runs inside the spawn loop's catch. Without an exact coordination
   // path there is nothing to publish, and throwing here would replace the
@@ -411,9 +500,9 @@ export function writeNoWaitSpawnFailure(entry, error, {
     sequencePhaseStartedAtMs: finishedAtMs,
     finishedAt: new Date(finishedAtMs).toISOString(),
     finishedAtMs,
-    error: { message: error?.message || String(error) },
+    error: { message: sanitizeDiagnosticText(error) },
   };
-  const canonical = path.join(runningDir, 'no-wait', `${entry.registryName}.json`);
+  const canonical = path.join(RUNNING_DIR, 'no-wait', `${entry.registryName}.json`);
   // Match the worker's publication protocol: the canonical monitor view must
   // be durable before the run-scoped file releases a dependent wave.
   for (const target of new Set([canonical, entry.statusFile])) {
@@ -2235,6 +2324,13 @@ async function startWorkspace(staticAgentArg, portArg, {
     // Clear every public and run-scoped status before spawning any worker.
     // The UUID-scoped coordination paths prevent a late writer from an older
     // detached invocation from satisfying this run's wave barrier.
+    if (noWaitSchedule.length) {
+      ensureVerifiedProducerDirectory({
+        trustedRoot: PLOINKY_WORKSPACE_ROOT,
+        relativeSegments: ['.ploinky', 'running', 'no-wait'],
+        mode: 0o700,
+      });
+    }
     for (const entry of noWaitSchedule.flat()) {
       if (!entry.registryName || !entry.statusFile) continue;
       const canonicalStatusFile = path.join(RUNNING_DIR, 'no-wait', `${entry.registryName}.json`);
@@ -2243,7 +2339,6 @@ async function startWorkspace(staticAgentArg, portArg, {
           if (error?.code !== 'ENOENT') throw error;
         }
       }
-      writeNoWaitRunMarker(entry);
     }
     for (const wave of noWaitSchedule) {
       for (const entry of wave) {
@@ -2255,7 +2350,7 @@ async function startWorkspace(staticAgentArg, portArg, {
         const rec = reg[registryName] || {};
         const routeKey = rec.alias || node.shortAgentName;
         try {
-          const { pid, logFile, statusFile } = spawnNoWaitWorker({
+          const { pid, logFile, statusFile } = await spawnNoWaitWorker({
             node,
             registryName,
             routeKey,
@@ -2276,9 +2371,15 @@ async function startWorkspace(staticAgentArg, portArg, {
           try {
             writeNoWaitSpawnFailure(entry, spawnErr);
           } catch (publishErr) {
-            console.error(`[start] no-wait spawn failure status for '${formatGraphNodeLabel(node, staticAgent)}' could not be published: ${publishErr?.message || publishErr}`);
+            console.error(sanitizeDiagnosticText(
+              `[start] no-wait spawn failure status for '${formatGraphNodeLabel(node, staticAgent)}' could not be published: ${sanitizeDiagnosticText(publishErr)}`,
+              { singleLine: true },
+            ));
           }
-          console.error(`[start] no-wait launch for '${formatGraphNodeLabel(node, staticAgent)}' failed to spawn: ${spawnErr?.message || spawnErr}`);
+          console.error(sanitizeDiagnosticText(
+            `[start] no-wait launch for '${formatGraphNodeLabel(node, staticAgent)}' failed to spawn: ${sanitizeDiagnosticText(spawnErr)}`,
+            { singleLine: true },
+          ));
         }
       }
     }

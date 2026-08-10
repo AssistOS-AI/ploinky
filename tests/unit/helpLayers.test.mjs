@@ -37,7 +37,8 @@ test('host and core lifecycle help have different scopes', () => {
     assert.match(host, /combined, read-only outer runtime and workspace status/i);
     assert.match(host, /stop core services, then stop the outer runtime/i);
     assert.match(host, /destroy \[--delete-cache\]/i);
-    assert.match(host, /delete \.ploinky\/box cache data without prompting/i);
+    assert.match(host, /remove the outer runtime without prompting/i);
+    assert.match(host, /optionally delete \.ploinky\/box cache data/i);
     assert.doesNotMatch(host, /--delete-volumes/i);
     assert.match(core, /leave the outer runtime running/i);
     assert.match(core, /exit the REPL before running host ploinky stop or ploinky destroy/i);
@@ -58,7 +59,7 @@ test('detailed lifecycle help preserves the selected host or core scope', () => 
         /retaining the host workspace and its \.ploinky\/box dependency and image cache directories by default/i,
     );
     assert.match(hostDestroy, /destroy --delete-cache/i);
-    assert.match(hostDestroy, /without prompting/i);
+    assert.match(hostDestroy, /both forms run without prompting/i);
     assert.match(hostDestroy, /\.ploinky\/box\/dependencies and \.ploinky\/box\/images/i);
     assert.match(hostDestroy, /\.ploinky\/master-key.*are never deleted/i);
     // Nested state is disposable now; help must not promise it is retained.
@@ -81,7 +82,51 @@ test('layer-aware main help preserves unrelated command lines', () => {
         assert.match(text, /dashboard\s+Print the administrator-only Dashboard access URL/);
         assert.match(text, /client tool <name>\s+Invoke any MCP tool/);
         assert.match(text, /restart\s+Restart enabled agents \+ Router/);
-        assert.match(text, /logs last <N>\s+Show last N router log lines/);
+        assert.match(text, /logs tail \[router\|<agent>\]\s+Follow Router or one agent's logs/);
+        assert.match(text, /logs last \[<N>\] \[router\|<agent>\]\s+Show the last N lines for one log source/);
+    }
+});
+
+test('the logs help summary states the no-mutation guarantee and both subcommands', () => {
+    for (const surface of ['host', 'core']) {
+        const text = captureHelp(['logs'], { surface });
+        assert.match(text, /Inspect Router and agent logs without changing any state/);
+        assert.match(text, /tail\s+Follow Router logs, or one agent/);
+        assert.match(text, /last\s+Show the last N lines of one log source/);
+        assert.match(text, /never create, start, repair, or remove/);
+        // Stdout is reserved for log bytes.
+        assert.match(text, /messages go to stderr/);
+    }
+});
+
+test('detailed logs tail help documents the agent forms, handoff, and --startup', () => {
+    for (const surface of ['host', 'core']) {
+        const text = captureHelp(['logs', 'tail'], { surface });
+        assert.match(text, /logs tail \[router\|<agent>\] \[--startup\]/);
+        // Every documented agent reference form appears in the examples.
+        assert.match(text, /logs tail router/);
+        assert.match(text, /logs tail myAgent/);
+        assert.match(text, /logs tail myRepo\/myAgent/);
+        assert.match(text, /logs tail myAgent --startup/);
+        assert.match(text, /Unqualified `router` always selects Router logs/);
+        assert.match(text, /one round-trip-proved reference per enabled record/);
+        assert.match(text, /Linux `\/proc` argv or macOS `KERN_PROCARGS2`/);
+        assert.match(text, /rechecks marker, registry generation, and source identity/);
+        assert.match(text, /never falls back/);
+        assert.match(text, /never opens runtime output/);
+    }
+});
+
+test('detailed logs last help documents strict counts and the output ceiling', () => {
+    for (const surface of ['host', 'core']) {
+        const text = captureHelp(['logs', 'last'], { surface });
+        assert.match(text, /logs last \[<N>\] \[router\|<agent>\] \[--startup\]/);
+        assert.match(text, /logs last 200 myRepo\/myAgent/);
+        assert.match(text, /logs last 40 myAgent --startup/);
+        assert.match(text, /between 1 and 10000/);
+        assert.match(text, /fractions, signs, partial integers, and padded values are rejected/);
+        assert.match(text, /ownership-proved runtime is selected before no-wait state/);
+        assert.match(text, /16 MiB/);
     }
 });
 

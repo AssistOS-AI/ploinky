@@ -158,6 +158,31 @@ test('every host-sandbox launch boundary revalidates exact generation authority 
     }
 });
 
+test('sandbox log producers commit ownership before unref and grant no pathname log writes', () => {
+    for (const [relativePath, startName] of [
+        ['cli/sandbox/bwrap/bwrapServiceManager.js', 'startBwrapProcess'],
+        ['cli/sandbox/seatbelt/seatbeltServiceManager.js', 'startSeatbeltProcess'],
+    ]) {
+        const source = fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
+        const start = source.indexOf(`function ${startName}(`);
+        const next = source.indexOf('\nfunction ', start + 1);
+        const body = source.slice(start, next === -1 ? source.length : next);
+        const spawnIndex = relativePath.includes('bwrap')
+            ? body.indexOf('child = spawn(BWRAP_PATH')
+            : body.indexOf("child = spawn('sandbox-exec'");
+        const guardIndex = body.indexOf('guardSpawnedChild(child');
+        assert.ok(spawnIndex >= 0 && spawnIndex < guardIndex, `${relativePath} must guard its spawned child`);
+        assert.ok(guardIndex < body.indexOf('logHandle.finalize(child.pid'), `${relativePath} must guard before pid use`);
+        assert.ok(body.indexOf('saveBwrapPid(') < body.indexOf('child.unref()'), relativePath);
+        assert.doesNotMatch(body, /readFileSync\(logFile/);
+        if (relativePath.includes('seatbelt')) {
+            assert.doesNotMatch(source, /extraWritePaths:\s*\[\s*LOGS_DIR/);
+            const immediate = body.slice(body.indexOf('if (!processAlive)'), body.indexOf('saveBwrapPid('));
+            assert.doesNotMatch(immediate, /clearBwrapPid/);
+        }
+    }
+});
+
 test('host-sandbox service and interactive boundaries deny an inactive generation before hooks or spawn', () => {
     for (const runtime of ['bwrap', 'seatbelt']) {
         const root = fs.mkdtempSync(path.join(os.tmpdir(), `ploinky-${runtime}-authority-`));

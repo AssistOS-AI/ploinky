@@ -13,18 +13,15 @@ import {
     logicalNetworkAttachments,
     networkContractHash,
 } from './networkContract.js';
+import {
+    NETWORK_LABELS,
+    physicalNetworkName,
+    workspaceNetworkIdentity,
+} from './networkIdentity.js';
+
+export { NETWORK_LABELS, physicalNetworkName, workspaceNetworkIdentity } from './networkIdentity.js';
 
 export const NETWORK_STATUS_SCHEMA_VERSION = '3';
-export const NETWORK_LABELS = Object.freeze({
-    managed: 'io.assistos.ploinky.managed',
-    resource: 'io.assistos.ploinky.resource',
-    schema: 'io.assistos.ploinky.network-schema',
-    workspace: 'io.assistos.ploinky.workspace',
-    logical: 'io.assistos.ploinky.logical',
-    contract: 'io.assistos.ploinky.network-contract',
-    instanceId: 'io.assistos.ploinky.instance-id',
-    enableGeneration: 'io.assistos.ploinky.enable-generation',
-});
 
 const MANAGED_HOST_NAME = 'host.containers.internal';
 const MANAGED_HOST_MAPPING = `${MANAGED_HOST_NAME}:host-gateway`;
@@ -71,20 +68,6 @@ function cleanupCapturedGeneratedRouterDescriptor(artifact) {
         throw new Error('generated Router descriptor identity changed before cleanup');
     }
     fs.unlinkSync(artifact.source);
-}
-
-function hash12(value) {
-    return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
-}
-
-export function workspaceNetworkIdentity(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
-    let canonical = path.resolve(workspaceRoot);
-    try { canonical = fs.realpathSync.native(canonical); } catch (_) {}
-    return { canonical, hash: hash12(canonical) };
-}
-
-export function physicalNetworkName(workspaceHash, logicalName) {
-    return `ploinky-nw-${workspaceHash}-${hash12(logicalName)}`;
 }
 
 function expectedNetworkLabels(workspaceHash, logicalName) {

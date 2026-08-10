@@ -77,7 +77,7 @@ preserve those operations reliably across the outer and nested containers.
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
 | `ploinky update` / `ploinky update all [PATH]` | Pull the cloned host Ploinky checkout from its configured upstream, refresh in-Box repositories/dependencies/skills, then restart an already configured running workspace |
-| `ploinky destroy` | Stop nested agents, then remove the outer container; retain the host workspace and `.ploinky/box` |
+| `ploinky destroy` | Without prompting, stop nested agents and remove the outer container; retain the host workspace and `.ploinky/box` |
 | `ploinky destroy --delete-cache` | Remove the outer container without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
 
@@ -244,6 +244,10 @@ node cli/index.js <args>
 - `client tool <toolName> [--agent <agent>] [--parameters <params>] [-key value...]`: call an MCP tool exposed by an enabled agent.
 - `client list tools|resources`: list MCP tools or resources exposed by enabled agents.
 - `client status <agent>`: check agent health status.
+- `logs tail [router|<agent>] [--startup]`: follow Router logs, or one agent from its current no-wait startup log through the automatic handoff to its verified application output. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation; the handoff then rechecks the run marker, registry generation, and already-opened runtime source before emitting runtime bytes. `--startup` follows only the startup log.
+- `logs last [<N>] [router|<agent>] [--startup]`: show the last `N` lines (default 200, maximum 10000) of one log source. An ownership-proved runtime wins before no-wait state is consulted. Reading logs never creates, starts, or repairs a workspace, a Box, or an agent runtime.
+
+Log completion offers one reference per enabled record and every offered reference round-trips to that record. Unqualified `router` is reserved; an enabled agent named `router` is offered only through an unambiguous qualified spelling. Docker/Podman readers use immutable container IDs, while Bubblewrap/Seatbelt readers pin process-specific files; pre-cut sandbox processes require one restart and never fall back to legacy names. Application bytes are intentionally passed through unredacted, but control diagnostics are bounded and redact credentials. Cancellation waits for bounded TERM/KILL child cleanup before returning.
 - `stop`: stop containers recorded in `.ploinky/agents.json` (do not remove).
 - `shutdown`: stop and remove containers recorded in `.ploinky/agents.json`.
 - `destroy`: stop the router, remove workspace containers, and clear `.ploinky/deps` while preserving isolated agent data in `.data/<agent-or-alias>`.

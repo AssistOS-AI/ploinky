@@ -281,7 +281,7 @@ test('stop relays to ploinky-local before stopping the outer Box without depende
     assert.ok(localStop >= 0 && localStop < outerStop);
 });
 
-test('destroy revalidates the confirmed immutable ID and retains cache data by default', async (t) => {
+test('destroy revalidates the inspected immutable ID and retains cache data by default', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
@@ -294,7 +294,7 @@ test('destroy revalidates the confirmed immutable ID and retains cache data by d
         discover: () => ownership,
         runner: { run(command, args) { events.push(args.join(' ')); } },
     });
-    await assert.rejects(() => supervisor.runDestroyTransaction('b'.repeat(64)), /changed after destroy confirmation/);
+    await assert.rejects(() => supervisor.runDestroyTransaction('b'.repeat(64)), /changed before destroy/);
     assert.equal(events.some((value) => value.includes('container rm')), false);
 
     const result = await supervisor.runDestroyTransaction(ownership.handles.container.id);

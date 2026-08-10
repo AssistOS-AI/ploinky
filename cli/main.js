@@ -13,6 +13,10 @@ import { getCommandRegistry } from './commands/commandRegistry.js';
 import { debugLog } from './utils/utils.js';
 import * as inputState from './commands/inputState.js';
 import { runReplCommand } from './sandbox/replCommandRunner.js';
+import { getForegroundCommandCoordinator } from './commands/foregroundCommand.js';
+import { createReplLifecycleController } from './commands/replLifecycle.js';
+import { enabledAgentLogSuggestionsFromMap } from './utils/agentRegistryResolver.js';
+import { readAgentRegistrySnapshot } from './utils/agentRegistrySnapshot.js';
 import { bootstrap } from './commands/ploinkyboot.js';
 import { enableMultilineNavigation } from './commands/multilineNavigation.js';
 import { getPredefinedRepos, parseStartArgs } from './utils/repos.js';
@@ -47,7 +51,22 @@ function getPredefinedRepoNames() {
     return Object.keys(getPredefinedRepos() || {}).sort();
 }
 
-function completer(line) {
+// Literal `router` plus every enabled-agent reference that resolves to exactly
+// one record. An alias or manifest name spelled `router` is deliberately absent
+// because the log grammar reserves that spelling for Router logs; such an agent
+// is still completable through its qualified `repo/agent` form.
+export function enabledAgentLogTargets() {
+    let suggestions = [];
+    try {
+        suggestions = enabledAgentLogSuggestionsFromMap(readAgentRegistrySnapshot());
+    } catch (_) {
+        // Completion must never fail a keystroke over unreadable state.
+        suggestions = [];
+    }
+    return ['router', ...suggestions];
+}
+
+export function completer(line) {
     const words = line.split(/\s+/).filter(Boolean);
     const lineFragment = line.endsWith(' ') ? '' : (words[words.length - 1] || '');
 
@@ -97,6 +116,10 @@ function completer(line) {
                 context = 'subcommands';
             } else if (words.length === 2) {
                 context = 'args';
+            } else if (command === 'logs') {
+                // `logs last <N> <target>` puts the target in the fourth token,
+                // past the generic two-token cutoff above.
+                context = 'args';
             } else {
                 // Only show files for commands that actually need them
                 // Most internal commands don't need file completion
@@ -133,6 +156,9 @@ function completer(line) {
                 if (['methods', 'status', 'task', 'task-status'].includes(clientSubcommand)) {
                     context = 'args'; // Will show agent names
                 }
+            } else if (command === 'logs' && words.length >= 3) {
+                // Complete a partially typed log target, not only a fresh one.
+                context = 'args';
             } else {
                 // Only show files for commands that actually need them
                 const fileCommands = ['cd', 'cat', 'ls', 'rm', 'cp', 'mv', 'mkdir', 'touch'];
@@ -183,11 +209,16 @@ function completer(line) {
                 } else {
                     completions = repos;
                 }
-            } else if (command === 'logs' && subcommand === 'tail') {
-                completions = ['router'];
-            } else if (command === 'logs' && subcommand === 'last') {
-                // may accept count then optional type; if third token, suggest type
-                if (words.length >= 4) completions = ['router'];
+            } else if (command === 'logs' && (subcommand === 'tail' || subcommand === 'last')) {
+                // Both subcommands take exactly one target, but `last` may
+                // carry a count before it. Offer targets only while the target
+                // position is still open, so a completed command stays quiet.
+                const positionals = words.slice(2).filter((token) => !token.startsWith('-'));
+                const countGiven = subcommand === 'last'
+                    && /^[1-9][0-9]*$/.test(positionals[0] || '');
+                const targetIndex = countGiven ? 1 : 0;
+                const typedTargets = line.endsWith(' ') ? positionals.length : positionals.length - 1;
+                if (typedTargets <= targetIndex) completions = enabledAgentLogTargets();
             } else if (command === 'expose') {
                 // expose <EXPOSED> <$VAR|value> <agent>
                 if (words.length >= 4) completions = getAgentNames();
@@ -315,6 +346,7 @@ function getColoredPrompt() {
 }
 
 function startInteractiveMode() {
+    const foreground = getForegroundCommandCoordinator();
     // Ensure clean TTY state when entering interactive mode
     if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
         try { process.stdin.setRawMode(false); } catch (_) {}
@@ -353,19 +385,22 @@ function startInteractiveMode() {
     inputState.registerInterface?.(rl);
     enableMultilineNavigation(rl);
 
-    const cleanupAndExit = () => {
-        try { cleanupCliSessions(); } catch (_) {}
-        try { inputState.registerInterface?.(null); } catch (_) {}
-        restoreTTY();
-        try { rl.close(); } catch(_) {}
-        process.exit(0);
-    };
+    const replLifecycle = createReplLifecycleController({
+        foreground,
+        cleanupSessions: cleanupCliSessions,
+        deregisterInput: () => inputState.registerInterface?.(null),
+        restoreTTY,
+        closeReadline: () => rl.close(),
+        exitProcess: (code) => process.exit(code),
+    });
+    const shutdownRepl = (exitCode = 0) => replLifecycle.shutdown(exitCode);
+    const onForegroundSignal = (signal) => replLifecycle.handleSignal(signal);
 
     // Handle signals to restore TTY
     try {
-        process.on('SIGINT', () => cleanupAndExit());
-        process.on('SIGTERM', () => cleanupAndExit());
-        process.on('uncaughtException', (err) => { try { console.error(err); } catch(_) {}; cleanupAndExit(); });
+        process.on('SIGINT', () => { void onForegroundSignal('SIGINT'); });
+        process.on('SIGTERM', () => { void onForegroundSignal('SIGTERM'); });
+        process.on('uncaughtException', (err) => { try { console.error(err); } catch(_) {}; void shutdownRepl(1); });
         process.on('exit', () => { try { restoreTTY(); } catch(_) {} });
     } catch(_) {}
 
@@ -376,7 +411,7 @@ function startInteractiveMode() {
         }
         const trimmedLine = line.trim();
             if (trimmedLine) {
-            if (trimmedLine === 'exit' || trimmedLine === 'quit') { return cleanupAndExit(); }
+            if (trimmedLine === 'exit' || trimmedLine === 'quit') { return shutdownRepl(); }
             // Append to history file immediately
             try {
                 fs.appendFileSync(historyPath, trimmedLine + '\n');
@@ -386,22 +421,27 @@ function startInteractiveMode() {
             await runReplCommand({
                 args: trimmedLine.split(/\s+/),
                 rl,
+                coordinator: foreground,
                 handleCommandImpl: handleCommand,
                 getPromptImpl: getColoredPrompt,
                 onError: (error) => {
                     console.error(`Error: ${error.message}`);
                     debugLog(`Command error details: ${error.stack}`);
                 },
+                shouldPrompt: () => !replLifecycle.isShuttingDown(),
             });
         } else if (process.stdin.isTTY) {
             rl.prompt();
         }
-    }).on('close', async () => { restoreTTY(); try { cleanupCliSessions(); } catch (_) {} try { inputState.registerInterface?.(null); } catch (_) {} if (process.stdin.isTTY) { console.log('Bye.'); } process.exit(0); });
+    }).on('close', () => {
+        if (process.stdin.isTTY) { console.log('Bye.'); }
+        void shutdownRepl(replLifecycle.selectedExitCode());
+    });
 
     // Ensure Ctrl-D (EOF) closes the CLI gracefully
     try {
-        rl.input.on('end', () => { try { restoreTTY(); rl.close(); } catch(_) {} });
-        process.stdin.on('end', () => { try { restoreTTY(); rl.close(); } catch(_) {} });
+        rl.input.on('end', () => { try { rl.close(); } catch(_) {} });
+        process.stdin.on('end', () => { try { rl.close(); } catch(_) {} });
     } catch(_) {}
 
     // If input is not a TTY, we are in script mode. Don't show initial prompt.

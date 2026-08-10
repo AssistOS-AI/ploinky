@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createInterface } from 'node:readline/promises';
 
 import { parseOuterArguments } from '../command/parse.mjs';
 import { routeOuterCommand } from '../command/route.mjs';
-import { buildContainerExecArgs, executeProcess } from '../command/execute.mjs';
+import { buildContainerExecArgs, executeProcess, executeProcessStreaming } from '../command/execute.mjs';
 import { updateHostPloinkySource } from '../command/hostUpdate.mjs';
 import { BOX_IMAGE_OVERRIDE_ENV, BOX_IMAGE_REFERENCE, BOX_LABELS } from '../constants.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
@@ -26,28 +25,23 @@ Commands:
   ploinky stop                    Stop core services and the outer Box
   ploinky update [all [PATH]]     Update host core, in-Box repos/deps/skills,
                                   then restart a configured running workspace
-  ploinky destroy                 Remove the outer Box after confirmation; retain .ploinky/box
+  ploinky destroy                 Remove the outer Box without prompting; retain .ploinky/box
   ploinky destroy --delete-cache  Remove the outer Box and delete .ploinky/box/dependencies
                                   and .ploinky/box/images without prompting
   ploinky cli                     Open Bash in the Box
   ploinky cli AGENT [ARGS]        Run an agent CLI through ploinky-local
+  ploinky logs tail [TARGET]      Follow Router or agent logs; inspect-only
+  ploinky logs last [N] [TARGET]  Show the last N lines; inspect-only
   ploinky help                    Show this help without engine discovery
+
+Logs are observational: they require an already running, initialized, owned Box
+and never create, prepare, or repair one.
 
 The default Box image is ${BOX_IMAGE_REFERENCE}.
 Set ${BOX_IMAGE_OVERRIDE_ENV} to pull a different Box image reference.
 Public CLI image options, engine, instance-name, and master-key overrides are unsupported.
 If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/security authority.
 `;
-}
-
-async function defaultConfirmDestroy(instance, { input, output }) {
-    const terminal = createInterface({ input, output });
-    try {
-        const answer = await terminal.question(`Destroy outer Box ${instance} and retain its .ploinky/box cache data? [y/N] `);
-        return /^y(?:es)?$/i.test(answer.trim());
-    } finally {
-        terminal.close();
-    }
 }
 
 function outerDebug(parsed, route, stdout) {
@@ -63,6 +57,7 @@ function executePrepared(prepared, coreArgv, {
     output,
     shell = false,
     interactive = false,
+    logStream = false,
     colorOutput = false,
     engineEnv,
 }) {
@@ -74,6 +69,7 @@ function executePrepared(prepared, coreArgv, {
             mediaHostPort: prepared.mediaHostPort,
             shell,
             interactive,
+            logStream,
             colorOutput,
             inputIsTty: input.isTTY === true,
             outputIsTty: output.isTTY === true,
@@ -88,7 +84,7 @@ export async function runOuterCli(argv, {
     errorOutput = process.stderr,
     supervisor,
     execute = executeProcess,
-    confirmDestroy = defaultConfirmDestroy,
+    executeStreaming = executeProcessStreaming,
     detectInsideBox = isInsideBox,
     repositoryRoot = path.resolve(import.meta.dirname, '../..'),
     updateHostSource = updateHostPloinkySource,
@@ -143,13 +139,6 @@ export async function runOuterCli(argv, {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }
-        if (!route.deleteCache) {
-            const confirmed = await confirmDestroy(status.identity.instance, { input, output });
-            if (!confirmed) {
-                output.write('Destroy cancelled; no resources changed.\n');
-                return 0;
-            }
-        }
         const destroyed = await selectedSupervisor.runDestroyTransaction(container?.id || null, {
             deleteCache: route.deleteCache,
         });
@@ -176,6 +165,35 @@ export async function runOuterCli(argv, {
             explicitMediaPort: route.mediaHostPort,
         });
         return 0;
+    }
+
+    // Logs are inspect-only at this boundary. The route reads Box status once
+    // and forwards only into an already owned, running, initialized Box; it
+    // never prepares, reconciles, installs dependencies, or takes a mutation
+    // lock, so asking for logs can never create or repair a Box.
+    if (route.kind === 'logs') {
+        const status = selectedSupervisor.inspectBoxStatus();
+        const container = status.ownership?.handles?.container;
+        const engine = status.ownership?.engine;
+        if (status.state !== 'running-initialized' || !container?.id || !engine?.name) {
+            errorOutput.write(
+                `ploinky logs: the outer Box is not running and initialized (state: ${status.state}).\n`
+                + 'Logs never create or repair a Box; start the workspace first with `ploinky start AGENT`.\n',
+            );
+            return 1;
+        }
+        return executePrepared({
+            containerId: container.id,
+            engine,
+            hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
+            mediaHostPort: Number(container.labels?.[BOX_LABELS.mediaHostPort]),
+        }, route.coreArgv, {
+            execute: executeStreaming,
+            input,
+            output,
+            logStream: true,
+            engineEnv,
+        });
     }
 
     if (route.kind === 'update') {

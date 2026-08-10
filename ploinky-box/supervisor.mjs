@@ -198,7 +198,7 @@ export function createBoxSupervisor({
                 return Object.freeze({ identity, action: 'absent' });
             }
             if (container && (!expectedContainerId || container.id !== expectedContainerId)) {
-                throw supervisorError('Box changed after destroy confirmation; nothing was removed');
+                throw supervisorError('Box changed before destroy; nothing was removed');
             }
             if (container) {
                 // Quiesce nested agents before the outer Box disappears. If the

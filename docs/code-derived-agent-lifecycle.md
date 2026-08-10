@@ -194,8 +194,11 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `client status|list|tool` | Talks to the local router MCP endpoint. `call`, `methods`, `task`, and `task-status` are old forms that print migration guidance. |
 | `/settings` / `settings` | Opens the settings menu and refreshes the LLM suggestion cache when env changes. |
 | `set` | Legacy spelling; prints that the command was renamed to `/settings`. |
-| `logs tail [router]` | Tails router log output. Router is the only supported target. |
-| `logs last <N> [router]` | Prints the last N router log lines. |
+| `logs tail [router\|<agent>] [--startup]` | Follows Router output, or one exact enabled agent. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation. While that worker starts, `tail` follows `.ploinky/logs/no-wait/<container>.<runId>.log`, then opens/proves the runtime source and rechecks the marker, registry generation, and source identity before the one handoff. A followed failure returns 1 without falling back. `--startup` follows only startup output. |
+| `logs last [<N>] [router\|<agent>] [--startup]` | Prints the last N lines (default 200, maximum 10000) of one source. A proved runtime is selected before no-wait state is consulted. Output is capped at 16 MiB. |
+| `logs` target resolution | Unqualified `router` is reserved for Router logs. Other targets resolve against a read-only `agents.json` snapshot by exact registry key, unique alias, `repo/agent`, then unique bare agent name. Completion offers one round-trip-proved reference per enabled record; an agent named `router` is usable only through a non-reserved unambiguous qualified spelling. |
+| `logs` mutation boundary | Observational only. Bypasses dependency assertion, `initEnvironment()`, and repository bootstrap; requires an already running, initialized, owned Box at the host boundary; never creates, adopts, repairs, starts, stops, or removes a runtime, and never writes registry, no-wait, or routing state. |
+| `logs` data and cleanup boundary | Docker/Podman sources use immutable container IDs. Bubblewrap/Seatbelt sources are immutable process-specific files; a pre-cut process requires one restart and no legacy name is probed. Application bytes pass through intentionally unredacted, while control diagnostics are bounded and redact credentials. Cancellation waits for bounded TERM/KILL cleanup. |
 | `var`, `vars`, `echo` | Manage/read encrypted `.ploinky/.secrets` values and resolved env aliases. |
 | `expose <name> [value] [agent]` | Edits the source manifest by adding/updating `manifest.expose`. |
 | `profile [name|list|show|validate]` | Reads or changes `.ploinky/profile` and validates profile definitions. |
@@ -805,7 +808,9 @@ Startup config providers can write values into encrypted `.ploinky/.secrets` bef
 | Seatbelt startup | repo `Agent/` | `.ploinky/seatbelt-runtime/<agent>/Agent-...` | Seatbelt |
 | Seatbelt startup | Source MCP config | resolved work directory `mcp-config.seatbelt.json` | Seatbelt |
 | Router start | Runtime route data | `.ploinky/routing.json` | Router |
-| No-wait start | Worker state | `.ploinky/running/no-wait/<container>.json` | No-wait dependencies |
+| No-wait start | Worker state | `.ploinky/running/no-wait/<container>.json`, `.ploinky/running/no-wait/<container>.<runId>.json`, `.ploinky/running/no-wait/<container>.current.json` | No-wait dependencies |
+| No-wait start | Worker orchestration output | `.ploinky/logs/no-wait/<container>.<runId>.log`, created exclusively at mode 0600 | No-wait dependencies |
+| Bubblewrap/Seatbelt startup | Sandbox application output | `.ploinky/logs/agents/<container>.<identityDigest>.log`, mode 0600, where `identityDigest = sha256(instanceId NUL enableGeneration NUL decimalPid)` | Bubblewrap and Seatbelt |
 | Watchdog start | Router PID/logs | `.ploinky/running/router.pid`, `.ploinky/logs/router.log`, `.ploinky/logs/watchdog.log` | Router |
 
 ## Startup Readiness vs Health Probes

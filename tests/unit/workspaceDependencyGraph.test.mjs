@@ -183,8 +183,8 @@ test('no-wait scheduling rejects non-exact coordination identities', () => {
 });
 
 test('a no-wait spawn failure is a valid terminal member of a wave barrier', async (t) => {
-    const runningDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-spawn-failure-'));
-    t.after(() => fs.rmSync(runningDir, { recursive: true, force: true }));
+    const runningDir = path.join(tempDir, '.ploinky', 'running');
+    fs.mkdirSync(runningDir, { recursive: true, mode: 0o700 });
     const runId = SCHEDULE_RUN_ID;
     const runStartedAtMs = Date.now();
     const [[scheduled]] = buildNoWaitLaunchSchedule([[{
@@ -197,7 +197,10 @@ test('a no-wait spawn failure is a valid terminal member of a wave barrier', asy
         },
     }]], { runId, runStartedAtMs, runningDir });
 
-    writeNoWaitSpawnFailure(scheduled, new Error('spawn refused'), { runningDir });
+    writeNoWaitSpawnFailure(
+        scheduled,
+        new Error('spawn refused Authorization: Bearer spawn-secret\ntoken=other-secret'),
+    );
 
     // A dependent must reach a deterministic decision from the spawn failure
     // alone, through the real poller against the real published files.
@@ -228,6 +231,10 @@ test('a no-wait spawn failure is a valid terminal member of a wave barrier', asy
     ));
     assert.equal(canonical.runStartedAtMs, runStartedAtMs);
     assert.equal(canonical.waveIndex, 0);
+    assert.match(canonical.error.message, /spawn refused/);
+    assert.equal(canonical.error.message.includes('spawn-secret'), false);
+    assert.equal(canonical.error.message.includes('other-secret'), false);
+    assert.ok(canonical.error.message.length <= 4_000);
     assert.equal(canonical.sequencePhase, 'active');
 });
 
@@ -273,7 +280,7 @@ test('resolveEnabledAgentRegistryRecord matches core direct, alias, canonical, a
     assert.throws(
         () => resolveEnabledAgentRegistryRecord('demo/shared', registry),
         (error) => error.code === 'AGENT_ALIAS_AMBIGUOUS'
-            && /Use alias: blue, green/.test(error.message),
+            && /Use one of: blue, green/.test(error.message),
     );
 });
 
@@ -459,6 +466,10 @@ test('prepared runtime records and routes commit together before activation, inc
         new URL('../../cli/commands/noWaitWorker.js', import.meta.url),
         'utf8',
     );
+    const noWaitArgsSource = fs.readFileSync(
+        new URL('../../cli/commands/noWaitWorkerArgs.js', import.meta.url),
+        'utf8',
+    );
     const routingFileSource = fs.readFileSync(
         new URL('../../cli/server/routingFile.js', import.meta.url),
         'utf8',
@@ -524,6 +535,7 @@ test('prepared runtime records and routes commit together before activation, inc
     ]) {
         for (const [label, text] of [
             ['noWaitWorker.js', noWaitSource],
+            ['noWaitWorkerArgs.js', noWaitArgsSource],
             ['workspaceUtil.js', workspaceUtilSource],
         ]) {
             assert.doesNotMatch(
@@ -539,8 +551,8 @@ test('prepared runtime records and routes commit together before activation, inc
         'the plural run-scoped spawn flag must remain',
     );
     assert.match(
-        noWaitSource,
-        /\['waitForStatuses', 'wait-for-statuses'\]/,
+        noWaitArgsSource,
+        /'wait-for-statuses'/,
         'the worker must keep the plural flag in its mandatory argument contract',
     );
     assert.doesNotMatch(source, /Waiting for .*background route activation/);

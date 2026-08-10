@@ -11,8 +11,15 @@ test('first debug token is removed only from classification and preserved for co
     assert.equal(routeOuterCommand(stop).kind, 'stop');
 
     const ordinary = parseOuterArguments(['logs', '--debug', 'tail']);
-    assert.equal(routeOuterCommand(ordinary).kind, 'generic');
+    const ordinaryRoute = routeOuterCommand(ordinary);
+    assert.equal(ordinaryRoute.kind, 'logs');
     assert.deepEqual(ordinary.forwardingArgv, ['logs', '--debug', 'tail']);
+    // The inspect-only logs route forwards the original Core argv unchanged.
+    assert.deepEqual(ordinaryRoute.coreArgv, ['logs', '--debug', 'tail']);
+
+    const generic = parseOuterArguments(['list', '--debug', 'agents']);
+    assert.equal(routeOuterCommand(generic).kind, 'generic');
+    assert.deepEqual(generic.forwardingArgv, ['list', '--debug', 'agents']);
 
     const duplicate = parseOuterArguments(['--debug', 'logs', '-d', 'tail']);
     assert.deepEqual(duplicate.classificationArgv, ['logs', '-d', 'tail']);
@@ -95,7 +102,11 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
         [['cli'], 'bash'],
         [['bash'], 'bash'],
         [['cli', 'Agent'], 'agent-cli'],
-        [['logs'], 'generic'],
+        [['list', 'agents'], 'generic'],
+        // Logs get their own inspect-only route so they never take the
+        // generic path, which prepares (and can create or repair) the Box.
+        [['logs'], 'logs'],
+        [['logs', 'tail', 'someAgent'], 'logs'],
     ];
     for (const [argv, kind] of cases) {
         assert.equal(routeOuterCommand(parseOuterArguments(argv)).kind, kind);

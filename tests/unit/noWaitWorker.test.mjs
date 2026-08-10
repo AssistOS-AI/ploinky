@@ -35,6 +35,7 @@ import {
     writeNoWaitWorkerStatus,
     writeStatus,
 } from '../../cli/commands/noWaitWorker.js';
+import { parseNoWaitWorkerArgs } from '../../cli/commands/noWaitWorkerArgs.js';
 import {
     imageBuildTimeoutMs,
     imagePullTimeoutMs,
@@ -45,6 +46,7 @@ function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-no-wait-worker-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const runningDir = path.join(root, 'running');
+    fs.mkdirSync(runningDir, { mode: 0o700 });
     return { root, runningDir };
 }
 
@@ -63,6 +65,24 @@ test('no-wait status replacement is atomic and leaves no temporary file', (t) =>
         assert.deepEqual(fs.readdirSync(statusDir), [`${containerName}.json`]);
     }
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+});
+
+test('no-wait status publication rejects unsafe or foreign producer directories', (t) => {
+    const { root, runningDir } = fixture(t);
+    fs.chmodSync(runningDir, 0o777);
+    assert.throws(
+        () => writeStatus('ploinky_demo_worker', { state: 'starting' }, { runningDir }),
+        /group- or other-writable/,
+    );
+    fs.chmodSync(runningDir, 0o700);
+
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(outside, { mode: 0o700 });
+    fs.symlinkSync(outside, path.join(runningDir, 'no-wait'));
+    assert.throws(
+        () => writeStatus('ploinky_demo_worker', { state: 'starting' }, { runningDir }),
+        /not one regular directory/,
+    );
 });
 
 const RUN_ID = '11111111-1111-4111-8111-111111111111';
@@ -568,6 +588,28 @@ test('invalid run and phase timestamps fail closed', async (t) => {
         runId: RUN_ID, runStartedAtMs, waveIndex: 0, state: 'starting', sequencePhase: 'active',
         sequencePhaseStartedAtMs: -1,
     }), /invalid start timestamp/);
+    for (const coercible of [null, '', false, [], String(runStartedAtMs), runStartedAtMs + 0.5]) {
+        assert.throws(() => observe({
+            runId: RUN_ID,
+            runStartedAtMs,
+            waveIndex: 0,
+            state: 'starting',
+            sequencePhase: 'active',
+            sequencePhaseStartedAtMs: coercible,
+            sequencePhaseStartedAt: new Date(runStartedAtMs).toISOString(),
+        }), /invalid start timestamp/, `a numeric timestamp of ${JSON.stringify(coercible)} must fail closed`);
+    }
+    assert.deepEqual(observe({
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 0,
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAt: new Date(runStartedAtMs).toISOString(),
+    }), {
+        deadline: runStartedAtMs + timeouts.activeTimeoutMs + timeouts.terminalPublicationGraceMs,
+        workerPid: null,
+    });
     assert.throws(
         () => observe({ runId: RUN_ID, waveIndex: 0, state: 'running', sequencePhase: 'active' }),
         /different run start/,
@@ -583,6 +625,14 @@ test('invalid run and phase timestamps fail closed', async (t) => {
         () => noWaitQueuedStatusDeadline(Number.MAX_SAFE_INTEGER, 3, timeouts),
         /overflowed its cumulative wave budget/,
     );
+    assert.throws(() => observe({
+        runId: RUN_ID,
+        runStartedAtMs,
+        waveIndex: 0,
+        state: 'starting',
+        sequencePhase: 'active',
+        sequencePhaseStartedAtMs: Number.MAX_SAFE_INTEGER,
+    }, { nowMs: Number.MAX_SAFE_INTEGER }), /deadline overflowed/);
 });
 
 test('the run-scoped argument contract rejects every missing mandatory flag', (t) => {
@@ -633,6 +683,42 @@ test('the run-scoped argument contract rejects every missing mandatory flag', (t
         /references wave 0 from wave 0/,
         'wave zero must never carry a barrier reference',
     );
+});
+
+test('the worker parser accepts only recognized unique name-value pairs', (t) => {
+    const { runningDir } = fixture(t);
+    const containerName = 'contract-container';
+    const argv = [
+        '--container', containerName,
+        '--short-agent', 'worker',
+        '--repo', 'demo',
+        '--manifest-path', '/workspace/demo/worker/manifest.json',
+        '--agent-path', '/workspace/demo/worker',
+        '--route-key', 'worker',
+        '--run-id', RUN_ID,
+        '--run-started-at-ms', '1700000000000',
+        '--wave-index', '0',
+        '--status-file', coordinationPath(runningDir, containerName),
+        '--wait-for-statuses', '[]',
+        '--alias', 'blue',
+        '--profile', 'default',
+        '--router-port', '8080',
+        '--force-recreate', '1',
+    ];
+    const parsed = parseNoWaitWorkerArgs(argv, { runningDir });
+    assert.equal(parsed.container, containerName);
+    assert.equal(parsed.runScoped.runId, RUN_ID);
+    assert.equal(parsed.routerPort, '8080');
+
+    for (const broken of [
+        [...argv, '--container', containerName],
+        ['--container', containerName, ...argv],
+        [...argv, '--unknown', 'value'],
+        [...argv, 'positional'],
+        [...argv, '--alias'],
+    ]) {
+        assert.throws(() => parseNoWaitWorkerArgs(broken, { runningDir }));
+    }
 });
 
 test('a barrier reference must name an earlier wave inside this run', (t) => {
@@ -2152,6 +2238,7 @@ test('a pre-start failure still publishes a terminal member of the wave barrier'
         '--repo', 'demo',
         '--manifest-path', manifestPath,
         '--agent-path', workspaceRoot,
+        '--route-key', 'preStart',
         '--run-id', RUN_ID,
         '--run-started-at-ms', String(runStartedAtMs),
         '--wave-index', '1',
@@ -2393,7 +2480,7 @@ test('a readiness failure preserves the probe output and a bounded runtime log t
         spawnSyncImpl: () => ({ stdout: 'x'.repeat(50_000), stderr: '' }),
     });
     assert.ok(huge.length < 5_000, 'the captured tail must stay bounded');
-    assert.match(huge, /truncated to the last/);
+    assert.match(huge, /…$/);
 });
 
 test('the worker publishes readiness detail into its terminal status', () => {

@@ -110,7 +110,10 @@ test('every public verb has the required single-lock depth and release boundary'
         { name: 'repl', argv: [], locks: 1, forwarded: true },
         { name: 'bash', argv: ['cli'], locks: 1, forwarded: true },
         { name: 'agent-cli', argv: ['cli', 'Agent'], locks: 1, forwarded: true },
-        { name: 'generic', argv: ['logs', '--tail'], locks: 1, forwarded: true },
+        { name: 'generic', argv: ['list', 'agents'], locks: 1, forwarded: true },
+        // Logs are observational: they inspect Box status and forward without
+        // ever taking the workspace mutation lock.
+        { name: 'logs', argv: ['logs', 'last', '5'], locks: 0, forwarded: true },
     ];
     for (const scenario of cases) {
         const events = [];
@@ -123,7 +126,7 @@ test('every public verb has the required single-lock depth and release boundary'
             errorOutput: bufferStream(),
             supervisor,
             execute,
-            confirmDestroy: async () => true,
+            executeStreaming: execute,
             updateHostSource: async () => ({ updated: false }),
         });
         assert.equal(code, 0, scenario.name);
@@ -211,7 +214,7 @@ test('foreign ownership blocks every lifecycle path with zero engine mutation', 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-foreign-matrix-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const identity = buildWorkspaceIdentity(root, { markerFound: false });
-    for (const argv of [['status'], ['stop'], ['destroy'], ['start', 'Agent'], ['logs']]) {
+    for (const argv of [['status'], ['stop'], ['destroy'], ['start', 'Agent'], ['logs'], ['list']]) {
         const mutations = [];
         const supervisor = createBoxSupervisor({
             resolveIdentity: () => identity,
@@ -225,9 +228,10 @@ test('foreign ownership blocks every lifecycle path with zero engine mutation', 
             env: {}, supervisor,
             input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
             execute() { mutations.push(['execute']); return 0; },
-            confirmDestroy: async () => { throw new Error('foreign destroy must not prompt'); },
         });
-        if (argv[0] === 'status' || argv[0] === 'destroy') {
+        // Inspect-only verbs report foreign ownership and exit nonzero; every
+        // preparing verb still refuses outright.
+        if (['status', 'destroy', 'logs'].includes(argv[0])) {
             assert.equal(await invocation, 1, argv.join(' '));
         } else {
             await assert.rejects(invocation, /foreign exact-name resource/, argv.join(' '));

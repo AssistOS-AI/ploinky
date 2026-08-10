@@ -110,10 +110,28 @@
   const logsOut = document.getElementById('logsOut');
   const logCount = document.getElementById('logCount');
   
-  async function refreshLogs() { 
-    const n = Math.max(1, parseInt(logCount.value || '200', 10));
+  // The CLI accepts one exact integer between 1 and 10000 and rejects
+  // fractions, signs, partial integers, and NaN. `parseInt` forwarded '12abc'
+  // as 12 and an empty field as NaN, so validate strictly here and never send
+  // a value the CLI is going to refuse.
+  const MAX_LOG_LINES = 10000;
+  const DEFAULT_LOG_LINES = 200;
+  function exactLogLineCount(raw) {
+    const text = String(raw ?? '').trim();
+    if (!text) return DEFAULT_LOG_LINES;
+    if (!/^[1-9][0-9]*$/.test(text)) return null;
+    const value = Number(text);
+    return Number.isSafeInteger(value) && value >= 1 && value <= MAX_LOG_LINES ? value : null;
+  }
+
+  async function refreshLogs() {
+    const n = exactLogLineCount(logCount.value);
+    if (n === null) {
+      logsOut.textContent = `Enter a whole number of lines between 1 and ${MAX_LOG_LINES}.`;
+      return;
+    }
     const j = await run(`logs last ${n}`);
-    logsOut.textContent = j.stdout || j.stderr || '[no output]'; 
+    logsOut.textContent = j.stdout || j.stderr || '[no output]';
   }
   
   setInterval(refreshLogs, 1000);

@@ -7,7 +7,8 @@ import { showHelp } from './help.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import * as agentsSvc from '../utils/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../utils/status.js';
-import { logsTail, showLast } from './logUtils.js';
+import { runLogCommand } from './logCommands.js';
+import { activeForegroundSignal } from './foregroundCommand.js';
 import {
     startWorkspace,
     runCli,
@@ -769,20 +770,10 @@ async function handleCommand(args) {
             console.log('[destroy] Removing all workspace containers...');
             await destroyAll();
             break;
-        case 'logs': {
-            const sub = options[0];
-            if (sub === 'tail') {
-                const kind = options[1] || 'router';
-                if (kind !== 'router') { console.log('Only router logs are available.'); break; }
-                await logsTail('router');
-            } else if (sub === 'last') {
-                const count = options[1] || '200';
-                const kind = options[2];
-                if (kind && kind !== 'router') { console.log('Only router logs are available.'); break; }
-                showLast(count, 'router');
-            } else { console.log("Usage: logs tail [router] | logs last <count>"); }
-            break;
-        }
+        case 'logs':
+            // One parser, resolver, and state machine serve the REPL and the
+            // lightweight one-shot entry point in cli/index.js.
+            return runLogCommand(['logs', ...options], { signal: activeForegroundSignal() });
         case 'clean':
             inactivateEdgeRoutingGeneration('cli-workspace-clean');
             console.log('[clean] Removing all workspace containers...');

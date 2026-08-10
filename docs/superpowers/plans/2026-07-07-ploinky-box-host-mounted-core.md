@@ -1020,9 +1020,9 @@ bind-mounts your checkout read-only at `/opt/ploinky` inside the box.
 2. Replace the whole "Quick start" section body with:
 
 ```markdown
-    git clone https://github.com/AssistOS-AI/ploinky ~/work/ploinky
+    git clone https://github.com/AssistOS-AI/ploinky ~/work/file-parser/ploinky
     cd ~/work/myProject
-    ~/work/ploinky/bin/ploinky start webtty   # box 'ploinky-box-myProject': up + start webtty + router probe
+    ~/work/file-parser/ploinky/bin/ploinky start webtty   # box 'ploinky-box-myProject': up + start webtty + router probe
     open http://127.0.0.1:8080/status
 
 On the first run the box has no Ploinky dependencies yet; the wrapper asks

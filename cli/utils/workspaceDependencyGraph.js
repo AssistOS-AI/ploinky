@@ -11,6 +11,7 @@ import {
     validateManifestNetworks,
 } from '../sandbox/networkContract.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
+import { resolveEnabledAgentRecordFromMap } from './agentRegistryResolver.js';
 
 function normalizeAuthMode(value) {
     const normalized = String(value || '').trim().toLowerCase();
@@ -121,58 +122,10 @@ function findRegistryRecord(registry, { repoName, shortAgentName, alias = '' }) 
 }
 
 // Resolve an operator-facing agent token against an already-loaded workspace
-// registry using the same precedence as the runtime command handlers. Keeping
-// this helper pure avoids re-reading agents.json during graph resolution.
+// registry. The precedence lives in the one pure resolver so graph resolution,
+// the loading command handlers, and the read-only log command cannot drift.
 function resolveEnabledAgentRegistryRecord(agentRef, registry = {}) {
-    const input = typeof agentRef === 'string' ? agentRef.trim() : '';
-    if (!input || !registry || typeof registry !== 'object') return null;
-
-    const direct = registry[input];
-    if (direct && direct.type === 'agent') {
-        return { containerName: input, record: direct };
-    }
-
-    const hasNamespace = /[:/]/.test(input);
-    let repoFilter = null;
-    let agentFilter = input;
-    if (hasNamespace) {
-        const parts = input.split(/[:/]/).filter(Boolean);
-        if (parts.length === 2) {
-            [repoFilter, agentFilter] = parts;
-        }
-    }
-
-    const entries = Object.entries(registry)
-        .filter(([key]) => key !== '_config');
-    let aliasEntry = entries.find(([, value]) => (
-        value && value.type === 'agent' && value.alias === input
-    ));
-    if (!aliasEntry && hasNamespace) {
-        aliasEntry = entries.find(([, value]) => (
-            value && value.type === 'agent' && value.alias === agentFilter
-        ));
-    }
-    if (aliasEntry) {
-        return { containerName: aliasEntry[0], record: aliasEntry[1] };
-    }
-
-    const matches = entries
-        .filter(([, value]) => value && typeof value === 'object' && value.type === 'agent')
-        .filter(([, value]) => {
-            if (!value.agentName) return false;
-            if (repoFilter && value.repoName !== repoFilter) return false;
-            return value.agentName === agentFilter;
-        });
-    if (!matches.length) return null;
-    if (matches.length > 1) {
-        const aliases = matches.map(([containerName, value]) => value.alias || containerName);
-        const error = new Error(`Multiple containers found for agent '${agentRef}'. Use alias: ${aliases.join(', ')}`);
-        error.code = 'AGENT_ALIAS_AMBIGUOUS';
-        throw error;
-    }
-
-    const [containerName, record] = matches[0];
-    return { containerName, record };
+    return resolveEnabledAgentRecordFromMap(agentRef, registry);
 }
 
 function normalizeProfileOverride(profile) {

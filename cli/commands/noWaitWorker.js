@@ -5,8 +5,16 @@
 // `startWorkspace` and inherits the workspace cwd and environment. In a managed
 // Box, cryptographic operations resolve the key from `.ploinky/master-key`; the
 // key is not inherited as an environment variable. The worker writes:
-//   - a single log stream at .ploinky/logs/no-wait/<container>.log (stdout+stderr)
-//   - a structured status JSON at .ploinky/running/no-wait/<container>.json
+//   - one run-scoped log stream at
+//     .ploinky/logs/no-wait/<container>.<runId>.log (stdout+stderr), created
+//     exclusively at mode 0600 by the spawning process
+//   - a run-scoped status JSON at
+//     .ploinky/running/no-wait/<container>.<runId>.json, plus the canonical
+//     .ploinky/running/no-wait/<container>.json summary
+// The log, the status, and the `<container>.current.json` marker all carry the
+// same run id, so an observer that binds to one run can prove the other two
+// belong to it and can tell a superseding start apart from its own. Two runs of
+// one agent therefore never share a log file.
 // Failures here must never bubble up to the main start command; they are
 // recorded durably so an operator can see what went wrong without losing the
 // already-running blocking stack.
@@ -22,10 +30,7 @@ import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.j
 import {
     ensureImagePresent,
     getRuntimeForAgent,
-    imageBuildTimeoutMs,
-    imagePullTimeoutMs,
     isSandboxRuntime,
-    MAX_IMAGE_OPERATION_TIMEOUT_MS,
 } from '../sandbox/docker/common.js';
 import {
     getExposedNames,
@@ -63,37 +68,70 @@ import { networkContractHash } from '../sandbox/networkContract.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import { effectiveInstanceKey } from '../utils/workspaceDependencyGraph.js';
 import { withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import { sanitizeDiagnosticText } from '../utils/diagnosticText.js';
+import {
+    assertSafeRelativeSegment,
+    ensureVerifiedProducerDirectory,
+} from '../utils/verifiedReadOnlyFile.js';
+import {
+    MAX_NO_WAIT_BARRIER_ENTRIES,
+    MAX_NO_WAIT_WAVE_INDEX,
+    exactEpochMs,
+    exactNoWaitBarrierEntry,
+    exactNoWaitCoordinationStatusPath,
+    exactNoWaitStatusPath,
+    exactRunId,
+    exactWaveIndex,
+    parseNoWaitStatusBarrier,
+    parseNoWaitWorkerArgs,
+    resolveNoWaitRunScopedArguments,
+} from './noWaitWorkerArgs.js';
+import {
+    boundedNoWaitTimeoutInput,
+    noWaitQueuedStatusDeadline,
+    resolveNoWaitBarrierTimeouts,
+    resolveRunScopedObservation,
+} from './noWaitProtocol.js';
 
-function parseArgs(argv) {
-    const out = {};
-    for (let i = 0; i < argv.length; i += 1) {
-        const token = argv[i];
-        if (!token.startsWith('--')) continue;
-        const key = token.slice(2);
-        const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : '';
-        out[key] = value;
-        if (value) i += 1;
-    }
-    return out;
-}
-
-function camelKey(key) {
-    return key.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-}
+export {
+    MAX_NO_WAIT_BARRIER_ENTRIES,
+    MAX_NO_WAIT_WAVE_INDEX,
+    exactNoWaitBarrierEntry,
+    parseNoWaitStatusBarrier,
+    resolveNoWaitRunScopedArguments,
+} from './noWaitWorkerArgs.js';
+export {
+    noWaitQueuedStatusDeadline,
+    resolveNoWaitBarrierTimeouts,
+    resolveRunScopedObservation,
+} from './noWaitProtocol.js';
 
 function statusPathFor(containerName, { runningDir = RUNNING_DIR } = {}) {
     return path.join(runningDir, 'no-wait', `${containerName}.json`);
 }
 
-function writeStatusFile(target, payload) {
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+function writeStatusFile(target, payload, { runningDir = RUNNING_DIR } = {}) {
+    const statusDirectory = ensureVerifiedProducerDirectory({
+        trustedRoot: runningDir,
+        relativeSegments: ['no-wait'],
+        mode: 0o700,
+    });
+    const resolvedTarget = path.resolve(String(target || ''));
+    let targetDirectory;
+    try { targetDirectory = fs.realpathSync(path.dirname(resolvedTarget)); } catch (_) {
+        throw new Error('no-wait status publication requires the verified status directory');
+    }
+    if (targetDirectory !== fs.realpathSync(statusDirectory)) {
+        throw new Error('no-wait status publication requires a file in the verified status directory');
+    }
+    assertSafeRelativeSegment(path.basename(resolvedTarget), 'no-wait status filename');
+    const temporary = `${resolvedTarget}.${process.pid}.${randomUUID()}.tmp`;
     try {
         fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), {
             flag: 'wx',
             mode: 0o600,
         });
-        fs.renameSync(temporary, target);
+        fs.renameSync(temporary, resolvedTarget);
     } finally {
         try { fs.unlinkSync(temporary); } catch (error) {
             if (error?.code !== 'ENOENT') throw error;
@@ -102,7 +140,7 @@ function writeStatusFile(target, payload) {
 }
 
 export function writeStatus(containerName, payload, { runningDir = RUNNING_DIR } = {}) {
-    writeStatusFile(statusPathFor(containerName, { runningDir }), payload);
+    writeStatusFile(statusPathFor(containerName, { runningDir }), payload, { runningDir });
 }
 
 export function writeNoWaitWorkerStatus(containerName, payload, {
@@ -133,193 +171,13 @@ export function writeNoWaitWorkerStatus(containerName, payload, {
     // view first so a completed wave barrier never exposes an older canonical
     // phase to monitors, then release the run-scoped coordination file last as
     // the final barrier handoff.
-    writeStatusFile(canonicalStatusFile, document);
-    writeStatusFile(coordinationStatusFile, document);
+    writeStatusFile(canonicalStatusFile, document, { runningDir });
+    writeStatusFile(coordinationStatusFile, document, { runningDir });
     return document;
-}
-
-function exactNoWaitStatusPath(rawStatusPath, {
-    runningDir = RUNNING_DIR,
-    label = 'no-wait status',
-} = {}) {
-    const statusPath = path.resolve(String(rawStatusPath || ''));
-    const statusRoot = path.resolve(runningDir, 'no-wait');
-    if (!path.isAbsolute(String(rawStatusPath || ''))
-        || path.dirname(statusPath) !== statusRoot
-        || path.extname(statusPath) !== '.json') {
-        throw new Error(`${label} must be an absolute JSON file in the workspace no-wait status directory`);
-    }
-    return statusPath;
-}
-
-// The scheduler mints run identities with randomUUID(). Every reader in this
-// protocol validates the same v4 shape so a stale-run rejection cannot depend
-// on which file performed the check.
-function exactRunId(value, label = 'no-wait run id') {
-    const runId = String(value || '').trim();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) {
-        throw new Error(`${label} must be one exact UUID`);
-    }
-    return runId.toLowerCase();
-}
-
-// A published identity field must be an actual JSON number. Returning null for
-// anything else keeps a coercible value (null, '', false, []) from comparing
-// equal to a legitimate zero.
-function publishedInteger(value) {
-    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
-function exactEpochMs(value, label = 'no-wait timestamp') {
-    const epochMs = Number(value);
-    if (!Number.isSafeInteger(epochMs) || epochMs < 0) {
-        throw new Error(`${label} must be one exact non-negative epoch millisecond integer`);
-    }
-    return epochMs;
-}
-
-// The wave bound matches the maximum barrier size so a cumulative queued
-// budget can never overflow a safe integer. The scheduler imports both so it
-// can reject an over-deep graph or an oversized barrier in the foreground,
-// instead of spawning a worker that would exit before publishing any status.
-export const MAX_NO_WAIT_WAVE_INDEX = 1023;
-export const MAX_NO_WAIT_BARRIER_ENTRIES = 1024;
-
-function exactWaveIndex(value, label = 'no-wait wave index') {
-    const waveIndex = Number(value);
-    if (!Number.isSafeInteger(waveIndex) || waveIndex < 0 || waveIndex > MAX_NO_WAIT_WAVE_INDEX) {
-        throw new Error(`${label} must be an integer between 0 and ${MAX_NO_WAIT_WAVE_INDEX}`);
-    }
-    return waveIndex;
-}
-
-function exactNoWaitCoordinationStatusPath(rawStatusPath, {
-    containerName,
-    runId,
-    runningDir = RUNNING_DIR,
-} = {}) {
-    const statusPath = exactNoWaitStatusPath(rawStatusPath, {
-        runningDir,
-        label: 'no-wait coordination status',
-    });
-    const expectedName = `${String(containerName || '')}.${exactRunId(runId)}.json`;
-    if (path.basename(statusPath) !== expectedName) {
-        throw new Error(
-            `no-wait coordination status must be the exact run-scoped file '${expectedName}'`,
-        );
-    }
-    return statusPath;
-}
-
-export function exactNoWaitBarrierEntry(entry, {
-    runningDir = RUNNING_DIR,
-    expectedRunId = '',
-    label = 'no-wait status barrier entry',
-} = {}) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)
-        || typeof entry.directDependency !== 'boolean') {
-        throw new Error(`${label} is invalid`);
-    }
-    const entryRunId = exactRunId(entry.runId, `${label} run id`);
-    if (expectedRunId && entryRunId !== exactRunId(expectedRunId)) {
-        throw new Error(`${label} belongs to a different run`);
-    }
-    return Object.freeze({
-        path: exactNoWaitStatusPath(entry.path, { runningDir, label }),
-        runId: entryRunId,
-        waveIndex: exactWaveIndex(entry.waveIndex, `${label} wave index`),
-        directDependency: entry.directDependency,
-    });
-}
-
-export function parseNoWaitStatusBarrier(rawBarrier, {
-    runId,
-    waveIndex,
-    runningDir = RUNNING_DIR,
-} = {}) {
-    if (typeof rawBarrier !== 'string' || rawBarrier === '') {
-        throw new Error('no-wait status barrier must be one JSON array argument');
-    }
-    const expectedRunId = exactRunId(runId);
-    const ownerWaveIndex = exactWaveIndex(waveIndex, 'no-wait status barrier owner wave index');
-    let parsed;
-    try {
-        parsed = JSON.parse(rawBarrier);
-    } catch (error) {
-        throw new Error(`no-wait status barrier is invalid JSON: ${error?.message || error}`);
-    }
-    if (!Array.isArray(parsed) || parsed.length > MAX_NO_WAIT_BARRIER_ENTRIES) {
-        throw new Error(`no-wait status barrier must be an array with at most ${MAX_NO_WAIT_BARRIER_ENTRIES} entries`);
-    }
-    const seen = new Set();
-    return Object.freeze(parsed.map((entry, index) => {
-        const barrierEntry = exactNoWaitBarrierEntry(entry, {
-            runningDir,
-            expectedRunId,
-            label: `no-wait status barrier entry ${index}`,
-        });
-        // A barrier only ever references strictly earlier waves. Same-wave and
-        // forward references would deadlock the run instead of ordering it.
-        if (barrierEntry.waveIndex >= ownerWaveIndex) {
-            throw new Error(
-                `no-wait status barrier entry ${index} references wave ${barrierEntry.waveIndex} from wave ${ownerWaveIndex}`,
-            );
-        }
-        if (seen.has(barrierEntry.path)) {
-            throw new Error(`no-wait status barrier repeats '${path.basename(barrierEntry.path)}'`);
-        }
-        seen.add(barrierEntry.path);
-        return barrierEntry;
-    }));
-}
-
-// Every one of these is mandatory. A missing flag must be rejected outright so
-// an incomplete invocation can never silently select another protocol.
-const REQUIRED_RUN_SCOPED_ARGUMENTS = Object.freeze([
-    ['runId', 'run-id'],
-    ['runStartedAtMs', 'run-started-at-ms'],
-    ['waveIndex', 'wave-index'],
-    ['statusFile', 'status-file'],
-    ['waitForStatuses', 'wait-for-statuses'],
-]);
-
-export function resolveNoWaitRunScopedArguments(args, {
-    containerName,
-    runningDir = RUNNING_DIR,
-} = {}) {
-    for (const [key, flag] of REQUIRED_RUN_SCOPED_ARGUMENTS) {
-        if (typeof args?.[key] !== 'string' || args[key] === '') {
-            throw new Error(`run-scoped no-wait launch requires --${flag}`);
-        }
-    }
-    const runId = exactRunId(args.runId);
-    const waveIndex = exactWaveIndex(args.waveIndex, 'no-wait worker wave index');
-    return Object.freeze({
-        runId,
-        runStartedAtMs: exactEpochMs(args.runStartedAtMs, 'no-wait run start'),
-        waveIndex,
-        statusFile: exactNoWaitCoordinationStatusPath(args.statusFile, {
-            containerName,
-            runId,
-            runningDir,
-        }),
-        waitForStatuses: parseNoWaitStatusBarrier(args.waitForStatuses, {
-            runId,
-            waveIndex,
-            runningDir,
-        }),
-    });
 }
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function parseSequenceTimestamp(status, numericField, isoField) {
-    const numeric = Number(status?.[numericField]);
-    if (Number.isFinite(numeric) && numeric >= 0) return numeric;
-    const parsed = Date.parse(String(status?.[isoField] || ''));
-    return Number.isFinite(parsed) ? parsed : NaN;
 }
 
 function readSequenceStatus(statusPath) {
@@ -333,71 +191,6 @@ function readSequenceStatus(statusPath) {
     }
 }
 
-function boundedTimeoutInput(value, { fallback, minimum, maximum }) {
-    const parsed = Number.parseInt(String(value ?? ''), 10);
-    return Number.isSafeInteger(parsed)
-        ? Math.min(Math.max(minimum, parsed), maximum)
-        : fallback;
-}
-
-// The active phase starts before the unlocked target prefetch. If that attempt
-// fails, the authoritative managed-network transaction may retry the target
-// and then resolve the fixed router-authority helper. The target retry may also
-// fall back to one local build. Every permitted blocking image operation must
-// be covered by the observer's deadline.
-const SANCTIONED_IMAGE_PULLS_PER_LAUNCH = 3;
-const SANCTIONED_IMAGE_BUILDS_PER_LAUNCH = 1;
-
-export function resolveNoWaitBarrierTimeouts({
-    activeTimeoutMs = process.env.PLOINKY_NO_WAIT_SEQUENCE_TIMEOUT_MS,
-    terminalPublicationGraceMs = process.env.PLOINKY_NO_WAIT_SEQUENCE_TERMINAL_GRACE_MS,
-    readRetryTimeoutMs = process.env.PLOINKY_NO_WAIT_STATUS_READ_RETRY_MS,
-    startupGraceMs = process.env.PLOINKY_NO_WAIT_STARTUP_GRACE_MS,
-    imagePullBudgetMs = imagePullTimeoutMs(),
-    imageBuildBudgetMs = imageBuildTimeoutMs(),
-} = {}) {
-    // An active worker may spend a sanctioned image-pull budget before it can
-    // publish anything terminal, and that budget is far larger than the launch
-    // and readiness work around it. Fold it into the active window so an
-    // observer cannot expire while its prerequisite is still doing permitted
-    // work; without it a healthy cold pull fails every dependent.
-    //
-    // One launch may perform more than one permitted pull: a managed-network
-    // launch resolves the target image and the fixed router-authority helper
-    // separately, and each is allowed the full pull timeout. Budget every one
-    // of them, or two individually valid pulls still expire the dependents.
-    const boundedPhaseTimeoutMs = boundedTimeoutInput(activeTimeoutMs, {
-        fallback: 900000, minimum: 1000, maximum: 3600000,
-    });
-    const boundedPullBudgetMs = boundedTimeoutInput(imagePullBudgetMs, {
-        fallback: 1800000, minimum: 0, maximum: MAX_IMAGE_OPERATION_TIMEOUT_MS,
-    });
-    const boundedBuildBudgetMs = boundedTimeoutInput(imageBuildBudgetMs, {
-        fallback: 1800000, minimum: 0, maximum: MAX_IMAGE_OPERATION_TIMEOUT_MS,
-    });
-    const sanctionedPullBudgetMs = boundedPullBudgetMs * SANCTIONED_IMAGE_PULLS_PER_LAUNCH;
-    const sanctionedBuildBudgetMs = boundedBuildBudgetMs * SANCTIONED_IMAGE_BUILDS_PER_LAUNCH;
-    // Every individual input is clamped here. The cumulative queued budget
-    // derived from them is deliberately not clamped back to these maxima.
-    return Object.freeze({
-        phaseTimeoutMs: boundedPhaseTimeoutMs,
-        imagePullBudgetMs: boundedPullBudgetMs,
-        imageBuildBudgetMs: boundedBuildBudgetMs,
-        sanctionedPullBudgetMs,
-        sanctionedBuildBudgetMs,
-        activeTimeoutMs: boundedPhaseTimeoutMs + sanctionedPullBudgetMs + sanctionedBuildBudgetMs,
-        terminalPublicationGraceMs: boundedTimeoutInput(terminalPublicationGraceMs, {
-            fallback: 60000, minimum: 0, maximum: 300000,
-        }),
-        readRetryTimeoutMs: boundedTimeoutInput(readRetryTimeoutMs, {
-            fallback: 5000, minimum: 100, maximum: 30000,
-        }),
-        startupGraceMs: boundedTimeoutInput(startupGraceMs, {
-            fallback: 60000, minimum: 0, maximum: 300000,
-        }),
-    });
-}
-
 // A cold no-wait launch can legitimately retain the workspace mutation lease
 // while it installs native dependencies or prepares a replacement runtime.
 // The former 180-second edge timeout was only suitable for short selector
@@ -408,96 +201,11 @@ export function resolveNoWaitLifecycleLeaseTimeoutMs({
     timeoutMs = process.env.PLOINKY_NO_WAIT_LIFECYCLE_LEASE_TIMEOUT_MS,
     timeouts = resolveNoWaitBarrierTimeouts(),
 } = {}) {
-    return boundedTimeoutInput(timeoutMs, {
+    return boundedNoWaitTimeoutInput(timeoutMs, {
         fallback: timeouts.activeTimeoutMs,
         minimum: 1000,
         maximum: timeouts.activeTimeoutMs,
     });
-}
-
-// A queued worker may wait through a direct-dependency chain whose maximum
-// depth is represented by its topological wave. A single run-wide deadline
-// would expire a deep dependency early; an unbounded queued phase would hide a
-// dead worker.
-export function noWaitQueuedStatusDeadline(runStartedAtMs, targetWaveIndex, timeouts) {
-    const exactRunStartedAtMs = exactEpochMs(runStartedAtMs, 'no-wait run start');
-    const waveIndex = exactWaveIndex(targetWaveIndex, 'no-wait barrier target wave index');
-    const perWaveMs = timeouts.activeTimeoutMs + timeouts.terminalPublicationGraceMs;
-    const deadline = exactRunStartedAtMs
-        + ((waveIndex + 1) * perWaveMs)
-        + timeouts.startupGraceMs;
-    if (!Number.isSafeInteger(deadline)) {
-        throw new Error('no-wait queued status deadline overflowed its cumulative wave budget');
-    }
-    return deadline;
-}
-
-const NO_WAIT_STATUS_STATES = Object.freeze(['starting', 'running', 'failed']);
-const NO_WAIT_SEQUENCE_PHASES = Object.freeze(['waiting-barrier', 'active']);
-
-export function resolveRunScopedObservation(status, {
-    expectedRunId,
-    runStartedAtMs,
-    targetWaveIndex,
-    timeouts,
-    nowMs,
-} = {}) {
-    if (!status || typeof status !== 'object' || Array.isArray(status)) {
-        throw new Error('no-wait barrier status must be one JSON object');
-    }
-    if (String(status.runId || '').trim().toLowerCase() !== exactRunId(expectedRunId)) {
-        throw new Error('no-wait barrier status belongs to a different run');
-    }
-    // Compare published integers by type, never by coercion: Number(null),
-    // Number('') and Number(false) are all 0 and would let a malformed status
-    // match a wave-zero target. The monitor's marker binding is strict for the
-    // same reason.
-    if (publishedInteger(status.runStartedAtMs) !== exactEpochMs(runStartedAtMs, 'no-wait run start')) {
-        throw new Error('no-wait barrier status belongs to a different run start');
-    }
-    if (publishedInteger(status.waveIndex)
-        !== exactWaveIndex(targetWaveIndex, 'no-wait barrier target wave index')) {
-        throw new Error('no-wait barrier status belongs to a different dependency wave');
-    }
-    const state = String(status.state || '');
-    if (!NO_WAIT_STATUS_STATES.includes(state)) {
-        throw new Error(`no-wait barrier status has invalid state '${state}'`);
-    }
-    const sequencePhase = String(status.sequencePhase || '');
-    if (!NO_WAIT_SEQUENCE_PHASES.includes(sequencePhase)) {
-        throw new Error(`no-wait barrier status has invalid sequence phase '${sequencePhase}'`);
-    }
-    // A failure is terminal in every phase, including 'waiting-barrier'. The
-    // legacy failed-while-waiting chain-following rule is deliberately gone:
-    // this worker waits for each explicitly listed dependency directly, so it
-    // never needs another worker's barrier to stay ordered.
-    if (state === 'failed') return { terminal: 'failed' };
-    if (state === 'running') {
-        if (sequencePhase !== 'active') {
-            throw new Error("no-wait barrier status reports 'running' outside its active phase");
-        }
-        return { terminal: 'running' };
-    }
-    if (sequencePhase === 'active') {
-        const phaseStartedAtMs = parseSequenceTimestamp(
-            status,
-            'sequencePhaseStartedAtMs',
-            'sequencePhaseStartedAt',
-        );
-        if (!Number.isFinite(phaseStartedAtMs)
-            || phaseStartedAtMs > nowMs + timeouts.terminalPublicationGraceMs) {
-            throw new Error('no-wait barrier active phase has an invalid start timestamp');
-        }
-        // An active member gets a fresh full window regardless of how long it
-        // spent queued behind earlier waves.
-        return {
-            deadline: phaseStartedAtMs
-                + timeouts.activeTimeoutMs
-                + timeouts.terminalPublicationGraceMs,
-            workerPid: publishedInteger(status.pid),
-        };
-    }
-    return { queued: true, workerPid: publishedInteger(status.pid) };
 }
 
 export function isNoWaitWorkerAlive(pid, { killImpl = process.kill } = {}) {
@@ -1491,10 +1199,10 @@ export const NO_WAIT_FAILURE_LOG_LINES = 40;
 const NO_WAIT_FAILURE_DETAIL_CHARS = 4000;
 
 function boundedFailureText(value) {
-    const text = String(value || '').trim();
-    return text.length > NO_WAIT_FAILURE_DETAIL_CHARS
-        ? `${text.slice(-NO_WAIT_FAILURE_DETAIL_CHARS)}\n[truncated to the last ${NO_WAIT_FAILURE_DETAIL_CHARS} characters]`
-        : text;
+    return sanitizeDiagnosticText(String(value || '').trim(), {
+        limit: NO_WAIT_FAILURE_DETAIL_CHARS,
+        fallback: '',
+    });
 }
 
 // Runtime output is arbitrary and may echo an injected credential. Diagnostics
@@ -1530,9 +1238,13 @@ export function redactNoWaitDiagnostics(value, {
         text = text.split(secret).join(`[redacted:${name}]`);
     }
     // Catch shapes that are secret regardless of which variable carried them.
-    return text
+    return sanitizeDiagnosticText(text
         .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '[redacted:jwt]')
-        .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, '[redacted:authorization]');
+        .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, '[redacted:authorization]'), {
+        secretNames: Array.from(names),
+        limit: NO_WAIT_FAILURE_DETAIL_CHARS,
+        fallback: '',
+    });
 }
 
 export function captureNoWaitRuntimeLogTail(containerName, {
@@ -1650,8 +1362,17 @@ async function waitForNoWaitReadiness({
 }
 
 async function main() {
-    const rawArgs = parseArgs(process.argv.slice(2));
-    const args = Object.fromEntries(Object.entries(rawArgs).map(([k, v]) => [camelKey(k), v]));
+    let args;
+    try {
+        args = parseNoWaitWorkerArgs(process.argv.slice(2));
+    } catch (error) {
+        console.error(sanitizeDiagnosticText(
+            `[no-wait] ${sanitizeDiagnosticText(error)}; refusing to run.`,
+            { singleLine: true },
+        ));
+        process.exit(2);
+        return;
+    }
     const containerName = args.container;
     const shortAgent = args.shortAgent;
     const repoName = args.repo;
@@ -1668,13 +1389,7 @@ async function main() {
         process.exit(2);
     }
 
-    let runScoped;
-    try {
-        runScoped = resolveNoWaitRunScopedArguments(args, { containerName });
-    } catch (error) {
-        console.error(`[no-wait] ${error?.message || error}; refusing to run.`);
-        process.exit(2);
-    }
+    const runScoped = args.runScoped;
     const {
         runId,
         runStartedAtMs,
@@ -1716,10 +1431,13 @@ async function main() {
                 sequencePhaseStartedAtMs: finishedAtMs,
                 finishedAt,
                 finishedAtMs,
-                error: { message: failure?.message || String(failure) },
+                error: { message: sanitizeDiagnosticText(failure) },
             });
         } catch (publishFailure) {
-            console.error(`[no-wait] ${shortAgent}: could not publish the pre-start failure status: ${publishFailure?.message || publishFailure}`);
+            console.error(sanitizeDiagnosticText(
+                `[no-wait] ${shortAgent}: could not publish the pre-start failure status: ${sanitizeDiagnosticText(publishFailure)}`,
+                { singleLine: true },
+            ));
         }
     };
 
@@ -1778,8 +1496,11 @@ async function main() {
         admission = admitRuntime();
     } catch (error) {
         publishPreStartFailure(error);
-        console.error(`[no-wait] ${shortAgent}: runtime admission failed: ${error?.message || error}`);
-        if (error?.stack) console.error(error.stack);
+        console.error(sanitizeDiagnosticText(
+            `[no-wait] ${shortAgent}: runtime admission failed: ${sanitizeDiagnosticText(error)}`,
+            { singleLine: true },
+        ));
+        if (error?.stack) console.error(sanitizeDiagnosticText(error.stack));
         process.exit(1);
     }
     const {
@@ -2083,8 +1804,11 @@ async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
     main().catch((err) => {
-        console.error('[no-wait] worker crashed:', err?.message || err);
-        if (err?.stack) console.error(err.stack);
+        console.error(sanitizeDiagnosticText(
+            `[no-wait] worker crashed: ${sanitizeDiagnosticText(err)}`,
+            { singleLine: true },
+        ));
+        if (err?.stack) console.error(sanitizeDiagnosticText(err.stack));
         process.exit(1);
     });
 }

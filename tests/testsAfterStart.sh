@@ -198,6 +198,16 @@ test_check "disable repo removes demo entry" test_disable_repo_demo_updates_enab
 stage_header "Logs Commands"
 test_check "logs tail router streams entries" test_logs_tail_router
 test_check "logs last prints five lines" test_logs_last_five
+test_check "logs last targets an exact agent runtime" test_logs_last_agent_runtime
+test_check "logs tail on an agent cancels without leaving a follower" test_logs_tail_agent_cancels_cleanly
+test_check "logs agent references resolve or fail closed" test_logs_agent_reference_forms
+test_check "logs last rejects malformed counts" test_logs_rejects_invalid_counts
+test_check "logs --startup exposes startup output and bounded failures" test_logs_startup_terminal_states
+test_check "logs tail hands off from startup to runtime in order" test_logs_startup_runtime_handoff_order
+test_check "sandbox logs use the process-specific file" test_logs_sandbox_process_specific_file
+if [[ "${PLOINKY_TEST_BOX_LOG_CANCELLATION:-0}" == "1" ]]; then
+  test_check "Box SIGINT/SIGTERM remove every in-Box log follower" test_logs_box_signals_remove_inbox_followers
+fi
 
 stage_header "LLM CLI Suggestions"
 test_check "Invalid CLI input handles configured or missing LLM credentials" test_llm_cli_suggestions

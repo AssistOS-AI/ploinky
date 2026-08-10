@@ -34,11 +34,10 @@ check_preinstall_run() {
     if [[ -n "$explorer_container" ]]; then
       local container_logs=""
       if is_bwrap_agent "$explorer_container"; then
-        local sandbox_log
-        for sandbox_log in "$TEST_RUN_DIR/.ploinky/logs/explorer-bwrap.log" "$TEST_RUN_DIR/.ploinky/logs/explorer-seatbelt.log"; do
-          [[ -f "$sandbox_log" ]] && break
-        done
-        container_logs=$(cat "$sandbox_log" 2>&1) || true
+        # Sandbox logs are process specific: the file name is derived from the
+        # registry's exact identity tuple and finalized pid, so read it through
+        # the command that owns that derivation instead of guessing a name.
+        container_logs=$("$PLOINKY_FAST_CLI" logs last 200 "$explorer_container" 2>&1) || true
       else
         container_logs=$($FAST_CONTAINER_RUNTIME logs "$explorer_container" 2>&1) || true
       fi

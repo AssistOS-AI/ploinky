@@ -66,11 +66,15 @@ import {
     removeAgentWorkDir,
     getAgentDataDir
 } from './workspaceStructure.js';
+import {
+    RESERVED_AGENT_REGISTRY_KEYS,
+    resolveEnabledAgentRecordFromMap,
+} from './agentRegistryResolver.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const AGENT_LIB_PATH = path.resolve(__dirname, '../../Agent');
-const RESERVED_AGENT_KEYS = new Set(['_config']);
+const RESERVED_AGENT_KEYS = RESERVED_AGENT_REGISTRY_KEYS;
 const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
 export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
@@ -1308,60 +1312,11 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
     return disabled;
 }
 
+// Loading wrapper around the one pure resolver. Every precedence, ambiguity,
+// and malformed-reference rule lives in `agentRegistryResolver.js` so the
+// read-only log command and the loading command handlers cannot drift apart.
 export function resolveEnabledAgentRecord(agentRef) {
     const input = typeof agentRef === 'string' ? agentRef.trim() : '';
     if (!input) return null;
-
-    const map = loadAgents();
-    if (!map || typeof map !== 'object') return null;
-
-    const direct = map[input];
-    if (direct && direct.type === 'agent') {
-        return { containerName: input, record: direct };
-    }
-
-    const hasNamespace = /[:/]/.test(input);
-    let repoFilter = null;
-    let agentFilter = input;
-    if (hasNamespace) {
-        const parts = input.split(/[:/]/).filter(Boolean);
-        if (parts.length === 2) {
-            [repoFilter, agentFilter] = parts;
-        }
-    }
-
-    let aliasEntry = Object.entries(map || {})
-        .filter(([key]) => !RESERVED_AGENT_KEYS.has(key))
-        .find(([, value]) => value && value.type === 'agent' && value.alias === input);
-    if (!aliasEntry && hasNamespace) {
-        aliasEntry = Object.entries(map || {})
-            .filter(([key]) => !RESERVED_AGENT_KEYS.has(key))
-            .find(([, value]) => value && value.type === 'agent' && value.alias === agentFilter);
-    }
-    if (aliasEntry) {
-        return { containerName: aliasEntry[0], record: aliasEntry[1] };
-    }
-
-    const matches = Object.entries(map)
-        .filter(([key, value]) => !RESERVED_AGENT_KEYS.has(key) && value && typeof value === 'object')
-        .filter(([, value]) => value.type === 'agent')
-        .filter(([, value]) => {
-            if (!value.agentName) return false;
-            if (repoFilter && value.repoName !== repoFilter) return false;
-            return value.agentName === agentFilter;
-        });
-
-    if (!matches.length) {
-        return null;
-    }
-
-    if (matches.length > 1) {
-        const aliasList = matches.map(([containerName, value]) => value.alias || containerName);
-        const err = new Error(`Multiple containers found for agent '${agentRef}'. Use alias: ${aliasList.join(', ')}`);
-        err.code = 'AGENT_ALIAS_AMBIGUOUS';
-        throw err;
-    }
-
-    const [containerName, record] = matches[0];
-    return { containerName, record };
+    return resolveEnabledAgentRecordFromMap(input, loadAgents());
 }

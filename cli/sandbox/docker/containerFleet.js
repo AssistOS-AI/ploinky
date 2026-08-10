@@ -15,11 +15,10 @@ import {
 import { clearLivenessState } from './healthProbes.js';
 import { stopBwrapProcesses, isBwrapProcessRunning } from '../bwrap/bwrapFleet.js';
 import {
-    NETWORK_LABELS,
     withNetworkLifecycleLock,
     workspaceNetworkIdentity,
 } from '../networkLifecycle.js';
-import { NETWORK_SCHEMA_VERSION } from '../networkContract.js';
+import { assertExactContainerOwnership } from './containerOwnership.js';
 
 const GENERATED_ROUTER_DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json';
 const GENERATED_ROUTER_DESCRIPTOR_ROOT = path.join(PLOINKY_DIR, 'run', 'router-descriptors');
@@ -77,39 +76,9 @@ function captureRecordedGeneratedRouterDescriptor(record) {
     return Object.freeze({ source, dev: stat.dev, ino: stat.ino });
 }
 
-function labelsOf(record) {
-    return record?.Config?.Labels || record?.Labels || record?.labels || {};
-}
-
 function defaultPause(milliseconds) {
     if (!(milliseconds > 0)) return;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
-}
-
-function assertExactContainerOwnership(name, record, inspected, expectedId, workspaceHash) {
-    const actualId = String(inspected?.Id || inspected?.ID || '');
-    const actualName = String(inspected?.Name || '').replace(/^\//, '');
-    if (actualId !== expectedId || actualName !== name) {
-        throw new Error(`fleet lifecycle for '${name}' could not prove exact immutable container identity`);
-    }
-    if (record?.type !== 'agent') {
-        throw new Error(`fleet lifecycle for '${name}' requires a current managed-agent registry record`);
-    }
-    const expectedInstanceId = String(record?.instanceId || '').trim();
-    const expectedEnableGeneration = String(record?.enableGeneration || '').trim();
-    const labels = labelsOf(inspected);
-    if (!expectedInstanceId || !expectedEnableGeneration
-        || labels?.[NETWORK_LABELS.managed] !== '1'
-        || labels?.[NETWORK_LABELS.resource] !== 'agent'
-        || labels?.[NETWORK_LABELS.schema] !== NETWORK_SCHEMA_VERSION
-        || labels?.[NETWORK_LABELS.workspace] !== workspaceHash
-        || !/^[a-f0-9]{64}$/.test(String(labels?.[NETWORK_LABELS.contract] || ''))
-        || String(labels?.[NETWORK_LABELS.instanceId] || '') !== expectedInstanceId
-        || String(labels?.[NETWORK_LABELS.enableGeneration] || '') !== expectedEnableGeneration
-        || inspected?.HostConfig?.Init !== true) {
-        throw new Error(`fleet lifecycle for '${name}' could not prove exact managed ownership labels and runtime identity`);
-    }
-    return inspected;
 }
 
 function assertExactDescriptorMount(name, inspected, artifact) {

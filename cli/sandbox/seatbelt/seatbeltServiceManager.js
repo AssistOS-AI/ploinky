@@ -20,6 +20,9 @@ import {
     readManifestStartCommand
 } from '../docker/agentCommands.js';
 import { LOGS_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
+import { openSandboxLogHandle, readSandboxCrashLog } from '../sandboxLogFiles.js';
+import { sanitizeDiagnosticText } from '../../utils/diagnosticText.js';
+import { guardSpawnedChild } from '../../utils/childSpawn.js';
 import { ensureSharedHostDir } from '../docker/agentHooks.js';
 import { readManifestVolumeOptions } from '../../utils/runtime/manifestVolumePolicy.js';
 import {
@@ -532,7 +535,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
-            LOGS_DIR,
             ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : [])
         ]
     });
@@ -545,17 +547,10 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         agentWorkDir
     });
 
-    // Ensure logs directory exists
     const logsDir = LOGS_DIR;
-    if (!fs.existsSync(logsDir)) {
-        fs.mkdirSync(logsDir, { recursive: true });
-    }
-    const logFile = path.join(logsDir, `${agentName}-seatbelt.log`);
-
     console.log(`[seatbelt] ${agentName}: starting sandbox (profile=${activeProfile}, cwd='${cwd}')`);
     debugLog(`[seatbelt] ${agentName}: entry command: sh -c "${entryCmd}"`);
     debugLog(`[seatbelt] ${agentName}: seatbelt profile: ${profilePath}`);
-    debugLog(`[seatbelt] ${agentName}: log file: ${logFile}`);
 
     // Spawn detached sandbox-exec process
     assertHostModeGenerationCapability({
@@ -565,51 +560,62 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         routeKey: options.alias || profileRecord.alias || agentName,
         containerName,
     }, { preparedCapability: options.preparedHostModeCapability });
-    const logFd = fs.openSync(logFile, 'a');
-    const child = spawn('sandbox-exec', ['-f', profilePath, 'sh', '-c', entryCmd], {
-        detached: true,
-        stdio: ['ignore', logFd, logFd],
-        env: envMap,
-        cwd
+    // The final log name is derived from this launch's identity tuple and its
+    // finalized pid, so it is only knowable once the child exists. Spawn
+    // against an exclusive 0600 temporary file and publish it with a
+    // no-replace hard link; the child keeps its own descriptor throughout.
+    const logHandle = openSandboxLogHandle({
+        containerName,
+        logsDir,
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     });
-    child.unref();
-    fs.closeSync(logFd);
-
-    if (!child.pid) {
-        throw new Error(`[seatbelt] ${agentName}: failed to spawn sandbox-exec process`);
-    }
-
-    // Wait briefly then verify the process is actually alive (not a zombie or already exited)
-    spawnSync('sleep', ['0.5']);
-    let processAlive = false;
+    let child;
     try {
-        // macOS: use ps to check process state (no /proc filesystem)
-        const psResult = spawnSync('ps', ['-p', String(child.pid), '-o', 'state='], { stdio: 'pipe' });
-        if (psResult.status === 0) {
-            const state = (psResult.stdout || '').toString().trim();
-            // 'Z' = zombie on macOS/BSD
-            processAlive = state.length > 0 && !state.startsWith('Z');
-        }
-    } catch {
-        processAlive = false;
-    }
-    if (!processAlive) {
-        let reason = 'unknown error';
+        child = spawn('sandbox-exec', ['-f', profilePath, 'sh', '-c', entryCmd], {
+            detached: true,
+            stdio: logHandle.stdio,
+            env: envMap,
+            cwd
+        });
+        guardSpawnedChild(child, {
+            label: `[seatbelt] ${agentName}: sandbox-exec process`,
+            onError: (error) => debugLog(
+                `[seatbelt] ${agentName}: child process error: ${sanitizeDiagnosticText(error)}`,
+            ),
+        });
+        const logFile = logHandle.finalize(child.pid, runtimeIdentity);
+        debugLog(`[seatbelt] ${agentName}: log file: ${logFile}`);
+
+        spawnSync('sleep', ['0.5']);
+        let processAlive = false;
         try {
-            const logContent = fs.readFileSync(logFile, 'utf8').trim();
-            const lastLine = logContent.split('\n').pop();
-            if (lastLine) reason = lastLine;
-        } catch { /* ignore */ }
-        clearBwrapPid(containerName);
-        throw new Error(`seatbelt process exited immediately: ${reason}`);
-    }
+            const psResult = spawnSync('ps', ['-p', String(child.pid), '-o', 'state='], { stdio: 'pipe' });
+            if (psResult.status === 0) {
+                const state = (psResult.stdout || '').toString().trim();
+                processAlive = state.length > 0 && !state.startsWith('Z');
+            }
+        } catch {
+            processAlive = false;
+        }
+        if (!processAlive) {
+            let reason = 'unknown error';
+            try {
+                reason = readSandboxCrashLog(containerName, {
+                    runtime: 'seatbelt', pid: child.pid, ...runtimeIdentity,
+                }, { logsDir }) || reason;
+            } catch {}
+            throw new Error(`seatbelt process exited immediately: ${sanitizeDiagnosticText(reason)}`);
+        }
 
-    // Save PID (reuse bwrap PID management)
-    try {
         saveBwrapPid(containerName, child.pid, runtimeIdentity);
+        logHandle.commit();
+        child.unref();
     } catch (error) {
-        try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { }
-        try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }
+        if (child?.pid) {
+            try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { }
+            try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }
+        }
+        logHandle.discard();
         throw error;
     }
     console.log(`[seatbelt] ${agentName}: started with PID ${child.pid}`);
@@ -922,7 +928,6 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         extraReadPaths: getSeatbeltExtraReadPaths(),
         extraWritePaths: [
-            LOGS_DIR,
             ...(runtimeResourcePlan.persistentStorage?.hostPath ? [runtimeResourcePlan.persistentStorage.hostPath] : [])
         ]
     });

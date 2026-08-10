@@ -38,6 +38,9 @@ import {
     SERVERS_CONFIG_FILE,
     PLOINKY_WORKSPACE_ROOT
 } from '../../utils/config.js';
+import { openSandboxLogHandle, readSandboxCrashLog } from '../sandboxLogFiles.js';
+import { sanitizeDiagnosticText } from '../../utils/diagnosticText.js';
+import { guardSpawnedChild } from '../../utils/childSpawn.js';
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
@@ -763,17 +766,10 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     // Add the command to run
     bwrapArgs.push('--', 'sh', '-c', entryCmd);
 
-    // Ensure logs directory exists
     const logsDir = LOGS_DIR;
-    if (!fs.existsSync(logsDir)) {
-        fs.mkdirSync(logsDir, { recursive: true });
-    }
-
-    const logFile = path.join(logsDir, `${agentName}-bwrap.log`);
 
     console.log(`[bwrap] ${agentName}: starting sandbox (profile=${activeProfile}, cwd='${cwd}')`);
     debugLog(`[bwrap] ${agentName}: entry command: sh -c "${entryCmd}"`);
-    debugLog(`[bwrap] ${agentName}: log file: ${logFile}`);
 
     // Spawn detached bwrap process
     assertHostModeGenerationCapability({
@@ -783,48 +779,59 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         routeKey: alias || agentName,
         containerName,
     }, { preparedCapability: options.preparedHostModeCapability });
-    const logFd = fs.openSync(logFile, 'a');
-    const child = spawn(BWRAP_PATH, bwrapArgs, {
-        detached: true,
-        stdio: ['ignore', logFd, logFd]
+    // The final log name is derived from this launch's identity tuple and its
+    // finalized pid, so it is only knowable once the child exists. Spawn
+    // against an exclusive 0600 temporary file and publish it with a
+    // no-replace hard link; the child keeps its own descriptor throughout.
+    const logHandle = openSandboxLogHandle({
+        containerName,
+        logsDir,
+        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     });
-    child.unref();
-    fs.closeSync(logFd);
-
-    if (!child.pid) {
-        throw new Error(`[bwrap] ${agentName}: failed to spawn bwrap process`);
-    }
-
-    // Wait briefly and verify the process didn't crash immediately
-    // (e.g. AppArmor blocking user namespaces, missing dependencies)
-    // Detached+unref'd processes become zombies when they die, so kill -0
-    // still returns true. Check /proc/PID/status for zombie state instead.
-    spawnSync('sleep', ['0.5']);
-    let processAlive = false;
+    let child;
     try {
-        const statusContent = fs.readFileSync(`/proc/${child.pid}/status`, 'utf8');
-        const stateLine = statusContent.split('\n').find(l => l.startsWith('State:')) || '';
-        processAlive = !stateLine.includes('Z (zombie)');
-    } catch {
-        processAlive = false;  // /proc/PID gone = process fully reaped
-    }
-    if (!processAlive) {
-        // Process died — read the log for the error message
-        let reason = 'unknown error';
+        child = spawn(BWRAP_PATH, bwrapArgs, {
+            detached: true,
+            stdio: logHandle.stdio
+        });
+        guardSpawnedChild(child, {
+            label: `[bwrap] ${agentName}: bwrap process`,
+            onError: (error) => debugLog(
+                `[bwrap] ${agentName}: child process error: ${sanitizeDiagnosticText(error)}`,
+            ),
+        });
+        const logFile = logHandle.finalize(child.pid, runtimeIdentity);
+        debugLog(`[bwrap] ${agentName}: log file: ${logFile}`);
+
+        // Wait briefly and verify the process didn't crash immediately.
+        spawnSync('sleep', ['0.5']);
+        let processAlive = false;
         try {
-            const logContent = fs.readFileSync(logFile, 'utf8').trim();
-            const recentLines = logContent.split('\n').slice(-12).join('\n');
-            if (recentLines) reason = recentLines;
-        } catch {}
-        throw new Error(`bwrap process exited immediately: ${reason}`);
-    }
+            const statusContent = fs.readFileSync(`/proc/${child.pid}/status`, 'utf8');
+            const stateLine = statusContent.split('\n').find(l => l.startsWith('State:')) || '';
+            processAlive = !stateLine.includes('Z (zombie)');
+        } catch {
+            processAlive = false;
+        }
+        if (!processAlive) {
+            let reason = 'unknown error';
+            try {
+                reason = readSandboxCrashLog(containerName, {
+                    runtime: 'bwrap', pid: child.pid, ...runtimeIdentity,
+                }, { logsDir }) || reason;
+            } catch {}
+            throw new Error(`bwrap process exited immediately: ${sanitizeDiagnosticText(reason)}`);
+        }
 
-    // Save PID
-    try {
         saveBwrapPid(containerName, child.pid, runtimeIdentity);
+        logHandle.commit();
+        child.unref();
     } catch (error) {
-        try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { }
-        try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }
+        if (child?.pid) {
+            try { process.kill(-child.pid, 'SIGKILL'); } catch (_) { }
+            try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }
+        }
+        logHandle.discard();
         throw error;
     }
     console.log(`[bwrap] ${agentName}: started with PID ${child.pid}`);

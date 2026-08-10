@@ -18,7 +18,7 @@ function lifecycleHelpLines(surface) {
         return [
             '  status                         Show combined, read-only outer runtime and workspace status',
             '  stop                           Stop core services, then stop the outer runtime',
-            '  destroy [--delete-cache]       Remove the outer runtime; optionally delete .ploinky/box cache data without prompting',
+            '  destroy [--delete-cache]       Remove the outer runtime without prompting; optionally delete .ploinky/box cache data',
         ];
     }
     return [
@@ -70,8 +70,9 @@ ${lifecycleHelpLines(surface).join('\n')}
   restart                        Restart enabled agents + Router
   disable agents-all             Disable all enabled agents and remove their containers
   reinstall <agentName>          Re-create a running agent container (destructive)
-  logs tail [router]             Follow router logs
-  logs last <N>                  Show last N router log lines
+  logs tail [router|<agent>]     Follow Router or one agent's logs
+  logs last [<N>] [router|<agent>]
+                                 Show the last N lines for one log source
 
 ▶ FOR DETAILED HELP
   help <command>                 Show detailed help for a command
@@ -345,19 +346,34 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             notes: 'A named restart requires the persisted RoutingServer port and refuses foreign or old-contract containers. The general restart fails if start was not configured yet.'
         },
         'logs': {
-            description: 'Inspect router logs',
+            description: 'Inspect Router and agent logs without changing any state',
             subcommands: {
                 'tail': {
-                    syntax: 'logs tail [router]',
-                    description: 'Follow router logs',
-                    examples: [ 'logs tail', 'logs tail router' ]
+                    syntax: 'logs tail [router|<agent>] [--startup]',
+                    description: 'Follow Router logs, or one agent from its current startup through the automatic handoff to its application output',
+                    examples: [
+                        'logs tail',
+                        'logs tail router',
+                        'logs tail myAgent',
+                        'logs tail myRepo/myAgent',
+                        'logs tail myAgent --startup'
+                    ],
+                    notes: 'Unqualified `router` always selects Router logs. Completion offers one round-trip-proved reference per enabled record; an agent named `router` needs a non-reserved unambiguous qualified spelling. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation. Tail follows that exact run\'s startup log, opens/proves its runtime source, and rechecks marker, registry generation, and source identity before switching. A failed start returns 1 and never falls back. `--startup` never opens runtime output.'
                 },
                 'last': {
-                    syntax: 'logs last <N>',
-                    description: 'Show last N router log lines',
-                    examples: [ 'logs last 200', 'logs last 50' ]
+                    syntax: 'logs last [<N>] [router|<agent>] [--startup]',
+                    description: 'Show the last N lines of one log source; N defaults to 200',
+                    examples: [
+                        'logs last',
+                        'logs last 50',
+                        'logs last myAgent',
+                        'logs last 200 myRepo/myAgent',
+                        'logs last 40 myAgent --startup'
+                    ],
+                    notes: 'N must be one exact whole number between 1 and 10000; fractions, signs, partial integers, and padded values are rejected. An ownership-proved runtime is selected before no-wait state is consulted; without one, the current run\'s startup log is used. Output is capped at 16 MiB and reports a limit failure instead of truncating silently.'
                 }
-            }
+            },
+            notes: 'Logs never create, start, repair, or remove a workspace, a Box, or an agent runtime. Docker/Podman uses immutable container IDs; Bubblewrap/Seatbelt uses immutable process-specific files, and pre-cut sandbox processes require one restart without legacy fallback. Application bytes pass through intentionally unredacted; bounded control diagnostics redact credentials. Only selected log bytes go to stdout; source and handoff messages go to stderr. Cancellation waits for bounded TERM/KILL cleanup.'
         },
         '/settings': {
             description: 'Open the interactive model/settings menu.',
@@ -725,7 +741,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 description: 'Stop nested agents and remove the outer runtime, retaining the host workspace and its .ploinky/box dependency and image cache directories by default.',
                 syntax: 'destroy [--delete-cache]',
                 examples: ['destroy', 'destroy --delete-cache'],
-                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Without the flag, this host-level command asks for confirmation and retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so pinned dependencies and reusable nested image content survive destroy and recreate. With --delete-cache, it removes the outer runtime and then deletes exactly those two directories without prompting; the workspace, .ploinky/master-key, repositories, agents, routing state, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
+                notes: 'Nested agents are stopped through the in-box helper before the outer runtime is removed; if that stop fails, the outer runtime is halted but nothing is removed. Both forms run without prompting. Without the flag, this host-level command retains the host workspace plus .ploinky/box/dependencies and .ploinky/box/images, so pinned dependencies and reusable nested image content survive destroy and recreate. With --delete-cache, it removes the outer runtime and then deletes exactly those two directories; the workspace, .ploinky/master-key, repositories, agents, routing state, and secrets are never deleted. Nested container records, writable layers, and inner named volumes are not retained by either form: they live on the outer runtime writable layer and are discarded with it, so persistent agent data must use workspace binds.',
             },
         }
         : {

@@ -250,7 +250,7 @@ test('generic forwarding prepares under the supervisor then execs the fixed targ
         PATH: '/bin', HOME: '/tmp', PLOINKY_MASTER_KEY: 'HOST_CANARY',
         UNRELATED_CANARY: 'NOPE',
     };
-    const code = await runOuterCli(['logs', '--debug', 'tail'], {
+    const code = await runOuterCli(['list', '--debug', 'agents'], {
         env,
         input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
@@ -260,7 +260,7 @@ test('generic forwarding prepares under the supervisor then execs the fixed targ
     assert.equal(events[0], 'prepare');
     assert.equal(events[1][1], 'podman');
     assert.deepEqual(events[1][2].slice(-4), [
-        '/opt/ploinky/bin/ploinky-local', 'logs', '--debug', 'tail',
+        '/opt/ploinky/bin/ploinky-local', 'list', '--debug', 'agents',
     ]);
     assert.deepEqual(events[1][2].slice(0, 8), [
         'container', 'exec',
@@ -270,6 +270,59 @@ test('generic forwarding prepares under the supervisor then execs the fixed targ
     ]);
     assert.equal(JSON.stringify(events[1][3]).includes('HOST_CANARY'), false);
     assert.equal(JSON.stringify(events[1][3]).includes('UNRELATED_CANARY'), false);
+});
+
+test('logs forward into an already running initialized Box without preparing it', async () => {
+    const events = [];
+    const env = {
+        PATH: '/bin', HOME: '/tmp', PLOINKY_MASTER_KEY: 'HOST_CANARY',
+        UNRELATED_CANARY: 'NOPE',
+    };
+    const code = await runOuterCli(['logs', '--debug', 'tail', 'someAgent'], {
+        env,
+        input: { isTTY: true }, output: bufferStream(true), errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
+        execute() { throw new Error('the logs route must use the streaming primitive'); },
+        executeStreaming(command, args, options) {
+            events.push(['stream', command, args, options]);
+            return 23;
+        },
+    });
+    // The Core exit code passes through unchanged.
+    assert.equal(code, 23);
+    assert.deepEqual(events.filter((event) => event === 'prepare'), []);
+    assert.deepEqual(events[0], 'status');
+    assert.equal(events[1][1], 'podman');
+    assert.deepEqual(events[1][2].slice(-5), [
+        '/opt/ploinky/bin/ploinky-local', 'logs', '--debug', 'tail', 'someAgent',
+    ]);
+    // A private interactive stdin pipe carries cancellation EOF; no TTY is allocated.
+    assert.equal(events[1][2].includes('--tty'), false);
+    assert.equal(events[1][2].includes('--interactive'), true);
+    assert.ok(events[1][2].includes('PLOINKY_BOX_LOG_STREAM=1'));
+    assert.equal(JSON.stringify(events[1][3]).includes('HOST_CANARY'), false);
+    assert.equal(JSON.stringify(events[1][3]).includes('UNRELATED_CANARY'), false);
+});
+
+test('logs never create, prepare, or repair a Box in any other state', async () => {
+    for (const statusState of [
+        'absent', 'stopped', 'running-uninitialized', 'running-transient',
+        'foreign', 'incompatible', 'unknown', 'unsupported',
+    ]) {
+        const events = [];
+        const errorOutput = bufferStream();
+        const code = await runOuterCli(['logs', 'last', '5'], {
+            env: { PATH: '/bin', HOME: '/tmp' },
+            input: { isTTY: false }, output: bufferStream(), errorOutput,
+            supervisor: fakeSupervisor(events, { statusState }),
+            execute() { throw new Error(`logs must not execute in state ${statusState}`); },
+            executeStreaming() { throw new Error(`logs must not stream in state ${statusState}`); },
+        });
+        assert.equal(code, 1, statusState);
+        assert.deepEqual(events, ['status'], statusState);
+        assert.match(errorOutput.value(), /not running and initialized/);
+        assert.match(errorOutput.value(), /never create or repair a Box/);
+    }
 });
 
 test('full update pulls the host source and relaunches before touching the Box when HEAD changes', async () => {
@@ -381,6 +434,16 @@ test('TTY flags appear only for interactive commands with both terminal ends', a
         mediaHostPort: 17891,
         interactive: true, inputIsTty: false, outputIsTty: true,
     }).includes('--tty'), false);
+    const logArgs = buildContainerExecArgs('a'.repeat(64), ['logs', 'tail'], {
+        hostPort: 19090,
+        mediaHostPort: 17891,
+        logStream: true,
+        inputIsTty: true,
+        outputIsTty: true,
+    });
+    assert.deepEqual(logArgs.slice(0, 3), ['container', 'exec', '--interactive']);
+    assert.equal(logArgs.includes('--tty'), false);
+    assert.ok(logArgs.includes('PLOINKY_BOX_LOG_STREAM=1'));
     const colorArgs = buildContainerExecArgs('a'.repeat(64), ['status'], {
         hostPort: 19090,
         mediaHostPort: 17891,
@@ -403,30 +466,30 @@ test('TTY flags appear only for interactive commands with both terminal ends', a
     assert.equal(events[1][1].includes('/bin/bash'), true);
 });
 
-test('destroy confirmation occurs after read-only inspect and before its single lock transaction', async () => {
+test('destroy runs without reading input after read-only inspect and before its single lock transaction', async () => {
     const events = [];
     const supervisor = fakeSupervisor(events, { statusState: 'running-initialized' });
+    const unreadableInput = new Proxy({}, {
+        get() { throw new Error('destroy must not read input'); },
+    });
     const code = await runOuterCli(['destroy'], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        env: {}, input: unreadableInput, output: bufferStream(), errorOutput: bufferStream(),
         supervisor,
-        confirmDestroy: async () => { events.push('confirm'); return true; },
     });
     assert.equal(code, 0);
     assert.deepEqual(events, [
         'status',
-        'confirm',
         ['destroy', 'a'.repeat(64), { deleteCache: false }],
     ]);
 });
 
-test('destroy --delete-cache skips confirmation and works without a container', async () => {
+test('destroy --delete-cache runs without prompting and works without a container', async () => {
     for (const statusState of ['running-initialized', 'absent']) {
         const events = [];
         const output = bufferStream();
         const code = await runOuterCli(['destroy', '--delete-cache'], {
             env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
             supervisor: fakeSupervisor(events, { statusState }),
-            confirmDestroy: async () => { throw new Error('must not prompt'); },
         });
         assert.equal(code, 0);
         assert.deepEqual(events, [
@@ -442,22 +505,23 @@ test('destroy --delete-cache skips confirmation and works without a container', 
     }
 });
 
-test('the default destroy confirmation states that cache data is retained', async () => {
+test('destroy is an input-free no-op when the outer Box is already absent', async () => {
     const events = [];
     const output = bufferStream();
-    let prompt = '';
+    const unreadableInput = new Proxy({}, {
+        get() { throw new Error('destroy must not read input'); },
+    });
     const code = await runOuterCli(['destroy'], {
-        env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
-        confirmDestroy: async (instance) => { prompt = instance; return false; },
+        env: {}, input: unreadableInput, output, errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events, { statusState: 'absent' }),
     });
     assert.equal(code, 0);
-    assert.equal(prompt, 'ploinky-box-workspace-123456789abc');
-    assert.match(output.value(), /Destroy cancelled; no resources changed/);
+    assert.deepEqual(events, ['status']);
+    assert.doesNotMatch(output.value(), /\[y\/N\]|cancelled/i);
     assert.equal(events.some((event) => Array.isArray(event) && event[0] === 'destroy'), false);
 });
 
-test('public help documents explicit no-prompt cache deletion', async () => {
+test('public help documents non-interactive destroy and explicit cache deletion', async () => {
     const output = bufferStream();
     const code = await runOuterCli(['help'], {
         env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
@@ -469,7 +533,7 @@ test('public help documents explicit no-prompt cache deletion', async () => {
     assert.match(output.value(), /destroy --delete-cache/);
     assert.doesNotMatch(output.value(), /--delete-volumes/);
     assert.match(output.value(), /\.ploinky\/box/);
-    assert.match(output.value(), /without prompting/);
+    assert.match(output.value(), /destroy\s+Remove the outer Box without prompting/);
     assert.match(output.value(), /docker\.io\/assistos\/ploinky-box:latest/);
     assert.match(output.value(), /PLOINKY_BOX_IMAGE/);
 });

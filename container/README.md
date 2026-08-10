@@ -14,9 +14,9 @@ runtime execute Ploinky core directly, preventing recursive outer startup.
 ## Quick start
 
 ```bash
-git clone https://github.com/AssistOS-AI/ploinky ~/work/ploinky
+git clone https://github.com/AssistOS-AI/ploinky ~/work/file-parser/ploinky
 cd ~/work/myProject
-~/work/ploinky/bin/ploinky start explorer
+~/work/file-parser/ploinky/bin/ploinky start explorer
 open http://127.0.0.1:8080/status
 ```
 
