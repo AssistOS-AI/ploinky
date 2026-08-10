@@ -59,8 +59,10 @@ visible to agents and files or directories created there by agents persist on
 the host. The dependency cache and nested image cache are bind-mounted from
 `<workspace>/.ploinky/box/dependencies` and `<workspace>/.ploinky/box/images`,
 so they survive destroy and recreate; nested container state does not. The outer
-runtime has exactly four mounts and owns no named volume. Transient Unix
-sockets stay under the outer runtime's private
+runtime has four durable host binds and one transient `/tmp` tmpfs created with
+`rw,exec,nosuid,nodev,mode=1777,notmpcopyup`; it owns no named volume. The tmpfs
+is empty on every outer boot, so inner Podman runtime metadata cannot survive a
+stop/start. Transient Unix sockets stay under the outer runtime's private
 `/run/ploinky` filesystem so the writable host bind remains portable through a
 macOS Podman Machine.
 Dependency-cache seeding inside the Box likewise uses `cp -a` copies instead
@@ -97,23 +99,26 @@ must match the source-owned allowlist. Ploinky pulls the selected reference only
 when creating a missing Box or preparing a validated replacement, validates the
 complete image metadata, and starts the captured image ID rather than racing the
 mutable tag. Compatible reuse, stopped-box start, status, stop, and destroy do
-not pull. Incompatible images or foreign owned resources are rejected before
+not pull. A stopped compatible Box is started with the same immutable outer
+container ID; only readiness output appended during that start is accepted,
+and the final inspection must still prove the Box is running. Incompatible
+images or foreign owned resources are rejected before
 pulling, cache preparation, restart, upgrade, or replacement. Ploinky does not
 migrate, clean, relabel, or adopt them: run `ploinky destroy` explicitly, then
 recreate the Box. Ordinary destroy retains `.ploinky/box`;
 `--delete-cache` performs an explicit storage reset of exactly those two cache
 directories without deleting any other workspace file.
 
-Only reusable content survives replacing the outer Box:
+State follows these stop/start and destroy boundaries:
 
-| State | Where it lives | Survives destroy? |
-| --- | --- | --- |
-| Workspace data | Host bind at `/workspace` | Yes, and no destroy path ever deletes it |
-| Pinned dependency cache | Host bind from `.ploinky/box/dependencies` at `/opt/ploinky/node_modules` | Yes, unless `--delete-cache` |
-| Nested image cache | Host bind from `.ploinky/box/images` at `/home/podman/.local/share/ploinky-images` | Yes, unless `--delete-cache` |
-| Nested container records and writable layers | Box writable layer under `/home/podman/.local/share/containers/storage` | No |
-| Inner Podman named volumes | Under the same disposable graphroot | No |
-| Transient runtime metadata | `/tmp/storage-run-1000` | No, reset every startup |
+| State | Where it lives | Survives stop/start? | Survives destroy? |
+| --- | --- | --- | --- |
+| Workspace data | Host bind at `/workspace` | Yes | Yes; no destroy path deletes it |
+| Pinned dependency cache | Host bind from `.ploinky/box/dependencies` at `/opt/ploinky/node_modules` | Yes | Yes, unless `--delete-cache` |
+| Nested image cache | Host bind from `.ploinky/box/images` at `/home/podman/.local/share/ploinky-images` | Yes | Yes, unless `--delete-cache` |
+| Nested container records and writable layers | Box writable layer under `/home/podman/.local/share/containers/storage` | Yes | No |
+| Inner Podman named volumes | Under the same disposable graphroot | Yes | No |
+| Transient runtime metadata | Tmpfs path `/tmp/storage-run-1000` | No; `/tmp` is fresh each boot | No |
 
 Nested container records, writable layers, networks, and inner Podman named
 volumes are discarded with the outer Box, so persistent agent data must use

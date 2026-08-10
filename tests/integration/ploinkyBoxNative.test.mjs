@@ -7,11 +7,15 @@ import test from 'node:test';
 import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
 import { routeOuterCommand } from '../../ploinky-box/command/route.mjs';
-import { BOX_MEDIA_PORT } from '../../ploinky-box/constants.mjs';
+import {
+    BOX_MEDIA_PORT,
+    BOX_TMPFS,
+    BOX_USERNS,
+} from '../../ploinky-box/constants.mjs';
 import { resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     removeContainerById,
-    waitForReadyLine,
+    startContainerAndWaitReady,
 } from '../../ploinky-box/lifecycle/container.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
 import { readSmokeGraphInputs, stageSmokeGraph } from '../../ploinky-box/smoke/graph.mjs';
@@ -22,9 +26,42 @@ import {
     execInBox,
     requirePodmanCandidate,
 } from '../e2e/ploinkyBox/nativeHelpers.mjs';
+import { readProxyTrace } from '../e2e/ploinkyBox/candidatePodmanProxy.mjs';
+import { captureCandidateEvidence } from '../e2e/ploinkyBox/candidateEvidence.mjs';
 
 // The supervisor defaults its read-only source bind to the repository root.
 const repositoryRoot = path.resolve(import.meta.dirname, '../..');
+
+const ISOLATED_BOX_PORTS = Object.freeze({
+    imageStore: Object.freeze({ hostPort: 19092, mediaHostPort: 17894 }),
+    bindReplacement: Object.freeze({ hostPort: 19093, mediaHostPort: 17895 }),
+    failedCreate: Object.freeze({ hostPort: 19094, mediaHostPort: 17896 }),
+    failedReplacementOriginal: Object.freeze({ hostPort: 19095, mediaHostPort: 17897 }),
+    failedReplacementCandidate: Object.freeze({ hostPort: 19096, mediaHostPort: 17898 }),
+});
+
+function isolatedBoxOptions(imageRef, ports, overrides = {}) {
+    return {
+        explicitPort: ports.hostPort,
+        explicitMediaPort: ports.mediaHostPort,
+        imageRef,
+        ...overrides,
+    };
+}
+
+function reserveUdpPortIfAvailable(port) {
+    return new Promise((resolve, reject) => {
+        const socket = dgram.createSocket('udp4');
+        socket.once('error', (error) => {
+            if (error?.code === 'EADDRINUSE') {
+                resolve(null);
+                return;
+            }
+            reject(error);
+        });
+        socket.bind(port, '0.0.0.0', () => resolve(socket));
+    });
+}
 
 function queryInBox(harness, containerId, argv) {
     return harness.runner.query('podman', [
@@ -77,14 +114,35 @@ function assertNoOwnedNamedVolume(harness) {
     }
 }
 
-function boxMounts(harness, containerId) {
+function boxInspection(harness, containerId) {
     const inspected = harness.runner.query('podman', ['container', 'inspect', containerId]);
     assert.equal(inspected.ok, true, inspected.stderr);
-    return JSON.parse(inspected.stdout)[0].Mounts;
+    return JSON.parse(inspected.stdout)[0];
 }
 
-function assertExactBindMounts(harness, containerId, repositoryRoot) {
-    const observed = boxMounts(harness, containerId)
+function repeatedArgument(argv, option) {
+    return argv.flatMap((value, index) => value === option ? [argv[index + 1]] : []);
+}
+
+function assertExactOuterStorage(harness, containerId, repositoryRoot) {
+    const record = boxInspection(harness, containerId);
+    const transientMounts = record.Mounts.filter((mount) => (
+        String(mount.Destination || '') === BOX_TMPFS.destination
+    ));
+    assert.ok(transientMounts.length <= 1);
+    if (transientMounts.length === 1) {
+        assert.deepEqual({
+            type: String(transientMounts[0].Type || '').toLowerCase(),
+            source: String(transientMounts[0].Source || ''),
+            name: String(transientMounts[0].Name || ''),
+            destination: String(transientMounts[0].Destination || ''),
+            rw: transientMounts[0].RW === true,
+        }, {
+            type: 'tmpfs', source: '', name: '', destination: BOX_TMPFS.destination, rw: true,
+        });
+    }
+    const observed = record.Mounts
+        .filter((mount) => String(mount.Destination || '') !== BOX_TMPFS.destination)
         .map((mount) => ({
             type: String(mount.Type || '').toLowerCase(),
             source: String(mount.Source || ''),
@@ -108,6 +166,28 @@ function assertExactBindMounts(harness, containerId, repositoryRoot) {
         },
         { type: 'bind', source: harness.identity.workspaceRoot, destination: '/workspace', rw: true },
     ]);
+    const inspectedTmpfs = record.HostConfig?.Tmpfs;
+    assert.deepEqual(Object.keys(inspectedTmpfs || {}), [BOX_TMPFS.destination]);
+    const runtimeOptions = String(inspectedTmpfs[BOX_TMPFS.destination]).split(',');
+    assert.equal(new Set(runtimeOptions).size, runtimeOptions.length);
+    assert.deepEqual(runtimeOptions.sort(), [
+        ...BOX_TMPFS.options.filter((option) => option !== 'notmpcopyup'),
+        'rprivate',
+    ].sort());
+    const createTmpfs = repeatedArgument(record.Config?.CreateCommand || [], '--tmpfs');
+    assert.equal(createTmpfs.length, 1);
+    const [destination, optionText] = createTmpfs[0].split(':');
+    assert.equal(destination, BOX_TMPFS.destination);
+    const createOptions = optionText.split(',');
+    assert.equal(new Set(createOptions).size, createOptions.length);
+    assert.deepEqual(createOptions.sort(), [...BOX_TMPFS.options].sort());
+    assert.equal(record.Config?.User, 'podman');
+    assert.equal(record.HostConfig?.Privileged, false);
+    assert.equal(record.HostConfig?.UsernsMode, 'private');
+    assert.deepEqual(
+        repeatedArgument(record.Config?.CreateCommand || [], '--userns'),
+        [BOX_USERNS],
+    );
 }
 
 function assertBoxCacheDirectoriesExist(harness) {
@@ -177,6 +257,83 @@ function readDependencyCacheFile(harness, relativePath) {
     ).trim();
 }
 
+test('a stopped Box restarts on the same outer ID with a fresh tmpfs boot', {
+    timeout: 30 * 60_000,
+}, async (t) => {
+    const candidateReference = requirePodmanCandidate(t);
+    if (!candidateReference) return;
+    const harness = createPodmanHarness(t, candidateReference);
+
+    // Keep the outer-runtime regression independent of smoke-graph revisions.
+    // The complete graph remains mandatory in the lifecycle test below and in
+    // the packed public CLI gate, while this case proves the original failure
+    // boundary: dependency verification immediately after outer stop/start.
+    const started = await harness.supervisor.prepareBoxForCommand({
+        explicitPort: 19091,
+        explicitMediaPort: 17893,
+        imageRef: candidateReference,
+    });
+    const containerId = started.containerId;
+    assert.match(containerId, /^[a-f0-9]{64}$/);
+    assertIntendedNestedStorage(harness, containerId);
+    assertExactOuterStorage(harness, containerId, repositoryRoot);
+    assertNoOwnedNamedVolume(harness);
+    const canary = `/tmp/ploinky-stop-start-${harness.identity.pathHash}`;
+    execInBox(harness.runner, containerId, [
+        'bash', '-c', 'printf transient > "$1"', 'bash', canary,
+    ]);
+    assert.equal(queryInBox(harness, containerId, ['test', '-f', canary]).ok, true);
+
+    const stopped = await harness.supervisor.runStopTransaction();
+    assert.equal(stopped.containerId, containerId);
+    const stoppedRecord = boxInspection(harness, containerId);
+    assert.equal(stoppedRecord.State?.Running, false);
+    assert.equal(String(stoppedRecord.State?.Status || ''), 'exited');
+
+    const traceStart = readProxyTrace(harness.candidateProxy.tracePath).length;
+    const restarted = await harness.supervisor.prepareBoxForCommand({
+        explicitPort: 19091,
+        explicitMediaPort: 17893,
+        imageRef: candidateReference,
+    });
+    assert.equal(restarted.action, 'reused');
+    assert.equal(restarted.containerId, containerId);
+    assert.equal(restarted.ownership.handles.container.runtime.running, true);
+    assert.equal(queryInBox(harness, containerId, ['test', '-e', canary]).ok, false);
+    assertIntendedNestedStorage(harness, containerId);
+    assertExactOuterStorage(harness, containerId, repositoryRoot);
+    assertNoOwnedNamedVolume(harness);
+    assert.match(readDependencyCacheFile(
+        harness,
+        '.ploinky-box-dependencies.json',
+    ), /^\{/);
+
+    const restartTrace = readProxyTrace(harness.candidateProxy.tracePath).slice(traceStart);
+    const restartArgv = restartTrace.filter((record) => record[0] === 'argv')
+        .map((record) => record.slice(1));
+    assert.equal(restartArgv.some((argv) => argv[0] === 'pull'), false);
+    assert.equal(restartArgv.some((argv) => (
+        argv[0] === 'container' && ['create', 'rm', 'remove'].includes(argv[1])
+    )), false);
+    captureCandidateEvidence({
+        runner: harness.runner,
+        diagnostic: (message) => t.diagnostic(message),
+        name: 'native-stop-start',
+        candidateReference,
+        beforeContainerId: containerId,
+        afterContainerId: restarted.containerId,
+        inspected: boxInspection(harness, restarted.containerId),
+        restartTrace,
+        verified: {
+            dependencyVerificationConfirmed: true,
+            entrypointReadinessConfirmed: true,
+            nestedRunRootConfirmed: true,
+            storageContractConfirmed: true,
+            tmpfsCanaryAbsent: true,
+        },
+    });
+});
+
 test('rootless Podman exercises the complete public lifecycle on one workspace identity', {
     timeout: 30 * 60_000,
 }, async (t) => {
@@ -195,8 +352,16 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.ok(startRoute.hostPort && startRoute.hostPort !== 8080,
         'candidate lifecycle start must exercise a custom public port');
     assert.equal(startRoute.mediaHostPort, selectedMediaHostPort);
+    const lifecyclePorts = Object.freeze({
+        hostPort: startRoute.hostPort,
+        mediaHostPort: startRoute.mediaHostPort,
+    });
 
-    const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const prepared = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, lifecyclePorts),
+    );
+    const candidateImageId = String(boxInspection(harness, prepared.containerId).Image || '');
+    assert.match(candidateImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky')), true);
     assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')).sort(),
         ['box', 'master-key'],
@@ -209,12 +374,22 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         fs.readdirSync(harness.identity.boxDataRoot).sort(),
         ['dependencies', 'images'],
     );
-    assertExactBindMounts(harness, prepared.containerId, repositoryRoot);
+    assertExactOuterStorage(harness, prepared.containerId, repositoryRoot);
     assertNoOwnedNamedVolume(harness);
     assert.equal(prepared.ownership.handles.container.runtime.running, true);
     assert.deepEqual(prepared.ownership.handles.container.runtime.publications, [
-        { containerPort: '7882', protocol: 'udp', hostIp: '0.0.0.0', hostPort: '7882' },
-        { containerPort: '8080', protocol: 'tcp', hostIp: '127.0.0.1', hostPort: '8080' },
+        {
+            containerPort: '7882',
+            protocol: 'udp',
+            hostIp: '0.0.0.0',
+            hostPort: String(lifecyclePorts.mediaHostPort),
+        },
+        {
+            containerPort: '8080',
+            protocol: 'tcp',
+            hostIp: '127.0.0.1',
+            hostPort: String(lifecyclePorts.hostPort),
+        },
     ]);
     assert.equal(prepared.ownership.handles.container.runtime.publications
         .some((entry) => entry.containerPort === '8081'), false);
@@ -236,9 +411,9 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
 
     const generic = routeOuterCommand(parseOuterArguments(['list', 'agents']));
     assert.equal(generic.kind, 'generic');
-    const genericPrepared = await harness.supervisor.prepareBoxForCommand({
-        imageRef: candidateReference,
-    });
+    const genericPrepared = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, lifecyclePorts),
+    );
     const genericResult = harness.runner.query('podman', buildContainerExecArgs(
         genericPrepared.containerId,
         generic.coreArgv,
@@ -251,9 +426,9 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
 
     const repl = routeOuterCommand(parseOuterArguments([]));
     assert.equal(repl.kind, 'repl');
-    const replPrepared = await harness.supervisor.prepareBoxForCommand({
-        imageRef: candidateReference,
-    });
+    const replPrepared = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, lifecyclePorts),
+    );
     const replArgs = buildContainerExecArgs(replPrepared.containerId, repl.coreArgv, {
         hostPort: replPrepared.hostPort,
         mediaHostPort: replPrepared.mediaHostPort,
@@ -293,8 +468,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(innerInfo.host?.security?.rootless ?? innerInfo.Host?.Security?.Rootless, true);
 
     const concurrent = await Promise.all([
-        harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference }),
-        harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference }),
+        harness.supervisor.prepareBoxForCommand(isolatedBoxOptions(candidateReference, lifecyclePorts)),
+        harness.supervisor.prepareBoxForCommand(isolatedBoxOptions(candidateReference, lifecyclePorts)),
     ]);
     assert.equal(concurrent[0].containerId, concurrent[1].containerId);
 
@@ -424,7 +599,9 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     );
     assert.ok(fs.readdirSync(harness.identity.dataPaths.images).length > 0,
         'the workspace-backed image store must retain content across destroy');
-    const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const recreated = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, lifecyclePorts),
+    );
     const recreatedKeyEvidence = execInBox(harness.runner, recreated.containerId, [
         'sha256sum', '/workspace/.ploinky/master-key',
     ]);
@@ -447,7 +624,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         'podman', 'image', 'inspect', nestedImageId,
     ]).ok, true);
     assertIntendedNestedStorage(harness, recreated.containerId);
-    assertExactBindMounts(harness, recreated.containerId, repositoryRoot);
+    assertExactOuterStorage(harness, recreated.containerId, repositoryRoot);
     assertNoOwnedNamedVolume(harness);
 
     // Explicit cache reset deletes exactly the two Box directories and leaves
@@ -477,9 +654,11 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
 
     // A clean rebuild recreates both cache directories and reinstalls the
     // pinned dependencies from scratch.
-    const rebuilt = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const rebuilt = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, lifecyclePorts),
+    );
     assertBoxCacheDirectoriesExist(harness);
-    assertExactBindMounts(harness, rebuilt.containerId, repositoryRoot);
+    assertExactOuterStorage(harness, rebuilt.containerId, repositoryRoot);
     assert.equal(fs.existsSync(path.join(
         harness.identity.dataPaths.dependencies, 't26-dependencies-canary',
     )), false);
@@ -489,16 +668,14 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ]), '');
     await harness.supervisor.runDestroyTransaction(rebuilt.containerId);
 
-    const udp = dgram.createSocket('udp4');
-    await new Promise((resolve, reject) => {
-        udp.once('error', reject);
-        udp.bind(BOX_MEDIA_PORT, '0.0.0.0', resolve);
-    });
+    // Either this test or an unrelated live Box may already own the default
+    // UDP port. Both establish the same precondition: an explicit media-port
+    // selection must not try to reserve BOX_MEDIA_PORT.
+    const udp = await reserveUdpPortIfAvailable(BOX_MEDIA_PORT);
     try {
-        const remapped = await harness.supervisor.prepareBoxForCommand({
-            explicitMediaPort: selectedMediaHostPort,
-            imageRef: candidateReference,
-        });
+        const remapped = await harness.supervisor.prepareBoxForCommand(
+            isolatedBoxOptions(candidateReference, lifecyclePorts),
+        );
         assert.equal(remapped.mediaHostPort, selectedMediaHostPort);
         assert.equal(remapped.ownership.handles.container.runtime.publications.some((entry) => (
             entry.protocol === 'udp'
@@ -507,7 +684,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         )), true);
         await harness.supervisor.runDestroyTransaction(remapped.containerId);
     } finally {
-        await new Promise((resolve) => udp.close(resolve));
+        if (udp) await new Promise((resolve) => udp.close(resolve));
     }
 
     const selectedUdp = dgram.createSocket('udp4');
@@ -517,10 +694,9 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     });
     try {
         await assert.rejects(
-            harness.supervisor.prepareBoxForCommand({
-                explicitMediaPort: selectedMediaHostPort,
-                imageRef: candidateReference,
-            }),
+            harness.supervisor.prepareBoxForCommand(
+                isolatedBoxOptions(candidateReference, lifecyclePorts),
+            ),
             new RegExp(`UDP|${selectedMediaHostPort}|already reserved`, 'i'),
         );
         assert.equal(harness.supervisor.inspectBoxStatus().state, 'absent');
@@ -533,11 +709,13 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     const foreignName = harness.identity.instance;
     const createdForeign = harness.runner.query('podman', [
         'container', 'create', '--name', foreignName, '--entrypoint', '/bin/true',
-        candidateReference,
+        candidateImageId,
     ]);
     assert.equal(createdForeign.ok, true, createdForeign.stderr);
     await assert.rejects(
-        harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference }),
+        harness.supervisor.prepareBoxForCommand(
+            isolatedBoxOptions(candidateReference, lifecyclePorts),
+        ),
         /exact-name resource .* is not owned by this Box/,
     );
     const foreignRecord = JSON.parse(harness.runner.query('podman', [
@@ -556,10 +734,10 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ]);
     assert.equal(createdRetired.ok, true, createdRetired.stderr);
     try {
-        const ignoring = await harness.supervisor.prepareBoxForCommand({
-            imageRef: candidateReference,
-        });
-        assertExactBindMounts(harness, ignoring.containerId, repositoryRoot);
+        const ignoring = await harness.supervisor.prepareBoxForCommand(
+            isolatedBoxOptions(candidateReference, lifecyclePorts),
+        );
+        assertExactOuterStorage(harness, ignoring.containerId, repositoryRoot);
         await harness.supervisor.runDestroyTransaction(ignoring.containerId, {
             deleteCache: true,
         });
@@ -584,8 +762,10 @@ test('the workspace-backed image store unpacks and reuses layers on the physical
     );
     const harness = createPodmanHarness(t, candidateReference);
 
-    const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
-    assertExactBindMounts(harness, prepared.containerId, repositoryRoot);
+    const prepared = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.imageStore),
+    );
+    assertExactOuterStorage(harness, prepared.containerId, repositoryRoot);
     assertNoOwnedNamedVolume(harness);
     assertIntendedNestedStorage(harness, prepared.containerId);
 
@@ -615,7 +795,9 @@ test('the workspace-backed image store unpacks and reuses layers on the physical
     await harness.supervisor.runDestroyTransaction(prepared.containerId);
     assertBoxCacheDirectoriesExist(harness);
 
-    const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const recreated = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.imageStore),
+    );
     // The image survives outer recreation and needs no second pull.
     assert.equal(execInBox(harness.runner, recreated.containerId, [
         'podman', 'image', 'inspect', '--format', '{{.Id}}', nestedImageId,
@@ -626,7 +808,9 @@ test('the workspace-backed image store unpacks and reuses layers on the physical
     // An explicit cache reset really empties the store.
     await harness.supervisor.runDestroyTransaction(recreated.containerId, { deleteCache: true });
     assert.equal(fs.existsSync(harness.identity.boxDataRoot), false);
-    const rebuilt = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const rebuilt = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.imageStore),
+    );
     assertBoxCacheDirectoriesExist(harness);
     assert.equal(queryInBox(harness, rebuilt.containerId, [
         'podman', 'image', 'inspect', nestedImageId,
@@ -639,7 +823,9 @@ test('a replaced live bind source recreates the outer Box before further writes'
     const candidateReference = requirePodmanCandidate(t);
     if (!candidateReference) return;
     const harness = createPodmanHarness(t, candidateReference);
-    const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const prepared = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.bindReplacement),
+    );
     const originalState = inspectWorkspaceDataPaths({ identity: harness.identity });
     const displaced = path.join(harness.root, 'displaced-dependencies');
 
@@ -656,10 +842,12 @@ test('a replaced live bind source recreates the outer Box before further writes'
     assert.equal(staleStatus.state, 'incompatible');
     assert.match(staleStatus.detail, /label set is incompatible/);
 
-    const replaced = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const replaced = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.bindReplacement),
+    );
     assert.equal(replaced.action, 'replaced');
     assert.notEqual(replaced.containerId, prepared.containerId);
-    assertExactBindMounts(harness, replaced.containerId, repositoryRoot);
+    assertExactOuterStorage(harness, replaced.containerId, repositoryRoot);
     const record = JSON.parse(harness.runner.query('podman', [
         'container', 'inspect', replaced.containerId,
     ]).stdout)[0];
@@ -689,17 +877,20 @@ test('failed candidate create removes the container and retains workspace cache 
     let injected = false;
     const harness = createPodmanHarness(t, candidateReference, {
         reconcile: (options) => reconcileBoxContainer(options, {
-            async waitReady(...args) {
+            async startAndWaitReady(...args) {
                 if (!injected) {
                     injected = true;
+                    await startContainerAndWaitReady(...args);
                     throw new Error('injected candidate create readiness failure');
                 }
-                return waitForReadyLine(...args);
+                return startContainerAndWaitReady(...args);
             },
         }),
     });
     await assert.rejects(
-        harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference }),
+        harness.supervisor.prepareBoxForCommand(
+            isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.failedCreate),
+        ),
         /transaction failed/i,
     );
     assert.equal(injected, true);
@@ -718,16 +909,19 @@ test('failed candidate replacement restores the validated old Box', {
     let injected = false;
     const harness = createPodmanHarness(t, candidateReference, {
         reconcile: (options) => reconcileBoxContainer(options, {
-            async waitReady(...args) {
+            async startAndWaitReady(...args) {
                 if (armed && !injected) {
                     injected = true;
+                    await startContainerAndWaitReady(...args);
                     throw new Error('injected candidate replacement readiness failure');
                 }
-                return waitForReadyLine(...args);
+                return startContainerAndWaitReady(...args);
             },
         }),
     });
-    const original = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const original = await harness.supervisor.prepareBoxForCommand(
+        isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.failedReplacementOriginal),
+    );
     execInBox(harness.runner, original.containerId, [
         'bash', '-c', 'printf replacement-retained > /workspace/replacement-canary',
     ]);
@@ -738,27 +932,30 @@ test('failed candidate replacement restores the validated old Box', {
         .map(([key, target]) => [key, String(fs.statSync(target).ino)]));
     armed = true;
     await assert.rejects(
-        harness.supervisor.prepareBoxForCommand({
-            explicitPort: 19091,
-            explicitMediaPort: 17892,
-            imageRef: candidateReference,
-        }),
+        harness.supervisor.prepareBoxForCommand(isolatedBoxOptions(
+            candidateReference,
+            ISOLATED_BOX_PORTS.failedReplacementCandidate,
+        )),
         /transaction failed/i,
     );
     assert.equal(injected, true);
     const restored = harness.supervisor.inspectBoxStatus();
     assert.match(restored.state, /^running-/);
     assert.equal(restored.ownership.handles.container.runtime.publications.some((entry) => (
-        entry.protocol === 'tcp' && entry.hostPort === '8080' && entry.containerPort === '8080'
+        entry.protocol === 'tcp'
+        && entry.hostPort === String(ISOLATED_BOX_PORTS.failedReplacementOriginal.hostPort)
+        && entry.containerPort === '8080'
     )), true);
     assert.equal(restored.ownership.handles.container.runtime.publications.some((entry) => (
-        entry.protocol === 'udp' && entry.hostPort === '7882' && entry.containerPort === '7882'
+        entry.protocol === 'udp'
+        && entry.hostPort === String(ISOLATED_BOX_PORTS.failedReplacementOriginal.mediaHostPort)
+        && entry.containerPort === '7882'
     )), true);
     // The restored Box binds the very same cache directories; nothing about
     // the durable workspace state was rolled back.
     assert.deepEqual(Object.fromEntries(Object.entries(harness.identity.dataPaths)
         .map(([key, target]) => [key, String(fs.statSync(target).ino)])), cacheInodes);
-    assertExactBindMounts(harness, restored.ownership.handles.container.id, repositoryRoot);
+    assertExactOuterStorage(harness, restored.ownership.handles.container.id, repositoryRoot);
     assertNoOwnedNamedVolume(harness);
     assert.equal(execInBox(harness.runner, restored.ownership.handles.container.id, [
         'cat', '/workspace/replacement-canary',

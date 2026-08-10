@@ -14,10 +14,6 @@ const HEALTH_SOCKET = path.join(PLOINKY_DIR, 'run', 'router-health.sock');
 const REQUEST_TIMEOUT_MS = 3_000;
 const HELPER_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_BYTES = 8 * 1024;
-const LOOPBACK_AUTH_BODIES = Object.freeze([
-    '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}',
-    '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}',
-]);
 const AUTHORITY_HELPER_USER = '65534:65534';
 const AUTHORITY_HELPER_LABEL = 'io.assistos.ploinky.authority-helper';
 const AUTHORITY_HELPER_NAME_PREFIX = 'ploinky-authority-';
@@ -79,6 +75,28 @@ function digest(value) {
     return `sha256:${crypto.createHash('sha256').update(canonicalJsonBytes(value)).digest('hex')}`;
 }
 
+function exactAuthRouteKey(value) {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== 'string' || !value || value !== value.trim()
+        || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) {
+        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority authentication route key is invalid');
+    }
+    return value;
+}
+
+function exactUnauthenticatedHealthBody(authRouteKey) {
+    const routeKey = exactAuthRouteKey(authRouteKey);
+    if (!routeKey) {
+        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'public authority attestation requires the generation-bound authentication route key');
+    }
+    const query = new URLSearchParams({ returnTo: '/health', agent: routeKey });
+    return JSON.stringify({
+        ok: false,
+        error: 'not_authenticated',
+        login: `/auth/login?${query.toString()}`,
+    });
+}
+
 function exactRuntimeProof(runtimeProof) {
     if (!runtimeProof || typeof runtimeProof !== 'object' || Array.isArray(runtimeProof)) {
         fail('PLOINKY_ROUTER_ATTESTATION_UNSUPPORTED', 'verified runtime proof is required');
@@ -100,10 +118,12 @@ export function buildRouterAuthorityTopologyIntent({
     platform = process.platform,
     routerHostPort = selectedRouterHostPort(),
     edgeTopologyFile,
+    authRouteKey,
 } = {}) {
     const mode = String(networkMode || '').trim().toLowerCase();
     if (mode === 'none') return null;
     const publicAuthority = `127.0.0.1:${routerHostPort}`;
+    const exactAuthenticationRoute = exactAuthRouteKey(authRouteKey);
     const markerOptions = { fsApi };
     if (markerPath) markerOptions.markerPath = markerPath;
     const insideBox = isInsideBox(markerOptions);
@@ -121,6 +141,7 @@ export function buildRouterAuthorityTopologyIntent({
             routerPort: '8080',
             internalRouterUrl: 'http://127.0.0.1:8081',
             edgeTopologyFile,
+            authRouteKey: exactAuthenticationRoute,
             runtimeProof: Object.freeze({ runtime: runtimeKind, platform }),
             networkFingerprint: digest({ runtime: runtimeKind, mode, platform }),
         });
@@ -138,6 +159,7 @@ export function buildRouterAuthorityTopologyIntent({
             routerPort: '8080',
             internalRouterUrl: 'http://127.0.0.1:8081',
             edgeTopologyFile,
+            authRouteKey: exactAuthenticationRoute,
             runtimeProof: Object.freeze({ runtime: 'host', platform }),
             networkFingerprint: digest({ runtime: 'host', mode, platform }),
         });
@@ -166,6 +188,7 @@ export function buildRouterAuthorityTopologyIntent({
         routerPort: '8080',
         internalRouterUrl: 'http://host.containers.internal:8081',
         edgeTopologyFile,
+        authRouteKey: exactAuthenticationRoute,
         runtimeProof: proof,
         networkFingerprint,
     });
@@ -311,7 +334,11 @@ export function validateRouterAuthorityObservation({ intent, nonce, records, ext
             hostSelectionKind: null,
             controlMiss: false,
         });
-        assertExternal(externalByHost(external, loopback), 401, LOOPBACK_AUTH_BODIES);
+        assertExternal(
+            externalByHost(external, loopback),
+            401,
+            exactUnauthenticatedHealthBody(intent.authRouteKey),
+        );
         assertExternal(externalByHost(external, hci), 421, '{"error":"UNKNOWN_HOST"}');
     } else {
         assertRecord(hciRecord, {

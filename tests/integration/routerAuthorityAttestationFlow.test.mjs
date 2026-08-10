@@ -40,10 +40,10 @@ function createActiveExplorerGeneration(t) {
     fs.mkdirSync(explorerDir, { recursive: true });
     writeJson(path.join(explorerDir, 'manifest.json'), {});
     writeJson(path.join(ploinkyDir, 'routing.json'), {
-        static: { agent: 'explorer', port: 7777 },
+        static: { agent: 'AchillesIDE/explorer', port: 7777 },
         routes: {
             explorer: {
-                repo: 'fixtures',
+                repo: 'AchillesIDE',
                 agent: 'explorer',
                 container: 'explorer-container',
                 hostPath: explorerDir,
@@ -54,7 +54,7 @@ function createActiveExplorerGeneration(t) {
     writeJson(path.join(ploinkyDir, 'agents.json'), {
         'explorer-container': {
             type: 'agent',
-            repoName: 'fixtures',
+            repoName: 'AchillesIDE',
             agentName: 'explorer',
             runtime: 'podman',
             containerId: 'a'.repeat(64),
@@ -232,7 +232,7 @@ test('registered observation headers are response-neutral in all four listener a
             server: publicServer,
             host: '127.0.0.1:18080',
             expectedStatus: 401,
-            expectedBody: '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=explorer"}',
+            expectedBody: '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=AchillesIDE%2Fexplorer"}',
         },
         {
             key: 'public-hci',

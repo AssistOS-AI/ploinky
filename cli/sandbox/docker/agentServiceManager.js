@@ -1578,6 +1578,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             networkFingerprint: plan.networkFingerprint,
             runtimeKind: 'container',
             edgeTopologyFile: runtimeRouterEnv.PLOINKY_EDGE_TOPOLOGY_FILE,
+            authRouteKey: generationLease.snapshot?.routing?.static?.agent,
         });
         const attested = attestRouterAuthority({
             intent,

@@ -26,9 +26,9 @@ import {
     removeContainerById,
     revalidateBoxDataPaths,
     secureCidfilePath,
+    startContainerAndWaitReady,
     stopPloinkyLocalByContainerId,
     validateCreatedContainer,
-    waitForReadyLine,
 } from './container.mjs';
 
 function transactionError(message, cause, rollbackFailures = []) {
@@ -112,7 +112,7 @@ async function createAndStart({
     runner,
     lock,
     discover,
-    waitReady,
+    startAndWaitReady,
     revalidateDataPaths,
     readCidfile,
     fsApi,
@@ -152,8 +152,7 @@ async function createAndStart({
         cleanCidfile(cidfile, fsApi);
     }
     writeProgress(stderr, `Starting Box container ${identity.instance}; streaming startup logs...`);
-    runner.run(engine.name, ['container', 'start', containerId]);
-    await waitReady(engine, containerId, runner, { stdout, stderr });
+    await startAndWaitReady(engine, containerId, runner, { stdout, stderr });
     const finalOwnership = discover(identity, { runner });
     const handle = validateCreatedContainer(finalOwnership, {
         identity,
@@ -192,7 +191,7 @@ async function restoreOldContainer({
         runner,
         lock,
         discover: dependencies.discover,
-        waitReady: dependencies.waitReady,
+        startAndWaitReady: dependencies.startAndWaitReady,
         revalidateDataPaths: dependencies.revalidateDataPaths,
         readCidfile: dependencies.readCidfile,
         fsApi: dependencies.fsApi,
@@ -233,7 +232,7 @@ export async function reconcileBoxContainer({
         revalidateDataPaths: seams.revalidateDataPaths || revalidateBoxDataPaths,
         removeContainer: seams.removeContainer || removeContainerById,
         stopPloinkyLocal: seams.stopPloinkyLocal || stopPloinkyLocalByContainerId,
-        waitReady: seams.waitReady || waitForReadyLine,
+        startAndWaitReady: seams.startAndWaitReady || startContainerAndWaitReady,
         readCidfile: seams.readCidfile || readContainerIdFromCidfile,
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
@@ -275,11 +274,18 @@ export async function reconcileBoxContainer({
         dependencies.revalidateDataPaths({ identity, lock, fsApi: dependencies.fsApi });
         if (!currentContainer.runtime.running) {
             writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
-            runner.run(engine.name, ['container', 'start', currentContainer.id]);
-            await dependencies.waitReady(engine, currentContainer.id, runner, { stdout, stderr });
+            await dependencies.startAndWaitReady(
+                engine,
+                currentContainer.id,
+                runner,
+                { stdout, stderr },
+            );
         }
         const finalOwnership = dependencies.discover(identity, { runner });
-        validateCreatedContainer(finalOwnership, old);
+        const finalHandle = validateCreatedContainer(finalOwnership, old);
+        if (finalHandle.id !== currentContainer.id) {
+            throw transactionError('Reused Box immutable ID changed during final validation');
+        }
         return Object.freeze({
             action: 'reused',
             ownership: finalOwnership,
@@ -323,7 +329,7 @@ export async function reconcileBoxContainer({
             runner,
             lock,
             discover: dependencies.discover,
-            waitReady: dependencies.waitReady,
+            startAndWaitReady: dependencies.startAndWaitReady,
             revalidateDataPaths: dependencies.revalidateDataPaths,
             readCidfile: dependencies.readCidfile,
             fsApi: dependencies.fsApi,

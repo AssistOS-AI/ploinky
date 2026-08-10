@@ -1,0 +1,217 @@
+name: Verify Ploinky Box Candidate
+
+on:
+  workflow_call:
+    inputs:
+      box_digest:
+        description: Immutable multi-architecture Ploinky Box digest
+        required: true
+        type: string
+      smoke_graph_revisions_json:
+        description: Exact seven-repository revision map as JSON
+        required: true
+        type: string
+    secrets:
+      PLOINKY_CANDIDATE_REPOSITORY_TOKEN:
+        description: Read-only token for the seven smoke-graph repositories
+        required: true
+  workflow_dispatch:
+    inputs:
+      box_digest:
+        description: Immutable multi-architecture Ploinky Box digest
+        required: true
+        type: string
+      smoke_graph_revisions_json:
+        description: Exact seven-repository revision map as JSON
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: macos-podman-machine-arm64
+            runs_on: '["self-hosted","macOS","ARM64","ploinky-box-candidate"]'
+          - host: native-linux-amd64
+            runs_on: '["self-hosted","Linux","X64","ploinky-box-candidate"]'
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    timeout-minutes: 120
+    env:
+      PLOINKY_BOX_REQUIRE_PODMAN: '1'
+      PLOINKY_BOX_CANDIDATE_DIGEST: ${{ inputs.box_digest }}
+      PLOINKY_BOX_EVIDENCE_DIR: ${{ runner.temp }}/ploinky-box-candidate-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.host }}
+      PLOINKY_BOX_CANDIDATE_LOG_DIR: ${{ runner.temp }}/ploinky-box-candidate-logs/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.host }}
+      SMOKE_GRAPH_ARGS_JSON: '["start","AchillesIDE/explorer","19090"]'
+      SMOKE_GRAPH_REVISIONS_JSON: ${{ inputs.smoke_graph_revisions_json }}
+      SMOKE_GRAPH_REPOSITORIES_JSON: >-
+        {"AssistOSExplorer":"${{ github.workspace }}/candidate-repositories/AssistOSExplorer","webmeetInfra":"${{ github.workspace }}/candidate-repositories/webmeetInfra","UmamiAgent":"${{ github.workspace }}/candidate-repositories/UmamiAgent","AchillesCLI":"${{ github.workspace }}/candidate-repositories/AchillesCLI","proxies":"${{ github.workspace }}/candidate-repositories/proxies","basic":"${{ github.workspace }}/candidate-repositories/basic","container-image-builds":"${{ github.workspace }}/candidate-repositories/container-image-builds"}
+      SMOKE_GRAPH_EDGE_DESIRED_FILE: ${{ runner.temp }}/ploinky-box-smoke-desired-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.host }}.json
+    steps:
+      - name: Check out Ploinky candidate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out AssistOSExplorer
+        uses: actions/checkout@v4
+        with:
+          repository: AssistOS-AI/AssistOSExplorer
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).AssistOSExplorer }}
+          path: candidate-repositories/AssistOSExplorer
+          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+          persist-credentials: false
+
+      - name: Check out webmeetInfra
+        uses: actions/checkout@v4
+        with:
+          repository: AssistOS-AI/webmeetInfra
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).webmeetInfra }}
+          path: candidate-repositories/webmeetInfra
+          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+          persist-credentials: false
+
+      - name: Check out UmamiAgent
+        uses: actions/checkout@v4
+        with:
+          repository: AssistOS-AI/UmamiAgent
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).UmamiAgent }}
+          path: candidate-repositories/UmamiAgent
+          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+          persist-credentials: false
+
+      - name: Check out AchillesCLI
+        uses: actions/checkout@v4
+        with:
+          repository: AssistOS-AI/AchillesCLI
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).AchillesCLI }}
+          path: candidate-repositories/AchillesCLI
+          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+          persist-credentials: false
+
+      - name: Check out proxies
+        uses: actions/checkout@v4
+        with:
+          repository: AssistOS-AI/proxies
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).proxies }}
+          path: candidate-repositories/proxies
+          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+          persist-credentials: false
+
+      - name: Check out basic
+        uses: actions/checkout@v4
+        with:
+          repository: AssistOS-AI/basic
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).basic }}
+          path: candidate-repositories/basic
+          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+          persist-credentials: false
+
+      - name: Check out container-image-builds
+        uses: actions/checkout@v4
+        with:
+          repository: AssistOS-AI/container-image-builds
+          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json)['container-image-builds'] }}
+          path: candidate-repositories/container-image-builds
+          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate immutable inputs and rootless Podman
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module -e '
+            const digest = process.env.PLOINKY_BOX_CANDIDATE_DIGEST;
+            if (!/^sha256:[a-f0-9]{64}$/.test(digest || "")) process.exit(2);
+            const revisions = JSON.parse(process.env.SMOKE_GRAPH_REVISIONS_JSON || "null");
+            const expected = ["AchillesCLI","AssistOSExplorer","UmamiAgent","basic","container-image-builds","proxies","webmeetInfra"].sort();
+            if (JSON.stringify(Object.keys(revisions || {}).sort()) !== JSON.stringify(expected)) process.exit(3);
+            if (Object.values(revisions).some((value) => !/^[a-f0-9]{40}$/.test(value))) process.exit(4);
+            const args = JSON.parse(process.env.SMOKE_GRAPH_ARGS_JSON || "null");
+            if (JSON.stringify(args) !== JSON.stringify(["start","AchillesIDE/explorer","19090"])) process.exit(5);
+          '
+          command -v podman
+          podman version --format json
+          podman info --format json | node --input-type=module -e '
+            let bytes = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", (chunk) => { bytes += chunk; });
+            process.stdin.on("end", () => {
+              const info = JSON.parse(bytes);
+              if ((info.host?.security?.rootless ?? info.Host?.Security?.Rootless) !== true) process.exit(6);
+            });
+          '
+
+      - name: Prepare local-only smoke desired state
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module -e '
+            import fs from "node:fs";
+            fs.writeFileSync(process.env.SMOKE_GRAPH_EDGE_DESIRED_FILE, "{\"hosts\":{}}\n", { flag: "wx", mode: 0o600 });
+          '
+          mkdir -p "$PLOINKY_BOX_EVIDENCE_DIR" "$PLOINKY_BOX_CANDIDATE_LOG_DIR"
+
+      - name: Run native candidate lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test tests/integration/ploinkyBoxNative.test.mjs \
+            2>&1 | tee "$PLOINKY_BOX_CANDIDATE_LOG_DIR/native.log"
+
+      - name: Run packed public CLI candidate lifecycle
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test tests/e2e/ploinkyBox/publicCli.test.mjs \
+            2>&1 | tee "$PLOINKY_BOX_CANDIDATE_LOG_DIR/public-cli.log"
+
+      - name: Require both evidence records
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find "$PLOINKY_BOX_EVIDENCE_DIR" -maxdepth 1 -name 'native-stop-start-*.json' -type f | wc -l | tr -d ' ')" = 1
+          test "$(find "$PLOINKY_BOX_EVIDENCE_DIR" -maxdepth 1 -name 'public-cli-stop-start-*.json' -type f | wc -l | tr -d ' ')" = 1
+          test "$(find "$PLOINKY_BOX_EVIDENCE_DIR" -maxdepth 1 -name '*.json' -type f | wc -l | tr -d ' ')" = 2
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import path from "node:path";
+            const files = fs.readdirSync(process.env.PLOINKY_BOX_EVIDENCE_DIR).filter((name) => name.endsWith(".json"));
+            for (const file of files) {
+              const evidence = JSON.parse(fs.readFileSync(path.join(process.env.PLOINKY_BOX_EVIDENCE_DIR, file), "utf8"));
+              if (evidence.kind !== "ploinky-box-candidate-evidence") process.exit(11);
+              if (evidence.candidateDigest !== process.env.PLOINKY_BOX_CANDIDATE_DIGEST) process.exit(12);
+              if (evidence.podman?.rootless !== true || evidence.outerContainer?.sameId !== true) process.exit(13);
+              if (evidence.restart?.pullObserved || evidence.restart?.createObserved || evidence.restart?.removeObserved) process.exit(14);
+              const expectedCreateTmpfs = "/tmp:rw,exec,nosuid,nodev,mode=1777,notmpcopyup";
+              if (JSON.stringify(evidence.outerContainer?.createTmpfs) !== JSON.stringify([expectedCreateTmpfs])) process.exit(15);
+              const expectedRuntimeTmpfs = ["rw","exec","nosuid","nodev","mode=1777","rprivate"].sort();
+              const runtimeTmpfs = String(evidence.outerContainer?.hostConfigTmpfs?.["/tmp"] || "").split(",").filter(Boolean).sort();
+              if (JSON.stringify(runtimeTmpfs) !== JSON.stringify(expectedRuntimeTmpfs)) process.exit(16);
+              if (!evidence.verified || Object.keys(evidence.verified).length === 0
+                  || Object.values(evidence.verified).some((value) => value !== true)) process.exit(17);
+            }
+          '
+
+      - name: Upload candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ploinky-box-candidate-${{ matrix.host }}
+          path: |
+            ${{ env.PLOINKY_BOX_EVIDENCE_DIR }}
+            ${{ env.PLOINKY_BOX_CANDIDATE_LOG_DIR }}
+          if-no-files-found: error
+          retention-days: 30

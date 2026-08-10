@@ -10,6 +10,7 @@ import {
     BOX_ROUTER_CONTAINER_PORT,
     BOX_ROUTER_HEALTH_SOCKET,
     BOX_ROLES,
+    BOX_TMPFS,
     BOX_USERNS,
 } from '../constants.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
@@ -43,9 +44,20 @@ function writeLogDelta(output, currentValue, previousValue) {
     const current = String(currentValue || '');
     const previous = String(previousValue || '');
     if (!current || current === previous) return current;
-    const delta = current.startsWith(previous) ? current.slice(previous.length) : current;
-    output?.write?.(delta);
+    output?.write?.(current.slice(previous.length));
     return current;
+}
+
+function assertImmutableContainerId(containerId, action) {
+    const value = String(containerId);
+    if (!/^[a-f0-9]{12,64}$/.test(value)) {
+        throw lifecycleError(`Refusing to ${action} without an immutable container ID`);
+    }
+    return value;
+}
+
+function tmpfsCreateArgument() {
+    return `${BOX_TMPFS.destination}:${BOX_TMPFS.options.join(',')}`;
 }
 
 export function containerCreateArgs({
@@ -86,6 +98,7 @@ export function containerCreateArgs({
         '--security-opt', 'label=disable',
         '--publish', `127.0.0.1:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
         '--publish', `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
+        '--tmpfs', tmpfsCreateArgument(),
         '--volume', `${source}:/opt/ploinky:ro`,
         '--volume', `${identity.workspaceRoot}:/workspace`,
         ...workspaceDataMountArgs(identity),
@@ -134,68 +147,143 @@ export function revalidateBoxDataPaths({ identity, lock, fsApi }) {
 }
 
 export function removeContainerById(engine, containerId, runner) {
-    if (!/^[a-f0-9]{12,64}$/.test(String(containerId))) {
-        throw lifecycleError('Refusing to remove a container without an immutable ID');
-    }
-    runner.run(engine.name, ['container', 'rm', '-f', String(containerId)]);
+    const id = assertImmutableContainerId(containerId, 'remove a container');
+    runner.run(engine.name, ['container', 'rm', '-f', id]);
 }
 
 export function stopPloinkyLocalByContainerId(engine, containerId, runner) {
-    if (!/^[a-f0-9]{12,64}$/.test(String(containerId))) {
-        throw lifecycleError('Refusing to relay ploinky-local stop without an immutable container ID');
-    }
+    const id = assertImmutableContainerId(containerId, 'relay ploinky-local stop');
     runner.run(engine.name, [
         'container', 'exec',
         '--user', 'podman',
         '--workdir', '/workspace',
-        String(containerId),
+        id,
         '/opt/ploinky/bin/ploinky-local',
         'stop',
     ]);
 }
 
+export function captureContainerLogBaseline(engine, containerId, runner) {
+    const id = assertImmutableContainerId(containerId, 'capture container logs');
+    const logs = runner.query(engine.name, ['container', 'logs', id]);
+    if (!logs?.ok) {
+        throw lifecycleError(
+            `Could not capture Box container logs before start; ${containerLogDiagnostic(logs)}`,
+            'PLOINKY_BOX_LOG_BASELINE_FAILED',
+            logs?.error,
+        );
+    }
+    return Object.freeze({
+        stdout: String(logs.stdout || ''),
+        stderr: String(logs.stderr || ''),
+    });
+}
+
+function validateLogBaseline(logBaseline) {
+    if (!logBaseline
+        || typeof logBaseline !== 'object'
+        || typeof logBaseline.stdout !== 'string'
+        || typeof logBaseline.stderr !== 'string') {
+        throw lifecycleError(
+            'Box readiness requires an exact pre-start log baseline',
+            'PLOINKY_BOX_LOG_BASELINE_INVALID',
+        );
+    }
+    return {
+        stdout: logBaseline.stdout,
+        stderr: logBaseline.stderr,
+    };
+}
+
+function logHistoryDrift(stream) {
+    throw lifecycleError(
+        `Box container ${stream} log history drifted from the pre-start baseline`,
+        'PLOINKY_BOX_LOG_HISTORY_DRIFT',
+    );
+}
+
 export async function waitForReadyLine(engine, containerId, runner, {
     readyLine = BOX_READY_LINE,
+    logBaseline,
     timeoutMs = 60_000,
     intervalMs = 100,
     delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     stdout = process.stdout,
     stderr = process.stderr,
 } = {}) {
+    const id = assertImmutableContainerId(containerId, 'wait for container readiness');
+    const baseline = validateLogBaseline(logBaseline);
     const deadline = Date.now() + timeoutMs;
     let emittedStdout = '';
     let emittedStderr = '';
+    let lastCurrentLogs = null;
+
+    function readCurrentBootLogs() {
+        const logs = runner.query(engine.name, ['container', 'logs', id]);
+        if (!logs?.ok) return { ok: false, result: logs };
+        const cumulativeStdout = String(logs.stdout || '');
+        const cumulativeStderr = String(logs.stderr || '');
+        if (!cumulativeStdout.startsWith(baseline.stdout)) logHistoryDrift('stdout');
+        if (!cumulativeStderr.startsWith(baseline.stderr)) logHistoryDrift('stderr');
+        const currentStdout = cumulativeStdout.slice(baseline.stdout.length);
+        const currentStderr = cumulativeStderr.slice(baseline.stderr.length);
+        if (!currentStdout.startsWith(emittedStdout)) logHistoryDrift('stdout');
+        if (!currentStderr.startsWith(emittedStderr)) logHistoryDrift('stderr');
+        emittedStdout = writeLogDelta(stdout, currentStdout, emittedStdout);
+        emittedStderr = writeLogDelta(stderr, currentStderr, emittedStderr);
+        lastCurrentLogs = { stdout: currentStdout, stderr: currentStderr };
+        return { ok: true, logs: lastCurrentLogs };
+    }
+
     while (Date.now() <= deadline) {
-        const logs = runner.query(engine.name, ['container', 'logs', containerId]);
-        if (logs.ok) {
-            emittedStdout = writeLogDelta(stdout, logs.stdout, emittedStdout);
-            emittedStderr = writeLogDelta(stderr, logs.stderr, emittedStderr);
-        }
-        if (logs.ok && String(logs.stdout || '').split(/\r?\n/).includes(readyLine)) {
-            return;
-        }
+        const logs = readCurrentBootLogs();
         const state = runner.query(engine.name, [
-            'container', 'inspect', '--format', '{{.State.Status}}', containerId,
+            'container', 'inspect', '--format', '{{.State.Status}}', id,
         ]);
-        if (state.ok && !['created', 'running'].includes(String(state.stdout || '').trim())) {
-            const finalLogs = runner.query(engine.name, ['container', 'logs', containerId]);
+        const status = state?.ok ? String(state.stdout || '').trim().toLowerCase() : '';
+        if (state?.ok && !['created', 'running'].includes(status)) {
+            const finalLogs = readCurrentBootLogs();
+            const diagnostics = finalLogs.ok
+                ? finalLogs.logs
+                : logs.ok
+                    ? logs.logs
+                    : finalLogs.result;
             throw lifecycleError(
-                `Box container exited before ${readyLine}; ${containerLogDiagnostic(finalLogs)}`,
+                `Box container entered ${status || 'an unknown terminal state'} before ${readyLine}; `
+                + containerLogDiagnostic(diagnostics),
             );
+        }
+        if (state?.ok
+            && status === 'running'
+            && logs.ok
+            && logs.logs.stdout.split(/\r?\n/).includes(readyLine)) {
+            return;
         }
         await delay(intervalMs);
     }
-    const logs = runner.query(engine.name, ['container', 'logs', containerId]);
+    const finalLogs = readCurrentBootLogs();
+    const diagnostics = finalLogs.ok ? finalLogs.logs : lastCurrentLogs || finalLogs.result;
     throw lifecycleError(
-        `Timed out waiting for exact ready line: ${readyLine}; ${containerLogDiagnostic(logs)}`,
+        `Timed out waiting for exact ready line: ${readyLine}; ${containerLogDiagnostic(diagnostics)}`,
         'PLOINKY_BOX_READY_TIMEOUT',
     );
+}
+
+export async function startContainerAndWaitReady(engine, containerId, runner, options = {}) {
+    const id = assertImmutableContainerId(containerId, 'start a container');
+    const logBaseline = captureContainerLogBaseline(engine, id, runner);
+    runner.run(engine.name, ['container', 'start', id]);
+    await waitForReadyLine(engine, id, runner, { ...options, logBaseline });
 }
 
 export function validateCreatedContainer(ownership, desired) {
     if (ownership?.state !== 'owned' || !ownership.handles?.container) {
         throw lifecycleError('Created Box could not be rediscovered as owned');
     }
-    validateContainerConfiguration(ownership.handles.container, desired);
-    return ownership.handles.container;
+    const container = ownership.handles.container;
+    validateContainerConfiguration(container, desired);
+    if (container.runtime?.running !== true) {
+        throw lifecycleError('Box container is not running after readiness validation');
+    }
+    return container;
 }

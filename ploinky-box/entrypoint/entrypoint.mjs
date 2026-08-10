@@ -270,9 +270,9 @@ export function validateEntrypointMounts(paths, fsApi = fs) {
     }
 }
 
-// Keyed to the Box runtime UID rather than the live process UID so the reset
-// always covers the exact runroot that storage.conf configures. The two are
-// identical inside the Box; deriving both from one constant keeps them so.
+// The outer runtime supplies /tmp as a fresh tmpfs on every boot. This narrow
+// UID-keyed cleanup protects repeated preparation within one boot and never
+// removes the tmpfs parent or attempts ownership repair.
 export function resetTransientNestedRuntime(paths, {
     fsApi = fs,
     uid = BOX_RUNTIME_UID,

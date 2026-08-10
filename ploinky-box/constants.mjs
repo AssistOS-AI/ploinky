@@ -60,3 +60,17 @@ export const BOX_DATA_FINGERPRINT_LABELS = Object.freeze({
 export const BOX_RUNTIME_UID = 1000;
 export const BOX_RUNTIME_GID = 1000;
 export const BOX_USERNS = `keep-id:uid=${BOX_RUNTIME_UID},gid=${BOX_RUNTIME_GID}`;
+
+// The outer Box keeps durable state in explicit host binds. Nested runtime
+// metadata is instead confined to a fresh filesystem for each outer boot.
+export const BOX_TMPFS = Object.freeze({
+    destination: '/tmp',
+    options: Object.freeze([
+        'rw',
+        'exec',
+        'nosuid',
+        'nodev',
+        'mode=1777',
+        'notmpcopyup',
+    ]),
+});

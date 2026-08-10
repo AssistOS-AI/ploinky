@@ -6,6 +6,7 @@ import {
     BOX_MEDIA_PORT,
     BOX_ROUTER_CONTAINER_PORT,
     BOX_ROUTER_HEALTH_SOCKET,
+    BOX_TMPFS,
     BOX_USERNS,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
@@ -71,6 +72,35 @@ function repeatedOptionValues(argv, option) {
     return result;
 }
 
+function normalizeOptionSet(value) {
+    if (typeof value !== 'string' || value === '') return null;
+    const options = value.split(',');
+    if (options.some((option) => option === '') || new Set(options).size !== options.length) {
+        return null;
+    }
+    return options.sort();
+}
+
+function normalizeTmpfsValue(value) {
+    const separator = String(value).indexOf(':');
+    if (separator <= 0) return null;
+    const destination = String(value).slice(0, separator);
+    const options = normalizeOptionSet(String(value).slice(separator + 1));
+    return options ? { destination, options } : null;
+}
+
+export function normalizeContainerTmpfs(value) {
+    if (value === undefined || value === null) return [];
+    if (typeof value !== 'object' || Array.isArray(value)) return null;
+    const result = [];
+    for (const [destination, optionText] of Object.entries(value)) {
+        const options = normalizeOptionSet(optionText);
+        if (!destination.startsWith('/') || !options) return null;
+        result.push({ destination, options });
+    }
+    return result.sort((left, right) => left.destination.localeCompare(right.destination));
+}
+
 export function normalizeContainerRuntime(record) {
     const config = record?.Config;
     const hostConfig = record?.HostConfig;
@@ -104,6 +134,7 @@ export function normalizeContainerRuntime(record) {
                 permissions: String(device?.CgroupPermissions ?? ''),
             })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
             : null,
+        tmpfs: normalizeContainerTmpfs(hostConfig?.Tmpfs),
         mounts: Array.isArray(record?.Mounts)
             ? record.Mounts.map((mount) => ({
                 type: String(mount?.Type ?? '').toLowerCase(),
@@ -270,15 +301,48 @@ export function validateContainerConfiguration(containerHandle, {
             + `expected=${JSON.stringify(expectedDevices)} hostKind=${hostKind}`,
         );
     }
-    // Every mount is a host bind. A Box created by the retired named-volume
-    // design fails here and is never adopted; `ploinky destroy` removes it.
+    const expectedTmpfs = [{
+        destination: BOX_TMPFS.destination,
+        // Podman records notmpcopyup only in Config.CreateCommand and exposes
+        // the resulting private propagation in HostConfig.Tmpfs.
+        options: [...BOX_TMPFS.options.filter((option) => option !== 'notmpcopyup'), 'rprivate']
+            .sort(),
+    }];
+    const recordedTmpfsValues = repeatedOptionValues(runtime.createCommand, '--tmpfs');
+    const recordedTmpfs = Array.isArray(recordedTmpfsValues)
+        ? recordedTmpfsValues.map(normalizeTmpfsValue)
+        : null;
+    const wantedRecordedTmpfs = [{
+        destination: BOX_TMPFS.destination,
+        options: [...BOX_TMPFS.options].sort(),
+    }];
+    if (JSON.stringify(runtime.tmpfs) !== JSON.stringify(expectedTmpfs)
+        || JSON.stringify(recordedTmpfs) !== JSON.stringify(wantedRecordedTmpfs)) {
+        throw publicationError(
+            `Owned Box tmpfs set is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`,
+        );
+    }
+    // Durable state is exactly four host binds. Podman currently reports the
+    // /tmp tmpfs through HostConfig.Tmpfs and may additionally expose the same
+    // mount in Mounts; no named, anonymous, or unrelated mount is accepted.
     const expectedMounts = {
         '/opt/ploinky': { source: repositoryRoot, rw: false },
         '/workspace': { source: identity.workspaceRoot, rw: true },
         [BOX_DATA_MOUNTS.dependencies]: { source: identity.dataPaths.dependencies, rw: true },
         [BOX_DATA_MOUNTS.images]: { source: identity.dataPaths.images, rw: true },
     };
-    if (!Array.isArray(runtime.mounts) || runtime.mounts.length !== 4) {
+    if (!Array.isArray(runtime.mounts)) {
+        throw publicationError('Owned Box mount set is incompatible');
+    }
+    const transientMounts = runtime.mounts.filter((mount) => mount.destination === BOX_TMPFS.destination);
+    if (transientMounts.length > 1
+        || (transientMounts.length === 1 && (
+            transientMounts[0].type !== 'tmpfs'
+            || transientMounts[0].source !== ''
+            || transientMounts[0].name !== ''
+            || transientMounts[0].rw !== true
+        ))
+        || runtime.mounts.length !== 4 + transientMounts.length) {
         throw publicationError('Owned Box mount set is incompatible');
     }
     for (const [destination, expected] of Object.entries(expectedMounts)) {

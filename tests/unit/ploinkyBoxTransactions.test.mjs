@@ -9,9 +9,13 @@ import {
     BOX_LABELS,
     BOX_READY_LINE,
     BOX_ROUTER_HEALTH_SOCKET,
+    BOX_TMPFS,
     BOX_USERNS,
 } from '../../ploinky-box/constants.mjs';
-import { validateContainerConfiguration } from '../../ploinky-box/contract/container.mjs';
+import {
+    normalizeContainerRuntime,
+    validateContainerConfiguration,
+} from '../../ploinky-box/contract/container.mjs';
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
@@ -19,8 +23,10 @@ import {
     inspectWorkspaceDataPaths,
 } from '../../ploinky-box/workspace-data.mjs';
 import {
+    captureContainerLogBaseline,
     containerCreateArgs,
     readContainerIdFromCidfile,
+    startContainerAndWaitReady,
     waitForReadyLine,
 } from '../../ploinky-box/lifecycle/container.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
@@ -29,6 +35,12 @@ const DATA_FINGERPRINTS = Object.freeze({
     dependencies: 'd'.repeat(64),
     images: 'f'.repeat(64),
 });
+const TMPFS_CREATE_ARGUMENT = `${BOX_TMPFS.destination}:${BOX_TMPFS.options.join(',')}`;
+const TMPFS_INSPECTED_OPTIONS = Object.freeze([
+    ...BOX_TMPFS.options.filter((option) => option !== 'notmpcopyup'),
+    'rprivate',
+].sort());
+const EMPTY_LOG_BASELINE = Object.freeze({ stdout: '', stderr: '' });
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-transaction-'));
@@ -83,6 +95,7 @@ function containerHandle({
                 '--init',
                 '--userns', BOX_USERNS,
                 '--device', '/dev/fuse', '--device', '/dev/net/tun',
+                '--tmpfs', TMPFS_CREATE_ARGUMENT,
             ],
             environment: {
                 ...IMAGE_CONTRACT.environment,
@@ -106,6 +119,7 @@ function containerHandle({
                 { hostPath: '/dev/fuse', containerPath: '/dev/fuse', permissions: 'rwm' },
                 { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
             ],
+            tmpfs: [{ destination: BOX_TMPFS.destination, options: [...TMPFS_INSPECTED_OPTIONS] }],
             mounts: [
                 { type: 'bind', name: '', source: identity.dataPaths.images, destination: '/home/podman/.local/share/ploinky-images', rw: true },
                 { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
@@ -171,6 +185,7 @@ test('Podman Machine validation tolerates its omitted device inspection only', (
         'podman', 'container', 'create',
         '--userns', BOX_USERNS,
         '--device', '/dev/fuse', '--device', '/dev/net/tun',
+        '--tmpfs', TMPFS_CREATE_ARGUMENT,
     ];
     assert.doesNotThrow(() => validateContainerConfiguration(handle, {
         ...desired,
@@ -260,6 +275,7 @@ function harness(state, {
     failPull = false,
     failCreate = false,
     failCandidateReady = false,
+    failBaselineCapture = false,
     corruptCidfile = false,
     failLocalStop = false,
     realDataPaths = false,
@@ -337,7 +353,10 @@ function harness(state, {
             calls.push(['seam', 'stop-ploinky-local', engine.name, id]);
             if (failLocalStop) throw new Error('ploinky-local stop failed');
         },
-        async waitReady(engine, id) {
+        async startAndWaitReady(engine, id, selectedRunner) {
+            calls.push(['seam', 'capture-logs', id]);
+            if (failBaselineCapture) throw new Error('log baseline unavailable');
+            selectedRunner.run(engine.name, ['container', 'start', id]);
             calls.push(['seam', 'wait-ready', id]);
             if (failCandidateReady && id === 'a'.repeat(64)) throw new Error('ready timeout');
         },
@@ -405,7 +424,7 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.includes(`${state.identity.workspaceRoot}:/workspace`), true);
     assert.equal(args.some((value) => value === `${state.identity.workspaceRoot}:/workspace:U`), false);
 
-    // Exactly four mounts, all host binds, and no named-volume source name.
+    // Exactly four durable binds and one transient tmpfs, with no named volume.
     const mountArgs = args.flatMap((value, index) => (
         value === '--volume' ? [args[index + 1]] : []
     ));
@@ -419,6 +438,101 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
         assert.equal(path.isAbsolute(mount.split(':')[0]), true);
         assert.equal(mount.includes(state.identity.instance), false);
     }
+    const tmpfsArgs = args.flatMap((value, index) => (
+        value === '--tmpfs' ? [args[index + 1]] : []
+    ));
+    assert.deepEqual(tmpfsArgs, [TMPFS_CREATE_ARGUMENT]);
+    const [destination, ...optionParts] = tmpfsArgs[0].split(':');
+    assert.equal(destination, BOX_TMPFS.destination);
+    assert.deepEqual(optionParts.join(':').split(',').sort(), [...BOX_TMPFS.options].sort());
+});
+
+test('Podman tmpfs inspection is normalized independently from its create record', () => {
+    const runtime = normalizeContainerRuntime({
+        Config: {
+            Env: [],
+            CreateCommand: [
+                'podman', 'container', 'create', '--tmpfs', TMPFS_CREATE_ARGUMENT, 'image-id',
+            ],
+        },
+        HostConfig: {
+            Tmpfs: {
+                '/tmp': 'rw,exec,nosuid,nodev,mode=1777,rprivate',
+            },
+        },
+        State: { Status: 'created', Running: false },
+        Mounts: [],
+    });
+    assert.deepEqual(runtime.tmpfs, [{
+        destination: BOX_TMPFS.destination,
+        options: [...TMPFS_INSPECTED_OPTIONS],
+    }]);
+});
+
+test('container validation accepts only the exact transient tmpfs contract', (t) => {
+    const state = fixture(t);
+    const desired = {
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'runtime',
+        hostPort: 19090,
+    };
+    const exact = () => containerHandle({ ...desired, id: 'b'.repeat(64) });
+    assert.doesNotThrow(() => validateContainerConfiguration(exact(), desired));
+
+    const cases = [
+        ['no tmpfs', (handle) => { handle.runtime.tmpfs = []; }],
+        ['noexec semantics', (handle) => {
+            handle.runtime.tmpfs[0].options = handle.runtime.tmpfs[0].options
+                .filter((option) => option !== 'exec').concat('noexec').sort();
+        }],
+        ['missing mode', (handle) => {
+            handle.runtime.tmpfs[0].options = handle.runtime.tmpfs[0].options
+                .filter((option) => option !== 'mode=1777');
+        }],
+        ['missing notmpcopyup', (handle) => {
+            handle.runtime.createCommand[handle.runtime.createCommand.indexOf(TMPFS_CREATE_ARGUMENT)] =
+                '/tmp:rw,exec,nosuid,nodev,mode=1777';
+        }],
+        ['extra option', (handle) => {
+            handle.runtime.tmpfs[0].options.push('size=64m');
+            handle.runtime.tmpfs[0].options.sort();
+        }],
+        ['runroot child', (handle) => {
+            handle.runtime.tmpfs[0].destination = '/tmp/storage-run-1000';
+            handle.runtime.createCommand[handle.runtime.createCommand.indexOf(TMPFS_CREATE_ARGUMENT)] =
+                TMPFS_CREATE_ARGUMENT.replace('/tmp:', '/tmp/storage-run-1000:');
+        }],
+        ['second tmpfs', (handle) => {
+            handle.runtime.tmpfs.push({
+                destination: '/var/tmp',
+                options: [...TMPFS_INSPECTED_OPTIONS],
+            });
+        }],
+        ['duplicate option', (handle) => {
+            handle.runtime.tmpfs[0].options.push('rw');
+        }],
+        ['create-command disagreement', (handle) => {
+            handle.runtime.createCommand[handle.runtime.createCommand.indexOf(TMPFS_CREATE_ARGUMENT)] =
+                `${TMPFS_CREATE_ARGUMENT},size=64m`;
+        }],
+    ];
+    for (const [name, mutate] of cases) {
+        const handle = exact();
+        mutate(handle);
+        assert.throws(
+            () => validateContainerConfiguration(handle, desired),
+            /tmpfs set is incompatible/,
+            name,
+        );
+    }
+
+    const representedInMounts = exact();
+    representedInMounts.runtime.mounts.push({
+        type: 'tmpfs', name: '', source: '', destination: '/tmp', rw: true,
+    });
+    assert.doesNotThrow(() => validateContainerConfiguration(representedInMounts, desired));
 });
 
 test('container validation rejects retired named-volume mounts and user-namespace drift', (t) => {
@@ -524,6 +638,10 @@ test('initial transaction preflights before pull, workspace data, and container 
     assert.ok(flat.findIndex((value) => value.includes('stream podman pull')) < flat.findIndex((value) => value.includes('ensure-data-paths')));
     assert.ok(flat.findIndex((value) => value.includes('ensure-data-paths')) < flat.findIndex((value) => value.includes('revalidate-data-paths')));
     assert.ok(flat.findIndex((value) => value.includes('revalidate-data-paths')) < flat.findIndex((value) => value.includes('container create')));
+    assert.ok(flat.findIndex((value) => value.includes('container create')) < flat.findIndex((value) => value.includes('capture-logs')));
+    assert.ok(flat.findIndex((value) => value.includes('capture-logs')) < flat.findIndex((value) => value.includes('container start')));
+    assert.ok(flat.findIndex((value) => value.includes('container start')) < flat.findIndex((value) => value.includes('wait-ready')));
+    assert.ok(flat.findIndex((value) => value.includes('wait-ready')) < flat.findIndex((value) => value.includes('discover')));
     assertNoEngineVolumeCommand(h.calls);
 });
 
@@ -569,8 +687,102 @@ test('validated reuse retains the exact workspace data bind sources without engi
     assert.equal(result.action, 'reused');
     assert.equal(h.calls.some((call) => call.includes('validate-existing-image')), true);
     assert.equal(h.calls.some((call) => call.includes('pull')), false);
+    assert.equal(h.calls.some((call) => call.includes('capture-logs')), false);
+    assert.equal(h.calls.some((call) => call.join(' ').includes('container start')), false);
     assert.equal(dataDirectoriesExist(state.identity), true);
     assertNoEngineVolumeCommand(h.calls);
+});
+
+test('stopped reuse captures logs before start and validates the same running ID', async (t) => {
+    const state = fixture(t);
+    const current = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+        running: false,
+    });
+    const h = harness(state, { initial: current });
+    const result = await reconcileBoxContainer({
+        identity: state.identity,
+        ownership: { state: 'owned', handles: { container: current } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+    }, h.seams);
+    assert.equal(result.action, 'reused');
+    assert.equal(result.ownership.handles.container.id, current.id);
+    assert.equal(result.ownership.handles.container.runtime.running, true);
+    const events = h.calls.map((call) => call.join(' '));
+    const revalidate = events.findIndex((value) => value.includes('revalidate-data-paths'));
+    const capture = events.findIndex((value) => value.includes('capture-logs'));
+    const start = events.findIndex((value) => value.includes('container start'));
+    const wait = events.findIndex((value) => value.includes('wait-ready'));
+    const discover = events.findIndex((value) => value.includes('discover'));
+    assert.ok(revalidate >= 0 && revalidate < capture);
+    assert.ok(capture < start && start < wait && wait < discover);
+    assert.equal(events.some((value) => value.includes('pull')), false);
+    assert.equal(events.some((value) => value.includes('container create')), false);
+    assert.equal(events.some((value) => value.includes('container rm')), false);
+});
+
+test('stopped reuse baseline failure mutates no container or image state', async (t) => {
+    const state = fixture(t);
+    const current = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+        running: false,
+    });
+    const h = harness(state, { initial: current, failBaselineCapture: true });
+    await assert.rejects(() => reconcileBoxContainer({
+        identity: state.identity,
+        ownership: { state: 'owned', handles: { container: current } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+    }, h.seams), /log baseline unavailable/);
+    assert.equal(current.runtime.running, false);
+    assert.equal(h.calls.some((call) => call.join(' ').includes('container start')), false);
+    assert.equal(h.calls.some((call) => call.includes('pull')), false);
+    assert.equal(h.calls.some((call) => call.join(' ').includes('container rm')), false);
+    assert.equal(h.calls.some((call) => call.join(' ').includes('container create')), false);
+});
+
+test('final stopped rediscovery rejects reconciliation after readiness', async (t) => {
+    const state = fixture(t);
+    const current = containerHandle({
+        identity: state.identity,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+        running: false,
+    });
+    const h = harness(state, { initial: current });
+    const discover = h.seams.discover;
+    h.seams.discover = () => {
+        const result = discover();
+        result.handles.container.runtime.running = false;
+        result.handles.container.runtime.status = 'exited';
+        return result;
+    };
+    await assert.rejects(() => reconcileBoxContainer({
+        identity: state.identity,
+        ownership: { state: 'owned', handles: { container: current } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+    }, h.seams), /not running after readiness/);
 });
 
 test('a replaced live bind source forces outer-container replacement', async (t) => {
@@ -797,6 +1009,190 @@ test('missing or corrupt cidfiles are fail-closed primitives', (t) => {
     assert.throws(() => readContainerIdFromCidfile(corrupt), /corrupt/);
 });
 
+test('container start captures an immutable cumulative-log baseline before mutation', async () => {
+    const calls = [];
+    let started = false;
+    const runner = {
+        query(_command, args) {
+            calls.push(['query', ...args]);
+            if (args[1] === 'logs') {
+                return started
+                    ? { ok: true, stdout: `historical\n${BOX_READY_LINE}\n`, stderr: 'old stderr\n' }
+                    : { ok: true, stdout: 'historical\n', stderr: 'old stderr\n' };
+            }
+            return { ok: true, stdout: 'running\n', stderr: '' };
+        },
+        run(_command, args) {
+            calls.push(['run', ...args]);
+            started = true;
+        },
+    };
+    const baseline = captureContainerLogBaseline(
+        { name: 'podman' },
+        'a'.repeat(64),
+        runner,
+    );
+    assert.deepEqual(baseline, { stdout: 'historical\n', stderr: 'old stderr\n' });
+    assert.equal(Object.isFrozen(baseline), true);
+
+    calls.length = 0;
+    started = false;
+    await startContainerAndWaitReady({ name: 'podman' }, 'a'.repeat(64), runner, {
+        stdout: { write() {} },
+        stderr: { write() {} },
+        intervalMs: 0,
+        delay: async () => {},
+    });
+    assert.deepEqual(calls.map((call) => call.slice(0, 3)), [
+        ['query', 'container', 'logs'],
+        ['run', 'container', 'start'],
+        ['query', 'container', 'logs'],
+        ['query', 'container', 'inspect'],
+    ]);
+
+    let startCalled = false;
+    const failedRunner = {
+        query() { return { ok: false, stdout: '', stderr: 'log driver unavailable' }; },
+        run() { startCalled = true; },
+    };
+    await assert.rejects(
+        () => startContainerAndWaitReady(
+            { name: 'podman' }, 'b'.repeat(64), failedRunner,
+        ),
+        /capture Box container logs before start/,
+    );
+    assert.equal(startCalled, false);
+    assert.throws(
+        () => captureContainerLogBaseline({ name: 'podman' }, 'not-an-id', runner),
+        /immutable container ID/,
+    );
+});
+
+test('historical readiness cannot hide a current-boot runroot failure', async () => {
+    const baseline = Object.freeze({
+        stdout: `[ploinky-box] first boot\n${BOX_READY_LINE}\n`,
+        stderr: '',
+    });
+    const runner = {
+        query(_command, args) {
+            if (args[1] === 'logs') {
+                return {
+                    ok: true,
+                    stdout: baseline.stdout,
+                    stderr: '[ploinky-box] SELF-CHECK FAILED: EACCES, Permission denied: /tmp/storage-run-1000\n',
+                };
+            }
+            return { ok: true, stdout: 'exited\n', stderr: '' };
+        },
+    };
+    await assert.rejects(
+        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+            logBaseline: baseline,
+            stdout: { write() {} },
+            stderr: { write() {} },
+        }),
+        (error) => /EACCES.*storage-run-1000/.test(error.message)
+            && !error.message.includes('first boot'),
+    );
+});
+
+test('only fresh ready output is streamed and accepted while the Box is running', async () => {
+    const baseline = Object.freeze({
+        stdout: `old output\n${BOX_READY_LINE}\n`,
+        stderr: 'old diagnostic\n',
+    });
+    const stdout = { value: '', write(chunk) { this.value += String(chunk); } };
+    const stderr = { value: '', write(chunk) { this.value += String(chunk); } };
+    let logReads = 0;
+    const runner = {
+        query(_command, args) {
+            if (args[1] === 'logs') {
+                logReads += 1;
+                return logReads === 1
+                    ? { ok: true, ...baseline }
+                    : {
+                        ok: true,
+                        stdout: `${baseline.stdout}current boot\n${BOX_READY_LINE}\n`,
+                        stderr: `${baseline.stderr}current diagnostic\n`,
+                    };
+            }
+            return { ok: true, stdout: 'running\n', stderr: '' };
+        },
+    };
+    await waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+        logBaseline: baseline,
+        stdout,
+        stderr,
+        intervalMs: 0,
+        delay: async () => {},
+    });
+    assert.equal(stdout.value, `current boot\n${BOX_READY_LINE}\n`);
+    assert.equal(stderr.value, 'current diagnostic\n');
+    assert.equal(logReads, 2);
+});
+
+test('a fresh ready marker never overrides a terminal state from the same poll', async () => {
+    const runner = {
+        query(_command, args) {
+            if (args[1] === 'logs') {
+                return { ok: true, stdout: `${BOX_READY_LINE}\n`, stderr: 'boot exited\n' };
+            }
+            return { ok: true, stdout: 'exited\n', stderr: '' };
+        },
+    };
+    await assert.rejects(
+        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+            logBaseline: EMPTY_LOG_BASELINE,
+            stdout: { write() {} },
+            stderr: { write() {} },
+        }),
+        /entered exited.*boot exited/,
+    );
+});
+
+test('readiness fails closed when either cumulative log stream drifts', async () => {
+    for (const stream of ['stdout', 'stderr']) {
+        const baseline = { stdout: 'stdout-before\n', stderr: 'stderr-before\n' };
+        const current = { ...baseline, [stream]: `${stream}-different\n` };
+        const runner = {
+            query(_command, args) {
+                if (args[1] === 'logs') return { ok: true, ...current };
+                return { ok: true, stdout: 'running\n', stderr: '' };
+            },
+        };
+        await assert.rejects(
+            () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+                logBaseline: baseline,
+                stdout: { write() {} },
+                stderr: { write() {} },
+            }),
+            new RegExp(`${stream} log history drifted`),
+        );
+    }
+});
+
+test('readiness cannot succeed without a running-state proof', async () => {
+    const runner = {
+        query(_command, args) {
+            if (args[1] === 'logs') {
+                return { ok: true, stdout: `${BOX_READY_LINE}\n`, stderr: '' };
+            }
+            return { ok: false, stdout: '', stderr: 'inspect unavailable' };
+        },
+    };
+    await assert.rejects(
+        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+            logBaseline: EMPTY_LOG_BASELINE,
+            stdout: { write() {} },
+            stderr: { write() {} },
+            timeoutMs: 0,
+            intervalMs: 0,
+            delay: async () => {},
+        }),
+        /Timed out waiting for exact ready line/,
+    );
+});
+
 test('readiness failure rereads bounded container self-check diagnostics after exit', async () => {
     let logReads = 0;
     const runner = {
@@ -816,7 +1212,9 @@ test('readiness failure rereads bounded container self-check diagnostics after e
         },
     };
     await assert.rejects(
-        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner),
+        () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+            logBaseline: EMPTY_LOG_BASELINE,
+        }),
         /container logs: \[ploinky-box\] SELF-CHECK FAILED: inner runtime is unavailable/,
     );
     assert.equal(logReads, 2);
@@ -837,6 +1235,7 @@ test('readiness explains legacy TUN self-check failures as an access problem', a
     };
     await assert.rejects(
         () => waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+            logBaseline: EMPTY_LOG_BASELINE,
             stdout: { write() {} },
             stderr: { write() {} },
         }),
@@ -864,6 +1263,7 @@ test('readiness streams each Box log line once before readiness', async () => {
         },
     };
     await waitForReadyLine({ name: 'podman' }, 'a'.repeat(64), runner, {
+        logBaseline: EMPTY_LOG_BASELINE,
         stdout,
         stderr,
         intervalMs: 0,

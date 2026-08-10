@@ -279,6 +279,7 @@ test('topology selection freezes public and managed request-authority rules', ()
         routerHostPort: 18080,
         edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
         platform: 'linux',
+        authRouteKey: 'explorer',
     };
     const box = buildRouterAuthorityTopologyIntent({ ...base, fsApi: presentBoxFs() });
     assert.deepEqual(
@@ -323,6 +324,10 @@ test('topology selection freezes public and managed request-authority rules', ()
         ['host-public-loopback', 'public', 'http://127.0.0.1:8080', '127.0.0.1:18080'],
     );
     assert.equal(buildRouterAuthorityTopologyIntent({ ...base, networkMode: 'none' }), null);
+    assert.throws(
+        () => buildRouterAuthorityTopologyIntent({ ...base, authRouteKey: ' explorer ' }),
+        /authentication route key is invalid/,
+    );
 });
 
 test('fixed public and managed attestation fixtures validate only in their exact cells', () => {
@@ -336,6 +341,7 @@ test('fixed public and managed attestation fixtures validate only in their exact
         edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
         platform: 'linux',
         fsApi: presentBoxFs(),
+        authRouteKey: 'explorer',
     });
     const managedIntent = buildRouterAuthorityTopologyIntent({
         networkMode: 'default',
@@ -354,6 +360,39 @@ test('fixed public and managed attestation fixtures validate only in their exact
         external: publicFixture.evidence.external,
         generationId: publicFixture.evidence.generationId,
     }));
+    const qualifiedIntent = Object.freeze({
+        ...publicIntent,
+        authRouteKey: 'AchillesIDE/explorer',
+    });
+    const qualifiedExternal = publicFixture.evidence.external.map((record) => (
+        record.host === qualifiedIntent.publicAuthority
+            ? {
+                ...record,
+                body: '{"ok":false,"error":"not_authenticated","login":"/auth/login?returnTo=%2Fhealth&agent=AchillesIDE%2Fexplorer"}',
+            }
+            : record
+    ));
+    assert.doesNotThrow(() => validateRouterAuthorityObservation({
+        intent: qualifiedIntent,
+        nonce: publicFixture.evidence.nonce,
+        records: publicFixture.evidence.records,
+        external: qualifiedExternal,
+        generationId: publicFixture.evidence.generationId,
+    }));
+    assert.throws(() => validateRouterAuthorityObservation({
+        intent: qualifiedIntent,
+        nonce: publicFixture.evidence.nonce,
+        records: publicFixture.evidence.records,
+        external: publicFixture.evidence.external,
+        generationId: publicFixture.evidence.generationId,
+    }), /fixed topology cell/);
+    assert.throws(() => validateRouterAuthorityObservation({
+        intent: { ...publicIntent, authRouteKey: null },
+        nonce: publicFixture.evidence.nonce,
+        records: publicFixture.evidence.records,
+        external: publicFixture.evidence.external,
+        generationId: publicFixture.evidence.generationId,
+    }), /generation-bound authentication route key/);
     assert.doesNotThrow(() => validateRouterAuthorityObservation({
         intent: managedIntent,
         nonce: managedFixture.evidence.nonce,
@@ -421,6 +460,7 @@ test('fixed public and managed attestation fixtures validate only in their exact
         edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
         platform: 'darwin',
         fsApi: missingBoxFs(),
+        authRouteKey: 'explorer',
     });
     const macosLoopbackRecords = publicFixture.evidence.records.map((record) => ({
         ...record,
@@ -433,13 +473,13 @@ test('fixed public and managed attestation fixtures validate only in their exact
             ? { ...record, body: '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}' }
             : record
     ));
-    assert.doesNotThrow(() => validateRouterAuthorityObservation({
+    assert.throws(() => validateRouterAuthorityObservation({
         intent: macosRemoteIntent,
         nonce: publicFixture.evidence.nonce,
         records: macosLoopbackRecords,
         external: macosExternal,
         generationId: publicFixture.evidence.generationId,
-    }));
+    }), /fixed topology cell/);
     assert.throws(() => validateRouterAuthorityObservation({
         intent: managedIntent,
         nonce: managedFixture.evidence.nonce,
@@ -462,6 +502,7 @@ test('attestation brackets only live observations with registration and consumpt
         edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
         platform: 'linux',
         fsApi: presentBoxFs(),
+        authRouteKey: 'explorer',
     });
     const order = [];
     const result = attestRouterAuthority({
@@ -509,6 +550,7 @@ test('slow helper preparation and cleanup do not consume the ten-second observat
         edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
         platform: 'linux',
         fsApi: presentBoxFs(),
+        authRouteKey: 'explorer',
     });
     let monotonicNow = 0;
     const registry = createRouterAuthorityAttestationRegistry({ now: () => monotonicNow });
@@ -569,6 +611,7 @@ test('attestation rejects missing and repeated observation lifecycle transitions
         edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
         platform: 'linux',
         fsApi: presentBoxFs(),
+        authRouteKey: 'explorer',
     });
     const generationLease = { id: fixture.evidence.generationId, commit: () => true };
     const registryClient = {

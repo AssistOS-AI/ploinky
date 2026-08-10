@@ -14,6 +14,14 @@ on:
         required: false
         default: false
         type: boolean
+      box_digest:
+        description: 'Immutable multi-architecture Ploinky Box digest (sha256:...)'
+        required: true
+        type: string
+      smoke_graph_revisions_json:
+        description: 'Exact seven-repository revision map as JSON'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -23,8 +31,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify-box-candidate:
+    name: Verify Box candidate on macOS and Linux
+    uses: ./.github/workflows/verify-ploinky-box-candidate.yml
+    with:
+      box_digest: ${{ inputs.box_digest }}
+      smoke_graph_revisions_json: ${{ inputs.smoke_graph_revisions_json }}
+    secrets:
+      PLOINKY_CANDIDATE_REPOSITORY_TOKEN: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
+
   release:
     name: Build, tag, and publish
+    needs: verify-box-candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:

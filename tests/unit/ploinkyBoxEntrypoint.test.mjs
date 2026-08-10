@@ -15,6 +15,7 @@ import {
     entrypointPaths,
     formatEntrypointFailure,
     prepareEntrypoint,
+    resetTransientNestedRuntime,
     retireStoppedManagedContainers,
     runEntrypoint,
 } from '../../ploinky-box/entrypoint/entrypoint.mjs';
@@ -199,6 +200,30 @@ test('entrypoint validates its marker and mounts before its first persistent wri
     fs.symlinkSync(paths.workspace, paths.dependencies);
     assert.throws(() => prepareEntrypoint({ root }), /mount target|mount is missing/);
     assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'master-key')), false);
+});
+
+test('transient cleanup removes only UID-keyed children and retains the tmpfs parent', (t) => {
+    const { paths } = fixture(t);
+    const calls = [];
+    resetTransientNestedRuntime(paths, {
+        fsApi: {
+            rmSync(target, options) { calls.push([target, options]); },
+        },
+    });
+    assert.deepEqual(calls, [
+        [paths.storageRunRoot, { recursive: true, force: true }],
+        [path.join(paths.tmp, `podman-run-${BOX_RUNTIME_UID}`), {
+            recursive: true,
+            force: true,
+        }],
+    ]);
+    assert.equal(calls.some(([target]) => target === paths.tmp), false);
+
+    const source = fs.readFileSync(
+        path.join(import.meta.dirname, '../../ploinky-box/entrypoint/entrypoint.mjs'),
+        'utf8',
+    );
+    assert.doesNotMatch(source, /\b(?:chown|sudo|setuid)\b|process\.setuid/);
 });
 
 test('full preparation creates one stable key, resets only transient runtime, and initializes pins', (t) => {

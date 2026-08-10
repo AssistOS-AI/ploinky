@@ -50,6 +50,7 @@ test('managed producer source enforces attestation, ordered generation checkpoin
     assert.ok(credentialMint < preStartHook && preStartHook < preRuntime && preRuntime < postInspection);
     assert.ok(imagePreparation > 0 && imagePreparation < helperPreparation && helperPreparation < managedTransaction);
     assert.match(source, /preStartLaunch: preStartGeneratedRouterLaunch/);
+    assert.match(source, /authRouteKey: generationLease\.snapshot\?\.routing\?\.static\?\.agent/);
     assert.match(source, /managed generated-local launch state is required before container creation/);
     assert.match(source, /const userNamespace = managedUserNamespaceFromAttestation\(launch\.attested\)/);
     assert.match(source, /\.\.\.\(userNamespace \? \[`--userns=\$\{userNamespace\}`\] : \[\]\)/);
@@ -108,13 +109,22 @@ test('descriptor cleanup is confined to an immutable container ID and exact reco
         new URL('../../cli/sandbox/docker/containerFleet.js', import.meta.url),
         'utf8',
     );
+    const ownership = fs.readFileSync(
+        new URL('../../cli/sandbox/docker/containerOwnership.js', import.meta.url),
+        'utf8',
+    );
     assert.match(fleet, /withLock = withNetworkLifecycleLock/);
     assert.match(fleet, /return withLock\(\(\) => \{/);
-    assert.match(fleet, /actualId !== expectedId \|\| actualName !== name/);
+    assert.match(fleet, /import \{ assertExactContainerOwnership \} from '\.\/containerOwnership\.js'/);
+    assert.match(fleet,
+        /assertExactContainerOwnership\(name, record, current, expectedId, workspaceHash\)/);
+    assert.match(fleet,
+        /assertExactContainerOwnership\(name, record, inspected, expectedId, workspaceHash\)/);
+    assert.match(ownership, /actualId !== expectedId \|\| actualName !== name/);
     assert.match(fleet, /control\(runtime, \['rm', '-f', expectedId\]\)/);
     assert.match(fleet, /inspect\(runtime, expectedId\)/);
-    assert.match(fleet, /NETWORK_LABELS\.instanceId/);
-    assert.match(fleet, /NETWORK_LABELS\.enableGeneration/);
+    assert.match(ownership, /NETWORK_LABELS\.instanceId/);
+    assert.match(ownership, /NETWORK_LABELS\.enableGeneration/);
     assert.match(fleet, /current\.dev !== artifact\.dev \|\| current\.ino !== artifact\.ino/);
     assert.match(fleet, /fs\.unlinkSync\(artifact\.source\)/);
 

@@ -27,6 +27,7 @@ function intent(fsApi, runtimeProof = proof) {
         edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
         platform: 'linux',
         fsApi,
+        authRouteKey: 'explorer',
     });
 }
 

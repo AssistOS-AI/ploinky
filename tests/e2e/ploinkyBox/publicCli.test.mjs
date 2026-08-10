@@ -13,6 +13,7 @@ import {
     readProxyTrace,
     writeCandidatePodmanProxy,
 } from './candidatePodmanProxy.mjs';
+import { captureCandidateEvidence } from './candidateEvidence.mjs';
 import {
     createPodmanHarness,
     execInBox,
@@ -113,10 +114,15 @@ test('installed public shims honor only the environment image override through t
     if (!candidateReference) return;
     const harness = createPodmanHarness(t, candidateReference);
     const graph = readSmokeGraphInputs(process.env, { runner: harness.runner });
-    const startRoute = routeOuterCommand(parseOuterArguments(graph.args));
+    const publicGraphArgs = ['--udp-port', '17892', ...graph.args];
+    const startRoute = routeOuterCommand(parseOuterArguments(publicGraphArgs));
     assert.equal(startRoute.kind, 'start');
 
-    const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const prepared = await harness.supervisor.prepareBoxForCommand({
+        imageRef: candidateReference,
+        explicitPort: startRoute.hostPort,
+        explicitMediaPort: startRoute.mediaHostPort,
+    });
     const initialKeyHash = execInBox(harness.runner, prepared.containerId, [
         'sha256sum', '/workspace/.ploinky/master-key',
     ]).split(/\s/)[0];
@@ -196,7 +202,9 @@ test('installed public shims honor only the environment image override through t
     const beforeStatus = treeHash(harness.workspace);
     const beforeBoxStatus = inBoxStateHash(prepared.containerId, harness);
     const statusBefore = publicCommand(['status']);
-    assert.equal(statusBefore.status, 0, statusBefore.stderr);
+    assert.notEqual(statusBefore.status, 0);
+    assert.match(statusBefore.stdout, /Ploinky Box: incompatible/);
+    assert.match(statusBefore.stdout, /Owned Box mount \/opt\/ploinky is incompatible/);
     assert.equal(treeHash(harness.workspace), beforeStatus);
     assert.equal(inBoxStateHash(prepared.containerId, harness), beforeBoxStatus);
     assert.equal(statusBefore.stdout.includes('HOST_MASTER_KEY_CANARY'), false);
@@ -237,7 +245,7 @@ test('installed public shims honor only the environment image override through t
         assert.equal(fs.statSync(target).isDirectory(), true, target);
     }
 
-    const started = publicCommand(['--debug', ...graph.args]);
+    const started = publicCommand(['--debug', ...publicGraphArgs]);
     assert.equal(started.status, 0, started.stderr);
     assert.equal(started.stdout.match(/Debug mode enabled/g)?.length, 1);
     assert.match(started.stdout,
@@ -290,7 +298,7 @@ test('installed public shims honor only the environment image override through t
     assert.equal(destroyed.status, 0, destroyed.stderr);
     assert.equal(destroyed.stdout.match(/Debug mode enabled/g)?.length, 1);
 
-    const recreated = publicCommand(graph.args);
+    const recreated = publicCommand(publicGraphArgs);
     assert.equal(recreated.status, 0, recreated.stderr);
     const currentIdentity = harness.resolveIdentity();
     const inspected = harness.runner.query('podman', ['container', 'inspect', currentIdentity.instance]);
@@ -336,6 +344,50 @@ test('installed public shims honor only the environment image override through t
     );
     assert.equal(effectiveStore.transientStore, true);
     assertNestedRoutingAndSecretBoundary(currentId, harness);
+
+    const restartTraceStart = readProxyTrace(tracePath).length;
+    const stoppedForReuse = publicCommand(['stop']);
+    assert.equal(stoppedForReuse.status, 0, stoppedForReuse.stderr);
+    const stoppedInspection = harness.runner.query('podman', [
+        'container', 'inspect', currentIdentity.instance,
+    ]);
+    assert.equal(stoppedInspection.ok, true, stoppedInspection.stderr);
+    const stoppedRecord = JSON.parse(stoppedInspection.stdout)[0];
+    assert.equal(String(stoppedRecord?.Id || ''), currentId);
+    assert.equal(stoppedRecord?.State?.Running, false);
+
+    const restarted = publicCommand(publicGraphArgs);
+    assert.equal(restarted.status, 0, restarted.stderr);
+    const restartedInspection = harness.runner.query('podman', [
+        'container', 'inspect', currentIdentity.instance,
+    ]);
+    assert.equal(restartedInspection.ok, true, restartedInspection.stderr);
+    const restartedRecord = JSON.parse(restartedInspection.stdout)[0];
+    assert.equal(String(restartedRecord?.Id || ''), currentId);
+    assert.equal(restartedRecord?.State?.Running, true);
+    assertNestedRoutingAndSecretBoundary(currentId, harness);
+    const restartTrace = readProxyTrace(tracePath).slice(restartTraceStart);
+    const restartArgv = restartTrace.filter((record) => record[0] === 'argv')
+        .map((record) => record.slice(1));
+    assert.equal(restartArgv.some((argv) => argv[0] === 'pull'), false);
+    assert.equal(restartArgv.some((argv) => (
+        argv[0] === 'container' && ['create', 'rm', 'remove'].includes(argv[1])
+    )), false);
+    captureCandidateEvidence({
+        runner: harness.runner,
+        diagnostic: (message) => t.diagnostic(message),
+        name: 'public-cli-stop-start',
+        candidateReference,
+        beforeContainerId: currentId,
+        afterContainerId: String(restartedRecord?.Id || ''),
+        inspected: restartedRecord,
+        restartTrace,
+        verified: {
+            healthConfirmed: true,
+            sameContainerId: true,
+            secretBoundaryConfirmed: true,
+        },
+    });
 
     const trace = readProxyTrace(tracePath);
     const argvTrace = trace.filter((record) => record[0] === 'argv')

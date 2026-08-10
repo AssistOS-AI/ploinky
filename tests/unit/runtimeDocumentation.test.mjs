@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
     BOX_MARKER_CONTENT,
     BOX_READY_LINE,
+    BOX_TMPFS,
 } from '../../ploinky-box/constants.mjs';
 import {
     DEPENDENCY_MARKER_NAME,
@@ -21,6 +22,10 @@ function read(relativePath) {
 test('active runtime documentation describes the semantic Box configuration', () => {
     assert.equal(BOX_MARKER_CONTENT, 'assistos/ploinky-box\n');
     assert.equal(BOX_READY_LINE, 'PLOINKY_BOX_READY');
+    assert.deepEqual(BOX_TMPFS, {
+        destination: '/tmp',
+        options: ['rw', 'exec', 'nosuid', 'nodev', 'mode=1777', 'notmpcopyup'],
+    });
     assert.equal(DEPENDENCY_MARKER_NAME, '.ploinky-box-dependencies.json');
     const runtimeDocuments = [
         'README.md',
@@ -46,6 +51,13 @@ test('active runtime documentation describes the semantic Box configuration', ()
         );
         assert.doesNotMatch(content, /three (?:managed |explicitly )?named volumes/i, relativePath);
         assert.doesNotMatch(content, /retained workspace-volume/i, relativePath);
+        assert.match(content, /four durable (?:host )?binds/i, relativePath);
+        assert.match(
+            content,
+            /rw,exec,nosuid,nodev,mode=1777,notmpcopyup/,
+            relativePath,
+        );
+        assert.match(content, /(?:transient )?`?\/tmp`? tmpfs/i, relativePath);
     }
 });
 
@@ -70,6 +82,11 @@ test('active runtime documentation separates durable caches from disposable nest
         // No active document may still promise the broad nested store survives.
         assert.doesNotMatch(content, /two named storage volumes/i, relativePath);
         assert.doesNotMatch(content, /deliberately preserves it/i, relativePath);
+        assert.doesNotMatch(
+            content,
+            /storage-run-1000[^.]{0,80}(?:survives|persists)[^.]{0,30}stop/i,
+            relativePath,
+        );
     }
 });
 
