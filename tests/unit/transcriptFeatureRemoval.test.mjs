@@ -57,8 +57,6 @@ test('transcript storage and conversation rating code is absent from Ploinky', (
         'cli/server/webchat/index.js',
         'cli/server/webchat/messages.js',
         'cli/server/webchat/network.js',
-        'cli/server/dashboard/dashboard.html',
-        'cli/server/dashboard/dashboard.js',
     ].map(source).join('\n');
 
     assert.doesNotMatch(checkedSources, /PLOINKY_TRANSCRIPT|TRANSCRIPTS_DIR|transcriptStore|transcriptCrypto/);

@@ -831,7 +831,7 @@ process.stdout.write(JSON.stringify(resolvePublishedPortMappings('demo-container
     }
 });
 
-test('collectLiveAgentContainers probes the runtime before listing live containers', () => {
+test('sync and async live-container collection share the canonical runtime projection', () => {
     const binDir = tempDir();
     try {
         const podmanPath = path.join(binDir, 'podman');
@@ -854,13 +854,16 @@ esac
         fs.chmodSync(podmanPath, 0o755);
 
         const result = runModuleSnippet(
-            `import { collectLiveAgentContainers } from './cli/sandbox/docker/containerRegistry.js';
-process.stdout.write(JSON.stringify(collectLiveAgentContainers()));`,
+            `import { collectLiveAgentContainers, collectLiveAgentContainersAsync } from './cli/sandbox/docker/containerRegistry.js';
+const sync = collectLiveAgentContainers();
+const asyncResult = await collectLiveAgentContainersAsync();
+process.stdout.write(JSON.stringify({ sync, asyncResult }));`,
             { PATH: binDir },
         );
 
         assert.equal(result.status, 0, result.stderr);
-        const containers = JSON.parse(result.stdout);
+        const { sync: containers, asyncResult } = JSON.parse(result.stdout);
+        assert.deepEqual(asyncResult, containers);
         assert.equal(containers.length, 1);
         assert.equal(containers[0].containerName, 'ploinky_repoA_agentA_project_12345678');
         assert.equal(containers[0].agentName, 'agentA');

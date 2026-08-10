@@ -11,7 +11,7 @@ import fsDefault from 'node:fs';
 import pathDefault from 'node:path';
 import { spawn as spawnDefault } from 'node:child_process';
 
-import { LOGS_DIR } from '../utils/config.js';
+import { LOGS_DIR, PLOINKY_DIR } from '../utils/config.js';
 import {
     assertSafeRelativeSegment,
     openVerifiedRegularFile,
@@ -30,6 +30,13 @@ export function logPathError(message) {
     return error;
 }
 
+export function getLogPath(kind) {
+    const map = {
+        router: pathDefault.join(LOGS_DIR, ROUTER_LOG_FILE),
+        policy: pathDefault.join(PLOINKY_DIR, 'data', 'router-security', 'policy-audit.log'),
+    };
+    return map[kind] || null;
+}
 export function logOutputLimitError(message) {
     const error = new Error(message);
     error.code = 'LOG_OUTPUT_LIMIT';

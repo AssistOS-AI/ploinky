@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { collectAgentRuntimeStates } from '../../cli/sandbox/agentRuntimeState.js';
+import { collectAgentRuntimeStates, collectAgentRuntimeStatesAsync } from '../../cli/sandbox/agentRuntimeState.js';
 import { __testables as marketplaceTestables } from '../../cli/server/authHandlers/marketplaceRoutes.js';
 
 test('collectAgentRuntimeStates reports live and stopped host sandboxes from tracked PIDs', () => {
@@ -75,6 +75,19 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
     assert.equal(states[0].state.running, true);
     assert.equal(states[1].runtime, 'docker');
     assert.equal(states[1].state.status, 'stopped');
+});
+
+test('collectAgentRuntimeStatesAsync uses the asynchronous container collector', async () => {
+    let called = 0;
+    const states = await collectAgentRuntimeStatesAsync({
+        registry: {},
+        collectContainers: async () => {
+            called += 1;
+            return [{ containerName: 'ploinky_demo', agentName: 'demo', state: { running: true, status: 'running' } }];
+        },
+    });
+    assert.equal(called, 1);
+    assert.equal(states[0].containerName, 'ploinky_demo');
 });
 
 test('Marketplace reports an enabled bwrap agent as running from generic runtime state', () => {

@@ -47,16 +47,16 @@ Ploinky is a workspace-local runtime for repository-backed agents.
   `/webchat?agent=<name>&...`, the router forwards additional query parameters
   except router-owned `tabId` to `ploinky cli <name>` as
   long-form CLI flags encoded as `--key=value`.
-- `/dashboard`: operational management surface for status, logs, agents, and runtime control.
-- `/status`: read-only browser view that shells out to `ploinky status` and adds router-side server and agent summaries.
+- `/dashboard`: administrator-only descriptor for Ploinky's generic read-only monitoring contracts.
+- `/dashboard/tail`: raw `tail -n`/`tail -F` stream for the router and policy-audit logs.
+- `/status/data`: current workspace resource snapshot; `follow=1` streams live NDJSON samples from the Router-owned collector.
 - `/api/marketplace`: JSON endpoint for the first-party agent marketplace. Authenticated local or SSO users may read repository, agent, enabled-record, recorded backend, and runtime state; Bubblewrap and Seatbelt liveness comes from tracked PIDs, while Docker and Podman use OCI state. Local admins may perform the complete `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` action set. A running agent may use a request-bound Agent Assertion to read state and submit only `enable_agent`, which supports on-demand dependency startup without granting repository or disable operations. Client helpers check status first and forward `mode` only when the caller supplies it; an omitted mode retains Marketplace's isolated default. Repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime so the watchdog does not restart it during the operation.
 
 `/webchat` uses the normal router login flow. `/dashboard` and `/status` are
 local-control surfaces that require a real router-authenticated local-admin
 session on an exact control Host. They do not accept a component token,
 invitation, agent assertion, media credential, or localhost provenance as admin
-identity; mutations additionally require the exact Origin and a session-bound
-CSRF proof.
+identity. These monitoring routes are read-only.
 
 ## Auth and agent cards
 

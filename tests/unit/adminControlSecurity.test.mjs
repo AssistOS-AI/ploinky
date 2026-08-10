@@ -9,7 +9,6 @@ const {
     canonicalControlOrigin,
     mintAdminCsrfToken,
     requireAdminControlRequest,
-    usesAdminControlMutationGuard,
     verifyAdminMutationRequest,
 } = await import(`../../cli/server/adminControlSecurity.js?t=${Date.now()}`);
 const { handleDashboard } = await import(`../../cli/server/handlers/dashboard.js?t=${Date.now()}`);
@@ -85,14 +84,6 @@ test('non-local, malformed, and suffix-confusable control origins are rejected',
     assert.equal(canonicalControlOrigin(request({ host: '[::1]:8080' })), 'http://[::1]:8080');
 });
 
-test('only Dashboard paths bypass the generic browser mutation guard', () => {
-    assert.equal(usesAdminControlMutationGuard('/dashboard'), true);
-    assert.equal(usesAdminControlMutationGuard('/dashboard/run'), true);
-    for (const path of ['/dashboardish', '/status/run', '/webchat/session', '/upload', '/explorer/mcp']) {
-        assert.equal(usesAdminControlMutationGuard(path), false, path);
-    }
-});
-
 test('dashboard and status independently reject ordinary users and legacy dashboard SID cookies', async () => {
     const ordinary = { id: 'local:bob', username: 'bob', roles: ['user'] };
     for (const [handler, url] of [[handleDashboard, '/dashboard/'], [handleStatus, '/status/data']]) {
@@ -115,6 +106,16 @@ test('removed dashboard token-auth route is absent even for an administrator', a
     handleDashboard(request({ url: '/dashboard/auth', method: 'POST' }), res, {}, {});
     await res.ended;
     assert.equal(res.statusCode, 404);
+});
+
+test('dashboard root exposes only generic read-only monitoring contracts', async () => {
+    const res = response();
+    handleDashboard(request(), res, {}, {});
+    await res.ended;
+    assert.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body);
+    assert.equal(body.readOnly, true);
+    assert.deepEqual(Object.keys(body.endpoints).sort(), ['logs', 'resources', 'status']);
 });
 
 test('mutation guard rejects missing Origin and CSRF before a control handler can run', async () => {

@@ -59,7 +59,6 @@ import { RuntimeRelayManager } from './runtimeRelay/RuntimeRelayManager.js';
 import { RelayRequestMinter } from './runtimeRelay/relayRequestMinter.js';
 import {
     requireAdminControlRequest,
-    usesAdminControlMutationGuard,
 } from './adminControlSecurity.js';
 
 // Logging
@@ -601,11 +600,7 @@ async function processRequest(req, res) {
     const method = String(req.method || 'GET').toUpperCase();
     if (!['GET', 'HEAD', 'OPTIONS'].includes(method)
         && (req.authMode === 'local' || req.authMode === 'sso')
-        && req.authChannel !== 'cli'
-        // Dashboard mutations are guarded by the stricter local-admin Origin
-        // and CSRF check in handleDashboard. Its control route intentionally
-        // has no policy route plan to commit here.
-        && !usesAdminControlMutationGuard(pathname)) {
+        && req.authChannel !== 'cli') {
         const mutationProof = verifyBrowserMutationRequest(req, {
             routePlan,
             authContext: req.edgeAuthContext,
@@ -1073,7 +1068,7 @@ server.listen(port, '0.0.0.0', () => {
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
     console.log('  Dashboard:       /dashboard');
     console.log('  WebChat:         /webchat');
-    console.log('  Status:          /status');
+    console.log('  Status data:     /status/data');
     console.log('  Health:          /health');
     console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/models,v1/chat/completions}');
     console.log('  Agent ports:     /base-agent-additional-server/<agent>/<port>/');

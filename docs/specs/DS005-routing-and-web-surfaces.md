@@ -430,10 +430,10 @@ The default workspace entry paths `/` and `/index.html` redirect to the configur
 
 ## Decisions & Questions
 
-### Question #1: Why does the repository document `cli/server/dashboard/` as the active dashboard surface instead of the root-level `dashboard/` directory?
+### Question #1: Why does Ploinky no longer render its own Dashboard?
 
 Response:
-The current router handlers resolve the active dashboard fallback from `cli/server/dashboard/`. The root-level `dashboard/` directory is present in the repository but is not the fallback path used by the routed `/dashboard` implementation on this branch, so the documentation must follow the active handler path.
+Ploinky is responsible only for authenticated read-only status and log contracts. Their presentation is consumer-owned and intentionally outside the runtime. `/dashboard` returns a neutral descriptor of those contracts; it neither renders a UI nor redirects to a particular application. This removes the duplicate UI and the former generic command-execution route without coupling Ploinky to a consumer.
 
 ### Question #2: Why does Ploinky expose both router-level and agent-level MCP routes?
 

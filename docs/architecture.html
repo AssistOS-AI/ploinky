@@ -398,13 +398,8 @@ DATABASE_URL=postgres://localhost/db</code></pre>
                             <li>Automatic reconnection handling</li>
                         </ul>
 
-                        <h3>Dashboard (dashboard/)</h3>
-                        <p>Management interface components:</p>
-                        <pre><code>landingPage.js      // Main dashboard UI
-auth.js             // Authentication
-repositories.js     // Repo management
-configurations.js   // Settings management
-observability.js    // Monitoring views</code></pre>
+                        <h3>Monitoring contracts</h3>
+                        <p>Ploinky exposes authenticated, administrator-only resource and log streams. Presentation belongs to API consumers; the runtime contains no monitoring UI, command execution, or runtime controls.</p>
 
                         <h3>WebSocket Protocol</h3>
                         <pre><code>// Message types

@@ -3,7 +3,6 @@ import crypto from 'node:crypto';
 import { deriveSubkey } from '../utils/security/masterKey.js';
 import { isLocalAdminUser } from './auth/localService.js';
 import { resolveSessionBindingId } from './sessionBinding.js';
-import { isRouteMount } from './utils/routeMounts.js';
 
 export const ADMIN_CSRF_HEADER = 'x-ploinky-csrf-token';
 
@@ -16,10 +15,6 @@ const FORWARDING_HEADERS = [
     'x-forwarded-port',
     'x-forwarded-proto',
 ];
-
-export function usesAdminControlMutationGuard(pathname) {
-    return isRouteMount(pathname, '/dashboard');
-}
 
 function headerValue(req, name) {
     const value = req?.headers?.[name];

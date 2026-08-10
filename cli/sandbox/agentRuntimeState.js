@@ -1,5 +1,5 @@
 import { getBwrapPid, isBwrapProcessRunning } from './bwrap/bwrapFleet.js';
-import { collectLiveAgentContainers, getAgentsRegistry } from './docker/containerRegistry.js';
+import { collectLiveAgentContainers, collectLiveAgentContainersAsync, getAgentsRegistry } from './docker/containerRegistry.js';
 
 const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
 
@@ -95,7 +95,15 @@ function collectAgentRuntimeStates(options = {}) {
     return states;
 }
 
+async function collectAgentRuntimeStatesAsync(options = {}) {
+    const liveContainers = Object.hasOwn(options, 'liveContainers')
+        ? (options.liveContainers || [])
+        : await (options.collectContainers || collectLiveAgentContainersAsync)();
+    return collectAgentRuntimeStates({ ...options, liveContainers });
+}
+
 export {
     HOST_SANDBOX_RUNTIMES,
     collectAgentRuntimeStates,
+    collectAgentRuntimeStatesAsync,
 };
