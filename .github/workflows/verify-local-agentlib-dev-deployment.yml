@@ -1,0 +1,445 @@
+name: Verify Local AgentLib Development Deployment
+
+on:
+  push:
+    branches:
+      - local-achilles-agentlib-dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-agentlib-development-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-fresh-deployment:
+    name: ubuntu-24.04 fresh Explorer deployment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      PLOINKY_BOX_REQUIRE_PODMAN: '1'
+
+    steps:
+      - name: Check out Ploinky without AgentLib
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install and validate rootless Podman
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            fuse-overlayfs \
+            podman \
+            slirp4netns \
+            uidmap
+
+          runner_user="$(id -un)"
+          if ! sudo awk -F: -v user="$runner_user" '$1 == user && $3 >= 65536 { found = 1 } END { exit !found }' /etc/subuid; then
+            sudo usermod --add-subuids 100000-165535 "$runner_user"
+          fi
+          if ! sudo awk -F: -v user="$runner_user" '$1 == user && $3 >= 65536 { found = 1 } END { exit !found }' /etc/subgid; then
+            sudo usermod --add-subgids 100000-165535 "$runner_user"
+          fi
+
+          if [[ ! -e /dev/fuse ]]; then
+            sudo modprobe fuse
+          fi
+          if [[ ! -e /dev/net/tun ]]; then
+            sudo modprobe tun
+          fi
+          test -c /dev/fuse
+          test -r /dev/fuse
+          test -w /dev/fuse
+          test -c /dev/net/tun
+          test -r /dev/net/tun
+          test -w /dev/net/tun
+
+          command -v podman
+          command -v newuidmap
+          command -v newgidmap
+          podman version
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+          podman info --format 'rootless={{.Host.Security.Rootless}} graphDriver={{.Store.GraphDriverName}} networkBackend={{.Host.NetworkBackend}}'
+          if command -v docker >/dev/null 2>&1; then
+            docker info >/dev/null
+          fi
+          df -h /
+
+      - name: Prepare a genuinely empty development workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$GITHUB_WORKSPACE/node_modules/achillesAgentLib/package.json"
+          dev_workspace="$RUNNER_TEMP/ploinky-local-agentlib-development"
+          mkdir "$dev_workspace"
+          test -z "$(find "$dev_workspace" -mindepth 1 -print -quit)"
+          printf 'PLOINKY_DEV_WORKSPACE=%s\n' "$dev_workspace" >> "$GITHUB_ENV"
+          printf '%s/bin\n' "$GITHUB_WORKSPACE" >> "$GITHUB_PATH"
+
+      - name: Start Explorer through the default development path
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PLOINKY_PROD PLOINKY_AGENTLIB_REF PLOINKY_WORKSPACE_ROOT PLOINKY_CWD
+          unset CONTAINER_RUNTIME CONTAINER_HOST PODMAN_HOST DOCKER_HOST
+          cd "$PLOINKY_DEV_WORKSPACE"
+          timeout --kill-after=30s 125m ploinky start explorer
+
+      - name: Wait for every background runtime to become ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module - "$PLOINKY_DEV_WORKSPACE" <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const workspace = path.resolve(process.argv[2]);
+          const noWaitDir = path.join(workspace, '.ploinky', 'running', 'no-wait');
+          const deadline = Date.now() + 60 * 60 * 1000;
+          const pollMs = 15_000;
+          let stableSignature = '';
+          let stableScans = 0;
+          let previousSummary = '';
+
+          const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+          const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const bounded = (value) => String(value || '')
+              .replace(/[\r\n\t]+/g, ' ')
+              .replace(/[^\x20-\x7e]/g, '?')
+              .slice(0, 500);
+
+          while (Date.now() <= deadline) {
+              let markerNames = [];
+              try {
+                  markerNames = fs.readdirSync(noWaitDir)
+                      .filter((name) => name.endsWith('.current.json'))
+                      .sort();
+              } catch (error) {
+                  if (error?.code !== 'ENOENT') throw error;
+              }
+
+              let running = 0;
+              const pending = [];
+              for (const markerName of markerNames) {
+                  const containerName = markerName.slice(0, -'.current.json'.length);
+                  const marker = readJson(path.join(noWaitDir, markerName));
+                  if (typeof marker.statusFile !== 'string'
+                      || path.basename(marker.statusFile) !== marker.statusFile) {
+                      throw new Error(`Invalid no-wait status binding for ${containerName}`);
+                  }
+                  const statusPath = path.join(noWaitDir, marker.statusFile);
+                  let status;
+                  try {
+                      status = readJson(statusPath);
+                  } catch (error) {
+                      if (error?.code === 'ENOENT') {
+                          pending.push(`${containerName}:unpublished`);
+                          continue;
+                      }
+                      throw error;
+                  }
+                  if (status.containerName !== containerName || status.runId !== marker.runId) {
+                      throw new Error(`No-wait status moved outside its exact run for ${containerName}`);
+                  }
+                  if (status.state === 'failed') {
+                      const phase = bounded(status.phase) || 'unknown phase';
+                      const message = bounded(status.error?.message) || 'no failure detail';
+                      throw new Error(`${containerName} failed during ${phase}: ${message}`);
+                  }
+                  if (status.state === 'running') {
+                      running += 1;
+                  } else {
+                      pending.push(`${containerName}:${bounded(status.state) || 'pending'}`);
+                  }
+              }
+
+              const summary = `markers=${markerNames.length} running=${running} pending=${pending.length}`;
+              if (summary !== previousSummary) {
+                  console.log(summary);
+                  previousSummary = summary;
+              }
+              if (markerNames.length > 0 && running === markerNames.length) {
+                  const signature = markerNames.join('\n');
+                  stableScans = signature === stableSignature ? stableScans + 1 : 1;
+                  stableSignature = signature;
+                  if (stableScans >= 2) {
+                      console.log(`All ${running} background runtimes reached running state.`);
+                      process.exit(0);
+                  }
+              } else {
+                  stableSignature = '';
+                  stableScans = 0;
+              }
+              await delay(pollMs);
+          }
+
+          throw new Error(`Background runtime readiness timed out after 60 minutes (${previousSummary || 'no markers'})`);
+          NODE
+
+      - name: Verify Explorer and local AgentLib provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PLOINKY_PROD PLOINKY_AGENTLIB_REF PLOINKY_WORKSPACE_ROOT PLOINKY_CWD
+          unset CONTAINER_RUNTIME CONTAINER_HOST PODMAN_HOST DOCKER_HOST
+
+          cd "$PLOINKY_DEV_WORKSPACE"
+          ploinky status | tee "$RUNNER_TEMP/ploinky-local-agentlib-status.txt"
+          curl --fail --silent --show-error --max-time 30 \
+            http://127.0.0.1:8080/ > "$RUNNER_TEMP/ploinky-local-agentlib-health.txt"
+
+          expected_agentlib_commit="$(git -C "$GITHUB_WORKSPACE" ls-tree HEAD node_modules/achillesAgentLib | awk '{ print $3 }')"
+          actual_agentlib_commit="$(git -C "$GITHUB_WORKSPACE/node_modules/achillesAgentLib" rev-parse HEAD)"
+          test "$actual_agentlib_commit" = "$expected_agentlib_commit"
+          test -z "$(git -C "$GITHUB_WORKSPACE/node_modules/achillesAgentLib" status --porcelain)"
+
+          for repo_name in basic AchillesIDE AchillesCLI copilot-agents; do
+            repo_path="$PLOINKY_DEV_WORKSPACE/.ploinky/repos/$repo_name"
+            test -d "$repo_path/.git"
+            printf '%s=%s\n' "$repo_name" "$(git -c "safe.directory=$repo_path" -C "$repo_path" rev-parse HEAD)"
+          done
+
+          pack_dir="$(mktemp -d "$RUNNER_TEMP/ploinky-agentlib-proof.XXXXXX")"
+          (
+            cd "$GITHUB_WORKSPACE/node_modules/achillesAgentLib"
+            npm pack \
+              --ignore-scripts \
+              --json \
+              --pack-destination "$pack_dir" >/dev/null
+          )
+          shopt -s nullglob
+          proof_archives=("$pack_dir"/*.tgz)
+          test "${#proof_archives[@]}" -eq 1
+          expected_archive_sha="$(sha256sum "${proof_archives[0]}" | cut -d ' ' -f 1)"
+          published_archive="$PLOINKY_DEV_WORKSPACE/.ploinky/box/dependencies/.ploinky-local-agentlib/$expected_archive_sha.tgz"
+          test -f "$published_archive"
+          unpacked_archive="$(mktemp -d "$RUNNER_TEMP/ploinky-agentlib-unpacked.XXXXXX")"
+          tar -xzf "$published_archive" -C "$unpacked_archive"
+          test -d "$unpacked_archive/package"
+
+          node --input-type=module - \
+            "$PLOINKY_DEV_WORKSPACE" \
+            "$RUNNER_TEMP/ploinky-local-agentlib-status.txt" \
+            "$RUNNER_TEMP/ploinky-local-agentlib-health.txt" \
+            "$expected_archive_sha" \
+            "$unpacked_archive/package" <<'NODE'
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const workspace = path.resolve(process.argv[2]);
+          const statusPath = path.resolve(process.argv[3]);
+          const healthPath = path.resolve(process.argv[4]);
+          const expectedArchiveSha = String(process.argv[5] || '');
+          const expectedPackageRoot = path.resolve(process.argv[6]);
+          const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+          const requireThat = (condition, message) => {
+              if (!condition) throw new Error(message);
+          };
+          const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          const findFiles = (root, predicate) => {
+              const matches = [];
+              const pending = [root];
+              while (pending.length > 0) {
+                  const current = pending.pop();
+                  for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+                      const absolute = path.join(current, entry.name);
+                      if (entry.isDirectory()) pending.push(absolute);
+                      else if (entry.isFile() && predicate(absolute, entry.name)) matches.push(absolute);
+                  }
+              }
+              return matches;
+          };
+          const requireArchiveBytes = (installedRoot) => {
+              const pending = [''];
+              while (pending.length > 0) {
+                  const relativeDirectory = pending.pop();
+                  const expectedDirectory = path.join(expectedPackageRoot, relativeDirectory);
+                  for (const entry of fs.readdirSync(expectedDirectory, { withFileTypes: true })) {
+                      const relative = path.join(relativeDirectory, entry.name);
+                      const expectedPath = path.join(expectedPackageRoot, relative);
+                      const installedPath = path.join(installedRoot, relative);
+                      let installedStat;
+                      try {
+                          installedStat = fs.lstatSync(installedPath);
+                      } catch (error) {
+                          if (error?.code === 'ENOENT') {
+                              throw new Error(`Installed AgentLib is missing archive entry: ${relative}`);
+                          }
+                          throw error;
+                      }
+                      const expectedStat = fs.lstatSync(expectedPath);
+                      if (expectedStat.isDirectory()) {
+                          requireThat(installedStat.isDirectory(),
+                              `Installed AgentLib entry is not a directory: ${relative}`);
+                          pending.push(relative);
+                      } else if (expectedStat.isSymbolicLink()) {
+                          requireThat(installedStat.isSymbolicLink()
+                              && fs.readlinkSync(installedPath) === fs.readlinkSync(expectedPath),
+                          `Installed AgentLib symlink differs from the archive: ${relative}`);
+                      } else if (expectedStat.isFile()) {
+                          requireThat(installedStat.isFile()
+                              && expectedStat.size === installedStat.size
+                              && sha256(expectedPath) === sha256(installedPath),
+                          `Installed AgentLib file differs from the archive: ${relative}`);
+                      } else {
+                          throw new Error(`Unsupported AgentLib archive entry type: ${relative}`);
+                      }
+                  }
+              }
+          };
+
+          const agents = readJson(path.join(workspace, '.ploinky', 'agents.json'));
+          const agentNames = Object.keys(agents);
+          requireThat(agentNames.length > 0, 'No managed agent runtimes were recorded');
+          const expectedGraph = [
+              'AchillesCLI/achilles-cli',
+              'AchillesIDE/dpuAgent',
+              'AchillesIDE/explorer',
+              'AchillesIDE/gitAgent',
+              'AchillesIDE/multimedia',
+              'AchillesIDE/onlyOffice',
+              'AchillesIDE/soplangAgent',
+              'AchillesIDE/tasksAgent',
+              'AchillesIDE/webAssist',
+              'AchillesIDE/webmeetAgent',
+              'AchillesIDE/webmeetScribeAgent',
+              'AchillesIDE/webmeetStt',
+              'UmamiAgent/umamiAgent',
+              'basic/webtty',
+              'proxies/default-local-llm',
+              'proxies/soul-gateway',
+              'webmeetInfra/liveKitServerAgent',
+          ].sort();
+          const actualGraph = agentNames.map((name) => `${agents[name]?.repoName}/${agents[name]?.agentName}`).sort();
+          requireThat(JSON.stringify(actualGraph) === JSON.stringify(expectedGraph),
+              `Managed graph differs from the expected Explorer graph: ${JSON.stringify(actualGraph)}`);
+          const explorerNames = agentNames.filter((name) => agents[name]?.repoName === 'AchillesIDE'
+              && agents[name]?.agentName === 'explorer');
+          requireThat(explorerNames.length === 1, 'Exactly one Explorer runtime must be recorded');
+
+          const status = fs.readFileSync(statusPath, 'utf8');
+          requireThat(status.includes('Router: listening (127.0.0.1:8080)'), 'Router is not listening on the public development port');
+          const runtimeSections = status.split(/Agent runtimes:\r?\n/);
+          requireThat(runtimeSections.length === 2, 'Status has no unambiguous agent runtime section');
+          const runtimeLines = runtimeSections[1].split(/\r?\n/)
+              .filter((line) => /^  - \S+ \[[^\]]+\]/.test(line));
+          requireThat(runtimeLines.length === agentNames.length,
+              `Status reported ${runtimeLines.length} runtimes for ${agentNames.length} registry records`);
+          requireThat(runtimeLines.every((line) => line.includes('[running]')),
+              'At least one managed runtime is not running');
+          requireThat(runtimeLines.some((line) => line.includes(explorerNames[0]) && line.includes('[running]')),
+              'Explorer is not running');
+
+          const healthBody = fs.readFileSync(healthPath, 'utf8');
+          requireThat(healthBody.includes('Authentication required'), 'The public Explorer route did not enforce authentication');
+
+          const marker = readJson(path.join(
+              workspace,
+              '.ploinky',
+              'box',
+              'dependencies',
+              '.ploinky-box-dependencies.json',
+          ));
+          const identity = String(marker.repositories?.achillesAgentLib || '');
+          const match = /^local:([a-f0-9]{64})$/.exec(identity);
+          requireThat(match, `Box AgentLib identity is not local: ${identity || '<missing>'}`);
+          const archiveSha = match[1];
+          requireThat(archiveSha === expectedArchiveSha,
+              'The active local AgentLib archive does not match an independent pack of the cloned checkout');
+          const publishedArchive = path.join(
+              workspace,
+              '.ploinky',
+              'box',
+              'dependencies',
+              '.ploinky-local-agentlib',
+              `${archiveSha}.tgz`,
+          );
+          requireThat(fs.statSync(publishedArchive).isFile(), 'The published local AgentLib archive is missing');
+          requireThat(sha256(publishedArchive) === archiveSha, 'The published local AgentLib archive hash does not match its identity');
+
+          const explorerCache = path.join(workspace, '.ploinky', 'deps', 'agents', 'AchillesIDE', 'explorer');
+          const nestedArchives = findFiles(
+              explorerCache,
+              (_file, name) => name === `achillesAgentLib-${archiveSha}.tgz`,
+          );
+          requireThat(nestedArchives.length > 0, 'Explorer did not receive the selected local AgentLib archive');
+          requireThat(nestedArchives.every((file) => sha256(file) === archiveSha),
+              'An Explorer AgentLib cache archive failed hash verification');
+          const installedPackages = findFiles(
+              explorerCache,
+              (file, name) => name === 'package.json'
+                  && file.endsWith(`${path.sep}node_modules${path.sep}achillesAgentLib${path.sep}package.json`),
+          );
+          requireThat(installedPackages.length > 0, 'Explorer has no installed AchillesAgentLib package');
+          for (const packageJson of installedPackages) {
+              requireArchiveBytes(path.dirname(packageJson));
+          }
+
+          console.log(JSON.stringify({
+              trackedAgents: agentNames.length,
+              runningAgents: runtimeLines.length,
+              explorer: explorerNames[0],
+              agentlibIdentity: identity,
+              explorerArchives: nestedArchives.length,
+              installedPackagesVerified: installedPackages.length,
+          }, null, 2));
+          NODE
+
+      - name: Print bounded failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          unset PLOINKY_PROD PLOINKY_AGENTLIB_REF PLOINKY_WORKSPACE_ROOT PLOINKY_CWD
+          unset CONTAINER_RUNTIME CONTAINER_HOST PODMAN_HOST DOCKER_HOST
+          cd "$PLOINKY_DEV_WORKSPACE" 2>/dev/null || exit 0
+          ploinky status
+          podman ps --all --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}'
+          node --input-type=module - "$PLOINKY_DEV_WORKSPACE" <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const root = path.join(path.resolve(process.argv[2]), '.ploinky', 'running', 'no-wait');
+          const bounded = (value) => String(value || '').replace(/[\r\n\t]+/g, ' ').slice(0, 500);
+          try {
+              for (const markerName of fs.readdirSync(root).filter((name) => name.endsWith('.current.json')).sort()) {
+                  const marker = JSON.parse(fs.readFileSync(path.join(root, markerName), 'utf8'));
+                  let status = null;
+                  try {
+                      status = JSON.parse(fs.readFileSync(path.join(root, path.basename(marker.statusFile)), 'utf8'));
+                  } catch {}
+                  console.log(JSON.stringify({
+                      container: markerName.slice(0, -'.current.json'.length),
+                      runId: bounded(marker.runId),
+                      state: bounded(status?.state) || 'unpublished',
+                      phase: bounded(status?.phase),
+                      error: bounded(status?.error?.message),
+                  }));
+              }
+          } catch (error) {
+              console.log(`No bounded no-wait diagnostics available: ${bounded(error.message)}`);
+          }
+          NODE
+
+      - name: Destroy the exact temporary workspace
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          unset PLOINKY_PROD PLOINKY_AGENTLIB_REF PLOINKY_WORKSPACE_ROOT PLOINKY_CWD
+          unset CONTAINER_RUNTIME CONTAINER_HOST PODMAN_HOST DOCKER_HOST
+          cd "$PLOINKY_DEV_WORKSPACE" 2>/dev/null || exit 0
+          timeout --kill-after=30s 10m ploinky destroy --delete-cache
