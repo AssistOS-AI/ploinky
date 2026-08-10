@@ -71,6 +71,8 @@ test('sandbox PID ownership is isolated by exact runtime key and rejects stale i
         fs.writeFileSync(legacyFile, String(process.pid), { mode: 0o600 });
         assert.equal(fleet.getBwrapPid(legacyKey), 0);
         assert.equal(fs.existsSync(legacyFile), true);
+        assert.equal(fleet.hasInvalidBwrapPidRecord(legacyKey), true);
+        assert.equal(fleet.hasInvalidBwrapPidRecord('ploinky_absent_record'), false);
         assert.throws(
             () => fleet.assertBwrapPidSlotAvailable(legacyKey),
             (error) => error?.code === 'PLOINKY_SANDBOX_PID_RECORD_INVALID',

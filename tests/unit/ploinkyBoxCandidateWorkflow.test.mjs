@@ -20,6 +20,7 @@ test('candidate workflow requires one digest and exact graph pins on both suppor
     assert.match(candidateWorkflow,
         /\["self-hosted","Linux","X64","ploinky-box-candidate"\]/);
     assert.match(candidateWorkflow, /PLOINKY_BOX_REQUIRE_PODMAN: '1'/);
+    assert.match(candidateWorkflow, /PLOINKY_PROD: 'true'/);
     assert.match(candidateWorkflow, /PLOINKY_BOX_CANDIDATE_DIGEST: \$\{\{ inputs\.box_digest \}\}/);
     assert.match(candidateWorkflow,
         /SMOKE_GRAPH_ARGS_JSON: '\["start","AchillesIDE\/explorer","19090"\]'/);

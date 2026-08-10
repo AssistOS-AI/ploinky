@@ -90,6 +90,8 @@ function matrixSupervisor(identity, events) {
         },
         startCore: async () => { events.push('start-core'); },
         healthCheck: async () => { events.push('health'); },
+        lockedAgentlibCommit: 'c'.repeat(40),
+        inspectAgentlibIdentity: () => 'c'.repeat(40),
     });
     return { supervisor, lockManager };
 }
@@ -120,7 +122,7 @@ test('every public verb has the required single-lock depth and release boundary'
         const { supervisor, lockManager } = matrixSupervisor(identity, events);
         const execute = () => { events.push('execute'); return 0; };
         const code = await runOuterCli(scenario.argv, {
-            env: {},
+            env: { PLOINKY_PROD: 'true' },
             input: { isTTY: false },
             output: bufferStream(),
             errorOutput: bufferStream(),
@@ -199,6 +201,8 @@ test('start stages host-owned edge desired state under the Box lock before core 
         },
         startCore: async () => { events.push('start-core'); },
         healthCheck: async () => { events.push('health'); },
+        lockedAgentlibCommit: 'c'.repeat(40),
+        inspectAgentlibIdentity: () => 'c'.repeat(40),
     });
 
     await stagedSupervisor.runStartTransaction(['start', 'Agent', '8080']);
@@ -225,7 +229,7 @@ test('foreign ownership blocks every lifecycle path with zero engine mutation', 
             },
         });
         const invocation = runOuterCli(argv, {
-            env: {}, supervisor,
+            env: { PLOINKY_PROD: 'true' }, supervisor,
             input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
             execute() { mutations.push(['execute']); return 0; },
         });
@@ -248,6 +252,8 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         USER: 'operator',
         XDG_CONFIG_HOME: '/private/config',
         PLOINKY_MASTER_KEY: 'HOST_MASTER_CANARY',
+        PLOINKY_PROD: 'true',
+        PLOINKY_AGENTLIB_REF: 'HOST_AGENTLIB_REF_CANARY',
         UNRELATED_SECRET: 'UNRELATED_CANARY',
     };
     const engineEnvironment = buildEngineProcessEnvironment(host);
@@ -292,6 +298,8 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
     const agentEnvironment = { SAFE: 'yes', ...host };
     stripReservedAgentEnv(agentEnvironment);
     assert.equal(agentEnvironment.PLOINKY_MASTER_KEY, undefined);
+    assert.equal(engineEnvironment.PLOINKY_PROD, undefined);
+    assert.equal(engineEnvironment.PLOINKY_AGENTLIB_REF, undefined);
 });
 
 test('managed workspace key is removed from Router inheritance and is never logged', () => {
@@ -303,6 +311,7 @@ test('managed workspace key is removed from Router inheritance and is never logg
     ), 'utf8');
     assert.match(workspaceUtil, /env:\s*\{\s*\.\.\.buildRouterEnv\(\),/);
     assert.match(workspaceUtil, /sanitizeManagedMasterKeyEnvironment/);
+    assert.match(workspaceUtil, /PLOINKY_PROD:\s*_hostOnlySourceSelector/);
     assert.match(watchdog, /const env = \{\s*\.\.\.restEnv,\s*MANAGED_BY_PROCESS_MANAGER:/);
     assert.doesNotMatch(workspaceUtil, /console\.(?:log|error)\([^\n]*PLOINKY_MASTER_KEY/);
     assert.doesNotMatch(watchdog, /(?:log|safeConsole)\([^\n]*PLOINKY_MASTER_KEY/);

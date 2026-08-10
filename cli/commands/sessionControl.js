@@ -9,7 +9,10 @@ import {
     destroyWorkspaceContainers
 } from '../sandbox/docker/index.js';
 import { debugLog } from '../utils/utils.js';
-import { resolvePersistedRouterPort } from '../sandbox/routerPort.js';
+import {
+    INITIAL_ROUTER_PORT,
+    resolvePersistedRouterPort,
+} from '../sandbox/routerPort.js';
 
 function registerSessionContainer(name) {
     try { addSessionContainer(name); } catch (_) { }
@@ -19,12 +22,45 @@ function cleanupSessionContainers() {
     try { cleanupSessionSet(); } catch (_) { }
 }
 
-function killRouterIfRunning() {
+// Watchdog permits 15s for graceful child shutdown, then allows another 1s
+// after SIGKILL before exiting. Keep margin for process and port observation.
+const ROUTER_SHUTDOWN_TIMEOUT_MS = 20_000;
+const ROUTER_SHUTDOWN_POLL_MS = 100;
+
+function sleepSynchronously(milliseconds) {
+    const sleepArr = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(sleepArr, 0, 0, milliseconds);
+}
+
+function killRouterIfRunning({ strict = false } = {}) {
     try {
         const pidFile = path.join(RUNNING_DIR, 'router.pid');
+        const pidFileExists = fs.existsSync(pidFile);
         let stopped = false;
         let port = null;
-        try { port = resolvePersistedRouterPort(); } catch (_) { }
+        let portResolutionError = null;
+        let persistedPid = null;
+        let persistedPidValid = false;
+        const targetedPids = new Set();
+        try {
+            port = resolvePersistedRouterPort();
+        } catch (error) {
+            portResolutionError = error;
+            // Managed Routers listen on exactly 8080. In strict mode, probe
+            // that fixed port even when persisted configuration is absent or
+            // malformed. A listener found without persisted authority is not
+            // killed by port alone, but it must block the source transition.
+            if (strict) port = INITIAL_ROUTER_PORT;
+        }
+
+        const isPidAlive = (pid) => {
+            try {
+                process.kill(pid, 0);
+                return true;
+            } catch (error) {
+                return error?.code === 'EPERM';
+            }
+        };
 
         const logRouterStop = (pid, signal, source) => {
             try {
@@ -53,13 +89,42 @@ function killRouterIfRunning() {
             return Array.from(pids);
         };
 
-        const isPortFree = () => {
-            return findPids().length === 0;
-        };
+        if (pidFileExists) {
+            const persistedPidText = fs.readFileSync(pidFile, 'utf8').trim();
+            if (/^[1-9]\d*$/.test(persistedPidText)) {
+                persistedPid = Number(persistedPidText);
+                persistedPidValid = Number.isSafeInteger(persistedPid);
+            }
+        }
 
-        if (fs.existsSync(pidFile)) {
-            const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-            if (pid && !Number.isNaN(pid)) {
+        const initialListenerPids = findPids();
+        if (strict && pidFileExists && !persistedPidValid) {
+            const error = new Error(
+                `Router Watchdog pidfile is invalid; refusing a port-only shutdown: ${pidFile}`,
+            );
+            error.code = 'PLOINKY_ROUTER_PID_AUTHORITY_INVALID';
+            throw error;
+        }
+        if (
+            strict
+            && initialListenerPids.length > 0
+            && (!persistedPidValid || !isPidAlive(persistedPid))
+        ) {
+            const error = new Error(
+                'A managed Router listener exists without a live persisted Watchdog PID; refusing a port-only shutdown',
+            );
+            error.code = 'PLOINKY_ROUTER_PID_AUTHORITY_MISSING';
+            throw error;
+        }
+
+        if (persistedPidValid) {
+            const pid = persistedPid;
+            if (pid) {
+                // Track the claimed owner before signalling it. Permission
+                // failures and other rejected signals must remain visible to
+                // strict callers instead of being mistaken for a completed
+                // shutdown when no persisted port is available.
+                targetedPids.add(pid);
                 try {
                     process.kill(pid, 'SIGTERM');
                     logRouterStop(pid, 'SIGTERM', 'pid_file');
@@ -67,12 +132,12 @@ function killRouterIfRunning() {
                     stopped = true;
                 } catch (_) { }
             }
-            try { fs.unlinkSync(pidFile); } catch (_) { }
         }
 
-        if (!stopped) {
+        if (!stopped && !portResolutionError) {
             const tryKill = (pid) => {
                 if (!pid) return false;
+                targetedPids.add(pid);
                 try {
                     process.kill(pid, 'SIGTERM');
                     logRouterStop(pid, 'SIGTERM', 'port_scan');
@@ -87,6 +152,7 @@ function killRouterIfRunning() {
             }
             if (!stopped && pids.length) {
                 for (const pid of pids) {
+                    targetedPids.add(pid);
                     try {
                         process.kill(pid, 'SIGKILL');
                         logRouterStop(pid, 'SIGKILL', 'port_scan');
@@ -97,19 +163,54 @@ function killRouterIfRunning() {
             }
         }
 
-        // Wait for the port to be free after killing the process
-        if (stopped) {
-            const maxWait = 50; // 5 seconds max
-            for (let i = 0; i < maxWait; i++) {
-                if (isPortFree()) {
-                    break;
-                }
-                // Synchronous sleep using Atomics
-                const sleepArr = new Int32Array(new SharedArrayBuffer(4));
-                Atomics.wait(sleepArr, 0, 0, 100);
-            }
+        // A source transition depends on this command being a real barrier, not
+        // merely on SIGTERM having been accepted. Wait for both the Watchdog PID
+        // and its Router listener to disappear before reporting success.
+        const remainingPids = waitForRouterQuiescence({
+            targetedPids,
+            isPidAlive,
+            findPids,
+        });
+        if (remainingPids.length > 0) {
+            const error = new Error(
+                `Router processes remain after shutdown: ${remainingPids.join(', ')}`,
+            );
+            error.code = 'PLOINKY_ROUTER_QUIESCENCE_FAILED';
+            throw error;
         }
-    } catch (_) { }
+        if (pidFileExists) {
+            try { fs.unlinkSync(pidFile); } catch (_) { }
+        }
+        return { stopped, remainingPids: [] };
+    } catch (error) {
+        if (strict) throw error;
+        debugLog(`Router shutdown was incomplete: ${error?.message || error}`);
+        return { stopped: false, error };
+    }
+}
+
+function waitForRouterQuiescence({
+    targetedPids,
+    isPidAlive,
+    findPids,
+    timeoutMs = ROUTER_SHUTDOWN_TIMEOUT_MS,
+    pollMs = ROUTER_SHUTDOWN_POLL_MS,
+    now = Date.now,
+    sleep = sleepSynchronously,
+}) {
+    const remainingPids = () => [...new Set([
+        ...[...targetedPids].filter(isPidAlive),
+        ...findPids(),
+    ])];
+    const deadline = now() + timeoutMs;
+    let remaining = remainingPids();
+    while (remaining.length > 0) {
+        const remainingWaitMs = deadline - now();
+        if (remainingWaitMs <= 0) break;
+        sleep(Math.min(pollMs, remainingWaitMs));
+        remaining = remainingPids();
+    }
+    return remaining;
 }
 
 async function destroyAll() {
@@ -141,6 +242,7 @@ async function shutdownSession() {
 export {
     registerSessionContainer,
     cleanupSessionContainers,
+    waitForRouterQuiescence,
     killRouterIfRunning,
     destroyAll,
     shutdownSession,

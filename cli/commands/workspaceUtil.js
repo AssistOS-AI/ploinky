@@ -192,19 +192,41 @@ function createAppendLogStdio(logFile) {
 // secretInjector.getSecret(): walked-up `.env` -> `.ploinky/.secrets` ->
 // `process.env`, with operator-exported values winning. This way the router
 // stays able to forward LLM/auth secrets to handlers across crash-restart
-// cycles without depending on the operator having `export`'d each one. Managed
-// Boxes then remove PLOINKY_MASTER_KEY because core reads its owned key file.
+// cycles without depending on the operator having `export`'d each one. AgentLib
+// source selectors are the exception: only the bounded process environment may
+// supply them. Managed Boxes then remove PLOINKY_MASTER_KEY because core reads
+// its owned key file.
 export function sanitizeRouterEnvironment(environment, { managedBox } = {}) {
-  return sanitizeManagedMasterKeyEnvironment(environment, { managedBox });
+  const { PLOINKY_PROD: _hostOnlySourceSelector, ...routerEnvironment } = environment || {};
+  return sanitizeManagedMasterKeyEnvironment(routerEnvironment, { managedBox });
 }
 
-export function buildRouterEnv({ managedBox } = {}) {
+function removePersistedAgentlibAuthority(environment) {
+  const sanitized = { ...(environment || {}) };
+  delete sanitized.PLOINKY_LOCAL_AGENTLIB_SHA;
+  delete sanitized.PLOINKY_AGENTLIB_REF;
+  return sanitized;
+}
+
+export function buildRouterEnv({
+  managedBox,
+  loadEnvFileImpl = loadEnvFile,
+  readSecretsFileImpl = readSecretsFile,
+  processEnvironment = process.env,
+} = {}) {
   let envFile = {};
-  try { envFile = loadEnvFile() || {}; } catch (_) { envFile = {}; }
+  try { envFile = loadEnvFileImpl() || {}; } catch (_) { envFile = {}; }
   let secrets = {};
-  try { secrets = readSecretsFile() || {}; } catch (_) { secrets = {}; }
+  try { secrets = readSecretsFileImpl() || {}; } catch (_) { secrets = {}; }
   return sanitizeRouterEnvironment(
-    { ...envFile, ...secrets, ...process.env },
+    {
+      ...removePersistedAgentlibAuthority(envFile),
+      ...removePersistedAgentlibAuthority(secrets),
+      // Only the environment of the bounded start process may select local
+      // AgentLib bytes. Watchdog and Router inherit these exact values across
+      // restarts; workspace .env/.secrets files cannot synthesize them.
+      ...(processEnvironment || {}),
+    },
     { managedBox },
   );
 }

@@ -12,6 +12,7 @@ import {
     formatBoxStatus,
     runBoundedCoreStart,
 } from '../../ploinky-box/supervisor.mjs';
+import { stopPloinkyLocalByContainerId } from '../../ploinky-box/lifecycle/container.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -227,7 +228,7 @@ test('unsupported discovery happens before markerless anchor materialization', a
     assert.deepEqual(events, ['lock', 'release']);
 });
 
-test('prepare acquires once, reconciles under lock, validates dependencies, then releases', async (t) => {
+test('prepare acquires once, reconciles under lock, preserves AgentLib, then releases', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
@@ -255,9 +256,179 @@ test('prepare acquires once, reconciles under lock, validates dependencies, then
     assert.deepEqual(events, [
         'lock',
         'reconcile',
-        `run:container exec --user podman --workdir /workspace ${ownership.handles.container.id} /opt/ploinky/bin/ploinky-install-deps`,
+        `run:container exec --user podman --workdir /workspace ${ownership.handles.container.id} /opt/ploinky/bin/ploinky-install-deps --preserve-agentlib`,
         'release',
     ]);
+});
+
+test('local start quiesces before publication and installation, then starts and checks health', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const events = [];
+    const sha256 = 'd'.repeat(64);
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        reconcile: async () => {
+            events.push('reconcile');
+            return { action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882 };
+        },
+        stopCore: (_engine, _containerId, _runner, options) => {
+            assert.deepEqual(options, { sourceTransition: true });
+            events.push('stop-core');
+        },
+        publishLocalAgentlib(source, options) {
+            assert.equal(source.sha256, sha256);
+            assert.equal(options.dependenciesRoot, identity.dataPaths.dependencies);
+            events.push('publish');
+        },
+        ensureDependencies: async (_engine, _containerId, _runner, options) => {
+            events.push(`dependencies:${options.localAgentlibSha}`);
+        },
+        readEdgeDesired: () => null,
+        resolveHostReachableIpv4: async () => null,
+        startCore: async () => events.push('start-core'),
+        healthCheck: async () => events.push('health'),
+    });
+
+    await supervisor.runStartTransaction(['start', 'explorer'], {
+        source: {
+            mode: 'local',
+            sha256,
+            tempArchivePath: '/private/achilles.tgz',
+        },
+    });
+
+    assert.deepEqual(events, [
+        'lock',
+        'reconcile',
+        'stop-core',
+        'publish',
+        `dependencies:${sha256}`,
+        'start-core',
+        'health',
+        'release',
+    ]);
+});
+
+test('source-transition stop is the only relay that carries the internal removal marker', () => {
+    const calls = [];
+    const engine = { name: 'podman' };
+    const containerId = 'a'.repeat(64);
+    const runner = {
+        run(command, args) {
+            calls.push([command, args]);
+        },
+    };
+
+    stopPloinkyLocalByContainerId(engine, containerId, runner);
+    stopPloinkyLocalByContainerId(engine, containerId, runner, { sourceTransition: true });
+
+    assert.deepEqual(calls.map(([, args]) => args.slice(-2)), [
+        ['/opt/ploinky/bin/ploinky-local', 'stop'],
+        ['stop', '--source-transition'],
+    ]);
+    assert.equal(calls.every(([command]) => command === 'podman'), true);
+});
+
+test('production start only quiesces when the installed Achilles identity is not locked', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const lockedCommit = 'c'.repeat(40);
+
+    for (const installedIdentity of [lockedCommit, `local:${'d'.repeat(64)}`, 'unknown']) {
+        const caseRoot = fs.mkdtempSync(path.join(state.root, 'case-'));
+        const events = [];
+        const supervisor = createBoxSupervisor({
+            resolveIdentity: () => identity,
+            lockManager: fakeLockManager(caseRoot, events),
+            discover: () => ownership,
+            reconcile: async () => {
+                events.push('reconcile');
+                return { action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882 };
+            },
+            lockedAgentlibCommit: lockedCommit,
+            inspectAgentlibIdentity: () => {
+                events.push(`inspect:${installedIdentity}`);
+                return installedIdentity;
+            },
+            stopCore: (_engine, _containerId, _runner, options) => {
+                assert.deepEqual(options, { sourceTransition: true });
+                events.push('stop-core');
+            },
+            ensureDependencies: async () => events.push('dependencies:locked'),
+            readEdgeDesired: () => null,
+            resolveHostReachableIpv4: async () => null,
+            startCore: async () => events.push('start-core'),
+            healthCheck: async () => events.push('health'),
+        });
+
+        await supervisor.runStartTransaction(['start', 'explorer'], {
+            source: { mode: 'locked' },
+        });
+
+        assert.equal(events.includes('stop-core'), installedIdentity !== lockedCommit);
+        assert.ok(events.indexOf(`inspect:${installedIdentity}`) < events.indexOf('dependencies:locked'));
+        if (installedIdentity !== lockedCommit) {
+            assert.ok(events.indexOf('stop-core') < events.indexOf('dependencies:locked'));
+        }
+        assert.ok(events.indexOf('dependencies:locked') < events.indexOf('start-core'));
+        assert.ok(events.indexOf('start-core') < events.indexOf('health'));
+    }
+});
+
+test('local stop and install failures cannot publish late or launch the inner graph', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const source = {
+        mode: 'local',
+        sha256: 'd'.repeat(64),
+        tempArchivePath: '/private/achilles.tgz',
+    };
+
+    for (const failure of ['stop', 'install']) {
+        const caseRoot = fs.mkdtempSync(path.join(state.root, `${failure}-`));
+        const events = [];
+        const supervisor = createBoxSupervisor({
+            resolveIdentity: () => identity,
+            lockManager: fakeLockManager(caseRoot, events),
+            discover: () => ownership,
+            reconcile: async () => ({
+                action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882,
+            }),
+            stopCore: () => {
+                events.push('stop-core');
+                if (failure === 'stop') throw new Error('quiescence refused');
+            },
+            publishLocalAgentlib: () => events.push('publish'),
+            ensureDependencies: async () => {
+                events.push('dependencies');
+                if (failure === 'install') throw new Error('install refused');
+            },
+            readEdgeDesired: () => null,
+            resolveHostReachableIpv4: async () => null,
+            startCore: async () => events.push('start-core'),
+            healthCheck: async () => events.push('health'),
+        });
+
+        await assert.rejects(
+            () => supervisor.runStartTransaction(['start', 'explorer'], { source }),
+            failure === 'stop' ? /quiescence refused/ : /install refused/,
+        );
+        assert.equal(events.includes('start-core'), false);
+        assert.equal(events.includes('health'), false);
+        if (failure === 'stop') {
+            assert.equal(events.includes('publish'), false);
+            assert.equal(events.includes('dependencies'), false);
+        }
+    }
 });
 
 test('stop relays to ploinky-local before stopping the outer Box without dependency repair', async (t) => {
@@ -588,9 +759,13 @@ test('start passes the native host address into the bounded in-box runtime', asy
             boundedOptions = options;
         },
         healthCheck: async (hostPort) => assert.equal(hostPort, 8080),
+        lockedAgentlibCommit: 'c'.repeat(40),
+        inspectAgentlibIdentity: () => 'c'.repeat(40),
     });
 
-    await supervisor.runStartTransaction(['start', 'explorer']);
+    await supervisor.runStartTransaction(['start', 'explorer'], {
+        source: { mode: 'resolved-ref', requestedRef: 'master' },
+    });
     assert.equal(boundedOptions.hostReachableIpv4, '192.168.1.12');
     assert.equal(boundedOptions.agentlibRef, 'master');
 });

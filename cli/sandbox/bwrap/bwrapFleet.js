@@ -123,6 +123,18 @@ function readBwrapPidRecord(runtimeKey) {
     }
 }
 
+function hasInvalidBwrapPidRecord(runtimeKey) {
+    const normalized = normalizeBwrapRuntimeKey(runtimeKey);
+    const pidFile = getPidFile(normalized);
+    try {
+        fs.lstatSync(pidFile);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+    return readBwrapPidRecord(normalized) === null;
+}
+
 function recordMatchesRuntimeIdentity(record, expectedIdentity) {
     if (expectedIdentity === undefined) return true;
     const expected = normalizeSandboxRuntimeIdentity(expectedIdentity);
@@ -147,7 +159,7 @@ function assertBwrapPidSlotAvailable(runtimeKey) {
         error.code = 'PLOINKY_SANDBOX_PID_RECORD_INVALID';
         throw error;
     }
-    if (isExactBwrapProcess(record)) {
+    if (isExactBwrapProcess(record) || isBwrapProcessGroupAlive(record.pid)) {
         const error = new Error(`sandbox runtime ${normalized} is already bound to a live process`);
         error.code = 'PLOINKY_SANDBOX_PID_SLOT_BUSY';
         throw error;
@@ -173,9 +185,9 @@ function saveBwrapPid(runtimeKey, pid, runtimeIdentity) {
             error.code = 'PLOINKY_SANDBOX_PID_RECORD_INVALID';
             throw error;
         }
-        if (isExactBwrapProcess(existing)) {
-            if (
-                existing.pid === numericPid
+        if (isExactBwrapProcess(existing) || isBwrapProcessGroupAlive(existing.pid)) {
+            if (isExactBwrapProcess(existing)
+                && existing.pid === numericPid
                 && existing.processIdentity === processIdentity
                 && existing.instanceId === identity.instanceId
                 && existing.enableGeneration === identity.enableGeneration
@@ -235,9 +247,21 @@ function isExactBwrapProcess(record) {
     return readProcessIdentity(record.pid) === record.processIdentity;
 }
 
+function isBwrapProcessGroupAlive(pid) {
+    try {
+        process.kill(-pid, 0);
+        return true;
+    } catch (error) {
+        return error?.code === 'EPERM';
+    }
+}
+
 function isBwrapProcessRunning(runtimeKey, expectedIdentity = undefined) {
     const record = readBwrapPidRecord(runtimeKey);
     if (!isExactBwrapProcess(record)) {
+        if (record && isBwrapProcessGroupAlive(record.pid)) {
+            return recordMatchesRuntimeIdentity(record, expectedIdentity);
+        }
         // A stale or PID-reused record never grants ownership of the process.
         if (record) clearBwrapPid(runtimeKey);
         return false;
@@ -246,7 +270,7 @@ function isBwrapProcessRunning(runtimeKey, expectedIdentity = undefined) {
 }
 
 function isPidAlive(entry) {
-    return isExactBwrapProcess(entry);
+    return isExactBwrapProcess(entry) || isBwrapProcessGroupAlive(entry.pid);
 }
 
 function samePidRecord(left, right) {
@@ -268,6 +292,12 @@ function clearBwrapPidIfExact(entry) {
 function sendSignalToBwrapEntry(entry, signal) {
     const { runtimeKey, pid } = entry;
     if (!isExactBwrapProcess(entry)) {
+        if (isBwrapProcessGroupAlive(pid)) {
+            // The leader disappeared after its identity was captured, but a
+            // descendant still owns the group. Retain the record and fail
+            // closed rather than claiming that the sandbox has stopped.
+            return false;
+        }
         clearBwrapPidIfExact(entry);
         entry.stopped = true;
         return true;
@@ -320,7 +350,10 @@ function stopBwrapProcesses(runtimeKeys, {
         seen.add(runtimeKey);
 
         const record = readBwrapPidRecord(runtimeKey);
-        if (!record || !isExactBwrapProcess(record)) {
+        const exactLeader = isExactBwrapProcess(record);
+        const orphanedGroup = Boolean(record && !exactLeader
+            && isBwrapProcessGroupAlive(record.pid));
+        if (!record || (!exactLeader && !orphanedGroup)) {
             debugLog(`[bwrap] ${runtimeKey}: no exact live PID record found`);
             if (record) clearBwrapPid(runtimeKey);
             continue;
@@ -332,7 +365,11 @@ function stopBwrapProcesses(runtimeKeys, {
             debugLog(`[bwrap] ${runtimeKey}: exact generation does not own the live PID record`);
             continue;
         }
-        entries.push({ ...record, stopped: false });
+        entries.push({
+            ...record,
+            stopped: false,
+            terminationBlocked: orphanedGroup,
+        });
     }
 
     for (const entry of entries) {
@@ -343,7 +380,7 @@ function stopBwrapProcesses(runtimeKeys, {
     while (Date.now() < deadline) {
         let hasRunningProcesses = false;
         for (const entry of entries) {
-            if (entry.stopped) continue;
+            if (entry.stopped || entry.terminationBlocked) continue;
             if (isPidAlive(entry)) {
                 hasRunningProcesses = true;
                 continue;
@@ -357,14 +394,19 @@ function stopBwrapProcesses(runtimeKeys, {
     }
 
     for (const entry of entries) {
-        if (entry.stopped) continue;
-        if (isExactBwrapProcess(entry)) {
+        if (entry.stopped || entry.terminationBlocked) continue;
+        if (isExactBwrapProcess(entry) || isBwrapProcessGroupAlive(entry.pid)) {
             console.log(`[bwrap] ${entry.runtimeKey}: force killing process ${entry.pid}`);
             try { process.kill(-entry.pid, 'SIGKILL'); } catch (_) { }
             if (isExactBwrapProcess(entry)) {
                 try { process.kill(entry.pid, 'SIGKILL'); } catch (_) { }
             }
         }
+        // Never erase the only process-identity evidence while that exact
+        // sandbox leader is still alive. Strict source-transition callers use
+        // the retained record to fail closed instead of reporting a successful
+        // stop after a rejected or ineffective SIGKILL.
+        if (isExactBwrapProcess(entry) || isBwrapProcessGroupAlive(entry.pid)) continue;
         clearBwrapPidIfExact(entry);
         entry.stopped = true;
     }
@@ -401,6 +443,7 @@ export {
     getBwrapPid,
     saveBwrapPid,
     clearBwrapPid,
+    hasInvalidBwrapPidRecord,
     isBwrapProcessRunning,
     stopBwrapProcesses,
     stopBwrapProcess,

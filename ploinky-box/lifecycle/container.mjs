@@ -151,7 +151,9 @@ export function removeContainerById(engine, containerId, runner) {
     runner.run(engine.name, ['container', 'rm', '-f', id]);
 }
 
-export function stopPloinkyLocalByContainerId(engine, containerId, runner) {
+export function stopPloinkyLocalByContainerId(engine, containerId, runner, {
+    sourceTransition = false,
+} = {}) {
     const id = assertImmutableContainerId(containerId, 'relay ploinky-local stop');
     runner.run(engine.name, [
         'container', 'exec',
@@ -160,6 +162,7 @@ export function stopPloinkyLocalByContainerId(engine, containerId, runner) {
         id,
         '/opt/ploinky/bin/ploinky-local',
         'stop',
+        ...(sourceTransition === true ? ['--source-transition'] : []),
     ]);
 }
 

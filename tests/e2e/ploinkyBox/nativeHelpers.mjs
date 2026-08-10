@@ -121,7 +121,10 @@ export function requirePodmanCandidate(t, env = process.env) {
 }
 
 export function createPodmanHarness(t, candidateReference, {
+    removeRootAfterCleanup = false,
     reconcile,
+    supervisorEnv = {},
+    supervisorOverrides = {},
 } = {}) {
     const createdRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-podman-'));
     const root = fs.realpathSync(createdRoot);
@@ -171,11 +174,12 @@ export function createPodmanHarness(t, candidateReference, {
     const output = { bytes: '', write(chunk) { this.bytes += String(chunk); } };
     const lockManager = createMutationLockManager({ homeDirectory: lockHome });
     const supervisorOptions = {
+        ...supervisorOverrides,
         runner,
         lockManager,
         resolveIdentity,
         platform: process.platform,
-        env: {},
+        env: supervisorEnv,
         stdout: output,
         stderr: output,
     };
@@ -192,7 +196,10 @@ export function createPodmanHarness(t, candidateReference, {
             env: {},
         });
     }
-    t.after(cleanup);
+    t.after(async () => {
+        await cleanup();
+        if (removeRootAfterCleanup) fs.rmSync(root, { recursive: true, force: true });
+    });
     return {
         root,
         workspace,

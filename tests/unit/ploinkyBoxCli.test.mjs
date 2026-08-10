@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import test from 'node:test';
 
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
@@ -233,14 +234,125 @@ test('explicit start is reachable and retains normalized debug argv', async () =
     const code = await runOuterCli([
         '--debug', '--port', '19090', '--udp-port', '17891', 'start', 'Agent',
     ], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        env: { PLOINKY_PROD: 'true' },
+        input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
     });
     assert.equal(code, 0);
     assert.deepEqual(events, [[
         'start',
         ['--debug', 'start', 'Agent', '8080'],
-        { explicitPort: 19090, explicitMediaPort: 17891 },
+        {
+            explicitPort: 19090,
+            explicitMediaPort: 17891,
+            source: { mode: 'locked' },
+        },
+    ]]);
+});
+
+test('start validates source policy before packing or constructing the supervisor', async () => {
+    for (const env of [
+        { PLOINKY_PROD: 'TRUE' },
+        { PLOINKY_PROD: 'false', PLOINKY_AGENTLIB_REF: 'feature' },
+    ]) {
+        let packed = false;
+        await assert.rejects(() => runOuterCli(['start', 'Agent'], {
+            env,
+            supervisor: new Proxy({}, {
+                get() { throw new Error('supervisor must remain untouched'); },
+            }),
+            prepareLocalAgentlib() { packed = true; },
+        }), /PLOINKY_(?:PROD|AGENTLIB_REF)/);
+        assert.equal(packed, false);
+    }
+});
+
+test('local start packs first, passes one typed snapshot, and always cleans it', async () => {
+    const snapshot = {
+        sha256: 'd'.repeat(64),
+        tempArchivePath: '/private/local-agentlib.tgz',
+    };
+    for (const failStart of [false, true]) {
+        const events = [];
+        const supervisor = fakeSupervisor(events);
+        if (failStart) {
+            supervisor.runStartTransaction = async () => {
+                events.push('start-failed');
+                throw new Error('start failed');
+            };
+        }
+        const invocation = runOuterCli(['start', 'Agent'], {
+            env: {},
+            supervisor,
+            prepareLocalAgentlib({ repositoryRoot }) {
+                assert.ok(path.isAbsolute(repositoryRoot));
+                events.push('pack');
+                return snapshot;
+            },
+            cleanupLocalAgentlib(value) {
+                assert.equal(value, snapshot);
+                events.push('cleanup');
+            },
+        });
+        if (failStart) await assert.rejects(() => invocation, /start failed/);
+        else assert.equal(await invocation, 0);
+        assert.equal(events[0], 'pack');
+        assert.equal(events.at(-1), 'cleanup');
+        if (!failStart) {
+            assert.deepEqual(events[1], [
+                'start',
+                ['start', 'Agent', '8080'],
+                {
+                    explicitPort: null,
+                    explicitMediaPort: null,
+                    source: { mode: 'local', ...snapshot },
+                },
+            ]);
+        }
+    }
+});
+
+test('production start never inspects the local checkout and forwards a resolved ref', async () => {
+    const events = [];
+    const code = await runOuterCli(['start', 'Agent'], {
+        env: { PLOINKY_PROD: 'true', PLOINKY_AGENTLIB_REF: 'feature/local-fix' },
+        supervisor: fakeSupervisor(events),
+        prepareLocalAgentlib() { throw new Error('production must not pack'); },
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(events[0][2].source, {
+        mode: 'resolved-ref',
+        requestedRef: 'feature/local-fix',
+    });
+});
+
+test('help and non-start commands ignore source selectors while local dry-run never packs', async () => {
+    const invalidEnv = { PLOINKY_PROD: 'invalid', PLOINKY_AGENTLIB_REF: 'ambiguous' };
+    assert.equal(await runOuterCli(['help'], {
+        env: invalidEnv,
+        output: bufferStream(),
+        supervisor: new Proxy({}, {
+            get() { throw new Error('help must not construct the supervisor'); },
+        }),
+    }), 0);
+
+    const stopEvents = [];
+    assert.equal(await runOuterCli(['stop'], {
+        env: invalidEnv,
+        supervisor: fakeSupervisor(stopEvents),
+    }), 0);
+    assert.deepEqual(stopEvents, ['stop']);
+
+    const dryRunEvents = [];
+    assert.equal(await runOuterCli(['--dry-run', 'start', 'Agent'], {
+        env: {},
+        output: bufferStream(),
+        supervisor: fakeSupervisor(dryRunEvents),
+        prepareLocalAgentlib() { throw new Error('dry-run must not pack'); },
+    }), 0);
+    assert.deepEqual(dryRunEvents, [[
+        'dry-run',
+        { explicitPort: null, explicitMediaPort: null, sourceMode: 'local' },
     ]]);
 });
 
@@ -536,16 +648,23 @@ test('public help documents non-interactive destroy and explicit cache deletion'
     assert.match(output.value(), /destroy\s+Remove the outer Box without prompting/);
     assert.match(output.value(), /docker\.io\/assistos\/ploinky-box:latest/);
     assert.match(output.value(), /PLOINKY_BOX_IMAGE/);
+    assert.match(output.value(), /editable node_modules\/achillesAgentLib checkout/);
+    assert.match(output.value(), /PLOINKY_PROD=true/);
 });
 
 test('dry-run and invalid arguments cause no preparation or execution', async () => {
     const events = [];
     await runOuterCli(['--dry-run', '--udp-port', '17891', 'start', 'Agent', '19090'], {
-        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        env: { PLOINKY_PROD: 'true' },
+        input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
     });
     assert.deepEqual(events, [[
-        'dry-run', { explicitPort: 19090, explicitMediaPort: 17891 },
+        'dry-run', {
+            explicitPort: 19090,
+            explicitMediaPort: 17891,
+            sourceMode: 'locked',
+        },
     ]]);
 
     await assert.rejects(() => runOuterCli(['--port', '0', 'start', 'Agent'], {

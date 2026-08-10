@@ -9,11 +9,16 @@ import {
     getRuntime,
     isContainerRunning,
     isSandboxRuntime,
+    listRunningContainerNames,
     loadAgentsMap,
     probeContainerRuntime
 } from './common.js';
 import { clearLivenessState } from './healthProbes.js';
-import { stopBwrapProcesses, isBwrapProcessRunning } from '../bwrap/bwrapFleet.js';
+import {
+    hasInvalidBwrapPidRecord,
+    isBwrapProcessRunning,
+    stopBwrapProcesses,
+} from '../bwrap/bwrapFleet.js';
 import {
     withNetworkLifecycleLock,
     workspaceNetworkIdentity,
@@ -122,17 +127,17 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         throw new Error(`fleet lifecycle for '${name}' requires a complete managed-agent registry identity`);
     }
     return withLock(() => {
-        const artifact = captureRecordedGeneratedRouterDescriptor(record);
-        const workspaceHash = String(workspaceIdentity()?.hash || '');
-        if (!workspaceHash) {
-            throw new Error(`fleet lifecycle for '${name}' could not resolve the workspace identity`);
-        }
         let inspected = inspect(runtime, expectedId);
         if (!inspected) {
             // Without a live immutable-ID inspection there is no container
             // ownership evidence that permits deleting even a recorded
             // descriptor artifact. Preserve both registry state and artifact.
             return Object.freeze({ found: false, stopped: false, removed: false });
+        }
+        const artifact = captureRecordedGeneratedRouterDescriptor(record);
+        const workspaceHash = String(workspaceIdentity()?.hash || '');
+        if (!workspaceHash) {
+            throw new Error(`fleet lifecycle for '${name}' could not resolve the workspace identity`);
         }
 
         const revalidate = () => {
@@ -176,8 +181,8 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         }
         inspected = revalidate();
         if (inspected) {
-            const removed = control(runtime, ['rm', '-f', expectedId]);
-            if (!controlSucceeded(removed) || inspect(runtime, expectedId)) {
+            control(runtime, ['rm', '-f', expectedId]);
+            if (inspect(runtime, expectedId)) {
                 throw new Error(`descriptor cleanup for '${name}' could not prove exact container removal`);
             }
         }
@@ -268,7 +273,7 @@ function getContainerCandidates(name, rec) {
     return name ? [name] : [];
 }
 
-function stopConfiguredAgents({ fast = false } = {}) {
+function stopConfiguredAgents({ fast = false, strict = false, remove = false } = {}) {
     const agents = loadAgents();
     const entries = Object.entries(agents || {})
         .filter(([name, rec]) => rec && (rec.type === 'agent' || rec.type === 'agentCore') && typeof name === 'string' && !name.startsWith('_'));
@@ -277,9 +282,17 @@ function stopConfiguredAgents({ fast = false } = {}) {
     const bwrapStopped = [];
     const bwrapEntries = [];
     const containerEntries = [];
+    const failures = new Map();
     for (const [name, rec] of entries) {
         if (isSandboxRuntime(rec?.runtime)) {
             const agentName = rec.agentName || name;
+            if (strict && hasInvalidBwrapPidRecord(name)) {
+                failures.set(
+                    name,
+                    `${rec.runtime} PID record is invalid or predates the current ownership schema`,
+                );
+                continue;
+            }
             if (isBwrapProcessRunning(name)) {
                 bwrapEntries.push({ name, runtimeKey: name, agentName, runtime: rec.runtime });
             } else {
@@ -294,9 +307,13 @@ function stopConfiguredAgents({ fast = false } = {}) {
             timeout: fast ? 100 : 5000
         }));
         for (const entry of bwrapEntries) {
-            if (!stoppedSandboxRuntimes.has(entry.runtimeKey)) continue;
-            console.log(`[stop] Stopped ${entry.agentName} (${entry.runtime})`);
-            bwrapStopped.push(entry.name);
+            if (stoppedSandboxRuntimes.has(entry.runtimeKey)
+                && !isBwrapProcessRunning(entry.runtimeKey)) {
+                console.log(`[stop] Stopped ${entry.agentName} (${entry.runtime})`);
+                bwrapStopped.push(entry.name);
+                continue;
+            }
+            failures.set(entry.name, `${entry.runtime} process remains live`);
         }
     }
 
@@ -310,18 +327,34 @@ function stopConfiguredAgents({ fast = false } = {}) {
             runtime ||= getRuntime();
             const result = removeExactContainerAndDescriptor(name, rec, runtime, {
                 fast,
-                remove: false,
+                remove,
             });
             if (!result.found) {
                 console.log(`[stop] ${rec?.agentName || name}: no exact registered container found.`);
+                if (strict && listRunningContainerNames({ runtime }).has(name)) {
+                    failures.set(name, 'registered runtime name remains live without exact ownership');
+                }
                 continue;
             }
-            console.log(`[stop] Stopped ${name}`);
+            if (strict && listRunningContainerNames({ runtime }).has(name)) {
+                failures.set(name, 'container remains live after stop');
+                continue;
+            }
+            console.log(`[stop] ${remove ? 'Removed' : 'Stopped'} ${name}`);
             clearLivenessState(name);
             stoppedContainers.push(name);
         } catch (error) {
             console.log(`[stop] Preserved ${name}: ${error?.message || error}`);
+            failures.set(name, error?.message || String(error));
         }
+    }
+    if (strict && failures.size > 0) {
+        const error = new Error(
+            `Configured runtimes remain after shutdown: ${[...failures]
+                .map(([name, reason]) => `${name} (${reason})`).join(', ')}`,
+        );
+        error.code = 'PLOINKY_CONFIGURED_RUNTIME_QUIESCENCE_FAILED';
+        throw error;
     }
     return [...bwrapStopped, ...stoppedContainers];
 }

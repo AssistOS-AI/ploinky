@@ -6,8 +6,8 @@ import {
     readStamp,
     isAgentCacheValid,
     isGlobalCacheValid,
-    hashMergedPackage,
     resolveGlobalCacheManifest,
+    resolveAgentCacheManifest,
 } from '../utils/dependencies/dependencyCache.js';
 import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../utils/dependencies/dependencyRuntimeKey.js';
 import {
@@ -17,10 +17,6 @@ import {
 } from '../utils/config.js';
 import { loadAgents } from '../utils/workspace.js';
 import { findAgent } from '../utils/utils.js';
-import {
-    readGlobalDepsPackage,
-    mergePackageJson,
-} from '../utils/dependencies/dependencyInstaller.js';
 import { getRepoAgentCodePath } from '../utils/workspaceStructure.js';
 import { getRuntimeForAgent } from '../sandbox/docker/common.js';
 import { readManifestStartCommand } from '../sandbox/docker/agentCommands.js';
@@ -225,10 +221,14 @@ function describeAgent(repoName, agentName, runtimeKey) {
     try {
         const agentPkgPath = resolveAgentPackagePath(repoName, agentName);
         const agentPkg = agentPkgPath ? JSON.parse(fs.readFileSync(agentPkgPath, 'utf8')) : null;
-        const merged = mergePackageJson(readGlobalDepsPackage(), agentPkg);
+        const merged = resolveAgentCacheManifest(
+            agentPkg,
+            process.env,
+            { cachePath },
+        );
         const check = isAgentCacheValid(cachePath, {
             runtimeKey,
-            mergedPackageHash: hashMergedPackage(merged),
+            mergedPackageHash: merged.hash,
         });
         status = check.valid ? 'valid' : 'stale (' + check.reason + ')';
     } catch (err) {

@@ -171,6 +171,7 @@ test('installed public shims honor only the environment image override through t
             : {}),
         PATH: `${proxy.directory}:${process.env.PATH}`,
         PLOINKY_MASTER_KEY: 'HOST_MASTER_KEY_CANARY',
+        PLOINKY_PROD: 'true',
         PLOINKY_BOX_IMAGE: logicalReference,
         PLOINKY_BOX_ENGINE: 'attacker-engine',
         PLOINKY_BOX_INSTANCE: 'attacker-instance',

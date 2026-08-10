@@ -1,14 +1,19 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 
 import {
     canonicalLockJson,
     DEPENDENCY_MARKER_NAME,
     installPinnedDependencies,
+    inspectInstalledAgentlibIdentity,
     readDependencyLock,
+    runInstallerCli,
     validateDependencyLock,
 } from '../../ploinky-box/entrypoint/install-dependencies.mjs';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
@@ -35,6 +40,28 @@ function fakeInstaller(counter, { failName = '' } = {}) {
 
 function readHead(directory) {
     try { return fs.readFileSync(path.join(directory, '.head'), 'utf8'); } catch { return ''; }
+}
+
+function writeLocalArchive(targetRoot, bytes) {
+    const sha = crypto.createHash('sha256').update(bytes).digest('hex');
+    const directory = path.join(targetRoot, '.ploinky-local-agentlib');
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, `${sha}.tgz`), bytes);
+    return sha;
+}
+
+function fakeLocalInstaller(counter, { fail = false } = {}) {
+    return ({ sha256, destination }) => {
+        counter.push(sha256);
+        if (fail) throw new Error('simulated local extraction failure');
+        fs.mkdirSync(destination);
+        fs.writeFileSync(path.join(destination, 'package.json'), JSON.stringify({
+            name: 'ploinky-agent-lib',
+            type: 'module',
+            main: 'index.mjs',
+        }));
+        fs.writeFileSync(path.join(destination, 'index.mjs'), `export const sha = '${sha256}';\n`);
+    };
 }
 
 test('dependency lock contains exactly two immutable 40-hex pins', () => {
@@ -275,4 +302,240 @@ test('marker mismatch and symlink volume roots fail before installation', (t) =>
         installRepository: fakeInstaller(installs),
         readInstalledHead: readHead,
     }), /not a real directory/);
+});
+
+test('local Achilles replacement preserves valid mcp-sdk and same SHA is a no-op', (t) => {
+    const state = fixture(t);
+    const repositoryInstalls = [];
+    const baseOptions = {
+        ...state,
+        installRepository: fakeInstaller(repositoryInstalls),
+        readInstalledHead: readHead,
+    };
+    installPinnedDependencies({ ...baseOptions, token: 'production-base' });
+    const lockedMcpHead = readHead(path.join(state.targetRoot, 'mcp-sdk'));
+    const sha = writeLocalArchive(state.targetRoot, Buffer.from('local-archive-one'));
+    const localInstalls = [];
+    repositoryInstalls.length = 0;
+    const local = installPinnedDependencies({
+        ...baseOptions,
+        localAgentlibSha: sha,
+        installLocalAgentlib: fakeLocalInstaller(localInstalls),
+        token: 'local-one',
+    });
+    assert.equal(local.changed, true);
+    assert.deepEqual(repositoryInstalls, []);
+    assert.deepEqual(localInstalls, [sha]);
+    assert.equal(readHead(path.join(state.targetRoot, 'mcp-sdk')), lockedMcpHead);
+    assert.equal(local.marker.repositories.achillesAgentLib, `local:${sha}`);
+    assert.equal(inspectInstalledAgentlibIdentity({ ...baseOptions }), `local:${sha}`);
+
+    localInstalls.length = 0;
+    const repeated = installPinnedDependencies({
+        ...baseOptions,
+        localAgentlibSha: sha,
+        installLocalAgentlib: fakeLocalInstaller(localInstalls),
+        token: 'local-repeat',
+    });
+    assert.equal(repeated.changed, false);
+    assert.deepEqual(localInstalls, []);
+});
+
+test('ordinary preparation preserves local Achilles while repairing another dependency', (t) => {
+    const state = fixture(t);
+    const repositoryInstalls = [];
+    const options = {
+        ...state,
+        installRepository: fakeInstaller(repositoryInstalls),
+        readInstalledHead: readHead,
+    };
+    installPinnedDependencies({ ...options, token: 'preserve-production-base' });
+    const sha = writeLocalArchive(state.targetRoot, Buffer.from('preserved-local-archive'));
+    installPinnedDependencies({
+        ...options,
+        localAgentlibSha: sha,
+        installLocalAgentlib: fakeLocalInstaller([]),
+        token: 'preserve-local-base',
+    });
+    const agentlibEntry = path.join(state.targetRoot, 'achillesAgentLib', 'index.mjs');
+    const beforeAgentlib = fs.readFileSync(agentlibEntry, 'utf8');
+
+    fs.rmSync(path.join(state.targetRoot, 'mcp-sdk'), { recursive: true });
+    repositoryInstalls.length = 0;
+    const prepared = runInstallerCli(['--preserve-agentlib'], {
+        ...options,
+        token: 'preserve-command-preparation',
+    });
+
+    assert.equal(prepared.changed, true);
+    assert.deepEqual(repositoryInstalls, ['mcp-sdk']);
+    assert.equal(prepared.marker.repositories.achillesAgentLib, `local:${sha}`);
+    assert.equal(fs.readFileSync(agentlibEntry, 'utf8'), beforeAgentlib);
+    assert.equal(inspectInstalledAgentlibIdentity(options), `local:${sha}`);
+});
+
+test('ordinary preparation never replaces an existing unvalidated Achilles identity', (t) => {
+    const state = fixture(t);
+    const repositoryInstalls = [];
+    const options = {
+        ...state,
+        installRepository: fakeInstaller(repositoryInstalls),
+        readInstalledHead: readHead,
+    };
+    installPinnedDependencies({ ...options, token: 'preserve-invalid-production-base' });
+    const sha = writeLocalArchive(state.targetRoot, Buffer.from('preserve-invalid-local'));
+    installPinnedDependencies({
+        ...options,
+        localAgentlibSha: sha,
+        installLocalAgentlib: fakeLocalInstaller([]),
+        token: 'preserve-invalid-local-base',
+    });
+    const agentlibEntry = path.join(state.targetRoot, 'achillesAgentLib', 'index.mjs');
+    const beforeAgentlib = fs.readFileSync(agentlibEntry, 'utf8');
+    fs.writeFileSync(path.join(state.targetRoot, DEPENDENCY_MARKER_NAME), '{invalid json\n');
+    fs.rmSync(path.join(state.targetRoot, 'mcp-sdk'), { recursive: true });
+    repositoryInstalls.length = 0;
+
+    assert.throws(
+        () => runInstallerCli(['--preserve-agentlib'], {
+            ...options,
+            token: 'preserve-invalid-command-preparation',
+        }),
+        /Refusing ordinary Box preparation because the existing AchillesAgentLib identity cannot be validated/,
+    );
+    assert.deepEqual(repositoryInstalls, []);
+    assert.equal(fs.readFileSync(agentlibEntry, 'utf8'), beforeAgentlib);
+});
+
+test('the real local installer extracts, installs, and loads the achillesAgentLib alias', async (t) => {
+    const state = fixture(t);
+    const options = {
+        ...state,
+        installRepository: fakeInstaller([]),
+        readInstalledHead: readHead,
+    };
+    installPinnedDependencies({ ...options, token: 'real-local-base' });
+
+    const packageRoot = path.join(state.root, 'local-package');
+    fs.mkdirSync(packageRoot);
+    fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({
+        name: 'ploinky-agent-lib',
+        version: '1.0.0',
+        type: 'module',
+        main: 'index.mjs',
+    }));
+    fs.writeFileSync(
+        path.join(packageRoot, 'index.mjs'),
+        'export const localMarker = "real-local-installer";\n',
+    );
+    const archiveDirectory = path.join(state.targetRoot, '.ploinky-local-agentlib');
+    fs.mkdirSync(archiveDirectory);
+    const packed = spawnSync('npm', [
+        'pack', '--ignore-scripts', '--json', '--pack-destination', archiveDirectory,
+    ], { cwd: packageRoot, encoding: 'utf8' });
+    assert.equal(packed.status, 0, packed.stderr);
+    const generated = path.join(archiveDirectory, JSON.parse(packed.stdout)[0].filename);
+    const sha = crypto.createHash('sha256').update(fs.readFileSync(generated)).digest('hex');
+    fs.renameSync(generated, path.join(archiveDirectory, `${sha}.tgz`));
+
+    const installed = installPinnedDependencies({
+        ...options,
+        localAgentlibSha: sha,
+        token: 'real-local-install',
+    });
+    assert.equal(installed.marker.repositories.achillesAgentLib, `local:${sha}`);
+    const module = await import(pathToFileURL(path.join(
+        state.targetRoot, 'achillesAgentLib', 'index.mjs',
+    )).href);
+    assert.equal(module.localMarker, 'real-local-installer');
+});
+
+test('new local SHA replaces only Achilles and production restores only the locked Achilles pin', (t) => {
+    const state = fixture(t);
+    const repositories = [];
+    const options = {
+        ...state,
+        installRepository: fakeInstaller(repositories),
+        readInstalledHead: readHead,
+    };
+    installPinnedDependencies({ ...options, token: 'base' });
+    const mcpPayload = fs.readFileSync(path.join(state.targetRoot, 'mcp-sdk', 'payload'), 'utf8');
+    const firstSha = writeLocalArchive(state.targetRoot, Buffer.from('first-local'));
+    installPinnedDependencies({
+        ...options,
+        localAgentlibSha: firstSha,
+        installLocalAgentlib: fakeLocalInstaller([]),
+        token: 'first-local',
+    });
+    const secondBytes = Buffer.from('second-local');
+    const secondSha = crypto.createHash('sha256').update(secondBytes).digest('hex');
+    fs.writeFileSync(
+        path.join(state.targetRoot, '.ploinky-local-agentlib', `${secondSha}.tgz`),
+        secondBytes,
+    );
+    const localInstalls = [];
+    repositories.length = 0;
+    installPinnedDependencies({
+        ...options,
+        localAgentlibSha: secondSha,
+        installLocalAgentlib: fakeLocalInstaller(localInstalls),
+        token: 'second-local',
+    });
+    assert.deepEqual(localInstalls, [secondSha]);
+    assert.deepEqual(repositories, []);
+    assert.equal(fs.readFileSync(path.join(state.targetRoot, 'mcp-sdk', 'payload'), 'utf8'), mcpPayload);
+
+    repositories.length = 0;
+    const production = installPinnedDependencies({ ...options, token: 'restore-production' });
+    assert.deepEqual(repositories, ['achillesAgentLib']);
+    assert.equal(production.marker.repositories.achillesAgentLib, readDependencyLock().repositories.achillesAgentLib.commit);
+    assert.equal(inspectInstalledAgentlibIdentity({ ...options }), production.marker.repositories.achillesAgentLib);
+    assert.equal(fs.readFileSync(path.join(state.targetRoot, 'mcp-sdk', 'payload'), 'utf8'), mcpPayload);
+});
+
+test('local install failures preserve the prior dependency and marker', (t) => {
+    const state = fixture(t);
+    const options = {
+        ...state,
+        installRepository: fakeInstaller([]),
+        readInstalledHead: readHead,
+    };
+    installPinnedDependencies({ ...options, token: 'base' });
+    const markerPath = path.join(state.targetRoot, DEPENDENCY_MARKER_NAME);
+    const beforeMarker = fs.readFileSync(markerPath, 'utf8');
+    const beforePayload = fs.readFileSync(path.join(state.targetRoot, 'achillesAgentLib', 'payload'), 'utf8');
+    const sha = writeLocalArchive(state.targetRoot, Buffer.from('will-fail'));
+    assert.throws(() => installPinnedDependencies({
+        ...options,
+        localAgentlibSha: sha,
+        installLocalAgentlib: fakeLocalInstaller([], { fail: true }),
+        token: 'failing-local',
+    }), /Pinned dependency installation failed/);
+    assert.equal(fs.readFileSync(markerPath, 'utf8'), beforeMarker);
+    assert.equal(fs.readFileSync(path.join(state.targetRoot, 'achillesAgentLib', 'payload'), 'utf8'), beforePayload);
+});
+
+test('identity inspection and CLI parsing are read-only and fail closed', (t) => {
+    const state = fixture(t);
+    const options = {
+        ...state,
+        installRepository: fakeInstaller([]),
+        readInstalledHead: readHead,
+    };
+    assert.equal(inspectInstalledAgentlibIdentity(options), 'unknown');
+    const before = fs.readdirSync(state.targetRoot);
+    let output = '';
+    assert.equal(runInstallerCli(['--print-agentlib-identity'], {
+        ...options,
+        stdout: { write(chunk) { output += String(chunk); } },
+    }), 'unknown');
+    assert.equal(output, 'unknown\n');
+    assert.deepEqual(fs.readdirSync(state.targetRoot), before);
+    for (const sha of ['A'.repeat(64), '0'.repeat(63), '']) {
+        assert.throws(
+            () => runInstallerCli(['--local-agentlib-sha', sha], options),
+            /64 lowercase hexadecimal/,
+        );
+    }
+    assert.throws(() => runInstallerCli(['--unknown'], options), /Usage:/);
 });

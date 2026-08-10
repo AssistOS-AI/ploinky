@@ -6,10 +6,107 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { waitForRouterReady } from '../../cli/commands/workspaceUtil.js';
+import { waitForRouterQuiescence } from '../../cli/commands/sessionControl.js';
+import { buildRouterEnv, waitForRouterReady } from '../../cli/commands/workspaceUtil.js';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const routingServerPath = path.join(repoRoot, 'cli/server/RoutingServer.js');
+
+test('Router shutdown barrier covers the Watchdog 15s grace and 1s forced-exit delay', () => {
+    let elapsedMs = 0;
+    const sleeps = [];
+
+    const remainingPids = waitForRouterQuiescence({
+        targetedPids: new Set([41001]),
+        isPidAlive: () => elapsedMs < 16_000,
+        findPids: () => elapsedMs < 16_100 ? [41002] : [],
+        now: () => elapsedMs,
+        sleep(milliseconds) {
+            sleeps.push(milliseconds);
+            elapsedMs += milliseconds;
+        },
+    });
+
+    assert.deepEqual(remainingPids, []);
+    assert.equal(elapsedMs, 16_100);
+    assert.equal(sleeps.every((milliseconds) => milliseconds <= 100), true);
+});
+
+test('Router shutdown barrier expires at 20s and reports both Watchdog and listener PIDs', () => {
+    let elapsedMs = 0;
+
+    const remainingPids = waitForRouterQuiescence({
+        targetedPids: new Set([42001]),
+        isPidAlive: () => true,
+        findPids: () => [42002],
+        now: () => elapsedMs,
+        sleep(milliseconds) {
+            elapsedMs += milliseconds;
+        },
+    });
+
+    assert.equal(elapsedMs, 20_000);
+    assert.deepEqual(remainingPids, [42001, 42002]);
+});
+
+test('Router source authority comes only from the bounded process environment', () => {
+    const localSha = 'a'.repeat(64);
+    const localRef = `file:/opt/ploinky/node_modules/.ploinky-local-agentlib/${localSha}.tgz`;
+    const environment = buildRouterEnv({
+        loadEnvFileImpl: () => ({
+            PLOINKY_LOCAL_AGENTLIB_SHA: 'b'.repeat(64),
+            PLOINKY_AGENTLIB_REF: 'file:/workspace-controlled.tgz',
+            FROM_ENV_FILE: 'kept',
+        }),
+        readSecretsFileImpl: () => ({
+            PLOINKY_LOCAL_AGENTLIB_SHA: 'c'.repeat(64),
+            PLOINKY_AGENTLIB_REF: 'file:/secrets-controlled.tgz',
+            FROM_SECRETS: 'kept',
+        }),
+        processEnvironment: {
+            PLOINKY_PROD: 'false',
+            PLOINKY_LOCAL_AGENTLIB_SHA: localSha,
+            PLOINKY_AGENTLIB_REF: localRef,
+            FROM_PROCESS: 'kept',
+        },
+    });
+
+    assert.equal(environment.PLOINKY_PROD, undefined);
+    assert.equal(environment.PLOINKY_LOCAL_AGENTLIB_SHA, localSha);
+    assert.equal(environment.PLOINKY_AGENTLIB_REF, localRef);
+    assert.equal(environment.FROM_ENV_FILE, 'kept');
+    assert.equal(environment.FROM_SECRETS, 'kept');
+    assert.equal(environment.FROM_PROCESS, 'kept');
+});
+
+test('workspace files cannot invent AgentLib authority and an explicit production ref survives', () => {
+    const withoutProcessAuthority = buildRouterEnv({
+        loadEnvFileImpl: () => ({
+            PLOINKY_LOCAL_AGENTLIB_SHA: 'd'.repeat(64),
+            PLOINKY_AGENTLIB_REF: 'file:/workspace-controlled.tgz',
+        }),
+        readSecretsFileImpl: () => ({
+            PLOINKY_LOCAL_AGENTLIB_SHA: 'e'.repeat(64),
+            PLOINKY_AGENTLIB_REF: 'file:/secrets-controlled.tgz',
+        }),
+        processEnvironment: {},
+    });
+    assert.equal(withoutProcessAuthority.PLOINKY_LOCAL_AGENTLIB_SHA, undefined);
+    assert.equal(withoutProcessAuthority.PLOINKY_AGENTLIB_REF, undefined);
+
+    const productionRef = 'git+https://github.com/example/AchillesAgentLib.git#candidate';
+    const withProductionOverride = buildRouterEnv({
+        loadEnvFileImpl: () => ({}),
+        readSecretsFileImpl: () => ({}),
+        processEnvironment: {
+            PLOINKY_PROD: 'true',
+            PLOINKY_AGENTLIB_REF: productionRef,
+        },
+    });
+    assert.equal(withProductionOverride.PLOINKY_PROD, undefined);
+    assert.equal(withProductionOverride.PLOINKY_LOCAL_AGENTLIB_SHA, undefined);
+    assert.equal(withProductionOverride.PLOINKY_AGENTLIB_REF, productionRef);
+});
 
 test('router readiness is TCP-only against 127.0.0.1', async () => {
     const attempts = [];

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -7,10 +8,30 @@ import {
 } from '../../cli/sandbox/docker/containerFleet.js';
 import { NETWORK_LABELS } from '../../cli/sandbox/networkLifecycle.js';
 import { NETWORK_SCHEMA_VERSION } from '../../cli/sandbox/networkContract.js';
+import { PLOINKY_DIR } from '../../cli/utils/config.js';
 
 const CONTAINER_ID = 'a'.repeat(64);
 const NAME = 'ploinky_exact_agent';
 const WORKSPACE_HASH = 'workspace-identity';
+const MISSING_DESCRIPTOR = path.join(
+    PLOINKY_DIR,
+    'run',
+    'router-descriptors',
+    '00000000-0000-4000-8000-000000000000.json',
+);
+
+function recordWithMissingDescriptor() {
+    return registryRecord({
+        config: {
+            binds: [{
+                source: MISSING_DESCRIPTOR,
+                target: '/run/ploinky/router-descriptor.json',
+                generatedRouterDescriptor: true,
+                ro: true,
+            }],
+        },
+    });
+}
 
 function registryRecord(overrides = {}) {
     return {
@@ -159,6 +180,66 @@ test('fleet removal preserves absent, incomplete, and legacy registry targets', 
     }
 });
 
+test('absent immutable container preserves a dangling recorded descriptor without inspecting it', () => {
+    assert.equal(fs.existsSync(MISSING_DESCRIPTOR), false);
+    let controls = 0;
+    const result = removeExactContainerAndDescriptor(
+        NAME,
+        recordWithMissingDescriptor(),
+        'podman',
+        {
+            inspect: () => null,
+            control: () => { controls += 1; return { status: 0 }; },
+            withLock: (callback) => callback(),
+            workspaceIdentity: () => ({ hash: WORKSPACE_HASH }),
+        },
+    );
+    assert.deepEqual(result, { found: false, stopped: false, removed: false });
+    assert.equal(controls, 0);
+});
+
+test('present immutable container with a missing recorded descriptor fails before control', () => {
+    assert.equal(fs.existsSync(MISSING_DESCRIPTOR), false);
+    let controls = 0;
+    assert.throws(
+        () => removeExactContainerAndDescriptor(
+            NAME,
+            recordWithMissingDescriptor(),
+            'podman',
+            {
+                inspect: () => inspectedRecord(),
+                control: () => { controls += 1; return { status: 0 }; },
+                withLock: (callback) => callback(),
+                workspaceIdentity: () => ({ hash: WORKSPACE_HASH }),
+            },
+        ),
+        /ENOENT/,
+    );
+    assert.equal(controls, 0);
+});
+
+test('rm failure is successful when immutable-ID reinspection proves the container absent', () => {
+    let current = inspectedRecord({ State: { Running: false } });
+    const controls = [];
+    const result = removeExactContainerAndDescriptor(NAME, registryRecord(), 'podman', {
+        fast: true,
+        inspect: () => current,
+        control(runtime, args) {
+            assert.equal(runtime, 'podman');
+            controls.push(args);
+            assert.equal(args.at(-1), CONTAINER_ID);
+            assert.equal(args[0], 'rm');
+            current = null;
+            return { status: 1, stderr: 'container disappeared during rm' };
+        },
+        withLock: (callback) => callback(),
+        pause() {},
+        workspaceIdentity: () => ({ hash: WORKSPACE_HASH }),
+    });
+    assert.deepEqual(result, { found: true, stopped: true, removed: true });
+    assert.deepEqual(controls, [['rm', '-f', CONTAINER_ID]]);
+});
+
 test('fleet bulk lifecycle contains no mutable-name signal/removal fallback', () => {
     const source = fs.readFileSync(
         new URL('../../cli/sandbox/docker/containerFleet.js', import.meta.url),
@@ -171,4 +252,22 @@ test('fleet bulk lifecycle contains no mutable-name signal/removal fallback', ()
     assert.doesNotMatch(bulk, /execSync\(/);
     assert.doesNotMatch(bulk, /\['rm', '-f', name\]/);
     assert.match(bulk, /removeExactContainerAndDescriptor\(name, record, runtime/);
+});
+
+test('configured stop opts into exact removal only for its internal transition mode', () => {
+    const source = fs.readFileSync(
+        new URL('../../cli/sandbox/docker/containerFleet.js', import.meta.url),
+        'utf8',
+    );
+    const configuredStop = source.slice(
+        source.indexOf('function stopConfiguredAgents('),
+        source.indexOf('function stopAndRemoveMany(', source.indexOf('function stopConfiguredAgents(')),
+    );
+    assert.match(
+        configuredStop,
+        /function stopConfiguredAgents\(\{ fast = false, strict = false, remove = false \} = \{\}\)/,
+    );
+    assert.match(configuredStop, /removeExactContainerAndDescriptor\(name, rec, runtime, \{\s*fast,\s*remove,/);
+    assert.doesNotMatch(configuredStop, /\['rm', '-f', name\]/);
+    assert.doesNotMatch(configuredStop, /execSync\(/);
 });
