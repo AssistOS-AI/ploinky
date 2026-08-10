@@ -63,6 +63,7 @@ function executePrepared(prepared, coreArgv, {
     output,
     shell = false,
     interactive = false,
+    colorOutput = false,
     engineEnv,
 }) {
     return execute(prepared.engine.name, buildContainerExecArgs(
@@ -73,6 +74,7 @@ function executePrepared(prepared, coreArgv, {
             mediaHostPort: prepared.mediaHostPort,
             shell,
             interactive,
+            colorOutput,
             inputIsTty: input.isTTY === true,
             outputIsTty: output.isTTY === true,
         },
@@ -118,6 +120,7 @@ export async function runOuterCli(argv, {
                 execute,
                 input,
                 output,
+                colorOutput: output.isTTY === true && !env.NO_COLOR,
                 engineEnv,
             });
             if (coreStatus === 0) return 0;

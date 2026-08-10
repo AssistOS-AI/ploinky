@@ -23,7 +23,8 @@ const ANSI = {
     gray: '\u001B[90m'
 };
 
-const supportsColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+const supportsColor = !process.env.NO_COLOR
+    && (Boolean(process.stdout.isTTY) || process.env.PLOINKY_COLOR === '1');
 
 function colorize(text, ...styles) {
     if (!supportsColor || styles.length === 0) return text;

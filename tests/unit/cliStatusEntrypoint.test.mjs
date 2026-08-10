@@ -37,7 +37,7 @@ test('status dispatches to its read-only renderer before core initialization', a
     assert.deepEqual(calls, ['status']);
 });
 
-test('status renders master-compatible runtime details without changing workspace state', (t) => {
+test('status renders terminal color intent without changing workspace state', (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-status-entrypoint-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const ploinky = path.join(root, '.ploinky');
@@ -54,26 +54,51 @@ test('status renders master-compatible runtime details without changing workspac
             projectPath: '/workspace',
         },
     }));
-    const before = treeHash(root);
-    for (let invocation = 0; invocation < 2; invocation += 1) {
+    const invokeStatus = (environmentOverrides = {}) => {
+        const environment = { ...process.env };
+        delete environment.NO_COLOR;
+        delete environment.PLOINKY_COLOR;
+        Object.assign(environment, environmentOverrides, {
+            PATH: '/usr/bin:/bin',
+            PLOINKY_WORKSPACE_ROOT: root,
+        });
+        const before = treeHash(root);
         const result = spawnSync(process.execPath, [
             path.resolve(import.meta.dirname, '../../cli/index.js'),
             'status',
         ], {
             cwd: root,
             encoding: 'utf8',
-            env: {
-                ...process.env,
-                PATH: '/usr/bin:/bin',
-                NO_COLOR: '1',
-                PLOINKY_WORKSPACE_ROOT: root,
-            },
+            env: environment,
         });
         assert.equal(result.status, 0, result.stderr);
-        assert.match(result.stdout, /Workspace status:/);
-        assert.match(result.stdout, /Agent runtimes:/);
-        assert.match(result.stdout, /ploinky_example \[stopped\] \[podman\]/);
-        assert.match(result.stdout, /agent: exampleAgent  repo: exampleRepo/);
         assert.equal(treeHash(root), before);
+        return result.stdout;
+    };
+
+    const plainOutput = invokeStatus();
+    const coloredOutput = invokeStatus({ PLOINKY_COLOR: '1' });
+    const noColorOutput = invokeStatus({ PLOINKY_COLOR: '1', NO_COLOR: '1' });
+
+    for (const output of [plainOutput, noColorOutput]) {
+        assert.doesNotMatch(output, /\u001B\[/);
+        assert.match(output, /Workspace status:/);
+        assert.match(output, /Agent runtimes:/);
+        assert.match(output, /ploinky_example \[stopped\] \[podman\]/);
+        assert.match(output, /agent: exampleAgent  repo: exampleRepo/);
+        assert.match(output, /^  - ploinky_example/m);
+        assert.doesNotMatch(output, /\u2022/);
     }
+
+    for (const expected of [
+        '\u001B[1m\u001B[36mWorkspace status:\u001B[0m',
+        '\u001B[90m\u2022\u001B[0m',
+        '\u001B[36mploinky_example\u001B[0m',
+        '\u001B[33m[stopped]\u001B[0m',
+        '\u001B[90m[podman]\u001B[0m',
+    ]) {
+        assert.ok(coloredOutput.includes(expected), `missing colored status fragment ${JSON.stringify(expected)}`);
+    }
+    assert.match(coloredOutput, /Workspace status:/);
+    assert.match(coloredOutput, /Agent runtimes:/);
 });

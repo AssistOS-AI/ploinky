@@ -57,16 +57,82 @@ function inBoxContentHash(containerId, harness) {
     ]);
 }
 
+function normalizeRuntimeInventory(inventory) {
+    return String(inventory || '').split(/\r?\n/).filter(Boolean).map((line) => {
+        let record;
+        try {
+            record = JSON.parse(line);
+        } catch (_) {
+            return line;
+        }
+        const isNetworkRecord = Object.hasOwn(record, 'network_interface')
+            || Object.hasOwn(record, 'NetworkInterface');
+        const networkName = String(record.name ?? record.Name ?? '');
+        if (isNetworkRecord && networkName === 'podman') {
+            // Podman synthesizes the default network when queried and reports
+            // the query time as its creation time. Its stable ID and complete
+            // semantic configuration remain mutation evidence; the generated
+            // timestamp does not.
+            delete record.created;
+            delete record.Created;
+            return JSON.stringify(record);
+        }
+        return line;
+    }).join('\n');
+}
+
 function inBoxRuntimeInventory(containerId, harness) {
-    return execInBox(harness.runner, containerId, [
+    return normalizeRuntimeInventory(execInBox(harness.runner, containerId, [
         'bash', '-c', [
             'podman container ls --all --no-trunc --format "{{json .}}"',
             'podman image ls --all --no-trunc --format "{{json .}}"',
             'podman volume ls --format "{{json .}}"',
             'podman network ls --format "{{json .}}"',
         ].map((command) => `${command} | LC_ALL=C sort`).join('; '),
-    ]);
+    ]));
 }
+
+function shellQuote(value) {
+    return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function spawnWithPty(command, args, options) {
+    const scriptArgs = process.platform === 'darwin'
+        ? ['-q', '/dev/null', command, ...args]
+        : ['-q', '-e', '-c', [command, ...args].map(shellQuote).join(' '), '/dev/null'];
+    return spawnSync('script', scriptArgs, {
+        ...options,
+        // Node implements a piped stdin as a socketpair on macOS. BSD script
+        // rejects that descriptor while copying terminal attributes, whereas
+        // an ignored stdin is backed by /dev/null and lets script own the PTY.
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+}
+
+test('runtime inventory ignores only the generated Podman default-network timestamp', () => {
+    const defaultNetwork = {
+        name: 'podman',
+        id: 'stable-default-network-id',
+        driver: 'bridge',
+        network_interface: 'podman0',
+        created: '2026-08-10T09:08:36.298131078Z',
+    };
+    const laterDefaultNetwork = {
+        ...defaultNetwork,
+        created: '2026-08-10T09:08:38.185953441Z',
+    };
+    assert.equal(
+        normalizeRuntimeInventory(JSON.stringify(defaultNetwork)),
+        normalizeRuntimeInventory(JSON.stringify(laterDefaultNetwork)),
+    );
+
+    const managedNetwork = { ...defaultNetwork, name: 'ploinky-managed-network' };
+    const recreatedManagedNetwork = { ...laterDefaultNetwork, name: managedNetwork.name };
+    assert.notEqual(
+        normalizeRuntimeInventory(JSON.stringify(managedNetwork)),
+        normalizeRuntimeInventory(JSON.stringify(recreatedManagedNetwork)),
+    );
+});
 
 test('public status renders the core workspace view without mutating Box state', {
     timeout: 10 * 60_000,
@@ -101,6 +167,8 @@ test('public status renders the core workspace view without mutating Box state',
             ? { XDG_CONFIG_HOME: harness.engineEnvironment.XDG_CONFIG_HOME }
             : {}),
     };
+    delete environment.NO_COLOR;
+    delete environment.PLOINKY_COLOR;
     const status = spawnSync(path.join(repositoryRoot, 'bin/ploinky'), ['status'], {
         cwd: harness.child,
         encoding: 'utf8',
@@ -113,6 +181,34 @@ test('public status renders the core workspace view without mutating Box state',
     assert.match(status.stdout, /Workspace status:/);
     assert.match(status.stdout, /Agent runtimes:/);
     assert.doesNotMatch(status.stdout, /^Ploinky Box:/m);
+    assert.doesNotMatch(status.stdout, /\u001B\[/);
+
+    const coloredStatus = spawnWithPty(path.join(repositoryRoot, 'bin/ploinky'), ['status'], {
+        cwd: harness.child,
+        encoding: 'utf8',
+        env: environment,
+        timeout: 120_000,
+    });
+    assert.equal(coloredStatus.error, undefined, coloredStatus.error?.message);
+    assert.equal(coloredStatus.status, 0, coloredStatus.stderr);
+    assert.ok(coloredStatus.stdout.includes(
+        '\u001B[1m\u001B[36mWorkspace status:\u001B[0m',
+    ));
+    assert.ok(coloredStatus.stdout.includes('\u001B[90m\u2022\u001B[0m'));
+    assert.ok(coloredStatus.stdout.includes('\u001B[36mploinky_status_probe\u001B[0m'));
+
+    const noColorStatus = spawnWithPty(path.join(repositoryRoot, 'bin/ploinky'), ['status'], {
+        cwd: harness.child,
+        encoding: 'utf8',
+        env: { ...environment, NO_COLOR: '1' },
+        timeout: 120_000,
+    });
+    assert.equal(noColorStatus.error, undefined, noColorStatus.error?.message);
+    assert.equal(noColorStatus.status, 0, noColorStatus.stderr);
+    assert.doesNotMatch(noColorStatus.stdout, /\u001B\[/);
+    assert.match(noColorStatus.stdout, /^  - ploinky_status_probe/m);
+    assert.doesNotMatch(noColorStatus.stdout, /\u2022/);
+
     assert.equal(treeHash(harness.workspace), hostBefore);
     assert.equal(inBoxContentHash(prepared.containerId, harness), boxBefore);
     assert.equal(inBoxRuntimeInventory(prepared.containerId, harness), runtimeBefore);

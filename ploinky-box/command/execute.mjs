@@ -16,6 +16,7 @@ export function buildContainerExecArgs(containerId, commandArgv, {
     inputIsTty = false,
     outputIsTty = false,
     shell = false,
+    colorOutput = false,
 } = {}) {
     const args = ['container', 'exec'];
     if (interactive && inputIsTty && outputIsTty) {
@@ -28,6 +29,7 @@ export function buildContainerExecArgs(containerId, commandArgv, {
         '--env', `PLOINKY_MEDIA_HOST_PORT=${parseHostPort(mediaHostPort, {
             source: 'prepared Box media host port',
         })}`,
+        ...(colorOutput === true ? ['--env', 'PLOINKY_COLOR=1'] : []),
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,

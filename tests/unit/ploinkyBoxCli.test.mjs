@@ -19,6 +19,14 @@ function bufferStream(isTTY = false) {
     };
 }
 
+function execEnvAssignments(args) {
+    const values = [];
+    for (let index = 0; index < args.length - 1; index += 1) {
+        if (args[index] === '--env') values.push(args[index + 1]);
+    }
+    return values;
+}
+
 function fakeSupervisor(events, { statusState = 'absent' } = {}) {
     const prepared = {
         containerId: 'a'.repeat(64),
@@ -121,6 +129,65 @@ test('running status uses the read-only core renderer without preparing the Box'
         '/opt/ploinky/bin/ploinky-local', 'status',
     ]);
     assert.equal(output.value(), '');
+});
+
+test('running status propagates only derived terminal color intent without allocating a TTY', async () => {
+    const cases = [
+        {
+            name: 'TTY output with color enabled',
+            outputIsTty: true,
+            env: {},
+            expectedMarkerCount: 1,
+        },
+        {
+            name: 'captured output',
+            outputIsTty: false,
+            env: {},
+            expectedMarkerCount: 0,
+        },
+        {
+            name: 'TTY output with NO_COLOR',
+            outputIsTty: true,
+            env: { NO_COLOR: '1' },
+            expectedMarkerCount: 0,
+        },
+        {
+            name: 'captured output with a host-supplied marker',
+            outputIsTty: false,
+            env: { PLOINKY_COLOR: '1' },
+            expectedMarkerCount: 0,
+        },
+    ];
+
+    for (const testCase of cases) {
+        const events = [];
+        const code = await runOuterCli(['status'], {
+            env: testCase.env,
+            input: { isTTY: true },
+            output: bufferStream(testCase.outputIsTty),
+            errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
+            execute(command, args) {
+                events.push(['execute', command, args]);
+                return 23;
+            },
+        });
+
+        assert.equal(code, 23, testCase.name);
+        assert.deepEqual(events[0], 'status', testCase.name);
+        assert.equal(events.includes('prepare'), false, testCase.name);
+        assert.equal(events[1][1], 'podman', testCase.name);
+        assert.deepEqual(events[1][2].slice(-2), [
+            '/opt/ploinky/bin/ploinky-local', 'status',
+        ], testCase.name);
+        assert.equal(events[1][2].includes('--tty'), false, testCase.name);
+        assert.equal(events[1][2].includes('--interactive'), false, testCase.name);
+        assert.equal(
+            execEnvAssignments(events[1][2]).filter((value) => value === 'PLOINKY_COLOR=1').length,
+            testCase.expectedMarkerCount,
+            testCase.name,
+        );
+    }
 });
 
 test('running status falls back to the Box summary when the core renderer fails', async () => {
@@ -314,6 +381,17 @@ test('TTY flags appear only for interactive commands with both terminal ends', a
         mediaHostPort: 17891,
         interactive: true, inputIsTty: false, outputIsTty: true,
     }).includes('--tty'), false);
+    const colorArgs = buildContainerExecArgs('a'.repeat(64), ['status'], {
+        hostPort: 19090,
+        mediaHostPort: 17891,
+        colorOutput: true,
+    });
+    assert.equal(
+        execEnvAssignments(colorArgs).filter((value) => value === 'PLOINKY_COLOR=1').length,
+        1,
+    );
+    assert.equal(colorArgs.includes('--interactive'), false);
+    assert.equal(colorArgs.includes('--tty'), false);
 
     const events = [];
     await runOuterCli(['cli'], {
