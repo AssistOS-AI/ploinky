@@ -95,6 +95,15 @@ function pathAllowed(pathname, allowed) {
 function callerAclForPlan(plan) {
     const security = plan.snapshot?.compiled?.security || {};
     if (plan.kind === 'private-operation') {
+        if (plan.operation === 'workspace-metrics') {
+            return {
+                operation: plan.operation,
+                callers: [],
+                anyCurrentCaller: true,
+                methods: ['GET'],
+                paths: ['/api/edge/workspace-metrics'],
+            };
+        }
         if (plan.operation === 'turn-credentials') {
             return {
                 operation: plan.operation,
@@ -118,7 +127,7 @@ function callerAclForPlan(plan) {
 }
 
 export function authorizePrivateRoutePlan({ req, plan, body = Buffer.alloc(0), assertionCache = replayCache } = {}) {
-    if (!plan?.ok || plan.listener !== 'private' && plan.kind !== 'private-operation') {
+    if (!plan?.ok || plan.listener !== 'private') {
         throw forbidden('request did not resolve on the private listener', 'PRIVATE_LISTENER_REQUIRED');
     }
     if (plan.kind === 'agent-port' && plan.access?.access !== 'authenticated') {

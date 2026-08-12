@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 
 import { handleWebChat } from './handlers/webchat/index.js';
 import { handleDashboard } from './handlers/dashboard.js';
-import { handleStatus } from './handlers/status.js';
+import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
 import * as staticSrv from './static/index.js';
 
@@ -795,6 +795,16 @@ async function processPrivateRequest(req, res) {
             });
             sendPrivateError(res, error);
         }
+        return;
+    }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'workspace-metrics') {
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        streamWorkspaceMetrics(res, {
+            isAuthorized: () => routePlan.lease?.isCurrent?.() === true,
+        });
         return;
     }
     req.edgeBufferedBody = body;

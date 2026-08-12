@@ -641,6 +641,24 @@ export function resolveEdgeRoutePlan({
     if (conventionPlan) return conventionPlan;
 
     if (listener === 'private') {
+        if (pathname === '/api/edge/workspace-metrics') {
+            if (url.search !== '?follow=1') {
+                return deny(400, 'WORKSPACE_METRICS_QUERY_INVALID', { lease, hostSelection });
+            }
+            return {
+                matched: true,
+                ok: true,
+                kind: 'private-operation',
+                operation: 'workspace-metrics',
+                listener,
+                host,
+                hostSelection,
+                pathname,
+                parsedUrl: url,
+                lease,
+                snapshot,
+            };
+        }
         if (pathname === '/api/edge/turn-credentials') {
             return {
                 matched: true,
