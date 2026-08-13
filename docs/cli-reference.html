@@ -363,10 +363,10 @@ webchat --rotate     # accepted for compatibility; still uses router login</code
                         <h4>Cancel Button</h4>
                         <p>While the agent is processing, the Send button is replaced by a Cancel button. Clicking Cancel sends an interrupt signal (ESC) to the agent's TTY session, aborting the current operation. The Send button returns when the agent produces output or the session closes.</p>
 
-                        <h3>/dashboard and /status</h3>
-                        <p>These are local-control browser surfaces, not token-minting CLI commands. Both require a real router-authenticated local-admin session on an exact local-control Host; assertions, invitations, media credentials, and localhost provenance do not grant administrator access. Mutations additionally require the exact Origin and a session-bound CSRF proof.</p>
+                        <h3>/status</h3>
+                        <p>This is a local-control read-only surface, not a token-minting CLI command. It requires a real router-authenticated local-admin session on an exact local-control Host; assertions, invitations, media credentials, and localhost provenance do not grant administrator access.</p>
                         <div class="alert alert-info">
-                            Local control: http://127.0.0.1:8080/dashboard
+                            Local status data: http://127.0.0.1:8080/status/data
                         </div>
 
                     </div>
@@ -510,16 +510,18 @@ MCP ping succeeded.</code></pre>
                         <h2>Logging & Monitoring</h2>
                         
                         <h3>logs tail</h3>
-                        <p>Follow router logs in real-time.</p>
-                        <pre><code>logs tail [router]</code></pre>
+                        <p>Follow Router logs by default, or one enabled agent in real-time.</p>
+                        <pre><code>logs tail [router|&lt;agent&gt;] [--startup]</code></pre>
                         <pre><code># Examples
-logs tail router    # Follow router logs</code></pre>
+logs tail            # Follow Router logs
+logs tail myAgent    # Follow one agent</code></pre>
 
                         <h3>logs last</h3>
-                        <p>Show last N router log lines.</p>
-                        <pre><code>logs last &lt;N&gt;</code></pre>
+                        <p>Show the last N Router lines by default, or the last N lines for one enabled agent.</p>
+                        <pre><code>logs last [&lt;N&gt;] [router|&lt;agent&gt;] [--startup]</code></pre>
                         <pre><code># Examples
-logs last 100           # Last 100 lines from router</code></pre>
+logs last 100           # Last 100 Router lines
+logs last 100 myAgent   # Last 100 agent lines</code></pre>
                     </div>
 
                     <div class="doc-section" id="deps">

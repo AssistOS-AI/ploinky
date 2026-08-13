@@ -14,7 +14,7 @@ Ploinky exposes operational state through router and watchdog logs, health check
 
 ## Core Content
 
-The watchdog and router must emit structured operational logs under `.ploinky/logs/`. The CLI exposes router-log streaming and tail retrieval through `logs tail` and `logs last`. The authenticated `/dashboard/tail` endpoint exposes only the exact router or policy-audit file and behaves like `tail -n` when `follow=0` and `tail -F` when `follow=1`; it adds no pagination, cursor, or event envelope. The policy audit remains the existing DS014 administrative-command audit and is not expanded into per-request HTTP, WebSocket, MCP-tool, or MCP-resource telemetry.
+Ploinky durably appends Router output to `.ploinky/logs/router.log`, Policy Audit records to `.ploinky/data/router-security/policy-audit.log`, and supervisor diagnostics to `.ploinky/logs/watchdog.log`. `workspaceMonitorAgent` owns the shared Router/Policy retention setting and schedules daily UTC maintenance, while the private `/api/edge/workspace-logs` operation makes Ploinky perform bounded list, read, search, atomic rotation, and cleanup against its own files. Retention defaults to 7 days and is constrained to 1–365 days. A missed maintenance boundary is recovered when the agent returns; no log transport or copied agent archive is involved. The CLI `logs tail` and `logs last` inspect Router or enabled-agent runtime output.
 
 The Router owns one permanent workspace resource collector. It keeps one container-engine `stats` stream for all running OCI runtimes and samples known host-sandbox PIDs. It retains only the latest sample in memory. `/status/data` returns that current snapshot and `/status/data?follow=1` distributes newline-delimited snapshots to any number of administrator clients without creating per-client engine collectors or a persistent history store.
 
@@ -56,7 +56,7 @@ The same folder may contain selected-CLI-owned task metadata and logs for user-r
 
 Operational logs must not intentionally record raw prompts or assistant replies. An agent-owned session store may contain conversation roles, text, timestamps, attachments, and references, but it remains outside Ploinky observability. The workspace owner remains responsible for the local filesystem trust boundary.
 
-Ploinky exposes administrator-only, read-only monitoring contracts. It does not own their user interface and does not select or locate a particular consumer. `/dashboard` returns a neutral endpoint descriptor; `/status/data` provides resource state and `/dashboard/tail` provides router or policy-audit log output. These routes contain no runtime control, restart, shell-command, configuration, conversation history, or conversation-rating analytics.
+Ploinky exposes the administrator-only `/status/data` resource contract and the capability-bound private workspace-log file operation. It owns Router/Policy files but not the Workspace Monitor UI or retention schedule. The operation contains no runtime control, shell-command, conversation history, or conversation-rating analytics.
 
 ## Decisions & Questions
 

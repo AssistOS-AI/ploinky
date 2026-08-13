@@ -104,6 +104,14 @@ function callerAclForPlan(plan) {
                 paths: ['/api/edge/workspace-metrics'],
             };
         }
+        if (plan.operation === 'workspace-logs') {
+            return {
+                operation: plan.operation,
+                callers: security.workspaceLogConsumers || [],
+                methods: ['POST'],
+                paths: ['/api/edge/workspace-logs'],
+            };
+        }
         if (plan.operation === 'turn-credentials') {
             return {
                 operation: plan.operation,

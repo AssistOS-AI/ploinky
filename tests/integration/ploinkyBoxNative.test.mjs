@@ -480,9 +480,9 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     });
     await checkBoxHealth(startRoute.hostPort);
     assert.match(harness.output.bytes,
-        new RegExp(`Dashboard: http://127\\.0\\.0\\.1:${startRoute.hostPort}/dashboard`));
+        new RegExp(`Router: http://127\\.0\\.0\\.1:${startRoute.hostPort}`));
     assert.doesNotMatch(harness.output.bytes,
-        /Dashboard: http:\/\/127\.0\.0\.1:8080\/dashboard/);
+        /Router: http:\/\/127\.0\.0\.1:8080(?:\s|$)/);
     assert.equal(started.ownership.handles.container.runtime.publications.some((entry) => (
         entry.protocol === 'tcp'
         && entry.hostPort === String(startRoute.hostPort)

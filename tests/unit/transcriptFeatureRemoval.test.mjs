@@ -5,7 +5,6 @@ import { Readable } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { handleDashboard } from '../../cli/server/handlers/dashboard.js';
 import { handleWebChat } from '../../cli/server/handlers/webchat/index.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -53,7 +52,6 @@ test('transcript storage and conversation rating code is absent from Ploinky', (
     const checkedSources = [
         ...sourcesUnder('cli/server/handlers/webchat'),
         'cli/utils/config.js',
-        'cli/server/handlers/dashboard.js',
         'cli/server/webchat/index.js',
         'cli/server/webchat/messages.js',
         'cli/server/webchat/network.js',
@@ -64,7 +62,7 @@ test('transcript storage and conversation rating code is absent from Ploinky', (
     assert.doesNotMatch(checkedSources, /thumb-up|thumb-down|feedback-changed|message-meta|rated turns|likes|dislikes/i);
 });
 
-test('removed WebChat and Dashboard endpoints return ordinary 404 responses', async () => {
+test('removed WebChat endpoints return ordinary 404 responses', async () => {
     const appState = { sessions: new Map(), runtimes: new Map() };
 
     const webchatResponse = makeResponse();
@@ -77,15 +75,4 @@ test('removed WebChat and Dashboard endpoints return ordinary 404 responses', as
     await webchatResponse.ended;
     assert.equal(webchatResponse.statusCode, 404);
 
-    for (const endpoint of ['/dashboard/api/transcripts', '/dashboard/api/feedback']) {
-        const dashboardResponse = makeResponse();
-        await handleDashboard(
-            makeRequest(endpoint),
-            dashboardResponse,
-            { agentName: 'Dashboard' },
-            appState
-        );
-        await dashboardResponse.ended;
-        assert.equal(dashboardResponse.statusCode, 404);
-    }
 });

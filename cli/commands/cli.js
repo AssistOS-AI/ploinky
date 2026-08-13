@@ -419,11 +419,6 @@ async function handleCommand(args) {
         case 'deps':
             await handleDepsCommand(options);
             break;
-        case 'dashboard': {
-            if ((options || []).filter(Boolean).length) throw new Error('Usage: dashboard');
-            printComponentAccess('dashboard');
-            break;
-        }
         case 'list':
             if (options[0] === 'agents') listAgents();
             else if (options[0] === 'repos') listRepos();

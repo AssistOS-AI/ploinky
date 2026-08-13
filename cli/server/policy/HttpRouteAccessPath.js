@@ -15,7 +15,6 @@ export const ROUTER_OWNED_FIRST_SEGMENTS = new Set([
     'auth',
     'admin',
     'webchat',
-    'dashboard',
     'status',
     'upload',
     'blobs',

@@ -249,8 +249,8 @@ test('installed public shims honor only the environment image override through t
     assert.equal(started.status, 0, started.stderr);
     assert.equal(started.stdout.match(/Debug mode enabled/g)?.length, 1);
     assert.match(started.stdout,
-        new RegExp(`Dashboard: http://127\\.0\\.0\\.1:${startRoute.hostPort}/dashboard`));
-    assert.doesNotMatch(started.stdout, /Dashboard: http:\/\/127\.0\.0\.1:8080\/dashboard/);
+        new RegExp(`Router: http://127\\.0\\.0\\.1:${startRoute.hostPort}`));
+    assert.doesNotMatch(started.stdout, /Router: http:\/\/127\.0\.0\.1:8080(?:\s|$)/);
     assert.equal(started.stdout.includes('HOST_MASTER_KEY_CANARY'), false);
     assert.equal(started.stderr.includes('HOST_MASTER_KEY_CANARY'), false);
 

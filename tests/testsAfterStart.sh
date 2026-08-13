@@ -26,7 +26,6 @@ source "$TESTS_DIR/test-functions/llm_cli_suggestions.sh"
 source "$TESTS_DIR/test-functions/enable_alias_tests.sh"
 source "$TESTS_DIR/test-functions/webmeet_tests.sh"
 source "$TESTS_DIR/test-functions/volume_mount_tests.sh"
-source "$TESTS_DIR/test-functions/dashboard_tests.sh"
 source "$TESTS_DIR/test-functions/manifest_ports_test.sh"
 source "$TESTS_DIR/test-functions/openai_endpoints_tests.sh"
 
@@ -100,7 +99,6 @@ if ! is_sandbox_runtime; then
 fi
 
 stage_header "Dashboard UI"
-test_check "Dashboard surfaces workspace status" assert_dashboard_status
 
 stage_header "WebMeet API"
 test_check "WebMeet legacy token auth endpoint is disabled" assert_webmeet_whoami

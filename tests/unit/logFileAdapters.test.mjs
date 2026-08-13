@@ -59,7 +59,7 @@ test('an absent root, directory, or file reports absence instead of failing', (t
     const root = workspace(t);
     assert.equal(openVerifiedLogFile({
         trustedRoot: path.join(root, 'missing'),
-        relativeSegments: ['router.log'],
+        relativeSegments: ['fixture.log'],
     }), null);
     assert.equal(openVerifiedLogFile({
         trustedRoot: root,
@@ -67,7 +67,7 @@ test('an absent root, directory, or file reports absence instead of failing', (t
     }), null);
     assert.equal(openVerifiedLogFile({
         trustedRoot: root,
-        relativeSegments: ['router.log'],
+        relativeSegments: ['fixture.log'],
     }), null);
 });
 
@@ -75,12 +75,12 @@ test('a symlinked root, parent, or file is rejected', (t) => {
     const root = workspace(t);
     const outside = path.join(root, 'outside');
     fs.mkdirSync(outside, { recursive: true });
-    fs.writeFileSync(path.join(outside, 'router.log'), 'foreign\n');
+    fs.writeFileSync(path.join(outside, 'fixture.log'), 'foreign\n');
 
     const linkedRoot = path.join(root, 'linked-root');
     fs.symlinkSync(outside, linkedRoot);
     assert.throws(
-        () => openVerifiedLogFile({ trustedRoot: linkedRoot, relativeSegments: ['router.log'] }),
+        () => openVerifiedLogFile({ trustedRoot: linkedRoot, relativeSegments: ['fixture.log'] }),
         (error) => error.code === 'LOG_PATH_UNSAFE' && /not one regular directory/.test(error.message),
     );
 
@@ -88,29 +88,29 @@ test('a symlinked root, parent, or file is rejected', (t) => {
     fs.mkdirSync(logs, { recursive: true });
     fs.symlinkSync(outside, path.join(logs, 'no-wait'));
     assert.throws(
-        () => openVerifiedLogFile({ trustedRoot: logs, relativeSegments: ['no-wait', 'router.log'] }),
+        () => openVerifiedLogFile({ trustedRoot: logs, relativeSegments: ['no-wait', 'fixture.log'] }),
         (error) => error.code === 'LOG_PATH_UNSAFE' && /not one regular directory/.test(error.message),
     );
 
-    fs.symlinkSync(path.join(outside, 'router.log'), path.join(logs, 'router.log'));
+    fs.symlinkSync(path.join(outside, 'fixture.log'), path.join(logs, 'fixture.log'));
     assert.throws(
-        () => openVerifiedLogFile({ trustedRoot: logs, relativeSegments: ['router.log'] }),
+        () => openVerifiedLogFile({ trustedRoot: logs, relativeSegments: ['fixture.log'] }),
         (error) => error.code === 'LOG_PATH_UNSAFE' && /not one regular file/.test(error.message),
     );
 });
 
 test('a non-regular file is rejected', (t) => {
     const root = workspace(t);
-    fs.mkdirSync(path.join(root, 'router.log'));
+    fs.mkdirSync(path.join(root, 'fixture.log'));
     assert.throws(
-        () => openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] }),
+        () => openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] }),
         (error) => error.code === 'LOG_PATH_UNSAFE' && /not one regular file/.test(error.message),
     );
 });
 
 test('an inode swapped between validation and open is rejected', (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     fs.writeFileSync(target, 'original\n');
     const replacement = path.join(root, 'replacement.log');
     fs.writeFileSync(replacement, 'replacement\n');
@@ -128,7 +128,7 @@ test('an inode swapped between validation and open is rejected', (t) => {
         },
     };
     assert.throws(
-        () => openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'], fsApi }),
+        () => openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'], fsApi }),
         (error) => error.code === 'LOG_PATH_UNSAFE' && /replaced during validation/.test(error.message),
     );
     assert.ok(lstatCalls > 0);
@@ -136,9 +136,9 @@ test('an inode swapped between validation and open is rejected', (t) => {
 
 test('a verified descriptor stays bound to its inode after the pathname is replaced', (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     fs.writeFileSync(target, 'first\nsecond\n');
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     fs.writeFileSync(path.join(root, 'other.log'), 'foreign content\n');
@@ -150,10 +150,10 @@ test('a verified descriptor stays bound to its inode after the pathname is repla
 
 test('the last-N reader returns exactly the requested suffix', (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     const lines = Array.from({ length: 500 }, (_, index) => `line-${index}`);
     fs.writeFileSync(target, `${lines.join('\n')}\n`);
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     for (const lineCount of [1, 5, 200, 500, 900]) {
@@ -181,9 +181,9 @@ test('the last-N reader handles empty files and a missing final newline', (t) =>
 
 test('a pinned end offset bounds the suffix even after the file grows', (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     fs.writeFileSync(target, 'one\ntwo\n');
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     const pinned = fs.statSync(target).size;
@@ -210,9 +210,9 @@ test('a pinned end offset bounds the suffix even after the file grows', (t) => {
 
 test('the follower emits no byte twice when a write lands during the initial suffix', async (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     fs.writeFileSync(target, 'first\n');
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     const output = collector();
@@ -249,10 +249,10 @@ test('the follower emits no byte twice when a write lands during the initial suf
 
 test('the last-N reader uses fixed-size buffers regardless of file size', (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     // One line far larger than the read chunk proves the scan is chunked.
     fs.writeFileSync(target, `${'a'.repeat(READ_CHUNK_BYTES * 3)}\nlast\n`);
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     const sizes = [];
@@ -272,10 +272,10 @@ test('the last-N reader uses fixed-size buffers regardless of file size', (t) =>
 
 test('one over-limit line fails the bounded last reader instead of emitting it', (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     const byteLimit = 4 * READ_CHUNK_BYTES;
     fs.writeFileSync(target, `${'x'.repeat(byteLimit * 2)}\n`);
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     assert.throws(
@@ -299,9 +299,9 @@ test('the last-N reader fails closed when the pinned file shrinks during a read'
 
 test('the follower emits the initial suffix then streams appended bytes', async (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     fs.writeFileSync(target, `${Array.from({ length: 30 }, (_, i) => `line-${i}`).join('\n')}\n`);
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     const output = collector();
@@ -329,9 +329,9 @@ test('the follower emits the initial suffix then streams appended bytes', async 
 
 test('the follower restarts cleanly when its own inode is truncated', async (t) => {
     const root = workspace(t);
-    const target = path.join(root, 'router.log');
+    const target = path.join(root, 'fixture.log');
     fs.writeFileSync(target, 'before\n');
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     const output = collector();
@@ -353,8 +353,8 @@ test('the follower restarts cleanly when its own inode is truncated', async (t) 
 
 test('the follower stops promptly when its signal aborts', async (t) => {
     const root = workspace(t);
-    fs.writeFileSync(path.join(root, 'router.log'), 'only\n');
-    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['router.log'] });
+    fs.writeFileSync(path.join(root, 'fixture.log'), 'only\n');
+    const opened = openVerifiedLogFile({ trustedRoot: root, relativeSegments: ['fixture.log'] });
     t.after(() => closeAll(opened));
 
     const controller = new AbortController();

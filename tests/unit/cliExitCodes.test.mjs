@@ -100,7 +100,7 @@ test('read-only core commands do not initialize authoritative edge sources', (t)
 });
 
 test('removed component-token rotation flags fail hard', (t) => {
-    for (const component of ['webchat', 'dashboard']) {
+    for (const component of ['webchat']) {
         const result = runPloinky(t, [component, '--rotate']);
         assert.notEqual(result.status, 0, `${component} unexpectedly accepted --rotate`);
         assert.match(`${result.stdout}\n${result.stderr}`, new RegExp(`Usage: ${component}`));

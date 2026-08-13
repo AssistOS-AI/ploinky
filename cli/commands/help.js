@@ -45,7 +45,6 @@ function mainHelpText(surface) {
   cli                            Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
   cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
   webchat                        Print the authenticated WebChat access URL
-  dashboard                      Print the administrator-only Dashboard access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
   network status [--json]        Show managed network topology (status schema 3)
@@ -70,9 +69,10 @@ ${lifecycleHelpLines(surface).join('\n')}
   restart                        Restart enabled agents + Router
   disable agents-all             Disable all enabled agents and remove their containers
   reinstall <agentName>          Re-create a running agent container (destructive)
-  logs tail [router|<agent>]     Follow Router or one agent's logs
-  logs last [<N>] [router|<agent>]
-                                 Show the last N lines for one log source
+  logs tail [router|agent] [--startup]
+                                 Follow Router or one agent's logs
+  logs last [<N>] [router|agent] [--startup]
+                                 Show the last N lines for Router or one agent
 
 ▶ FOR DETAILED HELP
   help <command>                 Show detailed help for a command
@@ -183,12 +183,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                 '/webchat?agent=achilles-cli&path=/absolute/path'
             ],
             notes: 'WebChat uses the normal Router login flow. When `/webchat` is opened with `?agent=<name>&...`, every extra query parameter except internal router/session fields is forwarded to `ploinky cli <name>` as a single-token long-form CLI flag in the form `--key=value`.'
-        },
-        'dashboard': {
-            description: 'Print the administrator-only Dashboard URL served at /dashboard.',
-            syntax: 'dashboard',
-            examples: [ 'dashboard' ],
-            notes: 'The Dashboard accepts only a real authenticated Router administrator session; mutations additionally require exact Origin and CSRF proof.'
         },
         'sso': {
             description: 'Manage the workspace SSO provider.',
@@ -346,11 +340,11 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             notes: 'A named restart requires the persisted RoutingServer port and refuses foreign or old-contract containers. The general restart fails if start was not configured yet.'
         },
         'logs': {
-            description: 'Inspect Router and agent logs without changing any state',
+            description: 'Inspect Router or agent runtime logs without changing lifecycle state',
             subcommands: {
                 'tail': {
-                    syntax: 'logs tail [router|<agent>] [--startup]',
-                    description: 'Follow Router logs, or one agent from its current startup through the automatic handoff to its application output',
+                    syntax: 'logs tail [router|agent] [--startup]',
+                    description: 'Follow the Ploinky Router file or one agent runtime',
                     examples: [
                         'logs tail',
                         'logs tail router',
@@ -358,14 +352,15 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                         'logs tail myRepo/myAgent',
                         'logs tail myAgent --startup'
                     ],
-                    notes: 'Unqualified `router` always selects Router logs. Completion offers one round-trip-proved reference per enabled record; an agent named `router` needs a non-reserved unambiguous qualified spelling. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation. Tail follows that exact run\'s startup log, opens/proves its runtime source, and rechecks marker, registry generation, and source identity before switching. A failed start returns 1 and never falls back. `--startup` never opens runtime output.'
+                    notes: 'Completion offers one round-trip-proved reference per enabled record. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation. Tail follows that exact run\'s startup log, opens/proves its runtime source, and rechecks marker, registry generation, and source identity before switching. A failed start returns 1 and never falls back. `--startup` never opens runtime output.'
                 },
                 'last': {
-                    syntax: 'logs last [<N>] [router|<agent>] [--startup]',
-                    description: 'Show the last N lines of one log source; N defaults to 200',
+                    syntax: 'logs last [<N>] [router|agent] [--startup]',
+                    description: 'Show the last N lines for Router or one agent; N defaults to 200',
                     examples: [
                         'logs last',
                         'logs last 50',
+                        'logs last 50 router',
                         'logs last myAgent',
                         'logs last 200 myRepo/myAgent',
                         'logs last 40 myAgent --startup'

@@ -754,7 +754,7 @@ test('webchat exposes only the WebChat router mount for the selected root', (t) 
         assert.equal(plan.surface, 'webchat', pathname);
     }
 
-    for (const pathname of ['/dashboard', '/status', '/workspace-files']) {
+    for (const pathname of ['/status', '/workspace-files']) {
         const plan = resolveEdgeRoutePlan({
             req: {
                 method: 'GET',
@@ -1148,6 +1148,50 @@ test('legacy generation without dependency HTTP routes remains loadable until re
     });
     assert.notEqual(replacement.selector.generation, applied.selector.generation);
     assert.equal(Object.hasOwn(replacement.generation.compiled, 'dependencyHttpRoutes'), true);
+});
+
+test('legacy generation without workspace log consumers remains loadable fail-closed until replacement', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'legacy-workspace-logs-baseline',
+    });
+    const generationFile = path.join(
+        fixture.edgeDir,
+        'generations',
+        `${applied.selector.generation.replace(/^sha256:/, '')}.json`,
+    );
+    const legacyDocument = JSON.parse(fs.readFileSync(generationFile, 'utf8'));
+    delete legacyDocument.compiled.security.workspaceLogConsumers;
+    legacyDocument.compiledDigest = compiledDigest(legacyDocument.compiled);
+    fs.writeFileSync(generationFile, JSON.stringify(legacyDocument, null, 2));
+
+    const legacyActive = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
+    assert.equal(Object.hasOwn(legacyActive.generation.compiled.security, 'workspaceLogConsumers'), false);
+
+    fs.writeFileSync(path.join(fixture.edgeDir, 'desired.json'), JSON.stringify({
+        hosts: {
+            'replacement.example.test': {
+                agent: 'fixtures/alpha',
+                routerSurfaces: [],
+            },
+        },
+    }, null, 2));
+    const replacement = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'legacy-workspace-logs-replacement',
+    });
+    assert.notEqual(replacement.selector.generation, applied.selector.generation);
+    assert.deepEqual(replacement.generation.compiled.security.workspaceLogConsumers, []);
 });
 
 test('live source drift is rejected without inactivating the selected generation', (t) => {

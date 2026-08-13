@@ -1,8 +1,7 @@
 import { resolvePersistedRouterPort } from '../../sandbox/routerPort.js';
 
 const COMPONENTS = {
-  webchat: { label: 'WebChat', path: '/webchat', administratorOnly: false },
-  dashboard: { label: 'Dashboard', path: '/dashboard', administratorOnly: true }
+  webchat: { label: 'WebChat', path: '/webchat', administratorOnly: false }
 };
 
 function getRouterPort() {

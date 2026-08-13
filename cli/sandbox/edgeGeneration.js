@@ -524,6 +524,24 @@ function collectStrictManifestPolicyEntries(routing, manifests) {
     return entries;
 }
 
+function collectWorkspaceLogConsumers(routing, manifests, agents) {
+    const consumers = [];
+    for (const [routeKey, route] of Object.entries(routing.routes || {})) {
+        if (!route || route.disabled) continue;
+        const value = manifests?.[routeKey]?.routerAccess?.workspaceLogs;
+        if (value === undefined || value === null || value === false) continue;
+        if (value !== true) {
+            throw edgeError(`manifest(${routeKey}).routerAccess.workspaceLogs must be a boolean`);
+        }
+        consumers.push(resolveEnabledIdentity({
+            routeKey,
+            route,
+            agent: `${String(route.repo || '').trim()}/${String(route.agent || '').trim()}`,
+        }, agents));
+    }
+    return consumers;
+}
+
 function routeDefaultDecision(routing, agents, routeKey, seen = new Set()) {
     const key = String(routeKey || '');
     if (!key || seen.has(key)) return { access: 'guest', routeKey: key, source: 'routeDefault' };
@@ -918,6 +936,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     assertObject(agents, 'agents registry');
     const normalizedDesired = normalizeDesired(desired);
     const hostNetworkCapabilities = collectManifestHostNetworkCapabilities(routing, manifests, agents);
+    const workspaceLogConsumers = collectWorkspaceLogConsumers(routing, manifests, agents);
     const turnCredentialConsumers = (normalizedDesired.turn?.credentialConsumers || []).map((agentRef) => (
         resolveEnabledIdentity(resolveAgentRoute(agentRef, routing), agents)
     ));
@@ -990,6 +1009,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
             policy: compiledPolicy,
             security: {
                 hostNetworkCapabilities,
+                workspaceLogConsumers,
                 turnCredentialConsumers,
             },
             publication: publicationDisposition(normalizedDesired),
@@ -1933,14 +1953,29 @@ function reconstructGeneration(document, selector) {
     }
     const expectedDigests = sourceDigests({ bytes });
     const storedCompiled = assertObject(document.compiled, 'generation compiled state');
-    // Generations written before dependency HTTP routing was introduced do not
-    // contain this derived allowlist. Accept only that exact additive omission
-    // so a running workspace can load its previous generation long enough to
-    // commit a newly compiled one. Runtime behavior remains unchanged for the
-    // legacy generation because its stored compiled state is returned below.
-    const semanticForStoredShape = Object.hasOwn(storedCompiled, 'dependencyHttpRoutes')
-        ? semantic.compiled
-        : Object.fromEntries(Object.entries(semantic.compiled).filter(([key]) => key !== 'dependencyHttpRoutes'));
+    // Generations written before a derived allowlist was introduced do not
+    // contain that field. Accept only these exact additive omissions so a
+    // running workspace can load its previous generation long enough to commit
+    // a newly compiled one. Runtime behavior remains unchanged (and therefore
+    // fail-closed for a missing capability) until replacement is committed.
+    let legacyCompiledShape = false;
+    let semanticForStoredShape = semantic.compiled;
+    if (!Object.hasOwn(storedCompiled, 'dependencyHttpRoutes')) {
+        legacyCompiledShape = true;
+        semanticForStoredShape = Object.fromEntries(
+            Object.entries(semanticForStoredShape).filter(([key]) => key !== 'dependencyHttpRoutes'),
+        );
+    }
+    const storedSecurity = assertObject(storedCompiled.security, 'generation compiled security state');
+    if (!Object.hasOwn(storedSecurity, 'workspaceLogConsumers')) {
+        legacyCompiledShape = true;
+        semanticForStoredShape = {
+            ...semanticForStoredShape,
+            security: Object.fromEntries(
+                Object.entries(semanticForStoredShape.security).filter(([key]) => key !== 'workspaceLogConsumers'),
+            ),
+        };
+    }
     if (stableStringify(document.sourceDigests) !== stableStringify(expectedDigests)
         || document.compiledDigest !== compiledDigest(semanticForStoredShape)
         || stableStringify(storedCompiled) !== stableStringify(semanticForStoredShape)) {
@@ -1958,9 +1993,7 @@ function reconstructGeneration(document, selector) {
         manifests,
         routerHostPort,
         mediaHostPort,
-        compiled: Object.hasOwn(storedCompiled, 'dependencyHttpRoutes')
-            ? semantic.compiled
-            : storedCompiled,
+        compiled: legacyCompiledShape ? storedCompiled : semantic.compiled,
     };
 }
 

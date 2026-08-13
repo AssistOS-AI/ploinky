@@ -6,7 +6,6 @@ import http from 'node:http';
 import test from 'node:test';
 
 const { buildHealthCheckRequestOptions } = await import('../../cli/server/Watchdog.js');
-const { buildDashboardUrl } = await import('../../cli/commands/workspaceUtil.js');
 
 function requestStatus(options) {
     return new Promise((resolve, reject) => {
@@ -46,15 +45,4 @@ test('Watchdog connects internally while presenting the public authority', async
         path: '/health',
         headers: { Host: expectedAuthority },
     });
-});
-
-test('Dashboard output uses only a nonempty public authority', () => {
-    assert.equal(
-        buildDashboardUrl(8080, {}),
-        'http://127.0.0.1:8080/dashboard',
-    );
-    assert.equal(
-        buildDashboardUrl(8080, { PLOINKY_PUBLIC_AUTHORITY: '127.0.0.1:19090' }),
-        'http://127.0.0.1:19090/dashboard',
-    );
 });

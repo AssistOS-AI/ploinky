@@ -78,14 +78,15 @@ function makeWorkspace(t, { agents } = {}) {
 
 test('the logs grammar accepts exactly the documented forms', () => {
     const accepted = [
-        [['logs', 'tail'], { subcommand: 'tail', target: 'router', isRouter: true, startup: false }],
-        [['logs', 'tail', 'router'], { subcommand: 'tail', target: 'router', isRouter: true }],
-        [['logs', 'tail', 'webAgent'], { subcommand: 'tail', target: 'webAgent', isRouter: false }],
+        [['logs', 'tail'], { subcommand: 'tail', target: 'router', startup: false }],
+        [['logs', 'tail', 'router'], { subcommand: 'tail', target: 'router', startup: false }],
+        [['logs', 'tail', 'webAgent'], { subcommand: 'tail', target: 'webAgent', startup: false }],
         [['logs', 'tail', 'webAgent', '--startup'], { target: 'webAgent', startup: true }],
         [['logs', 'tail', '--startup', 'webAgent'], { target: 'webAgent', startup: true }],
         [['logs', 'last'], { subcommand: 'last', target: 'router', lineCount: 200 }],
-        [['logs', 'last', '5'], { target: 'router', lineCount: 5 }],
-        [['logs', 'last', '10000'], { target: 'router', lineCount: 10000 }],
+        [['logs', 'last', '5'], { subcommand: 'last', target: 'router', lineCount: 5 }],
+        [['logs', 'last', '10000'], { subcommand: 'last', target: 'router', lineCount: 10000 }],
+        [['logs', 'last', 'router'], { subcommand: 'last', target: 'router', lineCount: 200 }],
         [['logs', 'last', 'webAgent'], { target: 'webAgent', lineCount: 200 }],
         [['logs', 'last', '200', 'webAgent'], { target: 'webAgent', lineCount: 200 }],
         [['logs', 'last', '7', 'repo/webAgent'], { target: 'repo/webAgent', lineCount: 7 }],
@@ -130,7 +131,7 @@ test('the logs grammar accepts exactly the documented forms', () => {
 
 test('logs dispatches to its read-only handler without importing core initialization', async () => {
     const seen = [];
-    const code = await launchCli(['logs', 'tail'], {
+    const code = await launchCli(['logs', 'tail', 'exampleAgent'], {
         importCoreImpl: async () => {
             throw new Error('core initialization must not be imported');
         },
@@ -142,7 +143,7 @@ test('logs dispatches to its read-only handler without importing core initializa
         }),
     });
     assert.equal(code, 7);
-    assert.deepEqual(seen, [['logs', 'tail']]);
+    assert.deepEqual(seen, [['logs', 'tail', 'exampleAgent']]);
 });
 
 test('the observational logs import graph excludes mutation-capable lifecycle modules', () => {
@@ -179,7 +180,7 @@ test('the private Box stdin EOF channel cancels logs without recording an operat
     const input = new EventEmitter();
     input.resume = () => {};
     let observedAbort = false;
-    const launched = launchCli(['logs', 'tail'], {
+    const launched = launchCli(['logs', 'tail', 'exampleAgent'], {
         env: { PLOINKY_BOX_LOG_STREAM: '1' },
         input,
         importCoreImpl: () => { throw new Error('logs must not import core'); },
@@ -203,7 +204,7 @@ test('the private Box stdin EOF channel cancels logs without recording an operat
 });
 
 test('logs accepts one global debug flag in either accepted placement', async () => {
-    for (const argv of [['--debug', 'logs', 'last', '5'], ['logs', '-d', 'last', '5']]) {
+    for (const argv of [['--debug', 'logs', 'last', '5', 'exampleAgent'], ['logs', '-d', 'last', '5', 'exampleAgent']]) {
         const stderr = [];
         const seen = [];
         let debugEnabled = false;
@@ -223,7 +224,7 @@ test('logs accepts one global debug flag in either accepted placement', async ()
         assert.equal(code, 0);
         assert.equal(debugEnabled, true);
         // The debug flag is consumed exactly once and never reaches the parser.
-        assert.deepEqual(seen, [['logs', 'last', '5']]);
+        assert.deepEqual(seen, [['logs', 'last', '5', 'exampleAgent']]);
         // Debug notice must not contaminate stdout, which carries log bytes only.
         assert.deepEqual(stderr, ['[INFO] Debug mode enabled.\n']);
     }
@@ -240,7 +241,7 @@ test('logs never creates workspace state in an absent workspace', (t) => {
     assert.equal(fs.existsSync(path.join(root, '.ploinky')), false);
 });
 
-test('logs leaves an existing workspace unchanged on success and on failure', (t) => {
+test('logs leaves an existing workspace unchanged on failure', (t) => {
     const root = makeWorkspace(t, {
         agents: {
             ploinky_example: {
@@ -251,16 +252,9 @@ test('logs leaves an existing workspace unchanged on success and on failure', (t
             },
         },
     });
-    fs.mkdirSync(path.join(root, '.ploinky', 'logs'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.ploinky', 'logs', 'router.log'), 'router line one\n');
     const before = treeHash(root);
 
-    const success = runLogsCli(['logs', 'last', '5'], { cwd: root });
-    assert.equal(success.status, 0, success.stderr);
-    assert.match(success.stdout, /router line one/);
-    assert.equal(treeHash(root), before);
-
-    const failure = runLogsCli(['logs', 'last', '0'], { cwd: root });
+    const failure = runLogsCli(['logs', 'last', '0', 'exampleAgent'], { cwd: root });
     assert.equal(failure.status, 1);
     assert.match(failure.stderr, /line count/);
     assert.equal(treeHash(root), before);
@@ -268,14 +262,11 @@ test('logs leaves an existing workspace unchanged on success and on failure', (t
 
 test('logs runs without the unrelated core runtime dependencies', (t) => {
     const root = makeWorkspace(t, { agents: {} });
-    fs.mkdirSync(path.join(root, '.ploinky', 'logs'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.ploinky', 'logs', 'router.log'), 'router line one\n');
     const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-logs-noroot-'));
     t.after(() => fs.rmSync(emptyRoot, { recursive: true, force: true }));
 
-    const logs = runLogsCli(['logs', 'last', '5'], { cwd: root, env: { PLOINKY_ROOT: emptyRoot } });
-    assert.equal(logs.status, 0, logs.stderr);
-    assert.match(logs.stdout, /router line one/);
+    const logs = runLogsCli(['logs', 'last', '5', 'missingAgent'], { cwd: root, env: { PLOINKY_ROOT: emptyRoot } });
+    assert.equal(logs.status, 1, logs.stderr);
     assert.doesNotMatch(logs.stderr, /dependencies missing/);
 
     // The same absent dependency root still blocks a mutating core command, so
@@ -352,3 +343,5 @@ test('a corrupt registry fails the logs command without repairing it', (t) => {
     assert.doesNotMatch(missing.stderr, /agents registry/);
     assert.match(missing.stderr, /is not one enabled agent/);
 });
+        [['logs', 'last'], { subcommand: 'last', target: 'router', lineCount: 200 }],
+        [['logs', 'last', '5'], { subcommand: 'last', target: 'router', lineCount: 5 }],

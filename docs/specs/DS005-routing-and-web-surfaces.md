@@ -17,8 +17,10 @@ The routed interface is the operator-visible face of a running Ploinky workspace
 The router must be supervised by `cli/server/Watchdog.js`, which launches and
 restarts `cli/server/RoutingServer.js`, records restart events, checks detailed
 health through an unmounted supervisor Unix socket, and writes watchdog logs
-under `.ploinky/logs/watchdog.log`. The router itself must write redacted request
-and lifecycle logs under `.ploinky/logs/router.log`.
+under `.ploinky/logs/watchdog.log`. Router request, lifecycle, and console output
+are persisted in `.ploinky/logs/router.log`; Policy Audit is persisted under
+`.ploinky/data/router-security/`. Workspace Monitor may manage rotation and
+retention only through the capability-bound private file operation.
 
 RoutingServer owns a public/control listener on box port `8080` and a private
 listener on `8081`. The outer box maps only the former to a loopback
@@ -61,7 +63,7 @@ The watchdog container monitor must defer automatic container restarts while a m
 
 For an agent whose manifest declares `startup: manual`, its route is also the durable activation marker used by watchdog monitoring. General startup removes the route of a stopped manual agent and the watchdog must ignore that registry entry. If the manual agent is already running, startup retains it and ensures its route. An explicit Marketplace enable or `ploinky cli` invocation recreates the route, after which the watchdog monitors and restarts the agent like any other active runtime. Agents with automatic startup remain watchdog targets without requiring this marker.
 
-The router must provide first-party browser surfaces at `/webchat`, `/dashboard`, and `/status`. Their fallback asset directories live under `cli/server/<surface>/`. `/webchat` relies on the router login flow and the authenticated router session; it does not accept surface-specific token login. `/dashboard` and `/status` are local control surfaces and require a real authenticated local-admin session on an allowed control Host. They do not accept an invitation, component token, Agent Assertion, Router Request, private assertion, LiveKit JWT, or localhost provenance as administrator identity. Every control mutation additionally requires the exact browser Origin and a session-bound CSRF proof. For sliding local sessions, this proof binds to the signed stable session `sid`, not the rotating JWT bytes, so concurrent authenticated reads cannot invalidate a proof while logout and session revocation still do. Dashboard mutations use this stricter control-surface guard directly rather than the route-generation mutation guard used by policy-routed browser endpoints; the control Host has no policy route plan to commit. Asset resolution may also consult the static host root and `webLibs/`, but the documented fallback implementation for the first-party surfaces lives under `cli/server/`.
+The router must provide first-party browser surfaces at `/webchat` and `/status`. Their fallback asset directories live under `cli/server/<surface>/`. `/webchat` relies on the router login flow and the authenticated router session; it does not accept surface-specific token login. `/status` is a local control surface and requires a real authenticated local-admin session on an allowed control Host. It does not accept an invitation, component token, Agent Assertion, Router Request, private assertion, LiveKit JWT, or localhost provenance as administrator identity. Every control mutation additionally requires the exact browser Origin and a session-bound CSRF proof. For sliding local sessions, this proof binds to the signed stable session `sid`, not the rotating JWT bytes, so concurrent authenticated reads cannot invalidate a proof while logout and session revocation still do. Asset resolution may also consult the static host root and `webLibs/`, but the documented fallback implementation for the first-party surfaces lives under `cli/server/`.
 
 For `/webchat`, the router must treat `agent` as an explicit agent-selection query parameter and must preserve the remaining query parameters across the browser session endpoints. When a WebChat request selects an explicit agent, the router must forward every additional query parameter except router-reserved stream/session parameters such as `tabId` and `sessionId` to that agent's `ploinky cli <agent>` launch as long-form CLI flags encoded as single `--key=value` tokens. The router must not hardcode ordinary target-agent parameter names for this forwarding behavior; interpretation belongs to the target agent CLI. The reserved alias parameters `workspace-dir`/`workspaceDir` and `workspace-skill-root`/`workspaceSkillRoot` are resolved by WebChat against the Ploinky workspace root and forwarded as absolute `--dir=` and `--skill-root=` values server-side so browser URLs can avoid leaking absolute host paths. The `ploinky cli <agent>` launch path is expected to resolve the agent manifest from workspace repositories and auto-enable missing agents in the standard global enable flow when needed.
 
@@ -343,7 +345,7 @@ stale, and mismatched tuples fail without proxying. A dedicated service host has
 a closed surface containing only its selected service and the exact auth
 transaction paths that service needs. An agent-root host has only the root/mounts
 and explicitly validated named `routerSurfaces` capabilities. Health, admin,
-policy, discovery, aggregate MCP, dashboard, status, WebChat, broker, and private
+policy, discovery, aggregate MCP, status, WebChat, broker, and private
 service routes are absent unless the selected class and closed allowlist permit
 them. Raw capability names are invalid configuration.
 
@@ -430,10 +432,10 @@ The default workspace entry paths `/` and `/index.html` redirect to the configur
 
 ## Decisions & Questions
 
-### Question #1: Why does Ploinky no longer render its own Dashboard?
+### Question #1: Why does Ploinky no longer expose its own Dashboard?
 
 Response:
-Ploinky is responsible only for authenticated read-only status and log contracts. Their presentation is consumer-owned and intentionally outside the runtime. `/dashboard` returns a neutral descriptor of those contracts; it neither renders a UI nor redirects to a particular application. This removes the duplicate UI and the former generic command-execution route without coupling Ploinky to a consumer.
+Ploinky owns authenticated status plus Router/Policy files and their private filesystem operations. `workspaceMonitorAgent` owns presentation, the retention setting, and the daily maintenance schedule. Ploinky exposes no `/dashboard` route; the agent never copies the files into its own storage.
 
 ### Question #2: Why does Ploinky expose both router-level and agent-level MCP routes?
 

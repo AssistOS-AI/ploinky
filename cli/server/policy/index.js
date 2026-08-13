@@ -30,8 +30,8 @@ import {
  */
 
 // The composition root is the single place the persistence strategy is chosen.
-// Swapping to a database = construct a different PolicyStateStore / PolicyAuditSink
-// here; nothing else in policy/ changes.
+// Policy state and audit files are durable Ploinky-owned data. Workspace Monitor
+// controls retention through the private log-maintenance operation.
 const repository = new PolicyStateRepository({ store: new FileSystemPolicyStateStore() });
 const auditLog = new PolicyAuditLog({ sink: new FileSystemPolicyAuditSink() });
 const httpRouteAccessPolicy = new HttpRouteAccessPolicy({ repository });

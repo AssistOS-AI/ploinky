@@ -137,6 +137,7 @@
     }
   ],
   "routerAccess": {
+    "workspaceLogs": false,           // Exact private log-file operation capability
     "httpRoutes": [
       { "path": "/assets/*", "access": "public" }
     ]
@@ -323,6 +324,11 @@
                                 <td><code>routerAccess.httpRoutes</code></td>
                                 <td>No</td>
                                 <td>Declares agent-relative Router paths with <code>public</code>, <code>guest</code>, or <code>authenticated</code> access. Declarations are expanded under the effective route key and cannot claim Router control paths.</td>
+                            </tr>
+                            <tr>
+                                <td><code>routerAccess.workspaceLogs</code></td>
+                                <td>No</td>
+                                <td>Boolean capability for the generation-bound private Router/Policy log-file operation. It does not publish a route or grant arbitrary filesystem access.</td>
                             </tr>
                             <tr>
                                 <td><code>providesConfig</code> / <code>configProviders</code></td>
