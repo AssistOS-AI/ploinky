@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Design Specifications - Ploinky</title>
+    <title>Specifications - Ploinky Documentation</title>
     <link rel="stylesheet" href="style.css">
     <script src="partials-loader.js" defer></script>
     <script type="module">
@@ -11,13 +11,15 @@
         mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
     </script>
     <style>
+        .specifications-page-header {
+            border-bottom: 1px solid var(--border-primary);
+        }
+
         .spec-layout {
             display: grid;
             grid-template-columns: 280px 1fr;
             gap: 0;
-            max-width: 1400px;
-            margin: 0 auto;
-            min-height: calc(100vh - 160px);
+            min-height: calc(100vh - 230px);
         }
 
         .spec-sidebar {
@@ -25,8 +27,8 @@
             border-right: 1px solid var(--border-primary);
             padding: 1.5rem 0;
             position: sticky;
-            top: 62px;
-            height: calc(100vh - 62px);
+            top: 90px;
+            max-height: calc(100vh - 110px);
             overflow-y: auto;
         }
 
@@ -42,6 +44,8 @@
 
         .spec-sidebar ul {
             list-style: none;
+            margin: 0;
+            padding: 0;
         }
 
         .spec-sidebar li a {
@@ -248,8 +252,8 @@
 
         /* Welcome card */
         .spec-welcome {
-            max-width: 640px;
-            margin: 2rem auto;
+            width: 100%;
+            margin: 2rem 0;
         }
 
         .spec-welcome h2 {
@@ -334,6 +338,7 @@
                 position: relative;
                 top: 0;
                 height: auto;
+                max-height: none;
                 border-right: none;
                 border-bottom: 1px solid var(--border-primary);
                 padding: 1rem 0;
@@ -359,8 +364,14 @@
 </head>
 <body data-page="spec-browser">
     <div data-include="partials/header.html"></div>
-
-    <div class="spec-layout">
+    <main>
+      <div class="container">
+        <div class="content-wrapper">
+          <div class="doc-section specifications-page-header">
+            <h1>Specifications</h1>
+            <p class="subtitle">Browse the Ploinky design specifications that define system behavior, runtime boundaries, interfaces, security, and operational requirements.</p>
+          </div>
+          <div class="spec-layout">
         <aside class="spec-sidebar">
             <div class="spec-search">
                 <input type="text" id="specSearch" placeholder="Filter specs...">
@@ -417,7 +428,11 @@
         <div class="spec-content" id="specContent">
             <!-- Content loaded dynamically -->
         </div>
-    </div>
+          </div>
+        </div>
+      </div>
+    </main>
+    <div data-include="partials/footer.html"></div>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script>
@@ -455,7 +470,7 @@
 
             content.innerHTML = `
                 <div class="spec-welcome">
-                    <h2>Design Specifications</h2>
+                    <h2>Specifications</h2>
                     <p>The Ploinky Design Specification (DS) documents define the complete system architecture, from core agent model to runtime operations. Select a spec from the sidebar or click below.</p>
                 </div>
                 <div class="spec-grid">${cards}</div>
@@ -506,7 +521,7 @@
                 // Rewrite internal DS links to work within the viewer
                 content.querySelectorAll('.md-body a').forEach(a => {
                     const href = a.getAttribute('href');
-                    if (href && href.match(/^\.\/DS\d{3}/)) {
+                    if (href && href.match(/(?:^\.\/|[?&]spec=)DS\d{3}/)) {
                         const match = href.match(/DS(\d{3})/);
                         if (match) {
                             const dsNum = 'DS' + match[1];
