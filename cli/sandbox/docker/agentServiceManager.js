@@ -1470,7 +1470,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         envStrings.push(formatEnvFlag('PLOINKY_INFERENCE_PORT', '8080'));
     }
 
-    // DS013/DS011: strip any reserved identity/master env FLAG a config layer
+    // DS014/DS012: strip any reserved identity/master env FLAG a config layer
     // emitted (manifest env, runtime resources, profile env/secrets), then
     // re-assert the authoritative Router locators and agent identity LAST so no
     // config can redirect the runtime, inject a master key, or override the

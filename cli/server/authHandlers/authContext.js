@@ -663,7 +663,7 @@ export async function ensureAgentAuthenticated(req, res, parsedUrl) {
     return {
         ok: false,
         error: 'legacy_agent_bearer_auth_removed',
-        detail: 'Agent-to-agent calls use an Agent Assertion JWT carried as `Authorization: Bearer`, verified by the router (DS013).'
+        detail: 'Agent-to-agent calls use an Agent Assertion JWT carried as `Authorization: Bearer`, verified by the router (DS014).'
     };
 }
 

@@ -9,7 +9,7 @@ import { computeRch } from '../../../Agent/lib/requestHash.mjs';
 
 /**
  * ShareAuthorizer (abstract) + HttpShareAuthorizer (concrete) — deny-by-default
- * bridge for normal-user public sharing (DS014).
+ * bridge for normal-user public sharing (DS015).
  *
  * The router cannot infer resource ownership from a path, so a normal user may
  * publish a route only if the OWNING agent affirmatively approves it via

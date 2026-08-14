@@ -1,6 +1,6 @@
 // AgentMcpClient: lets an agent call another agent's tools THROUGH the router.
 //
-// Agent-to-agent is always router-mediated (DS013): the source agent signs a
+// Agent-to-agent is always router-mediated (DS014): the source agent signs a
 // per-call Agent Assertion with its OWN PLOINKY_AGENT_SECRET, posts a direct
 // JSON-RPC tools/call to the router at /<target>/mcp with the assertion as
 // `Authorization: Bearer`, and the router verifies the assertion, applies MCP

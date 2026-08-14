@@ -864,7 +864,7 @@ async function executeRouterCommand(command, payload = {}, req = null, routePlan
                 return { statusCode: 200, body: { tools: aggregated, emptyAgents, errors } };
             }
             case 'list_resources': {
-                // Resources are an authenticated-class capability (DS014): an
+                // Resources are an authenticated-class capability (DS015): an
                 // internal/agent or anonymous caller gets an empty list.
                 if (!policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) }).allow) {
                     return { statusCode: 200, body: { resources: [], errors: [] } };
@@ -960,7 +960,7 @@ async function executeRouterCommand(command, payload = {}, req = null, routePlan
                 if (!uri) {
                     return { statusCode: 400, body: { error: 'missing uri' } };
                 }
-                // Fail-closed resource gate (DS014) before any lookup or mint.
+                // Fail-closed resource gate (DS015) before any lookup or mint.
                 const readDecision = policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) });
                 if (!readDecision.allow) {
                     return { statusCode: readDecision.status || 403, body: { error: 'access_denied', code: readDecision.code } };

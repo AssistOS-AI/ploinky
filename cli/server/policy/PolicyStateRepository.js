@@ -10,7 +10,7 @@ import { FileSystemPolicyStateStore } from './FileSystemPolicyStateStore.js';
  * schema-invalid document FAILS CLOSED — readers report `corrupt` so callers deny,
  * and `mutate` refuses rather than clobbering. The raw persistence mechanism is a
  * pluggable `PolicyStateStore` (Strategy/Adapter); it defaults to the filesystem
- * (`FileSystemPolicyStateStore`) but a database can be dropped in unchanged. DS014.
+ * (`FileSystemPolicyStateStore`) but a database can be dropped in unchanged. DS015.
  */
 
 const SCHEMA = 'router-policy';

@@ -5,33 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Agent Specification - Ploinky</title>
     <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
     <script type="module">
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
         mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
     </script>
 </head>
-<body>
-    <header>
-        <div class="container">
-            <div class="header-content">
-                <a href="index.html" class="logo">
-                    <div class="logo-icon">🚀</div>
-                    <span>Ploinky</span>
-                </a>
-                <nav>
-                    <ul>
-                        <li><a href="index.html">Home</a></li>
-                        <li><a href="cli-reference.html">CLI Reference</a></li>
-                        <li><a href="architecture.html">Architecture</a></li>
-                        <li><a href="specs.html">Specs</a></li>
-                        <li><a href="spec-agent.html" class="active">Agent Spec</a></li>
-                        <li><a href="webchat.html">WebChat</a></li>
-                        <li><button class="theme-toggle" id="themeToggle">🌙</button></li>
-                    </ul>
-                </nav>
-            </div>
-        </div>
-    </header>
+<body data-page="spec-agent">
+    <div data-include="partials/header.html"></div>
 
     <main>
         <div class="container">
@@ -894,22 +875,6 @@ main.on('exit', (code) => {
     </footer>
 
     <script>
-        // Theme toggle
-        const themeToggle = document.getElementById('themeToggle');
-        const body = document.body;
-        
-        const savedTheme = localStorage.getItem('theme') || 'light';
-        body.setAttribute('data-theme', savedTheme);
-        themeToggle.textContent = savedTheme === 'dark' ? '☀️' : '🌙';
-        
-        themeToggle.addEventListener('click', () => {
-            const currentTheme = body.getAttribute('data-theme');
-            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
-            body.setAttribute('data-theme', newTheme);
-            localStorage.setItem('theme', newTheme);
-            themeToggle.textContent = newTheme === 'dark' ? '☀️' : '🌙';
-        });
-
         // Highlight active section in sidebar
         const sections = document.querySelectorAll('.doc-section[id]');
         const navLinks = document.querySelectorAll('.sidebar a');

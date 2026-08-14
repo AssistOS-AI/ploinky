@@ -121,6 +121,66 @@ pre {
     gap: 10px;
 }
 
+.nav-menu {
+    position: relative;
+}
+
+.nav-menu__trigger {
+    min-height: 40px;
+    padding: 0 14px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    color: var(--ink-soft);
+    background: transparent;
+    font: inherit;
+    cursor: pointer;
+}
+
+.nav-menu__trigger::after {
+    content: " ▾";
+}
+
+.nav-menu__trigger:hover,
+.nav-menu__trigger:focus-visible,
+.nav-menu.is-open .nav-menu__trigger {
+    color: var(--ink);
+    border-color: rgba(29, 44, 42, 0.1);
+    background: rgba(255, 255, 255, 0.7);
+}
+
+.nav-menu__panel {
+    display: none;
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 0;
+    z-index: 30;
+    min-width: 220px;
+    padding: 8px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--panel-strong);
+    box-shadow: var(--shadow);
+}
+
+.nav-menu:last-child .nav-menu__panel {
+    right: 0;
+    left: auto;
+}
+
+.nav-menu.is-open .nav-menu__panel {
+    display: grid;
+    gap: 2px;
+}
+
+.nav-menu__panel a {
+    width: 100%;
+    border-radius: 10px;
+}
+
+.theme-toggle {
+    display: none;
+}
+
 .site-nav a {
     display: inline-flex;
     align-items: center;

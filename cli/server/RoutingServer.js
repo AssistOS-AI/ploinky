@@ -219,7 +219,7 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/api/marketplace'
         || pathname.startsWith('/api/marketplace/')
         || pathname.startsWith('/api/router/')
-        // Internal, non-policy-routable router-owned routes (DS014).
+        // Internal, non-policy-routable router-owned routes (DS015).
         || pathname === '/policy/command'
         || pathname === '/metrics'
         || pathname === '/health/internal'
@@ -432,7 +432,7 @@ async function processRequest(req, res) {
         return staticSrv.serveWebLibRequest(req, res);
     }
 
-    // DS014: any `__agent` segment is a router-owned agent control-plane path
+    // DS015: any `__agent` segment is a router-owned agent control-plane path
     // (e.g. the share authorizer). The router reaches those itself over a direct
     // loopback call carrying a minted Router Request — the PUBLIC listener never
     // serves them. Refuse here before passthrough handling can forward one to an
@@ -459,7 +459,7 @@ async function processRequest(req, res) {
         if (handled) return;
     }
 
-    // Single administrative endpoint for router access-control policy (DS014).
+    // Single administrative endpoint for router access-control policy (DS015).
     // Authenticated + never policy-routable; handles its own authorization.
     if (pathname === '/policy/command') {
         const handled = await policy.commandInvoker.handle(req, res);

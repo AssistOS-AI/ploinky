@@ -1,6 +1,6 @@
 /**
  * Caller — value object classifying the principal behind a request as
- * `user` / `guest` / `agent` / `none`, with an `isAdmin` flag (DS013/DS014).
+ * `user` / `guest` / `agent` / `none`, with an `isAdmin` flag (DS014/DS015).
  * A guest is never admin. The `fromRequest` factory is the single place caller
  * identity is derived for MCP-policy decisions.
  */

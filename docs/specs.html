@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Design Specifications - Ploinky</title>
     <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
     <script type="module">
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
         mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
@@ -356,27 +357,8 @@
         }
     </style>
 </head>
-<body>
-    <header>
-        <div class="container">
-            <div class="header-content">
-                <a href="index.html" class="logo">
-                    <div class="logo-icon">🚀</div>
-                    <span>Ploinky</span>
-                </a>
-                <nav>
-                    <ul>
-                        <li><a href="index.html">Home</a></li>
-                        <li><a href="cli-reference.html">CLI Reference</a></li>
-                        <li><a href="architecture.html">Architecture</a></li>
-                        <li><a href="specs.html" class="active">Specs</a></li>
-                        <li><a href="webchat.html">WebChat</a></li>
-                        <li><button class="theme-toggle" id="themeToggle">🌙</button></li>
-                    </ul>
-                </nav>
-            </div>
-        </div>
-    </header>
+<body data-page="spec-browser">
+    <div data-include="partials/header.html"></div>
 
     <div class="spec-layout">
         <aside class="spec-sidebar">
@@ -390,43 +372,44 @@
                     <li><a id="DS000" href="#DS000" data-spec="DS000-vision"><span class="spec-id">DS000</span> Vision</a></li>
                     <li><a id="DS001" href="#DS001" data-spec="DS001-coding-style"><span class="spec-id">DS001</span> Coding Style</a></li>
                     <li><a id="DS002" href="#DS002" data-spec="DS002-workspace-and-repository-model"><span class="spec-id">DS002</span> Workspace & Repository Model</a></li>
-                    <li><a id="DS003" href="#DS003" data-spec="DS003-agent-manifest-and-registry"><span class="spec-id">DS003</span> Agent Manifest & Registry</a></li>
+                    <li><a id="DS003" href="#DS003" data-spec="DS003-main-behavior"><span class="spec-id">DS003</span> Main Behavior</a></li>
+                    <li><a id="DS004" href="#DS004" data-spec="DS004-agent-manifest-and-registry"><span class="spec-id">DS004</span> Agent Manifest & Registry</a></li>
                 </ul>
             </div>
 
             <div class="sidebar-section">
                 <h3>Interfaces</h3>
                 <ul>
-                    <li><a id="DS005" href="#DS005" data-spec="DS005-routing-and-web-surfaces"><span class="spec-id">DS005</span> Routing & Web Surfaces</a></li>
-                    <li><a id="DS006" href="#DS006" data-spec="DS006-auth-capabilities-and-secure-wire"><span class="spec-id">DS006</span> Auth, Capabilities & Secure Wire</a></li>
-                    <li><a id="DS011" href="#DS011" data-spec="DS011-security-model"><span class="spec-id">DS011</span> Security Model</a></li>
-                    <li><a id="DS013" href="#DS013" data-spec="DS013-per-agent-identity-and-request-signed-jwts"><span class="spec-id">DS013</span> Per-Agent Identity & JWTs</a></li>
-                    <li><a id="DS014" href="#DS014" data-spec="DS014-router-access-control-http-route-access-and-mcp-policy"><span class="spec-id">DS014</span> Router Access Control</a></li>
+                    <li><a id="DS006" href="#DS006" data-spec="DS006-routing-and-web-surfaces"><span class="spec-id">DS006</span> Routing & Web Surfaces</a></li>
+                    <li><a id="DS007" href="#DS007" data-spec="DS007-auth-capabilities-and-secure-wire"><span class="spec-id">DS007</span> Auth, Capabilities & Secure Wire</a></li>
+                    <li><a id="DS012" href="#DS012" data-spec="DS012-security-model"><span class="spec-id">DS012</span> Security Model</a></li>
+                    <li><a id="DS014" href="#DS014" data-spec="DS014-per-agent-identity-and-request-signed-jwts"><span class="spec-id">DS014</span> Per-Agent Identity & JWTs</a></li>
+                    <li><a id="DS015" href="#DS015" data-spec="DS015-router-access-control-http-route-access-and-mcp-policy"><span class="spec-id">DS015</span> Router Access Control</a></li>
                 </ul>
             </div>
 
             <div class="sidebar-section">
                 <h3>Runtime</h3>
                 <ul>
-                    <li><a id="DS004" href="#DS004" data-spec="DS004-runtime-execution-and-isolation"><span class="spec-id">DS004</span> Runtime Execution & Isolation</a></li>
-                    <li><a id="DS007" href="#DS007" data-spec="DS007-dependency-caches-and-startup-readiness"><span class="spec-id">DS007</span> Dependency Caches & Startup Readiness</a></li>
-                    <li><a id="DS015" href="#DS015" data-spec="DS015-startup-config-providers"><span class="spec-id">DS015</span> Startup Config Providers</a></li>
+                    <li><a id="DS005" href="#DS005" data-spec="DS005-runtime-execution-and-isolation"><span class="spec-id">DS005</span> Runtime Execution & Isolation</a></li>
+                    <li><a id="DS008" href="#DS008" data-spec="DS008-dependency-caches-and-startup-readiness"><span class="spec-id">DS008</span> Dependency Caches & Startup Readiness</a></li>
+                    <li><a id="DS016" href="#DS016" data-spec="DS016-startup-config-providers"><span class="spec-id">DS016</span> Startup Config Providers</a></li>
                 </ul>
             </div>
 
             <div class="sidebar-section">
                 <h3>Configuration</h3>
                 <ul>
-                    <li><a id="DS008" href="#DS008" data-spec="DS008-secrets-skills-and-llm-assistance"><span class="spec-id">DS008</span> Secrets, Skills & LLM Assistance</a></li>
-                    <li><a id="DS012" href="#DS012" data-spec="DS012-local-llm-agent-architecture-catalog"><span class="spec-id">DS012</span> Local LLM Agent Catalog</a></li>
+                    <li><a id="DS009" href="#DS009" data-spec="DS009-secrets-skills-and-llm-assistance"><span class="spec-id">DS009</span> Secrets, Skills & LLM Assistance</a></li>
+                    <li><a id="DS013" href="#DS013" data-spec="DS013-local-llm-agent-architecture-catalog"><span class="spec-id">DS013</span> Local LLM Agent Catalog</a></li>
                 </ul>
             </div>
 
             <div class="sidebar-section">
                 <h3>Operations</h3>
                 <ul>
-                    <li><a id="DS009" href="#DS009" data-spec="DS009-observability"><span class="spec-id">DS009</span> Observability</a></li>
-                    <li><a id="DS010" href="#DS010" data-spec="DS010-testing-and-verification"><span class="spec-id">DS010</span> Testing & Verification</a></li>
+                    <li><a id="DS010" href="#DS010" data-spec="DS010-observability"><span class="spec-id">DS010</span> Observability</a></li>
+                    <li><a id="DS011" href="#DS011" data-spec="DS011-testing-and-verification"><span class="spec-id">DS011</span> Testing & Verification</a></li>
                 </ul>
             </div>
         </aside>
@@ -438,40 +421,25 @@
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script>
-        // Theme toggle
-        const themeToggle = document.getElementById('themeToggle');
-        const body = document.body;
-
-        const savedTheme = localStorage.getItem('theme') || 'light';
-        body.setAttribute('data-theme', savedTheme);
-        themeToggle.textContent = savedTheme === 'dark' ? '☀️' : '🌙';
-
-        themeToggle.addEventListener('click', () => {
-            const currentTheme = body.getAttribute('data-theme');
-            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
-            body.setAttribute('data-theme', newTheme);
-            localStorage.setItem('theme', newTheme);
-            themeToggle.textContent = newTheme === 'dark' ? '☀️' : '🌙';
-        });
-
         // Spec data
         const specs = [
             { id: 'DS000', file: 'DS000-vision', title: 'Vision', group: 'Core' },
             { id: 'DS001', file: 'DS001-coding-style', title: 'Coding Style', group: 'Core' },
             { id: 'DS002', file: 'DS002-workspace-and-repository-model', title: 'Workspace & Repository Model', group: 'Core' },
-            { id: 'DS003', file: 'DS003-agent-manifest-and-registry', title: 'Agent Manifest & Registry', group: 'Core' },
-            { id: 'DS004', file: 'DS004-runtime-execution-and-isolation', title: 'Runtime Execution & Isolation', group: 'Runtime' },
-            { id: 'DS005', file: 'DS005-routing-and-web-surfaces', title: 'Routing & Web Surfaces', group: 'Interfaces' },
-            { id: 'DS006', file: 'DS006-auth-capabilities-and-secure-wire', title: 'Auth, Capabilities & Secure Wire', group: 'Interfaces' },
-            { id: 'DS007', file: 'DS007-dependency-caches-and-startup-readiness', title: 'Dependency Caches & Startup Readiness', group: 'Runtime' },
-            { id: 'DS008', file: 'DS008-secrets-skills-and-llm-assistance', title: 'Secrets, Skills & LLM Assistance', group: 'Configuration' },
-            { id: 'DS009', file: 'DS009-observability', title: 'Observability', group: 'Operations' },
-            { id: 'DS010', file: 'DS010-testing-and-verification', title: 'Testing & Verification', group: 'Operations' },
-            { id: 'DS011', file: 'DS011-security-model', title: 'Security Model', group: 'Interfaces' },
-            { id: 'DS012', file: 'DS012-local-llm-agent-architecture-catalog', title: 'Local LLM Agent Catalog', group: 'Configuration' },
-            { id: 'DS013', file: 'DS013-per-agent-identity-and-request-signed-jwts', title: 'Per-Agent Identity & JWTs', group: 'Interfaces' },
-            { id: 'DS014', file: 'DS014-router-access-control-http-route-access-and-mcp-policy', title: 'Router Access Control', group: 'Interfaces' },
-            { id: 'DS015', file: 'DS015-startup-config-providers', title: 'Startup Config Providers', group: 'Runtime' }
+            { id: 'DS003', file: 'DS003-main-behavior', title: 'Main Behavior', group: 'Core' },
+            { id: 'DS004', file: 'DS004-agent-manifest-and-registry', title: 'Agent Manifest & Registry', group: 'Core' },
+            { id: 'DS005', file: 'DS005-runtime-execution-and-isolation', title: 'Runtime Execution & Isolation', group: 'Runtime' },
+            { id: 'DS006', file: 'DS006-routing-and-web-surfaces', title: 'Routing & Web Surfaces', group: 'Interfaces' },
+            { id: 'DS007', file: 'DS007-auth-capabilities-and-secure-wire', title: 'Auth, Capabilities & Secure Wire', group: 'Interfaces' },
+            { id: 'DS008', file: 'DS008-dependency-caches-and-startup-readiness', title: 'Dependency Caches & Startup Readiness', group: 'Runtime' },
+            { id: 'DS009', file: 'DS009-secrets-skills-and-llm-assistance', title: 'Secrets, Skills & LLM Assistance', group: 'Configuration' },
+            { id: 'DS010', file: 'DS010-observability', title: 'Observability', group: 'Operations' },
+            { id: 'DS011', file: 'DS011-testing-and-verification', title: 'Testing & Verification', group: 'Operations' },
+            { id: 'DS012', file: 'DS012-security-model', title: 'Security Model', group: 'Interfaces' },
+            { id: 'DS013', file: 'DS013-local-llm-agent-architecture-catalog', title: 'Local LLM Agent Catalog', group: 'Configuration' },
+            { id: 'DS014', file: 'DS014-per-agent-identity-and-request-signed-jwts', title: 'Per-Agent Identity & JWTs', group: 'Interfaces' },
+            { id: 'DS015', file: 'DS015-router-access-control-http-route-access-and-mcp-policy', title: 'Router Access Control', group: 'Interfaces' },
+            { id: 'DS016', file: 'DS016-startup-config-providers', title: 'Startup Config Providers', group: 'Runtime' }
         ];
 
         const content = document.getElementById('specContent');

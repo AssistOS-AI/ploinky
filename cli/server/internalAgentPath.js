@@ -1,5 +1,5 @@
 /**
- * Shared detector for router-owned `__agent` control-plane paths (DS014).
+ * Shared detector for router-owned `__agent` control-plane paths (DS015).
  *
  * An agent's `__agent/*` routes (e.g. the public-route-share authorizer) are
  * reached ONLY by the router itself, over a direct loopback call carrying a

@@ -17,7 +17,7 @@ test('operator documentation exposes log commands for Router and agents', () => 
 });
 
 test('observability specs assign Router and Policy files to Ploinky and maintenance scheduling to workspaceMonitorAgent', () => {
-    const observability = readRepoFile('docs/specs/DS009-observability.md');
+    const observability = readRepoFile('docs/specs/DS010-observability.md');
     assert.match(observability, /Ploinky durably appends Router output/);
     assert.match(observability, /workspaceMonitorAgent.*schedules daily UTC maintenance/);
     assert.match(observability, /Retention defaults to 7 days/);

@@ -6,7 +6,7 @@ import { readAgentSecret, expectedAudienceForSelf } from './invocationAuth.mjs';
 
 /**
  * agentAssertion.mjs — agent-side signer for the Agent Assertion JWT
- * (source agent → router, DS013 / Phase 3).
+ * (source agent → router, DS014 / Phase 3).
  *
  * A source agent proves its own identity to the router by signing a short-lived
  * assertion with its OWN `PLOINKY_AGENT_SECRET`. The assertion binds the
@@ -33,7 +33,7 @@ function signAgentAssertionWithRch({ secret, self, method, path, targetAgent, to
     if (!self) {
         throw new Error('agentAssertion: PLOINKY_AGENT_ID not configured');
     }
-    // The assertion MUST bind the addressed target (DS013). A target-less
+    // The assertion MUST bind the addressed target (DS014). A target-less
     // assertion is not cryptographically tied to the agent it is sent to.
     const target = String(targetAgent ?? '').trim();
     if (!target) {
@@ -111,7 +111,7 @@ export function signAgentHttpAssertion({
 
 /**
  * Sign a box-private Router request. This capability deliberately does not
- * reuse the stable DS013 PLOINKY_AGENT_SECRET: disable/re-enable and instance
+ * reuse the stable DS014 PLOINKY_AGENT_SECRET: disable/re-enable and instance
  * replacement rotate PLOINKY_AGENT_PRIVATE_SECRET, while the bound instance
  * and enable generation let the Router compare the assertion with its captured
  * current registry before dialing a private service.

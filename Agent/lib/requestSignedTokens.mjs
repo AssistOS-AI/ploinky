@@ -2,7 +2,7 @@ import { verifyJws } from './jwtVerify.mjs';
 
 /**
  * requestSignedTokens.mjs — verifiers for the request-bound JWT families
- * (DS013): Router Request (router → target agent) and Agent Assertion (source
+ * (DS014): Router Request (router → target agent) and Agent Assertion (source
  * agent → router).
  *
  * These live under `Agent/lib/` (mounted into every agent container) rather than

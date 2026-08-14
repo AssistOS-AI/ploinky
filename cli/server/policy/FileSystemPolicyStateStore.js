@@ -15,7 +15,7 @@ import {
 import { PolicyStateStore } from './PolicyStateStore.js';
 
 /**
- * FileSystemPolicyStateStore — the default `PolicyStateStore` adapter (DS014).
+ * FileSystemPolicyStateStore — the default `PolicyStateStore` adapter (DS015).
  * Persists the policy document as `policy-state.json` under the workspace
  * `.ploinky/data/router-security/`. Version token is `mtimeMs:size` (a cheap
  * `statSync`); writes are durable and atomic (fsynced temp → rename → directory fsync).

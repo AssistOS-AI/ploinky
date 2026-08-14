@@ -201,7 +201,7 @@ test('an anonymous request is rejected with 401 and no key is minted', async (t)
     assert.equal(result.body.subjectId, undefined);
 });
 
-test('a guest session is rejected — guests do not satisfy authenticated access (DS005)', async (t) => {
+test('a guest session is rejected — guests do not satisfy authenticated access (DS006)', async (t) => {
     const { route } = await loadModules(t);
 
     // A guest carries roles:['guest'] → Caller.fromRequest classifies kind='guest',

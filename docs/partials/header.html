@@ -5,11 +5,28 @@
       <span class="brand__title">Ploinky Documentation</span>
     </a>
     <nav class="site-nav" aria-label="Primary">
-      <a href="index.html" data-page="index">Overview</a>
-      <a href="runtime.html" data-page="runtime">Runtime</a>
-      <a href="interfaces.html" data-page="interfaces">Interfaces</a>
-      <a href="operations.html" data-page="operations">Operations</a>
-      <a href="specsLoader.html?spec=matrix.md" data-page="specs">Specs</a>
+      <div class="nav-menu">
+        <button class="nav-menu__trigger" type="button" aria-expanded="false" aria-controls="guides-menu">Guides</button>
+        <div class="nav-menu__panel" id="guides-menu">
+          <a href="index.html" data-page="index">Overview</a>
+          <a href="cli-reference.html" data-page="cli-reference">CLI Reference</a>
+          <a href="architecture.html" data-page="architecture">Architecture</a>
+          <a href="runtime.html" data-page="runtime">Runtime</a>
+          <a href="interfaces.html" data-page="interfaces">Interfaces</a>
+          <a href="operations.html" data-page="operations">Operations</a>
+          <a href="webchat.html" data-page="webchat">WebChat</a>
+        </div>
+      </div>
+      <div class="nav-menu">
+        <button class="nav-menu__trigger" type="button" aria-expanded="false" aria-controls="specifications-menu">Specifications</button>
+        <div class="nav-menu__panel" id="specifications-menu">
+          <a href="specsLoader.html?spec=matrix.md" data-page="specs">Specifications</a>
+          <a href="specs.html" data-page="spec-browser">Specification Browser</a>
+          <a href="spec-agent.html" data-page="spec-agent">Agent Spec</a>
+          <a href="spec-services.html" data-page="spec-services">Services</a>
+        </div>
+      </div>
     </nav>
+    <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle color theme">🌙</button>
   </div>
 </header>
