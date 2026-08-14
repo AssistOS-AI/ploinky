@@ -220,6 +220,27 @@ function hasPersistedGenerationEvidence(paths) {
     return false;
 }
 
+function discardEmptyDestroyTombstone(paths, present) {
+    if (present.some(Boolean)) return false;
+    const selector = readSelector(paths);
+    if (!selector
+        || selector.state !== 'inactive'
+        || selector.reason !== 'cli-workspace-destroy'
+        || selector.generation
+        || selector.previousGeneration) return false;
+    if (fs.existsSync(paths.topologyCurrentFile)) return false;
+    for (const directory of [paths.generationsDir, paths.topologyGenerationsDir]) {
+        try {
+            if (fs.readdirSync(directory).length > 0) return false;
+        } catch (error) {
+            if (error?.code !== 'ENOENT') return false;
+        }
+    }
+    fs.unlinkSync(paths.activeSelectorFile);
+    fsyncDirectory(path.dirname(paths.activeSelectorFile));
+    return true;
+}
+
 export function initializeFreshEdgeRoutingSources(options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const release = acquireApplyLock(paths, options);
@@ -230,7 +251,14 @@ export function initializeFreshEdgeRoutingSources(options = {}) {
             ['policy-state.json', paths.policyFile, EMPTY_POLICY_BYTES, 0o600],
             ['edge desired state', paths.desiredFile, EMPTY_DESIRED_BYTES, 0o600],
         ];
-        const present = sources.map(([, file]) => fs.existsSync(file));
+        let present = sources.map(([, file]) => fs.existsSync(file));
+        // `destroy` intentionally leaves an inactive selector while sources
+        // exist, but an interrupted/manual empty-workspace cleanup can leave
+        // only that selector behind. Treat this exact destroy tombstone as an
+        // empty baseline instead of reporting an unrecoverable partial state.
+        if (discardEmptyDestroyTombstone(paths, present)) {
+            present = sources.map(([, file]) => fs.existsSync(file));
+        }
         if (present.every(Boolean)) return Object.freeze({ initialized: false, paths });
         if (present.some(Boolean) || hasPersistedGenerationEvidence(paths)) {
             const missing = sources

@@ -95,6 +95,11 @@ function readExisting(target, fsApi, { normalizeMode = false } = {}) {
 function ensurePloinkyDirectory(root, fsApi) {
     const target = path.join(root, PLOINKY_DIRECTORY);
     try {
+        assertOwnedDirectory(target, fsApi);
+        // The Box mounts this directory into multiple confined producers. A
+        // pre-existing host directory may have inherited 0775 from umask;
+        // normalize it before any producer validates or writes beneath it.
+        fsApi.chmodSync(target, 0o700);
         return { path: target, fingerprint: assertOwnedDirectory(target, fsApi) };
     } catch (error) {
         if (error.code !== 'ENOENT') throw error;
@@ -106,6 +111,7 @@ function ensurePloinkyDirectory(root, fsApi) {
             throw initializerError(`Unable to create workspace state directory: ${target}`, error);
         }
     }
+    fsApi.chmodSync(target, 0o700);
     return { path: target, fingerprint: assertOwnedDirectory(target, fsApi) };
 }
 

@@ -38,6 +38,13 @@ test('empty workspace gets one private random key that remains byte-stable', (t)
     assert.equal(fs.statSync(first.path).mode & 0o777, 0o600);
 });
 
+test('existing permissive .ploinky directory is normalized to private mode', (t) => {
+    const root = fixture(t);
+    fs.mkdirSync(path.join(root, '.ploinky'), { mode: 0o775 });
+    initializeWorkspaceMasterKey({ workspaceRoot: root });
+    assert.equal(fs.statSync(path.join(root, '.ploinky')).mode & 0o777, 0o700);
+});
+
 test('current resolveMasterKey succeeds without a host-provided key', (t) => {
     const root = fixture(t);
     initializeWorkspaceMasterKey({ workspaceRoot: root });

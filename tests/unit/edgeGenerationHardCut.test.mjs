@@ -135,6 +135,26 @@ test('fresh edge initialization creates unversioned empty desired state exactly 
     assert.equal(initializeFreshEdgeRoutingSources({ workspaceRoot: workspace }).initialized, false);
 });
 
+test('fresh initialization removes only an empty destroy tombstone', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-destroy-tombstone-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const edgeDir = path.join(workspace, '.ploinky', 'data', 'edge-routing');
+    fs.mkdirSync(edgeDir, { recursive: true });
+    const body = {
+        schemaVersion: 1,
+        state: 'inactive',
+        previousGeneration: '',
+        reason: 'cli-workspace-destroy',
+        activationId: crypto.randomUUID(),
+        changedAt: new Date().toISOString(),
+    };
+    body.selectorDigest = compiledDigest(body);
+    fs.writeFileSync(path.join(edgeDir, 'active.json'), JSON.stringify(body, null, 2));
+    const initialized = initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    assert.equal(initialized.initialized, true);
+    assert.equal(fs.existsSync(path.join(edgeDir, 'active.json')), false);
+});
+
 test('active topology publishes routes and readiness without service locators or protocol versions', (t) => {
     const fixture = createFixture(t);
     const applied = applyEdgeRoutingGeneration({
