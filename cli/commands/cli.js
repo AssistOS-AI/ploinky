@@ -325,11 +325,6 @@ async function handleCommand(args) {
                 break;
             }
 
-            if (String(options[0] || '').toLowerCase() === 'agents-all') {
-                disableAllAgents();
-                break;
-            }
-
             if (String(options[0] || '').toLowerCase() === 'repo' || String(options[0] || '').toLowerCase() === 'repository') {
                 const parsed = parseRepoToggleArgs(options);
                 disableRepo(parsed.repoName);
@@ -405,11 +400,6 @@ async function handleCommand(args) {
             break;
         }
         // 'route' and 'probe' commands removed (replaced by start/status and client commands)
-        case 'webchat': {
-            if ((options || []).filter(Boolean).length) throw new Error('Usage: webchat');
-            printComponentAccess('webchat');
-            break;
-        }
         case 'sso':
             await handleSsoCommand(options);
             break;

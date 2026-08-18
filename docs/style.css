@@ -786,3 +786,11 @@ footer a:hover {
   background: var(--accent-green);
   color: white;
 }
+
+/* Keep the CLI reference table of contents available independently of page scroll. */
+body[data-page="cli-reference"] .sidebar {
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}

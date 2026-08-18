@@ -226,7 +226,7 @@ export function completer(line) {
                 if (subcommand === 'sandbox') {
                     completions = [];
                 } else {
-                    completions = [...new Set(['sandbox', 'agents-all', ...getAgentNames()])];
+                    completions = [...new Set(['sandbox', ...getAgentNames()])];
                 }
             } else if (command === 'enable' && subcommand === 'sandbox') {
                 completions = [];
