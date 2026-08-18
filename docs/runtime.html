@@ -1,145 +1,101 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ploinky Documentation</title>
-  <link rel="stylesheet" href="styles.css" />
-  <script type="module">
-      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-      mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
-  </script>
-  <script src="partials-loader.js" defer></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ploinky Documentation</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: { primaryColor: '#e8f5e9', primaryBorderColor: '#2e7d32', secondaryColor: '#e3f2fd', tertiaryColor: '#fff3e0', lineColor: '#546e7a' } });
+    </script>
 </head>
 <body data-page="runtime">
-  <div data-include="partials/header.html"></div>
-  <main class="doc-main">
-    <div class="doc-shell">
-      <nav class="breadcrumbs" aria-label="Breadcrumb">
-        <a href="index.html">Home</a>
-        <span>/</span>
-        <span>Runtime</span>
-      </nav>
+    <div data-include="partials/header.html"></div>
+    <main>
+        <div class="container">
+            <div class="doc-layout">
+                <aside class="sidebar">
+                    <h3>Runtime</h3>
+                    <ul>
+                        <li><a href="#workspace">Workspace state</a></li>
+                        <li><a href="#selection">Runtime selection</a></li>
+                        <li><a href="#startup">Startup and readiness</a></li>
+                        <li><a href="#isolation">Isolation and mounts</a></li>
+                    </ul>
+                </aside>
+                <div class="content-wrapper">
+                    <div class="doc-section">
+                        <h1>Ploinky Runtime</h1>
+                        <p class="subtitle">How Ploinky prepares, starts, and supervises one agent runtime without exposing its private services.</p>
+                    </div>
 
-      <article class="chapter">
-        <header class="chapter-header">
-          <p class="eyebrow">Execution Model</p>
-          <h1>Ploinky Documentation</h1>
-          <p>The runtime layer is responsible for workspace discovery, repository-backed agent discovery, per-agent workspace state, execution-backend selection, and the wave-based startup sequence that feeds the router’s route table.</p>
-        </header>
+                    <div class="doc-section" id="workspace">
+                        <h2>Workspace state</h2>
+                        <p>Each workspace owns its enabled-agent registry, managed repositories, generated dependency caches, and persistent agent homes. These records let lifecycle commands identify one exact runtime instead of guessing from a name or a live container.</p>
+                        <table class="command-table">
+                            <thead><tr><th>Workspace location</th><th>Runtime role</th></tr></thead>
+                            <tbody>
+                                <tr><td><code>.ploinky/agents.json</code></td><td>Stores enabled agents, aliases, selected runtime details, and workspace configuration.</td></tr>
+                                <tr><td><code>.ploinky/repos/</code></td><td>Stores managed repositories from which manifests and agent source are resolved.</td></tr>
+                                <tr><td><code>.data/&lt;agent-or-alias&gt;/</code></td><td>Provides the persistent per-instance home used for agent-owned configuration and state.</td></tr>
+                                <tr><td><code>.ploinky/deps/</code></td><td>Stores regenerated global and per-agent dependency caches keyed by runtime inputs.</td></tr>
+                                <tr><td><code>.ploinky/logs/</code></td><td>Stores Router, Watchdog, and command logs for workspace observation.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
 
-        <section class="chapter-section">
-          <h2>Workspace State</h2>
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Path</th>
-                <th>Purpose</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td><code>.ploinky/agents.json</code></td>
-                <td>Enabled-agent registry plus workspace configuration under the reserved <code>_config</code> key.</td>
-              </tr>
-              <tr>
-                <td><code>.ploinky/repos/</code></td>
-                <td>Cloned agent and skills repositories managed by <code>install</code>/<code>add</code> and <code>uninstall</code>/<code>remove</code>.</td>
-              </tr>
-              <tr>
-                <td><code>.data/&lt;agent-or-alias&gt;/</code></td>
-                <td>Persistent host-side agent home mounted at <code>/root</code> for enabled-agent instances. Destroy preserves this directory.</td>
-              </tr>
-              <tr>
-                <td><code>.ploinky/code/</code> and <code>.ploinky/skills/</code></td>
-                <td>Symlink layer exposing each enabled agent’s source tree and optional skills folder.</td>
-              </tr>
-              <tr>
-                <td><code>.ploinky/deps/</code></td>
-                <td>Runtime-keyed global and per-agent Node dependency caches. Destroy clears this regenerated cache.</td>
-              </tr>
-              <tr>
-                <td><code>.ploinky/keys/</code></td>
-                <td>Router and agent Ed25519 key material for secure delegated calls.</td>
-              </tr>
-              <tr>
-                <td><code>.ploinky/logs/</code></td>
-                <td>Router, watchdog, and command logs used by status surfaces and debugging workflows.</td>
-              </tr>
-            </tbody>
-          </table>
-        </section>
+                    <div class="doc-section" id="selection">
+                        <h2>Runtime selection</h2>
+                        <p>Enabling an agent resolves its manifest, validates an optional alias, selects an authentication mode, and records the resulting instance before the route can become active. An alias is both the route key and runtime identity, allowing more than one instance of the same agent in a workspace.</p>
+                        <figure class="diagram">
+                            <pre class="mermaid">flowchart LR
+    M[Agent manifest] --> E[Enable record]
+    E --> R{Placement policy}
+    R -->|Default| C[OCI runtime]
+    R -->|lite-sandbox on Linux| B[Bubblewrap]
+    R -->|lite-sandbox on macOS| S[Seatbelt]
+    C --> H[Persistent agent home]
+    B --> H
+    S --> H</pre>
+                            <figcaption><em>The manifest and selected policy determine the runtime while every instance retains its own persistent home.</em></figcaption>
+                        </figure>
+                        <p>Outside a Ploinky Box, the container path detects Podman before Docker. On Linux, <code>lite-sandbox: true</code> selects Bubblewrap; on macOS it selects Seatbelt. Inside a marked Box, all managed agent, helper, probe, and install-container work uses nested rootless Podman.</p>
+                        <div class="alert alert-info"><strong>Run modes:</strong> <code>isolated</code> uses the agent's persistent home as its working area. <code>global</code> uses the workspace root, and <code>devel</code> uses the selected repository checkout. All three retain the per-instance home for agent configuration.</div>
+                    </div>
 
-        <section class="chapter-section">
-          <h2>Agent Enablement and Run Modes</h2>
-          <p><code>enable agent</code> resolves a manifest through repository discovery, enforces alias uniqueness, chooses an auth mode, stores a normalized record in <code>.ploinky/agents.json</code>, and starts the selected runtime before publishing its route. Startup verification follows the recorded backend: Docker and Podman use container liveness, while Bubblewrap and Seatbelt use the tracked sandbox process. If the static agent passed to <code>start</code> is not already enabled, the CLI enables it automatically before booting the workspace.</p>
-          <div class="grid-two">
-            <div class="mini-panel">
-              <h3><code>isolated</code></h3>
-              <p>The default mode uses <code>.data/&lt;agent-or-alias&gt;/</code> as both the per-instance working directory and the persistent home mounted at <code>/root</code>.</p>
+                    <div class="doc-section" id="startup">
+                        <h2>Startup and readiness</h2>
+                        <p>Ploinky resolves the recursive manifest dependency graph before it starts agent processes. It prepares the matching dependency cache, starts each agent in dependency order, and admits its route only after the declared readiness checks succeed.</p>
+                        <figure class="diagram">
+                            <pre class="mermaid">flowchart LR
+    A[Resolve manifests] --> B[Prepare dependencies]
+    B --> C[Start selected runtime]
+    C --> D[Run readiness probe]
+    D -->|Healthy| E[Activate route]
+    D -->|Unhealthy| F[Keep route inactive]</pre>
+                            <figcaption><em>A route becomes reachable only after the selected runtime passes its own readiness contract.</em></figcaption>
+                        </figure>
+                        <p>The Watchdog observes the same recorded runtime identity after startup. A failed health check removes the stale route and schedules recovery against a fresh exact-generation runtime; a deliberately disabled agent is removed from the registry before its runtime is torn down, so it is not recreated by supervision.</p>
+                    </div>
+
+                    <div class="doc-section" id="isolation">
+                        <h2>Isolation and mounts</h2>
+                        <p>Runtime preparation mounts only the agent code, selected project path, declared volumes, dependency cache, and persistent home required by the manifest and profile. Profiles choose mount modes; development defaults code and skills mounts to read-write, while QA and production default them to read-only.</p>
+                        <p>Ploinky resolves agent environment entries from the selected manifest, profile, workspace variables, and approved startup providers. Reusable secrets remain outside the registry and logs. Fresh credentials used for a private interaction are generation-bound and delivered only through the confined channel.</p>
+                        <p>The outer Box exposes only the Router loopback TCP surface and LiveKit UDP. Agent ports, including the default MCP port <code>7000</code>, remain private to the Box. Reachability to the private Router does not grant request authority: the Router still verifies the caller, active generation, route policy, and request binding.</p>
+                    </div>
+                </div>
             </div>
-            <div class="mini-panel">
-              <h3><code>global</code> and <code>devel</code></h3>
-              <p><code>global</code> points the agent at the workspace root. <code>devel</code> points the agent at a repository checkout under <code>.ploinky/repos/&lt;repo&gt;/</code>. Both modes still mount <code>.data/&lt;agent-or-alias&gt;/</code> at <code>/root</code> for CLI and tool configuration.</p>
-            </div>
-          </div>
-          <p>Aliases become route keys and container names. This is how Ploinky supports multiple instances of the same agent in one workspace without overwriting the registry entry for the canonical instance.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Runtime Backends and Mount Policy</h2>
-          <p>Outside a marked Ploinky box, the container path is the default backend and auto-detects <code>podman</code> before <code>docker</code>. Agents with <code>lite-sandbox: true</code> run through the host sandbox backend when available: <code>bwrap</code> on Linux and <code>seatbelt</code> on macOS. Ploinky does not silently fall back from a requested host sandbox to containers; use <code>ploinky sandbox disable</code> when podman/docker testing is desired. Inside a marked box, every managed agent, helper, sidecar, probe, and install-container path uses nested Podman; retained sandbox settings, Docker, bwrap, and Seatbelt are not fallbacks.</p>
-          <p>Linux <code>bwrap</code> uses the same persistent-home contract as the container backend: <code>.data/&lt;agent-or-alias&gt;/</code> is bound read-write at <code>/root</code> and the process receives <code>HOME=/root</code>. In isolated mode that bind is also the project and <code>WORKSPACE_PATH</code>. In global and development modes, the workspace or repository checkout is mounted separately, so provider login and CLI configuration remain under the per-instance home while project operations retain their selected working tree.</p>
-          <p>Before mounting <code>/Agent</code> read-only, the Linux backend stages the shared Agent runtime under <code>.ploinky/deps/bwrap-runtime/</code> and creates an empty nested <code>node_modules</code> mount point there. The prepared dependency cache can then be mounted read-only at both <code>/code/node_modules</code> and <code>/Agent/node_modules</code> without Bubblewrap attempting to create a directory inside an already read-only mount. The staging copy is regenerated runtime state and does not modify the installed Ploinky source tree.</p>
-          <p>Bubblewrap also mounts the Node.js distribution that launched Ploinky read-only at <code>/opt/ploinky-node</code> and places its <code>bin</code> directory first in <code>PATH</code>. AgentServer, manifest install hooks, and interactive commands therefore use the same Node major and npm toolchain as the prepared sandbox dependency cache instead of accidentally selecting an older or incomplete system installation.</p>
-          <p>When stopping or destroying multiple host-sandboxed agents, Ploinky sends the graceful signal to all selected sandbox process groups before waiting. It then uses one shared deadline and force-kills only the sandbox processes that are still alive, so one stuck agent does not delay signal delivery to the rest of the workspace.</p>
-          <p>Disable removes registry entries before runtime teardown so the watchdog cannot recreate an intentionally stopped agent. Ploinky passes an in-memory snapshot of the removed records to teardown, preserving the backend identity needed to stop a Bubblewrap or Seatbelt PID instead of accidentally looking for an OCI container with the same instance key.</p>
-          <p>Runtime status uses that same recorded backend. Both <code>ploinky status</code> and Marketplace enumerate enabled records, label each runtime as container, Bubblewrap, or Seatbelt, and check the appropriate live primitive. Stopped enabled agents remain visible, while a live host sandbox is recognized through its PID without requiring an OCI container.</p>
-          <p>WebChat launches <code>ploinky cli</code> as a non-TTY one-shot wrapper around the selected backend's interactive process. The backend exit status propagates through the wrapper, and the wrapper exits as soon as the inner container or host-sandbox CLI ends. This gives WebChat an accurate close signal and prevents an idle launcher from remaining registered after its agent process has disappeared.</p>
-          <p>Profile handling is merged from manifest <code>profiles.default</code> plus the active profile from <code>.ploinky/profile</code>. In <code>dev</code>, code and skills mounts default to read-write. In <code>qa</code> and <code>prod</code>, they default to read-only unless the profile explicitly overrides them.</p>
-          <p>The managed outer Box is a clean hard cut. Every managed outer <code>ploinky-box</code> has exactly two engine publications: <code>127.0.0.1:&lt;selected-router-host-port&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. The wrapper constructs both mappings directly; profiles, manifests, dependency graphs, readiness, labels, and persisted state cannot add a physical-host publication. Outer <code>--port</code> selects only the loopback host side of fixed inner Router port <code>8080</code>; <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> are rejected. Incompatible Boxes must be recreated explicitly by an operator.</p>
-          <p>A compatible box is reused or started only when its normalized creation configuration matches exactly. It runs with an engine-provided init process so PID 1 reaps orphaned in-box children. Port, image, init, mount, device, security, or other creation drift fails before pull, stop, rename, removal, or creation. The operator must run <code>ploinky destroy</code> explicitly before recreation; no automatic replacement, backup rename, or rollback path exists.</p>
-          <p>An agent may declare browser targets with the existing <code>httpServices</code> entries and optional <code>httpServices[].port</code>. An omitted port selects the primary target; each distinct explicit TCP port gets one private inner mapping. No secondary-target field or special proxy exists. Inner targets remain private to the box network and never become outer publications.</p>
-          <p>The generic Router proxy keeps connection establishment bounded at 5 seconds, the complete ingress-to-HTTP-response-header interval bounded at 455 seconds, and WebSocket upgrade handshakes bounded separately at 15 seconds. The absolute HTTP deadline covers bounded relay setup, target connection, a 60-second application queue, three 120-second application attempts, two maximum-jitter default retry delays, and forwarding margin; policies configured beyond those defaults or work that ignores cancellation may be truncated. These finite deadlines do not weaken route authority, admission, body, idle, or concurrency limits.</p>
-          <p>Managed bridge launches use exactly <code>--hosts-file=none --add-host host.containers.internal:host-gateway</code>. That mapping is fixed name/address transport configuration, not a capability and not authorization. By contrast, manifest <code>network.mode: host</code> requires a Ploinky-granted capability for one exact effective instance and current enable generation. Even that capability grants only network placement; localhost or source-address provenance never authorizes a request.</p>
-          <p>
-            Before a managed-network launch can receive Router authority, Ploinky prepares the agent image reference locally, pulling a missing image before the managed-network transaction and failing before network mutation if preparation cannot complete. It then resolves that local reference to one immutable target image ID and reads only its bounded <code>Config.User</code> projection.
-            Empty, symbolic, root, and numeric image identities are admitted; the image does not need a Ploinky-specific user declaration.
-            The confined authority helper runs a separately resolved, pinned Node image as fixed numeric non-root user <code>65534:65534</code>; it never executes the target image or its entrypoint. Its creation and cleanup use a fixed bounded container-inspection projection, and the started helper proves zero effective/bounding capabilities plus active <code>NoNewPrivs</code> from <code>/proc/self/status</code> before either Router request. When the target image declares an exact numeric, non-root <code>UID:GID</code>, the real nested Podman container receives the corresponding <code>--userns=keep-id:uid=&lt;UID&gt;,gid=&lt;GID&gt;</code> mapping; other identities use the image default without a Ploinky user-namespace override.
-            Creation, adoption, and final inspection must agree on the immutable target image, image user, and optional user-namespace annotation.
-          </p>
-          <p>The helper's Router observations use a private, TTL-bounded registration that binds a random nonce to the exact selected preparation-generation lease. Only <code>GET /health</code> carrying that live nonce may classify the exact selected inactive snapshot. A different generation, method, path, expired or unknown nonce, and every ordinary request during inactive preparation continue to fail closed; this observation path does not activate or widen normal routing. Later blocking waves remain bound to the same prepared generation after earlier waves record runtime-only container IDs and route locators, while any lifecycle owner, policy, desired-state, or manifest mutation invalidates the lease.</p>
-          <p>Every managed process is also bound physically to that tuple. Container labels persist the exact <code>instanceId</code> and <code>enableGeneration</code>; bwrap and Seatbelt use a schema-2 PID/start-identity record with the same fields. Reuse and capability checks compare those immutable launch records to the selected generation, and identity derivation failure aborts startup instead of launching without a private assertion secret.</p>
-          <p>Inside a marked Box, private Router port <code>8081</code> binds the Box namespace wildcard so nested rootless Podman can reach it through <code>host-gateway</code>. It is never an outer publication, and source-address reachability grants nothing: every private request still requires an exact generation-bound, replay-protected assertion that binds its caller, method, path, and body.</p>
-          <p>Rootless nested Podman may present an exact NAT hairpin during the fixed <code>box-public-loopback</code> authority probe, with equal non-loopback local and remote addresses. Ploinky accepts that equality only for the raw unmanaged interface class in this topology. Managed, host-network, and loopback cells still reject it, and all nonce, generation, Host, and socket-evidence checks remain mandatory.</p>
-          <div class="callout callout--neutral">
-            <h3>Sandboxed Job Delegation vs <code>lite-sandbox</code></h3>
-            <p>The Basic catalog <code>bwrap-runner</code> agent is a separate, optional mechanism from <code>lite-sandbox: true</code>. <code>lite-sandbox: true</code> selects a host sandbox backend (Linux <code>bwrap</code> or macOS Seatbelt) for the entire agent process. <code>bwrap-runner</code> is a normal containerized agent that exposes an MCP tool <code>sandbox_exec</code>, so other agents can delegate a single bounded command to a nested inner bubblewrap sandbox without changing how their own runtime is selected. v1 does not transparently replace host <code>bwrap</code>: <code>getRuntimeForAgent()</code> still dispatches <code>lite-sandbox: true</code> agents to host bwrap on Linux or Seatbelt on macOS.</p>
-            <p>Nested bubblewrap still depends on host and outer-OCI runtime policy. The runner image ships <code>bwrap</code> and runs a startup nested-bwrap smoke command, but it cannot bake host sysctls such as <code>kernel.unprivileged_userns_clone</code> into the image. If the outer container runtime blocks <code>CLONE_NEWUSER</code>, readiness fails with an actionable error and the operator must adjust host or runtime policy.</p>
-          </div>
-          <p>A required environment entry may omit <code>default</code> or <code>value</code> when no safe deployment-independent value exists. It then becomes an explicit operator/provider prerequisite: profile readiness and launch resolve encrypted vars, startup-provider output, process environment, and <code>.env</code>, and fail with the exact missing name. Ploinky never infers URLs, hostnames, public IPs, realms, ports, or Origins. Safe portable defaults and generated-secret behavior remain unchanged.</p>
-          <div class="callout callout--warm">
-            <p>Manifest volumes resolve relative host paths against the workspace root and honor absolute host paths as declared. A byte-identical manifest and Ploinky bind is emitted once, while any same-target source or option conflict fails before container creation. Inside a Box, managed nested Podman launches use <code>--image-volume=ignore</code>, so image-declared OCI volumes cannot create anonymous mounts outside the reviewed Ploinky bind set; exact final inspection still rejects every unexpected mount. Runtime-resource persistent storage should prefer <code>.ploinky/data/</code>, while agent-owned home files and generated startup inputs should prefer <code>.data/&lt;agent-or-alias&gt;/</code>. Container destinations should use semantic paths such as <code>/data</code>, <code>/root</code>, or <code>/working-data/generated</code> unless an upstream image requires a specific path. Runtime resource planning can also create persistent storage directories under <code>.ploinky/data/</code> and template environment values from workspace roots, storage paths, secrets, and variables.</p>
-          </div>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Dependency Waves and Readiness Gating</h2>
-          <p>Ploinky first prepares the recursive manifest repository graph without enabling processes. It then captures an early inactive targetless generation for every retained or newly assigned graph identity before the fatal static preinstall hook and startup config providers run. After providers finish, Ploinky aborts the early lease, reloads the registry, re-evaluates retained predecessor runtime hashes, rotates any newly stale tuple, and captures the final inactive targetless generation. Only that final lease may authorize targets. Runtime launch preserves its exact identities; each blocking wave records resolved private targets through coordinated apply and passes readiness before the next wave may boot. Additional already-enabled agents outside the graph start after the blocking waves. Detached no-wait helpers are spawned last; the main command does not wait for their cache preparation, runtime startup, or readiness after spawning them. Sequenced helpers wait outside the shared mutation lease for an atomically published predecessor terminal state. The timeout applies to the one predecessor currently performing active work; a waiting helper follows the exact bounded status chain instead of consuming its budget from the common spawn time. Cycles, malformed references, a stuck active phase, and a stale terminal handoff fail closed.</p>
-          <p>An explicit <code>readiness.protocol</code> of <code>tcp</code>, <code>mcp</code>, or <code>none</code> wins. Without an explicit protocol, a start-only service with <code>health.readiness.script</code> uses the blocking script probe; another start-only service needs a reachable private target for TCP readiness. Execution modes that include AgentServer default to an MCP handshake. <code>none</code> is only for a true worker with no serving readiness surface.</p>
-          <p>Semantic health continues after startup at a bounded recurring interval. A later socket-owner or service-semantic failure inactivates routing before an exact-identity replacement is attempted; one historical success is never permanent ownership evidence.</p>
-          <p>Dependencies marked <code>no-wait</code> launch in detached workers and publish their resolved routes through a serialized update to <code>.ploinky/routing.json</code>. Foreground startup finalization preserves those freshly persisted routes instead of replacing them with its earlier in-memory snapshot, so dynamically assigned host ports remain reachable after startup completes.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Static Agent Responsibilities</h2>
-          <p>The static agent determines the default browser entry route in the validated immutable route-and-policy authorization generation. Requests for <code>/</code> and <code>/index.html</code> redirect to the static agent's routed <code>/&lt;agent&gt;/index.html</code> path. The router does not read the static agent's files from <code>static.hostPath</code>; it strips the <code>/&lt;agent&gt;</code> mount prefix and proxies the request to the agent server.</p>
-          <p>The agent server must serve its own <code>index.html</code> and related assets. The shared <code>AgentServer</code> serves static files from <code>PLOINKY_CODE_DIR</code> or <code>/code</code> after its built-in endpoints. Agents that use a custom <code>manifest.agent</code> command must implement the same static-file responsibility in that command.</p>
-          <p>Ploinky mounts the current box-owned, non-secret topology before a consumer starts. The snapshot distinguishes the route-and-policy authorization generation, a content-derived configuration generation, and a monotonic readiness/publication generation. Generic core records only declared service selectors and locator projections; it does not hardcode optional product identifiers. Browsers can obtain only one authenticated, <code>no-store</code> locator with configuration/publication ids, never the authorization id or inventory.</p>
-        </section>
-      </article>
-    </div>
-  </main>
-  <div data-include="partials/footer.html"></div>
+        </div>
+    </main>
+    <footer><div class="container"><p>&copy; 2025 Ploinky Project.</p></div></footer>
+    <script>
+        const navLinks = document.querySelectorAll('.sidebar a');
+        const sections = [...document.querySelectorAll('.doc-section[id]')];
+        function updateActiveSection() { let current = sections[0]?.id || ''; sections.forEach(section => { if (section.getBoundingClientRect().top <= 100) current = section.id; }); navLinks.forEach(link => link.classList.toggle('active', link.getAttribute('href') === `#${current}`)); }
+        window.addEventListener('scroll', updateActiveSection); updateActiveSection();
+    </script>
 </body>
 </html>

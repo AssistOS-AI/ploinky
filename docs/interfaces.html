@@ -1,106 +1,69 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ploinky Documentation</title>
-  <link rel="stylesheet" href="styles.css" />
-  <script type="module">
-      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-      mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
-  </script>
-  <script src="partials-loader.js" defer></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ploinky Documentation</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: { primaryColor: '#e8f5e9', primaryBorderColor: '#2e7d32', secondaryColor: '#e3f2fd', tertiaryColor: '#fff3e0', lineColor: '#546e7a' } });
+    </script>
 </head>
 <body data-page="interfaces">
-  <div data-include="partials/header.html"></div>
-  <main class="doc-main">
-    <div class="doc-shell">
-      <nav class="breadcrumbs" aria-label="Breadcrumb">
-        <a href="index.html">Home</a>
-        <span>/</span>
-        <span>Interfaces</span>
-      </nav>
-
-      <article class="chapter">
-        <header class="chapter-header">
-          <p class="eyebrow">Router Surfaces</p>
-          <h1>Ploinky Documentation</h1>
-          <p>The interface layer combines a supervised local router, prefixed browser surfaces, HTTP and MCP proxy routes, and authenticated sessions backed by local credentials or a configured SSO provider agent.</p>
-        </header>
-
-        <section class="chapter-section">
-          <h2>RoutingServer and Watchdog</h2>
-          <p><code>cli/server/RoutingServer.js</code> owns a public/control listener on fixed inner port <code>8080</code>, mapped only to the physical host's selected loopback port, and an un-published box-private listener on <code>8081</code>. Detailed supervisor health is available only through an unmounted Unix socket. Every TCP admin, control, and status handler requires a real local-admin session, and mutations additionally require valid Origin and CSRF checks.</p>
-          <p>Inside a marked Box, private <code>8081</code> binds the Box namespace wildcard so nested rootless Podman can reach it through <code>host.containers.internal:host-gateway</code>. The outer runtime never publishes that port, and transport reachability grants no authority: route policy, caller ACL, and an exact generation-bound private assertion remain mandatory.</p>
-          <p>HTTP, SSE, and WebSocket traffic share one resolver and one validated immutable route-and-policy authorization generation. Listener class and exact Host are resolved before pathname dispatch; dedicated service hosts and agent-root hosts have closed route-surface allowlists. Unknown, malformed, stale, suffix-confusable, and unauthorized host/path combinations fail before any upstream dial.</p>
-          <p>A host selects a declared <code>httpServices</code> service, canonicalized to its <code>externalPrefix</code>. The provider and the effective <code>HttpRouteAccessPolicy</code> independently admit the request. Candidate file edits have no effect until coordinated apply digests and validates the exact bytes, deactivates affected selectors, and atomically activates a new generation.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Browser Surfaces</h2>
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Prefix</th>
-                <th>Current Behavior</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td><code>/webchat</code></td>
-                <td>TTY-backed chat surface with agent-owned session snapshots, lazy history rendering, uploads, and generic selected-agent CLI argument forwarding.</td>
-              </tr>
-              <tr>
-                <td><code>/status</code></td>
-                <td>Read-only JSON snapshot and live NDJSON resource stream backed by the Router-owned permanent metrics collector.</td>
-              </tr>
-            </tbody>
-          </table>
-          <div class="callout"><p>Ploinky does not render a monitoring interface. It owns status plus Router/Policy files and exposes one capability-bound private file operation; <code>workspaceMonitorAgent</code> owns presentation, retention configuration, and maintenance scheduling.</p></div>
-          <p>For <code>/webchat</code>, the router treats <code>agent</code> as the agent selector and preserves ordinary query parameters on the browser session URL. When an explicit agent is selected, those parameters are forwarded to <code>ploinky cli &lt;agent&gt;</code> as single-token <code>--key=value</code> arguments. Router-owned <code>tabId</code> values are not forwarded.</p>
-          <p>Conversation sessions have no WebChat REST API. A compatible CLI publishes <code>current</code>, <code>list</code>, and <code>selected</code> records through <code>__webchatSession</code>; the router validates them and emits <code>session-state</code> events. The browser requests changes with <code>/session</code>, <code>/session new</code>, or <code>/session resume &lt;session-id&gt;</code>.</p>
-          <p>Generic CLI interactions use named <code>interaction-request</code> and <code>interaction-resolved</code> events on the existing WebChat EventSource. The browser answers through authenticated <code>POST /webchat/interaction</code>; the route validates the active subscriber, tab, runtime, request id, and declared option before delivering control input to the CLI TTY.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Authentication Modes</h2>
-          <p><code>/webchat</code> uses the normal router login flow. <code>/status</code> requires a real router-authenticated local-admin session on an exact local-control Host; component tokens, invitations, assertions, media credentials, and localhost provenance do not satisfy that requirement. The monitoring route is read-only. Local auth stores hashed users inside a workspace-managed variable such as <code>PLOINKY_AUTH_&lt;ROUTE&gt;_USERS</code>. SSO stores a configured provider agent in workspace SSO config; provider agents mark their manifests with <code>"ssoProvider": true</code>.</p>
-          <p>The auth bridge normalizes authenticated users onto <code>req.user</code> and tracks session cookies for both local and external sign-in paths. Local sessions are handled by the router’s session store, and SSO sessions inherit user identity and tokens from the provider flow. Logout clears the active cookie, revokes local session identifiers, and instructs only the browser receiving that response to evict its origin cache. Other users keep their cached resources, while Back navigation in the logged-out browser re-enters the router and redirects to the login page.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Marketplace API</h2>
-          <p>The router owns a JSON Marketplace API for first-party agent and repository management. <code>GET /api/marketplace</code> returns the current caller, marketplace permissions, installed and default repositories, remembered repository sources, repository kind, discoverable agents, enabled-agent records, the recorded runtime backend, and each agent's live state. Runtime detection follows the enabled record: Bubblewrap and Seatbelt use their tracked process PIDs, while Docker and Podman use OCI inspection. Browser reads require an authenticated local or SSO user, and non-admin clients use the returned permissions to hide management controls. A running Ploinky agent may read the same state with a request-bound Agent Assertion for <code>marketplace.read</code>.</p>
-          <p><code>POST /api/marketplace</code> accepts repository actions named <code>install_repo</code> and <code>uninstall_repo</code>, plus agent actions named <code>enable_agent</code> and <code>disable_agent</code>. Repository installation clones the checkout and records source metadata. Repository uninstall disables enabled agents from that repository, removes their runtime containers, removes the checkout, and preserves source metadata for reinstall. Agent enablement uses the standard enable path. Agent disablement is intentionally specific to this admin API: the route removes the enabled-agent registry record before removing the runtime container so the watchdog container monitor does not restart the agent during the operation.</p>
-          <p>Browser mutations require an authenticated local admin user. Agent callers have one narrow exception: a request-bound, replay-protected assertion for <code>marketplace.enable_agent</code> may submit only <code>enable_agent</code>, allowing an active agent to start an installed dependency on demand. Agents cannot install or uninstall repositories, disable agents, or inherit browser administrator permissions. The route is router-owned management API, not an agent proxy route, not a manifest HTTP service, and not an HTTP route-access policy entry.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Selected-root User Administration API</h2>
-          <p>An agent-root public host may opt into the <code>user-admin</code> Router surface. That surface admits only <code>/api/agents/&lt;selectedRouteKey&gt;/users</code>, one optional encoded user-id child, and <code>/api/agents/&lt;selectedRouteKey&gt;/settings</code>. The route key comes from the immutable host selector, so request input cannot select another enabled agent or another Router control API.</p>
-          <p>Reachability does not authorize a caller. Reads and mutations still require a valid local administrator session for the selected agent. <code>POST</code>, <code>PATCH</code>, and <code>DELETE</code> additionally retain the exact Origin and session-bound CSRF checks enforced by the user-administration handler.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Agent Cards and Secure Delegation</h2>
-          <p>Ploinky reads installed manifests into a small agent index for route names, principals, runtime resources, and SSO-provider markers. Provider-specific domain authorization lives in the target agent.</p>
-          <p>The router exposes agent-card discovery at <code>/agent-card</code> and <code>/&lt;agent&gt;/agent-card</code>. The aggregate endpoint queries each active route's agent-side <code>/agent-card</code> endpoint and returns successful responses without requiring a fixed metadata schema; per-agent failures are reported separately. Agent metadata can include tags, summaries, input conventions, schemas, or any other JSON fields useful to an orchestration layer.</p>
-          <p>OpenAI-compatible agent calls are routed through <code>/&lt;agent&gt;/v1/chat/completions</code>. The request body controls response mode: <code>stream: true</code> preserves the agent's SSE stream, while an absent or false stream flag returns the normal JSON completion response.</p>
-          <p><code>/agent-card</code> and <code>/&lt;agent&gt;/v1/chat/completions</code> are public at the router level; the target agent decides whether to accept or reject the request. Orchestrators discover remote agents through <code>PloinkyAgentSkillsSubsystem</code> and declare them via <code>## Allowed Agents</code> in <code>oskill.md</code>.</p>
-          <p>For delegated MCP and protected service calls, the router mints short-lived Router Request JWTs signed with the target agent's own <code>PLOINKY_AGENT_SECRET</code>. Agents and services verify audience, method, path, optional tool, request-content hash, expiry, and replay id before trusting forwarded identity.</p>
-          <p>Confined agent-port routing uses a separate transport-only relay session. After policy admission, initial current-generation lease commit, and exact immutable container/owner inspection, the router creates a fresh 32-byte channel key and sends it only over the private exec-stdio <code>HELLO</code> frame to <code>RuntimeHttpRelay.mjs</code>. Relay session and request tokens bind the principal, instance, generation, container, denied-port set, and exact request. After asynchronous request-token minting, the router re-commits the captured generation immediately before every <code>OPEN</code>, so a generation changed during setup or channel idleness creates no target socket. The key is never injected into the runtime environment, echoed in <code>READY</code>, or usable as a Router-facing agent credential, so host/none runtimes remain without <code>PLOINKY_AGENT_SECRET</code>.</p>
-          <p>Box-private service calls additionally require authenticated policy admission and an exact caller ACL for the current instance and enable generation. The short-lived assertion uses a separately derived tuple secret and binds its type, audience, caller, generation, method, canonical path, query, body digest, and replay state. It is a capability for one service call, not a user or administrator credential, and the captured authorization generation is revalidated immediately before every HTTP, SSE, or WebSocket upstream connection.</p>
-          <p>Mounted topology distinguishes the immutable route-and-policy authorization generation, a content-derived configuration generation, and a monotonic readiness/publication generation. The authenticated <code>no-store</code> browser projection returns only one active locator plus configuration/publication ids; it exposes neither the authorization id nor topology inventory.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>MCP and HTTP Service Paths</h2>
-          <p>The router aggregates tools and resources at <code>/mcp</code>, while agent-specific MCP endpoints are exposed under <code>/&lt;agent&gt;/mcp</code>. A public agent-root host that selects the <code>agent-mcp</code> capability compiles an exact allowlist from the selected root and its transitive active-manifest dependency closure; unrelated enabled routes cannot become MCP targets, and non-MCP dependency-looking paths remain selected-root content. Agent task-status passthrough lives at <code>/&lt;agent&gt;/task</code>. Public and authenticated HTTP service routes are defined separately and may inject compact auth headers for downstream agents; protected service invocation tokens bind the forwarded method, rewritten service path, query string, and body hash.</p>
-          <p>This split lets Ploinky expose first-party routing behavior and agent-specific protocol proxies without forcing every browser surface through the same transport semantics.</p>
-        </section>
-      </article>
-    </div>
-  </main>
-  <div data-include="partials/footer.html"></div>
+    <div data-include="partials/header.html"></div>
+    <main>
+        <div class="container"><div class="doc-layout">
+            <aside class="sidebar"><h3>Interfaces</h3><ul><li><a href="#router">Router boundary</a></li><li><a href="#browser">Browser APIs</a></li><li><a href="#mcp">MCP APIs</a></li><li><a href="#management">Management APIs</a></li></ul></aside>
+            <div class="content-wrapper">
+                <div class="doc-section"><h1>Ploinky Interfaces</h1><p class="subtitle">The authenticated Router surfaces that connect browsers, agents, and workspace operators to private runtimes.</p></div>
+                <div class="doc-section" id="router">
+                    <h2>Router boundary</h2>
+                    <p><code>cli/server/RoutingServer.js</code> is the single HTTP, server-sent event, WebSocket, and MCP edge for a Ploinky Box. It selects an exact listener, Host, route, caller, and active generation before opening an upstream connection.</p>
+                    <figure class="diagram"><pre class="mermaid">flowchart LR
+    C[Browser or agent] --> R[Router]
+    R --> P[Authentication and route policy]
+    P --> G[Active generation check]
+    G --> A[Private agent runtime]</pre><figcaption><em>Every request crosses the same Router policy and active-generation boundary before reaching an agent.</em></figcaption></figure>
+                    <p>Port <code>8080</code> is the Router's inner public surface. Port <code>8081</code> is private to the Box and is never outer-published. Unknown or stale host and path combinations fail before the Router reveals or contacts an upstream target.</p>
+                </div>
+                <div class="doc-section" id="browser">
+                    <h2>Browser APIs</h2>
+                    <p>Browser-facing routes use the Router login session. The table names the stable route families and their observable purpose.</p>
+                    <table class="command-table"><thead><tr><th>API route</th><th>Purpose and access boundary</th></tr></thead><tbody>
+                        <tr><td><code>/webchat/*</code></td><td>Hosts the TTY-backed chat page, EventSource stream, interactions, and workspace-scoped upload flow for an authenticated session.</td></tr>
+                        <tr><td><code>/workspace-files/*</code></td><td>Reads an approved workspace file for preview after path validation and route authorization.</td></tr>
+                        <tr><td><code>/status/*</code></td><td>Returns a read-only status snapshot or NDJSON metric stream to a local administrator.</td></tr>
+                        <tr><td><code>/auth/*</code></td><td>Runs local or configured SSO login, logout, session, and invitation flows.</td></tr>
+                    </tbody></table>
+                    <p>Browser mutations require the established session protections, including Origin and CSRF checks where applicable. Browser clients never connect directly to an agent container or receive its reusable credentials.</p>
+                </div>
+                <div class="doc-section" id="mcp">
+                    <h2>MCP APIs</h2>
+                    <p>The Model Context Protocol surfaces expose configured tools and resources through the Router. The Router applies caller policy and mints a request-bound token before the target AgentServer executes a tool or resource command.</p>
+                    <table class="command-table"><thead><tr><th>API route</th><th>Purpose and access boundary</th></tr></thead><tbody>
+                        <tr><td><code>/mcp</code></td><td>Aggregates discovery and calls across active agents for Router-authenticated users. Shared tool names must identify their source agent.</td></tr>
+                        <tr><td><code>/&lt;agent&gt;/mcp</code></td><td>Proxies JSON-RPC to one admitted agent after user authentication or an authenticated Agent Assertion.</td></tr>
+                        <tr><td><code>/&lt;agent&gt;/task</code></td><td>Returns protected status for an asynchronous agent task.</td></tr>
+                        <tr><td><code>/&lt;agent&gt;/task/cancel</code></td><td>Cancels an admitted task through a token bound to that task operation.</td></tr>
+                    </tbody></table>
+                    <p>Tool policy is fail-closed. It distinguishes authenticated, administrator, and internal tools; resource reads require a Router-authenticated user or guest session. Tokens are bound to the selected target, operation, method, path, arguments, generation, and replay state.</p>
+                </div>
+                <div class="doc-section" id="management">
+                    <h2>Management APIs</h2>
+                    <table class="command-table"><thead><tr><th>API route</th><th>Purpose and access boundary</th></tr></thead><tbody>
+                        <tr><td><code>GET /api/marketplace</code></td><td>Lists the caller's marketplace view, installed repositories, discovered agents, enabled records, and runtime state.</td></tr>
+                        <tr><td><code>POST /api/marketplace</code></td><td>Handles admitted repository and agent lifecycle actions. Browser mutations require a local administrator.</td></tr>
+                        <tr><td><code>/policy/command</code></td><td>Runs the Router-owned policy command surface for an authorized administrator or explicitly admitted agent request.</td></tr>
+                        <tr><td><code>/agent-card</code></td><td>Aggregates metadata from active agents without requiring a fixed card schema.</td></tr>
+                    </tbody></table>
+                    <p>An active agent can use only the narrow management paths explicitly admitted for an assertion. It does not inherit browser administrator authority or gain access to repository installation and removal merely because it is reachable through the Router.</p>
+                </div>
+            </div>
+        </div></div>
+    </main>
+    <footer><div class="container"><p>&copy; 2025 Ploinky Project.</p></div></footer>
+    <script>const navLinks=document.querySelectorAll('.sidebar a');const sections=[...document.querySelectorAll('.doc-section[id]')];function updateActiveSection(){let current=sections[0]?.id||'';sections.forEach(section=>{if(section.getBoundingClientRect().top<=100)current=section.id;});navLinks.forEach(link=>link.classList.toggle('active',link.getAttribute('href')===`#${current}`));}window.addEventListener('scroll',updateActiveSection);updateActiveSection();</script>
 </body>
 </html>
