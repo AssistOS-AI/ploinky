@@ -15,6 +15,7 @@
     <div data-include="partials/header.html"></div>
     <main>
         <div class="container">
+            <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / Runtime</nav>
             <div class="doc-layout">
                 <aside class="sidebar">
                     <h3>Runtime</h3>
@@ -34,7 +35,7 @@
 
                     <div class="doc-section" id="workspace">
                         <h2>Workspace state</h2>
-                        <p>Each workspace owns its enabled-agent registry, managed repositories, generated dependency caches, and persistent agent homes. These records let lifecycle commands identify one exact runtime instead of guessing from a name or a live container.</p>
+                        <p>Each <a href="wiki.html#definition-workspace">workspace</a> owns its enabled-agent registry, managed repositories, generated dependency caches, and persistent agent homes. These records let lifecycle commands identify one exact runtime instead of guessing from a name or a live container.</p>
                         <table class="command-table">
                             <thead><tr><th>Workspace location</th><th>Runtime role</th></tr></thead>
                             <tbody>
@@ -51,7 +52,7 @@
                         <h2>Runtime selection</h2>
                         <p>Enabling an agent resolves its manifest, validates an optional alias, selects an authentication mode, and records the resulting instance before the route can become active. An alias is both the route key and runtime identity, allowing more than one instance of the same agent in a workspace.</p>
                         <figure class="diagram">
-                            <pre class="mermaid">flowchart LR
+                            <pre class="mermaid">flowchart TD
     M[Agent manifest] --> E[Enable record]
     E --> R{Placement policy}
     R -->|Default| C[OCI runtime]
@@ -60,7 +61,7 @@
     C --> H[Persistent agent home]
     B --> H
     S --> H</pre>
-                            <figcaption><em>The manifest and selected policy determine the runtime while every instance retains its own persistent home.</em></figcaption>
+                            <figcaption><em>Runtime selection flow</em></figcaption>
                         </figure>
                         <p>Outside a Ploinky Box, the container path detects Podman before Docker. On Linux, <code>lite-sandbox: true</code> selects Bubblewrap; on macOS it selects Seatbelt. Inside a marked Box, all managed agent, helper, probe, and install-container work uses nested rootless Podman.</p>
                         <div class="alert alert-info"><strong>Run modes:</strong> <code>isolated</code> uses the agent's persistent home as its working area. <code>global</code> uses the workspace root, and <code>devel</code> uses the selected repository checkout. All three retain the per-instance home for agent configuration.</div>
@@ -68,22 +69,22 @@
 
                     <div class="doc-section" id="startup">
                         <h2>Startup and readiness</h2>
-                        <p>Ploinky resolves the recursive manifest dependency graph before it starts agent processes. It prepares the matching dependency cache, starts each agent in dependency order, and admits its route only after the declared readiness checks succeed.</p>
+                        <p>Ploinky resolves the recursive <a href="wiki.html#definition-dependency-graph">manifest dependency graph</a> before it starts agent processes. It prepares the matching dependency cache, starts each agent in dependency order, and admits its route only after the declared readiness checks succeed.</p>
                         <figure class="diagram">
-                            <pre class="mermaid">flowchart LR
+                            <pre class="mermaid">flowchart TD
     A[Resolve manifests] --> B[Prepare dependencies]
     B --> C[Start selected runtime]
     C --> D[Run readiness probe]
     D -->|Healthy| E[Activate route]
     D -->|Unhealthy| F[Keep route inactive]</pre>
-                            <figcaption><em>A route becomes reachable only after the selected runtime passes its own readiness contract.</em></figcaption>
+                            <figcaption><em>Agent startup and readiness flow</em></figcaption>
                         </figure>
                         <p>The Watchdog observes the same recorded runtime identity after startup. A failed health check removes the stale route and schedules recovery against a fresh exact-generation runtime; a deliberately disabled agent is removed from the registry before its runtime is torn down, so it is not recreated by supervision.</p>
                     </div>
 
                     <div class="doc-section" id="config-providers">
                         <h2>Startup config providers</h2>
-                        <p>A startup config provider is an agent component that discovers or generates workspace configuration before dependent agents launch. It runs a declared host-side command and returns a small versioned JSON document. Ploinky validates every returned name, stores accepted values in the encrypted workspace variable store, reloads the graph configuration, and only then starts consumers. The provider never edits the store directly and its output is not injected automatically into every agent.</p>
+                        <p>A <a href="wiki.html#definition-startup-config-provider">startup config provider</a> is an agent component that discovers or generates workspace configuration before dependent agents launch. It runs a declared host-side command and returns a small versioned JSON document. Ploinky validates every returned name, stores accepted values in the encrypted workspace variable store, reloads the graph configuration, and only then starts consumers. The provider never edits the store directly and its output is not injected automatically into every agent.</p>
                         <table class="command-table">
                             <thead><tr><th>Participant</th><th>What it declares or does</th></tr></thead>
                             <tbody>
@@ -101,7 +102,7 @@
     D --> E[Encrypted workspace store]
     E --> F[Consumer resolves its declared env values]
     F --> G[Final runtime preparation and launch]</pre>
-                            <figcaption><em>A provider computes candidate values; Ploinky owns validation, encrypted persistence, and delivery to declared consumers.</em></figcaption>
+                            <figcaption><em>Startup config provider flow</em></figcaption>
                         </figure>
                         <h3>Provider manifest</h3>
                         <pre><code>{
@@ -147,7 +148,7 @@
             </div>
         </div>
     </main>
-    <footer><div class="container"><p>&copy; 2025 Ploinky Project.</p></div></footer>
+    <div data-include="partials/footer.html"></div>
     <script>
         const navLinks = document.querySelectorAll('.sidebar a');
         const sections = [...document.querySelectorAll('.doc-section[id]')];

@@ -14,18 +14,18 @@
 <body data-page="interfaces">
     <div data-include="partials/header.html"></div>
     <main>
-        <div class="container"><div class="doc-layout">
+        <div class="container"><nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / Interfaces</nav><div class="doc-layout">
             <aside class="sidebar"><h3>Interfaces</h3><ul><li><a href="#router">Router boundary</a></li><li><a href="#browser">Browser APIs</a></li><li><a href="#mcp">MCP APIs</a></li><li><a href="#management">Management APIs</a></li></ul></aside>
             <div class="content-wrapper">
                 <div class="doc-section"><h1>Ploinky Interfaces</h1><p class="subtitle">The authenticated Router surfaces that connect browsers, agents, and workspace operators to private runtimes.</p></div>
                 <div class="doc-section" id="router">
                     <h2>Router boundary</h2>
-                    <p><code>cli/server/RoutingServer.js</code> is the single HTTP, server-sent event, WebSocket, and MCP edge for a Ploinky Box. It selects an exact listener, Host, route, caller, and active generation before opening an upstream connection.</p>
-                    <figure class="diagram"><pre class="mermaid">flowchart LR
+                    <p>The <a href="wiki.html#definition-router">Router</a> is the single HTTP, server-sent event, WebSocket, and MCP edge for a Ploinky Box. It selects an exact listener, Host, route, caller, and active generation before opening an upstream connection.</p>
+                    <figure class="diagram"><pre class="mermaid">flowchart TD
     C[Browser or agent] --> R[Router]
     R --> P[Authentication and route policy]
     P --> G[Active generation check]
-    G --> A[Private agent runtime]</pre><figcaption><em>Every request crosses the same Router policy and active-generation boundary before reaching an agent.</em></figcaption></figure>
+    G --> A[Private agent runtime]</pre><figcaption><em>Router request admission</em></figcaption></figure>
                     <p>Port <code>8080</code> is the Router's inner public surface. Port <code>8081</code> is private to the Box and is never outer-published. Unknown or stale host and path combinations fail before the Router reveals or contacts an upstream target.</p>
                 </div>
                 <div class="doc-section" id="browser">
@@ -41,7 +41,7 @@
                 </div>
                 <div class="doc-section" id="mcp">
                     <h2>MCP APIs</h2>
-                    <p>The Model Context Protocol surfaces expose configured tools and resources through the Router. The Router applies caller policy and mints a request-bound token before the target AgentServer executes a tool or resource command.</p>
+                    <p>The <a href="wiki.html#definition-model-context-protocol">Model Context Protocol</a> surfaces expose configured tools and resources through the Router. The Router applies caller policy and mints a request-bound token before the target AgentServer executes a tool or resource command.</p>
                     <table class="command-table"><thead><tr><th>API route</th><th>Purpose and access boundary</th></tr></thead><tbody>
                         <tr><td><code>/mcp</code></td><td>Aggregates discovery and calls across active agents for Router-authenticated users. Shared tool names must identify their source agent.</td></tr>
                         <tr><td><code>/&lt;agent&gt;/mcp</code></td><td>Proxies JSON-RPC to one admitted agent after user authentication or an authenticated Agent Assertion.</td></tr>
@@ -63,7 +63,7 @@
             </div>
         </div></div>
     </main>
-    <footer><div class="container"><p>&copy; 2025 Ploinky Project.</p></div></footer>
+    <div data-include="partials/footer.html"></div>
     <script>const navLinks=document.querySelectorAll('.sidebar a');const sections=[...document.querySelectorAll('.doc-section[id]')];function updateActiveSection(){let current=sections[0]?.id||'';sections.forEach(section=>{if(section.getBoundingClientRect().top<=100)current=section.id;});navLinks.forEach(link=>link.classList.toggle('active',link.getAttribute('href')===`#${current}`));}window.addEventListener('scroll',updateActiveSection);updateActiveSection();</script>
 </body>
 </html>

@@ -74,7 +74,7 @@ The provider and consumer declarations are intentionally separate. The provider 
     I --> J[Reload registry and manifest environment]
     J --> K[Rotate stale runtime tuples and capture final launch lease]
     G -->|Invalid output| L[Abort before consumer launch]</pre>
-<figcaption><em>The provider proposes values, but only Ploinky validates and commits them before dependent runtimes can start.</em></figcaption>
+<figcaption><em>Startup config provider flow</em></figcaption>
 </figure>
 
 Providers must run after the static preinstall hook and before the final graph preparation lease. They execute sequentially in the order selected by the static manifest and active profile. The command runs on the host from the provider directory. Its environment may contain `PATH`, `HOME`, workspace root, active workspace profile, provider repository and agent identifiers, the provider data directory, and provider manifest/profile environment values needed by the command.
@@ -117,3 +117,13 @@ Ploinky must reject empty output, malformed JSON, undeclared values, duplicate d
 Accepted values must be written through the encrypted workspace store. Provider code must not call `ploinky var` as its normal persistence path and must never receive storage-key material. Ploinky may write `.ploinky/config-providers/<provider>.json` containing the provider id, manifest version, active profile, application time, output names, sensitivity flags, sources, warnings, and the literal redaction marker; it must never include a returned value.
 
 A provider must not create or select the outer Box, host publications, Cloudflare ingress, DNS, public hostnames, Router targets, policy generations, route leases, TURN credentials, runtime capabilities, agent request secrets, or generated-secret ownership. Returning an ordinary variable whose name resembles one of those controls must be rejected. Provider output becomes ordinary workspace configuration and reaches an agent only through that agent's declared environment resolution described by [DS010-secrets-and-variable-resolution](specsLoader.html?spec=DS010-secrets-and-variable-resolution.md).
+
+### Provider architecture rationale
+
+| Decision | Reason |
+| --- | --- |
+| Separate the provider, Ploinky core, and consuming agents | The provider discovers values, core validates and persists them, and only declared consumers receive them. No workload gains direct authority over the secret store or another agent's environment. |
+| Require declared outputs and one bounded versioned JSON result | Core can validate names, sensitivity, size, provenance, and completeness before any consumer starts; arbitrary stdout or file mutation cannot become configuration. |
+| Run providers before the final runtime generation is admitted | Provider values may change runtime hashes and environments. Resolving them first prevents routes and identities from describing a runtime built with obsolete configuration. |
+| Persist accepted values through core-owned encrypted storage | A provider never receives the workspace master key and cannot bypass ownership, redaction, or consumer filtering by writing live state itself. |
+| Exclude topology, publication, policy, and identity controls from provider output | A configuration-discovery process must not redefine the boundary that confines it or mint the authority used to validate its own consumers. |

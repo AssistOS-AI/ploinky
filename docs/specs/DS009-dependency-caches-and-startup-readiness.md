@@ -77,3 +77,15 @@ The Watchdog may restart only an enabled agent whose registry tuple and runtime 
 A dependency marked `noWait` may continue in a detached worker only after the main transaction has resolved its identity, graph position, direct dependencies, and final preparation generation. Each worker must use a run-specific id, status file, log file, wave index, immutable registry binding, and bounded deadline. It may wait only for its declared direct dependency barriers and must never infer readiness from an unrelated worker.
 
 A no-wait worker must publish a terminal ready, failed, or superseded state. It must not activate a raw route candidate, overlap a blocking generation mutation, adopt a changed runtime, hide readiness failure, or survive the disablement of its exact registry identity. The synchronous `start` command may return after every blocking graph node and additional synchronous agent is ready and each no-wait worker has been spawned or has published its spawn failure. No-wait launch, readiness, route activation, and terminal status continue asynchronously and remain observable through their run-scoped status and log records. A higher-level managed Box readiness gate may additionally require declared external health checks before it reports the complete Box ready.
+
+### Cache and startup rationale
+
+| Decision | Reason |
+| --- | --- |
+| Build dependencies in a bounded shared cache and mount prepared results read-only | Long-running agents do not need package-manager mutation rights, and identical runtime inputs can reuse verified work without installing packages on the host. |
+| Acquire a cache lock, install into a temporary location, and promote atomically | Concurrent starts cannot observe or publish a partially installed dependency tree, and a failed installer leaves the previous complete cache entry intact. |
+| Derive cache identity from the actual runtime inputs | Reuse is safe only when the package manager, lock data, platform, runtime, and other installation inputs match; repository names alone do not prove equivalence. |
+| Admit the complete dependency graph before starting any node | Missing dependencies, unsafe cycles, invalid manifests, and provider failures are rejected before a partially usable graph can be exposed. |
+| Start blocking dependencies in topological waves | Consumers become eligible only after their required producers are ready, while independent nodes can still start concurrently. |
+| Treat readiness and liveness as separate contracts | Readiness decides when a route may first become active; liveness detects failure after activation and drives recovery without redefining initial admission. |
+| Make `no-wait` explicitly asynchronous | Optional or slow work need not block the command, but it still receives run-scoped status, readiness checks, and route activation instead of being silently considered ready. |

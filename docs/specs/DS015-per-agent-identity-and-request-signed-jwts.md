@@ -80,3 +80,13 @@ For a browser tool call, the Router begins with the authenticated user context a
 The Router must strip caller-supplied identity, authorization-info, forwarding, and invocation headers before attaching trusted target context. AgentServer must accept invocation metadata only after Router Request verification and must never trust an identity copied from an ordinary request header or tool argument.
 
 Compromise of one agent's request secret must permit neither forging a Router Request for another target nor deriving the workspace master or another agent's key. Rotation of the runtime tuple must invalidate private assertions and route leases from the predecessor. Relay credentials must remain private to their exact confined channel and must be destroyed with it. Raw secrets and tokens must not appear in URLs, logs, registry records, persisted routing state, selected runtime state, or test evidence.
+
+### Identity architecture rationale
+
+| Decision | Reason |
+| --- | --- |
+| Give every canonical agent a distinct principal and secret | Compromise is confined to one source identity and cannot be converted into another agent's authority or the workspace master key. |
+| Add a random instance and enable generation to the runtime identity | A replaced or re-enabled predecessor keeps the same human-readable agent name. The tuple distinguishes the current runtime and invalidates credentials captured from an older one. |
+| Use direction-specific Agent Assertions and Router Requests | The source proves what it asks the Router to authorize; the Router separately proves what the target may execute. Neither token can be reflected back into the opposite role. |
+| Bind method, path, query, body or tool arguments, target, expiry, and replay value | A token authorizes one canonical operation rather than acting as a reusable bearer credential for arbitrary requests. |
+| Derive per-purpose keys from core-owned master material | Verifiers receive only the key needed for their direction and target, limiting the consequences of disclosure and making rotation independent. |

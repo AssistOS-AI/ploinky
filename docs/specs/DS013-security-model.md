@@ -35,7 +35,7 @@ Ploinky protects a physical host by running repositories and agents inside a roo
     D --> E[Isolated agent runtime]
     E --> F[Agent-owned code, data, and private services]
     C -. only admitted browser or agent request .-> E</pre>
-<figcaption><em>The outer Box protects the host, while the Router and per-agent runtime boundary constrain what isolated agent code can reach and receive.</em></figcaption>
+<figcaption><em>Ploinky security boundaries</em></figcaption>
 </figure>
 
 The managed Box must run rootless and unprivileged with the expected immutable image identity, read-only Ploinky source, explicit workspace and cache binds, an init/reaper, and no privileged mode, SUID/setuid binaries, file capabilities, or relaxed confinement. The outer engine may publish only Router TCP on loopback and one LiveKit UDP mapping. Router private port `8081`, agent port `7000`, and agent-owned listeners must remain inside the Box.
@@ -73,3 +73,13 @@ Nested agents must receive a read-only source mount unless the selected profile 
 Every security decision must fail before the privileged action, file read, route publication, or upstream connection when its inputs are missing, malformed, stale, ambiguous, or changed. Cleanup must be bounded to exact proven resources and must not use broad engine pruning or recursive deletion from an unresolved root. Error responses must avoid distinguishing an unauthorized private target from a missing target when that distinction would disclose workspace state.
 
 The detailed authentication model is specified in [DS008-auth-capabilities-and-secure-wire](specsLoader.html?spec=DS008-auth-capabilities-and-secure-wire.md), secret ownership in [DS010-secrets-and-variable-resolution](specsLoader.html?spec=DS010-secrets-and-variable-resolution.md), request-signed identities in [DS015-per-agent-identity-and-request-signed-jwts](specsLoader.html?spec=DS015-per-agent-identity-and-request-signed-jwts.md), and Router policy in [DS016-router-access-control-http-route-access-and-mcp-policy](specsLoader.html?spec=DS016-router-access-control-http-route-access-and-mcp-policy.md).
+
+### Security architecture rationale
+
+| Decision | Reason |
+| --- | --- |
+| Treat agent workloads and their dependency trees as untrusted even when the operator selected them | Package-manager hooks, transitive packages, generated code, and prototype services can contain vulnerabilities. Trusting the operator's intent does not make every executed byte safe. |
+| Layer rootless containers, explicit mounts, Router mediation, purpose-bound credentials, and immutable generations | No single boundary covers filesystem, network, identity, and stale-state attacks. Independent controls reduce the authority available after one layer is compromised. |
+| Keep Ploinky itself inside a controlled Box boundary | The supervisor needs stable tools and runtime behavior without installing its complete dependency set on the physical host. Its authority is still limited by rootless execution and exact host grants. |
+| Prefer fixed external publications and brokered capabilities | The exposed host surface is auditable and workload code receives only the narrow operation it needs, not a container-engine socket, publication credentials, or general host access. |
+| Fail closed on missing, ambiguous, foreign, or stale evidence | Guessing ownership or falling back to raw configuration can turn recovery into cross-workspace mutation or revive an authorization decision from an obsolete generation. |

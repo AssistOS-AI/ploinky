@@ -14,19 +14,19 @@
 <body data-page="operations">
     <div data-include="partials/header.html"></div>
     <main>
-        <div class="container"><div class="doc-layout">
+        <div class="container"><nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / Workspace Lifecycle</nav><div class="doc-layout">
             <aside class="sidebar"><h3>Workspace lifecycle</h3><ul><li><a href="#start">Start a workspace</a></li><li><a href="#manage">Manage agents</a></li><li><a href="#observe">Observe runtime state</a></li><li><a href="#stop">Stop and destroy</a></li></ul></aside>
             <div class="content-wrapper">
                 <div class="doc-section"><h1>Workspace Lifecycle</h1><p class="subtitle">The operator workflows that prepare a workspace, run its agents, inspect its state, and remove only the resources selected by a lifecycle command.</p></div>
                 <div class="doc-section" id="start">
                     <h2>Start a workspace</h2>
-                    <p><code>ploinky start</code> resolves one workspace identity, acquires the workspace lock, prepares required repositories and dependencies, starts the Router and selected agents, and waits for the declared readiness graph. The command reports readiness only after the required external health checks pass.</p>
-                    <figure class="diagram"><pre class="mermaid">flowchart LR
+                    <p><code>ploinky start</code> resolves one <a href="wiki.html#definition-workspace">workspace</a> identity, acquires the workspace lock, prepares required repositories and dependencies, starts the Router and selected agents, and waits for the declared readiness graph. The command reports readiness only after the required external health checks pass.</p>
+                    <figure class="diagram"><pre class="mermaid">flowchart TD
     A[Select workspace] --> B[Lock and validate identity]
     B --> C[Prepare repositories and dependencies]
     C --> D[Start Router and agents]
     D --> E[Verify readiness graph]
-    E --> F[Expose active routes]</pre><figcaption><em>Workspace startup serializes mutation and activates routes only after the prepared runtime graph is ready.</em></figcaption></figure>
+    E --> F[Expose active routes]</pre><figcaption><em>Workspace startup flow</em></figcaption></figure>
                     <div class="alert alert-success"><strong>Example:</strong> run <code>ploinky start</code> from the workspace directory. A static target supplied to the command is enabled through the normal agent path before the workspace starts.</div>
                 </div>
                 <div class="doc-section" id="manage">
@@ -47,19 +47,19 @@
                 </div>
                 <div class="doc-section" id="stop">
                     <h2>Stop and destroy</h2>
-                    <p><code>stop</code> stops the Router and active agent runtimes while retaining reusable workspace state. <code>destroy</code> removes workspace runtimes and regenerated dependency caches. Host invocation also removes the exact managed outer Box while retaining its named volumes.</p>
-                    <figure class="diagram"><pre class="mermaid">flowchart LR
+                    <p><code>stop</code> stops the Router and active agent runtimes while retaining reusable workspace state. <code>destroy</code> removes the exact managed outer Box and discards its nested runtime layers and inner volumes. It preserves the workspace, <code>.data/</code> agent homes, dependency cache, and image cache unless an explicit cache-deletion option selects those regenerated caches.</p>
+                    <figure class="diagram"><pre class="mermaid">flowchart TD
     S[Stop] --> R[Router and agents stopped]
     R --> K[Workspace state retained]
     D[Destroy] --> X[Selected runtimes removed]
-    X --> C[Regenerated caches cleared]
-    C --> V[Persistent named volumes retained]</pre><figcaption><em>Stop preserves reusable state; destroy removes the selected runtime resources without selecting another workspace.</em></figcaption></figure>
+    X --> C[Nested runtime state discarded]
+    C --> V[Workspace and persistent data retained]</pre><figcaption><em>Workspace stop and destroy flow</em></figcaption></figure>
                     <p>Lifecycle actions validate immutable workspace identity immediately before mutation. A command that cannot identify its exact target fails rather than adopting a similarly named Box, container, process, or repository.</p>
                 </div>
             </div>
         </div></div>
     </main>
-    <footer><div class="container"><p>&copy; 2025 Ploinky Project.</p></div></footer>
+    <div data-include="partials/footer.html"></div>
     <script>const navLinks=document.querySelectorAll('.sidebar a');const sections=[...document.querySelectorAll('.doc-section[id]')];function updateActiveSection(){let current=sections[0]?.id||'';sections.forEach(section=>{if(section.getBoundingClientRect().top<=100)current=section.id;});navLinks.forEach(link=>link.classList.toggle('active',link.getAttribute('href')===`#${current}`));}window.addEventListener('scroll',updateActiveSection);updateActiveSection();</script>
 </body>
 </html>

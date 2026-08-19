@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Architecture - Ploinky</title>
+    <title>Ploinky Documentation</title>
     <link rel="stylesheet" href="style.css">
     <script src="partials-loader.js" defer></script>
     <script type="module">
@@ -21,6 +21,7 @@
 
     <main>
         <div class="container">
+            <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / Architecture</nav>
             <div class="doc-layout">
                 <aside class="sidebar">
                     <h3>Architecture Components</h3>
@@ -71,10 +72,10 @@ graph TB
         FLOW --> AGENT3
     end
                         </pre>
-                        <p class="diagram-caption"><em>High-level Ploinky Box architecture and its isolated nested agent runtimes.</em></p>
+                        <p class="diagram-caption"><em>Ploinky Box architecture</em></p>
 
                         <h3>Ploinky Box</h3>
-                        <p>The Ploinky Box is the rootless outer container that provides the runtime boundary for one workspace. A host user starts it with <code>ploinky start</code>; the Box Supervisor initializes the boundary and launches <code>ploinky-local</code> inside it. The Box exposes the host loopback Router surface while keeping the inner control and agent network private to the Box.</p>
+                        <p>The <a href="wiki.html#definition-ploinky-box">Ploinky Box</a> is the rootless outer container that provides the runtime boundary for one workspace. A host user starts it with <code>ploinky start</code>; the Box Supervisor initializes the boundary and launches <code>ploinky-local</code> inside it. The Box exposes the host loopback Router surface while keeping the inner control and agent network private to the Box.</p>
                         <p>The Ploinky Box remains the active runtime boundary while the user works through interactive Ploinky commands. Core REPL operations such as <code>stop</code> and <code>destroy</code> stop or clean workspace services and agent runtimes inside the Box without removing the Box itself. The Box remains in place until the user explicitly runs <code>ploinky destroy</code>, which removes the exact outer workspace instance.</p>
 
                         <h3>Routing Server and Watchdog</h3>
@@ -96,7 +97,7 @@ graph TB
 
                     <div class="doc-section" id="ploinky-local">
                         <h2>ploinky-local</h2>
-                        <p><code>ploinky-local</code> is the inner Ploinky runtime that coordinates one workspace inside the Ploinky Box. Its components receive commands and workspace state through a shared lifecycle boundary, and each component sends its work into the local coordinator.</p>
+                        <p><a href="wiki.html#definition-ploinky-local"><code>ploinky-local</code></a> is the inner Ploinky runtime that coordinates one workspace inside the Ploinky Box. Its components receive commands and workspace state through a shared lifecycle boundary, and each component sends its work into the local coordinator.</p>
 
                         <pre class="mermaid">
 flowchart TB
@@ -111,7 +112,7 @@ flowchart TB
         direction TB
     end
                         </pre>
-                        <p class="diagram-caption"><em>Main components that compose the inner <code>ploinky-local</code> runtime.</em></p>
+                        <p class="diagram-caption"><em>ploinky-local components</em></p>
 
                         <h3>CLI command layer</h3>
                         <p>The CLI command layer gives a workspace user one consistent interface for managing Ploinky without exposing the internal service layout. It defines the REPL vocabulary, command completion, command history, and one-shot command handling, then validates the user's command before any workspace state changes. The <a href="cli-reference.html">CLI Reference</a> describes the available command forms and their arguments.</p>
@@ -142,7 +143,7 @@ flowchart TB
                         <h2>Routing Server</h2>
                         
                         <h3>Purpose</h3>
-                        <p>The RoutingServer (<code>cli/server/RoutingServer.js</code>) is the network entry point for a Ploinky Box. It receives HTTP, server-sent event, and WebSocket requests, identifies the requested service, and decides whether Ploinky itself handles the request or forwards it to an enabled agent. This gives clients one stable entry point while agent runtimes remain private inside the Box.</p>
+                        <p>The <a href="wiki.html#definition-router">Router</a> is the network entry point for a Ploinky Box. It receives HTTP, server-sent event, WebSocket, and MCP requests, identifies the requested service, and decides whether Ploinky itself handles the request or forwards it to an enabled agent. This gives clients one stable entry point while agent runtimes remain private inside the Box.</p>
                         <p>Before forwarding an agent request, the router checks the listener, Host, path, caller authorization, and route policy. It selects the target only from the active route-and-policy generation and checks that generation again immediately before connecting to the agent. A partially written or obsolete routing configuration therefore cannot direct a request to an agent runtime.</p>
                         <p>The router listens on public/control port <code>8080</code>, on box-private port <code>8081</code>, and on an unmounted Unix health socket. The outer wrapper publishes exactly <code>127.0.0.1:&lt;selected-router-host-port&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. The host-side <code>--port</code> option changes only the host port mapped to router port <code>8080</code>; <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> cannot add another published TCP port.</p>
                         <p>Port <code>8081</code> is used only for private communication inside the Box. In a rootless Box, it binds the Box namespace wildcard so nested Podman runtimes can reach it through <code>host.containers.internal:host-gateway</code>; the outer runtime never publishes it on the host. Outside a Box, the private listener uses exact loopback or managed-address binds.</p>
@@ -162,7 +163,7 @@ flowchart TB
         ROUTER --&gt; DATA
         ROUTER --&gt; APPS
     end</pre>
-                            <figcaption><em>The Routing Server and the web service components it exposes.</em></figcaption>
+                            <figcaption><em>Routing Server components</em></figcaption>
                         </figure>
 
                         <h3>Exposed APIs</h3>
@@ -197,7 +198,7 @@ flowchart TB
     Router-&gt;&gt;Agent: Forward agent request
     Agent--&gt;&gt;Router: Response or stream
     Router--&gt;&gt;Client: Response or stream</pre>
-                            <figcaption><em>How the Routing Server authorizes and dispatches a client request.</em></figcaption>
+                            <figcaption><em>Router request flow</em></figcaption>
                         </figure>
                         <ol style="margin-left: 2rem;">
                             <li>The client sends an HTTP, server-sent event, or WebSocket request through the loopback edge or an authenticated Cloudflare hostname.</li>
@@ -439,7 +440,7 @@ DATABASE_URL=postgres://localhost/db</code></pre>
                         <p>Before the Router invokes a tool or reads a resource, it mints a target-specific Router Request token. The token is bound to the target agent, active generation, HTTP method, <code>/mcp</code> path, requested operation, and canonical arguments. AgentServer verifies that token and replay state before it exposes invocation metadata to a command. A token for one tool, resource, or argument set therefore cannot authorize another request.</p>
 
                         <h3>Agent MCP server and configuration</h3>
-                        <p><code>Agent/server/AgentServer.mjs</code> runs a Streamable HTTP MCP server at <code>/mcp</code> on port <code>7000</code> by default. Each MCP initialization creates an isolated server and transport session. The server also provides the private agent health endpoint, an optional agent card endpoint, and protected task status and cancellation endpoints.</p>
+                        <p>The <a href="wiki.html#definition-agentserver">AgentServer</a> runs a Streamable HTTP MCP server at <code>/mcp</code> on port <code>7000</code> by default. Each MCP initialization creates an isolated server and transport session. The server also provides the private agent health endpoint, an optional agent card endpoint, and protected task status and cancellation endpoints.</p>
                         <p>An agent declares its MCP surface in its <code>mcp-config.json</code>. During runtime preparation, Ploinky stages that file in the agent work directory and supplies the runtime configuration path through <code>PLOINKY_MCP_CONFIG_PATH</code>. The configuration can define tools, resources, resource templates, and prompts. A missing configuration produces an empty MCP surface; invalid or incomplete individual entries are skipped.</p>
                         <p>A configured tool or resource runs its command with a JSON payload on standard input. Tool payloads contain the tool name, input, and verified invocation metadata; resource payloads contain the resource name, URI, and template parameters. Standard output becomes the MCP result. A non-zero command result is returned as an MCP error.</p>
 
@@ -453,16 +454,7 @@ DATABASE_URL=postgres://localhost/db</code></pre>
         </div>
     </main>
 
-    <footer>
-        <div class="container">
-            <p>&copy; 2025 Ploinky Project. Built with security and simplicity in mind.</p>
-            <p>
-                <a href="https://github.com/AssistOS-AI/ploinky">GitHub</a> •
-                <a href="index.html">Home</a> • 
-                <a href="cli-reference.html">CLI Reference</a>
-            </p>
-        </div>
-    </footer>
+    <div data-include="partials/footer.html"></div>
 
     <script>
         // Highlight active section in sidebar

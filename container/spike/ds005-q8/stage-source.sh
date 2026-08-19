@@ -4,8 +4,9 @@ set -euo pipefail
 # DS005-Q8 architecture-decision spike (S0) -- coordinator: GREEN, pack,
 # install, verify, run.
 #
-# Normative source: docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md
-# sections 3-7 and 9, and its annex sections 1-4 (outer workspace root).
+# Active contracts: docs/specs/DS006-runtime-execution-and-isolation.md and
+# docs/specs/DS012-testing-and-verification.md. Historical section and line
+# annotations below are retained only as provenance for this self-contained spike.
 #
 # Owns: deterministic GREEN/pack/install/verify/run orchestration, coordinator
 # SSH/scanning, immutable transfers, and journals (main plan line 172).

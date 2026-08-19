@@ -1,7 +1,8 @@
 // DS005-Q8 architecture-decision spike (S0) — source contract test.
 //
-// Normative source: docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md
-// (sections 1-7, 9) and its annex (sections 1-4), in the outer workspace root.
+// Active contracts: docs/specs/DS006-runtime-execution-and-isolation.md and
+// docs/specs/DS012-testing-and-verification.md. Historical section and line
+// annotations in the spike are retained only as provenance.
 // This test asserts the exact five-file S0 inventory, the absence of every
 // alternate-candidate mechanism, and the literal command/schema/ordering
 // contract for Candidate N (native pasta -T/--tcp-ns port confinement).
@@ -642,8 +643,9 @@ describe('README operator documentation', () => {
         assert.match(src, /evidence never chooses the architecture/i);
     });
 
-    test('README documents that this repo is not the sole source of authority', () => {
+    test('README points to the active architecture and verification specifications', () => {
         const src = requireFile(PATHS.readme);
-        assert.match(src, /2026-07-19-ploinky-box-clean-rebuild/);
+        assert.match(src, /DS006-runtime-execution-and-isolation/);
+        assert.match(src, /DS012-testing-and-verification/);
     });
 });

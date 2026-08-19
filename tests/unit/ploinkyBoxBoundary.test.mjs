@@ -13,7 +13,7 @@ import {
 import { readDirtyEntries } from '../../ploinky-box/boundary/gitState.mjs';
 import { BoundaryViolationError } from '../../ploinky-box/errors.mjs';
 
-const ORIGINAL_PLAN_PATH = 'docs/superpowers/plans/original.md';
+const PROTECTED_HISTORY_PATH = 'docs/design-history/original.md';
 const RUNTIME_PATH = 'docs/runtime.html';
 const PROTECTED_PARAGRAPH = '<p>Default rootless Podman containers use pasta; '
     + 'on macOS the host alias remains available.</p>';
@@ -81,9 +81,9 @@ function captureFixtureManifest(repositoryRoot, baseSha, allowlist) {
         allowlist,
         dirtyFiles,
         originalPlan: {
-            path: ORIGINAL_PLAN_PATH,
-            gitBlobHash: git(repositoryRoot, ['hash-object', ORIGINAL_PLAN_PATH]).trim(),
-            ...fingerprintPath(repositoryRoot, ORIGINAL_PLAN_PATH),
+            path: PROTECTED_HISTORY_PATH,
+            gitBlobHash: git(repositoryRoot, ['hash-object', PROTECTED_HISTORY_PATH]).trim(),
+            ...fingerprintPath(repositoryRoot, PROTECTED_HISTORY_PATH),
         },
         editableBaseline: {
             path: RUNTIME_PATH,
@@ -109,7 +109,7 @@ function createFixture(t) {
     git(repositoryRoot, ['config', 'user.email', 'test@example.com']);
     git(repositoryRoot, ['config', 'user.name', 'Ploinky Box Test']);
     writeRepositoryFile(repositoryRoot, RUNTIME_PATH, runtimeDocument());
-    writeRepositoryFile(repositoryRoot, ORIGINAL_PLAN_PATH, 'original plan\n');
+    writeRepositoryFile(repositoryRoot, PROTECTED_HISTORY_PATH, 'original plan\n');
     writeRepositoryFile(repositoryRoot, 'protected.txt', 'committed content\n');
     writeRepositoryFile(repositoryRoot, 'fixture-id.txt', `${fixtureSequence}\n`);
     writeRepositoryFile(repositoryRoot, 'tests/unit/existing.test.mjs', 'export const value = 1;\n');
@@ -120,7 +120,7 @@ function createFixture(t) {
     const baseSha = git(repositoryRoot, ['rev-parse', 'HEAD']).trim();
 
     writeRepositoryFile(repositoryRoot, 'protected.txt', 'owner content\n');
-    writeRepositoryFile(repositoryRoot, ORIGINAL_PLAN_PATH, 'owner original plan\n');
+    writeRepositoryFile(repositoryRoot, PROTECTED_HISTORY_PATH, 'owner original plan\n');
     writeRepositoryFile(
         repositoryRoot,
         RUNTIME_PATH,
@@ -131,7 +131,7 @@ function createFixture(t) {
         'ploinky-box/**',
         'tests/unit/ploinkyBox*.test.mjs',
         'docs/runtime.html',
-        ORIGINAL_PLAN_PATH,
+        PROTECTED_HISTORY_PATH,
     ];
     const manifestPath = captureFixtureManifest(repositoryRoot, baseSha, allowlist);
     return {
@@ -230,12 +230,12 @@ test('boundary requires both sides of a rename to be authorized', async (t) => {
     });
 });
 
-test('boundary rejects original-plan content and mode changes', async (t) => {
+test('boundary rejects protected-history content and mode changes', async (t) => {
     await t.test('content', (subtest) => {
         const fixture = createFixture(subtest);
         writeRepositoryFile(
             fixture.repositoryRoot,
-            ORIGINAL_PLAN_PATH,
+            PROTECTED_HISTORY_PATH,
             'changed after capture\n',
         );
 
@@ -244,7 +244,7 @@ test('boundary rejects original-plan content and mode changes', async (t) => {
 
     await t.test('mode', (subtest) => {
         const fixture = createFixture(subtest);
-        fs.chmodSync(path.join(fixture.repositoryRoot, ORIGINAL_PLAN_PATH), 0o755);
+        fs.chmodSync(path.join(fixture.repositoryRoot, PROTECTED_HISTORY_PATH), 0o755);
 
         assertBoundaryViolation(() => checkFixture(fixture), /Protected dirty content or mode/);
     });

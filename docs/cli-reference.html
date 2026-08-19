@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CLI Reference - Ploinky</title>
+    <title>Ploinky Documentation</title>
     <link rel="stylesheet" href="style.css">
     <script src="partials-loader.js" defer></script>
     <script type="module">
@@ -16,6 +16,7 @@
 
     <main>
         <div class="container">
+            <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / CLI Reference</nav>
             <div class="doc-layout">
                 <aside class="sidebar">
                     <h3>Quick Navigation</h3>
@@ -327,8 +328,14 @@ default-skills PloinkySkills</code></pre>
 
                     <div class="doc-section" id="web">
                         <h2>Web Interfaces</h2>
-                        
-
+                        <p>Ploinky serves browser interfaces through the authenticated <a href="wiki.html#definition-router">Router</a> on the selected loopback port. The CLI does not publish an agent container port directly.</p>
+                        <table class="command-table"><thead><tr><th>Surface</th><th>Use</th></tr></thead><tbody>
+                            <tr><td><code>/webchat</code></td><td>Opens <a href="webchat.html">WebChat</a> for an enabled agent CLI, including sessions, structured interactions, task updates, uploads, and agent-defined command completion.</td></tr>
+                            <tr><td><code>/status</code></td><td>Shows authenticated workspace and runtime observations without turning status into a mutation surface.</td></tr>
+                            <tr><td><code>/api/marketplace</code></td><td>Provides the local-administrator repository and agent management surface used by the Marketplace UI.</td></tr>
+                            <tr><td><code>/&lt;agent&gt;/*</code></td><td>Routes an admitted agent web path according to its active route generation and HTTP access policy.</td></tr>
+                        </tbody></table>
+                        <p>See <a href="interfaces.html">Interfaces</a> for the complete route families and authentication boundaries.</p>
                     </div>
 
                     <div class="doc-section" id="ploinky-shell">
@@ -451,7 +458,7 @@ MCP ping succeeded.</code></pre>
                         <pre><code>shutdown</code></pre>
 
                         <h3>destroy</h3>
-                        <p>In the Ploinky REPL, <code>destroy</code> removes workspace runtimes and regenerated dependencies while leaving the outer box and <code>.data/</code> homes in place. From a host terminal, <code>ploinky destroy</code> removes the managed outer box and its anonymous volumes; its named volumes are retained.</p>
+                        <p>In the Ploinky REPL, <code>destroy</code> removes workspace runtimes and regenerated dependencies while leaving the outer Box and <code>.data/</code> homes in place. From a host terminal, <code>ploinky destroy</code> removes the exact managed outer Box and discards its nested runtime layer and inner volumes. Workspace files and persistent agent homes remain; regenerated dependency and image caches are removed only when the corresponding cache-deletion option selects them.</p>
                         <pre><code>destroy</code></pre>
 
                         <h3>clean</h3>
@@ -526,16 +533,7 @@ profile show</code></pre>
         </div>
     </main>
 
-    <footer>
-        <div class="container">
-            <p>&copy; 2025 Ploinky Project. Built with security and simplicity in mind.</p>
-            <p>
-                <a href="https://github.com/AssistOS-AI/ploinky">GitHub</a> •
-                <a href="index.html">Home</a> • 
-                <a href="architecture.html">Architecture</a>
-            </p>
-        </div>
-    </footer>
+    <div data-include="partials/footer.html"></div>
 
     <script>
         // Highlight active section in sidebar

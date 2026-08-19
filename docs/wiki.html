@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ploinky Documentation</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+    </script>
+</head>
+<body data-page="wiki">
+    <div data-include="partials/header.html"></div>
+    <main>
+        <div class="container">
+            <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / Wiki</nav>
+            <div class="doc-layout">
+                <aside class="sidebar">
+                    <h3>Wiki Topics</h3>
+                    <ul>
+                        <li><a href="#runtime-boundary">Runtime boundary</a></li>
+                        <li><a href="#workspace-model">Workspace model</a></li>
+                        <li><a href="#agent-lifecycle">Agent lifecycle</a></li>
+                        <li><a href="#routing-and-interfaces">Routing and interfaces</a></li>
+                        <li><a href="#identity-and-authentication">Identity and authentication</a></li>
+                        <li><a href="#authorization-policy">Authorization policy</a></li>
+                        <li><a href="#configuration-and-secrets">Configuration and secrets</a></li>
+                        <li><a href="#specialized-runtime-services">Specialized runtime services</a></li>
+                    </ul>
+                </aside>
+                <div class="content-wrapper">
+                    <div class="doc-section">
+                        <h1>Ploinky Wiki</h1>
+                        <p class="subtitle">Canonical definitions for the runtime, workspace, agent, routing, identity, and configuration concepts used by Ploinky.</p>
+                        <p>This page defines Ploinky-specific vocabulary used by the operational guides and design specifications. Each entry describes the concept's owner, role in a workflow, important relationships, and enforced boundary; implementation identifiers remain in their original form.</p>
+                    </div>
+
+                    <section class="doc-section" id="runtime-boundary">
+                        <h2>Runtime boundary</h2>
+
+                        <article id="definition-ploinky-box">
+                            <h3>Ploinky Box</h3>
+                            <p>The Ploinky Box is the single rootless outer container owned by the host <code>ploinky</code> process for one canonical workspace. It mounts Ploinky source read-only, mounts the selected workspace and validated caches explicitly, and contains <code>ploinky-local</code>, the Router, and nested agent runtimes. Its physical-host network boundary is fixed to the loopback Router TCP publication and one LiveKit UDP publication; agent listeners and private Router port <code>8081</code> remain inside the Box.</p>
+                        </article>
+
+                        <article id="definition-box-supervisor">
+                            <h3>Box Supervisor</h3>
+                            <p>The Box Supervisor is the host-side lifecycle code that resolves the workspace identity and creates, validates, starts, stops, replaces, or removes its exact Ploinky Box. It verifies ownership, engine state, image identity, mounts, confinement, and publications before mutation and never adopts an ambiguous or foreign container. It owns the outer boundary only; nested agents are controlled by <code>ploinky-local</code> inside the Box.</p>
+                        </article>
+
+                        <article id="definition-ploinky-local">
+                            <h3>ploinky-local</h3>
+                            <p><code>ploinky-local</code> is the in-Box Ploinky process that owns workspace initialization, repository and dependency preparation, enabled-agent lifecycle, routing generation, and supervision of nested runtimes. The public wrapper enters this process after the Box boundary is ready. It must not create another Box, because the host process is the only owner of the outer runtime.</p>
+                        </article>
+
+                        <article id="definition-nested-agent-runtime">
+                            <h3>Nested agent runtime</h3>
+                            <p>A nested agent runtime is the isolated process environment created for one enabled agent instance inside the Ploinky Box. Managed Box execution uses rootless Podman and supplies only the generated mounts, declared environment, private network placement, resource limits, and exact identity admitted for that instance. Its writable container layer and inner named volumes do not survive Box destruction, so durable data must use a workspace-backed bind.</p>
+                        </article>
+
+                        <article id="definition-runtime-backend">
+                            <h3>Runtime backend</h3>
+                            <p>A runtime backend is the implementation that creates and controls an agent process. Direct development may select an OCI container, Bubblewrap on Linux, or Seatbelt on macOS according to manifest and workspace policy, while a marked Ploinky Box forces nested rootless Podman for managed agent, helper, probe, and installation work. Backend selection changes process and mount mechanics but does not weaken workspace identity, environment filtering, readiness, or routing admission.</p>
+                        </article>
+                    </section>
+
+                    <section class="doc-section" id="workspace-model">
+                        <h2>Workspace model</h2>
+
+                        <article id="definition-workspace">
+                            <h3>Workspace</h3>
+                            <p>A workspace is the canonical directory from which Ploinky manages one project, its repositories, enabled agents, runtime state, and persistent data. Commands resolve the nearest valid workspace root or an explicitly admitted root before reading or mutating resources, and the absolute canonical path participates in the Box identity. One operation must never discover, adopt, or change another workspace's state.</p>
+                        </article>
+
+                        <article id="definition-ploinky-directory">
+                            <h3>.ploinky directory</h3>
+                            <p><code>.ploinky/</code> is Ploinky-owned workspace state. It contains managed repository checkouts, the enabled-agent registry, routing candidates, encrypted variables, the master key, logs, dependency and image caches, locks, generated topology, and feature-specific service data. Agents do not receive it as an unrestricted home, and cleanup must select exact owned children rather than recursively treating the complete directory as disposable.</p>
+                        </article>
+
+                        <article id="definition-agent-data-directory">
+                            <h3>.data directory</h3>
+                            <p><code>.data/</code> is the workspace-root directory that provides one persistent home for each agent instance. The directory name uses the alias when present and otherwise the agent name, so multiple instances of one source agent keep independent configuration and history. Disabling or replacing a runtime preserves this home unless a separate, explicit data-removal operation is defined.</p>
+                        </article>
+
+                        <article id="definition-managed-repository">
+                            <h3>Managed repository</h3>
+                            <p>A managed repository is a Git checkout stored under <code>.ploinky/repos/&lt;repository&gt;/</code> and recorded with enough source and branch information for later update or repair. Ploinky uses repositories as the distribution and development unit for agents, and one repository may contain several independent agent directories. Installing a repository makes its agents discoverable; it does not enable every discovered agent.</p>
+                        </article>
+
+                        <article id="definition-agent-directory">
+                            <h3>Agent directory</h3>
+                            <p>An agent directory is an immediate child of a managed repository that contains a file named exactly <code>manifest.json</code>. Its directory name becomes the manifest agent name, and an optional <code>code/</code> child becomes the source mount when present; otherwise the agent directory is the source. A directory without the required manifest is ordinary repository content and is not discoverable as an agent.</p>
+                        </article>
+
+                        <article id="definition-agent-manifest">
+                            <h3>Agent manifest</h3>
+                            <p>An agent manifest is the <code>manifest.json</code> contract that declares portable agent intent: image, commands, environment inputs, profiles, dependencies, startup behavior, mounts, readiness, network placement, MCP configuration, and supported policy metadata. Ploinky validates and combines it with workspace policy before runtime creation. The manifest cannot grant itself core credentials, publish an outer Box port, or override Router-owned identity and topology values.</p>
+                        </article>
+
+                        <article id="definition-runtime-profile">
+                            <h3>Runtime profile</h3>
+                            <p>A runtime profile is a named manifest configuration selected for a workspace stage such as development, QA, or production. It may refine the supported lifecycle hooks, environment declarations, mount access, dependencies, provider selection, and private runtime settings according to the manifest merge rules. A profile is not an unrestricted copy of the root manifest: root-only security fields and unsupported runtime arguments remain rejected.</p>
+                        </article>
+                    </section>
+
+                    <section class="doc-section" id="agent-lifecycle">
+                        <h2>Agent lifecycle</h2>
+
+                        <article id="definition-agent">
+                            <h3>Agent</h3>
+                            <p>An agent is repository-controlled software that Ploinky discovers through an agent manifest and runs through a selected isolated runtime. It may provide an interactive CLI, a long-running service, MCP tools and resources, static files, or other Router-mediated interfaces. Ploinky owns packaging, lifecycle, isolation, observation, and communication boundaries; the agent owns its application behavior and agent-specific persisted state.</p>
+                        </article>
+
+                        <article id="definition-enabled-agent-record">
+                            <h3>Enabled-agent record</h3>
+                            <p>An enabled-agent record is the workspace registry entry that binds one manifest agent to an exact repository, run mode, optional alias, runtime identity, authentication selection, and enable generation. Lifecycle and routing commands use this record instead of selecting a process by a convenient name. Removing the record coordinates route withdrawal and runtime teardown while leaving the instance's persistent home intact.</p>
+                        </article>
+
+                        <article id="definition-agent-alias">
+                            <h3>Agent alias</h3>
+                            <p>An agent alias is a workspace-unique name assigned to an additional enabled instance of a manifest agent. It becomes that instance's route key, command selector, runtime identity label, and <code>.data/</code> home name, allowing two instances of the same source agent to remain independent. An alias does not change the canonical source principal derived from the repository and manifest agent.</p>
+                        </article>
+
+                        <article id="definition-static-agent">
+                            <h3>Static agent</h3>
+                            <p>The static agent is the enabled agent selected as the workspace's default browser application during start. On a control host, the Router may redirect <code>/</code> or <code>/index.html</code> to this agent's prefixed route. Static selection does not grant the agent administrative authority, does not make it the aggregate MCP server, and does not let it bypass ordinary readiness and route policy.</p>
+                        </article>
+
+                        <article id="definition-manual-startup">
+                            <h3>Manual startup</h3>
+                            <p>Manual startup is the manifest policy <code>startup: "manual"</code>, which keeps an already stopped enabled agent outside the static dependency graph dormant during an ordinary workspace start. A running manual agent stays running, while a static agent or explicit dependency starts regardless of this policy. An operator activates a stopped manual instance through its explicit restart path, which must recreate or start the exact runtime, verify readiness, and restore its route.</p>
+                        </article>
+
+                        <article id="definition-dependency-graph">
+                            <h3>Dependency graph</h3>
+                            <p>The dependency graph is the complete resolved set and ordering of manifest agents required for a workspace start. Ploinky resolves repository-qualified references, profiles, provider nodes, and direct dependencies before launch, rejects cycles or ambiguity, and starts nodes only after their dependency barriers are satisfied. Graph membership can force a manual agent to start because required dependencies take precedence over the manual-startup preference.</p>
+                        </article>
+
+                        <article id="definition-dependency-cache">
+                            <h3>Dependency cache</h3>
+                            <p>A dependency cache is a prepared, runtime-keyed installation of global and per-agent Node dependencies stored under <code>.ploinky/deps/</code>. Ploinky validates the runtime key and merged package hash, prepares missing or stale content in the appropriate backend, and mounts accepted content read-only into the agent runtime. The cache is regenerated state rather than agent-owned durable data.</p>
+                        </article>
+
+                        <article id="definition-readiness">
+                            <h3>Readiness</h3>
+                            <p>Readiness answers whether a newly started agent runtime may receive traffic. Ploinky may use an MCP handshake, TCP connection, declared readiness script, or explicit no-serving-surface decision, then activates a route only after the selected check succeeds. A readiness failure prevents dependent startup and route publication; it is not hidden by the presence of a running process.</p>
+                        </article>
+
+                        <article id="definition-liveness">
+                            <h3>Liveness</h3>
+                            <p>Liveness answers whether an already admitted runtime remains healthy enough to keep serving. The Watchdog applies the declared recurring probe and bounded failure threshold to the exact recorded runtime, withdraws a stale route before recovery, and uses bounded restart backoff. Liveness does not replace initial readiness, and an activation-only readiness probe requires separate recurring liveness coverage.</p>
+                        </article>
+
+                        <article id="definition-no-wait-dependency">
+                            <h3>No-wait dependency</h3>
+                            <p>A no-wait dependency is a graph node allowed to continue startup asynchronously after its identity, direct dependencies, and final preparation generation have been fixed. Its detached worker has a run-specific identifier, status, log, deadline, and terminal ready, failed, or superseded state. No-wait shortens the synchronous command boundary but does not permit raw route activation, stale-runtime adoption, or unobservable readiness failure.</p>
+                        </article>
+                    </section>
+
+                    <section class="doc-section" id="routing-and-interfaces">
+                        <h2>Routing and interfaces</h2>
+
+                        <article id="definition-router">
+                            <h3>Router</h3>
+                            <p>The Router is Ploinky's single HTTP, Server-Sent Events, WebSocket, and MCP mediator for browsers, agents, and workspace services. It selects a closed surface from the listener class and exact Host, authenticates the caller, applies route or tool policy, verifies the active generation, and only then serves a file or opens a private upstream connection. Reachability, loopback origin, and container networking are never accepted as authorization.</p>
+                        </article>
+
+                        <article id="definition-route-key">
+                            <h3>Route key</h3>
+                            <p>A route key is the validated workspace-local name used to select one enabled agent through a path such as <code>/&lt;agentName&gt;/...</code>. It is normally the manifest agent name and becomes the alias for an aliased instance. The Router resolves it against the active generation, so an unknown, ambiguous, disabled, or stale key cannot fall through to another agent.</p>
+                        </article>
+
+                        <article id="definition-edge-generation">
+                            <h3>Edge generation</h3>
+                            <p>An edge generation is the immutable installed snapshot that binds host selection, routes, targets, and authorization policy for dispatch. Ploinky stages and validates a complete candidate before installation and keeps malformed, partial, or superseded candidates inactive. HTTP, SSE, WebSocket, static-file, and MCP operations revalidate the captured generation at their final execution boundary.</p>
+                        </article>
+
+                        <article id="definition-route-lease">
+                            <h3>Route lease</h3>
+                            <p>A route lease is the captured proof that a selected target and policy belong to the active generation for the current request. The Router commits or revalidates this lease immediately before reading agent content, dialing an upstream, or executing an operation. A generation change invalidates the lease and stops dispatch instead of allowing a request to reach a predecessor runtime.</p>
+                        </article>
+
+                        <article id="definition-agentserver">
+                            <h3>AgentServer</h3>
+                            <p>AgentServer is Ploinky's default private service for an agent that does not provide its own service command. It loads the runtime-owned <code>mcp-config.json</code>, exposes MCP tools, resources, and prompts, provides health and supported OpenAI-compatible endpoints, and performs traversal-safe static serving below the agent source. The Router remains the public policy boundary; AgentServer is not published directly to the physical host.</p>
+                        </article>
+
+                        <article id="definition-model-context-protocol">
+                            <h3>Model Context Protocol (MCP)</h3>
+                            <p>Model Context Protocol is the JSON-RPC interface Ploinky uses for tool, resource, prompt, task, and agent-service interactions. The control-host <code>/mcp</code> route aggregates admitted capabilities across active agents, while <code>/&lt;agent&gt;/mcp</code> selects one exact agent's MCP service. Router authentication, active-generation checks, MCP policy, and request-bound target credentials apply before an agent command executes.</p>
+                        </article>
+
+                        <article id="definition-webchat">
+                            <h3>WebChat</h3>
+                            <p>WebChat is the authenticated Router-owned browser application that connects one browser tab to a selected agent's manifest CLI. Browser input travels through protected HTTP routes, CLI output returns through a Server-Sent Events stream, and the browser never opens a direct terminal or container connection. The CLI owns conversation persistence and asynchronous task state; WebChat validates and renders bounded runtime snapshots.</p>
+                        </article>
+
+                        <article id="definition-webchat-message-envelope">
+                            <h3>WebChat message envelope</h3>
+                            <p>A WebChat message envelope is the optional versioned JSON record written to the selected CLI's standard input when <code>webchat.forwardEnvelope</code> is enabled. It carries the user text and validated request context such as attachments and workspace-relative references, followed by one newline. It does not contain reconstructed conversation history or reusable browser and provider credentials.</p>
+                        </article>
+
+                        <article id="definition-webchat-control-record">
+                            <h3>WebChat control record</h3>
+                            <p>A WebChat control record is one complete newline-delimited JSON object emitted by a CLI with a recognized versioned marker for session, task, runtime, workspace-file, skills, or interaction state. WebChat strips terminal controls, validates the schema, removes accepted records from visible assistant text, and converts them to named browser events. Malformed or unknown records remain ordinary output and cannot update browser state.</p>
+                        </article>
+
+                        <article id="definition-agent-command-catalog">
+                            <h3>Agent command catalog</h3>
+                            <p>An agent command catalog is the selected agent's structured list of slash commands and completion behavior exposed through its MCP tools. WebChat obtains it during page initialization, caches it in the browser, and performs filtering locally; a reconnect does not resend or reload the catalog. A full page load or an explicit post-skills-change refresh requests it again, and a bounded fallback may be derived from admitted <code>execute_*</code> tools when the catalog tool is absent.</p>
+                        </article>
+
+                        <article id="definition-marketplace">
+                            <h3>Marketplace</h3>
+                            <p>Marketplace is the Router-owned management surface that reports repositories, discoverable agents, enabled instances, and runtime state and accepts a bounded set of lifecycle actions. Human mutations require local administrator authority and browser mutation proof; an asserted agent receives only explicitly admitted operations such as reading inventory or enabling an already available dependency. Marketplace does not grant agents repository removal or general workspace administration.</p>
+                        </article>
+
+                        <article id="definition-watchdog">
+                            <h3>Watchdog</h3>
+                            <p>The Watchdog is the in-Box supervisor for the Router and admitted agent runtimes. It observes exact recorded identities, performs supported health checks, removes stale routes, records bounded diagnostics, and requests controlled recovery with backoff. It does not invent desired state, recreate deliberately disabled agents, or make read-only observation commands mutate the workspace.</p>
+                        </article>
+                    </section>
+
+                    <section class="doc-section" id="identity-and-authentication">
+                        <h2>Identity and authentication</h2>
+
+                        <article id="definition-local-user">
+                            <h3>Local user</h3>
+                            <p>A local user is a human identity authenticated by Router-managed password credentials for the selected route policy. The Router stores password material through its encrypted local-auth contract and issues a route- and generation-bound browser session after successful login. A local user's roles determine ordinary and administrative access; the user session is not an agent credential.</p>
+                        </article>
+
+                        <article id="definition-local-administrator">
+                            <h3>Local administrator</h3>
+                            <p>A local administrator is a locally authenticated user whose session and control proof satisfy Ploinky's administrator checks on an exact local-control Host. Administrative mutations additionally require the expected Origin and session-bound browser mutation proof. SSO identity, guest identity, agent assertions, loopback source, and component tokens do not substitute for this authority.</p>
+                        </article>
+
+                        <article id="definition-sso-user">
+                            <h3>SSO user</h3>
+                            <p>An SSO user is a human identity established through the route-selected external identity provider and normalized by the Router into a browser session. The callback, state, return path, and active generation must validate before the session is accepted. An SSO session can satisfy authenticated application access but cannot satisfy local-only administrator controls unless a separate contract explicitly grants that role.</p>
+                        </article>
+
+                        <article id="definition-guest-session">
+                            <h3>Guest session</h3>
+                            <p>A guest session is a Router-issued, expiring browser identity for a route whose HTTP policy explicitly permits guests. It may be scoped to the route or service that created it and can satisfy only policy classes that admit guests. It is not an anonymous bypass, a local administrator, an agent assertion, or a user-delegation source.</p>
+                        </article>
+
+                        <article id="definition-agent-principal">
+                            <h3>Agent principal</h3>
+                            <p>An agent principal is the canonical source identity <code>agent:&lt;repo&gt;/&lt;agent&gt;</code> assigned to a manifest agent. It identifies the repository and agent across enabled instances, while aliases and replacements receive separate runtime tuples. An agent can assert only its own principal and cannot choose a human identity, another agent, or a future generation.</p>
+                        </article>
+
+                        <article id="definition-runtime-tuple">
+                            <h3>Runtime tuple</h3>
+                            <p>A runtime tuple combines the canonical agent principal, random effective instance identifier, and enable generation for one active instance. Routing, private assertions, credentials, and cleanup compare this tuple to current registry and runtime ownership evidence. Disable, re-enable, replacement, or another identity-changing lifecycle operation rotates the tuple so predecessor authority becomes stale.</p>
+                        </article>
+
+                        <article id="definition-agent-assertion">
+                            <h3>Agent Assertion</h3>
+                            <p>An Agent Assertion is a short-lived request-bound token signed by a source agent with its eligible agent request secret for the Router. It identifies the source, target, operation, request-content hash, time window, and replay value needed for one admitted cross-agent MCP or HTTP request. The Router still applies active-tuple checks, caller ACL, and route or MCP policy; a valid signature alone does not authorize execution.</p>
+                        </article>
+
+                        <article id="definition-private-agent-assertion">
+                            <h3>Private Agent Assertion</h3>
+                            <p>A Private Agent Assertion is the tuple-specific token used by an eligible current agent to call the Router's private listener. It additionally binds effective instance, enable generation, HTTP method, normalized path and query, and body hash. Network access to port <code>8081</code> supplies transport only; an absent, replayed, or stale private assertion fails authorization.</p>
+                        </article>
+
+                        <article id="definition-router-request">
+                            <h3>Router Request</h3>
+                            <p>A Router Request is the target-specific token minted by the Router after it authenticates the caller and admits the operation. The target agent verifies this token with its own request secret, recomputes the request-content hash, and consumes replay state before exposing normalized invocation metadata to a command. A Router Request cannot be forged by presenting a browser cookie or another agent's assertion directly to the target.</p>
+                        </article>
+
+                        <article id="definition-user-delegation-grant">
+                            <h3>User Delegation Grant</h3>
+                            <p>A User Delegation Grant is a separately signed, bounded record of human consent for one declared source agent, target agent, tool, user, and scope set. It accompanies, but never replaces, the source agent's own Agent Assertion and cannot broaden route or MCP policy. Guest users do not receive delegation grants.</p>
+                        </article>
+
+                        <article id="definition-request-content-hash">
+                            <h3>Request-content hash (rch)</h3>
+                            <p>The request-content hash, carried as <code>rch</code>, is the canonical digest of the method, path, query, tool arguments, or body hash relevant to a signed request. The source, Router, and target recompute the applicable value so a token cannot be replayed against different content. Canonicalization rules are protocol-specific and remain paired with token type, audience, target, expiry, and nonce checks.</p>
+                        </article>
+
+                        <article id="definition-runtime-capability">
+                            <h3>Runtime capability</h3>
+                            <p>A runtime capability is a core-issued authorization for one exceptional lifecycle, placement, network, or resource operation in an exact workspace generation. It can admit behavior such as constrained host-network placement after the runtime policy verifies it. It is not a human session or application JWT and cannot be presented to an agent route as caller identity.</p>
+                        </article>
+
+                        <article id="definition-relay-credential">
+                            <h3>Relay credential</h3>
+                            <p>A relay credential is a fresh, short-lived, generation-bound secret for one verified confined relay channel and private target. Ploinky delivers it only after matching the runtime, container, lease, and destination and removes it with that channel. It is absent from ordinary manifest environment, persistent routing state, logs, and host or unconfined runtimes.</p>
+                        </article>
+                    </section>
+
+                    <section class="doc-section" id="authorization-policy">
+                        <h2>Authorization policy</h2>
+
+                        <article id="definition-http-route-access">
+                            <h3>HTTP route access</h3>
+                            <p>HTTP route access is the closed Router policy domain with the values <code>public</code>, <code>guest</code>, and <code>authenticated</code>. It determines which browser identity is required for an admitted path and keeps anonymous public behavior limited to supported safe operations. Unknown, malformed, absent where required, or inapplicable values deny access, and this policy does not govern MCP tool roles.</p>
+                        </article>
+
+                        <article id="definition-mcp-tool-policy">
+                            <h3>MCP tool policy</h3>
+                            <p>MCP tool policy is the separate closed domain with the values <code>authenticated</code>, <code>internal</code>, and <code>admin</code>. It decides whether a normalized user, agent, or local-administrator caller may execute one agent tool after discovery and target resolution. Manifest tags establish defaults, persisted Router policy remains authoritative, and an agent cannot turn its own tool into an administrative operation.</p>
+                        </article>
+
+                        <article id="definition-caller-acl">
+                            <h3>Caller ACL</h3>
+                            <p>A caller access-control list is the generation-bound declaration of which exact source agents may reach a protected target or private Router operation. The Router evaluates it together with the source's current tuple, request assertion, and the relevant HTTP or MCP policy. Membership alone does not authenticate a request and never grants a source agent human or administrator identity.</p>
+                        </article>
+
+                        <article id="definition-mutation-proof">
+                            <h3>Browser mutation proof</h3>
+                            <p>A browser mutation proof is the session-bound value required with state-changing Router requests after login. The Router validates it together with the exact Origin, selected Host, route, user session, and active generation to prevent a browser credential from authorizing an unrelated mutation. It does not replace local administrator checks on administrative operations.</p>
+                        </article>
+                    </section>
+
+                    <section class="doc-section" id="configuration-and-secrets">
+                        <h2>Configuration and secrets</h2>
+
+                        <article id="definition-workspace-variable">
+                            <h3>Workspace variable</h3>
+                            <p>A workspace variable is an operator- or provider-owned configuration value stored through Ploinky's encrypted variable contract in <code>.ploinky/.secrets</code>. An agent receives a value only when its selected manifest or profile declares the corresponding environment input and the purpose-specific resolver accepts the source. Variables are not routing authority and must not be copied into manifests, registry entries, status output, or logs when sensitive.</p>
+                        </article>
+
+                        <article id="definition-workspace-master-key">
+                            <h3>Workspace master key</h3>
+                            <p>The workspace master key is the root secret for encrypted workspace stores and purpose-separated derived keys. A managed Ploinky Box reads only the private <code>.ploinky/master-key</code> file created for that workspace and removes host environment overrides before core execution; direct development has a separate documented resolution order. The key is never injected into an agent, provider command, route, log, or test artifact.</p>
+                        </article>
+
+                        <article id="definition-agent-generated-secret">
+                            <h3>Agent-generated secret</h3>
+                            <p>An agent-generated secret is a deterministic manifest environment value derived for one workspace, repository, agent, and inside variable name. The declaration <code>generatedSecret: true</code> lets cooperating lifecycle code reproduce the value without storing it in the manifest, while keeping different agents and names separated. An operator value overrides it only when the manifest explicitly permits and validates that override.</p>
+                        </article>
+
+                        <article id="definition-shared-generated-secret">
+                            <h3>Shared generated secret</h3>
+                            <p>A shared generated secret is a deterministic value derived from the workspace key and an explicitly declared shared source name. It exists for agents that intentionally need the same secret and therefore has a broader trust boundary than an agent-generated secret. Ploinky still requires each consumer to declare the value and excludes it from provider output, logs, and ordinary routing metadata.</p>
+                        </article>
+
+                        <article id="definition-startup-config-provider">
+                            <h3>Startup config provider</h3>
+                            <p>A startup config provider is an agent repository component whose manifest declares a bounded command and an allowlist of configuration outputs needed before dependent runtimes start. Ploinky runs providers in the selected graph order, strips protected environment values, validates one versioned JSON result, persists only accepted changes, reloads affected configuration, and then captures the final launch lease. Provider code proposes ordinary values but cannot write Ploinky state directly or control routing, publication, topology, generated-secret ownership, or core credentials.</p>
+                        </article>
+                    </section>
+
+                    <section class="doc-section" id="specialized-runtime-services">
+                        <h2>Specialized runtime services</h2>
+
+                        <article id="definition-architecture-catalog">
+                            <h3>Architecture catalog</h3>
+                            <p>An architecture catalog is external, schema-validated JSON data that describes supported local-LLM platforms, accelerator requirements, images, runtime policy, and agent-to-architecture mappings. The hardware detector and selector consume this data to choose a compatible record, but the catalog cannot execute probes, inject raw engine arguments, grant arbitrary devices, or choose host paths. Ploinky converts only an allowlisted validated record into an ordinary constrained runtime plan.</p>
+                        </article>
+
+                        <article id="definition-local-llm-runtime">
+                            <h3>Local LLM runtime</h3>
+                            <p>A local LLM runtime is an agent container whose manifest opts into architecture-catalog selection and persistent model storage. Ploinky owns hardware matching, image and policy validation, safe device translation, the <code>/models</code> mount, redacted selection state, and normal lifecycle admission. The agent owns model downloads, cache layout, inference behavior, and its OpenAI-compatible or MCP application interfaces.</p>
+                        </article>
+
+                        <article id="definition-cloudflare-publication">
+                            <h3>Cloudflare publication</h3>
+                            <p>Cloudflare publication is the optional core-owned path that connects a configured external hostname to the fixed in-Box Router origin at <code>http://127.0.0.1:8080</code>. Ploinky validates complete configuration, keeps connector credentials out of agent environments, coordinates ingress and DNS with the active generation, and records ownership before any managed teardown. Without valid configuration the workspace remains local-only; agents and startup providers cannot create or mutate publication authority.</p>
+                        </article>
+
+                        <article id="definition-livekit-media-surface">
+                            <h3>LiveKit media surface</h3>
+                            <p>The LiveKit media surface is the Box's single wildcard UDP publication targeting the fixed in-Box listener on port <code>7882</code>. The physical-host UDP port may be selected independently, but it remains one of exactly two outer engine publications. Media reachability does not grant Router identity, agent access, or permission to publish another service.</p>
+                        </article>
+
+                        <article id="definition-turn-credential">
+                            <h3>TURN credential</h3>
+                            <p>A TURN credential is a short-lived media-relay credential minted through the Router's private service for an exact allowlisted current agent and available topology. It is rate-limited, generation-bound, and belongs only to the TURN protocol. It cannot serve as a browser session, Agent Assertion, Router Request, runtime capability, or reusable workspace variable.</p>
+                        </article>
+                    </section>
+                </div>
+            </div>
+        </div>
+    </main>
+    <div data-include="partials/footer.html"></div>
+    <script>
+        const navLinks = document.querySelectorAll('.sidebar a');
+        const sections = [...document.querySelectorAll('.doc-section[id]')];
+        function updateActiveSection() {
+            let current = sections[0]?.id || '';
+            sections.forEach((section) => {
+                if (section.getBoundingClientRect().top <= 100) current = section.id;
+            });
+            navLinks.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${current}`));
+        }
+        window.addEventListener('scroll', updateActiveSection);
+        updateActiveSection();
+    </script>
+</body>
+</html>

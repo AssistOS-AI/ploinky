@@ -24,3 +24,14 @@ Agent application output may be passed through as operator-requested log content
 Conversation history, task state, agent-specific checkpoints, and model artifacts are agent-owned state. Ploinky observability may expose transport and lifecycle summaries but must not treat those data sets as Router operational truth or persist them in routing and policy records.
 
 Observability must explain exact owned state without changing it and must preserve the same workspace, identity, and credential boundaries enforced during mutation.
+
+### Observability rationale
+
+| Decision | Reason |
+| --- | --- |
+| Keep `status` and `logs` strictly read-only | Asking what happened must remain safe during an incident. Observation that creates, pulls, repairs, or restarts resources can destroy the evidence it is meant to explain. |
+| Resolve logs through the exact enabled record and runtime identity | Names and first-match container searches can select a predecessor or another workspace. Exact ownership makes the displayed output attributable. |
+| Preserve startup output and hand it over to runtime log selection | Failures often happen before a durable runtime is ready. One continuous operator view explains both slow startup and the eventual running process. |
+| Bound history, tail buffers, retention, and cancellation cleanup | Log volume is controlled by agent code and must not create unbounded memory, disk, or child-process growth in the supervisor. |
+| Redact control diagnostics while allowing requested application output | Operators need the workload's own output, but Ploinky-generated evidence must not turn credentials or reusable proofs into durable log material. |
+| Leave conversations, tasks, and model artifacts under agent ownership | The Router observes transport and lifecycle state; treating application state as routing truth would couple core recovery to every agent implementation. |

@@ -7,15 +7,13 @@ resolve one question and nothing else. It does not implement, plan, or
 authorize any product runtime, CLI, Router, agent, image, workflow, or
 deployment behavior.
 
-Normative source (authority order, descending):
-
-1. `docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md`, sections
-   1-7 and 9, in the outer multi-repo workspace root.
-2. `docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild-annex-inventory.md`,
-   sections 1-4, same location.
-
-Section 8 of the main plan and annex sections 5-6 are non-normative deferred
-ledgers and are out of scope for this directory.
+The active architecture contract is
+`docs/specs/DS006-runtime-execution-and-isolation.md`; verification ownership
+and evidence rules are in `docs/specs/DS012-testing-and-verification.md`.
+This directory preserves a self-contained historical experiment for the
+port-scoped forwarding decision. References in source comments to a "main
+plan", an annex, or their line numbers are provenance labels from the retired
+design record and do not override the active DS contracts.
 
 ## Scope boundary
 

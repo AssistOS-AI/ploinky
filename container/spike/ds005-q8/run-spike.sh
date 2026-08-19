@@ -4,8 +4,9 @@ set -euo pipefail
 # DS005-Q8 architecture-decision spike (S0) -- runner preflight, topology,
 # probes, phase state, evidence, cleanup, and the final acknowledgement.
 #
-# Normative source: docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md
-# sections 2, 4.1, 6, and 9, and its annex sections 1 and 4 (outer workspace root).
+# Active contracts: docs/specs/DS006-runtime-execution-and-isolation.md and
+# docs/specs/DS012-testing-and-verification.md. Historical section and line
+# annotations below are retained only as provenance for this self-contained spike.
 #
 # This file runs in two contexts:
 #   1. Remote runner/scanner context: transported as static stdin bytes over

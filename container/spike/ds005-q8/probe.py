@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """DS005-Q8 architecture-decision spike (S0) -- Candidate N TCP probe.
 
-Normative source: docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md
-sections 4.1 and 6.4, and its annex sections 1 and 4 (outer workspace root).
+Active contracts: docs/specs/DS006-runtime-execution-and-isolation.md and
+docs/specs/DS012-testing-and-verification.md. Historical section and line
+annotations below are retained only as provenance for this self-contained spike.
 
 This module owns TCP probing plus the reference/decoy listener modes used to
 populate the S0 probe matrix (main plan section 6.4). It has no knowledge of

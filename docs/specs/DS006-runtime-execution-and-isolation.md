@@ -24,3 +24,15 @@ The host process owns the Box. A compatible running Box is reused, a compatible 
 Nested container records, writable layers, networks, and inner Podman named volumes live in the Box writable layer and do not survive Box destruction. Durable agent or service data must therefore use explicit workspace-backed binds. Stop and start may reuse the same Box writable layer, but `/tmp` and its transient inner runtime metadata are recreated on each outer boot.
 
 The runtime contract provides reproducible agent execution while keeping the physical-host boundary fixed, rootless, attributable to one workspace, and recoverable without broad cleanup.
+
+### Architectural rationale
+
+| Decision | Reason |
+| --- | --- |
+| Install and run agent dependencies inside the managed Box | Prototyping must not install unreviewed libraries, package-manager scripts, or vulnerable transitive dependencies on the physical host. Compromise is contained by the rootless boundary and explicit mounts. |
+| Use one workspace-owned Box with nested per-agent runtimes | The Box gives every supported host one consistent execution base, while nested runtimes isolate agents from one another. A single ownership layer also avoids recursive Box management and ambiguous cleanup. |
+| Mount Ploinky source read-only and validate the exact image before launch | Runtime behavior remains attributable to reviewed source and an immutable image identity; an in-Box process cannot silently rewrite the supervisor it depends on. |
+| Publish exactly the Router TCP endpoint and the LiveKit UDP endpoint | The physical-host boundary is known before untrusted manifests are read and remains stable as agents are enabled or disabled. An agent graph cannot widen host exposure. |
+| Use reviewed port-scoped rootless forwarding instead of address-wide loopback exposure | Required TCP ports remain reachable inside the Box while the private Router listener stays confined; granting an entire host-loopback address would expose unrelated services. |
+| Keep durable data in explicit workspace-backed binds | Nested container metadata and writable layers belong to one Box generation and are safely disposable. Explicit binds preserve only the data whose lifecycle is intentionally longer. |
+| Refuse foreign or incompatible runtime state instead of adopting it | Automatic adoption could mutate or delete resources owned by another workspace or created under a different security contract. Exact ownership evidence makes recovery bounded. |

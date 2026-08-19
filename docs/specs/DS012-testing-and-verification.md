@@ -24,3 +24,13 @@ Documentation changes must regenerate `docs/specs/matrix.md` from DS frontmatter
 The cross-repository `ploinky-proxy` deployment and Playwright gate is separate from ordinary verification and must run only when the user explicitly requests it. When requested, the exact branch, repository, image, workspace, deployment, and evidence requirements in `CLAUDE.md` are mandatory.
 
 Verification must prove the narrow unit contract and the real boundary at which Ploinky exposes lifecycle, routing, security, or browser behavior to a user or consuming system.
+
+### Verification rationale
+
+| Decision | Reason |
+| --- | --- |
+| Combine focused unit tests, subsystem integration tests, and public-boundary end-to-end tests | Pure mocks can prove validation logic but cannot prove rootless engine behavior, real publications, signals, browser sessions, or cross-process cleanup. |
+| Allocate isolated workspaces and exact resource labels per test | Tests must neither depend on nor mutate a developer's active workspace, and cleanup must be able to identify only the resources created by that test. |
+| Require negative and cross-generation security cases | Successful requests do not prove fail-closed behavior. Stale, replayed, malformed, unauthorized, and oversized inputs exercise the boundaries attackers use. |
+| Preserve bounded failure evidence before cleanup | Container, Router, and browser failures are otherwise difficult to reproduce; useful diagnostics must survive without retaining credentials or unrelated state. |
+| Keep the cross-repository deployment gate explicit | It is valuable acceptance evidence but mutates another checkout and deployment environment, so ordinary local verification must not trigger it implicitly. |

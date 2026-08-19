@@ -152,3 +152,13 @@ Update operations must refresh the Ploinky AchillesAgentLib checkout actually lo
 ### Declared external volumes
 
 Manifest volumes are explicit operator grants. Relative host paths resolve from the canonical workspace, absolute host paths remain exact operator-selected paths, and runtime-managed persistent service storage should use `.ploinky/data/`. A declared mount does not change workspace ownership or make its source part of `.data/`. No cleanup path may escape the validated declared location.
+
+### Workspace model rationale
+
+| Decision | Reason |
+| --- | --- |
+| Identify a workspace by its canonical real path and derived identity, not only by its directory name | Two unrelated workspaces can share a readable basename. Canonical identity lets ownership and destructive operations fail closed instead of targeting the wrong workspace. |
+| Separate `.ploinky/` control state from `.data/` agent homes | Control records and caches have different lifecycles from agent-owned history and configuration. Runtime replacement or cache cleanup must not erase an agent's durable home. |
+| Treat a Git repository as the acquisition unit and an immediate child containing `manifest.json` as an agent | One repository can distribute several related agents, while the required manifest makes discovery explicit and prevents arbitrary directories from becoming executable agents. |
+| Keep aliases in runtime state instead of copying or renaming source directories | Multiple instances can reuse one reviewed source tree while retaining distinct persistent homes, configuration, identity tuples, and lifecycle records. |
+| Require explicit manifest volumes for additional host paths | The isolated workspace remains the default boundary, and every broader filesystem grant is visible, reviewable, and confined to an exact path. |

@@ -75,3 +75,13 @@ Session cookies must be HTTP-only, use the route-appropriate lifetime, and remai
 The Router must remove caller-supplied Ploinky identity and forwarding headers before it creates trusted context. A browser session proves a human identity, an admin-control proof proves local administrative use, an Agent Assertion proves one source agent operation, a delegation grant proves bounded human consent, a Router Request proves the Router admitted one target operation, and a runtime capability proves one lifecycle action. No verifier may accept a different proof family because its signature is otherwise valid.
 
 Authentication failure must be indistinguishable from an unavailable private target wherever a detailed error would disclose protected state. Session ids, cookies, bearer tokens, CSRF values, agent secrets, assertions, Router Requests, delegation grants, and runtime capabilities must not enter logs, routing state, URLs, provider metadata, or evidence artifacts. The protocol may expose only the opaque short-lived value required by the intended recipient.
+
+### Authentication architecture rationale
+
+| Decision | Reason |
+| --- | --- |
+| Separate local administrators, authenticated users, and route-scoped guests | Workspace mutation is stronger than ordinary application use, while guest access must remain limited to the route that invited it. One undifferentiated user role would over-grant at least one surface. |
+| End browser sessions at the Router | Agent services need normalized, target-bound authorization rather than reusable cookies or identity-provider tokens. This confines account material to the component that owns authentication. |
+| Bind sessions and mutation proofs to the selected route and active generation | A proof captured for one hostname or obsolete publication cannot authorize a different surface after routing changes. |
+| Use distinct proof families for users, agents, delegated consent, Router requests, and lifecycle capabilities | Each proof answers a different authorization question. Direction and purpose separation prevent a valid signature from being reused at the wrong verifier. |
+| Return generic failures for protected targets | Detailed authentication errors could reveal which private agents, routes, or workspace resources exist even when access is denied. |

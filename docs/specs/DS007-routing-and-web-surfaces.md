@@ -133,3 +133,14 @@ The private `8081` listener accepts only exact request-bound assertions from a c
 | `GET /authority-attestations/<nonce>` on the Router health Unix socket | Consumes a completed authority observation and returns the recorded listener/route evidence, or a generic incomplete/not-found result. |
 
 The Router must return generic errors to unauthenticated, unauthorized, or guest callers where target disclosure would reveal private state. A malformed Host, unavailable compiled surface, missing route or policy, inactive runtime, changed generation, invalid assertion, or failed lease commit must stop dispatch before an upstream connection or file read occurs. Every user surface must converge on the same Router-owned workspace, route generation, authentication context, and exact private target without publishing an agent listener directly.
+
+### Routing and publication rationale
+
+| Decision | Reason |
+| --- | --- |
+| Mediate browser and agent traffic through the Router instead of publishing agent listeners | Authentication, authorization, limits, generation checks, and redaction have one enforceable boundary. Agents cannot independently expose the physical host. |
+| Select the listener and exact Host before interpreting the path | A path that is valid on the local control surface must not become reachable merely because the same path is requested on an agent hostname. Host-first selection prevents cross-surface route confusion. |
+| Separate public port `8080` from private agent port `8081` | Network reachability inside the Box is not authority. The private listener can require request-bound agent proofs without exposing those capabilities to browsers or the host network. |
+| Route agent HTTP and MCP services by agent identity and internal port convention | The manifest stays focused on the agent contract, Ploinky remains service-agnostic, and new agent services do not require new outer host publications. |
+| Keep edge publication under Ploinky core ownership | Public hostnames, connector credentials, route generations, health, replacement, and teardown must change together. Giving an agent or configuration provider that authority would let workload code redefine its own trust boundary. |
+| Support an explicit local-only mode | Isolation, routing, and agent collaboration remain useful without a public edge, and the absence of publication credentials is not treated as a partially configured deployment. |

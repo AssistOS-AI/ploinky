@@ -148,8 +148,26 @@ header {
 .brand {
   display: flex;
   flex-direction: column;
+  align-items: flex-start;
+  border: 0;
+  background: transparent;
   color: var(--text-header);
   text-decoration: none;
+  cursor: pointer;
+}
+
+.nav-menu--brand {
+  margin-right: auto;
+}
+
+.nav-menu--brand .nav-menu__trigger {
+  border-radius: 10px;
+}
+
+.nav-menu--brand .nav-menu__trigger::after {
+  position: absolute;
+  right: 0.7rem;
+  bottom: 0.45rem;
 }
 
 .brand__eyebrow {
@@ -166,6 +184,8 @@ header {
 
 .site-nav {
   display: flex;
+  flex: 1;
+  align-items: center;
   justify-content: flex-end;
   gap: 0.5rem;
 }
@@ -212,6 +232,11 @@ header {
 .nav-menu:last-child .nav-menu__panel {
   right: 0;
   left: auto;
+}
+
+.nav-menu--brand .nav-menu__panel {
+  right: auto;
+  left: 0;
 }
 
 .nav-menu.is-open .nav-menu__panel {
@@ -279,6 +304,16 @@ nav a.active {
 main {
   min-height: calc(100vh - 80px);
   padding: 3rem 0;
+}
+
+.breadcrumbs {
+  margin-bottom: 1rem;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.breadcrumbs a {
+  color: var(--text-link);
 }
 
 .content-wrapper {
@@ -513,7 +548,8 @@ pre {
     margin: 1.5rem 0;
 }
 
-.diagram pre.mermaid {
+.diagram pre.mermaid,
+.doc-section > pre.mermaid {
     margin: 0;
     padding: 0;
     border: 0;
@@ -524,7 +560,8 @@ pre {
     width: 100%;
 }
 
-.diagram pre.mermaid svg {
+.diagram pre.mermaid svg,
+.doc-section > pre.mermaid svg {
     display: block;
     margin-inline: auto;
 }

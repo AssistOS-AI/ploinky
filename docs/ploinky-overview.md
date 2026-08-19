@@ -5,11 +5,8 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 ## Workspace model
 
 - The workspace root is the nearest directory that contains `.ploinky/`.
-- Runtime state lives under `.ploinky/`, including `agents.json`, `routing.json`, `.secrets`, `repos/`, `deps/`, `logs/`, and `keys/`.
-- The first core command in a genuinely fresh workspace creates `agents.json`,
-  `routing.json`, `data/router-security/policy-state.json`, and
-  `data/edge-routing/desired.json` together before any registry mutation.
-  A partial set remains fail-closed and requires explicit repair.
+- Runtime state lives under `.ploinky/`, including `agents.json`, `routing.json`, `.secrets`, `repos/`, `deps/`, and `logs/`.
+- The first core command in a genuinely fresh workspace creates `agents.json`, `routing.json`, `data/router-security/policy-state.json`, and `data/edge-routing/desired.json` together before any registry mutation. A partial set remains fail-closed and requires explicit repair.
 - Agent repositories are cloned under `.ploinky/repos/<repo>/`.
 - The default `start` flow requires a static agent and router port the first time, then reuses the saved configuration.
 
@@ -37,24 +34,11 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 
 ## Web surfaces
 
-- `/webchat`: chat surface over a workspace-scoped TTY runtime. Conversation
-  sessions are owned by the selected CLI, which can publish `current`, `list`,
-  and `selected` snapshots through the generic `__webchatSession` protocol.
-  WebChat validates and retains the latest snapshot only in memory, renders
-  existing messages through `Click to load session history`, and sends
-  `/session`, `/session new`, or `/session resume <id>` for session controls.
-  Ploinky does not persist conversation files or hydrate the CLI's agent. When opened as
-  `/webchat?agent=<name>&...`, the router forwards additional query parameters
-  except router-owned `tabId` to `ploinky cli <name>` as
-  long-form CLI flags encoded as `--key=value`.
+- `/webchat`: chat surface over a workspace-scoped TTY runtime. Conversation sessions are owned by the selected CLI, which can publish `current`, `list`, and `selected` snapshots through the generic `__webchatSession` protocol. WebChat validates and retains the latest snapshot only in memory, renders existing messages through `Click to load session history`, and sends `/session`, `/session new`, or `/session resume <id>` for session controls. Ploinky does not persist conversation files or hydrate the CLI's agent. When opened as `/webchat?agent=<name>&...`, the router forwards additional query parameters except router-owned `tabId` to `ploinky cli <name>` as long-form CLI flags encoded as `--key=value`.
 - `/status/data`: current workspace resource snapshot; `follow=1` streams live NDJSON samples from the Router-owned collector.
 - `/api/marketplace`: JSON endpoint for the first-party agent marketplace. Authenticated local or SSO users may read repository, agent, enabled-record, recorded backend, and runtime state; Bubblewrap and Seatbelt liveness comes from tracked PIDs, while Docker and Podman use OCI state. Local admins may perform the complete `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` action set. A running agent may use a request-bound Agent Assertion to read state and submit only `enable_agent`, which supports on-demand dependency startup without granting repository or disable operations. Client helpers check status first and forward `mode` only when the caller supplies it; an omitted mode retains Marketplace's isolated default. Repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime so the watchdog does not restart it during the operation.
 
-`/webchat` uses the normal router login flow. `/status` is a local-control
-surface that requires a real router-authenticated local-admin
-session on an exact control Host. They do not accept a component token,
-invitation, agent assertion, media credential, or localhost provenance as admin
-identity. This monitoring route is read-only.
+`/webchat` uses the normal router login flow. `/status` is a local-control surface that requires a real router-authenticated local-admin session on an exact control Host. They do not accept a component token, invitation, agent assertion, media credential, or localhost provenance as admin identity. This monitoring route is read-only.
 
 ## Auth and agent cards
 
@@ -64,7 +48,7 @@ identity. This monitoring route is read-only.
 - `GET /agent-card` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /<agent>/agent-card` proxies one agent's metadata.
 - `POST /<agent>/v1/chat/completions` routes OpenAI-compatible requests to one agent, with `stream: true` selecting SSE streaming and normal JSON returned otherwise.
 - `/<agent>/...` routes are transparent per-agent proxy routes after router-owned paths are handled. The router strips the `/<agent>` prefix; the target agent owns paths such as `/index.html`, `/agent-card`, `/v1/chat/completions`, and custom HTTP endpoints. `/<agent>/mcp` remains special so the router can preserve MCP session mediation and secure-wire token minting.
-- `http://<service-slug>.localhost:<routerPort>/` selects a uniquely slugged `httpServices` entry. Its optional `port` resolves to an engine-assigned private target; omitted port preserves the owning agent's primary target. All HTTP, SSE, and WebSocket traffic uses the same immutable route-and-policy authorization generation.
+- `/base-agent-additional-server/<agentName>/<port>/<path>` selects an additional private server owned by an enabled agent. The agent must declare the path through `routerAccess.httpRoutes`; malformed selectors, reserved ports, stale owners, and undeclared paths fail closed. HTTP and WebSocket traffic uses the same immutable route-and-policy authorization generation.
 - Delegated MCP calls use router-minted invocation JWTs. The router verifies the caller's session and forwards a fresh target invocation token.
 
 ## Dependency and profile commands

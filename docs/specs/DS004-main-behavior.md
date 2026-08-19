@@ -3,6 +3,8 @@ title: DS004-main-behavior
 summary: Defines how Ploinky finds a workspace, starts and operates agents, mounts files, prepares dependencies, applies profiles, updates repositories, and exposes Router-owned interfaces and browser libraries.
 ---
 
+# DS004 Main Behavior
+
 ## Introduction
 
 Ploinky must let an operator run repository-described agents from a workspace without managing container addresses, dependency installations, or route wiring by hand. The public `ploinky` command must bind one managed outer Box to the selected host workspace, and the in-Box `ploinky-local` runtime must prepare the declared agent graph, start its processes, and expose the commands and Router paths used by operators, browsers, and agent integrations. The following components define the concrete outcomes that those actors depend on.

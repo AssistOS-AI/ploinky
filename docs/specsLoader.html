@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Specifications - Ploinky Documentation</title>
+  <title>Ploinky Documentation</title>
   <meta http-equiv="refresh" content="0; url=specs.html" />
   <script type="module">
     import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
@@ -15,7 +15,7 @@
   <script>
     const requestedSpec = new URLSearchParams(window.location.search).get('spec') || '';
     const match = requestedSpec.match(/^DS(\d{3})-[A-Za-z0-9-]+\.md$/);
-    const target = match ? `specs.html#DS${match[1]}` : 'specs.html';
+    const target = requestedSpec === 'matrix.md' ? 'specs.html' : (match ? `specs.html#DS${match[1]}` : 'specs.html');
     window.location.replace(target);
   </script>
 </body>
