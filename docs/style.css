@@ -505,14 +505,22 @@ pre {
 
 .diagram {
     margin: 1.5rem 0;
+    text-align: center;
 }
 
 .diagram pre.mermaid {
+    display: flex;
+    justify-content: center;
     margin: 0;
     padding: 0;
     border: 0;
     background: transparent;
     box-shadow: none;
+}
+
+.diagram pre.mermaid svg {
+    max-width: 100%;
+    height: auto;
 }
 
 .diagram figcaption {

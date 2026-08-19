@@ -15,7 +15,7 @@
     <div data-include="partials/header.html"></div>
     <main>
         <div class="container"><div class="doc-layout">
-            <aside class="sidebar"><h3>WebChat</h3><ul><li><a href="#sessions">Sessions</a></li><li><a href="#cli">Agent CLI</a></li><li><a href="#tasks">Tasks</a></li><li><a href="#files">Files and previews</a></li><li><a href="#messages">Message display</a></li></ul></aside>
+            <aside class="sidebar"><h3>WebChat</h3><ul><li><a href="#sessions">Sessions</a></li><li><a href="#cli">Agent CLI</a></li><li><a href="#protocol">TTY and event protocol</a></li><li><a href="#commands">Command catalogs</a></li><li><a href="#tasks">Tasks</a></li><li><a href="#files">Files and previews</a></li><li><a href="#messages">Message display</a></li></ul></aside>
             <div class="content-wrapper">
                 <div class="doc-section"><h1>Ploinky WebChat</h1><p class="subtitle">An authenticated browser interface for a selected agent CLI, its conversations, asynchronous work, and workspace-scoped files.</p></div>
                 <div class="doc-section" id="sessions">
@@ -34,8 +34,38 @@
                 </div>
                 <div class="doc-section" id="cli">
                     <h2>Agent CLI and interactions</h2>
-                    <p>The selected agent manifest provides the CLI command that WebChat launches. Typed text becomes CLI input. The composer supports multiline input, cancellation during active work, slash-command suggestions, and workspace path completion without turning browser controls into a separate agent API.</p>
-                    <p>A compatible CLI can publish an interaction request with a title, detail, options, and default choice. WebChat presents the choices above the composer and sends the selected answer through the authenticated interaction route. The answer is matched to the active tab, runtime, request identifier, and declared option before it is delivered to the CLI.</p>
+                    <p>The selected agent manifest provides the CLI command that WebChat launches. WebChat creates that command as a child process behind the Router and keeps its standard input, standard output, and standard error inside the Router-owned runtime. A browser never opens a terminal connection to an agent container. It sends authenticated HTTP requests to WebChat, and receives the resulting terminal output through the existing server-sent event stream.</p>
+                    <p>Typed text normally reaches the CLI as the original text followed by a newline, so an agent continues to own its normal command-line syntax and conversation history. An agent can opt in to structured inbound messages with <code>manifest.json</code> <code>webchat.forwardEnvelope: true</code>, or an equivalent WebChat launch option. In that mode, the Router writes one JSON object with <code>__webchatMessage: 1</code> and <code>version: 1</code> instead of plain text. The object carries the text, validated attachment metadata, workspace-relative references, presentation choice, source tab and page-instance identifiers, and, when available, the public origin and request-bound invocation token. WebChat does not include a reconstructed chat history; conversation persistence remains the CLI's responsibility.</p>
+                    <p>A compatible CLI can publish an interaction request with a title, detail, options, and default choice. WebChat presents the choices above the composer and sends the selected answer through the authenticated interaction route. The answer is matched to the authenticated browser session, active runtime, tab, optional page instance, request identifier, and declared option before it is delivered to the CLI. A pending interaction blocks ordinary input until it is submitted or cancelled, and a second use of the same request identifier is rejected.</p>
+                </div>
+                <div class="doc-section" id="protocol">
+                    <h2>TTY and event protocol</h2>
+                    <p>The CLI-to-WebChat protocol is line-oriented. Ordinary standard-output or standard-error text is conversation output. A control record must be a complete JSON object on its own newline-delimited output line; WebChat removes terminal control characters, recognizes the reserved marker, validates the versioned schema, stores the latest accepted state in memory for reconnecting browsers, and emits a named server-sent event. A malformed record cannot update WebChat state.</p>
+                    <figure class="diagram"><pre class="mermaid">sequenceDiagram
+    participant B as Browser
+    participant R as Router WebChat
+    participant C as Selected agent CLI
+    B->>R: POST input with browser mutation proof
+    R->>C: stdin: text or __webchatMessage JSON plus newline
+    C-->>R: stdout/stderr: text or one JSON control line
+    R-->>B: EventSource: message or named state event
+    B->>R: POST interaction answer
+    R->>C: stdin: __webchatInteractionResponse JSON plus newline</pre><figcaption><em>WebChat mediates all browser-to-CLI input, CLI output, and interaction responses through the Router.</em></figcaption></figure>
+                    <table class="command-table"><thead><tr><th>CLI output marker</th><th>Named browser event and purpose</th></tr></thead><tbody>
+                        <tr><td><code>__webchatSession: 1</code></td><td><code>session-state</code> publishes the current session or session list.</td></tr>
+                        <tr><td><code>__webchatTask: 1</code></td><td><code>task-update</code> publishes a task snapshot, update, or bounded log data.</td></tr>
+                        <tr><td><code>__webchatRuntimeState: 1</code></td><td><code>runtime-state</code> publishes the selected model label.</td></tr>
+                        <tr><td><code>__webchatWorkspaceFiles: 1</code></td><td><code>workspace-files</code> publishes a validated workspace-relative file index or delta.</td></tr>
+                        <tr><td><code>__webchatSkills: 1</code></td><td><code>skills-state</code> publishes the CLI-owned skills catalog state.</td></tr>
+                        <tr><td><code>__webchatInteraction: 1</code> and <code>__webchatInteractionResolved: 1</code></td><td><code>interaction-request</code> and <code>interaction-resolved</code> control a pending choice or input prompt.</td></tr>
+                    </tbody></table>
+                    <p>All reserved control records use <code>version: 1</code>. The interaction response uses a separate newline-delimited record, <code>__webchatInteractionResponse: 1</code>, containing the request <code>id</code> and exactly one accepted result: an <code>optionId</code>, a bounded text response, or <code>cancelled: true</code>. The Router never forwards browser credentials or provider credentials to the CLI as part of this protocol.</p>
+                </div>
+                <div class="doc-section" id="commands">
+                    <h2>Per-agent command catalogs</h2>
+                    <p>Slash-command suggestions are agent-defined, not a hardcoded Ploinky command list. For the selected agent, WebChat asks the routed <code>/&lt;agent&gt;/mcp</code> endpoint to initialize an MCP session, sends <code>notifications/initialized</code>, lists the tools with <code>tools/list</code>, and calls <code>list_achilles_cli_commands</code> when that tool is available. The catalog response is text content containing a JSON object with <code>type: "achilles-slash-command-catalog"</code> and a <code>commands</code> array. Each command may declare its name, description, subcommands, argument completions, matching mode, and suggestion limit.</p>
+                    <p>WebChat loads this catalog once when a browser page starts, keeps it in the browser, and performs filtering and completion locally while the user types. The catalog is not sent with each prompt and it is not reloaded merely because the EventSource reconnects. A fresh page load obtains a fresh catalog; a successful skills save also explicitly refreshes it because enabled skills can change the agent's command set. If the structured catalog tool is absent, WebChat derives a fallback list from the selected agent's MCP tools whose names begin with <code>execute_</code>.</p>
+                    <p>The MCP catalog request travels through the same authenticated Router route and carries the browser mutation proof required for the selected agent. This lets each enabled agent expose only its own available commands and lets WebChat remain generic across CLI implementations.</p>
                 </div>
                 <div class="doc-section" id="tasks">
                     <h2>Tasks</h2>

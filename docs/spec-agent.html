@@ -22,12 +22,15 @@
                     <ul>
                         <li><a href="#manifest">Manifest Structure</a></li>
                         <li><a href="#lifecycle">Agent Lifecycle</a></li>
+                        <li><a href="#startup">Startup modes</a></li>
                         <li><a href="#commands">Command Types</a></li>
                         <li><a href="#environment">Environment Setup</a></li>
+                        <li><a href="#mcp">MCP configuration</a></li>
                         <li><a href="#api">API Development</a></li>
                         <li><a href="#examples">Examples</a></li>
                         <li><a href="#best-practices">Best Practices</a></li>
                         <li><a href="#troubleshooting">Troubleshooting</a></li>
+                        <li><a href="#advanced">Advanced Features</a></li>
                     </ul>
                 </aside>
 
@@ -41,134 +44,22 @@
                         <h2>Manifest Structure</h2>
                         <p>Every agent is defined by a <code>manifest.json</code> file that specifies its container, dependencies, and behavior:</p>
                         
-                        <h3>Complete Manifest Schema</h3>
+                        <h3>Typical CLI-focused manifest</h3>
                         <pre><code>{
-  // Required fields
-  "container": "node:18-alpine",      // Docker/Podman image (alias: "image")
-
-  // Lifecycle commands
-  "preinstall": "scripts/bootstrap.sh", // Host command before the agent is registered
-  "install": "npm install",           // Run inside the container before first start
-  "postinstall": "npm run seed",      // Run after the container starts, then restarts it
-  "update": "npm update",             // Run when agent needs updating
-
-  // Host hooks (run on the host machine, not inside the container)
-  "hosthook_aftercreation": "echo created",  // Host command after container creation
-  "hosthook_postinstall": "echo done",       // Host command after postinstall completes
-
-  // Execution modes
-  "start": "node bootstrap.js",       // Runs before the agent command
-  "cli": "node repl.js",              // Interactive CLI command (cli)
-  "agent": "node server.js",          // Long-running service (start)
-
-  // Metadata
-  "about": "Express API server",      // Description shown in listings
-  "endpoints": {                     // OpenAI-compatible endpoints
-    "chatCompletions": {
-      "command": "node",
-      "args": ["/code/openai-chat.js"],
-      "supportsStream": true
-    },
-    "models": {
-      "command": "node",
-      "args": ["/code/openai-models.js"]
-    }
-  },
-  "capabilities": {                  // Optional open-ended capability metadata
-    "tags": ["coding-agent"],
-    "summary": "Short agent summary",
-    "whenToUse": "Use for code-focused requests.",
-    "input": {
-      "conventions": "Natural language prompt; supports OpenAI chat payloads.",
-      "schema": {
-        "type": "object",
-        "properties": {
-          "messages": { "type": "array" },
-          "stream": { "type": "boolean" }
-        }
-      }
-    }
-  },
-
-  // Sandbox and runtime
-  "lite-sandbox": true,               // Enable sandbox runtime auto-detection
-  "runtime": {                        // Optional runtime resources, not backend selection
-    "resources": {}
-  },
-  "containerSecurity": {              // Allowlisted OCI policy; trusted manifest power
-    "privileged": true
-  },
-  "network": {                        // "default", "bridge", "host", or "none"
-    "mode": "default"
-  },
-
-  // Readiness checks
-  "readiness": {                      // Startup readiness protocol
-    "protocol": "tcp"                 // "tcp", "mcp", or "none"
-  },
-
-  // Router-owned HTTP surfaces; port is a private TCP target only
-  "httpServices": [
-    {
-      "slug": "dashboard",
-      "externalPrefix": "/dashboard",
-      "internalPrefix": "/",
-      "port": 3000,
-      "access": "authenticated"
-    }
+  "container": "docker.io/assistos/ploinky-node:24-bookworm-tools",
+  "install": "sh /code/scripts/installPrerequisites.sh",
+  "env": [
+    "WORKSPACE_PATH",
+    "ACHILLES_MODEL_PLAN",
+    "ACHILLES_MODEL_CODE",
+    "ACHILLES_DEBUG"
   ],
-  "routerAccess": {
-    "workspaceLogs": false,           // Exact private log-file operation capability
-    "httpRoutes": [
-      { "path": "/assets/*", "access": "public" }
-    ]
-  },
-
-  // SSO provider marker
-  "ssoProvider": true,                // Marks this agent as an SSO provider
-
-  // Environment configuration
-  "env": {
-    "LOG_LEVEL": "info",
-    "DATABASE_URL": null
-  },
-
-  // Per-profile configuration
-  "profiles": {                       // Per-profile overrides
-    "production": {
-      "env": { "LOG_LEVEL": "warn" },
-      "install": "npm ci",
-      "secrets": ["API_KEY"],
-      "openPorts": ["127.0.0.1:9090:9090/tcp"], // Private inner support mapping; never physical-host publication
-      "configProviders": ["config-provider global"]
-    }
-  },
-
-  // Optional generic startup config provider contract
-  "providesConfig": {
-    "command": "node runtime/provider.mjs",
-    "outputs": [
-      { "name": "SERVICE_REGION", "sensitive": false }
-    ]
-  },
-
-  // Volumes and mounts
-  "volumes": {                        // Extra bind mounts
-    "data": "/app/data"               // hostRelPath: containerPath
-  },
-  "volumeOptions": {                  // Per-volume permissions
-    "/app/data": { "chmod": 493, "readOnly": true }
-  },
-
-  // Directives
-  "ploinky": ["pwd enable", "sso enable"],  // Ploinky directives (string or array)
-
-  // Auto-configuration (optional)
-  "enable": ["other-agent"],          // Auto-enable other agents
-  "repos": {                          // Auto-install repositories
-    "repo1": "https://github.com/org/repo.git"
-  }
+  "enable": ["proxies/soul-gateway no-wait"],
+  "webchat": { "forwardEnvelope": true },
+  "cli": "node /code/src/cli.mjs",
+  "about": "CLI agent that manages, generates, and tests skill definitions."
 }</code></pre>
+                        <p>This configuration represents the usual shape of a CLI-only agent: one pinned runtime image, a prerequisite command, explicit required inputs, optional background dependencies, an interactive CLI, and no exposed agent port. Because it defines neither <code>start</code> nor <code>agent</code>, Ploinky starts its default AgentServer to provide the private MCP surface. <code>webchat.forwardEnvelope</code> opts the CLI into WebChat's structured input envelope; it is not required for normal newline-terminated terminal input.</p>
 
                         <div class="alert alert-warning">
                             <strong>Slim edge boundary:</strong> Active manifests must not use <code>httpServices</code>; routed additional servers follow <code>/base-agent-additional-server/&lt;agent&gt;/&lt;port&gt;/&lt;suffix&gt;</code> and <code>HttpRouteAccessPolicy</code>. Do not add <code>edgePorts</code>, outer/physical publication, UDP, Cloudflare, tunnel, DNS, topology, consumer-binding, or generic server-inventory fields. <code>openPorts</code> is inner-runtime metadata only. No manifest field can change the Box's two fixed outer mappings or publish private Router <code>8081</code>.
@@ -259,7 +150,7 @@
                             <tr>
                                 <td><code>start</code></td>
                                 <td>No</td>
-                                <td>Command that runs before the <code>agent</code> command during startup (e.g., bootstrap scripts).</td>
+                                <td>Main container entry command. When <code>agent</code> or <code>commands.run</code> is also declared, Ploinky runs that agent command as a detached sidecar.</td>
                             </tr>
                             <tr>
                                 <td><code>hosthook_aftercreation</code></td>
@@ -436,6 +327,25 @@ start</code></pre>
                         </ul>
                     </div>
 
+                    <div class="doc-section" id="startup">
+                        <h2>Enablement, disablement, and manual startup</h2>
+                        <p><code>enable agent &lt;agent-or-repo/agent&gt;</code> is an activation command, not only a registry edit. Ploinky validates the manifest and runtime policy, creates the agent work directory and source links, records a new instance and enable generation, creates the runtime, waits for readiness, and publishes its Router route only after the runtime is ready. Enablement does not replace the workspace's primary/static agent selected by <code>start</code>.</p>
+                        <pre><code># Register and start an isolated instance (the default mode)
+enable agent tools/skill-cli
+
+# Register and start another independent instance
+enable agent tools/skill-cli as review-cli
+
+# Remove the route, registry record, and exact runtime; persistent .data remains
+disable agent review-cli</code></pre>
+                        <p><code>disable agent &lt;alias|repo/agent&gt;</code> first removes the target from the active route generation, then stops and removes its exact container or sandbox process and deletes its enabled-agent record. The source repository and persistent <code>.data/&lt;agent-or-alias&gt;</code> directory remain available for a later enablement. An unqualified name is rejected when it could refer to multiple enabled agents; use the alias or a repository-qualified name.</p>
+                        <h3>Manual startup policy</h3>
+                        <pre><code>{
+  "startup": "manual"
+}</code></pre>
+                        <p>Omitting <code>startup</code> means <code>automatic</code>. The <code>manual</code> policy applies only to an enabled agent outside the static agent's dependency graph. A normal workspace <code>start</code> leaves a stopped manual agent stopped and removes its stale route; it retains a manual agent that is already running. A static agent and an explicit dependency always start even when their manifest says <code>manual</code>. To activate a stopped manual instance explicitly, use <code>restart &lt;agent-or-alias&gt;</code>; Ploinky recreates or starts the runtime, checks readiness, then restores its route.</p>
+                    </div>
+
                     <div class="doc-section" id="commands">
                         <h2>Command Types</h2>
                         
@@ -468,54 +378,38 @@ app.get('/mcp/status', (req, res) => {
 
 app.listen(7000);</code></pre>
 
-                        <h3>Supervisor Mode</h3>
-                        <p>If no <code>agent</code> command is specified, Ploinky uses the default supervisor:</p>
-                        <pre><code># /Agent/AgentServer.mjs provides:
-- HTTP server on port 7000, mounted at /mcp
-- MCP protocol version 2025-06-18
-- Health check at /mcp/status
-- Process management
-- Automatic restarts</code></pre>
+                        <h3>Default AgentServer</h3>
+                        <p>When the manifest defines none of <code>start</code>, <code>agent</code>, or <code>commands.run</code>, Ploinky starts <code>sh /Agent/server/AgentServer.sh</code>. It serves the private MCP endpoint from the configured agent port and loads <code>mcp-config.json</code>. See <a href="#mcp">MCP configuration</a> for the configuration format and Router access rules.</p>
                     </div>
 
                     <div class="doc-section" id="environment">
                         <h2>Environment Setup</h2>
                         
                         <h3>Container Environment</h3>
-                        <p>Agents run with these environment variables:</p>
-                        <pre><code>AGENT_NAME=MyAgent           # Agent name
-AGENT_REPO=myrepo           # Repository name
-WORKSPACE_PATH=/root          # Isolated container home backed by .data/&lt;agent-or-alias&gt;
-CODE_PATH=/code             # Agent code directory
-PORT=7000                   # Default service port</code></pre>
-                        <p>A private Router caller is bound to an exact launcher-reserved identity tuple: canonical identity <code>agent:&lt;repo&gt;/&lt;agent&gt;</code>, effective runtime instance id, and current enable generation. A route key or alias can select that record but never replaces the canonical identity. Re-enable, instance replacement, or rebinding creates a new tuple; a stable agent secret or stale alias cannot authorize the old tuple. Private assertions are request-bound caller proofs that still require effective policy admission and an exact caller ACL; they are not user or administrator credentials.</p>
-                        <pre><code>PLOINKY_AGENT_ID=agent:myrepo/MyAgent
-PLOINKY_AGENT_INSTANCE_ID=&lt;effective-runtime-instance-id&gt;
-PLOINKY_AGENT_ENABLE_GENERATION=&lt;current-enable-generation&gt;</code></pre>
+                        <p>Ploinky combines the selected manifest/profile environment with runtime-owned variables. Manifest values resolve from workspace secrets, process environment, <code>.env</code>, and declared defaults; runtime-owned names are added after that resolution and cannot be overridden by a manifest, profile, or exposed secret.</p>
+                        <table class="command-table"><thead><tr><th>Variable</th><th>Runtime value</th></tr></thead><tbody>
+                            <tr><td><code>AGENT_NAME</code></td><td>The manifest agent name.</td></tr>
+                            <tr><td><code>WORKSPACE_PATH</code></td><td><code>/root</code> for an isolated instance; the selected workspace or development-repository path for global and development modes.</td></tr>
+                            <tr><td><code>PLOINKY_WORKSPACE_ROOT</code></td><td>The canonical workspace root.</td></tr>
+                            <tr><td><code>HOME</code></td><td><code>/root</code>, backed by the instance's persistent data directory.</td></tr>
+                            <tr><td><code>PLOINKY_MCP_CONFIG_PATH</code></td><td><code>/code/mcp-config.json</code>, the staged MCP configuration path.</td></tr>
+                            <tr><td><code>NODE_PATH</code></td><td><code>/code/node_modules</code> for the default AgentServer and agent code.</td></tr>
+                            <tr><td><code>PLOINKY_AGENT_ID</code>, <code>PLOINKY_AGENT_PRINCIPAL</code>, <code>PLOINKY_AGENT_INSTANCE_ID</code>, and <code>PLOINKY_AGENT_ENABLE_GENERATION</code></td><td>Generated identity values that bind the process to one canonical agent, instance, and enable generation.</td></tr>
+                        </tbody></table>
+                        <p>For managed routable runtime modes, Ploinky also supplies validated Router discovery and per-agent request-signing material after network attestation. It never injects the workspace master key, another agent's credentials, or reusable Router credentials into an agent with <code>network.mode: "none"</code>. Agents must treat every <code>PLOINKY_*</code> identity, Router, and credential variable as runtime-owned.</p>
 
                         <h3>Volume Mounts</h3>
-                        <table class="command-table">
-                            <tr>
-                                <th>Host Path</th>
-                                <th>Container Path</th>
-                                <th>Purpose</th>
-                            </tr>
-                            <tr>
-                                <td><code>$(pwd)</code></td>
-                                <td><code>$(pwd)</code></td>
-                                <td>Workspace access</td>
-                            </tr>
-                            <tr>
-                                <td><code>/Agent</code></td>
-                                <td><code>/Agent</code></td>
-                                <td>Supervisor runtime</td>
-                            </tr>
-                            <tr>
-                                <td><code>.ploinky/repos/X/Y</code></td>
-                                <td><code>/code</code></td>
-                                <td>Agent code</td>
-                            </tr>
-                        </table>
+                        <table class="command-table"><thead><tr><th>Enable mode</th><th>Project mount and working path</th><th>Persistent home</th></tr></thead><tbody>
+                            <tr><td><code>isolated</code> (default)</td><td><code>.data/&lt;agent-or-alias&gt;</code> → <code>/root</code>; <code>WORKSPACE_PATH=/root</code></td><td>The same <code>.data/&lt;agent-or-alias&gt;</code> directory is mounted read-write at <code>/root</code>.</td></tr>
+                            <tr><td><code>global</code></td><td>Workspace root → its selected project path</td><td><code>.data/&lt;agent-or-alias&gt;</code> → <code>/root</code> read-write.</td></tr>
+                            <tr><td><code>devel &lt;repo&gt;</code></td><td><code>.ploinky/repos/&lt;repo&gt;</code> → that development-repository path</td><td><code>.data/&lt;agent-or-alias&gt;</code> → <code>/root</code> read-write.</td></tr>
+                        </tbody></table>
+                        <table class="command-table"><thead><tr><th>Common mount</th><th>Container target</th><th>Purpose</th></tr></thead><tbody>
+                            <tr><td>Agent source tree</td><td><code>/code</code></td><td>Agent code and <code>mcp-config.json</code>; mount mode follows the selected profile.</td></tr>
+                            <tr><td>Ploinky Agent library</td><td><code>/Agent</code></td><td>Read-only default AgentServer and shared runtime helpers.</td></tr>
+                            <tr><td><code>.ploinky/shared</code></td><td><code>/shared</code></td><td>Workspace-shared files.</td></tr>
+                            <tr><td>Prepared dependency cache</td><td><code>/code/node_modules</code> and <code>/Agent/node_modules</code></td><td>Read-only dependencies when the runtime uses the prepared cache.</td></tr>
+                        </tbody></table>
 
                         <h3>Exposing Variables</h3>
                         <pre><code># Set variable in workspace
@@ -526,6 +420,38 @@ ploinky expose DATABASE_URL $DATABASE_URL MyAgent
 
 # Agent can now access:
 process.env.DATABASE_URL</code></pre>
+                    </div>
+
+                    <div class="doc-section" id="mcp">
+                        <h2>MCP configuration</h2>
+                        <p><code>mcp-config.json</code> defines the MCP tools, resources, and prompts served by the default <code>AgentServer</code>. Place the file beside the agent manifest. Ploinky synchronizes it into the instance work directory and sets <code>PLOINKY_MCP_CONFIG_PATH=/code/mcp-config.json</code>; the Router exposes the resulting MCP surface through <code>/&lt;agent-or-alias&gt;/mcp</code> without publishing the agent's private listener.</p>
+                        <p>The default server is started only when the manifest has no <code>start</code>, <code>agent</code>, or <code>commands.run</code> command. An agent that supplies its own service command must start and maintain its own compatible MCP server if it needs an MCP surface.</p>
+                        <pre><code>{
+  "tools": [
+    {
+      "name": "read_workspace_file",
+      "title": "Read workspace file",
+      "description": "Return an approved file from the agent workspace.",
+      "command": "node",
+      "args": ["tools/read-workspace-file.mjs"],
+      "cwd": "workspace",
+      "timeoutMs": 30000,
+      "tags": ["authenticated"],
+      "inputSchema": {
+        "path": { "type": "string", "description": "Workspace-relative file path" }
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "name": "review_change",
+      "description": "Prepare a change-review request.",
+      "messages": [{ "role": "user", "content": { "type": "text", "text": "Review the requested change." } }]
+    }
+  ]
+}</code></pre>
+                        <p>For tools and resources, <code>command</code>, optional <code>args</code>, <code>cwd</code>, <code>env</code>, and <code>timeoutMs</code> define the child process. A command path containing a slash is resolved from <code>/code</code>; <code>cwd: "workspace"</code> selects the runtime working directory. The command receives a JSON payload on standard input. For a tool, it contains <code>tool</code>, <code>input</code>, and verified invocation metadata; standard output becomes the MCP text result, while a non-zero exit becomes an MCP error.</p>
+                        <p>Tool <code>tags</code> establish the default Router policy: <code>authenticated</code>, <code>admin</code>, or <code>internal</code>. Missing tags mean <code>authenticated</code>. Unknown tags and the <code>internal</code> plus <code>admin</code> combination are denied. Router policy remains authoritative, so an agent configuration cannot bypass caller authentication, the active route generation, or a request-bound invocation token.</p>
                     </div>
 
                     <div class="doc-section" id="api">
@@ -619,6 +545,32 @@ client tool health.check --agent MyAgent</code></pre>
 
                     <div class="doc-section" id="examples">
                         <h2>Example Agents</h2>
+
+                        <h3>Create a CLI agent with MCP tools</h3>
+                        <p>Start with a directory in a repository that Ploinky discovers. Keep the manifest and MCP configuration at the agent root, and keep executable code below it:</p>
+                        <table class="command-table"><thead><tr><th>Path</th><th>Role</th></tr></thead><tbody>
+                            <tr><td><code>manifest.json</code></td><td>Declares the runtime, required environment names, dependencies, and interactive CLI.</td></tr>
+                            <tr><td><code>mcp-config.json</code></td><td>Declares MCP tools, resources, and prompts for the default AgentServer.</td></tr>
+                            <tr><td><code>src/cli.mjs</code></td><td>Implements the interactive CLI selected by <code>cli</code>.</td></tr>
+                            <tr><td><code>tools/read-workspace-file.mjs</code></td><td>Implements a configured MCP tool and reads its JSON input from standard input.</td></tr>
+                        </tbody></table>
+                        <p>Use the CLI-focused manifest shown in <a href="#manifest">Manifest Structure</a> as the starting point: it is the configuration shape used by the in-repository CLI agents—pinned Ploinky Node image, prerequisite script, explicit environment allow-list, optional <code>enable</code> dependency, <code>webchat.forwardEnvelope</code>, and a <code>cli</code> entry. Do not add <code>start</code> or <code>agent</code> when the bundled AgentServer should serve the configuration in <code>mcp-config.json</code>.</p>
+                        <pre><code>// tools/read-workspace-file.mjs
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+let raw = '';
+for await (const chunk of process.stdin) raw += chunk;
+const { input = {} } = JSON.parse(raw || '{}');
+const requested = String(input.path || '');
+if (!requested || path.isAbsolute(requested) || requested.split('/').includes('..')) {
+  throw new Error('path must be a workspace-relative path');
+}
+const target = path.join(process.cwd(), requested);
+process.stdout.write(await fs.readFile(target, 'utf8'));</code></pre>
+                        <p>After the repository is available to the workspace, enable and use the agent by its repository-qualified reference. The alias is optional, but useful when more than one instance is needed:</p>
+                        <pre><code>enable agent &lt;repository&gt;/my-cli as review-cli
+ploinky cli review-cli</code></pre>
                         
                         <h3>Simple Shell Agent</h3>
                         <pre><code>{
@@ -792,7 +744,7 @@ app.get('/mcp/status', (req, res) => {
                         <p>Scripts must live in the agent root (mounted as <code>/code</code>) and return exit code 0 for success. <code>interval</code> controls how often the probe runs (seconds), <code>timeout</code> caps each execution, and the thresholds set how many consecutive results are required. During startup an explicit manifest <code>readiness.protocol</code> of <code>tcp</code>, <code>mcp</code>, or <code>none</code> wins. Without an explicit protocol, a start-only service with <code>health.readiness.script</code> uses that script as its blocking startup probe. A configured but missing script, execution error, or exhausted failure threshold fails the dependency wave and prevents its dependents from starting. Later watchdog reuse of readiness is fail-closed by default: an exhausted recurring readiness or liveness probe inactivates routing and schedules managed recovery. Setting readiness <code>continuous: false</code> keeps an expensive full readiness attestation activation-only and requires a separate recurring liveness script. Every probe has an in-container hard deadline, runs in an exact process session inside an init-reaped managed container, and fails closed when process-tree cleanup cannot be proved. Repeated health failures trigger automatic container restarts that follow a CrashLoopBackOff curve (base 10s delay, doubling up to five minutes, reset after 10 minutes of stable uptime or any manual stop/restart/refresh).</p>
                     </div>
 
-                    <div class="doc-section">
+                    <div class="doc-section" id="advanced">
                         <h2>Advanced Features</h2>
                         
                         <h3>Auto-Configuration</h3>
