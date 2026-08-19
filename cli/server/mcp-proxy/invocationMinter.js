@@ -12,7 +12,7 @@ import {
  * Each is signed with the TARGET agent's own per-agent secret and bound to one
  * concrete request via `rch` (request-content-hash), so a token minted for one
  * agent/operation cannot be replayed against another. The legacy shared-key
- * `typ:"invocation"` families are removed; the DS014 per-agent model replaces them.
+ * `typ:"invocation"` families are removed; the DS015 per-agent model replaces them.
  *
  * `verifyAgentAssertion` authenticates a source agent for agent-to-agent calls by
  * deriving THAT agent's secret from its (untrusted) issuer claim and verifying

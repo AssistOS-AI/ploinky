@@ -1,4 +1,4 @@
-# DS004-Q8 architecture-decision spike (S0)
+# DS005-Q8 architecture-decision spike (S0)
 
 This directory is the complete, bounded implementation of S0: a native-evidence
 spike for **Candidate N** (pasta `-T` / `--tcp-ns` TCP port-8081 confinement),
@@ -22,14 +22,14 @@ ledgers and are out of scope for this directory.
 Only S0 is implementation-ready. This directory owns exactly five paths:
 
 ```text
-container/spike/ds004-q8/run-spike.sh
-container/spike/ds004-q8/probe.py
-container/spike/ds004-q8/stage-source.sh
-container/spike/ds004-q8/README.md
-tests/unit/ds004Q8SpikeContract.test.mjs
+container/spike/ds005-q8/run-spike.sh
+container/spike/ds005-q8/probe.py
+container/spike/ds005-q8/stage-source.sh
+container/spike/ds005-q8/README.md
+tests/unit/ds005Q8SpikeContract.test.mjs
 ```
 
-S0 edits no DS004, matrix, `specsLoader`, or HTML. It does not commit, push,
+S0 edits no DS005, matrix, `specsLoader`, or HTML. It does not commit, push,
 merge, publish, deploy, or mutate a registry.
 
 ## Decision rule
@@ -57,15 +57,15 @@ is missing, local source implementation and local contract verification
 touching a native runner and report the native execution gate as `BLOCKED`.
 
 ```text
-DS004_EXTERNAL_SCANNER_SSH
-DS004_AMD64_RUNNER_SSH
-DS004_ARM64_RUNNER_SSH
-DS004_AMD64_BOX_LAN_IPV4
-DS004_ARM64_BOX_LAN_IPV4
-DS004_SSH_KNOWN_HOSTS_FILE
-DS004_EXTERNAL_SCANNER_IDENTITY_FILE
-DS004_AMD64_RUNNER_IDENTITY_FILE
-DS004_ARM64_RUNNER_IDENTITY_FILE
+DS005_EXTERNAL_SCANNER_SSH
+DS005_AMD64_RUNNER_SSH
+DS005_ARM64_RUNNER_SSH
+DS005_AMD64_BOX_LAN_IPV4
+DS005_ARM64_BOX_LAN_IPV4
+DS005_SSH_KNOWN_HOSTS_FILE
+DS005_EXTERNAL_SCANNER_IDENTITY_FILE
+DS005_AMD64_RUNNER_IDENTITY_FILE
+DS005_ARM64_RUNNER_IDENTITY_FILE
 ```
 
 Destinations are `user@host`, ASCII-only, matching the canonical grammar in
@@ -96,7 +96,7 @@ alone enter stdin; dynamic values are positional args only.
 TDD order: direct RED, implement, local GREEN, then pack/install/verify/run.
 
 - `stage-source.sh green candidate-n` runs exactly `node --test
-  tests/unit/ds004Q8SpikeContract.test.mjs`, prints one 64-lowercase-hex
+  tests/unit/ds005Q8SpikeContract.test.mjs`, prints one 64-lowercase-hex
   `green_receipt_sha`, and never prints PASS.
 - `stage-source.sh pack candidate-n <arch> <green_receipt_sha>` verifies the
   receipt against current source, builds in a private mode-0700 temp
@@ -138,7 +138,7 @@ engine-permitted `address-reuse-<network>`, and every engine-permitted
 Every runnable path probes both alias (`http://host.containers.internal:<port>`)
 and literal (`http://<validated_transport_ipv4>:<port>`) destination forms at
 port `8081` and every fixed/discovered/decoy TCP port, with the fixed payload
-hex `44533030342d51382d524f555445522d4f4b0a` and `--source-ipv4
+hex `44533030352d51382d524f555445522d4f4b0a` and `--source-ipv4
 <validated_source_ipv4>`. Only managed/`8081` must `CONNECTED` with exact
 payload; every other runnable cell must be actual `REFUSED`.
 

@@ -504,9 +504,9 @@ future cross-engine discovery.
 | `docs/cli-reference.html` | Align CLI surface wording |
 | `docs/code-derived-agent-lifecycle.md` | Document nested lifecycle and publication checks |
 | `docs/ploinky-overview.md` | Align overview terminology |
-| `docs/specs/DS003-agent-manifest-and-registry.md` | Define `openPorts`, registry, profile, and effective-instance contracts |
-| `docs/specs/DS004-runtime-execution-and-isolation.md` | Define forced nested Podman and ownership labeling |
-| `docs/specs/DS007-dependency-caches-and-startup-readiness.md` | Define nested dependency cache/runtime and readiness behavior |
+| `docs/specs/DS004-agent-manifest-and-registry.md` | Define `openPorts`, registry, profile, and effective-instance contracts |
+| `docs/specs/DS005-runtime-execution-and-isolation.md` | Define forced nested Podman and ownership labeling |
+| `docs/specs/DS008-dependency-caches-and-startup-readiness.md` | Define nested dependency cache/runtime and readiness behavior |
 | `docs/superpowers/plans/2026-07-11-ploinky-box-invariant-alignment.md` | Record final approved decisions and implementation sequencing |
 | `docs/superpowers/specs/2026-07-11-mutable-runtime-image-hard-cut-design.md` | Align the hard-cut design with contract 2 |
 

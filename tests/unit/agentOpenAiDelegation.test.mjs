@@ -55,7 +55,7 @@ function envFor(agentId) {
     return { PLOINKY_AGENT_ID: agentId, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(agentId) };
 }
 
-// The target agent's env: holds ONLY its own per-agent secret + id (DS014).
+// The target agent's env: holds ONLY its own per-agent secret + id (DS015).
 function targetEnv() {
     return { PLOINKY_AGENT_ID: TARGET_AGENT, PLOINKY_AGENT_SECRET: deriveAgentRequestSecret(TARGET_AGENT) };
 }

@@ -13,7 +13,7 @@ import {
     MAX_TTL_SECONDS
 } from '../../Agent/lib/jwtVerify.mjs';
 
-// This suite covers the shared HS256 JWS primitive layer that every DS014 token
+// This suite covers the shared HS256 JWS primitive layer that every DS015 token
 // family (User Session, Agent Assertion, Router Request) is built on:
 // signing, audience binding, request-body binding (`bh`), replay/jti, and TTL.
 // The per-family `typ`/`iss`/`tool`/`rch` checks live in the dedicated

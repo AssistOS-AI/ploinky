@@ -1,6 +1,8 @@
 /* Ploinky Documentation - WhatsApp-inspired Theme */
 
 :root {
+  --page-gutter: 40px;
+
   /* Light theme colors */
   --bg-primary: #ffffff;
   --bg-secondary: #f0f2f5;
@@ -81,9 +83,11 @@ body {
 
 /* Layout */
 .container {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 0 20px;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding-right: var(--page-gutter);
+  padding-left: var(--page-gutter);
 }
 
 /* Header */
@@ -129,9 +133,11 @@ header {
 }
 
 .site-header__inner {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 0 20px;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding-right: var(--page-gutter);
+  padding-left: var(--page-gutter);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -505,22 +511,22 @@ pre {
 
 .diagram {
     margin: 1.5rem 0;
-    text-align: center;
 }
 
 .diagram pre.mermaid {
-    display: flex;
-    justify-content: center;
     margin: 0;
     padding: 0;
     border: 0;
     background: transparent;
     box-shadow: none;
+    display: flex;
+    justify-content: center;
+    width: 100%;
 }
 
 .diagram pre.mermaid svg {
-    max-width: 100%;
-    height: auto;
+    display: block;
+    margin-inline: auto;
 }
 
 .diagram figcaption {
@@ -699,9 +705,10 @@ footer a:hover {
   display: grid;
   grid-template-columns: 250px 1fr;
   gap: 2rem;
-  max-width: 1400px;
-  margin: 0 auto;
-  padding: 2rem;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 2rem 0;
 }
 
 .sidebar {

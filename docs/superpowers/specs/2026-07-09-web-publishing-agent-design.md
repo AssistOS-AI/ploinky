@@ -6,7 +6,7 @@ Status: proposed (planning session; no implementation yet).
 > Superseded implementation note (2026-07-09): this archival design was updated
 > for terminology only. The implemented runtime contract is Ploinky startup
 > config providers (`providesConfig` plus profile `configProviders`), documented
-> in `../../specs/DS015-startup-config-providers.md`; the rejected router
+> in `../../specs/DS016-startup-config-providers.md`; the rejected router
 > variable-publish architecture below is not the active implementation path.
 
 ## Problem
@@ -37,8 +37,8 @@ Ploinky box container.
 | No agent-facing API writes workspace vars today; writers are host-side only (CLI `var`/`vars`/`expose`, settings menu, runtime-resource planner, router component-token seeding) | `cli/commands/envVarCommands.js`, `cli/server/utils/routerEnv.js:6-9` |
 | The sanctioned "one component seeds config for others" path is a host `preinstall` hook calling `ploinky var`; WebMeet and OnlyOffice already do this | `cli/services/lifecycleHooks.js:269-281`, `cli/services/workspaceUtil.js:546-548`, `AssistOSExplorer/webmeetAgent/scripts/hooks/preinstall.sh:90-116`, `AssistOSExplorer/onlyOffice/scripts/hooks/preinstall.sh` |
 | Agent-only router endpoints authenticated by HTTP Agent Assertions exist; `/api/router/` is a reserved router-owned prefix | `cli/server/openAiAgentDiscovery.js`, `cli/server/RoutingServer.js:187`, `Agent/lib/agentAssertion.mjs` (`signAgentHttpAssertion`) |
-| HTTP route access classes `public` (GET/HEAD only) / `guest` / `authenticated` and MCP tool policy `authenticated`/`internal`/`admin` are implemented and fail closed | `docs/specs/DS014-*.md`, `cli/server/policy/HttpRouteAccessPolicy.js:46-57`, `cli/server/policy/McpToolPolicy.js:30-41` |
-| `basic/cloudflared` is the direct template: custom image (`assistos/cloudflared-agent:node24-cloudflared` built in `container-image-builds`), supervisor + AgentServer dual process, admin-tagged MCP tools, Explorer settings dashboard via manifest `ideSettings` + `IDE-plugins/cloudflared-settings/`, allowlisted `host.containers.internal:<port>` origins, refuses port 7000 | `basic/cloudflared/*`, `basic/docs/specs/DS003-cloudflared-agent.md`, `container-image-builds/images/cloudflared-agent/Dockerfile` |
+| HTTP route access classes `public` (GET/HEAD only) / `guest` / `authenticated` and MCP tool policy `authenticated`/`internal`/`admin` are implemented and fail closed | `docs/specs/DS015-*.md`, `cli/server/policy/HttpRouteAccessPolicy.js:46-57`, `cli/server/policy/McpToolPolicy.js:30-41` |
+| `basic/cloudflared` is the direct template: custom image (`assistos/cloudflared-agent:node24-cloudflared` built in `container-image-builds`), supervisor + AgentServer dual process, admin-tagged MCP tools, Explorer settings dashboard via manifest `ideSettings` + `IDE-plugins/cloudflared-settings/`, allowlisted `host.containers.internal:<port>` origins, refuses port 7000 | `basic/cloudflared/*`, `basic/docs/specs/DS004-cloudflared-agent.md`, `container-image-builds/images/cloudflared-agent/Dockerfile` |
 | Explorer discovers dashboards from `.ploinky/repos/<repo>/<agent>/IDE-plugins/` automatically; `applicationPlugins` is allow-by-default | `AssistOSExplorer/explorer/utils/ide-plugins.mjs`, `explorer/utils/pluginUtils.core.js`, `docs/specs/DS02-plugin-hosting-and-dependencies.md` |
 | Explorer `qa`/`prod` profiles enable `basic/cloudflared global no-wait` today | `AssistOSExplorer/explorer/manifest.json` profiles block |
 | nginx precedent image: `container-image-builds/images/livekit-server-agent/Dockerfile` (apt-get nginx + certbot on multi-stage base) | that Dockerfile, lines 14-49 |
@@ -97,7 +97,7 @@ via Cloudflare API, dashboard reconfiguration). The feature has four parts:
    loads its manifest, and accepts only names in that agent's `publishesVars`,
    rejecting reserved names (`PLOINKY_*`, `WEBDASHBOARD_TOKEN`) atomically.
 3. **Encrypted store**: `.ploinky/data/startup-config-providers.enc`, AES-256-GCM under a
-   **new HKDF purpose label `storage/startup-config-providers`** (per DS011's "new
+   **new HKDF purpose label `storage/startup-config-providers`** (per DS012's "new
    persistent secret ⇒ fresh purpose label" rule). Entries record
    `{value, publisher, updatedAt}`.
 4. **Resolution integration**: `cli/services/secretVars.js` consults the
@@ -121,7 +121,7 @@ Assertion) → encrypted store inside the workspace volume. `PLOINKY_MASTER_KEY`
 remains router/launcher-only (in-box it resolves to the generated
 `.ploinky/master-key` fallback); the publish endpoint denylists `PLOINKY_*` so
 the feature cannot be used to inject identity/master material. Raw user JWTs
-never reach the agent (DS013 flow unchanged).
+never reach the agent (DS014 flow unchanged).
 
 ### 5. Value ownership
 
@@ -129,9 +129,9 @@ never reach the agent (DS013 flow unchanged).
 | --- | --- | --- |
 | User-owned (dashboard inputs) | `WEB_PUBLISHING_CLOUDFLARE_API_TOKEN` + `WEB_PUBLISHING_CLOUDFLARE_ACCOUNT_ID` + `WEB_PUBLISHING_CLOUDFLARE_ZONE_ID` (API mode), or `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN` (token mode), base domain, per-service hostname overrides, `WEBMEET_CERT_EMAIL`, LAN host/IP override | Entered in dashboard, persisted in agent config store; secrets kept out of status output |
 | Generated/derived and published by Web Publishing | `ONLYOFFICE_PUBLIC_URL`, `WEBMEET_PUBLIC_LIVEKIT_URL`, `WEBMEET_TLS_HOSTNAME`, `WEBMEET_TURN_HOST`, `WEBMEET_TURN_EXTERNAL_IP`, `WEBMEET_CERT_EMAIL`, `WEB_PUBLISHING_CLOUDFLARED_TUNNEL_TOKEN` (API mode mints it) | Derived from base domain + exposure map + detected/entered host IP; written via startup-config-providers |
-| Untouched (Ploinky-generated) | `WEBMEET_LIVEKIT_API_KEY`, `WEBMEET_LIVEKIT_API_SECRET`, `WEBMEET_TURN_PASSWORD`, `PLOINKY_WEBMEET_MASTER_KEY`, `ONLYOFFICE_JWT_SECRET`/`JWT_SECRET`, `DPU_MASTER_KEY`, agent identity vars | Existing `generatedSecret`/`sharedGeneratedSecret`/DS013 injection |
+| Untouched (Ploinky-generated) | `WEBMEET_LIVEKIT_API_KEY`, `WEBMEET_LIVEKIT_API_SECRET`, `WEBMEET_TURN_PASSWORD`, `PLOINKY_WEBMEET_MASTER_KEY`, `ONLYOFFICE_JWT_SECRET`/`JWT_SECRET`, `DPU_MASTER_KEY`, agent identity vars | Existing `generatedSecret`/`sharedGeneratedSecret`/DS014 injection |
 | Optional/defaulted (not published in v1) | `WEBMEET_LIVEKIT_URL`, `ONLYOFFICE_INTERNAL_URL`, `ONLYOFFICE_CALLBACK_BASE_URL`, TURN ports/realm/user | Manifest profile defaults + existing preinstall seeding |
-| Forbidden | `PLOINKY_MASTER_KEY` (never in any agent), `PLOINKY_*` names via publish API | Endpoint denylist + existing DS013 guarantees |
+| Forbidden | `PLOINKY_MASTER_KEY` (never in any agent), `PLOINKY_*` names via publish API | Endpoint denylist + existing DS014 guarantees |
 
 Note (correctness): WebRTC media (LiveKit UDP, TURN) **cannot** transit
 Cloudflare Tunnel (HTTP/WS only). In tunnel deployments the WEBMEET topology
@@ -166,7 +166,7 @@ mirroring the cloudflared agent's redaction rules.
 nginx listens on the container port declared in profile `openPorts`
 (default profile `127.0.0.1:8081:8081`; a `lan` profile binds `0.0.0.0:8081:8081`
 — explicit non-local binds are an intentional, reviewable manifest decision per
-DS011). Server blocks are generated per exposure: `server_name <hostname>`,
+DS012). Server blocks are generated per exposure: `server_name <hostname>`,
 `proxy_pass` to an **allowlisted origin** — the Ploinky router
 (`http://host.containers.internal:8080`) by default, plus explicitly declared
 data planes (OnlyOffice `8082`, LiveKit ports) — with WebSocket upgrade headers
@@ -204,7 +204,7 @@ The dashboard is an **Explorer settings panel** (`ideSettings` with
 `adminOnly: true`), served by the router's `/workspace-files/...` static path
 and talking to `/web-publishing/mcp` via `/MCPBrowserClient.js` — exactly the
 cloudflared pattern. All mutations are **admin-tagged MCP tools**, so the router
-enforces admin policy (DS014) end to end; there is no agent-served HTTP config
+enforces admin policy (DS015) end to end; there is no agent-served HTTP config
 surface, no `routerAccess.httpRoutes`, no `httpServices`, and no public route in
 v1 (trivially satisfying "public = GET/HEAD readonly": there are none).
 
@@ -257,7 +257,7 @@ consumers with the new values.
 | --- | --- |
 | Publish call with undeclared/reserved name | Router rejects the whole batch 403 (atomic), logs names only |
 | Publish while operator var shadows the name | Write succeeds, response lists `shadowed`; dashboard warns |
-| Corrupt/undecryptable published store | Resolution treats store as absent (defaults apply); CLI `ploinky vars` reports the corrupt store; deleting the file is the documented recovery (mirrors DS014 policy-state remediation) |
+| Corrupt/undecryptable published store | Resolution treats store as absent (defaults apply); CLI `ploinky vars` reports the corrupt store; deleting the file is the documented recovery (mirrors DS015 policy-state remediation) |
 | Cloudflare API failure | Tool returns the API error (redacted); no partial state published; config store keeps last-applied |
 | Missing tunnel token in tunnel mode | Supervisor writes `missing-token` status and idles (cloudflared-agent behavior) |
 | nginx config regeneration invalid | `nginx -t` gate before reload; tool fails with validation output, previous conf stays active |

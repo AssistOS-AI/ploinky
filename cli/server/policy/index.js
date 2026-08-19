@@ -23,7 +23,7 @@ import {
 } from './commands/mcpPolicyCommands.js';
 
 /**
- * Composition root for the router access-control policy layer (DS014/DS015).
+ * Composition root for the router access-control policy layer (DS015/DS016).
  * Instantiates the singletons once and wires the 7 commands into the registry +
  * invoker. Nothing outside `policy/` constructs these classes — `RoutingServer`,
  * `mcp-proxy/index.js`, and `routerHandlers.js` import `policy` and call methods.

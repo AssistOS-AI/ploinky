@@ -1,9 +1,9 @@
 ---
-title: DS001-coding-style
+title: DS002-coding-style
 summary: Defines the canonical source layout, coding conventions, file-size policy, and modular test organization for Ploinky.
 ---
 
-# DS001 Coding Style
+# DS002 Coding Style
 
 ## Introduction
 
@@ -20,7 +20,5 @@ Modules must remain cohesive and reviewable. `fileSizesCheck.sh` is the reposito
 Tests must be organized by scope. Node unit tests belong under `tests/unit/`, integration tests under `tests/integration/`, end-to-end Box tests under `tests/e2e/`, reusable shell assertions under `tests/test-functions/`, stage mutations in `tests/do*.sh`, and stage validation in `tests/testsAfter*.sh`. `tests/run-all.sh` dispatches the main `tests/test_all.sh` harness, while `tests/runFailingFast.sh` provides targeted replay of recorded failures. New behavior must receive the narrowest useful unit coverage plus integration or end-to-end coverage when it crosses a process, network, engine, or browser boundary.
 
 Changes must preserve unrelated user work in the tree. Runtime and security code must remain generic, fail closed at uncertain ownership or authorization boundaries, avoid logging secrets, and use exact resource identities instead of broad discovery or cleanup operations.
-
-## Conclusion
 
 Ploinky code must remain modular, evidence-backed, security-conscious, and testable at the boundary where each behavior becomes observable.

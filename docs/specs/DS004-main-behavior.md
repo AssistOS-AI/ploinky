@@ -1,5 +1,5 @@
 ---
-title: DS003-main-behavior
+title: DS004-main-behavior
 summary: Defines how Ploinky finds a workspace, starts and operates agents, mounts files, prepares dependencies, applies profiles, updates repositories, and exposes Router-owned interfaces and browser libraries.
 ---
 
@@ -36,7 +36,7 @@ The operator initiates this behavior by running the public `ploinky` command fro
 | `PLOINKY_WORKSPACE_ROOT` | The selected workspace root: the valid explicit directory, the first parent containing `.ploinky`, or the launch directory when neither source selects another root. |
 | `PLOINKY_CWD` | The resolved directory from which the core command was launched; it may differ from the workspace root when the operator starts inside a descendant folder. |
 
-The observable result must be one ready workspace whose agent commands and Router surfaces refer to the same registry and active generation. The host `ploinky` process must remain the sole owner of outer Box lifecycle, while `ploinky-local` must own only the Router and nested agent graph. Workspace identity, repository ownership, and branch selection are specified in [DS002-workspace-and-repository-model](specsLoader.html?spec=DS002-workspace-and-repository-model.md), and graph readiness is specified in [DS008-dependency-caches-and-startup-readiness](specsLoader.html?spec=DS008-dependency-caches-and-startup-readiness.md).
+The observable result must be one ready workspace whose agent commands and Router surfaces refer to the same registry and active generation. The host `ploinky` process must remain the sole owner of outer Box lifecycle, while `ploinky-local` must own only the Router and nested agent graph. Workspace identity, repository ownership, and branch selection are specified in [DS003-workspace-and-repository-model](specsLoader.html?spec=DS003-workspace-and-repository-model.md), and graph readiness is specified in [DS009-dependency-caches-and-startup-readiness](specsLoader.html?spec=DS009-dependency-caches-and-startup-readiness.md).
 
 ### Container mounts
 
@@ -57,7 +57,7 @@ Before starting a Docker or Podman agent, Ploinky must build the complete mount 
 | Declared persistent-storage target | A directory rooted under `.ploinky/data/<key>` and mounted at the manifest's `runtime.resources.persistentStorage.containerPath`. |
 | `/models`, `/runtime`, and `/Agent/llm-runtime` | Identity-specific model storage, runtime state, and shared LLM runtime code when the manifest enables a supported LLM runtime. |
 
-Manifest relative volume sources must resolve from `PLOINKY_WORKSPACE_ROOT`. Inside the managed Box, Ploinky must reject a manifest volume source outside the managed workspace. A manifest must not replace reserved dependency targets such as `/code/node_modules`, and agent or profile input must not weaken the read-only Agent library, topology, or dependency-cache boundaries. Detailed runtime and isolation requirements are specified in [DS005-runtime-execution-and-isolation](specsLoader.html?spec=DS005-runtime-execution-and-isolation.md).
+Manifest relative volume sources must resolve from `PLOINKY_WORKSPACE_ROOT`. Inside the managed Box, Ploinky must reject a manifest volume source outside the managed workspace. A manifest must not replace reserved dependency targets such as `/code/node_modules`, and agent or profile input must not weaken the read-only Agent library, topology, or dependency-cache boundaries. Detailed runtime and isolation requirements are specified in [DS006-runtime-execution-and-isolation](specsLoader.html?spec=DS006-runtime-execution-and-isolation.md).
 
 ### Dependency installation
 
@@ -70,7 +70,7 @@ Ploinky must prepare a dependency cache before runtime launch when the agent nee
 | Global | `.ploinky/deps/global/<runtime-key>` stores the global dependency set for one runtime family, platform, architecture, Node major, and applicable libc variant. |
 | Per agent | `.ploinky/deps/agents/<repo>/<agent>/<runtime-key>` stores the merged global and agent dependency set and the validity stamp used by that agent. |
 
-Ploinky must reuse a cache only when its runtime key, merged-package hash, moving-dependency evidence, and installer metadata remain valid. A missing, stale, or incompatible cache must be prepared before the agent is reported ready. Cache preparation and readiness sequencing are specified in [DS008-dependency-caches-and-startup-readiness](specsLoader.html?spec=DS008-dependency-caches-and-startup-readiness.md).
+Ploinky must reuse a cache only when its runtime key, merged-package hash, moving-dependency evidence, and installer metadata remain valid. A missing, stale, or incompatible cache must be prepared before the agent is reported ready. Cache preparation and readiness sequencing are specified in [DS009-dependency-caches-and-startup-readiness](specsLoader.html?spec=DS009-dependency-caches-and-startup-readiness.md).
 
 ### Agent dependency overrides
 
@@ -78,7 +78,7 @@ An agent author initiates this behavior by declaring a dependency or development
 
 Ploinky must not modify `globalDeps/package.json` or the agent's source `package.json` while applying an override. An operator may set `PLOINKY_AGENTLIB_REF`, or use the supported start branch policy that derives it, to replace only the deployed `achillesAgentLib` source for that run. The selected value must participate in cache identity so a cache prepared from another AgentLib source cannot be reused as if it matched.
 
-The observable result is that one agent may use a required package version or AgentLib branch without changing another agent's source contract. Branch fallback and exact deployed-revision requirements must continue to obey [DS002-workspace-and-repository-model](specsLoader.html?spec=DS002-workspace-and-repository-model.md).
+The observable result is that one agent may use a required package version or AgentLib branch without changing another agent's source contract. Branch fallback and exact deployed-revision requirements must continue to obey [DS003-workspace-and-repository-model](specsLoader.html?spec=DS003-workspace-and-repository-model.md).
 
 ### Agent lifecycle commands
 
@@ -117,7 +117,7 @@ An operator selects a profile through the supported start or profile command, an
 | `startupConfigProviders` | Replace the default provider list when the active profile declares one. |
 | Runtime selection | Use the admitted manifest/profile runtime fields as one validated selection; a profile must not bypass Box runtime capability policy. |
 
-The default access for `/code` and `/code/skills` must be read-write in `default` and `dev` and read-only in other profiles. Explicit `mounts.code` and `mounts.skills` values may replace those defaults only with `ro` or `rw`. Profile secrets and generated identity values must remain subject to [DS009-secrets-skills-and-llm-assistance](specsLoader.html?spec=DS009-secrets-skills-and-llm-assistance.md), and startup configuration providers must obey [DS016-startup-config-providers](specsLoader.html?spec=DS016-startup-config-providers.md).
+The default access for `/code` and `/code/skills` must be read-write in `default` and `dev` and read-only in other profiles. Explicit `mounts.code` and `mounts.skills` values may replace those defaults only with `ro` or `rw`. Profile secrets and generated identity values must remain subject to [DS010-secrets-and-variable-resolution](specsLoader.html?spec=DS010-secrets-and-variable-resolution.md), and startup configuration providers must obey [DS017-startup-config-providers](specsLoader.html?spec=DS017-startup-config-providers.md).
 
 ### Workspace update
 
@@ -150,7 +150,7 @@ Browsers, operators, and agents initiate this behavior by sending HTTP, SSE, Web
 | `/upload`, `/blobs/*`, and `/workspace-files/*` | Admit authenticated upload and workspace-file operations through Router-owned confinement, quota, and path checks. |
 | `/` and `/index.html` | Resolve the configured static agent through the active Host and route plan and apply its authentication boundary before serving or proxying content. |
 
-The Router must reserve its control-plane prefixes so an agent cannot claim or policy-route them. Caller-supplied identity and forwarding headers must be stripped, and Router-generated identity context may be attached only after admission. The outer Box must expose only the Router's public listener; the private Router listener, AgentServer endpoints, and agent ports must remain inside the Box. Routing surfaces are specified in [DS006-routing-and-web-surfaces](specsLoader.html?spec=DS006-routing-and-web-surfaces.md), authentication in [DS007-auth-capabilities-and-secure-wire](specsLoader.html?spec=DS007-auth-capabilities-and-secure-wire.md), and route policy in [DS015-router-access-control-http-route-access-and-mcp-policy](specsLoader.html?spec=DS015-router-access-control-http-route-access-and-mcp-policy.md).
+The Router must reserve its control-plane prefixes so an agent cannot claim or policy-route them. Caller-supplied identity and forwarding headers must be stripped, and Router-generated identity context may be attached only after admission. The outer Box must expose only the Router's public listener; the private Router listener, AgentServer endpoints, and agent ports must remain inside the Box. Routing surfaces are specified in [DS007-routing-and-web-surfaces](specsLoader.html?spec=DS007-routing-and-web-surfaces.md), authentication in [DS008-auth-capabilities-and-secure-wire](specsLoader.html?spec=DS008-auth-capabilities-and-secure-wire.md), and route policy in [DS016-router-access-control-http-route-access-and-mcp-policy](specsLoader.html?spec=DS016-router-access-control-http-route-access-and-mcp-policy.md).
 
 ### Built-in browser libraries
 
@@ -164,7 +164,5 @@ An agent application may load the standard browser helpers from Router-owned pat
 | MCP browser client | `/MCPBrowserClient.js` loads Ploinky's browser-side MCP client from the shared Agent library. |
 
 These URLs must remain Router-owned public resources even when the surrounding agent application requires authentication. They must not grant access to arbitrary repository files, workspace files, private Router state, or another route generation.
-
-## Conclusion
 
 Ploinky fulfills its primary purpose when one workspace command produces one validated Box, a readiness-gated agent graph, predictable mounts and dependencies, profile-controlled runtimes, bounded lifecycle and update effects, and stable Router-owned interfaces. Future changes must preserve the concrete commands, paths, data boundaries, and observable results defined by these nine components; a change to one of those outcomes requires this specification and its specialized DS contract to be updated together.

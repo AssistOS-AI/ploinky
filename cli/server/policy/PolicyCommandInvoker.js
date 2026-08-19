@@ -12,7 +12,7 @@ function sendJson(res, statusCode, body) {
 
 /**
  * PolicyCommandInvoker — the Command-pattern invoker and HTTP adapter for
- * `POST /policy/command` (DS015). Authenticated via the local User Session
+ * `POST /policy/command` (DS016). Authenticated via the local User Session
  * cookie; agents (which cannot present a session cookie) are rejected. It builds
  * the CommandContext, looks the command up in the registry, runs authorize then
  * execute, maps the CommandResult to the HTTP response, and writes one audit line.

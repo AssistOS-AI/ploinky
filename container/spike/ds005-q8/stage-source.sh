@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# DS004-Q8 architecture-decision spike (S0) -- coordinator: GREEN, pack,
+# DS005-Q8 architecture-decision spike (S0) -- coordinator: GREEN, pack,
 # install, verify, run.
 #
 # Normative source: docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md
@@ -28,25 +28,25 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 
 FROZEN_BASE_SHA="ac39b870d990869616e4882222c78037dc11d07d"
-ARTIFACTS_ROOT="/var/tmp/ploinky-ds004-q8-artifacts"
-REMOTE_ROOT_TEMPLATE="/var/tmp/ploinky-ds004-q8/candidate-n"
-FIXED_PAYLOAD_HEX="44533030342d51382d524f555445522d4f4b0a"
+ARTIFACTS_ROOT="/var/tmp/ploinky-ds005-q8-artifacts"
+REMOTE_ROOT_TEMPLATE="/var/tmp/ploinky-ds005-q8/candidate-n"
+FIXED_PAYLOAD_HEX="44533030352d51382d524f555445522d4f4b0a"
 
 # Exact immutable artifact path templates (main plan section 6.3/6.5/7,
 # annex section 3), documented verbatim for traceability:
-#   GREEN:        /var/tmp/ploinky-ds004-q8-artifacts/green/candidate-n/<green_receipt_sha>/
-#   amd64 source: /var/tmp/ploinky-ds004-q8-artifacts/source/amd64/candidate-n/<manifest_sha>/
-#   arm64 source: /var/tmp/ploinky-ds004-q8-artifacts/source/arm64/candidate-n/<manifest_sha>/
-#   attempt root: /var/tmp/ploinky-ds004-q8-artifacts/runs/<arch>/candidate-n/<manifest_sha>/<attempt_id>/
-#   journal:      /var/tmp/ploinky-ds004-q8-artifacts/runs/<arch>/candidate-n/attempt-journal.jsonl
-#   remote root:  /var/tmp/ploinky-ds004-q8/candidate-n/<arch>/<manifest_sha>/<attempt_id>/
+#   GREEN:        /var/tmp/ploinky-ds005-q8-artifacts/green/candidate-n/<green_receipt_sha>/
+#   amd64 source: /var/tmp/ploinky-ds005-q8-artifacts/source/amd64/candidate-n/<manifest_sha>/
+#   arm64 source: /var/tmp/ploinky-ds005-q8-artifacts/source/arm64/candidate-n/<manifest_sha>/
+#   attempt root: /var/tmp/ploinky-ds005-q8-artifacts/runs/<arch>/candidate-n/<manifest_sha>/<attempt_id>/
+#   journal:      /var/tmp/ploinky-ds005-q8-artifacts/runs/<arch>/candidate-n/attempt-journal.jsonl
+#   remote root:  /var/tmp/ploinky-ds005-q8/candidate-n/<arch>/<manifest_sha>/<attempt_id>/
 
 NORMATIVE_PATHS=(
-  "container/spike/ds004-q8/run-spike.sh"
-  "container/spike/ds004-q8/probe.py"
-  "container/spike/ds004-q8/stage-source.sh"
-  "container/spike/ds004-q8/README.md"
-  "tests/unit/ds004Q8SpikeContract.test.mjs"
+  "container/spike/ds005-q8/run-spike.sh"
+  "container/spike/ds005-q8/probe.py"
+  "container/spike/ds005-q8/stage-source.sh"
+  "container/spike/ds005-q8/README.md"
+  "tests/unit/ds005Q8SpikeContract.test.mjs"
 )
 
 # Exact canonical destination grammar (main plan line 199), documented
@@ -345,9 +345,9 @@ PY
 require_coordinator_inputs() {
   local missing=()
   local v
-  for v in DS004_EXTERNAL_SCANNER_SSH DS004_AMD64_RUNNER_SSH DS004_ARM64_RUNNER_SSH \
-           DS004_AMD64_BOX_LAN_IPV4 DS004_ARM64_BOX_LAN_IPV4 DS004_SSH_KNOWN_HOSTS_FILE \
-           DS004_EXTERNAL_SCANNER_IDENTITY_FILE DS004_AMD64_RUNNER_IDENTITY_FILE DS004_ARM64_RUNNER_IDENTITY_FILE; do
+  for v in DS005_EXTERNAL_SCANNER_SSH DS005_AMD64_RUNNER_SSH DS005_ARM64_RUNNER_SSH \
+           DS005_AMD64_BOX_LAN_IPV4 DS005_ARM64_BOX_LAN_IPV4 DS005_SSH_KNOWN_HOSTS_FILE \
+           DS005_EXTERNAL_SCANNER_IDENTITY_FILE DS005_AMD64_RUNNER_IDENTITY_FILE DS005_ARM64_RUNNER_IDENTITY_FILE; do
     if [ -z "${!v:-}" ]; then missing+=("$v"); fi
   done
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -430,7 +430,7 @@ build_scanner_executor() {
     "$REMOTE_EXECUTOR_PREFIX" "$phase" "$manifest_sha" "$attempt_id" "$target_ipv4" "$tcp_ports" "$udp_ports"
 }
 
-# --- green: node --test tests/unit/ds004Q8SpikeContract.test.mjs -----------
+# --- green: node --test tests/unit/ds005Q8SpikeContract.test.mjs -----------
 
 cmd_green() {
   local candidate="${1:-}"
@@ -440,7 +440,7 @@ cmd_green() {
   out_file=$(mktemp -t ds004q8-green-XXXXXX)
 
   local exit_code=0
-  ( cd "$REPO_ROOT" && node --test tests/unit/ds004Q8SpikeContract.test.mjs ) > "$out_file" 2>&1 || exit_code=$?
+  ( cd "$REPO_ROOT" && node --test tests/unit/ds005Q8SpikeContract.test.mjs ) > "$out_file" 2>&1 || exit_code=$?
 
   if [ "$exit_code" -ne 0 ]; then
     log_err "green: contract test failed (exit $exit_code), see captured output below"
@@ -449,7 +449,7 @@ cmd_green() {
   fi
 
   local canonical_source_hash
-  canonical_source_hash=$(sha256_file "$REPO_ROOT/tests/unit/ds004Q8SpikeContract.test.mjs")
+  canonical_source_hash=$(sha256_file "$REPO_ROOT/tests/unit/ds005Q8SpikeContract.test.mjs")
   local raw_output_hash
   raw_output_hash=$(sha256_file "$out_file")
 
@@ -462,7 +462,7 @@ cmd_green() {
   # source reproduce the same green_receipt_sha (required by the exact
   # cross-arch equality assertions in main plan section 7).
   local receipt_input
-  receipt_input="candidate-n|node --test tests/unit/ds004Q8SpikeContract.test.mjs|${canonical_source_hash}|${exit_code}"
+  receipt_input="candidate-n|node --test tests/unit/ds005Q8SpikeContract.test.mjs|${canonical_source_hash}|${exit_code}"
   local green_receipt_sha
   green_receipt_sha=$(printf '%s' "$receipt_input" | sha256_stdin)
 
@@ -478,7 +478,7 @@ cmd_green() {
 {
   "greenReceiptSha256": "$green_receipt_sha",
   "candidate": "candidate-n",
-  "command": "node --test tests/unit/ds004Q8SpikeContract.test.mjs",
+  "command": "node --test tests/unit/ds005Q8SpikeContract.test.mjs",
   "canonicalSourceSha256": "$canonical_source_hash",
   "exitCode": $exit_code,
   "rawOutputSha256": "$raw_output_hash"
@@ -524,7 +524,7 @@ cmd_pack() {
 
   local canonical_source_hash current_hash
   canonical_source_hash=$(sed -n 's/.*"canonicalSourceSha256": "\([^"]*\)".*/\1/p' "$receipt_dir/green-receipt.json")
-  current_hash=$(sha256_file "$REPO_ROOT/tests/unit/ds004Q8SpikeContract.test.mjs")
+  current_hash=$(sha256_file "$REPO_ROOT/tests/unit/ds005Q8SpikeContract.test.mjs")
   [ "$canonical_source_hash" = "$current_hash" ] || die_setup_error "pack: GREEN receipt no longer matches current source"
 
   # Validate exact five-path git status before build (main plan line 245).
@@ -629,8 +629,8 @@ cmd_pack() {
 
 cmd_install() {
   require_coordinator_inputs
-  validate_destination "$DS004_AMD64_RUNNER_SSH" "DS004_AMD64_RUNNER_SSH"
-  validate_trust_file "$DS004_SSH_KNOWN_HOSTS_FILE" "DS004_SSH_KNOWN_HOSTS_FILE"
+  validate_destination "$DS005_AMD64_RUNNER_SSH" "DS005_AMD64_RUNNER_SSH"
+  validate_trust_file "$DS005_SSH_KNOWN_HOSTS_FILE" "DS005_SSH_KNOWN_HOSTS_FILE"
   die_blocked "install: native runner install is not exercised in this environment (no native amd64/arm64 runner reachable)"
 }
 

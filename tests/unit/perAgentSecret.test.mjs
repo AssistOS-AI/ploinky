@@ -58,7 +58,7 @@ test('per-agent secret is NOT the shared derived-master key', () => {
     assert.notEqual(deriveAgentRequestSecret(AGENT_A), resolveMasterKey().toString('hex'));
 });
 
-test('per-agent secret matches the canonical DS014 HKDF derivation (independent vector)', () => {
+test('per-agent secret matches the canonical DS015 HKDF derivation (independent vector)', () => {
     // Recompute HKDF_SHA256(master, salt="", info="ploinky/agent-secret/<id>/v1", 32)
     // directly, without going through deriveAgentRequestSecret, as an independent check.
     const ikm = resolveMasterKey();

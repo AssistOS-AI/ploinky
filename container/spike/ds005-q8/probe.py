@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DS004-Q8 architecture-decision spike (S0) -- Candidate N TCP probe.
+"""DS005-Q8 architecture-decision spike (S0) -- Candidate N TCP probe.
 
 Normative source: docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md
 sections 4.1 and 6.4, and its annex sections 1 and 4 (outer workspace root).
@@ -29,8 +29,8 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-# Fixed reference payload, main plan lines 263-264: "DS004-Q8-ROUTER-OK\n"
-FIXED_PAYLOAD_HEX = "44533030342d51382d524f555445522d4f4b0a"
+# Fixed reference payload, main plan lines 263-264: "DS005-Q8-ROUTER-OK\n"
+FIXED_PAYLOAD_HEX = "44533030352d51382d524f555445522d4f4b0a"
 
 RESULT_CONNECTED = "CONNECTED"
 RESULT_CONNECTED_UNEXPECTED_PAYLOAD = "CONNECTED_UNEXPECTED_PAYLOAD"
@@ -285,7 +285,7 @@ def run_self_test():
     bind_ip = "127.0.0.1"
     expected = hex_to_bytes(FIXED_PAYLOAD_HEX)
     assert bytes_to_hex(expected) == FIXED_PAYLOAD_HEX, "hex round-trip must be stable"
-    assert expected == b"DS004-Q8-ROUTER-OK\n", "fixed payload must decode to the documented ASCII string"
+    assert expected == b"DS005-Q8-ROUTER-OK\n", "fixed payload must decode to the documented ASCII string"
 
     failures = []
 
@@ -333,7 +333,7 @@ def run_self_test():
 
 
 def build_arg_parser():
-    parser = argparse.ArgumentParser(description="DS004-Q8 Candidate N TCP probe")
+    parser = argparse.ArgumentParser(description="DS005-Q8 Candidate N TCP probe")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--self-test", action="store_true", help="run the local self-test suite and exit")
     mode.add_argument("--destination-url", help="http://<host>:<port> destination to probe")

@@ -22,6 +22,7 @@
                         <li><a href="#workspace">Workspace state</a></li>
                         <li><a href="#selection">Runtime selection</a></li>
                         <li><a href="#startup">Startup and readiness</a></li>
+                        <li><a href="#config-providers">Startup config providers</a></li>
                         <li><a href="#isolation">Isolation and mounts</a></li>
                     </ul>
                 </aside>
@@ -78,6 +79,62 @@
                             <figcaption><em>A route becomes reachable only after the selected runtime passes its own readiness contract.</em></figcaption>
                         </figure>
                         <p>The Watchdog observes the same recorded runtime identity after startup. A failed health check removes the stale route and schedules recovery against a fresh exact-generation runtime; a deliberately disabled agent is removed from the registry before its runtime is torn down, so it is not recreated by supervision.</p>
+                    </div>
+
+                    <div class="doc-section" id="config-providers">
+                        <h2>Startup config providers</h2>
+                        <p>A startup config provider is an agent component that discovers or generates workspace configuration before dependent agents launch. It runs a declared host-side command and returns a small versioned JSON document. Ploinky validates every returned name, stores accepted values in the encrypted workspace variable store, reloads the graph configuration, and only then starts consumers. The provider never edits the store directly and its output is not injected automatically into every agent.</p>
+                        <table class="command-table">
+                            <thead><tr><th>Participant</th><th>What it declares or does</th></tr></thead>
+                            <tbody>
+                                <tr><td>Provider agent</td><td>Declares <code>providesConfig.command</code> and the exact output names, sensitivity flags, and required flags it may return.</td></tr>
+                                <tr><td>Static agent or active profile</td><td>Selects provider agents through <code>configProviders</code>, using the same repository-qualified and profile resolution rules as manifest dependencies.</td></tr>
+                                <tr><td>Consuming agent</td><td>Declares each value it needs through normal <code>env</code> entries. A provider result that is not declared by a consumer remains only a workspace value.</td></tr>
+                                <tr><td>Ploinky startup coordinator</td><td>Runs providers after static preinstall and before the final runtime lease, rejects unsafe output, persists changed values, and recalculates affected runtime identities.</td></tr>
+                            </tbody>
+                        </table>
+                        <figure class="diagram">
+                            <pre class="mermaid">flowchart TD
+    A[Static manifest selects provider] --> B[Ploinky resolves provider in dependency graph]
+    B --> C[Provider command returns versioned JSON]
+    C --> D[Ploinky validates declared output names]
+    D --> E[Encrypted workspace store]
+    E --> F[Consumer resolves its declared env values]
+    F --> G[Final runtime preparation and launch]</pre>
+                            <figcaption><em>A provider computes candidate values; Ploinky owns validation, encrypted persistence, and delivery to declared consumers.</em></figcaption>
+                        </figure>
+                        <h3>Provider manifest</h3>
+                        <pre><code>{
+  "providesConfig": {
+    "command": "node scripts/discover-config.mjs",
+    "outputs": [
+      { "name": "SERVICE_BASE_URL", "sensitive": false, "required": true },
+      { "name": "SERVICE_ACCESS_TOKEN", "sensitive": true, "required": true }
+    ]
+  }
+}</code></pre>
+                        <h3>Provider selection and consumption</h3>
+                        <pre><code>{
+  "configProviders": ["infrastructure/config-discovery"],
+  "env": [
+    { "name": "SERVICE_BASE_URL", "required": true },
+    { "name": "SERVICE_ACCESS_TOKEN", "required": true }
+  ]
+}</code></pre>
+                        <h3>Command output</h3>
+                        <pre><code>{
+  "version": 1,
+  "values": [
+    {
+      "name": "SERVICE_BASE_URL",
+      "value": "http://service.internal",
+      "sensitive": false,
+      "source": "service-discovery"
+    }
+  ],
+  "warnings": []
+}</code></pre>
+                        <p>The command runs from the provider directory with a bounded environment containing workspace and provider locators plus the provider's declared configuration. Ploinky removes master keys, agent request secrets, Router authority values, publication credentials, TURN credentials, and reserved <code>PLOINKY_*</code> names. Output names must match the provider allowlist and cannot collide with core-owned topology values or generated secrets. Provider metadata records only names, sources, warnings, and redaction markers; returned values never appear in that metadata.</p>
                     </div>
 
                     <div class="doc-section" id="isolation">

@@ -6,6 +6,10 @@ These instructions govern the complete Ploinky repository. This file is the cano
 
 Treat executable code and tests as the only source of truth for current Ploinky behavior. Historical DS/specification files and generated HTML may provide background, but do not use them to determine, justify, or change current behavior, and do not update them as part of behavior work.
 
+## Documentation structure
+
+Ploinky design specifications must not contain a `Conclusion` section. New DS files must omit it, and any `Conclusion` section encountered while editing an existing DS must be removed.
+
 ## Non-negotiable runtime and security invariants
 
 1. Keep Ploinky generic. Core routing, lifecycle code, and WebChat must not hardcode optional agent identifiers, model/provider tags, or agent-owned tool names.

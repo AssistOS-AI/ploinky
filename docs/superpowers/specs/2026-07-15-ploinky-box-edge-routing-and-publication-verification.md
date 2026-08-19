@@ -219,7 +219,7 @@ The architecture-conflicting slice is stopped at the precise fail-closed point:
 - `ploinky/cli/server/privateListenerSet.js:209` records the exact bind failure;
 - `ploinky/cli/server/privateListenerSet.js:223` throws the strict aggregate
   `PRIVATE_LISTENER_SET_INCOMPLETE` error;
-- `ploinky/docs/specs/DS004-runtime-execution-and-isolation.md:288` records the
+- `ploinky/docs/specs/DS005-runtime-execution-and-isolation.md:288` records the
   evidence and the three architecture choices requiring explicit approval;
 - the authority's implementation note is at
   `2026-07-15-ploinky-box-edge-routing-and-publication-design.md:17`.
@@ -252,5 +252,5 @@ The implementation is intentionally **not marked complete**. The fixed two-port
 physical boundary is proven, but the approved managed-bridge/private-listener
 topology is not realizable on the observed rootless nested Podman network, so the
 fresh full stack and both primary gates cannot pass. Release requires an explicit
-architecture decision for DS004 Question #8, a rebuilt v5 box, then successful
+architecture decision for DS005 Question #8, a rebuilt v5 box, then successful
 reruns of both primary commands and every blocked native/external/browser lane.

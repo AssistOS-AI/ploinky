@@ -1,9 +1,9 @@
 ---
-title: DS010-observability
+title: DS011-observability
 summary: Defines read-only status and log surfaces, redacted runtime evidence, exact ownership reporting, and operational health boundaries.
 ---
 
-# DS010 Observability
+# DS011 Observability
 
 ## Introduction
 
@@ -22,7 +22,5 @@ Ploinky durably appends Router output to `.ploinky/logs/router.log` and policy d
 Agent application output may be passed through as operator-requested log content, but Ploinky control diagnostics must remain bounded and redacted. Log completion must offer one unambiguous reference per enabled record, and each reference must resolve to the exact container id or process-specific file selected for that record. Cancellation must perform bounded child cleanup before returning.
 
 Conversation history, task state, agent-specific checkpoints, and model artifacts are agent-owned state. Ploinky observability may expose transport and lifecycle summaries but must not treat those data sets as Router operational truth or persist them in routing and policy records.
-
-## Conclusion
 
 Observability must explain exact owned state without changing it and must preserve the same workspace, identity, and credential boundaries enforced during mutation.

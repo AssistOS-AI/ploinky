@@ -5,7 +5,7 @@ import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import { PolicyAuditSink } from './PolicyAuditSink.js';
 
 /**
- * FileSystemPolicyAuditSink — the default `PolicyAuditSink` adapter (DS015). Appends
+ * FileSystemPolicyAuditSink — the default `PolicyAuditSink` adapter (DS016). Appends
  * one JSONL line per record to `policy-audit.log` under the workspace
  * `.ploinky/data/router-security/`. Holds all `node:fs`/`node:path` usage for the
  * audit trail. Errors propagate to `PolicyAuditLog`, which swallows them.

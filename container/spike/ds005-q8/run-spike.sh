@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# DS004-Q8 architecture-decision spike (S0) -- runner preflight, topology,
+# DS005-Q8 architecture-decision spike (S0) -- runner preflight, topology,
 # probes, phase state, evidence, cleanup, and the final acknowledgement.
 #
 # Normative source: docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md
@@ -28,9 +28,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)
 
-ARTIFACTS_ROOT="/var/tmp/ploinky-ds004-q8-artifacts"
-REMOTE_INSTALL_ROOT="/var/tmp/ploinky-ds004-q8/candidate-n"
-FIXED_PAYLOAD_HEX="44533030342d51382d524f555445522d4f4b0a"
+ARTIFACTS_ROOT="/var/tmp/ploinky-ds005-q8-artifacts"
+REMOTE_INSTALL_ROOT="/var/tmp/ploinky-ds005-q8/candidate-n"
+FIXED_PAYLOAD_HEX="44533030352d51382d524f555445522d4f4b0a"
 FIXED_TCP_PORTS="22,6379,7880,7980,7981,8080,8081"
 FIXED_UDP_PORTS="7882"
 

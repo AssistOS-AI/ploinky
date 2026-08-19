@@ -17,7 +17,7 @@ and the outer-port promotion portion of
 Implementation status (2026-07-15): independent runtime, manifest, image, test,
 and documentation slices have been applied, but managed-bridge reachability to
 private Router `8081` remains inactive and fail-closed on the observed rootless
-Podman `host-gateway` topology. Ploinky DS004 Question #8 records the exact
+Podman `host-gateway` topology. Ploinky DS005 Question #8 records the exact
 evidence and unresolved architecture choice. This implementation note does not
 amend the decision register or weaken the section 17 acceptance criteria.
 
@@ -106,7 +106,7 @@ contract is replaced.
 | `httpServices` already owns slug, prefix rewrite, access, identity/invocation behavior, and delegations, but always resolves to the primary route host port. | `cli/server/httpServiceRoutes.js`, `cli/server/routerHandlers.js`, `cli/server/wsServiceProxy.js` | Adding only a target container port preserves the current policy contract while allowing GPTResearcher `8000`, Umami `3000`, OnlyOffice `8080`, and LiveKit `7880`. |
 | The current secondary-server route bypasses `HttpRouteAccessPolicy`; HTTP and WebSocket use a different generic-auth path. | `cli/server/RoutingServer.js`, `cli/server/profileServerProxy.js`, `cli/server/wsServiceProxy.js` | Deleting that special route and resolving every declared `httpServices` target through one HTTP/WebSocket plan removes the drift. |
 | `HttpRouteAccessPolicy` already evaluates manifest service `public`, `guest`, and `authenticated` decisions. | `cli/server/policy/HttpRouteAccessPolicy.js`, `cli/server/policy/HttpRouteProviders.js` | The target reuses this behavior. Moving service access into persisted policy is deliberately out of scope. |
-| Ploinky security documentation treats public Internet use as requiring additional hardening. | `docs/specs/DS011-security-model.md` | Publication cannot be considered complete until origin, CSRF, rate-limit, upload, and admin-command controls pass acceptance tests. |
+| Ploinky security documentation treats public Internet use as requiring additional hardening. | `docs/specs/DS012-security-model.md` | Publication cannot be considered complete until origin, CSRF, rate-limit, upload, and admin-command controls pass acceptance tests. |
 
 The current implementation therefore cannot meet the two-port requirement by
 configuration alone. It requires a new hard-cut runtime contract.
@@ -1964,7 +1964,7 @@ the old files.
 
 When this proposal is implemented, behavior-changing work must update the
 normative specifications and HTML documentation in the same changes. Expected
-areas include Ploinky DS003/DS004/DS005/DS007/DS009/DS011/DS015 and routing,
+areas include Ploinky DS004/DS005/DS006/DS008/DS010/DS012/DS016 and routing,
 runtime-contract-v5, identity-generation, security, interface, and operations
 HTML; Explorer DS01/DS06 and
 architecture/env documentation; WebMeet Infra and WebMeet media specs;

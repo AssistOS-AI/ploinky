@@ -3777,9 +3777,9 @@ git commit -m "feat: make stop and destroy system wide"
 - Modify: ploinky/README.md
 - Modify: ploinky/container/README.md
 - Modify: ploinky/docs/code-derived-agent-lifecycle.md
-- Modify: ploinky/docs/specs/DS003-agent-manifest-and-registry.md
-- Modify: ploinky/docs/specs/DS004-runtime-execution-and-isolation.md
-- Modify: ploinky/docs/specs/DS007-dependency-caches-and-startup-readiness.md
+- Modify: ploinky/docs/specs/DS004-agent-manifest-and-registry.md
+- Modify: ploinky/docs/specs/DS005-runtime-execution-and-isolation.md
+- Modify: ploinky/docs/specs/DS008-dependency-caches-and-startup-readiness.md
 
 **Interfaces:**
 
@@ -3947,7 +3947,7 @@ The script exits nonzero on the first thrown assertion. Keep only `SMOKE_IMAGE`,
 
 - [ ] **Step 4: Update authoritative docs and DS contracts**
 
-Invoke the review_specs skill before editing DS003, DS004, and DS007. Preserve their numbered decision format and update only affected Core Content and Decisions & Questions.
+Invoke the review_specs skill before editing DS004, DS005, and DS008. Preserve their numbered decision format and update only affected Core Content and Decisions & Questions.
 
 All authoritative docs must encode this exact table:
 
@@ -3983,9 +3983,9 @@ Expected: tests pass and rg returns no live/authoritative match. Internal names 
 ~~~bash
 git add container/smoke-runtime.mjs container/runtime-supervisor-tests.mjs \
   README.md container/README.md docs/code-derived-agent-lifecycle.md \
-  docs/specs/DS003-agent-manifest-and-registry.md \
-  docs/specs/DS004-runtime-execution-and-isolation.md \
-  docs/specs/DS007-dependency-caches-and-startup-readiness.md
+  docs/specs/DS004-agent-manifest-and-registry.md \
+  docs/specs/DS005-runtime-execution-and-isolation.md \
+  docs/specs/DS008-dependency-caches-and-startup-readiness.md
 git add -u container/smoke-box.mjs
 git commit -m "docs: document the managed runtime supervisor"
 ~~~

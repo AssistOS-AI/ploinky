@@ -7,10 +7,10 @@ remain the DS specs:
 
 | Spec | Scope |
 | --- | --- |
-| `docs/specs/DS006-routing-and-web-surfaces.md` | Router surfaces, route table behavior, transparent agent proxying, HTTP services, and browser endpoints. |
-| `docs/specs/DS012-security-model.md` | Workspace trust model, sessions, storage keys, local/SSO/guest auth, runtime isolation, and deployment limits. |
-| `docs/specs/DS014-per-agent-identity-and-request-signed-jwts.md` | Per-agent identity, Agent Assertions, Router Requests, User Sessions, request-content hashes, and delegation grants. |
-| `docs/specs/DS015-router-access-control-http-route-access-and-mcp-policy.md` | HTTP route access, MCP policy, administrative policy commands, fail-closed state handling, and removed vocabulary. |
+| `docs/specs/DS007-routing-and-web-surfaces.md` | Router surfaces, route table behavior, transparent agent proxying, HTTP services, and browser endpoints. |
+| `docs/specs/DS013-security-model.md` | Workspace trust model, sessions, storage keys, local/SSO/guest auth, runtime isolation, and deployment limits. |
+| `docs/specs/DS015-per-agent-identity-and-request-signed-jwts.md` | Per-agent identity, Agent Assertions, Router Requests, User Sessions, request-content hashes, and delegation grants. |
+| `docs/specs/DS016-router-access-control-http-route-access-and-mcp-policy.md` | HTTP route access, MCP policy, administrative policy commands, fail-closed state handling, and removed vocabulary. |
 
 ## Executive Summary
 

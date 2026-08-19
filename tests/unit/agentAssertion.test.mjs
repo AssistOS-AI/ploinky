@@ -87,7 +87,7 @@ test('the signer refuses to issue a target-less assertion', () => {
     );
 });
 
-test('a target-less assertion is rejected at verify (DS014 target binding)', () => {
+test('a target-less assertion is rejected at verify (DS015 target binding)', () => {
     // Hand-craft a valid-but-target-less token; it must not be accepted as valid
     // for whatever target the router resolves from the URL.
     const now = Math.floor(Date.now() / 1000);

@@ -1,9 +1,9 @@
 ---
-title: DS015-router-access-control-http-route-access-and-mcp-policy
+title: DS016-router-access-control-http-route-access-and-mcp-policy
 summary: Defines fail-closed HTTP route access, MCP tool policy, caller ACL composition, coordinated administration, and immutable policy generations.
 ---
 
-# DS015 Router Access Control
+# DS016 Router Access Control
 
 ## Introduction
 
@@ -22,7 +22,5 @@ Policy mutation must occur through the Router-owned authenticated administrative
 HTTP, SSE, WebSocket, and MCP dispatch must use the active generation and exact lease and must revalidate immediately before dialing or executing the target. A corrupt digest, unreadable source, invalid schema, crash during apply, missing target, superseded lease, or incomplete partition leaves the affected selectors inactive. Recovery requires repairing candidate input and performing a new coordinated apply; translation, deletion, skipping, and fallback to an older generation are prohibited.
 
 Router-owned internal paths, authentication, administration, metrics, Marketplace, bare control roots, and paths containing reserved internal agent segments must not be controlled by ordinary route policy. Audit records may preserve bounded decision evidence but must never contain tokens, cookies, secrets, or raw sensitive values.
-
-## Conclusion
 
 Route access and MCP policy must remain separate, closed vocabularies compiled into one exact active generation so every transport makes the same fail-closed decision.

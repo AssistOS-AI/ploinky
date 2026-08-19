@@ -31,7 +31,7 @@ export async function handleUserIdentityKeyRoute(req, res, parsedUrl) {
     }
 
     // Only an authenticated, non-guest user may mint a user key. A guest session
-    // does not satisfy authenticated route access (DS006), and anonymous callers
+    // does not satisfy authenticated route access (DS007), and anonymous callers
     // never reach a populated req.user — both resolve to a non-'user' Caller kind,
     // so this single check is the authoritative 401 for them. (An agent principal
     // already carries its own signed key from agent env injection and has no

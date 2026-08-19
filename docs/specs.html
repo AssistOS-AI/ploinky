@@ -6,9 +6,11 @@
     <title>Specifications - Ploinky Documentation</title>
     <link rel="stylesheet" href="style.css">
     <script src="partials-loader.js" defer></script>
-    <script type="module">
-        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-        mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+    <script>
+        window.mermaidReady = import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs').then(({ default: mermaid }) => {
+            mermaid.initialize({ startOnLoad: false, theme: 'neutral' });
+            return mermaid;
+        });
     </script>
     <style>
         .specifications-page-header {
@@ -18,18 +20,28 @@
         .spec-layout {
             display: grid;
             grid-template-columns: 280px 1fr;
-            gap: 0;
+            gap: 2rem;
+            width: 100%;
+            padding: 2rem 0;
+            align-items: start;
             min-height: calc(100vh - 230px);
         }
 
         .spec-sidebar {
             background: var(--bg-primary);
-            border-right: 1px solid var(--border-primary);
+            border-radius: 12px;
+            box-shadow: var(--shadow-md);
             padding: 1.5rem 0;
             position: sticky;
-            top: 90px;
-            max-height: calc(100vh - 110px);
+            top: 100px;
+            max-height: calc(100vh - 120px);
             overflow-y: auto;
+            overscroll-behavior: contain;
+            scrollbar-gutter: stable;
+        }
+
+        .spec-main-panel {
+            min-width: 0;
         }
 
         .spec-sidebar h3 {
@@ -95,6 +107,7 @@
         .spec-content {
             background: var(--bg-primary);
             padding: 2rem 3rem;
+            min-width: 0;
             min-height: 100%;
             overflow-y: auto;
         }
@@ -176,6 +189,8 @@
 
         .spec-content .md-body table {
             width: 100%;
+            max-width: 100%;
+            table-layout: fixed;
             border-collapse: collapse;
             margin: 1rem 0;
             font-size: 0.9rem;
@@ -188,12 +203,22 @@
             font-weight: 600;
             color: var(--text-primary);
             border-bottom: 2px solid var(--border-primary);
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
 
         .spec-content .md-body td {
             padding: 0.6rem 1rem;
             border-bottom: 1px solid var(--border-primary);
             color: var(--text-primary);
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+
+        .spec-content .md-body td code,
+        .spec-content .md-body th code {
+            white-space: normal;
+            overflow-wrap: anywhere;
         }
 
         .spec-content .md-body tr:hover td {
@@ -351,7 +376,7 @@
 
         /* Scrollbar */
         .spec-sidebar::-webkit-scrollbar {
-            width: 6px;
+            width: 8px;
         }
         .spec-sidebar::-webkit-scrollbar-track {
             background: transparent;
@@ -366,68 +391,23 @@
     <div data-include="partials/header.html"></div>
     <main>
       <div class="container">
-        <div class="content-wrapper">
-          <div class="doc-section specifications-page-header">
-            <h1>Specifications</h1>
-            <p class="subtitle">Browse the Ploinky design specifications that define system behavior, runtime boundaries, interfaces, security, and operational requirements.</p>
-          </div>
-          <div class="spec-layout">
-        <aside class="spec-sidebar">
+        <div class="spec-layout">
+          <aside class="spec-sidebar">
             <div class="spec-search">
                 <input type="text" id="specSearch" placeholder="Filter specs...">
             </div>
 
-            <div class="sidebar-section">
-                <h3>Core</h3>
-                <ul>
-                    <li><a id="DS000" href="#DS000" data-spec="DS000-vision"><span class="spec-id">DS000</span> Vision</a></li>
-                    <li><a id="DS001" href="#DS001" data-spec="DS001-coding-style"><span class="spec-id">DS001</span> Coding Style</a></li>
-                    <li><a id="DS002" href="#DS002" data-spec="DS002-workspace-and-repository-model"><span class="spec-id">DS002</span> Workspace & Repository Model</a></li>
-                    <li><a id="DS003" href="#DS003" data-spec="DS003-main-behavior"><span class="spec-id">DS003</span> Main Behavior</a></li>
-                    <li><a id="DS004" href="#DS004" data-spec="DS004-agent-manifest-and-registry"><span class="spec-id">DS004</span> Agent Manifest & Registry</a></li>
-                </ul>
-            </div>
+            <div id="specGroups"></div>
+          </aside>
 
-            <div class="sidebar-section">
-                <h3>Interfaces</h3>
-                <ul>
-                    <li><a id="DS006" href="#DS006" data-spec="DS006-routing-and-web-surfaces"><span class="spec-id">DS006</span> Routing & Web Surfaces</a></li>
-                    <li><a id="DS007" href="#DS007" data-spec="DS007-auth-capabilities-and-secure-wire"><span class="spec-id">DS007</span> Auth, Capabilities & Secure Wire</a></li>
-                    <li><a id="DS012" href="#DS012" data-spec="DS012-security-model"><span class="spec-id">DS012</span> Security Model</a></li>
-                    <li><a id="DS014" href="#DS014" data-spec="DS014-per-agent-identity-and-request-signed-jwts"><span class="spec-id">DS014</span> Per-Agent Identity & JWTs</a></li>
-                    <li><a id="DS015" href="#DS015" data-spec="DS015-router-access-control-http-route-access-and-mcp-policy"><span class="spec-id">DS015</span> Router Access Control</a></li>
-                </ul>
+          <div class="content-wrapper spec-main-panel">
+            <div class="doc-section specifications-page-header">
+              <h1>Specifications</h1>
+              <p class="subtitle">Browse the Ploinky design specifications that define system behavior, runtime boundaries, interfaces, security, and operational requirements.</p>
             </div>
-
-            <div class="sidebar-section">
-                <h3>Runtime</h3>
-                <ul>
-                    <li><a id="DS005" href="#DS005" data-spec="DS005-runtime-execution-and-isolation"><span class="spec-id">DS005</span> Runtime Execution & Isolation</a></li>
-                    <li><a id="DS008" href="#DS008" data-spec="DS008-dependency-caches-and-startup-readiness"><span class="spec-id">DS008</span> Dependency Caches & Startup Readiness</a></li>
-                    <li><a id="DS016" href="#DS016" data-spec="DS016-startup-config-providers"><span class="spec-id">DS016</span> Startup Config Providers</a></li>
-                </ul>
+            <div class="spec-content" id="specContent">
+              <!-- Content loaded dynamically -->
             </div>
-
-            <div class="sidebar-section">
-                <h3>Configuration</h3>
-                <ul>
-                    <li><a id="DS009" href="#DS009" data-spec="DS009-secrets-skills-and-llm-assistance"><span class="spec-id">DS009</span> Secrets, Skills & LLM Assistance</a></li>
-                    <li><a id="DS013" href="#DS013" data-spec="DS013-local-llm-agent-architecture-catalog"><span class="spec-id">DS013</span> Local LLM Agent Catalog</a></li>
-                </ul>
-            </div>
-
-            <div class="sidebar-section">
-                <h3>Operations</h3>
-                <ul>
-                    <li><a id="DS010" href="#DS010" data-spec="DS010-observability"><span class="spec-id">DS010</span> Observability</a></li>
-                    <li><a id="DS011" href="#DS011" data-spec="DS011-testing-and-verification"><span class="spec-id">DS011</span> Testing & Verification</a></li>
-                </ul>
-            </div>
-        </aside>
-
-        <div class="spec-content" id="specContent">
-            <!-- Content loaded dynamically -->
-        </div>
           </div>
         </div>
       </div>
@@ -438,24 +418,33 @@
     <script>
         // Spec data
         const specs = [
-            { id: 'DS000', file: 'DS000-vision', title: 'Vision', group: 'Core' },
-            { id: 'DS001', file: 'DS001-coding-style', title: 'Coding Style', group: 'Core' },
-            { id: 'DS002', file: 'DS002-workspace-and-repository-model', title: 'Workspace & Repository Model', group: 'Core' },
-            { id: 'DS003', file: 'DS003-main-behavior', title: 'Main Behavior', group: 'Core' },
-            { id: 'DS004', file: 'DS004-agent-manifest-and-registry', title: 'Agent Manifest & Registry', group: 'Core' },
-            { id: 'DS005', file: 'DS005-runtime-execution-and-isolation', title: 'Runtime Execution & Isolation', group: 'Runtime' },
-            { id: 'DS006', file: 'DS006-routing-and-web-surfaces', title: 'Routing & Web Surfaces', group: 'Interfaces' },
-            { id: 'DS007', file: 'DS007-auth-capabilities-and-secure-wire', title: 'Auth, Capabilities & Secure Wire', group: 'Interfaces' },
-            { id: 'DS008', file: 'DS008-dependency-caches-and-startup-readiness', title: 'Dependency Caches & Startup Readiness', group: 'Runtime' },
-            { id: 'DS009', file: 'DS009-secrets-skills-and-llm-assistance', title: 'Secrets, Skills & LLM Assistance', group: 'Configuration' },
-            { id: 'DS010', file: 'DS010-observability', title: 'Observability', group: 'Operations' },
-            { id: 'DS011', file: 'DS011-testing-and-verification', title: 'Testing & Verification', group: 'Operations' },
-            { id: 'DS012', file: 'DS012-security-model', title: 'Security Model', group: 'Interfaces' },
-            { id: 'DS013', file: 'DS013-local-llm-agent-architecture-catalog', title: 'Local LLM Agent Catalog', group: 'Configuration' },
-            { id: 'DS014', file: 'DS014-per-agent-identity-and-request-signed-jwts', title: 'Per-Agent Identity & JWTs', group: 'Interfaces' },
-            { id: 'DS015', file: 'DS015-router-access-control-http-route-access-and-mcp-policy', title: 'Router Access Control', group: 'Interfaces' },
-            { id: 'DS016', file: 'DS016-startup-config-providers', title: 'Startup Config Providers', group: 'Runtime' }
+            { id: 'DS001', file: 'DS001-vision', title: 'Vision', group: 'Core' },
+            { id: 'DS002', file: 'DS002-coding-style', title: 'Coding Style', group: 'Core' },
+            { id: 'DS003', file: 'DS003-workspace-and-repository-model', title: 'Workspace & Repository Model', group: 'Core' },
+            { id: 'DS004', file: 'DS004-main-behavior', title: 'Main Behavior', group: 'Core' },
+            { id: 'DS005', file: 'DS005-agent-manifest-and-registry', title: 'Agent Manifest & Registry', group: 'Core' },
+            { id: 'DS006', file: 'DS006-runtime-execution-and-isolation', title: 'Runtime Execution & Isolation', group: 'Runtime' },
+            { id: 'DS007', file: 'DS007-routing-and-web-surfaces', title: 'Routing & Web Surfaces', group: 'Interfaces' },
+            { id: 'DS008', file: 'DS008-auth-capabilities-and-secure-wire', title: 'Auth, Capabilities & Secure Wire', group: 'Interfaces' },
+            { id: 'DS009', file: 'DS009-dependency-caches-and-startup-readiness', title: 'Dependency Caches & Startup Readiness', group: 'Runtime' },
+            { id: 'DS010', file: 'DS010-secrets-and-variable-resolution', title: 'Secrets & Variable Resolution', group: 'Configuration' },
+            { id: 'DS011', file: 'DS011-observability', title: 'Observability', group: 'Operations' },
+            { id: 'DS012', file: 'DS012-testing-and-verification', title: 'Testing & Verification', group: 'Operations' },
+            { id: 'DS013', file: 'DS013-security-model', title: 'Security Model', group: 'Interfaces' },
+            { id: 'DS014', file: 'DS014-local-llm-agent-architecture-catalog', title: 'Local LLM Agent Catalog', group: 'Configuration' },
+            { id: 'DS015', file: 'DS015-per-agent-identity-and-request-signed-jwts', title: 'Per-Agent Identity & JWTs', group: 'Interfaces' },
+            { id: 'DS016', file: 'DS016-router-access-control-http-route-access-and-mcp-policy', title: 'Router Access Control', group: 'Interfaces' },
+            { id: 'DS017', file: 'DS017-startup-config-providers', title: 'Startup Config Providers', group: 'Runtime' }
         ];
+
+        const groupOrder = ['Core', 'Runtime', 'Interfaces', 'Configuration', 'Operations'];
+        const groupsContainer = document.getElementById('specGroups');
+        groupsContainer.innerHTML = groupOrder.map(group => {
+            const entries = specs.filter(spec => spec.group === group);
+            if (!entries.length) return '';
+            const items = entries.map(spec => `<li><a id="${spec.id}" href="specs/${spec.file}.md" data-id="${spec.id}" data-spec="${spec.file}"><span class="spec-id">${spec.id}</span> ${spec.title}</a></li>`).join('');
+            return `<div class="sidebar-section" data-group="${group}"><h3>${group}</h3><ul>${items}</ul></div>`;
+        }).join('');
 
         const content = document.getElementById('specContent');
         const links = document.querySelectorAll('.spec-sidebar a[data-spec]');
@@ -465,7 +454,7 @@
         function showWelcome() {
             let cards = '';
             specs.forEach(s => {
-                cards += `<a href="#${s.id}" class="spec-card" onclick="loadSpec('${s.file}','${s.id}');return false;"><span class="card-id">${s.id}</span> ${s.title}</a>`;
+                cards += `<a href="specs/${s.file}.md" class="spec-card" onclick="loadSpec('${s.file}','${s.id}');return false;"><span class="card-id">${s.id}</span> ${s.title}</a>`;
             });
 
             content.innerHTML = `
@@ -516,7 +505,11 @@
                 wrapper.innerHTML = html;
                 content.appendChild(wrapper);
                 content.scrollTop = 0;
-                if (typeof mermaid !== 'undefined') { mermaid.run({ nodes: content.querySelectorAll('.mermaid') }); }
+                const diagramNodes = content.querySelectorAll('.mermaid');
+                if (diagramNodes.length) {
+                    const mermaid = await window.mermaidReady;
+                    await mermaid.run({ nodes: diagramNodes });
+                }
 
                 // Rewrite internal DS links to work within the viewer
                 content.querySelectorAll('.md-body a').forEach(a => {
@@ -537,7 +530,7 @@
                     }
                 });
             } catch (err) {
-                content.innerHTML = `<div class="spec-loading"><p>Failed to load specification: ${err.message}</p></div>`;
+                content.innerHTML = `<div class="spec-loading"><p>Failed to load specification: ${err.message}</p><p><a href="specs/${file}.md">Open the Markdown specification directly</a></p></div>`;
             }
         }
 
@@ -560,7 +553,7 @@
             link.addEventListener('click', (e) => {
                 e.preventDefault();
                 const file = link.dataset.spec;
-                const id = link.getAttribute('href').slice(1);
+                const id = link.dataset.id;
                 loadSpec(file, id);
             });
         });

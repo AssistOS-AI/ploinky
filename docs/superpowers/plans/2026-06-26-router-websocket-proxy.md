@@ -29,7 +29,7 @@
 ## Global Constraints
 
 - **Blast radius = production router core** (`RoutingServer.js` fronts all agents/hosts). The `'upgrade'` handler is strictly additive; it must never touch the HTTP request path. Any throw inside it ends in `socket.destroy()`, never an unhandled rejection.
-- **Security — fail closed:** `stripRouterIdentityHeaders(req.headers)` BEFORE forwarding; non-`public` services with no `req.user` → reject; non-`public` `includeAuthInfo` services that yield no signed header → reject; only forward to `apiRoutes[routeKey].hostPort`; re-apply `hasInternalAgentSegment` (DS014) 404.
+- **Security — fail closed:** `stripRouterIdentityHeaders(req.headers)` BEFORE forwarding; non-`public` services with no `req.user` → reject; non-`public` `includeAuthInfo` services that yield no signed header → reject; only forward to `apiRoutes[routeKey].hostPort`; re-apply `hasInternalAgentSegment` (DS015) 404.
 - **ESM only.** `cli/server/*.js` are ESM modules (`import`/`export`); `Agent/lib/*.mjs` likewise. Match the surrounding files. `loadApiRoutes()`/`resolveHttpServiceRoute()` read global config — do not assume injectability without a fixture.
 - Commit policy: no `Co-Authored-By`/AI attribution. No SSH deploy; production rollout via GitHub Actions only — out of plan scope.
 

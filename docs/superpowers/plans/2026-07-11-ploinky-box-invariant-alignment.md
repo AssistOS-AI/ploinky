@@ -742,9 +742,9 @@ Under approved D7:
 | tests/unit/helpLayers.test.mjs | Updated destroy and argument help |
 | README.md and container/README.md | Public runtime contract |
 | docs/code-derived-agent-lifecycle.md | Generic boxed lifecycle |
-| docs/specs/DS003-agent-manifest-and-registry.md | openPorts and graph semantics |
-| docs/specs/DS004-runtime-execution-and-isolation.md | Outer/nested runtime contract |
-| docs/specs/DS007-dependency-caches-and-startup-readiness.md | Planner and retained dependency volume |
+| docs/specs/DS004-agent-manifest-and-registry.md | openPorts and graph semantics |
+| docs/specs/DS005-runtime-execution-and-isolation.md | Outer/nested runtime contract |
+| docs/specs/DS008-dependency-caches-and-startup-readiness.md | Planner and retained dependency volume |
 | docs/superpowers/specs/2026-07-11-mutable-runtime-image-hard-cut-design.md | Reconcile design with approved contract-2 persistence, legacy hard cut, and other decisions |
 
 ### AssistOSExplorer
@@ -1250,9 +1250,9 @@ Under approved D7:
 - Modify: README.md
 - Modify: container/README.md
 - Modify: docs/code-derived-agent-lifecycle.md
-- Modify: docs/specs/DS003-agent-manifest-and-registry.md
-- Modify: docs/specs/DS004-runtime-execution-and-isolation.md
-- Modify: docs/specs/DS007-dependency-caches-and-startup-readiness.md
+- Modify: docs/specs/DS004-agent-manifest-and-registry.md
+- Modify: docs/specs/DS005-runtime-execution-and-isolation.md
+- Modify: docs/specs/DS008-dependency-caches-and-startup-readiness.md
 - Modify: ../container-image-builds/README.md
 
 **Steps**

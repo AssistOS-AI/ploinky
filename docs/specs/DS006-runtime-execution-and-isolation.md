@@ -1,9 +1,9 @@
 ---
-title: DS005-runtime-execution-and-isolation
+title: DS006-runtime-execution-and-isolation
 summary: Defines the managed outer Box, exact network boundary, rootless nested runtimes, mount policy, persistent caches, and lifecycle recovery.
 ---
 
-# DS005 Runtime Execution and Isolation
+# DS006 Runtime Execution and Isolation
 
 ## Introduction
 
@@ -22,7 +22,5 @@ Managed agent and helper containers must run through nested rootless Podman with
 The host process owns the Box. A compatible running Box is reused, a compatible stopped Box is started in place, and a requested image or port change may use a transactional validated replacement. Other creation drift and any foreign ownership fail before mutation and require explicit destruction. `stop` must quiesce core services before stopping the Box. `destroy` must remove only the exact owned Box and must preserve the workspace, agent homes, dependency cache, and nested image cache unless `--delete-cache` explicitly selects the two cache paths.
 
 Nested container records, writable layers, networks, and inner Podman named volumes live in the Box writable layer and do not survive Box destruction. Durable agent or service data must therefore use explicit workspace-backed binds. Stop and start may reuse the same Box writable layer, but `/tmp` and its transient inner runtime metadata are recreated on each outer boot.
-
-## Conclusion
 
 The runtime contract provides reproducible agent execution while keeping the physical-host boundary fixed, rootless, attributable to one workspace, and recoverable without broad cleanup.

@@ -1,4 +1,4 @@
-// DS004-Q8 architecture-decision spike (S0) — source contract test.
+// DS005-Q8 architecture-decision spike (S0) — source contract test.
 //
 // Normative source: docs/superpowers/plans/2026-07-19-ploinky-box-clean-rebuild.md
 // (sections 1-7, 9) and its annex (sections 1-4), in the outer workspace root.
@@ -20,7 +20,7 @@ import os from 'node:os';
 
 const TEST_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(TEST_FILE, '../../..');
-const SPIKE_DIR = path.join(REPO_ROOT, 'container/spike/ds004-q8');
+const SPIKE_DIR = path.join(REPO_ROOT, 'container/spike/ds005-q8');
 
 const PATHS = {
     runSpike: path.join(SPIKE_DIR, 'run-spike.sh'),
@@ -63,7 +63,7 @@ function tempRunSpike() {
     fs.mkdirSync(artifactRoot, { recursive: true });
     const script = path.join(tmp, 'run-spike.sh');
     const src = requireFile(PATHS.runSpike).replace(
-        'ARTIFACTS_ROOT="/var/tmp/ploinky-ds004-q8-artifacts"',
+        'ARTIFACTS_ROOT="/var/tmp/ploinky-ds005-q8-artifacts"',
         `ARTIFACTS_ROOT="${artifactRoot}"`,
     );
     fs.writeFileSync(script, src, { mode: 0o700 });
@@ -79,8 +79,8 @@ describe('exact five-file S0 inventory', () => {
         }
     });
 
-    test('container/spike/ds004-q8 contains exactly the four owned files', () => {
-        assert.ok(fs.existsSync(SPIKE_DIR), 'container/spike/ds004-q8 directory missing');
+    test('container/spike/ds005-q8 contains exactly the four owned files', () => {
+        assert.ok(fs.existsSync(SPIKE_DIR), 'container/spike/ds005-q8 directory missing');
         const entries = fs.readdirSync(SPIKE_DIR).sort();
         assert.deepEqual(entries, ['README.md', 'probe.py', 'run-spike.sh', 'stage-source.sh']);
     });
@@ -227,10 +227,10 @@ describe('SSH/SFTP trust and remote executor contract', () => {
 
 describe('immutable artifact path templates', () => {
     const TEMPLATES = [
-        '/var/tmp/ploinky-ds004-q8-artifacts/green/candidate-n/',
-        '/var/tmp/ploinky-ds004-q8-artifacts/source/',
-        '/var/tmp/ploinky-ds004-q8-artifacts/runs/',
-        '/var/tmp/ploinky-ds004-q8/candidate-n/',
+        '/var/tmp/ploinky-ds005-q8-artifacts/green/candidate-n/',
+        '/var/tmp/ploinky-ds005-q8-artifacts/source/',
+        '/var/tmp/ploinky-ds005-q8-artifacts/runs/',
+        '/var/tmp/ploinky-ds005-q8/candidate-n/',
     ];
 
     test('stage-source.sh references every immutable artifact path template', () => {
@@ -374,7 +374,7 @@ describe('probe matrix contract', () => {
 
     test('the fixed payload hex is embedded exactly', () => {
         const src = requireFile(PATHS.probe) + requireFile(PATHS.runSpike);
-        assert.ok(src.includes('44533030342d51382d524f555445522d4f4b0a'));
+        assert.ok(src.includes('44533030352d51382d524f555445522d4f4b0a'));
     });
 
     test('run-spike.sh aligns fixed TCP and UDP scanner ports', () => {
@@ -464,9 +464,9 @@ describe('failure taxonomy and status transitions', () => {
 describe('dynamic fail-closed behavior', () => {
     const CLEAN_ENV = { ...process.env };
     for (const v of [
-        'DS004_EXTERNAL_SCANNER_SSH', 'DS004_AMD64_RUNNER_SSH', 'DS004_ARM64_RUNNER_SSH',
-        'DS004_AMD64_BOX_LAN_IPV4', 'DS004_ARM64_BOX_LAN_IPV4', 'DS004_SSH_KNOWN_HOSTS_FILE',
-        'DS004_EXTERNAL_SCANNER_IDENTITY_FILE', 'DS004_AMD64_RUNNER_IDENTITY_FILE', 'DS004_ARM64_RUNNER_IDENTITY_FILE',
+        'DS005_EXTERNAL_SCANNER_SSH', 'DS005_AMD64_RUNNER_SSH', 'DS005_ARM64_RUNNER_SSH',
+        'DS005_AMD64_BOX_LAN_IPV4', 'DS005_ARM64_BOX_LAN_IPV4', 'DS005_SSH_KNOWN_HOSTS_FILE',
+        'DS005_EXTERNAL_SCANNER_IDENTITY_FILE', 'DS005_AMD64_RUNNER_IDENTITY_FILE', 'DS005_ARM64_RUNNER_IDENTITY_FILE',
     ]) delete CLEAN_ENV[v];
 
     test('probe.py --self-test exits 0 with no native/root dependency', (t) => {
@@ -611,7 +611,7 @@ describe('dynamic fail-closed behavior', () => {
 
     test('stage-source.sh green executes exactly the contract test itself', () => {
         const src = requireFile(PATHS.stageSource);
-        assert.ok(src.includes('node --test tests/unit/ds004Q8SpikeContract.test.mjs'), 'green must run exactly this test file');
+        assert.ok(src.includes('node --test tests/unit/ds005Q8SpikeContract.test.mjs'), 'green must run exactly this test file');
     });
 
     test('stage-source.sh with an unknown verb fails closed with empty stdout', () => {
@@ -629,9 +629,9 @@ describe('README operator documentation', () => {
     test('README documents the nine required coordinator inputs', () => {
         const src = requireFile(PATHS.readme);
         for (const v of [
-            'DS004_EXTERNAL_SCANNER_SSH', 'DS004_AMD64_RUNNER_SSH', 'DS004_ARM64_RUNNER_SSH',
-            'DS004_AMD64_BOX_LAN_IPV4', 'DS004_ARM64_BOX_LAN_IPV4', 'DS004_SSH_KNOWN_HOSTS_FILE',
-            'DS004_EXTERNAL_SCANNER_IDENTITY_FILE', 'DS004_AMD64_RUNNER_IDENTITY_FILE', 'DS004_ARM64_RUNNER_IDENTITY_FILE',
+            'DS005_EXTERNAL_SCANNER_SSH', 'DS005_AMD64_RUNNER_SSH', 'DS005_ARM64_RUNNER_SSH',
+            'DS005_AMD64_BOX_LAN_IPV4', 'DS005_ARM64_BOX_LAN_IPV4', 'DS005_SSH_KNOWN_HOSTS_FILE',
+            'DS005_EXTERNAL_SCANNER_IDENTITY_FILE', 'DS005_AMD64_RUNNER_IDENTITY_FILE', 'DS005_ARM64_RUNNER_IDENTITY_FILE',
         ]) {
             assert.ok(src.includes(v), `README missing coordinator input "${v}"`);
         }

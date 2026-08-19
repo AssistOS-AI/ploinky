@@ -1,7 +1,7 @@
 import { PolicyCommand } from './PolicyCommand.js';
 
 /**
- * The three `mcp.policy.*` commands (DS015) — admin-only. They share the
+ * The three `mcp.policy.*` commands (DS016) — admin-only. They share the
  * MCP-tool-policy responsibility, so they live together. Each takes the
  * `repository` via DI.
  */

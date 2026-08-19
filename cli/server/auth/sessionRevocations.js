@@ -3,7 +3,7 @@ import path from 'node:path';
 import { PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 
 /**
- * Persistent session revocation list (DS014/DS012).
+ * Persistent session revocation list (DS015/DS013).
  *
  * User Session and Guest Session JWTs are stateless, so logout / forced
  * revocation needs an out-of-band deny list. This stores revoked `sid` and

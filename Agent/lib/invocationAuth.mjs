@@ -46,7 +46,7 @@ export function readAgentSecret(env = process.env) {
     // Agents only ever hold their OWN per-agent secret (PLOINKY_AGENT_SECRET,
     // hex). There is intentionally no fallback to the master or a shared key:
     // that would let one agent forge Router Request tokens for another agent and
-    // defeat per-agent isolation (DS014).
+    // defeat per-agent isolation (DS015).
     const hex = String(env?.PLOINKY_AGENT_SECRET || '').trim();
     return hex ? Buffer.from(hex, 'hex') : null;
 }
