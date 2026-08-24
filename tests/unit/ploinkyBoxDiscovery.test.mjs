@@ -70,6 +70,7 @@ function retiredVolumeRecords(identity) {
 function fakeRunner(identity, {
     podman = podmanInfo(),
     docker = 'absent',
+    dockerInfo = null,
     container = null,
     inventoryRecords = null,
     connections = [],
@@ -91,7 +92,7 @@ function fakeRunner(identity, {
                 if (docker === 'absent') {
                     return { ok: false, stdout: '', stderr: '', error: { code: 'ENOENT' } };
                 }
-                return { ok: true, stdout: JSON.stringify({
+                return { ok: true, stdout: JSON.stringify(dockerInfo || {
                     ID: 'docker-host', DockerRootDir: '/docker', ServerVersion: '1', OSType: 'linux',
                 }), stderr: '' };
             }
@@ -313,6 +314,88 @@ test('Docker exact-name conflicts and engine ambiguity fail closed', (t) => {
     })(runner.query.bind(runner));
     const unknown = discoverBoxOwnership(identity, { platform: 'linux', env: {}, runner });
     assert.equal(unknown.state, 'unknown');
+});
+
+test('a Docker Podman-compatibility frontend is deduplicated across Box creation discovery', (t) => {
+    const identity = identityFixture(t);
+    const sharedInfo = podmanInfo();
+    const emptyDockerView = { container: {}, volume: {} };
+    const beforeCreate = discoverBoxOwnership(identity, {
+        platform: 'linux',
+        env: {},
+        runner: fakeRunner(identity, {
+            podman: sharedInfo,
+            docker: emptyDockerView,
+            dockerInfo: sharedInfo,
+        }),
+    });
+    assert.equal(beforeCreate.state, 'absent');
+
+    const container = ownedContainer(identity);
+    const dockerView = {
+        container: { [identity.instance]: container },
+        volume: {},
+    };
+    const afterCreate = discoverBoxOwnership(identity, {
+        platform: 'linux',
+        env: {},
+        runner: fakeRunner(identity, {
+            podman: sharedInfo,
+            docker: dockerView,
+            dockerInfo: sharedInfo,
+            container,
+        }),
+    });
+    assert.equal(afterCreate.state, 'owned');
+    assert.equal(afterCreate.handles.container.id, container.Id);
+    assert.equal(afterCreate.inventories.docker.handles.container.id, container.Id);
+});
+
+test('a same-backend claim cannot hide a divergent Docker container', (t) => {
+    const identity = identityFixture(t);
+    const sharedInfo = podmanInfo();
+    const container = ownedContainer(identity);
+    const divergent = { ...ownedContainer(identity), Id: 'different-container-id' };
+    const result = discoverBoxOwnership(identity, {
+        platform: 'linux',
+        env: {},
+        runner: fakeRunner(identity, {
+            podman: sharedInfo,
+            docker: {
+                container: { [identity.instance]: divergent },
+                volume: {},
+            },
+            dockerInfo: sharedInfo,
+            container,
+        }),
+    });
+
+    assert.equal(result.state, 'foreign');
+    assert.match(result.message, /inconsistent Box inventory/);
+});
+
+test('incomplete Podman-shaped Docker metadata cannot bypass a real conflict', (t) => {
+    const identity = identityFixture(t);
+    const container = ownedContainer(identity);
+    const incompleteDockerInfo = podmanInfo();
+    incompleteDockerInfo.version = {};
+    const result = discoverBoxOwnership(identity, {
+        platform: 'linux',
+        env: {},
+        runner: fakeRunner(identity, {
+            docker: {
+                container: {
+                    [identity.instance]: { ...ownedContainer(identity), Id: 'separate-docker-id' },
+                },
+                volume: {},
+            },
+            dockerInfo: incompleteDockerInfo,
+            container,
+        }),
+    });
+
+    assert.equal(result.state, 'foreign');
+    assert.match(result.message, /Docker has an exact-name or labeled resource conflicting/);
 });
 
 test('unexpected labeled inventory records are foreign even when exact names are absent', (t) => {

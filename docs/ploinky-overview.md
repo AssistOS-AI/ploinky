@@ -5,11 +5,8 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 ## Workspace model
 
 - The workspace root is the nearest directory that contains `.ploinky/`.
-- Runtime state lives under `.ploinky/`, including `agents.json`, `routing.json`, `.secrets`, `repos/`, `deps/`, `logs/`, and `keys/`.
-- The first core command in a genuinely fresh workspace creates `agents.json`,
-  `routing.json`, `data/router-security/policy-state.json`, and
-  `data/edge-routing/desired.json` together before any registry mutation.
-  A partial set remains fail-closed and requires explicit repair.
+- Runtime state lives under `.ploinky/`, including `agents.json`, `routing.json`, `.secrets`, `repos/`, `deps/`, and `logs/`.
+- The first core command in a genuinely fresh workspace creates `agents.json`, `routing.json`, `data/router-security/policy-state.json`, and `data/edge-routing/desired.json` together before any registry mutation. A partial set remains fail-closed and requires explicit repair.
 - Agent repositories are cloned under `.ploinky/repos/<repo>/`.
 - The default `start` flow requires a static agent and router port the first time, then reuses the saved configuration.
 
@@ -31,32 +28,17 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky shutdown`: stop the router and remove runtimes recorded for this workspace in `.ploinky/agents.json`.
 - `ploinky destroy`: stop the router, remove all Ploinky runtimes for the workspace, and clear the regenerated dependency cache under `.ploinky/deps/` without deleting `.data/<agent-or-alias>/`.
 - `ploinky clean`: alias for `destroy`.
-- `ploinky logs tail [router|<agent>] [--startup]` and `ploinky logs last [<N>] [router|<agent>] [--startup]`: inspect Router logs or one exact enabled agent. Completion returns one reference per enabled record and verifies that it resolves back to that record; unqualified `router` is reserved, so an agent named `router` must have a usable unambiguous qualified spelling. A no-wait worker is accepted only after exact argv proof from Linux `/proc` or macOS `KERN_PROCARGS2`. Agent sources are the current run-scoped startup file, Docker/Podman output proved by immutable-container-id ownership, or an already-opened process-specific Bubblewrap/Seatbelt file. `tail` rechecks marker, registry generation, and runtime source at its final handoff; `last` selects a proved runtime before consulting startup state. Pre-cut sandbox processes require one restart instead of legacy-name fallback. Cancellation completes a bounded TERM/KILL cleanup. Application bytes are deliberately unredacted, while control diagnostics are bounded and redact credentials. The command is observational: it never creates, starts, adopts, repairs, or removes a workspace, a Box, or an agent runtime, and it never writes `agents.json`, no-wait state, or routing state.
+- `ploinky logs tail [router|agent] [--startup]` and `ploinky logs last [<N>] [router|agent] [--startup]`: inspect the Ploinky-owned Router file by default or one exact enabled agent. `--startup` applies only to agents. Agent runtime ownership and cancellation checks remain unchanged.
 - `ploinky webchat [--rotate]`: print the WebChat access URL. WebChat uses the router login flow; `--rotate` is accepted for compatibility but does not mint a WebChat-specific token.
 - `ploinky client list tools|resources`, `ploinky client status <agent>`, and `ploinky client tool <name>`: inspect or call MCP surfaces through the router.
 
 ## Web surfaces
 
-- `/webchat`: chat surface over a workspace-scoped TTY runtime. Conversation
-  sessions are owned by the selected CLI, which can publish `current`, `list`,
-  and `selected` snapshots through the generic `__webchatSession` protocol.
-  WebChat validates and retains the latest snapshot only in memory, renders
-  existing messages through `Click to load session history`, and sends
-  `/session`, `/session new`, or `/session resume <id>` for session controls.
-  Ploinky does not persist conversation files or hydrate the CLI's agent. When opened as
-  `/webchat?agent=<name>&...`, the router forwards additional query parameters
-  except router-owned `tabId` to `ploinky cli <name>` as
-  long-form CLI flags encoded as `--key=value`.
-- `/dashboard`: administrator-only descriptor for Ploinky's generic read-only monitoring contracts.
-- `/dashboard/tail`: raw `tail -n`/`tail -F` stream for the router and policy-audit logs.
+- `/webchat`: chat surface over a workspace-scoped TTY runtime. Conversation sessions are owned by the selected CLI, which can publish `current`, `list`, and `selected` snapshots through the generic `__webchatSession` protocol. WebChat validates and retains the latest snapshot only in memory, renders existing messages through `Click to load session history`, and sends `/session`, `/session new`, or `/session resume <id>` for session controls. Ploinky does not persist conversation files or hydrate the CLI's agent. When opened as `/webchat?agent=<name>&...`, the router forwards additional query parameters except router-owned `tabId` to `ploinky cli <name>` as long-form CLI flags encoded as `--key=value`.
 - `/status/data`: current workspace resource snapshot; `follow=1` streams live NDJSON samples from the Router-owned collector.
 - `/api/marketplace`: JSON endpoint for the first-party agent marketplace. Authenticated local or SSO users may read repository, agent, enabled-record, recorded backend, and runtime state; Bubblewrap and Seatbelt liveness comes from tracked PIDs, while Docker and Podman use OCI state. Local admins may perform the complete `install_repo`, `uninstall_repo`, `enable_agent`, and `disable_agent` action set. A running agent may use a request-bound Agent Assertion to read state and submit only `enable_agent`, which supports on-demand dependency startup without granting repository or disable operations. Client helpers check status first and forward `mode` only when the caller supplies it; an omitted mode retains Marketplace's isolated default. Repository uninstall disables agents from that repository and removes the checkout while preserving source metadata for reinstall. Marketplace agent disablement removes the enabled-agent registry record before removing the runtime so the watchdog does not restart it during the operation.
 
-`/webchat` uses the normal router login flow. `/dashboard` and `/status` are
-local-control surfaces that require a real router-authenticated local-admin
-session on an exact control Host. They do not accept a component token,
-invitation, agent assertion, media credential, or localhost provenance as admin
-identity. These monitoring routes are read-only.
+`/webchat` uses the normal router login flow. `/status` is a local-control surface that requires a real router-authenticated local-admin session on an exact control Host. They do not accept a component token, invitation, agent assertion, media credential, or localhost provenance as admin identity. This monitoring route is read-only.
 
 ## Auth and agent cards
 
@@ -66,7 +48,7 @@ identity. These monitoring routes are read-only.
 - `GET /agent-card` on the router lists successful capability responses from active agents without enforcing a fixed payload shape; `GET /<agent>/agent-card` proxies one agent's metadata.
 - `POST /<agent>/v1/chat/completions` routes OpenAI-compatible requests to one agent, with `stream: true` selecting SSE streaming and normal JSON returned otherwise.
 - `/<agent>/...` routes are transparent per-agent proxy routes after router-owned paths are handled. The router strips the `/<agent>` prefix; the target agent owns paths such as `/index.html`, `/agent-card`, `/v1/chat/completions`, and custom HTTP endpoints. `/<agent>/mcp` remains special so the router can preserve MCP session mediation and secure-wire token minting.
-- `http://<service-slug>.localhost:<routerPort>/` selects a uniquely slugged `httpServices` entry. Its optional `port` resolves to an engine-assigned private target; omitted port preserves the owning agent's primary target. All HTTP, SSE, and WebSocket traffic uses the same immutable route-and-policy authorization generation.
+- `/base-agent-additional-server/<agentName>/<port>/<path>` selects an additional private server owned by an enabled agent. The agent must declare the path through `routerAccess.httpRoutes`; malformed selectors, reserved ports, stale owners, and undeclared paths fail closed. HTTP and WebSocket traffic uses the same immutable route-and-policy authorization generation.
 - Delegated MCP calls use router-minted invocation JWTs. The router verifies the caller's session and forwards a fresh target invocation token.
 
 ## Dependency and profile commands

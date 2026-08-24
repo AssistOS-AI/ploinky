@@ -19,7 +19,11 @@ import { collectAgentsSummary } from '../utils/status.js';
 import { findAgent } from '../utils/utils.js';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
-const DEFAULT_SKILLS_REPO_NAME = 'AchillesCopilotBasicSkills';
+const DEFAULT_SKILLS_REPO_NAMES = [
+    'AchillesCopilotBasicSkills',
+    'DocumentationSkills',
+    'PloinkySkills',
+];
 function getRepoNames() {
     if (!fs.existsSync(REPOS_DIR)) return [];
     return fs.readdirSync(REPOS_DIR).filter(file => fs.statSync(path.join(REPOS_DIR, file)).isDirectory());
@@ -54,7 +58,7 @@ function normalizeManagedRepoName(repoName) {
 }
 
 function refreshDefaultSkillsInPloinkyRepo(repoName, {
-    defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAME,
+    defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAMES[0],
 } = {}) {
     const repoNameLabel = String(repoName || '').trim();
     if (!repoNameLabel) {
@@ -88,35 +92,41 @@ function refreshDefaultSkillsInPloinkyRepo(repoName, {
 }
 
 function refreshDefaultSkillsInPloinkyRepos(repoNames = getGitRepoNames(), {
-    defaultSkillsRepoName = DEFAULT_SKILLS_REPO_NAME,
+    defaultSkillsRepoName,
 } = {}) {
-    const defaultSkillsRepoNameLabel = String(defaultSkillsRepoName || '').trim();
+    const defaultSkillsRepoNames = defaultSkillsRepoName
+        ? [String(defaultSkillsRepoName).trim()]
+        : DEFAULT_SKILLS_REPO_NAMES;
     const refreshed = [];
     const skipped = [];
     const failed = [];
 
     for (const repoName of repoNames) {
-        const repoNameLabel = String(repoName || '').trim();
-        try {
-            const result = refreshDefaultSkillsInPloinkyRepo(repoNameLabel, {
-                defaultSkillsRepoName: defaultSkillsRepoNameLabel,
-            });
-            if (result.refreshed) {
-                refreshed.push(result);
-            } else {
-                skipped.push(result);
+        for (const sourceRepoName of defaultSkillsRepoNames) {
+            const repoNameLabel = String(repoName || '').trim();
+            try {
+                const result = refreshDefaultSkillsInPloinkyRepo(repoNameLabel, {
+                    defaultSkillsRepoName: sourceRepoName,
+                });
+                if (result.refreshed) {
+                    refreshed.push(result);
+                } else {
+                    skipped.push(result);
+                }
+            } catch (err) {
+                failed.push({
+                    repoName: repoNameLabel,
+                    defaultSkillsRepoName: sourceRepoName,
+                    message: err?.message || String(err),
+                });
             }
-        } catch (err) {
-            failed.push({
-                repoName: repoNameLabel,
-                message: err?.message || String(err),
-            });
         }
     }
 
     return {
-        defaultSkillsRepoName: defaultSkillsRepoNameLabel,
-        total: repoNames.length,
+        defaultSkillsRepoName: defaultSkillsRepoNames.length === 1 ? defaultSkillsRepoNames[0] : null,
+        defaultSkillsRepoNames,
+        total: repoNames.length * defaultSkillsRepoNames.length,
         refreshed,
         skipped,
         failed,

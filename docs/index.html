@@ -4,8 +4,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ploinky - AI Agent Deployment System</title>
+    <title>Ploinky Documentation</title>
     <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
     <script type="module">
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
         mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
@@ -89,34 +90,16 @@
         }
     </style>
 </head>
-<body>
-    <header>
-        <div class="container">
-            <div class="header-content">
-                <a href="index.html" class="logo">
-                    <div class="logo-icon">🚀</div>
-                    <span>Ploinky</span>
-                </a>
-                <nav>
-                    <ul>
-                        <li><a href="index.html" class="active">Home</a></li>
-                        <li><a href="cli-reference.html">CLI Reference</a></li>
-                        <li><a href="architecture.html">Architecture</a></li>
-                        <li><a href="spec-agent.html">Agent Spec</a></li>
-                        <li><a href="webchat.html">WebChat</a></li>
-                        <li><button class="theme-toggle" id="themeToggle">🌙</button></li>
-                    </ul>
-                </nav>
-            </div>
-        </div>
-    </header>
+<body data-page="index">
+    <div data-include="partials/header.html"></div>
 
     <main>
         <div class="container">
             <div class="hero">
                 <h1>Ploinky</h1>
-                <p class="subtitle">Secure AI Agent Deployment & Development Platform</p>
-                <p>Deploy AI agents in isolated sandboxes — containers (Docker/Podman), bubblewrap, or macOS seatbelt. Perfect for running untrusted code safely.</p>
+                <p class="subtitle">Isolated, controllable, and observable agent workspaces</p>
+                <p>Build and use <a href="wiki.html#definition-agent">agents</a> inside controlled runtimes while Ploinky manages their lifecycle, routing, and observation without installing each agent's dependencies directly on the host.</p>
+                <p>The <a href="wiki.html">Ploinky Wiki</a> is the canonical reference for project-specific terminology used throughout these guides.</p>
             </div>
 
             <div class="demo-container" style="margin-top: 0;">
@@ -147,7 +130,7 @@
                 <div class="feature-card">
                     <div class="feature-icon">🔒</div>
                     <h3>Isolated Containers</h3>
-                    <p>Each agent runs in its own container with restricted access to ensure complete isolation.</p>
+                    <p>Each managed agent runs in a separate runtime with explicit mounts, filtered environment values, and private routing.</p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">📦</div>
@@ -157,7 +140,7 @@
                 <div class="feature-card">
                     <div class="feature-icon">🌐</div>
                     <h3>Web Interfaces</h3>
-                    <p>Transform any CLI tool into a modern web interface with WebChat and Dashboard.</p>
+                    <p>Use agent CLIs through WebChat and reach admitted agent web routes through the authenticated Router.</p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">🔧</div>
@@ -167,12 +150,12 @@
                 <div class="feature-card">
                     <div class="feature-icon">🚀</div>
                     <h3>Development Workflow</h3>
-                    <p>Seamless development with hot-reload support and integrated debugging tools.</p>
+                    <p>Keep agent homes and workspace files persistent while inspecting runtimes through Ploinky lifecycle and log commands.</p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">🔄</div>
-                    <h3>Production Ready</h3>
-                    <p>Deploy the same containerized agents to production with built-in health checks.</p>
+                    <h3>Readiness and Health</h3>
+                    <p>Activate routes only after the selected agent graph satisfies its declared readiness contract.</p>
                 </div>
             </div>
 
@@ -199,16 +182,14 @@
                     <h3>Installation</h3>
                     <pre><code>$ git clone https://github.com/AssistOS-AI/ploinky.git
 $ cd ploinky
-$ # Optional but recommended for an operator-managed workspace key
-$ echo 'PLOINKY_MASTER_KEY=change-me-to-a-random-secret' &gt; .env
 $ npm install
-$ echo 'export PATH="$PATH:$HOME/Desktop/work/ploinky/bin"' &gt;&gt; ~/.bashrc
+$ echo 'export PATH="$PATH:/path/to/ploinky/bin"' &gt;&gt; ~/.bashrc
 $ source ~/.bashrc
-$ cd ~/Desktop/work
+$ cd /path/to/workspace
 $ ploinky start explorer
 </code></pre>
-                    <p><code>PLOINKY_MASTER_KEY</code> is recommended because Ploinky derives workspace secrets from the resolved master seed. Any non-empty value works for local testing, but a long random value is better for operator-managed deployments. If neither the process environment nor a walked-up <code>.env</code> defines the key, Ploinky creates a persistent fallback seed at <code>.ploinky/master-key</code> so local agent startup can continue.</p>
-                    <p>The <code>PATH</code> line above points to the cloned Ploinky <code>bin</code> directory and makes <code>ploinky</code> available in new Bash sessions. If your clone lives somewhere else, replace <code>$HOME/Desktop/work/ploinky/bin</code> with that path. For Zsh, add the same line to <code>~/.zshrc</code>.</p>
+                    <p>The managed Box initializes the workspace master key at <code>.ploinky/master-key</code>. The <code>PLOINKY_MASTER_KEY</code> process or <code>.env</code> input is reserved for direct core-development flows that deliberately manage that seed.</p>
+                    <p>The <code>PATH</code> line points to the cloned Ploinky <code>bin</code> directory and makes <code>ploinky</code> available in new Bash sessions. Replace <code>/path/to/ploinky</code> and <code>/path/to/workspace</code> with your own locations. For Zsh, add the same line to <code>~/.zshrc</code>.</p>
 
                     <div style="text-align: center; margin-top: 3rem;">
                         <a href="cli-reference.html" class="btn btn-primary">View CLI Reference</a>
@@ -219,7 +200,7 @@ $ ploinky start explorer
                 <div class="doc-section">
                     <h2>Introduction to Agents</h2>
                     <p>In Ploinky, an "agent" is a tool that you can use and modify. It can be a simple script, a long-running service, a web application, or an LLM-powered coding tool.</p>
-                    <p>Agents are organized in repositories, which can contain multiple agents. You can add repositories, enable the agents you need, and keep their runtime files separated from your project files.</p>
+                    <p>Agents are organized in <a href="wiki.html#definition-managed-repository">managed repositories</a>, which can contain multiple agents. You can add repositories, enable the agents you need, and keep their runtime files separated from your project files.</p>
                     <p>Coding assistants can also be installed as Ploinky agents. For example, a <code>codexAgent</code> can run Codex inside a containerized environment, so its shell, package installs, and CLI configuration stay inside the agent home instead of directly mutating your host machine.</p>
                     <p>This is useful when a coding agent needs to inspect an unfamiliar project or install dependencies you do not fully trust. Running the agent in a container lets you keep the host workspace safer while still giving the agent a controlled place to work.</p>
 
@@ -228,7 +209,7 @@ $ ploinky start explorer
                     <ol style="margin-left: 2rem; line-height: 2;">
                         <li><strong>Individually:</strong> You can run an agent's command-line interface directly using the <code>cli</code> command. For example, <code>ploinky cli codexAgent</code> opens the Codex agent CLI inside its containerized environment. Agents can accept JSON, natural language, files, or any other convention defined by their manifest.</li>
                         <li><strong>As a shell environment:</strong> You can enter an agent's container with <code>ploinky shell &lt;agentName&gt;</code>. This is useful when you want to inspect the runtime, run package managers, debug tool installation, or see the same filesystem and home directory the agent sees.</li>
-                        <li><strong>Integrated with Ploinky:</strong> By enabling an agent, it becomes part of the Ploinky workspace. The Ploinky server will expose the agent on a local port, which allows you to build applications that interact with your agents through a simple API on localhost. When you open the web interface, you will need to provide a token, which can be found in <code>.ploinky/.secrets</code>.</li>
+                        <li><strong>Integrated with Ploinky:</strong> Enabling an agent records it in the <a href="wiki.html#definition-enabled-agent-record">enabled-agent registry</a>; starting the workspace creates its admitted runtime and routes. Browser clients authenticate through the Router login flow, while agent-to-agent calls use generation-bound credentials that Ploinky delivers only to eligible isolated runtimes.</li>
                     </ol>
                 </div>
 
@@ -254,39 +235,14 @@ $ ploinky start explorer
         </div>
     </main>
 
-    <footer>
-        <div class="container">
-            <p>&copy; 2025 Ploinky Project. Built with security and simplicity in mind.</p>
-            <p>
-                <a href="https://github.com/AssistOS-AI/ploinky">GitHub</a> • 
-                <a href="cli-reference.html">Documentation</a> • 
-                <a href="architecture.html">Architecture</a>
-            </p>
-        </div>
-    </footer>
+    <div data-include="partials/footer.html"></div>
 
     <script>
-        // Theme toggle
-        const themeToggle = document.getElementById('themeToggle');
-        const body = document.body;
-        
-        const savedTheme = localStorage.getItem('theme') || 'light';
-        body.setAttribute('data-theme', savedTheme);
-        themeToggle.textContent = savedTheme === 'dark' ? '☀️' : '🌙';
-        
-        themeToggle.addEventListener('click', () => {
-            const currentTheme = body.getAttribute('data-theme');
-            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
-            body.setAttribute('data-theme', newTheme);
-            localStorage.setItem('theme', newTheme);
-            themeToggle.textContent = newTheme === 'dark' ? '☀️' : '🌙';
-        });
-
         // Demo content for each tab
         const demos = {
             init: [
-                { type: 'command', text: 'user@host:~/Desktop/work$ ploinky start explorer' },
-                { type: 'output', text: 'Initializing Ploinky environment in ~/Desktop/work/.ploinky...' },
+                { type: 'command', text: 'user@host:/workspace$ ploinky start explorer' },
+                { type: 'output', text: 'Initializing Ploinky environment in /workspace/.ploinky...' },
                 { type: 'output', text: 'Default \'basic\' repository not found. Cloning...' },
                 { type: 'output', text: 'Cloning into \'.ploinky/repos/basic\'...' },
                 { type: 'output', text: 'remote: Enumerating objects: 102, done.' },
@@ -301,12 +257,11 @@ $ ploinky start explorer
                 { type: 'output', text: 'Installing agent dependencies...' },
                 { type: 'output', text: 'ploinky_agent_explorer_work_xxxxxx' },
                 { type: 'info', text: '[start] RoutingServer launched in background (pid xxxxx).' },
-                { type: 'info', text: '[start] Dashboard: http://127.0.0.1:8080/dashboard' },
                 { type: 'info', text: '[start] WebChat: http://127.0.0.1:8080/webchat' },
                 { type: 'output', text: '[RoutingServer] Ploinky server running on http://127.0.0.1:8080' }
             ],
             repos: [
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' },
+                { type: 'prompt', text: 'ploinky /workspace> ' },
                 { type: 'command', text: 'list repos' },
                 { type: 'output', text: 'Available repositories:' },
                 { type: 'output', text: '- basic: https://github.com/AssistOS-AI/Basic.git  [installed]' },
@@ -317,10 +272,10 @@ $ ploinky start explorer
                 { type: 'output', text: '- demo: https://github.com/AssistOS-AI/demo.git' },
                 { type: 'output', text: '' },
                 { type: 'output', text: 'Tip: install repos with \'install <url> [name]\'.' },
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' }
+                { type: 'prompt', text: 'ploinky /workspace> ' }
             ],
             enable: [
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' },
+                { type: 'prompt', text: 'ploinky /workspace> ' },
                 { type: 'command', text: 'install https://github.com/AssistOS-AI/demo.git demo' },
                 { type: 'output', text: 'Cloning into \'.ploinky/repos/demo\'...' },
                 { type: 'output', text: 'remote: Enumerating objects: 131, done.' },
@@ -330,12 +285,12 @@ $ ploinky start explorer
                 { type: 'output', text: 'Resolving deltas: 100% (29/29), done.' },
                 { type: 'success', text: '✓ Repo \'demo\' enabled. Use \'list agents\' to view agents.' },
                 { type: 'output', text: '' },
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' }
+                { type: 'prompt', text: 'ploinky /workspace> ' }
             ],
             admin: [
             ],
             start: [
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' },
+                { type: 'prompt', text: 'ploinky /workspace> ' },
                 { type: 'command', text: 'start demo' },
                 { type: 'success', text: '✓ Agent \'demo\' from repo \'demo\' enabled. Use \'start\' to start all configured agents.' },
                 { type: 'output', text: 'Cloning into \'.ploinky/repos/vibe\'...' },
@@ -351,31 +306,27 @@ $ ploinky start explorer
                 { type: 'output', text: 'ploinky_agent_simulator_work_xxxxxx' },
                 { type: 'output', text: 'ploinky_agent_moderator_work_xxxxxx' },
                 { type: 'info', text: '[start] RoutingServer launched in background (pid xxxxx).' },
-                { type: 'info', text: '[start] Logs: ~/Desktop/work/logs/router.log' },
-                { type: 'info', text: '[start] Dashboard: http://127.0.0.1:8080/dashboard' },
                 { type: 'output', text: '[RoutingServer] Ploinky server running on http://127.0.0.1:8080' },
-                { type: 'output', text: '  Dashboard: /dashboard' },
                 { type: 'output', text: '  WebChat:   /webchat' },
                 { type: 'output', text: '  Status:    /status/data' },
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' }
+                { type: 'prompt', text: 'ploinky /workspace> ' }
             ],
             status: [
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' },
+                { type: 'prompt', text: 'ploinky /workspace> ' },
                 { type: 'command', text: 'status' },
                 { type: 'info', text: 'Workspace status' },
                 { type: 'output', text: '- Workspace: work [xxxxxx]' },
                 { type: 'output', text: '- Static: agent=demo port=8080' },
                 { type: 'output', text: '- Interfaces:' },
-                { type: 'output', text: '  • Dashboard: served via router (configured)' },
                 { type: 'output', text: '  • WebChat: served via router (configured)' },
                 { type: 'output', text: '- Router: running (pid xxxxx)' },
                 { type: 'output', text: '- Agents:' },
                 { type: 'success', text: '  • demo [static]  [container: ploinky_agent_demo_work_xxxxxx] (running)' },
-                { type: 'output', text: '    image: node:18-alpine  repo: demo  cwd: ~/Desktop/work' },
+                { type: 'output', text: '    image: node:18-alpine  repo: demo  cwd: /workspace' },
                 { type: 'success', text: '  • simulator  [container: ploinky_agent_simulator_work_xxxxxx] (running)' },
-                { type: 'output', text: '    image: node:18-alpine  repo: demo  cwd: ~/Desktop/work' },
+                { type: 'output', text: '    image: node:18-alpine  repo: demo  cwd: /workspace' },
                 { type: 'success', text: '  • moderator  [container: ploinky_agent_moderator_work_xxxxxx] (running)' },
-                { type: 'prompt', text: 'ploinky ~/Desktop/work> ' }
+                { type: 'prompt', text: 'ploinky /workspace> ' }
             ]
         };
 

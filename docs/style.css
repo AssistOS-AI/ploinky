@@ -1,6 +1,8 @@
 /* Ploinky Documentation - WhatsApp-inspired Theme */
 
 :root {
+  --page-gutter: 40px;
+
   /* Light theme colors */
   --bg-primary: #ffffff;
   --bg-secondary: #f0f2f5;
@@ -81,9 +83,11 @@ body {
 
 /* Layout */
 .container {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 0 20px;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding-right: var(--page-gutter);
+  padding-left: var(--page-gutter);
 }
 
 /* Header */
@@ -122,6 +126,134 @@ header {
   align-items: center;
   justify-content: center;
   font-size: 1.2rem;
+}
+
+.site-header {
+  padding: 0.75rem 0;
+}
+
+.site-header__inner {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding-right: var(--page-gutter);
+  padding-left: var(--page-gutter);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  border: 0;
+  background: transparent;
+  color: var(--text-header);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.nav-menu--brand {
+  margin-right: auto;
+}
+
+.nav-menu--brand .nav-menu__trigger {
+  border-radius: 10px;
+}
+
+.nav-menu--brand .nav-menu__trigger::after {
+  position: absolute;
+  right: 0.7rem;
+  bottom: 0.45rem;
+}
+
+.brand__eyebrow {
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.brand__title {
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+.site-nav {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.nav-menu {
+  position: relative;
+}
+
+.nav-menu__trigger {
+  min-height: 40px;
+  padding: 0.5rem 0.8rem;
+  border: 0;
+  border-radius: 20px;
+  color: var(--text-header);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.nav-menu__trigger::after {
+  content: " ▾";
+}
+
+.nav-menu__trigger:hover,
+.nav-menu__trigger:focus-visible,
+.nav-menu.is-open .nav-menu__trigger {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.nav-menu__panel {
+  display: none;
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 1010;
+  min-width: 220px;
+  padding: 0.5rem;
+  border: 1px solid var(--border-primary);
+  border-radius: 12px;
+  background: var(--bg-primary);
+  box-shadow: var(--shadow-lg);
+}
+
+.nav-menu:last-child .nav-menu__panel {
+  right: 0;
+  left: auto;
+}
+
+.nav-menu--brand .nav-menu__panel {
+  right: auto;
+  left: 0;
+}
+
+.nav-menu.is-open .nav-menu__panel {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.nav-menu__panel a {
+  display: block;
+  color: var(--text-primary);
+  border-radius: 8px;
+}
+
+.nav-menu__panel a:hover,
+.nav-menu__panel a[aria-current="page"] {
+  color: var(--text-primary);
+  background: var(--bg-hover);
 }
 
 /* Navigation */
@@ -172,6 +304,16 @@ nav a.active {
 main {
   min-height: calc(100vh - 80px);
   padding: 3rem 0;
+}
+
+.breadcrumbs {
+  margin-bottom: 1rem;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.breadcrumbs a {
+  color: var(--text-link);
 }
 
 .content-wrapper {
@@ -395,6 +537,43 @@ pre {
   margin: 1rem 0;
 }
 
+.diagram-caption {
+    margin: 0.75rem 0 1.5rem;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    text-align: center;
+}
+
+.diagram {
+    margin: 1.5rem 0;
+}
+
+.diagram pre.mermaid,
+.doc-section > pre.mermaid {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    display: flex;
+    justify-content: center;
+    width: 100%;
+}
+
+.diagram pre.mermaid svg,
+.doc-section > pre.mermaid svg {
+    display: block;
+    margin-inline: auto;
+}
+
+.diagram figcaption {
+    margin-top: 0.75rem;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    font-style: italic;
+    text-align: center;
+}
+
 code {
   font-family: 'Cascadia Code', 'SF Mono', Monaco, 'Inconsolata', 'Fira Code', monospace;
   font-size: 0.9em;
@@ -529,6 +708,12 @@ footer a:hover {
 
 /* Responsive */
 @media (max-width: 768px) {
+  .site-nav {
+    order: 3;
+    width: 100%;
+    justify-content: flex-start;
+  }
+
   .hero h1 {
     font-size: 2rem;
   }
@@ -557,9 +742,10 @@ footer a:hover {
   display: grid;
   grid-template-columns: 250px 1fr;
   gap: 2rem;
-  max-width: 1400px;
-  margin: 0 auto;
-  padding: 2rem;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 2rem 0;
 }
 
 .sidebar {
@@ -678,4 +864,12 @@ footer a:hover {
 .copy-button.copied {
   background: var(--accent-green);
   color: white;
+}
+
+/* Keep the CLI reference table of contents available independently of page scroll. */
+body[data-page="cli-reference"] .sidebar {
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }

@@ -52,6 +52,31 @@ function collectStaticInfo() {
     }
 }
 
+export function streamWorkspaceMetrics(res, {
+    decorate = (snapshot) => snapshot,
+    isAuthorized = () => true,
+    monitor = workspaceMetricsMonitor,
+} = {}) {
+    res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson',
+        'Cache-Control': 'no-store',
+        Connection: 'keep-alive',
+    });
+    let unsubscribe = () => {};
+    const stop = () => {
+        unsubscribe();
+        if (!res.writableEnded) res.end();
+    };
+    unsubscribe = monitor.subscribe((snapshot) => {
+        if (!isAuthorized()) {
+            queueMicrotask(stop);
+            return;
+        }
+        if (!res.writableEnded) res.write(`${JSON.stringify(decorate(snapshot))}\n`);
+    });
+    cleanupWhenResponseCloses(res, unsubscribe);
+}
+
 function handleStatus(req, res) {
     const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname.substring(`/${appName}`.length) || '/';
@@ -66,15 +91,7 @@ function handleStatus(req, res) {
         };
         const decorate = (snapshot) => ({ ...requestBase, ...snapshot });
         if (parsedUrl.searchParams.get('follow') === '1') {
-            res.writeHead(200, {
-                'Content-Type': 'application/x-ndjson',
-                'Cache-Control': 'no-store',
-                Connection: 'keep-alive',
-            });
-            const unsubscribe = workspaceMetricsMonitor.subscribe((snapshot) => {
-                if (!res.writableEnded) res.write(`${JSON.stringify(decorate(snapshot))}\n`);
-            });
-            cleanupWhenResponseCloses(res, unsubscribe);
+            streamWorkspaceMetrics(res, { decorate });
             return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });

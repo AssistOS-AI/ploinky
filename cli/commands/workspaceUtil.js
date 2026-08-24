@@ -1755,11 +1755,11 @@ function assertStaticPreinstallSucceeded(result) {
   throw new Error(`static preinstall hook failed: ${result?.message || 'unknown hook failure'}`);
 }
 
-function buildDashboardUrl(staticPort, env = process.env) {
+function buildRouterUrl(staticPort, env = process.env) {
   const publicAuthority = String(env.PLOINKY_PUBLIC_AUTHORITY || '').trim();
   return publicAuthority
-    ? `http://${publicAuthority}/dashboard`
-    : `http://127.0.0.1:${staticPort}/dashboard`;
+    ? `http://${publicAuthority}`
+    : `http://127.0.0.1:${staticPort}`;
 }
 
 export function preflightWorkspaceStartRuntimeCapabilities(staticAgentArg) {
@@ -2409,7 +2409,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Watchdog will automatically restart the server if it crashes.`);
     console.log(`[start] Server logs: ${path.join(LOGS_DIR, 'router.log')}`);
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
-    console.log(`[start] Dashboard: ${buildDashboardUrl(staticPort)}`);
+    console.log(`[start] Router: ${buildRouterUrl(staticPort)}`);
   } catch (e) {
     const cleanedCandidateIds = new Set();
     for (const candidate of workspaceRuntimeCandidates.reverse()) {
@@ -3010,7 +3010,7 @@ async function reinstallAgent(agentName) {
 
 export {
   assertStaticPreinstallSucceeded,
-  buildDashboardUrl,
+  buildRouterUrl,
   buildBlockingReadinessEntryFromNode,
   computeRetainedManagedEnvHash,
   activatePreparedRuntimeAfterReadiness,

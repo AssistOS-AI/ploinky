@@ -134,7 +134,9 @@ const PREDEFINED_REPOS = {
     'copilot-agents': { url: 'https://github.com/AssistOS-AI/copilot-agents.git', description: 'OpenCode copilot agents', kind: 'agents' },
     demo: { url: 'https://github.com/AssistOS-AI/demo.git', description: 'Demo agents and examples', kind: 'agents' },
     proxies: { url: 'https://github.com/AssistOS-AI/proxies.git', description: 'API proxy agents (Kiro Gateway)', kind: 'agents' },
-    AchillesCopilotBasicSkills: { url: 'https://github.com/AssistOS-AI/AchillesCopilotBasicSkills.git', description: 'Default Anthropic-style skill catalog (SKILL.md folders)', kind: 'skills' }
+    AchillesCopilotBasicSkills: { url: 'https://github.com/AssistOS-AI/AchillesCopilotBasicSkills.git', description: 'Skills maintained for achillesAgentLib', kind: 'skills' },
+    DocumentationSkills: { url: 'https://github.com/AssistOS-AI/DocumentationSkills.git', description: 'Skills for software documentation', kind: 'skills' },
+    PloinkySkills: { url: 'https://github.com/AssistOS-AI/PloinkySkills.git', description: 'Skills for developing the Ploinky application', kind: 'skills' }
 };
 
 const BOOT_REPO_NAMES = ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents'];

@@ -1,17 +1,3 @@
-fast_check_webchat_token_rotation() {
-  load_state
-  require_var "TEST_RUN_DIR"
-
-  local secrets_file="$TEST_RUN_DIR/.ploinky/.secrets"
-
-  ploinky webchat --rotate >/dev/null 2>&1
-
-  if [[ -f "$secrets_file" ]] && grep -q '^WEBCHAT_TOKEN=' "$secrets_file"; then
-    echo "WEBCHAT_TOKEN should no longer be written to '$secrets_file'." >&2
-    return 1
-  fi
-}
-
 fast_check_webchat_alias_override() {
   load_state
   require_var "TEST_ROUTER_PORT"

@@ -39,8 +39,7 @@ export function loadServersConfig() {
         console.warn('Error loading servers config:', e.message);
     }
     return {
-        webchat: { port: null, command: null },
-        dashboard: { port: null }
+        webchat: { port: null, command: null }
     };
 }
 
@@ -147,8 +146,7 @@ export function getAllServerStatuses() {
     const statuses = {};
 
     const servers = [
-        { name: 'webchat', pidFile: 'webchat.pid', displayName: 'WebChat' },
-        { name: 'dashboard', pidFile: 'dashboard.pid', displayName: 'Dashboard' }
+        { name: 'webchat', pidFile: 'webchat.pid', displayName: 'WebChat' }
     ];
 
     for (const server of servers) {

@@ -564,13 +564,14 @@ export async function runBoundedCoreStart(
     if (!result.ok) {
         throw supervisorError(`In-box start failed with status ${result.status}`);
     }
-    const externalDashboard = `http://127.0.0.1:${hostPort}/dashboard`;
-    if (!String(result.stdout || '').includes(`[start] Dashboard: ${externalDashboard}`)) {
-        throw supervisorError(`In-box start did not report the public Dashboard URL ${externalDashboard}`);
+    const externalRouter = `http://127.0.0.1:${hostPort}`;
+    const outputLines = String(result.stdout || '').split(/\r?\n/);
+    if (!outputLines.includes(`[start] Router: ${externalRouter}`)) {
+        throw supervisorError(`In-box start did not report the public Router URL ${externalRouter}`);
     }
     if (Number(hostPort) !== 8080
-        && String(result.stdout || '').includes('[start] Dashboard: http://127.0.0.1:8080/dashboard')) {
-        throw supervisorError('In-box start advertised its internal-only Dashboard URL');
+        && outputLines.includes('[start] Router: http://127.0.0.1:8080')) {
+        throw supervisorError('In-box start advertised its internal-only Router URL');
     }
     return result.status;
 }

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { signPrivateRouterAssertion } from '../../Agent/lib/agentAssertion.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
+import { streamWorkspaceMetrics } from '../../cli/server/handlers/status.js';
 import { derivePrivateAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 import {
     authorizePrivateRoutePlan,
@@ -158,6 +160,90 @@ test('private assertions reject body tampering, replay, stale generations, and u
         body: Buffer.alloc(0),
         assertionCache: createMemoryReplayCache(),
     }), (error) => error.code === 'PRIVATE_CALLER_DENIED');
+});
+
+test('workspace metrics stream admits any exact current agent only through its bound GET query', () => {
+    const plan = {
+        ok: true,
+        listener: 'private',
+        kind: 'private-operation',
+        operation: 'workspace-metrics',
+        pathname: '/api/edge/workspace-metrics',
+        parsedUrl: new URL('http://host.containers.internal/api/edge/workspace-metrics?follow=1'),
+        snapshot: snapshot(),
+    };
+    const req = signedRequest(plan, Buffer.alloc(0), { method: 'GET' });
+    assert.equal(authorizePrivateRoutePlan({
+        req,
+        plan,
+        body: Buffer.alloc(0),
+        assertionCache: createMemoryReplayCache(),
+    }).agentId, caller.agentId);
+
+    const mismatchedPlan = { ...plan, parsedUrl: new URL('http://host.containers.internal/api/edge/workspace-metrics?follow=0') };
+    assert.throws(() => authorizePrivateRoutePlan({
+        req: signedRequest(plan, Buffer.alloc(0), { method: 'GET' }),
+        plan: mismatchedPlan,
+        body: Buffer.alloc(0),
+        assertionCache: createMemoryReplayCache(),
+    }), (error) => error.code === 'PRIVATE_ASSERTION_REJECTED');
+
+    assert.throws(() => authorizePrivateRoutePlan({
+        req: signedRequest(plan, Buffer.alloc(0), { method: 'GET' }),
+        plan: { ...plan, listener: 'public' },
+        body: Buffer.alloc(0),
+        assertionCache: createMemoryReplayCache(),
+    }), (error) => error.code === 'PRIVATE_LISTENER_REQUIRED');
+});
+
+test('workspace metrics stream emits NDJSON and unsubscribes when the response closes', () => {
+    let listener;
+    let unsubscribed = false;
+    const monitor = {
+        subscribe(callback) {
+            listener = callback;
+            return () => { unsubscribed = true; };
+        },
+    };
+    const response = Object.assign(new EventEmitter(), {
+        writableEnded: false,
+        headers: null,
+        output: '',
+        writeHead(status, headers) { this.status = status; this.headers = headers; },
+        write(chunk) { this.output += chunk; return true; },
+    });
+    streamWorkspaceMetrics(response, { monitor });
+    listener({ sampledAt: '2026-08-11T10:00:00Z', total: { cpuPercent: 81 } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers['Content-Type'], 'application/x-ndjson');
+    assert.deepEqual(JSON.parse(response.output.trim()).total, { cpuPercent: 81 });
+    response.emit('close');
+    assert.equal(unsubscribed, true);
+});
+
+test('workspace metrics stream closes when the captured Router generation is no longer current', async () => {
+    let listener;
+    let unsubscribed = false;
+    let authorized = true;
+    const monitor = {
+        subscribe(callback) {
+            listener = callback;
+            return () => { unsubscribed = true; };
+        },
+    };
+    const response = Object.assign(new EventEmitter(), {
+        writableEnded: false,
+        writeHead() {},
+        write() { return true; },
+        end() { this.writableEnded = true; this.emit('close'); },
+    });
+    streamWorkspaceMetrics(response, { monitor, isAuthorized: () => authorized });
+    listener({ sampledAt: '2026-08-11T10:00:00Z' });
+    authorized = false;
+    listener({ sampledAt: '2026-08-11T10:00:02Z' });
+    await Promise.resolve();
+    assert.equal(response.writableEnded, true);
+    assert.equal(unsubscribed, true);
 });
 
 test('TURN broker uses compiled exact callers and only external configured lanes', () => {

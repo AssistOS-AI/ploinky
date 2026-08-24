@@ -4,8 +4,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { handleWebChat } from './handlers/webchat/index.js';
-import { handleDashboard } from './handlers/dashboard.js';
-import { handleStatus } from './handlers/status.js';
+import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
+import { executeWorkspaceLogOperation } from './workspaceLogFiles.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
 import * as staticSrv from './static/index.js';
 
@@ -142,7 +142,6 @@ if (!global.processKill) {
 // Global state for all services
 const globalState = {
     webchat: { sessions: new Map(), runtimes: new Map() },
-    dashboard: { sessions: new Map() },
     status: { sessions: new Map() }
 };
 
@@ -220,7 +219,7 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/api/marketplace'
         || pathname.startsWith('/api/marketplace/')
         || pathname.startsWith('/api/router/')
-        // Internal, non-policy-routable router-owned routes (DS014).
+        // Internal, non-policy-routable router-owned routes (DS016).
         || pathname === '/policy/command'
         || pathname === '/metrics'
         || pathname === '/health/internal'
@@ -229,7 +228,6 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/__agent'
         || pathname.startsWith('/__agent/')
         || isRouteMount(pathname, '/webchat')
-        || isRouteMount(pathname, '/dashboard')
         || isRouteMount(pathname, '/status')
         || pathname === '/upload'
         || isRouteMount(pathname, '/blobs')
@@ -434,7 +432,7 @@ async function processRequest(req, res) {
         return staticSrv.serveWebLibRequest(req, res);
     }
 
-    // DS014: any `__agent` segment is a router-owned agent control-plane path
+    // DS016: any `__agent` segment is a router-owned agent control-plane path
     // (e.g. the share authorizer). The router reaches those itself over a direct
     // loopback call carrying a minted Router Request — the PUBLIC listener never
     // serves them. Refuse here before passthrough handling can forward one to an
@@ -461,7 +459,7 @@ async function processRequest(req, res) {
         if (handled) return;
     }
 
-    // Single administrative endpoint for router access-control policy (DS014).
+    // Single administrative endpoint for router access-control policy (DS016).
     // Authenticated + never policy-routable; handles its own authorization.
     if (pathname === '/policy/command') {
         const handled = await policy.commandInvoker.handle(req, res);
@@ -654,8 +652,6 @@ async function processRequest(req, res) {
     // Route to appropriate handler
     if (isRouteMount(pathname, '/webchat')) {
         return handleWebChat(req, res, config.webchat, globalState.webchat);
-    } else if (isRouteMount(pathname, '/dashboard')) {
-        return handleDashboard(req, res, config.dashboard, globalState.dashboard);
     } else if (isRouteMount(pathname, '/status')) {
         return handleStatus(req, res, config.status, globalState.status);
     } else if (pathname === '/upload') {
@@ -797,6 +793,28 @@ async function processPrivateRequest(req, res) {
         }
         return;
     }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'workspace-metrics') {
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        streamWorkspaceMetrics(res, { isAuthorized: () => routePlan.lease?.isCurrent?.() === true });
+        return;
+    }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'workspace-logs') {
+        if (!commitRoutePlan(routePlan)) {
+            sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
+            return;
+        }
+        try {
+            const input = JSON.parse(body.toString('utf8') || '{}');
+            const result = await executeWorkspaceLogOperation(input);
+            sendJsonResponse(res, 200, result, { 'Cache-Control': 'no-store' });
+        } catch (error) {
+            sendJsonResponse(res, 400, { error: 'workspace_log_operation_failed', message: error?.message || String(error) }, { 'Cache-Control': 'no-store' });
+        }
+        return;
+    }
     req.edgeBufferedBody = body;
     if (routePlan.kind === 'agent-port') {
         await executeHttpPlan({
@@ -830,7 +848,6 @@ function detailedHealthData() {
         },
         activeSessions: {
             webchat: globalState.webchat.sessions.size,
-            dashboard: globalState.dashboard.sessions.size,
             status: globalState.status.sessions.size,
             agent: agentSessionStore.size,
         },
@@ -1066,7 +1083,6 @@ healthServer.listen(detailedHealthSocket, () => {
 server.listen(port, '0.0.0.0', () => {
     cloudflaredRouterIntegration.markPublicListenerReady();
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
-    console.log('  Dashboard:       /dashboard');
     console.log('  WebChat:         /webchat');
     console.log('  Status data:     /status/data');
     console.log('  Health:          /health');

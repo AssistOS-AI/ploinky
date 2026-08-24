@@ -135,6 +135,26 @@ test('fresh edge initialization creates unversioned empty desired state exactly 
     assert.equal(initializeFreshEdgeRoutingSources({ workspaceRoot: workspace }).initialized, false);
 });
 
+test('fresh initialization removes only an empty destroy tombstone', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-edge-destroy-tombstone-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const edgeDir = path.join(workspace, '.ploinky', 'data', 'edge-routing');
+    fs.mkdirSync(edgeDir, { recursive: true });
+    const body = {
+        schemaVersion: 1,
+        state: 'inactive',
+        previousGeneration: '',
+        reason: 'cli-workspace-destroy',
+        activationId: crypto.randomUUID(),
+        changedAt: new Date().toISOString(),
+    };
+    body.selectorDigest = compiledDigest(body);
+    fs.writeFileSync(path.join(edgeDir, 'active.json'), JSON.stringify(body, null, 2));
+    const initialized = initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    assert.equal(initialized.initialized, true);
+    assert.equal(fs.existsSync(path.join(edgeDir, 'active.json')), false);
+});
+
 test('active topology publishes routes and readiness without service locators or protocol versions', (t) => {
     const fixture = createFixture(t);
     const applied = applyEdgeRoutingGeneration({
@@ -754,7 +774,7 @@ test('webchat exposes only the WebChat router mount for the selected root', (t) 
         assert.equal(plan.surface, 'webchat', pathname);
     }
 
-    for (const pathname of ['/dashboard', '/status', '/workspace-files']) {
+    for (const pathname of ['/status', '/workspace-files']) {
         const plan = resolveEdgeRoutePlan({
             req: {
                 method: 'GET',
@@ -1148,6 +1168,50 @@ test('legacy generation without dependency HTTP routes remains loadable until re
     });
     assert.notEqual(replacement.selector.generation, applied.selector.generation);
     assert.equal(Object.hasOwn(replacement.generation.compiled, 'dependencyHttpRoutes'), true);
+});
+
+test('legacy generation without workspace log consumers remains loadable fail-closed until replacement', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'legacy-workspace-logs-baseline',
+    });
+    const generationFile = path.join(
+        fixture.edgeDir,
+        'generations',
+        `${applied.selector.generation.replace(/^sha256:/, '')}.json`,
+    );
+    const legacyDocument = JSON.parse(fs.readFileSync(generationFile, 'utf8'));
+    delete legacyDocument.compiled.security.workspaceLogConsumers;
+    legacyDocument.compiledDigest = compiledDigest(legacyDocument.compiled);
+    fs.writeFileSync(generationFile, JSON.stringify(legacyDocument, null, 2));
+
+    const legacyActive = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
+    assert.equal(Object.hasOwn(legacyActive.generation.compiled.security, 'workspaceLogConsumers'), false);
+
+    fs.writeFileSync(path.join(fixture.edgeDir, 'desired.json'), JSON.stringify({
+        hosts: {
+            'replacement.example.test': {
+                agent: 'fixtures/alpha',
+                routerSurfaces: [],
+            },
+        },
+    }, null, 2));
+    const replacement = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'legacy-workspace-logs-replacement',
+    });
+    assert.notEqual(replacement.selector.generation, applied.selector.generation);
+    assert.deepEqual(replacement.generation.compiled.security.workspaceLogConsumers, []);
 });
 
 test('live source drift is rejected without inactivating the selected generation', (t) => {

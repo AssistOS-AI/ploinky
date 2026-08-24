@@ -249,10 +249,10 @@ node cli/index.js <args>
 - `client tool <toolName> [--agent <agent>] [--parameters <params>] [-key value...]`: call an MCP tool exposed by an enabled agent.
 - `client list tools|resources`: list MCP tools or resources exposed by enabled agents.
 - `client status <agent>`: check agent health status.
-- `logs tail [router|<agent>] [--startup]`: follow Router logs, or one agent from its current no-wait startup log through the automatic handoff to its verified application output. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation; the handoff then rechecks the run marker, registry generation, and already-opened runtime source before emitting runtime bytes. `--startup` follows only the startup log.
-- `logs last [<N>] [router|<agent>] [--startup]`: show the last `N` lines (default 200, maximum 10000) of one log source. An ownership-proved runtime wins before no-wait state is consulted. Reading logs never creates, starts, or repairs a workspace, a Box, or an agent runtime.
+- `logs tail [router|agent] [--startup]`: follow the Ploinky-owned Router file by default, or one agent from its current no-wait startup log through the automatic handoff to verified application output. `--startup` applies only to agents.
+- `logs last [<N>] [router|agent] [--startup]`: show the last `N` lines (default 200, maximum 10000) for Router by default or one agent. Reading logs never creates, starts, or repairs a runtime.
 
-Log completion offers one reference per enabled record and every offered reference round-trips to that record. Unqualified `router` is reserved; an enabled agent named `router` is offered only through an unambiguous qualified spelling. Docker/Podman readers use immutable container IDs, while Bubblewrap/Seatbelt readers pin process-specific files; pre-cut sandbox processes require one restart and never fall back to legacy names. Application bytes are intentionally passed through unredacted, but control diagnostics are bounded and redact credentials. Cancellation waits for bounded TERM/KILL child cleanup before returning.
+Log completion offers one reference per enabled record and every offered reference round-trips to that record. Docker/Podman readers use immutable container IDs, while Bubblewrap/Seatbelt readers pin process-specific files; pre-cut sandbox processes require one restart and never fall back to legacy names. Application bytes are intentionally passed through unredacted, but control diagnostics are bounded and redact credentials. Cancellation waits for bounded TERM/KILL child cleanup before returning.
 - `stop`: stop containers recorded in `.ploinky/agents.json` (do not remove).
 - `shutdown`: stop and remove containers recorded in `.ploinky/agents.json`.
 - `destroy`: stop the router, remove workspace containers, and clear `.ploinky/deps` while preserving isolated agent data in `.data/<agent-or-alias>`.
@@ -260,8 +260,8 @@ Log completion offers one reference per enabled record and every offered referen
 - `deps status`: list prepared global and per-agent caches with their runtime keys and validity.
 - `deps clean <repo>/<agent>|--global|--all`: remove a cache directory.
 
-The `/dashboard` and `/status` TCP control surfaces require a real
-router-authenticated local-admin session on an exact local-control Host. A
+The `/status` TCP control surface requires a real router-authenticated
+local-admin session on an exact local-control Host. A
 component token, invitation, agent assertion, media credential, or loopback
 source is not administrator identity. Mutations also require exact Origin and a
 session-bound CSRF proof.

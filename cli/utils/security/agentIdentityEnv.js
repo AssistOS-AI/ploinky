@@ -4,7 +4,7 @@ import { buildSubjectIdentityKey, getSubjectIdentityPublicKey } from './subjectI
 /**
  * The per-agent identity injected into EVERY agent runtime (docker, bwrap, and
  * host lifecycle hooks). An agent receives ONLY its own canonical id and the
- * material derived/signed for that id (DS013) — never the master key, never the
+ * material derived/signed for that id (DS015) — never the master key, never the
  * shared derived-master key, never another agent's secret, and never any private
  * signing key.
  *
@@ -141,7 +141,7 @@ const RESERVED = new Set(RESERVED_AGENT_ENV_NAMES);
 /**
  * Remove every reserved name from a CONFIG-sourced env map in place, so no
  * manifest/profile/secret layer can inject a master key or override an agent's
- * derived identity (DS011/DS013). Dropped names are logged (never their values).
+ * derived identity (DS013/DS015). Dropped names are logged (never their values).
  * Returns the same object for chaining. Apply this to config-sourced env BEFORE
  * the authoritative identity is (re)asserted with `buildAgentIdentityEnv`.
  */
@@ -154,7 +154,7 @@ export function stripReservedAgentEnv(env) {
         delete env[key];
     }
     if (dropped) {
-        console.error(`[ploinky] ignored reserved agent env name(s) ${dropped.join(', ')} from runtime config — these are router-managed (DS011/DS013).`);
+        console.error(`[ploinky] ignored reserved agent env name(s) ${dropped.join(', ')} from runtime config — these are router-managed (DS013/DS015).`);
     }
     return env;
 }

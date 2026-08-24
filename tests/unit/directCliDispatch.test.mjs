@@ -22,7 +22,6 @@ test('Router control handlers dispatch through the direct execution-plane CLI', 
     accessSync(DIRECT_CLI_PATH, constants.X_OK);
 
     for (const relativePath of [
-        'cli/server/handlers/dashboard.js',
         'cli/server/handlers/status.js',
     ]) {
         const source = readFileSync(path.join(repositoryRoot, relativePath), 'utf8');

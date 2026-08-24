@@ -1,6 +1,6 @@
 /**
  * PolicyCommandRegistry — maps a command name to its `PolicyCommand`
- * instance (DS014). Adding a command is `register(new XCommand(...))`; the
+ * instance (DS016). Adding a command is `register(new XCommand(...))`; the
  * invoker never changes (open/closed).
  */
 export class PolicyCommandRegistry {

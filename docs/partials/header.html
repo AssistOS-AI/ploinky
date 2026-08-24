@@ -1,15 +1,35 @@
 <header class="site-header">
   <div class="site-header__inner">
-    <a class="brand" href="index.html">
-      <span class="brand__eyebrow">Workspace Runtime</span>
-      <span class="brand__title">Ploinky Documentation</span>
-    </a>
     <nav class="site-nav" aria-label="Primary">
-      <a href="index.html" data-page="index">Overview</a>
-      <a href="runtime.html" data-page="runtime">Runtime</a>
-      <a href="interfaces.html" data-page="interfaces">Interfaces</a>
-      <a href="operations.html" data-page="operations">Operations</a>
-      <a href="specsLoader.html?spec=matrix.md" data-page="specs">Specs</a>
+      <div class="nav-menu nav-menu--brand">
+        <button class="brand nav-menu__trigger" type="button" aria-expanded="false" aria-controls="home-menu">
+          <span class="brand__eyebrow">Workspace Runtime</span>
+          <span class="brand__title">Ploinky Documentation</span>
+        </button>
+        <div class="nav-menu__panel" id="home-menu">
+          <a href="index.html" data-page="index">Overview</a>
+        </div>
+      </div>
+      <div class="nav-menu">
+        <button class="nav-menu__trigger" type="button" aria-expanded="false" aria-controls="guides-menu">Guides</button>
+        <div class="nav-menu__panel" id="guides-menu">
+          <a href="cli-reference.html" data-page="cli-reference">CLI Reference</a>
+          <a href="architecture.html" data-page="architecture">Architecture</a>
+          <a href="runtime.html" data-page="runtime">Runtime</a>
+          <a href="interfaces.html" data-page="interfaces">Interfaces</a>
+          <a href="operations.html" data-page="operations">Workspace Lifecycle</a>
+          <a href="webchat.html" data-page="webchat">WebChat</a>
+        </div>
+      </div>
+      <div class="nav-menu">
+        <button class="nav-menu__trigger" type="button" aria-expanded="false" aria-controls="reference-menu">Reference</button>
+        <div class="nav-menu__panel" id="reference-menu">
+          <a href="specsLoader.html?spec=matrix.md" data-page="spec-browser">Specifications</a>
+          <a href="spec-agent.html" data-page="spec-agent">Agent Spec</a>
+          <a href="wiki.html" data-page="wiki">Wiki</a>
+        </div>
+      </div>
     </nav>
+    <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle color theme">🌙</button>
   </div>
 </header>

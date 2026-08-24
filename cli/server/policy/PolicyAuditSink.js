@@ -1,5 +1,5 @@
 /**
- * PolicyAuditSink — the persistence port (Strategy/Adapter seam, DS014) for the
+ * PolicyAuditSink — the persistence port (Strategy/Adapter seam, DS016) for the
  * router access-control audit trail. `PolicyAuditLog` owns the domain concern
  * (timestamping each record and guaranteeing an audit failure never breaks the
  * request path) and delegates only the durable append to a concrete sink. Swapping

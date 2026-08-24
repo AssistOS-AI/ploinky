@@ -211,11 +211,6 @@ function createServiceConfig(getWebchatFactory) {
         get webchat() {
             return wrapWebchatFactory(getWebchatFactory());
         },
-        dashboard: {
-            agentName: 'Dashboard',
-            containerName: '-',
-            runtime: 'local'
-        },
         status: {
             agentName: 'Status',
             containerName: '-',

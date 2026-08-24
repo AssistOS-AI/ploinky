@@ -1,5 +1,5 @@
 /**
- * PolicyStateStore — the persistence port (Strategy/Adapter seam, DS014) for the
+ * PolicyStateStore — the persistence port (Strategy/Adapter seam, DS016) for the
  * router policy document (`policy-state.json`, schema `router-policy`).
  *
  * `PolicyStateRepository` owns ALL domain logic — schema validation, indexing, the

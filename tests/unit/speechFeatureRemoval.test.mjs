@@ -160,7 +160,7 @@ test('WebMeet no longer exposes dictation or read-aloud UI', () => {
 
 test('public docs no longer advertise Ploinky speech features', () => {
     const docs = [
-        'docs/specs/DS011-security-model.md',
+        'docs/specs/DS013-security-model.md',
         'docs/webchat.html',
         'docs/interfaces.html',
     ];

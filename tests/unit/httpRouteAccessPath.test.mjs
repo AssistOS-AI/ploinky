@@ -40,7 +40,7 @@ test('rejects percent-encoded __agent segments like the current internalAgentPat
 });
 
 test('rejects router-owned first segments so policy entries cannot shadow router surfaces', () => {
-    for (const value of ['/webchat/session', '/dashboard/*', '/status', '/upload', '/blobs/*', '/workspace-files/*', '/agent-card', '/api/agents/x', '/mcp', '/health', '/MCPBrowserClient.js', '/web-libs/webskel/webskel.mjs']) {
+    for (const value of ['/webchat/session', '/status', '/upload', '/blobs/*', '/workspace-files/*', '/agent-card', '/api/agents/x', '/mcp', '/health', '/MCPBrowserClient.js', '/web-libs/webskel/webskel.mjs']) {
         const result = HttpRouteAccessPath.normalize(value);
         assert.equal(result.ok, false, value);
         assert.equal(result.code, 'INTERNAL_ROUTE_NOT_ALLOWED', value);
@@ -49,7 +49,7 @@ test('rejects router-owned first segments so policy entries cannot shadow router
 
 test('ROUTER_OWNED_FIRST_SEGMENTS stays in sync with isRouterOwnedPath', () => {
     const expected = [
-        'agent-card', 'mcp', 'auth', 'admin', 'webchat', 'dashboard',
+        'agent-card', 'mcp', 'auth', 'admin', 'webchat',
         'status', 'upload', 'blobs', 'workspace-files', 'api', 'health',
         'metrics', 'MCPBrowserClient.js', 'web-libs',
     ];

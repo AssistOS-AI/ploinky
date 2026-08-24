@@ -79,36 +79,35 @@ test('layer-aware main help preserves unrelated command lines', () => {
         const text = captureHelp([], { surface });
         assert.match(text, /install <url\|repoName> \[name\] \[branch\]\s+Install repository/);
         assert.match(text, /webchat\s+Print the authenticated WebChat access URL/);
-        assert.match(text, /dashboard\s+Print the administrator-only Dashboard access URL/);
+        assert.doesNotMatch(text, /administrator-only Dashboard access URL/);
         assert.match(text, /client tool <name>\s+Invoke any MCP tool/);
         assert.match(text, /restart\s+Restart enabled agents \+ Router/);
-        assert.match(text, /logs tail \[router\|<agent>\]\s+Follow Router or one agent's logs/);
-        assert.match(text, /logs last \[<N>\] \[router\|<agent>\]\s+Show the last N lines for one log source/);
+        assert.match(text, /logs tail \[router\|agent\] \[--startup\]\s+Follow Router or one agent's logs/);
+        assert.match(text, /logs last \[<N>\] \[router\|agent\] \[--startup\]\s+Show the last N lines for Router or one agent/);
     }
 });
 
-test('the logs help summary states the no-mutation guarantee and both subcommands', () => {
+test('the logs help summary states the no-lifecycle-mutation guarantee and both subcommands', () => {
     for (const surface of ['host', 'core']) {
         const text = captureHelp(['logs'], { surface });
-        assert.match(text, /Inspect Router and agent logs without changing any state/);
-        assert.match(text, /tail\s+Follow Router logs, or one agent/);
-        assert.match(text, /last\s+Show the last N lines of one log source/);
+        assert.match(text, /Inspect Router or agent runtime logs without changing lifecycle state/);
+        assert.match(text, /tail\s+Follow the Ploinky Router file or one agent runtime/);
+        assert.match(text, /last\s+Show the last N lines for Router or one agent/);
         assert.match(text, /never create, start, repair, or remove/);
         // Stdout is reserved for log bytes.
         assert.match(text, /messages go to stderr/);
     }
 });
 
-test('detailed logs tail help documents the agent forms, handoff, and --startup', () => {
+test('detailed logs tail help documents Router and agent forms, handoff, and --startup', () => {
     for (const surface of ['host', 'core']) {
         const text = captureHelp(['logs', 'tail'], { surface });
-        assert.match(text, /logs tail \[router\|<agent>\] \[--startup\]/);
-        // Every documented agent reference form appears in the examples.
+        assert.match(text, /logs tail \[router\|agent\] \[--startup\]/);
         assert.match(text, /logs tail router/);
+        // Every documented agent reference form appears in the examples.
         assert.match(text, /logs tail myAgent/);
         assert.match(text, /logs tail myRepo\/myAgent/);
         assert.match(text, /logs tail myAgent --startup/);
-        assert.match(text, /Unqualified `router` always selects Router logs/);
         assert.match(text, /one round-trip-proved reference per enabled record/);
         assert.match(text, /Linux `\/proc` argv or macOS `KERN_PROCARGS2`/);
         assert.match(text, /rechecks marker, registry generation, and source identity/);
@@ -117,10 +116,11 @@ test('detailed logs tail help documents the agent forms, handoff, and --startup'
     }
 });
 
-test('detailed logs last help documents strict counts and the output ceiling', () => {
+test('detailed logs last help documents Router, strict counts, and the output ceiling', () => {
     for (const surface of ['host', 'core']) {
         const text = captureHelp(['logs', 'last'], { surface });
-        assert.match(text, /logs last \[<N>\] \[router\|<agent>\] \[--startup\]/);
+        assert.match(text, /logs last \[<N>\] \[router\|agent\] \[--startup\]/);
+        assert.match(text, /logs last 50 router/);
         assert.match(text, /logs last 200 myRepo\/myAgent/);
         assert.match(text, /logs last 40 myAgent --startup/);
         assert.match(text, /between 1 and 10000/);

@@ -544,8 +544,6 @@ check_router_stop_entry() {
   if [[ -n "$state_var" ]]; then
     write_state_var "$state_var" "$last_entry"
   fi
-
-  return 0
 }
 
 assert_container_running() {

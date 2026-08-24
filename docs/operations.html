@@ -1,92 +1,65 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ploinky Documentation</title>
-  <link rel="stylesheet" href="styles.css" />
-  <script type="module">
-      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-      mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
-  </script>
-  <script src="partials-loader.js" defer></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ploinky Documentation</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: { primaryColor: '#e8f5e9', primaryBorderColor: '#2e7d32', secondaryColor: '#e3f2fd', tertiaryColor: '#fff3e0', lineColor: '#546e7a' } });
+    </script>
 </head>
 <body data-page="operations">
-  <div data-include="partials/header.html"></div>
-  <main class="doc-main">
-    <div class="doc-shell">
-      <nav class="breadcrumbs" aria-label="Breadcrumb">
-        <a href="index.html">Home</a>
-        <span>/</span>
-        <span>Operations</span>
-      </nav>
-
-      <article class="chapter">
-        <header class="chapter-header">
-          <p class="eyebrow">Operator Workflow</p>
-          <h1>Ploinky Documentation</h1>
-          <p>Operations in Ploinky center on secret resolution, dependency-cache hygiene, observability, test execution, and the maintenance tooling that keeps browser docs, specs, and command-suggestion context aligned with the code.</p>
-        </header>
-
-        <section class="chapter-section">
-          <h2>Secrets and Variable Resolution</h2>
-          <p>Workspace-managed secrets live in <code>.ploinky/.secrets</code>. The secret injector also walks upward to find the nearest <code>.env</code> file and prefers process environment variables over both file-based sources. This precedence model is shared by auth config, runtime resource templating, dependency tooling, and the LLM helper. Manifest entries marked <code>generatedSecret: true</code> are intentionally different: Ploinky derives them from the agent identity and ignores same-named operator variables.</p>
-          <p><code>var</code>, <code>vars</code>, <code>echo</code>, and <code>expose</code> are the operator-facing commands for that layer. Variable exposure supports wildcard expansion, but the all-match <code>*</code> pattern deliberately excludes names containing <code>API_KEY</code> so sensitive values are never exposed accidentally through a broad manifest pattern.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Branch-Aware Startup</h2>
-          <p><code>ploinky start</code> accepts <code>--branch &lt;branch&gt;</code> to set a candidate branch for managed repos involved in startup, <code>--repo-branch &lt;repo=branch&gt;</code> to reconcile an existing named repo before manifest traversal and override that repo when traversal installs it, <code>--branch-fallback default|fail</code> to control missing or unrefreshable branch behavior, and <code>--reset-repos</code> to hard-reset targeted managed checkouts to the refreshed remote branch. Bootstrap applies the global branch only to the prefixed static-agent repo and applies explicit per-repo overrides to default boot repos. Manifest <code>repos</code> values may be objects with an explicit <code>branch</code> field, and prefixed <code>enable</code> entries auto-install missing repos through the normal source lookup. Strict branch selection aborts instead of using a stale remote-tracking ref when refresh fails. Branch metadata is recorded in <code>.ploinky/repo_sources.json</code> for reproducible restarts.</p>
-          <p>An enabled agent outside the resolved static dependency graph may declare <code>startup: "manual"</code> to remain dormant during general start and restart operations. Missing <code>startup</code> means automatic. Static agents and explicit manifest dependencies always start, even if their own manifest says manual. A running manual agent is retained; a stopped one has its stale route removed until an explicit Marketplace or CLI activation recreates it.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Dependency Cache Maintenance</h2>
-          <p><code>ploinky deps prepare</code>, <code>deps status</code>, and <code>deps clean</code> manage runtime-keyed Node caches under <code>.ploinky/deps/</code>. Global caches are prepared from <code>globalDeps/package.json</code>. Per-agent caches merge that baseline with an agent-local <code>package.json</code> when one exists. A cache is valid only when the runtime key, merged-package hash, stamp version, installer metadata, and core marker module all match the current inputs. <code>ploinky start</code> prepares or refreshes missing and stale caches before launching agents, so first startup may require npm, git, network access, and native build tools.</p>
-          <p>Container runtimes prepare caches inside a short-lived install container for the target image and record that image in the cache stamp so manifest image changes refresh stale native dependencies. Sandbox runtimes prepare caches on the host, but only when the runtime key matches the host runtime family and platform.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Observability</h2>
-          <p>The watchdog and router write structured logs under <code>.ploinky/logs/</code>. The CLI currently exposes only router log tailing and last-line inspection through <code>logs tail</code> and <code>logs last</code>. For a compatible running Box, the public <code>ploinky status</code> command uses the same read-only workspace renderer as the core command, including SSO, Router, repository, and per-agent runtime details. The status-only entrypoint bypasses core initialization and bootstrap; unavailable Box states retain the dependency-free outer summary. The browser status surface can therefore compare its router-side server and enabled-agent summaries with the same CLI view.</p>
-          <p>Release verification normalizes the actual engine <code>HostConfig.PortBindings</code> and requires exactly loopback Router TCP plus wildcard LiveKit UDP 7882 after both create and recreate. Supplemental host scans never replace engine inspection. A profile-specific, owner-aware in-box <code>ss -H -lntup</code> inventory records expected private listeners, bind addresses, and owners without assuming that the box has only two internal sockets.</p>
-          <p>Launch ownership and live socket ownership are separate evidence. Engine labels or sandbox PID/start records bind the exact instance/enable generation; recurring semantic probes prove the expected owner still holds its socket. Container state is collected once per watchdog tick for all OCI targets. If that shared inventory fails, the failure is logged and every OCI state decision is deferred for the tick; the monitor does not issue per-target fallback calls or infer that an unknown container has stopped. Every container probe has an in-container process-session deadline under an init reaper, and exact marker/token cleanup must succeed before a timeout is accepted. A failed recurring probe records selector inactivation and the exact replacement outcome.</p>
-          <p>Outer-runtime configuration drift is an operator boundary, not a reconciliation transaction. The supervisor reports the exact drift without registry traffic or container mutation; the operator explicitly destroys and recreates the box while retaining its three named volumes.</p>
-          <p>The route-and-policy authorization generation, topology configuration generation, and topology publication generation are distinct structured evidence, alongside exact-input digests, selector activation state, assertion rejection reasons, Cloudflare connector state, and TURN credential lifecycle. Detailed health remains supervisor-only on the unmounted Unix socket; the authenticated browser locator exposes only configuration/publication ids and no inventory.</p>
-          <p>Never remediate edge policy by deleting one candidate file and restarting. Missing policy, desired-state, routing, enabled-agent, manifest, or provider input leaves selectors inactive. Repair a complete validated source set, invoke coordinated apply, and verify its new digest; the managed runtime supplies no empty-source, previous-generation, or cleanup fallback.</p>
-          <p>WebChat conversation and task continuation are owned by the selected CLI, not by Ploinky operations. The router keeps only volatile validated snapshots for browser rendering and does not write conversation or task state.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Control-Surface Authentication</h2>
-          <p><code>webchat</code> prints the router login URL for the chat surface. <code>/dashboard</code> and <code>/status</code> are local-control surfaces that require a real router-authenticated local-admin session on an exact control Host.</p>
-          <p>A component token, invitation, agent assertion, media credential, or loopback source does not grant administrator authority. Every mutation additionally requires the exact browser Origin and the session-bound CSRF proof returned only to an authenticated local administrator.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Edge Publication Modes</h2>
-          <p>No Cloudflare credentials means the explicit local-only mode: the connector is absent, Router remains loopback-local, and no public HTTP hostname is advertised. Complete Cloudflare mode requires an existing tunnel connector token plus a separate least-privilege API token for Ploinky-managed DNS and ingress. Invalid or incomplete public configuration fails closed; Ploinky never creates a quick tunnel or a new tunnel, and the connector origin is always <code>http://127.0.0.1:8080</code> inside the box.</p>
-          <p>Before activating the managed runtime, the operator must revoke legacy standalone connector and API tokens and delete plaintext legacy state as an explicit destructive prerequisite. The current runtime contains no migration, import, cleanup reader, automatic recreation, or fallback path for old publication state.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Skills and LLM Assistance</h2>
-          <p><code>default-skills</code> refreshes every skill directory from a skills repository under <code>.agents/skills/</code>. Re-running the command replaces only skill folders owned by that source repository, so files removed upstream do not linger locally while unrelated existing skills are preserved. A workspace <code>ploinky-skills-manifest.json</code> uses an array of objects with <code>url</code>, <code>name</code>, optional <code>branch</code>, and selected <code>skills</code>; <code>update</code> clones or pulls those repositories in <code>.ploinky/repos</code> and reconstructs <code>.agents/skills</code> strictly from that selection. Legacy skills found under <code>.claude/skills/</code> are migrated into <code>.agents/skills/</code> before Claude compatibility symlinks are created, and the managed <code>.gitignore</code> block lists only the refreshed source skill folders plus the <code>.claude</code> compatibility path.</p>
-          <p><code>update</code> also refreshes Achilles default skills for project repositories discovered from the update search root. Before project discovery, the Ploinky runtime <code>node_modules/achillesAgentLib</code> checkout is refreshed, and installed repositories under <code>.ploinky/repos/</code> are pulled, or recloned on their recorded branch when a directory is missing direct git metadata but Ploinky knows the source URL. The <code>update</code>, <code>update all</code>, <code>update repos</code>, and <code>update repo &lt;name&gt;</code> flows refresh <code>AchillesCopilotBasicSkills</code> into eligible installed <code>.ploinky/repos/</code> entries through the same <code>default-skills</code> behavior, skipping the <code>AchillesCopilotBasicSkills</code> source repo and skills-only repos. Discovered project repositories with missing or unreachable remotes are logged and skipped for the pull step, while default skills are still refreshed in them. Without an explicit folder path, that search starts at the current working directory; with a folder path, discovery starts there and includes the root when it is itself a git repository.</p>
-          <p><code>ploinky-shell</code> and invalid-command fallback logic rely on Achilles LLM tooling. The suggestion prompt reads <code>docs/ploinky-overview.md</code>, inspects configured API-key sources, and uses the current model settings from workspace variables such as <code>ACHILLES_MODEL_PLAN</code>. If CLI behavior changes and that overview file is not updated, the suggestion layer becomes stale even when the main docs are correct.</p>
-        </section>
-
-        <section class="chapter-section">
-          <h2>Testing and Documentation Verification</h2>
-          <p><code>tests/test_all.sh</code> is the full-stage regression harness. It can optionally test another branch by creating a git worktree when <code>PLOINKY_BRANCH</code> is set. <code>tests/runFailingFast.sh</code> rebuilds one fresh workspace and reruns only the previously failing checks to shorten iteration time after a broken run.</p>
-          <p>Documentation verification is part of the repository contract. After documentation changes, regenerate <code>docs/specs/matrix.md</code>, copy <code>docs/specsLoader.html</code> from the GAMP asset, verify local links, and run the static-site verifier against the finished <code>docs/</code> directory.</p>
-          <div class="callout callout--warm">
-            <p>Use <code>fileSizesCheck.sh</code> when documentation or generated content grows substantially. The canonical script lives at the repository root and is referenced from the coding-style specification.</p>
-          </div>
-        </section>
-      </article>
-    </div>
-  </main>
-  <div data-include="partials/footer.html"></div>
+    <div data-include="partials/header.html"></div>
+    <main>
+        <div class="container"><nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / Workspace Lifecycle</nav><div class="doc-layout">
+            <aside class="sidebar"><h3>Workspace lifecycle</h3><ul><li><a href="#start">Start a workspace</a></li><li><a href="#manage">Manage agents</a></li><li><a href="#observe">Observe runtime state</a></li><li><a href="#stop">Stop and destroy</a></li></ul></aside>
+            <div class="content-wrapper">
+                <div class="doc-section"><h1>Workspace Lifecycle</h1><p class="subtitle">The operator workflows that prepare a workspace, run its agents, inspect its state, and remove only the resources selected by a lifecycle command.</p></div>
+                <div class="doc-section" id="start">
+                    <h2>Start a workspace</h2>
+                    <p><code>ploinky start</code> resolves one <a href="wiki.html#definition-workspace">workspace</a> identity, acquires the workspace lock, prepares required repositories and dependencies, starts the Router and selected agents, and waits for the declared readiness graph. The command reports readiness only after the required external health checks pass.</p>
+                    <figure class="diagram"><pre class="mermaid">flowchart TD
+    A[Select workspace] --> B[Lock and validate identity]
+    B --> C[Prepare repositories and dependencies]
+    C --> D[Start Router and agents]
+    D --> E[Verify readiness graph]
+    E --> F[Expose active routes]</pre><figcaption><em>Workspace startup flow</em></figcaption></figure>
+                    <div class="alert alert-success"><strong>Example:</strong> run <code>ploinky start</code> from the workspace directory. A static target supplied to the command is enabled through the normal agent path before the workspace starts.</div>
+                </div>
+                <div class="doc-section" id="manage">
+                    <h2>Manage agents and repositories</h2>
+                    <p>Repository commands install, update, inspect, or remove managed source. Agent commands enable, disable, start, restart, reinstall, stop, and open a selected agent's shell or CLI. Each action resolves the intended enabled record before it changes the runtime.</p>
+                    <table class="command-table"><thead><tr><th>Operator action</th><th>Result</th></tr></thead><tbody>
+                        <tr><td><code>enable</code> / <code>disable</code></td><td>Adds or removes an enabled-agent record and coordinates the matching runtime lifecycle.</td></tr>
+                        <tr><td><code>restart</code> / <code>reinstall</code></td><td>Replaces or refreshes the selected runtime through its recorded manifest and backend.</td></tr>
+                        <tr><td><code>shell</code> / <code>cli</code></td><td>Opens an interactive session in the selected agent runtime without exposing it as a host service.</td></tr>
+                        <tr><td><code>update</code></td><td>Refreshes managed repositories and invalidates prepared dependency caches when their resolved inputs change.</td></tr>
+                    </tbody></table>
+                    <p>Disabling an agent removes its registry record before runtime teardown. This preserves the precise selected identity for cleanup and prevents the Watchdog from treating the intentional stop as a failed runtime to recreate.</p>
+                </div>
+                <div class="doc-section" id="observe">
+                    <h2>Observe runtime state</h2>
+                    <p><code>ploinky status</code> and <code>ploinky logs</code> are observational paths. They inspect the existing workspace and its recorded agents without initializing a new workspace or repairing a failed one.</p>
+                    <p>The Watchdog supervises the Router and admitted runtimes. It performs health checks, applies bounded restart behavior, and removes a route when its corresponding runtime is no longer healthy. The authenticated status interface exposes read-only state and metrics; it does not become a command-execution surface.</p>
+                </div>
+                <div class="doc-section" id="stop">
+                    <h2>Stop and destroy</h2>
+                    <p><code>stop</code> stops the Router and active agent runtimes while retaining reusable workspace state. <code>destroy</code> removes the exact managed outer Box and discards its nested runtime layers and inner volumes. It preserves the workspace, <code>.data/</code> agent homes, dependency cache, and image cache unless an explicit cache-deletion option selects those regenerated caches.</p>
+                    <figure class="diagram"><pre class="mermaid">flowchart TD
+    S[Stop] --> R[Router and agents stopped]
+    R --> K[Workspace state retained]
+    D[Destroy] --> X[Selected runtimes removed]
+    X --> C[Nested runtime state discarded]
+    C --> V[Workspace and persistent data retained]</pre><figcaption><em>Workspace stop and destroy flow</em></figcaption></figure>
+                    <p>Lifecycle actions validate immutable workspace identity immediately before mutation. A command that cannot identify its exact target fails rather than adopting a similarly named Box, container, process, or repository.</p>
+                </div>
+            </div>
+        </div></div>
+    </main>
+    <div data-include="partials/footer.html"></div>
+    <script>const navLinks=document.querySelectorAll('.sidebar a');const sections=[...document.querySelectorAll('.doc-section[id]')];function updateActiveSection(){let current=sections[0]?.id||'';sections.forEach(section=>{if(section.getBoundingClientRect().top<=100)current=section.id;});navLinks.forEach(link=>link.classList.toggle('active',link.getAttribute('href')===`#${current}`));}window.addEventListener('scroll',updateActiveSection);updateActiveSection();</script>
 </body>
 </html>

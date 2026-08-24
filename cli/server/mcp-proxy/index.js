@@ -598,7 +598,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
                 break;
             }
             case 'resources/list': {
-                // Resources are an authenticated-class capability (DS014): a
+                // Resources are an authenticated-class capability (DS016): a
                 // session caller sees them, an internal/agent or anonymous
                 // caller sees an empty list (mirrors tools/list filtering).
                 const listDecision = policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) });
@@ -648,7 +648,7 @@ async function handleAgentJsonRpc(req, res, route, agentName, payload, { beforeD
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32602, message: 'Missing resource uri' } }, sessionIdHeader);
                     break;
                 }
-                // Fail-closed resource gate (DS014) before any token is minted.
+                // Fail-closed resource gate (DS016) before any token is minted.
                 const readDecision = policy.mcpToolPolicy.evaluateResource({ caller: policy.resolveCaller(req) });
                 if (!readDecision.allow) {
                     sendResponse(200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32003, message: 'Access denied', data: { code: readDecision.code } } }, sessionIdHeader);

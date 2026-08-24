@@ -44,8 +44,6 @@ function mainHelpText(surface) {
   shell <agentName>              Open interactive shell in container (attached TTY)
   cli                            Open /bin/bash in the managed outer runtime; exit returns to the previous prompt.
   cli <agentName> [args...]      Run manifest "cli" command (attached TTY)
-  webchat                        Print the authenticated WebChat access URL
-  dashboard                      Print the administrator-only Dashboard access URL
   sso enable|disable|status  Bind or inspect SSO provider agents
   sandbox status|disable|enable  Force lite-sandbox agents to use containers, or restore bwrap/seatbelt
   network status [--json]        Show managed network topology (status schema 3)
@@ -68,11 +66,11 @@ function mainHelpText(surface) {
 
 ${lifecycleHelpLines(surface).join('\n')}
   restart                        Restart enabled agents + Router
-  disable agents-all             Disable all enabled agents and remove their containers
   reinstall <agentName>          Re-create a running agent container (destructive)
-  logs tail [router|<agent>]     Follow Router or one agent's logs
-  logs last [<N>] [router|<agent>]
-                                 Show the last N lines for one log source
+  logs tail [router|agent] [--startup]
+                                 Follow Router or one agent's logs
+  logs last [<N>] [router|agent] [--startup]
+                                 Show the last N lines for Router or one agent
 
 ▶ FOR DETAILED HELP
   help <command>                 Show detailed help for a command
@@ -147,7 +145,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             description: 'Update Ploinky itself, its Achilles runtime checkout, workspace repositories, Achilles dependencies, and project repositories',
             syntax: 'update [folderPath] | update all [folderPath] | update repos | update repo <name>',
             examples: [ 'update', 'update /work/projects', 'update all /work/projects', 'update repos', 'update repo basic' ],
-            notes: '`update` is the same full workflow as `update all`: it runs git pull --rebase --autostash for the Ploinky checkout, refreshes ploinky/node_modules/achillesAgentLib, updates .ploinky/repos, and updates git repositories discovered recursively from folderPath. Inside a Ploinky box, the read-only source self-pull is skipped while writable runtime dependencies, managed repos, projects, and skills continue updating. Without folderPath, discovery starts at the current working directory. Missing or unreachable remotes in discovered project repositories are logged and skipped instead of failing the full update; managed .ploinky/repos updates remain strict. `update`, `update all`, `update repos`, and `update repo <name>` refresh `AchillesCopilotBasicSkills` into eligible installed .ploinky/repos entries, maintaining `.claude` compatibility and the managed `.gitignore` block; the refresh skips the `AchillesCopilotBasicSkills` source repo and skills-only repos. `update repos` also updates the Ploinky runtime achillesAgentLib checkout and managed-repo achillesAgentLib packages. Discovered workspace folders can define `ploinky-skills-manifest.json`; when present, that file must be an array of objects with url/name/branch/skills and selects the exact skills to install into `.agents/skills` for that workspace folder. In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new code is loaded.'
+            notes: '`update` is the same full workflow as `update all`: it runs git pull --rebase --autostash for the Ploinky checkout, refreshes ploinky/node_modules/achillesAgentLib, updates .ploinky/repos, and updates git repositories discovered recursively from folderPath. Inside a Ploinky box, the read-only source self-pull is skipped while writable runtime dependencies, managed repos, projects, and skills continue updating. Without folderPath, discovery starts at the current working directory. Missing or unreachable remotes in discovered project repositories are logged and skipped instead of failing the full update; managed .ploinky/repos updates remain strict. `update`, `update all`, `update repos`, and `update repo <name>` refresh `AchillesCopilotBasicSkills`, `DocumentationSkills`, and `PloinkySkills` into eligible installed .ploinky/repos entries, maintaining `.claude` compatibility and the managed `.gitignore` block; each source repo and all skills-only repos are skipped. `update repos` also updates the Ploinky runtime achillesAgentLib checkout and managed-repo achillesAgentLib packages. Discovered workspace folders can define `ploinky-skills-manifest.json`; when present, that file must be an array of objects with url/name/branch/skills and selects the exact skills to install into `.agents/skills` for that workspace folder. In an interactive Ploinky session, a detected Ploinky self-update is deferred: close the session, run `ploinky update`, then restart Ploinky so the new code is loaded.'
         },
         
         
@@ -174,21 +172,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                     notes: 'Attaches to a persistent container. REPLs stay attached until exit. Requires the agent manifest to define a "cli" entry. WebChat uses the same launch path and appends forwarded URL parameters as long-form CLI flags.'
                 }
             }
-        },
-        'webchat': {
-            description: 'Print the WebChat URL served at /webchat.',
-            syntax: 'webchat',
-            examples: [
-                'webchat',
-                '/webchat?agent=achilles-cli&path=/absolute/path'
-            ],
-            notes: 'WebChat uses the normal Router login flow. When `/webchat` is opened with `?agent=<name>&...`, every extra query parameter except internal router/session fields is forwarded to `ploinky cli <name>` as a single-token long-form CLI flag in the form `--key=value`.'
-        },
-        'dashboard': {
-            description: 'Print the administrator-only Dashboard URL served at /dashboard.',
-            syntax: 'dashboard',
-            examples: [ 'dashboard' ],
-            notes: 'The Dashboard accepts only a real authenticated Router administrator session; mutations additionally require exact Origin and CSRF proof.'
         },
         'sso': {
             description: 'Manage the workspace SSO provider.',
@@ -346,11 +329,11 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
             notes: 'A named restart requires the persisted RoutingServer port and refuses foreign or old-contract containers. The general restart fails if start was not configured yet.'
         },
         'logs': {
-            description: 'Inspect Router and agent logs without changing any state',
+            description: 'Inspect Router or agent runtime logs without changing lifecycle state',
             subcommands: {
                 'tail': {
-                    syntax: 'logs tail [router|<agent>] [--startup]',
-                    description: 'Follow Router logs, or one agent from its current startup through the automatic handoff to its application output',
+                    syntax: 'logs tail [router|agent] [--startup]',
+                    description: 'Follow the Ploinky Router file or one agent runtime',
                     examples: [
                         'logs tail',
                         'logs tail router',
@@ -358,14 +341,15 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                         'logs tail myRepo/myAgent',
                         'logs tail myAgent --startup'
                     ],
-                    notes: 'Unqualified `router` always selects Router logs. Completion offers one round-trip-proved reference per enabled record; an agent named `router` needs a non-reserved unambiguous qualified spelling. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation. Tail follows that exact run\'s startup log, opens/proves its runtime source, and rechecks marker, registry generation, and source identity before switching. A failed start returns 1 and never falls back. `--startup` never opens runtime output.'
+                    notes: 'Completion offers one round-trip-proved reference per enabled record. Linux `/proc` argv or macOS `KERN_PROCARGS2` must prove the exact no-wait worker invocation. Tail follows that exact run\'s startup log, opens/proves its runtime source, and rechecks marker, registry generation, and source identity before switching. A failed start returns 1 and never falls back. `--startup` never opens runtime output.'
                 },
                 'last': {
-                    syntax: 'logs last [<N>] [router|<agent>] [--startup]',
-                    description: 'Show the last N lines of one log source; N defaults to 200',
+                    syntax: 'logs last [<N>] [router|agent] [--startup]',
+                    description: 'Show the last N lines for Router or one agent; N defaults to 200',
                     examples: [
                         'logs last',
                         'logs last 50',
+                        'logs last 50 router',
                         'logs last myAgent',
                         'logs last 200 myRepo/myAgent',
                         'logs last 40 myAgent --startup'

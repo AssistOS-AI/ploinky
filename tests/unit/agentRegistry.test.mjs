@@ -72,7 +72,7 @@ test('isSsoProviderManifest requires explicit true', () => {
     assert.equal(isSsoProviderManifest({ ssoProvider: 'true' }), false);
 });
 
-test('agent registry does not expose DS006 agent public-key storage', () => {
+test('agent registry does not expose DS008 agent public-key storage', () => {
     assert.equal(Object.hasOwn(registryModule, 'registerAgentPublicKey'), false);
     assert.equal(Object.hasOwn(registryModule, 'getRegisteredAgentPublicKey'), false);
 });

@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Architecture - Ploinky</title>
+    <title>Ploinky Documentation</title>
     <link rel="stylesheet" href="style.css">
+    <script src="partials-loader.js" defer></script>
     <script type="module">
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
         mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
@@ -15,42 +16,23 @@
         }});
     </script>
 </head>
-<body>
-    <header>
-        <div class="container">
-            <div class="header-content">
-                <a href="index.html" class="logo">
-                    <div class="logo-icon">🚀</div>
-                    <span>Ploinky</span>
-                </a>
-                <nav>
-                    <ul>
-                        <li><a href="index.html">Home</a></li>
-                        <li><a href="cli-reference.html">CLI Reference</a></li>
-                        <li><a href="architecture.html" class="active">Architecture</a></li>
-                        <li><a href="specs.html">Specs</a></li>
-                        <li><a href="webchat.html">WebChat</a></li>
-                        <li><button class="theme-toggle" id="themeToggle">🌙</button></li>
-                    </ul>
-                </nav>
-            </div>
-        </div>
-    </header>
+<body data-page="architecture">
+    <div data-include="partials/header.html"></div>
 
     <main>
         <div class="container">
+            <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / Architecture</nav>
             <div class="doc-layout">
                 <aside class="sidebar">
                     <h3>Architecture Components</h3>
                     <ul>
                         <li><a href="#overview">System Overview</a></li>
-                        <li><a href="#core">Core Components</a></li>
-                        <li><a href="#containers">Container Management</a></li>
+                        <li><a href="#ploinky-local">ploinky-local</a></li>
                         <li><a href="#routing">Routing Server</a></li>
                         <li><a href="#watchdog">Watchdog</a></li>
                         <li><a href="#workspace">Workspace System</a></li>
                         <li><a href="#security">Security Model</a></li>
-                        <li><a href="#web-services">Web Services</a></li>
+                        <li><a href="#data-flow">Data Flow Examples</a></li>
                         <li><a href="#agent-mcp">Agent MCP Bridge</a></li>
                     </ul>
                 </aside>
@@ -63,31 +45,45 @@
 
                     <div class="doc-section" id="overview">
                         <h2>System Overview</h2>
-                        <p>Ploinky is built as a modular system with clear separation of concerns:</p>
-                        
-                        <pre class="mermaid">
-graph TD
-    UI["User Interface
-    CLI Commands / WebChat / Dashboard / Status"]
-    CLI["Ploinky CLI Core
-    Command Handler / Service Manager / Config"]
-    RS["Routing Server
-    + Watchdog"]
-    WS["Web Services
-    WebChat / Dashboard / Status"]
-    RT["Runtime Mgmt
-    Container / Bwrap / Seatbelt"]
-    AS["Agent Sandboxes
-    Containers, bubblewrap processes, seatbelt jails"]
+                        <p>Ploinky separates the host lifecycle boundary from the services and agent runtimes that operate inside it:</p>
 
-    UI --> CLI
-    CLI --> RS
-    CLI --> WS
-    CLI --> RT
-    RS --> AS
-    WS --> AS
-    RT --> AS
+                        <pre class="mermaid">
+graph TB
+    HOST["Host user / ploinky CLI\nBox Supervisor (host-side lifecycle)"] --> BOX
+
+    subgraph BOX["Ploinky Box\nrootless outer container"]
+        direction TB
+        ENTRY["Box Entrypoint\nvalidate mounts and initialize nested runtime"]
+        LOCAL["ploinky-local\ninner CLI and workspace supervisor"]
+        ROUTER["Routing Server\nHTTP / SSE / WebSocket / MCP edge"]
+        WATCHDOG["Watchdog\nhealth and restart supervisor"]
+
+        AGENT1["Isolated Agent 1"]
+        AGENT2["Isolated Agent 2"]
+        AGENT3["Isolated Agent 3"]
+        FLOW((" "))
+
+        ENTRY --> LOCAL
+        LOCAL --> ROUTER
+        WATCHDOG --> ROUTER
+        ROUTER -->|"CLI operations, API calls, etc."| FLOW
+        FLOW --> AGENT1
+        FLOW --> AGENT2
+        FLOW --> AGENT3
+    end
                         </pre>
+                        <p class="diagram-caption"><em>Ploinky Box architecture</em></p>
+
+                        <h3>Ploinky Box</h3>
+                        <p>The <a href="wiki.html#definition-ploinky-box">Ploinky Box</a> is the rootless outer container that provides the runtime boundary for one workspace. A host user starts it with <code>ploinky start</code>; the Box Supervisor initializes the boundary and launches <code>ploinky-local</code> inside it. The Box exposes the host loopback Router surface while keeping the inner control and agent network private to the Box.</p>
+                        <p>The Ploinky Box remains the active runtime boundary while the user works through interactive Ploinky commands. Core REPL operations such as <code>stop</code> and <code>destroy</code> stop or clean workspace services and agent runtimes inside the Box without removing the Box itself. The Box remains in place until the user explicitly runs <code>ploinky destroy</code>, which removes the exact outer workspace instance.</p>
+
+                        <h3>Routing Server and Watchdog</h3>
+                        <p>The Routing Server is the Box's single HTTP, SSE, WebSocket, and MCP edge. It authenticates and routes browser, CLI, and service requests to the selected agent runtime, while keeping private Router listeners inside the Box network.</p>
+                        <p>The Watchdog supervises the Routing Server and managed agent containers. It performs health and readiness checks, applies bounded restart and backoff behavior, and inactivates stale routes when an agent no longer satisfies its runtime contract.</p>
+
+                        <h3>Containerized agent runtimes</h3>
+                        <p>Each configured agent runs in its own nested runtime represented by the three agent rectangles in the diagram. Inside a marked Ploinky Box, these runtimes use nested rootless Podman; each agent receives its own container identity, process space, mounts, and service route. The separate runtimes keep agent processes and files isolated from one another while allowing the Routing Server and Watchdog to manage them as one workspace.</p>
 
                         <h3>Key Design Principles</h3>
                         <ul style="margin-left: 2rem;">
@@ -99,160 +95,125 @@ graph TD
                         </ul>
                     </div>
 
-                    <div class="doc-section" id="core">
-                        <h2>Core Components</h2>
-                        
-                        <h3>CLI Command System (cli/commands/cli.js)</h3>
-                        <p>The main entry point that handles all user commands:</p>
-                        <pre><code>// Command routing structure
-handleCommand(args) {
-    switch(command) {
-        case 'add':      // Repository management
-        case 'enable':   // Agent/repo activation
-        case 'start':    // Workspace initialization
-        case 'shell':    // Interactive container access
-        case 'webchat':  // Web interface launchers
-        // ... more commands
-    }
-}</code></pre>
+                    <div class="doc-section" id="ploinky-local">
+                        <h2>ploinky-local</h2>
+                        <p><a href="wiki.html#definition-ploinky-local"><code>ploinky-local</code></a> is the inner Ploinky runtime that coordinates one workspace inside the Ploinky Box. Its components receive commands and workspace state through a shared lifecycle boundary, and each component sends its work into the local coordinator.</p>
 
-                        <h3>Shared Utilities and Sandbox Backends</h3>
-                        <table class="command-table">
-                            <tr>
-                                <th>Service</th>
-                                <th>Responsibility</th>
-                            </tr>
-                            <tr>
-                                <td><code>cli/utils/workspace.js</code></td>
-                                <td>Manages .ploinky directory and configuration</td>
-                            </tr>
-                            <tr>
-                                <td><code>cli/sandbox/docker/</code></td>
-                                <td>Container lifecycle management modules (runtime helpers, interactive commands, agent management)</td>
-                            </tr>
-                            <tr>
-                                <td><code>cli/utils/repos.js</code></td>
-                                <td>Repository management and agent discovery</td>
-                            </tr>
-                            <tr>
-                                <td><code>cli/utils/agents.js</code></td>
-                                <td>Agent registration and configuration</td>
-                            </tr>
-                            <tr>
-                                <td><code>cli/utils/security/secretVars.js</code></td>
-                                <td>Environment variable and secrets management</td>
-                            </tr>
-                            <tr>
-                                <td><code>cli/utils/config.js</code></td>
-                                <td>Global configuration constants</td>
-                            </tr>
-                            <tr>
-                                <td><code>cli/commands/help.js</code></td>
-                                <td>Help system and documentation</td>
-                            </tr>
-                            <tr>
-                                <td><code>cli/sandbox/bwrap/</code></td>
-                                <td>Bubblewrap sandbox lifecycle management (Linux)</td>
-                            </tr>
-                            <tr>
-                                <td><code>cli/sandbox/seatbelt/</code></td>
-                                <td>Seatbelt sandbox lifecycle management (macOS)</td>
-                            </tr>
-                            <tr>
-                                <td><code>agentRegistry.js</code></td>
-                                <td>Installed-agent lookup, principal resolution, runtime resources, and SSO-provider discovery</td>
-                            </tr>
-                            <tr>
-                                <td><code>dependencyCache.js</code></td>
-                                <td>Stamp-based node_modules cache validation</td>
-                            </tr>
-                            <tr>
-                                <td><code>dependencyInstaller.js</code></td>
-                                <td>npm install in containers with globalDeps merge</td>
-                            </tr>
-                            <tr>
-                                <td><code>profileService.js</code></td>
-                                <td>Workspace profile management (dev/qa/prod)</td>
-                            </tr>
-                            <tr>
-                                <td><code>workspaceDependencyGraph.js</code></td>
-                                <td>Agent dependency graph resolution</td>
-                            </tr>
-                        </table>
-                    </div>
+                        <pre class="mermaid">
+flowchart TB
+    CLI["CLI command layer"] --> LOCAL
+    AGENTS["Agent service"] --> LOCAL
+    WORKSPACE["Workspace and bootstrap"] --> LOCAL
+    ROUTER["Routing Server"] --> LOCAL
+    WATCHDOG["Watchdog"] --> LOCAL
+    DEPS["Repository and dependency services"] --> LOCAL
 
-                    <div class="doc-section" id="containers">
-                        <h2>Container Management</h2>
-                        
-                        <h3>Container Lifecycle</h3>
-                        <p>Ploinky manages containers with specific naming conventions and lifecycle hooks:</p>
-                        
-                        <pre><code>// Container naming convention
-// Pattern: ploinky_&lt;repo&gt;_&lt;agent&gt;_&lt;project&gt;_&lt;cwdHash&gt;</code></pre>
+    subgraph LOCAL["ploinky-local"]
+        direction TB
+    end
+                        </pre>
+                        <p class="diagram-caption"><em>ploinky-local components</em></p>
 
-                        <h3>Volume Mounts</h3>
-                        <p>Each container gets specific volume mounts for security:</p>
-                        <pre><code>{
-    binds: [
-        { source: process.cwd(), target: process.cwd() },      // Workspace
-        { source: '/Agent', target: '/Agent' },                // Agent runtime
-        { source: agentPath, target: '/code' }                 // Agent code
-    ]
-}</code></pre>
+                        <h3>CLI command layer</h3>
+                        <p>The CLI command layer gives a workspace user one consistent interface for managing Ploinky without exposing the internal service layout. It defines the REPL vocabulary, command completion, command history, and one-shot command handling, then validates the user's command before any workspace state changes. The <a href="cli-reference.html">CLI Reference</a> describes the available command forms and their arguments.</p>
+                        <p>After parsing a command, the layer delegates work to the component that owns it. It sends repository, update, default-skill, and dependency work to repository and dependency services; sends agent lifecycle work to the agent service; starts the coordinated workspace path for <code>start</code>; and forwards interactive shell or agent CLI sessions to the selected runtime. Read-only commands such as status and logs take dedicated observational paths so they can inspect an existing workspace without initializing or repairing it.</p>
 
-                        <h3>Runtime Detection</h3>
-                        <p>Outside a marked Ploinky box, runtime selection follows the manifest and host. Inside a marked box, every managed agent, helper, sidecar, probe, and install-container path uses nested Podman; Docker, bwrap, and Seatbelt are not fallbacks:</p>
-                        <pre><code>// Runtime preference: podman > docker
-// Default: podman/docker
-// Host sandbox:
-//   manifest "lite-sandbox": true → macOS: seatbelt, Linux: bwrap
-// Container override:
-//   ploinky sandbox disable → podman/docker even for lite-sandbox agents
-// Marked box:
-//   nested podman only for every Ploinky-managed container path
-// Legacy string selectors such as "runtime": "bwrap" are rejected.</code></pre>
+                        <h3>Agent service</h3>
+                        <p>The agent service manages the lifecycle of one named agent or alias because each running agent needs an exact workspace identity, manifest, profile, and runtime record. It resolves an agent reference against installed repositories and enabled registry records, detects ambiguous names, and prevents an operation from selecting a different workspace instance.</p>
+                        <p>The service enables an agent, creates or starts its runtime, stops it, restarts it, reinstalls it from a clean runtime, removes it, and reports its current status. Before it asks the agent runtime service to act, it combines the selected manifest with the configured run mode, alias, authentication choice, profile, dependency graph, and network contract. The resulting lifecycle record preserves the container identity, port mappings, and readiness evidence needed by later commands and the Watchdog.</p>
+
+                        <h3>Workspace and bootstrap</h3>
+                        <p>The workspace and bootstrap component establishes the local state that every other component shares. It creates and reads the workspace directory structure, enabled-agent registry, secrets, active profile, managed repository records, routing inputs, and persisted authorization-generation data so commands operate on one exact workspace rather than on host-global state.</p>
+                        <p>When a workspace starts, bootstrap prepares the required repositories and applies the selected branch policy before agents are resolved. The workspace coordinator then orders manifest processing, dependency preparation, agent launch, route activation, and readiness checks. It refuses to activate a partial or stale state because the Router and agent service require the same exact registry, manifests, routing, policy, and desired-state inputs.</p>
+
+                        <h3>Routing Server</h3>
+                        <p>The Routing Server is the workspace edge that makes selected agent services reachable through HTTP, Server-Sent Events, WebSocket, and Model Context Protocol (MCP) requests. It exists so browser clients, command-line clients, and agent integrations use one authenticated entry point instead of connecting directly to arbitrary agent containers.</p>
+                        <p>For every request, the server resolves the listener and host, applies the active immutable routing and policy generation, and verifies the selected agent instance before it opens an upstream connection. It then proxies the admitted request to that agent's private target or aggregates the declared MCP tools and resources. This design keeps private agent listeners inside the Box and ensures that a route cannot outlive the runtime identity and policy that authorized it.</p>
+
+                        <h3>Watchdog</h3>
+                        <p>The Watchdog keeps the workspace reliable after its initial launch by supervising the Routing Server process and the active agent-container fleet. It exists because a successful startup does not prove that the Router or an agent will remain responsive while the workspace is running.</p>
+                        <p>The Watchdog starts the Router, records its output, checks its private health socket, and applies bounded restart backoff with a circuit breaker when the process fails repeatedly. It also polls the managed container inventory, runs the applicable continuous health checks, respects maintenance locks during explicit lifecycle operations, and writes structured events that identify failures and supervision decisions. The workspace coordinator remains the owner of configuration and activation; the Watchdog only supervises the runtimes that the coordinator has admitted.</p>
+
+                        <h3>Repository and dependency services</h3>
+                        <p>The repository and dependency services make agent source code and runtime packages available before an agent is launched. They install, remove, update, and inspect managed repositories; discover agents and manifests; apply repository branch policy; and refresh the default skill repositories into eligible project repositories.</p>
+                        <p>For startup, these services resolve the dependency graph declared by agent manifests and prepare reusable library dependency caches from the global and agent package requirements. The agent service receives a resolved repository, manifest, dependency order, and cache identity instead of attempting to construct them during container launch. This separation keeps repository updates, dependency installation, and runtime admission coordinated while allowing the same cache to be reused when the resolved inputs have not changed.</p>
                     </div>
 
                     <div class="doc-section" id="routing">
                         <h2>Routing Server</h2>
                         
                         <h3>Purpose</h3>
-                        <p>The RoutingServer (<code>cli/server/RoutingServer.js</code>) is the sole HTTP/SSE/WebSocket edge inside a managed box. It owns public/control port <code>8080</code> and the un-published box-private port <code>8081</code>, plus an unmounted Unix health socket. Its authorization unit is a validated immutable route-and-policy authorization generation, not a mutable candidate file or topology publication counter.</p>
-                        <p>The outer wrapper always constructs exactly <code>127.0.0.1:&lt;selected-router-host-port&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. Outer <code>--port</code> changes only the first mapping's physical-host side; <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> are rejected. No graph, manifest, profile, readiness result, environment value, label, or persisted state can add a third physical-host mapping.</p>
-                        <p>Coordinated apply requires exact readable routing, policy, desired-state, enabled-agent, and manifest sources. Missing input is never substituted with an empty policy or registry. A genuinely fresh core command initializes all four persisted source documents together after creating the workspace directories and before bootstrap or registry mutation; generic environment setup does not create <code>agents.json</code> independently. A partial set or retained generation evidence stays inactive until explicit repair.</p>
-                        <p><strong>Rootless private transport:</strong> inside a marked Box, private <code>8081</code> binds the Box namespace wildcard so nested Podman can reach it through <code>host.containers.internal:host-gateway</code>. The outer runtime never publishes <code>8081</code>, and every request remains fail-closed behind route policy, caller ACL, and a generation-bound private assertion. Outside a marked Box, private listeners retain exact loopback/managed-address binds.</p>
+                        <p>The <a href="wiki.html#definition-router">Router</a> is the network entry point for a Ploinky Box. It receives HTTP, server-sent event, WebSocket, and MCP requests, identifies the requested service, and decides whether Ploinky itself handles the request or forwards it to an enabled agent. This gives clients one stable entry point while agent runtimes remain private inside the Box.</p>
+                        <p>Before forwarding an agent request, the router checks the listener, Host, path, caller authorization, and route policy. It selects the target only from the active route-and-policy generation and checks that generation again immediately before connecting to the agent. A partially written or obsolete routing configuration therefore cannot direct a request to an agent runtime.</p>
+                        <p>The router listens on public/control port <code>8080</code>, on box-private port <code>8081</code>, and on an unmounted Unix health socket. The outer wrapper publishes exactly <code>127.0.0.1:&lt;selected-router-host-port&gt;:8080/tcp</code> and <code>0.0.0.0:7882:7882/udp</code>. The host-side <code>--port</code> option changes only the host port mapped to router port <code>8080</code>; <code>--publish</code>, <code>--expose</code>, and <code>--listen-lan</code> cannot add another published TCP port.</p>
+                        <p>Port <code>8081</code> is used only for private communication inside the Box. In a rootless Box, it binds the Box namespace wildcard so nested Podman runtimes can reach it through <code>host.containers.internal:host-gateway</code>; the outer runtime never publishes it on the host. Outside a Box, the private listener uses exact loopback or managed-address binds.</p>
 
-                        <pre><code>// Conceptual activated generation (illustrative fields only)
-{
-    "authorizationGeneration": "sha256:...",
-    "staticAgent": "explorer",
-    "routes": {
-        "explorer": {
-            "instance": "...",
-            "enableGeneration": "...",
-            "primaryTarget": "private-tcp-target",
-            "services": {
-                "dashboard": { "slug": "dashboard", "port": 3000, "externalPrefix": "/dashboard" }
-            }
-        }
-    },
-    "policyDigest": "sha256:..."
-}</code></pre>
+                        <figure class="diagram">
+                            <pre class="mermaid">flowchart TB
+    subgraph WEB["Routing Server architecture"]
+        direction TB
+        ROUTER["Routing Server"]
+        WEBCHAT["WebChat"]
+        STATUS["Status and metrics"]
+        DATA["Workspace files and blobs"]
+        APPS["Agent web applications"]
+
+        ROUTER --&gt; WEBCHAT
+        ROUTER --&gt; STATUS
+        ROUTER --&gt; DATA
+        ROUTER --&gt; APPS
+    end</pre>
+                            <figcaption><em>Routing Server components</em></figcaption>
+                        </figure>
+
+                        <h3>Exposed APIs</h3>
+                        <p>The RoutingServer owns the following route families. Agent-prefixed routes are forwarded only after their selected route has been authorized; the other route families are handled by the router or their dedicated router handler.</p>
+                        <table>
+                            <thead>
+                                <tr><th>Route family</th><th>Purpose</th></tr>
+                            </thead>
+                            <tbody>
+                                <tr><td><code>/auth/*</code></td><td>Authentication routes establish and manage the browser session used by protected router and agent surfaces.</td></tr>
+                                <tr><td><code>/api/agents/*</code></td><td>Agent administration routes expose the user and agent management control surface.</td></tr>
+                                <tr><td><code>/api/marketplace/*</code></td><td>Marketplace routes expose the router-owned marketplace control surface.</td></tr>
+                                <tr><td><code>/agent-card</code>, <code>/mcp</code>, and <code>/&lt;agent&gt;/mcp</code></td><td>Agent discovery and Model Context Protocol requests are served through the aggregate or agent-specific MCP handlers.</td></tr>
+                                <tr><td><code>/webchat/*</code> and <code>/status/*</code></td><td>WebChat and status handlers provide the authenticated interactive and workspace-observation surfaces.</td></tr>
+                                <tr><td><code>/upload</code>, <code>/blobs/*</code>, and <code>/workspace-files/*</code></td><td>Workspace file upload, blob streaming, and router-owned workspace-file access are handled without forwarding to an agent.</td></tr>
+                                <tr><td><code>/policy/command</code>, <code>/health</code>, and <code>/admin/*</code></td><td>Protected router control, health-summary, and administrative surfaces remain router-owned and require their applicable authorization checks.</td></tr>
+                                <tr><td><code>/&lt;agent&gt;/*</code></td><td>The selected agent's HTTP, server-sent event, or WebSocket service receives the request after the router removes the agent mount prefix and validates the active route generation.</td></tr>
+                            </tbody>
+                        </table>
 
                         <h3>Request Flow</h3>
+                        <figure class="diagram">
+                            <pre class="mermaid">sequenceDiagram
+    participant Client
+    participant Router as Routing Server
+    participant Generation as Active route and policy generation
+    participant Agent as Isolated agent runtime
+
+    Client-&gt;&gt;Router: Request
+    Router-&gt;&gt;Generation: Validate route and policy
+    Generation--&gt;&gt;Router: Authorized private target
+    Router-&gt;&gt;Agent: Forward agent request
+    Agent--&gt;&gt;Router: Response or stream
+    Router--&gt;&gt;Client: Response or stream</pre>
+                            <figcaption><em>Router request flow</em></figcaption>
+                        </figure>
                         <ol style="margin-left: 2rem;">
-                            <li>Client sends a request through the loopback edge or an authenticated Cloudflare hostname.</li>
-                            <li>RoutingServer resolves listener class and the exact Host before examining the pathname.</li>
-                            <li>The selected host surface resolves one declared service and canonicalizes its external prefix.</li>
-                            <li>The provider and effective route policy independently admit the request against one immutable authorization generation.</li>
-                            <li>For a guest ingestion route, RoutingServer strips spoofable source and identity headers and creates one route-scoped opaque transport-source HMAC for per-source throttling; this value is never authorization or user identity.</li>
-                            <li>RoutingServer revalidates that captured authorization generation immediately before creating the upstream connection.</li>
-                            <li>RoutingServer proxies to that generation's private primary or explicit-port TCP target.</li>
-                            <li>Returns response to client</li>
+                            <li>The client sends an HTTP, server-sent event, or WebSocket request through the loopback edge or an authenticated Cloudflare hostname.</li>
+                            <li>The RoutingServer identifies the listener class and exact Host, canonicalizes the path, and resolves the selected service.</li>
+                            <li>The routing provider and effective route policy admit the request against one active immutable authorization generation. For a guest ingestion route, the router also removes spoofable source and identity headers and creates a route-scoped opaque transport-source HMAC for throttling; that value is not authorization or user identity.</li>
+                            <li>Router-owned API routes are completed by their dedicated handlers. For an agent-prefixed route, the router captures the authorized private target and revalidates the generation lease immediately before creating the upstream connection.</li>
+                            <li>The router removes the agent mount prefix, proxies the request to the isolated agent runtime, and returns the response or stream to the client.</li>
                         </ol>
 
+                        <h3>WebChat</h3>
+                        <p>WebChat is the browser interface for an interactive session with an enabled agent. After the router session is established, it serves the chat interface, resolves the selected agent, and creates the corresponding terminal session. The browser submits input, control, and interaction requests over HTTP, while WebChat sends terminal output back as a server-sent event stream. This keeps browser interaction responsive without granting the browser direct access to the agent process.</p>
+                        <p>WebChat also supports task views, workspace file suggestions, uploads, and directory operations for the workspace selected by the session. These operations stay within the resolved workspace context, so a chat session can work with its intended files without treating an arbitrary host path as part of the web API.</p>
+
                         <h3>Agent Static Serving</h3>
-                        <p>The router no longer reads agent application files from the host filesystem. It owns workspace-global routes such as <code>/workspace-files</code> and the management surfaces, then proxies agent-prefixed requests to the selected agent. The agent receives the path with the mount prefix removed and is responsible for serving its own application files.</p>
+                        <p>An enabled agent can provide its own web application behind its agent-prefixed route. The router owns workspace-global routes such as <code>/workspace-files</code> and the management surfaces, then proxies agent-prefixed requests to the selected agent. The agent receives the path with the mount prefix removed and is responsible for serving its own application files, HTTP behavior, server-sent events, and WebSocket behavior without exposing its own host port.</p>
                         <pre><code>GET /index.html             → 302 /&lt;static-agent&gt;/index.html
 GET /explorer/index.html    → explorer upstream /index.html
 GET /explorer/assets/app.js → explorer upstream /assets/app.js
@@ -260,38 +221,49 @@ GET /workspace-files/doc.md → router workspace-file handler</code></pre>
                         <p>The shared <code>AgentServer</code> serves static files from <code>PLOINKY_CODE_DIR</code> or <code>/code</code> after its built-in endpoints. Agents that use a custom <code>manifest.agent</code> command must implement equivalent static serving themselves.</p>
 
                         <h3>Blob Storage API</h3>
-                        <p>The router exposes a simple blob storage API for large files with streaming upload/download.</p>
-                        <pre><code>// Upload (streaming)
-POST /blobs/&lt;agentName&gt;
-Headers:
-  Content-Type: application/octet-stream
-  X-Mime-Type: text/plain   # optional; falls back to Content-Type
-  X-File-Name: report.pdf   # optional; original filename for metadata
-Body: raw bytes (streamed)
+                        <p>The blob storage API transfers files and other raw byte payloads without placing them in an agent's source repository. A caller sends the payload as the request body, so the API can carry text, images, documents, archives, or another binary format. <code>Content-Type</code> describes the payload type; <code>X-Mime-Type</code> can override it, and <code>X-File-Name</code> records the original filename as metadata.</p>
+                        <p>Each stored blob has a generated identifier and a JSON metadata sidecar that records its size, MIME type, creation time, optional filename, and owning agent when applicable. The bytes are streamed during upload and download. Download responses include the stored content type and length, support <code>HEAD</code>, and accept byte ranges for partial downloads.</p>
 
-Response: 201 Created
-{ "id": "<uid>", "url": "/blobs/&lt;agentName&gt;/<uid>", "size": N, "mime": "text/plain", "agent": "<agent>", "filename": "report.pdf" }
+                        <h4>Storage Scope</h4>
+                        <p>A request to the shared blob endpoints stores bytes in <code>.ploinky/shared</code>. These blobs are not associated with one agent and can be addressed through their generated identifier. A request that names an enabled agent stores bytes in that agent's workspace at <code>&lt;agent-workspace&gt;/blobs</code>. This lets an agent create or consume files that belong to its own work without exposing the file as a workspace-global resource.</p>
+                        <p>The router resolves an agent name from the enabled-agent registry before accepting an agent-scoped upload or download. When the same agent name exists in more than one repository and the records have different workspaces, callers use <code>&lt;repository&gt;:&lt;agent&gt;</code> to identify the intended blob store.</p>
 
-// Download (streaming, supports Range)
-GET /blobs/&lt;agentName&gt;/&lt;id&gt;
-HEAD /blobs/&lt;agentName&gt;/&lt;id&gt;
- - Streams bytes from &lt;agentWorkspace&gt;/blobs/&lt;id&gt; with metadata from .../blobs/&lt;id&gt;.json
- - Sets Content-Type, Content-Length, Accept-Ranges, and supports partial responses (206)</code></pre>
+                        <h4>Endpoints</h4>
+                        <table>
+                            <thead>
+                                <tr><th>Endpoint</th><th>Behavior</th></tr>
+                            </thead>
+                            <tbody>
+                                <tr><td><code>POST /blobs</code></td><td>Streams a raw payload into the shared <code>.ploinky/shared</code> blob store and returns its generated identifier and download URL.</td></tr>
+                                <tr><td><code>GET</code> or <code>HEAD /blobs/&lt;id&gt;</code></td><td>Streams or inspects a shared blob.</td></tr>
+                                <tr><td><code>POST /blobs/&lt;agent&gt;</code></td><td>Streams a raw payload into the selected enabled agent's <code>blobs</code> directory and returns its generated identifier and download URL.</td></tr>
+                                <tr><td><code>GET</code> or <code>HEAD /blobs/&lt;agent&gt;/&lt;id&gt;</code></td><td>Streams or inspects a blob owned by the selected enabled agent.</td></tr>
+                            </tbody>
+                        </table>
+                        <p>The blob API is separate from <code>POST</code> or <code>PUT /upload?path=...</code>, which writes a replacement file at a selected workspace-relative path. Blob endpoints always generate the storage identifier and do not accept a caller-selected destination path.</p>
+
+                        <h3>Status and Metrics</h3>
+                        <p>The status service is an administrator-only observation surface. It returns the known server states, the selected static application information, and the latest workspace runtime metrics as JSON. A client can request a continuing NDJSON stream of metric snapshots, allowing a monitoring consumer to follow workspace changes without receiving command-execution or runtime-control capabilities.</p>
                     </div>
 
                     <div class="doc-section" id="watchdog">
                         <h2>Watchdog Supervisor</h2>
-                        <p>The Watchdog (<code>cli/server/Watchdog.js</code>) supervises the RoutingServer process:</p>
-                        <ul style="margin-left: 2rem;">
-                            <li><strong>Circuit breaker:</strong> Max 5 restarts in 60 seconds; trips and halts on breach.</li>
-                            <li><strong>Exponential backoff:</strong> Initial 1s, 2x multiplier, max 30s between restarts.</li>
-                            <li><strong>Health checks:</strong> Detailed probes use the supervisor-only unmounted Unix socket; no unauthenticated TCP health route is exposed.</li>
-                            <li><strong>Container monitoring:</strong> Polls every 5 seconds using one runtime container-name inventory for all OCI targets. If that shared inventory fails, the monitor logs the failure and defers every OCI state decision for the tick; it does not amplify a control-plane outage with per-target runtime calls or false restarts.</li>
-                            <li><strong>Recurring semantic ownership:</strong> Repeats manifest liveness and default-continuous readiness probes on a bounded interval; <code>health.readiness.continuous: false</code> keeps a full readiness attestation activation-only. Probe timeouts terminate an exact process session under an OCI init reaper and cleanup failure is fatal. Semantic failure inactivates routing and forces a fresh exact-generation replacement rather than trusting one startup success.</li>
-                            <li><strong>Manual activation:</strong> Agents with <code>startup: manual</code> are monitored only after explicit activation has created a route; stopped manual agents lose stale routes during general startup. Continuing a task is explicit activation of its stored provider: the selected CLI uses the router-owned Marketplace global enable lifecycle and waits for readiness before resuming the task.</li>
-                            <li><strong>Maintenance coordination:</strong> Defers automatic container restarts when the same container has an active maintenance lock, including timers scheduled before reinstall or explicit restart began.</li>
-                            <li><strong>Logging:</strong> Structured JSON to <code>.ploinky/logs/watchdog.log</code>.</li>
-                        </ul>
+                        <p>The Watchdog (<code>cli/server/Watchdog.js</code>) is the supervisor for the RoutingServer process and for enabled agent runtimes. It starts the router, observes whether it remains healthy, and starts the container monitor that tracks the runtime associated with each enabled agent. This supervision keeps the router and agent runtimes available without treating an intentional shutdown or a configuration error as a crash that should be retried.</p>
+                        <p>When a runtime needs recovery, the Watchdog uses the manifest and enabled-agent record that identify that exact runtime. It waits for the replacement runtime to satisfy its health contract before activating its route. If an agent becomes unhealthy after activation, the Watchdog removes its active route and prepares a new replacement rather than continuing to direct requests to a runtime that only passed an earlier startup check.</p>
+
+                        <table>
+                            <thead>
+                                <tr><th>Responsibility</th><th>How the Watchdog performs it</th></tr>
+                            </thead>
+                            <tbody>
+                                <tr><td>RoutingServer process supervision</td><td>The Watchdog starts the RoutingServer, probes its supervisor-only Unix health socket, and restarts it after three consecutive failed health checks or an unexpected exit. A clean exit, an intentional termination signal, a port or permission error, and a fatal exit do not trigger an automatic restart.</td></tr>
+                                <tr><td>Restart containment</td><td>The Watchdog waits with exponential backoff between restart attempts, beginning at one second and doubling up to thirty seconds. It stops automatic recovery after five restarts within sixty seconds, so a persistent failure cannot create an endless restart loop.</td></tr>
+                                <tr><td>Agent runtime monitoring</td><td>The container monitor runs every five seconds and checks all OCI targets from one shared runtime inventory. When that inventory cannot be read, it defers the tick instead of issuing separate runtime calls or restarting agents from incomplete state.</td></tr>
+                                <tr><td>Health and route admission</td><td>The Watchdog runs the health probes declared by an agent manifest before activating a replacement route and repeats continuous probes for running agents. A failed runtime probe inactivates routing for that runtime and schedules recovery through a fresh exact-generation replacement.</td></tr>
+                                <tr><td>Restart coordination</td><td>The Watchdog defers an automatic restart while a workspace-start or per-container maintenance lock is active. It rechecks the manifest and enabled-agent record during recovery so a restart cannot apply stale inputs over a concurrent lifecycle operation.</td></tr>
+                                <tr><td>Operational record</td><td>The Watchdog writes structured events for router lifecycle, health checks, container monitoring, and recovery to <code>.ploinky/logs/watchdog.log</code>.</td></tr>
+                            </tbody>
+                        </table>
                     </div>
 
                     <div class="doc-section" id="workspace">
@@ -354,12 +326,17 @@ HEAD /blobs/&lt;agentName&gt;/&lt;id&gt;
                         <h2>Security Model</h2>
                         
                         <h3>Container Isolation</h3>
-                        <ul style="margin-left: 2rem;">
-                            <li><strong>Filesystem:</strong> Manifests receive only their declared, profile-resolved mounts; writable code and host paths remain trusted capabilities.</li>
-                            <li><strong>Network:</strong> Managed bridge launches use exactly <code>--hosts-file=none --add-host host.containers.internal:host-gateway</code>; this is fixed transport configuration, not a capability. Host mode separately requires an exact effective-instance/current-generation capability and is not proof of authorization. Only one current capability owner may bind reserved UDP <code>7882</code>.</li>
-                            <li><strong>Process:</strong> Container, bubblewrap, and Seatbelt reduce exposure but do not create a hostile multi-tenant boundary inside one operator workspace.</li>
-                            <li><strong>Edge:</strong> Physical-host TCP is loopback-only; public HTTP is an outbound Cloudflare tunnel to Router. Private Router and support listeners are never outer-published.</li>
-                        </ul>
+                        <h4>Filesystem access</h4>
+                        <p>An agent does not receive access to the complete host filesystem or to every workspace directory. Ploinky builds the agent's view from the mounts declared in its manifest after resolving the active profile. If an agent needs writable code or a host path, that mount is an explicit trusted capability: the agent can modify what it can see there, so the manifest must request it deliberately.</p>
+
+                        <h4>Network access</h4>
+                        <p>A bridge-networked agent starts with a controlled hosts configuration and one fixed mapping, <code>host.containers.internal:host-gateway</code>. That mapping gives the agent a transport path to its approved private Router endpoint; it does not authenticate the agent or let it reach arbitrary host services. Host-network mode has a stricter requirement: it needs the exact effective-instance and current-generation capability, and only the owner of the current capability can bind reserved UDP port <code>7882</code>.</p>
+
+                        <h4>Process boundary</h4>
+                        <p>Container, bubblewrap, and Seatbelt runtimes limit how a launched agent process interacts with the surrounding system. They reduce accidental exposure between an agent and the host, but they are not a hostile multi-tenant security boundary because the same workspace operator controls the workloads and their declared capabilities.</p>
+
+                        <h4>Public and private network edge</h4>
+                        <p>Ploinky does not expose agent or router TCP ports directly on the physical network. The outer host accepts TCP only through loopback, and public HTTP reaches the RoutingServer through an outbound Cloudflare tunnel. Private Router and support listeners remain inside the Box, so another host cannot connect to them directly.</p>
 
                         <h3>Secret Management</h3>
                         <p>Environment variables stored in .ploinky/.secrets with aliasing support:</p>
@@ -382,31 +359,6 @@ DATABASE_URL=postgres://localhost/db</code></pre>
                         <h3>Cloudflare, Topology, and TURN</h3>
                         <p>The pinned in-box <code>cloudflared</code> process exists only in complete Cloudflare mode and always uses <code>http://127.0.0.1:8080</code> as origin. Local-only mode starts no connector. A coordinated apply already selects credential-absent state as <code>local-ready</code>, so the publication supervisor adopts that exact generation without a duplicate route apply; a previous Cloudflare ownership journal still requires fail-closed teardown and coordinated commit. Ploinky creates neither quick tunnels nor tunnels, and keeps connector/API credentials out of argv, status, diagnostics, and ordinary agent environments.</p>
                         <p>The box-owned topology carries only non-secret logical locators and distinguishes the immutable route-and-policy authorization generation, a content-derived configuration generation, and a monotonic readiness/publication generation. The authenticated <code>no-store</code> browser projection returns one active locator plus configuration/publication ids, never the authorization id or inventory. TURN long-term credentials remain in core; exact current-generation consumers receive only short-lived brokered credentials and their expiry.</p>
-                    </div>
-
-                    <div class="doc-section" id="web-services">
-                        <h2>Web Services Architecture</h2>
-                        
-                        <h3>WebChat (<code>cli/server/handlers/webchat/</code>)</h3>
-                        <p>Chat interface for CLI programs:</p>
-                        <ul style="margin-left: 2rem;">
-                            <li><code>index.js</code> authenticates and dispatches WebChat requests.</li>
-                            <li>Conversation, upload, workspace-suggestion, message-envelope, and runtime responsibilities are isolated in dedicated modules.</li>
-                            <li>Captures stdout/stdin through the selected agent's TTY implementation.</li>
-                            <li>Uses HTTP input requests and server-sent events for real-time output.</li>
-                            <li>WhatsApp-style UI with message bubbles</li>
-                            <li>Automatic reconnection handling</li>
-                        </ul>
-
-                        <h3>Monitoring contracts</h3>
-                        <p>Ploinky exposes authenticated, administrator-only resource and log streams. Presentation belongs to API consumers; the runtime contains no monitoring UI, command execution, or runtime controls.</p>
-
-                        <h3>WebSocket Protocol</h3>
-                        <pre><code>// Message types
-{ type: 'input', data: 'user command' }     // User input
-{ type: 'output', data: 'program output' }  // Program output
-{ type: 'resize', cols: 80, rows: 24 }      // Terminal resize
-{ type: 'ping' }                             // Keep-alive</code></pre>
                     </div>
 
                     <div class="doc-section" id="data-flow">
@@ -474,170 +426,62 @@ DATABASE_URL=postgres://localhost/db</code></pre>
    → Display as chat bubble</code></pre>
                     </div>
 
-                    <div class="doc-section" id="user-admin">
-                        <h2>Selected-root User Administration</h2>
-                        <p>A public agent-root host may select the closed <code>user-admin</code> Router surface. The immutable edge plan admits only the selected route key's users collection, one optional user-id child, and settings endpoint. Other agents and Router control paths remain absent from that host.</p>
-                        <p>The route plan grants reachability only. The existing handler still requires a real local administrator session for reads and mutations, and every mutation still requires an exact Origin plus a session-bound CSRF proof.</p>
-                    </div>
-
                     <div class="doc-section" id="agent-mcp">
                         <h2>Agent MCP Bridge</h2>
-                        <p>AgentServer (<code>Agent/server/AgentServer.mjs</code>) exposes capabilities through the <strong>Model Context Protocol (MCP)</strong> using <em>Streamable HTTP</em> at <code>/mcp</code> on the container port (default <code>7000</code>).</p>
+                        <p>The <strong>Model Context Protocol (MCP)</strong> bridge gives authenticated callers one Router-controlled way to discover and invoke capabilities supplied by active agents. The bridge keeps agent listeners private to the Box: the Router reaches an agent over its registered loopback target and does not publish the agent's MCP port as an outer Box service.</p>
 
-                        <h3>Router ↔ Agent Communication</h3>
-                        <ul style="margin-left: 2rem;">
-                            <li><strong>RouterServer abstraction:</strong> RouterServer talks to agents through <code>cli/server/AgentClient.js</code>, which wraps MCP transports.</li>
-                            <li><strong>MCP protocol:</strong> AgentClient builds a <code>StreamableHTTPClientTransport</code> towards <code>http://127.0.0.1:&lt;hostPort&gt;/mcp</code> and exposes <code>listTools()</code>, <code>callTool()</code>, <code>listResources()</code>, and <code>readResource()</code>.</li>
-                            <li><strong>Unified routing:</strong> Requests hitting <code>/mcp</code> carry commands such as <code>list_tools</code>, <code>list_resources</code>, or <code>tool</code>. RouterServer fans these calls out to every registered MCP endpoint and aggregates the replies.</li>
-                            <li><strong>Per-agent routes:</strong> Agent-prefixed paths like <code>/&lt;agent&gt;/mcp</code> provide direct access when needed. On a public agent-root host with the <code>agent-mcp</code> capability, the immutable edge generation admits only the selected root and its transitive active-manifest dependency closure; unrelated enabled agents and arbitrary dependency content are not selected.</li>
-                            <li><strong>Transport independence:</strong> RouterServer stays agnostic of protocol details; AgentClient encapsulates the MCP implementation.</li>
-                        </ul>
+                        <h3>Router-owned MCP endpoints</h3>
+                        <p><code>/mcp</code> is the aggregate MCP endpoint. It requires Router authentication, accepts JSON-RPC over POST, and creates a Router MCP session during <code>initialize</code>. The endpoint supports tool and resource discovery, tool calls, resource reads, and <code>ping</code>; GET event streams are not supported, and DELETE ends the Router session.</p>
+                        <p>For each request, the Router resolves routes from the captured active generation and revalidates its lease before it connects upstream. <code>cli/server/AgentClient.js</code> encapsulates the Streamable HTTP client transport used for that loopback connection. Discovery fans out only to active registered routes, annotates each returned tool or resource with its source agent, and returns upstream failures as bounded per-agent errors.</p>
+                        <p>The aggregate endpoint applies MCP policy before it advertises or invokes a tool. Tool access is fail-closed and is classified as <code>authenticated</code>, <code>admin</code>, or <code>internal</code>; resources are available only to Router-authenticated user or guest sessions. A tool name shared by multiple agents must be qualified with its agent route, preventing an ambiguous call from being sent to an arbitrary provider.</p>
+                        <p><code>/&lt;agent&gt;/mcp</code> is the corresponding single-agent proxy. Browser callers use the Router authentication flow. Agent-to-agent calls carry an Agent Assertion and may invoke only <code>tools/call</code>; the Router verifies the assertion, the target permission, caller ACL, and MCP policy before forwarding the request.</p>
 
-                        <h3>Tools and Resources</h3>
-                        <p>Agents declare their MCP surface through a JSON file committed alongside the agent source code: <code>.ploinky/repos/&lt;repo&gt;/&lt;agent&gt;/mcp-config.json</code>. When the CLI boots an agent container it copies this file to <code>/tmp/ploinky/mcp-config.json</code> (also keeping <code>/code/mcp-config.json</code> for reference). The file can expose tools, resources, and prompts, and each tool is executed by spawning a shell command. AgentServer does not register anything if the configuration file is missing.</p>
-                        <pre><code>{
-  "tools": [
-    {
-      "name": "list_things",
-      "title": "List Things",
-      "description": "Enumerate items in a category",
-      "command": "node scripts/list-things.js",
-      "input": {
-        "type": "object",
-        "properties": {
-          "category": {
-            "type": "string",
-            "description": "fruits | animals | colors"
-          }
-        },
-        "required": ["category"],
-        "additionalProperties": false
-      }
-    }
-  ],
-  "resources": [
-    {
-      "name": "health",
-      "uri": "health://status",
-      "description": "Service health state",
-      "mimeType": "application/json",
-      "command": "node scripts/health.js"
-    }
-  ],
-  "prompts": [
-    {
-      "name": "summarize",
-      "description": "Short summary",
-      "messages": [
-        { "role": "system", "content": "You are a concise analyst." },
-        { "role": "user", "content": "${input}" }
-      ]
-    }
-  ]
-}</code></pre>
-                        <p>AgentServer pipes a JSON payload to each command via stdin. Tool invocations receive <code>{ tool, input, metadata }</code>; resources receive <code>{ resource, uri, params }</code>. Command stdout is forwarded to the MCP response, while non-zero exit codes surface as MCP errors.</p>
+                        <h3>Request-bound agent invocation</h3>
+                        <p>Before the Router invokes a tool or reads a resource, it mints a target-specific Router Request token. The token is bound to the target agent, active generation, HTTP method, <code>/mcp</code> path, requested operation, and canonical arguments. AgentServer verifies that token and replay state before it exposes invocation metadata to a command. A token for one tool, resource, or argument set therefore cannot authorize another request.</p>
 
-                        <h3>MCP Task Queue</h3>
-                        <p>Longer running MCP tools are orchestrated through <code>Agent/server/TaskQueue.mjs</code>. Every tool execution is wrapped in a task object that captures the command, input payload, timeout hints, timestamps, and eventual result/error.</p>
-                        <ul style="margin-left: 2rem;">
-                            <li><strong>Concurrency guard:</strong> AgentServer limits work in flight (default 10, overridable via <code>"maxParallelTasks"</code> in <code>mcp-config.json</code>) and keeps the rest in a FIFO pending queue.</li>
-                            <li><strong>Durable state:</strong> Tasks are stored in <code>$PWD/.tasksQueue</code>. On restart, pending items resume and previously running entries are rewound to pending so they execute again.</li>
-                            <li><strong>Per-task payloads:</strong> The queue injects a unique <code>taskId</code> into the JSON delivered to each command so downstream scripts can correlate logs or offer a status channel.</li>
-                            <li><strong>Timeout + lifecycle:</strong> Tool definitions may specify <code>timeoutMs</code>. The queue arms a timer, kills the underlying process if it runs too long, and marks the task as failed with a timeout message.</li>
-                            <li><strong>Response and live-log channels:</strong> Successful executions persist stdout as the MCP result and use stderr for the live task log. Logs are bounded unless the tool declares full retention. A structured stdout object containing <code>outputText</code> is reduced to that field before exposure; a validated continuation descriptor may be retained as result metadata without entering visible task output. Failures retain stderr and exit-code diagnostics.</li>
-                        </ul>
+                        <h3>Agent MCP server and configuration</h3>
+                        <p>The <a href="wiki.html#definition-agentserver">AgentServer</a> runs a Streamable HTTP MCP server at <code>/mcp</code> on port <code>7000</code> by default. Each MCP initialization creates an isolated server and transport session. The server also provides the private agent health endpoint, an optional agent card endpoint, and protected task status and cancellation endpoints.</p>
+                        <p>An agent declares its MCP surface in its <code>mcp-config.json</code>. During runtime preparation, Ploinky stages that file in the agent work directory and supplies the runtime configuration path through <code>PLOINKY_MCP_CONFIG_PATH</code>. The configuration can define tools, resources, resource templates, and prompts. A missing configuration produces an empty MCP surface; invalid or incomplete individual entries are skipped.</p>
+                        <p>A configured tool or resource runs its command with a JSON payload on standard input. Tool payloads contain the tool name, input, and verified invocation metadata; resource payloads contain the resource name, URI, and template parameters. Standard output becomes the MCP result. A non-zero command result is returned as an MCP error.</p>
 
-                        <h3>Task Status Polling</h3>
-                        <p>The Router/CLI side uses <code>Agent/client/MCPBrowserClient.js</code> to follow long-running jobs.</p>
-                        <ul style="margin-left: 2rem;">
-                            <li><strong>Polling endpoint:</strong> After a task is enqueued, the client hits <code>/&lt;agent&gt;/task?taskId=...</code> (falling back to <code>/getTaskStatus</code>) every 30 seconds and adds a timestamp query parameter to avoid caching.</li>
-                            <li><strong>Incremental updates:</strong> Each  status response (HTTP 200) updates the console only if the task status changed (pending → running → completed/failed). Terminal states stop the poller immediately.</li>
-                            <li><strong>Error handling:</strong> Non-200 responses are logged and the poller keeps retrying (except <code>404 task not found</code>, which stops polling and reports failure), so status checks continue even across transient outages.</li>
-                        </ul>
-                        <p><code>AgentMcpClient.callTool()</code> owns blocking task polling and returns the terminal result. Its separate <code>callToolWithoutWait()</code> path returns the initial task response and offers it to a registered process-local observer without starting client-owned polling. A compatible CLI uses that observer in terminal and WebChat modes to detach tasks, persist metadata and logs in its own workspace store, reattach ongoing work after restart, and continue polling through the router. In WebChat mode the CLI emits generic task envelopes. Ploinky validates them, keeps only volatile runtime state, broadcasts <code>task-update</code> over the existing EventSource stream, and inserts no task state into its own persistence. The session-owning CLI inserts one lightweight <code>{ type: "task", taskId }</code> conversation item per started task after the active assistant placeholder. The browser resolves each id from the CLI's <code>/tasks</code> list into a compact task reference. Its link opens the authenticated HTML task view in the generic right-side iframe; the parent sends <code>/task view</code>, <code>/task stop</code>, or <code>/task continue</code> to the selected CLI and forwards matching stream updates through same-origin <code>postMessage</code>. The view does not create another EventSource or call task data/action REST APIs. A continuation keeps one CLI-owned local task id, increments <code>turn</code>, and ignores late prior-turn updates. The provider emits final answers through its live stream, and the CLI stores one final-range entry per completed turn without duplicating terminal output.</p>
-                        <p>Both <code>AgentMcpClient</code> and <code>MCPBrowserClient</code> expose <code>getAgentStatus()</code> and <code>ensureAgentRunning()</code>. The latter reads Marketplace state first, avoids a repeated enable request when the target already runs, otherwise submits the existing <code>enable_agent</code> action, and waits for live runtime status before the caller invokes the target. Enable mode is caller-controlled: the clients include <code>mode</code> only when supplied and otherwise leave Marketplace's isolated default intact. Agent-side calls use request-signed assertions; browser-side calls reuse the authenticated session and therefore retain normal Marketplace administrator checks.</p>
+                        <h3>Asynchronous tools</h3>
+                        <p>A tool marked <code>async</code> is queued by <code>Agent/server/TaskQueue.mjs</code> and returns task metadata immediately. The queue stores its state in <code>.tasksQueue</code>, runs up to ten tasks concurrently by default, and accepts <code>maxParallelTasks</code> from the MCP configuration. Pending tasks resume after restart, while tasks that were running are returned to the pending state.</p>
+                        <p>Each queued command receives a unique task identifier in its payload. Tool-specific <code>timeoutMs</code> limits execution time. The Router can obtain task state through <code>/task</code> or <code>/getTaskStatus</code>, and can cancel a task through <code>/task/cancel</code>; each operation requires a Router Request token bound to that exact task operation.</p>
                     </div>
 
-                    <div class="doc-section">
-                        <h2>Performance Considerations</h2>
-                        
-                        <h3>Container Optimization</h3>
-                        <ul style="margin-left: 2rem;">
-                            <li>Reuse existing containers when possible</li>
-                            <li>Lazy image pulling</li>
-                            <li>Shared base layers between agents</li>
-                            <li>Volume mount caching</li>
-                        </ul>
-
-                        <h3>Network Efficiency</h3>
-                        <ul style="margin-left: 2rem;">
-                            <li>Private in-box TCP targets avoid physical-host publication</li>
-                            <li>HTTP keep-alive for persistent connections</li>
-                            <li>WebSocket for real-time communication</li>
-                            <li>Request buffering and batching</li>
-                        </ul>
-
-                        <h3>Resource Management</h3>
-                        <ul style="margin-left: 2rem;">
-                            <li>Explicit scoped cleanup through the separate core and host lifecycle commands</li>
-                            <li>PID file tracking for process management</li>
-                            <li>Log rotation for long-running services</li>
-                            <li>Memory-efficient streaming for large outputs</li>
-                        </ul>
-                    </div>
                 </div>
             </div>
         </div>
     </main>
 
-    <footer>
-        <div class="container">
-            <p>&copy; 2025 Ploinky Project. Built with security and simplicity in mind.</p>
-            <p>
-                <a href="https://github.com/AssistOS-AI/ploinky">GitHub</a> •
-                <a href="index.html">Home</a> • 
-                <a href="cli-reference.html">CLI Reference</a>
-            </p>
-        </div>
-    </footer>
+    <div data-include="partials/footer.html"></div>
 
     <script>
-        // Theme toggle
-        const themeToggle = document.getElementById('themeToggle');
-        const body = document.body;
-        
-        const savedTheme = localStorage.getItem('theme') || 'light';
-        body.setAttribute('data-theme', savedTheme);
-        themeToggle.textContent = savedTheme === 'dark' ? '☀️' : '🌙';
-        
-        themeToggle.addEventListener('click', () => {
-            const currentTheme = body.getAttribute('data-theme');
-            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
-            body.setAttribute('data-theme', newTheme);
-            localStorage.setItem('theme', newTheme);
-            themeToggle.textContent = newTheme === 'dark' ? '☀️' : '🌙';
-        });
-
         // Highlight active section in sidebar
-        const sections = document.querySelectorAll('.doc-section[id]');
         const navLinks = document.querySelectorAll('.sidebar a');
-        
-        window.addEventListener('scroll', () => {
-            let current = '';
+        const navigationTargets = new Set([...navLinks].map(link => link.getAttribute('href')));
+        const sections = [...document.querySelectorAll('.doc-section[id]')]
+            .filter(section => navigationTargets.has(`#${section.id}`));
+
+        function updateActiveSection() {
+            let current = sections[0]?.id || '';
             sections.forEach(section => {
                 const rect = section.getBoundingClientRect();
                 if (rect.top <= 100) {
                     current = section.getAttribute('id');
                 }
             });
-            
+
             navLinks.forEach(link => {
                 link.classList.remove('active');
                 if (link.getAttribute('href') === `#${current}`) {
                     link.classList.add('active');
                 }
             });
-        });
+        }
+
+        window.addEventListener('scroll', updateActiveSection);
+        updateActiveSection();
     </script>
 </body>
 </html>

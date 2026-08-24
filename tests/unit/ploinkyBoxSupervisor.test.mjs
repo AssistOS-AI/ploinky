@@ -770,7 +770,7 @@ test('start passes the native host address into the bounded in-box runtime', asy
     assert.equal(boundedOptions.agentlibRef, 'master');
 });
 
-test('bounded start requires the external Dashboard URL and preserves normalized argv', async () => {
+test('bounded start requires the external Router URL and preserves normalized argv', async () => {
     const output = { value: '', write(chunk) { this.value += String(chunk); } };
     const calls = [];
     const status = await runBoundedCoreStart(
@@ -783,11 +783,11 @@ test('bounded start requires the external Dashboard URL and preserves normalized
             async stream(command, args, options) {
                 calls.push([command, args, options]);
                 options.stdout.write('[INFO] Debug mode enabled.\n');
-                options.stdout.write('[start] Dashboard: http://127.0.0.1:19090/dashboard\n');
+                options.stdout.write('[start] Router: http://127.0.0.1:19090\n');
                 return {
                     ok: true,
                     status: 0,
-                    stdout: '[INFO] Debug mode enabled.\n[start] Dashboard: http://127.0.0.1:19090/dashboard\n',
+                    stdout: '[INFO] Debug mode enabled.\n[start] Router: http://127.0.0.1:19090\n',
                     stderr: '',
                 };
             },
@@ -823,7 +823,7 @@ test('bounded start requires the external Dashboard URL and preserves normalized
                 return {
                     ok: true,
                     status: 0,
-                    stdout: '[start] Dashboard: http://127.0.0.1:8080/dashboard\n',
+                    stdout: '[start] Router: http://127.0.0.1:8080\n',
                     stderr: '',
                 };
             },
@@ -848,9 +848,9 @@ test('bounded start requires the external Dashboard URL and preserves normalized
 
     await assert.rejects(() => runBoundedCoreStart(
         { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090, 17891,
-        { stream: async () => ({ ok: true, status: 0, stdout: '[start] Dashboard: http://127.0.0.1:8080/dashboard\n', stderr: '' }) },
+        { stream: async () => ({ ok: true, status: 0, stdout: '[start] Router: http://127.0.0.1:8080\n', stderr: '' }) },
         { stdout: { write() {} }, stderr: { write() {} } },
-    ), /public Dashboard URL/);
+    ), /public Router URL/);
 });
 
 test('public health connects to the published port with matching authority', async (t) => {

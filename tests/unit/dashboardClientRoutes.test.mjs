@@ -2,27 +2,25 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { getLogPath } from '../../cli/commands/logUtils.js';
-import { LOGS_DIR, PLOINKY_DIR } from '../../cli/utils/config.js';
 
-test('dashboard log sources resolve through the canonical Ploinky directories', () => {
-    assert.equal(getLogPath('router'), path.join(LOGS_DIR, 'router.log'));
-    assert.equal(getLogPath('policy'), path.join(PLOINKY_DIR, 'data', 'router-security', 'policy-audit.log'));
-    assert.equal(getLogPath('unknown'), null);
+test('retired dashboard stays absent while Router and Policy use Ploinky-owned files', async () => {
+    const routingSource = await fs.readFile(path.resolve('cli/server/RoutingServer.js'), 'utf8');
+    const loggerSource = await fs.readFile(path.resolve('cli/server/utils/logger.js'), 'utf8');
+    const policySource = await fs.readFile(path.resolve('cli/server/policy/FileSystemPolicyAuditSink.js'), 'utf8');
+    assert.doesNotMatch(routingSource, /handleDashboard|isRouteMount\(pathname, '\/dashboard'\)/);
+    assert.match(loggerSource, /router\.log|appendFileSync/);
+    assert.match(policySource, /policy-audit\.log|appendFileSync/);
 });
 
-test('router dashboard exposes only generic read-only monitoring contracts', async () => {
-    const source = await fs.readFile(path.resolve('cli/server/handlers/dashboard.js'), 'utf8');
-    assert.doesNotMatch(source, /Location|resolveDashboardLocation|appConfig\.routes/);
-    assert.match(source, /readOnly: true/);
-    assert.match(source, /pathname === '\/tail'/);
-    assert.match(source, /'router', 'policy'/);
-    assert.match(source, /!follow && !fs\.existsSync\(logPath\)/);
-    assert.match(source, /follow \? \['-F'\] : \[\]/);
-    assert.match(source, /cleanupWhenResponseCloses\(res,/);
-    assert.doesNotMatch(source, /req\.on\('close'/);
-    assert.doesNotMatch(source, /pathname === '\/run'/);
-    assert.doesNotMatch(source, /DIRECT_CLI_PATH|readJsonBody|resolveAssetPath/);
+test('private Router exposes one capability-bound workspace-log operation endpoint', async () => {
+    const routingSource = await fs.readFile(path.resolve('cli/server/RoutingServer.js'), 'utf8');
+    const planSource = await fs.readFile(path.resolve('cli/server/edgeRoutePlan.js'), 'utf8');
+    const privateSource = await fs.readFile(path.resolve('cli/server/privateRouter.js'), 'utf8');
+    assert.match(planSource, /pathname === '\/api\/edge\/workspace-logs'/);
+    assert.match(privateSource, /workspaceLogConsumers/);
+    assert.match(privateSource, /paths: \['\/api\/edge\/workspace-logs'\]/);
+    assert.match(routingSource, /executeWorkspaceLogOperation/);
+    assert.doesNotMatch(routingSource, /streamWorkspaceLog/);
 });
 
 test('workspace metrics collection is asynchronous and publishes a safe projection', async () => {

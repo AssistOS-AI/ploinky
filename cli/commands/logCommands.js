@@ -45,6 +45,7 @@ export const SANDBOX_LOG_RUNTIMES = Object.freeze(['bwrap', 'seatbelt']);
 // Literal unqualified `router` is reserved by the log grammar and always
 // selects Router logs, even when an agent alias uses the same spelling.
 export const ROUTER_LOG_TARGET = 'router';
+
 export const DEFAULT_LAST_LINES = 200;
 export const MAX_LAST_LINES = 10000;
 export const TAIL_INITIAL_LINES = 10;
@@ -57,8 +58,8 @@ function writeLogDiagnostic(errorOutput, message) {
 
 export const LOG_USAGE = [
     'Usage:',
-    '  logs tail [router|<agent>] [--startup]',
-    '  logs last [<count>] [router|<agent>] [--startup]',
+    '  logs tail [router|agent] [--startup]',
+    '  logs last [<count>] [router|agent] [--startup]',
     '',
     `<count> is one exact integer between 1 and ${MAX_LAST_LINES}; it defaults to ${DEFAULT_LAST_LINES}.`,
     '--startup follows only the current no-wait startup log and requires an agent reference.',
@@ -132,38 +133,30 @@ export function parseLogCommandArgs(args = []) {
         lineCount = exactLineCount(positionals[0]);
         target = positionals[1];
     } else if (positionals.length === 1) {
-        // A number-shaped positional is always a count attempt, so `0`, `-1`,
-        // and `1.5` fail as malformed counts instead of silently becoming an
-        // agent reference. Anything else is the target.
-        if (COUNT_SHAPED.test(positionals[0])) lineCount = exactLineCount(positionals[0]);
-        else target = positionals[0];
+        if (COUNT_SHAPED.test(positionals[0])) {
+            lineCount = exactLineCount(positionals[0]);
+        } else target = positionals[0];
     }
 
-    const isRouter = target === ROUTER_LOG_TARGET;
-    if (startup && isRouter) {
+    if (startup && target === ROUTER_LOG_TARGET) {
         throw new LogUsageError('logs: --startup requires one agent reference');
     }
 
     return Object.freeze({
         subcommand,
         target,
-        isRouter,
         lineCount,
         initialLines: TAIL_INITIAL_LINES,
         startup,
+        isRouter: target === ROUTER_LOG_TARGET,
     });
 }
 
-// Router logs are one workspace-owned file. The descriptor stays open for the
-// whole read or follow, so replacing `router.log` never redirects the reader.
-async function runRouterSource(command, {
-    output,
-    errorOutput,
-    logsDir,
-    signal,
-    fsApi,
-    sleepImpl,
-}) {
+async function runRouterSource(command, { output, errorOutput, logsDir, signal, fsApi, sleepImpl }) {
+    if (command.startup) {
+        writeLogDiagnostic(errorOutput, 'logs: --startup requires one agent reference');
+        return 1;
+    }
     let opened;
     try {
         opened = openVerifiedLogFile({ ...routerLogSource({ logsDir }), fsApi });
@@ -177,10 +170,7 @@ async function runRouterSource(command, {
     }
     try {
         if (command.subcommand === 'last') {
-            const suffix = readLastLinesFromDescriptor(opened.descriptor, {
-                lineCount: command.lineCount,
-                fsApi,
-            });
+            const suffix = readLastLinesFromDescriptor(opened.descriptor, { lineCount: command.lineCount, fsApi });
             if (suffix.length) await writeWithBackpressure(output, suffix, { signal });
             return 0;
         }
@@ -799,7 +789,6 @@ export async function runLogCommand(args = [], {
     if (command.isRouter) {
         return runRouterSource(command, { output, errorOutput, logsDir, signal, fsApi, sleepImpl });
     }
-
     return runAgentSource(command, {
         output,
         errorOutput,

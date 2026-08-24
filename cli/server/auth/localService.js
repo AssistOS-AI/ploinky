@@ -134,7 +134,7 @@ function normalizeRoles(input) {
     const values = [];
     for (const entry of raw) {
         let normalized = String(entry || '').trim();
-        // Map the legacy base role `local` to the canonical `user` (DS013).
+        // Map the legacy base role `local` to the canonical `user` (DS015).
         if (normalized === 'local') {
             normalized = 'user';
         }

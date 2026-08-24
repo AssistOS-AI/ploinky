@@ -5,33 +5,24 @@ test_logs_tail_router() {
   require_var "TEST_ROUTER_LOG" || return 1
 
   local router_log="$TEST_ROUTER_LOG"
-  if [[ ! -f "$router_log" ]]; then
-    echo "Router log file '${router_log}' not found." >&2
-    return 1
-  fi
-
-  if [[ ! -s "$router_log" ]]; then
-    echo "Router log file '${router_log}' is empty." >&2
+  if [[ ! -f "$router_log" || ! -s "$router_log" ]]; then
+    echo "Router log file '${router_log}' is missing or empty." >&2
     return 1
   fi
 
   local output=""
   local status=0
-  output=$(timeout 2s "$PLOINKY_FAST_CLI" logs tail 2>&1) || status=$?
-
+  output=$(timeout 2s "$PLOINKY_FAST_CLI" logs tail router 2>&1) || status=$?
   if (( status != 0 && status != 124 )); then
-    echo "'ploinky logs tail' failed with exit status ${status}." >&2
+    echo "'ploinky logs tail router' failed with exit status ${status}." >&2
     printf '%s\n' "$output" >&2
     return 1
   fi
-
   output=${output//$'\r'/}
   if [[ -z "${output//[[:space:]]/}" ]]; then
-    echo "'ploinky logs tail' produced no log output." >&2
+    echo "'ploinky logs tail router' produced no log output." >&2
     return 1
   fi
-
-  return 0
 }
 
 # Resolves the container key the log command must address for the fixture's
@@ -80,37 +71,28 @@ test_logs_last_five() {
   require_var "TEST_ROUTER_LOG" || return 1
 
   local router_log="$TEST_ROUTER_LOG"
-  if [[ ! -f "$router_log" ]]; then
-    echo "Router log file '${router_log}' not found." >&2
-    return 1
-  fi
-
-  if [[ ! -s "$router_log" ]]; then
-    echo "Router log file '${router_log}' is empty." >&2
+  if [[ ! -f "$router_log" || ! -s "$router_log" ]]; then
+    echo "Router log file '${router_log}' is missing or empty." >&2
     return 1
   fi
 
   local output
-  if ! output=$(ploinky logs last 5); then
-    echo "'ploinky logs last 5' failed." >&2
+  if ! output=$(ploinky logs last 5 router); then
+    echo "'ploinky logs last 5 router' failed." >&2
     printf '%s\n' "$output" >&2
     return 1
   fi
-
   output=${output//$'\r'/}
   local _log_lines=()
   local log_line
   while IFS= read -r log_line || [[ -n "$log_line" ]]; do
     _log_lines+=("$log_line")
   done <<<"$output"
-  local line_count=${#_log_lines[@]}
-  if (( line_count != 5 )); then
-    echo "Expected 5 log lines, got ${line_count}." >&2
+  if (( ${#_log_lines[@]} != 5 )); then
+    echo "Expected 5 log lines, got ${#_log_lines[@]}." >&2
     printf '%s\n' "$output" >&2
     return 1
   fi
-
-  return 0
 }
 
 # `logs last <N> <agent>` must address the registered runtime for one exact
@@ -204,7 +186,7 @@ test_logs_agent_reference_forms() {
   return 0
 }
 
-# Strict count parsing must reject anything the Dashboard also refuses.
+# Strict count parsing rejects malformed counts; a count without a target reads Router logs.
 test_logs_rejects_invalid_counts() {
   load_state
   local candidate
@@ -216,10 +198,8 @@ test_logs_rejects_invalid_counts() {
       return 1
     fi
   done
-  local status=0
-  ploinky logs last 5 >/dev/null 2>&1 || status=$?
-  if (( status != 0 )); then
-    echo "'logs last 5' returned ${status} instead of succeeding." >&2
+  if ! ploinky logs last 5 >/dev/null 2>&1; then
+    echo "'logs last 5' did not use the default Router target." >&2
     return 1
   fi
   return 0
@@ -429,8 +409,10 @@ _logs_box_signal_case() {
   local cli="$3" engine="$4" container_id="$5"
   local output_file
   output_file=$(mktemp "${TMPDIR:-/tmp}/ploinky-box-logs-signal.XXXXXX") || return 1
+  local target
+  target=$(_logs_demo_container) || return 1
 
-  "$cli" logs tail router >"$output_file" 2>&1 &
+  "$cli" logs tail "$target" >"$output_file" 2>&1 &
   local wrapper_pid=$!
   local observed=0
   local attempt

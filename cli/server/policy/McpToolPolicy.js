@@ -4,7 +4,7 @@ import path from 'node:path';
 import { REPOS_DIR } from '../../utils/config.js';
 
 /**
- * McpToolPolicy — MCP tool access decisions (DS014). Maps mcp-config `tags` to
+ * McpToolPolicy — MCP tool access decisions (DS016). Maps mcp-config `tags` to
  * default access classes, bootstraps persisted policy at boot (persisted wins),
  * and evaluates whether a caller may invoke a tool. Fail-closed: missing /
  * unknown / ambiguous policy denies.
@@ -165,7 +165,7 @@ export class McpToolPolicy {
 
     // Decide whether `caller` may read/list MCP resources. Resources are not in
     // the per-tool policy model (per-resource admin/internal tagging is deferred,
-    // DS014); they are an `authenticated`-class capability — any router-
+    // DS016); they are an `authenticated`-class capability — any router-
     // authenticated session (user/guest/admin) may read, but internal agent
     // callers and anonymous callers may not. Fail-closed for unknown kinds.
     evaluateResource({ caller }) {

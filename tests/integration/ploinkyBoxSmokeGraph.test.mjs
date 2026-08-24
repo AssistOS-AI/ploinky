@@ -75,9 +75,9 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     });
     assert.equal(started.identity.instance, harness.identity.instance);
     assert.match(harness.output.bytes,
-        new RegExp(`\\[start\\] Dashboard: http://127\\.0\\.0\\.1:${route.hostPort}/dashboard`));
+        new RegExp(`\\[start\\] Router: http://127\\.0\\.0\\.1:${route.hostPort}`));
     assert.doesNotMatch(harness.output.bytes,
-        /\[start\] Dashboard: http:\/\/127\.0\.0\.1:8080\/dashboard/);
+        /\[start\] Router: http:\/\/127\.0\.0\.1:8080(?:\s|$)/);
     assert.equal(harness.output.bytes.includes(keyHash), false);
     assert.equal(harness.output.bytes.includes(keyValue), false);
 
