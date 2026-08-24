@@ -51,16 +51,35 @@ function nestedValue(value, paths) {
     return undefined;
 }
 
+function podmanBackendFields(info) {
+    return [
+        nestedValue(info, [['host', 'id'], ['Host', 'ID']]),
+        nestedValue(info, [['store', 'graphRoot'], ['Store', 'GraphRoot']]),
+        nestedValue(info, [['store', 'runRoot'], ['Store', 'RunRoot']]),
+        nestedValue(info, [['version', 'APIVersion'], ['Version', 'APIVersion']]),
+    ];
+}
+
 function engineIdentity(name, info) {
     const stableFields = name === 'podman'
-        ? [
-            nestedValue(info, [['host', 'id'], ['Host', 'ID']]),
-            nestedValue(info, [['store', 'graphRoot'], ['Store', 'GraphRoot']]),
-            nestedValue(info, [['store', 'runRoot'], ['Store', 'RunRoot']]),
-            nestedValue(info, [['version', 'APIVersion'], ['Version', 'APIVersion']]),
-        ]
+        ? podmanBackendFields(info)
         : [info.ID, info.DockerRootDir, info.ServerVersion, info.OSType];
     return sha256(Buffer.from(JSON.stringify([name, ...stableFields])));
+}
+
+function isSamePodmanBackend(podmanInfo, dockerInfo) {
+    const canonical = (info) => podmanBackendFields(info)
+        .map((value) => String(value ?? '').trim());
+    const podmanFields = canonical(podmanInfo);
+    const dockerFields = canonical(dockerInfo);
+    // GraphRoot, RunRoot, and the Podman API version establish that `docker`
+    // exposes the same Podman storage/runtime rather than a separate Docker
+    // engine that happens to report one coincidentally similar host field.
+    if (podmanFields.slice(1).some((value) => value === '')
+        || dockerFields.slice(1).some((value) => value === '')) {
+        return false;
+    }
+    return isDeepStrictEqual(podmanFields, dockerFields);
 }
 
 function probeEngine(name, runner) {
@@ -365,6 +384,19 @@ function inspectEngineResources(engine, identity, runner) {
     }
 }
 
+function inventoriesIdentifySameContainer(left, right) {
+    if (left?.state !== right?.state) return false;
+    if (left.state === 'absent') return true;
+    if (left.state !== 'owned') return false;
+    const leftContainer = left.handles?.container;
+    const rightContainer = right.handles?.container;
+    return Boolean(leftContainer && rightContainer)
+        && leftContainer.id === rightContainer.id
+        && leftContainer.name === rightContainer.name
+        && leftContainer.pathHash === rightContainer.pathHash
+        && isDeepStrictEqual(leftContainer.labels, rightContainer.labels);
+}
+
 export function discoverBoxOwnership(identity, {
     platform = process.platform,
     env = process.env,
@@ -466,7 +498,17 @@ export function discoverBoxOwnership(identity, {
                 engines: { podman, docker },
             };
         }
-        if (dockerInventory.state !== 'absent') {
+        const samePodmanBackend = isSamePodmanBackend(podman.info, docker.info);
+        if (samePodmanBackend
+            && !inventoriesIdentifySameContainer(podmanInventory, dockerInventory)) {
+            return {
+                state: 'foreign',
+                message: 'Docker Podman-compatibility frontend returned an inconsistent Box inventory',
+                engines: { podman, docker },
+                inventories: { podman: podmanInventory, docker: dockerInventory },
+            };
+        }
+        if (!samePodmanBackend && dockerInventory.state !== 'absent') {
             return {
                 state: 'foreign',
                 message: 'Docker has an exact-name or labeled resource conflicting with this Box',
