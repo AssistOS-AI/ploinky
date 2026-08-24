@@ -128,6 +128,7 @@ test('anchor materialization requires the matching lock and rejects unsafe targe
     const root = fixture(t);
     const workspace = path.join(root, 'workspace');
     fs.mkdirSync(workspace);
+    fs.chmodSync(workspace, 0o775);
     const identity = resolveWorkspaceIdentity({ env: {}, cwd: () => workspace });
     const lock = {
         assertHeld(instance) {
@@ -136,19 +137,38 @@ test('anchor materialization requires the matching lock and rejects unsafe targe
     };
 
     assert.throws(() => materializeIdentityAnchor(identity, null), /requires its mutation lock/);
-    assert.deepEqual(materializeIdentityAnchor(identity, lock), {
-        created: true,
-        path: path.join(workspace, '.ploinky'),
-    });
+    const created = materializeIdentityAnchor(identity, lock);
+    assert.equal(created.created, true);
+    assert.equal(created.path, path.join(workspace, '.ploinky'));
+    assert.equal(created.rootFingerprint.mode & 0o777, 0o755);
+    assert.equal(created.anchorFingerprint.mode & 0o777, 0o700);
+    assert.equal(fs.statSync(workspace).mode & 0o777, 0o755);
+    assert.equal(fs.statSync(path.join(workspace, '.ploinky')).mode & 0o777, 0o700);
     assert.deepEqual(fs.readdirSync(path.join(workspace, '.ploinky')), []);
-    assert.equal(materializeIdentityAnchor(identity, lock).created, false);
+    const refreshed = resolveWorkspaceIdentity({ env: {}, cwd: () => workspace });
+    assert.equal(materializeIdentityAnchor(refreshed, lock).created, false);
 
     fs.rmdirSync(path.join(workspace, '.ploinky'));
     fs.writeFileSync(path.join(workspace, '.ploinky'), 'foreign');
-    assert.throws(() => materializeIdentityAnchor(identity, lock), /not a directory/);
+    assert.throws(() => materializeIdentityAnchor(refreshed, lock), /not a directory/);
     fs.unlinkSync(path.join(workspace, '.ploinky'));
     fs.symlinkSync(root, path.join(workspace, '.ploinky'), 'dir');
-    assert.throws(() => materializeIdentityAnchor(identity, lock), /not a directory/);
+    assert.throws(() => materializeIdentityAnchor(refreshed, lock), /not a directory/);
+});
+
+test('permission materialization removes write bits without adding user permissions', (t) => {
+    const root = fixture(t);
+    const workspace = path.join(root, 'workspace');
+    const anchor = path.join(workspace, '.ploinky');
+    fs.mkdirSync(anchor, { recursive: true });
+    fs.chmodSync(workspace, 0o700);
+    fs.chmodSync(anchor, 0o775);
+    const identity = resolveWorkspaceIdentity({ env: {}, cwd: () => workspace });
+    const result = materializeIdentityAnchor(identity, { assertHeld() {} });
+
+    assert.equal(result.created, false);
+    assert.equal(fs.statSync(workspace).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(anchor).mode & 0o777, 0o700);
 });
 
 test('anchor materialization fails closed on a concurrent EEXIST', (t) => {

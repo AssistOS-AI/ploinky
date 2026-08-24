@@ -113,10 +113,13 @@ export function createBoxSupervisor({
         return discover(identity, runner, platform, env);
     }
 
-    async function lockedMutation(execute, authorize = assertMutableOwnership) {
+    async function lockedMutation(execute, authorize = assertMutableOwnership, {
+        materializeExistingAnchor = false,
+    } = {}) {
         return withWorkspaceMutationLock({
             resolveIdentity,
             lockManager,
+            materializeExistingAnchor,
             beforeAnchor(identity) {
                 return authorize(inspect(identity));
             },
@@ -152,7 +155,7 @@ export function createBoxSupervisor({
                 preserveAgentlib: true,
             });
             return Object.freeze({ identity, ...prepared, containerId, engine: ownership.engine });
-        });
+        }, assertMutableOwnership, { materializeExistingAnchor: true });
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
@@ -222,7 +225,7 @@ export function createBoxSupervisor({
             );
             await healthCheck(prepared.hostPort);
             return Object.freeze({ identity, ...prepared, containerId });
-        });
+        }, assertMutableOwnership, { materializeExistingAnchor: true });
     }
 
     async function runStopTransaction() {

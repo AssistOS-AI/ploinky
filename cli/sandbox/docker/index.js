@@ -16,6 +16,7 @@ export {
     listAllContainerNames,
     stopAndRemove,
     stopAndRemoveMany,
+    stopCoordinatedConfiguredAgents,
     stopConfiguredAgents,
     waitForContainers
 } from './containerFleet.js';

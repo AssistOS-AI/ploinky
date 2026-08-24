@@ -39,6 +39,12 @@ function owned(identity, { running = true } = {}) {
     };
 }
 
+function liveIdentityResolver(identity) {
+    return () => buildWorkspaceIdentity(identity.workspaceRoot, {
+        markerFound: fs.existsSync(identity.anchorPath),
+    });
+}
+
 function matrixSupervisor(identity, events) {
     const ownership = owned(identity);
     let acquisitions = 0;
@@ -77,7 +83,7 @@ function matrixSupervisor(identity, events) {
         },
     };
     const supervisor = createBoxSupervisor({
-        resolveIdentity: () => identity,
+        resolveIdentity: liveIdentityResolver(identity),
         discover: () => ownership,
         lockManager,
         runner,
@@ -161,7 +167,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
         size: 123,
     };
     const stagedSupervisor = createBoxSupervisor({
-        resolveIdentity: () => identity,
+        resolveIdentity: liveIdentityResolver(identity),
         discover: () => owned(identity),
         lockManager: {
             async acquire(instance) {
@@ -190,7 +196,8 @@ test('start stages host-owned edge desired state under the Box lock before core 
             action: 'reused',
         }),
         readEdgeDesired(selectedIdentity) {
-            assert.equal(selectedIdentity, identity);
+            assert.equal(selectedIdentity.workspaceRoot, identity.workspaceRoot);
+            assert.equal(selectedIdentity.instance, identity.instance);
             events.push('read-edge-desired');
             return candidate;
         },

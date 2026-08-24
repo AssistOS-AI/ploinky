@@ -101,6 +101,7 @@ import {
 } from '../utils/security/generatedRouterDescriptor.js';
 import { sanitizeDiagnosticText } from '../utils/diagnosticText.js';
 import { waitForChildSpawn } from '../utils/childSpawn.js';
+import { prepareWorkspacePrivateDirectories } from '../utils/runtime/workspacePrivateDirectories.js';
 import {
   assertSafeRelativeSegment,
   ensureVerifiedProducerDirectory,
@@ -1809,6 +1810,10 @@ async function startWorkspace(staticAgentArg, portArg, {
   if (!requestedStaticAgent) {
     throw new Error('start: missing static agent or port. Usage: start <staticAgent> <port> (first time).');
   }
+  // Establish every producer-only status/log directory before repositories,
+  // Router state, or agent runtimes can be mutated. Ubuntu commonly creates
+  // directories as 0775 under umask 0002; these exact leaves must remain 0700.
+  prepareWorkspacePrivateDirectories();
   try {
     prepareDefaultBootRepositories({
       branchPolicy,

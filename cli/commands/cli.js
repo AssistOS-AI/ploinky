@@ -29,7 +29,7 @@ import {
     getRuntime,
     containerExists,
     isContainerRunning,
-    stopConfiguredAgents,
+    stopCoordinatedConfiguredAgents,
     destroyWorkspaceContainers,
     ensureAgentService
 } from '../sandbox/docker/index.js';
@@ -714,11 +714,20 @@ async function handleCommand(args) {
                 const cfg = workspaceSvc.getConfig();
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) { console.error('restart: start is not configured. Run: start <staticAgent> <port>'); break; }
                 resolvePersistedRouterPort();
-                inactivateEdgeRoutingGeneration('cli-workspace-restart');
-                console.log('[restart] Stopping Router and configured agents...');
-                killRouterIfRunning();
-                console.log('[restart] Stopping configured agent containers...');
-                const list = stopConfiguredAgents();
+                console.log('[restart] Stopping detached no-wait workers...');
+                await quiesceNoWaitWorkers();
+                const list = await withWorkspaceMutationLease({
+                    operation: 'workspace-restart-stop',
+                }, async () => {
+                    assertNoLiveNoWaitWorkers();
+                    inactivateEdgeRoutingGeneration('cli-workspace-restart');
+                    console.log('[restart] Stopping Router and configured agents...');
+                    killRouterIfRunning({ strict: true });
+                    console.log('[restart] Stopping configured agent containers...');
+                    const stopped = stopCoordinatedConfiguredAgents({ strict: true });
+                    assertNoLiveNoWaitWorkers();
+                    return stopped;
+                });
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
                 else { console.log('[restart] No containers to stop.'); }
                 console.log('[restart] Starting workspace...');
@@ -776,7 +785,7 @@ async function handleCommand(args) {
                     console.log('[stop] Stopping RoutingServer...');
                     killRouterIfRunning({ strict: true });
                     console.log('[stop] Removing configured agent runtimes for source transition...');
-                    const removed = stopConfiguredAgents({ strict: true, remove: true });
+                    const removed = stopCoordinatedConfiguredAgents({ strict: true, remove: true });
                     assertNoLiveNoWaitWorkers();
                     return removed;
                 });
@@ -787,22 +796,28 @@ async function handleCommand(args) {
                 console.log(`Removed ${list.length} configured agent runtimes for source transition.`);
                 break;
             }
-            inactivateEdgeRoutingGeneration('cli-workspace-stop');
-            console.log('[stop] Stopping RoutingServer...');
-            killRouterIfRunning({ strict: true });
             console.log('[stop] Stopping detached no-wait workers...');
             const noWaitWorkers = await quiesceNoWaitWorkers();
             if (noWaitWorkers.length) {
                 console.log('[stop] Stopped detached no-wait workers:');
                 noWaitWorkers.forEach((worker) => console.log(` - ${worker.containerName}`));
             }
-            console.log('[stop] Stopping configured agent containers...');
-            const list = stopConfiguredAgents({ strict: true });
+            const list = await withWorkspaceMutationLease({
+                operation: 'workspace-stop',
+            }, async () => {
+                assertNoLiveNoWaitWorkers();
+                inactivateEdgeRoutingGeneration('cli-workspace-stop');
+                console.log('[stop] Stopping RoutingServer...');
+                killRouterIfRunning({ strict: true });
+                console.log('[stop] Stopping configured agent containers...');
+                const stopped = stopCoordinatedConfiguredAgents({ strict: true });
+                assertNoLiveNoWaitWorkers();
+                return stopped;
+            });
             if (list.length) {
                 console.log('[stop] Stopped containers:');
                 list.forEach(n => console.log(` - ${n}`));
             }
-            assertNoLiveNoWaitWorkers();
             console.log(`Stopped ${list.length} configured agent containers.`);
             break;
         }

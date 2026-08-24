@@ -246,6 +246,7 @@ export async function withWorkspaceMutationLock({
     execute,
     beforeAnchor = async () => undefined,
     materializeAnchor = materializeIdentityAnchor,
+    materializeExistingAnchor = false,
     maxHandoffs = 4,
 }) {
     if (typeof resolveIdentity !== 'function' || typeof execute !== 'function') {
@@ -270,10 +271,36 @@ export async function withWorkspaceMutationLock({
                 continue;
             }
             const prepared = await beforeAnchor(resolvedUnderLock, lock);
-            if (!resolvedUnderLock.markerFound) {
-                materializeAnchor(resolvedUnderLock, lock);
+            let transactionIdentity = resolvedUnderLock;
+            if (!resolvedUnderLock.markerFound || materializeExistingAnchor) {
+                const materialized = await materializeAnchor(resolvedUnderLock, lock);
+                // Native cleanup injects an explicit no-op materializer so it
+                // can remain read-only for a markerless workspace. The real
+                // materializer always returns both descriptor-pinned facts.
+                if (materialized) {
+                    const refreshed = resolveIdentity();
+                    const sameFingerprint = (expected, observed) => expected
+                        && observed
+                        && expected.device === observed.device
+                        && expected.inode === observed.inode
+                        && expected.mode === observed.mode
+                        && expected.uid === observed.uid
+                        && expected.directory === observed.directory
+                        && expected.symlinkTarget === observed.symlinkTarget;
+                    if (refreshed.workspaceRoot !== resolvedUnderLock.workspaceRoot
+                        || refreshed.instance !== resolvedUnderLock.instance
+                        || refreshed.pathHash !== resolvedUnderLock.pathHash
+                        || refreshed.markerFound !== true
+                        || !sameFingerprint(materialized.rootFingerprint, refreshed.rootFingerprint)
+                        || !sameFingerprint(materialized.anchorFingerprint, refreshed.anchorFingerprint)) {
+                        throw lockError(
+                            `Workspace identity changed during permission materialization at ${resolvedUnderLock.workspaceRoot}`,
+                        );
+                    }
+                    transactionIdentity = refreshed;
+                }
             }
-            return await execute(resolvedUnderLock, lock, prepared);
+            return await execute(transactionIdentity, lock, prepared);
         } finally {
             if (!released) {
                 lock.release();

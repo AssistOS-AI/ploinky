@@ -43,6 +43,28 @@ function fingerprint(stat) {
         .digest('hex');
 }
 
+function directoryIdentityFingerprint(stat) {
+    return Object.freeze({
+        device: String(stat.dev),
+        inode: String(stat.ino),
+        mode: stat.mode,
+        uid: stat.uid,
+        directory: stat.isDirectory(),
+        symlinkTarget: null,
+    });
+}
+
+function sameIdentityFingerprint(expected, observed) {
+    return expected
+        && observed
+        && expected.device === observed.device
+        && expected.inode === observed.inode
+        && expected.mode === observed.mode
+        && expected.uid === observed.uid
+        && expected.directory === observed.directory
+        && expected.symlinkTarget === observed.symlinkTarget;
+}
+
 function inspectDirectory(target, fsApi, {
     missing = 'Box data directory is missing',
     invalid = 'Box data path is not a real directory',
@@ -63,6 +85,7 @@ function inspectDirectory(target, fsApi, {
     return Object.freeze({
         path: target,
         fingerprint: fingerprint(stat),
+        identityFingerprint: directoryIdentityFingerprint(stat),
     });
 }
 
@@ -81,14 +104,17 @@ function assertWorkspaceRoot(identity, fsApi, code = 'PLOINKY_BOX_WORKSPACE_DATA
         device: String(stat.dev),
         inode: String(stat.ino),
         mode: stat.mode,
+        uid: stat.uid,
+        directory: stat.isDirectory(),
         symlinkTarget: stat.isSymbolicLink() ? fsApi.readlinkSync(identity.workspaceRoot) : null,
     };
     const expected = identity.rootFingerprint;
-    if (!expected
-        || observed.device !== expected.device
-        || observed.inode !== expected.inode
-        || observed.mode !== expected.mode
-        || observed.symlinkTarget !== expected.symlinkTarget) {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (stat.isSymbolicLink()
+        || !stat.isDirectory()
+        || (uid !== null && stat.uid !== uid)
+        || (stat.mode & 0o022) !== 0
+        || !sameIdentityFingerprint(expected, observed)) {
         throw workspaceDataError(
             `Workspace root changed before Box data mutation: ${identity.workspaceRoot}`,
             code,
@@ -145,6 +171,15 @@ function inspectParentChain(identity, fsApi, {
         invalid: 'Workspace identity anchor is not a real directory',
         code,
     });
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (!sameIdentityFingerprint(identity.anchorFingerprint, anchor.identityFingerprint)
+        || (uid !== null && anchor.identityFingerprint.uid !== uid)
+        || (anchor.identityFingerprint.mode & 0o022) !== 0) {
+        throw workspaceDataError(
+            `Workspace identity anchor changed before Box data mutation: ${identity.anchorPath}`,
+            code,
+        );
+    }
     const rootObserved = inspectPath(identity.boxDataRoot, fsApi);
     if (!rootObserved.exists) {
         if (!requireBoxRoot) return Object.freeze({ anchor, boxRoot: null });

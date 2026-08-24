@@ -6,6 +6,7 @@ import { PLOINKY_DIR } from '../../utils/config.js';
 import { loadAgents } from '../../utils/workspace.js';
 import {
     containerExists,
+    getAgentContainerName,
     getRuntime,
     isContainerRunning,
     isSandboxRuntime,
@@ -15,19 +16,67 @@ import {
 } from './common.js';
 import { clearLivenessState } from './healthProbes.js';
 import {
+    hasBwrapPidRecord,
     hasInvalidBwrapPidRecord,
     isBwrapProcessRunning,
     stopBwrapProcesses,
 } from '../bwrap/bwrapFleet.js';
 import {
+    NETWORK_LABELS,
     withNetworkLifecycleLock,
     workspaceNetworkIdentity,
 } from '../networkLifecycle.js';
 import { assertExactContainerOwnership } from './containerOwnership.js';
+import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
 const GENERATED_ROUTER_DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json';
 const GENERATED_ROUTER_DESCRIPTOR_ROOT = path.join(PLOINKY_DIR, 'run', 'router-descriptors');
 const CONTROL_TIMEOUT_MS = 5_000;
+const PREPARED_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isPlainRecord(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+}
+
+function assertCompletePreparedAgentRecord(name, record) {
+    const agentName = String(record?.agentName || '');
+    const repoName = String(record?.repoName || '');
+    const alias = String(record?.alias || '');
+    const instanceId = String(record?.instanceId || '');
+    const enableGeneration = String(record?.enableGeneration || '');
+    const createdAt = String(record?.createdAt || '');
+    const projectPath = String(record?.projectPath || '');
+    const runMode = String(record?.runMode || '');
+    const profile = String(record?.profile || '');
+    const config = record?.config;
+    const expectedName = getAgentContainerName(alias || agentName, repoName);
+    const complete = isPlainRecord(record)
+        && agentName.trim() === agentName
+        && Boolean(agentName)
+        && repoName.trim() === repoName
+        && Boolean(repoName)
+        && alias.trim() === alias
+        && name === expectedName
+        && PREPARED_ID_PATTERN.test(instanceId)
+        && PREPARED_ID_PATTERN.test(enableGeneration)
+        && instanceId.toLowerCase() !== enableGeneration.toLowerCase()
+        && Boolean(String(record.containerImage || '').trim())
+        && Boolean(createdAt)
+        && Number.isFinite(Date.parse(createdAt))
+        && path.isAbsolute(projectPath)
+        && Boolean(runMode.trim())
+        && Boolean(profile.trim())
+        && isPlainRecord(config)
+        && Array.isArray(config.binds)
+        && Array.isArray(config.env)
+        && Array.isArray(config.ports);
+    if (!complete) {
+        throw new Error(`fleet lifecycle for '${name}' is not one complete canonical prepared-agent record`);
+    }
+    return Object.freeze({ name, instanceId, enableGeneration });
+}
 
 function runContainerControl(runtime, args) {
     return spawnSync(runtime, args, {
@@ -48,6 +97,104 @@ function inspectExactContainer(runtime, identifier) {
     }
     const record = Array.isArray(parsed) ? parsed[0] : parsed;
     return record && typeof record === 'object' ? record : null;
+}
+
+function captureAllContainerInventory(runtime, {
+    control = runContainerControl,
+    inspect = inspectExactContainer,
+} = {}) {
+    const listed = control(runtime, ['ps', '--all', '--quiet', '--no-trunc']);
+    if (listed?.error || listed?.status !== 0) {
+        const detail = String(
+            listed?.error?.message
+            || listed?.stderr
+            || listed?.stdout
+            || `exit ${listed?.status ?? 'unknown'}`,
+        ).trim();
+        throw new Error(`cannot inventory all configured runtimes: ${detail}`);
+    }
+    const ids = String(listed.stdout || '')
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+    if (new Set(ids).size !== ids.length || ids.some((id) => !/^[a-f0-9]{64}$/.test(id))) {
+        throw new Error('all-container inventory returned malformed or duplicate immutable IDs');
+    }
+
+    const records = [];
+    const names = new Set();
+    for (const id of ids) {
+        const record = inspect(runtime, id);
+        const inspectedId = String(record?.Id || record?.ID || '').trim();
+        const name = String(record?.Name || record?.Names?.[0] || '')
+            .trim()
+            .replace(/^\//, '');
+        if (!record || inspectedId !== id || !name || names.has(name)) {
+            throw new Error(`all-container inventory changed while inspecting ${id}`);
+        }
+        names.add(name);
+        records.push(Object.freeze({
+            id,
+            name,
+            labels: Object.freeze({ ...(record?.Config?.Labels || record?.Labels || {}) }),
+        }));
+    }
+    return Object.freeze(records);
+}
+
+function preflightProvenStagedAbsence(entries, runtime, {
+    control = runContainerControl,
+    inspect = inspectExactContainer,
+    workspaceIdentity = workspaceNetworkIdentity,
+    sandboxPidRecordExists = hasBwrapPidRecord,
+} = {}) {
+    const candidates = [];
+    for (const [name, record] of entries) {
+        if (isSandboxRuntime(record?.runtime) || record?.type !== 'agent') continue;
+        const hasContainerId = Object.prototype.hasOwnProperty.call(record, 'containerId');
+        if (hasContainerId) {
+            if (!/^[a-f0-9]{64}$/.test(String(record.containerId || ''))) {
+                throw new Error(`fleet lifecycle for '${name}' has a malformed present registry container ID`);
+            }
+            if (!String(record.instanceId || '').trim()
+                || !String(record.enableGeneration || '').trim()) {
+                throw new Error(`fleet lifecycle for '${name}' requires a complete managed-agent registry identity`);
+            }
+            continue;
+        }
+        const candidate = assertCompletePreparedAgentRecord(name, record);
+        if (sandboxPidRecordExists(name)) {
+            throw new Error(`fleet lifecycle for '${name}' found sandbox PID authority for a staged runtime`);
+        }
+        candidates.push(candidate);
+    }
+    if (!candidates.length) return Object.freeze(new Set());
+
+    const workspaceHash = String(workspaceIdentity()?.hash || '');
+    if (!workspaceHash) {
+        throw new Error('staged runtime absence proof could not resolve the workspace identity');
+    }
+    const inventory = captureAllContainerInventory(runtime, { control, inspect });
+    const proven = new Set();
+    for (const candidate of candidates) {
+        for (const container of inventory) {
+            if (container.name === candidate.name) {
+                throw new Error(
+                    `fleet lifecycle for '${candidate.name}' found a same-name staged runtime without immutable registry ownership`,
+                );
+            }
+            const labels = container.labels;
+            if (String(labels[NETWORK_LABELS.workspace] || '') === workspaceHash
+                && String(labels[NETWORK_LABELS.instanceId] || '') === candidate.instanceId
+                && String(labels[NETWORK_LABELS.enableGeneration] || '') === candidate.enableGeneration) {
+                throw new Error(
+                    `fleet lifecycle for '${candidate.name}' found its staged identity under another container name`,
+                );
+            }
+        }
+        proven.add(candidate.name);
+    }
+    return Object.freeze(proven);
 }
 
 function captureRecordedGeneratedRouterDescriptor(record) {
@@ -273,8 +420,14 @@ function getContainerCandidates(name, rec) {
     return name ? [name] : [];
 }
 
-function stopConfiguredAgents({ fast = false, strict = false, remove = false } = {}) {
-    const agents = loadAgents();
+function stopConfiguredAgents({ fast = false, strict = false, remove = false } = {}, {
+    agents: suppliedAgents,
+    runtime: suppliedRuntime = null,
+    provenStagedAbsent = new Set(),
+    removeExact = removeExactContainerAndDescriptor,
+    listRunningNames = listRunningContainerNames,
+} = {}) {
+    const agents = suppliedAgents || loadAgents();
     const entries = Object.entries(agents || {})
         .filter(([name, rec]) => rec && (rec.type === 'agent' || rec.type === 'agentCore') && typeof name === 'string' && !name.startsWith('_'));
 
@@ -321,22 +474,26 @@ function stopConfiguredAgents({ fast = false, strict = false, remove = false } =
     // signal targets a revalidated immutable container ID while the shared
     // network lifecycle lock is held.
     const stoppedContainers = [];
-    let runtime = null;
+    let runtime = suppliedRuntime;
     for (const [name, rec] of containerEntries) {
+        if (provenStagedAbsent.has(name)) {
+            console.log(`[stop] ${rec?.agentName || name}: staged runtime is proven absent.`);
+            continue;
+        }
         try {
             runtime ||= getRuntime();
-            const result = removeExactContainerAndDescriptor(name, rec, runtime, {
+            const result = removeExact(name, rec, runtime, {
                 fast,
                 remove,
             });
             if (!result.found) {
                 console.log(`[stop] ${rec?.agentName || name}: no exact registered container found.`);
-                if (strict && listRunningContainerNames({ runtime }).has(name)) {
+                if (strict && listRunningNames({ runtime }).has(name)) {
                     failures.set(name, 'registered runtime name remains live without exact ownership');
                 }
                 continue;
             }
-            if (strict && listRunningContainerNames({ runtime }).has(name)) {
+            if (strict && listRunningNames({ runtime }).has(name)) {
                 failures.set(name, 'container remains live after stop');
                 continue;
             }
@@ -357,6 +514,62 @@ function stopConfiguredAgents({ fast = false, strict = false, remove = false } =
         throw error;
     }
     return [...bwrapStopped, ...stoppedContainers];
+}
+
+function stopCoordinatedConfiguredAgents({
+    fast = false,
+    strict = true,
+    remove = false,
+} = {}, {
+    load = loadAgents,
+    resolveRuntime = getRuntime,
+    insideBox = isInsideBox,
+    withLock = withNetworkLifecycleLock,
+    control = runContainerControl,
+    inspect = inspectExactContainer,
+    workspaceIdentity = workspaceNetworkIdentity,
+    sandboxPidRecordExists = hasBwrapPidRecord,
+    removeExact = removeExactContainerAndDescriptor,
+    listRunningNames = listRunningContainerNames,
+} = {}) {
+    return withLock(() => {
+        // Capture desired state under the same lifecycle lock that guards the
+        // absence proof and every exact runtime control. A pre-lock snapshot
+        // could become stale before classification and authorize a destructive
+        // transition against a newer generation.
+        const agents = load();
+        const entries = Object.entries(agents || {})
+            .filter(([name, record]) => record
+                && (record.type === 'agent' || record.type === 'agentCore')
+                && typeof name === 'string'
+                && !name.startsWith('_'));
+        const hasStagedContainerRecord = entries.some(([, record]) => (
+            record.type === 'agent'
+            && !isSandboxRuntime(record.runtime)
+            && !Object.prototype.hasOwnProperty.call(record, 'containerId')
+        ));
+        let runtime = null;
+        let provenStagedAbsent = new Set();
+        if (hasStagedContainerRecord) {
+            if (!insideBox()) {
+                throw new Error('staged runtime absence recovery is available only inside a managed Ploinky Box');
+            }
+            runtime = resolveRuntime();
+            provenStagedAbsent = preflightProvenStagedAbsence(entries, runtime, {
+                control,
+                inspect,
+                workspaceIdentity,
+                sandboxPidRecordExists,
+            });
+        }
+        return stopConfiguredAgents({ fast, strict, remove }, {
+            agents,
+            runtime,
+            provenStagedAbsent,
+            removeExact,
+            listRunningNames,
+        });
+    });
 }
 
 function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
@@ -480,6 +693,7 @@ export {
     stopAndRemove,
     stopAndRemoveMany,
     removeExactRegisteredContainer,
+    stopCoordinatedConfiguredAgents,
     stopConfiguredAgents,
     waitForContainers
 };

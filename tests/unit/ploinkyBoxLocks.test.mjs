@@ -149,3 +149,29 @@ test('bounded identity handoff releases the provisional lock before parent mutat
         `release:${resolved.instance}`,
     ]);
 });
+
+test('existing-anchor materialization refreshes the identity before mutation', async (t) => {
+    const root = fixture(t);
+    const workspace = path.join(root, 'workspace');
+    const anchor = path.join(workspace, '.ploinky');
+    fs.mkdirSync(anchor, { recursive: true });
+    fs.chmodSync(workspace, 0o775);
+    fs.chmodSync(anchor, 0o775);
+    const manager = createMutationLockManager({ homeDirectory: root });
+
+    const result = await withWorkspaceMutationLock({
+        resolveIdentity: () => buildWorkspaceIdentity(workspace, { markerFound: true }),
+        lockManager: manager,
+        materializeExistingAnchor: true,
+        execute(identity, lock) {
+            lock.assertHeld(identity.instance);
+            assert.equal(identity.rootFingerprint.mode & 0o777, 0o755);
+            assert.equal(identity.anchorFingerprint.mode & 0o777, 0o700);
+            assert.equal(fs.statSync(workspace).mode & 0o777, 0o755);
+            assert.equal(fs.statSync(anchor).mode & 0o777, 0o700);
+            return identity;
+        },
+    });
+
+    assert.equal(result.markerFound, true);
+});

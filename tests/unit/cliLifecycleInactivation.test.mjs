@@ -23,10 +23,18 @@ test('whole-workspace and Router lifecycle commands inactivate edge authorizatio
         "inactivateEdgeRoutingGeneration('cli-router-restart')",
         'killRouterIfRunning();',
     ]);
-    assertOrdered(cliSource, [
+    const restartBlock = cliSource.slice(
+        cliSource.indexOf("case 'restart':"),
+        cliSource.indexOf("case 'delete':"),
+    );
+    assertOrdered(restartBlock, [
+        'await quiesceNoWaitWorkers();',
+        "operation: 'workspace-restart-stop'",
+        'assertNoLiveNoWaitWorkers();',
         "inactivateEdgeRoutingGeneration('cli-workspace-restart')",
-        'killRouterIfRunning();',
-        'const list = stopConfiguredAgents();',
+        'killRouterIfRunning({ strict: true });',
+        'const stopped = stopCoordinatedConfiguredAgents({ strict: true });',
+        'assertNoLiveNoWaitWorkers();',
         'await startWorkspace(',
     ]);
     assertOrdered(cliSource, [
@@ -34,25 +42,37 @@ test('whole-workspace and Router lifecycle commands inactivate edge authorizatio
         'killRouterIfRunning();',
         'const list = destroyWorkspaceContainers();',
     ]);
-    assertOrdered(cliSource, [
+    const stopBlock = cliSource.slice(
+        cliSource.indexOf("case 'stop':"),
+        cliSource.indexOf("case 'destroy':"),
+    );
+    assertOrdered(stopBlock, [
+        'const noWaitWorkers = await quiesceNoWaitWorkers();',
+        "operation: 'workspace-stop'",
+        'assertNoLiveNoWaitWorkers();',
         "inactivateEdgeRoutingGeneration('cli-workspace-stop')",
         'killRouterIfRunning({ strict: true });',
-        'const list = stopConfiguredAgents({ strict: true });',
+        'const stopped = stopCoordinatedConfiguredAgents({ strict: true });',
+        'assertNoLiveNoWaitWorkers();',
     ]);
-    assertOrdered(cliSource, [
+    assertOrdered(stopBlock, [
         'await waitForNoWaitWorkersToSettle();',
         "operation: 'agentlib-source-transition-stop'",
         'assertNoLiveNoWaitWorkers();',
         'initializeFreshEdgeRoutingSources();',
         "inactivateEdgeRoutingGeneration('cli-agentlib-source-transition-stop')",
         'killRouterIfRunning({ strict: true });',
-        'const removed = stopConfiguredAgents({ strict: true, remove: true });',
+        'const removed = stopCoordinatedConfiguredAgents({ strict: true, remove: true });',
         'assertNoLiveNoWaitWorkers();',
     ]);
     const containerFleet = read('cli/sandbox/docker/containerFleet.js');
     assert.match(
         containerFleet,
-        /strict && listRunningContainerNames\(\{ runtime \}\)\.has\(name\)/,
+        /listRunningNames = listRunningContainerNames/,
+    );
+    assert.match(
+        containerFleet,
+        /strict && listRunningNames\(\{ runtime \}\)\.has\(name\)/,
     );
     assert.match(
         containerFleet,
@@ -100,6 +120,11 @@ test('start admits prepared repositories before persisting the fixed Router port
         startWorkspaceSource.indexOf('preflightWorkspaceStartRuntimeCapabilities')
             > startWorkspaceSource.indexOf('prepareManifestRepositories'),
         'fresh dependency repositories must be acquired before complete-graph admission',
+    );
+    assert.ok(
+        startWorkspaceSource.indexOf('prepareWorkspacePrivateDirectories();')
+            < startWorkspaceSource.indexOf('prepareDefaultBootRepositories'),
+        'private producer directories must be secured before repository or runtime mutation',
     );
     assertOrdered(workspaceSource, [
         'prepareDefaultBootRepositories',

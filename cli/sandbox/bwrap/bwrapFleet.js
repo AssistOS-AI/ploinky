@@ -135,6 +135,17 @@ function hasInvalidBwrapPidRecord(runtimeKey) {
     return readBwrapPidRecord(normalized) === null;
 }
 
+function hasBwrapPidRecord(runtimeKey) {
+    const pidFile = getPidFile(runtimeKey);
+    try {
+        fs.lstatSync(pidFile);
+        return true;
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+}
+
 function recordMatchesRuntimeIdentity(record, expectedIdentity) {
     if (expectedIdentity === undefined) return true;
     const expected = normalizeSandboxRuntimeIdentity(expectedIdentity);
@@ -443,6 +454,7 @@ export {
     getBwrapPid,
     saveBwrapPid,
     clearBwrapPid,
+    hasBwrapPidRecord,
     hasInvalidBwrapPidRecord,
     isBwrapProcessRunning,
     stopBwrapProcesses,

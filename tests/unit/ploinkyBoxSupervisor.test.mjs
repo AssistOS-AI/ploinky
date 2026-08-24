@@ -22,6 +22,12 @@ function fixture(t) {
     return { root, workspace };
 }
 
+function liveIdentityResolver(workspace) {
+    return () => buildWorkspaceIdentity(workspace, {
+        markerFound: fs.existsSync(path.join(workspace, '.ploinky')),
+    });
+}
+
 function fakeLockManager(root, events) {
     let acquisitions = 0;
     return {
@@ -238,7 +244,7 @@ test('prepare acquires once, reconciles under lock, preserves AgentLib, then rel
     const imageOverride = 'registry.example.test/ploinky-box:dev';
     const runner = { run(command, args) { events.push(`run:${args.join(' ')}`); } };
     const supervisor = createBoxSupervisor({
-        resolveIdentity: () => identity,
+        resolveIdentity: liveIdentityResolver(state.workspace),
         lockManager,
         discover: () => ownership,
         env: { PLOINKY_BOX_IMAGE: imageOverride },
@@ -269,7 +275,7 @@ test('local start quiesces before publication and installation, then starts and 
     const events = [];
     const sha256 = 'd'.repeat(64);
     const supervisor = createBoxSupervisor({
-        resolveIdentity: () => identity,
+        resolveIdentity: liveIdentityResolver(state.workspace),
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
         reconcile: async () => {
@@ -345,7 +351,7 @@ test('production start only quiesces when the installed Achilles identity is not
         const caseRoot = fs.mkdtempSync(path.join(state.root, 'case-'));
         const events = [];
         const supervisor = createBoxSupervisor({
-            resolveIdentity: () => identity,
+            resolveIdentity: liveIdentityResolver(state.workspace),
             lockManager: fakeLockManager(caseRoot, events),
             discover: () => ownership,
             reconcile: async () => {
@@ -397,7 +403,7 @@ test('local stop and install failures cannot publish late or launch the inner gr
         const caseRoot = fs.mkdtempSync(path.join(state.root, `${failure}-`));
         const events = [];
         const supervisor = createBoxSupervisor({
-            resolveIdentity: () => identity,
+            resolveIdentity: liveIdentityResolver(state.workspace),
             lockManager: fakeLockManager(caseRoot, events),
             discover: () => ownership,
             reconcile: async () => ({
@@ -739,7 +745,7 @@ test('start passes the native host address into the bounded in-box runtime', asy
     let boundedOptions;
     const supervisor = createBoxSupervisor({
         env: { PLOINKY_AGENTLIB_REF: 'master' },
-        resolveIdentity: () => identity,
+        resolveIdentity: liveIdentityResolver(state.workspace),
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
         platform: 'darwin',

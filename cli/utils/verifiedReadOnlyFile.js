@@ -102,6 +102,112 @@ export function ensureVerifiedProducerDirectory({
     return current;
 }
 
+// Normalizes one producer-owned leaf without weakening validation of its root
+// or parents. The final directory is descriptor-pinned before chmod so a path
+// replacement cannot redirect permission changes outside the trusted tree.
+export function normalizeVerifiedProducerDirectory({
+    trustedRoot,
+    relativeSegments = [],
+    mode = 0o700,
+    fsApi = fsDefault,
+    pathApi = pathDefault,
+    uid = typeof process.getuid === 'function' ? process.getuid() : undefined,
+} = {}) {
+    const rootInput = String(trustedRoot || '').trim();
+    if (!rootInput || !Array.isArray(relativeSegments) || relativeSegments.length === 0) {
+        throw verifiedFileError('a normalized producer directory requires one trusted root and relative path');
+    }
+    if (!Number.isInteger(mode) || mode < 0 || mode > 0o7777) {
+        throw verifiedFileError('a normalized producer directory requires one valid mode');
+    }
+    const segments = relativeSegments.map((segment) => {
+        const value = String(segment ?? '');
+        return value === '.ploinky' ? value : assertSafeRelativeSegment(value, 'producer path component');
+    });
+    const root = pathApi.resolve(rootInput);
+    const rootStat = lstatOrAbsent(fsApi, root);
+    if (!rootStat) throw verifiedFileError(`producer root '${root}' does not exist`);
+    assertOwnedSecureDirectory(root, rootStat, { uid });
+    let realRoot;
+    try { realRoot = fsApi.realpathSync(root); } catch (_) {
+        throw verifiedFileError(`producer root '${root}' is unresolvable`);
+    }
+
+    let current = root;
+    let leafStat = null;
+    for (let index = 0; index < segments.length; index += 1) {
+        current = pathApi.join(current, segments[index]);
+        let stat = lstatOrAbsent(fsApi, current);
+        if (!stat) {
+            if (index !== segments.length - 1) {
+                throw verifiedFileError(`producer parent '${current}' does not exist`);
+            }
+            try {
+                fsApi.mkdirSync(current, { mode });
+            } catch (error) {
+                throw verifiedFileError(`producer directory '${current}' could not be created safely: ${error?.message || error}`);
+            }
+            stat = lstatOrAbsent(fsApi, current);
+        }
+        if (!stat?.isDirectory() || stat.isSymbolicLink?.()) {
+            throw verifiedFileError(`producer path '${current}' is not one regular directory`);
+        }
+        if (Number.isInteger(uid) && stat.uid !== uid) {
+            throw verifiedFileError(`producer directory '${current}' is not owned by the current user`);
+        }
+        if (index !== segments.length - 1) {
+            assertOwnedSecureDirectory(current, stat, { uid });
+        } else {
+            leafStat = stat;
+        }
+    }
+
+    const constants = fsApi.constants || fsDefault.constants;
+    const flags = (constants.O_RDONLY || 0)
+        | (constants.O_DIRECTORY || 0)
+        | (constants.O_NOFOLLOW || 0);
+    let descriptor;
+    try {
+        descriptor = fsApi.openSync(current, flags);
+    } catch (_) {
+        throw verifiedFileError(`producer directory '${current}' could not be opened safely`);
+    }
+    try {
+        const opened = fsApi.fstatSync(descriptor);
+        if (!opened.isDirectory()
+            || opened.dev !== leafStat.dev
+            || opened.ino !== leafStat.ino
+            || (Number.isInteger(uid) && opened.uid !== uid)) {
+            throw verifiedFileError(`producer directory '${current}' was replaced during validation`);
+        }
+        fsApi.fchmodSync(descriptor, mode);
+        const normalized = fsApi.fstatSync(descriptor);
+        const named = lstatOrAbsent(fsApi, current);
+        if (!named
+            || named.isSymbolicLink?.()
+            || !named.isDirectory()
+            || normalized.dev !== opened.dev
+            || normalized.ino !== opened.ino
+            || named.dev !== normalized.dev
+            || named.ino !== normalized.ino
+            || named.mode !== normalized.mode
+            || (normalized.mode & 0o7777) !== mode) {
+            throw verifiedFileError(`producer directory '${current}' changed during permission normalization`);
+        }
+    } finally {
+        try { fsApi.closeSync(descriptor); } catch (_) {}
+    }
+
+    let realDirectory;
+    try { realDirectory = fsApi.realpathSync(current); } catch (_) {
+        throw verifiedFileError(`producer directory '${current}' is unresolvable`);
+    }
+    if (!beneathRoot(pathApi, realRoot, realDirectory)) {
+        throw verifiedFileError(`producer directory '${current}' resolves outside its trusted root`);
+    }
+    return current;
+}
+
 // Pins one already-validated regular inode. Missing components return null;
 // every ambiguous or unsafe filesystem state fails closed.
 export function openVerifiedRegularFile({
