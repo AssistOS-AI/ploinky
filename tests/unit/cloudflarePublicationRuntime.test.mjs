@@ -7,10 +7,86 @@ import test from 'node:test';
 import {
     createEdgePublicationRouteCoordinator,
     createExternalHostnameProbe,
+    releaseExactPublicationLease,
     startCloudflarePublicationRuntime,
 } from '../../ploinky-box/cloudflared/runtime.mjs';
 
 const GENERATION = `sha256:${'a'.repeat(64)}`;
+
+test('publication release keeps retrying its exact live lease until removal succeeds', async () => {
+    const lease = {
+        token: 'exact-publication-token',
+        operation: 'cloudflare-publication:exact-activation',
+    };
+    const audits = [];
+    const sleeps = [];
+    let attempts = 0;
+    let current = lease;
+
+    const released = await releaseExactPublicationLease(lease, {
+        releaseWorkspaceLease(candidate) {
+            assert.equal(candidate, lease);
+            attempts += 1;
+            if (attempts < 3) return false;
+            current = null;
+            return true;
+        },
+        inspectWorkspaceLease() {
+            return current
+                ? { active: true, lock: current }
+                : { active: false, lock: null };
+        },
+        audit(event, value) { audits.push({ event, value }); },
+        retryDelayMs: 7,
+        sleep: async (delayMs) => { sleeps.push(delayMs); },
+    });
+
+    assert.equal(released, true);
+    assert.equal(attempts, 3);
+    assert.deepEqual(sleeps, [7, 7]);
+    assert.deepEqual(audits, [
+        {
+            event: 'cloudflare-workspace-lease-release-deferred',
+            value: {
+                operation: 'cloudflare-publication:exact-activation',
+                failures: 1,
+            },
+        },
+        {
+            event: 'cloudflare-workspace-lease-release-recovered',
+            value: {
+                operation: 'cloudflare-publication:exact-activation',
+                failures: 2,
+            },
+        },
+    ]);
+});
+
+test('publication release never removes a replacement workspace lease', async () => {
+    const lease = {
+        token: 'completed-publication-token',
+        operation: 'cloudflare-publication:completed-activation',
+    };
+    let attempts = 0;
+    let slept = false;
+    const released = await releaseExactPublicationLease(lease, {
+        releaseWorkspaceLease() {
+            attempts += 1;
+            return false;
+        },
+        inspectWorkspaceLease() {
+            return {
+                active: true,
+                lock: { token: 'replacement-token' },
+            };
+        },
+        sleep: async () => { slept = true; },
+    });
+
+    assert.equal(released, true);
+    assert.equal(attempts, 1);
+    assert.equal(slept, false);
+});
 
 test('edge publication coordinator commits only exact captured desired semantics and states', async () => {
     const desired = { hosts: {} };
