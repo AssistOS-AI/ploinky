@@ -8,6 +8,11 @@ import {
     BOX_IMAGE_REFERENCE,
     BOX_LABELS,
 } from '../constants.mjs';
+import {
+    agentLibContractFromContainer,
+    agentLibSelectionChanged,
+    normalizeBoxAgentLib,
+} from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import {
     inspectAndValidateExistingImage,
@@ -45,6 +50,9 @@ function transactionError(message, cause, rollbackFailures = []) {
 }
 
 function oldDesired(identity, ownership, repositoryRoot, engine) {
+    // The AgentLib contract is reconstructed from the observed mount plus the
+    // Box labels, never from the caller's new selection: an existing Box has to
+    // prove which source it actually has before it can be reused.
     const container = ownership.handles.container;
     const hostPort = Number(container.labels[BOX_LABELS.routerHostPort]);
     const mediaHostPort = Number(container.labels[BOX_LABELS.mediaHostPort]);
@@ -54,6 +62,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         key,
         String(container.labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
     ])));
+    const agentLib = agentLibContractFromContainer(container);
     const desired = {
         identity,
         hostPort,
@@ -63,6 +72,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         repositoryRoot,
         hostKind: engine.hostKind,
         dataFingerprints,
+        agentLib,
     };
     validateContainerConfiguration(container, desired);
     return Object.freeze(desired);
@@ -109,6 +119,7 @@ async function createAndStart({
     hostPort,
     mediaHostPort,
     repositoryRoot,
+    agentLib,
     runner,
     lock,
     discover,
@@ -128,6 +139,7 @@ async function createAndStart({
     runner.run(engine.name, containerCreateArgs({
         identity,
         dataFingerprints: dataState.fingerprints,
+        agentLib,
         imageId: image.immutableId,
         imageRef,
         hostPort,
@@ -163,6 +175,7 @@ async function createAndStart({
         repositoryRoot,
         hostKind: engine.hostKind,
         dataFingerprints: dataState.fingerprints,
+        agentLib,
     });
     if (handle.id !== containerId) {
         throw transactionError('Created Box immutable ID changed during final validation');
@@ -188,6 +201,7 @@ async function restoreOldContainer({
         hostPort: old.hostPort,
         mediaHostPort: old.mediaHostPort,
         repositoryRoot: old.repositoryRoot,
+        agentLib: old.agentLib,
         runner,
         lock,
         discover: dependencies.discover,
@@ -208,6 +222,7 @@ export async function reconcileBoxContainer({
     runner,
     lock,
     repositoryRoot,
+    agentLib,
     explicitPort,
     explicitMediaPort,
     imageRef = BOX_IMAGE_REFERENCE,
@@ -237,6 +252,10 @@ export async function reconcileBoxContainer({
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
+    if (!agentLib) {
+        throw transactionError('Box reconciliation requires a selected achillesAgentLib source');
+    }
+    const desiredAgentLib = normalizeBoxAgentLib(agentLib);
     const portPlan = resolveEffectiveHostPort({ explicitPort, explicitMediaPort, ownership });
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
@@ -266,6 +285,9 @@ export async function reconcileBoxContainer({
         || old.mediaHostPort !== portPlan.mediaHostPort
         || old.imageRef !== imageRef
         || dataPathsChanged
+        // A changed source directory, mode, identity, or fingerprint must never
+        // leave the old inode mounted in a reused Box.
+        || agentLibSelectionChanged(old.agentLib, desiredAgentLib)
     );
     if (old && !requiresReplacement) {
         // Reuse is valid only while the host directories are the exact bind
@@ -326,6 +348,7 @@ export async function reconcileBoxContainer({
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
             repositoryRoot,
+            agentLib: desiredAgentLib,
             runner,
             lock,
             discover: dependencies.discover,

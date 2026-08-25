@@ -12,6 +12,13 @@ import {
     validateDependencyLock,
 } from '../../ploinky-box/entrypoint/install-dependencies.mjs';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
+import { AGENTLIB_ENV, AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
+import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
+
+// The Box installs only mcp-sdk now; achillesAgentLib arrives as a direct mount
+// the supervisor established, which the installer validates but never creates.
+const INSTALLED_DEPENDENCIES = ['mcp-sdk'];
+const MOUNT_FINGERPRINT = 'b2'.repeat(32);
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-deps-'));
@@ -20,7 +27,16 @@ function fixture(t) {
     fs.mkdirSync(targetRoot);
     const markerPath = path.join(root, 'ploinky-box');
     fs.writeFileSync(markerPath, BOX_MARKER_CONTENT);
-    return { root, targetRoot, markerPath };
+    const agentLibPath = path.join(root, 'mounted-agentlib');
+    fs.mkdirSync(agentLibPath);
+    writeAgentLibCheckout(agentLibPath);
+    const agentLibEnv = {
+        [AGENTLIB_ENV.dir]: agentLibPath,
+        [AGENTLIB_ENV.mode]: 'local',
+        [AGENTLIB_ENV.fingerprint]: MOUNT_FINGERPRINT,
+        [AGENTLIB_ENV.commit]: '',
+    };
+    return { root, targetRoot, markerPath, agentLibPath, agentLibEnv };
 }
 
 function fakeInstaller(counter, { failName = '' } = {}) {
@@ -69,9 +85,10 @@ test('empty-volume install is transactional and repeat runs are no-ops', (t) => 
     };
     const first = installPinnedDependencies(options);
     assert.equal(first.changed, true);
-    assert.deepEqual(installs.sort(), ['achillesAgentLib', 'mcp-sdk']);
+    // achillesAgentLib is deliberately absent: it is direct-mounted, never installed.
+    assert.deepEqual(installs.sort(), ['mcp-sdk']);
     assert.equal(fs.existsSync(path.join(state.targetRoot, 'mcp-sdk')), true);
-    assert.equal(fs.existsSync(path.join(state.targetRoot, 'achillesAgentLib')), true);
+    assert.equal(fs.existsSync(path.join(state.targetRoot, 'achillesAgentLib')), false);
     const marker = JSON.parse(fs.readFileSync(path.join(
         state.targetRoot,
         DEPENDENCY_MARKER_NAME,
@@ -103,13 +120,13 @@ test('partial or wrong-pin installs are repaired as one replacement', (t) => {
 
 test('repair backs up a real owner-read-only dependency without losing unrelated data', (t) => {
     const state = fixture(t);
-    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+    for (const name of INSTALLED_DEPENDENCIES) {
         const directory = path.join(state.targetRoot, name);
         fs.mkdirSync(directory);
         fs.writeFileSync(path.join(directory, '.head'), '0'.repeat(40));
         fs.writeFileSync(path.join(directory, 'payload'), `original:${name}`);
     }
-    const protectedDirectory = path.join(state.targetRoot, 'achillesAgentLib');
+    const protectedDirectory = path.join(state.targetRoot, 'mcp-sdk');
     fs.chmodSync(protectedDirectory, 0o500);
     fs.writeFileSync(path.join(state.targetRoot, 'unrelated-canary'), 'retain');
     const fsApi = new Proxy(fs, {
@@ -141,26 +158,26 @@ test('repair backs up a real owner-read-only dependency without losing unrelated
     assert.equal(result.changed, true);
     assert.equal(fs.readFileSync(path.join(state.targetRoot, 'unrelated-canary'), 'utf8'), 'retain');
     assert.equal(fs.readdirSync(state.targetRoot).some((name) => name.includes('stage')), false);
-    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+    for (const name of INSTALLED_DEPENDENCIES) {
         assert.equal(readHead(path.join(state.targetRoot, name)), result.marker.repositories[name]);
     }
 });
 
 test('failed swap restores a dependency mode changed only for backup', (t) => {
     const state = fixture(t);
-    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+    for (const name of INSTALLED_DEPENDENCIES) {
         const directory = path.join(state.targetRoot, name);
         fs.mkdirSync(directory);
         fs.writeFileSync(path.join(directory, '.head'), '0'.repeat(40));
         fs.writeFileSync(path.join(directory, 'payload'), `original:${name}`);
     }
-    const protectedDirectory = path.join(state.targetRoot, 'achillesAgentLib');
+    const protectedDirectory = path.join(state.targetRoot, 'mcp-sdk');
     fs.chmodSync(protectedDirectory, 0o500);
     const fsApi = new Proxy(fs, {
         get(target, property) {
             if (property === 'renameSync') {
                 return (source, destination) => {
-                    if (path.basename(String(destination)) === '.backup-achillesAgentLib') {
+                    if (path.basename(String(destination)) === '.backup-mcp-sdk') {
                         const error = new Error('simulated second backup failure');
                         error.code = 'EIO';
                         throw error;
@@ -180,7 +197,7 @@ test('failed swap restores a dependency mode changed only for backup', (t) => {
         token: 'rollback-mode',
     }), /Pinned dependency installation failed/);
     assert.equal(fs.statSync(protectedDirectory).mode & 0o777, 0o500);
-    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+    for (const name of INSTALLED_DEPENDENCIES) {
         assert.equal(
             fs.readFileSync(path.join(state.targetRoot, name, 'payload'), 'utf8'),
             `original:${name}`,
@@ -191,12 +208,12 @@ test('failed swap restores a dependency mode changed only for backup', (t) => {
 
 test('failed repair preserves established dependency directories for retry', (t) => {
     const state = fixture(t);
-    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+    for (const name of INSTALLED_DEPENDENCIES) {
         fs.mkdirSync(path.join(state.targetRoot, name));
         fs.writeFileSync(path.join(state.targetRoot, name, '.head'), '0'.repeat(40));
         fs.writeFileSync(path.join(state.targetRoot, name, 'payload'), `original:${name}`);
     }
-    const before = Object.fromEntries(['mcp-sdk', 'achillesAgentLib'].map((name) => [
+    const before = Object.fromEntries(INSTALLED_DEPENDENCIES.map((name) => [
         name,
         fs.readFileSync(path.join(state.targetRoot, name, 'payload'), 'utf8'),
     ]));
@@ -213,7 +230,7 @@ test('failed repair preserves established dependency directories for retry', (t)
 
 test('post-commit backup cleanup failure cannot roll back the installed dependency set', (t) => {
     const state = fixture(t);
-    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+    for (const name of INSTALLED_DEPENDENCIES) {
         fs.mkdirSync(path.join(state.targetRoot, name));
         fs.writeFileSync(path.join(state.targetRoot, name, '.head'), '0'.repeat(40));
         fs.writeFileSync(path.join(state.targetRoot, name, 'payload'), `original:${name}`);
@@ -243,7 +260,7 @@ test('post-commit backup cleanup failure cannot roll back the installed dependen
     });
     assert.equal(result.changed, true);
     assert.equal(failedCleanup, true);
-    for (const name of ['mcp-sdk', 'achillesAgentLib']) {
+    for (const name of INSTALLED_DEPENDENCIES) {
         assert.equal(readHead(path.join(state.targetRoot, name)), result.marker.repositories[name]);
         assert.equal(
             fs.readFileSync(path.join(state.targetRoot, name, 'payload'), 'utf8'),
@@ -275,4 +292,85 @@ test('marker mismatch and symlink volume roots fail before installation', (t) =>
         installRepository: fakeInstaller(installs),
         readInstalledHead: readHead,
     }), /not a real directory/);
+});
+
+// --- direct-mounted achillesAgentLib ---------------------------------------
+
+test('installation requires the supervisor-provided direct mount', (t) => {
+    const state = fixture(t);
+    const installs = [];
+    const attempt = (agentLibEnv, agentLibPath = state.agentLibPath) => installPinnedDependencies({
+        ...state,
+        agentLibEnv,
+        agentLibPath,
+        installRepository: fakeInstaller(installs),
+        readInstalledHead: readHead,
+    });
+
+    // A missing contract is an error, not permission to obtain a copy in-Box.
+    assert.throws(() => attempt({}), new RegExp(`${AGENTLIB_ENV.dir} must be`));
+    assert.throws(
+        () => attempt({ ...state.agentLibEnv, [AGENTLIB_ENV.dir]: '/somewhere/else' }),
+        new RegExp(`${AGENTLIB_ENV.dir} must be`),
+    );
+    assert.throws(
+        () => attempt({ ...state.agentLibEnv, [AGENTLIB_ENV.fingerprint]: 'not-a-digest' }),
+        new RegExp(`${AGENTLIB_ENV.fingerprint} must carry`),
+    );
+    assert.deepEqual(installs, [], 'nothing may be installed before the mount is proven');
+
+    const missingMount = path.join(state.root, 'absent-agentlib');
+    assert.throws(
+        () => attempt({ ...state.agentLibEnv, [AGENTLIB_ENV.dir]: missingMount }, missingMount),
+        /direct mount is missing/,
+    );
+
+    const wrongPackage = path.join(state.root, 'wrong-agentlib');
+    fs.mkdirSync(wrongPackage);
+    writeAgentLibCheckout(wrongPackage);
+    fs.writeFileSync(path.join(wrongPackage, 'package.json'), JSON.stringify({ name: 'something-else' }));
+    assert.throws(
+        () => attempt({ ...state.agentLibEnv, [AGENTLIB_ENV.dir]: wrongPackage }, wrongPackage),
+        /declares package name 'something-else'/,
+    );
+    assert.deepEqual(installs, []);
+});
+
+test('a leftover Box-installed achillesAgentLib is removed rather than loaded', (t) => {
+    const state = fixture(t);
+    const stale = path.join(state.targetRoot, 'achillesAgentLib');
+    fs.mkdirSync(stale);
+    fs.writeFileSync(path.join(stale, 'payload'), 'stale copy');
+    const result = installPinnedDependencies({
+        ...state,
+        installRepository: fakeInstaller([]),
+        readInstalledHead: readHead,
+        token: 'stale-agentlib',
+    });
+    assert.equal(result.changed, true);
+    assert.equal(fs.existsSync(stale), false, 'the retired Box copy must not survive');
+    assert.equal(fs.existsSync(path.join(state.targetRoot, 'mcp-sdk')), true);
+});
+
+test('an ambiguous achillesAgentLib entry fails with a cleanup instruction', (t) => {
+    const state = fixture(t);
+    fs.symlinkSync(state.agentLibPath, path.join(state.targetRoot, 'achillesAgentLib'), 'dir');
+    const installs = [];
+    assert.throws(() => installPinnedDependencies({
+        ...state,
+        installRepository: fakeInstaller(installs),
+        readInstalledHead: readHead,
+    }), new RegExp(`direct-mounted at ${AGENTLIB_STABLE_MOUNT_PATH}`));
+    assert.deepEqual(installs, [], 'a suspicious entry blocks installation instead of being consumed');
+});
+
+test('the marker covers only the dependencies the Box installs', (t) => {
+    const state = fixture(t);
+    const result = installPinnedDependencies({
+        ...state,
+        installRepository: fakeInstaller([]),
+        readInstalledHead: readHead,
+        token: 'marker-scope',
+    });
+    assert.deepEqual(Object.keys(result.marker.repositories), INSTALLED_DEPENDENCIES);
 });

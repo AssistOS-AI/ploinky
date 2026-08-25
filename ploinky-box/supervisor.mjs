@@ -5,6 +5,12 @@ import {
     BOX_LABELS,
     resolveBoxImageReference,
 } from './constants.mjs';
+import { selectWorkspaceAgentLibSource } from './agentlib-source.mjs';
+import {
+    agentLibBoxEnv,
+    agentLibContractFromContainer,
+    normalizeBoxAgentLib,
+} from './contract/agentlib.mjs';
 import { validateContainerConfiguration } from './contract/container.mjs';
 import { inspectAndValidateExistingImage } from './contract/image.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
@@ -66,6 +72,7 @@ export function createBoxSupervisor({
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
+    selectAgentLib = selectWorkspaceAgentLibSource,
     destroyBoxCache = removeWorkspaceDataPaths,
     inspectBoxData = inspectWorkspaceDataPaths,
     stdout = process.stdout,
@@ -89,9 +96,16 @@ export function createBoxSupervisor({
     async function prepareBoxForCommand({
         explicitPort,
         explicitMediaPort,
+        branchPolicy = null,
         imageRef = resolveBoxImageReference(env),
     } = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            // The source is selected before Box reconciliation so the mount
+            // contract can be part of the Box's immutable identity.
+            const { selection } = await selectAgentLib({
+                workspaceRoot: identity.workspaceRoot,
+                branchPolicy,
+            });
             const prepared = await reconcile({
                 identity,
                 ownership,
@@ -99,6 +113,7 @@ export function createBoxSupervisor({
                 runner,
                 lock,
                 repositoryRoot,
+                agentLib: selection,
                 explicitPort,
                 explicitMediaPort,
                 imageRef,
@@ -109,12 +124,18 @@ export function createBoxSupervisor({
             });
             const containerId = prepared.ownership.handles.container.id;
             await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
-            return Object.freeze({ identity, ...prepared, containerId, engine: ownership.engine });
+            return Object.freeze({
+                identity, ...prepared, containerId, engine: ownership.engine, agentLib: selection,
+            });
         });
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            const { selection } = await selectAgentLib({
+                workspaceRoot: identity.workspaceRoot,
+                branchPolicy: options.branchPolicy || null,
+            });
             const prepared = await reconcile({
                 identity,
                 ownership,
@@ -122,6 +143,7 @@ export function createBoxSupervisor({
                 runner,
                 lock,
                 repositoryRoot,
+                agentLib: selection,
                 explicitPort: options.explicitPort,
                 explicitMediaPort: options.explicitMediaPort,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
@@ -153,11 +175,11 @@ export function createBoxSupervisor({
                     stdout,
                     stderr,
                     hostReachableIpv4,
-                    agentlibRef: env.PLOINKY_AGENTLIB_REF,
+                    agentLib: selection,
                 },
             );
             await healthCheck(prepared.hostPort);
-            return Object.freeze({ identity, ...prepared, containerId });
+            return Object.freeze({ identity, ...prepared, containerId, agentLib: selection });
         });
     }
 
@@ -274,6 +296,7 @@ export function createBoxSupervisor({
             validateContainer(container, {
                 identity,
                 dataFingerprints: dataState?.fingerprints,
+                agentLib: agentLibContractFromContainer(container),
                 hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
                 mediaHostPort: Number(container.labels?.[BOX_LABELS.mediaHostPort]),
                 imageId: image.immutableId,
@@ -418,20 +441,25 @@ export async function runBoundedCoreStart(
         stderr = process.stderr,
         timeoutMs = 1_800_000,
         hostReachableIpv4 = '',
-        agentlibRef = '',
+        agentLib = null,
     } = {},
 ) {
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
         throw supervisorError('Bounded core start requires normalized start argv');
     }
     const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
-    const normalizedAgentlibRef = String(agentlibRef || '').trim();
     if (normalizedHostReachableIpv4 && !isUsableHostIpv4(normalizedHostReachableIpv4)) {
         throw supervisorError(
             `${HOST_REACHABLE_IPV4_ENV} must be a usable canonical literal IPv4 address`,
             'PLOINKY_BOX_HOST_REACHABLE_IPV4_INVALID',
         );
     }
+    if (!agentLib) {
+        throw supervisorError('Bounded core start requires the selected achillesAgentLib contract');
+    }
+    // The in-Box core reads the source only through the reserved environment,
+    // which names the stable mount path rather than any host path.
+    const agentLibEnvironment = agentLibBoxEnv(normalizeBoxAgentLib(agentLib));
     const runtimeEnvironment = [
         'container', 'exec',
         '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
@@ -439,9 +467,7 @@ export async function runBoundedCoreStart(
         ...(normalizedHostReachableIpv4
             ? ['--env', `${HOST_REACHABLE_IPV4_ENV}=${normalizedHostReachableIpv4}`]
             : []),
-        ...(normalizedAgentlibRef
-            ? ['--env', `PLOINKY_AGENTLIB_REF=${normalizedAgentlibRef}`]
-            : []),
+        ...Object.entries(agentLibEnvironment).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
     ];
     const result = await runner.stream(engine.name, [
         ...runtimeEnvironment,

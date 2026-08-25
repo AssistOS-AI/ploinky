@@ -13,6 +13,12 @@ import {
     BOX_TMPFS,
     BOX_USERNS,
 } from '../constants.mjs';
+import {
+    agentLibEnvArgs,
+    agentLibLabels,
+    agentLibMountArgs,
+    normalizeBoxAgentLib,
+} from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import {
@@ -63,6 +69,7 @@ function tmpfsCreateArgument() {
 export function containerCreateArgs({
     identity,
     dataFingerprints,
+    agentLib,
     imageId,
     imageRef,
     hostPort,
@@ -72,6 +79,10 @@ export function containerCreateArgs({
     hostKind = 'native-linux',
 }) {
     const source = path.resolve(repositoryRoot);
+    if (!agentLib) {
+        throw lifecycleError('Container creation requires a selected achillesAgentLib source');
+    }
+    const agentLibContract = normalizeBoxAgentLib(agentLib);
     const labels = {
         [BOX_LABELS.pathHash]: identity.pathHash,
         [BOX_LABELS.role]: BOX_ROLES.container,
@@ -86,6 +97,7 @@ export function containerCreateArgs({
         }
         labels[BOX_DATA_FINGERPRINT_LABELS[key]] = value;
     }
+    Object.assign(labels, agentLibLabels(agentLibContract));
     return [
         'container', 'create',
         '--init',
@@ -102,6 +114,10 @@ export function containerCreateArgs({
         '--volume', `${source}:/opt/ploinky:ro`,
         '--volume', `${identity.workspaceRoot}:/workspace`,
         ...workspaceDataMountArgs(identity),
+        // The AgentLib binds come last so the read-only alias shadow lands on
+        // top of the writable /workspace bind that also exposes that path.
+        ...agentLibMountArgs(agentLibContract),
+        ...agentLibEnvArgs(agentLibContract),
         '--env', 'PLOINKY_PUBLIC_BIND=0.0.0.0',
         '--env', `PLOINKY_PUBLIC_AUTHORITY=127.0.0.1:${hostPort}`,
         '--env', 'PLOINKY_PRIVATE_BIND=0.0.0.0',
