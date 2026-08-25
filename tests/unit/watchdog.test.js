@@ -23,7 +23,15 @@ const {
     getRouterNodeExecutable,
     performHealthCheck,
     runHealthCheckTick,
+    resolveContainerSnapshotIntervalMs,
 } = await import('../../cli/server/Watchdog.js');
+
+test('Box container inventory uses a control-plane-safe snapshot cadence', () => {
+    assert.equal(resolveContainerSnapshotIntervalMs({ insideBox: false, configured: undefined }), 0);
+    assert.equal(resolveContainerSnapshotIntervalMs({ insideBox: true, configured: undefined }), 5 * 60 * 1000);
+    assert.equal(resolveContainerSnapshotIntervalMs({ insideBox: true, configured: '45000' }), 45_000);
+    assert.equal(resolveContainerSnapshotIntervalMs({ insideBox: true, configured: 'invalid' }), 5 * 60 * 1000);
+});
 
 const extractEvents = () => getTestLogs().map(entry => entry.event);
 

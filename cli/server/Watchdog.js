@@ -9,9 +9,25 @@ import { appendLog } from './utils/logger.js';
 import { LOGS_DIR, PLOINKY_DIR } from '../utils/config.js';
 import { inspectWorkspaceStartLock } from '../utils/runtime/maintenanceLocks.js';
 import { parseRouterPort } from '../sandbox/routerPort.js';
+import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const HOST_CONTAINER_SNAPSHOT_INTERVAL_MS = 0;
+const BOX_CONTAINER_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+
+export function resolveContainerSnapshotIntervalMs({
+    insideBox = false,
+    configured = process.env.PLOINKY_CONTAINER_SNAPSHOT_INTERVAL_MS,
+} = {}) {
+    const parsed = Number(configured);
+    if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+    return insideBox
+        ? BOX_CONTAINER_SNAPSHOT_INTERVAL_MS
+        : HOST_CONTAINER_SNAPSHOT_INTERVAL_MS;
+}
+
+const insideBox = isInsideBox();
 
 // Configuration
 const CONFIG = {
@@ -40,7 +56,12 @@ const CONFIG = {
     NODE_OPTIONS: process.env.NODE_OPTIONS || '',
 
     // Container monitoring
-    CONTAINER_CHECK_INTERVAL_MS: 5000, // Poll containers every 5 seconds
+    CONTAINER_CHECK_INTERVAL_MS: 5000, // Advance supervision every 5 seconds.
+    // Nested rootless Podman has one practical control-plane lane. Cache the
+    // shared Box inventory for the semantic-probe interval so probe scheduling
+    // stays responsive without repeatedly stalling live agent traffic. Host
+    // runtimes retain one fresh inventory snapshot per monitor tick.
+    CONTAINER_SNAPSHOT_INTERVAL_MS: resolveContainerSnapshotIntervalMs({ insideBox }),
     CONTAINER_SNAPSHOT_RETRY_INITIAL_MS: 15000,
     CONTAINER_SNAPSHOT_RETRY_MAX_MS: 60000,
 };

@@ -7,8 +7,14 @@ test('retired dashboard stays absent while Router and Policy use Ploinky-owned f
     const routingSource = await fs.readFile(path.resolve('cli/server/RoutingServer.js'), 'utf8');
     const loggerSource = await fs.readFile(path.resolve('cli/server/utils/logger.js'), 'utf8');
     const policySource = await fs.readFile(path.resolve('cli/server/policy/FileSystemPolicyAuditSink.js'), 'utf8');
+    const appendLogSource = loggerSource.slice(
+        loggerSource.indexOf('export function appendLog'),
+        loggerSource.indexOf('export function flushPendingLogs'),
+    );
     assert.doesNotMatch(routingSource, /handleDashboard|isRouteMount\(pathname, '\/dashboard'\)/);
-    assert.match(loggerSource, /router\.log|appendFileSync/);
+    assert.match(loggerSource, /router\.log/);
+    assert.match(loggerSource, /createAsyncLogWriter|promises\.appendFile/);
+    assert.doesNotMatch(appendLogSource, /appendFileSync|mkdirSync/);
     assert.match(policySource, /policy-audit\.log|appendFileSync/);
 });
 

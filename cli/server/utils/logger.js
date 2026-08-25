@@ -4,6 +4,7 @@ import { LOGS_DIR } from '../../utils/config.js';
 
 const LOG_DIR = LOGS_DIR;
 const LOG_PATH = path.join(LOG_DIR, 'router.log');
+const DEFAULT_MAX_PENDING_BYTES = 1024 * 1024;
 
 function ensureLogDirectory() {
     try {
@@ -13,19 +14,122 @@ function ensureLogDirectory() {
     }
 }
 
+function normalizeMaxPendingBytes(value) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0
+        ? parsed
+        : DEFAULT_MAX_PENDING_BYTES;
+}
+
+export function createAsyncLogWriter({
+    fsApi = fs,
+    logDir = LOG_DIR,
+    logPath = LOG_PATH,
+    maxPendingBytes = DEFAULT_MAX_PENDING_BYTES,
+} = {}) {
+    const byteLimit = normalizeMaxPendingBytes(maxPendingBytes);
+    const pending = [];
+    let pendingBytes = 0;
+    let droppedRecords = 0;
+    let scheduled = null;
+    let flushPromise = null;
+
+    function schedule() {
+        if (scheduled || flushPromise) return;
+        scheduled = setImmediate(() => {
+            scheduled = null;
+            void flush();
+        });
+        scheduled.unref?.();
+    }
+
+    function appendLine(line) {
+        const normalized = String(line || '');
+        const bytes = Buffer.byteLength(normalized);
+        if (bytes > byteLimit) {
+            droppedRecords += 1;
+            schedule();
+            return false;
+        }
+        while (pending.length > 0 && pendingBytes + bytes > byteLimit) {
+            const removed = pending.shift();
+            pendingBytes -= removed.bytes;
+            droppedRecords += 1;
+        }
+        pending.push({ line: normalized, bytes });
+        pendingBytes += bytes;
+        schedule();
+        return true;
+    }
+
+    async function flush() {
+        if (flushPromise) return flushPromise;
+        if (scheduled) {
+            clearImmediate(scheduled);
+            scheduled = null;
+        }
+        flushPromise = (async () => {
+            try {
+                await fsApi.promises.mkdir(logDir, { recursive: true });
+                while (pending.length > 0 || droppedRecords > 0) {
+                    const records = pending.splice(0);
+                    pendingBytes = 0;
+                    const dropped = droppedRecords;
+                    droppedRecords = 0;
+                    const droppedLine = dropped > 0
+                        ? `${JSON.stringify({
+                            ts: new Date().toISOString(),
+                            level: 'warn',
+                            type: 'router_log_records_dropped',
+                            dropped,
+                        })}\n`
+                        : '';
+                    await fsApi.promises.appendFile(
+                        logPath,
+                        droppedLine + records.map(record => record.line).join(''),
+                    );
+                }
+            } catch (_) {
+                // Diagnostics must never interrupt routing. A later record
+                // schedules a fresh attempt after a transient write failure.
+            }
+        })().finally(() => {
+            flushPromise = null;
+            if (pending.length > 0 || droppedRecords > 0) schedule();
+        });
+        return flushPromise;
+    }
+
+    return {
+        appendLine,
+        flush,
+        pendingState: () => ({
+            pendingRecords: pending.length,
+            pendingBytes,
+            droppedRecords,
+            flushing: Boolean(flushPromise),
+        }),
+    };
+}
+
+const routerLogWriter = createAsyncLogWriter();
+
 export function appendLog(type, data = {}) {
     try {
-        ensureLogDirectory();
         const record = JSON.stringify({
             ts: new Date().toISOString(),
             level: 'debug',
             type,
             ...data
         });
-        fs.appendFileSync(LOG_PATH, `${record}\n`);
+        routerLogWriter.appendLine(`${record}\n`);
     } catch (_) {
         // Ignore logging failures; diagnostics should not interrupt routing.
     }
+}
+
+export function flushPendingLogs() {
+    return routerLogWriter.flush();
 }
 
 export function logBootEvent(action, details = {}) {
