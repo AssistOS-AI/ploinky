@@ -13,6 +13,7 @@ import {
     agentLibEntrypointHashes,
     compareAgentLibAttestation,
 } from '../../agentlib/runtime.mjs';
+import { AGENTLIB_ENV } from '../../agentlib/contract.mjs';
 import { hashFileBytes } from '../../agentlib/fingerprint.mjs';
 
 export const AGENTLIB_AGENT_ATTEST_SCRIPT = '/Agent/lib/agentlibAttest.mjs';
@@ -25,6 +26,97 @@ function attestationError(message, cause) {
 
 function resultText(value) {
     return Buffer.isBuffer(value) ? value.toString('utf8') : String(value || '');
+}
+
+function missingNodeExecutable(result) {
+    if (result?.status !== 127) return false;
+    const detail = `${resultText(result?.stderr)}\n${result?.error?.message || ''}`.toLowerCase();
+    return detail.includes('node')
+        && /not found|no such file|not in \$?path|executable file/.test(detail);
+}
+
+function successfulCommand(result, label) {
+    if (result?.error) {
+        throw attestationError(`${label} could not start: ${result.error.message}`, result.error);
+    }
+    if (result?.status !== 0) {
+        const detail = resultText(result?.stderr).trim().split('\n').slice(-1)[0]
+            || `status ${String(result?.status)}`;
+        throw attestationError(`${label} failed: ${detail}`);
+    }
+    return resultText(result?.stdout).trim();
+}
+
+function grantEnvironment(grant) {
+    return Object.freeze({
+        [AGENTLIB_ENV.dir]: String(grant.runtimePath || ''),
+        [AGENTLIB_ENV.mode]: String(grant.mode || ''),
+        [AGENTLIB_ENV.fingerprint]: String(grant.fingerprint || ''),
+        [AGENTLIB_ENV.commit]: String(grant.commit || ''),
+        [AGENTLIB_ENV.sourceId]: String(grant.sourceIdHash || ''),
+    });
+}
+
+function inspectContainerAgentLibEnvironment({ runtime, containerId, grant, spawn }) {
+    const result = spawn(runtime, [
+        'container', 'inspect', '--format', '{{json .Config.Env}}', containerId,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const raw = successfulCommand(result, `container ${containerId} environment inspection`);
+    let entries;
+    try {
+        entries = JSON.parse(raw);
+    } catch (error) {
+        throw attestationError(`container ${containerId} environment inspection returned invalid JSON`, error);
+    }
+    if (!Array.isArray(entries)) {
+        throw attestationError(`container ${containerId} environment inspection did not return an environment list`);
+    }
+    const expected = grantEnvironment(grant);
+    for (const [name, value] of Object.entries(expected)) {
+        const matches = entries.filter((entry) => String(entry).startsWith(`${name}=`));
+        if (matches.length !== 1 || matches[0] !== `${name}=${value}`) {
+            throw attestationError(
+                `container ${containerId} does not carry the exact ${name} AgentLib contract`,
+            );
+        }
+    }
+    return expected;
+}
+
+function inspectHelperImageId({ runtime, helperImage, spawn }) {
+    const result = spawn(runtime, [
+        'image', 'inspect', '--format', '{{.Id}}', helperImage,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const imageId = successfulCommand(result, 'AgentLib attestation helper image inspection');
+    if (!/^(?:sha256:)?[a-f0-9]{64}$/.test(imageId)) {
+        throw attestationError('AgentLib attestation helper image did not resolve to an immutable image ID');
+    }
+    return imageId;
+}
+
+function runContainerVolumeProbe({ runtime, containerId, grant, helperImage, spawn }) {
+    if (!helperImage) {
+        throw attestationError(
+            `container ${containerId} has no Node.js executable and no fixed AgentLib attestation helper image was provided`,
+        );
+    }
+    const environment = inspectContainerAgentLibEnvironment({ runtime, containerId, grant, spawn });
+    const helperImageId = inspectHelperImageId({ runtime, helperImage, spawn });
+    const envArgs = Object.entries(environment).flatMap(([name, value]) => [
+        '--env', `${name}=${value}`,
+    ]);
+    return spawn(runtime, [
+        'run', '--rm', '--pull=never',
+        '--network', 'none',
+        '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+        '--pids-limit', '32', '--memory', '128m', '--cpus', '0.25',
+        '--volumes-from', `${containerId}:ro`,
+        '--workdir', '/code',
+        ...envArgs,
+        '--entrypoint', 'node',
+        helperImageId,
+        AGENTLIB_AGENT_ATTEST_SCRIPT,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 /** Parse the one JSON document emitted by the confined probe. */
@@ -70,14 +162,30 @@ export function attestContainerAgentLib({
     runtime,
     containerId,
     grant,
+    helperImage = '',
     spawn,
 }) {
-    const result = spawn(runtime, [
+    let result = spawn(runtime, [
         'exec',
         '--workdir', '/code',
         containerId,
         'node', AGENTLIB_AGENT_ATTEST_SCRIPT,
     ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    // Some valid start-only agents deliberately use Python or appliance images
+    // without Node.js. In that case, execute the same resolution probe in a
+    // fixed, immutable Node helper over the exact container's read-only volume
+    // topology. This still resolves from the target's /code/node_modules chain
+    // and selected /opt/ploinky-agentlib mount; it never substitutes a copied
+    // package tree or executes the target image's entrypoint.
+    if (missingNodeExecutable(result)) {
+        result = runContainerVolumeProbe({
+            runtime,
+            containerId,
+            grant,
+            helperImage,
+            spawn,
+        });
+    }
     return assertAgentLibRuntimeAttestation(
         parseAgentLibAttestationResult(result, `container ${containerId}`),
         grant,
