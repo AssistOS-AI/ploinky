@@ -81,6 +81,7 @@ import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
 import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 import { nodeModulesDir, prepareAgentCache } from '../../utils/dependencies/dependencyCache.js';
+import { ensureAgentLibCacheLink } from '../../utils/dependencies/agentLibLink.js';
 import {
     runPreContainerLifecycle,
     runProfileLifecycle
@@ -1293,6 +1294,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // alone determines that path, so this must not force a container probe on
     // agents that need no dependency cache.
     const containerAgentLibGrant = agentLibGrant('container');
+    // A start-only agent with no package.json still receives the same bare
+    // package-resolution adapter as dependency-bearing agents. No branch that
+    // skips npm may leave an empty node_modules directory behind.
+    ensureAgentLibCacheLink(
+        path.dirname(preparedNodeModulesDir),
+        containerAgentLibGrant.runtimePath,
+    );
     let podmanStagedTargetMounts = [];
     if (runtime === 'podman') {
         fs.mkdirSync(PODMAN_RUNTIME_ROOT, { recursive: true });
@@ -1890,13 +1898,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let launchedContainerId = '';
     let generatedLaunch = null;
     let adoptedExistingRuntime = false;
+    // A non-Node target image needs the fixed Node helper to attest its exact
+    // read-only volume topology. Pull it before any lifecycle/network lock; the
+    // later probe uses only the already-present immutable image ID.
+    ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
     try {
     if (runtimeNetworkPlan.requiresManagedNetwork) {
         // Resolve both the target and fixed probe images before the network
         // transaction. The helper never pulls and never executes target-image
         // entrypoints, including start-only images without Node.js.
         ensureImagePresent(image, { runtime });
-        ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
         const launched = networkLifecycle.runManagedContainerTransaction({
             network: manifestNetwork,
             canonicalAgentId: agentName,
@@ -2051,6 +2062,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             runtime,
             containerId: launchedContainerId,
             grant: containerAgentLibGrant,
+            helperImage: ROUTER_AUTHORITY_HELPER_IMAGE,
             spawn: spawnSync,
         });
     } catch (error) {

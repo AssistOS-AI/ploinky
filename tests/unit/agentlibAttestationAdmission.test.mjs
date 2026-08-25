@@ -104,6 +104,108 @@ test('container, bwrap, and seatbelt admissions probe their exact runtime bounda
     });
 });
 
+test('a non-Node container is attested through a fixed helper over its exact read-only volumes', (t) => {
+    const { grant, attestation } = fixture(t);
+    const containerId = 'c'.repeat(64);
+    const helperImage = `docker.io/library/node:24@sha256:${'d'.repeat(64)}`;
+    const helperImageId = `sha256:${'e'.repeat(64)}`;
+    const expectedEnvironment = [
+        `PLOINKY_AGENTLIB_DIR=${grant.runtimePath}`,
+        `PLOINKY_AGENTLIB_MODE=${grant.mode}`,
+        `PLOINKY_AGENTLIB_FINGERPRINT=${grant.fingerprint}`,
+        `PLOINKY_AGENTLIB_COMMIT=${grant.commit}`,
+        `PLOINKY_AGENTLIB_SOURCE_ID=${grant.sourceIdHash}`,
+    ];
+    let call = 0;
+
+    const result = attestContainerAgentLib({
+        runtime: 'podman',
+        containerId,
+        grant,
+        helperImage,
+        spawn(command, args, options) {
+            assert.equal(command, 'podman');
+            assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
+            call += 1;
+            if (call === 1) {
+                assert.deepEqual(args, [
+                    'exec', '--workdir', '/code', containerId,
+                    'node', AGENTLIB_AGENT_ATTEST_SCRIPT,
+                ]);
+                return {
+                    status: 127,
+                    stdout: '',
+                    stderr: 'crun: executable file `node` not found in $PATH',
+                };
+            }
+            if (call === 2) {
+                assert.deepEqual(args, [
+                    'container', 'inspect', '--format', '{{json .Config.Env}}', containerId,
+                ]);
+                return { status: 0, stdout: JSON.stringify(['PATH=/usr/bin', ...expectedEnvironment]), stderr: '' };
+            }
+            if (call === 3) {
+                assert.deepEqual(args, [
+                    'image', 'inspect', '--format', '{{.Id}}', helperImage,
+                ]);
+                return { status: 0, stdout: `${helperImageId}\n`, stderr: '' };
+            }
+            assert.equal(call, 4);
+            assert.deepEqual(args, [
+                'run', '--rm', '--pull=never',
+                '--network', 'none',
+                '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                '--pids-limit', '32', '--memory', '128m', '--cpus', '0.25',
+                '--volumes-from', `${containerId}:ro`,
+                '--workdir', '/code',
+                ...expectedEnvironment.flatMap((entry) => ['--env', entry]),
+                '--entrypoint', 'node',
+                helperImageId,
+                AGENTLIB_AGENT_ATTEST_SCRIPT,
+            ]);
+            return { status: 0, stdout: JSON.stringify(attestation), stderr: '' };
+        },
+    });
+
+    assert.equal(call, 4);
+    assert.equal(result.sourceRootRealpath, grant.runtimePath);
+});
+
+test('the non-Node helper path rejects a target container with a divergent AgentLib environment', (t) => {
+    const { grant } = fixture(t);
+    const containerId = 'd'.repeat(64);
+    let call = 0;
+    assert.throws(
+        () => attestContainerAgentLib({
+            runtime: 'podman',
+            containerId,
+            grant,
+            helperImage: `docker.io/library/node:24@sha256:${'e'.repeat(64)}`,
+            spawn(_command, args) {
+                call += 1;
+                if (call === 1) {
+                    return { status: 127, stderr: 'node: executable file not found', stdout: '' };
+                }
+                assert.equal(call, 2);
+                assert.equal(args[0], 'container');
+                return {
+                    status: 0,
+                    stderr: '',
+                    stdout: JSON.stringify([
+                        `PLOINKY_AGENTLIB_DIR=${grant.runtimePath}`,
+                        `PLOINKY_AGENTLIB_MODE=${grant.mode}`,
+                        'PLOINKY_AGENTLIB_FINGERPRINT=wrong',
+                        `PLOINKY_AGENTLIB_COMMIT=${grant.commit}`,
+                        `PLOINKY_AGENTLIB_SOURCE_ID=${grant.sourceIdHash}`,
+                    ]),
+                };
+            },
+        }),
+        /does not carry the exact PLOINKY_AGENTLIB_FINGERPRINT AgentLib contract/,
+    );
+    assert.equal(call, 2);
+});
+
 test('runtime admission rejects a probe whose loaded bytes differ from the selected source', (t) => {
     const { grant, attestation } = fixture(t);
     const divergent = {
