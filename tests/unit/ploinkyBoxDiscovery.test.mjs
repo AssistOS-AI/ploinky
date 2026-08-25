@@ -4,7 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { BOX_LABELS, BOX_ROLES } from '../../ploinky-box/constants.mjs';
+import {
+    BOX_AGENTLIB_LABELS,
+    BOX_LABELS,
+    BOX_ROLES,
+} from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { discoverBoxOwnership } from '../../ploinky-box/engine/discovery.mjs';
 
@@ -25,6 +29,11 @@ function labels(identity, role) {
         result[BOX_LABELS.mediaHostPort] = '17891';
         result[BOX_LABELS.dependenciesFingerprint] = 'd'.repeat(64);
         result[BOX_LABELS.imagesFingerprint] = 'f'.repeat(64);
+        result[BOX_AGENTLIB_LABELS.mode] = 'local';
+        result[BOX_AGENTLIB_LABELS.sourceIdHash] = 'a'.repeat(64);
+        result[BOX_AGENTLIB_LABELS.fingerprint] = 'b'.repeat(64);
+        result[BOX_AGENTLIB_LABELS.sourceRelativePath] = 'achillesAgentLib';
+        result[BOX_AGENTLIB_LABELS.commit] = 'c'.repeat(40);
     }
     return result;
 }
@@ -271,6 +280,12 @@ test('unlabeled exact names and label drift fail closed', (t) => {
     const partialFingerprint = ownedContainer(identity);
     delete partialFingerprint.Labels[BOX_LABELS.imagesFingerprint];
     variants.push(partialFingerprint);
+    const missingAgentLibFingerprint = ownedContainer(identity);
+    delete missingAgentLibFingerprint.Labels[BOX_AGENTLIB_LABELS.fingerprint];
+    variants.push(missingAgentLibFingerprint);
+    const invalidAgentLibMode = ownedContainer(identity);
+    invalidAgentLibMode.Labels[BOX_AGENTLIB_LABELS.mode] = 'legacy';
+    variants.push(invalidAgentLibMode);
 
     for (const container of variants) {
         const result = discoverBoxOwnership(identity, {

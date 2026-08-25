@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 
 import {
+    BOX_AGENTLIB_LABELS,
     BOX_DATA_FINGERPRINT_LABELS,
     BOX_DATA_KEYS,
     BOX_LABELS,
@@ -275,26 +276,41 @@ function hasExactResourceLabels(labels, pathHash, role) {
         String(labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
     ]));
     const fingerprintValues = Object.values(dataFingerprints);
-    const hasNoFingerprints = fingerprintValues.every((value) => value === '');
     const hasCompleteFingerprints = fingerprintValues.every((value) => /^[a-f0-9]{64}$/.test(value));
-    const expectedFingerprints = hasCompleteFingerprints
-        ? Object.fromEntries(BOX_DATA_KEYS.map((key) => [
-            BOX_DATA_FINGERPRINT_LABELS[key],
-            dataFingerprints[key],
-        ]))
-        : {};
+    const expectedFingerprints = Object.fromEntries(BOX_DATA_KEYS.map((key) => [
+        BOX_DATA_FINGERPRINT_LABELS[key],
+        dataFingerprints[key],
+    ]));
+    const agentLibLabels = {
+        [BOX_AGENTLIB_LABELS.mode]: String(labels?.[BOX_AGENTLIB_LABELS.mode] || ''),
+        [BOX_AGENTLIB_LABELS.sourceIdHash]: String(labels?.[BOX_AGENTLIB_LABELS.sourceIdHash] || ''),
+        [BOX_AGENTLIB_LABELS.fingerprint]: String(labels?.[BOX_AGENTLIB_LABELS.fingerprint] || ''),
+        [BOX_AGENTLIB_LABELS.sourceRelativePath]: String(labels?.[BOX_AGENTLIB_LABELS.sourceRelativePath] || ''),
+        [BOX_AGENTLIB_LABELS.commit]: String(labels?.[BOX_AGENTLIB_LABELS.commit] || ''),
+    };
+    const sourceRelativePath = agentLibLabels[BOX_AGENTLIB_LABELS.sourceRelativePath];
+    const commit = agentLibLabels[BOX_AGENTLIB_LABELS.commit];
+    const hasCompleteAgentLib = ['local', 'managed'].includes(agentLibLabels[BOX_AGENTLIB_LABELS.mode])
+        && /^[a-f0-9]{64}$/.test(agentLibLabels[BOX_AGENTLIB_LABELS.sourceIdHash])
+        && /^[a-f0-9]{64}$/.test(agentLibLabels[BOX_AGENTLIB_LABELS.fingerprint])
+        && sourceRelativePath.length > 0
+        && !sourceRelativePath.startsWith('/')
+        && !sourceRelativePath.split('/').includes('..')
+        && (commit === '' || /^[a-f0-9]{40}$/.test(commit));
     return /^[1-9][0-9]{0,4}$/.test(hostPort)
         && Number(hostPort) <= 65535
         && /^[1-9][0-9]{0,4}$/.test(mediaHostPort)
         && Number(mediaHostPort) <= 65535
         && imageRef.length > 0
-        && (hasNoFingerprints || hasCompleteFingerprints)
+        && hasCompleteFingerprints
+        && hasCompleteAgentLib
         && hasExactLabels(labels, {
             ...expectedImmutableLabels(pathHash, role),
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: hostPort,
             [BOX_LABELS.mediaHostPort]: mediaHostPort,
             ...expectedFingerprints,
+            ...agentLibLabels,
         });
 }
 

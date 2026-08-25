@@ -12,7 +12,11 @@ import {
     formatBoxStatus,
     runBoundedCoreStart,
 } from '../../ploinky-box/supervisor.mjs';
-import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
+import {
+    agentLibFixture,
+    agentLibFixtureLabels,
+    agentLibFixtureMounts,
+} from '../helpers/agentlibFixture.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -48,6 +52,7 @@ function fakeLockManager(root, events) {
 }
 
 function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
+    const agentLib = agentLibFixture(identity.workspaceRoot);
     return {
         state: 'owned',
         engine: { name: 'podman', identity: 'engine' },
@@ -55,9 +60,14 @@ function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
             container: {
                 id,
                 labels: {
+                    ...agentLibFixtureLabels(agentLib),
                     [BOX_LABELS.imageRef]: BOX_IMAGE_REFERENCE,
                 },
-                runtime: { running, imageId: 'b'.repeat(64) },
+                runtime: {
+                    running,
+                    imageId: 'b'.repeat(64),
+                    mounts: agentLibFixtureMounts(agentLib),
+                },
             },
         },
     };
@@ -608,13 +618,13 @@ test('start selects the AgentLib source and passes the host address into the bou
     });
 
     await supervisor.runStartTransaction(['start', 'explorer'], {
-        branchPolicy: { branch: 'ploinky-proxy', fallback: 'fail' },
+        branchPolicy: { branch: 'feature-agentlib', fallback: 'fail' },
     });
     assert.equal(boundedOptions.hostReachableIpv4, '192.168.1.12');
     // The source is selected from the resolved workspace before Box
     // reconciliation, and the same selection reaches the in-Box core.
     assert.equal(selectedFor.workspaceRoot, identity.workspaceRoot);
-    assert.deepEqual(selectedFor.branchPolicy, { branch: 'ploinky-proxy', fallback: 'fail' });
+    assert.deepEqual(selectedFor.branchPolicy, { branch: 'feature-agentlib', fallback: 'fail' });
     assert.equal(boundedOptions.agentLib, agentLib);
     // The source is revalidated after the graph is ready, and `active.json` is
     // committed only after that succeeds.

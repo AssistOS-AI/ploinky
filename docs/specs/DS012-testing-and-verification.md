@@ -21,7 +21,7 @@ WebChat behavior must be tested at the protocol and browser-model boundaries for
 
 Documentation changes must regenerate `docs/specs/matrix.md` from DS frontmatter and validate contiguous numbering, exact titles, the required DS sections, DS links, specification-loader targets, and the absence of unsupported metadata. Site-wide verification may additionally validate HTML navigation and assets, but a DS-only change must report pre-existing HTML failures without rewriting HTML outside the requested scope.
 
-The cross-repository `ploinky-proxy` deployment and Playwright gate is separate from ordinary verification and must run only when the user explicitly requests it. When requested, the exact branch, repository, image, workspace, deployment, and evidence requirements in `CLAUDE.md` are mandatory.
+The cross-repository release-candidate deployment and Playwright gate is separate from ordinary verification and must run only when the user explicitly requests it. When requested, the exact branch, repository, image, workspace, deployment, and evidence requirements in `CLAUDE.md` are mandatory.
 
 Verification must prove the narrow unit contract and the real boundary at which Ploinky exposes lifecycle, routing, security, or browser behavior to a user or consuming system.
 

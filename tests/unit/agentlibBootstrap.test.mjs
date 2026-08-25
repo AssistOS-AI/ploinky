@@ -202,12 +202,12 @@ test('status bootstraps read-only and core commands bootstrap fully', async () =
     assert.deepEqual(bootstraps, [{ readOnly: true, branch: null }]);
 
     bootstraps.length = 0;
-    await launchCli(['start', 'demo', '--branch', 'ploinky-proxy'], {
+    await launchCli(['start', 'demo', '--branch', 'feature-agentlib'], {
         bootstrapAgentLibImpl,
         importCoreImpl: async () => ({ runCoreCli: async () => 0 }),
         env: {},
     });
-    assert.deepEqual(bootstraps, [{ readOnly: false, branch: 'ploinky-proxy' }]);
+    assert.deepEqual(bootstraps, [{ readOnly: false, branch: 'feature-agentlib' }]);
 });
 
 test('a malformed branch policy does not pre-empt the command that owns the error', async () => {
