@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { PLOINKY_DIR } from './config.js';
+import { parseBranchPolicy } from '../../agentlib/branchPolicy.mjs';
 
 export const REPO_SOURCES_FILE = path.join(PLOINKY_DIR, 'repo_sources.json');
 export const ENABLED_REPOS_FILE = path.join(PLOINKY_DIR, 'enabled_repos.json');
@@ -603,67 +604,11 @@ export function pullGitRepo(repoPath, { rebase = true, autostash = true, stdio =
 // ---------------------------------------------------------------------------
 // Branch policy — used by `ploinky start --branch`
 // ---------------------------------------------------------------------------
+// The parser itself lives in the dependency-free `agentlib/` group so the outer
+// `ploinky` supervisor can select the achillesAgentLib source with exactly the
+// same policy before it reconciles the Box.
 
-export function parseBranchPolicy(args) {
-    const policy = {
-        branch: null,
-        repoBranches: {},
-        fallback: 'default',
-        resetRepos: false,
-    };
-    if (!Array.isArray(args) || !args.length) return policy;
-
-    for (let i = 0; i < args.length; i += 1) {
-        const arg = String(args[i] || '');
-
-        if (arg === '--branch' && i + 1 < args.length) {
-            policy.branch = String(args[++i]);
-            continue;
-        }
-        if (arg.startsWith('--branch=')) {
-            policy.branch = arg.slice('--branch='.length);
-            continue;
-        }
-
-        if (arg === '--repo-branch' && i + 1 < args.length) {
-            const pair = String(args[++i]);
-            const eqIdx = pair.indexOf('=');
-            if (eqIdx < 1) {
-                throw new Error(`Malformed --repo-branch value '${pair}'. Expected repo=branch.`);
-            }
-            policy.repoBranches[pair.slice(0, eqIdx)] = pair.slice(eqIdx + 1);
-            continue;
-        }
-        if (arg.startsWith('--repo-branch=')) {
-            const pair = arg.slice('--repo-branch='.length);
-            const eqIdx = pair.indexOf('=');
-            if (eqIdx < 1) {
-                throw new Error(`Malformed --repo-branch value '${pair}'. Expected repo=branch.`);
-            }
-            policy.repoBranches[pair.slice(0, eqIdx)] = pair.slice(eqIdx + 1);
-            continue;
-        }
-
-        if (arg === '--branch-fallback' && i + 1 < args.length) {
-            policy.fallback = String(args[++i]);
-            continue;
-        }
-        if (arg.startsWith('--branch-fallback=')) {
-            policy.fallback = arg.slice('--branch-fallback='.length);
-            continue;
-        }
-
-        if (arg === '--reset-repos') {
-            policy.resetRepos = true;
-            continue;
-        }
-    }
-
-    if (policy.fallback !== 'default' && policy.fallback !== 'fail') {
-        throw new Error(`Invalid --branch-fallback value '${policy.fallback}'. Use 'default' or 'fail'.`);
-    }
-    return policy;
-}
+export { parseBranchPolicy };
 
 export function parseStartArgs(rawArgs) {
     const args = (rawArgs || []).map(a => String(a));
