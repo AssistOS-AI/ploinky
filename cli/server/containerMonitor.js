@@ -46,6 +46,12 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROBE_WORKER_URL = new URL('./probeWorker.js', import.meta.url);
+// A rootless nested Podman control plane can stall its network relay when
+// multiple inspect/exec/list operations overlap. Keep recurring semantic
+// probes single-file by default; callers may still opt into more concurrency
+// when their runtime has proved that it can safely sustain it.
+const DEFAULT_MAX_CONCURRENT_PROBE_WORKERS = 1;
+const DEFAULT_CONTINUOUS_PROBE_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_CONTAINER_SNAPSHOT_RETRY_INITIAL_MS = 15_000;
 const DEFAULT_CONTAINER_SNAPSHOT_RETRY_MAX_MS = 60_000;
 const TRANSIENT_PROBE_INFRASTRUCTURE_CODES = new Set([
@@ -243,6 +249,7 @@ function createContainerTarget(info, monitor) {
         probeLastSuccessAt: null,
         probeInfrastructureFailures: 0,
         probeRetryNotBefore: null,
+        probeConcurrencyDeferred: false,
         attemptEpoch: 0,
         restartInputDigest: info.restartInputDigest,
         runtimeAdmission: info.runtimeAdmission,
@@ -424,6 +431,15 @@ function handleProbeInfrastructureFailure(monitor, target, message, code) {
     });
 }
 
+function activeProbeWorkerCount(monitor) {
+    if (!monitor?.targets) return 0;
+    let count = 0;
+    for (const current of monitor.targets.values()) {
+        if (current?.probeWorker) count += 1;
+    }
+    return count;
+}
+
 export function startProbeWorker(monitor, target) {
     if (!monitor || !target) return;
     if (target.circuitBreakerTripped) return;
@@ -437,11 +453,22 @@ export function startProbeWorker(monitor, target) {
     const maxConcurrency = positiveInteger(
         monitor?.config?.PROBE_MAX_CONCURRENCY
             ?? process.env.PLOINKY_CONTAINER_MONITOR_PROBE_MAX_CONCURRENCY,
-        4,
+        DEFAULT_MAX_CONCURRENT_PROBE_WORKERS,
     );
-    const activeWorkers = [...(monitor.targets?.values?.() || [])]
-        .filter((candidate) => Boolean(candidate?.probeWorker)).length;
-    if (activeWorkers >= maxConcurrency) return;
+    const activeWorkers = activeProbeWorkerCount(monitor);
+    if (activeWorkers >= maxConcurrency) {
+        if (!target.probeConcurrencyDeferred) {
+            target.probeConcurrencyDeferred = true;
+            logEvent(monitor, 'debug', 'container_probe_concurrency_deferred', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                maxConcurrentWorkers: maxConcurrency,
+            });
+        }
+        return;
+    }
+    target.probeConcurrencyDeferred = false;
 
     let manifest;
     try {
@@ -1517,6 +1544,28 @@ export function monitorTick(monitor) {
     const syncContainers = monitor.syncManagedContainers || syncManagedContainers;
     syncContainers(monitor);
 
+    // Each semantic probe owns a bounded sequence of runtime inspect/exec
+    // calls. Do not overlap the shared `podman ps` snapshot with that sequence:
+    // nested rootless Podman has one practical control-plane lane, and
+    // saturating it can interrupt otherwise healthy agent traffic. The next
+    // five-second monitor tick resumes snapshots as soon as the worker exits.
+    // Maintenance owns the stronger lifecycle contract and must still be able
+    // to cancel a worker before snapshot serialization takes effect.
+    for (const target of monitor.targets.values()) {
+        if (target?.probeWorker) deferMonitorWorkForMaintenance(monitor, target);
+    }
+    const activeWorkers = activeProbeWorkerCount(monitor);
+    if (activeWorkers > 0) {
+        if (!monitor.runtimeSnapshotProbeDeferred) {
+            monitor.runtimeSnapshotProbeDeferred = true;
+            logEvent(monitor, 'debug', 'container_status_snapshot_deferred_active_probe', {
+                activeWorkers,
+            });
+        }
+        return;
+    }
+    monitor.runtimeSnapshotProbeDeferred = false;
+
     const runningContainerNames = snapshotRunningContainerNames(monitor);
 
     for (const target of monitor.targets.values()) {
@@ -1576,7 +1625,7 @@ export function monitorTick(monitor) {
             const continuousProbeIntervalMs = positiveInteger(
                 monitor?.config?.CONTINUOUS_PROBE_INTERVAL_MS
                     ?? process.env.PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS,
-                30_000,
+                DEFAULT_CONTINUOUS_PROBE_INTERVAL_MS,
             );
             if (target.probeState === 'success'
                 && (!target.probeLastSuccessAt

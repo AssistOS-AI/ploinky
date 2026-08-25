@@ -45,7 +45,7 @@ test('a running probe worker blocks overlapping probe executions for the same ta
     assert.deepEqual(events, [], 'no probe start or failure may fire while a probe is in flight');
 });
 
-test('successive monitor ticks preserve one in-flight probe worker', () => {
+test('successive monitor ticks preserve one in-flight probe worker without overlapping snapshots', () => {
     const { monitor, events } = monitorRecorder();
     const activeWorker = { sentinel: 'active-probe-worker' };
     const target = {
@@ -70,10 +70,12 @@ test('successive monitor ticks preserve one in-flight probe worker', () => {
     monitorTick(monitor);
     monitorTick(monitor);
 
-    assert.equal(snapshots, 2, 'each tick takes one shared runtime snapshot');
+    assert.equal(snapshots, 0, 'shared runtime snapshots wait for the worker to finish');
     assert.equal(target.probeWorker, activeWorker, 'ticks must not replace the in-flight worker');
     assert.equal(target.probeState, 'running');
-    assert.deepEqual(events, []);
+    assert.deepEqual(events.map(({ event }) => event), [
+        'container_status_snapshot_deferred_active_probe',
+    ]);
 });
 
 test('a running no-wait container is not probed until activation readiness publishes running', () => {
@@ -542,6 +544,116 @@ test('probe worker concurrency is capped to avoid a Podman control-plane stamped
     startProbeWorker(monitor, targets[2]);
     assert.ok(targets[2].probeWorker instanceof FakeWorker);
     assert.equal(targets.filter(({ probeWorker }) => Boolean(probeWorker)).length, 2);
+});
+
+test('probe workers are serialized by default', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-probe-default-serialization-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const manifestPath = path.join(workspace, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify({
+        health: { liveness: { script: 'healthcheck.sh' } },
+    }));
+
+    class FakeWorker extends EventEmitter {
+        postMessage() {}
+        terminate() { return Promise.resolve(0); }
+    }
+
+    const { monitor, events } = monitorRecorder();
+    monitor.Worker = FakeWorker;
+    monitor.targets.set('active-container', { probeWorker: { active: true } });
+    const target = {
+        containerName: 'default-deferred-container',
+        agentName: 'default-deferred-agent',
+        repoName: 'demo-repo',
+        manifestPath,
+        probeWorker: null,
+        probeState: 'pending',
+    };
+    monitor.targets.set(target.containerName, target);
+
+    startProbeWorker(monitor, target);
+
+    assert.equal(target.probeWorker, null);
+    assert.equal(target.probeState, 'pending');
+    assert.ok(events.some(({ event, data }) => (
+        event === 'container_probe_concurrency_deferred'
+        && data.maxConcurrentWorkers === 1
+    )));
+
+    monitor.targets.get('active-container').probeWorker = null;
+    startProbeWorker(monitor, target);
+
+    assert.ok(target.probeWorker instanceof FakeWorker);
+    target.probeWorker.emit('message', { status: 'success' });
+});
+
+test('runtime snapshots wait for the active semantic probe to release the control plane', () => {
+    const { monitor, events } = monitorRecorder();
+    const target = {
+        containerName: 'serialized-container',
+        agentName: 'serialized-agent',
+        repoName: 'demo-repo',
+        runtime: 'container',
+        probeWorker: { active: true },
+        probeState: 'running',
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+    monitor.targets.set(target.containerName, target);
+    monitor.inspectWorkspaceStartLock = () => ({ active: false, stale: false });
+    monitor.syncManagedContainers = () => {};
+    let snapshots = 0;
+    monitor.listRunningContainerNames = () => {
+        snapshots += 1;
+        return [target.containerName];
+    };
+
+    monitorTick(monitor);
+    monitorTick(monitor);
+
+    assert.equal(snapshots, 0, 'podman ps must not overlap an in-flight probe');
+    assert.equal(
+        events.filter(({ event }) => event === 'container_status_snapshot_deferred_active_probe').length,
+        1,
+        'a prolonged worker emits one deferral event instead of one per tick',
+    );
+
+    target.probeWorker = null;
+    target.probeState = 'success';
+    target.probeLastSuccessAt = Date.now();
+    monitor.startProbeWorker = () => {};
+    monitorTick(monitor);
+
+    assert.equal(snapshots, 1, 'the first post-probe tick resumes the shared snapshot');
+    assert.equal(monitor.runtimeSnapshotProbeDeferred, false);
+});
+
+test('successful semantic probes recur every five minutes by default', () => {
+    const { monitor } = monitorRecorder();
+    const target = {
+        containerName: 'interval-container',
+        agentName: 'interval-agent',
+        repoName: 'demo-repo',
+        runtime: 'container',
+        probeWorker: null,
+        probeState: 'success',
+        probeLastSuccessAt: Date.now() - 60_000,
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+    monitor.targets.set(target.containerName, target);
+    monitor.inspectWorkspaceStartLock = () => ({ active: false, stale: false });
+    monitor.syncManagedContainers = () => {};
+    monitor.listRunningContainerNames = () => [target.containerName];
+    monitor.startProbeWorker = () => {};
+
+    monitorTick(monitor);
+    assert.equal(target.probeState, 'success', 'one minute is below the safe recurring interval');
+
+    target.probeLastSuccessAt = Date.now() - (6 * 60_000);
+    monitorTick(monitor);
+    assert.equal(target.probeState, 'pending', 'an overdue probe becomes eligible again');
 });
 
 test('no-wait marker identities must be real JSON numbers, not coercible values', (t) => {
