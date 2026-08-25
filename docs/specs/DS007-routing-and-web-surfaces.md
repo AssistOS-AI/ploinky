@@ -51,7 +51,7 @@ The following table is the active Router-owned HTTP surface. Endpoint families w
 | `GET` or `POST /auth/account` | Renders account information and allows an authenticated local user to update their own username or password with a mutation proof. External-auth accounts are read-only here. |
 | `GET /auth/callback` | Completes the configured SSO callback, binds the new session to the current edge generation, and redirects to the validated return path. |
 | `GET` or `POST /auth/logout` | Renders logout confirmation or invalidates the session after mutation-proof validation and clears authentication state. |
-| `GET` or `POST /auth/token` | Returns the authenticated browser's token metadata, user, browser-mutation proof, route/generation binding, and local admin-control proof when applicable. `POST` may request an SSO refresh and requires CSRF validation. |
+| `GET` or `POST /auth/token` | Returns the authenticated browser's token metadata, user, session/origin/host-bound browser-mutation proof, current generation metadata, and local admin-control proof when applicable. Route authorization remains separate. `POST` may request an SSO refresh and requires CSRF validation. |
 | `/auth/local-users`, `/auth/github/*`, and `POST /auth/agent-token` | Reserved removed surfaces. They return `410` or `404` and must not be reused; user administration and router-mediated agent assertions replace them. |
 | `GET /api/agents/<agentName>/settings` | Returns Router login presentation settings for a host-selected agent using local authentication. A local administrator session is required. |
 | `PATCH /api/agents/<agentName>/settings` | Updates supported Router login settings after administrator and mutation-proof checks. |

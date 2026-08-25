@@ -28,7 +28,7 @@ function request(headers = {}) {
     };
 }
 
-test('browser mutation proof binds session, exact routed origin, route selector, and generation', () => {
+test('browser mutation proof binds session, exact routed origin, and selected host', () => {
     const routePlan = publicPlan();
     const authContext = { routeKey: 'identity-owner', boundHostRouteKey: 'example' };
     const req = request({ origin: 'https://app.example.test' });
@@ -56,8 +56,16 @@ test('browser mutation proof binds session, exact routed origin, route selector,
             routePlan: publicPlan({ generation: 'edge-generation-b' }),
             authContext,
             sessionId: 'session-a',
-        }).code,
-        'BROWSER_CSRF_INVALID',
+        }).ok,
+        true,
+    );
+    assert.equal(
+        verifyBrowserMutationRequest(req, {
+            routePlan,
+            authContext: { ...authContext, routeKey: 'other-service' },
+            sessionId: 'session-a',
+        }).ok,
+        true,
     );
     assert.equal(
         verifyBrowserMutationRequest(req, {
@@ -73,7 +81,7 @@ test('browser mutation proof binds session, exact routed origin, route selector,
     );
 });
 
-test('service mutation proof stays bound to both the public host root and allowed service route', () => {
+test('service mutation proof stays bound to the public host while route authorization remains separate', () => {
     const routePlan = publicPlan({ routeKey: 'explorer' });
     const serviceContext = {
         routeKey: 'explorer',
@@ -107,7 +115,7 @@ test('service mutation proof stays bound to both the public host root and allowe
         routePlan,
         authContext: { ...serviceContext, serviceRouteKey: 'onlyOffice' },
         sessionId: 'session-a',
-    }).code, 'BROWSER_CSRF_INVALID');
+    }).ok, true);
     assert.equal(verifyBrowserMutationRequest(req, {
         routePlan: publicPlan({ routeKey: 'other-root' }),
         authContext: {
@@ -118,7 +126,7 @@ test('service mutation proof stays bound to both the public host root and allowe
     }).code, 'BROWSER_CSRF_INVALID');
 });
 
-test('named router-surface proof cannot be substituted with a general root proof', () => {
+test('named router surfaces share the host CSRF proof and retain separate authorization', () => {
     const routePlan = publicPlan({ routeKey: 'explorer' });
     const rootContext = {
         routeKey: 'explorer',
@@ -140,7 +148,7 @@ test('named router-surface proof cannot be substituted with a general root proof
         routePlan,
         authContext: userAdminContext,
         sessionId: 'session-a',
-    }).code, 'BROWSER_CSRF_INVALID');
+    }).ok, true);
 });
 
 test('browser mutation proof survives local JWT refresh for the same signed session id', () => {
