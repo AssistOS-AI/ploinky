@@ -12,6 +12,11 @@ import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-
 import { buildEngineProcessEnvironment } from '../../ploinky-box/process.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { stripReservedAgentEnv } from '../../cli/utils/security/agentIdentityEnv.js';
+import {
+    agentLibFixture,
+    agentLibFixtureLabels,
+    agentLibFixtureMounts,
+} from '../helpers/agentlibFixture.mjs';
 
 function bufferStream(isTTY = false) {
     let bytes = '';
@@ -23,6 +28,7 @@ function bufferStream(isTTY = false) {
 }
 
 function owned(identity, { running = true } = {}) {
+    const agentLib = agentLibFixture(identity.workspaceRoot);
     return {
         state: 'owned',
         engine: { name: 'podman', identity: 'engine-fingerprint' },
@@ -30,10 +36,11 @@ function owned(identity, { running = true } = {}) {
             container: {
                 id: 'a'.repeat(64),
                 labels: {
+                    ...agentLibFixtureLabels(agentLib),
                     [BOX_LABELS.routerHostPort]: '8080',
                     [BOX_LABELS.mediaHostPort]: '7882',
                 },
-                runtime: { running },
+                runtime: { running, mounts: agentLibFixtureMounts(agentLib) },
             },
         },
     };
@@ -41,6 +48,7 @@ function owned(identity, { running = true } = {}) {
 
 function matrixSupervisor(identity, events) {
     const ownership = owned(identity);
+    const agentLib = agentLibFixture(identity.workspaceRoot);
     let acquisitions = 0;
     const lockManager = {
         get acquisitions() { return acquisitions; },
@@ -83,13 +91,25 @@ function matrixSupervisor(identity, events) {
         runner,
         validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
         validateContainer: () => ({}),
+        selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
+        updateAgentLib: async () => ({
+            selection: agentLib,
+            changed: false,
+            previous: agentLib,
+        }),
         reconcile: async ({ lock }) => {
             lock.assertHeld(identity.instance);
             events.push('reconcile');
             return { ownership, hostPort: 8080, mediaHostPort: 7882, action: 'reused' };
         },
         startCore: async () => { events.push('start-core'); },
+        runCoreCommand: async () => { events.push('core-command'); },
         healthCheck: async () => { events.push('health'); },
+        attestAgentLibGraph: async () => ({
+            deploymentFingerprint: agentLib.contentFingerprint,
+        }),
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
     });
     return { supervisor, lockManager };
 }
@@ -106,7 +126,7 @@ test('every public verb has the required single-lock depth and release boundary'
         { name: 'stop', argv: ['stop'], locks: 1 },
         { name: 'destroy', argv: ['destroy'], locks: 1 },
         { name: 'start', argv: ['start', 'Agent'], locks: 1 },
-        { name: 'update', argv: ['update'], locks: 1, forwarded: true },
+        { name: 'update', argv: ['update'], locks: 1 },
         { name: 'repl', argv: [], locks: 1, forwarded: true },
         { name: 'bash', argv: ['cli'], locks: 1, forwarded: true },
         { name: 'agent-cli', argv: ['cli', 'Agent'], locks: 1, forwarded: true },
@@ -158,6 +178,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
         digest: 'b'.repeat(64),
         size: 123,
     };
+    const agentLib = agentLibFixture(identity.workspaceRoot);
     const stagedSupervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
         discover: () => owned(identity),
@@ -181,6 +202,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
             run(command, args) { events.push(`run:${args.join(' ')}`); },
             query() { return { ok: true, stdout: '' }; },
         },
+        selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
         reconcile: async () => ({
             ownership: owned(identity),
             hostPort: 8080,
@@ -199,6 +221,11 @@ test('start stages host-owned edge desired state under the Box lock before core 
         },
         startCore: async () => { events.push('start-core'); },
         healthCheck: async () => { events.push('health'); },
+        attestAgentLibGraph: async () => ({
+            deploymentFingerprint: agentLib.contentFingerprint,
+        }),
+        revalidateAgentLibSource: () => {},
+        commitAgentLibSelection: () => {},
     });
 
     await stagedSupervisor.runStartTransaction(['start', 'Agent', '8080']);

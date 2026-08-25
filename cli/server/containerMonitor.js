@@ -357,6 +357,11 @@ function stopProbeWorker(target) {
 
 function handleProbeFailure(monitor, target, message, { runtimeHealth = false } = {}) {
     if (!monitor || !target) return;
+    // A manually managed replacement may be running before its declared
+    // readiness contract succeeds. Continuous liveness is not authoritative
+    // during that transaction: treating the expected not-ready interval as a
+    // failure would inactivate the exact generation owned by the maintainer.
+    if (deferMonitorWorkForMaintenance(monitor, target)) return;
     target.probeState = 'failed';
     target.lastError = message;
     target.probeFailures = (target.probeFailures || 0) + 1;
@@ -386,6 +391,7 @@ function handleProbeFailure(monitor, target, message, { runtimeHealth = false } 
 export function startProbeWorker(monitor, target) {
     if (!monitor || !target) return;
     if (target.circuitBreakerTripped) return;
+    if (deferMonitorWorkForMaintenance(monitor, target)) return;
     if (target.probeWorker || target.probeState === 'success') return;
 
     let manifest;
@@ -441,6 +447,7 @@ export function startProbeWorker(monitor, target) {
             return;
         }
         if (msg.status === 'success') {
+            if (deferMonitorWorkForMaintenance(monitor, target)) return;
             target.probeState = 'success';
             target.probeLastSuccessAt = Date.now();
             logEvent(monitor, 'info', 'container_probe_succeeded', {
@@ -591,6 +598,17 @@ function shouldDeferMaintenanceRestart(monitor, target) {
             expiresAt: result.lock?.expiresAt || null
         });
     }
+    return true;
+}
+
+function deferMonitorWorkForMaintenance(monitor, target) {
+    if (!shouldDeferMaintenanceRestart(monitor, target)) return false;
+    // A worker may have started immediately before the maintenance lock was
+    // acquired. Terminate it and discard any earlier success timestamp so the
+    // first post-maintenance tick performs a fresh semantic probe.
+    stopProbeWorker(target);
+    target.probeState = 'pending';
+    target.probeLastSuccessAt = null;
     return true;
 }
 
@@ -1416,6 +1434,7 @@ export function monitorTick(monitor) {
 
     for (const target of monitor.targets.values()) {
         if (!target || target.circuitBreakerTripped) continue;
+        if (deferMonitorWorkForMaintenance(monitor, target)) continue;
         if (target.isRestarting || target.pendingRestartTimer) continue;
 
         let running = false;
@@ -1483,10 +1502,6 @@ export function monitorTick(monitor) {
         }
 
         if (target.probeState === 'running') {
-            continue;
-        }
-
-        if (shouldDeferMaintenanceRestart(monitor, target)) {
             continue;
         }
 
