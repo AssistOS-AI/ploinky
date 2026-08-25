@@ -12,6 +12,7 @@ import {
     formatBoxStatus,
     runBoundedCoreStart,
 } from '../../ploinky-box/supervisor.mjs';
+import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -559,16 +560,22 @@ test('failed ploinky-local stop still stops the outer Box', async (t) => {
     assert.equal(events.some((value) => value.includes('container stop --time 30')), true);
 });
 
-test('start passes the native host address into the bounded in-box runtime', async (t) => {
+test('start selects the AgentLib source and passes the host address into the bounded runtime', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
     const ownership = owned(identity);
     const events = [];
     let boundedOptions;
+    const agentLib = agentLibFixture(identity.workspaceRoot);
+    let selectedFor = null;
     const supervisor = createBoxSupervisor({
-        env: { PLOINKY_AGENTLIB_REF: 'master' },
+        env: {},
         resolveIdentity: () => identity,
+        selectAgentLib: async ({ workspaceRoot, branchPolicy }) => {
+            selectedFor = { workspaceRoot, branchPolicy };
+            return { selection: agentLib, mode: 'local' };
+        },
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
         platform: 'darwin',
@@ -590,12 +597,21 @@ test('start passes the native host address into the bounded in-box runtime', asy
         healthCheck: async (hostPort) => assert.equal(hostPort, 8080),
     });
 
-    await supervisor.runStartTransaction(['start', 'explorer']);
+    await supervisor.runStartTransaction(['start', 'explorer'], {
+        branchPolicy: { branch: 'ploinky-proxy', fallback: 'fail' },
+    });
     assert.equal(boundedOptions.hostReachableIpv4, '192.168.1.12');
-    assert.equal(boundedOptions.agentlibRef, 'master');
+    // The source is selected from the resolved workspace before Box
+    // reconciliation, and the same selection reaches the in-Box core.
+    assert.equal(selectedFor.workspaceRoot, identity.workspaceRoot);
+    assert.deepEqual(selectedFor.branchPolicy, { branch: 'ploinky-proxy', fallback: 'fail' });
+    assert.equal(boundedOptions.agentLib, agentLib);
 });
 
-test('bounded start requires the external Router URL and preserves normalized argv', async () => {
+test('bounded start requires the external Router URL and preserves normalized argv', async (t) => {
+    const boundedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-bounded-'));
+    t.after(() => fs.rmSync(boundedRoot, { recursive: true, force: true }));
+    const boundedAgentLib = agentLibFixture(boundedRoot);
     const output = { value: '', write(chunk) { this.value += String(chunk); } };
     const calls = [];
     const status = await runBoundedCoreStart(
@@ -622,17 +638,22 @@ test('bounded start requires the external Router URL and preserves normalized ar
             stderr: output,
             timeoutMs: 1000,
             hostReachableIpv4: '192.168.1.12',
-            agentlibRef: 'master',
+            agentLib: boundedAgentLib,
         },
     );
     assert.equal(status, 0);
     assert.deepEqual(calls[0][1].slice(-4), ['--debug', 'start', 'Agent', '8080']);
-    assert.deepEqual(calls[0][1].slice(0, 14), [
+    // The in-Box core learns the source only through the reserved environment,
+    // which names the stable mount path rather than any host path.
+    assert.deepEqual(calls[0][1].slice(0, 20), [
         'container', 'exec',
         '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
         '--env', 'PLOINKY_MEDIA_HOST_PORT=17891',
         '--env', 'PLOINKY_HOST_REACHABLE_IPV4=192.168.1.12',
-        '--env', 'PLOINKY_AGENTLIB_REF=master',
+        '--env', 'PLOINKY_AGENTLIB_DIR=/opt/ploinky-agentlib',
+        '--env', 'PLOINKY_AGENTLIB_MODE=local',
+        '--env', `PLOINKY_AGENTLIB_FINGERPRINT=${boundedAgentLib.fingerprint}`,
+        '--env', 'PLOINKY_AGENTLIB_COMMIT=',
         '--user', 'podman', '--workdir', '/workspace',
     ]);
     assert.equal(calls[0][2].stdout, output);
@@ -653,7 +674,7 @@ test('bounded start requires the external Router URL and preserves normalized ar
                 };
             },
         },
-        { stdout: { write() {} }, stderr: { write() {} } },
+        { stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
     );
     assert.equal(defaultTimeoutCalls[0].timeoutMs, 1_800_000);
     assert.equal(
@@ -674,8 +695,16 @@ test('bounded start requires the external Router URL and preserves normalized ar
     await assert.rejects(() => runBoundedCoreStart(
         { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090, 17891,
         { stream: async () => ({ ok: true, status: 0, stdout: '[start] Router: http://127.0.0.1:8080\n', stderr: '' }) },
-        { stdout: { write() {} }, stderr: { write() {} } },
+        { stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
     ), /public Router URL/);
+
+    // A start without a selected source is a contract error, not a start that
+    // lets the in-Box core resolve achillesAgentLib for itself.
+    await assert.rejects(() => runBoundedCoreStart(
+        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 8080, 7882,
+        { stream: async () => { throw new Error('must fail before Podman'); } },
+        { stdout: { write() {} }, stderr: { write() {} } },
+    ), /requires the selected achillesAgentLib contract/);
 });
 
 test('public health connects to the published port with matching authority', async (t) => {

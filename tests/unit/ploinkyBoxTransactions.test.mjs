@@ -30,6 +30,12 @@ import {
     waitForReadyLine,
 } from '../../ploinky-box/lifecycle/container.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
+import {
+    agentLibFixture,
+    agentLibFixtureEnv,
+    agentLibFixtureLabels,
+    agentLibFixtureMounts,
+} from '../helpers/agentlibFixture.mjs';
 
 const DATA_FINGERPRINTS = Object.freeze({
     dependencies: 'd'.repeat(64),
@@ -55,7 +61,10 @@ function fixture(t) {
         path: lockPath,
         assertHeld(instance) { assert.equal(instance, identity.instance); },
     };
-    return { root, identity, lock };
+    // Every Box now carries the direct-mounted achillesAgentLib source as part
+    // of its immutable contract, so the fixture selects one for the workspace.
+    const agentLib = agentLibFixture(identity.workspaceRoot);
+    return { root, identity, lock, agentLib };
 }
 
 function dataDirectoriesExist(identity) {
@@ -72,10 +81,12 @@ function containerHandle({
     id,
     running = true,
     dataFingerprints = DATA_FINGERPRINTS,
+    agentLib,
 }) {
     return {
         id,
         labels: {
+            ...agentLibFixtureLabels(agentLib),
             'io.buildah.version': '1.43.1',
             [BOX_LABELS.pathHash]: identity.pathHash,
             [BOX_LABELS.role]: 'box',
@@ -99,6 +110,7 @@ function containerHandle({
             ],
             environment: {
                 ...IMAGE_CONTRACT.environment,
+                ...agentLibFixtureEnv(agentLib),
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
@@ -125,6 +137,7 @@ function containerHandle({
                 { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
                 { type: 'bind', name: '', source: identity.workspaceRoot, destination: '/workspace', rw: true },
+                ...agentLibFixtureMounts(agentLib),
             ],
         },
     };
@@ -134,6 +147,7 @@ test('container validation ignores inherited image labels but rejects unknown ow
     const state = fixture(t);
     const handle = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -142,6 +156,7 @@ test('container validation ignores inherited image labels but rejects unknown ow
     });
     const desired = {
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -159,6 +174,7 @@ test('Podman Machine validation tolerates its omitted device inspection only', (
     const state = fixture(t);
     const handle = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -168,6 +184,7 @@ test('Podman Machine validation tolerates its omitted device inspection only', (
     handle.runtime.devices = [];
     const desired = {
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -197,6 +214,7 @@ test('native device mismatch reports normalized observed and expected devices', 
     const state = fixture(t);
     const handle = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -212,6 +230,7 @@ test('native device mismatch reports normalized observed and expected devices', 
     assert.throws(
         () => validateContainerConfiguration(handle, {
             identity: state.identity,
+            agentLib: state.agentLib,
             repositoryRoot: state.root,
             imageId: 'a'.repeat(64),
             imageRef: 'runtime',
@@ -225,6 +244,7 @@ test('omitted device inspection requires the exact recorded device arguments', (
     const state = fixture(t);
     const handle = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -234,6 +254,7 @@ test('omitted device inspection requires the exact recorded device arguments', (
     handle.runtime.devices = [];
     const desired = {
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -254,6 +275,7 @@ test('Box container argv disables outer SELinux label confinement on every suppo
         const args = containerCreateArgs({
             identity: state.identity,
             dataFingerprints: DATA_FINGERPRINTS,
+            agentLib: state.agentLib,
             imageId: 'a'.repeat(64),
             imageRef: 'runtime',
             hostPort: 19090,
@@ -304,6 +326,7 @@ function harness(state, {
                 ));
                 current = containerHandle({
                     identity: state.identity,
+                    agentLib: state.agentLib,
                     repositoryRoot: state.root,
                     imageId,
                     imageRef: imageRefLabel.slice(imageRefLabel.indexOf('=') + 1),
@@ -397,6 +420,7 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     const args = containerCreateArgs({
         identity: state.identity,
         dataFingerprints: DATA_FINGERPRINTS,
+        agentLib: state.agentLib,
         imageId: 'a'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
         hostPort: 19090,
@@ -424,7 +448,10 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.includes(`${state.identity.workspaceRoot}:/workspace`), true);
     assert.equal(args.some((value) => value === `${state.identity.workspaceRoot}:/workspace:U`), false);
 
-    // Exactly four durable binds and one transient tmpfs, with no named volume.
+    // Exactly six durable binds and one transient tmpfs, with no named volume.
+    // The two achillesAgentLib binds come last and are both read-only: the
+    // stable runtime path, then the shadow over the writable /workspace alias
+    // that would otherwise leave the same inode writable.
     const mountArgs = args.flatMap((value, index) => (
         value === '--volume' ? [args[index + 1]] : []
     ));
@@ -433,7 +460,17 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
         `${state.identity.workspaceRoot}:/workspace`,
         `${state.identity.dataPaths.dependencies}:/opt/ploinky/node_modules`,
         `${state.identity.dataPaths.images}:/home/podman/.local/share/ploinky-images`,
+        `${state.agentLib.sourceDir}:/opt/ploinky-agentlib:ro`,
+        `${state.agentLib.sourceDir}:/workspace/achillesAgentLib:ro`,
     ]);
+    assert.ok(
+        mountArgs.indexOf(`${state.identity.workspaceRoot}:/workspace`)
+        < mountArgs.indexOf(`${state.agentLib.sourceDir}:/workspace/achillesAgentLib:ro`),
+        'the alias shadow must be applied after the writable workspace bind',
+    );
+    assert.equal(args.includes(`PLOINKY_AGENTLIB_DIR=/opt/ploinky-agentlib`), true);
+    assert.equal(args.includes(`PLOINKY_AGENTLIB_MODE=local`), true);
+    assert.equal(args.includes(`PLOINKY_AGENTLIB_FINGERPRINT=${state.agentLib.fingerprint}`), true);
     for (const mount of mountArgs) {
         assert.equal(path.isAbsolute(mount.split(':')[0]), true);
         assert.equal(mount.includes(state.identity.instance), false);
@@ -473,6 +510,7 @@ test('container validation accepts only the exact transient tmpfs contract', (t)
     const state = fixture(t);
     const desired = {
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -539,6 +577,7 @@ test('container validation rejects retired named-volume mounts and user-namespac
     const state = fixture(t);
     const desired = {
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'a'.repeat(64),
         imageRef: 'runtime',
@@ -600,6 +639,7 @@ test('container validation rejects a Box that cannot reap orphaned children', (t
     const state = fixture(t);
     const handle = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
@@ -622,6 +662,7 @@ test('initial transaction preflights before pull, workspace data, and container 
     const h = harness(state);
     const result = await reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'absent', handles: null },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -651,6 +692,7 @@ test('a real create materializes the workspace data directories before the conta
 
     const result = await reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'absent', handles: null },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -668,6 +710,7 @@ test('validated reuse retains the exact workspace data bind sources without engi
     const data = ensureWorkspaceDataPaths({ identity: state.identity, lock: state.lock });
     const current = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
@@ -678,6 +721,7 @@ test('validated reuse retains the exact workspace data bind sources without engi
     const h = harness(state, { initial: current, realDataPaths: true });
     const result = await reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: current } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -697,6 +741,7 @@ test('stopped reuse captures logs before start and validates the same running ID
     const state = fixture(t);
     const current = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
@@ -707,6 +752,7 @@ test('stopped reuse captures logs before start and validates the same running ID
     const h = harness(state, { initial: current });
     const result = await reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: current } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -733,6 +779,7 @@ test('stopped reuse baseline failure mutates no container or image state', async
     const state = fixture(t);
     const current = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
@@ -743,6 +790,7 @@ test('stopped reuse baseline failure mutates no container or image state', async
     const h = harness(state, { initial: current, failBaselineCapture: true });
     await assert.rejects(() => reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: current } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -760,6 +808,7 @@ test('final stopped rediscovery rejects reconciliation after readiness', async (
     const state = fixture(t);
     const current = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
@@ -777,6 +826,7 @@ test('final stopped rediscovery rejects reconciliation after readiness', async (
     };
     await assert.rejects(() => reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: current } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -790,6 +840,7 @@ test('a replaced live bind source forces outer-container replacement', async (t)
     const original = ensureWorkspaceDataPaths({ identity: state.identity, lock: state.lock });
     const current = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
@@ -809,6 +860,7 @@ test('a replaced live bind source forces outer-container replacement', async (t)
     const h = harness(state, { initial: current, realDataPaths: true });
     const result = await reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: current } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -830,6 +882,7 @@ test('an incompatible owned image hard-cuts before any engine mutation', async (
     const state = fixture(t);
     const current = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
@@ -845,6 +898,7 @@ test('an incompatible owned image hard-cuts before any engine mutation', async (
     };
     await assert.rejects(() => reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: {
             state: 'owned',
             handles: { container: current },
@@ -866,6 +920,7 @@ test('preflight and pull failures create no workspace data and no container', as
         const h = harness(state, { ...scenario, realDataPaths: true });
         await assert.rejects(() => reconcileBoxContainer({
             identity: state.identity,
+            agentLib: state.agentLib,
             ownership: { state: 'absent', handles: null },
             engine: { name: 'podman', identity: 'engine' },
             runner: h.runner,
@@ -884,6 +939,7 @@ test('create races and ready timeouts remove the candidate but retain workspace 
         const h = harness(state, { ...scenario, realDataPaths: true });
         await assert.rejects(() => reconcileBoxContainer({
             identity: state.identity,
+            agentLib: state.agentLib,
             ownership: { state: 'absent', handles: null },
             engine: { name: 'podman', identity: 'engine' },
             runner: h.runner,
@@ -904,6 +960,7 @@ test('replacement failure removes the candidate and restores the validated old i
     const oldImage = 'd'.repeat(64);
     const old = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: oldImage,
         imageRef: BOX_IMAGE_REFERENCE,
@@ -914,6 +971,7 @@ test('replacement failure removes the candidate and restores the validated old i
     const h = harness(state, { initial: old, failCandidateReady: true });
     await assert.rejects(() => reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: old } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -937,6 +995,7 @@ test('successful replacement gracefully stops core before stopping and removing 
     const state = fixture(t);
     const old = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: 'd'.repeat(64),
         imageRef: BOX_IMAGE_REFERENCE,
@@ -946,6 +1005,7 @@ test('successful replacement gracefully stops core before stopping and removing 
     const h = harness(state, { initial: old });
     const result = await reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: old } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -969,6 +1029,7 @@ test('ploinky-local replacement stop failure preserves the old same-image Box wi
     const oldImage = 'd'.repeat(64);
     const old = containerHandle({
         identity: state.identity,
+        agentLib: state.agentLib,
         repositoryRoot: state.root,
         imageId: oldImage,
         imageRef: BOX_IMAGE_REFERENCE,
@@ -982,6 +1043,7 @@ test('ploinky-local replacement stop failure preserves the old same-image Box wi
     });
     await assert.rejects(() => reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'owned', handles: { container: old } },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,
@@ -1278,6 +1340,7 @@ test('a corrupt cidfile can recover only through rediscovered immutable image id
     const h = harness(state, { corruptCidfile: true });
     const result = await reconcileBoxContainer({
         identity: state.identity,
+        agentLib: state.agentLib,
         ownership: { state: 'absent', handles: null },
         engine: { name: 'podman', identity: 'engine' },
         runner: h.runner,

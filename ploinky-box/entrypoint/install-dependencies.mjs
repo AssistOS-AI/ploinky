@@ -4,6 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+    AGENTLIB_ENV,
+    AGENTLIB_PACKAGE_NAME,
+    AGENTLIB_STABLE_MOUNT_PATH,
+    FORBIDDEN_BOX_AGENTLIB_PATH,
+} from '../../agentlib/contract.mjs';
 import { BOX_MARKER_CONTENT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
@@ -11,6 +17,11 @@ import { createProcessRunner } from '../process.mjs';
 const LOCK_PATH = path.resolve(import.meta.dirname, '../dependencies.lock.json');
 export const DEPENDENCY_MARKER_NAME = '.ploinky-box-dependencies.json';
 const PIN_PATTERN = /^[a-f0-9]{40}$/;
+
+// achillesAgentLib is direct-mounted from the selected workspace source, so the
+// Box installs only mcp-sdk. Its lock entry stays canonical source policy for
+// the host-side selector.
+export const BOX_INSTALLED_DEPENDENCIES = Object.freeze(['mcp-sdk']);
 
 function dependencyError(message, cause) {
     return new PloinkyBoxError(message, {
@@ -61,6 +72,17 @@ export function validateDependencyLock(lock) {
     return lock;
 }
 
+/**
+ * The subset of the lock the Box actually installs.
+ *
+ * Keeping achillesAgentLib in the lock file but out of the install set is
+ * deliberate: the lock remains the one canonical remote/commit policy that the
+ * host-side source selector reads.
+ */
+export function boxInstallableRepositories(lock) {
+    return Object.fromEntries(BOX_INSTALLED_DEPENDENCIES.map((name) => [name, lock.repositories[name]]));
+}
+
 export function readDependencyLock({ fsApi = fs, lockPath = LOCK_PATH } = {}) {
     let lock;
     try {
@@ -99,9 +121,12 @@ function assertBoxMarker(markerPath, fsApi) {
 }
 
 function markerFor(lock) {
+    const installable = boxInstallableRepositories(lock);
     return {
-        fingerprint: crypto.createHash('sha256').update(canonicalLockJson(lock)).digest('hex'),
-        repositories: Object.fromEntries(Object.entries(lock.repositories).map(([name, value]) => (
+        fingerprint: crypto.createHash('sha256')
+            .update(canonicalLockJson({ repositories: installable }))
+            .digest('hex'),
+        repositories: Object.fromEntries(Object.entries(installable).map(([name, value]) => (
             [name, value.commit]
         ))),
     };
@@ -151,6 +176,88 @@ function defaultInstallRepository({ name, repository, destination, runner, fsApi
     }
 }
 
+/**
+ * Prove the direct AgentLib mount before installing anything.
+ *
+ * The Box is a consumer, never an owner: it validates the source the supervisor
+ * mounted and fails if that contract is missing, rather than obtaining a copy
+ * of its own.
+ */
+export function validateMountedAgentLib({
+    fsApi = fs,
+    env = process.env,
+    sourcePath = AGENTLIB_STABLE_MOUNT_PATH,
+} = {}) {
+    const declared = String(env?.[AGENTLIB_ENV.dir] || '').trim();
+    if (declared !== sourcePath) {
+        throw dependencyError(
+            `${AGENTLIB_ENV.dir} must be ${sourcePath} inside the Box (got ${declared || 'unset'}). `
+            + 'The host supervisor owns achillesAgentLib selection.',
+        );
+    }
+    let stat;
+    try {
+        stat = fsApi.lstatSync(sourcePath);
+    } catch (error) {
+        throw dependencyError(`The achillesAgentLib direct mount is missing at ${sourcePath}`, error);
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw dependencyError(`The achillesAgentLib direct mount at ${sourcePath} is not a real directory`);
+    }
+    let pkg;
+    try {
+        pkg = JSON.parse(fsApi.readFileSync(path.join(sourcePath, 'package.json'), 'utf8'));
+    } catch (error) {
+        throw dependencyError(`The achillesAgentLib direct mount at ${sourcePath} has no readable package.json`, error);
+    }
+    if (pkg?.name !== AGENTLIB_PACKAGE_NAME) {
+        throw dependencyError(
+            `The achillesAgentLib direct mount at ${sourcePath} declares package name '${String(pkg?.name)}'`,
+        );
+    }
+    const fingerprint = String(env?.[AGENTLIB_ENV.fingerprint] || '');
+    if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
+        throw dependencyError(`${AGENTLIB_ENV.fingerprint} must carry the selected content fingerprint`);
+    }
+    return Object.freeze({ sourcePath, fingerprint, mode: String(env?.[AGENTLIB_ENV.mode] || '') });
+}
+
+/**
+ * Reject or remove a leftover Box-installed achillesAgentLib.
+ *
+ * It is removed only when it is provably Ploinky-owned cache data inside the
+ * Box dependency root; ambiguous ownership fails with a cleanup instruction
+ * rather than being loaded or silently deleted.
+ */
+export function removeForbiddenBoxAgentLib({ root, fsApi = fs }) {
+    const target = path.join(root, 'achillesAgentLib');
+    if (path.resolve(target) !== FORBIDDEN_BOX_AGENTLIB_PATH
+        && path.dirname(path.resolve(target)) !== path.resolve(root)) {
+        throw dependencyError(`Refusing AgentLib cleanup outside ${root}`);
+    }
+    let stat;
+    try {
+        stat = fsApi.lstatSync(target);
+    } catch (error) {
+        if (error.code === 'ENOENT') return Object.freeze({ removed: false });
+        throw dependencyError(`Unable to inspect ${target}`, error);
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw dependencyError(
+            `${target} must not exist. achillesAgentLib is direct-mounted at `
+            + `${AGENTLIB_STABLE_MOUNT_PATH}; remove ${target} and retry.`,
+        );
+    }
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+        throw dependencyError(
+            `${target} is not owned by the Box runtime user, so its ownership is ambiguous. `
+            + 'Remove it manually and retry.',
+        );
+    }
+    fsApi.rmSync(target, { recursive: true, force: true });
+    return Object.freeze({ removed: true, path: target });
+}
+
 function readMarker(markerPath, fsApi) {
     try {
         const stat = fsApi.lstatSync(markerPath);
@@ -167,7 +274,7 @@ function installationMatches({ targetRoot, expected, lock, fsApi, runner, readIn
     if (!markerMatches(readMarker(path.join(targetRoot, DEPENDENCY_MARKER_NAME), fsApi), expected)) {
         return false;
     }
-    for (const [name, repository] of Object.entries(lock.repositories)) {
+    for (const [name, repository] of Object.entries(boxInstallableRepositories(lock))) {
         const directory = path.join(targetRoot, name);
         try {
             const stat = fsApi.lstatSync(directory);
@@ -210,11 +317,16 @@ export function installPinnedDependencies({
     installRepository = defaultInstallRepository,
     readInstalledHead = defaultReadInstalledHead,
     token = crypto.randomBytes(12).toString('hex'),
+    agentLibEnv = process.env,
+    agentLibPath = AGENTLIB_STABLE_MOUNT_PATH,
 } = {}) {
     validateDependencyLock(lock);
     assertBoxMarker(markerPath, fsApi);
     const root = path.resolve(targetRoot);
     assertRealDirectory(root, fsApi);
+    validateMountedAgentLib({ fsApi, env: agentLibEnv, sourcePath: agentLibPath });
+    removeForbiddenBoxAgentLib({ root, fsApi });
+    const installable = boxInstallableRepositories(lock);
     const expected = markerFor(lock);
     if (installationMatches({
         targetRoot: root, expected, lock, fsApi, runner, readInstalledHead,
@@ -233,7 +345,7 @@ export function installPinnedDependencies({
     const movedNames = new Set();
     let committed = false;
     try {
-        for (const [name, repository] of Object.entries(lock.repositories)) {
+        for (const [name, repository] of Object.entries(installable)) {
             const destination = path.join(transactionRoot, name);
             installRepository({ name, repository, destination, runner, fsApi });
             if (readInstalledHead(destination, runner) !== repository.commit) {
@@ -242,7 +354,7 @@ export function installPinnedDependencies({
             staged.set(name, destination);
         }
 
-        for (const name of Object.keys(lock.repositories)) {
+        for (const name of Object.keys(installable)) {
             const destination = path.join(root, name);
             const backup = path.join(transactionRoot, `.backup-${name}`);
             try {
@@ -276,7 +388,7 @@ export function installPinnedDependencies({
         return Object.freeze({ changed: true, marker: expected });
     } catch (error) {
         if (!committed) {
-            for (const name of [...Object.keys(lock.repositories)].reverse()) {
+            for (const name of [...Object.keys(installable)].reverse()) {
                 const destination = path.join(root, name);
                 const backup = backups.get(name);
                 if (movedNames.has(name)) {

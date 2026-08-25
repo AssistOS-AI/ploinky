@@ -1,4 +1,5 @@
 import {
+    BOX_AGENTLIB_LABELS,
     BOX_DATA_FINGERPRINT_LABELS,
     BOX_DATA_KEYS,
     BOX_DATA_MOUNTS,
@@ -10,6 +11,11 @@ import {
     BOX_USERNS,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import {
+    agentLibBoxEnv,
+    expectedAgentLibMounts,
+    normalizeBoxAgentLib,
+} from './agentlib.mjs';
 import { IMAGE_CONTRACT } from './image.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
@@ -206,6 +212,7 @@ export function validateContainerPublications(
 export function validateContainerConfiguration(containerHandle, {
     identity,
     dataFingerprints,
+    agentLib,
     hostPort,
     mediaHostPort = BOX_MEDIA_PORT,
     imageId,
@@ -249,6 +256,16 @@ export function validateContainerConfiguration(containerHandle, {
             expectedLabels[BOX_DATA_FINGERPRINT_LABELS[key]] = String(selectedFingerprints[key]);
         }
     }
+    if (!agentLib) {
+        throw publicationError(
+            `Owned Box has no selected achillesAgentLib source${INCOMPATIBLE_BOX_GUIDANCE}`,
+        );
+    }
+    const agentLibContract = normalizeBoxAgentLib(agentLib);
+    expectedLabels[BOX_AGENTLIB_LABELS.mode] = agentLibContract.mode;
+    expectedLabels[BOX_AGENTLIB_LABELS.sourceIdHash] = agentLibContract.sourceIdHash;
+    expectedLabels[BOX_AGENTLIB_LABELS.fingerprint] = agentLibContract.fingerprint;
+    expectedLabels[BOX_AGENTLIB_LABELS.sourceRelativePath] = agentLibContract.sourceRelativePath;
     const ownershipLabels = Object.fromEntries(Object.entries(containerHandle.labels)
         .filter(([key]) => key.startsWith(BOX_OWNERSHIP_LABEL_PREFIX))
         .sort());
@@ -258,6 +275,7 @@ export function validateContainerConfiguration(containerHandle, {
     }
     const expectedEnvironment = {
         ...IMAGE_CONTRACT.environment,
+        ...agentLibBoxEnv(agentLibContract),
         PLOINKY_PUBLIC_BIND: '0.0.0.0',
         PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
         PLOINKY_PRIVATE_BIND: '0.0.0.0',
@@ -322,14 +340,17 @@ export function validateContainerConfiguration(containerHandle, {
             `Owned Box tmpfs set is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`,
         );
     }
-    // Durable state is exactly four host binds. Podman currently reports the
-    // /tmp tmpfs through HostConfig.Tmpfs and may additionally expose the same
-    // mount in Mounts; no named, anonymous, or unrelated mount is accepted.
+    // Durable state is exactly six host binds: the four workspace binds plus the
+    // stable read-only achillesAgentLib source and the read-only shadow over its
+    // writable /workspace alias. Podman currently reports the /tmp tmpfs through
+    // HostConfig.Tmpfs and may additionally expose the same mount in Mounts; no
+    // named, anonymous, or unrelated mount is accepted.
     const expectedMounts = {
         '/opt/ploinky': { source: repositoryRoot, rw: false },
         '/workspace': { source: identity.workspaceRoot, rw: true },
         [BOX_DATA_MOUNTS.dependencies]: { source: identity.dataPaths.dependencies, rw: true },
         [BOX_DATA_MOUNTS.images]: { source: identity.dataPaths.images, rw: true },
+        ...expectedAgentLibMounts(agentLibContract),
     };
     if (!Array.isArray(runtime.mounts)) {
         throw publicationError('Owned Box mount set is incompatible');
@@ -342,7 +363,7 @@ export function validateContainerConfiguration(containerHandle, {
             || transientMounts[0].name !== ''
             || transientMounts[0].rw !== true
         ))
-        || runtime.mounts.length !== 4 + transientMounts.length) {
+        || runtime.mounts.length !== Object.keys(expectedMounts).length + transientMounts.length) {
         throw publicationError('Owned Box mount set is incompatible');
     }
     for (const [destination, expected] of Object.entries(expectedMounts)) {
