@@ -40,6 +40,19 @@ test('status dispatches to its read-only renderer before core initialization', a
 test('status renders terminal color intent without changing workspace state', (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-status-entrypoint-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const agentLib = path.join(root, 'achillesAgentLib');
+    for (const directory of ['LLMAgents', 'utils', 'jwt']) {
+        fs.mkdirSync(path.join(agentLib, directory), { recursive: true });
+    }
+    fs.writeFileSync(path.join(agentLib, 'package.json'), '{"name":"ploinky-agent-lib"}\n');
+    for (const entrypoint of [
+        'LLMAgents/index.mjs',
+        'utils/LLMClient.mjs',
+        'jwt/jwtSign.mjs',
+        'jwt/jwtVerify.mjs',
+    ]) {
+        fs.writeFileSync(path.join(agentLib, entrypoint), 'export {};\n');
+    }
     const ploinky = path.join(root, '.ploinky');
     fs.mkdirSync(path.join(ploinky, 'repos'), { recursive: true });
     fs.writeFileSync(path.join(ploinky, 'routing.json'), '{"port":8080}\n');
