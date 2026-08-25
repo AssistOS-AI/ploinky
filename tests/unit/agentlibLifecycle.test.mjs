@@ -94,6 +94,7 @@ test('update never pulls, resets, or checks out a local checkout', async () => {
 
     const first = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace,
+        insideBox: false,
         runner: { run: (args) => { calls.push(args.join(' ')); throw new Error('no Git for a local source'); } },
         gitState: () => ({ commit: 'd'.repeat(40), branch: 'master', dirty: false }),
     });
@@ -106,6 +107,7 @@ test('update never pulls, resets, or checks out a local checkout', async () => {
     fs.appendFileSync(path.join(checkout, 'index.mjs'), '\n// edited\n');
     const second = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace,
+        insideBox: false,
         gitState: () => ({ commit: 'd'.repeat(40), branch: 'master', dirty: true }),
     });
     assert.equal(second.changed, true);
@@ -116,6 +118,7 @@ test('a managed update stages a new generation and keeps the old one for rollbac
     const workspace = makeWorkspace({ withCheckout: false });
     const base = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace,
+        insideBox: false,
         runner: stubGit([]),
         remote: REMOTE,
     });
@@ -123,6 +126,7 @@ test('a managed update stages a new generation and keeps the old one for rollbac
 
     const updated = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace,
+        insideBox: false,
         branchPolicy: { branch: 'feature-x', fallback: 'fail' },
         runner: stubGit([]),
         remote: REMOTE,
@@ -141,6 +145,7 @@ test('an ordinary managed update follows the lock commit without a branch lookup
     const calls = [];
     const result = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace,
+        insideBox: false,
         runner: stubGit(calls),
         remote: REMOTE,
     });
@@ -191,6 +196,7 @@ test('a local source that disappears switches provenance on the next lifecycle c
     fs.rmSync(path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME), { recursive: true, force: true });
     const managed = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace,
+        insideBox: false,
         runner: stubGit([]),
         remote: REMOTE,
     });
@@ -382,6 +388,17 @@ test('in-Box update refuses to own the source and takes no lock', async () => {
     const commands = fs.readFileSync(path.join(repoRoot, 'cli/commands/repoAgentCommands.js'), 'utf8');
     assert.match(commands, /isInsideBoxRuntime/);
     assert.match(commands, /owned by the outer host/);
+
+    // Defense in depth: even a caller that skips the guard cannot mutate the
+    // source from inside the Box.
+    await assert.rejects(
+        boxSource.updateWorkspaceAgentLibSource({
+            workspaceRoot: workspace,
+            insideBox: true,
+            runner: { run: () => { throw new Error('the Box must never reach Git'); } },
+        }),
+        /host supervisor owns it/,
+    );
 
     // Nothing was created while checking.
     assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'agentlib')), false);

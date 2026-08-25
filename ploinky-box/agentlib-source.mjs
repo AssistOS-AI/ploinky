@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
 import { AGENTLIB_ERROR_CODES, AGENTLIB_LOCAL_DIR_NAME, agentLibError } from '../agentlib/contract.mjs';
+import { isInsideBoxRuntime } from '../agentlib/bootstrap.mjs';
 import { fingerprintSource } from '../agentlib/fingerprint.mjs';
 import { createGitRunner, selectManagedSource } from '../agentlib/materialize.mjs';
 import {
@@ -150,8 +151,12 @@ export async function updateWorkspaceAgentLibSource({
     fsApi = fs,
     runner = createGitRunner(),
     gitState = readLocalGitState,
+    insideBox = isInsideBoxRuntime({ fsApi }),
     now,
 }) {
+    // Defense in depth: callers are expected to check first, but a future
+    // unguarded caller must not be able to reopen in-Box source mutation.
+    assertNotInBoxSourceOwner(insideBox);
     const previous = readActiveDescriptor(workspaceRoot, fsApi);
     const local = selectAgentLibSource({
         workspaceRoot,
