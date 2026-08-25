@@ -16,6 +16,7 @@ import { readGlobalDepsPackage } from '../utils/dependencies/dependencyInstaller
 import { collectAgentsSummary } from '../utils/status.js';
 import { findAgent } from '../utils/utils.js';
 import { updateWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
+import { isInsideBoxRuntime } from '../../agentlib/bootstrap.mjs';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const DEFAULT_SKILLS_REPO_NAMES = [
@@ -154,7 +155,13 @@ function formatWorkspaceRepoSkip(repo, remoteCheck) {
  * staging a new immutable generation. Either way the fingerprint change is what
  * forces a coherent restart, not an in-place package refresh.
  */
-async function refreshAgentLibSourceForUpdate(failed, branchPolicy = null) {
+async function refreshAgentLibSourceForUpdate(failed, branchPolicy = null, insideBox = isInsideBoxRuntime()) {
+    if (insideBox) {
+        // The outer host supervisor is the one source writer. An in-Box update
+        // must not take the source lock, clone, fetch, or rewrite active.json.
+        console.log('achillesAgentLib source: owned by the outer host; run `ploinky update` there.');
+        return null;
+    }
     console.log('Updating the achillesAgentLib source...');
     let result = null;
     try {

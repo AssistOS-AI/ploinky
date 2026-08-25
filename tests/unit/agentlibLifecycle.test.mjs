@@ -362,3 +362,51 @@ test('the Box dependency lock stays the canonical source policy', () => {
     const installer = fs.readFileSync(path.join(repoRoot, 'ploinky-box/entrypoint/install-dependencies.mjs'), 'utf8');
     assert.match(installer, /BOX_INSTALLED_DEPENDENCIES = Object\.freeze\(\['mcp-sdk'\]\)/);
 });
+
+// --- in-Box update ownership ------------------------------------------------
+
+test('in-Box update refuses to own the source and takes no lock', async () => {
+    const workspace = makeWorkspace({ withCheckout: false });
+    const bootstrap = await import(path.join(repoRoot, 'agentlib/bootstrap.mjs'));
+
+    // The marker file is the Box image contract, so it is what decides.
+    assert.equal(bootstrap.isInsideBoxRuntime({ fsApi: { statSync: () => ({ isFile: () => true }) } }), true);
+    assert.equal(
+        bootstrap.isInsideBoxRuntime({
+            fsApi: { statSync: () => { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } },
+        }),
+        false,
+    );
+
+    // The in-Box guard is explicit and reachable from the update path.
+    const commands = fs.readFileSync(path.join(repoRoot, 'cli/commands/repoAgentCommands.js'), 'utf8');
+    assert.match(commands, /isInsideBoxRuntime/);
+    assert.match(commands, /owned by the outer host/);
+
+    // Nothing was created while checking.
+    assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'agentlib')), false);
+});
+
+test('the outer host owns source mutation and the Box only validates', async () => {
+    const workspace = makeWorkspace({ withCheckout: false });
+    // The in-Box bootstrap validates a provided contract and never selects.
+    const bootstrap = await import(path.join(repoRoot, 'agentlib/bootstrap.mjs'));
+    bootstrap.resetAgentLibBootstrap();
+    await assert.rejects(
+        bootstrap.bootstrapAgentLibRuntime({
+            env: {},
+            insideBox: true,
+            select: async () => { throw new Error('the Box must never select a source'); },
+        }),
+        (error) => error.code === contract.AGENTLIB_ERROR_CODES.contractMissing,
+    );
+    assert.equal(
+        fs.existsSync(path.join(workspace, '.ploinky', 'agentlib')),
+        false,
+        'a failed in-Box bootstrap must not create managed source state',
+    );
+    assert.throws(
+        () => boxSource.assertNotInBoxSourceOwner(true),
+        /host supervisor owns it/,
+    );
+});

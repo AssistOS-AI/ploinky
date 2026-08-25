@@ -26,6 +26,11 @@ import {
 import { loadAgents } from '../../utils/workspace.js';
 import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
 import { SHARED_DIR } from '../../utils/config.js';
+import {
+    agentLibAliasShadows,
+    agentLibGrant,
+    agentLibGrantEnv,
+} from '../agentLibGrant.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -78,7 +83,18 @@ function buildInteractiveAgentCreateCommand({
     portOptions = '',
     envVars = '',
     containerImage,
+    agentLibGrant: grant = agentLibGrant('container'),
 } = {}) {
+    // The interactive shell receives exactly the same achillesAgentLib grant as
+    // the detached service: the source read-only at the stable path, plus a
+    // read-only shadow over every writable alias that reaches the same inode.
+    const agentLibShadows = agentLibAliasShadows(grant, [
+        { hostPath: projectDir, runtimePath: projectDir },
+        ...(path.resolve(projectDir) === path.resolve(homeDir)
+            ? []
+            : [{ hostPath: homeDir, runtimePath: '/root' }]),
+        { hostPath: sharedDir, runtimePath: '/shared' },
+    ]);
     return joinShellCommandParts([
         runtime,
         'create',
@@ -96,6 +112,9 @@ function buildInteractiveAgentCreateCommand({
         `-v "${agentLibPath}:/Agent${readOnlySuffix}"`,
         `-v "${absAgentPath}:/code${readOnlySuffix}"`,
         `-v "${sharedDir}:/shared${volumeSuffix}"`,
+        `-v "${grant.sourceDir}:${grant.runtimePath}${readOnlySuffix}"`,
+        ...agentLibShadows.map((shadow) => `-v "${shadow.hostPath}:${shadow.runtimePath}${readOnlySuffix}"`),
+        ...Object.entries(agentLibGrantEnv(grant)).map(([key, value]) => formatEnvFlag(key, value)),
         portOptions,
         envVars,
         containerImage,

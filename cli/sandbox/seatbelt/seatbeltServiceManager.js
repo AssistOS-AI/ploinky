@@ -75,7 +75,7 @@ import {
 } from '../bwrap/bwrapFleet.js';
 // Reuse env map builder from bwrap (with runtimeName param)
 import { buildFullEnvMap } from '../bwrap/bwrapServiceManager.js';
-import { agentLibGrant, agentLibRuntimeRecord } from '../agentLibGrant.js';
+import { agentLibGrant, agentLibReuseProblem, agentLibRuntimeRecord } from '../agentLibGrant.js';
 import { detectHostRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 // Seatbelt profile generator
 import { buildSeatbeltProfile, writeSeatbeltProfile } from './seatbeltProfile.js';
@@ -792,8 +792,18 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
     if (exactRuntimeRunning) {
         const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
         const current = existingRecord.envHash || '';
+        // Seatbelt regenerates its profile from the source path, which does not
+        // change when the same directory's content does, so the selection is
+        // compared explicitly.
+        const agentLibProblem = agentLibReuseProblem(
+            existingRecord,
+            agentLibGrant(detectHostRuntimeKey('seatbelt')),
+        );
         if (desired && desired !== current) {
             console.log(`[seatbelt] ${agentName}: env hash changed, restarting...`);
+            stopBwrapProcess(containerName);
+        } else if (agentLibProblem) {
+            console.log(`[seatbelt] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
             stopBwrapProcess(containerName);
         } else {
             debugLog(`[seatbelt] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
