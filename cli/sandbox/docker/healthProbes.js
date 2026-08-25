@@ -16,7 +16,11 @@ const DEFAULT_PROBE_KILL_GRACE_SECONDS = 1;
 const PROBE_CONTROL_PLANE_GRACE_MS = 15_000;
 const PROBE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
 const PROBE_CONTAINER_WAIT_TIMEOUT_MS = 10_000;
-const PROBE_CLEANUP_TIMEOUT_MS = 5_000;
+const PROBE_CLEANUP_TIMEOUT_MS = 30_000;
+const DEFAULT_PROBE_CLEANUP_ATTEMPTS = 3;
+const DEFAULT_PROBE_CLEANUP_RETRY_MS = 2_000;
+const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
+const DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS = 10_000;
 const PROBE_RUNNER_PATH = '/Agent/server/HealthProbeRunner.sh';
 const PROBE_MARKER_PREFIX = '/tmp/.ploinky-health-probe-';
 const BACKOFF_BASE_DELAY_MS = 10_000;
@@ -98,39 +102,92 @@ function probeToken(options = {}) {
 function cleanupExactProbe(agentName, containerName, markerPath, token, options = {}) {
     const runtime = options.runtime || getRuntime();
     const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
-    const cleanupRes = spawnSyncImpl(
-        runtime,
-        [
-            'exec',
-            containerName,
-            'sh',
-            PROBE_RUNNER_PATH,
-            'cleanup',
-            markerPath,
-            token,
-        ],
-        {
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'pipe'],
-            timeout: options.cleanupTimeoutMs || PROBE_CLEANUP_TIMEOUT_MS,
-            killSignal: 'SIGKILL',
-        },
+    const sleepMsImpl = options.sleepMsImpl || sleepMs;
+    const attempts = coercePositiveInteger(
+        options.cleanupAttempts,
+        DEFAULT_PROBE_CLEANUP_ATTEMPTS,
     );
-    if (cleanupRes.error || cleanupRes.status !== 0) {
-        const detail = String(
-            cleanupRes.error?.message
-            || cleanupRes.stderr
-            || cleanupRes.stdout
-            || `exit ${cleanupRes.status ?? 'unknown'}`,
-        ).trim();
-        const error = new Error(
-            `[probe] ${agentName}: exact probe cleanup failed for '${containerName}': ${detail}`,
+    const retryMs = Number.isFinite(Number(options.cleanupRetryMs))
+        && Number(options.cleanupRetryMs) >= 0
+        ? Number(options.cleanupRetryMs)
+        : DEFAULT_PROBE_CLEANUP_RETRY_MS;
+    let cleanupRes;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        cleanupRes = spawnSyncImpl(
+            runtime,
+            [
+                'exec',
+                containerName,
+                'sh',
+                PROBE_RUNNER_PATH,
+                'cleanup',
+                markerPath,
+                token,
+            ],
+            {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+                timeout: options.cleanupTimeoutMs || PROBE_CLEANUP_TIMEOUT_MS,
+                killSignal: 'SIGKILL',
+            },
         );
-        error.code = cleanupRes.error?.code === 'ETIMEDOUT'
-            ? 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
-            : 'PLOINKY_PROBE_CLEANUP_FAILED';
-        throw error;
+        if (!cleanupRes.error && cleanupRes.status === 0) return;
+
+        const timedOut = cleanupRes.error?.code === 'ETIMEDOUT';
+        if (!timedOut || attempt === attempts) break;
+        postProbeLog(
+            'warn',
+            `[probe] ${agentName}: exact probe cleanup control plane timed out; `
+                + `retrying exact token ${attempt + 1}/${attempts}.`,
+        );
+        if (retryMs > 0) sleepMsImpl(retryMs);
     }
+
+    const detail = String(
+        cleanupRes?.error?.message
+        || cleanupRes?.stderr
+        || cleanupRes?.stdout
+        || `exit ${cleanupRes?.status ?? 'unknown'}`,
+    ).trim();
+    const error = new Error(
+        `[probe] ${agentName}: exact probe cleanup failed for '${containerName}': ${detail}`,
+    );
+    // A timed-out cleanup has not proved that the exact execution is gone.
+    // Do not let a caller mistake that uncertainty for permission to launch a
+    // second probe. The idempotent token cleanup has already exhausted its own
+    // bounded control-plane retries.
+    error.code = 'PLOINKY_PROBE_CLEANUP_FAILED';
+    throw error;
+}
+
+function runProbeWithControlPlaneRetry(agentName, operation, callback, options = {}) {
+    const threshold = coercePositiveInteger(
+        options.controlPlaneFailureThreshold,
+        DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD,
+    );
+    const retryMs = Number.isFinite(Number(options.controlPlaneRetryMs))
+        && Number(options.controlPlaneRetryMs) >= 0
+        ? Number(options.controlPlaneRetryMs)
+        : DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS;
+    const sleepMsImpl = options.sleepMsImpl || sleepMs;
+
+    for (let attempt = 1; attempt <= threshold; attempt += 1) {
+        try {
+            return callback();
+        } catch (error) {
+            if (error?.code !== 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
+                || attempt === threshold) {
+                throw error;
+            }
+            postProbeLog(
+                'warn',
+                `[probe] ${agentName}: ${operation} hit transient runtime control-plane `
+                    + `uncertainty; retrying ${attempt + 1}/${threshold}.`,
+            );
+            if (retryMs > 0) sleepMsImpl(retryMs);
+        }
+    }
+    throw new Error(`[probe] ${agentName}: unreachable control-plane retry state`);
 }
 
 function asProbeControlPlaneError(agentName, operation, sourceError) {
@@ -273,7 +330,12 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
                 detail: '',
             };
         }
-        const result = runProbeOnce(agentName, containerName, probe, options);
+        const result = runProbeWithControlPlaneRetry(
+            agentName,
+            `${type} probe`,
+            () => runProbeOnce(agentName, containerName, probe, options),
+            options,
+        );
 
         const detail = (result.stdout || result.stderr || '').trim();
         if (result.success) {
@@ -455,6 +517,7 @@ export const __testHooks = {
     runContainerScriptReadiness,
     probeControlPlaneFailure,
     cleanupExactProbe,
+    runProbeWithControlPlaneRetry,
     asProbeControlPlaneError,
     probeToken,
     computeBackoffDelay,
@@ -469,6 +532,10 @@ export const __testConstants = {
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_FAILURE_THRESHOLD,
     DEFAULT_SUCCESS_THRESHOLD,
+    DEFAULT_PROBE_CLEANUP_ATTEMPTS,
+    DEFAULT_PROBE_CLEANUP_RETRY_MS,
+    DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD,
+    DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS,
     DEFAULT_PROBE_KILL_GRACE_SECONDS,
     PROBE_CONTROL_PLANE_GRACE_MS,
     PROBE_CLEANUP_TIMEOUT_MS,
