@@ -37,8 +37,13 @@ function buildSeatbeltProfile(options) {
         volumeOptions = {},
         workspaceRoot = PLOINKY_WORKSPACE_ROOT,
         extraReadPaths = [],
-        extraWritePaths = []
+        extraWritePaths = [],
+        agentLibGrant: grant = null,
     } = options;
+
+    if (!grant) {
+        throw new Error('[seatbelt] profile generation requires the selected achillesAgentLib grant');
+    }
 
     const normalizedExtraWritePaths = normalizePathList(extraWritePaths);
     const normalizedVolumes = normalizeManifestVolumeHostPaths(volumes, {
@@ -66,6 +71,11 @@ function buildSeatbeltProfile(options) {
         skillsReadOnly,
         }),
         ...volumeAccess.filter(entry => entry.readOnly).map(entry => ({ kind: 'subpath', path: entry.hostPath })),
+        // Seatbelt creates no mount namespace, so the selected achillesAgentLib
+        // source cannot be shadowed by a read-only bind. The write denial is
+        // path-based and therefore applies through every workspace alias that
+        // reaches the same directory.
+        { kind: 'subpath', path: grant.sourceDir },
     ];
     const lines = [];
     lines.push('(version 1)');
@@ -93,6 +103,7 @@ function buildSeatbeltProfile(options) {
         agentWorkDir,
         sharedDir,
         cwd,
+        grant.sourceDir,
         ...(skillsPath && fs.existsSync(skillsPath) ? [skillsPath] : []),
         ...normalizedVolumes,
         ...normalizePathList(extraReadPaths),

@@ -12,11 +12,22 @@ import {
 import { parseRuntimeKey, detectHostRuntimeKey } from './dependencyRuntimeKey.js';
 import { debugLog } from '../utils.js';
 import { readGlobalDepsPackage, mergePackageJson } from './dependencyInstaller.js';
+import {
+    activeAgentLibSelection,
+    agentLibCacheLinkProblem,
+    agentLibLinkTarget,
+    agentLibStampProblem,
+    agentLibStampSection,
+    ensureAgentLibCacheLink,
+} from './agentLibLink.js';
 import { getRuntime, managedContainerLabelArgs } from '../../sandbox/docker/common.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from '../../sandbox/docker/shellDetection.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
-export const STAMP_VERSION = 1;
+// v2 records the direct-mounted achillesAgentLib selection, so a cache prepared
+// against a different source — or for a different runtime family's link target
+// — cannot be adopted.
+export const STAMP_VERSION = 2;
 export const STAMP_FILENAME = 'stamp.json';
 export const LOCK_FILENAME = '.lock';
 export const CORE_MARKER_MODULE = 'mcp-sdk';
@@ -78,17 +89,15 @@ export function hashMergedPackage(mergedPackage) {
 /**
  * Resolve the global dependency manifest used to build the shared cache.
  *
- * Goes through readGlobalDepsPackage so a PLOINKY_AGENTLIB_REF override
- * (`ploinky start --branch`) is reflected in both the installed package
- * and the cache key. The hash is over the resolved (post-override) contents so
- * switching the achillesAgentLib ref invalidates the shared cache instead of
- * serving the pinned #master to every agent that seeds from it.
+ * The manifest covers npm-installed dependencies only. achillesAgentLib is not
+ * among them: it is linked into the cache from the selected source, and its
+ * identity is tracked in the stamp rather than in this hash, so a changed
+ * AgentLib fingerprint refreshes the link without reinstalling npm packages.
  *
- * @param {NodeJS.ProcessEnv} [env=process.env]
  * @returns {{ pkg: object, hash: string }}
  */
-export function resolveGlobalCacheManifest(env = process.env) {
-    const pkg = readGlobalDepsPackage(env);
+export function resolveGlobalCacheManifest() {
+    const pkg = readGlobalDepsPackage();
     return { pkg, hash: hashMergedPackage(pkg) };
 }
 
@@ -252,6 +261,25 @@ function installerMismatchReason(stamp, expectedInstaller = null) {
         }
     }
     return '';
+}
+
+/**
+ * Whether the direct-mounted achillesAgentLib adapter is still correct.
+ *
+ * Reported separately from npm validity: a changed local AgentLib fingerprint
+ * must refresh the link and stamp and force runtime recreation, but must not
+ * reinstall unrelated npm packages whose manifests and installer are unchanged.
+ *
+ * @returns {{ valid: boolean, reason: string }}
+ */
+export function isAgentLibLinkValid(cachePath, { runtimeKey, agentLib = null } = {}) {
+    const selection = agentLib || activeAgentLibSelection();
+    const expected = agentLibStampSection(runtimeKey, selection);
+    const stampReason = agentLibStampProblem(readStamp(cachePath), expected);
+    if (stampReason) return { valid: false, reason: stampReason };
+    const linkReason = agentLibCacheLinkProblem(cachePath, expected.linkTarget);
+    if (linkReason) return { valid: false, reason: linkReason };
+    return { valid: true, reason: 'ok' };
 }
 
 export function isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, installer = null }) {
@@ -651,7 +679,15 @@ function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog }
     }
 }
 
-export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, image = '', runtime = null } = {}) {
+export function prepareGlobalCache(runtimeKey, {
+    force = false,
+    log = debugLog,
+    image = '',
+    runtime = null,
+    agentLib = null,
+} = {}) {
+    const selection = agentLib || activeAgentLibSelection();
+    const agentLibSection = agentLibStampSection(runtimeKey, selection);
     const backend = resolveInstallBackend(runtimeKey, { image, runtime, log });
     const expectedInstaller = installerMetadata(runtimeKey, backend);
 
@@ -659,18 +695,35 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
     if (!fs.existsSync(globalPackageFile)) {
         throw new Error(`globalDeps/package.json missing at ${globalPackageFile}`);
     }
-    // Resolve via readGlobalDepsPackage so a PLOINKY_AGENTLIB_REF override is
-    // reflected in BOTH the cache key and the installed package. Hashing/copying
-    // the raw file here would serve the pinned #master to every agent that seeds
-    // from this shared cache, regardless of the --branch override.
     const { pkg: globalPkg, hash: globalPackageHash } = resolveGlobalCacheManifest();
     const cachePath = getGlobalCachePath(runtimeKey);
 
     if (!force) {
         const check = isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, installer: expectedInstaller });
-        if (check.valid) {
+        const linkCheck = check.valid
+            ? isAgentLibLinkValid(cachePath, { runtimeKey, agentLib: selection })
+            : { valid: false, reason: check.reason };
+        if (check.valid && linkCheck.valid) {
             log(`[deps-cache] global cache hit (${runtimeKey})`);
             return { cachePath, reused: true, reason: check.reason };
+        }
+        if (check.valid) {
+            // The npm side is unchanged; only the AgentLib adapter drifted, so
+            // repair the link and restamp instead of reinstalling packages.
+            const lock = acquireLock(cachePath);
+            try {
+                ensureAgentLibCacheLink(cachePath, agentLibSection.linkTarget);
+                const stamp = writeStamp(cachePath, {
+                    runtimeKey,
+                    globalPackageHash,
+                    installer: expectedInstaller,
+                    agentLib: agentLibSection,
+                });
+                log(`[deps-cache] global cache AgentLib link refreshed (${linkCheck.reason})`);
+                return { cachePath, reused: true, reason: linkCheck.reason, stamp };
+            } finally {
+                lock.release();
+            }
         }
         log(`[deps-cache] global cache miss (${runtimeKey}): ${check.reason}`);
     }
@@ -683,15 +736,33 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
             JSON.stringify(globalPkg, null, 2),
         );
         backend.install(cachePath);
+        // Last cache step, after every npm operation: npm prunes node_modules
+        // entries it does not know about, and this link is one of them.
+        finalizeAgentLibCacheLink(cachePath, agentLibSection);
         const stamp = writeStamp(cachePath, {
             runtimeKey,
             globalPackageHash,
             installer: expectedInstaller,
+            agentLib: agentLibSection,
         });
         log(`[deps-cache] global cache prepared at ${cachePath}`);
         return { cachePath, reused: false, stamp };
     } finally {
         lock.release();
+    }
+}
+
+/**
+ * Create the AgentLib cache link and prove it before the cache is stamped.
+ *
+ * Verify-then-stamp, never stamp-then-verify: a stamp is the claim that the
+ * cache is usable, so it must not be written while the adapter is missing.
+ */
+function finalizeAgentLibCacheLink(cachePath, agentLibSection) {
+    ensureAgentLibCacheLink(cachePath, agentLibSection.linkTarget);
+    const problem = agentLibCacheLinkProblem(cachePath, agentLibSection.linkTarget);
+    if (problem) {
+        throw new Error(`Dependency cache could not establish its achillesAgentLib link: ${problem}`);
     }
 }
 
@@ -717,14 +788,19 @@ export function prepareAgentCache({
     log = debugLog,
     image = '',
     runtime = null,
+    agentLib = null,
 } = {}) {
+    const selection = agentLib || activeAgentLibSelection();
+    const agentLibSection = agentLibStampSection(runtimeKey, selection);
     const backend = resolveInstallBackend(runtimeKey, { image, runtime, log });
     const expectedInstaller = installerMetadata(runtimeKey, backend);
     if (!repoName || !agentName) {
         throw new Error('prepareAgentCache requires repoName and agentName');
     }
 
-    const globalResult = prepareGlobalCache(runtimeKey, { force, log, image, runtime });
+    const globalResult = prepareGlobalCache(runtimeKey, {
+        force, log, image, runtime, agentLib: selection,
+    });
     const globalCachePath = globalResult.cachePath;
 
     const globalPkg = readGlobalDepsPackage();
@@ -739,9 +815,32 @@ export function prepareAgentCache({
 
     if (!force) {
         const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer: expectedInstaller });
-        if (check.valid) {
+        const linkCheck = check.valid
+            ? isAgentLibLinkValid(cachePath, { runtimeKey, agentLib: selection })
+            : { valid: false, reason: check.reason };
+        if (check.valid && linkCheck.valid) {
             log(`[deps-cache] agent cache hit ${repoName}/${agentName} (${runtimeKey})`);
             return { cachePath, reused: true, reason: check.reason, mergedPackageHash };
+        }
+        if (check.valid) {
+            const lock = acquireLock(cachePath);
+            try {
+                ensureAgentLibCacheLink(cachePath, agentLibSection.linkTarget);
+                const stamp = writeStamp(cachePath, {
+                    runtimeKey,
+                    globalPackageHash,
+                    agentPackageHash,
+                    mergedPackageHash,
+                    installer: expectedInstaller,
+                    agentLib: agentLibSection,
+                });
+                log(`[deps-cache] agent cache AgentLib link refreshed ${repoName}/${agentName} (${linkCheck.reason})`);
+                return {
+                    cachePath, reused: true, reason: linkCheck.reason, mergedPackageHash, stamp,
+                };
+            } finally {
+                lock.release();
+            }
         }
         log(`[deps-cache] agent cache miss ${repoName}/${agentName} (${runtimeKey}): ${check.reason}`);
     }
@@ -763,12 +862,14 @@ export function prepareAgentCache({
         if (agentPkg) {
             backend.install(cachePath);
         }
+        finalizeAgentLibCacheLink(cachePath, agentLibSection);
         const stamp = writeStamp(cachePath, {
             runtimeKey,
             globalPackageHash,
             agentPackageHash,
             mergedPackageHash,
             installer: expectedInstaller,
+            agentLib: agentLibSection,
         });
         log(`[deps-cache] agent cache prepared at ${cachePath}`);
         return { cachePath, reused: false, stamp, mergedPackageHash };
@@ -815,6 +916,7 @@ export function verifyAgentCache({
     repoName,
     agentName,
     agentPackagePath = '',
+    agentLib = null,
 }) {
     const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
     const nm = nodeModulesDir(cachePath);
@@ -825,9 +927,12 @@ export function verifyAgentCache({
     const mergedPkg = mergePackageJson(readGlobalDepsPackage(), agentPkg);
     const mergedPackageHash = hashMergedPackage(mergedPkg);
     const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash });
-    if (check.valid) return nm;
+    const linkCheck = check.valid
+        ? isAgentLibLinkValid(cachePath, { runtimeKey, agentLib })
+        : check;
+    if (check.valid && linkCheck.valid) return nm;
     throw new Error(
-        `prepared dependency cache is ${check.reason} at ${nm}. `
+        `prepared dependency cache is ${check.valid ? linkCheck.reason : check.reason} at ${nm}. `
         + `Run \`ploinky deps prepare ${repoName}/${agentName}\` and try again.`
     );
 }
@@ -885,4 +990,11 @@ export function ensureAgentCacheForFamily({
     }
 }
 
-export { assertHostMatchesRuntimeKey, runNpmInstall, installerMetadata, seedFromGlobalCache };
+export {
+    assertHostMatchesRuntimeKey,
+    runNpmInstall,
+    installerMetadata,
+    seedFromGlobalCache,
+    agentLibLinkTarget,
+    activeAgentLibSelection,
+};

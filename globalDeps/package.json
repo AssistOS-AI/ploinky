@@ -1,10 +1,9 @@
 {
-  "name": "ploinky-global-deps",
-  "version": "1.0.0",
-  "type": "module",
-  "description": "Global dependencies available to all ploinky agents",
-  "dependencies": {
-    "achillesAgentLib": "git+https://github.com/AssistOS-AI/achillesAgentLib.git",
-    "mcp-sdk": "git+https://github.com/AssistOS-AI/MCPSDK.git#main"
-  }
+    "name": "ploinky-global-deps",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "Global dependencies available to all ploinky agents",
+    "dependencies": {
+        "mcp-sdk": "git+https://github.com/AssistOS-AI/MCPSDK.git#main"
+    }
 }

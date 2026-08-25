@@ -67,7 +67,6 @@ function runAggregateUpdateChild(workspaceRoot, body) {
         const runtimeRoot = ${JSON.stringify(runtimeRoot)};
         process.env.PLOINKY_WORKSPACE_ROOT = workspaceRoot;
         process.env.PLOINKY_ROOT = runtimeRoot;
-        delete process.env.PLOINKY_AGENTLIB_REF;
 
         function mkdir(dir) {
             fs.mkdirSync(dir, { recursive: true });
@@ -191,7 +190,6 @@ function runAggregateUpdateChild(workspaceRoot, body) {
             ...process.env,
             PLOINKY_WORKSPACE_ROOT: workspaceRoot,
             PLOINKY_ROOT: runtimeRoot,
-            PLOINKY_AGENTLIB_REF: '',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
