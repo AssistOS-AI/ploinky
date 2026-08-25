@@ -200,6 +200,7 @@ export function buildAgentLibAttestation({
         deploymentFingerprint: String(env?.[AGENTLIB_ENV.fingerprint] || ''),
         mode: String(env?.[AGENTLIB_ENV.mode] || ''),
         commit: String(env?.[AGENTLIB_ENV.commit] || ''),
+        sourceIdHash: String(env?.[AGENTLIB_ENV.sourceId] || ''),
         sourceRootRealpath: base,
         packageJsonHash: hashFileBytes(path.join(base, 'package.json'), fsApi),
         entrypoints: attested,
@@ -230,10 +231,18 @@ export function compareAgentLibAttestation(attestation, expected) {
             `AgentLib fingerprint mismatch: expected ${expected.fingerprint}, attested ${String(attestation.deploymentFingerprint)}.`,
         );
     }
+    if (expected?.sourceIdHash && attestation.sourceIdHash !== expected.sourceIdHash) {
+        problems.push(
+            `AgentLib source identity mismatch: expected ${expected.sourceIdHash}, attested ${String(attestation.sourceIdHash)}.`,
+        );
+    }
     if (expected?.sourceRoot && attestation.sourceRootRealpath !== expected.sourceRoot) {
         problems.push(
             `AgentLib source root mismatch: expected ${expected.sourceRoot}, attested ${String(attestation.sourceRootRealpath)}.`,
         );
+    }
+    if (expected?.packageJsonHash && attestation.packageJsonHash !== expected.packageJsonHash) {
+        problems.push('AgentLib package.json hash mismatch.');
     }
     for (const [entry, hash] of Object.entries(expected?.entrypoints || {})) {
         const actual = attestation.entrypoints?.[entry];

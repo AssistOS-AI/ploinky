@@ -91,23 +91,33 @@ test('bootstrap is idempotent and does not re-select', async () => {
     assert.equal(first, second);
 });
 
-test('an existing host contract is inherited rather than re-selected', async () => {
+test('an ambient host contract cannot bypass workspace selection', async () => {
     const workspace = makeWorkspace();
     const sourceDir = fs.realpathSync(path.join(workspace, 'achillesAgentLib'));
     const env = {
-        [contract.AGENTLIB_ENV.dir]: sourceDir,
-        [contract.AGENTLIB_ENV.mode]: 'local',
+        [contract.AGENTLIB_ENV.dir]: '/ambient/wrong-agentlib',
+        [contract.AGENTLIB_ENV.mode]: 'managed',
         [contract.AGENTLIB_ENV.fingerprint]: 'c'.repeat(64),
         [contract.AGENTLIB_ENV.commit]: '',
+        [contract.AGENTLIB_ENV.sourceId]: 'd'.repeat(64),
     };
+    let calls = 0;
     const result = await freshBootstrap()({
         env,
         cwd: workspace,
         insideBox: false,
-        select: async () => { throw new Error('must not re-select'); },
+        select: async ({ workspaceRoot }) => {
+            calls += 1;
+            const { selectAgentLibSource } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
+            return selectAgentLibSource({ workspaceRoot });
+        },
     });
+    assert.equal(calls, 1);
     assert.equal(result.sourceDir, sourceDir);
-    assert.equal(result.owned, false);
+    assert.equal(result.owned, true);
+    assert.equal(env[contract.AGENTLIB_ENV.dir], sourceDir);
+    assert.notEqual(env[contract.AGENTLIB_ENV.fingerprint], 'c'.repeat(64));
+    assert.match(env[contract.AGENTLIB_ENV.sourceId], /^[a-f0-9]{64}$/);
 });
 
 // --- in-Box bootstrap ------------------------------------------------------
@@ -181,7 +191,7 @@ test('status bootstraps read-only and core commands bootstrap fully', async () =
     const bootstraps = [];
     const bootstrapAgentLibImpl = async (options) => {
         bootstraps.push({ readOnly: options.readOnly === true, branch: options.branchPolicy?.branch ?? null });
-        return { sourceDir: '/selected', mode: 'local', fingerprint: 'f', commit: '', owned: true };
+        return { sourceDir: '/selected', mode: 'local', fingerprint: 'f', commit: '', owned: false };
     };
 
     await launchCli(['status'], {
@@ -207,13 +217,174 @@ test('a malformed branch policy does not pre-empt the command that owns the erro
     await launchCli(['start', 'demo', '--branch-fallback', 'maybe'], {
         bootstrapAgentLibImpl: async (options) => {
             bootstrapped = options.branchPolicy;
-            return { sourceDir: '/selected', mode: 'local', fingerprint: 'f', commit: '', owned: true };
+            return { sourceDir: '/selected', mode: 'local', fingerprint: 'f', commit: '', owned: false };
         },
         importCoreImpl: async () => ({ runCoreCli: async (args) => { coreArgs = args; return 0; } }),
         env: {},
     });
     assert.equal(bootstrapped, null, 'an unparsable policy is treated as absent by bootstrap');
     assert.deepEqual(coreArgs, ['start', 'demo', '--branch-fallback', 'maybe']);
+});
+
+test('direct start commits active.json only after graph attestation and source revalidation', async () => {
+    const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
+    const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
+    const workspace = makeWorkspace();
+    const selection = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: path.join(workspace, 'achillesAgentLib'),
+        mode: 'local',
+    });
+    const env = { PLOINKY_WORKSPACE_ROOT: workspace };
+    const events = [];
+    const result = await launchCli(['start', 'demo'], {
+        env,
+        bootstrapAgentLibImpl: async () => {
+            Object.assign(env, contract.agentLibRuntimeEnv(selection, selection.sourceDir));
+            return { owned: true, selection };
+        },
+        readActiveImpl: () => null,
+        importCoreImpl: async () => ({
+            runCoreCli: async (args, options) => {
+                events.push(['core', args, options]);
+                return 0;
+            },
+        }),
+        attestDeploymentImpl: () => { events.push('attest'); return { ok: true }; },
+        writeActiveImpl: (_workspaceRoot, active) => events.push(['commit', active]),
+    });
+    assert.equal(result, 0);
+    assert.equal(events[0][0], 'core');
+    assert.deepEqual(events[0][1], ['start', 'demo']);
+    assert.equal(events[1], 'attest');
+    assert.equal(events[2][0], 'commit');
+    assert.equal(events[2][1], selection);
+});
+
+test('direct start tears down a failed admission and never commits the candidate', async () => {
+    const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
+    const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
+    const workspace = makeWorkspace();
+    const selection = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: path.join(workspace, 'achillesAgentLib'),
+        mode: 'local',
+    });
+    const env = { PLOINKY_WORKSPACE_ROOT: workspace };
+    const coreCalls = [];
+    let committed = false;
+    await assert.rejects(
+        launchCli(['start', 'demo'], {
+            env,
+            bootstrapAgentLibImpl: async () => {
+                Object.assign(env, contract.agentLibRuntimeEnv(selection, selection.sourceDir));
+                return { owned: true, selection };
+            },
+            readActiveImpl: () => null,
+            importCoreImpl: async () => ({
+                runCoreCli: async (args) => { coreCalls.push(args); return 0; },
+            }),
+            attestDeploymentImpl: () => { throw new Error('agent proof diverged'); },
+            writeActiveImpl: () => { committed = true; },
+        }),
+        /agent proof diverged/,
+    );
+    assert.deepEqual(coreCalls, [['start', 'demo'], ['stop']]);
+    assert.equal(committed, false);
+});
+
+test('direct update forwards branch policy to the source owner and activates in a fresh process', async () => {
+    const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
+    const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
+    const workspace = makeWorkspace();
+    const current = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: path.join(workspace, 'achillesAgentLib'),
+        mode: 'local',
+    });
+    const candidateDir = path.join(workspace, '.ploinky', 'agentlib', 'generations', 'candidate');
+    writeAgentLibCheckout(candidateDir);
+    const candidate = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: candidateDir,
+        mode: 'managed',
+        remoteUrl: 'https://example.invalid/achillesAgentLib.git',
+        requestedRef: 'candidate',
+        resolvedCommit: '1'.repeat(40),
+    });
+    const env = { PLOINKY_WORKSPACE_ROOT: workspace };
+    let coreInvocation = null;
+    let staged = null;
+    let activation = null;
+    await launchCli(['update', '--branch', 'candidate', '--branch-fallback', 'fail'], {
+        env,
+        bootstrapAgentLibImpl: async ({ branchPolicy }) => {
+            assert.equal(branchPolicy.branch, 'candidate');
+            Object.assign(env, contract.agentLibRuntimeEnv(current, current.sourceDir));
+            return { owned: true, selection: current };
+        },
+        readActiveImpl: () => current,
+        importCoreImpl: async () => ({
+            runCoreCli: async (args, options) => {
+                coreInvocation = { args, options };
+                return { agentLib: { selection: candidate, previous: current } };
+            },
+        }),
+        writeTransactionImpl: (_workspaceRoot, value) => { staged = value; },
+        spawnActivationImpl: (command, args, options) => {
+            activation = { command, args, options };
+            return { status: 0 };
+        },
+    });
+    assert.deepEqual(coreInvocation.args, ['update']);
+    assert.deepEqual(coreInvocation.options.agentLibBranchPolicy, {
+        branch: 'candidate', repoBranches: {}, fallback: 'fail', resetRepos: false,
+    });
+    assert.equal(staged, candidate);
+    assert.equal(activation.command, process.execPath);
+    assert.deepEqual(activation.args.slice(-2), ['--agentlib-activate-transaction', 'commit']);
+    assert.equal(activation.options.env.PLOINKY_WORKSPACE_ROOT, workspace);
+});
+
+test('direct update activation failure stages and restarts the exact prior selection', async () => {
+    const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
+    const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
+    const workspace = makeWorkspace();
+    const prior = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: path.join(workspace, 'achillesAgentLib'),
+        mode: 'local',
+    });
+    const candidateDir = path.join(workspace, '.ploinky', 'agentlib', 'generations', 'candidate-failure');
+    writeAgentLibCheckout(candidateDir);
+    const candidate = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: candidateDir,
+        mode: 'managed',
+        remoteUrl: 'https://example.invalid/achillesAgentLib.git',
+        resolvedCommit: '2'.repeat(40),
+    });
+    const env = { PLOINKY_WORKSPACE_ROOT: workspace };
+    const staged = [];
+    let spawnCalls = 0;
+    await assert.rejects(
+        launchCli(['update'], {
+            env,
+            bootstrapAgentLibImpl: async () => {
+                Object.assign(env, contract.agentLibRuntimeEnv(prior, prior.sourceDir));
+                return { owned: true, selection: prior };
+            },
+            readActiveImpl: () => prior,
+            importCoreImpl: async () => ({
+                runCoreCli: async () => ({ agentLib: { selection: candidate, previous: prior } }),
+            }),
+            writeTransactionImpl: (_workspaceRoot, value) => staged.push(value),
+            spawnActivationImpl: () => ({ status: spawnCalls++ === 0 ? 23 : 0 }),
+        }),
+        /activation failed with status 23/,
+    );
+    assert.deepEqual(staged, [candidate, prior]);
+    assert.equal(spawnCalls, 2);
 });
 
 // --- the standalone Agent tree --------------------------------------------

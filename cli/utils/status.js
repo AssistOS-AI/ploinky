@@ -7,6 +7,8 @@ import { collectAgentRuntimeStates } from '../sandbox/agentRuntimeState.js';
 import { findAgent } from './utils.js';
 import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
 import { inspectWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
+import { AGENTLIB_ENV } from '../../agentlib/contract.mjs';
+import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { buildAgentLibAttestation } from '../../agentlib/runtime.mjs';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
@@ -127,6 +129,24 @@ export function listCurrentAgents() {
             resourceParts.push(`${styles.label('ports')}: ${ports}`);
         }
         console.log(`     ${resourceParts.join('  ')}`);
+        const grant = entry.agentLib;
+        const attestation = entry.agentLibAttestation;
+        if (grant) {
+            console.log(`     ${styles.label('AgentLib selection')}: ${String(grant.fingerprint || '-').slice(0, 12)}`
+                + `  ${styles.label('source id')}: ${String(grant.sourceIdHash || '-').slice(0, 12)}`);
+        }
+        if (entry.state?.running && attestation) {
+            const matchesGrant = attestation.deploymentFingerprint === grant?.fingerprint
+                && attestation.sourceIdHash === grant?.sourceIdHash
+                && attestation.sourceRootRealpath === grant?.runtimePath;
+            console.log(`     ${styles.label('AgentLib resolved root')}: ${attestation.sourceRootRealpath || '-'}`);
+            console.log(`     ${styles.label('AgentLib proof')}: ${matchesGrant ? styles.success('admitted') : styles.danger('mismatch')}`);
+            for (const [subpath, hash] of Object.entries(attestation.entrypoints || {})) {
+                console.log(`       ${subpath}: ${String(hash).slice(0, 12)}`);
+            }
+        } else if (entry.state?.running) {
+            console.log(`     ${styles.label('AgentLib proof')}: ${styles.warn('missing — restart required')}`);
+        }
         console.log('');
     }
 }
@@ -372,6 +392,9 @@ function printAgentLibStatus() {
     if (info.active) {
         console.log(`AgentLib active:   ${info.active.contentFingerprint.slice(0, 12)}`
             + `${info.active.resolvedCommit ? ` @ ${info.active.resolvedCommit.slice(0, 12)}` : ''}`);
+        console.log(`AgentLib identity: ${sourceIdHash(info.active.sourceId).slice(0, 12)}`
+            + `  source ${info.active.sourceRelativePath}`
+            + `${info.active.requestedRef ? `  requested ${info.active.requestedRef}` : ''}`);
     }
     if (info.drifted) {
         console.log(styles.warn('AgentLib: restart required — the local source no longer matches the active selection.'));
@@ -381,6 +404,8 @@ function printAgentLibStatus() {
     try {
         const attestation = buildAgentLibAttestation();
         console.log(`AgentLib core:     ${attestation.sourceRootRealpath}`);
+        console.log(`AgentLib runtime:  ${String(process.env[AGENTLIB_ENV.fingerprint] || '').slice(0, 12)}`
+            + `  source-id ${String(process.env[AGENTLIB_ENV.sourceId] || '').slice(0, 12)}`);
         for (const [entry, hash] of Object.entries(attestation.entrypoints)) {
             console.log(`  ${entry}: ${hash.slice(0, 12)}`);
         }

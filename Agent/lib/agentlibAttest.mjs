@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
-import { agentLibRootFromEnv, resolveAgentLibFile } from './agentlibResolve.mjs';
+import { agentLibRootFromEnv } from './agentlibResolve.mjs';
 
 export const ATTESTATION_SCHEMA_VERSION = 1;
 export const ATTESTED_ENTRYPOINTS = Object.freeze([
@@ -64,18 +64,30 @@ export function buildAgentAttestation({ env = process.env, resolveFrom = process
     const packageJsonPath = resolvePackageJsonThroughRuntime(require);
     const resolvedRoot = path.dirname(packageJsonPath);
     const confined = resolvedRoot === granted || resolvedRoot.startsWith(`${granted}${path.sep}`);
+    if (!confined) {
+        const error = new Error(
+            `achillesAgentLib package resolution escaped the granted source (${resolvedRoot} outside ${granted})`,
+        );
+        error.code = 'PLOINKY_AGENTLIB_ATTESTATION_MISMATCH';
+        throw error;
+    }
     const entrypoints = {};
     for (const entry of ATTESTED_ENTRYPOINTS) {
-        entrypoints[entry] = sha256File(resolveAgentLibFile(entry, env));
+        const resolved = fs.realpathSync(path.join(resolvedRoot, ...entry.split('/')));
+        if (resolved !== resolvedRoot && !resolved.startsWith(`${resolvedRoot}${path.sep}`)) {
+            const error = new Error(`achillesAgentLib entry point ${entry} escaped the resolved package root`);
+            error.code = 'PLOINKY_AGENTLIB_ATTESTATION_MISMATCH';
+            throw error;
+        }
+        entrypoints[entry] = sha256File(resolved);
     }
     return {
         schemaVersion: ATTESTATION_SCHEMA_VERSION,
         deploymentFingerprint: String(env.PLOINKY_AGENTLIB_FINGERPRINT || ''),
         mode: String(env.PLOINKY_AGENTLIB_MODE || ''),
         commit: String(env.PLOINKY_AGENTLIB_COMMIT || ''),
-        grantedRoot: granted,
-        resolvedRoot,
-        confined,
+        sourceIdHash: String(env.PLOINKY_AGENTLIB_SOURCE_ID || ''),
+        sourceRootRealpath: resolvedRoot,
         packageJsonHash: sha256File(packageJsonPath),
         entrypoints,
     };

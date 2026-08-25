@@ -14,7 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AGENTLIB_ENV, AGENTLIB_PACKAGE_NAME } from '../../agentlib/contract.mjs';
-import { fingerprintSource } from '../../agentlib/fingerprint.mjs';
+import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -56,12 +56,14 @@ export function resolveTestAgentLibSource(env = process.env) {
 
 /** Export the reserved runtime environment for this process and its children. */
 export function applyTestAgentLibContract(env = process.env) {
-    if (String(env[AGENTLIB_ENV.dir] || '').trim()) return env[AGENTLIB_ENV.dir];
-    const sourceDir = resolveTestAgentLibSource(env);
+    const declared = String(env[AGENTLIB_ENV.dir] || '').trim();
+    const sourceDir = declared ? fs.realpathSync(declared) : resolveTestAgentLibSource(env);
+    const observed = fingerprintSource(sourceDir);
     env[AGENTLIB_ENV.dir] = sourceDir;
-    env[AGENTLIB_ENV.mode] = 'local';
-    env[AGENTLIB_ENV.fingerprint] = fingerprintSource(sourceDir).fingerprint;
-    env[AGENTLIB_ENV.commit] = '';
+    env[AGENTLIB_ENV.mode] ||= 'local';
+    env[AGENTLIB_ENV.fingerprint] = observed.fingerprint;
+    env[AGENTLIB_ENV.commit] ||= '';
+    env[AGENTLIB_ENV.sourceId] = sourceIdHash(observed.sourceId);
     return sourceDir;
 }
 

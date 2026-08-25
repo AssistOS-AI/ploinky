@@ -20,6 +20,7 @@ import {
 } from '../contract/image.mjs';
 import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { preflightPublications, resolveEffectiveHostPort } from '../ports.mjs';
 import {
     ensureWorkspaceDataPaths,
@@ -193,6 +194,13 @@ async function restoreOldContainer({
     stdout,
     stderr,
 }) {
+    const observedSource = fingerprintSource(old.agentLib.sourceDir, { fsApi: dependencies.fsApi });
+    if (observedSource.fingerprint !== old.agentLib.fingerprint
+        || sourceIdHash(observedSource.sourceId) !== old.agentLib.sourceIdHash) {
+        throw transactionError(
+            `Refusing to restore the old Box because its achillesAgentLib source at ${old.agentLib.sourceDir} changed`,
+        );
+    }
     return createAndStart({
         engine,
         identity,
@@ -313,6 +321,20 @@ export async function reconcileBoxContainer({
             ownership: finalOwnership,
             hostPort: old.hostPort,
             mediaHostPort: old.mediaHostPort,
+            previousAgentLib: old.agentLib,
+            finalize() {},
+            async rollback() {
+                // Reuse did not replace an outer resource. The supervisor owns
+                // stopping any partially restarted inner graph.
+                return Object.freeze({
+                    action: 'reused-preserved',
+                    ownership: finalOwnership,
+                    containerId: currentContainer.id,
+                    hostPort: old.hostPort,
+                    mediaHostPort: old.mediaHostPort,
+                    agentLib: old.agentLib,
+                });
+            },
         });
     }
 
@@ -361,12 +383,65 @@ export async function reconcileBoxContainer({
             stderr,
         });
         candidateId = created.containerId;
+        let settled = false;
+        const finalize = () => { settled = true; };
+        const rollback = async () => {
+            lock.assertHeld(identity.instance);
+            if (settled) return Object.freeze({ action: 'already-settled' });
+            settled = true;
+            const failures = [];
+            const observed = dependencies.discover(identity, { runner });
+            const observedId = observed?.state === 'owned'
+                ? observed.handles?.container?.id
+                : null;
+            if (observedId && observedId !== candidateId) {
+                throw transactionError(
+                    `Box changed before candidate rollback (${observedId} != ${candidateId})`,
+                );
+            }
+            if (observedId === candidateId) {
+                try { dependencies.removeContainer(engine, candidateId, runner); } catch (error) {
+                    failures.push(`candidate removal: ${error.message}`);
+                }
+            }
+            let restored = null;
+            if (oldRemoved) {
+                try {
+                    restored = await restoreOldContainer({
+                        engine,
+                        identity,
+                        old,
+                        runner,
+                        lock,
+                        dependencies,
+                        stdout,
+                        stderr,
+                    });
+                } catch (error) {
+                    failures.push(`old Box restoration: ${error.message}`);
+                }
+            }
+            if (failures.length) {
+                throw transactionError('Box post-reconcile rollback failed', null, failures);
+            }
+            return Object.freeze(oldRemoved ? {
+                action: 'restored',
+                ownership: restored.ownership,
+                containerId: restored.containerId,
+                hostPort: old.hostPort,
+                mediaHostPort: old.mediaHostPort,
+                agentLib: old.agentLib,
+            } : { action: 'candidate-removed' });
+        };
         return Object.freeze({
             action: old ? 'replaced' : 'created',
             ownership: created.ownership,
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
             imageId: image.immutableId,
+            previousAgentLib: old?.agentLib || null,
+            finalize,
+            rollback,
         });
     } catch (error) {
         const rollbackFailures = [];

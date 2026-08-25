@@ -89,7 +89,12 @@ export function agentLibMountArgs(contract) {
 /** The reserved runtime environment, as it appears inside the Box. */
 export function agentLibBoxEnv(contract) {
     return agentLibRuntimeEnv(
-        { mode: contract.mode, contentFingerprint: contract.fingerprint, resolvedCommit: contract.commit },
+        {
+            mode: contract.mode,
+            contentFingerprint: contract.fingerprint,
+            resolvedCommit: contract.commit,
+            sourceIdHash: contract.sourceIdHash,
+        },
         contract.stablePath,
     );
 }
@@ -104,6 +109,7 @@ export function agentLibLabels(contract) {
         [BOX_AGENTLIB_LABELS.sourceIdHash]: contract.sourceIdHash,
         [BOX_AGENTLIB_LABELS.fingerprint]: contract.fingerprint,
         [BOX_AGENTLIB_LABELS.sourceRelativePath]: contract.sourceRelativePath,
+        [BOX_AGENTLIB_LABELS.commit]: contract.commit,
     };
 }
 
@@ -123,7 +129,8 @@ export function agentLibContractFromContainer(container) {
     const fingerprint = String(labels[BOX_AGENTLIB_LABELS.fingerprint] || '');
     const sourceRelativePath = String(labels[BOX_AGENTLIB_LABELS.sourceRelativePath] || '');
     const sourceIdHashValue = String(labels[BOX_AGENTLIB_LABELS.sourceIdHash] || '');
-    if (!mode && !fingerprint && !sourceRelativePath && !sourceIdHashValue) return null;
+    const commit = String(labels[BOX_AGENTLIB_LABELS.commit] || '');
+    if (!mode && !fingerprint && !sourceRelativePath && !sourceIdHashValue && !commit) return null;
     const mounts = Array.isArray(container?.runtime?.mounts) ? container.runtime.mounts : [];
     const stable = mounts.find((mount) => mount.destination === AGENTLIB_STABLE_MOUNT_PATH);
     if (!stable) {
@@ -136,7 +143,7 @@ export function agentLibContractFromContainer(container) {
         sourceRelativePath,
         mode,
         fingerprint,
-        commit: '',
+        commit,
         sourceIdHash: sourceIdHashValue,
         stablePath: AGENTLIB_STABLE_MOUNT_PATH,
         aliasPath: path.posix.join(BOX_WORKSPACE_MOUNT, sourceRelativePath),
@@ -155,6 +162,7 @@ export function agentLibSelectionChanged(current, desired) {
     return current.sourceDir !== desired.sourceDir
         || current.sourceRelativePath !== desired.sourceRelativePath
         || current.mode !== desired.mode
+        || current.commit !== desired.commit
         || current.sourceIdHash !== desired.sourceIdHash
         || current.fingerprint !== desired.fingerprint;
 }

@@ -62,7 +62,7 @@ fi
 # customizes routing. A partial source set is intentionally rejected. Import
 # the initializer directly so fixture setup does not clone default boot repos.
 edge_generation_module="$TESTS_DIR/../cli/sandbox/edgeGeneration.js"
-node --input-type=module -e '
+node --import "$TESTS_DIR/helpers/agentlibTestContract.mjs" --input-type=module -e '
   import { pathToFileURL } from "node:url";
   const edge = await import(pathToFileURL(process.argv[1]).href);
   edge.initializeFreshEdgeRoutingSources({ workspaceRoot: process.cwd() });

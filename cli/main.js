@@ -455,7 +455,7 @@ function startInteractiveMode() {
     }
 }
 
-export async function runCoreCli(args = []) {
+export async function runCoreCli(args = [], { agentLibBranchPolicy = null } = {}) {
     assertRuntimeDependencies();
     logPloinkyDirectory();
     args = [...args];
@@ -487,5 +487,5 @@ export async function runCoreCli(args = []) {
     }
 
     if (args.length === 0) return startInteractiveMode();
-    return handleCommand(args);
+    return handleCommand(args, { agentLibBranchPolicy });
 }

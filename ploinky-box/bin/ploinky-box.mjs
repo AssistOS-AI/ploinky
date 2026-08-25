@@ -10,6 +10,7 @@ import { BOX_IMAGE_OVERRIDE_ENV, BOX_IMAGE_REFERENCE, BOX_LABELS } from '../cons
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { createBoxSupervisor, formatBoxStatus } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
+import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 
 export function publicUsageText() {
     return `ploinky - run Ploinky through its managed outer Box
@@ -19,6 +20,7 @@ Usage: ploinky [--debug] [--dry-run] [--port PORT] [--udp-port PORT] [--] COMMAN
 Commands:
   ploinky                         Prepare the Box and open the Ploinky REPL
   ploinky start AGENT [PORT]      Start the graph; the Router host port defaults to 8080
+  ploinky restart [AGENT]         Restart through the same source/readiness transaction
   ploinky --udp-port PORT start AGENT [PORT]
                                   Select the media host UDP port; defaults to 7882
   ploinky status                  Inspect Box and core state without mutation
@@ -163,6 +165,13 @@ export async function runOuterCli(argv, {
         await selectedSupervisor.runStartTransaction(route.coreArgv, {
             explicitPort: route.hostPort,
             explicitMediaPort: route.mediaHostPort,
+            branchPolicy: parseBranchPolicy(route.coreArgv),
+        });
+        return 0;
+    }
+    if (route.kind === 'restart') {
+        await selectedSupervisor.runRestartTransaction(stripBranchPolicyArgs(route.coreArgv), {
+            branchPolicy: parseBranchPolicy(route.coreArgv),
         });
         return 0;
     }
@@ -208,25 +217,16 @@ export async function runOuterCli(argv, {
         const priorStatus = selectedSupervisor.inspectBoxStatus();
         const restartAfterUpdate = priorStatus.state === 'running-initialized'
             && priorStatus.inbox?.routingConfigured === true;
-        const prepared = await selectedSupervisor.prepareBoxForCommand();
-        const updateCode = executePrepared(prepared, route.coreArgv, {
-            execute,
-            input,
-            output,
-            engineEnv,
+        await selectedSupervisor.runUpdateTransaction(stripBranchPolicyArgs(route.coreArgv), {
+            branchPolicy: parseBranchPolicy(route.coreArgv),
+            restartAfterUpdate,
         });
-        if (updateCode !== 0) return updateCode;
         if (!restartAfterUpdate) {
             output.write('Update complete; no configured running workspace required a restart.\n');
             return 0;
         }
-        output.write('Update complete; restarting the Router and managed agents...\n');
-        return executePrepared(prepared, ['restart'], {
-            execute,
-            input,
-            output,
-            engineEnv,
-        });
+        output.write('Update complete; the Router and managed agents were restarted coherently.\n');
+        return 0;
     }
 
     const prepared = await selectedSupervisor.prepareBoxForCommand();

@@ -104,6 +104,7 @@ import {
     agentLibReuseProblem,
     agentLibRuntimeRecord,
 } from '../agentLibGrant.js';
+import { attestBwrapAgentLib } from '../agentLibAttestation.js';
 import { detectHostRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -825,6 +826,13 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         agentLibGrant: grant,
     });
 
+    const agentLibAttestation = attestBwrapAgentLib({
+        bwrapPath: BWRAP_PATH,
+        baseArgs: bwrapArgs,
+        grant,
+        spawn: spawnSync,
+    });
+
     // Build the entry command
     const entryCmd = buildBwrapEntryCommand(agentName, manifest, profileConfig);
 
@@ -938,6 +946,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
             volumes: manifest.volumes,
             volumeOptions: readManifestVolumeOptions(manifest),
         }))),
+        agentLibAttestation,
         config: {
             binds: [
                 { source: agentLibPath, target: '/Agent', ro: true },

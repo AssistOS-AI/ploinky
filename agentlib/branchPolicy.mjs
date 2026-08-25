@@ -106,3 +106,24 @@ export function collectBranchPolicyArgs(args) {
     }
     return collected;
 }
+
+/** Remove source/repository branch-policy tokens before command dispatch. */
+export function stripBranchPolicyArgs(args) {
+    const list = (args || []).map((value) => String(value));
+    const stripped = [];
+    for (let index = 0; index < list.length; index += 1) {
+        const arg = list[index];
+        if (arg === '--branch' || arg === '--repo-branch' || arg === '--branch-fallback') {
+            index += 1;
+            continue;
+        }
+        if (arg.startsWith('--branch=')
+            || arg.startsWith('--repo-branch=')
+            || arg.startsWith('--branch-fallback=')
+            || arg === '--reset-repos') {
+            continue;
+        }
+        stripped.push(arg);
+    }
+    return stripped;
+}

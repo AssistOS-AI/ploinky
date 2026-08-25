@@ -160,6 +160,7 @@ import {
     agentLibReuseProblem,
     agentLibRuntimeRecord,
 } from '../agentLibGrant.js';
+import { attestContainerAgentLib } from '../agentLibAttestation.js';
 import {
     assertCandidateLifecycleTransition,
     isCandidateCleanupReceiptDocument,
@@ -2044,6 +2045,17 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             exactCleanupPerformed,
         });
     };
+    let agentLibAttestation;
+    try {
+        agentLibAttestation = attestContainerAgentLib({
+            runtime,
+            containerId: launchedContainerId,
+            grant: containerAgentLibGrant,
+            spawn: spawnSync,
+        });
+    } catch (error) {
+        cleanupExactLaunch(error);
+    }
     const agents = loadAgentsMap();
     const declaredEnvNames2 = [
         ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
@@ -2087,6 +2099,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ...(isolatedHome || !agentHomeDir ? [] : [{ hostPath: agentHomeDir, runtimePath: '/root' }]),
             ],
         )),
+        agentLibAttestation,
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },

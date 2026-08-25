@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { AGENTLIB_LOCAL_DIR_NAME, AGENTLIB_PACKAGE_NAME } from '../../agentlib/contract.mjs';
-import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
+import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { BOX_AGENTLIB_LABELS } from '../../ploinky-box/constants.mjs';
 import {
     agentLibBoxEnv,
@@ -55,7 +55,7 @@ export function writeAgentLibCheckout(dir) {
  * @returns {Readonly<object>} the normalized Box AgentLib contract
  */
 export function agentLibFixture(workspaceRoot, {
-    fingerprint = AGENTLIB_FIXTURE_FINGERPRINT,
+    fingerprint = null,
     mode = 'local',
     sourceRelativePath = AGENTLIB_LOCAL_DIR_NAME,
     commit = '',
@@ -66,13 +66,14 @@ export function agentLibFixture(workspaceRoot, {
         fs.mkdirSync(sourceDir, { recursive: true });
         writeAgentLibCheckout(sourceDir);
     }
+    const observed = fingerprintSource(sourceDir);
     return normalizeBoxAgentLib({
         sourceDir,
         sourceRelativePath,
         mode,
-        contentFingerprint: fingerprint,
+        contentFingerprint: fingerprint || observed.fingerprint,
         resolvedCommit: commit,
-        sourceId: { device: '1', inode: '2' },
+        sourceId: observed.sourceId,
     });
 }
 

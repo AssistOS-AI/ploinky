@@ -129,7 +129,10 @@ export function resolveManagedTarget({
  *
  * Reuse is fully offline: it never consults the mirror or the remote.
  */
-export function findExistingGeneration(workspaceRoot, commit, { fsApi = fs } = {}) {
+export function findExistingGeneration(workspaceRoot, commit, {
+    fsApi = fs,
+    runner = createGitRunner(),
+} = {}) {
     const dir = managedGenerationsDir(workspaceRoot);
     let names;
     try {
@@ -143,6 +146,12 @@ export function findExistingGeneration(workspaceRoot, commit, { fsApi = fs } = {
         const candidate = path.join(dir, name);
         try {
             const { sourceDir } = validateAgentLibSource(candidate, { fsApi, deepSymlinkScan: false });
+            const { fingerprint } = fingerprintSource(sourceDir, { fsApi });
+            if (name !== generationDirName(commit, fingerprint)) continue;
+            const head = runner.run(['rev-parse', 'HEAD'], { cwd: sourceDir });
+            const status = runner.run(['status', '--porcelain', '--untracked-files=all'], { cwd: sourceDir });
+            if (head.status !== 0 || head.stdout.trim() !== commit) continue;
+            if (status.status !== 0 || status.stdout.trim() !== '') continue;
             return sourceDir;
         } catch (_) {
             // A half-written or corrupt generation is simply not reusable; it is
@@ -202,7 +211,7 @@ export function materializeManagedGeneration({
             `A managed AgentLib generation requires an exact 40-hex commit (got ${String(commit)}).`,
         );
     }
-    const existing = findExistingGeneration(workspaceRoot, commit, { fsApi });
+    const existing = findExistingGeneration(workspaceRoot, commit, { fsApi, runner });
     if (existing) return { sourceDir: existing, commit, reused: true };
 
     const mirror = ensureMirror(workspaceRoot, remoteUrl, { runner, fsApi });
@@ -226,10 +235,19 @@ export function materializeManagedGeneration({
         const { fingerprint } = fingerprintSource(fsApi.realpathSync(staging), { fsApi });
         const finalDir = path.join(generations, generationDirName(commit, fingerprint));
         if (fsApi.existsSync(finalDir)) {
-            // Another holder of the lock won the race; keep its immutable copy.
+            // Another holder of the lock may have won the race. Reuse it only
+            // after the same commit/content/cleanliness proof as an offline
+            // generation; a mutated directory is never relabelled as clean.
             removeTree(staging, fsApi);
-            const { sourceDir } = validateAgentLibSource(finalDir, { fsApi, deepSymlinkScan: false });
-            return { sourceDir, commit, reused: true };
+            const existingWinner = findExistingGeneration(workspaceRoot, commit, { fsApi, runner });
+            if (existingWinner === fsApi.realpathSync(finalDir)) {
+                return { sourceDir: existingWinner, commit, reused: true };
+            }
+            throw agentLibError(
+                AGENTLIB_ERROR_CODES.materializeFailed,
+                `Managed achillesAgentLib generation ${finalDir} exists but no longer matches commit ${commit}; `
+                + 'refusing to reuse or overwrite it.',
+            );
         }
         fsApi.renameSync(staging, finalDir);
         const { sourceDir } = validateAgentLibSource(finalDir, { fsApi });
