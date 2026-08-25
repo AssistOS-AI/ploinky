@@ -3241,6 +3241,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             `[ensureAgentService] ${agentName}: missing podman bind record after startAgentContainer; refusing to write a fallback bind list.`
         );
     }
+    if (!startedRecord.agentLib || !startedRecord.agentLibAttestation) {
+        throw new Error(
+            `[ensureAgentService] ${agentName}: physical runtime admission returned no complete AgentLib proof.`
+        );
+    }
     agents[containerName] = {
         agentName,
         repoName,
@@ -3257,6 +3262,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         containerId: started.containerId,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        agentLib: structuredClone(startedRecord.agentLib),
+        agentLibAttestation: structuredClone(startedRecord.agentLibAttestation),
         config: {
             binds: hasStartedBinds ? startedRecord.config.binds : [
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
