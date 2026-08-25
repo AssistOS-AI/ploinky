@@ -33,6 +33,35 @@ function expectedHashes(root, fsApi) {
     };
 }
 
+const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
+const OCI_CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
+
+function admittedRuntimeIdentity(record, runtimeName) {
+    const runtime = String(record?.runtime || '').trim().toLowerCase();
+    const containerId = String(record?.containerId || '').trim().toLowerCase();
+    const pid = Number(record?.pid || 0);
+    const hasAgentLibMetadata = record?.agentLib != null
+        || record?.agentLibAttestation != null;
+    const hasAdmissionSignal = Boolean(runtime || containerId || pid || hasAgentLibMetadata);
+
+    // Enabling an agent creates a registry entry before its no-wait worker has
+    // physically admitted a runtime. Those configured records are outside the
+    // deployment proof until admission publishes a backend identity and the
+    // AgentLib grant atomically.
+    if (!hasAdmissionSignal) return null;
+
+    const hasPhysicalIdentity = HOST_SANDBOX_RUNTIMES.has(runtime)
+        ? Number.isSafeInteger(pid) && pid > 0
+        : OCI_CONTAINER_ID_PATTERN.test(containerId);
+    if (!runtime || !hasPhysicalIdentity) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.attestationMismatch,
+            `Agent ${runtimeName} has an incomplete physical runtime identity.`,
+        );
+    }
+    return Object.freeze({ runtime });
+}
+
 /**
  * Build and validate the graph proof visible to this core process.
  *
@@ -68,6 +97,8 @@ export function attestAgentLibDeployment({
     const agents = [];
     for (const [runtimeName, record] of Object.entries(snapshot).sort(([a], [b]) => a.localeCompare(b))) {
         if (!record || record.type !== 'agent') continue;
+        const admitted = admittedRuntimeIdentity(record, runtimeName);
+        if (!admitted) continue;
         const grant = record.agentLib;
         if (!grant || String(grant.sourceDir || '') !== root
             || String(grant.fingerprint || '') !== fingerprint
@@ -86,7 +117,7 @@ export function attestAgentLibDeployment({
         }, `Agent ${runtimeName}`);
         agents.push(Object.freeze({
             runtimeName,
-            runtime: String(record.runtime || 'container'),
+            runtime: admitted.runtime,
             instanceId: String(record.instanceId || ''),
             enableGeneration: String(record.enableGeneration || ''),
             attestation: structuredClone(attestation),

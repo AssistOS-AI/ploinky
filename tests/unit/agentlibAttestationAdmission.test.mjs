@@ -130,9 +130,15 @@ test('deployment admission requires core and every managed agent to prove one so
     const core = buildAgentLibAttestation({ env, root: selection.sourceDir });
     const directGrant = { ...grant, runtimePath: selection.sourceDir, namespaced: false };
     const registry = {
+        configuredNoWaitAgent: {
+            type: 'agent',
+            instanceId: 'instance-configured',
+            enableGeneration: 'generation-configured',
+        },
         demoAgent: {
             type: 'agent',
             runtime: 'seatbelt',
+            pid: 12345,
             instanceId: 'instance-1',
             enableGeneration: 'generation-1',
             agentLib: directGrant,
@@ -143,6 +149,16 @@ test('deployment admission requires core and every managed agent to prove one so
     assert.equal(proof.deploymentFingerprint, selection.contentFingerprint);
     assert.equal(proof.sourceIdHash, grant.sourceIdHash);
     assert.equal(proof.agents.length, 1);
+    assert.equal(proof.agents[0].runtimeName, 'demoAgent');
+
+    registry.configuredNoWaitAgent.runtime = 'podman';
+    registry.configuredNoWaitAgent.containerId = 'a'.repeat(64);
+    assert.throws(
+        () => attestAgentLibDeployment({ env, workspaceRoot: workspace, registry }),
+        /configuredNoWaitAgent does not carry the core AgentLib source identity/,
+    );
+    delete registry.configuredNoWaitAgent.runtime;
+    delete registry.configuredNoWaitAgent.containerId;
 
     registry.demoAgent.agentLibAttestation = {
         ...core,
