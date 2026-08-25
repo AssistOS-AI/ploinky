@@ -49,6 +49,8 @@ const PROBE_WORKER_URL = new URL('./probeWorker.js', import.meta.url);
 const DEFAULT_MAX_CONCURRENT_PROBE_WORKERS = 2;
 const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
 const DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS = 10_000;
+const DEFAULT_CONTAINER_SNAPSHOT_RETRY_INITIAL_MS = 15_000;
+const DEFAULT_CONTAINER_SNAPSHOT_RETRY_MAX_MS = 60_000;
 const RETRYABLE_PROBE_ERROR_CODES = new Set([
     'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT',
 ]);
@@ -1493,12 +1495,42 @@ export function snapshotRunningContainerNames(monitor) {
     ))) {
         return null;
     }
+    const now = typeof monitor.now === 'function' ? monitor.now() : Date.now();
+    if (Number(monitor.runtimeSnapshotRetryNotBefore || 0) > now) {
+        return null;
+    }
     try {
         const listRunning = monitor.listRunningContainerNames || listRunningContainerNames;
-        return new Set(listRunning());
+        const runningContainerNames = new Set(listRunning());
+        const previousFailures = Number(monitor.runtimeSnapshotFailures || 0);
+        monitor.runtimeSnapshotFailures = 0;
+        monitor.runtimeSnapshotRetryNotBefore = 0;
+        if (previousFailures > 0) {
+            logEvent(monitor, 'info', 'container_status_snapshot_recovered', {
+                previousFailures,
+            });
+        }
+        return runningContainerNames;
     } catch (error) {
+        const consecutiveFailures = Number(monitor.runtimeSnapshotFailures || 0) + 1;
+        const initialRetryMs = positiveInteger(
+            monitor?.config?.CONTAINER_SNAPSHOT_RETRY_INITIAL_MS,
+            DEFAULT_CONTAINER_SNAPSHOT_RETRY_INITIAL_MS,
+        );
+        const maxRetryMs = positiveInteger(
+            monitor?.config?.CONTAINER_SNAPSHOT_RETRY_MAX_MS,
+            DEFAULT_CONTAINER_SNAPSHOT_RETRY_MAX_MS,
+        );
+        const retryAfterMs = Math.min(
+            initialRetryMs * (2 ** Math.min(consecutiveFailures - 1, 20)),
+            Math.max(initialRetryMs, maxRetryMs),
+        );
+        monitor.runtimeSnapshotFailures = consecutiveFailures;
+        monitor.runtimeSnapshotRetryNotBefore = now + retryAfterMs;
         logEvent(monitor, 'error', 'container_status_snapshot_failed', {
             error: error?.message || error,
+            consecutiveFailures,
+            retryAfterMs,
         });
         return null;
     }
@@ -1621,6 +1653,8 @@ export function createContainerMonitor({ config, log, isShuttingDown, terminalLe
         isShuttingDown: typeof isShuttingDown === 'function' ? isShuttingDown : () => false,
         targets: new Map(),
         timer: null,
+        runtimeSnapshotFailures: 0,
+        runtimeSnapshotRetryNotBefore: 0,
         ...(ledgerFile ? { terminalLedgerFile: ledgerFile } : {}),
         terminalLedger: null,
     };
