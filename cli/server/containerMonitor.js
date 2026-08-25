@@ -720,6 +720,7 @@ function deferMonitorWorkForMaintenance(monitor, target) {
 export function syncManagedContainers(monitor) {
     const monitorRef = monitor;
     if (!monitorRef) return;
+    let inventoryChanged = false;
 
     let agentsMap = {};
     try {
@@ -808,7 +809,7 @@ export function syncManagedContainers(monitor) {
                 const target = monitorRef.targets.get(containerName);
                 if (target?.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
                 if (target) stopProbeWorker(target);
-                monitorRef.targets.delete(containerName);
+                inventoryChanged = monitorRef.targets.delete(containerName) || inventoryChanged;
             }
             logEvent(monitorRef, terminal ? 'warn' : 'error', terminal
                 ? 'container_runtime_policy_terminal'
@@ -859,6 +860,7 @@ export function syncManagedContainers(monitor) {
             target = createContainerTarget(info, monitorRef);
             target.runtime = runtime;
             monitorRef.targets.set(containerName, target);
+            inventoryChanged = true;
             logEvent(monitorRef, 'info', 'container_watch_added', {
                 container: containerName,
                 agent: agentName,
@@ -908,8 +910,13 @@ export function syncManagedContainers(monitor) {
             stopProbeWorker(target);
             target.attemptEpoch += 1;
             monitorRef.targets.delete(containerName);
+            inventoryChanged = true;
             logEvent(monitorRef, 'info', 'container_watch_removed', { container: containerName });
         }
+    }
+
+    if (inventoryChanged) {
+        monitorRef.runtimeSnapshotTakenAt = 0;
     }
 }
 
@@ -1436,6 +1443,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                         monitor.targets.delete(oldName);
                         target.containerName = prepared.containerName;
                         monitor.targets.set(target.containerName, target);
+                        monitor.runtimeSnapshotTakenAt = 0;
                     }
 
                     stopProbeWorker(target);
@@ -1501,12 +1509,25 @@ export function snapshotRunningContainerNames(monitor) {
         return null;
     }
     const now = typeof monitor.now === 'function' ? monitor.now() : Date.now();
+    const configuredSnapshotInterval = Number(monitor?.config?.CONTAINER_SNAPSHOT_INTERVAL_MS);
+    const snapshotIntervalMs = Number.isSafeInteger(configuredSnapshotInterval)
+        && configuredSnapshotInterval >= 0
+        ? configuredSnapshotInterval
+        : 0;
+    if (snapshotIntervalMs > 0
+        && monitor.runtimeSnapshot instanceof Set
+        && Number(monitor.runtimeSnapshotTakenAt || 0) > 0
+        && now - monitor.runtimeSnapshotTakenAt < snapshotIntervalMs) {
+        return monitor.runtimeSnapshot;
+    }
     if (Number(monitor.runtimeSnapshotRetryNotBefore || 0) > now) {
         return null;
     }
     try {
         const listRunning = monitor.listRunningContainerNames || listRunningContainerNames;
         const runningContainerNames = new Set(listRunning());
+        monitor.runtimeSnapshot = runningContainerNames;
+        monitor.runtimeSnapshotTakenAt = now;
         const previousFailures = Number(monitor.runtimeSnapshotFailures || 0);
         monitor.runtimeSnapshotFailures = 0;
         monitor.runtimeSnapshotRetryNotBefore = 0;
@@ -1682,6 +1703,8 @@ export function createContainerMonitor({ config, log, isShuttingDown, terminalLe
         timer: null,
         runtimeSnapshotFailures: 0,
         runtimeSnapshotRetryNotBefore: 0,
+        runtimeSnapshot: null,
+        runtimeSnapshotTakenAt: 0,
         ...(ledgerFile ? { terminalLedgerFile: ledgerFile } : {}),
         terminalLedger: null,
     };
@@ -1731,4 +1754,6 @@ export function clearContainerTargets(monitor) {
     if (!monitor) return;
     stopContainerMonitor(monitor);
     monitor.targets.clear();
+    monitor.runtimeSnapshot = null;
+    monitor.runtimeSnapshotTakenAt = 0;
 }

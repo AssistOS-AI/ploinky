@@ -273,3 +273,48 @@ test('snapshot failure defers every OCI target without per-target amplification 
         data: { previousFailures: 1 },
     });
 });
+
+test('Box inventory caching preserves five-second probe scheduling without repeated runtime lists', () => {
+    let calls = 0;
+    let now = 1_000;
+    const probeStarts = [];
+    const target = {
+        runtime: 'container',
+        containerName: 'cached-container',
+        agentName: 'cached-agent',
+        repoName: 'demo-repo',
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+    const monitor = {
+        targets: new Map([[target.containerName, target]]),
+        config: { CONTAINER_SNAPSHOT_INTERVAL_MS: 5 * 60 * 1000 },
+        now: () => now,
+        isShuttingDown: () => false,
+        inspectWorkspaceStartLock: () => ({ active: false, stale: false }),
+        syncManagedContainers() {},
+        listRunningContainerNames() {
+            calls += 1;
+            return [target.containerName];
+        },
+        startProbeWorker(_monitor, current) {
+            probeStarts.push(current.containerName);
+            current.probeState = 'success';
+            current.probeLastSuccessAt = now;
+        },
+        log() {},
+    };
+
+    monitorTick(monitor);
+    target.probeState = 'pending';
+    now += 5_000;
+    monitorTick(monitor);
+
+    assert.equal(calls, 1, 'the second monitor tick must reuse the Box inventory');
+    assert.deepEqual(probeStarts, [target.containerName, target.containerName]);
+
+    now += (5 * 60 * 1000) - 5_000;
+    monitorTick(monitor);
+    assert.equal(calls, 2, 'the inventory refreshes at the bounded cache deadline');
+});
