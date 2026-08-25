@@ -404,7 +404,7 @@ At readiness:
 - The supervisor compares every attestation with the desired source fingerprint and selected entry-point hashes.
 - Any missing, divergent, or unconfined path is a readiness failure.
 
-For a `ploinky-proxy` deployment, additionally require a clean source, exact configured upstream, exact remote `ploinky-proxy` branch commit, no fallback, and matching loaded-byte attestation. The separate cross-repository deployment/E2E gate remains on-demand as required by `CLAUDE.md`.
+For a release-candidate deployment, additionally require the exact pushed Ploinky current-branch commit, clean dependency sources at their recorded remote default branches, no fallback to alternate dependency branches, and matching loaded-byte attestation. The separate cross-repository deployment/E2E gate remains on-demand as required by `CLAUDE.md`.
 
 ## 9. Phased implementation
 
@@ -425,7 +425,7 @@ Tests:
 - Absence creates one managed generation; later offline selection reuses it.
 - Invalid present directory, root symlink, escaping internal symlink, source substitution, and malformed descriptor all fail closed.
 - Exact spelling and workspace-root behavior.
-- Lock commit/default, explicit branch, fallback, dirty local branch, and `ploinky-proxy` cases.
+- Lock commit/default, explicit branch, fallback, dirty local branch, and release-candidate cases.
 - Interrupted materialization never changes `active.json`.
 
 Exit gate: a selection can be produced, staged, revalidated, and rolled back without any runtime consuming it yet.
@@ -547,7 +547,7 @@ Exit gate: only the new direct-source graph is admissible. Obsolete Ploinky-owne
 | bwrap | Exact read-only source bind, including interactive shell |
 | seatbelt | Exact host source read grant, write denial, and host-target cache link |
 | Read-only commands | Help/logs/status do not clone, fetch, repair, or create source state |
-| `ploinky-proxy` policy | Exact clean remote branch/commit and loaded-byte hashes; no fallback |
+| Release-candidate policy | Exact pushed Ploinky current-branch commit, clean dependency default-branch commits, and loaded-byte hashes; no fallback |
 
 ### 10.2 Repository gates
 
@@ -561,7 +561,7 @@ When a native Linux nested-Podman environment is available, extend and run `test
 
 Also test direct `ploinky-local` on macOS seatbelt and Linux bwrap because those paths do not share the same mount mechanics.
 
-Do not automatically perform the cross-repository `ploinky-proxy` deployment or Playwright gate as part of normal implementation verification. Run it only when explicitly requested.
+Do not automatically perform the cross-repository release-candidate deployment or Playwright gate as part of normal implementation verification. Run it only when explicitly requested.
 
 ## 11. File-level change map
 

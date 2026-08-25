@@ -99,10 +99,10 @@ test('host source update pulls its configured upstream and is idempotent', async
         fs.writeFileSync(path.join(seed, 'version.txt'), 'one\n');
         git(seed, ['add', 'version.txt']);
         git(seed, ['commit', '-m', 'initial']);
-        git(seed, ['branch', '-M', 'ploinky-proxy']);
+        git(seed, ['branch', '-M', 'feature-agentlib']);
         git(seed, ['remote', 'add', 'origin', remote]);
-        git(seed, ['push', '--set-upstream', 'origin', 'ploinky-proxy']);
-        execFileSync('git', ['clone', '--branch', 'ploinky-proxy', remote, checkout], { stdio: 'ignore' });
+        git(seed, ['push', '--set-upstream', 'origin', 'feature-agentlib']);
+        execFileSync('git', ['clone', '--branch', 'feature-agentlib', remote, checkout], { stdio: 'ignore' });
 
         fs.writeFileSync(path.join(seed, 'version.txt'), 'two\n');
         git(seed, ['add', 'version.txt']);

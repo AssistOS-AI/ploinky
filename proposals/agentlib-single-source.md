@@ -122,7 +122,7 @@ This replaces achillesAgentLib's share of the `git ls-remote` moving-dep invalid
 
 ### 3.7 Proof surface
 
-`ploinky status` gains one AgentLib line — provenance, directory, commit, dirty flag, fingerprint. The Box dependency marker and every cache stamp carry the same fingerprint, so "same lib everywhere" becomes a checkable assertion. This directly serves the `ploinky-proxy` gate's "prove the loaded AgentLib bytes" requirement (`ploinky/CLAUDE.md` invariant 9): `--branch ploinky-proxy` yields a managed clone (or validates a workspace checkout) at that branch, and status/marker output is the evidence. `--branch-fallback fail` maps to the gate's no-fallback rule.
+`ploinky status` gains one AgentLib line — provenance, directory, commit, dirty flag, fingerprint. The Box dependency marker and every cache stamp carry the same fingerprint, so "same lib everywhere" becomes a checkable assertion. This directly serves the release gate's "prove the loaded AgentLib bytes" requirement (`ploinky/CLAUDE.md` invariant 9): status and marker output prove that the selected workspace source matches the recorded default-branch revision.
 
 ## 4. What this deletes
 

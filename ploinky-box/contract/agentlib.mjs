@@ -121,7 +121,7 @@ export function agentLibLabels(contract) {
  * from the observed mount set, so a relabelled Box cannot claim a source it
  * does not actually have.
  *
- * @returns {Readonly<object>|null} null when the Box predates this contract
+ * @returns {Readonly<object>}
  */
 export function agentLibContractFromContainer(container) {
     const labels = container?.labels || {};
@@ -130,7 +130,9 @@ export function agentLibContractFromContainer(container) {
     const sourceRelativePath = String(labels[BOX_AGENTLIB_LABELS.sourceRelativePath] || '');
     const sourceIdHashValue = String(labels[BOX_AGENTLIB_LABELS.sourceIdHash] || '');
     const commit = String(labels[BOX_AGENTLIB_LABELS.commit] || '');
-    if (!mode && !fingerprint && !sourceRelativePath && !sourceIdHashValue && !commit) return null;
+    if (!mode && !fingerprint && !sourceRelativePath && !sourceIdHashValue && !commit) {
+        throw agentLibContractError('Owned Box is missing its required AgentLib selection labels');
+    }
     const mounts = Array.isArray(container?.runtime?.mounts) ? container.runtime.mounts : [];
     const stable = mounts.find((mount) => mount.destination === AGENTLIB_STABLE_MOUNT_PATH);
     if (!stable) {

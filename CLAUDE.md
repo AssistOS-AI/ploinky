@@ -20,18 +20,18 @@ Ploinky design specifications must not contain a `Conclusion` section. New DS fi
 6. Serialize workspace mutations with the workspace lock. Revalidate immutable identity immediately before mutation, bound rollback, and declare readiness only when the complete manifest graph is ready or has reached its declared no-wait terminal state and every required external health check passes.
 7. Routing fails closed. Apply the same authenticated route policy, caller ACL, exact active generation/lease checks, and replay protection to HTTP, SSE, and WebSocket traffic.
 8. Confine credentials. Never inject reusable agent credentials into host or `none` runtimes. Relay/channel credentials must be fresh, generation-bound, delivered only through the private confined channel, and absent from logs, persisted state, and test artifacts.
-9. A `ploinky-proxy` deployment must use the exact remote `ploinky-proxy` branch in every affected repository, including the AchillesAgentLib checkout actually loaded at runtime. Prove the loaded AgentLib bytes and repository revisions; a manifest claim alone is insufficient. Branch fallback is forbidden.
+9. A release-candidate deployment must use the exact pushed commit of Ploinky's current branch. Every other deployed repository must use its recorded remote default branch and exact commit, including the AchillesAgentLib checkout actually loaded at runtime. Prove the loaded AgentLib bytes and repository revisions; a manifest claim alone is insufficient. Falling back to a non-default dependency branch is forbidden.
 10. Preserve the versionless semantic Box identity. Do not turn schema or runtime revisions into incrementing public Box names.
 
-## On-demand cross-repository `ploinky-proxy` gate
+## On-demand cross-repository release gate
 
-Do not automatically deploy Explorer or run the Playwright E2E gates after each `ploinky-proxy` change. Run this cross-repository gate only when the user explicitly requests the deployment or E2E validation in the current task. Normal scoped unit, integration, and static verification still applies to every change.
+Do not automatically deploy Explorer or run the Playwright E2E gates after each Ploinky change. Run this cross-repository gate only when the user explicitly requests the deployment or E2E validation in the current task. Normal scoped unit, integration, and static verification still applies to every change.
 
 When the user requests this gate, all steps below are mandatory against the exact pushed candidate revisions. Do not infer an E2E request from a code change, a prior task, or the existence of this procedure.
 
 ### 1. Pin the candidate
 
-Commit and push every participating candidate revision first because Ploinky resolves remote branches. Record the exact `origin/ploinky-proxy` commit for every affected/deployed repository, its configured upstream, the expected immutable Box image identity, and the release manifest used by the Copilot gate. Do not test uncommitted source and do not silently mix branch heads from different candidate generations.
+Commit and push the Ploinky candidate first. Record its current branch, exact pushed commit, and configured upstream. For every other participating or deployed repository, resolve and record the remote symbolic `HEAD`, its default branch, that branch's exact commit, and the configured upstream used by the fixture. Also record the expected immutable Box image identity and the release manifest used by the Copilot gate. Do not test uncommitted source and do not silently mix branch heads from different candidate generations.
 
 ### 2. Recreate the dedicated local fixture
 
@@ -53,9 +53,9 @@ Do not add arguments or flags to this deployment command, including `--branch`, 
 Before testing, prove all of the following:
 
 1. The entire declared Explorer graph is ready, including required external health checks.
-2. Every deployed repository is clean, tracks `origin/ploinky-proxy`, and is at the recorded candidate commit.
+2. Ploinky is clean, tracks the pushed current branch, and is at its recorded candidate commit. Every other deployed repository is clean, tracks its recorded `origin/<default-branch>`, and is at the recorded default-branch commit.
 3. The running Box has the expected immutable image identity and fresh generation.
-4. The running AchillesAgentLib bytes come from its recorded `ploinky-proxy` candidate revision.
+4. The running AchillesAgentLib bytes come from its recorded remote-default-branch revision.
 5. The network publications and runtime privileges still satisfy the invariants above.
 
 Any fallback, detached/mixed revision, stale generation, unclean checkout, missing agent, or readiness exception invalidates the deployment.

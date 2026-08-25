@@ -632,12 +632,12 @@ test('a requested branch is validated against a local checkout without modifying
     const workspace = makeWorkspace();
     const dir = localCheckout(workspace);
     const before = fingerprintMod.fingerprintSource(dir).fingerprint;
-    const readGitState = () => ({ commit: 'd'.repeat(40), dirty: true, branch: 'ploinky-proxy' });
+    const readGitState = () => ({ commit: 'd'.repeat(40), dirty: true, branch: 'feature-agentlib' });
 
     const matched = source.selectAgentLibSource({
         workspaceRoot: workspace,
         readGitState,
-        branchPolicy: { branch: 'ploinky-proxy', fallback: 'fail' },
+        branchPolicy: { branch: 'feature-agentlib', fallback: 'fail' },
     });
     assert.equal(matched.selection.resolvedCommit, 'd'.repeat(40));
     assert.equal(matched.selection.dirty, true, 'a dirty local checkout is reported, not hidden');
@@ -650,7 +650,7 @@ test('a requested branch is validated against a local checkout without modifying
     });
     assert.equal(mismatched.selection.mode, 'local');
     assert.equal(
-        source.assertLocalBranchPolicy(dir, { branch: 'ploinky-proxy' }, { branch: 'other', fallback: 'default' }).matched,
+        source.assertLocalBranchPolicy(dir, { branch: 'feature-agentlib' }, { branch: 'other', fallback: 'default' }).matched,
         false,
     );
 
@@ -664,7 +664,7 @@ test('a branch mismatch on a local checkout is fail-closed under --branch-fallba
         () => source.selectAgentLibSource({
             workspaceRoot: workspace,
             readGitState: () => ({ commit: null, dirty: false, branch: 'master' }),
-            branchPolicy: { branch: 'ploinky-proxy', fallback: 'fail' },
+            branchPolicy: { branch: 'feature-agentlib', fallback: 'fail' },
         }),
         (error) => error.code === contract.AGENTLIB_ERROR_CODES.branchMissing,
     );
@@ -672,7 +672,7 @@ test('a branch mismatch on a local checkout is fail-closed under --branch-fallba
         () => source.selectAgentLibSource({
             workspaceRoot: workspace,
             readGitState: () => ({ commit: null, dirty: false, branch: null }),
-            branchPolicy: { branch: 'ploinky-proxy', fallback: 'fail' },
+            branchPolicy: { branch: 'feature-agentlib', fallback: 'fail' },
         }),
         /detached or unknown revision/,
     );
