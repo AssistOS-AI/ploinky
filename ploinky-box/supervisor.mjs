@@ -8,7 +8,8 @@ import {
 import { selectWorkspaceAgentLibSource } from './agentlib-source.mjs';
 import { AGENTLIB_ERROR_CODES, agentLibError } from '../agentlib/contract.mjs';
 import { fingerprintSource, sourceIdEquals } from '../agentlib/fingerprint.mjs';
-import { writeActiveDescriptor } from '../agentlib/source.mjs';
+import { canonicalWorkspaceRoot, managedRootPath, writeActiveDescriptor } from '../agentlib/source.mjs';
+import fsPromisesFree from 'node:fs';
 import {
     agentLibBoxEnv,
     agentLibContractFromContainer,
@@ -60,6 +61,40 @@ function defaultDiscovery(identity, runner, platform, env) {
 }
 
 /**
+ * Remove the workspace-owned managed AgentLib state.
+ *
+ * Scoped to `.ploinky/agentlib`, which Ploinky created and owns. A local
+ * `<workspace>/achillesAgentLib` checkout belongs to the user and is never
+ * deleted or mutated, so it is deliberately out of range here.
+ *
+ * @param {string} workspaceRoot
+ * @returns {readonly string[]} the paths removed
+ */
+function removeManagedAgentLibState(workspaceRoot, fsApi = fsPromisesFree) {
+    const target = managedRootPath(workspaceRoot, fsApi);
+    const expected = path.join(canonicalWorkspaceRoot(workspaceRoot, fsApi), '.ploinky', 'agentlib');
+    if (target !== expected) {
+        throw supervisorError(
+            `Refusing to delete managed AgentLib state outside ${expected}`,
+            'PLOINKY_BOX_AGENTLIB_CLEANUP_REFUSED',
+        );
+    }
+    try {
+        if (!fsApi.lstatSync(target).isDirectory()) {
+            throw supervisorError(
+                `Managed AgentLib state at ${target} is not a real directory; nothing was removed`,
+                'PLOINKY_BOX_AGENTLIB_CLEANUP_REFUSED',
+            );
+        }
+    } catch (error) {
+        if (error?.code === 'ENOENT') return Object.freeze([]);
+        throw error;
+    }
+    fsApi.rmSync(target, { recursive: true, force: true });
+    return Object.freeze([target]);
+}
+
+/**
  * Prove the selected source is still exactly the one the graph was admitted for.
  *
  * A local checkout is outside Ploinky's locks, so a developer edit during
@@ -106,6 +141,7 @@ export function createBoxSupervisor({
     commitAgentLibSelection = writeActiveDescriptor,
     revalidateAgentLibSource = defaultRevalidateAgentLibSource,
     destroyBoxCache = removeWorkspaceDataPaths,
+    destroyManagedAgentLib = removeManagedAgentLibState,
     inspectBoxData = inspectWorkspaceDataPaths,
     stdout = process.stdout,
     stderr = process.stderr,
@@ -301,12 +337,19 @@ export function createBoxSupervisor({
             const deletedPaths = deleteCache
                 ? destroyBoxCache({ identity, lock })
                 : Object.freeze([]);
+            // Workspace-owned managed AgentLib state may go with the cache, but
+            // only once the Box is proven absent. A user-owned local checkout is
+            // never touched: it is outside `.ploinky` entirely.
+            const deletedAgentLibPaths = deleteCache && !container
+                ? destroyManagedAgentLib(identity.workspaceRoot)
+                : Object.freeze([]);
             return Object.freeze({
                 identity,
                 action: container ? 'destroyed' : 'deleted-cache',
                 containerId: container?.id || null,
                 deletedCache: deleteCache,
                 deletedPaths,
+                deletedAgentLibPaths,
             });
         });
     }

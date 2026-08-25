@@ -173,7 +173,7 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
         '/usr/local/bin/node', '-e', [
             "const f=require('node:fs');",
             "f.unlinkSync('/opt/ploinky/node_modules/.ploinky-box-dependencies.json');",
-            "f.chmodSync('/opt/ploinky/node_modules/achillesAgentLib',0o500);",
+            "f.chmodSync('/opt/ploinky/node_modules/mcp-sdk',0o500);",
         ].join(''),
     ]);
     const corruptedHash = dependencyTreeHash(harness);
