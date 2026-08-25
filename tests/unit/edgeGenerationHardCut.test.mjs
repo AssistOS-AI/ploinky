@@ -14,6 +14,7 @@ import {
     captureEdgeRoutingObservationLease,
     commitAdditiveEdgeRoutingGeneration,
     createRouterAttestationGenerationLease,
+    currentEnabledAgentIdentity,
     initializeFreshEdgeRoutingSources,
     loadActiveEdgeRoutingGeneration,
     prepareAdditiveEdgeRoutingGeneration,
@@ -303,6 +304,73 @@ test('generation compiles convention access solely from HTTP route policy', (t) 
     ));
     assert.equal(policyEntry.access, 'authenticated');
     assert.equal(Object.hasOwn(applied.generation.compiled.security, 'privateRouteConsumers'), false);
+});
+
+test('a draining route rejects new selectors while retaining its exact identity and policy', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'alpha.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+    });
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    routing.routes.alpha.draining = true;
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+
+    const agentsFile = path.join(fixture.ploinkyDir, 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    agents['alpha-container'].runtime = 'podman';
+    agents['alpha-container'].containerId = 'a'.repeat(64);
+    fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
+
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'targeted-restart-draining-route',
+        publicationState: 'ready',
+    });
+    assert.equal(applied.generation.routing.routes.alpha.draining, true);
+    assert.deepEqual(currentEnabledAgentIdentity(
+        applied.generation,
+        'agent:fixtures/alpha',
+    ), {
+        agentId: 'agent:fixtures/alpha',
+        instanceId: 'alpha-instance',
+        enableGeneration: 'alpha-enable-generation',
+        routeKey: 'alpha',
+    });
+    assert.equal(applied.generation.compiled.policy.routeDefaults.alpha.access, 'authenticated');
+    assert.equal(applied.generation.compiled.hosts['alpha.example.test'].routeKey, 'alpha');
+
+    const convention = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/base-agent-additional-server/alpha/7000/callback',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+    });
+    assert.equal(convention.ok, false);
+    assert.equal(convention.code, 'AGENT_OWNER_INACTIVE');
+
+    const publicHost = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/',
+            headers: { host: 'alpha.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(publicHost.ok, false);
+    assert.equal(publicHost.code, 'HOST_SELECTOR_INACTIVE');
+    assert.equal(publicHost.status, 503);
 });
 
 test('agent-mcp exposes only the selected root manifest dependency closure', (t) => {

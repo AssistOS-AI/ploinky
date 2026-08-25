@@ -60,6 +60,8 @@ const ROUTES = {
     soplangAgent: { hostPort: 4102, hostPath: '/ignored', repo: 'AssistOSExplorer', agent: 'soplangAgent' },
     // Disabled — must be excluded even though it has a port + manifest.
     disabledAgent: { hostPort: 4103, disabled: true, repo: 'AssistOSExplorer', agent: 'disabledAgent' },
+    // Draining — its identity remains enabled, but discovery must admit no new work.
+    drainingAgent: { hostPort: 4105, draining: true, repo: 'AssistOSExplorer', agent: 'drainingAgent' },
     // No host port — must be excluded.
     portlessAgent: { repo: 'AssistOSExplorer', agent: 'portlessAgent' },
     // Active port but manifest cannot be resolved — must be excluded.
@@ -74,6 +76,7 @@ const MANIFESTS = {
         endpoints: { chatCompletions: { command: '/chat', supportsStream: true } },
     },
     disabledAgent: { name: 'Disabled Agent', version: '1.0.0' },
+    drainingAgent: { name: 'Draining Agent', version: '1.0.0' },
     manifestlessAgent: null,
 };
 
@@ -135,12 +138,13 @@ test('responderKind: llm + streaming when no chatCompletions block', () => {
     assert.equal(agents[0].supportsStreaming, true);
 });
 
-test('builder omits disabled, portless, and manifest-less routes', () => {
+test('builder omits disabled, draining, portless, and manifest-less routes', () => {
     const reader = makeManifestReader(MANIFESTS);
     const { agents } = buildOpenAiAgentDiscovery({ routes: ROUTES, readManifest: reader });
     const keys = agents.map((a) => a.routeKey).sort();
     assert.deepEqual(keys, ['llmAssistant', 'soplangAgent']);
     assert.equal(agents.some((a) => a.routeKey === 'disabledAgent'), false);
+    assert.equal(agents.some((a) => a.routeKey === 'drainingAgent'), false);
     assert.equal(agents.some((a) => a.routeKey === 'portlessAgent'), false);
     assert.equal(agents.some((a) => a.routeKey === 'manifestlessAgent'), false);
 });
