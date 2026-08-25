@@ -2,32 +2,22 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { debugLog } from '../utils/utils.js';
+import { resolveAgentLibPath } from '../../agentlib/runtime.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 let cachedValidApiKeys = null;
-const LLM_CONFIG_RELATIVE_PATH = ['node_modules', 'achillesAgentLib', 'LLMConfig.json'];
 const DEFAULT_ENV_FILENAME = '.env';
 
+/**
+ * LLMConfig.json comes from the one selected achillesAgentLib source.
+ *
+ * The retired candidate search walked several install trees and could silently
+ * read a different copy than the runtime loaded; the explicit resolver cannot.
+ */
 function resolveLlmConfigPath() {
-    const candidates = [
-        path.resolve(process.cwd(), ...LLM_CONFIG_RELATIVE_PATH),
-        path.resolve(__dirname, '..', '..', ...LLM_CONFIG_RELATIVE_PATH),
-        path.resolve(__dirname, '..', '..', '..', ...LLM_CONFIG_RELATIVE_PATH)
-    ];
-
-    for (const candidate of candidates) {
-        try {
-            if (fs.existsSync(candidate)) {
-                return candidate;
-            }
-        } catch (error) {
-            debugLog('resolveLlmConfigPath: check failed', error?.message || error);
-        }
-    }
-
-    return candidates[0];
+    return resolveAgentLibPath('LLMConfig.json');
 }
 
 function findEnvFileUpwards(startDir = process.cwd(), filename = DEFAULT_ENV_FILENAME) {

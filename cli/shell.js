@@ -12,7 +12,8 @@ import {
     handleSystemCommand,
     resetLlmInvokerCache,
 } from './commands/llmSystemCommands.js';
-import { getPrioritizedModels } from 'achillesAgentLib/utils/LLMClient.mjs';
+import { bootstrapAgentLibRuntime } from '../agentlib/bootstrap.mjs';
+import { importAgentLib } from '../agentlib/runtime.mjs';
 import {
     loadValidLlmApiKeys,
     collectAvailableLlmKeys,
@@ -149,6 +150,9 @@ async function logAvailableModels(availableKeys = []) {
 async function logCurrentModelChoice() {
     try {
         const configured = String(getSecret('ACHILLES_MODEL_PLAN') || '').trim();
+        // Loaded lazily from the one selected achillesAgentLib source, after
+        // the launcher has established the runtime contract.
+        const { getPrioritizedModels } = await importAgentLib('utils/LLMClient.mjs');
         const prioritized = await getPrioritizedModels(configured || null);
         const current = Array.isArray(prioritized) && prioritized.length ? prioritized[0] : null;
         if (current) {
@@ -501,7 +505,11 @@ async function main() {
     process.exit(ok ? 0 : 1);
 }
 
-main().catch((error) => {
-    console.error(`ploinky-shell failed: ${error?.message || error}`);
-    process.exit(1);
-});
+// The shell surfaces LLM recommendations, so it needs the same AgentLib runtime
+// contract the core CLI establishes before importing framework code.
+bootstrapAgentLibRuntime()
+    .then(() => main())
+    .catch((error) => {
+        console.error(`ploinky-shell failed: ${error?.message || error}`);
+        process.exit(1);
+    });

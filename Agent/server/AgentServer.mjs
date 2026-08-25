@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { zod } from 'mcp-sdk';
@@ -23,10 +22,13 @@ import {
     buildDefaultStreamRejection
 } from './openAiDefaultResponder.mjs';
 import { buildLoopToolsFromMcp } from './mcpToolBridge.mjs';
+import { importAgentLibFile } from '../lib/agentlibResolve.mjs';
 const { z } = zod;
-const require = createRequire(import.meta.url);
-const achillesAgentLibRoot = path.dirname(require.resolve('achillesAgentLib/package.json'));
-const { isOptOutModel, runOpenAiAgenticResponse } = await import(pathToFileURL(path.join(achillesAgentLibRoot, 'LLMAgents/openAiAgenticResponder.mjs')).href);
+// achillesAgentLib is resolved from the one selected source through the
+// explicit resolver, never from an install tree next to this file.
+const { isOptOutModel, runOpenAiAgenticResponse } = await importAgentLibFile(
+    'LLMAgents/openAiAgenticResponder.mjs',
+);
 
 const DEFAULT_MAX_CONCURRENT_TASKS = 10;
 const DEFAULT_TASK_LOG_TAIL_BYTES = 128 * 1024;

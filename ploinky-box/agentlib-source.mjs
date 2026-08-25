@@ -13,6 +13,7 @@ import { AGENTLIB_ERROR_CODES, agentLibError } from '../agentlib/contract.mjs';
 import { createGitRunner, selectManagedSource } from '../agentlib/materialize.mjs';
 import {
     readActiveDescriptor,
+    resolveDescriptorSource,
     selectAgentLibSource,
     withAgentLibSourceLock,
 } from '../agentlib/source.mjs';
@@ -51,11 +52,13 @@ export function readLocalGitState(sourceDir, { spawn = spawnSync } = {}) {
  * @param {object} params
  * @param {string} params.workspaceRoot
  * @param {{branch: string|null, fallback: 'default'|'fail'}|null} [params.branchPolicy]
+ * @param {boolean} [params.readOnly] - reuse only; never clone, fetch, or create state
  * @returns {Promise<{ selection: object, mode: 'local'|'managed' }>}
  */
 export async function selectWorkspaceAgentLibSource({
     workspaceRoot,
     branchPolicy = null,
+    readOnly = false,
     fsApi = fs,
     runner = createGitRunner(),
     gitState = readLocalGitState,
@@ -70,6 +73,21 @@ export async function selectWorkspaceAgentLibSource({
     });
     if (!local.requiresMaterialization) {
         return { selection: local.selection, mode: 'local' };
+    }
+    if (readOnly) {
+        // Read-only commands may reuse an already-materialized generation but
+        // must never create one, so an unmaterialized workspace is reported
+        // rather than silently populated.
+        const activeDescriptor = readActiveDescriptor(workspaceRoot, fsApi);
+        if (!activeDescriptor) {
+            throw agentLibError(
+                AGENTLIB_ERROR_CODES.sourceMissing,
+                'No achillesAgentLib source is available for this workspace yet. '
+                + 'Add <workspace>/achillesAgentLib, or run `ploinky start` to materialize a managed source.',
+            );
+        }
+        const { sourceDir } = resolveDescriptorSource(activeDescriptor, workspaceRoot, { fsApi });
+        return { selection: { ...activeDescriptor, sourceDir }, mode: activeDescriptor.mode };
     }
     // Only a managed source needs the writer lock; a local checkout is selected
     // without creating any workspace state at all.

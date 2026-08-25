@@ -206,7 +206,11 @@ run_node_unit_tests() {
       return 1
     fi
 
-    node --test "${test_files[@]}"
+    # The direct-mount design gives achillesAgentLib no install-tree fallback, so
+    # the runner names one source explicitly (see the helper for how it is
+    # chosen). The helper exports the reserved environment, which test-spawned
+    # subprocesses inherit too.
+    node --test --import "$TESTS_DIR/helpers/agentlibTestContract.mjs" "${test_files[@]}"
 }
 
 # --- Main Test Execution Flow ---

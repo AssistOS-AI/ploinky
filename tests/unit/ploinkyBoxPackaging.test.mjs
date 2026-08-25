@@ -57,10 +57,33 @@ test('package metadata changes only the exact bin map and immutable postinstall'
     });
 });
 
-test('packaging binaries preserve baseline bytes and executable modes', () => {
-    assert.deepEqual(
-        fs.readFileSync(path.join(repositoryRoot, 'bin/ploinky-local')),
-        Buffer.from(run('git', ['show', `${BASE_SHA}:bin/ploinky`], { encoding: null }).stdout),
+// The only intended change to the renamed launcher is the removal of the
+// install-tree dependency gate: achillesAgentLib is now selected from the
+// workspace and validated by the Node bootstrap, not required next to the
+// checkout. Asserting the exact substitution keeps every other byte pinned.
+const REMOVED_AGENTLIB_GATE = [
+    'if [[ ! -d "$PLOINKY_ROOT/node_modules/achillesAgentLib" ]]; then',
+    '    echo "Ploinky dependency missing: $PLOINKY_ROOT/node_modules/achillesAgentLib" >&2',
+    '    echo "Run \'npm install\' from $PLOINKY_ROOT before running ploinky." >&2',
+    '    exit 1',
+    'fi',
+    '',
+].join('\n');
+
+const AGENTLIB_GATE_REPLACEMENT = [
+    '# achillesAgentLib is not an installed dependency of this checkout: it is',
+    '# selected from the workspace (or a managed workspace generation) and validated',
+    '# by the Node bootstrap in cli/index.js before any framework import.',
+    '',
+].join('\n');
+
+test('packaging binaries preserve baseline bytes apart from the removed AgentLib gate', () => {
+    const baseline = run('git', ['show', `${BASE_SHA}:bin/ploinky`], { encoding: 'utf8' }).stdout;
+    assert.ok(baseline.includes(REMOVED_AGENTLIB_GATE), 'the baseline launcher must contain the retired gate');
+    const expected = baseline.replace(REMOVED_AGENTLIB_GATE, AGENTLIB_GATE_REPLACEMENT);
+    assert.equal(
+        fs.readFileSync(path.join(repositoryRoot, 'bin/ploinky-local'), 'utf8'),
+        expected,
     );
     for (const name of ['p-cli', 'ploinky-shell']) {
         assert.deepEqual(
@@ -102,7 +125,8 @@ test('npm pack exports working boxed and local commands without running postinst
     const boxed = run(path.join(packageRoot, 'bin/ploinky'), ['help'], { cwd: packageRoot });
     assert.match(boxed.stdout, /run Ploinky through its managed outer Box/);
 
-    fs.mkdirSync(path.join(packageRoot, 'node_modules/achillesAgentLib'), { recursive: true });
+    // No achillesAgentLib install tree is created here on purpose: the packaged
+    // launcher must reach cli/index.js without one.
     const controlled = controlledNodeFixture(root);
     run(path.join(packageRoot, 'bin/ploinky-local'), ['status', '--fixture'], {
         cwd: packageRoot,

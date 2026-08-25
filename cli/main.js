@@ -32,8 +32,11 @@ function commandOwnsRuntimeAdmission(args) {
     return !['repo', 'repository', 'sandbox', 'host-sandbox', 'lite-sandbox'].includes(targetKind);
 }
 
+// achillesAgentLib is deliberately absent here: it is direct-mounted from the
+// selected workspace source and validated by the AgentLib bootstrap, not
+// installed under this checkout's node_modules.
 function assertRuntimeDependencies() {
-    const missing = ['achillesAgentLib', 'mcp-sdk'].filter((dep) => {
+    const missing = ['mcp-sdk'].filter((dep) => {
         try {
             return !fs.statSync(path.join(PLOINKY_ROOT, 'node_modules', dep)).isDirectory();
         } catch (_) {
