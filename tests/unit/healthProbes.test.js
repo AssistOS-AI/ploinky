@@ -280,44 +280,49 @@ test('non-timeout client errors clean the exact execution before surfacing', () 
     ]);
 });
 
-test('outer exec timeout invokes exact marker cleanup and preserves control-plane uncertainty', () => {
+test('outer exec timeout proves exact cleanup before retrying the readiness probe', () => {
     const timeoutError = new Error('timed out');
     timeoutError.code = 'ETIMEDOUT';
     const calls = [];
-    assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
+    const retrySleeps = [];
+    let tokenSequence = 0;
+    const result = runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
         timeout: 0.01,
         failureThreshold: 1,
     }, {
         runtime: 'fake-runtime',
-        tokenFactory: () => 'outer-timeout',
+        tokenFactory: () => `outer-timeout-${tokenSequence += 1}`,
         spawnSyncImpl: fakeSpawnSequence([
             { status: null, signal: 'SIGTERM', error: timeoutError, stdout: '', stderr: '' },
             { status: 0, stdout: '', stderr: '' },
+            { status: 0, stdout: 'ready\n', stderr: '' },
         ], calls),
-        sleepMsImpl() {},
+        controlPlaneRetryMs: 17,
+        sleepMsImpl(ms) { retrySleeps.push(ms); },
         isContainerRunningImpl() { return true; },
-    }), (error) => {
-        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
-        assert.match(error.message, /runtime control plane timed out/);
-        return true;
     });
+    assert.deepEqual(result, { status: 'success', detail: 'ready' });
+    assert.deepEqual(retrySleeps, [17]);
     assert.deepEqual(calls[2].args, [
         'exec',
         'database-container',
         'sh',
         '/Agent/server/HealthProbeRunner.sh',
         'cleanup',
-        '/tmp/.ploinky-health-probe-outer-timeout',
-        'outer-timeout',
+        '/tmp/.ploinky-health-probe-outer-timeout-1',
+        'outer-timeout-1',
     ]);
-    assert.equal(calls[2].options.timeout, 5000);
+    assert.equal(calls[2].options.timeout, 30000);
     assert.equal(calls[2].options.killSignal, 'SIGKILL');
+    assert.equal(calls[3].args.includes('outer-timeout-2'), true);
 });
 
-test('exact cleanup timeout remains a retryable control-plane failure', () => {
+test('exact cleanup control-plane timeouts exhaust idempotent retries and fail closed', () => {
     const timeoutError = new Error('spawnSync podman ETIMEDOUT');
     timeoutError.code = 'ETIMEDOUT';
+    const calls = [];
+    const cleanupSleeps = [];
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
         timeout: 0.01,
@@ -328,14 +333,82 @@ test('exact cleanup timeout remains a retryable control-plane failure', () => {
         spawnSyncImpl: fakeSpawnSequence([
             { status: null, error: timeoutError, stdout: '', stderr: '' },
             { status: null, error: timeoutError, stdout: '', stderr: '' },
-        ], []),
+            { status: null, error: timeoutError, stdout: '', stderr: '' },
+            { status: null, error: timeoutError, stdout: '', stderr: '' },
+        ], calls),
+        cleanupRetryMs: 19,
+        sleepMsImpl(ms) { cleanupSleeps.push(ms); },
+        isContainerRunningImpl() { return true; },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_PROBE_CLEANUP_FAILED');
+        assert.match(error.message, /exact probe cleanup failed/);
+        return true;
+    });
+    assert.deepEqual(cleanupSleeps, [19, 19]);
+    assert.equal(calls.filter(({ args }) => args.includes('cleanup')).length, 3);
+    assert.equal(calls.at(-1).options.timeout, 30000);
+});
+
+test('a delayed exact cleanup can recover before the probe retry proceeds', () => {
+    const timeoutError = new Error('spawnSync podman ETIMEDOUT');
+    timeoutError.code = 'ETIMEDOUT';
+    const calls = [];
+    const sleeps = [];
+    let tokenSequence = 0;
+    const result = runContainerScriptReadiness('onlyOffice', 'onlyoffice-container', {
+        script: 'healthcheck.sh',
+        timeout: 5,
+        failureThreshold: 180,
+    }, {
+        runtime: 'fake-runtime',
+        tokenFactory: () => `onlyoffice-${tokenSequence += 1}`,
+        spawnSyncImpl: fakeSpawnSequence([
+            { status: null, error: timeoutError, stdout: '', stderr: '' },
+            { status: null, error: timeoutError, stdout: '', stderr: '' },
+            { status: 0, stdout: '', stderr: '' },
+            { status: 0, stdout: 'ready\n', stderr: '' },
+        ], calls),
+        cleanupRetryMs: 11,
+        controlPlaneRetryMs: 23,
+        sleepMsImpl(ms) { sleeps.push(ms); },
+        isContainerRunningImpl() { return true; },
+    });
+
+    assert.deepEqual(result, { status: 'success', detail: 'ready' });
+    assert.deepEqual(sleeps, [11, 23]);
+    assert.equal(calls.filter(({ args }) => args.includes('cleanup')).length, 2);
+    assert.equal(calls.filter(({ args }) => args.includes('run')).length, 2);
+});
+
+test('probe control-plane retries remain bounded after each exact cleanup succeeds', () => {
+    const timeoutError = new Error('spawnSync podman ETIMEDOUT');
+    timeoutError.code = 'ETIMEDOUT';
+    const calls = [];
+    let tokenSequence = 0;
+    assert.throws(() => runContainerScriptReadiness('onlyOffice', 'onlyoffice-container', {
+        script: 'healthcheck.sh',
+        timeout: 5,
+        failureThreshold: 180,
+    }, {
+        runtime: 'fake-runtime',
+        tokenFactory: () => `bounded-${tokenSequence += 1}`,
+        spawnSyncImpl: fakeSpawnSequence([
+            { status: null, error: timeoutError, stdout: '', stderr: '' },
+            { status: 0, stdout: '', stderr: '' },
+            { status: null, error: timeoutError, stdout: '', stderr: '' },
+            { status: 0, stdout: '', stderr: '' },
+        ], calls),
+        controlPlaneFailureThreshold: 2,
+        controlPlaneRetryMs: 0,
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
     }), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
-        assert.match(error.message, /exact probe cleanup failed/);
+        assert.match(error.message, /runtime control plane timed out/);
         return true;
     });
+    assert.equal(calls.filter(({ args }) => args.includes('run')).length, 2);
+    assert.equal(calls.filter(({ args }) => args.includes('cleanup')).length, 2);
 });
 
 test('outer exec timeout fails closed when exact cleanup cannot be proved', () => {
