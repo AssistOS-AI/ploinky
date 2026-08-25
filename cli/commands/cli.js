@@ -50,7 +50,7 @@ import {
     findAgentManifest,
 } from './repoAgentCommands.js';
 import { parseStartArgs } from '../utils/repos.js';
-import { resolveAgentlibBranchRef } from '../utils/dependencies/dependencyInstaller.js';
+import { importAgentLib } from '../../agentlib/runtime.mjs';
 import {
     handleVarsCommand,
     handleVarCommand,
@@ -92,7 +92,9 @@ const ENABLE_AGENT_CLI_TOKEN_SET = new Set(Object.values(ENABLE_AGENT_CLI_TOKENS
 
 async function ensureLlmAgentsLoaded() {
     if (!llmAgentsLoadPromise) {
-        llmAgentsLoadPromise = import('achillesAgentLib/LLMAgents').catch((error) => {
+        // Resolved from the one selected achillesAgentLib source, not through
+        // bare package resolution against an install tree.
+        llmAgentsLoadPromise = importAgentLib('LLMAgents').catch((error) => {
             llmAgentsLoadPromise = null;
             throw error;
         });
@@ -382,16 +384,10 @@ async function handleCommand(args) {
                     throw new Error(profileResult.message);
                 }
             }
-            // The global --branch also drives the achillesAgentLib used by agent
-            // containers (when the branch is absent, the default fallback keeps
-            // the unpinned AgentLib dependency on its remote default branch).
-            // Propagated via PLOINKY_AGENTLIB_REF,
-            // read host-side by readGlobalDepsPackage and inherited by the
-            // Watchdog/router via buildRouterEnv.
-            const agentlibRef = resolveAgentlibBranchRef(startParsed.branchPolicy);
-            if (agentlibRef) {
-                process.env.PLOINKY_AGENTLIB_REF = agentlibRef;
-            }
+            // The global --branch is applied to achillesAgentLib by the source
+            // selector that runs before this command, which resolves the branch
+            // to one exact managed generation or validates a local checkout
+            // against it. Nothing here reconfigures an AgentLib dependency.
             await startWorkspace(startParsed.staticAgent, startParsed.port ?? undefined, {
                 enableAgent,
                 killRouterIfRunning,

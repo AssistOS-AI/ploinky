@@ -3,7 +3,8 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { showHelp } from './commands/help.js';
-import { runOuterRuntimeShell } from './sandbox/runtimeShell.js';
+import { bootstrapAgentLibRuntime } from '../agentlib/bootstrap.mjs';
+import { parseBranchPolicy } from '../agentlib/branchPolicy.mjs';
 
 // `runCoreCli()` accepts one global debug flag in any position. The read-only
 // log dispatch has to recognize the same placement before it can decide whether
@@ -17,14 +18,29 @@ function extractGlobalDebugFlag(args) {
     return { commandArgs, debug: true };
 }
 
+// Branch policy only narrows the AgentLib selection; a malformed value is
+// reported by the command that owns it, so bootstrap treats it as absent rather
+// than failing before the command can produce its own message.
+function safeBranchPolicy(args) {
+    try {
+        return parseBranchPolicy(args);
+    } catch (_) {
+        return null;
+    }
+}
+
 export async function launchCli(args = process.argv.slice(2), {
     showHelpImpl = showHelp,
-    runOuterRuntimeShellImpl = runOuterRuntimeShell,
+    // The runtime shell reaches the Router security path, which resolves
+    // achillesAgentLib at module load. Importing it lazily keeps `help` and
+    // `logs` loadable without any AgentLib runtime contract at all.
+    runOuterRuntimeShellImpl = null,
     statusWorkspaceImpl,
     importCoreImpl = () => import('./main.js'),
     importLogCommandsImpl = () => import('./commands/logCommands.js'),
     importConfigImpl = () => import('./utils/config.js'),
     importForegroundImpl = () => import('./commands/foregroundCommand.js'),
+    bootstrapAgentLibImpl = bootstrapAgentLibRuntime,
     input = process.stdin,
     env = process.env,
     errorOutput = process.stderr,
@@ -34,13 +50,20 @@ export async function launchCli(args = process.argv.slice(2), {
         return 0;
     }
     if (args.length === 1 && args[0] === 'status') {
+        // Status reports the selected AgentLib source, so it needs the runtime
+        // contract — but in read-only mode, which never clones, fetches, or
+        // creates workspace state.
+        await bootstrapAgentLibImpl({ env, readOnly: true });
         const renderStatus = statusWorkspaceImpl
             || (await import('./utils/status.js')).statusWorkspace;
         await renderStatus();
         return 0;
     }
     if (args.length === 1 && args[0] === 'cli') {
-        return runOuterRuntimeShellImpl();
+        await bootstrapAgentLibImpl({ env, readOnly: true });
+        const runShell = runOuterRuntimeShellImpl
+            || (await import('./sandbox/runtimeShell.js')).runOuterRuntimeShell;
+        return runShell();
     }
     // Logs are observational, so they bypass dependency assertion, environment
     // initialization, and repository bootstrap. Stdout carries only log bytes;
@@ -72,6 +95,12 @@ export async function launchCli(args = process.argv.slice(2), {
             input.removeListener?.('close', onEof);
         }
     }
+    // Establish the achillesAgentLib runtime contract before importing any core
+    // module. Outside the Box this selects (and, for a managed source, stages)
+    // the one workspace source; inside the Box it only validates the mount the
+    // host supervisor established. Help, logs, and single-word status returned
+    // above, so they stay free of any clone or fetch side effect.
+    await bootstrapAgentLibImpl({ env, branchPolicy: safeBranchPolicy(args) });
     const { runCoreCli } = await importCoreImpl();
     return runCoreCli(args);
 }
