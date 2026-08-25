@@ -160,6 +160,9 @@ test('sixteen container targets share one status snapshot in an actual monitor t
 test('snapshot failure defers every OCI target without per-target amplification or false restart', () => {
     const logs = [];
     let calls = 0;
+    let now = 1_000;
+    let snapshotAvailable = false;
+    const probeStarts = [];
     const monitor = {
         targets: new Map(Array.from({ length: 16 }, (_, index) => [
             `container-${index}`,
@@ -173,16 +176,21 @@ test('snapshot failure defers every OCI target without per-target amplification 
                 pendingRestartTimer: null,
             },
         ])),
-        config: {},
+        config: {
+            CONTAINER_SNAPSHOT_RETRY_INITIAL_MS: 15_000,
+            CONTAINER_SNAPSHOT_RETRY_MAX_MS: 60_000,
+        },
+        now: () => now,
         isShuttingDown: () => false,
         inspectWorkspaceStartLock: () => ({ active: false, stale: false }),
         syncManagedContainers() {},
         listRunningContainerNames() {
             calls += 1;
-            throw new Error('snapshot unavailable');
+            if (!snapshotAvailable) throw new Error('snapshot unavailable');
+            return [...monitor.targets.keys()];
         },
-        startProbeWorker() {
-            assert.fail('unknown runtime state must not be treated as ready');
+        startProbeWorker(_monitor, target) {
+            probeStarts.push(target.containerName);
         },
         log(level, event, data) {
             logs.push({ level, event, data });
@@ -190,8 +198,11 @@ test('snapshot failure defers every OCI target without per-target amplification 
     };
 
     monitorTick(monitor);
+    monitorTick(monitor);
+    now += 14_999;
+    monitorTick(monitor);
 
-    assert.equal(calls, 1, 'one failed shared call is the entire tick control-plane cost');
+    assert.equal(calls, 1, 'snapshot backoff must suppress repeated control-plane calls');
     assert.ok([...monitor.targets.values()].every((target) => (
         target.pendingRestartTimer === null
         && target.isRestarting === false
@@ -200,6 +211,24 @@ test('snapshot failure defers every OCI target without per-target amplification 
     assert.deepEqual(logs, [{
         level: 'error',
         event: 'container_status_snapshot_failed',
-        data: { error: 'snapshot unavailable' },
+        data: {
+            error: 'snapshot unavailable',
+            consecutiveFailures: 1,
+            retryAfterMs: 15_000,
+        },
     }]);
+
+    snapshotAvailable = true;
+    now += 1;
+    monitorTick(monitor);
+
+    assert.equal(calls, 2, 'snapshot is retried when the bounded backoff expires');
+    assert.equal(probeStarts.length, 16);
+    assert.equal(monitor.runtimeSnapshotFailures, 0);
+    assert.equal(monitor.runtimeSnapshotRetryNotBefore, 0);
+    assert.deepEqual(logs.at(-1), {
+        level: 'info',
+        event: 'container_status_snapshot_recovered',
+        data: { previousFailures: 1 },
+    });
 });
