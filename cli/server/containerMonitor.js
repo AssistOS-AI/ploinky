@@ -1483,6 +1483,7 @@ export function snapshotRunningContainerNames(monitor) {
     if (![...monitor.targets.values()].some((target) => (
         target && !isSandboxRuntime(target.runtime)
     ))) {
+        monitor.runtimeSnapshotFreshForTick = false;
         return null;
     }
     const now = typeof monitor.now === 'function' ? monitor.now() : Date.now();
@@ -1495,9 +1496,11 @@ export function snapshotRunningContainerNames(monitor) {
         && monitor.runtimeSnapshot instanceof Set
         && Number(monitor.runtimeSnapshotTakenAt || 0) > 0
         && now - monitor.runtimeSnapshotTakenAt < snapshotIntervalMs) {
+        monitor.runtimeSnapshotFreshForTick = false;
         return monitor.runtimeSnapshot;
     }
     if (Number(monitor.runtimeSnapshotRetryNotBefore || 0) > now) {
+        monitor.runtimeSnapshotFreshForTick = false;
         return null;
     }
     try {
@@ -1508,6 +1511,7 @@ export function snapshotRunningContainerNames(monitor) {
         const previousFailures = Number(monitor.runtimeSnapshotFailures || 0);
         monitor.runtimeSnapshotFailures = 0;
         monitor.runtimeSnapshotRetryNotBefore = 0;
+        monitor.runtimeSnapshotFreshForTick = true;
         if (previousFailures > 0) {
             logEvent(monitor, 'info', 'container_status_snapshot_recovered', {
                 previousFailures,
@@ -1530,6 +1534,7 @@ export function snapshotRunningContainerNames(monitor) {
         );
         monitor.runtimeSnapshotFailures = consecutiveFailures;
         monitor.runtimeSnapshotRetryNotBefore = now + retryAfterMs;
+        monitor.runtimeSnapshotFreshForTick = false;
         logEvent(monitor, 'error', 'container_status_snapshot_failed', {
             error: error?.message || error,
             consecutiveFailures,
@@ -1603,7 +1608,15 @@ export function monitorTick(monitor) {
                         enableGeneration: target.enableGeneration,
                     });
             } else if (runningContainerNames) {
-                running = runningContainerNames.has(target.containerName);
+                if (runningContainerNames.has(target.containerName)) {
+                    running = true;
+                } else if (monitor.runtimeSnapshotFreshForTick === false) {
+                    // Cached presence is still useful positive evidence, but
+                    // cached absence says nothing about containers created
+                    // after the snapshot. Only a runtime list collected by
+                    // this tick may authorize a not_running restart.
+                    continue;
+                }
             } else {
                 // A failed shared runtime snapshot means container state is
                 // unknown. Defer this tick instead of multiplying the outage
@@ -1682,6 +1695,7 @@ export function createContainerMonitor({ config, log, isShuttingDown, terminalLe
         runtimeSnapshotRetryNotBefore: 0,
         runtimeSnapshot: null,
         runtimeSnapshotTakenAt: 0,
+        runtimeSnapshotFreshForTick: false,
         ...(ledgerFile ? { terminalLedgerFile: ledgerFile } : {}),
         terminalLedger: null,
     };
@@ -1733,4 +1747,5 @@ export function clearContainerTargets(monitor) {
     monitor.targets.clear();
     monitor.runtimeSnapshot = null;
     monitor.runtimeSnapshotTakenAt = 0;
+    monitor.runtimeSnapshotFreshForTick = false;
 }

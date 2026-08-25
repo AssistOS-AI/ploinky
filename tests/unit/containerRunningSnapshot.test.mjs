@@ -286,14 +286,100 @@ test('Box inventory caching preserves five-second probe scheduling without repea
     };
 
     monitorTick(monitor);
+    assert.equal(monitor.runtimeSnapshotFreshForTick, true);
     target.probeState = 'pending';
     now += 5_000;
     monitorTick(monitor);
 
     assert.equal(calls, 1, 'the second monitor tick must reuse the Box inventory');
+    assert.equal(monitor.runtimeSnapshotFreshForTick, false);
     assert.deepEqual(probeStarts, [target.containerName, target.containerName]);
 
     now += (5 * 60 * 1000) - 5_000;
     monitorTick(monitor);
     assert.equal(calls, 2, 'the inventory refreshes at the bounded cache deadline');
+    assert.equal(monitor.runtimeSnapshotFreshForTick, true);
+});
+
+test('cached inventory absence is unknown until a fresh runtime list confirms it', () => {
+    let calls = 0;
+    let now = 1_000;
+    let noWaitState = 'starting';
+    const logs = [];
+    const runningTarget = {
+        runtime: 'container',
+        containerName: 'already-running-container',
+        agentName: 'already-running-agent',
+        repoName: 'demo-repo',
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+    const lateTarget = {
+        runtime: 'container',
+        containerName: 'late-container',
+        agentName: 'late-agent',
+        repoName: 'demo-repo',
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+        restartHistory: [],
+        currentBackoff: 1_000,
+        circuitBreakerTripped: false,
+    };
+    const monitor = {
+        targets: new Map([
+            [runningTarget.containerName, runningTarget],
+            [lateTarget.containerName, lateTarget],
+        ]),
+        config: {
+            CONTAINER_SNAPSHOT_INTERVAL_MS: 5 * 60 * 1000,
+            MAX_RESTARTS_IN_WINDOW: 0,
+        },
+        now: () => now,
+        isShuttingDown: () => false,
+        inspectWorkspaceStartLock: () => ({ active: false, stale: false }),
+        syncManagedContainers() {},
+        listRunningContainerNames() {
+            calls += 1;
+            return [runningTarget.containerName];
+        },
+        readNoWaitStatus() {
+            return { state: noWaitState };
+        },
+        startProbeWorker() {},
+        log(level, event, data) {
+            logs.push({ level, event, data });
+        },
+    };
+
+    monitorTick(monitor);
+    assert.equal(calls, 1);
+    assert.equal(monitor.runtimeSnapshotFreshForTick, true);
+    assert.equal(lateTarget.circuitBreakerTripped, false);
+
+    noWaitState = 'running';
+    now += 5_000;
+    monitorTick(monitor);
+
+    assert.equal(calls, 1, 'the second tick must reuse the cached inventory');
+    assert.equal(monitor.runtimeSnapshotFreshForTick, false);
+    assert.equal(lateTarget.circuitBreakerTripped, false);
+    assert.equal(lateTarget.pendingRestartTimer, null);
+    assert.equal(
+        logs.some(({ event }) => event === 'container_scheduling_restart'),
+        false,
+        'cached absence must not schedule a restart after no-wait becomes running',
+    );
+
+    now += (5 * 60 * 1000) - 5_000;
+    monitorTick(monitor);
+
+    assert.equal(calls, 2, 'the cache deadline must collect a fresh inventory');
+    assert.equal(monitor.runtimeSnapshotFreshForTick, true);
+    assert.equal(
+        lateTarget.circuitBreakerTripped,
+        true,
+        'a fresh confirmed absence may authorize the restart path',
+    );
 });
