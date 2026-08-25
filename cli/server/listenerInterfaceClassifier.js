@@ -134,6 +134,7 @@ export function createListenerInterfaceClassifier({
     now = () => Date.now(),
     refreshIntervalMs = REFRESH_INTERVAL_MS,
     platform = process.platform,
+    managedGatewayDiscovery = true,
     schedule = (callback, delay) => setTimeout(callback, delay),
     cancelSchedule = (timer) => clearTimeout(timer),
 } = {}) {
@@ -143,10 +144,18 @@ export function createListenerInterfaceClassifier({
     if (!Number.isFinite(refreshIntervalMs) || refreshIntervalMs < 1) {
         throw new TypeError('listener interface classifier refresh interval must be positive');
     }
+    if (typeof managedGatewayDiscovery !== 'boolean') {
+        throw new TypeError('listener interface classifier managed gateway discovery must be boolean');
+    }
     if (typeof schedule !== 'function' || typeof cancelSchedule !== 'function') {
         throw new TypeError('listener interface classifier scheduler must be callable');
     }
-    const bindsRuntimeBridgeGatewaysLocally = platform === 'linux';
+    // Native Linux binds the private Router to exact managed bridge gateways.
+    // A Box instead owns one unpublished wildcard listener whose accepted
+    // sockets carry explicit private provenance, so inspecting every nested
+    // Podman network there adds no admission evidence and can starve agent
+    // traffic on the single rootless runtime control plane.
+    const bindsRuntimeBridgeGatewaysLocally = platform === 'linux' && managedGatewayDiscovery;
     const identity = workspaceNetworkIdentity(workspaceRoot);
     const namePrefix = `ploinky-nw-${identity.hash}-`;
     let state = Object.freeze({
@@ -237,7 +246,7 @@ export function createListenerInterfaceClassifier({
 
     function scheduleRefresh() {
         clearRefreshTimer();
-        if (!started || closing) return;
+        if (!started || closing || !bindsRuntimeBridgeGatewaysLocally) return;
         timer = schedule(() => {
             timer = null;
             void refresh({ force: true });
@@ -267,7 +276,9 @@ export function createListenerInterfaceClassifier({
                     gateways: next,
                     lastError: null,
                     refreshedAt: completedAt,
-                    expiresAt: completedAt + refreshIntervalMs,
+                    expiresAt: bindsRuntimeBridgeGatewaysLocally
+                        ? completedAt + refreshIntervalMs
+                        : Number.POSITIVE_INFINITY,
                     durationMs: Math.max(0, completedAt - startedAt),
                 });
             } catch (error) {
