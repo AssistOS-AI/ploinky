@@ -1,11 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import net from 'net';
-import { PLOINKY_DIR, ROUTING_FILE } from './config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
 import * as reposSvc from './repos.js';
 import { collectAgentRuntimeStates } from '../sandbox/agentRuntimeState.js';
 import { findAgent } from './utils.js';
 import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
+import { inspectWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
+import { buildAgentLibAttestation } from '../../agentlib/runtime.mjs';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const PREDEFINED_REPOS = reposSvc.getPredefinedRepos();
@@ -344,8 +346,53 @@ function printRouterStatus(routerPort, isListening) {
     console.log(`- ${styles.label('Router')}: ${stateText} ${endpoint}`);
 }
 
+/**
+ * Report the selected achillesAgentLib source without mutating anything.
+ *
+ * A local checkout can change independently of Ploinky, so the bytes on disk
+ * are hashed here and compared against the active selection: a difference is a
+ * `restart required` state, not something status repairs.
+ */
+function printAgentLibStatus() {
+    let info;
+    try {
+        info = inspectWorkspaceAgentLibSource({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+    } catch (error) {
+        console.log(`AgentLib: ${styles.warn(`unavailable (${error?.message || error})`)}`);
+        return;
+    }
+    const where = info.sourceRelativePath || '(not selected)';
+    console.log(`AgentLib source: ${info.mode} ${where}`);
+    if (info.contentFingerprint) {
+        const revision = info.commit
+            ? `${info.commit.slice(0, 12)}${info.dirty ? ' (dirty)' : ''}${info.branch ? ` on ${info.branch}` : ''}`
+            : 'no git revision';
+        console.log(`AgentLib content:  ${info.contentFingerprint.slice(0, 12)} — ${revision}`);
+    }
+    if (info.active) {
+        console.log(`AgentLib active:   ${info.active.contentFingerprint.slice(0, 12)}`
+            + `${info.active.resolvedCommit ? ` @ ${info.active.resolvedCommit.slice(0, 12)}` : ''}`);
+    }
+    if (info.drifted) {
+        console.log(styles.warn('AgentLib: restart required — the local source no longer matches the active selection.'));
+    }
+    // Core proves which bytes it actually loaded, rather than reporting the
+    // descriptor it was handed.
+    try {
+        const attestation = buildAgentLibAttestation();
+        console.log(`AgentLib core:     ${attestation.sourceRootRealpath}`);
+        for (const [entry, hash] of Object.entries(attestation.entrypoints)) {
+            console.log(`  ${entry}: ${hash.slice(0, 12)}`);
+        }
+    } catch (error) {
+        console.log(`AgentLib core: ${styles.warn(`not attested (${error?.message || error})`)}`);
+    }
+    if (info.detail) console.log(`AgentLib detail: ${info.detail}`);
+}
+
 export async function statusWorkspace() {
     console.log(styles.header('Workspace status:'));
+    printAgentLibStatus();
     const ssoStatus = gatherSsoStatus();
     printSsoStatusSummary(ssoStatus);
 

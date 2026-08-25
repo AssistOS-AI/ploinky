@@ -1,14 +1,12 @@
 import fs from 'fs';
 import path from 'path';
-import { PLOINKY_DIR } from '../utils/config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import { showHelp } from './help.js';
 import * as reposSvc from '../utils/repos.js';
 import * as agentsSvc from '../utils/agents.js';
 import * as skillsSvc from './skills.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import {
-    refreshAchillesDependenciesInRepos,
-    refreshPloinkyRuntimeAchillesDependency,
     resolveMovingGitDepCommits,
     resolvePloinkyRoot,
     updatePloinkySelf,
@@ -17,6 +15,7 @@ import { invalidateDepsCacheForMovingGitDeps } from '../utils/dependencies/depen
 import { readGlobalDepsPackage } from '../utils/dependencies/dependencyInstaller.js';
 import { collectAgentsSummary } from '../utils/status.js';
 import { findAgent } from '../utils/utils.js';
+import { updateWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const DEFAULT_SKILLS_REPO_NAMES = [
@@ -147,32 +146,48 @@ function formatWorkspaceRepoSkip(repo, remoteCheck) {
     return `  - ${repo.name}: skipped update, ${reason}${location}`;
 }
 
-function refreshRuntimeAchillesForUpdate(failed, ploinkyRoot = resolvePloinkyRoot()) {
-    console.log('Refreshing Ploinky Achilles runtime dependency...');
+/**
+ * Advance the one achillesAgentLib source and the npm dependency caches.
+ *
+ * A local workspace checkout is never pulled or reset — Ploinky reports what it
+ * finds there and the developer owns it. A managed source advances only by
+ * staging a new immutable generation. Either way the fingerprint change is what
+ * forces a coherent restart, not an in-place package refresh.
+ */
+async function refreshAgentLibSourceForUpdate(failed, branchPolicy = null) {
+    console.log('Updating the achillesAgentLib source...');
+    let result = null;
     try {
-        const result = refreshPloinkyRuntimeAchillesDependency({ ploinkyRoot });
-        console.log(`  ✓ ${path.relative(ploinkyRoot, result.installedPath)} (${result.method})`);
-        // The prepared dependency caches under .ploinky/deps embed the global git
-        // dependencies (mcp-sdk `#main` or explicit deploy-time overrides) but are keyed
-        // on the package.json spec string, so a moving ref that advanced upstream
-        // would otherwise serve a stale copy to containers. Resolve each moving git
-        // dep's upstream commit and invalidate the caches only when one changed.
+        result = await updateWorkspaceAgentLibSource({
+            workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+            branchPolicy,
+        });
+        const where = result.mode === 'local'
+            ? `local checkout ${result.selection.sourceRelativePath}`
+            : `managed generation ${result.selection.resolvedCommit?.slice(0, 12) || 'unknown'}`;
+        console.log(`  ✓ ${where} (${result.selection.contentFingerprint.slice(0, 12)})`);
+        if (result.changed) {
+            console.log('  ✓ achillesAgentLib content changed; run `ploinky restart` to activate it everywhere.');
+        }
+    } catch (err) {
+        const message = err?.message || String(err);
+        failed.push({ repoName: 'achillesAgentLib', message });
+        console.error(`  ✗ achillesAgentLib: ${message}`);
+    }
+    // The npm caches under .ploinky/deps are keyed on package.json spec strings,
+    // so a moving git ref (mcp-sdk `#main`) that advanced upstream would serve a
+    // stale copy. This stays independent of the AgentLib source.
+    try {
         const gitDepCommits = resolveMovingGitDepCommits(readGlobalDepsPackage().dependencies);
         const invalidation = invalidateDepsCacheForMovingGitDeps(gitDepCommits);
         if (invalidation.invalidated) {
             const changedLabel = invalidation.changed.length ? invalidation.changed.join(', ') : 'initial';
             console.log(`  ✓ Dependency caches invalidated (moving git deps changed: ${changedLabel}); agents reinstall on next start.`);
         }
-        return result;
     } catch (err) {
-        const message = err?.message || String(err);
-        failed.push({
-            repoName: 'ploinky/node_modules/achillesAgentLib',
-            message,
-        });
-        console.error(`  ✗ node_modules/achillesAgentLib: ${message}`);
-        return null;
+        console.error(`  ✗ dependency cache invalidation: ${err?.message || err}`);
     }
+    return result;
 }
 
 function appendDefaultSkillFailures(failed, summary) {
@@ -292,12 +307,8 @@ async function updateRepo(repoName) {
         } else {
             console.log(`✓ Repo '${repoName}' updated.`);
         }
-        const repoPath = path.join(REPOS_DIR, repoName);
-        const achilles = refreshAchillesDependenciesInRepos({ reposRoot: repoPath });
-        if (achilles.failed.length) {
-            const failedPackages = achilles.failed.map(entry => path.relative(repoPath, entry.packageDir) || '.').join(', ');
-            throw new Error(`Failed to refresh achillesAgentLib in ${failedPackages}`);
-        }
+        // achillesAgentLib is not a per-repository npm package any more: it is
+        // the one workspace-selected source, advanced by `ploinky update`.
         const defaultSkills = refreshDefaultSkillsInPloinkyRepos([repoName]);
         logDefaultSkillSummary(defaultSkills, '  ');
         if (defaultSkills.failed.length) {
@@ -313,7 +324,7 @@ async function updatePloinkyRepos() {
     const ploinkyRepos = getGitRepoNames();
     const failed = [];
     let updated = 0;
-    const runtimeAchilles = refreshRuntimeAchillesForUpdate(failed);
+    const agentLib = await refreshAgentLibSourceForUpdate(failed);
 
     if (ploinkyRepos.length) {
         console.log('Updating ploinky repositories...');
@@ -332,31 +343,18 @@ async function updatePloinkyRepos() {
         console.log('No ploinky repositories installed.');
     }
 
-    const achilles = refreshAchillesDependenciesInRepos();
-    if (achilles.failed.length) {
-        for (const entry of achilles.failed) {
-            failed.push({
-                repoName: `achillesAgentLib ${path.relative(REPOS_DIR, entry.packageDir) || '.'}`,
-                message: entry.message,
-            });
-        }
-    }
-
     const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos);
     logDefaultSkillSummary(defaultSkills);
     appendDefaultSkillFailures(failed, defaultSkills);
 
     console.log(`Ploinky repository update summary: ${updated}/${ploinkyRepos.length} repositories updated.`);
-    if (achilles.total) {
-        console.log(`Achilles dependency summary: ${achilles.refreshed.length}/${achilles.total} package(s) refreshed.`);
-    }
 
     if (failed.length) {
         const failedNames = failed.map(entry => entry.repoName).join(', ');
         throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
     }
 
-    return { total: ploinkyRepos.length, updated, failed, runtimeAchilles, achilles, defaultSkills };
+    return { total: ploinkyRepos.length, updated, failed, agentLib, defaultSkills };
 }
 
 async function updateAllRepos(folderPath, options = {}) {
@@ -374,7 +372,7 @@ async function updateAllRepos(folderPath, options = {}) {
     const failed = [];
     const skipped = [];
     let updated = 0;
-    let runtimeAchilles = null;
+    let agentLib = null;
 
     console.log('Updating Ploinky...');
     let selfUpdate = null;
@@ -399,7 +397,7 @@ async function updateAllRepos(folderPath, options = {}) {
         console.error(`  ✗ Ploinky: ${message}`);
     }
 
-    runtimeAchilles = refreshRuntimeAchillesForUpdate(failed, ploinkyRoot);
+    agentLib = await refreshAgentLibSourceForUpdate(failed);
 
     if (ploinkyRepos.length) {
         console.log('Updating ploinky repositories...');
@@ -434,16 +432,6 @@ async function updateAllRepos(folderPath, options = {}) {
                 failed.push({ repoName: repo.name, message });
                 console.error(`  ✗ ${repo.name}: ${message}`);
             }
-        }
-    }
-
-    const achilles = refreshAchillesDependenciesInRepos();
-    if (achilles.failed.length) {
-        for (const entry of achilles.failed) {
-            failed.push({
-                repoName: `achillesAgentLib ${path.relative(REPOS_DIR, entry.packageDir) || '.'}`,
-                message: entry.message,
-            });
         }
     }
 
@@ -491,16 +479,12 @@ async function updateAllRepos(folderPath, options = {}) {
         const skippedNames = skipped.map(entry => entry.repoName).join(', ');
         console.log(`Workspace repository update skipped: ${skippedNames}`);
     }
-    if (achilles.total) {
-        console.log(`Achilles dependency summary: ${achilles.refreshed.length}/${achilles.total} package(s) refreshed.`);
-    }
-
     if (failed.length) {
         const failedNames = failed.map(entry => entry.repoName).join(', ');
         throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
     }
 
-    return { total: totalRepos, updated, failed, skipped, selfUpdate, runtimeAchilles, achilles, defaultSkills };
+    return { total: totalRepos, updated, failed, skipped, selfUpdate, agentLib, defaultSkills };
 }
 
 function pathsReferToSameLocation(first, second) {

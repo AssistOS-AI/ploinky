@@ -6,6 +6,9 @@ import {
     resolveBoxImageReference,
 } from './constants.mjs';
 import { selectWorkspaceAgentLibSource } from './agentlib-source.mjs';
+import { AGENTLIB_ERROR_CODES, agentLibError } from '../agentlib/contract.mjs';
+import { fingerprintSource, sourceIdEquals } from '../agentlib/fingerprint.mjs';
+import { writeActiveDescriptor } from '../agentlib/source.mjs';
 import {
     agentLibBoxEnv,
     agentLibContractFromContainer,
@@ -56,6 +59,33 @@ function defaultDiscovery(identity, runner, platform, env) {
     return discoverBoxOwnership(identity, { runner, platform, env });
 }
 
+/**
+ * Prove the selected source is still exactly the one the graph was admitted for.
+ *
+ * A local checkout is outside Ploinky's locks, so a developer edit during
+ * startup is detectable only here. It is a hard failure: declaring readiness
+ * would claim one fingerprint for a graph that loaded another.
+ */
+function defaultRevalidateAgentLibSource(selection) {
+    const { fingerprint, sourceId } = fingerprintSource(selection.sourceDir);
+    if (!sourceIdEquals(sourceId, selection.sourceId)) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.sourceChanged,
+            `The achillesAgentLib source at ${selection.sourceDir} was replaced during startup; `
+            + 'the deployment was not declared ready.',
+        );
+    }
+    if (fingerprint !== selection.contentFingerprint) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.sourceChanged,
+            `The achillesAgentLib source at ${selection.sourceDir} changed during startup `
+            + `(${selection.contentFingerprint.slice(0, 12)} -> ${fingerprint.slice(0, 12)}); `
+            + 'the deployment was not declared ready. Run the command again.',
+        );
+    }
+    return selection;
+}
+
 export function createBoxSupervisor({
     runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
     lockManager = createMutationLockManager(),
@@ -73,6 +103,8 @@ export function createBoxSupervisor({
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
     selectAgentLib = selectWorkspaceAgentLibSource,
+    commitAgentLibSelection = writeActiveDescriptor,
+    revalidateAgentLibSource = defaultRevalidateAgentLibSource,
     destroyBoxCache = removeWorkspaceDataPaths,
     inspectBoxData = inspectWorkspaceDataPaths,
     stdout = process.stdout,
@@ -179,6 +211,13 @@ export function createBoxSupervisor({
                 },
             );
             await healthCheck(prepared.hostPort);
+            // The selection is revalidated against the host source only after
+            // the whole graph is ready. A source that changed while startup was
+            // in progress means the admitted graph does not match any single
+            // selection, so readiness is refused and nothing is committed.
+            revalidateAgentLibSource(selection);
+            // Atomic commit last: `active.json` records what is actually running.
+            commitAgentLibSelection(identity.workspaceRoot, selection);
             return Object.freeze({ identity, ...prepared, containerId, agentLib: selection });
         });
     }
