@@ -569,6 +569,8 @@ test('start selects the AgentLib source and passes the host address into the bou
     let boundedOptions;
     const agentLib = agentLibFixture(identity.workspaceRoot);
     let selectedFor = null;
+    let revalidated = null;
+    let committed = null;
     const supervisor = createBoxSupervisor({
         env: {},
         resolveIdentity: () => identity,
@@ -595,6 +597,8 @@ test('start selects the AgentLib source and passes the host address into the bou
             boundedOptions = options;
         },
         healthCheck: async (hostPort) => assert.equal(hostPort, 8080),
+        revalidateAgentLibSource: (selection) => { revalidated = selection; },
+        commitAgentLibSelection: (workspaceRoot, selection) => { committed = { workspaceRoot, selection }; },
     });
 
     await supervisor.runStartTransaction(['start', 'explorer'], {
@@ -606,6 +610,45 @@ test('start selects the AgentLib source and passes the host address into the bou
     assert.equal(selectedFor.workspaceRoot, identity.workspaceRoot);
     assert.deepEqual(selectedFor.branchPolicy, { branch: 'ploinky-proxy', fallback: 'fail' });
     assert.equal(boundedOptions.agentLib, agentLib);
+    // The source is revalidated after the graph is ready, and `active.json` is
+    // committed only after that succeeds.
+    assert.equal(revalidated, agentLib);
+    assert.deepEqual(committed, { workspaceRoot: identity.workspaceRoot, selection: agentLib });
+});
+
+test('a source that changes during startup is not committed and is not declared ready', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const agentLib = agentLibFixture(identity.workspaceRoot);
+    let committed = false;
+    const supervisor = createBoxSupervisor({
+        env: {},
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, []),
+        discover: () => ownership,
+        platform: 'linux',
+        runner: { run() {} },
+        selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
+        reconcile: async () => ({ action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882 }),
+        readEdgeDesired: () => null,
+        resolveHostReachableIpv4: async () => '',
+        startCore: async () => {},
+        healthCheck: async () => {},
+        revalidateAgentLibSource: () => {
+            const error = new Error('achillesAgentLib source changed during startup');
+            error.code = 'PLOINKY_AGENTLIB_SOURCE_CHANGED';
+            throw error;
+        },
+        commitAgentLibSelection: () => { committed = true; },
+    });
+
+    await assert.rejects(
+        () => supervisor.runStartTransaction(['start', 'explorer']),
+        /source changed during startup/,
+    );
+    assert.equal(committed, false, 'the active selection must not record an unready graph');
 });
 
 test('bounded start requires the external Router URL and preserves normalized argv', async (t) => {

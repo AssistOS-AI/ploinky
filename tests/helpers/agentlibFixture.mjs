@@ -30,7 +30,13 @@ export function writeAgentLibCheckout(dir) {
         name: AGENTLIB_PACKAGE_NAME,
         version: '0.0.0',
         type: 'module',
-        exports: { '.': './index.mjs', './LLMAgents': './LLMAgents/index.mjs' },
+        exports: {
+            '.': './index.mjs',
+            './package.json': './package.json',
+            './LLMAgents': './LLMAgents/index.mjs',
+            './utils/*': './utils/*',
+            './jwt/*': './jwt/*',
+        },
     }));
     fs.writeFileSync(path.join(dir, 'index.mjs'), 'export const marker = "fixture";\n');
     fs.writeFileSync(path.join(dir, 'LLMAgents/index.mjs'), 'export const marker = "fixture";\n');

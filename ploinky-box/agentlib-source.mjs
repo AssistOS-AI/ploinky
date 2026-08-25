@@ -9,12 +9,15 @@
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
-import { AGENTLIB_ERROR_CODES, agentLibError } from '../agentlib/contract.mjs';
+import { AGENTLIB_ERROR_CODES, AGENTLIB_LOCAL_DIR_NAME, agentLibError } from '../agentlib/contract.mjs';
+import { fingerprintSource } from '../agentlib/fingerprint.mjs';
 import { createGitRunner, selectManagedSource } from '../agentlib/materialize.mjs';
 import {
+    planSourceSelection,
     readActiveDescriptor,
     resolveDescriptorSource,
     selectAgentLibSource,
+    validateAgentLibSource,
     withAgentLibSourceLock,
 } from '../agentlib/source.mjs';
 
@@ -59,6 +62,7 @@ export async function selectWorkspaceAgentLibSource({
     workspaceRoot,
     branchPolicy = null,
     readOnly = false,
+    remote = null,
     fsApi = fs,
     runner = createGitRunner(),
     gitState = readLocalGitState,
@@ -97,6 +101,7 @@ export async function selectWorkspaceAgentLibSource({
             workspaceRoot,
             activeDescriptor,
             branchPolicy,
+            remote,
             runner,
             fsApi,
             ...(now ? { now } : {}),
@@ -118,5 +123,131 @@ export function assertNotInBoxSourceOwner(insideBox) {
             'The in-Box process must not select or materialize an achillesAgentLib source; '
             + 'the host supervisor owns it.',
         );
+    }
+}
+
+/**
+ * The one `ploinky update` behavior for the achillesAgentLib source.
+ *
+ * A local checkout is never pulled, reset, or checked out — it belongs to the
+ * developer. It is revalidated and reported; if its bytes changed, the new
+ * fingerprint becomes the selection and consumers must restart coherently.
+ *
+ * A managed source advances only through a new immutable generation: an explicit
+ * branch is fetched and resolved to one exact commit, and an unpinned managed
+ * source follows the canonical lock commit, which moves only when Ploinky itself
+ * is updated.
+ *
+ * @param {object} params
+ * @param {string} params.workspaceRoot
+ * @param {{branch: string|null, fallback: 'default'|'fail'}|null} [params.branchPolicy]
+ * @returns {Promise<{mode: 'local'|'managed', selection: object, changed: boolean, previous: object|null}>}
+ */
+export async function updateWorkspaceAgentLibSource({
+    workspaceRoot,
+    branchPolicy = null,
+    remote = null,
+    fsApi = fs,
+    runner = createGitRunner(),
+    gitState = readLocalGitState,
+    now,
+}) {
+    const previous = readActiveDescriptor(workspaceRoot, fsApi);
+    const local = selectAgentLibSource({
+        workspaceRoot,
+        fsApi,
+        branchPolicy,
+        readGitState: gitState,
+        ...(now ? { now } : {}),
+    });
+    if (!local.requiresMaterialization) {
+        const selection = local.selection;
+        return {
+            mode: 'local',
+            selection,
+            changed: previous?.contentFingerprint !== selection.contentFingerprint,
+            previous,
+        };
+    }
+    return withAgentLibSourceLock(workspaceRoot, () => {
+        // An update is allowed to resolve a moving branch, so the previous
+        // descriptor is not used to pin the commit here; a new generation is
+        // staged and the old one is retained for rollback.
+        const { selection } = selectManagedSource({
+            workspaceRoot,
+            activeDescriptor: branchPolicy?.branch ? null : previous,
+            branchPolicy,
+            remote,
+            runner,
+            fsApi,
+            ...(now ? { now } : {}),
+        });
+        return {
+            mode: 'managed',
+            selection,
+            changed: previous?.contentFingerprint !== selection.contentFingerprint,
+            previous,
+        };
+    }, { fsApi });
+}
+
+/**
+ * Read-only inspection of the workspace source for `status`.
+ *
+ * Creates nothing, fetches nothing, and repairs nothing: an unmaterialized or
+ * drifted workspace is reported as such.
+ *
+ * @returns {{mode: string, sourceRelativePath: string|null, active: object|null, drifted: boolean, present: boolean, detail: string}}
+ */
+export function inspectWorkspaceAgentLibSource({
+    workspaceRoot,
+    fsApi = fs,
+    gitState = readLocalGitState,
+}) {
+    const plan = planSourceSelection(workspaceRoot, { fsApi });
+    let active = null;
+    let detail = '';
+    try {
+        active = readActiveDescriptor(workspaceRoot, fsApi);
+    } catch (error) {
+        detail = error.message;
+    }
+    if (!plan.present) {
+        return {
+            mode: active?.mode || 'managed',
+            sourceRelativePath: active?.sourceRelativePath || null,
+            active,
+            drifted: false,
+            present: Boolean(active),
+            detail: detail || (active ? '' : 'no achillesAgentLib source has been selected yet'),
+        };
+    }
+    try {
+        const { sourceDir } = validateAgentLibSource(plan.candidate, { fsApi, deepSymlinkScan: false });
+        const { fingerprint } = fingerprintSource(sourceDir, { fsApi });
+        const git = gitState(sourceDir);
+        return {
+            mode: 'local',
+            sourceRelativePath: AGENTLIB_LOCAL_DIR_NAME,
+            active,
+            // A local checkout can change independently of Ploinky, so the
+            // active selection is compared against the bytes on disk right now.
+            drifted: Boolean(active) && active.contentFingerprint !== fingerprint,
+            present: true,
+            contentFingerprint: fingerprint,
+            commit: git?.commit || null,
+            branch: git?.branch || null,
+            dirty: Boolean(git?.dirty),
+            detail,
+        };
+    } catch (error) {
+        return {
+            mode: 'local',
+            sourceRelativePath: AGENTLIB_LOCAL_DIR_NAME,
+            active,
+            drifted: false,
+            present: true,
+            detail: error.message,
+        };
     }
 }
