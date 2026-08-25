@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const module = await import('../../cli/sandbox/docker/healthProbes.js');
@@ -17,6 +18,7 @@ const {
     validateScriptName,
     normalizeProbeConfig,
     runContainerScriptReadiness,
+    healthProbeHostDir,
     computeBackoffDelay,
     maybeResetBackoff,
     getLivenessState
@@ -121,10 +123,27 @@ test('clearLivenessState fully resets container tracking', () => {
 function fakeSpawnSequence(results, calls) {
     return (_runtime, args, options) => {
         calls.push({ args, options });
-        if (args.at(-1).startsWith('[ -f ')) {
-            return { status: 0, stdout: '', stderr: '' };
+        const result = results.shift() || { status: 0, stdout: 'ready\n', stderr: '' };
+        if (!args.includes('/Agent/server/HealthProbeRunner.sh')) return result;
+
+        const controlPath = path.join(healthProbeHostDir(args[2]), args[7]);
+        const writeResult = (value) => {
+            if (value.stdout) fs.writeFileSync(path.join(controlPath, 'probe-stdout'), value.stdout);
+            if (value.stderr) fs.writeFileSync(path.join(controlPath, 'probe-stderr'), value.stderr);
+            fs.writeFileSync(path.join(controlPath, 'result'), `${value.status}\n`);
+        };
+        if (Object.hasOwn(result, 'cancellationStatus')) {
+            writeResult({
+                status: result.cancellationStatus,
+                stdout: result.cancellationStdout || '',
+                stderr: result.cancellationStderr || '',
+            });
         }
-        return results.shift() || { status: 0, stdout: 'ready\n', stderr: '' };
+        if (result.launchOnly || result.error || typeof result.status !== 'number') {
+            return result;
+        }
+        writeResult(result);
+        return { status: 0, stdout: '', stderr: '' };
     };
 }
 
@@ -152,23 +171,24 @@ test('blocking container script readiness succeeds after the configured success 
 
     assert.equal(result.status, 'success');
     assert.equal(result.detail, 'ready');
-    assert.equal(calls.length, 3);
-    assert.deepEqual(calls[1].args.slice(0, 6), [
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0].args.slice(0, 7), [
         'exec',
+        '--detach',
         'database-container',
         'sh',
         '/Agent/server/HealthProbeRunner.sh',
         'run',
-        '/tmp/.ploinky-health-probe-success-1',
+        '/run/ploinky-health-probes/success-1',
     ]);
-    assert.deepEqual(calls[1].args.slice(-4), [
+    assert.deepEqual(calls[0].args.slice(-4), [
         'success-1',
         'healthcheck.sh',
         '2',
         '1',
     ]);
-    assert.equal(calls[1].options.timeout, 17_000);
-    assert.equal(calls[1].options.killSignal, 'SIGKILL');
+    assert.equal(calls[0].options.timeout, 60_000);
+    assert.equal(calls[0].options.killSignal, 'SIGTERM');
 });
 
 test('blocking container script readiness reports nonzero exhaustion', () => {
@@ -231,56 +251,10 @@ test('probe identity rejects unsafe generated tokens before runtime execution', 
         spawnSyncImpl: fakeSpawnSequence([], calls),
         isContainerRunningImpl() { return true; },
     }), /generated probe token is invalid/);
-    assert.equal(calls.length, 1, 'only the argv-safe script existence check may run');
+    assert.equal(calls.length, 0, 'unsafe identity must be rejected before runtime execution');
 });
 
-test('probe termination without an exit status fails closed', () => {
-    const calls = [];
-    const result = runContainerScriptReadiness('database', 'database-container', {
-        script: 'healthcheck.sh',
-        timeout: 1,
-        failureThreshold: 1,
-    }, {
-        runtime: 'fake-runtime',
-        tokenFactory: () => 'signal-exit',
-        spawnSyncImpl: fakeSpawnSequence([
-            { status: null, signal: 'SIGKILL', stdout: '', stderr: '' },
-            { status: 0, stdout: '', stderr: '' },
-        ], calls),
-        sleepMsImpl() {},
-        isContainerRunningImpl() { return true; },
-    });
-
-    assert.deepEqual(result, { status: 'failed', reason: 'exit 125', detail: '' });
-    assert.equal(calls.some(({ args }) => args.includes('cleanup')), true);
-});
-
-test('non-timeout client errors clean the exact execution before surfacing', () => {
-    const clientError = new Error('client output overflow');
-    clientError.code = 'ENOBUFS';
-    const calls = [];
-    assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
-        script: 'healthcheck.sh',
-        timeout: 1,
-        failureThreshold: 1,
-    }, {
-        runtime: 'fake-runtime',
-        tokenFactory: () => 'client-error',
-        spawnSyncImpl: fakeSpawnSequence([
-            { status: null, error: clientError, stdout: '', stderr: '' },
-            { status: 0, stdout: '', stderr: '' },
-        ], calls),
-        sleepMsImpl() {},
-        isContainerRunningImpl() { return true; },
-    }), /failed to run 'healthcheck\.sh': client output overflow/);
-    assert.deepEqual(calls[2].args.slice(-3), [
-        'cleanup',
-        '/tmp/.ploinky-health-probe-client-error',
-        'client-error',
-    ]);
-});
-
-test('outer exec timeout proves exact cleanup before retrying the readiness probe', () => {
+test('an uncertain detached launch is cancelled through the mount before retry', () => {
     const timeoutError = new Error('timed out');
     timeoutError.code = 'ETIMEDOUT';
     const calls = [];
@@ -294,8 +268,12 @@ test('outer exec timeout proves exact cleanup before retrying the readiness prob
         runtime: 'fake-runtime',
         tokenFactory: () => `outer-timeout-${tokenSequence += 1}`,
         spawnSyncImpl: fakeSpawnSequence([
-            { status: null, signal: 'SIGTERM', error: timeoutError, stdout: '', stderr: '' },
-            { status: 0, stdout: '', stderr: '' },
+            {
+                status: null,
+                signal: 'SIGTERM',
+                error: timeoutError,
+                cancellationStatus: 125,
+            },
             { status: 0, stdout: 'ready\n', stderr: '' },
         ], calls),
         controlPlaneRetryMs: 17,
@@ -304,56 +282,48 @@ test('outer exec timeout proves exact cleanup before retrying the readiness prob
     });
     assert.deepEqual(result, { status: 'success', detail: 'ready' });
     assert.deepEqual(retrySleeps, [17]);
-    assert.deepEqual(calls[2].args, [
-        'exec',
-        'database-container',
-        'sh',
-        '/Agent/server/HealthProbeRunner.sh',
-        'cleanup',
-        '/tmp/.ploinky-health-probe-outer-timeout-1',
-        'outer-timeout-1',
-    ]);
-    assert.equal(calls[2].options.timeout, 30000);
-    assert.equal(calls[2].options.killSignal, 'SIGKILL');
-    assert.equal(calls[3].args.includes('outer-timeout-2'), true);
+    assert.equal(calls.length, 2, 'no cleanup exec is launched');
+    assert.equal(calls[0].args.includes('--detach'), true);
+    assert.equal(calls[1].args.includes('outer-timeout-2'), true);
 });
 
-test('exact cleanup control-plane timeouts exhaust idempotent retries and fail closed', () => {
-    const timeoutError = new Error('spawnSync podman ETIMEDOUT');
+test('an unacknowledged detached launch fails closed without a second runtime exec', () => {
+    const timeoutError = new Error('detached launch timed out');
     timeoutError.code = 'ETIMEDOUT';
     const calls = [];
-    const cleanupSleeps = [];
+    let now = 0;
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
         timeout: 0.01,
         failureThreshold: 1,
     }, {
         runtime: 'fake-runtime',
-        tokenFactory: () => 'cleanup-timeout',
+        tokenFactory: () => 'unacknowledged-launch',
         spawnSyncImpl: fakeSpawnSequence([
             { status: null, error: timeoutError, stdout: '', stderr: '' },
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
         ], calls),
-        cleanupRetryMs: 19,
-        sleepMsImpl(ms) { cleanupSleeps.push(ms); },
+        probeCancellationGraceMs: 5,
+        nowImpl() { return now; },
+        sleepMsImpl(ms) { now += ms; },
         isContainerRunningImpl() { return true; },
     }), (error) => {
-        assert.equal(error.code, 'PLOINKY_PROBE_CLEANUP_FAILED');
-        assert.match(error.message, /exact probe cleanup failed/);
+        assert.equal(error.code, 'PLOINKY_PROBE_EXECUTION_UNSAFE');
+        assert.match(error.message, /exact cancellation was not acknowledged/);
         return true;
     });
-    assert.deepEqual(cleanupSleeps, [19, 19]);
-    assert.equal(calls.filter(({ args }) => args.includes('cleanup')).length, 3);
-    assert.equal(calls.at(-1).options.timeout, 30000);
+    assert.equal(calls.length, 1);
+    assert.equal(calls.some(({ args }) => args.includes('cleanup')), false);
+    fs.rmSync(
+        path.join(healthProbeHostDir('database-container'), 'unacknowledged-launch'),
+        { recursive: true, force: true },
+    );
 });
 
-test('a delayed exact cleanup can recover before the probe retry proceeds', () => {
-    const timeoutError = new Error('spawnSync podman ETIMEDOUT');
-    timeoutError.code = 'ETIMEDOUT';
+test('a mounted cancellation acknowledgement recovers a delayed detached result', () => {
     const calls = [];
-    const sleeps = [];
+    let now = 0;
+    let firstControlPath = '';
+    let launchCount = 0;
     let tokenSequence = 0;
     const result = runContainerScriptReadiness('onlyOffice', 'onlyoffice-container', {
         script: 'healthcheck.sh',
@@ -362,25 +332,39 @@ test('a delayed exact cleanup can recover before the probe retry proceeds', () =
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => `onlyoffice-${tokenSequence += 1}`,
-        spawnSyncImpl: fakeSpawnSequence([
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
-            { status: 0, stdout: '', stderr: '' },
-            { status: 0, stdout: 'ready\n', stderr: '' },
-        ], calls),
-        cleanupRetryMs: 11,
+        spawnSyncImpl(_runtime, args, options) {
+            calls.push({ args, options });
+            launchCount += 1;
+            const controlPath = path.join(healthProbeHostDir(args[2]), args[7]);
+            if (launchCount === 1) {
+                firstControlPath = controlPath;
+            } else {
+                fs.writeFileSync(path.join(controlPath, 'probe-stdout'), 'ready\n');
+                fs.writeFileSync(path.join(controlPath, 'result'), '0\n');
+            }
+            return { status: 0, stdout: '', stderr: '' };
+        },
+        probeResultGraceMs: 1,
+        probeCancellationGraceMs: 10,
         controlPlaneRetryMs: 23,
-        sleepMsImpl(ms) { sleeps.push(ms); },
+        nowImpl() { return now; },
+        sleepMsImpl(ms) {
+            now += ms;
+            if (firstControlPath
+                && fs.existsSync(path.join(firstControlPath, 'cancelled'))
+                && !fs.existsSync(path.join(firstControlPath, 'result'))) {
+                fs.writeFileSync(path.join(firstControlPath, 'result'), '125\n');
+            }
+        },
         isContainerRunningImpl() { return true; },
     });
 
     assert.deepEqual(result, { status: 'success', detail: 'ready' });
-    assert.deepEqual(sleeps, [11, 23]);
-    assert.equal(calls.filter(({ args }) => args.includes('cleanup')).length, 2);
-    assert.equal(calls.filter(({ args }) => args.includes('run')).length, 2);
+    assert.equal(calls.length, 2);
+    assert.equal(calls.every(({ args }) => args.includes('--detach')), true);
 });
 
-test('probe control-plane retries remain bounded after each exact cleanup succeeds', () => {
+test('detached launch control-plane retries remain bounded after cancellation acknowledgements', () => {
     const timeoutError = new Error('spawnSync podman ETIMEDOUT');
     timeoutError.code = 'ETIMEDOUT';
     const calls = [];
@@ -393,10 +377,8 @@ test('probe control-plane retries remain bounded after each exact cleanup succee
         runtime: 'fake-runtime',
         tokenFactory: () => `bounded-${tokenSequence += 1}`,
         spawnSyncImpl: fakeSpawnSequence([
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
-            { status: 0, stdout: '', stderr: '' },
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
-            { status: 0, stdout: '', stderr: '' },
+            { status: null, error: timeoutError, cancellationStatus: 125 },
+            { status: null, error: timeoutError, cancellationStatus: 125 },
         ], calls),
         controlPlaneFailureThreshold: 2,
         controlPlaneRetryMs: 0,
@@ -408,28 +390,25 @@ test('probe control-plane retries remain bounded after each exact cleanup succee
         return true;
     });
     assert.equal(calls.filter(({ args }) => args.includes('run')).length, 2);
-    assert.equal(calls.filter(({ args }) => args.includes('cleanup')).length, 2);
+    assert.equal(calls.filter(({ args }) => args.includes('cleanup')).length, 0);
 });
 
-test('outer exec timeout fails closed when exact cleanup cannot be proved', () => {
-    const timeoutError = new Error('timed out');
-    timeoutError.code = 'ETIMEDOUT';
+test('non-timeout launch errors surface after mounted cancellation is acknowledged', () => {
+    const clientError = new Error('detached client failed');
+    clientError.code = 'EIO';
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
         timeout: 0.01,
         failureThreshold: 1,
     }, {
         runtime: 'fake-runtime',
-        tokenFactory: () => 'cleanup-failure',
+        tokenFactory: () => 'client-error',
         spawnSyncImpl: fakeSpawnSequence([
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
-            { status: 125, stdout: '', stderr: 'descendant survived' },
+            { status: null, error: clientError, cancellationStatus: 125 },
         ], []),
-        sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
     }), (error) => {
-        assert.equal(error.code, 'PLOINKY_PROBE_CLEANUP_FAILED');
-        assert.match(error.message, /descendant survived/);
+        assert.match(error.message, /failed to launch 'healthcheck\.sh': detached client failed/);
         return true;
     });
 });
@@ -450,7 +429,6 @@ test('reserved runner cleanup failure is fatal and cannot enter the retry loop',
                 stdout: '',
                 stderr: 'exact probe descendants survived cleanup',
             },
-            { status: 0, stdout: '', stderr: '' },
         ], calls),
         sleepMsImpl() {
             assert.fail('unsafe cleanup must not be retried');
@@ -461,12 +439,7 @@ test('reserved runner cleanup failure is fatal and cannot enter the retry loop',
         assert.match(error.message, /descendants survived cleanup/);
         return true;
     });
-    assert.equal(calls.length, 3, 'existence, one probe, and one exact cleanup are the only calls');
-    assert.deepEqual(calls[2].args.slice(-3), [
-        'cleanup',
-        '/tmp/.ploinky-health-probe-runner-cleanup-failure',
-        'runner-cleanup-failure',
-    ]);
+    assert.equal(calls.length, 1, 'one detached probe launch is the only runtime call');
 });
 
 test('blocking container script readiness fails fast when the script is missing', () => {
@@ -474,34 +447,28 @@ test('blocking container script readiness fails fast when the script is missing'
         script: 'missing.sh',
     }, {
         runtime: 'fake-runtime',
-        spawnSyncImpl(_runtime, args) {
-            assert.ok(args.at(-1).startsWith('[ -f '));
-            return { status: 1 };
-        },
+        tokenFactory: () => 'missing-script',
+        spawnSyncImpl: fakeSpawnSequence([{ status: 127 }], []),
+        isContainerRunningImpl() { return true; },
     }), /missing\.sh not found inside container/);
 });
 
-test('script inspection has a hard deadline and reports a typed timeout', () => {
-    const timeoutError = new Error('runtime did not answer');
-    timeoutError.code = 'ETIMEDOUT';
+test('a definitive detached launch failure does not wait for a result', () => {
     const calls = [];
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
     }, {
         runtime: 'fake-runtime',
-        controlPlaneTimeoutMs: 123,
-        spawnSyncImpl(runtime, args, options) {
-            calls.push({ runtime, args, options });
-            return { status: null, error: timeoutError };
-        },
+        tokenFactory: () => 'launch-rejected',
+        spawnSyncImpl: fakeSpawnSequence([
+            { status: 42, stderr: 'runtime rejected launch', launchOnly: true },
+        ], calls),
+        isContainerRunningImpl() { return true; },
     }), (error) => {
-        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
-        assert.match(error.message, /runtime did not answer/);
+        assert.match(error.message, /runtime rejected launch/);
         return true;
     });
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].options.timeout, 123);
-    assert.equal(calls[0].options.killSignal, 'SIGKILL');
 });
 
 test('blocking container script readiness fails immediately after the container exits', () => {
@@ -524,7 +491,7 @@ test('blocking container script readiness fails immediately after the container 
         reason: 'container exited',
         detail: '',
     });
-    assert.equal(calls.length, 1, 'only the initial script existence check should run');
+    assert.equal(calls.length, 0, 'an exited container must not launch a probe');
 });
 
 test('container running-state timeout remains a retryable probe control-plane failure', () => {
@@ -665,14 +632,16 @@ test('probe runner is executable and binds cleanup to exact kernel identity', ()
     assert.match(source, /PLOINKY_PROBE_TOKEN/);
     assert.match(source, /PLOINKY_PROBE_TOKEN="\$\{token\}:"/);
     assert.match(source, /\$\{PROBE_TOKEN_PREFIX\}\$\{token\}:/);
-    assert.match(source, /\/tmp\/\.ploinky-health-probe-\$\{token\}/);
+    assert.match(source, /PROBE_CONTROL_ROOT='\/run\/ploinky-health-probes'/);
     assert.match(source, /expected_start="\$\{identity_rest#\*:\}"/);
     assert.match(source, /\[ "\$MATCHED_SIGNAL_PID" = "\$signal_pid" \]/);
     assert.match(source, /\[ "\$MATCHED_START_TIME" = "\$expected_start" \]/);
     assert.match(source, /signal_matching_probe_processes\s+\\?\s*TERM/);
     assert.match(source, /signal_matching_probe_processes\s+\\?\s*KILL/);
     assert.match(source, /\[ "\$session_id" -gt 0 \]/);
-    assert.match(source, /mkdir "\$marker_path\/\$PROBE_CANCEL_DIR"/);
+    assert.match(source, /while \[ ! -d "\$control_path\/\$PROBE_CANCEL_DIR" \]/);
+    assert.match(source, /PROBE_OUTPUT_BLOCK_COUNT=256/);
+    assert.match(source, /mv "\$control_path\/result-tmp" "\$control_path\/result"/);
     assert.equal(
         (source.match(/grep -Fl/g) || []).length,
         1,
@@ -680,24 +649,24 @@ test('probe runner is executable and binds cleanup to exact kernel identity', ()
     );
 });
 
-test('probe runner rejects marker substitution and malformed durations before execution', () => {
+test('probe runner rejects control-path substitution and malformed durations before execution', () => {
     const runnerPath = fileURLToPath(new URL('../../Agent/server/HealthProbeRunner.sh', import.meta.url));
-    const markerMismatch = spawnSync('sh', [
+    const controlMismatch = spawnSync('sh', [
         runnerPath,
         'run',
-        '/tmp/.ploinky-health-probe-other',
+        '/run/ploinky-health-probes/other',
         'exact-token',
         'healthcheck.sh',
         '1',
         '1',
     ], { encoding: 'utf8' });
-    assert.equal(markerMismatch.status, 125);
-    assert.match(markerMismatch.stderr, /marker path is invalid/);
+    assert.equal(controlMismatch.status, 125);
+    assert.match(controlMismatch.stderr, /control path is invalid/);
 
     const malformedDuration = spawnSync('sh', [
         runnerPath,
         'run',
-        '/tmp/.ploinky-health-probe-exact-token',
+        '/run/ploinky-health-probes/exact-token',
         'exact-token',
         'healthcheck.sh',
         '1.2.3',

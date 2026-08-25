@@ -53,7 +53,12 @@ import {
     saveAgentsMap,
     syncAgentMcpConfig
 } from './common.js';
-import { clearLivenessState, runContainerScriptReadiness } from './healthProbes.js';
+import {
+    PROBE_CONTROL_CONTAINER_ROOT,
+    clearLivenessState,
+    ensureHealthProbeHostDir,
+    runContainerScriptReadiness,
+} from './healthProbes.js';
 import { removeExactRegisteredContainer, stopAndRemove } from './containerFleet.js';
 import {
     TARGETED_DRAIN_ACKNOWLEDGEMENT,
@@ -879,6 +884,7 @@ function buildPersistentAgentRunArgs({
     useNestedDependencyMounts = false,
     preparedNodeModulesDir = '',
     sharedDir,
+    healthProbeHostDir,
     cwd,
     cwdMountTarget,
     isolatedHome = true,
@@ -887,6 +893,9 @@ function buildPersistentAgentRunArgs({
 } = {}) {
     if (!grant) {
         throw new Error('agent admission requires the selected achillesAgentLib grant');
+    }
+    if (!healthProbeHostDir) {
+        throw new Error('agent admission requires its dedicated health-probe control directory');
     }
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const readOnlyMount = runtime === 'podman' ? ':z,ro' : ':ro';
@@ -910,6 +919,9 @@ function buildPersistentAgentRunArgs({
         ] : []),
         // Shared directory
         '-v', `${sharedDir}:/shared${runtime === 'podman' ? ':z' : ''}`,
+        // A per-container control channel lets detached probes publish completion
+        // and receive exact cancellation without a second runtime exec.
+        '-v', `${healthProbeHostDir}:${PROBE_CONTROL_CONTAINER_ROOT}${runtime === 'podman' ? ':z' : ''}`,
         // CWD passthrough. Isolated agents receive their host data dir as /root.
         '-v', `${cwd}:${cwdMountTarget}${runtime === 'podman' ? ':z' : ''}`,
     ];
@@ -923,6 +935,7 @@ function buildPersistentAgentRunArgs({
     const writableBinds = [
         ...(codeMountMode.includes('ro') ? [] : [{ hostPath: codeMountPath, runtimePath: '/code' }]),
         { hostPath: sharedDir, runtimePath: '/shared' },
+        { hostPath: healthProbeHostDir, runtimePath: PROBE_CONTROL_CONTAINER_ROOT },
         { hostPath: cwd, runtimePath: cwdMountTarget },
         ...(isolatedHome || !agentHomeDir ? [] : [{ hostPath: agentHomeDir, runtimePath: '/root' }]),
     ];
@@ -1333,6 +1346,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     // Ensure the agent home directory exists on host.
     fs.mkdirSync(agentHomeDir, { recursive: true });
+    const healthProbeHostDir = ensureHealthProbeHostDir(containerName);
 
     // Build volume mount arguments using new workspace structure
     // Prepared node_modules are mounted read-only; runtime containers never mutate deps.
@@ -1348,6 +1362,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         useNestedDependencyMounts,
         preparedNodeModulesDir,
         sharedDir,
+        healthProbeHostDir,
         cwd,
         cwdMountTarget,
         isolatedHome,
