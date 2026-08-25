@@ -44,6 +44,7 @@ test.after(() => {
 
 const LOCK_COMMIT = 'a'.repeat(40);
 const BRANCH_COMMIT = 'b'.repeat(40);
+const ADVANCED_BRANCH_COMMIT = 'c'.repeat(40);
 const REMOTE = { url: 'https://example.invalid/AchillesAgentLib.git', commit: LOCK_COMMIT };
 
 function stubGit(calls, { refs = { 'feature-x': BRANCH_COMMIT } } = {}) {
@@ -68,6 +69,7 @@ function stubGit(calls, { refs = { 'feature-x': BRANCH_COMMIT } } = {}) {
             if (command === 'fetch') {
                 known.add(LOCK_COMMIT);
                 known.add(BRANCH_COMMIT);
+                for (const commit of Object.values(refs)) known.add(commit);
                 return { status: 0, stdout: '', stderr: '' };
             }
             if (command === 'clone') {
@@ -79,6 +81,10 @@ function stubGit(calls, { refs = { 'feature-x': BRANCH_COMMIT } } = {}) {
                 fs.writeFileSync(path.join(cwd, 'GENERATION'), args.at(-1));
                 return { status: 0, stdout: '', stderr: '' };
             }
+            if (command === 'rev-parse') {
+                return { status: 0, stdout: `${path.basename(cwd).slice(0, 40)}\n`, stderr: '' };
+            }
+            if (command === 'status') return { status: 0, stdout: '', stderr: '' };
             return { status: 0, stdout: '', stderr: '' };
         },
     };
@@ -151,6 +157,33 @@ test('an ordinary managed update follows the lock commit without a branch lookup
     });
     assert.equal(result.selection.resolvedCommit, LOCK_COMMIT);
     assert.equal(calls.some((call) => call.startsWith('ls-remote')), false);
+});
+
+test('a managed update without a new flag advances the previously requested branch', async () => {
+    const workspace = makeWorkspace({ withCheckout: false });
+    const refs = { 'feature-x': BRANCH_COMMIT };
+    const calls = [];
+    const runner = stubGit(calls, { refs });
+    const first = await boxSource.updateWorkspaceAgentLibSource({
+        workspaceRoot: workspace,
+        insideBox: false,
+        branchPolicy: { branch: 'feature-x', fallback: 'fail' },
+        runner,
+        remote: REMOTE,
+    });
+    source.writeActiveDescriptor(workspace, first.selection);
+    refs['feature-x'] = ADVANCED_BRANCH_COMMIT;
+
+    const updated = await boxSource.updateWorkspaceAgentLibSource({
+        workspaceRoot: workspace,
+        insideBox: false,
+        runner,
+        remote: REMOTE,
+    });
+    assert.equal(updated.selection.requestedRef, 'feature-x');
+    assert.equal(updated.selection.resolvedCommit, ADVANCED_BRANCH_COMMIT);
+    assert.equal(updated.changed, true);
+    assert.ok(calls.includes(`ls-remote ${REMOTE.url} feature-x`));
 });
 
 // --- status ----------------------------------------------------------------
@@ -230,11 +263,13 @@ test('an agent probe resolves through its own node_modules and proves confinemen
         [contract.AGENTLIB_ENV.mode]: 'local',
         [contract.AGENTLIB_ENV.fingerprint]: fingerprintMod.fingerprintSource(grantedRoot).fingerprint,
         [contract.AGENTLIB_ENV.commit]: '',
+        [contract.AGENTLIB_ENV.sourceId]: fingerprintMod.sourceIdHash(
+            fingerprintMod.fingerprintSource(grantedRoot).sourceId,
+        ),
     };
     const attestation = attest.buildAgentAttestation({ env, resolveFrom: agentRoot });
-    assert.equal(attestation.confined, true);
-    assert.equal(attestation.resolvedRoot, grantedRoot);
-    assert.equal(attestation.grantedRoot, grantedRoot);
+    assert.equal(attestation.sourceRootRealpath, grantedRoot);
+    assert.equal(attestation.sourceIdHash, env[contract.AGENTLIB_ENV.sourceId]);
     assert.deepEqual(
         Object.keys(attestation.entrypoints).sort(),
         [...attest.ATTESTED_ENTRYPOINTS].sort(),
@@ -254,14 +289,18 @@ test('an agent whose cache link points elsewhere is reported as unconfined', () 
     fs.mkdirSync(path.join(agentRoot, 'node_modules'), { recursive: true });
     fs.symlinkSync(foreign, path.join(agentRoot, 'node_modules', 'achillesAgentLib'));
 
-    const attestation = attest.buildAgentAttestation({
-        env: {
-            [contract.AGENTLIB_ENV.dir]: grantedRoot,
-            [contract.AGENTLIB_ENV.fingerprint]: 'a'.repeat(64),
-        },
-        resolveFrom: agentRoot,
-    });
-    assert.equal(attestation.confined, false, 'a link outside the grant must not read as confined');
+    assert.throws(
+        () => attest.buildAgentAttestation({
+            env: {
+                [contract.AGENTLIB_ENV.dir]: grantedRoot,
+                [contract.AGENTLIB_ENV.fingerprint]: 'a'.repeat(64),
+                [contract.AGENTLIB_ENV.sourceId]: 'b'.repeat(64),
+            },
+            resolveFrom: agentRoot,
+        }),
+        (error) => error.code === contract.AGENTLIB_ERROR_CODES.attestationMismatch,
+        'a link outside the grant must fail admission',
+    );
 });
 
 test('attestation comparison rejects a divergent or unconfined load', () => {

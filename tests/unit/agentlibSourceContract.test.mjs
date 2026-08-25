@@ -323,6 +323,11 @@ function stubGit({ commits, calls }) {
                 writeAgentLibTree(cwd, { marker: args[args.length - 1].slice(0, 7) });
                 return { status: 0, stdout: '', stderr: '' };
             }
+            if (command === 'rev-parse') {
+                const generationCommit = path.basename(cwd || '').slice(0, 40);
+                return { status: 0, stdout: `${generationCommit}\n`, stderr: '' };
+            }
+            if (command === 'status') return { status: 0, stdout: '', stderr: '' };
             return { status: 0, stdout: '', stderr: '' };
         },
     };
@@ -357,7 +362,7 @@ test('managed first start materializes exactly one generation at the lock commit
     assert.equal(fs.readdirSync(source.managedGenerationsDir(workspace)).length, 1);
 });
 
-test('managed offline restart reuses the active generation without any Git call', () => {
+test('managed offline restart revalidates the generation without any network Git call', () => {
     const workspace = makeWorkspace();
     const first = materialize.selectManagedSource({
         workspaceRoot: workspace,
@@ -374,8 +379,38 @@ test('managed offline restart reuses the active generation without any Git call'
         runner: stubGit({ commits: gitFixture(), calls }),
     });
     assert.equal(second.reused, true);
-    assert.deepEqual(calls, [], 'reuse must not invoke Git at all');
+    assert.deepEqual(calls, [
+        'rev-parse HEAD',
+        'status --porcelain --untracked-files=all',
+    ], 'reuse may inspect the local generation but must not consult a mirror or remote');
     assert.equal(second.selection.contentFingerprint, first.selection.contentFingerprint);
+});
+
+test('a mutated managed generation is never relabelled or reused in place', () => {
+    const workspace = makeWorkspace();
+    const commits = gitFixture();
+    const first = materialize.selectManagedSource({
+        workspaceRoot: workspace,
+        remote: REMOTE,
+        runner: stubGit({ commits, calls: [] }),
+    });
+    fs.writeFileSync(path.join(first.selection.sourceDir, 'index.mjs'), 'export const marker = "tampered";\n');
+
+    assert.throws(
+        () => materialize.selectManagedSource({
+            workspaceRoot: workspace,
+            activeDescriptor: source.readActiveDescriptor(workspace),
+            remote: REMOTE,
+            runner: stubGit({ commits, calls: [] }),
+        }),
+        (error) => error.code === contract.AGENTLIB_ERROR_CODES.materializeFailed
+            && /refusing to reuse or overwrite/.test(error.message),
+    );
+    assert.equal(
+        fs.readFileSync(path.join(first.selection.sourceDir, 'index.mjs'), 'utf8'),
+        'export const marker = "tampered";\n',
+        'Ploinky must not mutate the compromised generation while failing closed',
+    );
 });
 
 test('an explicit branch stages a new immutable generation and keeps the old one', () => {

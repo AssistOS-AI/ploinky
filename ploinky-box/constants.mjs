@@ -40,6 +40,7 @@ export const BOX_AGENTLIB_LABELS = Object.freeze({
     sourceIdHash: 'io.assistos.ploinky-box.agentlib-source-id',
     fingerprint: 'io.assistos.ploinky-box.agentlib-fingerprint',
     sourceRelativePath: 'io.assistos.ploinky-box.agentlib-source-path',
+    commit: 'io.assistos.ploinky-box.agentlib-commit',
 });
 
 export const BOX_ROLES = Object.freeze({

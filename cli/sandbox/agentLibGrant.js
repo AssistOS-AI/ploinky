@@ -15,7 +15,6 @@ import {
     agentLibError,
     agentLibRuntimeEnv,
 } from '../../agentlib/contract.mjs';
-import { sha256Hex } from '../../agentlib/fingerprint.mjs';
 import { activeAgentLibSelection, agentLibLinkTarget } from '../utils/dependencies/agentLibLink.js';
 
 export { AGENTLIB_STABLE_MOUNT_PATH, activeAgentLibSelection };
@@ -35,13 +34,20 @@ export function agentLibGrant(runtimeKey, selection = null) {
     const active = selection || activeAgentLibSelection();
     const sourceDir = path.resolve(active.sourceDir);
     const runtimePath = agentLibLinkTarget(runtimeKey, active);
+    const sourceIdHash = String(active.sourceIdHash || '');
+    if (!/^[a-f0-9]{64}$/.test(sourceIdHash)) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.contractMissing,
+            'Agent runtime admission requires the selected physical achillesAgentLib source identity.',
+        );
+    }
     return Object.freeze({
         sourceDir,
         runtimePath,
         mode: active.mode,
         fingerprint: active.fingerprint,
         commit: active.commit || '',
-        sourceIdHash: sha256Hex(sourceDir),
+        sourceIdHash,
         namespaced: runtimePath === AGENTLIB_STABLE_MOUNT_PATH,
     });
 }
@@ -49,7 +55,12 @@ export function agentLibGrant(runtimeKey, selection = null) {
 /** The reserved runtime environment an agent must receive for a grant. */
 export function agentLibGrantEnv(grant) {
     return agentLibRuntimeEnv(
-        { mode: grant.mode, contentFingerprint: grant.fingerprint, resolvedCommit: grant.commit },
+        {
+            mode: grant.mode,
+            contentFingerprint: grant.fingerprint,
+            resolvedCommit: grant.commit,
+            sourceIdHash: grant.sourceIdHash,
+        },
         grant.runtimePath,
     );
 }

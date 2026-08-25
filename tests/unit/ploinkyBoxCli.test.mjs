@@ -56,6 +56,8 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
     return {
         prepareBoxForCommand: async () => { events.push('prepare'); return prepared; },
         runStartTransaction: async (argv, options) => events.push(['start', argv, options]),
+        runRestartTransaction: async (argv, options) => events.push(['restart', argv, options]),
+        runUpdateTransaction: async (argv, options) => events.push(['update-transaction', argv, options]),
         runStopTransaction: async () => events.push('stop'),
         runDestroyTransaction: async (id, options) => {
             events.push(['destroy', id, options]);
@@ -240,7 +242,40 @@ test('explicit start is reachable and retains normalized debug argv', async () =
     assert.deepEqual(events, [[
         'start',
         ['--debug', 'start', 'Agent', '8080'],
-        { explicitPort: 19090, explicitMediaPort: 17891 },
+        {
+            explicitPort: 19090,
+            explicitMediaPort: 17891,
+            branchPolicy: {
+                branch: null,
+                repoBranches: {},
+                fallback: 'default',
+                resetRepos: false,
+            },
+        },
+    ]]);
+});
+
+test('restart is a supervisor transaction and branch policy is consumed at the outer boundary', async () => {
+    const events = [];
+    const code = await runOuterCli([
+        'restart', '--branch', 'candidate', '--repo-branch=Agent=agent-candidate',
+        '--branch-fallback', 'fail', '--reset-repos',
+    ], {
+        env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events),
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(events, [[
+        'restart',
+        ['restart'],
+        {
+            branchPolicy: {
+                branch: 'candidate',
+                repoBranches: { Agent: 'agent-candidate' },
+                fallback: 'fail',
+                resetRepos: true,
+            },
+        },
     ]]);
 });
 
@@ -372,40 +407,68 @@ test('full update refreshes in-Box state then restarts an already configured wor
             events.push('host-update');
             return { updated: false };
         },
-        execute(command, args) {
-            events.push(['execute', command, args]);
-            return 0;
-        },
+        execute() { throw new Error('the supervisor owns the full update transaction'); },
         relaunch() { throw new Error('unchanged host source must not relaunch'); },
     });
     assert.equal(code, 0);
-    assert.deepEqual(events.slice(0, 3), ['host-update', 'status', 'prepare']);
-    const executions = events.filter((entry) => Array.isArray(entry) && entry[0] === 'execute');
-    assert.deepEqual(executions.map((entry) => entry[2].slice(-2)), [
-        ['/opt/ploinky/bin/ploinky-local', 'update'],
-        ['/opt/ploinky/bin/ploinky-local', 'restart'],
+    assert.deepEqual(events, [
+        'host-update',
+        'status',
+        ['update-transaction', ['update'], {
+            branchPolicy: {
+                branch: null,
+                repoBranches: {},
+                fallback: 'default',
+                resetRepos: false,
+            },
+            restartAfterUpdate: true,
+        }],
     ]);
-    assert.match(output.value(), /restarting the Router and managed agents/);
+    assert.match(output.value(), /were restarted coherently/);
 });
 
 test('full update does not restart an unconfigured workspace or continue after update failure', async () => {
-    for (const updateCode of [0, 27]) {
-        const events = [];
-        const output = bufferStream();
-        const code = await runOuterCli(['update', 'all'], {
-            env: {},
-            input: { isTTY: false }, output, errorOutput: bufferStream(),
-            supervisor: fakeSupervisor(events, { statusState: 'absent' }),
-            async updateHostSource() { return { updated: false }; },
-            execute(command, args) {
-                events.push(['execute', command, args]);
-                return updateCode;
+    const events = [];
+    const output = bufferStream();
+    const code = await runOuterCli([
+        'update', 'all', '--branch=candidate', '--branch-fallback=fail',
+    ], {
+        env: {},
+        input: { isTTY: false }, output, errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(events, { statusState: 'absent' }),
+        async updateHostSource() { return { updated: false }; },
+        execute() { throw new Error('the supervisor owns the full update transaction'); },
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(events, [
+        'status',
+        ['update-transaction', ['update', 'all'], {
+            branchPolicy: {
+                branch: 'candidate',
+                repoBranches: {},
+                fallback: 'fail',
+                resetRepos: false,
             },
-        });
-        assert.equal(code, updateCode);
-        assert.equal(events.filter((entry) => Array.isArray(entry) && entry[0] === 'execute').length, 1);
-        assert.equal(output.value().includes('restarting the Router'), false);
-    }
+            restartAfterUpdate: false,
+        }],
+    ]);
+    assert.match(output.value(), /no configured running workspace required a restart/);
+
+    const failedEvents = [];
+    const failedSupervisor = fakeSupervisor(failedEvents, { statusState: 'absent' });
+    failedSupervisor.runUpdateTransaction = async () => {
+        failedEvents.push('update-failed');
+        throw new Error('candidate update failed');
+    };
+    await assert.rejects(
+        runOuterCli(['update'], {
+            env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            supervisor: failedSupervisor,
+            async updateHostSource() { return { updated: false }; },
+        }),
+        /candidate update failed/,
+    );
+    assert.deepEqual(failedEvents, ['status', 'update-failed']);
 });
 
 test('targeted update forms retain generic forwarding without a host pull', async () => {

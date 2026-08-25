@@ -18,7 +18,6 @@ import {
     AGENTLIB_STABLE_MOUNT_PATH,
     agentLibError,
 } from '../../../agentlib/contract.mjs';
-import { sha256Hex } from '../../../agentlib/fingerprint.mjs';
 import { parseRuntimeKey, SUPPORTED_FAMILIES } from './dependencyRuntimeKey.js';
 
 /** Runtime families that get their own mount namespace. */
@@ -32,7 +31,7 @@ const MOUNT_NAMESPACE_FAMILIES = new Set(['container', 'bwrap']);
  * not be able to pick a different source than the core loaded.
  *
  * @param {NodeJS.ProcessEnv} [env]
- * @returns {{ sourceDir: string, mode: string, fingerprint: string, commit: string }}
+ * @returns {{ sourceDir: string, mode: string, fingerprint: string, commit: string, sourceIdHash: string }}
  */
 export function activeAgentLibSelection(env = process.env) {
     const sourceDir = String(env?.[AGENTLIB_ENV.dir] || '').trim();
@@ -48,6 +47,7 @@ export function activeAgentLibSelection(env = process.env) {
         mode: String(env[AGENTLIB_ENV.mode] || ''),
         fingerprint: String(env[AGENTLIB_ENV.fingerprint] || ''),
         commit: String(env[AGENTLIB_ENV.commit] || ''),
+        sourceIdHash: String(env[AGENTLIB_ENV.sourceId] || ''),
     };
 }
 
@@ -169,7 +169,7 @@ export function agentLibStampSection(runtimeKey, selection) {
         mode: selection.mode,
         fingerprint: selection.fingerprint,
         commit: selection.commit || '',
-        sourceIdHash: sha256Hex(path.resolve(selection.sourceDir)),
+        sourceIdHash: selection.sourceIdHash,
         linkTarget: agentLibLinkTarget(runtimeKey, selection),
     };
 }

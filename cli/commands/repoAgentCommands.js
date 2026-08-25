@@ -155,11 +155,19 @@ function formatWorkspaceRepoSkip(repo, remoteCheck) {
  * staging a new immutable generation. Either way the fingerprint change is what
  * forces a coherent restart, not an in-place package refresh.
  */
-async function refreshAgentLibSourceForUpdate(failed, branchPolicy = null, insideBox = isInsideBoxRuntime()) {
+async function refreshAgentLibSourceForUpdate(failed, {
+    branchPolicy = null,
+    insideBox = isInsideBoxRuntime(),
+    interactiveSession = false,
+} = {}) {
     if (insideBox) {
         // The outer host supervisor is the one source writer. An in-Box update
         // must not take the source lock, clone, fetch, or rewrite active.json.
         console.log('achillesAgentLib source: owned by the outer host; run `ploinky update` there.');
+        return null;
+    }
+    if (interactiveSession) {
+        console.log('achillesAgentLib source: update deferred; close this session and run `ploinky-local update` from your shell.');
         return null;
     }
     console.log('Updating the achillesAgentLib source...');
@@ -174,7 +182,7 @@ async function refreshAgentLibSourceForUpdate(failed, branchPolicy = null, insid
             : `managed generation ${result.selection.resolvedCommit?.slice(0, 12) || 'unknown'}`;
         console.log(`  ✓ ${where} (${result.selection.contentFingerprint.slice(0, 12)})`);
         if (result.changed) {
-            console.log('  ✓ achillesAgentLib content changed; run `ploinky restart` to activate it everywhere.');
+            console.log('  ✓ achillesAgentLib content changed; this update will activate it coherently.');
         }
     } catch (err) {
         const message = err?.message || String(err);
@@ -327,11 +335,14 @@ async function updateRepo(repoName) {
     }
 }
 
-async function updatePloinkyRepos() {
+async function updatePloinkyRepos(options = {}) {
     const ploinkyRepos = getGitRepoNames();
     const failed = [];
     let updated = 0;
-    const agentLib = await refreshAgentLibSourceForUpdate(failed);
+    const agentLib = await refreshAgentLibSourceForUpdate(failed, {
+        branchPolicy: options.agentLibBranchPolicy || null,
+        interactiveSession: options.interactiveSession === true,
+    });
 
     if (ploinkyRepos.length) {
         console.log('Updating ploinky repositories...');
@@ -404,7 +415,10 @@ async function updateAllRepos(folderPath, options = {}) {
         console.error(`  ✗ Ploinky: ${message}`);
     }
 
-    agentLib = await refreshAgentLibSourceForUpdate(failed);
+    agentLib = await refreshAgentLibSourceForUpdate(failed, {
+        branchPolicy: options.agentLibBranchPolicy || null,
+        interactiveSession: options.interactiveSession === true,
+    });
 
     if (ploinkyRepos.length) {
         console.log('Updating ploinky repositories...');

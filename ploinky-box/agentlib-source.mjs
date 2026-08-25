@@ -178,10 +178,17 @@ export async function updateWorkspaceAgentLibSource({
         // An update is allowed to resolve a moving branch, so the previous
         // descriptor is not used to pin the commit here; a new generation is
         // staged and the old one is retained for rollback.
+        const effectiveBranchPolicy = branchPolicy?.branch
+            ? branchPolicy
+            : previous?.requestedRef
+                ? { branch: previous.requestedRef, fallback: 'fail' }
+                : null;
         const { selection } = selectManagedSource({
             workspaceRoot,
-            activeDescriptor: branchPolicy?.branch ? null : previous,
-            branchPolicy,
+            // Update is the operation that advances a moving source. Never
+            // feed the active descriptor back into ordinary-start pinning.
+            activeDescriptor: null,
+            branchPolicy: effectiveBranchPolicy,
             remote,
             runner,
             fsApi,

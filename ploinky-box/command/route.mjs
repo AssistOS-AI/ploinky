@@ -84,6 +84,12 @@ export function routeOuterCommand(parsed) {
             coreArgv: parsed.start.coreArgv,
         });
     }
+    if (parsed.command === 'restart') {
+        return Object.freeze({
+            kind: parsed.dryRun ? 'dry-run' : 'restart',
+            coreArgv: parsed.forwardingArgv,
+        });
+    }
     if (!parsed.command) {
         return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'repl', coreArgv: parsed.forwardingArgv });
     }

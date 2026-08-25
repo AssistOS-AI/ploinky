@@ -5,9 +5,18 @@ import {
     BOX_LABELS,
     resolveBoxImageReference,
 } from './constants.mjs';
-import { selectWorkspaceAgentLibSource } from './agentlib-source.mjs';
+import {
+    selectWorkspaceAgentLibSource,
+    updateWorkspaceAgentLibSource,
+} from './agentlib-source.mjs';
 import { AGENTLIB_ERROR_CODES, agentLibError } from '../agentlib/contract.mjs';
-import { fingerprintSource, sourceIdEquals } from '../agentlib/fingerprint.mjs';
+import {
+    fingerprintSource,
+    hashFileBytes,
+    sourceIdEquals,
+    sourceIdHash,
+} from '../agentlib/fingerprint.mjs';
+import { agentLibEntrypointHashes, compareAgentLibAttestation } from '../agentlib/runtime.mjs';
 import { canonicalWorkspaceRoot, managedRootPath, writeActiveDescriptor } from '../agentlib/source.mjs';
 import fsPromisesFree from 'node:fs';
 import {
@@ -133,11 +142,14 @@ export function createBoxSupervisor({
     validateExistingImage = inspectAndValidateExistingImage,
     validateContainer = validateContainerConfiguration,
     startCore = runBoundedCoreStart,
+    runCoreCommand = runBoundedCoreCommand,
+    attestAgentLibGraph = runBoundedAgentLibAttestation,
     resolveHostReachableIpv4 = detectHostReachableIpv4,
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
     selectAgentLib = selectWorkspaceAgentLibSource,
+    updateAgentLib = updateWorkspaceAgentLibSource,
     commitAgentLibSelection = writeActiveDescriptor,
     revalidateAgentLibSource = defaultRevalidateAgentLibSource,
     destroyBoxCache = removeWorkspaceDataPaths,
@@ -191,11 +203,108 @@ export function createBoxSupervisor({
                 stderr,
             });
             const containerId = prepared.ownership.handles.container.id;
-            await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
-            return Object.freeze({
-                identity, ...prepared, containerId, engine: ownership.engine, agentLib: selection,
-            });
+            try {
+                await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+                prepared.finalize?.();
+                return Object.freeze({
+                    identity, ...prepared, containerId, engine: ownership.engine, agentLib: selection,
+                });
+            } catch (error) {
+                await rollbackPreparedGraph({
+                    prepared, ownership, containerId, error,
+                    stopGraph: false,
+                    restoreGraph: false,
+                });
+            }
         });
+    }
+
+    async function rollbackPreparedGraph({
+        prepared,
+        ownership,
+        containerId,
+        error,
+        stopGraph,
+        restoreGraph,
+    }) {
+        const failures = [];
+        if (stopGraph) {
+            try {
+                stopPloinkyLocalByContainerId(ownership.engine, containerId, runner);
+            } catch (stopError) {
+                failures.push(`candidate graph stop: ${stopError.message}`);
+            }
+        }
+        let outerRollback = null;
+        try {
+            outerRollback = await prepared.rollback?.();
+        } catch (rollbackError) {
+            failures.push(`outer Box rollback: ${rollbackError.message}`);
+        }
+        if (restoreGraph && outerRollback?.agentLib && failures.length === 0) {
+            try {
+                const prior = outerRollback.agentLib;
+                const observed = fingerprintSource(prior.sourceDir);
+                if (observed.fingerprint !== prior.fingerprint
+                    || sourceIdHash(observed.sourceId) !== prior.sourceIdHash) {
+                    throw new Error('the prior achillesAgentLib source changed during rollback');
+                }
+                const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                await runCoreCommand(
+                    ownership.engine,
+                    outerRollback.containerId,
+                    ['restart'],
+                    outerRollback.hostPort,
+                    outerRollback.mediaHostPort,
+                    runner,
+                    {
+                        stdout,
+                        stderr,
+                        hostReachableIpv4,
+                        agentLib: prior,
+                    },
+                );
+                await healthCheck(outerRollback.hostPort);
+                await attestAgentLibGraph(
+                    ownership.engine,
+                    outerRollback.containerId,
+                    prior,
+                    runner,
+                    { stdout, stderr },
+                );
+            } catch (restoreError) {
+                failures.push(`prior graph restoration: ${restoreError.message}`);
+            }
+        }
+        if (failures.length) {
+            throw supervisorError(
+                `${error.message}; rollback failures: ${failures.join('; ')}`,
+                'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED',
+            );
+        }
+        throw error;
+    }
+
+    async function completeGraphAdmission({
+        identity,
+        ownership,
+        prepared,
+        selection,
+        containerId,
+        requireHealth = true,
+    }) {
+        if (requireHealth) await healthCheck(prepared.hostPort);
+        const attestation = await attestAgentLibGraph(
+            ownership.engine,
+            containerId,
+            selection,
+            runner,
+            { stdout, stderr },
+        );
+        revalidateAgentLibSource(selection);
+        commitAgentLibSelection(identity.workspaceRoot, selection);
+        prepared.finalize?.();
+        return attestation;
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
@@ -221,40 +330,183 @@ export function createBoxSupervisor({
                 stderr,
             });
             const containerId = prepared.ownership.handles.container.id;
-            await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
-            const edgeDesired = readEdgeDesired(identity);
-            if (edgeDesired) {
-                stageEdgeDesired({
-                    candidate: edgeDesired,
-                    engine: ownership.engine,
+            let graphMutated = false;
+            try {
+                await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+                const edgeDesired = readEdgeDesired(identity);
+                if (edgeDesired) {
+                    stageEdgeDesired({
+                        candidate: edgeDesired,
+                        engine: ownership.engine,
+                        containerId,
+                        runner,
+                    });
+                }
+                const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                graphMutated = true;
+                await startCore(
+                    ownership.engine,
                     containerId,
+                    coreArgs,
+                    prepared.hostPort,
+                    prepared.mediaHostPort,
                     runner,
+                    {
+                        stdout,
+                        stderr,
+                        hostReachableIpv4,
+                        agentLib: selection,
+                    },
+                );
+                const attestation = await completeGraphAdmission({
+                    identity, ownership, prepared, selection, containerId,
+                });
+                return Object.freeze({
+                    identity, ...prepared, containerId, agentLib: selection, attestation,
+                });
+            } catch (error) {
+                await rollbackPreparedGraph({
+                    prepared,
+                    ownership,
+                    containerId,
+                    error,
+                    stopGraph: graphMutated,
+                    restoreGraph: Boolean(prepared.previousAgentLib)
+                        && (graphMutated || prepared.action === 'replaced'),
                 });
             }
-            const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
-            await startCore(
-                ownership.engine,
-                containerId,
-                coreArgs,
-                prepared.hostPort,
-                prepared.mediaHostPort,
+        });
+    }
+
+    async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
+        return lockedMutation(async (identity, lock, ownership) => {
+            const { selection } = await selectAgentLib({
+                workspaceRoot: identity.workspaceRoot,
+                branchPolicy: options.branchPolicy || null,
+            });
+            const prepared = await reconcile({
+                identity,
+                ownership,
+                engine: ownership.engine,
                 runner,
-                {
-                    stdout,
-                    stderr,
-                    hostReachableIpv4,
-                    agentLib: selection,
-                },
-            );
-            await healthCheck(prepared.hostPort);
-            // The selection is revalidated against the host source only after
-            // the whole graph is ready. A source that changed while startup was
-            // in progress means the admitted graph does not match any single
-            // selection, so readiness is refused and nothing is committed.
-            revalidateAgentLibSource(selection);
-            // Atomic commit last: `active.json` records what is actually running.
-            commitAgentLibSelection(identity.workspaceRoot, selection);
-            return Object.freeze({ identity, ...prepared, containerId, agentLib: selection });
+                lock,
+                repositoryRoot,
+                agentLib: selection,
+                imageRef: options.imageRef || resolveBoxImageReference(env),
+                platform,
+                env,
+                stdout,
+                stderr,
+            });
+            const containerId = prepared.ownership.handles.container.id;
+            let graphMutated = false;
+            try {
+                await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+                const effectiveArgs = prepared.action === 'replaced' && coreArgs.length > 1
+                    ? ['restart']
+                    : coreArgs;
+                const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                graphMutated = true;
+                await runCoreCommand(
+                    ownership.engine,
+                    containerId,
+                    effectiveArgs,
+                    prepared.hostPort,
+                    prepared.mediaHostPort,
+                    runner,
+                    { stdout, stderr, hostReachableIpv4, agentLib: selection },
+                );
+                const attestation = await completeGraphAdmission({
+                    identity, ownership, prepared, selection, containerId,
+                });
+                return Object.freeze({
+                    identity, ...prepared, containerId, agentLib: selection, attestation,
+                });
+            } catch (error) {
+                await rollbackPreparedGraph({
+                    prepared,
+                    ownership,
+                    containerId,
+                    error,
+                    stopGraph: graphMutated,
+                    restoreGraph: Boolean(prepared.previousAgentLib)
+                        && (graphMutated || prepared.action === 'replaced'),
+                });
+            }
+        });
+    }
+
+    async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
+        return lockedMutation(async (identity, lock, ownership) => {
+            const { selection, changed, previous } = await updateAgentLib({
+                workspaceRoot: identity.workspaceRoot,
+                branchPolicy: options.branchPolicy || null,
+                insideBox: false,
+            });
+            const prepared = await reconcile({
+                identity,
+                ownership,
+                engine: ownership.engine,
+                runner,
+                lock,
+                repositoryRoot,
+                agentLib: selection,
+                imageRef: options.imageRef || resolveBoxImageReference(env),
+                platform,
+                env,
+                stdout,
+                stderr,
+            });
+            const containerId = prepared.ownership.handles.container.id;
+            let graphMutated = false;
+            try {
+                await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+                await runCoreCommand(
+                    ownership.engine,
+                    containerId,
+                    coreArgs,
+                    prepared.hostPort,
+                    prepared.mediaHostPort,
+                    runner,
+                    { stdout, stderr, agentLib: selection },
+                );
+                if (options.restartAfterUpdate === true) {
+                    const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                    graphMutated = true;
+                    await runCoreCommand(
+                        ownership.engine,
+                        containerId,
+                        ['restart'],
+                        prepared.hostPort,
+                        prepared.mediaHostPort,
+                        runner,
+                        { stdout, stderr, hostReachableIpv4, agentLib: selection },
+                    );
+                }
+                const attestation = await completeGraphAdmission({
+                    identity,
+                    ownership,
+                    prepared,
+                    selection,
+                    containerId,
+                    requireHealth: options.restartAfterUpdate === true,
+                });
+                return Object.freeze({
+                    identity, ...prepared, containerId, agentLib: selection,
+                    changed, previous, attestation,
+                });
+            } catch (error) {
+                await rollbackPreparedGraph({
+                    prepared,
+                    ownership,
+                    containerId,
+                    error,
+                    stopGraph: graphMutated,
+                    restoreGraph: options.restartAfterUpdate === true
+                        && Boolean(prepared.previousAgentLib)
+                        && (graphMutated || prepared.action === 'replaced'),
+                });
+            }
         });
     }
 
@@ -459,6 +711,8 @@ export function createBoxSupervisor({
     return Object.freeze({
         prepareBoxForCommand,
         runStartTransaction,
+        runRestartTransaction,
+        runUpdateTransaction,
         runStopTransaction,
         runDestroyTransaction,
         inspectBoxStatus,
@@ -511,6 +765,112 @@ export function formatBoxStatus(status) {
     return `${lines.join('\n')}\n`;
 }
 
+function boundedCoreEnvironment(hostPort, mediaHostPort, agentLib, hostReachableIpv4 = '') {
+    if (!agentLib) {
+        throw supervisorError('Bounded core command requires the selected achillesAgentLib contract');
+    }
+    const agentLibEnvironment = agentLibBoxEnv(normalizeBoxAgentLib(agentLib));
+    return [
+        'container', 'exec',
+        '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
+        '--env', `PLOINKY_MEDIA_HOST_PORT=${mediaHostPort}`,
+        ...(hostReachableIpv4
+            ? ['--env', `${HOST_REACHABLE_IPV4_ENV}=${hostReachableIpv4}`]
+            : []),
+        ...Object.entries(agentLibEnvironment).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+    ];
+}
+
+export async function runBoundedCoreCommand(
+    engine,
+    containerId,
+    coreArgv,
+    hostPort,
+    mediaHostPort,
+    runner,
+    {
+        stdout = process.stdout,
+        stderr = process.stderr,
+        timeoutMs = 1_800_000,
+        hostReachableIpv4 = '',
+        agentLib = null,
+    } = {},
+) {
+    const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
+    if (normalizedHostReachableIpv4 && !isUsableHostIpv4(normalizedHostReachableIpv4)) {
+        throw supervisorError(
+            `${HOST_REACHABLE_IPV4_ENV} must be a usable canonical literal IPv4 address`,
+            'PLOINKY_BOX_HOST_REACHABLE_IPV4_INVALID',
+        );
+    }
+    const result = await runner.stream(engine.name, [
+        ...boundedCoreEnvironment(
+            hostPort,
+            mediaHostPort,
+            agentLib,
+            normalizedHostReachableIpv4,
+        ),
+        '--user', 'podman',
+        '--workdir', '/workspace',
+        containerId,
+        '/opt/ploinky/bin/ploinky-local',
+        ...coreArgv,
+    ], { timeoutMs, stdout, stderr });
+    if (!result.ok) {
+        throw supervisorError(`In-box ${coreArgv[0] || 'command'} failed with status ${result.status}`);
+    }
+    return result;
+}
+
+export async function runBoundedAgentLibAttestation(
+    engine,
+    containerId,
+    selection,
+    runner,
+    { stderr = process.stderr, timeoutMs = 120_000 } = {},
+) {
+    const normalized = normalizeBoxAgentLib(selection);
+    const args = [
+        ...boundedCoreEnvironment(0, 0, selection),
+        '--user', 'podman',
+        '--workdir', '/workspace',
+        containerId,
+        '/usr/local/bin/node',
+        '/opt/ploinky/cli/agentlib-attest.mjs',
+    ];
+    const sink = { write() {} };
+    const result = typeof runner.stream === 'function'
+        ? await runner.stream(engine.name, args, { timeoutMs, stdout: sink, stderr })
+        : runner.query(engine.name, args);
+    if (!result?.ok) {
+        throw supervisorError(`In-box AgentLib graph attestation failed with status ${String(result?.status)}`);
+    }
+    let proof;
+    try {
+        proof = JSON.parse(String(result.stdout || '').trim());
+    } catch (error) {
+        throw supervisorError('In-box AgentLib graph attestation returned malformed JSON');
+    }
+    const expected = {
+        fingerprint: normalized.fingerprint,
+        sourceIdHash: normalized.sourceIdHash,
+        sourceRoot: '/opt/ploinky-agentlib',
+        packageJsonHash: hashFileBytes(path.join(selection.sourceDir, 'package.json')),
+        entrypoints: agentLibEntrypointHashes(selection.sourceDir),
+    };
+    const compared = compareAgentLibAttestation(proof.core, expected);
+    if (!compared.ok
+        || proof.deploymentFingerprint !== normalized.fingerprint
+        || proof.sourceIdHash !== normalized.sourceIdHash) {
+        const detail = compared.problems.join(' ') || 'deployment identity differs';
+        throw supervisorError(`In-box AgentLib graph attestation mismatch: ${detail}`);
+    }
+    if (!Array.isArray(proof.agents)) {
+        throw supervisorError('In-box AgentLib graph attestation omitted the managed agent proofs');
+    }
+    return Object.freeze(proof);
+}
+
 export async function runBoundedCoreStart(
     engine,
     containerId,
@@ -529,39 +889,15 @@ export async function runBoundedCoreStart(
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
         throw supervisorError('Bounded core start requires normalized start argv');
     }
-    const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
-    if (normalizedHostReachableIpv4 && !isUsableHostIpv4(normalizedHostReachableIpv4)) {
-        throw supervisorError(
-            `${HOST_REACHABLE_IPV4_ENV} must be a usable canonical literal IPv4 address`,
-            'PLOINKY_BOX_HOST_REACHABLE_IPV4_INVALID',
-        );
-    }
-    if (!agentLib) {
-        throw supervisorError('Bounded core start requires the selected achillesAgentLib contract');
-    }
-    // The in-Box core reads the source only through the reserved environment,
-    // which names the stable mount path rather than any host path.
-    const agentLibEnvironment = agentLibBoxEnv(normalizeBoxAgentLib(agentLib));
-    const runtimeEnvironment = [
-        'container', 'exec',
-        '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
-        '--env', `PLOINKY_MEDIA_HOST_PORT=${mediaHostPort}`,
-        ...(normalizedHostReachableIpv4
-            ? ['--env', `${HOST_REACHABLE_IPV4_ENV}=${normalizedHostReachableIpv4}`]
-            : []),
-        ...Object.entries(agentLibEnvironment).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
-    ];
-    const result = await runner.stream(engine.name, [
-        ...runtimeEnvironment,
-        '--user', 'podman',
-        '--workdir', '/workspace',
+    const result = await runBoundedCoreCommand(
+        engine,
         containerId,
-        '/opt/ploinky/bin/ploinky-local',
-        ...coreArgv,
-    ], { timeoutMs, stdout, stderr });
-    if (!result.ok) {
-        throw supervisorError(`In-box start failed with status ${result.status}`);
-    }
+        coreArgv,
+        hostPort,
+        mediaHostPort,
+        runner,
+        { stdout, stderr, timeoutMs, hostReachableIpv4, agentLib },
+    );
     const externalRouter = `http://127.0.0.1:${hostPort}`;
     const outputLines = String(result.stdout || '').split(/\r?\n/);
     if (!outputLines.includes(`[start] Router: ${externalRouter}`)) {

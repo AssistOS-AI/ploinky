@@ -266,6 +266,7 @@ export function validateContainerConfiguration(containerHandle, {
     expectedLabels[BOX_AGENTLIB_LABELS.sourceIdHash] = agentLibContract.sourceIdHash;
     expectedLabels[BOX_AGENTLIB_LABELS.fingerprint] = agentLibContract.fingerprint;
     expectedLabels[BOX_AGENTLIB_LABELS.sourceRelativePath] = agentLibContract.sourceRelativePath;
+    expectedLabels[BOX_AGENTLIB_LABELS.commit] = agentLibContract.commit;
     const ownershipLabels = Object.fromEntries(Object.entries(containerHandle.labels)
         .filter(([key]) => key.startsWith(BOX_OWNERSHIP_LABEL_PREFIX))
         .sort());

@@ -19,6 +19,7 @@ const link = await import(path.join(repoRoot, 'cli/utils/dependencies/agentLibLi
 const grantMod = await import(path.join(repoRoot, 'cli/sandbox/agentLibGrant.js'));
 
 const tempRoots = [];
+const SOURCE_ID_HASH = 'd1'.repeat(32);
 
 function tempDir(prefix = 'agentlib-cache-') {
     const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
@@ -37,6 +38,7 @@ const SELECTION = Object.freeze({
     mode: 'local',
     fingerprint: 'a1'.repeat(32),
     commit: '',
+    sourceIdHash: SOURCE_ID_HASH,
 });
 
 // --- link target per runtime family ---------------------------------------
@@ -151,12 +153,14 @@ test('the active selection comes from the validated runtime contract, not the cw
         [contract.AGENTLIB_ENV.mode]: 'managed',
         [contract.AGENTLIB_ENV.fingerprint]: 'b2'.repeat(32),
         [contract.AGENTLIB_ENV.commit]: 'c'.repeat(40),
+        [contract.AGENTLIB_ENV.sourceId]: SOURCE_ID_HASH,
     };
     assert.deepEqual(link.activeAgentLibSelection(env), {
         sourceDir: '/selected/achillesAgentLib',
         mode: 'managed',
         fingerprint: 'b2'.repeat(32),
         commit: 'c'.repeat(40),
+        sourceIdHash: SOURCE_ID_HASH,
     });
 });
 
@@ -166,6 +170,7 @@ test('a grant shadows every writable alias of the selected source', () => {
         mode: 'local',
         fingerprint: 'a1'.repeat(32),
         commit: '',
+        sourceIdHash: SOURCE_ID_HASH,
     });
     assert.equal(grant.runtimePath, contract.AGENTLIB_STABLE_MOUNT_PATH);
 
@@ -190,6 +195,7 @@ test('a seatbelt grant is not namespaced and needs no shadow bind', () => {
         mode: 'local',
         fingerprint: 'a1'.repeat(32),
         commit: '',
+        sourceIdHash: SOURCE_ID_HASH,
     });
     assert.equal(grant.namespaced, false);
     assert.equal(grant.runtimePath, grant.sourceDir);
@@ -207,6 +213,7 @@ test('the grant environment names the runtime path, never the host path, for nam
         [contract.AGENTLIB_ENV.mode]: 'local',
         [contract.AGENTLIB_ENV.fingerprint]: SELECTION.fingerprint,
         [contract.AGENTLIB_ENV.commit]: '',
+        [contract.AGENTLIB_ENV.sourceId]: SOURCE_ID_HASH,
     });
 });
 

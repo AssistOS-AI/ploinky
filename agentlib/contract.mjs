@@ -5,6 +5,7 @@
 // runtime tree. It must never pull in a lifecycle module, and importing it must
 // never touch the network or mutate workspace state.
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,6 +39,7 @@ export const AGENTLIB_ENV = Object.freeze({
     mode: 'PLOINKY_AGENTLIB_MODE',
     fingerprint: 'PLOINKY_AGENTLIB_FINGERPRINT',
     commit: 'PLOINKY_AGENTLIB_COMMIT',
+    sourceId: 'PLOINKY_AGENTLIB_SOURCE_ID',
 });
 
 /** Reserved environment names an agent manifest or user env layer must not set. */
@@ -246,11 +248,26 @@ export function agentLibRuntimeEnv(selection, runtimeDir) {
             `AgentLib runtime directory must be an absolute path (got ${String(runtimeDir)}).`,
         );
     }
+    const sourceId = selection?.sourceId;
+    const sourceIdValue = String(selection?.sourceIdHash || (
+        sourceId?.device !== undefined && sourceId?.inode !== undefined
+            ? crypto.createHash('sha256')
+                .update(`${String(sourceId.device)}:${String(sourceId.inode)}`)
+                .digest('hex')
+            : ''
+    ));
+    if (!/^[a-f0-9]{64}$/.test(sourceIdValue)) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.contractMissing,
+            'AgentLib runtime contract requires the selected physical source identity.',
+        );
+    }
     return {
         [AGENTLIB_ENV.dir]: runtimeDir,
         [AGENTLIB_ENV.mode]: selection.mode,
         [AGENTLIB_ENV.fingerprint]: selection.contentFingerprint,
         [AGENTLIB_ENV.commit]: selection.resolvedCommit || '',
+        [AGENTLIB_ENV.sourceId]: sourceIdValue,
     };
 }
 
