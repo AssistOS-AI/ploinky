@@ -3,6 +3,7 @@ import http from 'node:http';
 
 import {
     BOX_LABELS,
+    BOX_ROUTER_CONTAINER_PORT,
     resolveBoxImageReference,
 } from './constants.mjs';
 import {
@@ -53,6 +54,41 @@ import {
 
 function supervisorError(message, code = 'PLOINKY_BOX_SUPERVISOR_FAILED') {
     return new PloinkyBoxError(message, { code });
+}
+
+export function captureConfiguredCoreStartArgv(identity, { fsApi = fsPromisesFree } = {}) {
+    const rawWorkspaceRoot = String(identity?.workspaceRoot || '');
+    if (!rawWorkspaceRoot || !path.isAbsolute(rawWorkspaceRoot)) {
+        throw supervisorError('Prior graph capture requires an exact workspace root');
+    }
+    const workspaceRoot = path.resolve(rawWorkspaceRoot);
+    const routingPath = path.join(workspaceRoot, '.ploinky', 'routing.json');
+    let routing;
+    try {
+        const stat = fsApi.lstatSync(routingPath);
+        if (!stat.isFile() || stat.isSymbolicLink()) {
+            throw supervisorError('The prior graph routing configuration is not a regular file');
+        }
+        routing = JSON.parse(fsApi.readFileSync(routingPath, 'utf8'));
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        if (error instanceof PloinkyBoxError) throw error;
+        throw supervisorError(`Could not capture the prior graph start configuration: ${error.message}`);
+    }
+    // routing.json is the graph source of truth and survives a failed runtime
+    // candidate even if a stale registry writer drops agents.json._config.
+    const staticAgent = String(routing?.static?.agent || '').trim();
+    const staticPort = Number(routing?.port);
+    if (!staticAgent && !routing?.static) return null;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/.test(staticAgent)) {
+        throw supervisorError('The prior graph static agent is invalid');
+    }
+    if (!Number.isSafeInteger(staticPort) || staticPort !== BOX_ROUTER_CONTAINER_PORT) {
+        throw supervisorError(
+            `The prior graph must use the Box Router port ${BOX_ROUTER_CONTAINER_PORT}`,
+        );
+    }
+    return Object.freeze(['start', staticAgent, String(staticPort)]);
 }
 
 function assertMutableOwnership(ownership) {
@@ -155,6 +191,7 @@ export function createBoxSupervisor({
     destroyBoxCache = removeWorkspaceDataPaths,
     destroyManagedAgentLib = removeManagedAgentLibState,
     inspectBoxData = inspectWorkspaceDataPaths,
+    captureCoreStartArgv = captureConfiguredCoreStartArgv,
     stdout = process.stdout,
     stderr = process.stderr,
 } = {}) {
@@ -226,6 +263,7 @@ export function createBoxSupervisor({
         error,
         stopGraph,
         restoreGraph,
+        restoreCoreArgv = null,
     }) {
         const failures = [];
         if (stopGraph) {
@@ -243,6 +281,9 @@ export function createBoxSupervisor({
         }
         if (restoreGraph && outerRollback?.agentLib && failures.length === 0) {
             try {
+                if (!Array.isArray(restoreCoreArgv) || restoreCoreArgv[0] !== 'start') {
+                    throw new Error('the prior graph start configuration was not captured');
+                }
                 const prior = outerRollback.agentLib;
                 const observed = fingerprintSource(prior.sourceDir);
                 if (observed.fingerprint !== prior.fingerprint
@@ -253,7 +294,7 @@ export function createBoxSupervisor({
                 await runCoreCommand(
                     ownership.engine,
                     outerRollback.containerId,
-                    ['restart'],
+                    restoreCoreArgv,
                     outerRollback.hostPort,
                     outerRollback.mediaHostPort,
                     runner,
@@ -309,6 +350,7 @@ export function createBoxSupervisor({
 
     async function runStartTransaction(coreArgs = [], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            const priorCoreStartArgv = captureCoreStartArgv(identity);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -372,7 +414,9 @@ export function createBoxSupervisor({
                     error,
                     stopGraph: graphMutated,
                     restoreGraph: Boolean(prepared.previousAgentLib)
+                        && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
+                    restoreCoreArgv: priorCoreStartArgv,
                 });
             }
         });
@@ -380,6 +424,7 @@ export function createBoxSupervisor({
 
     async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            const priorCoreStartArgv = captureCoreStartArgv(identity);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -430,7 +475,9 @@ export function createBoxSupervisor({
                     error,
                     stopGraph: graphMutated,
                     restoreGraph: Boolean(prepared.previousAgentLib)
+                        && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
+                    restoreCoreArgv: priorCoreStartArgv,
                 });
             }
         });
@@ -438,6 +485,7 @@ export function createBoxSupervisor({
 
     async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            const priorCoreStartArgv = captureCoreStartArgv(identity);
             const { selection, changed, previous } = await updateAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -504,7 +552,9 @@ export function createBoxSupervisor({
                     stopGraph: graphMutated,
                     restoreGraph: options.restartAfterUpdate === true
                         && Boolean(prepared.previousAgentLib)
+                        && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
+                    restoreCoreArgv: priorCoreStartArgv,
                 });
             }
         });

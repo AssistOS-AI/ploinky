@@ -92,7 +92,9 @@ function matrixSupervisor(identity, events) {
         validateContainer: () => ({}),
         selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
         updateAgentLib: async () => ({
-            selection: agentLib, changed: false, previous: agentLib,
+            selection: agentLib,
+            changed: false,
+            previous: agentLib,
         }),
         reconcile: async ({ lock }) => {
             lock.assertHeld(identity.instance);
@@ -198,11 +200,11 @@ test('start stages host-owned edge desired state under the Box lock before core 
                 };
             },
         },
-        selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
         runner: {
             run(command, args) { events.push(`run:${args.join(' ')}`); },
             query() { return { ok: true, stdout: '' }; },
         },
+        selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
         reconcile: async () => ({
             ownership,
             hostPort: 8080,

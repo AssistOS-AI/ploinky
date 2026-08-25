@@ -7,6 +7,7 @@ import test from 'node:test';
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
+    captureConfiguredCoreStartArgv,
     checkBoxHealth,
     createBoxSupervisor,
     formatBoxStatus,
@@ -668,6 +669,23 @@ test('a source that changes during startup is not committed and is not declared 
     assert.equal(committed, false, 'the active selection must not record an unready graph');
 });
 
+test('prior graph capture records an exact start command before mutation', (t) => {
+    const state = fixture(t);
+    const ploinkyDir = path.join(state.workspace, '.ploinky');
+    fs.mkdirSync(ploinkyDir);
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+        static: { agent: 'AssistOSExplorer/explorer' },
+        port: 8080,
+        routes: {},
+    }));
+
+    const argv = captureConfiguredCoreStartArgv(identity);
+
+    assert.deepEqual(argv, ['start', 'AssistOSExplorer/explorer', '8080']);
+    assert.equal(Object.isFrozen(argv), true);
+});
+
 test('a failed replacement restores and re-attests the prior Box graph before surfacing the failure', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
@@ -690,6 +708,7 @@ test('a failed replacement restores and re-attests the prior Box graph before su
             run(_command, args) { events.push(`run:${args.join(' ')}`); },
         },
         selectAgentLib: async () => ({ selection: candidateAgentLib, mode: 'managed' }),
+        captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
         reconcile: async () => ({
             action: 'replaced',
             ownership: candidateOwnership,
@@ -731,14 +750,14 @@ test('a failed replacement restores and re-attests the prior Box graph before su
         /candidate restart failed/,
     );
     assert.equal(committed, false);
-    assert.equal(coreCalls, 2, 'the second bounded restart restores the prior graph');
+    assert.equal(coreCalls, 2, 'the second bounded command restores the prior graph');
     const rollbackIndex = events.indexOf('outer-rollback');
-    const priorRestartIndex = events.findIndex((event) => (
-        event.startsWith(`core:${oldOwnership.handles.container.id}:restart:`)
+    const priorStartIndex = events.findIndex((event) => (
+        event.startsWith(`core:${oldOwnership.handles.container.id}:start explorer 8080:`)
     ));
-    assert.ok(rollbackIndex >= 0 && priorRestartIndex > rollbackIndex);
-    assert.ok(events.indexOf('prior-health') > priorRestartIndex);
-    assert.ok(events.indexOf(`attest:${oldOwnership.handles.container.id}`) > priorRestartIndex);
+    assert.ok(rollbackIndex >= 0 && priorStartIndex > rollbackIndex);
+    assert.ok(events.indexOf('prior-health') > priorStartIndex);
+    assert.ok(events.indexOf(`attest:${oldOwnership.handles.container.id}`) > priorStartIndex);
 });
 
 test('bounded start requires the external Router URL and preserves normalized argv', async (t) => {
