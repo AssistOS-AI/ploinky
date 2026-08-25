@@ -41,8 +41,28 @@ test('running-container inventory fails closed on runtime errors', () => {
                 return { status: 125, stdout: '', stderr: 'runtime unavailable' };
             },
         }),
-        /cannot list running containers: runtime unavailable/,
+        (error) => {
+            assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED');
+            assert.match(error.message, /cannot list running containers: runtime unavailable/);
+            return true;
+        },
     );
+});
+
+test('running-container inventory preserves typed control-plane timeouts', () => {
+    const timeout = new Error('runtime timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(() => isContainerRunning('exact-container', {
+        runtime: 'podman',
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            return { status: null, error: timeout, stdout: '', stderr: '' };
+        },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /runtime timed out/);
+        return true;
+    });
 });
 
 test('single-container status checks are argv-safe and bounded', () => {

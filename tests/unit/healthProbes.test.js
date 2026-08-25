@@ -280,11 +280,11 @@ test('non-timeout client errors clean the exact execution before surfacing', () 
     ]);
 });
 
-test('outer exec timeout invokes exact marker cleanup before reporting timeout', () => {
+test('outer exec timeout invokes exact marker cleanup and preserves control-plane uncertainty', () => {
     const timeoutError = new Error('timed out');
     timeoutError.code = 'ETIMEDOUT';
     const calls = [];
-    const result = runContainerScriptReadiness('database', 'database-container', {
+    assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
         timeout: 0.01,
         failureThreshold: 1,
@@ -297,9 +297,11 @@ test('outer exec timeout invokes exact marker cleanup before reporting timeout',
         ], calls),
         sleepMsImpl() {},
         isContainerRunningImpl() { return true; },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /runtime control plane timed out/);
+        return true;
     });
-
-    assert.deepEqual(result, { status: 'failed', reason: 'timeout', detail: '' });
     assert.deepEqual(calls[2].args, [
         'exec',
         'database-container',
@@ -311,6 +313,29 @@ test('outer exec timeout invokes exact marker cleanup before reporting timeout',
     ]);
     assert.equal(calls[2].options.timeout, 5000);
     assert.equal(calls[2].options.killSignal, 'SIGKILL');
+});
+
+test('exact cleanup timeout remains a retryable control-plane failure', () => {
+    const timeoutError = new Error('spawnSync podman ETIMEDOUT');
+    timeoutError.code = 'ETIMEDOUT';
+    assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+        timeout: 0.01,
+        failureThreshold: 1,
+    }, {
+        runtime: 'fake-runtime',
+        tokenFactory: () => 'cleanup-timeout',
+        spawnSyncImpl: fakeSpawnSequence([
+            { status: null, error: timeoutError, stdout: '', stderr: '' },
+            { status: null, error: timeoutError, stdout: '', stderr: '' },
+        ], []),
+        sleepMsImpl() {},
+        isContainerRunningImpl() { return true; },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /exact probe cleanup failed/);
+        return true;
+    });
 });
 
 test('outer exec timeout fails closed when exact cleanup cannot be proved', () => {
