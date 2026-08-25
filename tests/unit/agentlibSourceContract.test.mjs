@@ -563,3 +563,82 @@ test('the canonical remote comes from the Box dependency lock', () => {
     assert.match(remote.commit, /^[0-9a-f]{40}$/);
     assert.match(remote.url, /AchillesAgentLib/i);
 });
+
+// --- workspace canonicalization -------------------------------------------
+
+test('a workspace reached through a symlinked path still selects its own source', () => {
+    const real = makeWorkspace();
+    localCheckout(real);
+    const linkParent = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'agentlib-link-'));
+    tempRoots.push(linkParent);
+    const aliased = path.join(linkParent, 'workspace-alias');
+    fs.symlinkSync(real, aliased);
+
+    const viaAlias = source.selectAgentLibSource({ workspaceRoot: aliased });
+    const viaReal = source.selectAgentLibSource({ workspaceRoot: real });
+    assert.equal(viaAlias.selection.sourceRelativePath, contract.AGENTLIB_LOCAL_DIR_NAME);
+    assert.equal(
+        viaAlias.selection.workspacePathHash,
+        viaReal.selection.workspacePathHash,
+        'one physical workspace must hash the same however it was reached',
+    );
+
+    // A descriptor written through one spelling must resolve through the other.
+    source.writeActiveDescriptor(aliased, viaAlias.selection);
+    assert.equal(
+        source.resolveDescriptorSource(source.readActiveDescriptor(real), real).sourceDir,
+        fs.realpathSync(source.localCandidatePath(real)),
+    );
+});
+
+// --- explicit branch policy against a local checkout -----------------------
+
+test('a requested branch is validated against a local checkout without modifying it', () => {
+    const workspace = makeWorkspace();
+    const dir = localCheckout(workspace);
+    const before = fingerprintMod.fingerprintSource(dir).fingerprint;
+    const readGitState = () => ({ commit: 'd'.repeat(40), dirty: true, branch: 'ploinky-proxy' });
+
+    const matched = source.selectAgentLibSource({
+        workspaceRoot: workspace,
+        readGitState,
+        branchPolicy: { branch: 'ploinky-proxy', fallback: 'fail' },
+    });
+    assert.equal(matched.selection.resolvedCommit, 'd'.repeat(40));
+    assert.equal(matched.selection.dirty, true, 'a dirty local checkout is reported, not hidden');
+
+    // A mismatch under `default` is reported but still selects the local source.
+    const mismatched = source.selectAgentLibSource({
+        workspaceRoot: workspace,
+        readGitState,
+        branchPolicy: { branch: 'other', fallback: 'default' },
+    });
+    assert.equal(mismatched.selection.mode, 'local');
+    assert.equal(
+        source.assertLocalBranchPolicy(dir, { branch: 'ploinky-proxy' }, { branch: 'other', fallback: 'default' }).matched,
+        false,
+    );
+
+    assert.equal(fingerprintMod.fingerprintSource(dir).fingerprint, before, 'the checkout must not be mutated');
+});
+
+test('a branch mismatch on a local checkout is fail-closed under --branch-fallback fail', () => {
+    const workspace = makeWorkspace();
+    localCheckout(workspace);
+    assert.throws(
+        () => source.selectAgentLibSource({
+            workspaceRoot: workspace,
+            readGitState: () => ({ commit: null, dirty: false, branch: 'master' }),
+            branchPolicy: { branch: 'ploinky-proxy', fallback: 'fail' },
+        }),
+        (error) => error.code === contract.AGENTLIB_ERROR_CODES.branchMissing,
+    );
+    assert.throws(
+        () => source.selectAgentLibSource({
+            workspaceRoot: workspace,
+            readGitState: () => ({ commit: null, dirty: false, branch: null }),
+            branchPolicy: { branch: 'ploinky-proxy', fallback: 'fail' },
+        }),
+        /detached or unknown revision/,
+    );
+});

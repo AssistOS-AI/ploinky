@@ -45,32 +45,57 @@ export function resolveWorkspaceRoot({ cwd = process.cwd(), env = process.env, f
     if (explicit) {
         const normalized = path.resolve(explicit);
         try {
-            if (fsApi.statSync(normalized).isDirectory()) return normalized;
+            if (fsApi.statSync(normalized).isDirectory()) return canonicalWorkspaceRoot(normalized, fsApi);
         } catch (_) { /* fall through to discovery */ }
     }
     let current = path.resolve(cwd);
     while (true) {
         try {
-            if (fsApi.statSync(path.join(current, '.ploinky')).isDirectory()) return current;
+            if (fsApi.statSync(path.join(current, '.ploinky')).isDirectory()) {
+                return canonicalWorkspaceRoot(current, fsApi);
+            }
         } catch (_) { /* keep walking */ }
         const parent = path.dirname(current);
         if (parent === current) break;
         current = parent;
     }
-    return path.resolve(cwd);
+    return canonicalWorkspaceRoot(cwd, fsApi);
 }
 
-export function workspacePathHash(workspaceRoot) {
-    return sha256Hex(path.resolve(workspaceRoot));
+/**
+ * One canonical spelling for a workspace root.
+ *
+ * Source paths are always canonicalized, so the root must be too: otherwise a
+ * workspace reached through a symlinked component (a macOS `/tmp/...` path, for
+ * example) yields a source that looks like it is outside its own workspace, and
+ * the same physical workspace hashes differently depending on how it was
+ * reached.
+ *
+ * @param {string} workspaceRoot
+ * @param {typeof fs} [fsApi]
+ * @returns {string}
+ */
+export function canonicalWorkspaceRoot(workspaceRoot, fsApi = fs) {
+    const resolved = path.resolve(workspaceRoot);
+    try {
+        return fsApi.realpathSync(resolved);
+    } catch (_) {
+        // A not-yet-created workspace still has a stable resolved spelling.
+        return resolved;
+    }
+}
+
+export function workspacePathHash(workspaceRoot, fsApi = fs) {
+    return sha256Hex(canonicalWorkspaceRoot(workspaceRoot, fsApi));
 }
 
 /** The only implicit local candidate. No ancestor or recursive search. */
-export function localCandidatePath(workspaceRoot) {
-    return path.join(path.resolve(workspaceRoot), AGENTLIB_LOCAL_DIR_NAME);
+export function localCandidatePath(workspaceRoot, fsApi = fs) {
+    return path.join(canonicalWorkspaceRoot(workspaceRoot, fsApi), AGENTLIB_LOCAL_DIR_NAME);
 }
 
-export function managedRootPath(workspaceRoot) {
-    return path.join(path.resolve(workspaceRoot), AGENTLIB_MANAGED_RELATIVE_DIR);
+export function managedRootPath(workspaceRoot, fsApi = fs) {
+    return path.join(canonicalWorkspaceRoot(workspaceRoot, fsApi), AGENTLIB_MANAGED_RELATIVE_DIR);
 }
 
 export function managedGenerationsDir(workspaceRoot) {
@@ -262,7 +287,7 @@ export function buildSelection({
     fsApi = fs,
     now = () => new Date().toISOString(),
 }) {
-    const root = path.resolve(workspaceRoot);
+    const root = canonicalWorkspaceRoot(workspaceRoot, fsApi);
     const canonicalSource = fsApi.realpathSync(sourceDir);
     const { fingerprint, sourceId } = fingerprintSource(canonicalSource, { fsApi });
     const relative = path.relative(root, canonicalSource);
@@ -274,7 +299,7 @@ export function buildSelection({
     }
     const descriptor = validateSelectionDescriptor({
         schemaVersion: AGENTLIB_SELECTION_SCHEMA_VERSION,
-        workspacePathHash: workspacePathHash(root),
+        workspacePathHash: workspacePathHash(root, fsApi),
         mode,
         sourceRelativePath: relative.split(path.sep).join('/'),
         sourceId,
@@ -303,8 +328,8 @@ export function buildSelection({
  */
 export function resolveDescriptorSource(descriptor, workspaceRoot, { fsApi = fs, requireSameSourceId = true } = {}) {
     const normalized = validateSelectionDescriptor(descriptor);
-    const root = path.resolve(workspaceRoot);
-    if (normalized.workspacePathHash !== workspacePathHash(root)) {
+    const root = canonicalWorkspaceRoot(workspaceRoot, fsApi);
+    if (normalized.workspacePathHash !== workspacePathHash(root, fsApi)) {
         throw agentLibError(
             AGENTLIB_ERROR_CODES.descriptorInvalid,
             'AgentLib selection belongs to a different workspace; refusing to adopt it.',
@@ -393,9 +418,39 @@ export function readTransactionDescriptor(workspaceRoot, fsApi = fs) {
  * @returns {{ mode: 'local'|'managed', candidate: string, present: boolean }}
  */
 export function planSourceSelection(workspaceRoot, { fsApi = fs } = {}) {
-    const candidate = localCandidatePath(workspaceRoot);
+    const candidate = localCandidatePath(workspaceRoot, fsApi);
     const present = localCandidateExists(candidate, fsApi);
     return { mode: present ? 'local' : 'managed', candidate, present };
+}
+
+/**
+ * Check an explicitly requested branch against a local checkout.
+ *
+ * Ploinky never mutates a local checkout, so a requested branch can only be
+ * validated, never applied. `--branch-fallback fail` stays fail-closed: a
+ * deployment that pinned a branch must not silently run whatever the developer
+ * happens to have checked out.
+ *
+ * @param {string} sourceDir
+ * @param {{branch?: string|null}} gitState
+ * @param {{branch: string|null, fallback: 'default'|'fail'}|null} branchPolicy
+ * @returns {{ matched: boolean, requested: string|null, actual: string|null }}
+ */
+export function assertLocalBranchPolicy(sourceDir, gitState, branchPolicy) {
+    const requested = branchPolicy?.branch ? String(branchPolicy.branch) : null;
+    const actual = gitState?.branch ? String(gitState.branch) : null;
+    if (!requested) return { matched: true, requested: null, actual };
+    if (actual === requested) return { matched: true, requested, actual };
+    if (branchPolicy?.fallback === 'fail') {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.branchMissing,
+            `The local achillesAgentLib checkout at ${sourceDir} is on `
+            + `${actual ? `branch '${actual}'` : 'a detached or unknown revision'}, not the requested `
+            + `branch '${requested}'. Ploinky never modifies a local checkout; check it out yourself `
+            + 'or remove it to use a managed source (--branch-fallback fail).',
+        );
+    }
+    return { matched: false, requested, actual };
 }
 
 /**
@@ -408,17 +463,25 @@ export function planSourceSelection(workspaceRoot, { fsApi = fs } = {}) {
  * @param {object} params
  * @param {string} params.workspaceRoot
  * @param {typeof fs} [params.fsApi]
- * @param {(dir: string) => {commit: string|null, dirty: boolean}} [params.readGitState]
+ * @param {(dir: string) => {commit: string|null, dirty: boolean, branch: string|null}} [params.readGitState]
+ * @param {{branch: string|null, fallback: 'default'|'fail'}|null} [params.branchPolicy]
  * @param {() => string} [params.now]
  */
-export function selectAgentLibSource({ workspaceRoot, fsApi = fs, readGitState = null, now } = {}) {
-    const root = path.resolve(workspaceRoot);
+export function selectAgentLibSource({
+    workspaceRoot,
+    fsApi = fs,
+    readGitState = null,
+    branchPolicy = null,
+    now,
+} = {}) {
+    const root = canonicalWorkspaceRoot(workspaceRoot, fsApi);
     const plan = planSourceSelection(root, { fsApi });
     if (!plan.present) {
         return { requiresMaterialization: true, mode: 'managed', candidate: plan.candidate, selection: null };
     }
     const { sourceDir } = validateAgentLibSource(plan.candidate, { fsApi });
-    const git = readGitState ? readGitState(sourceDir) : { commit: null, dirty: false };
+    const git = readGitState ? readGitState(sourceDir) : { commit: null, dirty: false, branch: null };
+    assertLocalBranchPolicy(sourceDir, git, branchPolicy);
     const selection = buildSelection({
         workspaceRoot: root,
         sourceDir,
@@ -470,7 +533,7 @@ export async function withAgentLibSourceLock(workspaceRoot, fn, {
     pollMs = 100,
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
-    const root = managedRootPath(workspaceRoot);
+    const root = managedRootPath(workspaceRoot, fsApi);
     fsApi.mkdirSync(root, { recursive: true, mode: 0o700 });
     const lockPath = path.join(root, SOURCE_LOCK_FILENAME);
     const deadline = Date.now() + timeoutMs;
