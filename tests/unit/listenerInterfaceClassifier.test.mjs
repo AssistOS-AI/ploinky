@@ -77,6 +77,38 @@ test('remote-VM host topology does not query or bind VM-only bridge gateways', a
     assert.deepEqual(calls, []);
 });
 
+test('Box topology disables nested managed-gateway polling on Linux', async () => {
+    const calls = [];
+    const scheduled = [];
+    const classifier = createListenerInterfaceClassifier({
+        workspaceRoot,
+        platform: 'linux',
+        managedGatewayDiscovery: false,
+        run(args) {
+            calls.push(args);
+            return { ok: true, stdout: '[]' };
+        },
+        schedule(callback, delay) {
+            const timer = { callback, delay, unref() {} };
+            scheduled.push(timer);
+            return timer;
+        },
+    });
+
+    const snapshot = await classifier.start();
+    assert.deepEqual(snapshot.gateways, []);
+    assert.equal(snapshot.expired, false);
+    assert.equal(classifier.classify('127.0.0.1'), 'loopback');
+    assert.equal(classifier.classify('10.89.0.1'), 'unmanaged');
+    assert.deepEqual(calls, []);
+    assert.deepEqual(scheduled, []);
+
+    await classifier.refresh({ force: true });
+    assert.deepEqual(calls, []);
+    assert.deepEqual(scheduled, []);
+    await classifier.close();
+});
+
 test('managed gateway validation rejects foreign labels and non-exact bridge state', () => {
     const options = { workspaceHash, expectedNamePrefix: `ploinky-nw-${workspaceHash}-` };
     assert.equal(validatedManagedGateway(networkRecord(), options), '10.89.0.1');
@@ -468,5 +500,9 @@ test('classifier rejects invalid refresh intervals and scheduler dependencies', 
     assert.throws(
         () => createListenerInterfaceClassifier({ schedule: null }),
         /scheduler must be callable/,
+    );
+    assert.throws(
+        () => createListenerInterfaceClassifier({ managedGatewayDiscovery: 'no' }),
+        /managed gateway discovery must be boolean/,
     );
 });

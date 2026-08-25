@@ -107,7 +107,10 @@ const runtimeRelayManager = new RuntimeRelayManager({
 });
 const detailedHealthSocket = process.env.PLOINKY_ROUTER_HEALTH_SOCKET
     || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
-const interfaceClassifier = createListenerInterfaceClassifier();
+const insideBox = isInsideBox();
+const interfaceClassifier = createListenerInterfaceClassifier({
+    managedGatewayDiscovery: !insideBox,
+});
 const routerAuthorityAttestationRegistry = createRouterAuthorityAttestationRegistry();
 
 if (Object.prototype.hasOwnProperty.call(process.env, 'PORT') && process.env.PORT !== String(port)) {
@@ -877,7 +880,7 @@ const privateListenerSet = createPrivateListenerSet({
     httpServer: privateServer,
     interfaceClassifier,
     port: privatePort,
-    wildcardHost: isInsideBox(),
+    wildcardHost: insideBox,
     audit: (event, value) => appendLog(event, value),
 });
 const cloudflaredRouterIntegration = createCloudflaredRouterIntegration({
