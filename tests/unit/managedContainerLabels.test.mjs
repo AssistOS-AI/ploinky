@@ -58,6 +58,16 @@ test('persistent agent run builder carries the exact managed label', () => {
         sharedDir: '/workspace/.ploinky/shared',
         cwd: '/workspace/.data/demo',
         cwdMountTarget: '/root',
+        // Every container admission now carries the selected achillesAgentLib grant.
+        agentLibGrant: {
+            sourceDir: '/workspace/achillesAgentLib',
+            runtimePath: '/opt/ploinky-agentlib',
+            mode: 'local',
+            fingerprint: 'a1'.repeat(32),
+            commit: '',
+            sourceIdHash: 'b2'.repeat(32),
+            namespaced: true,
+        },
     };
     const args = buildPersistentAgentRunArgs(options);
     assertExactManagedArgv(args);

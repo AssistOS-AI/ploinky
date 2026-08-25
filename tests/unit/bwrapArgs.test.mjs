@@ -11,9 +11,29 @@ import {
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
 } from '../../cli/sandbox/bwrap/bwrapServiceManager.js';
+import { AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
+import { agentLibFixture, writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
 function tempDir(prefix = 'bwrap-args-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+/**
+ * Every bwrap admission now carries the selected achillesAgentLib grant. The
+ * fixture places the source inside the workspace root so its writable alias is
+ * exercised too.
+ */
+function grantFor(root) {
+    const contract = agentLibFixture(root);
+    return {
+        sourceDir: contract.sourceDir,
+        runtimePath: AGENTLIB_STABLE_MOUNT_PATH,
+        mode: contract.mode,
+        fingerprint: contract.fingerprint,
+        commit: '',
+        sourceIdHash: contract.sourceIdHash,
+        namespaced: true,
+    };
 }
 
 function hasRoBind(args, source, target = source) {
@@ -50,6 +70,7 @@ test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind
 
         const args = buildBwrapArgs({
             agentCodePath,
+            agentLibGrant: grantFor(root),
             agentLibPath,
             nodeModulesDir,
             sharedDir,
@@ -107,6 +128,7 @@ test('buildBwrapArgs allows manifest volumes outside .ploinky', () => {
 
         const args = buildBwrapArgs({
             agentCodePath,
+            agentLibGrant: grantFor(root),
             agentLibPath,
             nodeModulesDir,
             sharedDir,
@@ -141,6 +163,7 @@ test('buildBwrapArgs enforces read-only manifest volume options', () => {
 
         const args = buildBwrapArgs({
             agentCodePath,
+            agentLibGrant: grantFor(root),
             agentLibPath,
             nodeModulesDir,
             sharedDir,
@@ -174,6 +197,7 @@ test('buildBwrapArgs uses the persistent home as /root for isolated agents', () 
 
         const args = buildBwrapArgs({
             agentCodePath,
+            agentLibGrant: grantFor(root),
             agentLibPath,
             nodeModulesDir,
             sharedDir,
@@ -244,4 +268,73 @@ test('buildShellCommand quotes argv for script pty wrapper', () => {
         buildShellCommand(['cmd', 'a b', "it's"]),
         "'cmd' 'a b' 'it'\\''s'"
     );
+});
+
+test('buildBwrapArgs grants the selected AgentLib source read-only and shadows its writable alias', () => {
+    const root = tempDir('bwrap-agentlib-');
+    try {
+        const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
+        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
+        const sharedDir = path.join(root, '.ploinky', 'shared');
+        const agentLibPath = path.join(root, 'Agent');
+        const agentHomeDir = path.join(root, '.data', 'demo');
+        const nodeRuntimePath = path.join(root, 'node-runtime');
+        for (const dir of [agentCodePath, nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir, nodeRuntimePath]) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        const grant = grantFor(root);
+
+        const args = buildBwrapArgs({
+            agentCodePath,
+            agentLibGrant: grant,
+            agentLibPath,
+            nodeModulesDir,
+            sharedDir,
+            cwd: root,
+            agentHomeDir,
+            nodeRuntimePath,
+            skillsPath: null,
+            envMap: {},
+            codeReadOnly: true,
+            skillsReadOnly: true,
+            volumes: {},
+        });
+
+        // The stable runtime path every mount namespace agrees on.
+        assert.ok(hasRoBind(args, grant.sourceDir, AGENTLIB_STABLE_MOUNT_PATH));
+
+        // The workspace is bound writable at its host-absolute path, so the same
+        // inode is reachable there; that alias must be shadowed read-only, and
+        // the shadow must come after the writable bind that creates it.
+        const alias = path.join(root, 'achillesAgentLib');
+        assert.ok(hasBind(args, root), 'the workspace bind is writable');
+        assert.ok(hasRoBind(args, grant.sourceDir, alias), 'the writable alias must be shadowed read-only');
+        const writableIndex = args.lastIndexOf(root);
+        const shadowIndex = args.lastIndexOf(alias);
+        assert.ok(shadowIndex > writableIndex, 'the shadow must be applied after the writable bind');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('buildBwrapArgs refuses admission without a selected AgentLib grant', () => {
+    const root = tempDir('bwrap-agentlib-missing-');
+    try {
+        const agentLibPath = path.join(root, 'Agent');
+        fs.mkdirSync(path.join(agentLibPath, 'node_modules'), { recursive: true });
+        assert.throws(
+            () => buildBwrapArgs({
+                agentCodePath: root,
+                agentLibPath,
+                nodeModulesDir: path.join(root, 'node_modules'),
+                sharedDir: root,
+                cwd: root,
+                envMap: {},
+                volumes: {},
+            }),
+            /requires the selected achillesAgentLib grant/,
+        );
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });

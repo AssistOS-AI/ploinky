@@ -154,6 +154,12 @@ import {
 } from '../routerAuthorityAttestation.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 import {
+    agentLibAliasShadows,
+    agentLibGrant,
+    agentLibGrantEnv,
+    agentLibRuntimeRecord,
+} from '../agentLibGrant.js';
+import {
     assertCandidateLifecycleTransition,
     isCandidateCleanupReceiptDocument,
     RUNTIME_CLEANUP_RECEIPT_VERSION,
@@ -874,8 +880,13 @@ function buildPersistentAgentRunArgs({
     cwdMountTarget,
     isolatedHome = true,
     agentHomeDir = '',
+    agentLibGrant: grant = null,
 } = {}) {
+    if (!grant) {
+        throw new Error('agent admission requires the selected achillesAgentLib grant');
+    }
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
+    const readOnlyMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const args = [
         'run', '-d', '--init', '--name', containerName,
         ...managedContainerLabelArgs(),
@@ -901,6 +912,19 @@ function buildPersistentAgentRunArgs({
     ];
     if (!isolatedHome) {
         args.push('-v', `${agentHomeDir}:/root${runtime === 'podman' ? ':z' : ''}`);
+    }
+    // The one selected achillesAgentLib source at the stable path, followed by a
+    // read-only shadow over every writable alias that already exposes the same
+    // inode. Both come after the writable binds so the shadows actually win.
+    args.push('-v', `${grant.sourceDir}:${grant.runtimePath}${readOnlyMount}`);
+    const writableBinds = [
+        ...(codeMountMode.includes('ro') ? [] : [{ hostPath: codeMountPath, runtimePath: '/code' }]),
+        { hostPath: sharedDir, runtimePath: '/shared' },
+        { hostPath: cwd, runtimePath: cwdMountTarget },
+        ...(isolatedHome || !agentHomeDir ? [] : [{ hostPath: agentHomeDir, runtimePath: '/root' }]),
+    ];
+    for (const shadow of agentLibAliasShadows(grant, writableBinds)) {
+        args.push('-v', `${shadow.hostPath}:${shadow.runtimePath}${readOnlyMount}`);
     }
     return args;
 }
@@ -1262,6 +1286,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let agentLibMountPath = AGENT_LIB_PATH;
     let codeMountPath = agentCodePath;
     const useNestedDependencyMounts = runtime !== 'podman';
+    // Container and nested-Podman agents see the selected achillesAgentLib
+    // source at the stable path inside their own mount namespace. The family
+    // alone determines that path, so this must not force a container probe on
+    // agents that need no dependency cache.
+    const containerAgentLibGrant = agentLibGrant('container');
     let podmanStagedTargetMounts = [];
     if (runtime === 'podman') {
         fs.mkdirSync(PODMAN_RUNTIME_ROOT, { recursive: true });
@@ -1313,6 +1342,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         cwdMountTarget,
         isolatedHome,
         agentHomeDir,
+        agentLibGrant: containerAgentLibGrant,
     });
     const topologyMount = edgeTopologyMount();
     fs.mkdirSync(topologyMount.source, { recursive: true, mode: 0o700 });
@@ -1484,6 +1514,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         envStrings.push(formatEnvFlag(key, value));
     }
     envStrings.push(formatEnvFlag('HOME', '/root'));
+    // The achillesAgentLib contract is asserted at the same final authoritative
+    // layer, after stripReservedAndRestoreRuntimeRouterEnvFlags has removed any
+    // config-layer attempt to point the agent at a different source.
+    for (const [key, value] of Object.entries(agentLibGrantEnv(containerAgentLibGrant))) {
+        envStrings.push(formatEnvFlag(key, value));
+    }
 
     const envFlags = flagsToArgs(envStrings);
     if (envFlags.length) args.push(...envFlags);
@@ -2041,9 +2077,23 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         type: 'agent',
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        agentLib: agentLibRuntimeRecord(containerAgentLibGrant, agentLibAliasShadows(
+            containerAgentLibGrant,
+            [
+                ...(codeMountMode.includes('ro') ? [] : [{ hostPath: codeMountPath, runtimePath: '/code' }]),
+                { hostPath: sharedDir, runtimePath: '/shared' },
+                { hostPath: cwd, runtimePath: cwdMountTarget },
+                ...(isolatedHome || !agentHomeDir ? [] : [{ hostPath: agentHomeDir, runtimePath: '/root' }]),
+            ],
+        )),
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
+                {
+                    source: containerAgentLibGrant.sourceDir,
+                    target: containerAgentLibGrant.runtimePath,
+                    ro: true,
+                },
                 { source: topologyMount.source, target: topologyMount.target, ro: true },
                 ...(generatedLaunch ? [{
                     source: generatedLaunch.descriptorHostFile,
