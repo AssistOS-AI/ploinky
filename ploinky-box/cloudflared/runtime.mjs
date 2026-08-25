@@ -12,6 +12,7 @@ import {
 import { applyEdgeRoutingGeneration } from '../../cli/sandbox/coordinatedEdgeApply.js';
 import {
     createWorkspaceMutationLease,
+    inspectWorkspaceStartLock,
     releaseWorkspaceMutationLease,
 } from '../../cli/utils/runtime/maintenanceLocks.js';
 import { writeCloudflarePublicationStatus } from './status.mjs';
@@ -37,6 +38,63 @@ function publicationRuntimeError(message, code = 'CLOUDFLARE_RUNTIME_COORDINATIO
 
 function sleepFor(delayMs) {
     return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+export async function releaseExactPublicationLease(lease, {
+    releaseWorkspaceLease = releaseWorkspaceMutationLease,
+    inspectWorkspaceLease = inspectWorkspaceStartLock,
+    audit = () => {},
+    retryDelayMs = 100,
+    sleep = sleepFor,
+    continueRetry = () => true,
+} = {}) {
+    if (!lease) return true;
+    const operation = String(lease.operation || 'cloudflare-publication');
+    const delayMs = Math.max(1, Number(retryDelayMs) || 100);
+    let failures = 0;
+    let deferred = false;
+    while (true) {
+        let released = false;
+        try {
+            released = releaseWorkspaceLease(lease);
+        } catch (_) {}
+        if (released) {
+            if (deferred) {
+                audit('cloudflare-workspace-lease-release-recovered', {
+                    operation,
+                    failures,
+                });
+            }
+            return true;
+        }
+
+        let current = null;
+        try {
+            current = inspectWorkspaceLease();
+        } catch (_) {}
+        // The exact lease is already gone if the lock is absent or a newer
+        // token owns the path. Never unlink a replacement on behalf of this
+        // completed publication.
+        if (current && !current.active) return true;
+        if (current?.lock?.token && current.lock.token !== lease.token) return true;
+
+        failures += 1;
+        if (!deferred) {
+            deferred = true;
+            audit('cloudflare-workspace-lease-release-deferred', {
+                operation,
+                failures,
+            });
+        }
+        if (!continueRetry()) {
+            audit('cloudflare-workspace-lease-release-failed', {
+                operation,
+                failures,
+            });
+            return false;
+        }
+        await sleep(delayMs);
+    }
 }
 
 function sleepForWithSignal(delayMs, signal) {
@@ -264,6 +322,9 @@ export function startCloudflarePublicationRuntime({
     retryMaximumDelayMs = 30_000,
     createWorkspaceLease = createWorkspaceMutationLease,
     releaseWorkspaceLease = releaseWorkspaceMutationLease,
+    inspectWorkspaceLease = inspectWorkspaceStartLock,
+    leaseReleaseRetryDelayMs = 100,
+    leaseReleaseSleep = sleepFor,
     inactivateInvalidGeneration = inactivateEdgeRoutingGeneration,
 } = {}) {
     const handledActivations = new Set();
@@ -318,12 +379,14 @@ export function startCloudflarePublicationRuntime({
     }
 
     function releasePublicationLease(lease) {
-        if (!lease) return;
-        if (!releaseWorkspaceLease(lease)) {
-            audit('cloudflare-workspace-lease-release-failed', {
-                operation: String(lease.operation || 'cloudflare-publication'),
-            });
-        }
+        return releaseExactPublicationLease(lease, {
+            releaseWorkspaceLease,
+            inspectWorkspaceLease,
+            audit,
+            retryDelayMs: leaseReleaseRetryDelayMs,
+            sleep: leaseReleaseSleep,
+            continueRetry: () => !stopped,
+        });
     }
 
     function retryActivationFor(input, fallbackActivationId) {
@@ -415,7 +478,7 @@ export function startCloudflarePublicationRuntime({
                 });
             } finally {
                 inFlight = null;
-                releasePublicationLease(workspaceLease);
+                await releasePublicationLease(workspaceLease);
                 if (superseded && !stopped) void scan();
             }
         }, delayMs);
@@ -446,7 +509,7 @@ export function startCloudflarePublicationRuntime({
                         return;
                     }
                 } finally {
-                    releasePublicationLease(workspaceLease);
+                    await releasePublicationLease(workspaceLease);
                 }
             }
             if (!active) return;
@@ -501,7 +564,7 @@ export function startCloudflarePublicationRuntime({
             }
         } finally {
             inFlight = null;
-            releasePublicationLease(workspaceLease);
+            await releasePublicationLease(workspaceLease);
         }
     }
 
