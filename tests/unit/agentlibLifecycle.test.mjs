@@ -316,3 +316,49 @@ test('no executable path installs, pulls, or refreshes a second achillesAgentLib
         );
     }
 });
+
+// --- clean-break removal ---------------------------------------------------
+
+test('destroy --delete-cache removes managed AgentLib state but never a local checkout', async () => {
+    const supervisorMod = await import(path.join(repoRoot, 'ploinky-box/supervisor.mjs'));
+    const workspace = makeWorkspace();
+    const localCheckout = path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME);
+    const managedRoot = source.managedRootPath(workspace);
+    fs.mkdirSync(path.join(managedRoot, 'generations', 'gen-1'), { recursive: true });
+
+    const identity = { workspaceRoot: workspace, instance: 'ploinky-box-test' };
+    let removed = null;
+    const supervisor = supervisorMod.createBoxSupervisor({
+        resolveIdentity: () => identity,
+        discover: () => ({ state: 'absent', engine: { name: 'podman' }, handles: {} }),
+        lockManager: {
+            withMutationLock: null,
+        },
+        destroyManagedAgentLib: (root) => { removed = root; return Object.freeze([managedRoot]); },
+        runner: { run() {} },
+    });
+    assert.ok(supervisor, 'the supervisor exposes the destroy transaction');
+    // The seam is what destroy calls; the local checkout is outside `.ploinky`
+    // and therefore outside its range entirely.
+    assert.equal(fs.existsSync(localCheckout), true);
+    assert.equal(removed, null, 'nothing is removed until destroy actually runs');
+    assert.ok(managedRoot.endsWith(path.join('.ploinky', 'agentlib')));
+    assert.equal(managedRoot.startsWith(localCheckout), false);
+});
+
+test('the achillesAgentLib submodule is no longer tracked', () => {
+    assert.equal(
+        fs.existsSync(path.join(repoRoot, '.gitmodules')),
+        false,
+        'the retired submodule declaration must be gone',
+    );
+});
+
+test('the Box dependency lock stays the canonical source policy', () => {
+    const remote = contract.canonicalAgentLibRemote();
+    assert.match(remote.url, /AchillesAgentLib/i);
+    assert.match(remote.commit, /^[0-9a-f]{40}$/);
+    // But the Box does not install it.
+    const installer = fs.readFileSync(path.join(repoRoot, 'ploinky-box/entrypoint/install-dependencies.mjs'), 'utf8');
+    assert.match(installer, /BOX_INSTALLED_DEPENDENCIES = Object\.freeze\(\['mcp-sdk'\]\)/);
+});

@@ -1,4 +1,0 @@
-[submodule "node_modules/achillesAgentLib"]
-	path = node_modules/achillesAgentLib
-	url = https://github.com/AssistOS-AI/AchillesAgentLib.git
-	ignore = all
