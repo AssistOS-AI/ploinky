@@ -56,6 +56,7 @@ test('persistent agent run builder carries the exact managed label', () => {
         codeMountPath: '/workspace/.ploinky/runtime/code',
         codeMountMode: ':z,ro',
         sharedDir: '/workspace/.ploinky/shared',
+        healthProbeHostDir: '/workspace/.ploinky/run/health-probes/ploinky_demo',
         cwd: '/workspace/.data/demo',
         cwdMountTarget: '/root',
         // Every container admission now carries the selected achillesAgentLib grant.
@@ -73,10 +74,18 @@ test('persistent agent run builder carries the exact managed label', () => {
     assertExactManagedArgv(args);
     assert.equal(args.filter((value) => value === '--init').length, 1);
     assert.equal(args.filter((value) => value === '--image-volume=ignore').length, 1);
+    assert.equal(
+        args.includes('/workspace/.ploinky/run/health-probes/ploinky_demo:/run/ploinky-health-probes:z'),
+        true,
+    );
 
     const dockerArgs = buildPersistentAgentRunArgs({ ...options, runtime: 'docker' });
     assertExactManagedArgv(dockerArgs);
     assert.equal(dockerArgs.includes('--image-volume=ignore'), false);
+    assert.equal(
+        dockerArgs.includes('/workspace/.ploinky/run/health-probes/ploinky_demo:/run/ploinky-health-probes'),
+        true,
+    );
 });
 
 test('both interactive create/retry command families carry the exact managed label', () => {

@@ -11,9 +11,9 @@ import {
 
 // Opt-in native regression. This host must provide rootless Podman plus the
 // immutable Box candidate image; the probe image must be an immutable Linux
-// reference with POSIX sh, /proc, setsid, grep, tr, and fractional sleep. A
-// pinned BusyBox-based Alpine image is preferred because it exercises the
-// production runner without GNU-only setsid or timeout flags.
+// reference with POSIX sh, /proc, cat, dd, grep, mkfifo, mv, rm, setsid, tr,
+// and fractional sleep. A pinned BusyBox-based Alpine image is preferred
+// because it exercises the production runner without GNU-only flags.
 // Exact command on a capable Linux/nested-Podman host, from the ploinky root:
 //   PLOINKY_BOX_REQUIRE_PODMAN=1 \
 //   PLOINKY_BOX_CANDIDATE_DIGEST=sha256:<ploinky-box image digest> \
@@ -22,7 +22,7 @@ import {
 
 const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
 
-test('native nested Podman probe timeout leaves no descendants, zombies, or exec conmon', {
+test('native detached nested-Podman probes publish bounded results and cancel without another exec', {
     timeout: 10 * 60_000,
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
@@ -38,6 +38,7 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
     const probeRoot = path.join(harness.workspace, 'health-probe-native');
     fs.mkdirSync(path.join(probeRoot, 'code'), { recursive: true });
     fs.mkdirSync(path.join(probeRoot, 'Agent', 'server'), { recursive: true });
+    fs.mkdirSync(path.join(probeRoot, 'control'), { recursive: true });
     fs.copyFileSync(
         path.join(repositoryRoot, 'Agent', 'server', 'HealthProbeRunner.sh'),
         path.join(probeRoot, 'Agent', 'server', 'HealthProbeRunner.sh'),
@@ -85,6 +86,7 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
         'podman', 'run', '-d', '--init', '--name', containerName,
         '-v', '/workspace/health-probe-native/code:/code:ro',
         '-v', '/workspace/health-probe-native/Agent:/Agent:ro',
+        '-v', '/workspace/health-probe-native/control:/run/ploinky-health-probes',
         probeImage,
         'sh', '-c', 'while :; do sleep 3600; done',
     ]);
@@ -105,62 +107,62 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
         '/usr/local/bin/node', '-e', [
             "const f=require('node:fs'),c=require('node:child_process');",
             "const countConmon=()=>f.readdirSync('/proc').filter(x=>/^\\d+$/.test(x)).filter(x=>{try{return f.readFileSync('/proc/'+x+'/comm','utf8').trim()==='conmon'}catch{return false}}).length;",
+            "const control='/workspace/health-probe-native/control/native-timeout';f.mkdirSync(control,{recursive:true});",
             'const before=countConmon();',
-            "const r=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run','/tmp/.ploinky-health-probe-native-timeout','native-timeout','hang.sh','0.2','0.2'],{encoding:'utf8',timeout:30000});",
+            "const launch=c.spawnSync('podman',['exec','--detach',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run','/run/ploinky-health-probes/native-timeout','native-timeout','hang.sh','0.2','0.2'],{encoding:'utf8',timeout:30000,killSignal:'SIGTERM'});",
+            "const resultPath=control+'/result',deadline=Date.now()+30000;while(!f.existsSync(resultPath)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25);",
+            "const status=f.existsSync(resultPath)?Number(f.readFileSync(resultPath,'utf8').trim()):null;",
             "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500);",
             'const after=countConmon();',
-            "process.stdout.write(JSON.stringify({status:r.status,error:r.error?.code||null,stdout:r.stdout,stderr:r.stderr,before,after}));",
+            "process.stdout.write(JSON.stringify({launchStatus:launch.status,launchError:launch.error?.code||null,launchStderr:launch.stderr,status,before,after}));",
         ].join(''),
         containerName,
     ]));
-    assert.equal(result.error, null, JSON.stringify(result));
-    assert.equal(result.status, 124, result.stderr);
+    assert.equal(result.launchError, null, JSON.stringify(result));
+    assert.equal(result.launchStatus, 0, result.launchStderr);
+    assert.equal(result.status, 124, JSON.stringify(result));
     assert.equal(result.after, result.before, 'the timed-out exec must not leave a conmon process');
 
     const preCancelled = JSON.parse(execInBox(harness.runner, prepared.containerId, [
         '/usr/local/bin/node', '-e', [
-            "const c=require('node:child_process');",
-            "const marker='/tmp/.ploinky-health-probe-native-pre-cancel';",
-            "const cleanup=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','cleanup',marker,'native-pre-cancel'],{encoding:'utf8',timeout:30000});",
-            "const run=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run',marker,'native-pre-cancel','ok.sh','5','1'],{encoding:'utf8',timeout:30000});",
-            "process.stdout.write(JSON.stringify({cleanupStatus:cleanup.status,cleanupError:cleanup.error?.code||null,status:run.status,error:run.error?.code||null,stdout:run.stdout,stderr:run.stderr}));",
+            "const f=require('node:fs'),c=require('node:child_process');",
+            "const control='/workspace/health-probe-native/control/native-pre-cancel';f.mkdirSync(control+'/cancelled',{recursive:true});",
+            "const launch=c.spawnSync('podman',['exec','--detach',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run','/run/ploinky-health-probes/native-pre-cancel','native-pre-cancel','ok.sh','5','1'],{encoding:'utf8',timeout:30000,killSignal:'SIGTERM'});",
+            "const resultPath=control+'/result',deadline=Date.now()+30000;while(!f.existsSync(resultPath)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25);",
+            "const status=f.existsSync(resultPath)?Number(f.readFileSync(resultPath,'utf8').trim()):null;",
+            "process.stdout.write(JSON.stringify({launchStatus:launch.status,launchError:launch.error?.code||null,launchStderr:launch.stderr,status}));",
         ].join(''),
         containerName,
     ]));
-    assert.equal(preCancelled.cleanupError, null, JSON.stringify(preCancelled));
-    assert.equal(preCancelled.cleanupStatus, 0, JSON.stringify(preCancelled));
-    assert.equal(preCancelled.error, null, JSON.stringify(preCancelled));
+    assert.equal(preCancelled.launchError, null, JSON.stringify(preCancelled));
+    assert.equal(preCancelled.launchStatus, 0, preCancelled.launchStderr);
     assert.equal(preCancelled.status, 125, 'a cancellation that wins before session setup must prevent execution');
 
-    const killedClient = JSON.parse(execInBox(harness.runner, prepared.containerId, [
+    const mountedCancellation = JSON.parse(execInBox(harness.runner, prepared.containerId, [
         '/usr/local/bin/node', '-e', [
             "const f=require('node:fs'),c=require('node:child_process');",
             "const countConmon=()=>f.readdirSync('/proc').filter(x=>/^\\d+$/.test(x)).filter(x=>{try{return f.readFileSync('/proc/'+x+'/comm','utf8').trim()==='conmon'}catch{return false}}).length;",
-            "(async()=>{",
-            "const marker='/tmp/.ploinky-health-probe-native-client-kill',token='native-client-kill';",
+            "const control='/workspace/health-probe-native/control/native-mounted-cancel',token='native-mounted-cancel';f.mkdirSync(control,{recursive:true});",
             "const before=countConmon();",
-            "const child=c.spawn('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run',marker,token,'hang.sh','30','1'],{stdio:['ignore','pipe','pipe']});",
-            "let active=false;const deadline=Date.now()+10000;",
-            "while(Date.now()<deadline){const seen=c.spawnSync('podman',['exec',process.argv[1],'sh','-c','test -d \"$1\" && find \"$1\" -maxdepth 1 -type d -name \"active-*\" | grep -q .','sh',marker],{stdio:'ignore',timeout:5000});if(seen.status===0){active=true;break}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,50)}",
-            "if(!active){child.kill('SIGKILL');throw new Error('probe session did not publish an active identity')}",
-            "child.kill('SIGKILL');",
-            "const close=await new Promise(resolve=>child.once('close',(status,signal)=>resolve({status,signal})));",
-            "const cleanup=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','cleanup',marker,token],{encoding:'utf8',timeout:30000});",
+            "const launch=c.spawnSync('podman',['exec','--detach',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run','/run/ploinky-health-probes/'+token,token,'hang.sh','30','0.2'],{encoding:'utf8',timeout:30000,killSignal:'SIGTERM'});",
+            "let active=false;const activeDeadline=Date.now()+10000;while(Date.now()<activeDeadline){try{active=f.readdirSync(control+'/session').some(name=>name.startsWith('active-'))}catch{}if(active)break;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25)}",
+            "if(active)f.mkdirSync(control+'/cancelled');",
+            "const resultPath=control+'/result',deadline=Date.now()+30000;while(!f.existsSync(resultPath)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25);",
+            "const status=f.existsSync(resultPath)?Number(f.readFileSync(resultPath,'utf8').trim()):null;",
             "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500);",
             "const after=countConmon();",
-            "process.stdout.write(JSON.stringify({active,close,cleanupStatus:cleanup.status,cleanupError:cleanup.error?.code||null,cleanupStdout:cleanup.stdout,cleanupStderr:cleanup.stderr,before,after}));",
-            "})().catch(error=>{process.stderr.write(error.stack||String(error));process.exit(1)});",
+            "process.stdout.write(JSON.stringify({active,launchStatus:launch.status,launchError:launch.error?.code||null,launchStderr:launch.stderr,status,before,after}));",
         ].join(''),
         containerName,
     ], { timeoutMs: 60_000 }));
-    assert.equal(killedClient.active, true, JSON.stringify(killedClient));
-    assert.deepEqual(killedClient.close, { status: null, signal: 'SIGKILL' });
-    assert.equal(killedClient.cleanupError, null, JSON.stringify(killedClient));
-    assert.equal(killedClient.cleanupStatus, 0, killedClient.cleanupStderr);
+    assert.equal(mountedCancellation.active, true, JSON.stringify(mountedCancellation));
+    assert.equal(mountedCancellation.launchError, null, JSON.stringify(mountedCancellation));
+    assert.equal(mountedCancellation.launchStatus, 0, mountedCancellation.launchStderr);
+    assert.equal(mountedCancellation.status, 125, JSON.stringify(mountedCancellation));
     assert.equal(
-        killedClient.after,
-        killedClient.before,
-        'external client death plus exact cleanup must not strand exec conmon',
+        mountedCancellation.after,
+        mountedCancellation.before,
+        'mounted cancellation must not strand an exec conmon',
     );
 
     const inspection = JSON.parse(execInBox(harness.runner, prepared.containerId, [
@@ -170,15 +172,15 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
 
     const processAudit = execInBox(harness.runner, prepared.containerId, [
         'podman', 'exec', containerName, 'sh', '-c', [
-            'test ! -e /tmp/.ploinky-health-probe-native-timeout',
-            'test ! -e /tmp/.ploinky-health-probe-native-pre-cancel',
-            'test ! -e /tmp/.ploinky-health-probe-native-client-kill',
+            'test ! -e /run/ploinky-health-probes/native-timeout/session',
+            'test ! -e /run/ploinky-health-probes/native-pre-cancel/session',
+            'test ! -e /run/ploinky-health-probes/native-mounted-cancel/session',
             "for p in /proc/[0-9]*; do",
             "  test -r \"$p/environ\" || continue",
             "  environment=\"$(tr '\\000' '\\n' < \"$p/environ\")\"",
             "  printf '%s\\n' \"$environment\" | grep -Fqx 'PLOINKY_PROBE_TOKEN=native-timeout:' && exit 20",
             "  printf '%s\\n' \"$environment\" | grep -Fqx 'PLOINKY_PROBE_TOKEN=native-pre-cancel:' && exit 22",
-            "  printf '%s\\n' \"$environment\" | grep -Fqx 'PLOINKY_PROBE_TOKEN=native-client-kill:' && exit 23",
+            "  printf '%s\\n' \"$environment\" | grep -Fqx 'PLOINKY_PROBE_TOKEN=native-mounted-cancel:' && exit 23",
             'done',
             "zombies=''",
             "for p in /proc/[0-9]*/stat; do",
@@ -204,18 +206,22 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
     // A subsequent probe on the same container must run normally end to end.
     const recovery = JSON.parse(execInBox(harness.runner, prepared.containerId, [
         '/usr/local/bin/node', '-e', [
-            "const c=require('node:child_process');",
-            "const r=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run','/tmp/.ploinky-health-probe-native-recovery','native-recovery','ok.sh','5','1'],{encoding:'utf8',timeout:30000});",
-            "process.stdout.write(JSON.stringify({status:r.status,error:r.error?.code||null,stdout:r.stdout,stderr:r.stderr}));",
+            "const f=require('node:fs'),c=require('node:child_process');",
+            "const control='/workspace/health-probe-native/control/native-recovery';f.mkdirSync(control,{recursive:true});",
+            "const launch=c.spawnSync('podman',['exec','--detach',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run','/run/ploinky-health-probes/native-recovery','native-recovery','ok.sh','5','1'],{encoding:'utf8',timeout:30000,killSignal:'SIGTERM'});",
+            "const resultPath=control+'/result',deadline=Date.now()+30000;while(!f.existsSync(resultPath)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25);",
+            "const status=f.existsSync(resultPath)?Number(f.readFileSync(resultPath,'utf8').trim()):null;const stdout=f.existsSync(control+'/probe-stdout')?f.readFileSync(control+'/probe-stdout','utf8'):'';",
+            "process.stdout.write(JSON.stringify({launchStatus:launch.status,launchError:launch.error?.code||null,launchStderr:launch.stderr,status,stdout}));",
         ].join(''),
         containerName,
     ]));
-    assert.equal(recovery.error, null, recovery.stderr);
+    assert.equal(recovery.launchError, null, JSON.stringify(recovery));
+    assert.equal(recovery.launchStatus, 0, recovery.launchStderr);
     assert.equal(recovery.status, 0, recovery.stderr);
     assert.equal(recovery.stdout.trim(), 'healthy');
     const recoveryAudit = execInBox(harness.runner, prepared.containerId, [
         'podman', 'exec', containerName, 'sh', '-c',
-        'test ! -e /tmp/.ploinky-health-probe-native-recovery && printf \'%s\' clean',
+        'test ! -e /run/ploinky-health-probes/native-recovery/session && printf \'%s\' clean',
     ]);
     assert.equal(recoveryAudit, 'clean', 'a successful probe must remove its own marker');
 });

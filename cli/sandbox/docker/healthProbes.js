@@ -1,5 +1,7 @@
 import { spawnSync } from 'child_process';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { parentPort } from 'worker_threads';
 import {
     getRuntime,
@@ -7,22 +9,25 @@ import {
     waitForContainerRunning,
     sleepMs
 } from './common.js';
+import { PLOINKY_DIR } from '../../utils/config.js';
 
 const DEFAULT_INTERVAL_SECONDS = 1;
 const DEFAULT_TIMEOUT_SECONDS = 5;
 const DEFAULT_FAILURE_THRESHOLD = 5;
 const DEFAULT_SUCCESS_THRESHOLD = 1;
 const DEFAULT_PROBE_KILL_GRACE_SECONDS = 1;
-const PROBE_CONTROL_PLANE_GRACE_MS = 15_000;
 const PROBE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
 const PROBE_CONTAINER_WAIT_TIMEOUT_MS = 10_000;
-const PROBE_CLEANUP_TIMEOUT_MS = 30_000;
-const DEFAULT_PROBE_CLEANUP_ATTEMPTS = 3;
-const DEFAULT_PROBE_CLEANUP_RETRY_MS = 2_000;
+const PROBE_DETACHED_LAUNCH_TIMEOUT_MS = 60_000;
+const PROBE_RESULT_GRACE_MS = 60_000;
+const PROBE_CANCELLATION_GRACE_MS = 15_000;
+const PROBE_RESULT_POLL_MS = 50;
+const PROBE_OUTPUT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
 const DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS = 10_000;
 const PROBE_RUNNER_PATH = '/Agent/server/HealthProbeRunner.sh';
-const PROBE_MARKER_PREFIX = '/tmp/.ploinky-health-probe-';
+const PROBE_CONTROL_HOST_ROOT = path.join(PLOINKY_DIR, 'run', 'health-probes');
+export const PROBE_CONTROL_CONTAINER_ROOT = '/run/ploinky-health-probes';
 const BACKOFF_BASE_DELAY_MS = 10_000;
 const BACKOFF_MAX_DELAY_MS = 300_000;
 const BACKOFF_RESET_MS = 600_000;
@@ -99,65 +104,116 @@ function probeToken(options = {}) {
     return token;
 }
 
-function cleanupExactProbe(agentName, containerName, markerPath, token, options = {}) {
-    const runtime = options.runtime || getRuntime();
-    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
-    const sleepMsImpl = options.sleepMsImpl || sleepMs;
-    const attempts = coercePositiveInteger(
-        options.cleanupAttempts,
-        DEFAULT_PROBE_CLEANUP_ATTEMPTS,
-    );
-    const retryMs = Number.isFinite(Number(options.cleanupRetryMs))
-        && Number(options.cleanupRetryMs) >= 0
-        ? Number(options.cleanupRetryMs)
-        : DEFAULT_PROBE_CLEANUP_RETRY_MS;
-    let cleanupRes;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-        cleanupRes = spawnSyncImpl(
-            runtime,
-            [
-                'exec',
-                containerName,
-                'sh',
-                PROBE_RUNNER_PATH,
-                'cleanup',
-                markerPath,
-                token,
-            ],
-            {
-                encoding: 'utf8',
-                stdio: ['ignore', 'pipe', 'pipe'],
-                timeout: options.cleanupTimeoutMs || PROBE_CLEANUP_TIMEOUT_MS,
-                killSignal: 'SIGKILL',
-            },
-        );
-        if (!cleanupRes.error && cleanupRes.status === 0) return;
-
-        const timedOut = cleanupRes.error?.code === 'ETIMEDOUT';
-        if (!timedOut || attempt === attempts) break;
-        postProbeLog(
-            'warn',
-            `[probe] ${agentName}: exact probe cleanup control plane timed out; `
-                + `retrying exact token ${attempt + 1}/${attempts}.`,
-        );
-        if (retryMs > 0) sleepMsImpl(retryMs);
+function requireContainerSegment(containerName) {
+    const segment = String(containerName || '').trim();
+    if (!segment || !/^[A-Za-z0-9._-]+$/.test(segment)) {
+        throw new Error(`[probe] invalid container name '${segment || '<missing>'}'`);
     }
+    return segment;
+}
 
-    const detail = String(
-        cleanupRes?.error?.message
-        || cleanupRes?.stderr
-        || cleanupRes?.stdout
-        || `exit ${cleanupRes?.status ?? 'unknown'}`,
-    ).trim();
-    const error = new Error(
-        `[probe] ${agentName}: exact probe cleanup failed for '${containerName}': ${detail}`,
+export function healthProbeHostDir(containerName, options = {}) {
+    const root = path.resolve(options.probeControlHostRoot || PROBE_CONTROL_HOST_ROOT);
+    return path.join(root, requireContainerSegment(containerName));
+}
+
+export function ensureHealthProbeHostDir(containerName, options = {}) {
+    const hostDir = healthProbeHostDir(containerName, options);
+    fs.mkdirSync(hostDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(hostDir, 0o700);
+    return hostDir;
+}
+
+function createProbeControl(containerName, token, options = {}) {
+    const hostDir = path.resolve(
+        options.probeControlHostDir || ensureHealthProbeHostDir(containerName, options),
     );
-    // A timed-out cleanup has not proved that the exact execution is gone.
-    // Do not let a caller mistake that uncertainty for permission to launch a
-    // second probe. The idempotent token cleanup has already exhausted its own
-    // bounded control-plane retries.
-    error.code = 'PLOINKY_PROBE_CLEANUP_FAILED';
-    throw error;
+    fs.mkdirSync(hostDir, { recursive: true, mode: 0o700 });
+    const hostPath = path.join(hostDir, token);
+    fs.mkdirSync(hostPath, { mode: 0o700 });
+    return {
+        hostPath,
+        containerPath: `${PROBE_CONTROL_CONTAINER_ROOT}/${token}`,
+        token,
+    };
+}
+
+function readBoundedFile(filePath) {
+    try {
+        const handle = fs.openSync(filePath, 'r');
+        try {
+            const stat = fs.fstatSync(handle);
+            const length = Math.min(stat.size, PROBE_OUTPUT_MAX_BYTES);
+            const buffer = Buffer.alloc(length);
+            const bytesRead = fs.readSync(handle, buffer, 0, length, 0);
+            return buffer.subarray(0, bytesRead).toString('utf8');
+        } finally {
+            fs.closeSync(handle);
+        }
+    } catch (error) {
+        if (error?.code === 'ENOENT') return '';
+        throw error;
+    }
+}
+
+function readProbeResult(control) {
+    const resultPath = path.join(control.hostPath, 'result');
+    let result;
+    try {
+        result = fs.readFileSync(resultPath, 'utf8').trim();
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+    }
+    if (!/^(?:0|[1-9][0-9]{0,2})$/.test(result)) {
+        const error = new Error(`[probe] invalid detached probe result '${result}'`);
+        error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
+        throw error;
+    }
+    const status = Number(result);
+    const probeStdout = readBoundedFile(path.join(control.hostPath, 'probe-stdout'));
+    const probeStderr = readBoundedFile(path.join(control.hostPath, 'probe-stderr'));
+    const runnerStdout = readBoundedFile(path.join(control.hostPath, 'runner-stdout'));
+    const runnerStderr = readBoundedFile(path.join(control.hostPath, 'runner-stderr'));
+    return {
+        status,
+        stdout: `${probeStdout}${runnerStdout}`,
+        stderr: `${probeStderr}${runnerStderr}`,
+    };
+}
+
+function waitForProbeResult(control, timeoutMs, options = {}) {
+    const sleepMsImpl = options.sleepMsImpl || sleepMs;
+    const nowImpl = options.nowImpl || Date.now;
+    const deadline = nowImpl() + Math.max(0, timeoutMs);
+    while (true) {
+        const result = readProbeResult(control);
+        if (result) return result;
+        const remaining = deadline - nowImpl();
+        if (remaining <= 0) return null;
+        sleepMsImpl(Math.min(PROBE_RESULT_POLL_MS, remaining));
+    }
+}
+
+function requestProbeCancellation(control) {
+    fs.mkdirSync(path.join(control.hostPath, 'cancelled'), { recursive: false, mode: 0o700 });
+}
+
+function removeCompletedProbeControl(control) {
+    fs.rmSync(control.hostPath, { recursive: true, force: true });
+}
+
+function cancelAndAwaitProbe(control, options = {}) {
+    try {
+        requestProbeCancellation(control);
+    } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+    }
+    return waitForProbeResult(
+        control,
+        options.probeCancellationGraceMs || PROBE_CANCELLATION_GRACE_MS,
+        options,
+    );
 }
 
 function runProbeWithControlPlaneRetry(agentName, operation, callback, options = {}) {
@@ -208,59 +264,102 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
     const runtime = options.runtime || getRuntime();
     const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
     const token = probeToken(options);
-    const markerPath = `${PROBE_MARKER_PREFIX}${token}`;
+    const control = createProbeControl(containerName, token, options);
     const killGraceSeconds = coercePositiveNumber(
         options.killGraceSeconds,
         DEFAULT_PROBE_KILL_GRACE_SECONDS,
     );
     const execCommand = [
         'exec',
+        '--detach',
         containerName,
         'sh',
         PROBE_RUNNER_PATH,
         'run',
-        markerPath,
+        control.containerPath,
         token,
         probe.script,
         String(probe.timeout),
         String(killGraceSeconds),
     ];
-    const execRes = spawnSyncImpl(
+    const launchRes = spawnSyncImpl(
         runtime,
         execCommand,
         {
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'pipe'],
-            timeout: Math.ceil(probe.timeout * 1000) + PROBE_CONTROL_PLANE_GRACE_MS,
-            killSignal: 'SIGKILL',
+            timeout: options.probeLaunchTimeoutMs || PROBE_DETACHED_LAUNCH_TIMEOUT_MS,
+            killSignal: 'SIGTERM',
         },
     );
-    const stdout = (execRes.stdout || '').trim();
-    const stderr = (execRes.stderr || '').trim();
-    const outerTimedOut = Boolean(execRes.error && execRes.error.code === 'ETIMEDOUT');
-    const outerCompletionUncertain = Boolean(execRes.error)
-        || typeof execRes.status !== 'number';
-    if (outerCompletionUncertain) {
-        cleanupExactProbe(agentName, containerName, markerPath, token, options);
-    }
-    if (outerTimedOut) {
+    const launchTimedOut = Boolean(launchRes.error?.code === 'ETIMEDOUT');
+    const launchCompletionUncertain = Boolean(launchRes.error)
+        || typeof launchRes.status !== 'number';
+    if (launchCompletionUncertain) {
+        const cancelledResult = cancelAndAwaitProbe(control, options);
+        if (!cancelledResult) {
+            const error = new Error(
+                `[probe] ${agentName}: detached probe launch became uncertain and exact cancellation `
+                    + `was not acknowledged for '${probe.script}'`,
+            );
+            error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
+            throw error;
+        }
+        removeCompletedProbeControl(control);
+        if (!launchTimedOut) {
+            throw new Error(
+                `[probe] ${agentName}: failed to launch '${probe.script}': `
+                    + `${launchRes.error?.message || launchRes.error}`,
+            );
+        }
         const error = new Error(
-            `[probe] ${agentName}: runtime control plane timed out while running '${probe.script}'`,
+            `[probe] ${agentName}: runtime control plane timed out while launching '${probe.script}'`,
         );
         error.code = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
         throw error;
     }
-    if (execRes.error && !outerTimedOut) {
-        throw new Error(`[probe] ${agentName}: failed to run '${probe.script}': ${execRes.error.message || execRes.error}`);
+    if (launchRes.status !== 0) {
+        const detail = String(launchRes.stderr || launchRes.stdout || `exit ${launchRes.status}`).trim();
+        removeCompletedProbeControl(control);
+        throw new Error(`[probe] ${agentName}: failed to launch '${probe.script}': ${detail}`);
     }
+
+    const completionTimeoutMs = Math.ceil(probe.timeout * 1000)
+        + Math.ceil(killGraceSeconds * 1000)
+        + (options.probeResultGraceMs || PROBE_RESULT_GRACE_MS);
+    let execRes = waitForProbeResult(control, completionTimeoutMs, options);
+    if (!execRes) {
+        execRes = cancelAndAwaitProbe(control, options);
+        if (!execRes) {
+            const error = new Error(
+                `[probe] ${agentName}: detached runner did not acknowledge exact cancellation `
+                    + `for '${probe.script}'`,
+            );
+            error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
+            throw error;
+        }
+        removeCompletedProbeControl(control);
+        const error = new Error(
+            `[probe] ${agentName}: detached runner exceeded its bounded completion window `
+                + `for '${probe.script}'`,
+        );
+        error.code = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
+        throw error;
+    }
+    removeCompletedProbeControl(control);
+
+    const stdout = (execRes.stdout || '').trim();
+    const stderr = (execRes.stderr || '').trim();
     if (execRes.status === 125) {
-        cleanupExactProbe(agentName, containerName, markerPath, token, options);
         const detail = String(stderr || stdout || 'runner exited 125').trim();
         const error = new Error(
             `[probe] ${agentName}: exact cleanup was not proved for '${probe.script}': ${detail}`,
         );
         error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
         throw error;
+    }
+    if (execRes.status === 127) {
+        throw new Error(`[probe] ${agentName}: ${probe.script} not found inside container.`);
     }
     const timedOut = execRes.status === 124;
     const exitCode = typeof execRes.status === 'number'
@@ -276,37 +375,7 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
     };
 }
 
-function ensureScriptExists(agentName, containerName, probe, options = {}) {
-    const runtime = options.runtime || getRuntime();
-    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
-    const scriptPath = `/code/${probe.script}`;
-    const exists = spawnSyncImpl(
-        runtime,
-        ['exec', containerName, 'sh', '-lc', `[ -f "${scriptPath}" ]`],
-        {
-            stdio: 'ignore',
-            timeout: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
-            killSignal: 'SIGKILL',
-        },
-    );
-
-    if (exists.error) {
-        const error = new Error(
-            `[probe] ${agentName}: unable to inspect ${probe.script}: ${exists.error.message || exists.error}`,
-        );
-        error.code = exists.error.code === 'ETIMEDOUT'
-            ? 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
-            : 'PLOINKY_PROBE_CONTROL_PLANE_FAILED';
-        throw error;
-    }
-
-    if (exists.status !== 0) {
-        throw new Error(`[probe] ${agentName}: ${probe.script} not found inside container.`);
-    }
-}
-
 function runProbeLoop(agentName, containerName, type, probe, options = {}) {
-    ensureScriptExists(agentName, containerName, probe, options);
     postProbeLog('info', `[probe] ${agentName}: ${type} probe -> script='${probe.script}', interval=${probe.interval}s, timeout=${probe.timeout}s, successThreshold=${probe.successThreshold}, failureThreshold=${probe.failureThreshold}, continuous=${probe.continuous}`);
     let consecutiveSuccesses = 0;
     let consecutiveFailures = 0;
@@ -516,7 +585,12 @@ export const __testHooks = {
     runProbeOnce,
     runContainerScriptReadiness,
     probeControlPlaneFailure,
-    cleanupExactProbe,
+    healthProbeHostDir,
+    ensureHealthProbeHostDir,
+    createProbeControl,
+    readProbeResult,
+    waitForProbeResult,
+    cancelAndAwaitProbe,
     runProbeWithControlPlaneRetry,
     asProbeControlPlaneError,
     probeToken,
@@ -532,15 +606,17 @@ export const __testConstants = {
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_FAILURE_THRESHOLD,
     DEFAULT_SUCCESS_THRESHOLD,
-    DEFAULT_PROBE_CLEANUP_ATTEMPTS,
-    DEFAULT_PROBE_CLEANUP_RETRY_MS,
     DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD,
     DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS,
     DEFAULT_PROBE_KILL_GRACE_SECONDS,
-    PROBE_CONTROL_PLANE_GRACE_MS,
-    PROBE_CLEANUP_TIMEOUT_MS,
+    PROBE_DETACHED_LAUNCH_TIMEOUT_MS,
+    PROBE_RESULT_GRACE_MS,
+    PROBE_CANCELLATION_GRACE_MS,
+    PROBE_RESULT_POLL_MS,
+    PROBE_OUTPUT_MAX_BYTES,
     PROBE_RUNNER_PATH,
-    PROBE_MARKER_PREFIX,
+    PROBE_CONTROL_HOST_ROOT,
+    PROBE_CONTROL_CONTAINER_ROOT,
     BACKOFF_BASE_DELAY_MS,
     BACKOFF_MAX_DELAY_MS,
     BACKOFF_RESET_MS
