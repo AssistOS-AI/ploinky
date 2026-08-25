@@ -129,3 +129,31 @@ export function agentLibRecordProblem(recorded, desired) {
 }
 
 export { AGENTLIB_ENV };
+
+/**
+ * Why a running runtime must not be reused for this grant, or an empty string.
+ *
+ * The AgentLib selection is not derivable from a manifest or profile, so the
+ * config-derived env hash cannot detect a changed source on its own. Every
+ * runtime family therefore compares the recorded grant explicitly: a local edit
+ * plus `ploinky restart` must replace core AND every agent, never leave them on
+ * different active selections.
+ *
+ * Only the grant identity is compared here. Alias shadows follow from the
+ * runtime's writable binds, which the caller has not necessarily recomputed at
+ * reuse time; adoption compares the full record through `agentLibRecordProblem`.
+ *
+ * @param {object} existingRecord - the persisted runtime record
+ * @param {object} grant
+ * @returns {string}
+ */
+export function agentLibReuseProblem(existingRecord, grant) {
+    const recorded = existingRecord?.agentLib;
+    if (!recorded) return 'agentLib runtime record missing';
+    for (const key of ['mode', 'fingerprint', 'sourceIdHash', 'sourceDir', 'runtimePath']) {
+        if (String(recorded[key] ?? '') !== String(grant[key] ?? '')) {
+            return `agentLib ${key} changed (${recorded[key] ?? 'null'} != ${grant[key] ?? 'null'})`;
+        }
+    }
+    return '';
+}

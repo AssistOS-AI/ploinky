@@ -101,6 +101,7 @@ import {
     agentLibAliasShadows,
     agentLibGrant,
     agentLibGrantEnv,
+    agentLibReuseProblem,
     agentLibRuntimeRecord,
 } from '../agentLibGrant.js';
 import { detectHostRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
@@ -1081,8 +1082,18 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         // Compare env hash
         const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
         const current = existingRecord.envHash || '';
+        // The AgentLib selection is not derivable from the manifest or profile,
+        // so a changed source is invisible to the env hash and must be compared
+        // on its own.
+        const agentLibProblem = agentLibReuseProblem(
+            existingRecord,
+            agentLibGrant(detectHostRuntimeKey('bwrap')),
+        );
         if (desired && desired !== current) {
             console.log(`[bwrap] ${agentName}: env hash changed, restarting...`);
+            stopBwrapProcess(containerName);
+        } else if (agentLibProblem) {
+            console.log(`[bwrap] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
             stopBwrapProcess(containerName);
         } else {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);

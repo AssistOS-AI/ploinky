@@ -157,6 +157,7 @@ import {
     agentLibAliasShadows,
     agentLibGrant,
     agentLibGrantEnv,
+    agentLibReuseProblem,
     agentLibRuntimeRecord,
 } from '../agentLibGrant.js';
 import {
@@ -2927,6 +2928,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (desired && desired !== current) {
             debugLog(`[ensureAgentService] ${agentName}: env hash changed (current=${current || '<none>'}, desired=${desired.slice(0, 12)}…), recreating container`);
             recreateReason ||= 'envHashChanged';
+        }
+    }
+
+    // The AgentLib selection lives outside the manifest and profile, so the env
+    // hash cannot see a changed source. Compare it directly: a fingerprint
+    // change must replace this container, not reuse it against old bytes.
+    if (containerExists(containerName)) {
+        const agentLibProblem = agentLibReuseProblem(existingRecord, agentLibGrant('container'));
+        if (agentLibProblem) {
+            debugLog(`[ensureAgentService] ${agentName}: ${agentLibProblem}, recreating container`);
+            recreateReason ||= 'agentLibSelectionChanged';
         }
     }
 

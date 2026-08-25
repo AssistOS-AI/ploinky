@@ -240,3 +240,69 @@ test('the reserved AgentLib environment cannot be set by a manifest or profile l
     assert.equal(env[contract.AGENTLIB_ENV.dir], undefined);
     assert.equal(env.SAFE, 'yes');
 });
+
+// --- coherent replacement across runtime families ---------------------------
+
+test('a stale fingerprint is not reusable in any runtime family', () => {
+    // The AgentLib selection lives outside the manifest and profile, so the
+    // config-derived env hash cannot see it. Every family must compare it.
+    for (const runtimeKey of [
+        'container-linux-x64-node25',
+        'bwrap-linux-x64-node25',
+        'seatbelt-darwin-arm64-node25',
+    ]) {
+        const grant = grantMod.agentLibGrant(runtimeKey, SELECTION);
+        const running = { agentLib: grantMod.agentLibRuntimeRecord(grant, []) };
+        assert.equal(grantMod.agentLibReuseProblem(running, grant), '', runtimeKey);
+
+        // A local edit changes only the content fingerprint.
+        const edited = grantMod.agentLibGrant(runtimeKey, { ...SELECTION, fingerprint: 'b2'.repeat(32) });
+        assert.match(
+            grantMod.agentLibReuseProblem(running, edited),
+            /fingerprint changed/,
+            `${runtimeKey} must replace a runtime running older AgentLib bytes`,
+        );
+
+        // Provenance and source identity are equally disqualifying.
+        assert.match(
+            grantMod.agentLibReuseProblem(running, grantMod.agentLibGrant(runtimeKey, { ...SELECTION, mode: 'managed' })),
+            /mode changed/,
+        );
+        assert.match(
+            grantMod.agentLibReuseProblem(
+                running,
+                grantMod.agentLibGrant(runtimeKey, { ...SELECTION, sourceDir: '/other/achillesAgentLib' }),
+            ),
+            /sourceIdHash changed|sourceDir changed/,
+        );
+    }
+});
+
+test('a runtime with no recorded grant is never reused', () => {
+    const grant = grantMod.agentLibGrant('container-linux-x64-node25', SELECTION);
+    assert.match(grantMod.agentLibReuseProblem({}, grant), /record missing/);
+    assert.match(grantMod.agentLibReuseProblem(undefined, grant), /record missing/);
+});
+
+test('every runtime manager consults the reuse comparison', async () => {
+    const managers = [
+        'cli/sandbox/docker/agentServiceManager.js',
+        'cli/sandbox/bwrap/bwrapServiceManager.js',
+        'cli/sandbox/seatbelt/seatbeltServiceManager.js',
+    ];
+    for (const relative of managers) {
+        const text = fs.readFileSync(path.join(repoRoot, relative), 'utf8');
+        assert.match(
+            text,
+            /agentLibReuseProblem\(/,
+            `${relative} must compare the AgentLib selection before reusing a runtime`,
+        );
+    }
+});
+
+test('the interactive container carries the same grant as the detached service', () => {
+    const text = fs.readFileSync(path.join(repoRoot, 'cli/sandbox/docker/interactive.js'), 'utf8');
+    assert.match(text, /grant\.sourceDir\}:\$\{grant\.runtimePath\}/);
+    assert.match(text, /agentLibAliasShadows\(grant/);
+    assert.match(text, /agentLibGrantEnv\(grant\)/);
+});
