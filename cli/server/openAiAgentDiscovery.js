@@ -121,7 +121,7 @@ export function buildOpenAiAgentDiscovery({ routes = {}, readManifest = readEnab
     let complete = true;
 
     for (const [routeKey, route] of Object.entries(routes || {})) {
-        if (!route || route.disabled) continue;
+        if (!route || route.disabled || route.draining) continue;
         if (!isActiveHostPort(route.hostPort)) continue;
         let manifest = null;
         try {

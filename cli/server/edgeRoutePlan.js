@@ -66,7 +66,7 @@ export function normalizeExactHost(hostHeader) {
 function exactRoute(routes, routeKey) {
     const key = String(routeKey || '');
     const route = routes?.[key];
-    return route && !route.disabled ? { routeKey: key, route } : null;
+    return route && !route.disabled && !route.draining ? { routeKey: key, route } : null;
 }
 
 function classifyHost({ host, listener, snapshot }) {
@@ -82,7 +82,8 @@ function classifyHost({ host, listener, snapshot }) {
     if (host === MANAGED_ROUTER_HOST) return null;
     const record = snapshot.compiled?.hosts?.[host];
     if (!record) return null;
-    if (snapshot.publicationState !== 'ready') {
+    const selectedRoute = snapshot.routing?.routes?.[String(record.routeKey || '')];
+    if (snapshot.publicationState !== 'ready' || selectedRoute?.draining === true) {
         return { kind: 'inactive-public', host, record };
     }
     return { kind: 'agent-root', source: 'public-host', host, record };

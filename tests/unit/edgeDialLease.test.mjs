@@ -102,6 +102,7 @@ test('aggregate MCP clients refuse a stale captured generation before dialing', 
                 routing: {
                     routes: {
                         captured: { hostPort: 9 },
+                        draining: { hostPort: 10, draining: true },
                     },
                 },
             },

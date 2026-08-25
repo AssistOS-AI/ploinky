@@ -301,7 +301,7 @@ async function handleRoutedAggregateAgentCard(req, res, routePlan) {
     }
     const apiRoutes = routePlan.lease.snapshot?.routing?.routes || {};
     const candidates = Object.entries(apiRoutes || {})
-        .filter(([, route]) => route && !route.disabled && route.hostPort);
+        .filter(([, route]) => route && !route.disabled && !route.draining && route.hostPort);
     const results = await Promise.all(candidates.map(([agentName, route]) =>
         requestAgentCard(route, agentName, req.headers, {
             beforeDial: () => routePlan?.lease?.commit?.() === true,

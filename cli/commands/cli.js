@@ -19,6 +19,11 @@ import {
     cleanupFailedPreparedRuntime,
     admitDirectAgentRuntimeManifest,
 } from './workspaceUtil.js';
+import {
+    cleanupFailedTargetedAgentRestart,
+    commitTargetedAgentRestart,
+    prepareTargetedAgentRestart,
+} from './targetedAgentRestart.js';
 import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
 import {
@@ -649,11 +654,25 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
                                 repo: resolved.repo,
                             },
                         }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+                            const agentPath = path.dirname(resolved.manifestPath);
+                            const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
+                            const transition = await prepareTargetedAgentRestart({
+                                containerName,
+                                routeKey,
+                                repoName: registryRecord?.record?.repoName || resolved.repo,
+                                shortAgentName: resolved.shortAgentName,
+                                record: registryRecord.record,
+                                networkLifecycleCapability,
+                            });
+                            let result = null;
                             try {
-                                const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
+                                result = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                                     containerName,
                                     alias: registryRecord?.record?.alias,
                                     forceRecreate: true,
+                                    instanceId: transition.identity.instanceId,
+                                    enableGeneration: transition.identity.enableGeneration,
+                                    targetedRestart: transition.targetedRestart,
                                     profileName: profileResolution.resolvedProfileName,
                                     profileResolution,
                                     routerEndpoint,
@@ -671,16 +690,15 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
                                             hostPort: result?.hostPort || 0,
                                         },
                                     });
-                                    await activatePreparedRuntimeAfterReadiness({
+                                    await commitTargetedAgentRestart({
+                                        transition,
                                         result,
-                                        routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
-                                        repoName: registryRecord?.record?.repoName || resolved.repo,
-                                        shortAgentName: resolved.shortAgentName,
-                                        agentPath: path.dirname(resolved.manifestPath),
+                                        agentPath,
                                         alias: registryRecord?.record?.alias || '',
+                                        networkLifecycleCapability,
                                     });
                                 } catch (error) {
-                                    cleanupFailedPreparedRuntime(result, error, 'manual-restart-readiness-failed');
+                                    cleanupFailedTargetedAgentRestart(result, error);
                                     throw error;
                                 }
                             } catch (routeError) {

@@ -600,7 +600,7 @@ export function createAgentRouteEntries(routePlan) {
     }
     const entries = [];
     for (const [agentName, route] of Object.entries(routes || {})) {
-        if (!route || route.disabled) continue;
+        if (!route || route.disabled || route.draining) continue;
         const port = Number(route.hostPort);
         if (!Number.isFinite(port)) continue;
         const baseUrl = `http://127.0.0.1:${port}/mcp`;

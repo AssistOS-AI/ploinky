@@ -88,6 +88,21 @@ test('single restart and reinstall delegate physical replacement to the shared r
     assert.match(reinstall, /catch \(e\) \{[\s\S]*?throw e;/);
 });
 
+test('managed single-agent restart drains before replacement and publishes only after readiness', () => {
+    const restartStart = cliSource.indexOf('// Recreate through the managed transaction');
+    const restartEnd = cliSource.indexOf("console.log('✓ Agent restarted.');", restartStart);
+    const restart = cliSource.slice(restartStart, restartEnd);
+
+    assertOrdered(restart, [
+        'await prepareTargetedAgentRestart({',
+        'targetedRestart: transition.targetedRestart',
+        'await waitForManifestReadiness({',
+        'await commitTargetedAgentRestart({',
+    ]);
+    assert.match(restart, /catch \(error\) \{[\s\S]*cleanupFailedTargetedAgentRestart\(result, error\)/);
+    assert.doesNotMatch(restart, /activatePreparedRuntimeAfterReadiness/);
+});
+
 test('sandbox ownership checks use exact runtime keys rather than short agent names', () => {
     assert.match(cliSource, /isBwrapProcessRunning\(containerName, \{/);
     assert.match(workspaceSource, /isSandboxRunningImpl\(existing\.key, \{/);
