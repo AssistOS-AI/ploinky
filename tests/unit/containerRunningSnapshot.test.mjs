@@ -41,8 +41,28 @@ test('running-container inventory fails closed on runtime errors', () => {
                 return { status: 125, stdout: '', stderr: 'runtime unavailable' };
             },
         }),
-        /cannot list running containers: runtime unavailable/,
+        (error) => {
+            assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED');
+            assert.match(error.message, /cannot list running containers: runtime unavailable/);
+            return true;
+        },
     );
+});
+
+test('running-container inventory preserves typed control-plane timeouts', () => {
+    const timeout = new Error('runtime timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(() => isContainerRunning('exact-container', {
+        runtime: 'podman',
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            return { status: null, error: timeout, stdout: '', stderr: '' };
+        },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /runtime timed out/);
+        return true;
+    });
 });
 
 test('single-container status checks are argv-safe and bounded', () => {
@@ -96,6 +116,48 @@ test('container startup inspection has per-call and aggregate deadlines', () => 
     assert.ok(calls.every(({ options }) => options.timeout > 0 && options.timeout <= 17));
     assert.ok(calls.every(({ options }) => options.killSignal === 'SIGKILL'));
     assert.deepEqual(sleeps, [1]);
+});
+
+test('container startup inspection can preserve an all-timeout control-plane failure', () => {
+    const timeout = new Error('inspect timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(() => waitForContainerRunning('slow-container', 2, 1, {
+        runtime: 'podman',
+        timeoutMs: 17,
+        totalTimeoutMs: 50,
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            return { status: null, error: timeout, stdout: '', stderr: '' };
+        },
+        sleepMsImpl() {},
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /inspect timed out/);
+        return true;
+    });
+});
+
+test('container startup inspection preserves final control-plane uncertainty after a valid response', () => {
+    const timeout = new Error('inspect timed out after initial response');
+    timeout.code = 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT';
+    let attempt = 0;
+    assert.throws(() => waitForContainerRunning('slow-container', 2, 1, {
+        runtime: 'podman',
+        timeoutMs: 17,
+        totalTimeoutMs: 50,
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            attempt += 1;
+            return attempt === 1
+                ? { status: 0, stdout: 'created\n', stderr: '' }
+                : { status: null, error: timeout, stdout: '', stderr: '' };
+        },
+        sleepMsImpl() {},
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /inspect timed out after initial response/);
+        return true;
+    });
 });
 
 test('sixteen container targets share one status snapshot in an actual monitor tick', () => {

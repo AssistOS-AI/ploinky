@@ -332,6 +332,7 @@ function isContainerRunning(containerName, options = {}) {
         return running;
     } catch (error) {
         debugLog(`Unable to prove container '${containerName}' is running: ${error?.message || error}`);
+        if (options.throwOnControlPlaneError) throw error;
         return false;
     }
 }
@@ -357,7 +358,11 @@ function listRunningContainerNames(options = {}) {
             || result.stdout
             || `exit ${result.status ?? 'unknown'}`,
         ).trim();
-        throw new Error(`cannot list running containers: ${detail}`);
+        const error = new Error(`cannot list running containers: ${detail}`);
+        error.code = result.error?.code === 'ETIMEDOUT'
+            ? 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
+            : 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
+        throw error;
     }
     return new Set(
         String(result.stdout || '')
@@ -628,6 +633,7 @@ function waitForContainerRunning(containerName, maxAttempts = 20, delayMs = 250,
     const totalTimeoutMs = options.totalTimeoutMs
         || Math.max(1, maxAttempts * Math.max(1, delayMs));
     const deadline = Date.now() + totalTimeoutMs;
+    let lastControlPlaneError = null;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) break;
@@ -651,11 +657,27 @@ function waitForContainerRunning(containerName, maxAttempts = 20, delayMs = 250,
             if (!result.error && result.status === 0 && status === 'running') {
                 return true;
             }
-        } catch (_) {}
+            if (result.error) {
+                lastControlPlaneError = result.error;
+            } else if (typeof result.status === 'number') {
+                lastControlPlaneError = null;
+            }
+        } catch (error) {
+            lastControlPlaneError = error;
+        }
         const remainingAfterInspectMs = deadline - Date.now();
         if (attempt + 1 < maxAttempts && remainingAfterInspectMs > 0) {
             sleepMsImpl(Math.min(delayMs, remainingAfterInspectMs));
         }
+    }
+    if (options.throwOnControlPlaneError && lastControlPlaneError) {
+        const detail = lastControlPlaneError?.message || String(lastControlPlaneError);
+        const error = new Error(`cannot inspect container '${containerName}' running state: ${detail}`);
+        error.code = lastControlPlaneError?.code === 'ETIMEDOUT'
+            || lastControlPlaneError?.code === 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
+            ? 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
+            : 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
+        throw error;
     }
     return false;
 }

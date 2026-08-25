@@ -116,9 +116,25 @@ function cleanupExactProbe(agentName, containerName, markerPath, token, options 
         const error = new Error(
             `[probe] ${agentName}: exact probe cleanup failed for '${containerName}': ${detail}`,
         );
-        error.code = 'PLOINKY_PROBE_CLEANUP_FAILED';
+        error.code = cleanupRes.error?.code === 'ETIMEDOUT'
+            ? 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
+            : 'PLOINKY_PROBE_CLEANUP_FAILED';
         throw error;
     }
+}
+
+function asProbeControlPlaneError(agentName, operation, sourceError) {
+    if (String(sourceError?.code || '').startsWith('PLOINKY_PROBE_CONTROL_PLANE_')) {
+        return sourceError;
+    }
+    const error = new Error(
+        `[probe] ${agentName}: ${operation}: ${sourceError?.message || sourceError}`,
+    );
+    error.code = sourceError?.code === 'ETIMEDOUT'
+        || sourceError?.code === 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
+        ? 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
+        : 'PLOINKY_PROBE_CONTROL_PLANE_FAILED';
+    return error;
 }
 
 function runProbeOnce(agentName, containerName, probe, options = {}) {
@@ -160,6 +176,13 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
     if (outerCompletionUncertain) {
         cleanupExactProbe(agentName, containerName, markerPath, token, options);
     }
+    if (outerTimedOut) {
+        const error = new Error(
+            `[probe] ${agentName}: runtime control plane timed out while running '${probe.script}'`,
+        );
+        error.code = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
+        throw error;
+    }
     if (execRes.error && !outerTimedOut) {
         throw new Error(`[probe] ${agentName}: failed to run '${probe.script}': ${execRes.error.message || execRes.error}`);
     }
@@ -172,7 +195,7 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
         error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
         throw error;
     }
-    const timedOut = outerTimedOut || execRes.status === 124;
+    const timedOut = execRes.status === 124;
     const exitCode = typeof execRes.status === 'number'
         ? execRes.status
         : (timedOut ? 124 : 125);
@@ -222,9 +245,16 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
     let consecutiveFailures = 0;
     while (true) {
         const isContainerRunningImpl = options.isContainerRunningImpl || isContainerRunning;
-        if (!isContainerRunningImpl(containerName, {
-            timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
-        })) {
+        let containerRunning = false;
+        try {
+            containerRunning = isContainerRunningImpl(containerName, {
+                timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
+                throwOnControlPlaneError: true,
+            });
+        } catch (error) {
+            throw asProbeControlPlaneError(agentName, 'unable to inspect container running state', error);
+        }
+        if (!containerRunning) {
             return {
                 status: 'failed',
                 reason: 'container exited',
@@ -352,10 +382,17 @@ function ensureReadiness(agentName, containerName, probe, options = {}) {
 
 export function runHealthProbes(agentName, containerName, manifest = {}, options = {}) {
     const waitForRunning = options.waitForContainerRunningImpl || waitForContainerRunning;
-    if (!waitForRunning(containerName, 40, 250, {
-        timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
-        totalTimeoutMs: options.containerWaitTimeoutMs || PROBE_CONTAINER_WAIT_TIMEOUT_MS,
-    })) {
+    let containerRunning = false;
+    try {
+        containerRunning = waitForRunning(containerName, 40, 250, {
+            timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
+            totalTimeoutMs: options.containerWaitTimeoutMs || PROBE_CONTAINER_WAIT_TIMEOUT_MS,
+            throwOnControlPlaneError: true,
+        });
+    } catch (error) {
+        throw asProbeControlPlaneError(agentName, 'unable to wait for container running state', error);
+    }
+    if (!containerRunning) {
         throw new Error(`[probe] ${agentName}: failed to start; container is not running.`);
     }
 
@@ -402,6 +439,7 @@ export const __testHooks = {
     runProbeOnce,
     runContainerScriptReadiness,
     cleanupExactProbe,
+    asProbeControlPlaneError,
     probeToken,
     computeBackoffDelay,
     maybeResetBackoff,
