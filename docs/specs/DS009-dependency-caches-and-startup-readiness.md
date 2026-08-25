@@ -78,6 +78,8 @@ A dependency marked `noWait` may continue in a detached worker only after the ma
 
 A no-wait worker must publish a terminal ready, failed, or superseded state. It must not activate a raw route candidate, overlap a blocking generation mutation, adopt a changed runtime, hide readiness failure, or survive the disablement of its exact registry identity. The synchronous `start` command may return after every blocking graph node and additional synchronous agent is ready and each no-wait worker has been spawned or has published its spawn failure. No-wait launch, readiness, route activation, and terminal status continue asynchronously and remain observable through their run-scoped status and log records. A higher-level managed Box readiness gate may additionally require declared external health checks before it reports the complete Box ready.
 
+A no-wait worker that resumes after an unlocked cold-cache operation may observe either an inactive selector or routing sources that a peer has changed but not yet captured in a new active generation. It must release the workspace mutation lease, retry only those two transient observations within one bounded lifecycle deadline, and recapture the exact current active generation before creating, adopting, inspecting, or publishing a runtime. Corrupt generations, invalid identities, and every other lifecycle error fail immediately; a source-changing observation is never accepted as authority.
+
 ### Cache and startup rationale
 
 | Decision | Reason |
