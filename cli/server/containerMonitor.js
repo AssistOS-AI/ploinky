@@ -46,6 +46,12 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROBE_WORKER_URL = new URL('./probeWorker.js', import.meta.url);
+const DEFAULT_MAX_CONCURRENT_PROBE_WORKERS = 2;
+const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
+const DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS = 10_000;
+const RETRYABLE_PROBE_ERROR_CODES = new Set([
+    'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT',
+]);
 const LOGGED_RESTART_FAILURES = new WeakSet();
 const TERMINAL_POLICY_CODES = new Set([
     'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
@@ -236,6 +242,9 @@ function createContainerTarget(info, monitor) {
         probeState: 'pending',
         probeWorker: null,
         probeLastSuccessAt: null,
+        probeControlPlaneFailures: 0,
+        probeRetryNotBefore: null,
+        probeConcurrencyDeferred: false,
         attemptEpoch: 0,
         restartInputDigest: info.restartInputDigest,
         runtimeAdmission: info.runtimeAdmission,
@@ -355,6 +364,69 @@ function stopProbeWorker(target) {
     }
 }
 
+function resetProbeControlPlaneDeferral(target) {
+    if (!target) return;
+    target.probeControlPlaneFailures = 0;
+    target.probeRetryNotBefore = null;
+}
+
+function activeProbeWorkerCount(monitor) {
+    if (!monitor?.targets) return 0;
+    let count = 0;
+    for (const current of monitor.targets.values()) {
+        if (current?.probeWorker) count += 1;
+    }
+    return count;
+}
+
+function deferRetryableProbeFailure(monitor, target, message, code) {
+    if (!RETRYABLE_PROBE_ERROR_CODES.has(code)) return false;
+    if (deferMonitorWorkForMaintenance(monitor, target)) return true;
+
+    const threshold = positiveInteger(
+        monitor?.config?.PROBE_CONTROL_PLANE_FAILURE_THRESHOLD
+            ?? process.env.PLOINKY_CONTAINER_MONITOR_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD,
+        DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD,
+    );
+    const failures = (target.probeControlPlaneFailures || 0) + 1;
+    target.probeControlPlaneFailures = failures;
+
+    if (failures >= threshold) {
+        logEvent(monitor, 'error', 'container_probe_control_plane_exhausted', {
+            container: target.containerName,
+            agent: target.agentName,
+            repo: target.repoName,
+            error: message,
+            code,
+            failures,
+            threshold,
+        });
+        resetProbeControlPlaneDeferral(target);
+        return false;
+    }
+
+    const retryMs = positiveInteger(
+        monitor?.config?.PROBE_CONTROL_PLANE_RETRY_MS
+            ?? process.env.PLOINKY_CONTAINER_MONITOR_PROBE_CONTROL_PLANE_RETRY_MS,
+        DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS,
+    );
+    const delayMs = retryMs * failures;
+    target.probeState = 'pending';
+    target.lastError = message;
+    target.probeRetryNotBefore = Date.now() + delayMs;
+    logEvent(monitor, 'warn', 'container_probe_control_plane_deferred', {
+        container: target.containerName,
+        agent: target.agentName,
+        repo: target.repoName,
+        error: message,
+        code,
+        failures,
+        threshold,
+        delayMs,
+    });
+    return true;
+}
+
 function handleProbeFailure(monitor, target, message, { runtimeHealth = false } = {}) {
     if (!monitor || !target) return;
     // A manually managed replacement may be running before its declared
@@ -362,6 +434,7 @@ function handleProbeFailure(monitor, target, message, { runtimeHealth = false } 
     // during that transaction: treating the expected not-ready interval as a
     // failure would inactivate the exact generation owned by the maintainer.
     if (deferMonitorWorkForMaintenance(monitor, target)) return;
+    resetProbeControlPlaneDeferral(target);
     target.probeState = 'failed';
     target.lastError = message;
     target.probeFailures = (target.probeFailures || 0) + 1;
@@ -393,6 +466,8 @@ export function startProbeWorker(monitor, target) {
     if (target.circuitBreakerTripped) return;
     if (deferMonitorWorkForMaintenance(monitor, target)) return;
     if (target.probeWorker || target.probeState === 'success') return;
+    if (Number(target.probeRetryNotBefore) > Date.now()) return;
+    target.probeRetryNotBefore = null;
 
     let manifest;
     try {
@@ -404,9 +479,29 @@ export function startProbeWorker(monitor, target) {
     }
 
     if (!manifest || typeof manifest !== 'object' || !manifest.health) {
+        resetProbeControlPlaneDeferral(target);
         target.probeState = 'success';
         return;
     }
+
+    const maxConcurrentWorkers = positiveInteger(
+        monitor?.config?.MAX_CONCURRENT_PROBE_WORKERS
+            ?? process.env.PLOINKY_CONTAINER_MONITOR_MAX_CONCURRENT_PROBE_WORKERS,
+        DEFAULT_MAX_CONCURRENT_PROBE_WORKERS,
+    );
+    if (activeProbeWorkerCount(monitor) >= maxConcurrentWorkers) {
+        if (!target.probeConcurrencyDeferred) {
+            target.probeConcurrencyDeferred = true;
+            logEvent(monitor, 'debug', 'container_probe_concurrency_deferred', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                maxConcurrentWorkers,
+            });
+        }
+        return;
+    }
+    target.probeConcurrencyDeferred = false;
 
     try {
         const WorkerClass = monitor.Worker || Worker;
@@ -448,6 +543,7 @@ export function startProbeWorker(monitor, target) {
         }
         if (msg.status === 'success') {
             if (deferMonitorWorkForMaintenance(monitor, target)) return;
+            resetProbeControlPlaneDeferral(target);
             target.probeState = 'success';
             target.probeLastSuccessAt = Date.now();
             logEvent(monitor, 'info', 'container_probe_succeeded', {
@@ -459,6 +555,7 @@ export function startProbeWorker(monitor, target) {
         } else if (msg.status === 'error') {
             stopProbeWorker(target);
             const message = msg.error || 'Probe worker reported failure.';
+            if (deferRetryableProbeFailure(monitor, target, message, msg.code)) return;
             handleProbeFailure(monitor, target, message, { runtimeHealth: true });
         }
     });
@@ -607,6 +704,7 @@ function deferMonitorWorkForMaintenance(monitor, target) {
     // acquired. Terminate it and discard any earlier success timestamp so the
     // first post-maintenance tick performs a fresh semantic probe.
     stopProbeWorker(target);
+    resetProbeControlPlaneDeferral(target);
     target.probeState = 'pending';
     target.probeLastSuccessAt = null;
     return true;
@@ -778,6 +876,7 @@ export function syncManagedContainers(monitor) {
                 target.restartHistory = [];
                 target.circuitBreakerTripped = false;
                 target.currentBackoff = monitorRef?.config?.INITIAL_BACKOFF_MS ?? 1000;
+                resetProbeControlPlaneDeferral(target);
             }
             target.agentName = agentName;
             target.repoName = repoName;
@@ -1333,6 +1432,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                     }
 
                     stopProbeWorker(target);
+                    resetProbeControlPlaneDeferral(target);
                     target.probeState = 'pending';
 
                     const now = Date.now();

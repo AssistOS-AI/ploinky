@@ -10,6 +10,7 @@ import {
     readNoWaitStatus,
     startProbeWorker,
 } from '../../cli/server/containerMonitor.js';
+import { serializeProbeError } from '../../cli/server/probeWorker.js';
 
 function monitorRecorder() {
     const events = [];
@@ -381,6 +382,7 @@ test('a probe worker error inactivates routing and schedules managed recovery', 
     worker.emit('message', {
         status: 'error',
         error: '[probe] readiness-failure-agent: readiness probe failed (exit 1); managed restart required',
+        code: 'PLOINKY_READINESS_FAILED',
     });
 
     assert.equal(target.probeState, 'failed');
@@ -399,6 +401,187 @@ test('a probe worker error inactivates routing and schedules managed recovery', 
     clearTimeout(target.pendingRestartTimer);
     target.pendingRestartTimer = null;
     target.isRestarting = false;
+});
+
+test('probe workers preserve typed control-plane failures for monitor policy', () => {
+    const error = new Error('podman inspection timed out');
+    error.code = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
+
+    assert.deepEqual(serializeProbeError(error), {
+        status: 'error',
+        error: 'podman inspection timed out',
+        code: 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT',
+    });
+    assert.deepEqual(serializeProbeError(new Error('semantic failure')), {
+        status: 'error',
+        error: 'semantic failure',
+    });
+});
+
+test('a transient probe control-plane timeout preserves active routing and retries', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-probe-timeout-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const manifestPath = path.join(workspace, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify({
+        health: { readiness: { script: 'healthcheck.sh' } },
+    }));
+
+    class FakeWorker extends EventEmitter {
+        postMessage() {}
+        terminate() { return Promise.resolve(0); }
+    }
+
+    const { monitor, events } = monitorRecorder();
+    const inactivations = [];
+    monitor.Worker = FakeWorker;
+    monitor.inactivateEdgeRoutingGeneration = (reason) => inactivations.push(reason);
+    const target = {
+        containerName: 'transient-timeout-container',
+        agentName: 'transient-timeout-agent',
+        repoName: 'demo-repo',
+        manifestPath,
+        probeWorker: null,
+        probeState: 'pending',
+        restartHistory: [],
+        currentBackoff: 60_000,
+        isRestarting: false,
+        pendingRestartTimer: null,
+        circuitBreakerTripped: false,
+    };
+
+    startProbeWorker(monitor, target);
+    target.probeWorker.emit('message', {
+        status: 'error',
+        error: 'spawnSync podman ETIMEDOUT',
+        code: 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT',
+    });
+
+    assert.equal(target.probeState, 'pending');
+    assert.equal(target.probeWorker, null);
+    assert.equal(target.probeControlPlaneFailures, 1);
+    assert.ok(target.probeRetryNotBefore > Date.now());
+    assert.equal(target.isRestarting, false);
+    assert.equal(target.pendingRestartTimer, null);
+    assert.deepEqual(inactivations, []);
+    assert.ok(events.some(({ level, event, data }) => (
+        level === 'warn'
+        && event === 'container_probe_control_plane_deferred'
+        && data.code === 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
+        && data.failures === 1
+    )));
+    assert.equal(events.some(({ event }) => event === 'container_probe_failed'), false);
+});
+
+test('repeated probe control-plane timeouts eventually fail closed', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-probe-timeout-threshold-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const manifestPath = path.join(workspace, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify({
+        health: { readiness: { script: 'healthcheck.sh' } },
+    }));
+
+    class FakeWorker extends EventEmitter {
+        postMessage() {}
+        terminate() { return Promise.resolve(0); }
+    }
+
+    const { monitor, events } = monitorRecorder();
+    const inactivations = [];
+    monitor.Worker = FakeWorker;
+    monitor.config.INITIAL_BACKOFF_MS = 60_000;
+    monitor.config.PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
+    monitor.config.PROBE_CONTROL_PLANE_RETRY_MS = 1;
+    monitor.inactivateEdgeRoutingGeneration = (reason) => inactivations.push(reason);
+    const target = {
+        containerName: 'persistent-timeout-container',
+        agentName: 'persistent-timeout-agent',
+        repoName: 'demo-repo',
+        manifestPath,
+        probeWorker: null,
+        probeState: 'pending',
+        restartHistory: [],
+        currentBackoff: 60_000,
+        isRestarting: false,
+        pendingRestartTimer: null,
+        circuitBreakerTripped: false,
+    };
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        target.probeRetryNotBefore = null;
+        startProbeWorker(monitor, target);
+        assert.ok(target.probeWorker instanceof FakeWorker);
+        target.probeWorker.emit('message', {
+            status: 'error',
+            error: `podman timeout ${attempt}`,
+            code: 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT',
+        });
+        if (attempt < 3) {
+            assert.equal(target.probeState, 'pending');
+            assert.deepEqual(inactivations, []);
+        }
+    }
+
+    assert.equal(target.probeState, 'failed');
+    assert.equal(target.isRestarting, true);
+    assert.ok(target.pendingRestartTimer);
+    assert.deepEqual(inactivations, [
+        'continuous-runtime-probe-failed:persistent-timeout-container',
+    ]);
+    assert.ok(events.some(({ event, data }) => (
+        event === 'container_probe_control_plane_exhausted'
+        && data.failures === 3
+        && data.threshold === 3
+    )));
+
+    clearTimeout(target.pendingRestartTimer);
+    target.pendingRestartTimer = null;
+    target.isRestarting = false;
+});
+
+test('probe worker concurrency is bounded and deferred targets start when capacity opens', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-probe-concurrency-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const manifestPath = path.join(workspace, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify({
+        health: { readiness: { script: 'healthcheck.sh' } },
+    }));
+
+    class FakeWorker extends EventEmitter {
+        postMessage() {}
+        terminate() { return Promise.resolve(0); }
+    }
+
+    const { monitor, events } = monitorRecorder();
+    monitor.Worker = FakeWorker;
+    monitor.config.MAX_CONCURRENT_PROBE_WORKERS = 2;
+    monitor.targets.set('active-one', { probeWorker: { active: true } });
+    monitor.targets.set('active-two', { probeWorker: { active: true } });
+    const target = {
+        containerName: 'deferred-container',
+        agentName: 'deferred-agent',
+        repoName: 'demo-repo',
+        manifestPath,
+        probeWorker: null,
+        probeState: 'pending',
+    };
+    monitor.targets.set(target.containerName, target);
+
+    startProbeWorker(monitor, target);
+
+    assert.equal(target.probeWorker, null);
+    assert.equal(target.probeState, 'pending');
+    assert.ok(events.some(({ event, data }) => (
+        event === 'container_probe_concurrency_deferred'
+        && data.maxConcurrentWorkers === 2
+    )));
+
+    monitor.targets.get('active-one').probeWorker = null;
+    startProbeWorker(monitor, target);
+
+    assert.ok(target.probeWorker instanceof FakeWorker);
+    assert.equal(target.probeState, 'running');
+    target.probeWorker.emit('message', { status: 'success' });
+    assert.equal(target.probeState, 'success');
 });
 
 test('no-wait marker identities must be real JSON numbers, not coercible values', (t) => {
