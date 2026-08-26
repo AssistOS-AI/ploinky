@@ -261,6 +261,96 @@ test('direct start commits active.json only after graph attestation and source r
     assert.equal(events[2][1], selection);
 });
 
+test('direct start preserves an inactive diagnostic Router after a core graph failure', async () => {
+    const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
+    const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
+    const workspace = makeWorkspace();
+    const selection = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: path.join(workspace, 'achillesAgentLib'),
+        mode: 'local',
+    });
+    const env = { PLOINKY_WORKSPACE_ROOT: workspace };
+    const coreCalls = [];
+    let attested = false;
+    let committed = false;
+    await assert.rejects(
+        launchCli(['start', 'demo'], {
+            env,
+            bootstrapAgentLibImpl: async () => {
+                Object.assign(env, contract.agentLibRuntimeEnv(selection, selection.sourceDir));
+                return { owned: true, selection };
+            },
+            readActiveImpl: () => null,
+            importCoreImpl: async () => ({
+                runCoreCli: async (args) => {
+                    coreCalls.push(args);
+                    throw new Error('dependency readiness failed');
+                },
+            }),
+            attestDeploymentImpl: () => { attested = true; },
+            writeActiveImpl: () => { committed = true; },
+        }),
+        /dependency readiness failed/,
+    );
+    assert.deepEqual(coreCalls, [['start', 'demo']]);
+    assert.equal(attested, false);
+    assert.equal(committed, false);
+});
+
+test('direct start restores a different prior AgentLib selection after a core graph failure', async () => {
+    const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
+    const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
+    const workspace = makeWorkspace();
+    const prior = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: path.join(workspace, 'achillesAgentLib'),
+        mode: 'local',
+    });
+    const candidateDir = path.join(workspace, '.ploinky', 'agentlib', 'generations', 'failed-start');
+    writeAgentLibCheckout(candidateDir);
+    const candidate = buildSelection({
+        workspaceRoot: workspace,
+        sourceDir: candidateDir,
+        mode: 'managed',
+        remoteUrl: 'https://example.invalid/achillesAgentLib.git',
+        resolvedCommit: '3'.repeat(40),
+    });
+    const env = { PLOINKY_WORKSPACE_ROOT: workspace };
+    const coreCalls = [];
+    let staged = null;
+    let activation = null;
+    await assert.rejects(
+        launchCli(['start', 'demo'], {
+            env,
+            bootstrapAgentLibImpl: async () => {
+                Object.assign(env, contract.agentLibRuntimeEnv(candidate, candidate.sourceDir));
+                return { owned: true, selection: candidate };
+            },
+            readActiveImpl: () => prior,
+            importCoreImpl: async () => ({
+                runCoreCli: async (args) => {
+                    coreCalls.push(args);
+                    if (args[0] === 'start') throw new Error('dependency readiness failed');
+                    return 0;
+                },
+            }),
+            writeTransactionImpl: (_workspaceRoot, selection) => { staged = selection; },
+            spawnActivationImpl: (command, args, options) => {
+                activation = { command, args, options };
+                return { status: 0 };
+            },
+        }),
+        /dependency readiness failed/,
+    );
+    assert.deepEqual(coreCalls, [['start', 'demo'], ['stop']]);
+    assert.equal(staged.contentFingerprint, prior.contentFingerprint);
+    assert.deepEqual(staged.sourceId, prior.sourceId);
+    assert.equal(activation.command, process.execPath);
+    assert.deepEqual(activation.args.slice(-2), ['--agentlib-activate-transaction', 'restart']);
+    assert.equal(activation.options.env.PLOINKY_WORKSPACE_ROOT, workspace);
+});
+
 test('direct start tears down a failed admission and never commits the candidate', async () => {
     const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
     const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));

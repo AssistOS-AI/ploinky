@@ -15,7 +15,9 @@ import {
 import { RelayRequestMinter } from '../../cli/server/runtimeRelay/relayRequestMinter.js';
 import {
     RuntimeRelayManager,
+    openRuntimeRelayExecTransport,
     openRuntimeRelaySocketTransport,
+    openRuntimeRelayTransport,
     resolveRuntimeRelaySocket,
 } from '../../cli/server/runtimeRelay/RuntimeRelayManager.js';
 import { NETWORK_LABELS } from '../../cli/sandbox/networkLifecycle.js';
@@ -140,6 +142,61 @@ test('runtime relay production transport verifies and connects the exact private
     });
     transport.stdin.write('socket-transport-ok');
     assert.equal(String(await echoed), 'socket-transport-ok');
+});
+
+test('direct macOS relay transport uses exact immutable runtime exec identity', () => {
+    const fakeTransport = { stdin: {}, stdout: {}, kill() {} };
+    const calls = [];
+    const relay = {
+        runtime: 'podman',
+        containerId: CONTAINER_ID,
+    };
+    const transport = openRuntimeRelayTransport({
+        platform: 'darwin',
+        relay,
+        spawnProcess: (...args) => {
+            calls.push(args);
+            return fakeTransport;
+        },
+    });
+    assert.equal(transport, fakeTransport);
+    assert.deepEqual(calls, [[
+        'podman',
+        [
+            'exec', '-i', CONTAINER_ID,
+            'node', '/Agent/server/RuntimeHttpRelay.mjs', 'stdio',
+        ],
+        { stdio: ['pipe', 'pipe', 'pipe'] },
+    ]]);
+});
+
+test('direct macOS relay transport rejects non-exact runtime identity', () => {
+    assert.throws(() => openRuntimeRelayExecTransport({
+        relay: { runtime: 'podman', containerId: 'container-name' },
+        spawnProcess: () => assert.fail('invalid identity must not spawn'),
+    }), /direct macOS transport identity is invalid/);
+    assert.throws(() => openRuntimeRelayExecTransport({
+        relay: { runtime: 'ssh', containerId: CONTAINER_ID },
+        spawnProcess: () => assert.fail('invalid runtime must not spawn'),
+    }), /direct macOS transport identity is invalid/);
+});
+
+test('Linux relay transport remains on the exact private control socket', async () => {
+    const fakeTransport = { stdin: {}, stdout: {}, kill() {} };
+    const calls = [];
+    const transport = await openRuntimeRelayTransport({
+        platform: 'linux',
+        endpoint: TEST_RELAY_ENDPOINT,
+        timeoutMs: 1_000,
+        openSocketTransport: async (options) => {
+            calls.push(options);
+            return fakeTransport;
+        },
+        spawnProcess: () => assert.fail('Linux transport must not create an OCI exec session'),
+    });
+    assert.equal(transport, fakeTransport);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].endpoint, TEST_RELAY_ENDPOINT);
 });
 
 test('runtime relay starts with only the tracked Agent library available', () => {

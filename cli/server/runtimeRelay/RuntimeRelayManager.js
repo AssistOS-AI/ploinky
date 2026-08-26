@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -153,6 +153,34 @@ export function openRuntimeRelaySocketTransport({ endpoint, timeoutMs }) {
         socket.once('error', onError);
         socket.once('connect', onConnect);
     });
+}
+
+export function openRuntimeRelayExecTransport({ relay, spawnProcess = spawn }) {
+    const runtime = String(relay?.runtime || '').trim();
+    const containerId = String(relay?.containerId || '').trim().toLowerCase();
+    if (!['docker', 'podman'].includes(runtime) || !/^[a-f0-9]{64}$/.test(containerId)) {
+        throw new Error('runtimeRelay: direct macOS transport identity is invalid');
+    }
+    return spawnProcess(runtime, [
+        'exec', '-i', containerId,
+        'node', '/Agent/server/RuntimeHttpRelay.mjs', 'stdio',
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+export function openRuntimeRelayTransport(options = {}) {
+    const platform = String(options.platform || process.platform);
+    if (platform === 'darwin') {
+        // Public Ploinky runs the Router inside the Linux Box, where the exact
+        // bind-mounted Unix socket is connectable and remains exec-free. The
+        // internal ploinky-local lifecycle tests run directly on macOS while
+        // their containers live in a Linux VM: the projected socket keeps its
+        // inode and mode but cannot cross that kernel boundary (ECONNREFUSED).
+        // Preserve direct local development by using the authenticated stdio
+        // helper against the already-inspected immutable container identity.
+        return openRuntimeRelayExecTransport(options);
+    }
+    const openSocketTransport = options.openSocketTransport || openRuntimeRelaySocketTransport;
+    return openSocketTransport(options);
 }
 
 function staleGenerationError() {
@@ -417,7 +445,7 @@ export class RuntimeRelayManager {
         minter,
         inspectContainer = defaultInspect,
         resolveSocket = resolveRuntimeRelaySocket,
-        openTransport = openRuntimeRelaySocketTransport,
+        openTransport = openRuntimeRelayTransport,
         limits,
         channelIdleTimeoutMs = DEFAULT_CHANNEL_IDLE_TIMEOUT_MS,
     } = {}) {

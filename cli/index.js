@@ -240,7 +240,16 @@ export async function launchCli(args = process.argv.slice(2), {
             throw new Error(`${commandArgs[0] || 'command'} failed with status ${result}`);
         }
     } catch (error) {
-        if (bootstrap.owned && ['start', 'restart'].includes(commandArgs[0])) {
+        // A graph/readiness failure deliberately leaves the diagnostic Router
+        // running with its edge generation inactive. Tear it down here only
+        // when this command displaced a different committed AgentLib source
+        // that must be restored. A successful core start which later fails the
+        // AgentLib deployment attestation is handled by the stricter teardown
+        // below.
+        if (bootstrap.owned
+            && ['start', 'restart'].includes(commandArgs[0])
+            && previous
+            && selectionsDiffer(previous, bootstrap.selection)) {
             try { await runCoreCli(['stop']); } catch (_) {}
             restorePreviousDeployment(error, previous, bootstrap.selection);
         }
