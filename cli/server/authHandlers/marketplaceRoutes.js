@@ -5,6 +5,13 @@ import * as reposSvc from '../../utils/repos.js';
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
 import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
+import { readAgentRegistrySnapshot } from '../../utils/agentRegistrySnapshot.js';
+import {
+    createNoWaitRunBinding,
+    observeBoundNoWaitRun,
+    readNoWaitRunMarker,
+    summarizeNoWaitFailure,
+} from '../../commands/noWaitLogObserver.js';
 import { collectAgentsSummary } from '../../utils/status.js';
 import { isLocalAdminUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
@@ -218,6 +225,84 @@ function marketplaceContainerMatchesAgent(containerName, repoName, agentName) {
     return String(containerName || '').startsWith(prefix);
 }
 
+function collectMarketplaceNoWaitStates(registry, {
+    readRunMarker = readNoWaitRunMarker,
+    createRunBinding = createNoWaitRunBinding,
+    observeRun = observeBoundNoWaitRun,
+    summarizeFailure = summarizeNoWaitFailure,
+    readRegistrySnapshot = readAgentRegistrySnapshot,
+} = {}) {
+    const states = new Map();
+    for (const [containerName, record] of Object.entries(registry || {})) {
+        if (!record || record.type !== 'agent') continue;
+        try {
+            const marker = readRunMarker(containerName);
+            if (!marker) continue;
+            const binding = createRunBinding(containerName, record, marker);
+            const observation = observeRun(binding, {
+                readRegistrySnapshot,
+            });
+            if (observation.state === 'pending' || observation.state === 'starting') {
+                states.set(containerName, {
+                    status: 'starting',
+                    detail: observation.queued
+                        ? 'Waiting for an earlier startup wave.'
+                        : 'Background startup is in progress.',
+                });
+            } else if (observation.state === 'failed') {
+                states.set(containerName, {
+                    status: 'failed',
+                    detail: summarizeFailure(observation.status),
+                });
+            } else if (observation.state === 'running') {
+                states.set(containerName, { status: 'running', detail: '' });
+            }
+        } catch (error) {
+            if (error?.code === 'NO_WAIT_RUN_SUPERSEDED') continue;
+            if (error?.code === 'NO_WAIT_OBSERVATION_STALE') {
+                states.set(containerName, {
+                    status: 'failed',
+                    detail: 'Background startup expired before reaching a terminal state.',
+                });
+                continue;
+            }
+            states.set(containerName, {
+                status: 'unknown',
+                detail: 'Background startup state could not be verified.',
+            });
+        }
+    }
+    return states;
+}
+
+function normalizeMarketplaceAgentStatus({ active, runtimeState, noWaitState } = {}) {
+    if (!active) return { status: 'disabled', detail: '' };
+    if (runtimeState?.running === true) return { status: 'running', detail: '' };
+
+    const noWaitStatus = String(noWaitState?.status || '').trim().toLowerCase();
+    if (['starting', 'failed', 'unknown'].includes(noWaitStatus)) {
+        return {
+            status: noWaitStatus,
+            detail: String(noWaitState?.detail || '').trim(),
+        };
+    }
+
+    const runtimeStatus = String(runtimeState?.status || '').trim().toLowerCase();
+    if (['created', 'configured', 'restarting', 'starting'].includes(runtimeStatus)) {
+        return { status: 'starting', detail: '' };
+    }
+    if (runtimeStatus === 'dead' || runtimeStatus === 'failed') {
+        return { status: 'failed', detail: '' };
+    }
+    if (runtimeStatus === 'paused') {
+        return { status: 'paused', detail: '' };
+    }
+    if (!runtimeStatus || ['exited', 'removing', 'stopped'].includes(runtimeStatus)) {
+        return { status: 'stopped', detail: '' };
+    }
+    return { status: 'unknown', detail: '' };
+}
+
 function buildMarketplaceState(user = null, options = {}) {
     const reposDir = path.join(PLOINKY_DIR, 'repos');
     const predefined = reposSvc.getPredefinedRepos();
@@ -262,6 +347,9 @@ function buildMarketplaceState(user = null, options = {}) {
     const runtimeEntries = Object.hasOwn(options, 'runtimeEntries')
         ? (options.runtimeEntries || [])
         : collectAgentRuntimeStates({ registry: agentsRegistry });
+    const noWaitStates = Object.hasOwn(options, 'noWaitStates')
+        ? (options.noWaitStates || new Map())
+        : collectMarketplaceNoWaitStates(agentsRegistry);
     const summaries = Object.hasOwn(options, 'summaries')
         ? (options.summaries || [])
         : collectAgentsSummary({ includeInactive: true });
@@ -285,6 +373,12 @@ function buildMarketplaceState(user = null, options = {}) {
             } : null;
             const active = enabledKeys.has(ref);
             const enabledRecord = enabledByRef.get(ref) || null;
+            const noWaitState = enabledRecord
+                ? (noWaitStates instanceof Map
+                    ? noWaitStates.get(enabledRecord.containerName)
+                    : noWaitStates[enabledRecord.containerName])
+                : null;
+            const lifecycle = normalizeMarketplaceAgentStatus({ active, runtimeState, noWaitState });
             agents.push({
                 ref,
                 repo: agent.repo,
@@ -294,7 +388,8 @@ function buildMarketplaceState(user = null, options = {}) {
                 enableMode: enabledRecord?.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE,
                 enableModes: agentsSvc.ENABLE_AGENT_MODES,
                 runtime: runtimeState?.backend || enabledRecord?.runtime || '',
-                status: runtimeState?.status || (active ? 'stopped' : 'inactive'),
+                status: lifecycle.status,
+                ...(lifecycle.detail ? { statusDetail: lifecycle.detail } : {}),
                 running: runtimeState?.running || false,
                 pid: runtimeState?.pid || null,
                 containerName: runtimeState?.containerName || enabledRecord?.containerName || '',
@@ -501,6 +596,8 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
 
 export const __testables = {
     buildMarketplaceState,
+    collectMarketplaceNoWaitStates,
+    normalizeMarketplaceAgentStatus,
     readAuthorizationBearer,
     sendLifecycleError,
     verifyMarketplaceAgentRequest,
