@@ -46,6 +46,9 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROBE_WORKER_URL = new URL('./probeWorker.js', import.meta.url);
+const TRANSIENT_PROBE_INFRASTRUCTURE_CODES = new Set([
+    'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT',
+]);
 const LOGGED_RESTART_FAILURES = new WeakSet();
 const TERMINAL_POLICY_CODES = new Set([
     'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
@@ -236,6 +239,8 @@ function createContainerTarget(info, monitor) {
         probeState: 'pending',
         probeWorker: null,
         probeLastSuccessAt: null,
+        probeInfrastructureFailures: 0,
+        probeRetryNotBefore: null,
         attemptEpoch: 0,
         restartInputDigest: info.restartInputDigest,
         runtimeAdmission: info.runtimeAdmission,
@@ -383,10 +388,52 @@ function handleProbeFailure(monitor, target, message, { runtimeHealth = false } 
     }
 }
 
+function handleProbeInfrastructureFailure(monitor, target, message, code) {
+    if (!monitor || !target) return;
+    target.probeState = 'pending';
+    target.lastError = message;
+    target.probeInfrastructureFailures = (target.probeInfrastructureFailures || 0) + 1;
+    const initialBackoffMs = positiveInteger(
+        monitor?.config?.PROBE_INFRASTRUCTURE_BACKOFF_MS
+            ?? process.env.PLOINKY_CONTAINER_MONITOR_PROBE_INFRASTRUCTURE_BACKOFF_MS,
+        5_000,
+    );
+    const maxBackoffMs = positiveInteger(
+        monitor?.config?.PROBE_INFRASTRUCTURE_MAX_BACKOFF_MS
+            ?? process.env.PLOINKY_CONTAINER_MONITOR_PROBE_INFRASTRUCTURE_MAX_BACKOFF_MS,
+        30_000,
+    );
+    const exponent = Math.min(target.probeInfrastructureFailures - 1, 10);
+    const retryInMs = Math.min(initialBackoffMs * (2 ** exponent), maxBackoffMs);
+    target.probeRetryNotBefore = Date.now() + retryInMs;
+    logEvent(monitor, 'warn', 'container_probe_infrastructure_error', {
+        container: target.containerName,
+        agent: target.agentName,
+        repo: target.repoName,
+        error: message,
+        code,
+        failures: target.probeInfrastructureFailures,
+        retryInMs,
+    });
+}
+
 export function startProbeWorker(monitor, target) {
     if (!monitor || !target) return;
     if (target.circuitBreakerTripped) return;
     if (target.probeWorker || target.probeState === 'success') return;
+    const now = Date.now();
+    if (typeof target.probeRetryNotBefore === 'number'
+        && now < target.probeRetryNotBefore) return;
+    target.probeRetryNotBefore = null;
+
+    const maxConcurrency = positiveInteger(
+        monitor?.config?.PROBE_MAX_CONCURRENCY
+            ?? process.env.PLOINKY_CONTAINER_MONITOR_PROBE_MAX_CONCURRENCY,
+        4,
+    );
+    const activeWorkers = [...(monitor.targets?.values?.() || [])]
+        .filter((candidate) => Boolean(candidate?.probeWorker)).length;
+    if (activeWorkers >= maxConcurrency) return;
 
     let manifest;
     try {
@@ -443,6 +490,9 @@ export function startProbeWorker(monitor, target) {
         if (msg.status === 'success') {
             target.probeState = 'success';
             target.probeLastSuccessAt = Date.now();
+            target.probeInfrastructureFailures = 0;
+            target.probeRetryNotBefore = null;
+            target.lastError = null;
             logEvent(monitor, 'info', 'container_probe_succeeded', {
                 container: target.containerName,
                 agent: target.agentName,
@@ -452,7 +502,12 @@ export function startProbeWorker(monitor, target) {
         } else if (msg.status === 'error') {
             stopProbeWorker(target);
             const message = msg.error || 'Probe worker reported failure.';
-            handleProbeFailure(monitor, target, message, { runtimeHealth: true });
+            const code = String(msg.code || '');
+            if (TRANSIENT_PROBE_INFRASTRUCTURE_CODES.has(code)) {
+                handleProbeInfrastructureFailure(monitor, target, message, code);
+            } else {
+                handleProbeFailure(monitor, target, message, { runtimeHealth: true });
+            }
         }
     });
 

@@ -2,6 +2,13 @@ import { parentPort, workerData } from 'worker_threads';
 
 import { runHealthProbes } from '../sandbox/docker/healthProbes.js';
 
+export function serializeProbeError(error) {
+    return {
+        error: error?.message || String(error || 'unknown error'),
+        code: typeof error?.code === 'string' ? error.code : null,
+    };
+}
+
 async function main() {
     const { agentName, containerName, manifest } = workerData || {};
     if (!agentName || !containerName) {
@@ -14,7 +21,7 @@ async function main() {
     } catch (error) {
         parentPort?.postMessage({
             status: 'error',
-            error: error?.message || String(error || 'unknown error')
+            ...serializeProbeError(error),
         });
     }
 }
