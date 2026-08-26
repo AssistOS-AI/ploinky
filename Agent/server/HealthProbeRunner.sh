@@ -10,6 +10,10 @@ PROBE_TIMEOUT_DIR='timed-out'
 PROBE_CONTROL_ROOT='/run/ploinky-health-probes'
 PROBE_OUTPUT_BLOCK_SIZE=4096
 PROBE_OUTPUT_BLOCK_COUNT=256
+PROBE_REQUEST_FILE='request'
+PROBE_CLAIM_DIR='claimed'
+PROBE_BROKER_READY_DIR='.broker-ready'
+PROBE_BROKER_POLL_SECONDS='0.05'
 
 fail() {
     printf '%s\n' "ploinky health probe runner: $*" >&2
@@ -29,15 +33,19 @@ require_control_path() {
         || fail 'probe control path is invalid'
 }
 
-require_positive_duration() {
+positive_duration_is_valid() {
     value="${1:-}"
     case "$value" in
-        ''|*[!0-9.]*|.*|*.*.*|*.) fail 'probe duration is invalid' ;;
+        ''|*[!0-9.]*|.*|*.*.*|*.) return 1 ;;
     esac
     case "$value" in
-        *[1-9]*) ;;
-        *) fail 'probe duration must be positive' ;;
+        *[1-9]*) return 0 ;;
+        *) return 1 ;;
     esac
+}
+
+require_positive_duration() {
+    positive_duration_is_valid "${1:-}" || fail 'probe duration is invalid'
 }
 
 proc_stat_path_fields() {
@@ -412,8 +420,115 @@ session_run() {
     exit "$status"
 }
 
+write_broker_failure() {
+    control_path="$1"
+    message="$2"
+    [ -d "$control_path" ] || return 0
+    printf '%s\n' "ploinky health probe broker: $message" \
+        > "$control_path/runner-stderr"
+    printf '%s\n' '125' > "$control_path/result-tmp"
+    mv "$control_path/result-tmp" "$control_path/result"
+}
+
+run_broker_request() {
+    control_path="$1"
+    token="$2"
+    request_path="$control_path/$PROBE_REQUEST_FILE"
+    request_version=''
+    request_token=''
+    request_script=''
+    request_timeout=''
+    request_kill_after=''
+    request_extra=''
+
+    if ! {
+        IFS= read -r request_version \
+            && IFS= read -r request_token \
+            && IFS= read -r request_script \
+            && IFS= read -r request_timeout \
+            && IFS= read -r request_kill_after
+    } < "$request_path"; then
+        write_broker_failure "$control_path" 'request is incomplete'
+        return 0
+    fi
+    request_lines="$(wc -l < "$request_path" 2>/dev/null || printf '0')"
+    [ "$request_lines" = '5' ] || {
+        write_broker_failure "$control_path" 'request has an invalid field count'
+        return 0
+    }
+    [ "$request_version" = 'ploinky-health-probe/1' ] || {
+        write_broker_failure "$control_path" 'request version is invalid'
+        return 0
+    }
+    require_plain_token "$token"
+    [ "$request_token" = "$token" ] || {
+        write_broker_failure "$control_path" 'request token is inconsistent'
+        return 0
+    }
+    case "$request_script" in
+        ''|*[!A-Za-z0-9._-]*|*..*)
+            write_broker_failure "$control_path" 'request script is invalid'
+            return 0
+            ;;
+    esac
+    if ! positive_duration_is_valid "$request_timeout"; then
+        write_broker_failure "$control_path" 'request timeout is invalid'
+        return 0
+    fi
+    if ! positive_duration_is_valid "$request_kill_after"; then
+        write_broker_failure "$control_path" 'request kill-after is invalid'
+        return 0
+    fi
+
+    if ! sh "$0" run \
+        "$control_path" "$token" "$request_script" \
+        "$request_timeout" "$request_kill_after"; then
+        [ -f "$control_path/result" ] \
+            || write_broker_failure "$control_path" 'runner failed before publishing a result'
+    fi
+}
+
+serve_broker() {
+    [ "$#" -eq 1 ] || fail 'serve requires the exact control root'
+    control_root="$1"
+    [ "$control_root" = "$PROBE_CONTROL_ROOT" ] \
+        || fail 'broker control root is invalid'
+    [ -d "$control_root" ] || fail 'broker control root is unavailable'
+    for command_name in mkdir mv rmdir sh sleep wc; do
+        command -v "$command_name" >/dev/null 2>&1 \
+            || fail "required broker command '$command_name' is unavailable"
+    done
+
+    ready_path="$control_root/$PROBE_BROKER_READY_DIR"
+    rmdir "$ready_path" 2>/dev/null || true
+    mkdir "$ready_path" || fail 'broker ready marker cannot be created'
+    trap 'rmdir "$ready_path" 2>/dev/null || true; exit 0' HUP INT TERM
+    trap 'rmdir "$ready_path" 2>/dev/null || true' EXIT
+
+    while :; do
+        for control_path in "$control_root"/*; do
+            [ -d "$control_path" ] || continue
+            [ ! -L "$control_path" ] || continue
+            token="${control_path##*/}"
+            case "$token" in
+                ''|*[!A-Za-z0-9._-]*) continue ;;
+            esac
+            request_path="$control_path/$PROBE_REQUEST_FILE"
+            [ -f "$request_path" ] || continue
+            [ ! -L "$request_path" ] || continue
+            mkdir "$control_path/$PROBE_CLAIM_DIR" 2>/dev/null || continue
+            run_broker_request "$control_path" "$token"
+        done
+        sleep "$PROBE_BROKER_POLL_SECONDS"
+    done
+}
+
 mode="${1:-}"
 case "$mode" in
+    serve)
+        [ "$#" -eq 2 ] || fail 'serve requires the exact control root'
+        serve_broker "$2"
+        ;;
     run)
         [ "$#" -eq 6 ] || fail 'run requires control path, token, script, timeout, and kill-after'
         control_path="$2"

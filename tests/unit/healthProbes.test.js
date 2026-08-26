@@ -19,6 +19,7 @@ const {
     normalizeProbeConfig,
     runContainerScriptReadiness,
     healthProbeHostDir,
+    submitProbeRequest,
     computeBackoffDelay,
     maybeResetBackoff,
     getLivenessState
@@ -120,18 +121,22 @@ test('clearLivenessState fully resets container tracking', () => {
     assert.equal(reset.startedAt, null);
 });
 
-function fakeSpawnSequence(results, calls) {
-    return (_runtime, args, options) => {
-        calls.push({ args, options });
+function fakeBrokerSequence(results, calls) {
+    return (control, probe, killGraceSeconds) => {
+        submitProbeRequest(control, probe, killGraceSeconds);
+        calls.push({
+            control,
+            probe,
+            killGraceSeconds,
+            request: fs.readFileSync(path.join(control.hostPath, 'request'), 'utf8'),
+        });
         const result = results.shift() || { status: 0, stdout: 'ready\n', stderr: '' };
-        if (!args.includes('/Agent/server/HealthProbeRunner.sh')) return result;
-
-        const controlPath = path.join(healthProbeHostDir(args[2]), args[7]);
         const writeResult = (value) => {
-            if (value.stdout) fs.writeFileSync(path.join(controlPath, 'probe-stdout'), value.stdout);
-            if (value.stderr) fs.writeFileSync(path.join(controlPath, 'probe-stderr'), value.stderr);
-            fs.writeFileSync(path.join(controlPath, 'result'), `${value.status}\n`);
+            if (value.stdout) fs.writeFileSync(path.join(control.hostPath, 'probe-stdout'), value.stdout);
+            if (value.stderr) fs.writeFileSync(path.join(control.hostPath, 'probe-stderr'), value.stderr);
+            fs.writeFileSync(path.join(control.hostPath, 'result'), `${value.status}\n`);
         };
+        if (result.claimed) fs.mkdirSync(path.join(control.hostPath, 'claimed'));
         if (Object.hasOwn(result, 'cancellationStatus')) {
             writeResult({
                 status: result.cancellationStatus,
@@ -139,11 +144,9 @@ function fakeSpawnSequence(results, calls) {
                 stderr: result.cancellationStderr || '',
             });
         }
-        if (result.launchOnly || result.error || typeof result.status !== 'number') {
-            return result;
-        }
+        if (result.noResult) return;
+        if (result.error) throw result.error;
         writeResult(result);
-        return { status: 0, stdout: '', stderr: '' };
     };
 }
 
@@ -161,7 +164,7 @@ test('blocking container script readiness succeeds after the configured success 
             let sequence = 0;
             return () => `success-${sequence += 1}`;
         })(),
-        spawnSyncImpl: fakeSpawnSequence([
+        submitProbeRequestImpl: fakeBrokerSequence([
             { status: 0, stdout: 'warming\n', stderr: '' },
             { status: 0, stdout: 'ready\n', stderr: '' },
         ], calls),
@@ -172,23 +175,17 @@ test('blocking container script readiness succeeds after the configured success 
     assert.equal(result.status, 'success');
     assert.equal(result.detail, 'ready');
     assert.equal(calls.length, 2);
-    assert.deepEqual(calls[0].args.slice(0, 7), [
-        'exec',
-        '--detach',
-        'database-container',
-        'sh',
-        '/Agent/server/HealthProbeRunner.sh',
-        'run',
-        '/run/ploinky-health-probes/success-1',
-    ]);
-    assert.deepEqual(calls[0].args.slice(-4), [
+    assert.equal(calls[0].control.token, 'success-1');
+    assert.equal(calls[0].probe.script, 'healthcheck.sh');
+    assert.equal(calls[0].killGraceSeconds, 1);
+    assert.equal(calls[0].request, [
+        'ploinky-health-probe/1',
         'success-1',
         'healthcheck.sh',
         '2',
         '1',
-    ]);
-    assert.equal(calls[0].options.timeout, 60_000);
-    assert.equal(calls[0].options.killSignal, 'SIGTERM');
+        '',
+    ].join('\n'));
 });
 
 test('blocking container script readiness reports nonzero exhaustion', () => {
@@ -200,7 +197,7 @@ test('blocking container script readiness reports nonzero exhaustion', () => {
         failureThreshold: 2,
     }, {
         runtime: 'fake-runtime',
-        spawnSyncImpl: fakeSpawnSequence([
+        submitProbeRequestImpl: fakeBrokerSequence([
             { status: 9, stdout: '', stderr: 'not ready\n' },
             { status: 9, stdout: '', stderr: 'still not ready\n' },
         ], calls),
@@ -224,7 +221,7 @@ test('blocking container script readiness reports the in-container hard deadline
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => 'inner-timeout',
-        spawnSyncImpl: fakeSpawnSequence([
+        submitProbeRequestImpl: fakeBrokerSequence([
             { status: 124, stdout: '', stderr: '' },
         ], calls),
         sleepMsImpl() {},
@@ -232,11 +229,7 @@ test('blocking container script readiness reports the in-container hard deadline
     });
 
     assert.deepEqual(result, { status: 'failed', reason: 'timeout', detail: '' });
-    assert.equal(
-        calls.some(({ args }) => args.includes('cleanup')),
-        false,
-        'the exact in-container runner cleans its own deadline before returning 124',
-    );
+    assert.equal(calls.length, 1, 'the mounted broker publishes one terminal result');
 });
 
 test('probe identity rejects unsafe generated tokens before runtime execution', () => {
@@ -248,17 +241,16 @@ test('probe identity rejects unsafe generated tokens before runtime execution', 
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => 'unsafe token; touch /tmp/escaped',
-        spawnSyncImpl: fakeSpawnSequence([], calls),
+        submitProbeRequestImpl: fakeBrokerSequence([], calls),
         isContainerRunningImpl() { return true; },
     }), /generated probe token is invalid/);
     assert.equal(calls.length, 0, 'unsafe identity must be rejected before runtime execution');
 });
 
-test('an uncertain detached launch is cancelled through the mount before retry', () => {
-    const timeoutError = new Error('timed out');
-    timeoutError.code = 'ETIMEDOUT';
+test('an unclaimed mounted request retries without any runtime exec', () => {
     const calls = [];
     const retrySleeps = [];
+    let now = 0;
     let tokenSequence = 0;
     const result = runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
@@ -267,29 +259,34 @@ test('an uncertain detached launch is cancelled through the mount before retry',
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => `outer-timeout-${tokenSequence += 1}`,
-        spawnSyncImpl: fakeSpawnSequence([
-            {
-                status: null,
-                signal: 'SIGTERM',
-                error: timeoutError,
-                cancellationStatus: 125,
-            },
+        submitProbeRequestImpl: fakeBrokerSequence([
+            { noResult: true },
             { status: 0, stdout: 'ready\n', stderr: '' },
         ], calls),
+        probeResultGraceMs: 1,
+        probeCancellationGraceMs: 1,
         controlPlaneRetryMs: 17,
-        sleepMsImpl(ms) { retrySleeps.push(ms); },
+        nowImpl() { return now; },
+        sleepMsImpl(ms) {
+            now += ms;
+            retrySleeps.push(ms);
+        },
         isContainerRunningImpl() { return true; },
     });
     assert.deepEqual(result, { status: 'success', detail: 'ready' });
-    assert.deepEqual(retrySleeps, [17]);
-    assert.equal(calls.length, 2, 'no cleanup exec is launched');
-    assert.equal(calls[0].args.includes('--detach'), true);
-    assert.equal(calls[1].args.includes('outer-timeout-2'), true);
+    assert.equal(retrySleeps.includes(17), true);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].control.token, 'outer-timeout-1');
+    assert.equal(calls[1].control.token, 'outer-timeout-2');
+    assert.equal(
+        fs.statSync(path.join(calls[0].control.hostPath, 'cancelled')).isDirectory(),
+        true,
+        'a late broker claimant must still observe exact cancellation',
+    );
+    fs.rmSync(calls[0].control.hostPath, { recursive: true, force: true });
 });
 
-test('an unacknowledged detached launch fails closed without a second runtime exec', () => {
-    const timeoutError = new Error('detached launch timed out');
-    timeoutError.code = 'ETIMEDOUT';
+test('a claimed mounted request without cancellation acknowledgement fails closed', () => {
     const calls = [];
     let now = 0;
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
@@ -298,32 +295,32 @@ test('an unacknowledged detached launch fails closed without a second runtime ex
         failureThreshold: 1,
     }, {
         runtime: 'fake-runtime',
-        tokenFactory: () => 'unacknowledged-launch',
-        spawnSyncImpl: fakeSpawnSequence([
-            { status: null, error: timeoutError, stdout: '', stderr: '' },
+        tokenFactory: () => 'unacknowledged-request',
+        submitProbeRequestImpl: fakeBrokerSequence([
+            { noResult: true, claimed: true },
         ], calls),
+        probeResultGraceMs: 1,
         probeCancellationGraceMs: 5,
         nowImpl() { return now; },
         sleepMsImpl(ms) { now += ms; },
         isContainerRunningImpl() { return true; },
     }), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_EXECUTION_UNSAFE');
-        assert.match(error.message, /exact cancellation was not acknowledged/);
+        assert.match(error.message, /claimed 'healthcheck\.sh' but did not acknowledge exact cancellation/);
         return true;
     });
     assert.equal(calls.length, 1);
-    assert.equal(calls.some(({ args }) => args.includes('cleanup')), false);
     fs.rmSync(
-        path.join(healthProbeHostDir('database-container'), 'unacknowledged-launch'),
+        path.join(healthProbeHostDir('database-container'), 'unacknowledged-request'),
         { recursive: true, force: true },
     );
 });
 
-test('a mounted cancellation acknowledgement recovers a delayed detached result', () => {
+test('a mounted cancellation acknowledgement permits a bounded broker retry', () => {
     const calls = [];
     let now = 0;
     let firstControlPath = '';
-    let launchCount = 0;
+    let submissionCount = 0;
     let tokenSequence = 0;
     const result = runContainerScriptReadiness('onlyOffice', 'onlyoffice-container', {
         script: 'healthcheck.sh',
@@ -332,17 +329,17 @@ test('a mounted cancellation acknowledgement recovers a delayed detached result'
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => `onlyoffice-${tokenSequence += 1}`,
-        spawnSyncImpl(_runtime, args, options) {
-            calls.push({ args, options });
-            launchCount += 1;
-            const controlPath = path.join(healthProbeHostDir(args[2]), args[7]);
-            if (launchCount === 1) {
-                firstControlPath = controlPath;
+        submitProbeRequestImpl(control, probe, killGraceSeconds) {
+            submitProbeRequest(control, probe, killGraceSeconds);
+            calls.push({ control, probe, killGraceSeconds });
+            submissionCount += 1;
+            if (submissionCount === 1) {
+                firstControlPath = control.hostPath;
+                fs.mkdirSync(path.join(control.hostPath, 'claimed'));
             } else {
-                fs.writeFileSync(path.join(controlPath, 'probe-stdout'), 'ready\n');
-                fs.writeFileSync(path.join(controlPath, 'result'), '0\n');
+                fs.writeFileSync(path.join(control.hostPath, 'probe-stdout'), 'ready\n');
+                fs.writeFileSync(path.join(control.hostPath, 'result'), '0\n');
             }
-            return { status: 0, stdout: '', stderr: '' };
         },
         probeResultGraceMs: 1,
         probeCancellationGraceMs: 10,
@@ -361,13 +358,11 @@ test('a mounted cancellation acknowledgement recovers a delayed detached result'
 
     assert.deepEqual(result, { status: 'success', detail: 'ready' });
     assert.equal(calls.length, 2);
-    assert.equal(calls.every(({ args }) => args.includes('--detach')), true);
 });
 
-test('detached launch control-plane retries remain bounded after cancellation acknowledgements', () => {
-    const timeoutError = new Error('spawnSync podman ETIMEDOUT');
-    timeoutError.code = 'ETIMEDOUT';
+test('mounted broker control-plane retries remain bounded after cancellation acknowledgements', () => {
     const calls = [];
+    let now = 0;
     let tokenSequence = 0;
     assert.throws(() => runContainerScriptReadiness('onlyOffice', 'onlyoffice-container', {
         script: 'healthcheck.sh',
@@ -376,25 +371,36 @@ test('detached launch control-plane retries remain bounded after cancellation ac
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => `bounded-${tokenSequence += 1}`,
-        spawnSyncImpl: fakeSpawnSequence([
-            { status: null, error: timeoutError, cancellationStatus: 125 },
-            { status: null, error: timeoutError, cancellationStatus: 125 },
-        ], calls),
+        submitProbeRequestImpl(control, probe, killGraceSeconds) {
+            submitProbeRequest(control, probe, killGraceSeconds);
+            calls.push(control);
+            fs.mkdirSync(path.join(control.hostPath, 'claimed'));
+        },
         controlPlaneFailureThreshold: 2,
         controlPlaneRetryMs: 0,
-        sleepMsImpl() {},
+        probeResultGraceMs: 1,
+        probeCancellationGraceMs: 1,
+        nowImpl() { return now; },
+        sleepMsImpl(ms) {
+            now += ms;
+            for (const control of calls) {
+                if (fs.existsSync(path.join(control.hostPath, 'cancelled'))
+                    && !fs.existsSync(path.join(control.hostPath, 'result'))) {
+                    fs.writeFileSync(path.join(control.hostPath, 'result'), '125\n');
+                }
+            }
+        },
         isContainerRunningImpl() { return true; },
     }), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
-        assert.match(error.message, /runtime control plane timed out/);
+        assert.match(error.message, /bounded completion window/);
         return true;
     });
-    assert.equal(calls.filter(({ args }) => args.includes('run')).length, 2);
-    assert.equal(calls.filter(({ args }) => args.includes('cleanup')).length, 0);
+    assert.equal(calls.length, 2);
 });
 
-test('non-timeout launch errors surface after mounted cancellation is acknowledged', () => {
-    const clientError = new Error('detached client failed');
+test('mounted request submission errors surface without a runtime fallback', () => {
+    const clientError = new Error('mounted request failed');
     clientError.code = 'EIO';
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
@@ -403,12 +409,12 @@ test('non-timeout launch errors surface after mounted cancellation is acknowledg
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => 'client-error',
-        spawnSyncImpl: fakeSpawnSequence([
-            { status: null, error: clientError, cancellationStatus: 125 },
-        ], []),
+        submitProbeRequestImpl() { throw clientError; },
         isContainerRunningImpl() { return true; },
     }), (error) => {
-        assert.match(error.message, /failed to launch 'healthcheck\.sh': detached client failed/);
+        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_FAILED');
+        assert.match(error.message, /failed to submit 'healthcheck\.sh' to its mounted broker/);
+        assert.equal(error.cause, clientError);
         return true;
     });
 });
@@ -423,7 +429,7 @@ test('reserved runner cleanup failure is fatal and cannot enter the retry loop',
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => 'runner-cleanup-failure',
-        spawnSyncImpl: fakeSpawnSequence([
+        submitProbeRequestImpl: fakeBrokerSequence([
             {
                 status: 125,
                 stdout: '',
@@ -439,7 +445,7 @@ test('reserved runner cleanup failure is fatal and cannot enter the retry loop',
         assert.match(error.message, /descendants survived cleanup/);
         return true;
     });
-    assert.equal(calls.length, 1, 'one detached probe launch is the only runtime call');
+    assert.equal(calls.length, 1, 'one mounted request is the only control operation');
 });
 
 test('blocking container script readiness fails fast when the script is missing', () => {
@@ -448,27 +454,31 @@ test('blocking container script readiness fails fast when the script is missing'
     }, {
         runtime: 'fake-runtime',
         tokenFactory: () => 'missing-script',
-        spawnSyncImpl: fakeSpawnSequence([{ status: 127 }], []),
+        submitProbeRequestImpl: fakeBrokerSequence([{ status: 127 }], []),
         isContainerRunningImpl() { return true; },
     }), /missing\.sh not found inside container/);
 });
 
-test('a definitive detached launch failure does not wait for a result', () => {
-    const calls = [];
+test('a malformed mounted result fails closed immediately', () => {
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
     }, {
         runtime: 'fake-runtime',
-        tokenFactory: () => 'launch-rejected',
-        spawnSyncImpl: fakeSpawnSequence([
-            { status: 42, stderr: 'runtime rejected launch', launchOnly: true },
-        ], calls),
+        tokenFactory: () => 'malformed-result',
+        submitProbeRequestImpl(control, probe, killGraceSeconds) {
+            submitProbeRequest(control, probe, killGraceSeconds);
+            fs.writeFileSync(path.join(control.hostPath, 'result'), 'not-a-status\n');
+        },
         isContainerRunningImpl() { return true; },
     }), (error) => {
-        assert.match(error.message, /runtime rejected launch/);
+        assert.equal(error.code, 'PLOINKY_PROBE_EXECUTION_UNSAFE');
+        assert.match(error.message, /invalid mounted-broker probe result/);
         return true;
     });
-    assert.equal(calls.length, 1);
+    fs.rmSync(
+        path.join(healthProbeHostDir('database-container'), 'malformed-result'),
+        { recursive: true, force: true },
+    );
 });
 
 test('blocking container script readiness fails immediately after the container exits', () => {
@@ -479,7 +489,7 @@ test('blocking container script readiness fails immediately after the container 
         failureThreshold: 60,
     }, {
         runtime: 'fake-runtime',
-        spawnSyncImpl: fakeSpawnSequence([], calls),
+        submitProbeRequestImpl: fakeBrokerSequence([], calls),
         isContainerRunningImpl() { return false; },
         sleepMsImpl() {
             assert.fail('an exited container must not consume another probe interval');
@@ -501,7 +511,7 @@ test('container running-state timeout remains a retryable probe control-plane fa
         script: 'healthcheck.sh',
     }, {
         runtime: 'fake-runtime',
-        spawnSyncImpl: fakeSpawnSequence([], []),
+        submitProbeRequestImpl: fakeBrokerSequence([], []),
         isContainerRunningImpl() { throw timeout; },
     }), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
@@ -543,17 +553,15 @@ test('continuous health runs cheap liveness while activation-only readiness stay
         tokenFactory: () => 'liveness-only',
         waitForContainerRunningImpl() { return true; },
         isContainerRunningImpl() { return true; },
-        spawnSyncImpl: fakeSpawnSequence([
+        submitProbeRequestImpl: fakeBrokerSequence([
             { status: 0, stdout: 'live\n', stderr: '' },
         ], calls),
     });
 
-    const executedScripts = calls
-        .filter(({ args }) => args.includes('/Agent/server/HealthProbeRunner.sh'))
-        .map(({ args }) => args.at(-3));
+    const executedScripts = calls.map(({ probe }) => probe.script);
     assert.deepEqual(executedScripts, ['liveness.sh']);
     assert.equal(
-        calls.some(({ args }) => args.includes('healthcheck.sh')),
+        calls.some(({ probe }) => probe.script === 'healthcheck.sh'),
         false,
         'heavy readiness must not be re-executed by the continuous worker',
     );
@@ -590,7 +598,7 @@ test('recurring readiness exhaustion is fatal to the probe worker cycle', () => 
         tokenFactory: () => 'readiness-failure',
         waitForContainerRunningImpl() { return true; },
         isContainerRunningImpl() { return true; },
-        spawnSyncImpl: fakeSpawnSequence([
+        submitProbeRequestImpl: fakeBrokerSequence([
             { status: 7, stdout: '', stderr: 'semantic dependency unavailable\n' },
         ], calls),
     }), (error) => {
@@ -600,7 +608,7 @@ test('recurring readiness exhaustion is fatal to the probe worker cycle', () => 
         return true;
     });
     assert.equal(
-        calls.filter(({ args }) => args.includes('/Agent/server/HealthProbeRunner.sh')).length,
+        calls.length,
         1,
     );
 });
@@ -615,7 +623,11 @@ test('probe runner is executable and binds cleanup to exact kernel identity', ()
         'the runner must use the BusyBox-compatible setsid contract',
     );
     assert.doesNotMatch(source, /setsid\s+-[a-z]/i);
-    assert.doesNotMatch(source, /(?:^|[\s`$(])timeout(?:\s|$)/m);
+    assert.doesNotMatch(
+        source,
+        /^[ \t]*(?:command[ \t]+-v[ \t]+)?timeout(?:[ \t]|$)/m,
+        'the runner must not depend on a timeout executable',
+    );
     assert.match(source, /proc_stat_path_fields "\/proc\/\$1\/stat"/);
     assert.match(source, /proc_stat_path_fields \/proc\/self\/stat/);
     assert.match(source, /session_proc_pid="\$PROC_PID"/);
@@ -642,11 +654,25 @@ test('probe runner is executable and binds cleanup to exact kernel identity', ()
     assert.match(source, /while \[ ! -d "\$control_path\/\$PROBE_CANCEL_DIR" \]/);
     assert.match(source, /PROBE_OUTPUT_BLOCK_COUNT=256/);
     assert.match(source, /mv "\$control_path\/result-tmp" "\$control_path\/result"/);
+    assert.match(source, /serve_broker\(\)/);
+    assert.match(source, /mkdir "\$control_path\/\$PROBE_CLAIM_DIR"/);
+    assert.match(source, /mkdir "\$ready_path"/);
     assert.equal(
         (source.match(/grep -Fl/g) || []).length,
         1,
         'each process-table scan must use one fixed-string token lookup, not a helper pipeline per PID',
     );
+});
+
+test('agent entrypoint owns the broker without creating runtime exec sessions', () => {
+    const entrypointUrl = new URL('../../Agent/server/AgentEntrypoint.sh', import.meta.url);
+    const source = fs.readFileSync(entrypointUrl, 'utf8');
+    assert.notEqual(fs.statSync(entrypointUrl).mode & 0o111, 0);
+    assert.match(source, /sh "\$PROBE_BROKER" serve "\$PROBE_CONTROL_ROOT" &/);
+    assert.match(source, /"\$@" &/);
+    assert.match(source, /wait "\$main_pid"/);
+    assert.doesNotMatch(source, /\b(?:docker|podman)\b/);
+    assert.doesNotMatch(source, /\bexec\b/);
 });
 
 test('probe runner rejects control-path substitution and malformed durations before execution', () => {

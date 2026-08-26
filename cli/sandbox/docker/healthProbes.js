@@ -1,10 +1,8 @@
-import { spawnSync } from 'child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parentPort } from 'worker_threads';
 import {
-    getRuntime,
     isContainerRunning,
     waitForContainerRunning,
     sleepMs
@@ -18,16 +16,17 @@ const DEFAULT_SUCCESS_THRESHOLD = 1;
 const DEFAULT_PROBE_KILL_GRACE_SECONDS = 1;
 const PROBE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
 const PROBE_CONTAINER_WAIT_TIMEOUT_MS = 10_000;
-const PROBE_DETACHED_LAUNCH_TIMEOUT_MS = 60_000;
 const PROBE_RESULT_GRACE_MS = 60_000;
 const PROBE_CANCELLATION_GRACE_MS = 15_000;
 const PROBE_RESULT_POLL_MS = 50;
 const PROBE_OUTPUT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
 const DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS = 10_000;
-const PROBE_RUNNER_PATH = '/Agent/server/HealthProbeRunner.sh';
 const PROBE_CONTROL_HOST_ROOT = path.join(PLOINKY_DIR, 'run', 'health-probes');
 export const PROBE_CONTROL_CONTAINER_ROOT = '/run/ploinky-health-probes';
+const PROBE_REQUEST_FILE = 'request';
+const PROBE_REQUEST_TEMP_FILE = 'request-tmp';
+const PROBE_CLAIM_DIR = 'claimed';
 const BACKOFF_BASE_DELAY_MS = 10_000;
 const BACKOFF_MAX_DELAY_MS = 300_000;
 const BACKOFF_RESET_MS = 600_000;
@@ -128,6 +127,30 @@ function createProbeControl(containerName, token, options = {}) {
     };
 }
 
+function submitProbeRequest(control, probe, killGraceSeconds) {
+    const requestPath = path.join(control.hostPath, PROBE_REQUEST_FILE);
+    const requestTempPath = path.join(control.hostPath, PROBE_REQUEST_TEMP_FILE);
+    const payload = [
+        'ploinky-health-probe/1',
+        control.token,
+        probe.script,
+        String(probe.timeout),
+        String(killGraceSeconds),
+        '',
+    ].join('\n');
+    fs.writeFileSync(requestTempPath, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    fs.renameSync(requestTempPath, requestPath);
+}
+
+function probeWasClaimed(control) {
+    try {
+        return fs.statSync(path.join(control.hostPath, PROBE_CLAIM_DIR)).isDirectory();
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+}
+
 function readBoundedFile(filePath) {
     try {
         const handle = fs.openSync(filePath, 'r');
@@ -156,7 +179,7 @@ function readProbeResult(control) {
         throw error;
     }
     if (!/^(?:0|[1-9][0-9]{0,2})$/.test(result)) {
-        const error = new Error(`[probe] invalid detached probe result '${result}'`);
+        const error = new Error(`[probe] invalid mounted-broker probe result '${result}'`);
         error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
         throw error;
     }
@@ -251,67 +274,23 @@ function asProbeControlPlaneError(agentName, operation, sourceError) {
 }
 
 function runProbeOnce(agentName, containerName, probe, options = {}) {
-    const runtime = options.runtime || getRuntime();
-    const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
     const token = probeToken(options);
     const control = createProbeControl(containerName, token, options);
     const killGraceSeconds = coercePositiveNumber(
         options.killGraceSeconds,
         DEFAULT_PROBE_KILL_GRACE_SECONDS,
     );
-    const execCommand = [
-        'exec',
-        '--detach',
-        containerName,
-        'sh',
-        PROBE_RUNNER_PATH,
-        'run',
-        control.containerPath,
-        token,
-        probe.script,
-        String(probe.timeout),
-        String(killGraceSeconds),
-    ];
-    const launchRes = spawnSyncImpl(
-        runtime,
-        execCommand,
-        {
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'pipe'],
-            timeout: options.probeLaunchTimeoutMs || PROBE_DETACHED_LAUNCH_TIMEOUT_MS,
-            killSignal: 'SIGTERM',
-        },
-    );
-    const launchTimedOut = Boolean(launchRes.error?.code === 'ETIMEDOUT');
-    const launchCompletionUncertain = Boolean(launchRes.error)
-        || typeof launchRes.status !== 'number';
-    if (launchCompletionUncertain) {
-        const cancelledResult = cancelAndAwaitProbe(control, options);
-        if (!cancelledResult) {
-            const error = new Error(
-                `[probe] ${agentName}: detached probe launch became uncertain and exact cancellation `
-                    + `was not acknowledged for '${probe.script}'`,
-            );
-            error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
-            throw error;
-        }
+    const submitProbeRequestImpl = options.submitProbeRequestImpl || submitProbeRequest;
+    try {
+        submitProbeRequestImpl(control, probe, killGraceSeconds);
+    } catch (cause) {
         removeCompletedProbeControl(control);
-        if (!launchTimedOut) {
-            throw new Error(
-                `[probe] ${agentName}: failed to launch '${probe.script}': `
-                    + `${launchRes.error?.message || launchRes.error}`,
-            );
-        }
         const error = new Error(
-            `[probe] ${agentName}: runtime control plane timed out while launching '${probe.script}'`,
+            `[probe] ${agentName}: failed to submit '${probe.script}' to its mounted broker`,
+            { cause },
         );
-        error.code = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
+        error.code = 'PLOINKY_PROBE_CONTROL_PLANE_FAILED';
         throw error;
-    }
-    if (launchRes.status !== 0) {
-        const detail = String(launchRes.stderr || launchRes.stdout || `exit ${launchRes.status}`).trim();
-        removeCompletedProbeControl(control);
-        throw new Error(`[probe] ${agentName}: failed to launch '${probe.script}': ${detail}`);
     }
 
     const completionTimeoutMs = Math.ceil(probe.timeout * 1000)
@@ -321,16 +300,24 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
     if (!execRes) {
         execRes = cancelAndAwaitProbe(control, options);
         if (!execRes) {
+            const claimed = probeWasClaimed(control);
+            // Never erase an unterminated request. A broker can atomically
+            // claim it immediately after our observation; preserving the
+            // already-cancelled directory guarantees such a late claimant
+            // sees cancellation before it can execute the script.
             const error = new Error(
-                `[probe] ${agentName}: detached runner did not acknowledge exact cancellation `
-                    + `for '${probe.script}'`,
+                claimed
+                    ? `[probe] ${agentName}: in-container broker claimed '${probe.script}' but did not acknowledge exact cancellation`
+                    : `[probe] ${agentName}: in-container broker did not claim '${probe.script}' within its bounded window; the cancelled request was preserved`,
             );
-            error.code = 'PLOINKY_PROBE_EXECUTION_UNSAFE';
+            error.code = claimed
+                ? 'PLOINKY_PROBE_EXECUTION_UNSAFE'
+                : 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
             throw error;
         }
         removeCompletedProbeControl(control);
         const error = new Error(
-            `[probe] ${agentName}: detached runner exceeded its bounded completion window `
+            `[probe] ${agentName}: in-container broker exceeded its bounded completion window `
                 + `for '${probe.script}'`,
         );
         error.code = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
@@ -572,6 +559,8 @@ export const __testHooks = {
     healthProbeHostDir,
     ensureHealthProbeHostDir,
     createProbeControl,
+    submitProbeRequest,
+    probeWasClaimed,
     readProbeResult,
     waitForProbeResult,
     cancelAndAwaitProbe,
@@ -593,14 +582,15 @@ export const __testConstants = {
     DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD,
     DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS,
     DEFAULT_PROBE_KILL_GRACE_SECONDS,
-    PROBE_DETACHED_LAUNCH_TIMEOUT_MS,
     PROBE_RESULT_GRACE_MS,
     PROBE_CANCELLATION_GRACE_MS,
     PROBE_RESULT_POLL_MS,
     PROBE_OUTPUT_MAX_BYTES,
-    PROBE_RUNNER_PATH,
     PROBE_CONTROL_HOST_ROOT,
     PROBE_CONTROL_CONTAINER_ROOT,
+    PROBE_REQUEST_FILE,
+    PROBE_REQUEST_TEMP_FILE,
+    PROBE_CLAIM_DIR,
     BACKOFF_BASE_DELAY_MS,
     BACKOFF_MAX_DELAY_MS,
     BACKOFF_RESET_MS

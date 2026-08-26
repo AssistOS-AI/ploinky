@@ -343,5 +343,3 @@ test('a corrupt registry fails the logs command without repairing it', (t) => {
     assert.doesNotMatch(missing.stderr, /agents registry/);
     assert.match(missing.stderr, /is not one enabled agent/);
 });
-        [['logs', 'last'], { subcommand: 'last', target: 'router', lineCount: 200 }],
-        [['logs', 'last', '5'], { subcommand: 'last', target: 'router', lineCount: 5 }],

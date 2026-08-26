@@ -12,6 +12,7 @@ import {
     resetPreinstallRunInProcess,
 } from '../../cli/utils/runtime/lifecycleHooks.js';
 import { buildExecArgs } from '../../cli/sandbox/docker/interactive.js';
+import { buildAgentLibAttestation } from '../../agentlib/runtime.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/agentServiceManager.js')).href;
@@ -504,17 +505,29 @@ test('global enabled agents keep workspace projectPath and declare persistent /r
         const stateFile = path.join(binDir, 'container-name.txt');
         const runningFile = path.join(binDir, 'container-running.txt');
         const argsFile = path.join(binDir, 'run-args.txt');
+        const attestationFile = path.join(binDir, 'agentlib-attestation.json');
         const inspectHelper = path.join(binDir, 'inspect-helper.mjs');
         const podmanPath = path.join(binDir, 'podman');
+        fs.writeFileSync(attestationFile, JSON.stringify({
+            ...buildAgentLibAttestation(),
+            sourceRootRealpath: '/opt/ploinky-agentlib',
+            loaded: {},
+        }));
         fs.writeFileSync(inspectHelper, `
 import fs from 'node:fs';
-const [argsPath, statePath, runningPath] = process.argv.slice(2);
+const [argsPath, statePath, runningPath, mode = 'full'] = process.argv.slice(2);
 const args = fs.readFileSync(argsPath, 'utf8').split(/\\r?\\n/).filter(Boolean);
 const labels = {};
+const env = [];
 for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '-e') env.push(args[index + 1]);
   if (args[index] !== '--label') continue;
   const [key, ...value] = String(args[index + 1] || '').split('=');
   labels[key] = value.join('=');
+}
+if (mode === 'env') {
+  process.stdout.write(JSON.stringify(env));
+  process.exit(0);
 }
 const running = fs.existsSync(runningPath);
 process.stdout.write(JSON.stringify([{
@@ -535,6 +548,9 @@ emit_inspect() {
 }
 case "$1" in
   image)
+    if [ "$2" = "inspect" ]; then
+      printf '%s\\n' 'sha256:${'a'.repeat(64)}'
+    fi
     exit 0
     ;;
   inspect)
@@ -542,7 +558,11 @@ case "$1" in
     ;;
   container)
     [ "$2" = "inspect" ] || exit 1
-    emit_inspect
+    if [ "$3" = "--format" ] && [ "$4" = '{{json .Config.Env}}' ]; then
+      ${JSON.stringify(process.execPath)} ${JSON.stringify(inspectHelper)} ${JSON.stringify(argsFile)} ${JSON.stringify(stateFile)} ${JSON.stringify(runningFile)} env
+    else
+      emit_inspect
+    fi
     ;;
   create)
     printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}
@@ -565,6 +585,10 @@ case "$1" in
     ;;
   port)
     exit 1
+    ;;
+  run)
+    cat ${JSON.stringify(attestationFile)}
+    exit 0
     ;;
   *)
     exit 0
