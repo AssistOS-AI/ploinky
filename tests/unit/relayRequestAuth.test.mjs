@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createRelayReplayCache } from '../../Agent/lib/relayTokenVerify.mjs';
@@ -11,7 +13,11 @@ import {
     verifyRelaySessionToken,
 } from '../../Agent/lib/relayRequestAuth.mjs';
 import { RelayRequestMinter } from '../../cli/server/runtimeRelay/relayRequestMinter.js';
-import { RuntimeRelayManager } from '../../cli/server/runtimeRelay/RuntimeRelayManager.js';
+import {
+    RuntimeRelayManager,
+    openRuntimeRelaySocketTransport,
+    resolveRuntimeRelaySocket,
+} from '../../cli/server/runtimeRelay/RuntimeRelayManager.js';
 import { NETWORK_LABELS } from '../../cli/sandbox/networkLifecycle.js';
 import {
     RelayFrameDecoder,
@@ -34,6 +40,7 @@ const identity = {
     generationDigest: 'generation-one',
 };
 const RELAY_HELPER_PATH = fileURLToPath(new URL('../../Agent/server/RuntimeHttpRelay.mjs', import.meta.url));
+const TEST_RELAY_ENDPOINT = Object.freeze({ path: '/test/runtime-relay.sock' });
 
 function decodeFrames(bytes) {
     const frames = [];
@@ -45,7 +52,7 @@ function decodeFrames(bytes) {
 }
 
 function runRuntimeRelaySync(frames) {
-    const result = spawnSync(process.execPath, [RELAY_HELPER_PATH], {
+    const result = spawnSync(process.execPath, [RELAY_HELPER_PATH, 'stdio'], {
         env: {
             PATH: process.env.PATH || '',
             PLOINKY_AGENT_ID: identity.targetAgentId,
@@ -68,9 +75,77 @@ function trackChildInputFrames(child, frames) {
     return child;
 }
 
+test('runtime relay production transport verifies and connects the exact private control socket', async (t) => {
+    const root = fs.mkdtempSync('/tmp/ploinky-relay-socket-');
+    const parent = path.join(root, 'long-workspace-component-'.repeat(4), 'health-probes');
+    const containerName = 'alpha-container';
+    const controlDir = path.join(parent, containerName);
+    fs.mkdirSync(controlDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(controlDir, 0o700);
+    const socketPath = path.join(controlDir, 'runtime-relay.sock');
+    assert.ok(Buffer.byteLength(socketPath) > 107, 'fixture must exceed Linux AF_UNIX pathname length');
+    const listenAliasRoot = fs.mkdtempSync('/tmp/ploinky-relay-listen-');
+    const listenAlias = path.join(listenAliasRoot, 'control');
+    fs.symlinkSync(controlDir, listenAlias, 'dir');
+    const server = net.createServer(socket => socket.pipe(socket));
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(path.join(listenAlias, 'runtime-relay.sock'), resolve);
+    });
+    fs.chmodSync(socketPath, 0o600);
+    let transport;
+    t.after(async () => {
+        transport?.kill();
+        await new Promise(resolve => server.close(resolve));
+        fs.rmSync(listenAliasRoot, { recursive: true, force: true });
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    const endpoint = resolveRuntimeRelaySocket({ containerName }, {
+        Mounts: [{
+            Type: 'bind',
+            Source: controlDir,
+            Destination: '/run/ploinky-health-probes',
+            RW: true,
+        }],
+    }, { controlRoot: parent });
+    assert.equal(endpoint.path, socketPath);
+    fs.chmodSync(socketPath, 0o755);
+    assert.equal(
+        resolveRuntimeRelaySocket({ containerName }, {
+            Mounts: [{
+                Type: 'bind',
+                Source: controlDir,
+                Destination: '/run/ploinky-health-probes',
+                RW: true,
+            }],
+        }, { controlRoot: parent }).ino,
+        endpoint.ino,
+        '0755 shared-filesystem sockets remain confined by their exact 0700 parent',
+    );
+    fs.chmodSync(socketPath, 0o775);
+    assert.throws(() => resolveRuntimeRelaySocket({ containerName }, {
+        Mounts: [{
+            Type: 'bind',
+            Source: controlDir,
+            Destination: '/run/ploinky-health-probes',
+            RW: true,
+        }],
+    }, { controlRoot: parent }), /control socket identity is invalid/);
+    fs.chmodSync(socketPath, 0o600);
+    transport = await openRuntimeRelaySocketTransport({ endpoint, timeoutMs: 1_000 });
+    const echoed = new Promise((resolve, reject) => {
+        transport.stdout.once('data', resolve);
+        transport.once('error', reject);
+    });
+    transport.stdin.write('socket-transport-ok');
+    assert.equal(String(await echoed), 'socket-transport-ok');
+});
+
 test('runtime relay starts with only the tracked Agent library available', () => {
     const result = spawnSync(process.execPath, [
         RELAY_HELPER_PATH,
+        'stdio',
     ], {
         env: {
             ...process.env,
@@ -190,6 +265,7 @@ test('runtime relay verifies HELLO with only its principal and the channel-scope
     }, { signingSecret });
     const child = spawn(process.execPath, [
         fileURLToPath(new URL('../../Agent/server/RuntimeHttpRelay.mjs', import.meta.url)),
+        'stdio',
     ], {
         env: {
             PATH: process.env.PATH || '',
@@ -302,18 +378,16 @@ test('runtime relay manager rechecks a principal-only host-mode lease immediatel
                 },
             };
         },
-        spawnProcess: (runtime, args, options) => {
-            assert.equal(runtime, 'podman');
-            assert.deepEqual(args, [
-                'exec', '-i', CONTAINER_ID,
-                'node', '/Agent/server/RuntimeHttpRelay.mjs',
-            ]);
-            return trackChildInputFrames(spawn(process.execPath, [RELAY_HELPER_PATH], {
+        resolveSocket: () => TEST_RELAY_ENDPOINT,
+        openTransport: async ({ endpoint, relay }) => {
+            assert.equal(endpoint, TEST_RELAY_ENDPOINT);
+            assert.equal(relay.containerId, CONTAINER_ID);
+            return trackChildInputFrames(spawn(process.execPath, [RELAY_HELPER_PATH, 'stdio'], {
                 env: {
                     PATH: process.env.PATH || '',
                     PLOINKY_AGENT_ID: identity.targetAgentId,
                 },
-                stdio: options.stdio,
+                stdio: ['pipe', 'pipe', 'pipe'],
             }), routerFrames);
         },
         channelIdleTimeoutMs: 5_000,
@@ -325,7 +399,7 @@ test('runtime relay manager rechecks a principal-only host-mode lease immediatel
             enableGeneration: identity.enableGeneration,
         },
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: 'podman',
             containerId: CONTAINER_ID,
             containerName,
@@ -406,13 +480,14 @@ test('runtime relay buffers a container-exit failure until the request listener 
                 },
             },
         }),
-        spawnProcess: (_runtime, _args, options) => {
-            relayChild = spawn(process.execPath, [RELAY_HELPER_PATH], {
+        resolveSocket: () => TEST_RELAY_ENDPOINT,
+        openTransport: async () => {
+            relayChild = spawn(process.execPath, [RELAY_HELPER_PATH, 'stdio'], {
                 env: {
                     PATH: process.env.PATH || '',
                     PLOINKY_AGENT_ID: identity.targetAgentId,
                 },
-                stdio: options.stdio,
+                stdio: ['pipe', 'pipe', 'pipe'],
             });
             return relayChild;
         },
@@ -425,7 +500,7 @@ test('runtime relay buffers a container-exit failure until the request listener 
             enableGeneration: identity.enableGeneration,
         },
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: 'podman',
             containerId: CONTAINER_ID,
             containerName,
@@ -515,13 +590,14 @@ test('runtime relay forgets an abandoned request before its container exits', as
                 },
             },
         }),
-        spawnProcess: (_runtime, _args, options) => {
-            relayChild = spawn(process.execPath, [RELAY_HELPER_PATH], {
+        resolveSocket: () => TEST_RELAY_ENDPOINT,
+        openTransport: async () => {
+            relayChild = spawn(process.execPath, [RELAY_HELPER_PATH, 'stdio'], {
                 env: {
                     PATH: process.env.PATH || '',
                     PLOINKY_AGENT_ID: identity.targetAgentId,
                 },
-                stdio: options.stdio,
+                stdio: ['pipe', 'pipe', 'pipe'],
             });
             return relayChild;
         },
@@ -534,7 +610,7 @@ test('runtime relay forgets an abandoned request before its container exits', as
             enableGeneration: identity.enableGeneration,
         },
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: 'podman',
             containerId: CONTAINER_ID,
             containerName,
@@ -618,13 +694,14 @@ test('a reused relay channel rechecks the new checkout lease before a second tar
                 },
             },
         }),
-        spawnProcess: (_runtime, _args, options) => trackChildInputFrames(
-            spawn(process.execPath, [RELAY_HELPER_PATH], {
+        resolveSocket: () => TEST_RELAY_ENDPOINT,
+        openTransport: async () => trackChildInputFrames(
+            spawn(process.execPath, [RELAY_HELPER_PATH, 'stdio'], {
                 env: {
                     PATH: process.env.PATH || '',
                     PLOINKY_AGENT_ID: identity.targetAgentId,
                 },
-                stdio: options.stdio,
+                stdio: ['pipe', 'pipe', 'pipe'],
             }),
             routerFrames,
         ),
@@ -637,7 +714,7 @@ test('a reused relay channel rechecks the new checkout lease before a second tar
             enableGeneration: identity.enableGeneration,
         },
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: 'podman',
             containerId: CONTAINER_ID,
             containerName,
@@ -741,12 +818,13 @@ test('runtime relay preserves the HTTP response-header budget before applying bo
                 },
             },
         }),
-        spawnProcess: (_runtime, _args, options) => spawn(process.execPath, [RELAY_HELPER_PATH], {
+        resolveSocket: () => TEST_RELAY_ENDPOINT,
+        openTransport: async () => spawn(process.execPath, [RELAY_HELPER_PATH, 'stdio'], {
             env: {
                 PATH: process.env.PATH || '',
                 PLOINKY_AGENT_ID: identity.targetAgentId,
             },
-            stdio: options.stdio,
+            stdio: ['pipe', 'pipe', 'pipe'],
         }),
         channelIdleTimeoutMs: 5_000,
     });
@@ -757,7 +835,7 @@ test('runtime relay preserves the HTTP response-header budget before applying bo
             enableGeneration: identity.enableGeneration,
         },
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: 'podman',
             containerId: CONTAINER_ID,
             containerName,
@@ -837,12 +915,13 @@ test('runtime relay applies the body idle timeout after the first HTTP response 
                 },
             },
         }),
-        spawnProcess: (_runtime, _args, options) => spawn(process.execPath, [RELAY_HELPER_PATH], {
+        resolveSocket: () => TEST_RELAY_ENDPOINT,
+        openTransport: async () => spawn(process.execPath, [RELAY_HELPER_PATH, 'stdio'], {
             env: {
                 PATH: process.env.PATH || '',
                 PLOINKY_AGENT_ID: identity.targetAgentId,
             },
-            stdio: options.stdio,
+            stdio: ['pipe', 'pipe', 'pipe'],
         }),
         channelIdleTimeoutMs: 5_000,
     });
@@ -853,7 +932,7 @@ test('runtime relay applies the body idle timeout after the first HTTP response 
             enableGeneration: identity.enableGeneration,
         },
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: 'podman',
             containerId: CONTAINER_ID,
             containerName,

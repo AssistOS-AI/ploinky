@@ -60,6 +60,16 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
     );
 
     const harness = createPodmanHarness(t, candidateReference);
+    const agentLibSource = path.resolve(
+        process.env.PLOINKY_HEALTH_PROBE_AGENTLIB_SOURCE
+            || path.join(repositoryRoot, 'node_modules', 'achillesAgentLib'),
+    );
+    assert.equal(
+        fs.statSync(agentLibSource).isDirectory(),
+        true,
+        'native health gate requires a local validated achillesAgentLib checkout',
+    );
+    fs.cpSync(agentLibSource, path.join(harness.workspace, 'achillesAgentLib'), { recursive: true });
     const probeRoot = path.join(harness.workspace, 'health-probe-native');
     fs.mkdirSync(path.join(probeRoot, 'code'), { recursive: true });
     fs.mkdirSync(path.join(probeRoot, 'Agent', 'server'), { recursive: true });
@@ -116,7 +126,11 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
         '',
     ].join('\n'), { mode: 0o755 });
 
-    const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const prepared = await harness.supervisor.prepareBoxForCommand({
+        imageRef: candidateReference,
+        explicitPort: 19098,
+        explicitMediaPort: 17902,
+    });
     execInBox(harness.runner, prepared.containerId, [
         'mkdir', '-p', '/workspace/health-probe-native',
     ]);
@@ -149,6 +163,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
             '-v', '/workspace/health-probe-native/code:/code:ro',
             '-v', '/workspace/health-probe-native/Agent:/Agent:ro',
             '-v', '/workspace/health-probe-native/control:/run/ploinky-health-probes',
+            '-e', 'PLOINKY_HEALTH_PROBE_BROKER=1',
             '--entrypoint', '/Agent/server/AgentEntrypoint.sh',
             probeImage,
             'sh', '/code/main.sh',

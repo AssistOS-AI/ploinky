@@ -312,7 +312,7 @@ function agentPortPlan({
         forwardedPrefix: `/${selector.convention}/${selector.rawAgent}/${selector.canonicalPort}`,
         unmatchedSuffix: selector.suffix,
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: runtime.runtime,
             containerId: runtime.containerId,
             containerName: runtime.containerName,

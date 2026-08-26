@@ -549,7 +549,11 @@ emit_inspect() {
 case "$1" in
   image)
     if [ "$2" = "inspect" ]; then
-      printf '%s\\n' 'sha256:${'a'.repeat(64)}'
+      if [ "$3" = "--format" ] && [ "$4" = '{{json .Config.Entrypoint}}' ]; then
+        printf '%s\\n' 'null'
+      else
+        printf '%s\\n' 'sha256:${'a'.repeat(64)}'
+      fi
     fi
     exit 0
     ;;
