@@ -172,6 +172,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
     const startTarget = (mainScript = 'main.sh') => {
         execInBox(harness.runner, prepared.containerId, [
             'podman', 'run', '-d', '--init', '--name', containerName,
+            '--userns=keep-id:uid=1000,gid=1000', '--user', '1000:1000',
             '-v', '/workspace/health-probe-native/code:/code:ro',
             '-v', '/workspace/health-probe-native/Agent:/Agent:ro',
             '-v', '/workspace/health-probe-native/control:/run/ploinky-health-probes',
@@ -198,6 +199,11 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
             inspection.Config?.Entrypoint,
             ['/Agent/server/AgentEntrypoint.sh'],
             `${stage}: target must be launched through the mounted broker entrypoint`,
+        );
+        assert.equal(
+            inspection.Config?.User,
+            '1000:1000',
+            `${stage}: native broker regression must exercise a non-root image user`,
         );
     };
     const submitRequest = ({ token, script, timeout, killAfter, cancelMode = 'none' }) => (

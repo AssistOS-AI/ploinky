@@ -887,7 +887,11 @@ test('probe runner is executable and binds cleanup to exact kernel identity', ()
     assert.match(source, /PLOINKY_PROBE_TOKEN="\$\{token\}:"/);
     assert.match(source, /\$\{PROBE_TOKEN_PREFIX\}\$\{token\}:/);
     assert.match(source, /PROBE_CONTROL_ROOT='\/run\/ploinky-health-probes'/);
-    assert.match(source, /PROBE_RUNTIME_ROOT='\/run\/ploinky-health-probe-runtime'/);
+    assert.match(source, /PROBE_RUNTIME_PARENT='\/tmp'/);
+    assert.match(source, /PROBE_RUNTIME_ROOT="\$PROBE_RUNTIME_PARENT\/ploinky-health-probe-runtime"/);
+    assert.match(source, /\[ -d "\$PROBE_RUNTIME_PARENT" \]/);
+    assert.match(source, /\[ ! -L "\$PROBE_RUNTIME_PARENT" \]/);
+    assert.match(source, /\[ -w "\$PROBE_RUNTIME_PARENT" \]/);
     assert.match(source, /runtime_path="\$PROBE_RUNTIME_ROOT\/\$token"/);
     assert.match(source, /stdout_fifo="\$runtime_path\/stdout-fifo"/);
     assert.match(source, /stderr_fifo="\$runtime_path\/stderr-fifo"/);

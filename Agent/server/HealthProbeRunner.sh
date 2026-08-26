@@ -8,7 +8,8 @@ PROBE_ACTIVE_PREFIX='active-'
 PROBE_CANCEL_DIR='cancelled'
 PROBE_TIMEOUT_DIR='timed-out'
 PROBE_CONTROL_ROOT='/run/ploinky-health-probes'
-PROBE_RUNTIME_ROOT='/run/ploinky-health-probe-runtime'
+PROBE_RUNTIME_PARENT='/tmp'
+PROBE_RUNTIME_ROOT="$PROBE_RUNTIME_PARENT/ploinky-health-probe-runtime"
 PROBE_OUTPUT_BLOCK_SIZE=4096
 PROBE_OUTPUT_BLOCK_COUNT=256
 PROBE_REQUEST_FILE='request'
@@ -576,6 +577,9 @@ serve_broker() {
     trap 'remove_broker_artifacts' EXIT
 
     umask 077
+    [ -d "$PROBE_RUNTIME_PARENT" ] && [ ! -L "$PROBE_RUNTIME_PARENT" ] \
+        && [ -w "$PROBE_RUNTIME_PARENT" ] \
+        || fail 'probe runtime parent is not one writable directory'
     [ ! -e "$PROBE_RUNTIME_ROOT" ] && [ ! -L "$PROBE_RUNTIME_ROOT" ] \
         || fail 'probe runtime root already exists'
     mkdir "$PROBE_RUNTIME_ROOT" || fail 'probe runtime root cannot be created'
