@@ -66,6 +66,7 @@ export function canonicalBrowserMutationOrigin(req, routePlan) {
 function browserCsrfMac({
     sessionId,
     origin,
+    generation,
     hostRouteKey,
 }) {
     return crypto
@@ -75,6 +76,8 @@ function browserCsrfMac({
         .update(String(sessionId || ''))
         .update('\0')
         .update(String(origin || ''))
+        .update('\0')
+        .update(String(generation || ''))
         .update('\0')
         .update(String(hostRouteKey || ''))
         .digest('base64url');
