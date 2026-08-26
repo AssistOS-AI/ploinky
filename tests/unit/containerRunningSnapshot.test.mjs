@@ -98,6 +98,27 @@ test('container startup inspection has per-call and aggregate deadlines', () => 
     assert.deepEqual(sleeps, [1]);
 });
 
+test('container startup inspection can surface an all-timeout control-plane failure', () => {
+    const timeout = new Error('inspect timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(
+        () => waitForContainerRunning('slow-container', 2, 1, {
+            runtime: 'podman',
+            timeoutMs: 17,
+            totalTimeoutMs: 50,
+            throwOnControlPlaneTimeout: true,
+            spawnSyncImpl: () => ({
+                status: null,
+                error: timeout,
+                stdout: '',
+                stderr: '',
+            }),
+            sleepMsImpl() {},
+        }),
+        (error) => error === timeout,
+    );
+});
+
 test('sixteen container targets share one status snapshot in an actual monitor tick', () => {
     let calls = 0;
     const logs = [];

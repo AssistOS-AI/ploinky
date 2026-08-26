@@ -429,6 +429,36 @@ test('blocking container script readiness fails immediately after the container 
     assert.equal(calls.length, 1, 'only the initial script existence check should run');
 });
 
+test('blocking readiness preserves a typed running-state control-plane timeout', () => {
+    const calls = [];
+    const timeout = new Error('podman ps timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+    }, {
+        runtime: 'fake-runtime',
+        spawnSyncImpl: fakeSpawnSequence([], calls),
+        isContainerRunningImpl() { throw timeout; },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /inspect container running state/);
+        return true;
+    });
+    assert.equal(calls.length, 1, 'only script inspection should reach the runtime');
+});
+
+test('continuous health preserves a typed startup-state control-plane timeout', () => {
+    const timeout = new Error('podman inspect timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(() => runHealthProbes('webtty', 'webtty-container', {}, {
+        waitForContainerRunningImpl() { throw timeout; },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /inspect container startup state/);
+        return true;
+    });
+});
+
 test('continuous health runs cheap liveness while activation-only readiness stays skipped', () => {
     const calls = [];
     runHealthProbes('onlyOffice', 'onlyoffice-container', {

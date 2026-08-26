@@ -332,6 +332,7 @@ function isContainerRunning(containerName, options = {}) {
         return running;
     } catch (error) {
         debugLog(`Unable to prove container '${containerName}' is running: ${error?.message || error}`);
+        if (options.throwOnError === true) throw error;
         return false;
     }
 }
@@ -357,7 +358,9 @@ function listRunningContainerNames(options = {}) {
             || result.stdout
             || `exit ${result.status ?? 'unknown'}`,
         ).trim();
-        throw new Error(`cannot list running containers: ${detail}`);
+        const error = new Error(`cannot list running containers: ${detail}`);
+        if (result.error?.code) error.code = result.error.code;
+        throw error;
     }
     return new Set(
         String(result.stdout || '')
@@ -628,6 +631,8 @@ function waitForContainerRunning(containerName, maxAttempts = 20, delayMs = 250,
     const totalTimeoutMs = options.totalTimeoutMs
         || Math.max(1, maxAttempts * Math.max(1, delayMs));
     const deadline = Date.now() + totalTimeoutMs;
+    let lastControlPlaneTimeout = null;
+    let sawDefinitiveResponse = false;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) break;
@@ -651,11 +656,27 @@ function waitForContainerRunning(containerName, maxAttempts = 20, delayMs = 250,
             if (!result.error && result.status === 0 && status === 'running') {
                 return true;
             }
-        } catch (_) {}
+            if (result.error?.code === 'ETIMEDOUT') {
+                lastControlPlaneTimeout = result.error;
+            } else if (!result.error) {
+                sawDefinitiveResponse = true;
+            }
+        } catch (error) {
+            if (error?.code === 'ETIMEDOUT') {
+                lastControlPlaneTimeout = error;
+            } else {
+                sawDefinitiveResponse = true;
+            }
+        }
         const remainingAfterInspectMs = deadline - Date.now();
         if (attempt + 1 < maxAttempts && remainingAfterInspectMs > 0) {
             sleepMsImpl(Math.min(delayMs, remainingAfterInspectMs));
         }
+    }
+    if (options.throwOnControlPlaneTimeout === true
+        && lastControlPlaneTimeout
+        && !sawDefinitiveResponse) {
+        throw lastControlPlaneTimeout;
     }
     return false;
 }

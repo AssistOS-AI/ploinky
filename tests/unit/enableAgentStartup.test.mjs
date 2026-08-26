@@ -6,6 +6,7 @@ import {
     enableAgent,
     preferredHostPortForNetworkMode,
     verifyEnabledAgentStarted,
+    waitForEnabledAgentReadiness,
 } from '../../cli/utils/agents.js';
 import { mergeRuntimeRoute } from '../../cli/server/routingFile.js';
 
@@ -132,4 +133,75 @@ test('verifyEnabledAgentStarted fails clearly when startup returns no runtime in
         waitRunning: () => true,
         log: () => {}
     }), /enable agent: failed to start 'codexAgent': no runtime instance was returned/);
+});
+
+test('enabled agent readiness stops immediately when the exact container exits', async () => {
+    const exactContainerId = 'a'.repeat(64);
+    let observedTarget = '';
+    let readinessOptions = null;
+
+    await assert.rejects(
+        waitForEnabledAgentReadiness('searchAgent', {
+            readiness: { protocol: 'mcp', port: 7000 },
+        }, {
+            containerName: 'ploinky_proxies_searchAgent_workspace_deadbeef',
+            containerId: exactContainerId,
+            registryRecord: {
+                runtime: 'podman',
+                containerId: exactContainerId,
+                instanceId: 'instance-1',
+                enableGeneration: 'generation-1',
+                repoName: 'proxies',
+                agentName: 'searchAgent',
+            },
+        }, {
+            containerWaitRunning: (target, attempts, delayMs, options) => {
+                observedTarget = target;
+                assert.equal(attempts, 1);
+                assert.equal(delayMs, 1);
+                assert.equal(options.runtime, 'podman');
+                assert.equal(options.throwOnControlPlaneTimeout, true);
+                return false;
+            },
+            waitUntilReady: async (_route, options) => {
+                readinessOptions = options;
+                return options.beforeProbe();
+            },
+        }),
+        /podman runtime 'ploinky_proxies_searchAgent_workspace_deadbeef' exited before readiness protocol 'mcp' succeeded/,
+    );
+
+    assert.equal(observedTarget, exactContainerId);
+    assert.equal(typeof readinessOptions.beforeProbe, 'function');
+});
+
+test('enabled agent readiness tolerates an inconclusive runtime control-plane timeout', async () => {
+    const timeout = Object.assign(new Error('inspect timed out'), { code: 'ETIMEDOUT' });
+    let probes = 0;
+
+    await assert.doesNotReject(waitForEnabledAgentReadiness('searchAgent', {
+        readiness: { protocol: 'mcp', port: 7000 },
+    }, {
+        containerName: 'search-agent',
+        containerId: 'b'.repeat(64),
+        registryRecord: {
+            runtime: 'podman',
+            containerId: 'b'.repeat(64),
+            instanceId: 'instance-2',
+            enableGeneration: 'generation-2',
+            repoName: 'proxies',
+            agentName: 'searchAgent',
+        },
+    }, {
+        containerWaitRunning: () => {
+            throw timeout;
+        },
+        waitUntilReady: async (_route, options) => {
+            probes += 1;
+            assert.equal(options.beforeProbe(), true);
+            return true;
+        },
+    }));
+
+    assert.equal(probes, 1);
 });

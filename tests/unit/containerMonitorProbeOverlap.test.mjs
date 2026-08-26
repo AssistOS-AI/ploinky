@@ -374,6 +374,9 @@ test('a probe worker error inactivates routing and schedules managed recovery', 
         pendingRestartTimer: null,
         circuitBreakerTripped: false,
     };
+    t.after(() => {
+        if (target.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
+    });
 
     startProbeWorker(monitor, target);
     const worker = target.probeWorker;
@@ -399,6 +402,146 @@ test('a probe worker error inactivates routing and schedules managed recovery', 
     clearTimeout(target.pendingRestartTimer);
     target.pendingRestartTimer = null;
     target.isRestarting = false;
+});
+
+test('a typed probe control-plane timeout is retried without invalidating a healthy route', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-probe-infrastructure-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const manifestPath = path.join(workspace, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify({
+        health: {
+            readiness: {
+                script: 'healthcheck.sh',
+            },
+        },
+    }));
+
+    class FakeWorker extends EventEmitter {
+        postMessage() {}
+        terminate() {
+            return Promise.resolve(0);
+        }
+    }
+
+    const { monitor, events } = monitorRecorder();
+    const inactivations = [];
+    monitor.Worker = FakeWorker;
+    monitor.config.PROBE_INFRASTRUCTURE_BACKOFF_MS = 60_000;
+    monitor.config.PROBE_INFRASTRUCTURE_MAX_BACKOFF_MS = 60_000;
+    monitor.inactivateEdgeRoutingGeneration = (reason) => inactivations.push(reason);
+    const target = {
+        containerName: 'control-plane-timeout-container',
+        agentName: 'control-plane-timeout-agent',
+        repoName: 'demo-repo',
+        manifestPath,
+        probeWorker: null,
+        probeState: 'pending',
+        restartHistory: [],
+        currentBackoff: 60_000,
+        isRestarting: false,
+        pendingRestartTimer: null,
+        circuitBreakerTripped: false,
+    };
+    t.after(() => {
+        if (target.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
+    });
+
+    startProbeWorker(monitor, target);
+    const worker = target.probeWorker;
+    assert.ok(worker instanceof FakeWorker);
+    const observedAt = Date.now();
+    worker.emit('message', {
+        status: 'error',
+        code: 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT',
+        error: '[probe] control-plane-timeout-agent: unable to inspect healthcheck.sh: spawnSync podman ETIMEDOUT',
+    });
+
+    assert.equal(target.probeState, 'pending');
+    assert.equal(target.probeWorker, null);
+    assert.equal(target.probeInfrastructureFailures, 1);
+    assert.ok(target.probeRetryNotBefore >= observedAt + 60_000);
+    assert.equal(target.isRestarting, false);
+    assert.equal(target.pendingRestartTimer, null);
+    assert.deepEqual(inactivations, []);
+    assert.ok(events.some(({ level, event, data }) => (
+        level === 'warn'
+        && event === 'container_probe_infrastructure_error'
+        && data.code === 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
+        && data.failures === 1
+        && data.retryInMs === 60_000
+    )));
+    assert.equal(
+        events.some(({ event }) => event === 'container_probe_failed'),
+        false,
+    );
+    assert.equal(
+        events.some(({ event }) => event === 'container_scheduling_restart'),
+        false,
+    );
+
+    const startsBeforeRetry = events.filter(({ event }) => event === 'container_probe_started').length;
+    startProbeWorker(monitor, target);
+    assert.equal(target.probeWorker, null, 'the retry backoff must block an immediate retry storm');
+    assert.equal(
+        events.filter(({ event }) => event === 'container_probe_started').length,
+        startsBeforeRetry,
+    );
+
+    target.probeRetryNotBefore = Date.now() - 1;
+    startProbeWorker(monitor, target);
+    const retryWorker = target.probeWorker;
+    assert.ok(retryWorker instanceof FakeWorker);
+    retryWorker.emit('message', { status: 'success' });
+    assert.equal(target.probeState, 'success');
+    assert.equal(target.probeInfrastructureFailures, 0);
+    assert.equal(target.probeRetryNotBefore, null);
+    assert.equal(target.lastError, null);
+});
+
+test('probe worker concurrency is capped to avoid a Podman control-plane stampede', (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-probe-concurrency-'));
+    t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    const manifestPath = path.join(workspace, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify({
+        health: {
+            readiness: {
+                script: 'healthcheck.sh',
+            },
+        },
+    }));
+
+    class FakeWorker extends EventEmitter {
+        postMessage() {}
+        terminate() {
+            return Promise.resolve(0);
+        }
+    }
+
+    const { monitor, events } = monitorRecorder();
+    monitor.Worker = FakeWorker;
+    monitor.config.PROBE_MAX_CONCURRENCY = 2;
+    const targets = Array.from({ length: 4 }, (_, index) => ({
+        containerName: `concurrency-container-${index}`,
+        agentName: `concurrency-agent-${index}`,
+        repoName: 'demo-repo',
+        manifestPath,
+        probeWorker: null,
+        probeState: 'pending',
+        circuitBreakerTripped: false,
+    }));
+    for (const target of targets) monitor.targets.set(target.containerName, target);
+
+    for (const target of targets) startProbeWorker(monitor, target);
+
+    assert.equal(targets.filter(({ probeWorker }) => Boolean(probeWorker)).length, 2);
+    assert.equal(targets[2].probeState, 'pending');
+    assert.equal(targets[3].probeState, 'pending');
+    assert.equal(events.filter(({ event }) => event === 'container_probe_started').length, 2);
+
+    targets[0].probeWorker.emit('message', { status: 'success' });
+    startProbeWorker(monitor, targets[2]);
+    assert.ok(targets[2].probeWorker instanceof FakeWorker);
+    assert.equal(targets.filter(({ probeWorker }) => Boolean(probeWorker)).length, 2);
 });
 
 test('no-wait marker identities must be real JSON numbers, not coercible values', (t) => {

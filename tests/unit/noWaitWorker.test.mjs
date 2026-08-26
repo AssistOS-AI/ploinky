@@ -27,6 +27,7 @@ import {
     resolveNoWaitWorkerLifecycleSnapshot,
     resolveRunScopedObservation,
     runNoWaitLifecycleTransaction,
+    runNoWaitScriptReadinessWithControlPlaneRetry,
     waitForNoWaitLifecycle,
     waitForNoWaitStatusBarrier,
     waitForNoWaitRouteActivation,
@@ -2481,6 +2482,76 @@ test('a readiness failure preserves the probe output and a bounded runtime log t
     });
     assert.ok(huge.length < 5_000, 'the captured tail must stay bounded');
     assert.match(huge, /…$/);
+});
+
+test('no-wait script readiness retries only typed probe control-plane timeouts', async () => {
+    const delays = [];
+    let calls = 0;
+    const result = await runNoWaitScriptReadinessWithControlPlaneRetry(
+        'liveKitServerAgent',
+        'livekit-container',
+        { script: 'healthcheck.sh' },
+        {
+            maxRetries: 3,
+            retryDelayMs: 25,
+            maxRetryDelayMs: 100,
+            sleepImpl: async (delayMs) => { delays.push(delayMs); },
+            runReadiness() {
+                calls += 1;
+                if (calls < 3) {
+                    const error = new Error('runtime control plane did not answer');
+                    error.code = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
+                    throw error;
+                }
+                return { status: 'success' };
+            },
+        },
+    );
+
+    assert.deepEqual(result, { status: 'success' });
+    assert.equal(calls, 3);
+    assert.deepEqual(delays, [25, 50]);
+
+    let semanticCalls = 0;
+    await assert.rejects(
+        () => runNoWaitScriptReadinessWithControlPlaneRetry(
+            'liveKitServerAgent',
+            'livekit-container',
+            { script: 'healthcheck.sh' },
+            {
+                maxRetries: 3,
+                sleepImpl: async () => { throw new Error('must not sleep'); },
+                runReadiness() {
+                    semanticCalls += 1;
+                    throw new Error('healthcheck.sh is missing');
+                },
+            },
+        ),
+        /healthcheck\.sh is missing/,
+    );
+    assert.equal(semanticCalls, 1);
+});
+
+test('no-wait script readiness bounds typed control-plane retries', async () => {
+    let calls = 0;
+    const timeout = new Error('runtime control plane did not answer');
+    timeout.code = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
+    await assert.rejects(
+        () => runNoWaitScriptReadinessWithControlPlaneRetry(
+            'liveKitServerAgent',
+            'livekit-container',
+            { script: 'healthcheck.sh' },
+            {
+                maxRetries: 2,
+                retryDelayMs: 0,
+                maxRetryDelayMs: 0,
+                sleepImpl: async () => {},
+                runReadiness() { calls += 1; throw timeout; },
+            },
+        ),
+        (error) => error === timeout,
+    );
+    assert.equal(calls, 3);
 });
 
 test('the worker publishes readiness detail into its terminal status', () => {
