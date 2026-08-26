@@ -507,17 +507,55 @@ test('blocking container script readiness fails immediately after the container 
 test('container running-state timeout remains a retryable probe control-plane failure', () => {
     const timeout = new Error('podman inventory timed out');
     timeout.code = 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT';
+    let attempts = 0;
+    const retrySleeps = [];
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
     }, {
         runtime: 'fake-runtime',
         submitProbeRequestImpl: fakeBrokerSequence([], []),
-        isContainerRunningImpl() { throw timeout; },
+        isContainerRunningImpl() {
+            attempts += 1;
+            throw timeout;
+        },
+        controlPlaneRetryMs: 17,
+        sleepMsImpl(delayMs) { retrySleeps.push(delayMs); },
     }), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
         assert.match(error.message, /podman inventory timed out/);
         return true;
     });
+    assert.equal(attempts, 3);
+    assert.deepEqual(retrySleeps, [17, 17]);
+});
+
+test('script readiness proves container state once instead of amplifying runtime inventory', () => {
+    const calls = [];
+    let stateInspections = 0;
+    const result = runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+        interval: 1,
+        successThreshold: 1,
+        failureThreshold: 3,
+    }, {
+        tokenFactory: (() => {
+            let sequence = 0;
+            return () => `single-state-${sequence += 1}`;
+        })(),
+        submitProbeRequestImpl: fakeBrokerSequence([
+            { status: 9, stderr: 'warming\n' },
+            { status: 0, stdout: 'ready\n' },
+        ], calls),
+        isContainerRunningImpl() {
+            stateInspections += 1;
+            return true;
+        },
+        sleepMsImpl() {},
+    });
+
+    assert.deepEqual(result, { status: 'success', detail: 'ready' });
+    assert.equal(calls.length, 2);
+    assert.equal(stateInspections, 1);
 });
 
 test('initial container wait timeout remains a retryable probe control-plane failure', () => {

@@ -14,7 +14,7 @@ const DEFAULT_TIMEOUT_SECONDS = 5;
 const DEFAULT_FAILURE_THRESHOLD = 5;
 const DEFAULT_SUCCESS_THRESHOLD = 1;
 const DEFAULT_PROBE_KILL_GRACE_SECONDS = 1;
-const PROBE_CONTROL_PLANE_TIMEOUT_MS = 5_000;
+const PROBE_CONTROL_PLANE_TIMEOUT_MS = 30_000;
 const PROBE_CONTAINER_WAIT_TIMEOUT_MS = 10_000;
 const PROBE_RESULT_GRACE_MS = 60_000;
 const PROBE_CANCELLATION_GRACE_MS = 15_000;
@@ -356,24 +356,39 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
     postProbeLog('info', `[probe] ${agentName}: ${type} probe -> script='${probe.script}', interval=${probe.interval}s, timeout=${probe.timeout}s, successThreshold=${probe.successThreshold}, failureThreshold=${probe.failureThreshold}, continuous=${probe.continuous}`);
     let consecutiveSuccesses = 0;
     let consecutiveFailures = 0;
+    // Prove the immutable runtime once before entering the semantic loop. A
+    // mounted broker result is itself evidence that the same main process tree
+    // executed each subsequent probe, so repeating runtime inventory here adds
+    // no identity proof and can overload nested Podman during cold fan-out.
+    const isContainerRunningImpl = options.isContainerRunningImpl || isContainerRunning;
+    const containerRunning = runProbeWithControlPlaneRetry(
+        agentName,
+        'container running-state inspection',
+        () => {
+            try {
+                return isContainerRunningImpl(containerName, {
+                    timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
+                    throwOnControlPlaneError: true,
+                });
+            } catch (error) {
+                throw asProbeControlPlaneError(
+                    agentName,
+                    'unable to inspect container running state',
+                    error,
+                );
+            }
+        },
+        options,
+    );
+    if (!containerRunning) {
+        return {
+            status: 'failed',
+            reason: 'container exited',
+            detail: '',
+        };
+    }
+
     while (true) {
-        const isContainerRunningImpl = options.isContainerRunningImpl || isContainerRunning;
-        let containerRunning = false;
-        try {
-            containerRunning = isContainerRunningImpl(containerName, {
-                timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
-                throwOnControlPlaneError: true,
-            });
-        } catch (error) {
-            throw asProbeControlPlaneError(agentName, 'unable to inspect container running state', error);
-        }
-        if (!containerRunning) {
-            return {
-                status: 'failed',
-                reason: 'container exited',
-                detail: '',
-            };
-        }
         const result = runProbeWithControlPlaneRetry(
             agentName,
             `${type} probe`,

@@ -49,7 +49,7 @@ test('running-container inventory fails closed on runtime errors', () => {
     );
 });
 
-test('running-container inventory preserves typed control-plane timeouts', () => {
+test('single-container inspection preserves typed control-plane timeouts', () => {
     const timeout = new Error('runtime timed out');
     timeout.code = 'ETIMEDOUT';
     assert.throws(() => isContainerRunning('exact-container', {
@@ -65,7 +65,7 @@ test('running-container inventory preserves typed control-plane timeouts', () =>
     });
 });
 
-test('single-container status checks are argv-safe and bounded', () => {
+test('single-container status checks use one exact argv-safe inspect and are bounded', () => {
     const calls = [];
     const running = isContainerRunning('exact-container', {
         runtime: 'podman',
@@ -74,7 +74,7 @@ test('single-container status checks are argv-safe and bounded', () => {
             calls.push({ runtime, args, options });
             return {
                 status: 0,
-                stdout: 'other-container\nexact-container\n',
+                stdout: 'running\n',
                 stderr: '',
             };
         },
@@ -82,9 +82,49 @@ test('single-container status checks are argv-safe and bounded', () => {
 
     assert.equal(running, true);
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].args, ['ps', '--format', '{{.Names}}']);
+    assert.deepEqual(calls[0].args, [
+        'container',
+        'inspect',
+        '--format',
+        '{{.State.Status}}',
+        'exact-container',
+    ]);
     assert.equal(calls[0].options.timeout, 321);
     assert.equal(calls[0].options.killSignal, 'SIGKILL');
+});
+
+test('single-container status checks distinguish stopped and absent runtimes', () => {
+    assert.equal(isContainerRunning('stopped-container', {
+        runtime: 'podman',
+        spawnSyncImpl() {
+            return { status: 0, stdout: 'exited\n', stderr: '' };
+        },
+    }), false);
+    assert.equal(isContainerRunning('missing-container', {
+        runtime: 'podman',
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            return {
+                status: 125,
+                stdout: '',
+                stderr: 'Error: no such container missing-container',
+            };
+        },
+    }), false);
+});
+
+test('single-container status checks fail closed on malformed runtime output', () => {
+    assert.throws(() => isContainerRunning('malformed-container', {
+        runtime: 'podman',
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            return { status: 0, stdout: '[{"State":{"Status":"running"}}]\n', stderr: '' };
+        },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED');
+        assert.match(error.message, /invalid status/);
+        return true;
+    });
 });
 
 test('container startup inspection has per-call and aggregate deadlines', () => {

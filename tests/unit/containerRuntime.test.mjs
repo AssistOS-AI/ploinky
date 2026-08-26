@@ -564,6 +564,12 @@ case "$1" in
     [ "$2" = "inspect" ] || exit 1
     if [ "$3" = "--format" ] && [ "$4" = '{{json .Config.Env}}' ]; then
       ${JSON.stringify(process.execPath)} ${JSON.stringify(inspectHelper)} ${JSON.stringify(argsFile)} ${JSON.stringify(stateFile)} ${JSON.stringify(runningFile)} env
+    elif [ "$3" = "--format" ] && [ "$4" = '{{.State.Status}}' ]; then
+      if [ -f ${JSON.stringify(runningFile)} ]; then
+        printf '%s\\n' running
+      else
+        printf '%s\\n' configured
+      fi
     else
       emit_inspect
     fi
