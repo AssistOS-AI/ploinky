@@ -135,6 +135,9 @@ export const RESERVED_AGENT_ENV_NAMES = Object.freeze([
     'PLOINKY_AGENT_LIB_DIR',
     'PLOINKY_AGENT_SECRET',
     'PLOINKY_AGENT_PRIVATE_SECRET',
+    // Managed entrypoint selection. A manifest cannot disable or manufacture
+    // the in-process broker contract for a container generation.
+    'PLOINKY_HEALTH_PROBE_BROKER',
     // The direct-mounted achillesAgentLib contract. A manifest or user env
     // layer must not be able to point an agent at a different source than the
     // one the workspace selected.

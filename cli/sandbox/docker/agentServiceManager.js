@@ -176,7 +176,7 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
-const AGENT_HEALTH_ENTRYPOINT = '/Agent/server/AgentEntrypoint.sh';
+const AGENT_CONTROL_ENTRYPOINT = '/Agent/server/AgentEntrypoint.sh';
 const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
 const AUTHORIZED_CLEANUP_RECEIPTS = new WeakMap();
 const CONSUMED_CLEANUP_RECEIPTS = new WeakSet();
@@ -1067,6 +1067,10 @@ function inspectImageEntrypoint(runtime, image, spawn = spawnSync) {
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const repoName = path.basename(path.dirname(agentPath));
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
+    const useHealthProbeBroker = manifestUsesHealthProbeBroker(manifest);
+    const managedControlEnv = Object.freeze({
+        PLOINKY_HEALTH_PROBE_BROKER: useHealthProbeBroker ? '1' : '0',
+    });
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
@@ -1203,7 +1207,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     });
     const envHash = computeEnvHash(manifest, profileConfig, {
         ...runtimeRouterEnv,
-        ...runtimeNetworkPlan.hashEnv
+        ...runtimeNetworkPlan.hashEnv,
+        ...managedControlEnv,
     }, { agentName, repoName });
 
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
@@ -1576,6 +1581,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     for (const [key, value] of Object.entries(agentLibGrantEnv(containerAgentLibGrant))) {
         envStrings.push(formatEnvFlag(key, value));
     }
+    for (const [key, value] of Object.entries(managedControlEnv)) {
+        envStrings.push(formatEnvFlag(key, value));
+    }
 
     const envFlags = flagsToArgs(envStrings);
     if (envFlags.length) args.push(...envFlags);
@@ -1591,20 +1599,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     args.push('-e', `NODE_PATH=/code/node_modules`);
 
     const manifestEntrypoint = typeof manifest?.entrypoint === 'string' ? manifest.entrypoint.trim() : '';
-    const useHealthProbeBroker = manifestUsesHealthProbeBroker(manifest);
-    let mainEntrypoint = [];
-    if (useHealthProbeBroker) {
-        // The broker is part of the container's main process tree, so health
-        // checks never create target OCI exec sessions. Preserve the exact
-        // manifest override or image entrypoint as the wrapper's child command.
-        ensureImagePresent(image, { runtime });
-        mainEntrypoint = manifestEntrypoint
-            ? Object.freeze([manifestEntrypoint])
-            : inspectImageEntrypoint(runtime, image);
-        args.push('--entrypoint', AGENT_HEALTH_ENTRYPOINT);
-    } else if (manifestEntrypoint) {
-        args.push('--entrypoint', manifestEntrypoint);
-    }
+    // Every managed container owns its health and runtime-relay brokers in the
+    // main process tree. Preserve the exact manifest override or immutable
+    // image entrypoint as the wrapper's child command.
+    ensureImagePresent(image, { runtime });
+    const mainEntrypoint = manifestEntrypoint
+        ? Object.freeze([manifestEntrypoint])
+        : inspectImageEntrypoint(runtime, image);
+    args.push('--entrypoint', AGENT_CONTROL_ENTRYPOINT);
     args.push(image);
     const mainCommandIndex = args.length;
     let entrySummary = DEFAULT_AGENT_ENTRY;
@@ -1649,17 +1651,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             args.push('sh', '/Agent/server/AgentServer.sh');
         }
     }
-    if (useHealthProbeBroker) {
-        args.splice(mainCommandIndex, 0, ...mainEntrypoint);
-        entrySummary = `${AGENT_HEALTH_ENTRYPOINT} -> ${[
-            ...mainEntrypoint,
-            ...args.slice(mainCommandIndex + mainEntrypoint.length),
-        ].join(' ')}`;
-    }
+    args.splice(mainCommandIndex, 0, ...mainEntrypoint);
+    entrySummary = `${AGENT_CONTROL_ENTRYPOINT} -> ${[
+        ...mainEntrypoint,
+        ...args.slice(mainCommandIndex + mainEntrypoint.length),
+    ].join(' ')}`;
 
     const principalId = deriveAgentPrincipalId(repoName, agentName);
     const computeSemanticEnvHash = (payload) => computeEnvHash(manifest, profileConfig, {
         ...runtimeNetworkPlan.hashEnv,
+        ...managedControlEnv,
         PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
         PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
         PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
@@ -1820,7 +1821,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
             const descriptorEnv = buildGeneratedRouterDescriptorEnv(payload);
             const credentialEnv = buildAgentCredentialEnv(principalId, runtimeIdentity);
-            const expectedEnv = Object.freeze({ ...descriptorEnv, ...credentialEnv });
+            const expectedEnv = Object.freeze({
+                ...descriptorEnv,
+                ...credentialEnv,
+                ...managedControlEnv,
+            });
             const expectedMounts = expectedBindMountsFromArgs(args, descriptorHostFile);
             const expectedEnvHash = computeSemanticEnvHash(payload);
             if (!hasExactManagedEnv(record, expectedEnv)) {
@@ -1829,8 +1834,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             if (record?.HostConfig?.Init !== true
                 || String(record?.Image || '') !== String(attested.evidence.target.image || '')
                 || String(record?.Config?.User || '') !== String(attested.evidence.target.user || '')
-                || (useHealthProbeBroker && JSON.stringify(record?.Config?.Entrypoint || [])
-                    !== JSON.stringify([AGENT_HEALTH_ENTRYPOINT]))
+                || JSON.stringify(record?.Config?.Entrypoint || [])
+                    !== JSON.stringify([AGENT_CONTROL_ENTRYPOINT])
                 || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
                     !== managedUserNamespaceFromAttestation(attested)
                 || String(record?.Config?.WorkingDir || '') !== containerWorkdir
@@ -1883,7 +1888,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const finalizeGeneratedRouterLaunch = ({ launch, record }) => {
         if (!launch) throw new Error('managed generated-local launch is missing its attested launch state');
         const expectedMounts = expectedBindMountsFromArgs(args, launch.descriptorHostFile);
-        if (!hasExactManagedEnv(record, launch.env)) {
+        if (!hasExactManagedEnv(record, { ...launch.env, ...managedControlEnv })) {
             throw new Error('managed candidate generated Router env failed exact inspection');
         }
         const descriptorMounts = (record?.Mounts || []).filter((mount) => (
@@ -1895,8 +1900,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             || record?.HostConfig?.Init !== true
             || String(record?.Image || '') !== String(launch.attested.evidence.target.image || '')
             || String(record?.Config?.User || '') !== String(launch.attested.evidence.target.user || '')
-            || (useHealthProbeBroker && JSON.stringify(record?.Config?.Entrypoint || [])
-                !== JSON.stringify([AGENT_HEALTH_ENTRYPOINT]))
+            || JSON.stringify(record?.Config?.Entrypoint || [])
+                !== JSON.stringify([AGENT_CONTROL_ENTRYPOINT])
             || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
                 !== managedUserNamespaceFromAttestation(launch.attested)
             || String(record?.Config?.WorkingDir || '') !== containerWorkdir
@@ -2975,7 +2980,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
     const envHashExtra = {
         ...runtimeRouterEnv,
-        ...runtimeNetworkPlan.hashEnv
+        ...runtimeNetworkPlan.hashEnv,
+        PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(manifest) ? '1' : '0',
     };
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);

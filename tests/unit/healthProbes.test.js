@@ -664,11 +664,13 @@ test('probe runner is executable and binds cleanup to exact kernel identity', ()
     );
 });
 
-test('agent entrypoint owns the broker without creating runtime exec sessions', () => {
+test('agent entrypoint owns health and relay brokers without creating runtime exec sessions', () => {
     const entrypointUrl = new URL('../../Agent/server/AgentEntrypoint.sh', import.meta.url);
     const source = fs.readFileSync(entrypointUrl, 'utf8');
     assert.notEqual(fs.statSync(entrypointUrl).mode & 0o111, 0);
     assert.match(source, /sh "\$PROBE_BROKER" serve "\$PROBE_CONTROL_ROOT" &/);
+    assert.match(source, /node "\$RELAY_BROKER" serve "\$RELAY_SOCKET" &/);
+    assert.match(source, /PLOINKY_HEALTH_PROBE_BROKER/);
     assert.match(source, /"\$@" &/);
     assert.match(source, /wait "\$main_pid"/);
     assert.doesNotMatch(source, /\b(?:docker|podman)\b/);

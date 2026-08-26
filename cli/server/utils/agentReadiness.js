@@ -72,7 +72,7 @@ export function buildRelayReadinessRoute({
     return {
         ...route,
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime,
             containerId,
             containerName,
