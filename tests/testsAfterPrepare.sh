@@ -7,6 +7,7 @@ source "$TESTS_DIR/test-functions/workspace_dependency_startup_tests.sh"
 load_state
 require_var "TEST_RUN_DIR"
 require_var "TEST_AGENT_WORKSPACE"
+require_var "TEST_AGENT_DATA_DIR"
 
 cd "$TEST_RUN_DIR"
 
@@ -15,7 +16,7 @@ test_check "Repository directory created" assert_dir_exists "$TEST_RUN_DIR/.ploi
 test_check "Agent manifest present" assert_file_exists "$TEST_RUN_DIR/.ploinky/repos/$TEST_REPO_NAME/$TEST_AGENT_NAME/manifest.json"
 test_check "Agent registration waits for Router startup" assert_agent_not_registered
 test_check "Repository enabled flag recorded" assert_enabled_repo
-test_check "Isolated agent workspace created" assert_dir_exists "$TEST_AGENT_WORKSPACE"
+test_check "Isolated agent data directory created" assert_dir_exists "$TEST_AGENT_DATA_DIR"
 
 stage_header "Workspace Dependency Startup"
 test_check "Recursive dependency graph waits wave-by-wave before starting dependents" fast_test_recursive_dependency_graph_startup

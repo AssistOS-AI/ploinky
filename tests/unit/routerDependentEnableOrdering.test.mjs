@@ -68,6 +68,23 @@ test('doPrepare.sh defers every agent enable until the Router exists', () => {
     );
 });
 
+test('doPrepare.sh pins the networked fast suite to container runtime before recording it', () => {
+    const lines = commandLines(readHarness('doPrepare.sh'));
+    const routing = lines.find((line) => /^cat >.*\.ploinky\/routing\.json/.test(line.text));
+    const disable = lines.find((line) => /^ploinky disable sandbox\b/.test(line.text));
+    const runtime = lines.find((line) => /^write_state_var "FAST_AGENT_RUNTIME"/.test(line.text));
+    const repo = lines.find((line) => /^ploinky enable repo\b/.test(line.text));
+
+    assert.ok(routing, 'doPrepare.sh should initialize the workspace before changing sandbox policy');
+    assert.ok(disable, 'doPrepare.sh should explicitly select the container fallback');
+    assert.ok(runtime, 'doPrepare.sh should persist the effective fixture runtime');
+    assert.ok(repo, 'doPrepare.sh should continue with repository enablement');
+    assert.ok(routing.index < disable.index, 'sandbox policy must be workspace-scoped');
+    assert.ok(disable.index < runtime.index, 'the expected runtime must follow the persisted policy');
+    assert.ok(runtime.index < repo.index, 'runtime policy must be fixed before repository preparation');
+    assert.doesNotMatch(readHarness('doPrepare.sh'), /ploinky enable sandbox/);
+});
+
 test('graph startup fixtures do not enable their root agent before the Router lifecycle starts', () => {
     const graphFixtures = readHarness('test-functions/workspace_dependency_startup_tests.sh');
     assert.doesNotMatch(
