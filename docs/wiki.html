@@ -312,7 +312,7 @@
 
                         <article id="definition-mutation-proof">
                             <h3>Browser mutation proof</h3>
-                            <p>A browser mutation proof is the session-bound value required with state-changing Router requests after login. The Router validates it together with the exact Origin, selected Host, and user session. Route authorization and the active routing generation are validated separately before the mutation is committed. It does not replace local administrator checks on administrative operations.</p>
+                            <p>A browser mutation proof is the session-bound value required with state-changing Router requests after login. The Router validates it together with the exact Origin, selected Host, active routing generation, and user session. Internal service-route authorization is validated separately before the mutation is committed. It does not replace local administrator checks on administrative operations.</p>
                         </article>
                     </section>
 
