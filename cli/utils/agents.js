@@ -162,9 +162,12 @@ export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
     log(`Agent '${shortAgentName}' started successfully with ${runtime} runtime '${runtimeInstanceName}'.`);
 }
 
-async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
+export async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
     networkMode = '',
     generationDigest = '',
+    waitUntilReady = waitForAgentReady,
+    containerWaitRunning = waitForContainerRunning,
+    sandboxIsRunning = isBwrapProcessRunning,
 } = {}) {
     const protocol = resolveAgentReadinessProtocol(manifest);
     if (protocol === 'none') return;
@@ -194,13 +197,56 @@ async function waitForEnabledAgentReadiness(shortAgentName, manifest, started, {
     if (!readinessRoute.hostPort && !readinessRoute.relay) {
         throw new Error(`readiness protocol '${protocol}' requires one resolved private target or readiness.port`);
     }
-    const ready = await waitForAgentReady(readinessRoute, {
+    const runtime = String(started?.runtime || started?.registryRecord?.runtime || 'container').trim().toLowerCase();
+    const runtimeInstanceName = String(started?.containerName || '').trim();
+    const runtimeIdentity = {
+        instanceId: String(started?.registryRecord?.instanceId || '').trim(),
+        enableGeneration: String(started?.registryRecord?.enableGeneration || '').trim(),
+    };
+    let runtimeExited = false;
+    let livenessCheckWarning = null;
+    const beforeProbe = () => {
+        try {
+            const running = runtime === 'bwrap' || runtime === 'seatbelt'
+                ? sandboxIsRunning(runtimeInstanceName, runtimeIdentity)
+                : containerWaitRunning(
+                    String(started?.containerId || started?.registryRecord?.containerId || runtimeInstanceName),
+                    1,
+                    1,
+                    {
+                        runtime: ['docker', 'podman'].includes(runtime) ? runtime : undefined,
+                        totalTimeoutMs: 5000,
+                        throwOnControlPlaneTimeout: true,
+                    },
+                );
+            runtimeExited = !running;
+            return running;
+        } catch (error) {
+            // A transient runtime control-plane timeout is not proof that the
+            // exact process exited. Preserve readiness retries and retain the
+            // warning in case the semantic probe eventually times out.
+            livenessCheckWarning = error;
+            return true;
+        }
+    };
+    const ready = await waitUntilReady(readinessRoute, {
         timeoutMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_TIMEOUT_MS || '120000', 10),
         intervalMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_INTERVAL_MS || '250', 10),
         probeTimeoutMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_PROBE_TIMEOUT_MS || '1000', 10),
         protocol,
+        beforeProbe,
     });
-    if (!ready) throw new Error(`readiness protocol '${protocol}' did not succeed`);
+    if (!ready && runtimeExited) {
+        throw new Error(
+            `${runtime} runtime '${runtimeInstanceName || shortAgentName}' exited before readiness protocol '${protocol}' succeeded`,
+        );
+    }
+    if (!ready) {
+        const warning = livenessCheckWarning?.message
+            ? `; runtime liveness check warning: ${livenessCheckWarning.message}`
+            : '';
+        throw new Error(`readiness protocol '${protocol}' did not succeed${warning}`);
+    }
 }
 
 function parsePloinkyDirectives(rawValue) {
@@ -989,6 +1035,7 @@ function removeDisabledRuntimes(disabledRecords, {
     containerExistsImpl = containerExists,
 } = {}) {
     const containerTargets = [];
+    const containerRecords = {};
     for (const { containerName, record } of disabledRecords) {
         if (isSandboxRuntimeImpl(record?.runtime)) {
             stopSandboxImpl(containerName);
@@ -997,12 +1044,13 @@ function removeDisabledRuntimes(disabledRecords, {
             }
         } else {
             containerTargets.push(containerName);
+            containerRecords[containerName] = record;
         }
     }
     if (containerTargets.length === 1) {
-        stopAndRemoveImpl(containerTargets[0]);
+        stopAndRemoveImpl(containerTargets[0], { records: containerRecords });
     } else if (containerTargets.length > 1) {
-        stopAndRemoveManyImpl(containerTargets);
+        stopAndRemoveManyImpl(containerTargets, { records: containerRecords });
     }
     const retained = containerTargets.filter((containerName) => containerExistsImpl(containerName));
     if (retained.length) {
