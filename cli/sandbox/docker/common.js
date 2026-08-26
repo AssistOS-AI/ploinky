@@ -380,7 +380,7 @@ function isContainerRunning(containerName, options = {}) {
         return running;
     } catch (error) {
         debugLog(`Unable to prove container '${containerName}' is running: ${error?.message || error}`);
-        if (options.throwOnError === true) throw error;
+        if (options.throwOnControlPlaneError === true || options.throwOnError === true) throw error;
         return false;
     }
 }
@@ -406,8 +406,12 @@ function listRunningContainerNames(options = {}) {
             || result.stdout
             || `exit ${result.status ?? 'unknown'}`,
         ).trim();
-        const error = new Error(`cannot list running containers: ${detail}`);
-        if (result.error?.code) error.code = result.error.code;
+        const error = new Error(`cannot list running containers: ${detail}`, {
+            ...(result.error ? { cause: result.error } : {}),
+        });
+        error.code = result.error?.code === 'ETIMEDOUT'
+            ? 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
+            : 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
         throw error;
     }
     return new Set(

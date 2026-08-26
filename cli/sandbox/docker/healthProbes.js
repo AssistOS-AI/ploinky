@@ -51,6 +51,7 @@ function probeControlPlaneFailure(agentName, action, error) {
     const detail = String(error?.message || error || 'unknown runtime failure').trim();
     const failure = new Error(`[probe] ${agentName}: unable to ${action}: ${detail}`);
     failure.code = error?.code === 'ETIMEDOUT'
+        || error?.code === 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
         || error?.code === 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
         ? 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
         : 'PLOINKY_PROBE_CONTROL_PLANE_FAILED';

@@ -49,6 +49,24 @@ test('running-container inventory fails closed on runtime errors', () => {
     );
 });
 
+test('running-container inventory preserves typed runtime timeouts', () => {
+    const timeout = new Error('runtime timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(
+        () => listRunningContainerNames({
+            runtime: 'podman',
+            spawnSyncImpl() {
+                return { status: null, error: timeout, stdout: '', stderr: '' };
+            },
+        }),
+        (error) => {
+            assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
+            assert.equal(error.cause, timeout);
+            return true;
+        },
+    );
+});
+
 test('single-container inspection preserves typed control-plane timeouts', () => {
     const timeout = new Error('runtime timed out');
     timeout.code = 'ETIMEDOUT';
