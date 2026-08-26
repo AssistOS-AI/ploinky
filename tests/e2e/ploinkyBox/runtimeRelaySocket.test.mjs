@@ -20,12 +20,18 @@ const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
 
 const WAIT_FOR_SOCKET_SCRIPT = [
     "const f=require('node:fs');",
-    'const p=process.argv[1],deadline=Date.now()+30000;',
+    'const p=process.argv[1],prior=process.argv[2]||"",deadline=Date.now()+30000;',
     'let ready=false;',
     'while(Date.now()<deadline){',
-    'try{const s=f.lstatSync(p),m=s.mode&0o777;ready=s.isSocket()&&!s.isSymbolicLink()&&(m===0o600||m===0o755)}catch{}',
+    'try{const s=f.lstatSync(p),m=s.mode&0o777,id=`${s.dev}:${s.ino}`;ready=s.isSocket()&&!s.isSymbolicLink()&&(m===0o600||m===0o755)&&(!prior||id!==prior)}catch{}',
     'if(ready)break;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25)}',
     "if(!ready){process.stderr.write('runtime relay socket readiness timed out');process.exit(1)}",
+].join('');
+
+const READ_SOCKET_IDENTITY_SCRIPT = [
+    "const s=require('node:fs').lstatSync(process.argv[1]);",
+    "if(!s.isSocket()||s.isSymbolicLink())process.exit(1);",
+    'process.stdout.write(`${s.dev}:${s.ino}`);',
 ].join('');
 
 const TARGET_SERVER_SCRIPT = [
@@ -162,7 +168,8 @@ test('native mounted relay serves through the exact control socket with zero OCI
         } catch {}
     });
 
-    const startTarget = () => {
+    const controlSocketPath = `/workspace/.ploinky/run/health-probes/${containerName}/runtime-relay.sock`;
+    const startTarget = (priorSocketIdentity = '') => {
         execInBox(harness.runner, prepared.containerId, [
             'podman', 'run', '-d', '--init', '--name', containerName,
             '--label', 'io.assistos.ploinky.managed=1',
@@ -180,9 +187,12 @@ test('native mounted relay serves through the exact control socket with zero OCI
         targetExists = true;
         execInBox(harness.runner, prepared.containerId, [
             '/usr/local/bin/node', '-e', WAIT_FOR_SOCKET_SCRIPT,
-            `/workspace/.ploinky/run/health-probes/${containerName}/runtime-relay.sock`,
+            controlSocketPath, priorSocketIdentity,
         ]);
     };
+    const readSocketIdentity = () => execInBox(harness.runner, prepared.containerId, [
+        '/usr/local/bin/node', '-e', READ_SOCKET_IDENTITY_SCRIPT, controlSocketPath,
+    ]);
     const inspectTarget = () => JSON.parse(execInBox(harness.runner, prepared.containerId, [
         'podman', 'container', 'inspect', containerName,
     ]))[0];
@@ -196,6 +206,15 @@ test('native mounted relay serves through the exact control socket with zero OCI
             `${stage}: target bypassed the managed control entrypoint`,
         );
     };
+    const exerciseRelay = () => {
+        const exercised = JSON.parse(execInBox(harness.runner, prepared.containerId, [
+            '/usr/local/bin/node', '--input-type=module', '-e', EXERCISE_RELAY_SCRIPT,
+            containerName, effectiveInstanceId, enableGeneration, String(targetPort),
+        ]));
+        assert.match(exercised.containerId, /^[a-f0-9]{64}$/);
+        assert.equal(exercised.response, 'native-relay-ok');
+        return exercised.containerId;
+    };
     const removeTarget = () => {
         assertExecFree('before removal');
         execInBox(harness.runner, prepared.containerId, [
@@ -206,19 +225,19 @@ test('native mounted relay serves through the exact control socket with zero OCI
 
     startTarget();
     assertExecFree('after startup');
-    const exercised = JSON.parse(execInBox(harness.runner, prepared.containerId, [
-        '/usr/local/bin/node', '--input-type=module', '-e', EXERCISE_RELAY_SCRIPT,
-        containerName, effectiveInstanceId, enableGeneration, String(targetPort),
-    ]));
-    assert.match(exercised.containerId, /^[a-f0-9]{64}$/);
-    assert.equal(exercised.response, 'native-relay-ok');
+    const firstContainerId = exerciseRelay();
+    const firstSocketIdentity = readSocketIdentity();
+    assert.match(firstSocketIdentity, /^\d+:\d+$/);
     assertExecFree('after relayed traffic');
     removeTarget();
 
     // Abrupt removal may leave the socket inode in the persistent control bind.
     // A replacement with the exact same name must safely retire it and start a
     // new broker without manufacturing an OCI exec session.
-    startTarget();
+    startTarget(firstSocketIdentity);
     assertExecFree('after replacement');
+    const replacementContainerId = exerciseRelay();
+    assert.notEqual(replacementContainerId, firstContainerId);
+    assertExecFree('after replacement relayed traffic');
     removeTarget();
 });

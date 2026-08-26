@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,6 +20,7 @@ const {
     normalizeProbeConfig,
     runContainerScriptReadiness,
     healthProbeHostDir,
+    prepareHealthProbeHostDirForLaunch,
     submitProbeRequest,
     computeBackoffDelay,
     maybeResetBackoff,
@@ -55,6 +57,73 @@ test('validateScriptName enforces agent-root scripts', () => {
     assert.throws(() => validateScriptName('liveness', '../evil.sh'));
     assert.throws(() => validateScriptName('readiness', 'nested/check.sh'));
     assert.throws(() => validateScriptName('readiness', 'nested\\check.sh'));
+});
+
+test('launch preparation retires only exact fixed broker artifacts', async (t) => {
+    const root = fs.mkdtempSync('/tmp/ploinky-probe-launch-');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const name = 'agent-runtime-replacement';
+    const control = path.join(root, name);
+    fs.mkdirSync(path.join(control, '.broker-ready'), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(
+        path.join(control, '.runtime-relay-ready-123e4567-e89b-42d3-a456-426614174000'),
+        { mode: 0o700 },
+    );
+    const preservedRequest = path.join(control, 'probe-request-token');
+    fs.mkdirSync(preservedRequest, { mode: 0o700 });
+    fs.writeFileSync(path.join(preservedRequest, 'request'), 'preserve-me');
+
+    const socketPath = path.join(control, 'runtime-relay.sock');
+    const server = net.createServer();
+    let serverClosed = false;
+    t.after(() => {
+        if (!serverClosed) server.close();
+    });
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socketPath, resolve);
+    });
+
+    assert.equal(prepareHealthProbeHostDirForLaunch(name, {
+        probeControlHostRoot: root,
+    }), control);
+    assert.equal(fs.existsSync(path.join(control, '.broker-ready')), false);
+    assert.equal(
+        fs.existsSync(path.join(control, '.runtime-relay-ready-123e4567-e89b-42d3-a456-426614174000')),
+        false,
+    );
+    assert.equal(fs.existsSync(socketPath), false);
+    assert.equal(fs.readFileSync(path.join(preservedRequest, 'request'), 'utf8'), 'preserve-me');
+    await new Promise(resolve => server.close(resolve));
+    serverClosed = true;
+});
+
+test('launch preparation fails closed on a substituted relay socket', (t) => {
+    const root = fs.mkdtempSync('/tmp/ploinky-probe-substitution-');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const name = 'agent-runtime-substitution';
+    const control = path.join(root, name);
+    fs.mkdirSync(control, { recursive: true, mode: 0o700 });
+    const substituted = path.join(control, 'runtime-relay.sock');
+    fs.writeFileSync(substituted, 'not-a-socket');
+
+    assert.throws(() => prepareHealthProbeHostDirForLaunch(name, {
+        probeControlHostRoot: root,
+    }), /socket identity is invalid/);
+    assert.equal(fs.readFileSync(substituted, 'utf8'), 'not-a-socket');
+});
+
+test('health-probe control preparation rejects a substituted container directory', (t) => {
+    const root = fs.mkdtempSync('/tmp/ploinky-probe-control-substitution-');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const outside = fs.mkdtempSync('/tmp/ploinky-probe-control-outside-');
+    t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+    const name = 'agent-control-substitution';
+    fs.symlinkSync(outside, path.join(root, name), 'dir');
+
+    assert.throws(() => prepareHealthProbeHostDirForLaunch(name, {
+        probeControlHostRoot: root,
+    }), /control directory identity is invalid/);
 });
 
 test('normalizeProbeConfig applies defaults and ignores missing scripts', () => {
@@ -710,12 +779,31 @@ test('agent entrypoint owns health and relay brokers without creating runtime ex
     const source = fs.readFileSync(entrypointUrl, 'utf8');
     assert.notEqual(fs.statSync(entrypointUrl).mode & 0o111, 0);
     assert.match(source, /sh "\$PROBE_BROKER" serve "\$PROBE_CONTROL_ROOT" &/);
-    assert.match(source, /node "\$RELAY_BROKER" serve "\$RELAY_SOCKET" &/);
+    assert.match(source, /randomUUID/);
+    assert.match(source, /node "\$RELAY_BROKER" serve "\$RELAY_SOCKET" "\$relay_ready" &/);
+    assert.match(source, /while \[ ! -d "\$relay_ready" \]/);
+    assert.doesNotMatch(source, /while \[ ! -S "\$RELAY_SOCKET" \]/);
     assert.match(source, /PLOINKY_HEALTH_PROBE_BROKER/);
     assert.match(source, /"\$@" &/);
     assert.match(source, /wait "\$main_pid"/);
     assert.doesNotMatch(source, /\b(?:docker|podman)\b/);
     assert.doesNotMatch(source, /\bexec\b/);
+});
+
+test('runtime relay retries shared-filesystem bind release and unlinks only its own socket', () => {
+    const relayUrl = new URL('../../Agent/server/RuntimeHttpRelay.mjs', import.meta.url);
+    const source = fs.readFileSync(relayUrl, 'utf8');
+    assert.match(source, /TRANSIENT_RELAY_BIND_ERRORS/);
+    assert.match(source, /'ENOTSUP'/);
+    assert.match(source, /serveSocketBrokerWithRetry/);
+    assert.match(source, /removeOwnedRelaySocket/);
+    assert.match(source, /current\.dev === ownedIdentity\.dev/);
+    assert.match(source, /current\.ino === ownedIdentity\.ino/);
+    assert.match(source, /requireRelayReadyPath/);
+    assert.doesNotMatch(
+        source,
+        /process\.once\('exit',[\s\S]{0,160}removeStaleRelaySocket/,
+    );
 });
 
 test('probe runner rejects control-path substitution and malformed durations before execution', () => {

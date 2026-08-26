@@ -122,6 +122,19 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     }
 });
 
+test('runtime creation cleans fixed control artifacts only after predecessor handling', () => {
+    const source = fs.readFileSync(
+        new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url),
+        'utf8',
+    );
+    const createStart = source.indexOf('const createContainer = (plan, launch) => {');
+    const cleanup = source.indexOf('prepareHealthProbeHostDirForLaunch(containerName);', createStart);
+    const runtimeCreate = source.indexOf('const res = spawnSync(runtime, createArgs', createStart);
+    assert.ok(createStart >= 0);
+    assert.ok(cleanup > createStart);
+    assert.ok(runtimeCreate > cleanup);
+});
+
 test('effective generation capability requires the exact managed runtime to be running', () => {
     const owner = {
         agentId: 'agent:repo/livekit',
