@@ -18,7 +18,12 @@ const PROBE_CONTROL_PLANE_TIMEOUT_MS = 30_000;
 const PROBE_CONTAINER_WAIT_TIMEOUT_MS = 10_000;
 const PROBE_CLAIM_GRACE_MS = 30_000;
 const PROBE_RESULT_GRACE_MS = 60_000;
-const PROBE_CANCELLATION_GRACE_MS = 30_000;
+// A probe killed during a cold, I/O-heavy nested-container launch can remain in
+// uninterruptible kernel I/O after the broker has observed cancellation. Keep
+// waiting for the broker's exact cleanup acknowledgement instead of declaring
+// that still-bounded cleanup unsafe too early. Unacknowledged requests remain
+// preserved and still fail closed when this deadline expires.
+const PROBE_CANCELLATION_GRACE_MS = 180_000;
 const PROBE_RESULT_POLL_MS = 50;
 const PROBE_OUTPUT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;

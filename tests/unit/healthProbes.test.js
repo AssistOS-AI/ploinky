@@ -472,6 +472,52 @@ test('a mounted cancellation acknowledgement permits a bounded broker retry', ()
     assert.equal(calls.length, 2);
 });
 
+test('the default cancellation grace covers delayed exact cleanup under cold I/O', () => {
+    const calls = [];
+    let now = 0;
+    let cancellationObservedAt = null;
+    let tokenSequence = 0;
+    const result = runContainerScriptReadiness('onlyOffice', 'onlyoffice-container', {
+        script: 'healthcheck.sh',
+        timeout: 5,
+        failureThreshold: 180,
+    }, {
+        runtime: 'fake-runtime',
+        tokenFactory: () => `cold-io-${tokenSequence += 1}`,
+        submitProbeRequestImpl(control, probe, killGraceSeconds) {
+            submitProbeRequest(control, probe, killGraceSeconds);
+            calls.push(control);
+            if (calls.length === 1) {
+                fs.mkdirSync(path.join(control.hostPath, 'claimed'));
+            } else {
+                fs.writeFileSync(path.join(control.hostPath, 'probe-stdout'), 'ready\n');
+                fs.writeFileSync(path.join(control.hostPath, 'result'), '0\n');
+            }
+        },
+        controlPlaneRetryMs: 0,
+        nowImpl() { return now; },
+        sleepMsImpl(ms) {
+            now += ms;
+            const firstControlPath = calls[0]?.hostPath;
+            if (!firstControlPath) return;
+            if (cancellationObservedAt === null
+                && fs.existsSync(path.join(firstControlPath, 'cancelled'))) {
+                cancellationObservedAt = now;
+            }
+            if (cancellationObservedAt !== null
+                && now - cancellationObservedAt >= 94_000
+                && !fs.existsSync(path.join(firstControlPath, 'result'))) {
+                fs.writeFileSync(path.join(firstControlPath, 'result'), '125\n');
+            }
+        },
+        isContainerRunningImpl() { return true; },
+    });
+
+    assert.deepEqual(result, { status: 'success', detail: 'ready' });
+    assert.equal(calls.length, 2);
+    assert.ok(cancellationObservedAt !== null);
+});
+
 test('mounted broker control-plane retries remain bounded after cancellation acknowledgements', () => {
     const calls = [];
     let now = 0;
