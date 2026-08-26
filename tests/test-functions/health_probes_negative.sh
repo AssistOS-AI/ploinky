@@ -124,6 +124,24 @@ health_probes_wait_for_failure_logs() {
   return 1
 }
 
+health_probes_response_proves_edge_active() {
+  local status="$1"
+  local body_file="$2"
+
+  if [[ "$status" == "200" ]]; then
+    return 0
+  fi
+
+  # The public route is allowed to require authentication once its exact edge
+  # generation is active. Distinguish that expected policy response from an
+  # arbitrary 401 so the recovery check remains fail-closed.
+  [[ "$status" == "401" ]] || return 1
+  jq -e '
+    .ok == false
+      and .error.code == "AUTH_REQUIRED"
+  ' "$body_file" >/dev/null 2>&1
+}
+
 health_probes_wait_for_edge_recovery() {
   load_state
   require_var "TEST_HEALTH_AGENT_CONT_NAME" || return 1
@@ -132,17 +150,21 @@ health_probes_wait_for_edge_recovery() {
   wait_for_container "$TEST_HEALTH_AGENT_CONT_NAME" || return 1
 
   local attempts=240
+  local body_file
+  body_file=$(mktemp -t ploinky-edge-active.XXXXXX)
   local i
   for (( i=0; i<attempts; i++ )); do
     local status
-    status=$(curl -sS -o /dev/null -w '%{http_code}' \
+    status=$(curl -sS -o "$body_file" -w '%{http_code}' \
       "http://127.0.0.1:${TEST_ROUTER_PORT}/status" 2>/dev/null || true)
-    if [[ "$status" == "200" ]]; then
+    if health_probes_response_proves_edge_active "$status" "$body_file"; then
+      rm -f "$body_file"
       return 0
     fi
     sleep 0.5
   done
 
+  rm -f "$body_file"
   echo "Router edge generation did not reactivate after health probe recovery." >&2
   return 1
 }

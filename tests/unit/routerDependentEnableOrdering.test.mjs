@@ -85,6 +85,15 @@ test('doPrepare.sh pins the networked fast suite to container runtime before rec
     assert.doesNotMatch(readHarness('doPrepare.sh'), /ploinky enable sandbox/);
 });
 
+test('fast lifecycle launches use a bounded recurring-probe interval without changing production defaults', () => {
+    const lib = readHarness('lib.sh');
+    const wrapper = extractShellFunction(lib, 'ploinky');
+    assert.match(
+        wrapper,
+        /PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS="\$\{PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS:-5000\}"/,
+    );
+});
+
 test('graph startup fixtures do not enable their root agent before the Router lifecycle starts', () => {
     const graphFixtures = readHarness('test-functions/workspace_dependency_startup_tests.sh');
     assert.doesNotMatch(
@@ -102,6 +111,35 @@ test('continuous health recovery follows the exact watchdog lifecycle events', (
     assert.match(health, /semantic_probe_failed/);
     assert.match(health, /TEST_HEALTH_AGENT_CONT_NAME/);
     assert.doesNotMatch(health, /TEST_AGENT_START_LOG/);
+});
+
+test('continuous health recovery accepts only exact active public-route responses', () => {
+    const healthHarness = path.join(testsDir, 'test-functions/health_probes_negative.sh');
+    const run = (status, body) => {
+        const result = spawnSync('bash', ['-c', `
+            set -euo pipefail
+            FAST_STATE_FILE=$(mktemp -t ploinky-health-response-state.XXXXXX)
+            export FAST_STATE_FILE
+            source "$1"
+            response_file=$(mktemp -t ploinky-active-response.XXXXXX)
+            trap 'rm -f "$FAST_STATE_FILE" "$response_file"' EXIT
+            printf '%s' "$3" > "$response_file"
+            health_probes_response_proves_edge_active "$2" "$response_file"
+        `, 'health-response-test', healthHarness, status, body], {
+            encoding: 'utf8',
+            env: process.env,
+        });
+        return result.status;
+    };
+
+    assert.equal(run('200', '{}'), 0, 'an open active route may return 200');
+    assert.equal(
+        run('401', JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED' } })),
+        0,
+        'an auth-protected active route must return the exact structured denial',
+    );
+    assert.notEqual(run('401', JSON.stringify({ error: { code: 'OTHER' } })), 0);
+    assert.notEqual(run('503', JSON.stringify({ error: { code: 'EDGE_GENERATION_INACTIVE' } })), 0);
 });
 
 test('each post-Router enable records its own completion marker', () => {

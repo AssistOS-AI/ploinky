@@ -1944,7 +1944,12 @@ async function startWorkspace(staticAgentArg, portArg, {
     const providerRegistry = lockedStart.registry;
     const dependencyGraph = lockedStart.graph;
 
-    let reg = providerRegistry;
+    // The locked admission intentionally precedes the first config mutation,
+    // so its registry snapshot cannot contain the static identity persisted
+    // above on an initial start. Refresh the non-authorizing workspace config
+    // before saving that admitted registry; otherwise this stale write removes
+    // `_config.static` and a later zero-argument start cannot recover it.
+    let reg = deduplicateAgentRegistry(providerRegistry, dockerSvc.getAgentContainerName);
     workspaceSvc.saveAgents(reg);
 
     const { getAgentContainerName, ensureAgentService } = dockerSvc;

@@ -515,6 +515,14 @@ export function startCloudflarePublicationRuntime({
             if (!active) return;
         }
         const observedActivationId = active.selector.activationId;
+        // The polling loop is deliberately frequent, but a generation that
+        // already reconciled must not keep taking the global workspace
+        // mutation lease. Besides needless filesystem churn, a poll interval
+        // that phase-aligns with another lifecycle monitor can otherwise
+        // starve that monitor indefinitely. The selected generation is loaded
+        // again after acquisition below, so a new activation that races this
+        // fast path is picked up by the next bounded poll.
+        if (handledActivations.has(observedActivationId)) return;
         const workspaceLease = acquirePublicationLease(observedActivationId);
         if (!workspaceLease) return;
         try {

@@ -1551,6 +1551,7 @@ export function monitorTick(monitor) {
     const workspaceStart = inspectStartLock();
     if (workspaceStart.stale) {
         logEvent(monitor, 'info', 'workspace_start_lock_removed', {
+            operation: workspaceStart.lock?.operation || null,
             ownerPid: workspaceStart.lock?.ownerPid || null,
             expiresAt: workspaceStart.lock?.expiresAt || null,
         });
@@ -1559,6 +1560,7 @@ export function monitorTick(monitor) {
         if (!monitor.workspaceStartDeferred) {
             monitor.workspaceStartDeferred = true;
             logEvent(monitor, 'info', 'container_monitor_deferred_workspace_start', {
+                operation: workspaceStart.lock?.operation || null,
                 ownerPid: workspaceStart.lock?.ownerPid || null,
                 expiresAt: workspaceStart.lock?.expiresAt || null,
             });

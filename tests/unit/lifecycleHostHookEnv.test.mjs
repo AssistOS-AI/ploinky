@@ -4,8 +4,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { RESERVED_AGENT_ENV_NAMES } from '../../cli/utils/security/agentIdentityEnv.js';
-import { buildLifecycleHookEnv, executeHostHook } from '../../cli/utils/runtime/lifecycleHooks.js';
+// Lifecycle environment modules resolve config paths at import time. Keep
+// their secrets fixture out of any ancestor ~/.ploinky owned by the developer.
+const isolatedConfigRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-hosthook-config-'));
+process.env.PLOINKY_WORKSPACE_ROOT = isolatedConfigRoot;
+process.once('exit', () => fs.rmSync(isolatedConfigRoot, { recursive: true, force: true }));
+
+const { RESERVED_AGENT_ENV_NAMES } = await import('../../cli/utils/security/agentIdentityEnv.js');
+const { buildLifecycleHookEnv, executeHostHook } = await import('../../cli/utils/runtime/lifecycleHooks.js');
 
 // Host hooks (preinstall, hosthook_aftercreation, hosthook_postinstall) run on the
 // HOST before the container exists, so the container-only PLOINKY_WORKSPACE_ROOT

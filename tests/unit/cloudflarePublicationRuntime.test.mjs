@@ -652,6 +652,8 @@ test('publication runtime reconciles each successful selected activation once an
     let reconciliations = 0;
     const inputs = [];
     let stops = 0;
+    let leaseAcquisitions = 0;
+    let leaseReleases = 0;
     const inactive = Object.assign(new Error('inactive'), { code: 'EDGE_GENERATION_INACTIVE' });
     const runtime = startCloudflarePublicationRuntime({
         workspaceRoot: workspace,
@@ -660,6 +662,14 @@ test('publication runtime reconciles each successful selected activation once an
         loadActive: () => {
             if (!selected) throw inactive;
             return selected;
+        },
+        createWorkspaceLease: ({ operation }) => {
+            leaseAcquisitions += 1;
+            return { token: `publication-${leaseAcquisitions}`, operation };
+        },
+        releaseWorkspaceLease: () => {
+            leaseReleases += 1;
+            return true;
         },
         routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
         controllerFactory: () => ({
@@ -684,12 +694,16 @@ test('publication runtime reconciles each successful selected activation once an
     await runtime.scan();
     await runtime.scan();
     assert.equal(reconciliations, 1);
+    assert.equal(leaseAcquisitions, 1, 'a handled activation must not reacquire the workspace lease');
+    assert.equal(leaseReleases, 1);
     selected = {
         ...selected,
         selector: { ...selected.selector, activationId: 'activation-two' },
     };
     await runtime.scan();
     assert.equal(reconciliations, 2);
+    assert.equal(leaseAcquisitions, 2);
+    assert.equal(leaseReleases, 2);
     assert.equal(inputs[0].selectedPublicationState, 'ready');
     assert.deepEqual(runtime.getStatus(), { state: 'fixture' });
     await runtime.stop();

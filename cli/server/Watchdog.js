@@ -308,6 +308,7 @@ function deferHealthCheckForWorkspaceStart(workspaceStart) {
     if (state.healthCheckWorkspaceStartDeferred) return;
     state.healthCheckWorkspaceStartDeferred = true;
     log('info', 'health_check_deferred_workspace_start', {
+        operation: workspaceStart?.lock?.operation || null,
         ownerPid: workspaceStart?.lock?.ownerPid || null,
         expiresAt: workspaceStart?.lock?.expiresAt || null,
     });
