@@ -887,6 +887,17 @@ test('probe runner is executable and binds cleanup to exact kernel identity', ()
     assert.match(source, /PLOINKY_PROBE_TOKEN="\$\{token\}:"/);
     assert.match(source, /\$\{PROBE_TOKEN_PREFIX\}\$\{token\}:/);
     assert.match(source, /PROBE_CONTROL_ROOT='\/run\/ploinky-health-probes'/);
+    assert.match(source, /PROBE_RUNTIME_ROOT='\/run\/ploinky-health-probe-runtime'/);
+    assert.match(source, /runtime_path="\$PROBE_RUNTIME_ROOT\/\$token"/);
+    assert.match(source, /stdout_fifo="\$runtime_path\/stdout-fifo"/);
+    assert.match(source, /stderr_fifo="\$runtime_path\/stderr-fifo"/);
+    assert.doesNotMatch(
+        source,
+        /(?:stdout|stderr)_fifo="\$control_path\//,
+        'special output pipes must stay off the host-mounted control filesystem',
+    );
+    assert.match(source, /mkdir "\$PROBE_RUNTIME_ROOT"/);
+    assert.match(source, /rmdir "\$runtime_path"/);
     assert.match(source, /expected_start="\$\{identity_rest#\*:\}"/);
     assert.match(source, /\[ "\$MATCHED_SIGNAL_PID" = "\$signal_pid" \]/);
     assert.match(source, /\[ "\$MATCHED_START_TIME" = "\$expected_start" \]/);

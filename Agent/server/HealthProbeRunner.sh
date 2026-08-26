@@ -8,6 +8,7 @@ PROBE_ACTIVE_PREFIX='active-'
 PROBE_CANCEL_DIR='cancelled'
 PROBE_TIMEOUT_DIR='timed-out'
 PROBE_CONTROL_ROOT='/run/ploinky-health-probes'
+PROBE_RUNTIME_ROOT='/run/ploinky-health-probe-runtime'
 PROBE_OUTPUT_BLOCK_SIZE=4096
 PROBE_OUTPUT_BLOCK_COUNT=256
 PROBE_REQUEST_FILE='request'
@@ -343,9 +344,14 @@ bounded_output_reader() {
 
 remove_session_artifacts() {
     marker_path="$1"
-    stdout_fifo="$2"
-    stderr_fifo="$3"
-    rm -f "$stdout_fifo" "$stderr_fifo"
+    runtime_path="$2"
+    runtime_owned="$3"
+    stdout_fifo="$4"
+    stderr_fifo="$5"
+    if [ "$runtime_owned" = 1 ]; then
+        rm -f "$stdout_fifo" "$stderr_fifo"
+        rmdir "$runtime_path" 2>/dev/null || true
+    fi
     remove_marker_dir "$marker_path"
 }
 
@@ -356,8 +362,10 @@ session_run() {
     timeout_seconds="$4"
     kill_after_seconds="$5"
     marker_path="$control_path/session"
-    stdout_fifo="$control_path/stdout-fifo"
-    stderr_fifo="$control_path/stderr-fifo"
+    runtime_path="$PROBE_RUNTIME_ROOT/$token"
+    runtime_owned=0
+    stdout_fifo="$runtime_path/stdout-fifo"
+    stderr_fifo="$runtime_path/stderr-fifo"
 
     [ "${PLOINKY_PROBE_SESSION:-}" = 1 ] \
         || fail 'session runner requires exact setsid provenance'
@@ -382,8 +390,15 @@ session_run() {
         fi
         fail 'probe marker already exists'
     fi
-    trap 'remove_session_artifacts "$marker_path" "$stdout_fifo" "$stderr_fifo"' EXIT
+    trap 'remove_session_artifacts "$marker_path" "$runtime_path" "$runtime_owned" "$stdout_fifo" "$stderr_fifo"' EXIT
     trap 'exit 125' HUP INT TERM
+
+    # macOS rootless Podman exposes host binds through virtiofs, which permits
+    # regular control files but rejects FIFO creation. Keep the authenticated
+    # request/result plane on the bind and create only the transient output
+    # pipes in this container-local runtime directory.
+    mkdir "$runtime_path" || fail 'probe runtime directory cannot be created'
+    runtime_owned=1
 
     active_identity="$marker_path/$PROBE_ACTIVE_PREFIX$session_proc_pid-$start_time-$session_signal_pid-$token"
     mkdir "$active_identity" || fail 'probe identity marker cannot be created'
@@ -479,6 +494,13 @@ write_broker_failure() {
     mv "$control_path/result-tmp" "$control_path/result"
 }
 
+remove_broker_artifacts() {
+    [ -z "${ready_path:-}" ] || rmdir "$ready_path" 2>/dev/null || true
+    [ "${runtime_root_owned:-0}" != 1 ] \
+        || rmdir "$PROBE_RUNTIME_ROOT" 2>/dev/null \
+        || true
+}
+
 run_broker_request() {
     control_path="$1"
     token="$2"
@@ -548,11 +570,20 @@ serve_broker() {
             || fail "required broker command '$command_name' is unavailable"
     done
 
+    ready_path=''
+    runtime_root_owned=0
+    trap 'remove_broker_artifacts; exit 0' HUP INT TERM
+    trap 'remove_broker_artifacts' EXIT
+
+    umask 077
+    [ ! -e "$PROBE_RUNTIME_ROOT" ] && [ ! -L "$PROBE_RUNTIME_ROOT" ] \
+        || fail 'probe runtime root already exists'
+    mkdir "$PROBE_RUNTIME_ROOT" || fail 'probe runtime root cannot be created'
+    runtime_root_owned=1
+
     ready_path="$control_root/$PROBE_BROKER_READY_DIR"
     rmdir "$ready_path" 2>/dev/null || true
     mkdir "$ready_path" || fail 'broker ready marker cannot be created'
-    trap 'rmdir "$ready_path" 2>/dev/null || true; exit 0' HUP INT TERM
-    trap 'rmdir "$ready_path" 2>/dev/null || true' EXIT
 
     while :; do
         for control_path in "$control_root"/*; do
