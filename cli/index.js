@@ -180,7 +180,10 @@ export async function launchCli(args = process.argv.slice(2), {
         return 0;
     }
     if (args.length === 1 && args[0] === 'cli') {
-        await bootstrapAgentLibImpl({ env, readOnly: true });
+        // Keep this boundary lighter than the core command graph. Outside the
+        // managed Box, runtimeShell owns the precise "requires the managed
+        // runtime" failure; inside it, the Box entrypoint already established
+        // and validated the AgentLib contract before this process starts.
         const runShell = runOuterRuntimeShellImpl
             || (await import('./sandbox/runtimeShell.js')).runOuterRuntimeShell;
         return runShell();

@@ -28,13 +28,17 @@ function treeHash(root) {
 test('status dispatches to its read-only renderer before core initialization', async () => {
     const calls = [];
     const code = await launchCli(['status'], {
+        bootstrapAgentLibImpl: async ({ readOnly }) => {
+            assert.equal(readOnly, true);
+            calls.push('agentlib');
+        },
         statusWorkspaceImpl: async () => calls.push('status'),
         importCoreImpl: async () => {
             throw new Error('core initialization must not be imported');
         },
     });
     assert.equal(code, 0);
-    assert.deepEqual(calls, ['status']);
+    assert.deepEqual(calls, ['agentlib', 'status']);
 });
 
 test('status renders terminal color intent without changing workspace state', (t) => {
