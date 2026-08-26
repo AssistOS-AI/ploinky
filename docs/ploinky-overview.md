@@ -29,7 +29,7 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - `ploinky destroy`: stop the router, remove all Ploinky runtimes for the workspace, and clear the regenerated dependency cache under `.ploinky/deps/` without deleting `.data/<agent-or-alias>/`.
 - `ploinky clean`: alias for `destroy`.
 - `ploinky logs tail [router|agent] [--startup]` and `ploinky logs last [<N>] [router|agent] [--startup]`: inspect the Ploinky-owned Router file by default or one exact enabled agent. `--startup` applies only to agents. Agent runtime ownership and cancellation checks remain unchanged.
-- `ploinky webchat [--rotate]`: print the WebChat access URL. WebChat uses the router login flow; `--rotate` is accepted for compatibility but does not mint a WebChat-specific token.
+- WebChat is served by the running Router at `/webchat/`; the retired `ploinky webchat [--rotate]` access command is no longer registered.
 - `ploinky client list tools|resources`, `ploinky client status <agent>`, and `ploinky client tool <name>`: inspect or call MCP surfaces through the router.
 
 ## Web surfaces
