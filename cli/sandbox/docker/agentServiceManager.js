@@ -57,6 +57,7 @@ import {
     PROBE_CONTROL_CONTAINER_ROOT,
     clearLivenessState,
     ensureHealthProbeHostDir,
+    prepareHealthProbeHostDirForLaunch,
     runContainerScriptReadiness,
 } from './healthProbes.js';
 import { removeExactRegisteredContainer, stopAndRemove } from './containerFleet.js';
@@ -1948,6 +1949,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             state: 'preserved-ambiguous',
             inspectionComplete: false,
         });
+        // Creation is reached only after the exact predecessor is gone (or was
+        // proved absent). Retire its two fixed control-plane artifacts here so
+        // shared-filesystem socket projection cannot leak across generations.
+        // Per-request directories remain untouched and fail closed separately.
+        prepareHealthProbeHostDirForLaunch(containerName);
         const res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
     };

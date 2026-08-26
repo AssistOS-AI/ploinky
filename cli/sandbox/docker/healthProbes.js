@@ -24,6 +24,9 @@ const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
 const DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS = 10_000;
 const PROBE_CONTROL_HOST_ROOT = path.join(PLOINKY_DIR, 'run', 'health-probes');
 export const PROBE_CONTROL_CONTAINER_ROOT = '/run/ploinky-health-probes';
+const PROBE_BROKER_READY_DIR = '.broker-ready';
+const RUNTIME_RELAY_SOCKET_FILE = 'runtime-relay.sock';
+const RUNTIME_RELAY_READY_PATTERN = /^\.runtime-relay-ready-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PROBE_REQUEST_FILE = 'request';
 const PROBE_REQUEST_TEMP_FILE = 'request-tmp';
 const PROBE_CLAIM_DIR = 'claimed';
@@ -109,7 +112,57 @@ export function healthProbeHostDir(containerName, options = {}) {
 export function ensureHealthProbeHostDir(containerName, options = {}) {
     const hostDir = healthProbeHostDir(containerName, options);
     fs.mkdirSync(hostDir, { recursive: true, mode: 0o700 });
+    const identity = fs.lstatSync(hostDir);
+    if (!identity.isDirectory() || identity.isSymbolicLink()
+        || identity.uid !== process.geteuid()) {
+        throw new Error('[probe] health-probe control directory identity is invalid');
+    }
     fs.chmodSync(hostDir, 0o700);
+    return hostDir;
+}
+
+function removeEmptyLaunchDirectory(hostDir, entryName) {
+    const entryPath = path.join(hostDir, entryName);
+    let identity;
+    try {
+        identity = fs.lstatSync(entryPath);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return;
+        throw error;
+    }
+    if (!identity.isDirectory() || identity.isSymbolicLink()
+        || identity.uid !== process.geteuid()) {
+        throw new Error(`[probe] stale launch artifact '${entryName}' is not an exact directory`);
+    }
+    try {
+        fs.rmdirSync(entryPath);
+    } catch (cause) {
+        throw new Error(`[probe] stale launch artifact '${entryName}' is not empty`, { cause });
+    }
+}
+
+export function prepareHealthProbeHostDirForLaunch(containerName, options = {}) {
+    const hostDir = ensureHealthProbeHostDir(containerName, options);
+    removeEmptyLaunchDirectory(hostDir, PROBE_BROKER_READY_DIR);
+    for (const entryName of fs.readdirSync(hostDir)) {
+        if (RUNTIME_RELAY_READY_PATTERN.test(entryName)) {
+            removeEmptyLaunchDirectory(hostDir, entryName);
+        }
+    }
+
+    const socketPath = path.join(hostDir, RUNTIME_RELAY_SOCKET_FILE);
+    let socketIdentity;
+    try {
+        socketIdentity = fs.lstatSync(socketPath);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return hostDir;
+        throw error;
+    }
+    if (!socketIdentity.isSocket() || socketIdentity.isSymbolicLink()
+        || socketIdentity.uid !== process.geteuid()) {
+        throw new Error('[probe] stale runtime relay socket identity is invalid');
+    }
+    fs.unlinkSync(socketPath);
     return hostDir;
 }
 
@@ -573,6 +626,7 @@ export const __testHooks = {
     runContainerScriptReadiness,
     healthProbeHostDir,
     ensureHealthProbeHostDir,
+    prepareHealthProbeHostDirForLaunch,
     createProbeControl,
     submitProbeRequest,
     probeWasClaimed,
@@ -603,6 +657,9 @@ export const __testConstants = {
     PROBE_OUTPUT_MAX_BYTES,
     PROBE_CONTROL_HOST_ROOT,
     PROBE_CONTROL_CONTAINER_ROOT,
+    PROBE_BROKER_READY_DIR,
+    RUNTIME_RELAY_SOCKET_FILE,
+    RUNTIME_RELAY_READY_PATTERN,
     PROBE_REQUEST_FILE,
     PROBE_REQUEST_TEMP_FILE,
     PROBE_CLAIM_DIR,
