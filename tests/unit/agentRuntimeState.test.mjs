@@ -26,6 +26,9 @@ test('collectAgentRuntimeStates reports live and stopped host sandboxes from tra
     const states = collectAgentRuntimeStates({
         registry,
         liveContainers: [],
+        routes: {
+            codexAgent: { repo: 'Agents', agent: 'codexAgent', hostPort: 41001 },
+        },
         isSandboxRunning(agentName) {
             checked.push(agentName);
             return agentName === 'codexAgent';
@@ -69,7 +72,13 @@ test('collectAgentRuntimeStates merges OCI state and retains stopped enabled con
         config: {},
     }];
 
-    const states = collectAgentRuntimeStates({ registry, liveContainers });
+    const states = collectAgentRuntimeStates({
+        registry,
+        liveContainers,
+        routes: {
+            runningAgent: { repo: 'Agents', agent: 'runningAgent', hostPort: 41002 },
+        },
+    });
 
     assert.equal(states[0].runtime, 'podman');
     assert.equal(states[0].state.running, true);
@@ -85,9 +94,85 @@ test('collectAgentRuntimeStatesAsync uses the asynchronous container collector',
             called += 1;
             return [{ containerName: 'ploinky_demo', agentName: 'demo', state: { running: true, status: 'running' } }];
         },
+        routes: { demo: { agent: 'demo', hostPort: 41003 } },
     });
     assert.equal(called, 1);
     assert.equal(states[0].containerName, 'ploinky_demo');
+});
+
+test('collectAgentRuntimeStates reports a starting runtime until its active route has a port', () => {
+    const states = collectAgentRuntimeStates({
+        registry: {
+            demoKey: {
+                type: 'agent',
+                runtime: 'podman',
+                repoName: 'Agents',
+                agentName: 'demo',
+            },
+        },
+        liveContainers: [{
+            containerName: 'demoKey',
+            state: { status: 'running', running: true, pid: 99 },
+        }],
+        routes: {
+            demo: { repo: 'Agents', agent: 'demo' },
+        },
+    });
+
+    assert.equal(states[0].state.status, 'starting');
+    assert.equal(states[0].state.running, false);
+    assert.equal(states[0].state.pid, 99);
+});
+
+test('collectAgentRuntimeStates does not report disabled or mismatched routes as running', () => {
+    const registry = {
+        demoKey: {
+            type: 'agent',
+            runtime: 'podman',
+            repoName: 'Agents',
+            agentName: 'demo',
+        },
+    };
+    const liveContainers = [{
+        containerName: 'demoKey',
+        state: {status: 'running', running: true, pid: 99},
+    }];
+    const collect = (route) => collectAgentRuntimeStates({
+        registry,
+        liveContainers,
+        routes: {demo: route},
+    })[0].state;
+
+    assert.deepEqual(collect({
+        repo: 'Agents',
+        agent: 'demo',
+        container: 'demoKey',
+        hostPort: 41004,
+        disabled: true,
+    }), {
+        status: 'starting',
+        running: false,
+        pid: 99,
+    });
+    assert.deepEqual(collect({
+        repo: 'OtherAgents',
+        agent: 'demo',
+        container: 'otherKey',
+        hostPort: 41004,
+    }), {
+        status: 'starting',
+        running: false,
+        pid: 99,
+    });
+    assert.deepEqual(collect({
+        agent: 'demo',
+        container: 'demoKey',
+        hostPort: 41004,
+    }), {
+        status: 'starting',
+        running: false,
+        pid: 99,
+    });
 });
 
 test('Marketplace reports an enabled bwrap agent as running from generic runtime state', () => {
