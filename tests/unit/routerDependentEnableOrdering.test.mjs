@@ -94,6 +94,16 @@ test('graph startup fixtures do not enable their root agent before the Router li
     );
 });
 
+test('continuous health recovery follows the exact watchdog lifecycle events', () => {
+    const health = readHarness('test-functions/health_probes_negative.sh');
+    assert.match(health, /\.ploinky\/logs\/watchdog\.log/);
+    assert.match(health, /container_probe_failed/);
+    assert.match(health, /container_scheduling_restart/);
+    assert.match(health, /semantic_probe_failed/);
+    assert.match(health, /TEST_HEALTH_AGENT_CONT_NAME/);
+    assert.doesNotMatch(health, /TEST_AGENT_START_LOG/);
+});
+
 test('each post-Router enable records its own completion marker', () => {
     const lib = readHarness('lib.sh');
     const body = extractShellFunction(lib, 'enable_fast_suite_agents_after_router');

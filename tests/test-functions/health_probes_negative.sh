@@ -63,28 +63,57 @@ health_probes_force_success() {
   wait_for_container "$TEST_HEALTH_AGENT_CONT_NAME" 20
 }
 
+health_probe_watchdog_event_count() {
+  local log_file="$1"
+  local event="$2"
+  local container="$3"
+  local reason="${4:-}"
+  local error_fragment="${5:-}"
+
+  jq -Rr \
+    --arg event "$event" \
+    --arg container "$container" \
+    --arg reason "$reason" \
+    --arg error_fragment "$error_fragment" \
+    'fromjson?
+      | select(.event == $event and .container == $container)
+      | select($reason == "" or ((.reason // "") == $reason))
+      | select($error_fragment == "" or ((.error // "") | contains($error_fragment)))
+      | 1' \
+    "$log_file" 2>/dev/null \
+    | awk '{ count += $1 } END { print count + 0 }'
+}
+
 health_probes_wait_for_failure_logs() {
   load_state
-  require_var "TEST_AGENT_START_LOG"
+  require_var "TEST_RUN_DIR"
+  require_var "TEST_HEALTH_AGENT_CONT_NAME"
   local baseline_failures="${1:-0}"
+  local baseline_restarts="${2:-0}"
 
-  local log_file="$TEST_AGENT_START_LOG"
+  local log_file="$TEST_RUN_DIR/.ploinky/logs/watchdog.log"
   if [[ ! -f "$log_file" ]]; then
     echo "Log file '$log_file' not found." >&2
     return 1
   fi
 
-
-  local failure_pattern='liveness probe failed'
-  local restart_pattern='restarting container'
-
   local attempts=120
   local i
   for (( i=0; i<attempts; i++ )); do
     local current_failures
-    current_failures=$(grep -c "$failure_pattern" "$log_file" 2>/dev/null || true)
-    if (( current_failures > baseline_failures )) \
-      && grep -q "$restart_pattern" "$log_file" 2>/dev/null; then
+    current_failures=$(health_probe_watchdog_event_count \
+      "$log_file" \
+      "container_probe_failed" \
+      "$TEST_HEALTH_AGENT_CONT_NAME" \
+      "" \
+      "liveness probe failed")
+    local current_restarts
+    current_restarts=$(health_probe_watchdog_event_count \
+      "$log_file" \
+      "container_scheduling_restart" \
+      "$TEST_HEALTH_AGENT_CONT_NAME" \
+      "semantic_probe_failed")
+    if (( current_failures > baseline_failures && current_restarts > baseline_restarts )); then
       return 0
     fi
     sleep 0.5
@@ -144,13 +173,30 @@ health_probes_assert_edge_inactive() {
 
 health_probes_fail_closed_and_recovers() {
   load_state
-  require_var "TEST_AGENT_START_LOG" || return 1
+  require_var "TEST_RUN_DIR" || return 1
+  require_var "TEST_HEALTH_AGENT_CONT_NAME" || return 1
 
+  local log_file="$TEST_RUN_DIR/.ploinky/logs/watchdog.log"
+  if [[ ! -f "$log_file" ]]; then
+    echo "Log file '$log_file' not found." >&2
+    return 1
+  fi
   local baseline_failures
-  baseline_failures=$(grep -c 'liveness probe failed' "$TEST_AGENT_START_LOG" 2>/dev/null || true)
+  baseline_failures=$(health_probe_watchdog_event_count \
+    "$log_file" \
+    "container_probe_failed" \
+    "$TEST_HEALTH_AGENT_CONT_NAME" \
+    "" \
+    "liveness probe failed")
+  local baseline_restarts
+  baseline_restarts=$(health_probe_watchdog_event_count \
+    "$log_file" \
+    "container_scheduling_restart" \
+    "$TEST_HEALTH_AGENT_CONT_NAME" \
+    "semantic_probe_failed")
 
   health_probes_force_failure || return 1
-  if ! health_probes_wait_for_failure_logs "$baseline_failures"; then
+  if ! health_probes_wait_for_failure_logs "$baseline_failures" "$baseline_restarts"; then
     health_probes_write_success_scripts || true
     return 1
   fi

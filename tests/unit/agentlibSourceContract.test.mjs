@@ -535,6 +535,19 @@ test('the removed PLOINKY_AGENTLIB_REF setting fails loudly', () => {
     );
 });
 
+test('fast endpoint checks resolve AgentLib through the selected-source runtime', () => {
+    const harness = fs.readFileSync(
+        path.join(repoRoot, 'tests', 'test-functions', 'openai_endpoints_tests.sh'),
+        'utf8',
+    );
+    assert.match(harness, /agentlib\/runtime\.mjs/);
+    assert.match(harness, /importAgentLib\('PloinkyAgentSkillsSubsystem\/AgentHttpClient\.mjs'\)/);
+    assert.match(harness, /createAgentHttpClient\(\{[\s\S]*routerUrl:[\s\S]*env: \{\},[\s\S]*\}\)/);
+    assert.doesNotMatch(harness, /PLOINKY_ROUTER_URL/);
+    assert.doesNotMatch(harness, /PLOINKY_AGENT_LIB_DIR/);
+    assert.doesNotMatch(harness, /node_modules\/achillesAgentLib/);
+});
+
 test('every framework subpath resolves inside the selected root', () => {
     const workspace = makeWorkspace();
     const dir = fs.realpathSync(localCheckout(workspace));

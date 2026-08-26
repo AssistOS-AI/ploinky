@@ -4,7 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { createAsyncLogWriter } from '../../cli/server/utils/logger.js';
+import {
+    createAsyncLogWriter,
+    writeDurableLogRecord,
+} from '../../cli/server/utils/logger.js';
 
 test('router log writer batches ordered records without synchronous file writes', async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-log-'));
@@ -53,4 +56,22 @@ test('router log writer bounds pending diagnostics and records dropped entries',
     assert.equal(dropped.type, 'router_log_records_dropped');
     assert.equal(dropped.dropped, 1);
     assert.deepEqual(records.slice(1), ['second', 'third']);
+});
+
+test('short-lived lifecycle commands synchronously persist their terminal record', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-durable-log-'));
+    const logPath = path.join(root, 'router.log');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+    assert.equal(writeDurableLogRecord('server_stop', {
+        pid: 123,
+        signal: 'SIGTERM',
+        source: 'pid_file',
+        port: 8080,
+    }, { logDir: root, logPath }), true);
+
+    const record = JSON.parse(fs.readFileSync(logPath, 'utf8'));
+    assert.equal(record.type, 'server_stop');
+    assert.equal(record.pid, 123);
+    assert.equal(record.port, 8080);
 });

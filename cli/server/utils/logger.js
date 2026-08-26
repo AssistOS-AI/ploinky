@@ -114,6 +114,25 @@ export function createAsyncLogWriter({
 
 const routerLogWriter = createAsyncLogWriter();
 
+export function writeDurableLogRecord(type, data = {}, {
+    fsApi = fs,
+    logDir = LOG_DIR,
+    logPath = LOG_PATH,
+} = {}) {
+    try {
+        fsApi.mkdirSync(logDir, { recursive: true });
+        fsApi.appendFileSync(logPath, `${JSON.stringify({
+            ts: new Date().toISOString(),
+            level: 'debug',
+            type,
+            ...data,
+        })}\n`);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
 export function appendLog(type, data = {}) {
     try {
         const record = JSON.stringify({

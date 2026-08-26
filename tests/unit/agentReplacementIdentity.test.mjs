@@ -246,6 +246,7 @@ test('failed coordinated prepare retains the new candidate tuple and leaves the 
         networkLifecycleCapability,
     }, {
         assertNetworkCapability: (received) => assert.equal(received, networkLifecycleCapability),
+        withApplyLock: (callback) => callback(Object.freeze({})),
         inactivate: (reason) => inactivations.push(reason),
         loadRegistry: () => structuredClone(registry),
         saveRegistry: (value) => { registry = structuredClone(value); },

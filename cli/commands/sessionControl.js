@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { appendLog } from '../server/utils/logger.js';
+import { writeDurableLogRecord } from '../server/utils/logger.js';
 import { DEPS_DIR, RUNNING_DIR } from '../utils/config.js';
 import {
     addSessionContainer,
@@ -28,7 +28,10 @@ function killRouterIfRunning() {
 
         const logRouterStop = (pid, signal, source) => {
             try {
-                appendLog('server_stop', { pid, signal, source, port });
+                // This CLI process exits immediately after lifecycle control.
+                // The stop record therefore cannot use Router's asynchronous
+                // diagnostic queue: it must be durable before this call returns.
+                writeDurableLogRecord('server_stop', { pid, signal, source, port });
             } catch (_) { }
         };
 

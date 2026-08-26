@@ -1,13 +1,22 @@
 fast_openai_chat_completions() {
   local output
-  output=$(PLOINKY_ROUTER_URL="http://127.0.0.1:${TEST_ROUTER_PORT}" \
-    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../node_modules/achillesAgentLib}" \
+  output=$(PLOINKY_TEST_AGENTLIB_RUNTIME="$TESTS_DIR/../agentlib/runtime.mjs" \
+    TEST_ROUTER_PORT="$TEST_ROUTER_PORT" \
     TEST_OPENAI_AGENT_NAME="$TEST_OPENAI_AGENT_NAME" \
     node --input-type=module <<'NODE'
-const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/code/node_modules/achillesAgentLib';
-const { createAgentHttpClient } = await import(`${agentLibDir}/PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs`);
+import { pathToFileURL } from 'node:url';
+const runtimeUrl = pathToFileURL(process.env.PLOINKY_TEST_AGENTLIB_RUNTIME).href;
+const { importAgentLib } = await import(runtimeUrl);
+const { createAgentHttpClient } = await importAgentLib('PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs');
 
-const client = createAgentHttpClient();
+const routerPort = String(process.env.TEST_ROUTER_PORT || '');
+if (!/^[1-9][0-9]{0,4}$/.test(routerPort) || Number(routerPort) > 65535) {
+  throw new Error(`Invalid TEST_ROUTER_PORT: ${routerPort}`);
+}
+const client = createAgentHttpClient({
+  routerUrl: `http://127.0.0.1:${routerPort}`,
+  env: {},
+});
 const response = await client.chatCompletions(process.env.TEST_OPENAI_AGENT_NAME, {
   model: 'demo',
   messages: [{ role: 'user', content: 'ping' }]
@@ -23,14 +32,23 @@ NODE
 
 fast_openai_chat_completions_stream() {
   local output
-  output=$(PLOINKY_ROUTER_URL="http://127.0.0.1:${TEST_ROUTER_PORT}" \
-    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../node_modules/achillesAgentLib}" \
+  output=$(PLOINKY_TEST_AGENTLIB_RUNTIME="$TESTS_DIR/../agentlib/runtime.mjs" \
+    TEST_ROUTER_PORT="$TEST_ROUTER_PORT" \
     TEST_OPENAI_AGENT_NAME="$TEST_OPENAI_AGENT_NAME" \
     node --input-type=module <<'NODE'
-const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/code/node_modules/achillesAgentLib';
-const { createAgentHttpClient } = await import(`${agentLibDir}/PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs`);
+import { pathToFileURL } from 'node:url';
+const runtimeUrl = pathToFileURL(process.env.PLOINKY_TEST_AGENTLIB_RUNTIME).href;
+const { importAgentLib } = await import(runtimeUrl);
+const { createAgentHttpClient } = await importAgentLib('PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs');
 
-const client = createAgentHttpClient();
+const routerPort = String(process.env.TEST_ROUTER_PORT || '');
+if (!/^[1-9][0-9]{0,4}$/.test(routerPort) || Number(routerPort) > 65535) {
+  throw new Error(`Invalid TEST_ROUTER_PORT: ${routerPort}`);
+}
+const client = createAgentHttpClient({
+  routerUrl: `http://127.0.0.1:${routerPort}`,
+  env: {},
+});
 const events = [];
 for await (const event of client.chatCompletionsStream(process.env.TEST_OPENAI_AGENT_NAME, {
   model: 'demo',
@@ -57,14 +75,23 @@ NODE
 
 fast_openai_agent_card() {
   local output
-  output=$(PLOINKY_ROUTER_URL="http://127.0.0.1:${TEST_ROUTER_PORT}" \
-    PLOINKY_AGENT_LIB_DIR="${PLOINKY_AGENT_LIB_DIR:-$TESTS_DIR/../node_modules/achillesAgentLib}" \
+  output=$(PLOINKY_TEST_AGENTLIB_RUNTIME="$TESTS_DIR/../agentlib/runtime.mjs" \
+    TEST_ROUTER_PORT="$TEST_ROUTER_PORT" \
     TEST_OPENAI_AGENT_NAME="$TEST_OPENAI_AGENT_NAME" \
     node --input-type=module <<'NODE'
-const agentLibDir = process.env.PLOINKY_AGENT_LIB_DIR || '/code/node_modules/achillesAgentLib';
-const { createAgentHttpClient } = await import(`${agentLibDir}/PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs`);
+import { pathToFileURL } from 'node:url';
+const runtimeUrl = pathToFileURL(process.env.PLOINKY_TEST_AGENTLIB_RUNTIME).href;
+const { importAgentLib } = await import(runtimeUrl);
+const { createAgentHttpClient } = await importAgentLib('PloinkyAgentSkillsSubsystem/AgentHttpClient.mjs');
 
-const client = createAgentHttpClient();
+const routerPort = String(process.env.TEST_ROUTER_PORT || '');
+if (!/^[1-9][0-9]{0,4}$/.test(routerPort) || Number(routerPort) > 65535) {
+  throw new Error(`Invalid TEST_ROUTER_PORT: ${routerPort}`);
+}
+const client = createAgentHttpClient({
+  routerUrl: `http://127.0.0.1:${routerPort}`,
+  env: {},
+});
 const response = await client.agentCard();
 process.stdout.write(JSON.stringify(response));
 NODE
