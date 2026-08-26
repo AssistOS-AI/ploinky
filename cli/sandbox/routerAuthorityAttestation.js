@@ -84,17 +84,22 @@ function exactAuthRouteKey(value) {
     return value;
 }
 
-function exactUnauthenticatedHealthBody(authRouteKey) {
+function exactUnauthenticatedHealthBodies(authRouteKey) {
     const routeKey = exactAuthRouteKey(authRouteKey);
     if (!routeKey) {
         fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'public authority attestation requires the generation-bound authentication route key');
     }
     const query = new URLSearchParams({ returnTo: '/health', agent: routeKey });
-    return JSON.stringify({
-        ok: false,
-        error: 'not_authenticated',
-        login: `/auth/login?${query.toString()}`,
-    });
+    // Authenticated route modes challenge before the admin-only health guard;
+    // auth-free modes reach that guard directly. Both denials are exact.
+    return Object.freeze([
+        JSON.stringify({
+            ok: false,
+            error: 'not_authenticated',
+            login: `/auth/login?${query.toString()}`,
+        }),
+        JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED' } }),
+    ]);
 }
 
 function exactRuntimeProof(runtimeProof) {
@@ -337,7 +342,7 @@ export function validateRouterAuthorityObservation({ intent, nonce, records, ext
         assertExternal(
             externalByHost(external, loopback),
             401,
-            exactUnauthenticatedHealthBody(intent.authRouteKey),
+            exactUnauthenticatedHealthBodies(intent.authRouteKey),
         );
         assertExternal(externalByHost(external, hci), 421, '{"error":"UNKNOWN_HOST"}');
     } else {
