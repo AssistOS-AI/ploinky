@@ -143,11 +143,8 @@ append_candidate_proc_pid() {
     CANDIDATE_PROC_PIDS="${CANDIDATE_PROC_PIDS}${candidate_proc_pid} "
 }
 
-collect_candidate_proc_pids() {
+append_session_descendant_proc_pids() {
     session_id="$1"
-    token="$2"
-    collect_token_pids "$token"
-    CANDIDATE_PROC_PIDS="$TOKEN_PIDS"
     [ "$session_id" -gt 0 ] || return 0
 
     descendant_queue="$session_id"
@@ -182,6 +179,24 @@ collect_candidate_proc_pids() {
             done
         done
     done
+}
+
+collect_session_candidate_proc_pids() {
+    session_id="$1"
+    # Deadline and cancellation watchers are already inside the freshly
+    # created probe session. Walk only that exact tree here; a whole-container
+    # token scan is reserved for the final escaped-descendant proof.
+    TOKEN_PIDS=' '
+    CANDIDATE_PROC_PIDS=' '
+    append_session_descendant_proc_pids "$session_id"
+}
+
+collect_candidate_proc_pids() {
+    session_id="$1"
+    token="$2"
+    collect_token_pids "$token"
+    CANDIDATE_PROC_PIDS="$TOKEN_PIDS"
+    append_session_descendant_proc_pids "$session_id"
 }
 
 process_matches_probe() {
@@ -219,12 +234,53 @@ collect_matching_probe_identities() {
     done
 }
 
+collect_matching_session_identities() {
+    session_id="$1"
+    token="$2"
+    collect_excluded_pattern=":${3:-}:"
+    MATCHING_PROBE_IDENTITIES=''
+    collect_session_candidate_proc_pids "$session_id"
+    for proc_pid in $CANDIDATE_PROC_PIDS; do
+        case "$collect_excluded_pattern" in
+            *":$proc_pid:"*) continue ;;
+        esac
+        if process_matches_probe "$proc_pid" "$session_id"; then
+            identity="${MATCHED_SIGNAL_PID}:${MATCHED_PROC_PID}:${MATCHED_START_TIME}"
+            if [ -n "$MATCHING_PROBE_IDENTITIES" ]; then
+                MATCHING_PROBE_IDENTITIES="$MATCHING_PROBE_IDENTITIES $identity"
+            else
+                MATCHING_PROBE_IDENTITIES="$identity"
+            fi
+        fi
+    done
+}
+
 signal_matching_probe_processes() {
     signal="$1"
     session_id="$2"
     token="$3"
     signal_excluded_proc_ids="${4:-}"
     collect_matching_probe_identities "$session_id" "$token" "$signal_excluded_proc_ids"
+    identities="$MATCHING_PROBE_IDENTITIES"
+    for identity in $identities; do
+        signal_pid="${identity%%:*}"
+        identity_rest="${identity#*:}"
+        proc_pid="${identity_rest%%:*}"
+        expected_start="${identity_rest#*:}"
+        if process_matches_probe "$proc_pid" "$session_id" \
+            && [ "$MATCHED_SIGNAL_PID" = "$signal_pid" ] \
+            && [ "$MATCHED_START_TIME" = "$expected_start" ]; then
+            kill -s "$signal" "$signal_pid" 2>/dev/null || true
+        fi
+    done
+}
+
+signal_matching_session_processes() {
+    signal="$1"
+    session_id="$2"
+    token="$3"
+    signal_excluded_proc_ids="${4:-}"
+    collect_matching_session_identities "$session_id" "$token" "$signal_excluded_proc_ids"
     identities="$MATCHING_PROBE_IDENTITIES"
     for identity in $identities; do
         signal_pid="${identity%%:*}"
@@ -367,10 +423,10 @@ session_run() {
         if proc_self_identity_fields; then
             cancellation_proc_pid="$PROC_PID"
             cancellation_excluded_proc_ids="$session_proc_pid:$cancellation_proc_pid"
-            signal_matching_probe_processes \
+            signal_matching_session_processes \
                 TERM "$session_proc_pid" "$token" "$cancellation_excluded_proc_ids"
             sleep "$kill_after_seconds"
-            signal_matching_probe_processes \
+            signal_matching_session_processes \
                 KILL "$session_proc_pid" "$token" "$cancellation_excluded_proc_ids"
         fi
     ) &
@@ -381,10 +437,10 @@ session_run() {
         if proc_self_identity_fields; then
             watchdog_proc_pid="$PROC_PID"
             watchdog_excluded_proc_ids="$session_proc_pid:$watchdog_proc_pid"
-            signal_matching_probe_processes \
+            signal_matching_session_processes \
                 TERM "$session_proc_pid" "$token" "$watchdog_excluded_proc_ids"
             sleep "$kill_after_seconds"
-            signal_matching_probe_processes \
+            signal_matching_session_processes \
                 KILL "$session_proc_pid" "$token" "$watchdog_excluded_proc_ids"
         else
             # The session is exact and freshly created. If procfs cannot identify
