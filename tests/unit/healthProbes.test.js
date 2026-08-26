@@ -641,6 +641,22 @@ test('container running-state timeout remains a retryable probe control-plane fa
     assert.deepEqual(retrySleeps, [17, 17]);
 });
 
+test('blocking readiness maps a typed container timeout to a typed probe timeout', () => {
+    const timeout = new Error('podman inspect timed out');
+    timeout.code = 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT';
+    assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+    }, {
+        runtime: 'fake-runtime',
+        isContainerRunningImpl() { throw timeout; },
+        controlPlaneFailureThreshold: 1,
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /inspect container running state/);
+        return true;
+    });
+});
+
 test('script readiness proves container state once instead of amplifying runtime inventory', () => {
     const calls = [];
     let stateInspections = 0;
