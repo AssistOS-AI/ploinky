@@ -104,6 +104,11 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
         'exit 1',
         '',
     ].join('\n'), { mode: 0o755 });
+    fs.writeFileSync(path.join(probeRoot, 'code', 'unacknowledged.sh'), [
+        '#!/bin/sh',
+        'while :; do sleep 60 & wait "$!"; done',
+        '',
+    ].join('\n'), { mode: 0o755 });
     fs.writeFileSync(path.join(probeRoot, 'code', 'audit.sh'), [
         '#!/bin/sh',
         'decoy_pid="$(cat /run/ploinky-health-probes/decoy.pid)"',
@@ -157,7 +162,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
         timeoutMs: 5 * 60_000,
     });
 
-    const startTarget = () => {
+    const startTarget = (mainScript = 'main.sh') => {
         execInBox(harness.runner, prepared.containerId, [
             'podman', 'run', '-d', '--init', '--name', containerName,
             '-v', '/workspace/health-probe-native/code:/code:ro',
@@ -166,7 +171,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
             '-e', 'PLOINKY_HEALTH_PROBE_BROKER=1',
             '--entrypoint', '/Agent/server/AgentEntrypoint.sh',
             probeImage,
-            'sh', '/code/main.sh',
+            'sh', `/code/${mainScript}`,
         ]);
         targetExists = true;
         execInBox(harness.runner, prepared.containerId, [
@@ -204,6 +209,27 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
             'sh', '-c', 'podman container exists "$1"; test "$?" -ne 0',
             'sh', containerName,
         ]);
+    };
+    const stopTargetAndAssertExit = async (expectedExitCode) => {
+        assertNoTargetExecSessions('before signaled stop');
+        execInBox(harness.runner, prepared.containerId, [
+            'podman', 'kill', '--signal', 'TERM', containerName,
+        ]);
+        const deadline = Date.now() + 35_000;
+        let inspection = inspectTarget();
+        while (inspection.State?.Running === true && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            inspection = inspectTarget();
+        }
+        assert.equal(inspection.State?.Running, false, 'graceful main process did not stop');
+        assert.equal(
+            inspection.State?.ExitCode,
+            expectedExitCode,
+            expectedExitCode === 0
+                ? 'entrypoint replaced the main process drain acknowledgement'
+                : 'entrypoint incorrectly manufactured a drain acknowledgement',
+        );
+        assert.deepEqual(inspection.ExecIDs || [], [], 'signaled stop acquired an OCI exec session');
     };
 
     startTarget();
@@ -255,11 +281,24 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
     assert.equal(recovery.sessionExists, false, JSON.stringify(recovery));
     assertNoTargetExecSessions('after recovery');
 
-    removeTarget();
+    await stopTargetAndAssertExit(0);
+    execInBox(harness.runner, prepared.containerId, [
+        'podman', 'container', 'rm', containerName,
+    ]);
+    targetExists = false;
 
     // Reuse the same name and persistent control bind to prove a managed
     // replacement can start after the predecessor without stale exec state.
     startTarget();
     assertNoTargetExecSessions('after replacement');
     removeTarget();
+
+    // A main process without a graceful drain handler must retain its
+    // signal-style failure; the wrapper may not manufacture exit zero.
+    startTarget('unacknowledged.sh');
+    await stopTargetAndAssertExit(143);
+    execInBox(harness.runner, prepared.containerId, [
+        'podman', 'container', 'rm', containerName,
+    ]);
+    targetExists = false;
 });

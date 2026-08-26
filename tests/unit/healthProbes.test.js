@@ -786,6 +786,15 @@ test('agent entrypoint owns health and relay brokers without creating runtime ex
     assert.match(source, /PLOINKY_HEALTH_PROBE_BROKER/);
     assert.match(source, /"\$@" &/);
     assert.match(source, /wait "\$main_pid"/);
+    assert.match(source, /termination_fallback_status/);
+    assert.match(source, /acknowledged_status="\$\?"/);
+    assert.match(source, /main_status="\$acknowledged_status"/);
+    assert.match(source, /exit "\$main_status"/);
+    assert.doesNotMatch(
+        source,
+        /terminate\(\)[\s\S]*?exit "\$status"/,
+        'the wrapper must not replace an application drain acknowledgement with the signal status',
+    );
     assert.doesNotMatch(source, /\b(?:docker|podman)\b/);
     assert.doesNotMatch(source, /\bexec\b/);
 });
