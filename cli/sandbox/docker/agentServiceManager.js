@@ -176,6 +176,7 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
+const AGENT_HEALTH_ENTRYPOINT = '/Agent/server/AgentEntrypoint.sh';
 const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
 const AUTHORIZED_CLEANUP_RECEIPTS = new WeakMap();
 const CONSUMED_CLEANUP_RECEIPTS = new WeakSet();
@@ -919,8 +920,9 @@ function buildPersistentAgentRunArgs({
         ] : []),
         // Shared directory
         '-v', `${sharedDir}:/shared${runtime === 'podman' ? ':z' : ''}`,
-        // A per-container control channel lets detached probes publish completion
-        // and receive exact cancellation without a second runtime exec.
+        // A per-container control channel carries requests, results, and exact
+        // cancellation to the broker in the container's main process tree.
+        // Health checks therefore create no target OCI exec sessions.
         '-v', `${healthProbeHostDir}:${PROBE_CONTROL_CONTAINER_ROOT}${runtime === 'podman' ? ':z' : ''}`,
         // CWD passthrough. Isolated agents receive their host data dir as /root.
         '-v', `${cwd}:${cwdMountTarget}${runtime === 'podman' ? ':z' : ''}`,
@@ -1031,6 +1033,35 @@ function hasExactManagedEnv(record, expectedEnv) {
         const observed = values.get(name) || [];
         return observed.length === 1 && observed[0] === String(value);
     });
+}
+
+function manifestUsesHealthProbeBroker(manifest) {
+    return ['liveness', 'readiness'].some((type) => (
+        typeof manifest?.health?.[type]?.script === 'string'
+        && manifest.health[type].script.trim() !== ''
+    ));
+}
+
+function inspectImageEntrypoint(runtime, image, spawn = spawnSync) {
+    const result = spawn(runtime, [
+        'image', 'inspect', '--format', '{{json .Config.Entrypoint}}', image,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    if (result?.error || result?.status !== 0) {
+        const detail = String(result?.stderr || result?.error?.message || result?.status || 'unknown').trim();
+        throw new Error(`[image] cannot inspect entrypoint for ${image}: ${detail}`);
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(String(result.stdout || '').trim() || 'null');
+    } catch (cause) {
+        throw new Error(`[image] entrypoint inspection for ${image} returned invalid JSON`, { cause });
+    }
+    if (parsed === null) return Object.freeze([]);
+    const values = Array.isArray(parsed) ? parsed : [parsed];
+    if (values.some((value) => typeof value !== 'string' || value.length === 0)) {
+        throw new Error(`[image] entrypoint inspection for ${image} returned an invalid command`);
+    }
+    return Object.freeze(values.map(String));
 }
 
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
@@ -1560,10 +1591,22 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     args.push('-e', `NODE_PATH=/code/node_modules`);
 
     const manifestEntrypoint = typeof manifest?.entrypoint === 'string' ? manifest.entrypoint.trim() : '';
-    if (manifestEntrypoint) {
+    const useHealthProbeBroker = manifestUsesHealthProbeBroker(manifest);
+    let mainEntrypoint = [];
+    if (useHealthProbeBroker) {
+        // The broker is part of the container's main process tree, so health
+        // checks never create target OCI exec sessions. Preserve the exact
+        // manifest override or image entrypoint as the wrapper's child command.
+        ensureImagePresent(image, { runtime });
+        mainEntrypoint = manifestEntrypoint
+            ? Object.freeze([manifestEntrypoint])
+            : inspectImageEntrypoint(runtime, image);
+        args.push('--entrypoint', AGENT_HEALTH_ENTRYPOINT);
+    } else if (manifestEntrypoint) {
         args.push('--entrypoint', manifestEntrypoint);
     }
     args.push(image);
+    const mainCommandIndex = args.length;
     let entrySummary = DEFAULT_AGENT_ENTRY;
     if (useStartEntry) {
         const startArgs = splitCommandArgs(startCmd);
@@ -1605,6 +1648,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         } else {
             args.push('sh', '/Agent/server/AgentServer.sh');
         }
+    }
+    if (useHealthProbeBroker) {
+        args.splice(mainCommandIndex, 0, ...mainEntrypoint);
+        entrySummary = `${AGENT_HEALTH_ENTRYPOINT} -> ${[
+            ...mainEntrypoint,
+            ...args.slice(mainCommandIndex + mainEntrypoint.length),
+        ].join(' ')}`;
     }
 
     const principalId = deriveAgentPrincipalId(repoName, agentName);
@@ -1779,6 +1829,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             if (record?.HostConfig?.Init !== true
                 || String(record?.Image || '') !== String(attested.evidence.target.image || '')
                 || String(record?.Config?.User || '') !== String(attested.evidence.target.user || '')
+                || (useHealthProbeBroker && JSON.stringify(record?.Config?.Entrypoint || [])
+                    !== JSON.stringify([AGENT_HEALTH_ENTRYPOINT]))
                 || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
                     !== managedUserNamespaceFromAttestation(attested)
                 || String(record?.Config?.WorkingDir || '') !== containerWorkdir
@@ -1843,6 +1895,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             || record?.HostConfig?.Init !== true
             || String(record?.Image || '') !== String(launch.attested.evidence.target.image || '')
             || String(record?.Config?.User || '') !== String(launch.attested.evidence.target.user || '')
+            || (useHealthProbeBroker && JSON.stringify(record?.Config?.Entrypoint || [])
+                !== JSON.stringify([AGENT_HEALTH_ENTRYPOINT]))
             || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
                 !== managedUserNamespaceFromAttestation(launch.attested)
             || String(record?.Config?.WorkingDir || '') !== containerWorkdir
@@ -3660,6 +3714,8 @@ export {
     expectedBindMountsFromArgs,
     hasExactManagedEnv,
     hasExactManagedMountContract,
+    inspectImageEntrypoint,
+    manifestUsesHealthProbeBroker,
     mergeNodeOptions,
     manifestVolumeMountSuffix,
     podmanManifestVolumeMountSuffix,

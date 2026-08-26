@@ -5,7 +5,11 @@ import {
     PLOINKY_MANAGED_LABEL,
     managedContainerLabelArgs,
 } from '../../cli/sandbox/docker/common.js';
-import { buildPersistentAgentRunArgs } from '../../cli/sandbox/docker/agentServiceManager.js';
+import {
+    buildPersistentAgentRunArgs,
+    inspectImageEntrypoint,
+    manifestUsesHealthProbeBroker,
+} from '../../cli/sandbox/docker/agentServiceManager.js';
 import {
     buildInteractiveAgentCreateCommand,
     buildInteractiveCommandCreateCommand,
@@ -86,6 +90,42 @@ test('persistent agent run builder carries the exact managed label', () => {
         dockerArgs.includes('/workspace/.ploinky/run/health-probes/ploinky_demo:/run/ploinky-health-probes'),
         true,
     );
+});
+
+test('only script-backed health manifests require the in-container broker', () => {
+    assert.equal(manifestUsesHealthProbeBroker({}), false);
+    assert.equal(manifestUsesHealthProbeBroker({ health: { readiness: {} } }), false);
+    assert.equal(manifestUsesHealthProbeBroker({
+        health: { readiness: { script: '  ' } },
+    }), false);
+    assert.equal(manifestUsesHealthProbeBroker({
+        health: { readiness: { script: 'ready.sh' } },
+    }), true);
+    assert.equal(manifestUsesHealthProbeBroker({
+        health: { liveness: { script: 'live.sh' } },
+    }), true);
+});
+
+test('image entrypoint inspection preserves its exact argv without executing the image', () => {
+    const calls = [];
+    const entrypoint = inspectImageEntrypoint('podman', 'example/image@sha256:abc',
+        (command, args, options) => {
+            calls.push({ command, args, options });
+            return { status: 0, stdout: '["/usr/bin/tini","--","node"]\n', stderr: '' };
+        });
+    assert.deepEqual(entrypoint, ['/usr/bin/tini', '--', 'node']);
+    assert.deepEqual(calls[0].args, [
+        'image', 'inspect', '--format', '{{json .Config.Entrypoint}}',
+        'example/image@sha256:abc',
+    ]);
+    assert.deepEqual(calls[0].options.stdio, ['ignore', 'pipe', 'pipe']);
+
+    assert.deepEqual(inspectImageEntrypoint('podman', 'example/no-entrypoint', () => ({
+        status: 0, stdout: 'null\n', stderr: '',
+    })), []);
+    assert.throws(() => inspectImageEntrypoint('podman', 'example/bad', () => ({
+        status: 0, stdout: '{', stderr: '',
+    })), /returned invalid JSON/);
 });
 
 test('both interactive create/retry command families carry the exact managed label', () => {

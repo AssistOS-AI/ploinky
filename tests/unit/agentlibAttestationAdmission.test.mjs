@@ -57,21 +57,44 @@ function successfulProbe(attestation, inspect) {
 
 test('container, bwrap, and seatbelt admissions probe their exact runtime boundaries', (t) => {
     const { grant, attestation } = fixture(t);
+    const containerId = 'a'.repeat(64);
+    const helperImage = `docker.io/library/node:24@sha256:${'d'.repeat(64)}`;
+    const helperImageId = `sha256:${'e'.repeat(64)}`;
+    const expectedEnvironment = Object.entries({
+        PLOINKY_AGENTLIB_DIR: grant.runtimePath,
+        PLOINKY_AGENTLIB_MODE: grant.mode,
+        PLOINKY_AGENTLIB_FINGERPRINT: grant.fingerprint,
+        PLOINKY_AGENTLIB_COMMIT: grant.commit,
+        PLOINKY_AGENTLIB_SOURCE_ID: grant.sourceIdHash,
+    }).map(([name, value]) => `${name}=${value}`);
+    const containerCalls = [];
 
     const container = attestContainerAgentLib({
         runtime: 'podman',
-        containerId: 'a'.repeat(64),
+        containerId,
         grant,
-        spawn: successfulProbe(attestation, (command, args, options) => {
+        helperImage,
+        spawn(command, args, options) {
             assert.equal(command, 'podman');
-            assert.deepEqual(args, [
-                'exec', '--workdir', '/code', 'a'.repeat(64),
-                'node', AGENTLIB_AGENT_ATTEST_SCRIPT,
-            ]);
             assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
-        }),
+            containerCalls.push(args);
+            if (containerCalls.length === 1) {
+                return { status: 0, stdout: JSON.stringify(expectedEnvironment), stderr: '' };
+            }
+            if (containerCalls.length === 2) {
+                return { status: 0, stdout: `${helperImageId}\n`, stderr: '' };
+            }
+            return { status: 0, stdout: JSON.stringify(attestation), stderr: '' };
+        },
     });
     assert.equal(container.sourceRootRealpath, grant.runtimePath);
+    assert.equal(containerCalls.length, 3);
+    assert.equal(containerCalls.some((args) => args.includes('exec')), false);
+    assert.deepEqual(containerCalls[0], [
+        'container', 'inspect', '--format', '{{json .Config.Env}}', containerId,
+    ]);
+    assert.equal(containerCalls[2].includes(`--volumes-from`), true);
+    assert.equal(containerCalls[2].includes(`${containerId}:ro`), true);
 
     const baseArgs = ['--die-with-parent', '--ro-bind', '/host/source', grant.runtimePath];
     attestBwrapAgentLib({
@@ -104,7 +127,7 @@ test('container, bwrap, and seatbelt admissions probe their exact runtime bounda
     });
 });
 
-test('a non-Node container is attested through a fixed helper over its exact read-only volumes', (t) => {
+test('every container is attested through a fixed helper over its exact read-only volumes', (t) => {
     const { grant, attestation } = fixture(t);
     const containerId = 'c'.repeat(64);
     const helperImage = `docker.io/library/node:24@sha256:${'d'.repeat(64)}`;
@@ -129,28 +152,17 @@ test('a non-Node container is attested through a fixed helper over its exact rea
             call += 1;
             if (call === 1) {
                 assert.deepEqual(args, [
-                    'exec', '--workdir', '/code', containerId,
-                    'node', AGENTLIB_AGENT_ATTEST_SCRIPT,
-                ]);
-                return {
-                    status: 127,
-                    stdout: '',
-                    stderr: 'crun: executable file `node` not found in $PATH',
-                };
-            }
-            if (call === 2) {
-                assert.deepEqual(args, [
                     'container', 'inspect', '--format', '{{json .Config.Env}}', containerId,
                 ]);
                 return { status: 0, stdout: JSON.stringify(['PATH=/usr/bin', ...expectedEnvironment]), stderr: '' };
             }
-            if (call === 3) {
+            if (call === 2) {
                 assert.deepEqual(args, [
                     'image', 'inspect', '--format', '{{.Id}}', helperImage,
                 ]);
                 return { status: 0, stdout: `${helperImageId}\n`, stderr: '' };
             }
-            assert.equal(call, 4);
+            assert.equal(call, 3);
             assert.deepEqual(args, [
                 'run', '--rm', '--pull=never',
                 '--network', 'none',
@@ -167,11 +179,11 @@ test('a non-Node container is attested through a fixed helper over its exact rea
         },
     });
 
-    assert.equal(call, 4);
+    assert.equal(call, 3);
     assert.equal(result.sourceRootRealpath, grant.runtimePath);
 });
 
-test('the non-Node helper path rejects a target container with a divergent AgentLib environment', (t) => {
+test('the helper path rejects a target container with a divergent AgentLib environment', (t) => {
     const { grant } = fixture(t);
     const containerId = 'd'.repeat(64);
     let call = 0;
@@ -183,10 +195,7 @@ test('the non-Node helper path rejects a target container with a divergent Agent
             helperImage: `docker.io/library/node:24@sha256:${'e'.repeat(64)}`,
             spawn(_command, args) {
                 call += 1;
-                if (call === 1) {
-                    return { status: 127, stderr: 'node: executable file not found', stdout: '' };
-                }
-                assert.equal(call, 2);
+                assert.equal(call, 1);
                 assert.equal(args[0], 'container');
                 return {
                     status: 0,
@@ -203,7 +212,7 @@ test('the non-Node helper path rejects a target container with a divergent Agent
         }),
         /does not carry the exact PLOINKY_AGENTLIB_FINGERPRINT AgentLib contract/,
     );
-    assert.equal(call, 2);
+    assert.equal(call, 1);
 });
 
 test('runtime admission rejects a probe whose loaded bytes differ from the selected source', (t) => {
@@ -217,7 +226,31 @@ test('runtime admission rejects a probe whose loaded bytes differ from the selec
             runtime: 'podman',
             containerId: 'b'.repeat(64),
             grant,
-            spawn: () => ({ status: 0, stdout: JSON.stringify(divergent), stderr: '' }),
+            helperImage: `docker.io/library/node:24@sha256:${'c'.repeat(64)}`,
+            spawn: (() => {
+                let call = 0;
+                return (_command, args) => {
+                    call += 1;
+                    if (call === 1) {
+                        return {
+                            status: 0,
+                            stdout: JSON.stringify(Object.entries({
+                                PLOINKY_AGENTLIB_DIR: grant.runtimePath,
+                                PLOINKY_AGENTLIB_MODE: grant.mode,
+                                PLOINKY_AGENTLIB_FINGERPRINT: grant.fingerprint,
+                                PLOINKY_AGENTLIB_COMMIT: grant.commit,
+                                PLOINKY_AGENTLIB_SOURCE_ID: grant.sourceIdHash,
+                            }).map(([name, value]) => `${name}=${value}`)),
+                            stderr: '',
+                        };
+                    }
+                    if (call === 2) {
+                        return { status: 0, stdout: `sha256:${'d'.repeat(64)}\n`, stderr: '' };
+                    }
+                    assert.equal(args[0], 'run');
+                    return { status: 0, stdout: JSON.stringify(divergent), stderr: '' };
+                };
+            })(),
         }),
         /loaded the wrong achillesAgentLib/,
     );

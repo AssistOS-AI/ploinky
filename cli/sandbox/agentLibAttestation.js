@@ -28,13 +28,6 @@ function resultText(value) {
     return Buffer.isBuffer(value) ? value.toString('utf8') : String(value || '');
 }
 
-function missingNodeExecutable(result) {
-    if (result?.status !== 127) return false;
-    const detail = `${resultText(result?.stderr)}\n${result?.error?.message || ''}`.toLowerCase();
-    return detail.includes('node')
-        && /not found|no such file|not in \$?path|executable file/.test(detail);
-}
-
 function successfulCommand(result, label) {
     if (result?.error) {
         throw attestationError(`${label} could not start: ${result.error.message}`, result.error);
@@ -97,7 +90,7 @@ function inspectHelperImageId({ runtime, helperImage, spawn }) {
 function runContainerVolumeProbe({ runtime, containerId, grant, helperImage, spawn }) {
     if (!helperImage) {
         throw attestationError(
-            `container ${containerId} has no Node.js executable and no fixed AgentLib attestation helper image was provided`,
+            `container ${containerId} has no fixed immutable AgentLib attestation helper image`,
         );
     }
     const environment = inspectContainerAgentLibEnvironment({ runtime, containerId, grant, spawn });
@@ -157,7 +150,15 @@ export function assertAgentLibRuntimeAttestation(attestation, grant, {
     return Object.freeze(structuredClone(attestation));
 }
 
-/** Probe a running OCI container through its immutable container ID. */
+/**
+ * Probe a running OCI container without creating an exec session in it.
+ *
+ * Nested rootless Podman cannot reliably retire target containers that have
+ * completed OCI exec sessions: its cleanup path requires open_by_handle_at,
+ * which is deliberately unavailable inside Ploinky Box. The fixed helper
+ * therefore resolves through the target's exact read-only volume topology for
+ * every image, including images that happen to contain Node.js.
+ */
 export function attestContainerAgentLib({
     runtime,
     containerId,
@@ -165,27 +166,13 @@ export function attestContainerAgentLib({
     helperImage = '',
     spawn,
 }) {
-    let result = spawn(runtime, [
-        'exec',
-        '--workdir', '/code',
+    const result = runContainerVolumeProbe({
+        runtime,
         containerId,
-        'node', AGENTLIB_AGENT_ATTEST_SCRIPT,
-    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    // Some valid start-only agents deliberately use Python or appliance images
-    // without Node.js. In that case, execute the same resolution probe in a
-    // fixed, immutable Node helper over the exact container's read-only volume
-    // topology. This still resolves from the target's /code/node_modules chain
-    // and selected /opt/ploinky-agentlib mount; it never substitutes a copied
-    // package tree or executes the target image's entrypoint.
-    if (missingNodeExecutable(result)) {
-        result = runContainerVolumeProbe({
-            runtime,
-            containerId,
-            grant,
-            helperImage,
-            spawn,
-        });
-    }
+        grant,
+        helperImage,
+        spawn,
+    });
     return assertAgentLibRuntimeAttestation(
         parseAgentLibAttestationResult(result, `container ${containerId}`),
         grant,
