@@ -16,8 +16,9 @@ const DEFAULT_SUCCESS_THRESHOLD = 1;
 const DEFAULT_PROBE_KILL_GRACE_SECONDS = 1;
 const PROBE_CONTROL_PLANE_TIMEOUT_MS = 30_000;
 const PROBE_CONTAINER_WAIT_TIMEOUT_MS = 10_000;
+const PROBE_CLAIM_GRACE_MS = 30_000;
 const PROBE_RESULT_GRACE_MS = 60_000;
-const PROBE_CANCELLATION_GRACE_MS = 15_000;
+const PROBE_CANCELLATION_GRACE_MS = 30_000;
 const PROBE_RESULT_POLL_MS = 50;
 const PROBE_OUTPUT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
@@ -271,6 +272,22 @@ function waitForProbeResult(control, timeoutMs, options = {}) {
     }
 }
 
+function waitForProbeClaimOrResult(control, timeoutMs, options = {}) {
+    const sleepMsImpl = options.sleepMsImpl || sleepMs;
+    const nowImpl = options.nowImpl || Date.now;
+    const deadline = nowImpl() + Math.max(0, timeoutMs);
+    while (true) {
+        const result = readProbeResult(control);
+        if (result) return { claimed: probeWasClaimed(control), result };
+        if (probeWasClaimed(control)) return { claimed: true, result: null };
+        const remaining = deadline - nowImpl();
+        if (remaining <= 0) {
+            return { claimed: probeWasClaimed(control), result: null };
+        }
+        sleepMsImpl(Math.min(PROBE_RESULT_POLL_MS, remaining));
+    }
+}
+
 function requestProbeCancellation(control) {
     fs.mkdirSync(path.join(control.hostPath, 'cancelled'), { recursive: false, mode: 0o700 });
 }
@@ -356,10 +373,18 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
         throw error;
     }
 
+    const claimOutcome = waitForProbeClaimOrResult(
+        control,
+        options.probeClaimGraceMs || PROBE_CLAIM_GRACE_MS,
+        options,
+    );
     const completionTimeoutMs = Math.ceil(probe.timeout * 1000)
         + Math.ceil(killGraceSeconds * 1000)
         + (options.probeResultGraceMs || PROBE_RESULT_GRACE_MS);
-    let execRes = waitForProbeResult(control, completionTimeoutMs, options);
+    let execRes = claimOutcome.result;
+    if (!execRes && claimOutcome.claimed) {
+        execRes = waitForProbeResult(control, completionTimeoutMs, options);
+    }
     if (!execRes) {
         execRes = cancelAndAwaitProbe(control, options);
         if (!execRes) {
@@ -644,6 +669,7 @@ export const __testHooks = {
     probeWasClaimed,
     readProbeResult,
     waitForProbeResult,
+    waitForProbeClaimOrResult,
     cancelAndAwaitProbe,
     runProbeWithControlPlaneRetry,
     asProbeControlPlaneError,
@@ -663,6 +689,7 @@ export const __testConstants = {
     DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD,
     DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS,
     DEFAULT_PROBE_KILL_GRACE_SECONDS,
+    PROBE_CLAIM_GRACE_MS,
     PROBE_RESULT_GRACE_MS,
     PROBE_CANCELLATION_GRACE_MS,
     PROBE_RESULT_POLL_MS,
