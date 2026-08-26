@@ -93,20 +93,23 @@ else
 fi
 
 main_pid=''
-terminate() {
-    status="$1"
-    trap - HUP INT TERM
-    if [ -n "$main_pid" ]; then
-        kill -TERM "$main_pid" 2>/dev/null || true
+termination_fallback_status=''
+forward_termination() {
+    signal_status="$1"
+    # One termination request is enough. Ignore repeats while the application
+    # performs its bounded drain so the wrapper cannot mask its acknowledgement.
+    trap '' HUP INT TERM
+    if [ -z "$main_pid" ]; then
+        stop_brokers
+        exit "$signal_status"
     fi
-    [ -z "$main_pid" ] || wait "$main_pid" 2>/dev/null || true
-    stop_brokers
-    exit "$status"
+    termination_fallback_status="$signal_status"
+    kill -TERM "$main_pid" 2>/dev/null || true
 }
 
-trap 'terminate 129' HUP
-trap 'terminate 130' INT
-trap 'terminate 143' TERM
+trap 'forward_termination 129' HUP
+trap 'forward_termination 130' INT
+trap 'forward_termination 143' TERM
 
 "$@" &
 main_pid="$!"
@@ -115,5 +118,21 @@ wait "$main_pid"
 main_status="$?"
 set -e
 
+# A signal trap interrupts wait(1) before the main application necessarily
+# exits. Reap it again and preserve its real result: exit zero is the explicit
+# graceful-drain acknowledgement, while a default SIGTERM remains exit 143.
+if [ -n "$termination_fallback_status" ]; then
+    set +e
+    wait "$main_pid"
+    acknowledged_status="$?"
+    set -e
+    if [ "$acknowledged_status" -ne 127 ]; then
+        main_status="$acknowledged_status"
+    elif [ "$main_status" -eq 127 ]; then
+        main_status="$termination_fallback_status"
+    fi
+fi
+
+trap - HUP INT TERM
 stop_brokers
 exit "$main_status"
