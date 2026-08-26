@@ -255,13 +255,10 @@ collect_matching_session_identities() {
     done
 }
 
-signal_matching_probe_processes() {
+signal_collected_probe_identities() {
     signal="$1"
     session_id="$2"
-    token="$3"
-    signal_excluded_proc_ids="${4:-}"
-    collect_matching_probe_identities "$session_id" "$token" "$signal_excluded_proc_ids"
-    identities="$MATCHING_PROBE_IDENTITIES"
+    identities="$3"
     for identity in $identities; do
         signal_pid="${identity%%:*}"
         identity_rest="${identity#*:}"
@@ -282,17 +279,7 @@ signal_matching_session_processes() {
     signal_excluded_proc_ids="${4:-}"
     collect_matching_session_identities "$session_id" "$token" "$signal_excluded_proc_ids"
     identities="$MATCHING_PROBE_IDENTITIES"
-    for identity in $identities; do
-        signal_pid="${identity%%:*}"
-        identity_rest="${identity#*:}"
-        proc_pid="${identity_rest%%:*}"
-        expected_start="${identity_rest#*:}"
-        if process_matches_probe "$proc_pid" "$session_id" \
-            && [ "$MATCHED_SIGNAL_PID" = "$signal_pid" ] \
-            && [ "$MATCHED_START_TIME" = "$expected_start" ]; then
-            kill -s "$signal" "$signal_pid" 2>/dev/null || true
-        fi
-    done
+    signal_collected_probe_identities "$signal" "$session_id" "$identities"
 }
 
 cleanup_probe_processes() {
@@ -302,16 +289,22 @@ cleanup_probe_processes() {
 
     collect_matching_probe_identities "$session_id" "$token" "$cleanup_excluded_proc_ids"
     [ -z "$MATCHING_PROBE_IDENTITIES" ] && return 0
+    identities="$MATCHING_PROBE_IDENTITIES"
 
-    signal_matching_probe_processes TERM "$session_id" "$token" "$cleanup_excluded_proc_ids"
+    # One whole-container token scan snapshots escaped descendants. Revalidate
+    # the captured PID/start-time identities for both signals instead of
+    # repeating that expensive scan before TERM and again before KILL.
+    signal_collected_probe_identities TERM "$session_id" "$identities"
     sleep "$PROBE_CLEANUP_INTERVAL_SECONDS"
-    signal_matching_probe_processes KILL "$session_id" "$token" "$cleanup_excluded_proc_ids"
+    signal_collected_probe_identities KILL "$session_id" "$identities"
 
     attempt=0
     while [ "$attempt" -lt "$PROBE_CLEANUP_ATTEMPTS" ]; do
+        sleep "$PROBE_CLEANUP_INTERVAL_SECONDS"
         collect_matching_probe_identities "$session_id" "$token" "$cleanup_excluded_proc_ids"
         [ -z "$MATCHING_PROBE_IDENTITIES" ] && return 0
-        sleep "$PROBE_CLEANUP_INTERVAL_SECONDS"
+        identities="$MATCHING_PROBE_IDENTITIES"
+        signal_collected_probe_identities KILL "$session_id" "$identities"
         attempt=$((attempt + 1))
     done
 

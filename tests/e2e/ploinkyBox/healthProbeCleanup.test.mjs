@@ -72,6 +72,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
     fs.cpSync(agentLibSource, path.join(harness.workspace, 'achillesAgentLib'), { recursive: true });
     const probeRoot = path.join(harness.workspace, 'health-probe-native');
     fs.mkdirSync(path.join(probeRoot, 'code'), { recursive: true });
+    fs.mkdirSync(path.join(probeRoot, 'code', 'slow-bin'), { recursive: true });
     fs.mkdirSync(path.join(probeRoot, 'Agent', 'server'), { recursive: true });
     fs.mkdirSync(path.join(probeRoot, 'control'), { recursive: true });
     for (const fileName of ['HealthProbeRunner.sh', 'AgentEntrypoint.sh']) {
@@ -92,6 +93,12 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
         '#!/bin/sh',
         "printf '%s' healthy",
         'exit 0',
+        '',
+    ].join('\n'), { mode: 0o755 });
+    fs.writeFileSync(path.join(probeRoot, 'code', 'slow-bin', 'grep'), [
+        '#!/bin/sh',
+        'if [ -f /run/ploinky-health-probes/.slow-token-scan ]; then sleep 2; fi',
+        'exec /bin/grep "$@"',
         '',
     ].join('\n'), { mode: 0o755 });
     fs.writeFileSync(path.join(probeRoot, 'code', 'main.sh'), [
@@ -169,6 +176,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
             '-v', '/workspace/health-probe-native/Agent:/Agent:ro',
             '-v', '/workspace/health-probe-native/control:/run/ploinky-health-probes',
             '-e', 'PLOINKY_HEALTH_PROBE_BROKER=1',
+            '-e', 'PATH=/code/slow-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
             '--entrypoint', '/Agent/server/AgentEntrypoint.sh',
             probeImage,
             'sh', `/code/${mainScript}`,
@@ -256,14 +264,27 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
     assert.equal(preCancelled.sessionExists, false, JSON.stringify(preCancelled));
     assertNoTargetExecSessions('after pre-cancellation');
 
-    const mountedCancellation = submitRequest({
-        token: 'native-mounted-cancel', script: 'hang.sh', timeout: 30, killAfter: 0.2,
-        cancelMode: 'active',
-    });
+    const slowTokenScanMarker = path.join(probeRoot, 'control', '.slow-token-scan');
+    fs.writeFileSync(slowTokenScanMarker, 'enabled\n');
+    const cancellationStartedAt = Date.now();
+    let mountedCancellation;
+    try {
+        mountedCancellation = submitRequest({
+            token: 'native-mounted-cancel', script: 'hang.sh', timeout: 30, killAfter: 0.2,
+            cancelMode: 'active',
+        });
+    } finally {
+        fs.rmSync(slowTokenScanMarker, { force: true });
+    }
+    const cancellationElapsedMs = Date.now() - cancellationStartedAt;
     assert.equal(mountedCancellation.active, true, JSON.stringify(mountedCancellation));
     assert.equal(mountedCancellation.claimed, true, JSON.stringify(mountedCancellation));
     assert.equal(mountedCancellation.status, 125, JSON.stringify(mountedCancellation));
     assert.equal(mountedCancellation.sessionExists, false, JSON.stringify(mountedCancellation));
+    assert.ok(
+        cancellationElapsedMs < 5_000,
+        `exact cancellation waited ${cancellationElapsedMs}ms on a whole-container token scan`,
+    );
     assertNoTargetExecSessions('after mounted cancellation');
 
     const audit = submitRequest({

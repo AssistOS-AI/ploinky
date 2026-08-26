@@ -355,6 +355,49 @@ test('an unclaimed mounted request retries without any runtime exec', () => {
     fs.rmSync(calls[0].control.hostPath, { recursive: true, force: true });
 });
 
+test('the execution deadline begins only after a delayed broker claim', () => {
+    let now = 0;
+    let controlPath = '';
+    let cancellationObserved = false;
+    const result = runContainerScriptReadiness('onlyOffice', 'onlyoffice-container', {
+        script: 'healthcheck.sh',
+        timeout: 0.01,
+        failureThreshold: 1,
+    }, {
+        runtime: 'fake-runtime',
+        tokenFactory: () => 'delayed-broker-claim',
+        killGraceSeconds: 0.01,
+        probeClaimGraceMs: 100,
+        probeResultGraceMs: 1,
+        probeCancellationGraceMs: 1,
+        submitProbeRequestImpl(control, probe, killGraceSeconds) {
+            submitProbeRequest(control, probe, killGraceSeconds);
+            controlPath = control.hostPath;
+        },
+        nowImpl() { return now; },
+        sleepMsImpl(ms) {
+            now += ms;
+            if (fs.existsSync(path.join(controlPath, 'cancelled'))) {
+                cancellationObserved = true;
+            }
+            if (now >= 50 && !fs.existsSync(path.join(controlPath, 'claimed'))) {
+                fs.mkdirSync(path.join(controlPath, 'claimed'));
+            }
+            if (now >= 60
+                && !cancellationObserved
+                && !fs.existsSync(path.join(controlPath, 'result'))) {
+                fs.writeFileSync(path.join(controlPath, 'probe-stdout'), 'ready after claim\n');
+                fs.writeFileSync(path.join(controlPath, 'result'), '0\n');
+            }
+        },
+        isContainerRunningImpl() { return true; },
+    });
+
+    assert.deepEqual(result, { status: 'success', detail: 'ready after claim' });
+    assert.equal(cancellationObserved, false);
+    assert.equal(fs.existsSync(controlPath), false, 'a completed request must be retired');
+});
+
 test('a claimed mounted request without cancellation acknowledgement fails closed', () => {
     const calls = [];
     let now = 0;
@@ -758,8 +801,10 @@ test('probe runner is executable and binds cleanup to exact kernel identity', ()
     assert.match(source, /expected_start="\$\{identity_rest#\*:\}"/);
     assert.match(source, /\[ "\$MATCHED_SIGNAL_PID" = "\$signal_pid" \]/);
     assert.match(source, /\[ "\$MATCHED_START_TIME" = "\$expected_start" \]/);
-    assert.match(source, /signal_matching_probe_processes\s+\\?\s*TERM/);
-    assert.match(source, /signal_matching_probe_processes\s+\\?\s*KILL/);
+    assert.match(source, /signal_matching_session_processes\s+\\?\s*TERM/);
+    assert.match(source, /signal_matching_session_processes\s+\\?\s*KILL/);
+    assert.match(source, /signal_collected_probe_identities TERM/);
+    assert.match(source, /signal_collected_probe_identities KILL/);
     assert.match(source, /\[ "\$session_id" -gt 0 \]/);
     assert.match(source, /while \[ ! -d "\$control_path\/\$PROBE_CANCEL_DIR" \]/);
     assert.match(source, /PROBE_OUTPUT_BLOCK_COUNT=256/);
