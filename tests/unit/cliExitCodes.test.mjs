@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isKnownCommand } from '../../cli/commands/commandRegistry.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
@@ -99,12 +100,8 @@ test('read-only core commands do not initialize authoritative edge sources', (t)
     assert.equal(fs.existsSync(path.join(ploinky, 'data', 'edge-routing', 'desired.json')), false);
 });
 
-test('removed component-token rotation flags fail hard', (t) => {
-    for (const component of ['webchat']) {
-        const result = runPloinky(t, [component, '--rotate']);
-        assert.notEqual(result.status, 0, `${component} unexpectedly accepted --rotate`);
-        assert.match(`${result.stdout}\n${result.stderr}`, new RegExp(`Usage: ${component}`));
-    }
+test('retired WebChat access command is absent from the Ploinky registry', () => {
+    assert.equal(isKnownCommand('webchat'), false);
 });
 
 test('enable repo marks an installed repository as enabled', (t) => {

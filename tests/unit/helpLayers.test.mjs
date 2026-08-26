@@ -78,7 +78,7 @@ test('layer-aware main help preserves unrelated command lines', () => {
     for (const surface of ['host', 'core']) {
         const text = captureHelp([], { surface });
         assert.match(text, /install <url\|repoName> \[name\] \[branch\]\s+Install repository/);
-        assert.match(text, /webchat\s+Print the authenticated WebChat access URL/);
+        assert.doesNotMatch(text, /webchat\s+Print the authenticated WebChat access URL/);
         assert.doesNotMatch(text, /administrator-only Dashboard access URL/);
         assert.match(text, /client tool <name>\s+Invoke any MCP tool/);
         assert.match(text, /restart\s+Restart enabled agents \+ Router/);

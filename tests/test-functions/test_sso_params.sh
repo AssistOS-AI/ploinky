@@ -6,7 +6,6 @@ configure_webchat_cli_for_test_agent() {
   require_var "TEST_AGENT_NAME"
   require_var "TEST_ROUTER_PORT"
   ploinky start "$TEST_AGENT_NAME" "$TEST_ROUTER_PORT" >/dev/null 2>&1 || return 1
-  ploinky webchat >/dev/null 2>&1 || return 1
 }
 
 ensure_webchat_cli_session() {
