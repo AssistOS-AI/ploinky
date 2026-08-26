@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
     LOCKED_ROOT_POSTINSTALL,
+    defaultPaths,
     parseCommandLine,
     parseExactGitCommitSpec,
     readBoundedJsonFile,
@@ -101,6 +102,33 @@ test('release verifier accepts one complete, exact immutable bundle', () => {
         ))),
         SHAS,
     );
+});
+
+test('release verifier paths pin the deployed repositories without nesting AgentLib in Ploinky', () => {
+    const paths = defaultPaths('/candidate/ploinky', {
+        env: {
+            PLOINKY_RELEASE_AGENTLIB_DIR: '/workspace/achillesAgentLib',
+            PLOINKY_RELEASE_ACHILLESCLI_DIR: '/workspace/.ploinky/repos/AchillesCLI',
+            PLOINKY_RELEASE_EXPLORER_DIR: '/workspace/.ploinky/repos/AchillesIDE',
+        },
+    });
+    assert.equal(paths.ploinky, '/candidate/ploinky');
+    assert.equal(paths.achillesAgentLib, '/workspace/achillesAgentLib');
+    assert.equal(paths.achillesCLI, '/workspace/.ploinky/repos/AchillesCLI');
+    assert.equal(paths.explorer, '/workspace/.ploinky/repos/AchillesIDE');
+});
+
+test('release verifier repository pins are exact absolute paths', () => {
+    for (const [name, value] of [
+        ['PLOINKY_RELEASE_AGENTLIB_DIR', 'relative/achillesAgentLib'],
+        ['PLOINKY_RELEASE_ACHILLESCLI_DIR', ' /workspace/.ploinky/repos/AchillesCLI'],
+        ['PLOINKY_RELEASE_EXPLORER_DIR', '/workspace/.ploinky/repos/AchillesIDE '],
+    ]) {
+        assert.throws(
+            () => defaultPaths('/candidate/ploinky', { env: { [name]: value } }),
+            new RegExp(`${name} must be`),
+        );
+    }
 });
 
 test('release manifest rejects missing, extra, branch, and non-immutable identities', () => {

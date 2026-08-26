@@ -27,6 +27,12 @@ const REQUIRED_GATE_OPTIONS = Object.freeze([
     'boxDigest',
 ]);
 
+const RELEASE_REPOSITORY_PATH_ENV = Object.freeze({
+    achillesAgentLib: 'PLOINKY_RELEASE_AGENTLIB_DIR',
+    achillesCLI: 'PLOINKY_RELEASE_ACHILLESCLI_DIR',
+    explorer: 'PLOINKY_RELEASE_EXPLORER_DIR',
+});
+
 const repositoryRoot = path.resolve(import.meta.dirname, '../..');
 
 function bundleError(message, cause) {
@@ -317,14 +323,39 @@ function verifyRepositoryState({ name, expectedCommit, repositoryPath, state }) 
     return Object.freeze({ name, repositoryPath, commit: actualCommit });
 }
 
-function defaultPaths(root = repositoryRoot) {
+function configuredRepositoryPath(env, name, fallback) {
+    const envName = RELEASE_REPOSITORY_PATH_ENV[name];
+    const rawValue = env?.[envName];
+    if (rawValue === undefined || rawValue === '') return fallback;
+    if (typeof rawValue !== 'string' || rawValue !== rawValue.trim()) {
+        throw bundleError(`${envName} must be one exact absolute repository path`);
+    }
+    if (!path.isAbsolute(rawValue)) {
+        throw bundleError(`${envName} must be an absolute repository path`);
+    }
+    return path.normalize(rawValue);
+}
+
+function defaultPaths(root = repositoryRoot, { env = process.env } = {}) {
     return Object.freeze({
         ploinky: root,
-        // The workspace-local checkout convention: a release deployment selects
-        // <workspace>/achillesAgentLib, never an install tree under node_modules.
-        achillesAgentLib: path.join(root, 'achillesAgentLib'),
-        achillesCLI: path.resolve(root, '..', 'AchillesCLI'),
-        explorer: path.resolve(root, '..', 'AssistOSExplorer'),
+        // Release gates can verify the exact deployed workspace checkouts without
+        // placing a second AgentLib tree inside the clean Ploinky candidate.
+        achillesAgentLib: configuredRepositoryPath(
+            env,
+            'achillesAgentLib',
+            path.join(root, 'achillesAgentLib'),
+        ),
+        achillesCLI: configuredRepositoryPath(
+            env,
+            'achillesCLI',
+            path.resolve(root, '..', 'AchillesCLI'),
+        ),
+        explorer: configuredRepositoryPath(
+            env,
+            'explorer',
+            path.resolve(root, '..', 'AssistOSExplorer'),
+        ),
         rootPackage: path.join(root, 'package.json'),
         globalPackage: path.join(root, 'globalDeps', 'package.json'),
         dependencyLock: path.join(root, 'ploinky-box', 'dependencies.lock.json'),
