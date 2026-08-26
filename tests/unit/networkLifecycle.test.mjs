@@ -473,7 +473,7 @@ test('runtime identity labels bind inspection and label construction to the exac
     };
     assert.deepEqual(
         harness.adapter.inspectContainerContract('demo-container', network, 'demo', exactOptions),
-        { state: 'exact', id },
+        { state: 'exact', id, running: true },
     );
     assert.deepEqual(
         harness.adapter.inspectContainerContract('demo-container', network, 'demo', {

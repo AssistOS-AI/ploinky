@@ -324,10 +324,58 @@ function isContainerRunning(containerName, options = {}) {
     if (!runtime) return false;
     debugLog(`Checking if container '${containerName}' is running via ${runtime}.`);
     try {
-        const running = listRunningContainerNames({
-            ...options,
+        // A single-target status check must not expand into a global `ps`.
+        // Cold no-wait launches run many semantic probes concurrently; one
+        // inventory command per probe iteration amplifies into enough nested
+        // Podman readers to starve the very control plane being observed.
+        const spawnSyncImpl = options.spawnSyncImpl || spawnSync;
+        const result = spawnSyncImpl(
             runtime,
-        }).has(containerName);
+            ['container', 'inspect', '--format', '{{.State.Status}}', containerName],
+            {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'pipe'],
+                timeout: options.timeoutMs || CONTAINER_CONTROL_PLANE_TIMEOUT_MS,
+                killSignal: 'SIGKILL',
+            },
+        );
+        if (result.error) {
+            const error = new Error(
+                `cannot inspect container '${containerName}' running state: ${result.error.message}`,
+            );
+            error.code = result.error.code === 'ETIMEDOUT'
+                ? 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
+                : 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
+            throw error;
+        }
+        const output = String(result.stdout || '').trim().toLowerCase();
+        if (result.status !== 0) {
+            const detail = String(result.stderr || result.stdout || '').trim();
+            if (/\b(?:no such (?:object|container)|not found|does not exist)\b/i.test(detail)) {
+                debugLog(`Container '${containerName}' is running: false (absent)`);
+                return false;
+            }
+            const error = new Error(
+                `cannot inspect container '${containerName}' running state: ${detail || `exit ${result.status ?? 'unknown'}`}`,
+            );
+            error.code = 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
+            throw error;
+        }
+        if (!output) {
+            const error = new Error(
+                `cannot inspect container '${containerName}' running state: runtime returned an empty status`,
+            );
+            error.code = 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
+            throw error;
+        }
+        const running = output === 'running';
+        if (!running && !/^(?:configured|created|dead|exited|initialized|paused|removing|restarting|stopped|stopping|unknown)$/.test(output)) {
+            const error = new Error(
+                `cannot inspect container '${containerName}' running state: runtime returned invalid status '${output}'`,
+            );
+            error.code = 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
+            throw error;
+        }
         debugLog(`Container '${containerName}' is running: ${running}`);
         return running;
     } catch (error) {

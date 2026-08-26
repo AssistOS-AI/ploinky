@@ -508,18 +508,57 @@ test('blocking readiness preserves a typed running-state control-plane timeout',
     const calls = [];
     const timeout = new Error('podman ps timed out');
     timeout.code = 'ETIMEDOUT';
+    let attempts = 0;
+    const retrySleeps = [];
     assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
         script: 'healthcheck.sh',
     }, {
         runtime: 'fake-runtime',
         submitProbeRequestImpl: fakeBrokerSequence([], calls),
-        isContainerRunningImpl() { throw timeout; },
+        isContainerRunningImpl() {
+            attempts += 1;
+            throw timeout;
+        },
+        controlPlaneRetryMs: 17,
+        sleepMsImpl(delayMs) { retrySleeps.push(delayMs); },
     }), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
         assert.match(error.message, /inspect container running state/);
         return true;
     });
     assert.equal(calls.length, 0, 'a failed running-state check must not submit a probe');
+    assert.equal(attempts, 3);
+    assert.deepEqual(retrySleeps, [17, 17]);
+    assert.equal(calls.length, 0, 'a failed running-state check must not submit a probe');
+});
+
+test('script readiness proves container state once instead of amplifying runtime inventory', () => {
+    const calls = [];
+    let stateInspections = 0;
+    const result = runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+        interval: 1,
+        successThreshold: 1,
+        failureThreshold: 3,
+    }, {
+        tokenFactory: (() => {
+            let sequence = 0;
+            return () => `single-state-${sequence += 1}`;
+        })(),
+        submitProbeRequestImpl: fakeBrokerSequence([
+            { status: 9, stderr: 'warming\n' },
+            { status: 0, stdout: 'ready\n' },
+        ], calls),
+        isContainerRunningImpl() {
+            stateInspections += 1;
+            return true;
+        },
+        sleepMsImpl() {},
+    });
+
+    assert.deepEqual(result, { status: 'success', detail: 'ready' });
+    assert.equal(calls.length, 2);
+    assert.equal(stateInspections, 1);
 });
 
 test('continuous health preserves a typed startup-state control-plane timeout', () => {

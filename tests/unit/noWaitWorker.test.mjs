@@ -1900,10 +1900,9 @@ test('no-wait cleanup accepts an exited container only when its immutable contra
     };
     const dependencies = {
         createAdapter: () => ({
-            inspectContainerContract: () => ({ state: 'exact', id: containerId }),
+            inspectContainerContract: () => ({ state: 'exact', id: containerId, running: false }),
         }),
         getRuntime: () => 'podman',
-        isContainerRunning: () => false,
     };
     const context = {
         profileResolution: { network: { mode: 'default' } },

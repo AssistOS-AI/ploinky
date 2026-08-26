@@ -563,7 +563,6 @@ export function assertNoWaitRuntimeStillExact(result, {
 } = {}, {
     createAdapter = createNetworkLifecycleAdapter,
     getRuntime = dockerSvc.getRuntime,
-    isContainerRunning = dockerSvc.isContainerRunning,
     isSandboxRunning = isBwrapProcessRunning,
     requireRunning = true,
 } = {}) {
@@ -615,9 +614,12 @@ export function assertNoWaitRuntimeStillExact(result, {
             requireRuntimeIdentity: true,
         },
     );
+    // The contract inspection already binds state to the exact immutable
+    // container ID. Reusing that snapshot avoids a second, global runtime
+    // inventory between inspection and publication.
     if (inspection?.state !== 'exact'
         || String(inspection.id || '').trim().toLowerCase() !== returnedContainerId
-        || (requireRunning && !isContainerRunning(containerName))) {
+        || (requireRunning && inspection.running !== true)) {
         throw new Error(`no-wait runtime '${containerName}' changed immutable identity before publication`);
     }
     return result;
