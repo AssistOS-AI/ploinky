@@ -396,9 +396,13 @@ function handleWorkspaceUpload(req, res, { policy, timers, workspaceRoot } = {})
             },
         });
     } catch (error) {
+        const storageFull = error?.code === 'ENOSPC' || error?.code === 'EDQUOT';
         const message = error instanceof Error ? error.message : String(error);
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: message }));
+        res.writeHead(storageFull ? 507 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: false,
+            error: storageFull ? 'upload_storage_full' : message,
+        }));
     }
 }
 

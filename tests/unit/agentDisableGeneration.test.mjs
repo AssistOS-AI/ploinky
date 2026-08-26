@@ -41,6 +41,7 @@ function lifecycleHarness({
     let routing = structuredClone(initialRouting);
     const existing = new Set(Object.keys(registry).filter((key) => key !== '_config'));
     const events = [];
+    const removalCalls = [];
     const lease = Object.freeze({
         transactionId: 'disable-lease',
         preparedGeneration: 'sha256:prepared',
@@ -87,13 +88,15 @@ function lifecycleHarness({
         isSandboxRuntimeImpl() {
             return false;
         },
-        stopAndRemoveImpl(containerName) {
+        stopAndRemoveImpl(containerName, options = {}) {
             events.push(`remove:${containerName}`);
+            removalCalls.push({ containerNames: [containerName], options: structuredClone(options) });
             if (failRemoval) throw new Error('engine refused removal');
             existing.delete(containerName);
         },
-        stopAndRemoveManyImpl(containerNames) {
+        stopAndRemoveManyImpl(containerNames, options = {}) {
             events.push(`remove-many:${containerNames.join(',')}`);
+            removalCalls.push({ containerNames: [...containerNames], options: structuredClone(options) });
             if (failRemoval) throw new Error('engine refused removal');
             containerNames.forEach((name) => existing.delete(name));
         },
@@ -104,6 +107,7 @@ function lifecycleHarness({
     return {
         dependencies,
         events,
+        removalCalls,
         snapshots,
         registry: () => registry,
         routing: () => routing,
@@ -147,6 +151,10 @@ test('single disable commits exact registry and route removal before runtime rem
     assert.equal(harness.routing().routes.old, undefined);
     assert.equal(harness.routing().routes.current.hostPort, 31000);
     assert.equal(harness.snapshots[0].routing.routes.old, undefined);
+    assert.deepEqual(harness.removalCalls, [{
+        containerNames: ['old_container'],
+        options: { records: { old_container: oldRecord } },
+    }]);
     assert.ok(
         harness.events.indexOf('prepare') < harness.events.indexOf('remove:old_container'),
         'the inactive route-removal generation must exist before physical removal',
@@ -210,10 +218,12 @@ test('selector commit failure after removal remains inactive and releases the ex
 });
 
 test('batch disable stages every exact route removal before one physical batch removal', () => {
+    const alphaRecord = agentRecord('alpha');
+    const betaRecord = agentRecord('beta', { alias: 'beta-alias' });
     const harness = lifecycleHarness({
         initialRegistry: {
-            alpha_container: agentRecord('alpha'),
-            beta_container: agentRecord('beta', { alias: 'beta-alias' }),
+            alpha_container: alphaRecord,
+            beta_container: betaRecord,
         },
         initialRouting: {
             port: 8080,
@@ -238,6 +248,15 @@ test('batch disable stages every exact route removal before one physical batch r
     assert.deepEqual(harness.registry(), {});
     assert.deepEqual(harness.routing().routes, {});
     assert.deepEqual(harness.snapshots[0].routing.routes, {});
+    assert.deepEqual(harness.removalCalls, [{
+        containerNames: ['beta_container', 'alpha_container'],
+        options: {
+            records: {
+                beta_container: betaRecord,
+                alpha_container: alphaRecord,
+            },
+        },
+    }]);
     assert.ok(
         harness.events.indexOf('prepare')
             < harness.events.indexOf('remove-many:beta_container,alpha_container'),

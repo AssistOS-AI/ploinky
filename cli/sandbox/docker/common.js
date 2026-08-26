@@ -380,7 +380,7 @@ function isContainerRunning(containerName, options = {}) {
         return running;
     } catch (error) {
         debugLog(`Unable to prove container '${containerName}' is running: ${error?.message || error}`);
-        if (options.throwOnControlPlaneError) throw error;
+        if (options.throwOnControlPlaneError === true || options.throwOnError === true) throw error;
         return false;
     }
 }
@@ -406,7 +406,9 @@ function listRunningContainerNames(options = {}) {
             || result.stdout
             || `exit ${result.status ?? 'unknown'}`,
         ).trim();
-        const error = new Error(`cannot list running containers: ${detail}`);
+        const error = new Error(`cannot list running containers: ${detail}`, {
+            ...(result.error ? { cause: result.error } : {}),
+        });
         error.code = result.error?.code === 'ETIMEDOUT'
             ? 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
             : 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
@@ -681,7 +683,8 @@ function waitForContainerRunning(containerName, maxAttempts = 20, delayMs = 250,
     const totalTimeoutMs = options.totalTimeoutMs
         || Math.max(1, maxAttempts * Math.max(1, delayMs));
     const deadline = Date.now() + totalTimeoutMs;
-    let lastControlPlaneError = null;
+    let lastControlPlaneTimeout = null;
+    let sawDefinitiveResponse = false;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) break;
@@ -705,27 +708,27 @@ function waitForContainerRunning(containerName, maxAttempts = 20, delayMs = 250,
             if (!result.error && result.status === 0 && status === 'running') {
                 return true;
             }
-            if (result.error) {
-                lastControlPlaneError = result.error;
-            } else if (typeof result.status === 'number') {
-                lastControlPlaneError = null;
+            if (result.error?.code === 'ETIMEDOUT') {
+                lastControlPlaneTimeout = result.error;
+            } else if (!result.error) {
+                sawDefinitiveResponse = true;
             }
         } catch (error) {
-            lastControlPlaneError = error;
+            if (error?.code === 'ETIMEDOUT') {
+                lastControlPlaneTimeout = error;
+            } else {
+                sawDefinitiveResponse = true;
+            }
         }
         const remainingAfterInspectMs = deadline - Date.now();
         if (attempt + 1 < maxAttempts && remainingAfterInspectMs > 0) {
             sleepMsImpl(Math.min(delayMs, remainingAfterInspectMs));
         }
     }
-    if (options.throwOnControlPlaneError && lastControlPlaneError) {
-        const detail = lastControlPlaneError?.message || String(lastControlPlaneError);
-        const error = new Error(`cannot inspect container '${containerName}' running state: ${detail}`);
-        error.code = lastControlPlaneError?.code === 'ETIMEDOUT'
-            || lastControlPlaneError?.code === 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
-            ? 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
-            : 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED';
-        throw error;
+    if (options.throwOnControlPlaneTimeout === true
+        && lastControlPlaneTimeout
+        && !sawDefinitiveResponse) {
+        throw lastControlPlaneTimeout;
     }
     return false;
 }

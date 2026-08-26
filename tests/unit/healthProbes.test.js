@@ -639,6 +639,36 @@ test('initial container wait timeout remains a retryable probe control-plane fai
     });
 });
 
+test('blocking readiness preserves a typed running-state control-plane timeout', () => {
+    const calls = [];
+    const timeout = new Error('podman ps timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(() => runContainerScriptReadiness('database', 'database-container', {
+        script: 'healthcheck.sh',
+    }, {
+        submitProbeRequestImpl: fakeBrokerSequence([], calls),
+        isContainerRunningImpl() { throw timeout; },
+        controlPlaneFailureThreshold: 1,
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /inspect container running state/);
+        return true;
+    });
+    assert.equal(calls.length, 0, 'a failed running-state check must not submit a probe');
+});
+
+test('continuous health preserves a typed startup-state control-plane timeout', () => {
+    const timeout = new Error('podman inspect timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(() => runHealthProbes('webtty', 'webtty-container', {}, {
+        waitForContainerRunningImpl() { throw timeout; },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /inspect container startup state/);
+        return true;
+    });
+});
+
 test('continuous health runs cheap liveness while activation-only readiness stays skipped', () => {
     const calls = [];
     runHealthProbes('onlyOffice', 'onlyoffice-container', {

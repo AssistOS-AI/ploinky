@@ -155,13 +155,21 @@ function manualTimers() {
     };
 }
 
-test('every upload route declares byte, count, timeout, and storage quotas', () => {
+test('every upload route declares byte and timeout limits', () => {
     assert.deepEqual(
         Object.values(UPLOAD_ROUTE_POLICIES).map(policy => policy.route).sort(),
         ['/blobs', '/upload', '/webchat/uploads'],
     );
     for (const policy of Object.values(UPLOAD_ROUTE_POLICIES)) {
-        for (const field of ['maxBytes', 'maxFiles', 'timeoutMs', 'maxStorageBytes']) {
+        for (const field of ['maxBytes', 'timeoutMs']) {
+            assert.equal(Number.isSafeInteger(policy[field]), true, `${policy.route} ${field}`);
+            assert.ok(policy[field] > 0, `${policy.route} ${field} must be positive`);
+        }
+    }
+    assert.equal('maxFiles' in UPLOAD_ROUTE_POLICIES.workspace, false);
+    assert.equal('maxStorageBytes' in UPLOAD_ROUTE_POLICIES.workspace, false);
+    for (const policy of [UPLOAD_ROUTE_POLICIES.blobs, UPLOAD_ROUTE_POLICIES.webchat]) {
+        for (const field of ['maxFiles', 'maxStorageBytes']) {
             assert.equal(Number.isSafeInteger(policy[field]), true, `${policy.route} ${field}`);
             assert.ok(policy[field] > 0, `${policy.route} ${field} must be positive`);
         }
@@ -549,4 +557,76 @@ test('successful workspace upload atomically replaces its target', async (t) => 
     assert.equal(fs.readFileSync(targetPath, 'utf8'), 'new');
     assert.equal(fs.statSync(targetPath).mode & 0o777, 0o750);
     assert.deepEqual(regularFiles(root), ['report.txt']);
+});
+
+test('workspace upload relies on filesystem capacity instead of cumulative inventory', async (t) => {
+    const root = temporaryDirectory(t, 'workspace-filesystem-capacity');
+    const runtimeDirectory = path.join(root, '.ploinky', 'runtime');
+    fs.mkdirSync(runtimeDirectory, { recursive: true });
+    for (let index = 0; index < 20; index += 1) {
+        fs.writeFileSync(path.join(runtimeDirectory, `${index}.bin`), 'runtime');
+    }
+    const request = endedRequest({
+        url: '/upload?path=.ploinky/user-file.bin',
+        headers: { 'content-length': '2' },
+        chunks: ['ok'],
+    });
+    const response = new MockResponse();
+
+    handleWorkspaceUpload(request, response, {
+        workspaceRoot: root,
+    });
+    await responseFinished(response);
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(fs.readFileSync(path.join(root, '.ploinky', 'user-file.bin'), 'utf8'), 'ok');
+});
+
+test('workspace upload still enforces its per-file byte limit', async (t) => {
+    const root = temporaryDirectory(t, 'workspace-byte-limit');
+    const request = endedRequest({
+        url: '/upload?path=large.bin',
+        headers: {
+            'content-length': String(UPLOAD_ROUTE_POLICIES.workspace.maxBytes + 1),
+        },
+        chunks: ['ignored'],
+    });
+    const response = new MockResponse();
+
+    handleWorkspaceUpload(request, response, { workspaceRoot: root });
+    await responseFinished(response);
+
+    assert.equal(response.statusCode, 413);
+    assert.equal(JSON.parse(response.bodyText()).error, 'upload_too_large');
+    assert.equal(fs.existsSync(path.join(root, 'large.bin')), false);
+});
+
+test('workspace upload reports filesystem capacity exhaustion as 507', async (t) => {
+    const root = temporaryDirectory(t, 'workspace-storage-full');
+    const request = endedRequest({
+        url: '/upload?path=file.bin',
+        headers: { 'content-length': '1' },
+        chunks: ['x'],
+    });
+    const response = new MockResponse();
+    const originalOpenSync = fs.openSync;
+    fs.openSync = (...args) => {
+        if (String(args[0]).includes('.ploinky-upload-')) {
+            const error = new Error('No space left on device');
+            error.code = 'ENOSPC';
+            throw error;
+        }
+        return originalOpenSync(...args);
+    };
+
+    try {
+        handleWorkspaceUpload(request, response, { workspaceRoot: root });
+        await responseFinished(response);
+    } finally {
+        fs.openSync = originalOpenSync;
+    }
+
+    assert.equal(response.statusCode, 507);
+    assert.equal(JSON.parse(response.bodyText()).error, 'upload_storage_full');
+    assert.equal(fs.existsSync(path.join(root, 'file.bin')), false);
 });

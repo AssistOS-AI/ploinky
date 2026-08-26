@@ -180,6 +180,61 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const PROBE_CONTROL_PLANE_TIMEOUT_CODE = 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT';
+
+function boundedNoWaitProbeRetryInput(value, fallback, maximum) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isInteger(parsed) && parsed >= 0
+        ? Math.min(parsed, maximum)
+        : fallback;
+}
+
+export async function runNoWaitScriptReadinessWithControlPlaneRetry(
+    agentName,
+    containerName,
+    probe,
+    {
+        runReadiness = runContainerScriptReadiness,
+        sleepImpl = sleep,
+        maxRetries = boundedNoWaitProbeRetryInput(
+            process.env.PLOINKY_NO_WAIT_PROBE_CONTROL_PLANE_RETRIES,
+            3,
+            10,
+        ),
+        retryDelayMs = boundedNoWaitProbeRetryInput(
+            process.env.PLOINKY_NO_WAIT_PROBE_CONTROL_PLANE_RETRY_MS,
+            1_000,
+            30_000,
+        ),
+        maxRetryDelayMs = boundedNoWaitProbeRetryInput(
+            process.env.PLOINKY_NO_WAIT_PROBE_CONTROL_PLANE_MAX_RETRY_MS,
+            5_000,
+            30_000,
+        ),
+    } = {},
+) {
+    let retries = 0;
+    while (true) {
+        try {
+            return await Promise.resolve(runReadiness(agentName, containerName, probe));
+        } catch (error) {
+            if (error?.code !== PROBE_CONTROL_PLANE_TIMEOUT_CODE || retries >= maxRetries) {
+                throw error;
+            }
+            retries += 1;
+            const delayMs = Math.min(
+                retryDelayMs * (2 ** (retries - 1)),
+                Math.max(retryDelayMs, maxRetryDelayMs),
+            );
+            console.warn(
+                `[no-wait] ${agentName}: probe control plane timed out; `
+                + `retrying readiness (${retries}/${maxRetries}) in ${delayMs}ms`,
+            );
+            await sleepImpl(delayMs);
+        }
+    }
+}
+
 function readSequenceStatus(statusPath) {
     try {
         return {
@@ -1327,7 +1382,11 @@ async function waitForNoWaitReadiness({
     if (protocol === 'none') return;
     if (protocol === 'script') {
         const probe = normalizeProbeConfig('readiness', manifest?.health?.readiness);
-        const result = await Promise.resolve(runContainerScriptReadiness(shortAgent, containerName, probe));
+        const result = await runNoWaitScriptReadinessWithControlPlaneRetry(
+            shortAgent,
+            containerName,
+            probe,
+        );
         if (result?.status !== 'success') {
             // The probe already carries the script's own output, and exact
             // cleanup removes the container moments from now. Attach both here

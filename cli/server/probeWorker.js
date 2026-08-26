@@ -3,13 +3,9 @@ import { parentPort, workerData } from 'worker_threads';
 import { runHealthProbes } from '../sandbox/docker/healthProbes.js';
 
 export function serializeProbeError(error) {
-    const code = typeof error?.code === 'string' && error.code.trim()
-        ? error.code.trim()
-        : null;
     return {
-        status: 'error',
         error: error?.message || String(error || 'unknown error'),
-        ...(code ? { code } : {}),
+        code: typeof error?.code === 'string' ? error.code : null,
     };
 }
 
@@ -23,7 +19,10 @@ async function main() {
         runHealthProbes(agentName, containerName, manifest || {});
         parentPort?.postMessage({ status: 'success' });
     } catch (error) {
-        parentPort?.postMessage(serializeProbeError(error));
+        parentPort?.postMessage({
+            status: 'error',
+            ...serializeProbeError(error),
+        });
     }
 }
 

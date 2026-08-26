@@ -479,13 +479,13 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
         cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
         csrf: 'browser',
         body: {
-            username: 'stale-generation',
-            password: 'stale-generation-pass',
+            username: 'same-host-new-generation',
+            password: 'same-host-new-generation-pass',
         },
         routePlan: publicRoutePlan('public-generation-b'),
     });
-    assert.equal(result.statusCode, 403);
-    assert.equal(result.body.error, 'browser_csrf_invalid');
+    assert.equal(result.statusCode, 201, JSON.stringify(result.body));
+    assert.equal(result.body.user.username, 'same-host-new-generation');
 
     result = await invoke(authHandlers.handleUserAdminRoutes, {
         url: '/api/agents/explorer/users',

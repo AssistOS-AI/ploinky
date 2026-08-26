@@ -158,46 +158,25 @@ test('container startup inspection has per-call and aggregate deadlines', () => 
     assert.deepEqual(sleeps, [1]);
 });
 
-test('container startup inspection can preserve an all-timeout control-plane failure', () => {
+test('container startup inspection can surface an all-timeout control-plane failure', () => {
     const timeout = new Error('inspect timed out');
     timeout.code = 'ETIMEDOUT';
-    assert.throws(() => waitForContainerRunning('slow-container', 2, 1, {
-        runtime: 'podman',
-        timeoutMs: 17,
-        totalTimeoutMs: 50,
-        throwOnControlPlaneError: true,
-        spawnSyncImpl() {
-            return { status: null, error: timeout, stdout: '', stderr: '' };
-        },
-        sleepMsImpl() {},
-    }), (error) => {
-        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
-        assert.match(error.message, /inspect timed out/);
-        return true;
-    });
-});
-
-test('container startup inspection preserves final control-plane uncertainty after a valid response', () => {
-    const timeout = new Error('inspect timed out after initial response');
-    timeout.code = 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT';
-    let attempt = 0;
-    assert.throws(() => waitForContainerRunning('slow-container', 2, 1, {
-        runtime: 'podman',
-        timeoutMs: 17,
-        totalTimeoutMs: 50,
-        throwOnControlPlaneError: true,
-        spawnSyncImpl() {
-            attempt += 1;
-            return attempt === 1
-                ? { status: 0, stdout: 'created\n', stderr: '' }
-                : { status: null, error: timeout, stdout: '', stderr: '' };
-        },
-        sleepMsImpl() {},
-    }), (error) => {
-        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
-        assert.match(error.message, /inspect timed out after initial response/);
-        return true;
-    });
+    assert.throws(
+        () => waitForContainerRunning('slow-container', 2, 1, {
+            runtime: 'podman',
+            timeoutMs: 17,
+            totalTimeoutMs: 50,
+            throwOnControlPlaneTimeout: true,
+            spawnSyncImpl: () => ({
+                status: null,
+                error: timeout,
+                stdout: '',
+                stderr: '',
+            }),
+            sleepMsImpl() {},
+        }),
+        (error) => error === timeout,
+    );
 });
 
 test('sixteen container targets share one status snapshot in an actual monitor tick', () => {

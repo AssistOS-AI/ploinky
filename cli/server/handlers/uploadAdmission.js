@@ -14,8 +14,6 @@ export const UPLOAD_ROUTE_POLICIES = Object.freeze({
     workspace: Object.freeze({
         route: '/upload',
         maxBytes: 256 * MEBIBYTE,
-        maxFiles: 100_000,
-        maxStorageBytes: 20 * GIBIBYTE,
         timeoutMs: 300_000,
     }),
     webchat: Object.freeze({
@@ -40,14 +38,25 @@ function uploadError(status, code, message = code) {
 }
 
 function validatePolicy(policy) {
+    const hasMaxFiles = policy?.maxFiles !== undefined && policy?.maxFiles !== null;
+    const hasMaxStorageBytes = policy?.maxStorageBytes !== undefined
+        && policy?.maxStorageBytes !== null;
+    if (hasMaxFiles !== hasMaxStorageBytes) {
+        throw new TypeError(
+            'Upload policy maxFiles and maxStorageBytes must be configured together.',
+        );
+    }
     const normalized = {
         route: String(policy?.route || '').trim(),
         maxBytes: Number(policy?.maxBytes),
-        maxFiles: Number(policy?.maxFiles),
-        maxStorageBytes: Number(policy?.maxStorageBytes),
+        maxFiles: hasMaxFiles ? Number(policy.maxFiles) : null,
+        maxStorageBytes: hasMaxStorageBytes ? Number(policy.maxStorageBytes) : null,
         timeoutMs: Number(policy?.timeoutMs),
     };
-    for (const key of ['maxBytes', 'maxFiles', 'maxStorageBytes', 'timeoutMs']) {
+    const numericKeys = hasMaxFiles
+        ? ['maxBytes', 'maxFiles', 'maxStorageBytes', 'timeoutMs']
+        : ['maxBytes', 'timeoutMs'];
+    for (const key of numericKeys) {
         if (!Number.isSafeInteger(normalized[key]) || normalized[key] <= 0) {
             throw new TypeError(`Upload policy ${key} must be a positive safe integer.`);
         }
@@ -56,6 +65,10 @@ function validatePolicy(policy) {
         throw new TypeError('Upload policy route is required.');
     }
     return normalized;
+}
+
+function hasStorageQuota(policy) {
+    return policy.maxFiles !== null && policy.maxStorageBytes !== null;
 }
 function readContentLength(req) {
     let value = req?.headers?.['content-length'];
@@ -264,16 +277,20 @@ function reserveUpload({
     }
 
     const targetState = readTargetState(normalizedTarget, replaceExisting);
-    const fileDelta = targetState.exists ? 0 : 1;
-    const reservedBytes = contentLength === null ? normalizedPolicy.maxBytes : contentLength;
-    const active = activeTotals(normalizedRoot);
-    const inventory = inspectStorage(normalizedRoot, {
-        ignoredPaths: active.ignoredPaths,
-        includeEntry,
-        includeDirectory,
-        policy: normalizedPolicy,
-    });
-    assertQuota(normalizedPolicy, inventory, active, fileDelta, reservedBytes);
+    let fileDelta = 0;
+    let reservedBytes = 0;
+    if (hasStorageQuota(normalizedPolicy)) {
+        fileDelta = targetState.exists ? 0 : 1;
+        reservedBytes = contentLength === null ? normalizedPolicy.maxBytes : contentLength;
+        const active = activeTotals(normalizedRoot);
+        const inventory = inspectStorage(normalizedRoot, {
+            ignoredPaths: active.ignoredPaths,
+            includeEntry,
+            includeDirectory,
+            policy: normalizedPolicy,
+        });
+        assertQuota(normalizedPolicy, inventory, active, fileDelta, reservedBytes);
+    }
 
     const reservation = {
         storageRoot: normalizedRoot,
@@ -302,6 +319,7 @@ function verifyFinalQuota(reservation, size) {
     if (!targetStillMatches(reservation)) {
         throw uploadError(409, 'upload_target_changed');
     }
+    if (!hasStorageQuota(reservation.policy)) return;
     const active = activeTotals(reservation.storageRoot, reservation);
     const inventory = inspectStorage(reservation.storageRoot, {
         ignoredPaths: active.ignoredPaths,
@@ -330,6 +348,9 @@ function commitTemporary(reservation) {
 
 function normalizeFailure(error) {
     if (error instanceof UploadAdmissionError) return error;
+    if (error?.code === 'ENOSPC' || error?.code === 'EDQUOT') {
+        return uploadError(507, 'upload_storage_full');
+    }
     return uploadError(500, 'upload_write_failed');
 }
 
@@ -390,16 +411,16 @@ export function streamAdmittedUpload(req, {
         if (reservation.targetState.exists) {
             fs.fchmodSync(fileDescriptor, reservation.targetState.identity.mode & 0o777);
         }
-    } catch (_) {
+    } catch (error) {
         if (fileDescriptor !== undefined) {
             try { fs.closeSync(fileDescriptor); } catch (_) { /* ignore */ }
         }
         const cleanupSucceeded = removePartial(reservation.temporaryPath);
         releaseReservation(reservation);
         try { req.resume?.(); } catch (_) { /* ignore */ }
-        onFailure?.(uploadError(500, cleanupSucceeded
-            ? 'upload_write_failed'
-            : 'upload_cleanup_failed'));
+        onFailure?.(cleanupSucceeded
+            ? normalizeFailure(error)
+            : uploadError(500, 'upload_cleanup_failed'));
         return { accepted: false };
     }
 
@@ -464,7 +485,7 @@ export function streamAdmittedUpload(req, {
     const onAborted = () => fail(uploadError(400, 'upload_aborted'));
     const onRequestError = () => fail(uploadError(400, 'upload_aborted'));
 
-    output.once('error', () => fail(uploadError(500, 'upload_write_failed')));
+    output.once('error', (error) => fail(error));
     output.once('finish', () => {
         streamFinished = true;
     });

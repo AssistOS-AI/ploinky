@@ -46,6 +46,17 @@ function postProbeLog(level, message) {
     }
 }
 
+function probeControlPlaneFailure(agentName, action, error) {
+    const detail = String(error?.message || error || 'unknown runtime failure').trim();
+    const failure = new Error(`[probe] ${agentName}: unable to ${action}: ${detail}`);
+    failure.code = error?.code === 'ETIMEDOUT'
+        || error?.code === 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT'
+        || error?.code === 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
+        ? 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT'
+        : 'PLOINKY_PROBE_CONTROL_PLANE_FAILED';
+    return failure;
+}
+
 function coercePositiveNumber(value, fallback) {
     const num = Number(value);
     if (!Number.isFinite(num) || num <= 0) return fallback;
@@ -421,14 +432,12 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
             try {
                 return isContainerRunningImpl(containerName, {
                     timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
-                    throwOnControlPlaneError: true,
+                    runtime: options.runtime,
+                    spawnSyncImpl: options.spawnSyncImpl,
+                    throwOnError: true,
                 });
             } catch (error) {
-                throw asProbeControlPlaneError(
-                    agentName,
-                    'unable to inspect container running state',
-                    error,
-                );
+                throw probeControlPlaneFailure(agentName, 'inspect container running state', error);
             }
         },
         options,
@@ -568,17 +577,20 @@ function ensureReadiness(agentName, containerName, probe, options = {}) {
 
 export function runHealthProbes(agentName, containerName, manifest = {}, options = {}) {
     const waitForRunning = options.waitForContainerRunningImpl || waitForContainerRunning;
-    let containerRunning = false;
+    let running;
     try {
-        containerRunning = waitForRunning(containerName, 40, 250, {
+        running = waitForRunning(containerName, 40, 250, {
             timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
             totalTimeoutMs: options.containerWaitTimeoutMs || PROBE_CONTAINER_WAIT_TIMEOUT_MS,
-            throwOnControlPlaneError: true,
+            runtime: options.runtime,
+            spawnSyncImpl: options.spawnSyncImpl,
+            sleepMsImpl: options.sleepMsImpl,
+            throwOnControlPlaneTimeout: true,
         });
     } catch (error) {
-        throw asProbeControlPlaneError(agentName, 'unable to wait for container running state', error);
+        throw probeControlPlaneFailure(agentName, 'inspect container startup state', error);
     }
-    if (!containerRunning) {
+    if (!running) {
         throw new Error(`[probe] ${agentName}: failed to start; container is not running.`);
     }
 
@@ -624,6 +636,7 @@ export const __testHooks = {
     normalizeProbeConfig,
     runProbeOnce,
     runContainerScriptReadiness,
+    probeControlPlaneFailure,
     healthProbeHostDir,
     ensureHealthProbeHostDir,
     prepareHealthProbeHostDirForLaunch,
