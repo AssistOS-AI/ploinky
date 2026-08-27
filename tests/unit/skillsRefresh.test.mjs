@@ -67,7 +67,6 @@ function runAggregateUpdateChild(workspaceRoot, body) {
         const runtimeRoot = ${JSON.stringify(runtimeRoot)};
         process.env.PLOINKY_WORKSPACE_ROOT = workspaceRoot;
         process.env.PLOINKY_ROOT = runtimeRoot;
-        delete process.env.PLOINKY_AGENTLIB_REF;
 
         function mkdir(dir) {
             fs.mkdirSync(dir, { recursive: true });
@@ -143,38 +142,62 @@ function runAggregateUpdateChild(workspaceRoot, body) {
             const repoName = 'UnitAggregateRepo-' + unique;
             const providerName = 'UnitAggregateProvider-' + unique;
             const sourceRepoPath = path.join(workspaceRoot, '.fixtures', 'source-repo');
-            const defaultSkillsSourcePath = path.join(workspaceRoot, '.fixtures', 'default-skills-source');
             const installedRepoPath = path.join(REPOS_DIR, repoName);
             const defaultSkillsRepoPath = path.join(REPOS_DIR, 'AchillesCopilotBasicSkills');
+            const defaultSkillsSources = [
+                {
+                    name: 'AchillesCopilotBasicSkills',
+                    sourcePath: path.join(workspaceRoot, '.fixtures', 'default-skills-source'),
+                    files: defaultSkillsHasSkills
+                        ? { 'skills/defaultSkill/SKILL.md': '# Default skill\\n' }
+                        : { 'README.md': '# default skills\\n' },
+                },
+                {
+                    name: 'DocumentationSkills',
+                    sourcePath: path.join(workspaceRoot, '.fixtures', 'documentation-skills-source'),
+                    files: { 'skills/documentationSkill/SKILL.md': '# Documentation skill\\n' },
+                },
+                {
+                    name: 'PloinkySkills',
+                    sourcePath: path.join(workspaceRoot, '.fixtures', 'ploinky-skills-source'),
+                    files: { 'skills/ploinkySkill/SKILL.md': '# Ploinky skill\\n' },
+                },
+            ];
 
             mkdir(REPOS_DIR);
             initGitRepo(sourceRepoPath, { 'README.md': '# managed\\n' });
-            initGitRepo(
-                defaultSkillsSourcePath,
-                defaultSkillsHasSkills
-                    ? { 'skills/defaultSkill/SKILL.md': '# Default skill\\n' }
-                    : { 'README.md': '# default skills\\n' },
-            );
+            for (const source of defaultSkillsSources) {
+                initGitRepo(source.sourcePath, source.files);
+            }
             mkdir(path.join(REPOS_DIR, providerName, 'agent'));
             writeFile(path.join(REPOS_DIR, providerName, 'agent', 'manifest.json'), JSON.stringify({
                 repos: { [repoName]: sourceRepoPath },
             }, null, 2));
             mkdir(installedRepoPath);
             writeFile(path.join(installedRepoPath, 'stale.txt'), 'stale\\n');
-            execFileSync('git', ['clone', '--quiet', defaultSkillsSourcePath, defaultSkillsRepoPath], { stdio: 'ignore' });
+            for (const source of defaultSkillsSources) {
+                execFileSync('git', ['clone', '--quiet', source.sourcePath, path.join(REPOS_DIR, source.name)], {
+                    stdio: 'ignore',
+                });
+            }
 
             return { repoName, installedRepoPath, defaultSkillsRepoPath };
         }
 
         function assertDefaultSkillsSummary(summary, repoName) {
             assert.ok(summary, 'aggregate result includes defaultSkills');
-            assert.equal(summary.defaultSkillsRepoName, 'AchillesCopilotBasicSkills');
-            assert.equal(summary.total, 2);
-            assert.deepEqual(summary.refreshed.map(entry => entry.repoName), [repoName]);
-            assert.deepEqual(
-                summary.skipped.map(entry => ({ repoName: entry.repoName, reason: entry.reason })),
-                [{ repoName: 'AchillesCopilotBasicSkills', reason: 'default skills source repo' }],
-            );
+            assert.equal(summary.defaultSkillsRepoName, null);
+            assert.deepEqual(summary.defaultSkillsRepoNames, [
+                'AchillesCopilotBasicSkills',
+                'DocumentationSkills',
+                'PloinkySkills',
+            ]);
+            assert.equal(summary.total, 12);
+            assert.equal(summary.refreshed.length, 3);
+            assert.deepEqual([...new Set(summary.refreshed.map(entry => entry.repoName))], [repoName]);
+            assert.equal(summary.skipped.length, 9);
+            assert.equal(summary.skipped.filter(entry => entry.reason === 'default skills source repo').length, 3);
+            assert.equal(summary.skipped.filter(entry => entry.reason === 'skills-only repo').length, 6);
             assert.equal(summary.failed.length, 0);
         }
 
@@ -191,7 +214,6 @@ function runAggregateUpdateChild(workspaceRoot, body) {
             ...process.env,
             PLOINKY_WORKSPACE_ROOT: workspaceRoot,
             PLOINKY_ROOT: runtimeRoot,
-            PLOINKY_AGENTLIB_REF: '',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -510,7 +532,11 @@ test('updateRepo reports default skill refresh failures after updating a managed
             const providerName = 'UnitCommandProvider-${process.pid}-${Date.now()}';
             const sourceRepoPath = path.join(workspaceRoot, 'source-repo');
             const installedRepoPath = path.join(REPOS_DIR, repoName);
-            const defaultSkillsRepoPath = path.join(REPOS_DIR, 'AchillesCopilotBasicSkills');
+            const defaultSkillsRepoPaths = [
+                path.join(REPOS_DIR, 'AchillesCopilotBasicSkills'),
+                path.join(REPOS_DIR, 'DocumentationSkills'),
+                path.join(REPOS_DIR, 'PloinkySkills'),
+            ];
 
             mkdir(REPOS_DIR);
             initGitRepo(sourceRepoPath);
@@ -520,7 +546,17 @@ test('updateRepo reports default skill refresh failures after updating a managed
             }, null, 2));
             mkdir(installedRepoPath);
             fs.writeFileSync(path.join(installedRepoPath, 'stale.txt'), 'stale\\n');
-            mkdir(defaultSkillsRepoPath);
+            for (const [index, defaultSkillsRepoPath] of defaultSkillsRepoPaths.entries()) {
+                mkdir(defaultSkillsRepoPath);
+                if (index > 0) {
+                    const skillName = 'source-' + index;
+                    mkdir(path.join(defaultSkillsRepoPath, 'skills', skillName));
+                    fs.writeFileSync(
+                        path.join(defaultSkillsRepoPath, 'skills', skillName, 'SKILL.md'),
+                        '# Source ' + index + '\\n',
+                    );
+                }
+            }
 
             const logs = [];
             const originalLog = console.log;
@@ -544,7 +580,7 @@ test('updateRepo reports default skill refresh failures after updating a managed
 
             assert.equal(fs.existsSync(path.join(installedRepoPath, 'README.md')), true);
             assert.equal(fs.existsSync(path.join(installedRepoPath, 'stale.txt')), false);
-            assert.ok(logs.includes('  Default skills summary: 0/1 repo(s) refreshed.'));
+            assert.ok(logs.includes('  Default skills summary: 2/3 repo(s) refreshed.'));
         `], {
             cwd: projectRoot,
             env: {

@@ -53,7 +53,13 @@ import {
     saveAgentsMap,
     syncAgentMcpConfig
 } from './common.js';
-import { clearLivenessState, runContainerScriptReadiness } from './healthProbes.js';
+import {
+    PROBE_CONTROL_CONTAINER_ROOT,
+    clearLivenessState,
+    ensureHealthProbeHostDir,
+    prepareHealthProbeHostDirForLaunch,
+    runContainerScriptReadiness,
+} from './healthProbes.js';
 import { removeExactRegisteredContainer, stopAndRemove } from './containerFleet.js';
 import {
     TARGETED_DRAIN_ACKNOWLEDGEMENT,
@@ -81,6 +87,7 @@ import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
 import { detectRuntimeKeyForAgent, isNoNodeRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 import { nodeModulesDir, prepareAgentCache } from '../../utils/dependencies/dependencyCache.js';
+import { ensureAgentLibCacheLink } from '../../utils/dependencies/agentLibLink.js';
 import {
     runPreContainerLifecycle,
     runProfileLifecycle
@@ -154,6 +161,14 @@ import {
 } from '../routerAuthorityAttestation.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 import {
+    agentLibAliasShadows,
+    agentLibGrant,
+    agentLibGrantEnv,
+    agentLibReuseProblem,
+    agentLibRuntimeRecord,
+} from '../agentLibGrant.js';
+import { attestContainerAgentLib } from '../agentLibAttestation.js';
+import {
     assertCandidateLifecycleTransition,
     isCandidateCleanupReceiptDocument,
     RUNTIME_CLEANUP_RECEIPT_VERSION,
@@ -162,6 +177,7 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
+const AGENT_CONTROL_ENTRYPOINT = '/Agent/server/AgentEntrypoint.sh';
 const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
 const AUTHORIZED_CLEANUP_RECEIPTS = new WeakMap();
 const CONSUMED_CLEANUP_RECEIPTS = new WeakSet();
@@ -870,12 +886,21 @@ function buildPersistentAgentRunArgs({
     useNestedDependencyMounts = false,
     preparedNodeModulesDir = '',
     sharedDir,
+    healthProbeHostDir,
     cwd,
     cwdMountTarget,
     isolatedHome = true,
     agentHomeDir = '',
+    agentLibGrant: grant = null,
 } = {}) {
+    if (!grant) {
+        throw new Error('agent admission requires the selected achillesAgentLib grant');
+    }
+    if (!healthProbeHostDir) {
+        throw new Error('agent admission requires its dedicated health-probe control directory');
+    }
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
+    const readOnlyMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const args = [
         'run', '-d', '--init', '--name', containerName,
         ...managedContainerLabelArgs(),
@@ -896,11 +921,29 @@ function buildPersistentAgentRunArgs({
         ] : []),
         // Shared directory
         '-v', `${sharedDir}:/shared${runtime === 'podman' ? ':z' : ''}`,
+        // A per-container control channel carries requests, results, and exact
+        // cancellation to the broker in the container's main process tree.
+        // Health checks therefore create no target OCI exec sessions.
+        '-v', `${healthProbeHostDir}:${PROBE_CONTROL_CONTAINER_ROOT}${runtime === 'podman' ? ':z' : ''}`,
         // CWD passthrough. Isolated agents receive their host data dir as /root.
         '-v', `${cwd}:${cwdMountTarget}${runtime === 'podman' ? ':z' : ''}`,
     ];
     if (!isolatedHome) {
         args.push('-v', `${agentHomeDir}:/root${runtime === 'podman' ? ':z' : ''}`);
+    }
+    // The one selected achillesAgentLib source at the stable path, followed by a
+    // read-only shadow over every writable alias that already exposes the same
+    // inode. Both come after the writable binds so the shadows actually win.
+    args.push('-v', `${grant.sourceDir}:${grant.runtimePath}${readOnlyMount}`);
+    const writableBinds = [
+        ...(codeMountMode.includes('ro') ? [] : [{ hostPath: codeMountPath, runtimePath: '/code' }]),
+        { hostPath: sharedDir, runtimePath: '/shared' },
+        { hostPath: healthProbeHostDir, runtimePath: PROBE_CONTROL_CONTAINER_ROOT },
+        { hostPath: cwd, runtimePath: cwdMountTarget },
+        ...(isolatedHome || !agentHomeDir ? [] : [{ hostPath: agentHomeDir, runtimePath: '/root' }]),
+    ];
+    for (const shadow of agentLibAliasShadows(grant, writableBinds)) {
+        args.push('-v', `${shadow.hostPath}:${shadow.runtimePath}${readOnlyMount}`);
     }
     return args;
 }
@@ -993,9 +1036,42 @@ function hasExactManagedEnv(record, expectedEnv) {
     });
 }
 
+function manifestUsesHealthProbeBroker(manifest) {
+    return ['liveness', 'readiness'].some((type) => (
+        typeof manifest?.health?.[type]?.script === 'string'
+        && manifest.health[type].script.trim() !== ''
+    ));
+}
+
+function inspectImageEntrypoint(runtime, image, spawn = spawnSync) {
+    const result = spawn(runtime, [
+        'image', 'inspect', '--format', '{{json .Config.Entrypoint}}', image,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    if (result?.error || result?.status !== 0) {
+        const detail = String(result?.stderr || result?.error?.message || result?.status || 'unknown').trim();
+        throw new Error(`[image] cannot inspect entrypoint for ${image}: ${detail}`);
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(String(result.stdout || '').trim() || 'null');
+    } catch (cause) {
+        throw new Error(`[image] entrypoint inspection for ${image} returned invalid JSON`, { cause });
+    }
+    if (parsed === null) return Object.freeze([]);
+    const values = Array.isArray(parsed) ? parsed : [parsed];
+    if (values.some((value) => typeof value !== 'string' || value.length === 0)) {
+        throw new Error(`[image] entrypoint inspection for ${image} returned an invalid command`);
+    }
+    return Object.freeze(values.map(String));
+}
+
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const repoName = path.basename(path.dirname(agentPath));
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
+    const useHealthProbeBroker = manifestUsesHealthProbeBroker(manifest);
+    const managedControlEnv = Object.freeze({
+        PLOINKY_HEALTH_PROBE_BROKER: useHealthProbeBroker ? '1' : '0',
+    });
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
@@ -1132,7 +1208,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     });
     const envHash = computeEnvHash(manifest, profileConfig, {
         ...runtimeRouterEnv,
-        ...runtimeNetworkPlan.hashEnv
+        ...runtimeNetworkPlan.hashEnv,
+        ...managedControlEnv,
     }, { agentName, repoName });
 
     // LLM runtime opt-in: catalog-driven image, hardware-aware policy, reuse hash.
@@ -1262,6 +1339,18 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let agentLibMountPath = AGENT_LIB_PATH;
     let codeMountPath = agentCodePath;
     const useNestedDependencyMounts = runtime !== 'podman';
+    // Container and nested-Podman agents see the selected achillesAgentLib
+    // source at the stable path inside their own mount namespace. The family
+    // alone determines that path, so this must not force a container probe on
+    // agents that need no dependency cache.
+    const containerAgentLibGrant = agentLibGrant('container');
+    // A start-only agent with no package.json still receives the same bare
+    // package-resolution adapter as dependency-bearing agents. No branch that
+    // skips npm may leave an empty node_modules directory behind.
+    ensureAgentLibCacheLink(
+        path.dirname(preparedNodeModulesDir),
+        containerAgentLibGrant.runtimePath,
+    );
     let podmanStagedTargetMounts = [];
     if (runtime === 'podman') {
         fs.mkdirSync(PODMAN_RUNTIME_ROOT, { recursive: true });
@@ -1294,6 +1383,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
     // Ensure the agent home directory exists on host.
     fs.mkdirSync(agentHomeDir, { recursive: true });
+    const healthProbeHostDir = ensureHealthProbeHostDir(containerName);
 
     // Build volume mount arguments using new workspace structure
     // Prepared node_modules are mounted read-only; runtime containers never mutate deps.
@@ -1309,10 +1399,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         useNestedDependencyMounts,
         preparedNodeModulesDir,
         sharedDir,
+        healthProbeHostDir,
         cwd,
         cwdMountTarget,
         isolatedHome,
         agentHomeDir,
+        agentLibGrant: containerAgentLibGrant,
     });
     const topologyMount = edgeTopologyMount();
     fs.mkdirSync(topologyMount.source, { recursive: true, mode: 0o700 });
@@ -1484,6 +1576,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         envStrings.push(formatEnvFlag(key, value));
     }
     envStrings.push(formatEnvFlag('HOME', '/root'));
+    // The achillesAgentLib contract is asserted at the same final authoritative
+    // layer, after stripReservedAndRestoreRuntimeRouterEnvFlags has removed any
+    // config-layer attempt to point the agent at a different source.
+    for (const [key, value] of Object.entries(agentLibGrantEnv(containerAgentLibGrant))) {
+        envStrings.push(formatEnvFlag(key, value));
+    }
+    for (const [key, value] of Object.entries(managedControlEnv)) {
+        envStrings.push(formatEnvFlag(key, value));
+    }
 
     const envFlags = flagsToArgs(envStrings);
     if (envFlags.length) args.push(...envFlags);
@@ -1499,10 +1600,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     args.push('-e', `NODE_PATH=/code/node_modules`);
 
     const manifestEntrypoint = typeof manifest?.entrypoint === 'string' ? manifest.entrypoint.trim() : '';
-    if (manifestEntrypoint) {
-        args.push('--entrypoint', manifestEntrypoint);
-    }
+    // Every managed container owns its health and runtime-relay brokers in the
+    // main process tree. Preserve the exact manifest override or immutable
+    // image entrypoint as the wrapper's child command.
+    ensureImagePresent(image, { runtime });
+    const mainEntrypoint = manifestEntrypoint
+        ? Object.freeze([manifestEntrypoint])
+        : inspectImageEntrypoint(runtime, image);
+    args.push('--entrypoint', AGENT_CONTROL_ENTRYPOINT);
     args.push(image);
+    const mainCommandIndex = args.length;
     let entrySummary = DEFAULT_AGENT_ENTRY;
     if (useStartEntry) {
         const startArgs = splitCommandArgs(startCmd);
@@ -1545,10 +1652,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             args.push('sh', '/Agent/server/AgentServer.sh');
         }
     }
+    args.splice(mainCommandIndex, 0, ...mainEntrypoint);
+    entrySummary = `${AGENT_CONTROL_ENTRYPOINT} -> ${[
+        ...mainEntrypoint,
+        ...args.slice(mainCommandIndex + mainEntrypoint.length),
+    ].join(' ')}`;
 
     const principalId = deriveAgentPrincipalId(repoName, agentName);
     const computeSemanticEnvHash = (payload) => computeEnvHash(manifest, profileConfig, {
         ...runtimeNetworkPlan.hashEnv,
+        ...managedControlEnv,
         PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
         PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
         PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
@@ -1709,7 +1822,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
 
             const descriptorEnv = buildGeneratedRouterDescriptorEnv(payload);
             const credentialEnv = buildAgentCredentialEnv(principalId, runtimeIdentity);
-            const expectedEnv = Object.freeze({ ...descriptorEnv, ...credentialEnv });
+            const expectedEnv = Object.freeze({
+                ...descriptorEnv,
+                ...credentialEnv,
+                ...managedControlEnv,
+            });
             const expectedMounts = expectedBindMountsFromArgs(args, descriptorHostFile);
             const expectedEnvHash = computeSemanticEnvHash(payload);
             if (!hasExactManagedEnv(record, expectedEnv)) {
@@ -1718,6 +1835,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             if (record?.HostConfig?.Init !== true
                 || String(record?.Image || '') !== String(attested.evidence.target.image || '')
                 || String(record?.Config?.User || '') !== String(attested.evidence.target.user || '')
+                || JSON.stringify(record?.Config?.Entrypoint || [])
+                    !== JSON.stringify([AGENT_CONTROL_ENTRYPOINT])
                 || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
                     !== managedUserNamespaceFromAttestation(attested)
                 || String(record?.Config?.WorkingDir || '') !== containerWorkdir
@@ -1770,7 +1889,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const finalizeGeneratedRouterLaunch = ({ launch, record }) => {
         if (!launch) throw new Error('managed generated-local launch is missing its attested launch state');
         const expectedMounts = expectedBindMountsFromArgs(args, launch.descriptorHostFile);
-        if (!hasExactManagedEnv(record, launch.env)) {
+        if (!hasExactManagedEnv(record, { ...launch.env, ...managedControlEnv })) {
             throw new Error('managed candidate generated Router env failed exact inspection');
         }
         const descriptorMounts = (record?.Mounts || []).filter((mount) => (
@@ -1782,6 +1901,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             || record?.HostConfig?.Init !== true
             || String(record?.Image || '') !== String(launch.attested.evidence.target.image || '')
             || String(record?.Config?.User || '') !== String(launch.attested.evidence.target.user || '')
+            || JSON.stringify(record?.Config?.Entrypoint || [])
+                !== JSON.stringify([AGENT_CONTROL_ENTRYPOINT])
             || String(record?.HostConfig?.Annotations?.['io.podman.annotations.userns'] || '')
                 !== managedUserNamespaceFromAttestation(launch.attested)
             || String(record?.Config?.WorkingDir || '') !== containerWorkdir
@@ -1828,6 +1949,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             state: 'preserved-ambiguous',
             inspectionComplete: false,
         });
+        // Creation is reached only after the exact predecessor is gone (or was
+        // proved absent). Retire its two fixed control-plane artifacts here so
+        // shared-filesystem socket projection cannot leak across generations.
+        // Per-request directories remain untouched and fail closed separately.
+        prepareHealthProbeHostDirForLaunch(containerName);
         const res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
     };
@@ -1852,13 +1978,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let launchedContainerId = '';
     let generatedLaunch = null;
     let adoptedExistingRuntime = false;
+    // A non-Node target image needs the fixed Node helper to attest its exact
+    // read-only volume topology. Pull it before any lifecycle/network lock; the
+    // later probe uses only the already-present immutable image ID.
+    ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
     try {
     if (runtimeNetworkPlan.requiresManagedNetwork) {
         // Resolve both the target and fixed probe images before the network
         // transaction. The helper never pulls and never executes target-image
         // entrypoints, including start-only images without Node.js.
         ensureImagePresent(image, { runtime });
-        ensureImagePresent(ROUTER_AUTHORITY_HELPER_IMAGE, { runtime });
         const launched = networkLifecycle.runManagedContainerTransaction({
             network: manifestNetwork,
             canonicalAgentId: agentName,
@@ -2007,6 +2136,18 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             exactCleanupPerformed,
         });
     };
+    let agentLibAttestation;
+    try {
+        agentLibAttestation = attestContainerAgentLib({
+            runtime,
+            containerId: launchedContainerId,
+            grant: containerAgentLibGrant,
+            helperImage: ROUTER_AUTHORITY_HELPER_IMAGE,
+            spawn: spawnSync,
+        });
+    } catch (error) {
+        cleanupExactLaunch(error);
+    }
     const agents = loadAgentsMap();
     const declaredEnvNames2 = [
         ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
@@ -2041,9 +2182,24 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         type: 'agent',
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        agentLib: agentLibRuntimeRecord(containerAgentLibGrant, agentLibAliasShadows(
+            containerAgentLibGrant,
+            [
+                ...(codeMountMode.includes('ro') ? [] : [{ hostPath: codeMountPath, runtimePath: '/code' }]),
+                { hostPath: sharedDir, runtimePath: '/shared' },
+                { hostPath: cwd, runtimePath: cwdMountTarget },
+                ...(isolatedHome || !agentHomeDir ? [] : [{ hostPath: agentHomeDir, runtimePath: '/root' }]),
+            ],
+        )),
+        agentLibAttestation,
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
+                {
+                    source: containerAgentLibGrant.sourceDir,
+                    target: containerAgentLibGrant.runtimePath,
+                    ro: true,
+                },
                 { source: topologyMount.source, target: topologyMount.target, ro: true },
                 ...(generatedLaunch ? [{
                     source: generatedLaunch.descriptorHostFile,
@@ -2830,7 +2986,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const runtimeNetworkPlan = buildRuntimeNetworkPlan(runtime, manifestNetwork);
     const envHashExtra = {
         ...runtimeRouterEnv,
-        ...runtimeNetworkPlan.hashEnv
+        ...runtimeNetworkPlan.hashEnv,
+        PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(manifest) ? '1' : '0',
     };
 
     const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest, profileConfig);
@@ -2877,6 +3034,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (desired && desired !== current) {
             debugLog(`[ensureAgentService] ${agentName}: env hash changed (current=${current || '<none>'}, desired=${desired.slice(0, 12)}…), recreating container`);
             recreateReason ||= 'envHashChanged';
+        }
+    }
+
+    // The AgentLib selection lives outside the manifest and profile, so the env
+    // hash cannot see a changed source. Compare it directly: a fingerprint
+    // change must replace this container, not reuse it against old bytes.
+    if (containerExists(containerName)) {
+        const agentLibProblem = agentLibReuseProblem(existingRecord, agentLibGrant('container'));
+        if (agentLibProblem) {
+            debugLog(`[ensureAgentService] ${agentName}: ${agentLibProblem}, recreating container`);
+            recreateReason ||= 'agentLibSelectionChanged';
         }
     }
 
@@ -3166,6 +3334,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             `[ensureAgentService] ${agentName}: missing podman bind record after startAgentContainer; refusing to write a fallback bind list.`
         );
     }
+    if (!startedRecord.agentLib || !startedRecord.agentLibAttestation) {
+        throw new Error(
+            `[ensureAgentService] ${agentName}: physical runtime admission returned no complete AgentLib proof.`
+        );
+    }
     agents[containerName] = {
         agentName,
         repoName,
@@ -3182,6 +3355,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         containerId: started.containerId,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
+        agentLib: structuredClone(startedRecord.agentLib),
+        agentLibAttestation: structuredClone(startedRecord.agentLibAttestation),
         config: {
             binds: hasStartedBinds ? startedRecord.config.binds : [
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
@@ -3551,6 +3726,8 @@ export {
     expectedBindMountsFromArgs,
     hasExactManagedEnv,
     hasExactManagedMountContract,
+    inspectImageEntrypoint,
+    manifestUsesHealthProbeBroker,
     mergeNodeOptions,
     manifestVolumeMountSuffix,
     podmanManifestVolumeMountSuffix,

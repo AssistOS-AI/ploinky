@@ -563,7 +563,6 @@ export function assertNoWaitRuntimeStillExact(result, {
 } = {}, {
     createAdapter = createNetworkLifecycleAdapter,
     getRuntime = dockerSvc.getRuntime,
-    isContainerRunning = dockerSvc.isContainerRunning,
     isSandboxRunning = isBwrapProcessRunning,
     requireRunning = true,
 } = {}) {
@@ -615,9 +614,12 @@ export function assertNoWaitRuntimeStillExact(result, {
             requireRuntimeIdentity: true,
         },
     );
+    // The contract inspection already binds state to the exact immutable
+    // container ID. Reusing that snapshot avoids a second, global runtime
+    // inventory between inspection and publication.
     if (inspection?.state !== 'exact'
         || String(inspection.id || '').trim().toLowerCase() !== returnedContainerId
-        || (requireRunning && !isContainerRunning(containerName))) {
+        || (requireRunning && inspection.running !== true)) {
         throw new Error(`no-wait runtime '${containerName}' changed immutable identity before publication`);
     }
     return result;
@@ -973,6 +975,11 @@ function loadNoWaitWorkerLifecycle(identity) {
     );
 }
 
+function isRetryableNoWaitWorkerLifecycleObservation(error) {
+    return error?.code === 'EDGE_GENERATION_INACTIVE'
+        || error?.code === 'EDGE_GENERATION_SOURCE_CHANGED';
+}
+
 export async function waitForNoWaitLifecycle(identity, {
     timeoutMs = Number.parseInt(
         process.env.PLOINKY_NO_WAIT_EDGE_TIMEOUT_MS || '180000',
@@ -1008,7 +1015,7 @@ export async function waitForNoWaitWorkerLifecycle(identity, {
         try {
             return loadFn(identity);
         } catch (error) {
-            if (error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
+            if (!isRetryableNoWaitWorkerLifecycleObservation(error)) throw error;
         }
         await sleepFn(pollIntervalMs);
     }
@@ -1037,12 +1044,13 @@ export async function withActiveNoWaitWorkerLifecycleLease(identity, callback, {
     while (nowFn() < deadline) {
         let observedLifecycle;
         try {
-            // Publication must be able to reacquire the shared lease while a
-            // retryable failure has left the selector inactive. Never wait for
-            // an active selector from inside the workspace mutation lease.
+            // Publication must be able to reacquire the shared lease while the
+            // selector is inactive or while a peer's source mutation has not
+            // yet been captured into a new active generation. Never wait for
+            // an exact selector from inside the workspace mutation lease.
             observedLifecycle = loadFn(identity);
         } catch (error) {
-            if (error?.code !== 'EDGE_GENERATION_INACTIVE') throw error;
+            if (!isRetryableNoWaitWorkerLifecycleObservation(error)) throw error;
             const remainingMs = deadline - nowFn();
             if (remainingMs <= 0) break;
             await sleepFn(Math.min(boundedPollIntervalMs, remainingMs));
@@ -1060,7 +1068,9 @@ export async function withActiveNoWaitWorkerLifecycleLease(identity, callback, {
             try {
                 lockedLifecycle = loadFn(identity);
             } catch (error) {
-                if (error?.code === 'EDGE_GENERATION_INACTIVE') return { retry: true };
+                if (isRetryableNoWaitWorkerLifecycleObservation(error)) {
+                    return { retry: true };
+                }
                 throw error;
             }
             // Publication or another exact workspace mutation may have

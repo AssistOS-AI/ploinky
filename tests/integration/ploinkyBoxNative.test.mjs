@@ -454,14 +454,33 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ]).split(/\n/);
     assert.equal(keyEvidence[0], '600');
     assert.match(keyEvidence[1], /^[a-f0-9]{64}\s/);
+    // The Box installs mcp-sdk only. achillesAgentLib is the direct-mounted
+    // workspace source, so it has no pinned Box checkout to inspect.
     for (const [repository, revision] of [
         ['mcp-sdk', '7efe9d17f52a625743e411089d3a6879f6f89156'],
-        ['achillesAgentLib', '975e7a318e1c8c8d1792ec96fe7b820fc465d1f5'],
     ]) {
         assert.equal(execInBox(harness.runner, prepared.containerId, [
             'git', '-C', `/opt/ploinky/node_modules/${repository}`, 'rev-parse', 'HEAD',
         ]), revision);
     }
+    // The selected source is present read-only at the stable path, and the
+    // retired Box-installed copy is absent.
+    assert.match(
+        execInBox(harness.runner, prepared.containerId, [
+            'node', '-e', "process.stdout.write(require('/opt/ploinky-agentlib/package.json').name)",
+        ]),
+        /ploinky-agent-lib/,
+    );
+    assert.equal(execInBox(harness.runner, prepared.containerId, [
+        'test', '!', '-e', '/opt/ploinky/node_modules/achillesAgentLib',
+    ]), '');
+    assert.notEqual(
+        execInBox(harness.runner, prepared.containerId, [
+            'bash', '-c', 'touch /opt/ploinky-agentlib/tamper 2>&1; echo $?',
+        ]).trim(),
+        '0',
+        'the direct AgentLib mount must be read-only inside the Box',
+    );
     const innerInfo = JSON.parse(execInBox(harness.runner, prepared.containerId, [
         'podman', 'info', '--format', 'json',
     ]));
@@ -571,7 +590,9 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
             "printf workspace-retained > /workspace/t26-workspace-canary",
             "printf dependencies-retained > /opt/ploinky/node_modules/t26-dependencies-canary",
             "printf 'corrupt\\n' > /opt/ploinky/node_modules/.ploinky-box-dependencies.json",
-            'chmod 500 /opt/ploinky/node_modules/achillesAgentLib',
+            // mcp-sdk is now the only Box-installed dependency; achillesAgentLib
+            // arrives as a read-only direct mount the Box never installs.
+            'chmod 500 /opt/ploinky/node_modules/mcp-sdk',
         ].join('; '),
     ]);
     assert.equal(fs.readFileSync(
@@ -664,8 +685,19 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     )), false);
     assert.match(readDependencyCacheFile(harness, '.ploinky-box-dependencies.json'), /^\{/);
     assert.equal(execInBox(harness.runner, rebuilt.containerId, [
-        'test', '-d', '/opt/ploinky/node_modules/achillesAgentLib',
+        'test', '-d', '/opt/ploinky/node_modules/mcp-sdk',
     ]), '');
+    // The retired Box-installed copy must be absent, and the direct mount must
+    // carry the selected package, read-only.
+    assert.equal(execInBox(harness.runner, rebuilt.containerId, [
+        'test', '!', '-e', '/opt/ploinky/node_modules/achillesAgentLib',
+    ]), '');
+    assert.match(
+        execInBox(harness.runner, rebuilt.containerId, [
+            'node', '-e', "process.stdout.write(require('/opt/ploinky-agentlib/package.json').name)",
+        ]),
+        /ploinky-agent-lib/,
+    );
     await harness.supervisor.runDestroyTransaction(rebuilt.containerId);
 
     // Either this test or an unrelated live Box may already own the default

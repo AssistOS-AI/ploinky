@@ -97,6 +97,15 @@ import {
     assertRuntimeAdmissionCurrent,
 } from '../runtimeCapabilities.js';
 import { assertHostModeGenerationCapability } from '../edgeGeneration.js';
+import {
+    agentLibAliasShadows,
+    agentLibGrant,
+    agentLibGrantEnv,
+    agentLibReuseProblem,
+    agentLibRuntimeRecord,
+} from '../agentLibGrant.js';
+import { attestBwrapAgentLib } from '../agentLibAttestation.js';
+import { detectHostRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -312,6 +321,30 @@ function addProtectedWorkspaceOverlays(args, options) {
 /**
  * Build the bwrap argument array for running a Node.js agent in a sandbox.
  */
+/**
+ * The writable binds bwrap compiles, in the order it emits them, so any alias of
+ * the selected achillesAgentLib source can be shadowed read-only afterwards.
+ */
+function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, agentHomeDir, sharedDir, volumes, volumeOptions }) {
+    const binds = [];
+    if (!codeReadOnly && agentCodePath) binds.push({ hostPath: agentCodePath, runtimePath: '/code' });
+    if (sharedDir) binds.push({ hostPath: sharedDir, runtimePath: '/shared' });
+    const projectTarget = cwdMountTarget || cwd;
+    const homeDir = agentHomeDir || cwd;
+    if (cwd && (cwd !== homeDir || projectTarget !== '/root')) {
+        binds.push({ hostPath: cwd, runtimePath: projectTarget });
+    }
+    if (homeDir) binds.push({ hostPath: homeDir, runtimePath: '/root' });
+    if (volumes && typeof volumes === 'object') {
+        for (const [hostPath, containerPath] of Object.entries(volumes)) {
+            const mountOptions = (volumeOptions || {})[containerPath] || {};
+            if (mountOptions.readOnly === true) continue;
+            binds.push({ hostPath: resolveManifestVolumeHostPath(hostPath), runtimePath: containerPath });
+        }
+    }
+    return binds;
+}
+
 function buildBwrapArgs(options) {
     const {
         agentCodePath,
@@ -327,9 +360,13 @@ function buildBwrapArgs(options) {
         codeReadOnly,
         skillsReadOnly,
         volumes,
-        agentPrivateKeyPath
+        agentPrivateKeyPath,
+        agentLibGrant: grant,
     } = options;
 
+    if (!grant) {
+        throw new Error('[bwrap] agent admission requires the selected achillesAgentLib grant');
+    }
     const agentNodeModulesMountPoint = path.join(agentLibPath, 'node_modules');
     if (!fs.existsSync(agentNodeModulesMountPoint)) {
         throw new Error(
@@ -396,6 +433,10 @@ function buildBwrapArgs(options) {
     // Agent library (always read-only)
     args.push('--ro-bind', agentLibPath, '/Agent');
 
+    // The one selected achillesAgentLib source, at the stable path every mount
+    // namespace agrees on. The agent cache symlink resolves into it.
+    args.push('--ro-bind', grant.sourceDir, grant.runtimePath);
+
     // Agent code (rw in dev, ro in qa/prod)
     if (codeReadOnly) {
         args.push('--ro-bind', agentCodePath, '/code');
@@ -461,6 +502,21 @@ function buildBwrapArgs(options) {
         codeReadOnly,
     });
 
+    // Applied after every writable bind: a workspace or project mount that also
+    // exposes the selected source would otherwise leave the same inode writable.
+    for (const shadow of agentLibAliasShadows(grant, writableBwrapBinds({
+        agentCodePath,
+        codeReadOnly,
+        cwd,
+        cwdMountTarget,
+        agentHomeDir,
+        sharedDir,
+        volumes,
+        volumeOptions: options.volumeOptions,
+    }))) {
+        args.push('--ro-bind', shadow.hostPath, shadow.runtimePath);
+    }
+
     // Process isolation — do NOT unshare network (agents need host network)
     // NOTE: --die-with-parent is intentionally omitted. Agent processes must survive
     // the ploinky CLI exit (daemon mode). Cleanup is handled by ploinky stop/destroy
@@ -489,7 +545,7 @@ function buildBwrapArgs(options) {
  * Build the full environment map for a bwrap agent.
  * Mirrors the env construction in startAgentContainer.
  */
-function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null, routerEndpoint = undefined, runtimeIdentity = undefined) {
+function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, runtimeName = 'bwrap', runtimeResourcePlan = null, routerEndpoint = undefined, runtimeIdentity = undefined, agentLibGrantForEnv = null) {
     const endpoint = assertRouterEndpoint(routerEndpoint, 'host');
     // Start with manifest env vars (resolved from secrets)
     const env = buildEnvMap(manifest, profileConfig, { agentName, repoName, forRuntime: true });
@@ -575,6 +631,13 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
             exactRuntimeIdentity,
         ),
     );
+
+    // The achillesAgentLib contract is injected at the same final authoritative
+    // layer as the other reserved runtime identity variables, after
+    // stripReservedAgentEnv has removed any manifest or profile attempt to set it.
+    if (agentLibGrantForEnv) {
+        Object.assign(env, agentLibGrantEnv(agentLibGrantForEnv));
+    }
 
     return env;
 }
@@ -719,6 +782,8 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     fs.mkdirSync(bwrapAgentRoot, { recursive: true });
     pruneStaleRuntimeEntries(bwrapAgentRoot);
     const agentLibPath = ensureBwrapAgentLibDir(instanceName, nodeModulesDir);
+    const bwrapRuntimeKey = detectHostRuntimeKey('bwrap');
+    const grant = agentLibGrant(bwrapRuntimeKey);
 
     // Port resolution — with shared host network, hostPort === containerPort
     // Must happen before env map so PORT is set correctly
@@ -731,7 +796,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const hostPort = allPortMappings[0]?.hostPort;
 
     // Build environment map
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repoName, activeProfile, 'bwrap', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
     const agentPrivateKeyPath = envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH || '';
     delete envMap.__PLOINKY_AGENT_PRIVATE_KEY_HOST_PATH;
 
@@ -757,7 +822,15 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         volumes: manifest.volumes,
         volumeOptions: readManifestVolumeOptions(manifest),
         runtimeResourcePlan,
-        agentPrivateKeyPath
+        agentPrivateKeyPath,
+        agentLibGrant: grant,
+    });
+
+    const agentLibAttestation = attestBwrapAgentLib({
+        bwrapPath: BWRAP_PATH,
+        baseArgs: bwrapArgs,
+        grant,
+        spawn: spawnSync,
     });
 
     // Build the entry command
@@ -863,9 +936,21 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         runtimeStaging: {
             agentLibPath
         },
+        agentLib: agentLibRuntimeRecord(grant, agentLibAliasShadows(grant, writableBwrapBinds({
+            agentCodePath,
+            codeReadOnly,
+            cwd,
+            cwdMountTarget,
+            agentHomeDir,
+            sharedDir,
+            volumes: manifest.volumes,
+            volumeOptions: readManifestVolumeOptions(manifest),
+        }))),
+        agentLibAttestation,
         config: {
             binds: [
                 { source: agentLibPath, target: '/Agent', ro: true },
+                { source: grant.sourceDir, target: grant.runtimePath, ro: true },
                 { source: agentCodePath, target: '/code', ro: codeReadOnly },
                 { source: nodeModulesDir, target: '/code/node_modules', ro: true },
                 { source: nodeModulesDir, target: '/Agent/node_modules', ro: true },
@@ -1006,8 +1091,18 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         // Compare env hash
         const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
         const current = existingRecord.envHash || '';
+        // The AgentLib selection is not derivable from the manifest or profile,
+        // so a changed source is invisible to the env hash and must be compared
+        // on its own.
+        const agentLibProblem = agentLibReuseProblem(
+            existingRecord,
+            agentLibGrant(detectHostRuntimeKey('bwrap')),
+        );
         if (desired && desired !== current) {
             console.log(`[bwrap] ${agentName}: env hash changed, restarting...`);
+            stopBwrapProcess(containerName);
+        } else if (agentLibProblem) {
+            console.log(`[bwrap] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
             stopBwrapProcess(containerName);
         } else {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);

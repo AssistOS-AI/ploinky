@@ -41,11 +41,49 @@ test('running-container inventory fails closed on runtime errors', () => {
                 return { status: 125, stdout: '', stderr: 'runtime unavailable' };
             },
         }),
-        /cannot list running containers: runtime unavailable/,
+        (error) => {
+            assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED');
+            assert.match(error.message, /cannot list running containers: runtime unavailable/);
+            return true;
+        },
     );
 });
 
-test('single-container status checks are argv-safe and bounded', () => {
+test('running-container inventory preserves typed runtime timeouts', () => {
+    const timeout = new Error('runtime timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(
+        () => listRunningContainerNames({
+            runtime: 'podman',
+            spawnSyncImpl() {
+                return { status: null, error: timeout, stdout: '', stderr: '' };
+            },
+        }),
+        (error) => {
+            assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
+            assert.equal(error.cause, timeout);
+            return true;
+        },
+    );
+});
+
+test('single-container inspection preserves typed control-plane timeouts', () => {
+    const timeout = new Error('runtime timed out');
+    timeout.code = 'ETIMEDOUT';
+    assert.throws(() => isContainerRunning('exact-container', {
+        runtime: 'podman',
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            return { status: null, error: timeout, stdout: '', stderr: '' };
+        },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_TIMEOUT');
+        assert.match(error.message, /runtime timed out/);
+        return true;
+    });
+});
+
+test('single-container status checks use one exact argv-safe inspect and are bounded', () => {
     const calls = [];
     const running = isContainerRunning('exact-container', {
         runtime: 'podman',
@@ -54,7 +92,7 @@ test('single-container status checks are argv-safe and bounded', () => {
             calls.push({ runtime, args, options });
             return {
                 status: 0,
-                stdout: 'other-container\nexact-container\n',
+                stdout: 'running\n',
                 stderr: '',
             };
         },
@@ -62,9 +100,49 @@ test('single-container status checks are argv-safe and bounded', () => {
 
     assert.equal(running, true);
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0].args, ['ps', '--format', '{{.Names}}']);
+    assert.deepEqual(calls[0].args, [
+        'container',
+        'inspect',
+        '--format',
+        '{{.State.Status}}',
+        'exact-container',
+    ]);
     assert.equal(calls[0].options.timeout, 321);
     assert.equal(calls[0].options.killSignal, 'SIGKILL');
+});
+
+test('single-container status checks distinguish stopped and absent runtimes', () => {
+    assert.equal(isContainerRunning('stopped-container', {
+        runtime: 'podman',
+        spawnSyncImpl() {
+            return { status: 0, stdout: 'exited\n', stderr: '' };
+        },
+    }), false);
+    assert.equal(isContainerRunning('missing-container', {
+        runtime: 'podman',
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            return {
+                status: 125,
+                stdout: '',
+                stderr: 'Error: no such container missing-container',
+            };
+        },
+    }), false);
+});
+
+test('single-container status checks fail closed on malformed runtime output', () => {
+    assert.throws(() => isContainerRunning('malformed-container', {
+        runtime: 'podman',
+        throwOnControlPlaneError: true,
+        spawnSyncImpl() {
+            return { status: 0, stdout: '[{"State":{"Status":"running"}}]\n', stderr: '' };
+        },
+    }), (error) => {
+        assert.equal(error.code, 'PLOINKY_CONTAINER_CONTROL_PLANE_FAILED');
+        assert.match(error.message, /invalid status/);
+        return true;
+    });
 });
 
 test('container startup inspection has per-call and aggregate deadlines', () => {
@@ -160,6 +238,9 @@ test('sixteen container targets share one status snapshot in an actual monitor t
 test('snapshot failure defers every OCI target without per-target amplification or false restart', () => {
     const logs = [];
     let calls = 0;
+    let now = 1_000;
+    let snapshotAvailable = false;
+    const probeStarts = [];
     const monitor = {
         targets: new Map(Array.from({ length: 16 }, (_, index) => [
             `container-${index}`,
@@ -173,16 +254,21 @@ test('snapshot failure defers every OCI target without per-target amplification 
                 pendingRestartTimer: null,
             },
         ])),
-        config: {},
+        config: {
+            CONTAINER_SNAPSHOT_RETRY_INITIAL_MS: 15_000,
+            CONTAINER_SNAPSHOT_RETRY_MAX_MS: 60_000,
+        },
+        now: () => now,
         isShuttingDown: () => false,
         inspectWorkspaceStartLock: () => ({ active: false, stale: false }),
         syncManagedContainers() {},
         listRunningContainerNames() {
             calls += 1;
-            throw new Error('snapshot unavailable');
+            if (!snapshotAvailable) throw new Error('snapshot unavailable');
+            return [...monitor.targets.keys()];
         },
-        startProbeWorker() {
-            assert.fail('unknown runtime state must not be treated as ready');
+        startProbeWorker(_monitor, target) {
+            probeStarts.push(target.containerName);
         },
         log(level, event, data) {
             logs.push({ level, event, data });
@@ -190,8 +276,11 @@ test('snapshot failure defers every OCI target without per-target amplification 
     };
 
     monitorTick(monitor);
+    monitorTick(monitor);
+    now += 14_999;
+    monitorTick(monitor);
 
-    assert.equal(calls, 1, 'one failed shared call is the entire tick control-plane cost');
+    assert.equal(calls, 1, 'snapshot backoff must suppress repeated control-plane calls');
     assert.ok([...monitor.targets.values()].every((target) => (
         target.pendingRestartTimer === null
         && target.isRestarting === false
@@ -200,6 +289,155 @@ test('snapshot failure defers every OCI target without per-target amplification 
     assert.deepEqual(logs, [{
         level: 'error',
         event: 'container_status_snapshot_failed',
-        data: { error: 'snapshot unavailable' },
+        data: {
+            error: 'snapshot unavailable',
+            consecutiveFailures: 1,
+            retryAfterMs: 15_000,
+        },
     }]);
+
+    snapshotAvailable = true;
+    now += 1;
+    monitorTick(monitor);
+
+    assert.equal(calls, 2, 'snapshot is retried when the bounded backoff expires');
+    assert.equal(probeStarts.length, 16);
+    assert.equal(monitor.runtimeSnapshotFailures, 0);
+    assert.equal(monitor.runtimeSnapshotRetryNotBefore, 0);
+    assert.deepEqual(logs.at(-1), {
+        level: 'info',
+        event: 'container_status_snapshot_recovered',
+        data: { previousFailures: 1 },
+    });
+});
+
+test('Box inventory caching preserves five-second probe scheduling without repeated runtime lists', () => {
+    let calls = 0;
+    let now = 1_000;
+    const probeStarts = [];
+    const target = {
+        runtime: 'container',
+        containerName: 'cached-container',
+        agentName: 'cached-agent',
+        repoName: 'demo-repo',
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+    const monitor = {
+        targets: new Map([[target.containerName, target]]),
+        config: { CONTAINER_SNAPSHOT_INTERVAL_MS: 5 * 60 * 1000 },
+        now: () => now,
+        isShuttingDown: () => false,
+        inspectWorkspaceStartLock: () => ({ active: false, stale: false }),
+        syncManagedContainers() {},
+        listRunningContainerNames() {
+            calls += 1;
+            return [target.containerName];
+        },
+        startProbeWorker(_monitor, current) {
+            probeStarts.push(current.containerName);
+            current.probeState = 'success';
+            current.probeLastSuccessAt = now;
+        },
+        log() {},
+    };
+
+    monitorTick(monitor);
+    assert.equal(monitor.runtimeSnapshotFreshForTick, true);
+    target.probeState = 'pending';
+    now += 5_000;
+    monitorTick(monitor);
+
+    assert.equal(calls, 1, 'the second monitor tick must reuse the Box inventory');
+    assert.equal(monitor.runtimeSnapshotFreshForTick, false);
+    assert.deepEqual(probeStarts, [target.containerName, target.containerName]);
+
+    now += (5 * 60 * 1000) - 5_000;
+    monitorTick(monitor);
+    assert.equal(calls, 2, 'the inventory refreshes at the bounded cache deadline');
+    assert.equal(monitor.runtimeSnapshotFreshForTick, true);
+});
+
+test('cached inventory absence is unknown until a fresh runtime list confirms it', () => {
+    let calls = 0;
+    let now = 1_000;
+    let noWaitState = 'starting';
+    const logs = [];
+    const runningTarget = {
+        runtime: 'container',
+        containerName: 'already-running-container',
+        agentName: 'already-running-agent',
+        repoName: 'demo-repo',
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+    };
+    const lateTarget = {
+        runtime: 'container',
+        containerName: 'late-container',
+        agentName: 'late-agent',
+        repoName: 'demo-repo',
+        probeState: 'pending',
+        isRestarting: false,
+        pendingRestartTimer: null,
+        restartHistory: [],
+        currentBackoff: 1_000,
+        circuitBreakerTripped: false,
+    };
+    const monitor = {
+        targets: new Map([
+            [runningTarget.containerName, runningTarget],
+            [lateTarget.containerName, lateTarget],
+        ]),
+        config: {
+            CONTAINER_SNAPSHOT_INTERVAL_MS: 5 * 60 * 1000,
+            MAX_RESTARTS_IN_WINDOW: 0,
+        },
+        now: () => now,
+        isShuttingDown: () => false,
+        inspectWorkspaceStartLock: () => ({ active: false, stale: false }),
+        syncManagedContainers() {},
+        listRunningContainerNames() {
+            calls += 1;
+            return [runningTarget.containerName];
+        },
+        readNoWaitStatus() {
+            return { state: noWaitState };
+        },
+        startProbeWorker() {},
+        log(level, event, data) {
+            logs.push({ level, event, data });
+        },
+    };
+
+    monitorTick(monitor);
+    assert.equal(calls, 1);
+    assert.equal(monitor.runtimeSnapshotFreshForTick, true);
+    assert.equal(lateTarget.circuitBreakerTripped, false);
+
+    noWaitState = 'running';
+    now += 5_000;
+    monitorTick(monitor);
+
+    assert.equal(calls, 1, 'the second tick must reuse the cached inventory');
+    assert.equal(monitor.runtimeSnapshotFreshForTick, false);
+    assert.equal(lateTarget.circuitBreakerTripped, false);
+    assert.equal(lateTarget.pendingRestartTimer, null);
+    assert.equal(
+        logs.some(({ event }) => event === 'container_scheduling_restart'),
+        false,
+        'cached absence must not schedule a restart after no-wait becomes running',
+    );
+
+    now += (5 * 60 * 1000) - 5_000;
+    monitorTick(monitor);
+
+    assert.equal(calls, 2, 'the cache deadline must collect a fresh inventory');
+    assert.equal(monitor.runtimeSnapshotFreshForTick, true);
+    assert.equal(
+        lateTarget.circuitBreakerTripped,
+        true,
+        'a fresh confirmed absence may authorize the restart path',
+    );
 });

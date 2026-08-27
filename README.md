@@ -24,8 +24,8 @@ p-cli
 enable agent my-agent
 start my-agent 8080
 
-# Browser chat surface
-webchat
+# Browser chat surface (after Router login)
+# http://localhost:8080/webchat/
 ```
 
 ## Usage
@@ -245,7 +245,7 @@ node cli/index.js <args>
 - `cli`: from the managed runtime, open `/bin/bash` as `podman` in `/workspace`.
 - `cli <name> [args...]`: run the agent’s manifest CLI command interactively.
 - `shell <name>`: open interactive `/bin/sh` in the agent container.
-- `webchat [--rotate]`: print the WebChat access URL for the router login flow.
+- WebChat is served by the running Router at `/webchat/`; the retired `webchat [--rotate]` CLI access command is no longer registered.
 - `client tool <toolName> [--agent <agent>] [--parameters <params>] [-key value...]`: call an MCP tool exposed by an enabled agent.
 - `client list tools|resources`: list MCP tools or resources exposed by enabled agents.
 - `client status <agent>`: check agent health status.

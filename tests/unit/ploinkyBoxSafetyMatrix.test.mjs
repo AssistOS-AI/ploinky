@@ -12,6 +12,11 @@ import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-
 import { buildEngineProcessEnvironment } from '../../ploinky-box/process.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { stripReservedAgentEnv } from '../../cli/utils/security/agentIdentityEnv.js';
+import {
+    agentLibFixture,
+    agentLibFixtureLabels,
+    agentLibFixtureMounts,
+} from '../helpers/agentlibFixture.mjs';
 
 function bufferStream(isTTY = false) {
     let bytes = '';
@@ -22,7 +27,7 @@ function bufferStream(isTTY = false) {
     };
 }
 
-function owned(identity, { running = true } = {}) {
+function owned(identity, { running = true, agentLib = agentLibFixture(identity.workspaceRoot) } = {}) {
     return {
         state: 'owned',
         engine: { name: 'podman', identity: 'engine-fingerprint' },
@@ -30,17 +35,19 @@ function owned(identity, { running = true } = {}) {
             container: {
                 id: 'a'.repeat(64),
                 labels: {
+                    ...agentLibFixtureLabels(agentLib),
                     [BOX_LABELS.routerHostPort]: '8080',
                     [BOX_LABELS.mediaHostPort]: '7882',
                 },
-                runtime: { running },
+                runtime: { running, mounts: agentLibFixtureMounts(agentLib) },
             },
         },
     };
 }
 
 function matrixSupervisor(identity, events) {
-    const ownership = owned(identity);
+    const agentLib = agentLibFixture(identity.workspaceRoot);
+    const ownership = owned(identity, { agentLib });
     let acquisitions = 0;
     const lockManager = {
         get acquisitions() { return acquisitions; },
@@ -83,13 +90,26 @@ function matrixSupervisor(identity, events) {
         runner,
         validateExistingImage: () => ({ immutableId: 'b'.repeat(64) }),
         validateContainer: () => ({}),
+        selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
+        updateAgentLib: async () => ({
+            selection: agentLib,
+            changed: false,
+            previous: agentLib,
+        }),
         reconcile: async ({ lock }) => {
             lock.assertHeld(identity.instance);
             events.push('reconcile');
             return { ownership, hostPort: 8080, mediaHostPort: 7882, action: 'reused' };
         },
         startCore: async () => { events.push('start-core'); },
+        runCoreCommand: async () => { events.push('run-core-command'); },
         healthCheck: async () => { events.push('health'); },
+        attestAgentLibGraph: async () => {
+            events.push('attest-agentlib');
+            return { deploymentFingerprint: agentLib.contentFingerprint };
+        },
+        revalidateAgentLibSource: () => { events.push('revalidate-agentlib'); },
+        commitAgentLibSelection: () => { events.push('commit-agentlib'); },
     });
     return { supervisor, lockManager };
 }
@@ -106,7 +126,7 @@ test('every public verb has the required single-lock depth and release boundary'
         { name: 'stop', argv: ['stop'], locks: 1 },
         { name: 'destroy', argv: ['destroy'], locks: 1 },
         { name: 'start', argv: ['start', 'Agent'], locks: 1 },
-        { name: 'update', argv: ['update'], locks: 1, forwarded: true },
+        { name: 'update', argv: ['update'], locks: 1 },
         { name: 'repl', argv: [], locks: 1, forwarded: true },
         { name: 'bash', argv: ['cli'], locks: 1, forwarded: true },
         { name: 'agent-cli', argv: ['cli', 'Agent'], locks: 1, forwarded: true },
@@ -140,6 +160,10 @@ test('every public verb has the required single-lock depth and release boundary'
         if (scenario.name === 'start') {
             assert.ok(events.indexOf('health') < events.indexOf('release'));
         }
+        if (scenario.name === 'update') {
+            assert.ok(events.lastIndexOf('run-core-command') < events.indexOf('attest-agentlib'));
+            assert.ok(events.indexOf('attest-agentlib') < events.indexOf('release'));
+        }
         if (scenario.name === 'stop') {
             const outerStop = events.findIndex((event) => event.includes('container stop --time 30'));
             assert.ok(outerStop >= 0 && outerStop < events.indexOf('release'));
@@ -152,6 +176,8 @@ test('start stages host-owned edge desired state under the Box lock before core 
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     fs.mkdirSync(path.join(root, '.ploinky'));
     const identity = buildWorkspaceIdentity(root, { markerFound: true });
+    const agentLib = agentLibFixture(identity.workspaceRoot);
+    const ownership = owned(identity, { agentLib });
     const events = [];
     const candidate = {
         path: path.join(root, '.ploinky', 'edge-desired.json'),
@@ -160,7 +186,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
     };
     const stagedSupervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
-        discover: () => owned(identity),
+        discover: () => ownership,
         lockManager: {
             async acquire(instance) {
                 events.push('lock');
@@ -177,12 +203,13 @@ test('start stages host-owned edge desired state under the Box lock before core 
                 };
             },
         },
+        selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
         runner: {
             run(command, args) { events.push(`run:${args.join(' ')}`); },
             query() { return { ok: true, stdout: '' }; },
         },
         reconcile: async () => ({
-            ownership: owned(identity),
+            ownership,
             hostPort: 8080,
             mediaHostPort: 7882,
             action: 'reused',
@@ -199,6 +226,12 @@ test('start stages host-owned edge desired state under the Box lock before core 
         },
         startCore: async () => { events.push('start-core'); },
         healthCheck: async () => { events.push('health'); },
+        attestAgentLibGraph: async () => {
+            events.push('attest-agentlib');
+            return { deploymentFingerprint: agentLib.contentFingerprint };
+        },
+        revalidateAgentLibSource: () => { events.push('revalidate-agentlib'); },
+        commitAgentLibSelection: () => { events.push('commit-agentlib'); },
     });
 
     await stagedSupervisor.runStartTransaction(['start', 'Agent', '8080']);
@@ -207,7 +240,10 @@ test('start stages host-owned edge desired state under the Box lock before core 
     assert.ok(events.indexOf('read-edge-desired') < events.indexOf('stage-edge-desired'));
     assert.ok(events.indexOf('stage-edge-desired') < events.indexOf('start-core'));
     assert.ok(events.indexOf('start-core') < events.indexOf('health'));
-    assert.ok(events.indexOf('health') < events.indexOf('release'));
+    assert.ok(events.indexOf('health') < events.indexOf('attest-agentlib'));
+    assert.ok(events.indexOf('attest-agentlib') < events.indexOf('revalidate-agentlib'));
+    assert.ok(events.indexOf('revalidate-agentlib') < events.indexOf('commit-agentlib'));
+    assert.ok(events.indexOf('commit-agentlib') < events.indexOf('release'));
 });
 
 test('foreign ownership blocks every lifecycle path with zero engine mutation', async (t) => {
@@ -273,6 +309,14 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         dataFingerprints: {
             dependencies: 'd'.repeat(64),
             images: 'f'.repeat(64),
+        },
+        agentLib: {
+            sourceDir: '/private/workspace/achillesAgentLib',
+            sourceRelativePath: 'achillesAgentLib',
+            mode: 'local',
+            contentFingerprint: 'a1'.repeat(32),
+            resolvedCommit: '',
+            sourceId: { device: '1', inode: '2' },
         },
         imageId: 'b'.repeat(64),
         imageRef: 'docker.io/assistos/ploinky-box:runtime',

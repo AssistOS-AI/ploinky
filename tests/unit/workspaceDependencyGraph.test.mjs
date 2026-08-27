@@ -411,6 +411,25 @@ test('coordinated graph topology precedes startup preinstall and config provider
     assert.doesNotMatch(source, /applyManifestDirectives/, 'workspace start must not use sequential manifest enable/start');
 });
 
+test('initial start refreshes persisted static identity before saving its stale admitted registry', () => {
+    const source = startWorkspace.toString();
+    const persistIndex = source.indexOf('workspaceSvc.setConfig(cfg)');
+    const refreshIndex = source.indexOf(
+        'let reg = deduplicateAgentRegistry(providerRegistry, dockerSvc.getAgentContainerName)',
+    );
+    const saveIndex = source.indexOf('workspaceSvc.saveAgents(reg)', refreshIndex);
+
+    assert.ok(persistIndex >= 0, 'initial start must persist the static identity');
+    assert.ok(
+        refreshIndex > persistIndex,
+        'the pre-config admission snapshot must be refreshed after static identity persistence',
+    );
+    assert.ok(
+        saveIndex > refreshIndex,
+        'the admitted registry must only be saved after the persisted workspace config is restored',
+    );
+});
+
 test('static preinstall failure is fatal before startup providers can run', () => {
     assert.throws(
         () => assertStaticPreinstallSucceeded({ success: false, message: 'fixture failure' }),

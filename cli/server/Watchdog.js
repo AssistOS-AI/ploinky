@@ -7,10 +7,27 @@ import http from 'http';
 import { createContainerMonitor, startContainerMonitor, stopContainerMonitor, clearContainerTargets } from './containerMonitor.js';
 import { appendLog } from './utils/logger.js';
 import { LOGS_DIR, PLOINKY_DIR } from '../utils/config.js';
+import { inspectWorkspaceStartLock } from '../utils/runtime/maintenanceLocks.js';
 import { parseRouterPort } from '../sandbox/routerPort.js';
+import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const HOST_CONTAINER_SNAPSHOT_INTERVAL_MS = 0;
+const BOX_CONTAINER_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+
+export function resolveContainerSnapshotIntervalMs({
+    insideBox = false,
+    configured = process.env.PLOINKY_CONTAINER_SNAPSHOT_INTERVAL_MS,
+} = {}) {
+    const parsed = Number(configured);
+    if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+    return insideBox
+        ? BOX_CONTAINER_SNAPSHOT_INTERVAL_MS
+        : HOST_CONTAINER_SNAPSHOT_INTERVAL_MS;
+}
+
+const insideBox = isInsideBox();
 
 // Configuration
 const CONFIG = {
@@ -39,7 +56,14 @@ const CONFIG = {
     NODE_OPTIONS: process.env.NODE_OPTIONS || '',
 
     // Container monitoring
-    CONTAINER_CHECK_INTERVAL_MS: 5000, // Poll containers every 5 seconds
+    CONTAINER_CHECK_INTERVAL_MS: 5000, // Advance supervision every 5 seconds.
+    // Nested rootless Podman has one practical control-plane lane. Cache the
+    // shared Box inventory for the semantic-probe interval so probe scheduling
+    // stays responsive without repeatedly stalling live agent traffic. Host
+    // runtimes retain one fresh inventory snapshot per monitor tick.
+    CONTAINER_SNAPSHOT_INTERVAL_MS: resolveContainerSnapshotIntervalMs({ insideBox }),
+    CONTAINER_SNAPSHOT_RETRY_INITIAL_MS: 15000,
+    CONTAINER_SNAPSHOT_RETRY_MAX_MS: 60000,
 };
 
 const IS_TEST_MODE = process.env.PLOINKY_WATCHDOG_TEST_MODE === '1';
@@ -58,7 +82,8 @@ function createInitialState() {
         lastStartTime: null,
         circuitBreakerTripped: false,
         containerMonitor: null,
-        pendingHealthCheckRestart: false  // True when Watchdog initiated a restart via health check
+        pendingHealthCheckRestart: false, // True when Watchdog initiated a restart via health check
+        healthCheckWorkspaceStartDeferred: false,
     };
 }
 
@@ -267,6 +292,109 @@ async function performHealthCheck() {
     });
 }
 
+function inspectHealthCheckWorkspaceStart(inspectWorkspaceStartLockImpl) {
+    try {
+        return inspectWorkspaceStartLockImpl();
+    } catch (error) {
+        log('error', 'health_check_workspace_start_inspection_failed', {
+            error: error?.message || String(error),
+        });
+        return { active: false, stale: false, lock: null };
+    }
+}
+
+function deferHealthCheckForWorkspaceStart(workspaceStart) {
+    state.healthCheckFailures = 0;
+    if (state.healthCheckWorkspaceStartDeferred) return;
+    state.healthCheckWorkspaceStartDeferred = true;
+    log('info', 'health_check_deferred_workspace_start', {
+        operation: workspaceStart?.lock?.operation || null,
+        ownerPid: workspaceStart?.lock?.ownerPid || null,
+        expiresAt: workspaceStart?.lock?.expiresAt || null,
+    });
+}
+
+function resumeHealthCheckAfterWorkspaceStart() {
+    if (!state.healthCheckWorkspaceStartDeferred) return;
+    state.healthCheckWorkspaceStartDeferred = false;
+    log('info', 'health_check_resumed_workspace_start');
+}
+
+async function runHealthCheckTick({
+    performHealthCheckImpl = performHealthCheck,
+    inspectWorkspaceStartLockImpl = inspectWorkspaceStartLock,
+    appendLogImpl = appendLog,
+} = {}) {
+    if (state.isShuttingDown || !state.childProcess || state.pendingHealthCheckRestart) {
+        return;
+    }
+
+    const checkedChild = state.childProcess;
+    const workspaceStartBeforeCheck = inspectHealthCheckWorkspaceStart(inspectWorkspaceStartLockImpl);
+    if (workspaceStartBeforeCheck.active) {
+        deferHealthCheckForWorkspaceStart(workspaceStartBeforeCheck);
+        return;
+    }
+    resumeHealthCheckAfterWorkspaceStart();
+
+    const isHealthy = await performHealthCheckImpl();
+
+    // A health response from a superseded Router must not mutate the current
+    // process's counters or terminate the replacement process.
+    if (state.isShuttingDown
+        || state.childProcess !== checkedChild
+        || state.pendingHealthCheckRestart) {
+        return;
+    }
+
+    // Workspace startup can begin while the asynchronous health request is in
+    // flight. Recheck the exact lease before consuming a failure so startup
+    // load cannot be mistaken for a dead Router.
+    const workspaceStartAfterCheck = inspectHealthCheckWorkspaceStart(inspectWorkspaceStartLockImpl);
+    if (workspaceStartAfterCheck.active) {
+        deferHealthCheckForWorkspaceStart(workspaceStartAfterCheck);
+        return;
+    }
+    resumeHealthCheckAfterWorkspaceStart();
+
+    if (isHealthy) {
+        if (state.healthCheckFailures > 0) {
+            log('info', 'health_check_recovered', {
+                previousFailures: state.healthCheckFailures
+            });
+        }
+        state.healthCheckFailures = 0;
+        return;
+    }
+
+    state.healthCheckFailures++;
+    log('warn', 'health_check_failed', {
+        consecutiveFailures: state.healthCheckFailures,
+        threshold: CONFIG.HEALTH_CHECK_FAILURES_THRESHOLD
+    });
+
+    if (state.healthCheckFailures < CONFIG.HEALTH_CHECK_FAILURES_THRESHOLD) {
+        return;
+    }
+
+    state.pendingHealthCheckRestart = true;
+    log('error', 'health_check_threshold_exceeded', {
+        failures: state.healthCheckFailures,
+        action: 'restarting_process'
+    });
+
+    const pid = checkedChild.pid;
+    appendLogImpl('process_signal', {
+        action: 'health_check_kill',
+        pid,
+        signal: 'SIGTERM',
+        reason: 'health_check_threshold_exceeded',
+        failures: state.healthCheckFailures,
+        source: 'Watchdog.healthCheck'
+    });
+    checkedChild.kill('SIGTERM');
+}
+
 // Start health check monitoring
 function startHealthCheckMonitoring() {
     if (!CONFIG.HEALTH_CHECK_ENABLED) {
@@ -275,49 +403,12 @@ function startHealthCheckMonitoring() {
     
     stopHealthCheckMonitoring();
     
-    state.healthCheckTimer = setInterval(async () => {
-        if (state.isShuttingDown || !state.childProcess) {
-            return;
-        }
-        
-        const isHealthy = await performHealthCheck();
-        
-        if (isHealthy) {
-            if (state.healthCheckFailures > 0) {
-                log('info', 'health_check_recovered', {
-                    previousFailures: state.healthCheckFailures
-                });
-            }
-            state.healthCheckFailures = 0;
-        } else {
-            state.healthCheckFailures++;
-            log('warn', 'health_check_failed', {
-                consecutiveFailures: state.healthCheckFailures,
-                threshold: CONFIG.HEALTH_CHECK_FAILURES_THRESHOLD
+    state.healthCheckTimer = setInterval(() => {
+        runHealthCheckTick().catch((error) => {
+            log('error', 'health_check_tick_failed', {
+                error: error?.message || String(error),
             });
-            
-            if (state.healthCheckFailures >= CONFIG.HEALTH_CHECK_FAILURES_THRESHOLD) {
-                log('error', 'health_check_threshold_exceeded', {
-                    failures: state.healthCheckFailures,
-                    action: 'restarting_process'
-                });
-
-                // Kill the unresponsive process - set flag so we know to restart
-                if (state.childProcess) {
-                    state.pendingHealthCheckRestart = true;
-                    const pid = state.childProcess.pid;
-                    appendLog('process_signal', {
-                        action: 'health_check_kill',
-                        pid,
-                        signal: 'SIGTERM',
-                        reason: 'health_check_threshold_exceeded',
-                        failures: state.healthCheckFailures,
-                        source: 'Watchdog.healthCheck'
-                    });
-                    state.childProcess.kill('SIGTERM');
-                }
-            }
-        }
+        });
     }, CONFIG.HEALTH_CHECK_INTERVAL_MS);
 }
 
@@ -695,5 +786,6 @@ export {
     getRouterNodeExecutable,
     buildHealthCheckRequestOptions,
     performHealthCheck,
+    runHealthCheckTick,
     IS_TEST_MODE as __IS_TEST_MODE
 };

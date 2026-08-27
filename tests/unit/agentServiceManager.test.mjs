@@ -105,6 +105,11 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     assert.match(source, /createdByThisLaunch:\s*started\?\.createdByThisLaunch !== false/);
     assert.match(source, /const registryRecord = \{\s*\.\.\.existingRecord,\s*runtime,\s*containerId: reuseInspection\.id,/);
     assert.match(source, /type: 'agent',\s*runtime,\s*containerId: started\.containerId,/);
+    assert.match(source, /physical runtime admission returned no complete AgentLib proof/);
+    assert.match(source, /agentLib:\s*structuredClone\(startedRecord\.agentLib\)/);
+    assert.match(source, /agentLibAttestation:\s*structuredClone\(startedRecord\.agentLibAttestation\)/);
+    assert.match(source, /ensureAgentLibCacheLink\(\s*path\.dirname\(preparedNodeModulesDir\),\s*containerAgentLibGrant\.runtimePath,\s*\)/);
+    assert.match(source, /ensureImagePresent\(ROUTER_AUTHORITY_HELPER_IMAGE, \{ runtime \}\);[\s\S]*helperImage:\s*ROUTER_AUTHORITY_HELPER_IMAGE/);
     assert.match(source, /assertHostModeGenerationCapability\(\{[\s\S]*containerName,\s*\}, \{ preparedCapability: options\.preparedHostModeCapability \}\)/);
 
     for (const runtime of ['bwrap', 'seatbelt']) {
@@ -115,6 +120,19 @@ test('prepared graph launches suppress intermediate registry persistence only fo
         assert.match(runtimeSource, /preservePreparedRegistryRecord:\s*options\.preservePreparedRegistryRecord/);
         assert.match(runtimeSource, /registryRecord:\s*structuredClone\(agents\[containerName\]\)/);
     }
+});
+
+test('runtime creation cleans fixed control artifacts only after predecessor handling', () => {
+    const source = fs.readFileSync(
+        new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url),
+        'utf8',
+    );
+    const createStart = source.indexOf('const createContainer = (plan, launch) => {');
+    const cleanup = source.indexOf('prepareHealthProbeHostDirForLaunch(containerName);', createStart);
+    const runtimeCreate = source.indexOf('const res = spawnSync(runtime, createArgs', createStart);
+    assert.ok(createStart >= 0);
+    assert.ok(cleanup > createStart);
+    assert.ok(runtimeCreate > cleanup);
 });
 
 test('effective generation capability requires the exact managed runtime to be running', () => {

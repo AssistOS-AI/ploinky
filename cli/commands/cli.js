@@ -19,6 +19,11 @@ import {
     cleanupFailedPreparedRuntime,
     admitDirectAgentRuntimeManifest,
 } from './workspaceUtil.js';
+import {
+    cleanupFailedTargetedAgentRestart,
+    commitTargetedAgentRestart,
+    prepareTargetedAgentRestart,
+} from './targetedAgentRestart.js';
 import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
 import {
@@ -50,7 +55,8 @@ import {
     findAgentManifest,
 } from './repoAgentCommands.js';
 import { parseStartArgs } from '../utils/repos.js';
-import { resolveAgentlibBranchRef } from '../utils/dependencies/dependencyInstaller.js';
+import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
+import { importAgentLib } from '../../agentlib/runtime.mjs';
 import {
     handleVarsCommand,
     handleVarCommand,
@@ -92,7 +98,9 @@ const ENABLE_AGENT_CLI_TOKEN_SET = new Set(Object.values(ENABLE_AGENT_CLI_TOKENS
 
 async function ensureLlmAgentsLoaded() {
     if (!llmAgentsLoadPromise) {
-        llmAgentsLoadPromise = import('achillesAgentLib/LLMAgents').catch((error) => {
+        // Resolved from the one selected achillesAgentLib source, not through
+        // bare package resolution against an install tree.
+        llmAgentsLoadPromise = importAgentLib('LLMAgents').catch((error) => {
             llmAgentsLoadPromise = null;
             throw error;
         });
@@ -221,7 +229,7 @@ export async function handleCliCommand(options = [], {
     return runAgentCliImpl(options[0], options.slice(1));
 }
 
-async function handleCommand(args) {
+async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
     const [command, ...options] = args;
     if (command === 'start') {
         const parsed = parseStartArgs(options);
@@ -264,21 +272,24 @@ async function handleCommand(args) {
             break;
         case 'update':
             {
-                const first = String(options[0] || '').trim();
+                const normalizedOptions = stripBranchPolicyArgs(options);
+                const updateBranchPolicy = agentLibBranchPolicy || parseBranchPolicy(args);
+                const interactiveSession = Boolean(inputState.getInterface?.());
+                const first = String(normalizedOptions[0] || '').trim();
                 const firstLower = first.toLowerCase();
                 if (!first || firstLower === 'all') {
-                    const folderArg = first ? String(options[1] || '').trim() || undefined : undefined;
-                    await updateAllRepos(folderArg, { interactiveSession: Boolean(inputState.getInterface?.()) });
+                    const folderArg = first ? String(normalizedOptions[1] || '').trim() || undefined : undefined;
+                    return updateAllRepos(folderArg, { interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
                 } else if (firstLower === 'repos' || firstLower === 'repositories') {
-                    await updatePloinkyRepos();
+                    return updatePloinkyRepos({ interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
                 } else if (firstLower === 'repo' || firstLower === 'repository') {
-                    await updateRepo(options[1]);
+                    return updateRepo(normalizedOptions[1]);
                 } else {
                     const resolved = path.resolve(first);
                     if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-                        await updateAllRepos(first, { interactiveSession: Boolean(inputState.getInterface?.()) });
+                        return updateAllRepos(first, { interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
                     } else {
-                        await updateRepo(first);
+                        return updateRepo(first);
                     }
                 }
             }
@@ -382,16 +393,10 @@ async function handleCommand(args) {
                     throw new Error(profileResult.message);
                 }
             }
-            // The global --branch also drives the achillesAgentLib used by agent
-            // containers (when the branch is absent, the default fallback keeps
-            // the unpinned AgentLib dependency on its remote default branch).
-            // Propagated via PLOINKY_AGENTLIB_REF,
-            // read host-side by readGlobalDepsPackage and inherited by the
-            // Watchdog/router via buildRouterEnv.
-            const agentlibRef = resolveAgentlibBranchRef(startParsed.branchPolicy);
-            if (agentlibRef) {
-                process.env.PLOINKY_AGENTLIB_REF = agentlibRef;
-            }
+            // The global --branch is applied to achillesAgentLib by the source
+            // selector that runs before this command, which resolves the branch
+            // to one exact managed generation or validates a local checkout
+            // against it. Nothing here reconfigures an AgentLib dependency.
             await startWorkspace(startParsed.staticAgent, startParsed.port ?? undefined, {
                 enableAgent,
                 killRouterIfRunning,
@@ -448,8 +453,7 @@ async function handleCommand(args) {
             if (target && target.toLowerCase() === 'router') {
                 const cfg = workspaceSvc.getConfig();
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
-                    console.error('restart router: start is not configured. Run: start <staticAgent> <port> first.');
-                    break;
+                    throw new Error('restart router: start is not configured. Run: start <staticAgent> <port> first.');
                 }
                 inactivateEdgeRoutingGeneration('cli-router-restart');
                 console.log('[restart] Restarting RoutingServer (containers untouched)...');
@@ -469,8 +473,7 @@ async function handleCommand(args) {
                 try {
                     registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
                 } catch (err) {
-                    console.error(err?.message || err);
-                    return;
+                    throw new Error(err?.message || String(err));
                 }
                 let resolved;
                 try {
@@ -479,8 +482,7 @@ async function handleCommand(args) {
                         : agentName;
                     resolved = findAgent(lookup);
                 } catch (err) {
-                    console.error(err?.message || `Agent '${agentName}' not found.`);
-                    return;
+                    throw new Error(err?.message || `Agent '${agentName}' not found.`);
                 }
 
                 // Read manifest and determine runtime
@@ -490,8 +492,7 @@ async function handleCommand(args) {
                     manifestBytes = fs.readFileSync(resolved.manifestPath);
                     manifest = JSON.parse(manifestBytes.toString('utf8'));
                 } catch (err) {
-                    console.error(`Failed to read manifest for '${agentName}': ${err?.message || err}`);
-                    return;
+                    throw new Error(`Failed to read manifest for '${agentName}': ${err?.message || err}`);
                 }
 
                 const profileResolution = resolveManifestRuntimeProfile(manifest, {
@@ -522,8 +523,7 @@ async function handleCommand(args) {
                     const containerAlsoRunning = isContainerRunning(containerName);
                     const containerPresent = containerAlsoRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
                     if (!bwrapRunning && !containerPresent) {
-                        console.error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
-                        return;
+                        throw new Error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
                     }
 
                     if (!bwrapRunning && !containerAlsoRunning && containerPresent) {
@@ -571,7 +571,7 @@ async function handleCommand(args) {
                             }));
                             console.log('✓ Agent started.');
                         } catch (e) {
-                            console.error(`Failed to start container ${containerName}: ${e.message}`);
+                            throw new Error(`Failed to start container ${containerName}: ${e.message}`, { cause: e });
                         }
                         return;
                     }
@@ -629,7 +629,10 @@ async function handleCommand(args) {
 
                         console.log(`✓ Agent restarted (${agentRuntime}).`);
                     } catch (e) {
-                        console.error(`Failed to restart agent '${agentName}' via ${agentRuntime}: ${e.message}`);
+                        throw new Error(
+                            `Failed to restart agent '${agentName}' via ${agentRuntime}: ${e.message}`,
+                            { cause: e },
+                        );
                     }
                 } else {
                     // Recreate through the managed transaction so a manual
@@ -638,8 +641,7 @@ async function handleCommand(args) {
                     const containerRunning = isContainerRunning(containerName);
                     const containerPresent = containerRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
                     if (!containerPresent) {
-                        console.error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
-                        return;
+                        throw new Error(`Agent '${agentName}' has no existing container. Run 'ploinky reinstall ${agentName}'.`);
                     }
 
                     const runtimeAction = 'restart';
@@ -652,11 +654,25 @@ async function handleCommand(args) {
                                 repo: resolved.repo,
                             },
                         }, async () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+                            const agentPath = path.dirname(resolved.manifestPath);
+                            const routeKey = registryRecord?.record?.alias || resolved.shortAgentName;
+                            const transition = await prepareTargetedAgentRestart({
+                                containerName,
+                                routeKey,
+                                repoName: registryRecord?.record?.repoName || resolved.repo,
+                                shortAgentName: resolved.shortAgentName,
+                                record: registryRecord.record,
+                                networkLifecycleCapability,
+                            });
+                            let result = null;
                             try {
-                                const result = ensureAgentService(resolved.shortAgentName, manifest, path.dirname(resolved.manifestPath), {
+                                result = ensureAgentService(resolved.shortAgentName, manifest, agentPath, {
                                     containerName,
                                     alias: registryRecord?.record?.alias,
                                     forceRecreate: true,
+                                    instanceId: transition.identity.instanceId,
+                                    enableGeneration: transition.identity.enableGeneration,
+                                    targetedRestart: transition.targetedRestart,
                                     profileName: profileResolution.resolvedProfileName,
                                     profileResolution,
                                     routerEndpoint,
@@ -674,16 +690,15 @@ async function handleCommand(args) {
                                             hostPort: result?.hostPort || 0,
                                         },
                                     });
-                                    await activatePreparedRuntimeAfterReadiness({
+                                    await commitTargetedAgentRestart({
+                                        transition,
                                         result,
-                                        routeKey: registryRecord?.record?.alias || resolved.shortAgentName,
-                                        repoName: registryRecord?.record?.repoName || resolved.repo,
-                                        shortAgentName: resolved.shortAgentName,
-                                        agentPath: path.dirname(resolved.manifestPath),
+                                        agentPath,
                                         alias: registryRecord?.record?.alias || '',
+                                        networkLifecycleCapability,
                                     });
                                 } catch (error) {
-                                    cleanupFailedPreparedRuntime(result, error, 'manual-restart-readiness-failed');
+                                    cleanupFailedTargetedAgentRestart(result, error);
                                     throw error;
                                 }
                             } catch (routeError) {
@@ -692,12 +707,17 @@ async function handleCommand(args) {
                         }));
                         console.log('✓ Agent restarted.');
                     } catch (e) {
-                        console.error(`Failed to ${runtimeAction} container ${containerName}: ${e.message}`);
+                        throw new Error(
+                            `Failed to ${runtimeAction} container ${containerName}: ${e.message}`,
+                            { cause: e },
+                        );
                     }
                 }
             } else {
                 const cfg = workspaceSvc.getConfig();
-                if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) { console.error('restart: start is not configured. Run: start <staticAgent> <port>'); break; }
+                if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
+                    throw new Error('restart: start is not configured. Run: start <staticAgent> <port>');
+                }
                 resolvePersistedRouterPort();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
                 console.log('[restart] Stopping Router and configured agents...');

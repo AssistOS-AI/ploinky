@@ -46,6 +46,14 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROBE_WORKER_URL = new URL('./probeWorker.js', import.meta.url);
+// A rootless nested Podman control plane can stall its network relay when
+// multiple inspect/exec/list operations overlap. Keep recurring semantic
+// probes single-file by default; callers may still opt into more concurrency
+// when their runtime has proved that it can safely sustain it.
+const DEFAULT_MAX_CONCURRENT_PROBE_WORKERS = 1;
+const DEFAULT_CONTINUOUS_PROBE_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_CONTAINER_SNAPSHOT_RETRY_INITIAL_MS = 15_000;
+const DEFAULT_CONTAINER_SNAPSHOT_RETRY_MAX_MS = 60_000;
 const TRANSIENT_PROBE_INFRASTRUCTURE_CODES = new Set([
     'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT',
 ]);
@@ -241,6 +249,7 @@ function createContainerTarget(info, monitor) {
         probeLastSuccessAt: null,
         probeInfrastructureFailures: 0,
         probeRetryNotBefore: null,
+        probeConcurrencyDeferred: false,
         attemptEpoch: 0,
         restartInputDigest: info.restartInputDigest,
         runtimeAdmission: info.runtimeAdmission,
@@ -360,8 +369,22 @@ function stopProbeWorker(target) {
     }
 }
 
+function activeProbeWorkerCount(monitor) {
+    if (!monitor?.targets) return 0;
+    let count = 0;
+    for (const current of monitor.targets.values()) {
+        if (current?.probeWorker) count += 1;
+    }
+    return count;
+}
+
 function handleProbeFailure(monitor, target, message, { runtimeHealth = false } = {}) {
     if (!monitor || !target) return;
+    // A manually managed replacement may be running before its declared
+    // readiness contract succeeds. Continuous liveness is not authoritative
+    // during that transaction: treating the expected not-ready interval as a
+    // failure would inactivate the exact generation owned by the maintainer.
+    if (deferMonitorWorkForMaintenance(monitor, target)) return;
     target.probeState = 'failed';
     target.lastError = message;
     target.probeFailures = (target.probeFailures || 0) + 1;
@@ -420,6 +443,7 @@ function handleProbeInfrastructureFailure(monitor, target, message, code) {
 export function startProbeWorker(monitor, target) {
     if (!monitor || !target) return;
     if (target.circuitBreakerTripped) return;
+    if (deferMonitorWorkForMaintenance(monitor, target)) return;
     if (target.probeWorker || target.probeState === 'success') return;
     const now = Date.now();
     if (typeof target.probeRetryNotBefore === 'number'
@@ -429,11 +453,22 @@ export function startProbeWorker(monitor, target) {
     const maxConcurrency = positiveInteger(
         monitor?.config?.PROBE_MAX_CONCURRENCY
             ?? process.env.PLOINKY_CONTAINER_MONITOR_PROBE_MAX_CONCURRENCY,
-        4,
+        DEFAULT_MAX_CONCURRENT_PROBE_WORKERS,
     );
-    const activeWorkers = [...(monitor.targets?.values?.() || [])]
-        .filter((candidate) => Boolean(candidate?.probeWorker)).length;
-    if (activeWorkers >= maxConcurrency) return;
+    const activeWorkers = activeProbeWorkerCount(monitor);
+    if (activeWorkers >= maxConcurrency) {
+        if (!target.probeConcurrencyDeferred) {
+            target.probeConcurrencyDeferred = true;
+            logEvent(monitor, 'debug', 'container_probe_concurrency_deferred', {
+                container: target.containerName,
+                agent: target.agentName,
+                repo: target.repoName,
+                maxConcurrentWorkers: maxConcurrency,
+            });
+        }
+        return;
+    }
+    target.probeConcurrencyDeferred = false;
 
     let manifest;
     try {
@@ -488,6 +523,7 @@ export function startProbeWorker(monitor, target) {
             return;
         }
         if (msg.status === 'success') {
+            if (deferMonitorWorkForMaintenance(monitor, target)) return;
             target.probeState = 'success';
             target.probeLastSuccessAt = Date.now();
             target.probeInfrastructureFailures = 0;
@@ -649,9 +685,21 @@ function shouldDeferMaintenanceRestart(monitor, target) {
     return true;
 }
 
+function deferMonitorWorkForMaintenance(monitor, target) {
+    if (!shouldDeferMaintenanceRestart(monitor, target)) return false;
+    // A worker may have started immediately before the maintenance lock was
+    // acquired. Terminate it and discard any earlier success timestamp so the
+    // first post-maintenance tick performs a fresh semantic probe.
+    stopProbeWorker(target);
+    target.probeState = 'pending';
+    target.probeLastSuccessAt = null;
+    return true;
+}
+
 export function syncManagedContainers(monitor) {
     const monitorRef = monitor;
     if (!monitorRef) return;
+    let inventoryChanged = false;
 
     let agentsMap = {};
     try {
@@ -740,7 +788,7 @@ export function syncManagedContainers(monitor) {
                 const target = monitorRef.targets.get(containerName);
                 if (target?.pendingRestartTimer) clearTimeout(target.pendingRestartTimer);
                 if (target) stopProbeWorker(target);
-                monitorRef.targets.delete(containerName);
+                inventoryChanged = monitorRef.targets.delete(containerName) || inventoryChanged;
             }
             logEvent(monitorRef, terminal ? 'warn' : 'error', terminal
                 ? 'container_runtime_policy_terminal'
@@ -791,6 +839,7 @@ export function syncManagedContainers(monitor) {
             target = createContainerTarget(info, monitorRef);
             target.runtime = runtime;
             monitorRef.targets.set(containerName, target);
+            inventoryChanged = true;
             logEvent(monitorRef, 'info', 'container_watch_added', {
                 container: containerName,
                 agent: agentName,
@@ -839,8 +888,13 @@ export function syncManagedContainers(monitor) {
             stopProbeWorker(target);
             target.attemptEpoch += 1;
             monitorRef.targets.delete(containerName);
+            inventoryChanged = true;
             logEvent(monitorRef, 'info', 'container_watch_removed', { container: containerName });
         }
+    }
+
+    if (inventoryChanged) {
+        monitorRef.runtimeSnapshotTakenAt = 0;
     }
 }
 
@@ -1367,6 +1421,7 @@ export async function performContainerRestart(monitor, target, reason, attempt =
                         monitor.targets.delete(oldName);
                         target.containerName = prepared.containerName;
                         monitor.targets.set(target.containerName, target);
+                        monitor.runtimeSnapshotTakenAt = 0;
                     }
 
                     stopProbeWorker(target);
@@ -1428,14 +1483,62 @@ export function snapshotRunningContainerNames(monitor) {
     if (![...monitor.targets.values()].some((target) => (
         target && !isSandboxRuntime(target.runtime)
     ))) {
+        monitor.runtimeSnapshotFreshForTick = false;
+        return null;
+    }
+    const now = typeof monitor.now === 'function' ? monitor.now() : Date.now();
+    const configuredSnapshotInterval = Number(monitor?.config?.CONTAINER_SNAPSHOT_INTERVAL_MS);
+    const snapshotIntervalMs = Number.isSafeInteger(configuredSnapshotInterval)
+        && configuredSnapshotInterval >= 0
+        ? configuredSnapshotInterval
+        : 0;
+    if (snapshotIntervalMs > 0
+        && monitor.runtimeSnapshot instanceof Set
+        && Number(monitor.runtimeSnapshotTakenAt || 0) > 0
+        && now - monitor.runtimeSnapshotTakenAt < snapshotIntervalMs) {
+        monitor.runtimeSnapshotFreshForTick = false;
+        return monitor.runtimeSnapshot;
+    }
+    if (Number(monitor.runtimeSnapshotRetryNotBefore || 0) > now) {
+        monitor.runtimeSnapshotFreshForTick = false;
         return null;
     }
     try {
         const listRunning = monitor.listRunningContainerNames || listRunningContainerNames;
-        return new Set(listRunning());
+        const runningContainerNames = new Set(listRunning());
+        monitor.runtimeSnapshot = runningContainerNames;
+        monitor.runtimeSnapshotTakenAt = now;
+        const previousFailures = Number(monitor.runtimeSnapshotFailures || 0);
+        monitor.runtimeSnapshotFailures = 0;
+        monitor.runtimeSnapshotRetryNotBefore = 0;
+        monitor.runtimeSnapshotFreshForTick = true;
+        if (previousFailures > 0) {
+            logEvent(monitor, 'info', 'container_status_snapshot_recovered', {
+                previousFailures,
+            });
+        }
+        return runningContainerNames;
     } catch (error) {
+        const consecutiveFailures = Number(monitor.runtimeSnapshotFailures || 0) + 1;
+        const initialRetryMs = positiveInteger(
+            monitor?.config?.CONTAINER_SNAPSHOT_RETRY_INITIAL_MS,
+            DEFAULT_CONTAINER_SNAPSHOT_RETRY_INITIAL_MS,
+        );
+        const maxRetryMs = positiveInteger(
+            monitor?.config?.CONTAINER_SNAPSHOT_RETRY_MAX_MS,
+            DEFAULT_CONTAINER_SNAPSHOT_RETRY_MAX_MS,
+        );
+        const retryAfterMs = Math.min(
+            initialRetryMs * (2 ** Math.min(consecutiveFailures - 1, 20)),
+            Math.max(initialRetryMs, maxRetryMs),
+        );
+        monitor.runtimeSnapshotFailures = consecutiveFailures;
+        monitor.runtimeSnapshotRetryNotBefore = now + retryAfterMs;
+        monitor.runtimeSnapshotFreshForTick = false;
         logEvent(monitor, 'error', 'container_status_snapshot_failed', {
             error: error?.message || error,
+            consecutiveFailures,
+            retryAfterMs,
         });
         return null;
     }
@@ -1448,6 +1551,7 @@ export function monitorTick(monitor) {
     const workspaceStart = inspectStartLock();
     if (workspaceStart.stale) {
         logEvent(monitor, 'info', 'workspace_start_lock_removed', {
+            operation: workspaceStart.lock?.operation || null,
             ownerPid: workspaceStart.lock?.ownerPid || null,
             expiresAt: workspaceStart.lock?.expiresAt || null,
         });
@@ -1456,6 +1560,7 @@ export function monitorTick(monitor) {
         if (!monitor.workspaceStartDeferred) {
             monitor.workspaceStartDeferred = true;
             logEvent(monitor, 'info', 'container_monitor_deferred_workspace_start', {
+                operation: workspaceStart.lock?.operation || null,
                 ownerPid: workspaceStart.lock?.ownerPid || null,
                 expiresAt: workspaceStart.lock?.expiresAt || null,
             });
@@ -1467,10 +1572,33 @@ export function monitorTick(monitor) {
     const syncContainers = monitor.syncManagedContainers || syncManagedContainers;
     syncContainers(monitor);
 
+    // Each semantic probe owns a bounded sequence of runtime inspect/exec
+    // calls. Do not overlap the shared `podman ps` snapshot with that sequence:
+    // nested rootless Podman has one practical control-plane lane, and
+    // saturating it can interrupt otherwise healthy agent traffic. The next
+    // five-second monitor tick resumes snapshots as soon as the worker exits.
+    // Maintenance owns the stronger lifecycle contract and must still be able
+    // to cancel a worker before snapshot serialization takes effect.
+    for (const target of monitor.targets.values()) {
+        if (target?.probeWorker) deferMonitorWorkForMaintenance(monitor, target);
+    }
+    const activeWorkers = activeProbeWorkerCount(monitor);
+    if (activeWorkers > 0) {
+        if (!monitor.runtimeSnapshotProbeDeferred) {
+            monitor.runtimeSnapshotProbeDeferred = true;
+            logEvent(monitor, 'debug', 'container_status_snapshot_deferred_active_probe', {
+                activeWorkers,
+            });
+        }
+        return;
+    }
+    monitor.runtimeSnapshotProbeDeferred = false;
+
     const runningContainerNames = snapshotRunningContainerNames(monitor);
 
     for (const target of monitor.targets.values()) {
         if (!target || target.circuitBreakerTripped) continue;
+        if (deferMonitorWorkForMaintenance(monitor, target)) continue;
         if (target.isRestarting || target.pendingRestartTimer) continue;
 
         let running = false;
@@ -1482,7 +1610,15 @@ export function monitorTick(monitor) {
                         enableGeneration: target.enableGeneration,
                     });
             } else if (runningContainerNames) {
-                running = runningContainerNames.has(target.containerName);
+                if (runningContainerNames.has(target.containerName)) {
+                    running = true;
+                } else if (monitor.runtimeSnapshotFreshForTick === false) {
+                    // Cached presence is still useful positive evidence, but
+                    // cached absence says nothing about containers created
+                    // after the snapshot. Only a runtime list collected by
+                    // this tick may authorize a not_running restart.
+                    continue;
+                }
             } else {
                 // A failed shared runtime snapshot means container state is
                 // unknown. Defer this tick instead of multiplying the outage
@@ -1525,7 +1661,7 @@ export function monitorTick(monitor) {
             const continuousProbeIntervalMs = positiveInteger(
                 monitor?.config?.CONTINUOUS_PROBE_INTERVAL_MS
                     ?? process.env.PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS,
-                30_000,
+                DEFAULT_CONTINUOUS_PROBE_INTERVAL_MS,
             );
             if (target.probeState === 'success'
                 && (!target.probeLastSuccessAt
@@ -1538,10 +1674,6 @@ export function monitorTick(monitor) {
         }
 
         if (target.probeState === 'running') {
-            continue;
-        }
-
-        if (shouldDeferMaintenanceRestart(monitor, target)) {
             continue;
         }
 
@@ -1561,6 +1693,11 @@ export function createContainerMonitor({ config, log, isShuttingDown, terminalLe
         isShuttingDown: typeof isShuttingDown === 'function' ? isShuttingDown : () => false,
         targets: new Map(),
         timer: null,
+        runtimeSnapshotFailures: 0,
+        runtimeSnapshotRetryNotBefore: 0,
+        runtimeSnapshot: null,
+        runtimeSnapshotTakenAt: 0,
+        runtimeSnapshotFreshForTick: false,
         ...(ledgerFile ? { terminalLedgerFile: ledgerFile } : {}),
         terminalLedger: null,
     };
@@ -1610,4 +1747,7 @@ export function clearContainerTargets(monitor) {
     if (!monitor) return;
     stopContainerMonitor(monitor);
     monitor.targets.clear();
+    monitor.runtimeSnapshot = null;
+    monitor.runtimeSnapshotTakenAt = 0;
+    monitor.runtimeSnapshotFreshForTick = false;
 }

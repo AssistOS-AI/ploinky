@@ -3,8 +3,8 @@ import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
-import { createRequire } from 'module';
 import { debugLog } from '../utils/utils.js';
+import { resolveAgentLibPath } from '../../agentlib/runtime.mjs';
 import {
     loadValidLlmApiKeys,
     collectAvailableLlmKeys,
@@ -16,7 +16,6 @@ import * as inputState from './inputState.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const require = createRequire(import.meta.url);
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const LLM_SYSTEM_CONTEXT_PATH = path.join(PROJECT_ROOT, 'docs', 'ploinky-overview.md');
@@ -29,7 +28,10 @@ async function getDefaultInvoker() {
     if (cachedInvoker) return cachedInvoker;
     let llmPath;
     try {
-        llmPath = require.resolve('achillesAgentLib/utils/LLMClient.mjs');
+        // The one selected achillesAgentLib source; there is no install-tree
+        // fallback, so a missing contract fails here rather than loading
+        // whichever copy happened to be resolvable.
+        llmPath = resolveAgentLibPath('utils/LLMClient.mjs');
     } catch (error) {
         throw new Error(`Unable to resolve Achilles LLM client: ${error?.message || error}`);
     }

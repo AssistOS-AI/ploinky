@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import fs from 'node:fs';
 import net from 'node:net';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { createRelayReplayCache } from '../lib/relayTokenVerify.mjs';
 import { verifyRelayRequestToken, verifyRelaySessionToken } from '../lib/relayRequestAuth.mjs';
@@ -8,6 +11,228 @@ import {
     encodeRelayFrame,
 } from '../lib/runtimeRelayProtocol.mjs';
 
+export const RUNTIME_RELAY_SOCKET_PATH = '/run/ploinky-health-probes/runtime-relay.sock';
+const RUNTIME_RELAY_READY_PREFIX = '/run/ploinky-health-probes/.runtime-relay-ready-';
+const RUNTIME_RELAY_BIND_ATTEMPTS = 600;
+const RUNTIME_RELAY_BIND_RETRY_MS = 50;
+const TRANSIENT_RELAY_BIND_ERRORS = new Set(['EADDRINUSE', 'EAGAIN', 'EBUSY', 'ENOTSUP']);
+
+const relayScriptPath = fileURLToPath(import.meta.url);
+
+function isPrivateRelaySocketMode(mode) {
+    const permissions = mode & 0o777;
+    // Linux filesystems honor the 0177 creation umask and expose 0600. The
+    // macOS Podman/Docker shared-filesystem bridges reject chmod(EINVAL) and
+    // project the same socket as 0666 inside the nested container and 0755 in
+    // the owning Box. The Router separately verifies that authoritative outer
+    // projection plus the exact 0700 source directory before connecting.
+    return permissions === 0o600 || permissions === 0o666 || permissions === 0o755;
+}
+
+function removeStaleRelaySocket(socketPath) {
+    let identity;
+    try {
+        identity = fs.lstatSync(socketPath);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return;
+        throw error;
+    }
+    if (!identity.isSocket() || identity.isSymbolicLink()) {
+        throw new Error('runtime relay socket path is occupied by an invalid filesystem object');
+    }
+    fs.unlinkSync(socketPath);
+}
+
+function relaySocketIdentity(socketPath) {
+    const identity = fs.lstatSync(socketPath);
+    if (!identity.isSocket() || identity.isSymbolicLink()
+        || !isPrivateRelaySocketMode(identity.mode)) {
+        throw new Error(
+            `runtime relay socket permissions are invalid (${(identity.mode & 0o777).toString(8)})`,
+        );
+    }
+    return Object.freeze({ dev: identity.dev, ino: identity.ino, uid: identity.uid });
+}
+
+function removeOwnedRelaySocket(socketPath, ownedIdentity) {
+    if (!ownedIdentity) return;
+    let current;
+    try {
+        current = fs.lstatSync(socketPath);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return;
+        throw error;
+    }
+    if (current.isSocket() && !current.isSymbolicLink()
+        && current.dev === ownedIdentity.dev
+        && current.ino === ownedIdentity.ino
+        && current.uid === ownedIdentity.uid) {
+        fs.unlinkSync(socketPath);
+    }
+}
+
+function requireRelayReadyPath(readyPath) {
+    if (!readyPath.startsWith(RUNTIME_RELAY_READY_PREFIX)) {
+        throw new Error('runtime relay readiness path is invalid');
+    }
+    const token = readyPath.slice(RUNTIME_RELAY_READY_PREFIX.length);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(token)) {
+        throw new Error('runtime relay readiness token is invalid');
+    }
+}
+
+function removeRelayReadyMarker(readyPath) {
+    let identity;
+    try {
+        identity = fs.lstatSync(readyPath);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return;
+        throw error;
+    }
+    if (!identity.isDirectory() || identity.isSymbolicLink()) {
+        throw new Error('runtime relay readiness path is occupied by an invalid filesystem object');
+    }
+    fs.rmdirSync(readyPath);
+}
+
+const waitForBindRetry = () => new Promise(resolve => {
+    setTimeout(resolve, RUNTIME_RELAY_BIND_RETRY_MS);
+});
+
+async function serveSocketBroker(socketPath, readyPath) {
+    if (socketPath !== RUNTIME_RELAY_SOCKET_PATH) {
+        throw new Error('runtime relay socket path is invalid');
+    }
+    requireRelayReadyPath(readyPath);
+    const parent = fs.lstatSync('/run/ploinky-health-probes');
+    if (!parent.isDirectory() || parent.isSymbolicLink()) {
+        throw new Error('runtime relay control mount is invalid');
+    }
+    removeRelayReadyMarker(readyPath);
+    removeStaleRelaySocket(socketPath);
+
+    const workers = new Set();
+    const sockets = new Set();
+    let ownedSocketIdentity = null;
+    const server = net.createServer(socket => {
+        sockets.add(socket);
+        const worker = spawn(process.execPath, [relayScriptPath, 'stdio'], {
+            env: process.env,
+            stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        workers.add(worker);
+        socket.pipe(worker.stdin);
+        worker.stdout.pipe(socket);
+        worker.stderr.pipe(process.stderr, { end: false });
+
+        socket.once('close', () => {
+            sockets.delete(socket);
+            if (worker.exitCode === null && worker.signalCode === null) worker.kill('SIGTERM');
+        });
+        worker.once('error', error => socket.destroy(error));
+        worker.once('exit', () => {
+            workers.delete(worker);
+            if (!socket.destroyed) socket.end();
+        });
+    });
+
+    const priorUmask = process.umask(0o177);
+    let umaskRestored = false;
+    const restoreUmask = () => {
+        if (umaskRestored) return;
+        umaskRestored = true;
+        process.umask(priorUmask);
+    };
+    let startupErrorHandler;
+    await new Promise((resolve, reject) => {
+        const onError = error => {
+            restoreUmask();
+            server.off('listening', onListening);
+            reject(error);
+        };
+        startupErrorHandler = onError;
+        const onListening = () => {
+            try {
+                restoreUmask();
+                ownedSocketIdentity = relaySocketIdentity(socketPath);
+                fs.mkdirSync(readyPath, { mode: 0o700 });
+                server.off('error', onError);
+                resolve();
+            } catch (error) {
+                restoreUmask();
+                server.off('error', onError);
+                server.close(() => {
+                    try { removeOwnedRelaySocket(socketPath, ownedSocketIdentity); } catch (_) {}
+                    try { removeRelayReadyMarker(readyPath); } catch (_) {}
+                    reject(error);
+                });
+            }
+        };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        try {
+            server.listen(socketPath);
+        } catch (error) {
+            restoreUmask();
+            server.off('error', onError);
+            server.off('listening', onListening);
+            reject(error);
+        }
+    });
+    server.off('error', startupErrorHandler);
+
+    let stopping = false;
+    const stop = () => {
+        if (stopping) return;
+        stopping = true;
+        for (const socket of sockets) socket.destroy();
+        for (const worker of workers) worker.kill('SIGTERM');
+        server.close(() => {
+            try { removeOwnedRelaySocket(socketPath, ownedSocketIdentity); } catch (_) {}
+            try { removeRelayReadyMarker(readyPath); } catch (_) {}
+        });
+    };
+    server.on('error', error => {
+        console.error(`runtime relay broker: ${error?.message || error}`);
+        process.exitCode = 125;
+        stop();
+    });
+    process.once('SIGTERM', stop);
+    process.once('SIGINT', stop);
+    process.once('SIGHUP', stop);
+    process.once('exit', () => {
+        try { removeOwnedRelaySocket(socketPath, ownedSocketIdentity); } catch (_) {}
+        try { removeRelayReadyMarker(readyPath); } catch (_) {}
+    });
+}
+
+async function serveSocketBrokerWithRetry(socketPath, readyPath) {
+    for (let attempt = 1; attempt <= RUNTIME_RELAY_BIND_ATTEMPTS; attempt += 1) {
+        try {
+            await serveSocketBroker(socketPath, readyPath);
+            return;
+        } catch (error) {
+            if (!TRANSIENT_RELAY_BIND_ERRORS.has(error?.code)
+                || attempt === RUNTIME_RELAY_BIND_ATTEMPTS) {
+                throw error;
+            }
+            await waitForBindRetry();
+        }
+    }
+}
+
+const relayMode = String(process.argv[2] || '');
+if (relayMode === 'serve') {
+    try {
+        await serveSocketBrokerWithRetry(
+            String(process.argv[3] || ''),
+            String(process.argv[4] || ''),
+        );
+    } catch (error) {
+        console.error(`runtime relay broker: ${error?.message || error}`);
+        process.exitCode = 125;
+    }
+} else if (relayMode === 'stdio') {
 const effectiveAgentId = String(process.env.PLOINKY_AGENT_ID || process.env.PLOINKY_AGENT_PRINCIPAL || '');
 const sessionReplayCache = createRelayReplayCache();
 const requestReplayCache = createRelayReplayCache();
@@ -234,3 +459,7 @@ process.stdin.on('end', () => {
     for (const state of streams.values()) state.socket.destroy();
 });
 process.stdin.on('error', terminate);
+} else {
+    console.error('runtime relay requires an explicit serve or stdio mode');
+    process.exitCode = 125;
+}

@@ -7,10 +7,86 @@ import test from 'node:test';
 import {
     createEdgePublicationRouteCoordinator,
     createExternalHostnameProbe,
+    releaseExactPublicationLease,
     startCloudflarePublicationRuntime,
 } from '../../ploinky-box/cloudflared/runtime.mjs';
 
 const GENERATION = `sha256:${'a'.repeat(64)}`;
+
+test('publication release keeps retrying its exact live lease until removal succeeds', async () => {
+    const lease = {
+        token: 'exact-publication-token',
+        operation: 'cloudflare-publication:exact-activation',
+    };
+    const audits = [];
+    const sleeps = [];
+    let attempts = 0;
+    let current = lease;
+
+    const released = await releaseExactPublicationLease(lease, {
+        releaseWorkspaceLease(candidate) {
+            assert.equal(candidate, lease);
+            attempts += 1;
+            if (attempts < 3) return false;
+            current = null;
+            return true;
+        },
+        inspectWorkspaceLease() {
+            return current
+                ? { active: true, lock: current }
+                : { active: false, lock: null };
+        },
+        audit(event, value) { audits.push({ event, value }); },
+        retryDelayMs: 7,
+        sleep: async (delayMs) => { sleeps.push(delayMs); },
+    });
+
+    assert.equal(released, true);
+    assert.equal(attempts, 3);
+    assert.deepEqual(sleeps, [7, 7]);
+    assert.deepEqual(audits, [
+        {
+            event: 'cloudflare-workspace-lease-release-deferred',
+            value: {
+                operation: 'cloudflare-publication:exact-activation',
+                failures: 1,
+            },
+        },
+        {
+            event: 'cloudflare-workspace-lease-release-recovered',
+            value: {
+                operation: 'cloudflare-publication:exact-activation',
+                failures: 2,
+            },
+        },
+    ]);
+});
+
+test('publication release never removes a replacement workspace lease', async () => {
+    const lease = {
+        token: 'completed-publication-token',
+        operation: 'cloudflare-publication:completed-activation',
+    };
+    let attempts = 0;
+    let slept = false;
+    const released = await releaseExactPublicationLease(lease, {
+        releaseWorkspaceLease() {
+            attempts += 1;
+            return false;
+        },
+        inspectWorkspaceLease() {
+            return {
+                active: true,
+                lock: { token: 'replacement-token' },
+            };
+        },
+        sleep: async () => { slept = true; },
+    });
+
+    assert.equal(released, true);
+    assert.equal(attempts, 1);
+    assert.equal(slept, false);
+});
 
 test('edge publication coordinator commits only exact captured desired semantics and states', async () => {
     const desired = { hosts: {} };
@@ -576,6 +652,8 @@ test('publication runtime reconciles each successful selected activation once an
     let reconciliations = 0;
     const inputs = [];
     let stops = 0;
+    let leaseAcquisitions = 0;
+    let leaseReleases = 0;
     const inactive = Object.assign(new Error('inactive'), { code: 'EDGE_GENERATION_INACTIVE' });
     const runtime = startCloudflarePublicationRuntime({
         workspaceRoot: workspace,
@@ -584,6 +662,14 @@ test('publication runtime reconciles each successful selected activation once an
         loadActive: () => {
             if (!selected) throw inactive;
             return selected;
+        },
+        createWorkspaceLease: ({ operation }) => {
+            leaseAcquisitions += 1;
+            return { token: `publication-${leaseAcquisitions}`, operation };
+        },
+        releaseWorkspaceLease: () => {
+            leaseReleases += 1;
+            return true;
         },
         routeCoordinatorFactory: () => ({ inactivate() {}, commit() {} }),
         controllerFactory: () => ({
@@ -608,12 +694,16 @@ test('publication runtime reconciles each successful selected activation once an
     await runtime.scan();
     await runtime.scan();
     assert.equal(reconciliations, 1);
+    assert.equal(leaseAcquisitions, 1, 'a handled activation must not reacquire the workspace lease');
+    assert.equal(leaseReleases, 1);
     selected = {
         ...selected,
         selector: { ...selected.selector, activationId: 'activation-two' },
     };
     await runtime.scan();
     assert.equal(reconciliations, 2);
+    assert.equal(leaseAcquisitions, 2);
+    assert.equal(leaseReleases, 2);
     assert.equal(inputs[0].selectedPublicationState, 'ready');
     assert.deepEqual(runtime.getStatus(), { state: 'fixture' });
     await runtime.stop();

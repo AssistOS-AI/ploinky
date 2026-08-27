@@ -68,6 +68,32 @@ test('doPrepare.sh defers every agent enable until the Router exists', () => {
     );
 });
 
+test('doPrepare.sh pins the networked fast suite to container runtime before recording it', () => {
+    const lines = commandLines(readHarness('doPrepare.sh'));
+    const routing = lines.find((line) => /^cat >.*\.ploinky\/routing\.json/.test(line.text));
+    const disable = lines.find((line) => /^ploinky disable sandbox\b/.test(line.text));
+    const runtime = lines.find((line) => /^write_state_var "FAST_AGENT_RUNTIME"/.test(line.text));
+    const repo = lines.find((line) => /^ploinky enable repo\b/.test(line.text));
+
+    assert.ok(routing, 'doPrepare.sh should initialize the workspace before changing sandbox policy');
+    assert.ok(disable, 'doPrepare.sh should explicitly select the container fallback');
+    assert.ok(runtime, 'doPrepare.sh should persist the effective fixture runtime');
+    assert.ok(repo, 'doPrepare.sh should continue with repository enablement');
+    assert.ok(routing.index < disable.index, 'sandbox policy must be workspace-scoped');
+    assert.ok(disable.index < runtime.index, 'the expected runtime must follow the persisted policy');
+    assert.ok(runtime.index < repo.index, 'runtime policy must be fixed before repository preparation');
+    assert.doesNotMatch(readHarness('doPrepare.sh'), /ploinky enable sandbox/);
+});
+
+test('fast lifecycle launches use a bounded recurring-probe interval without changing production defaults', () => {
+    const lib = readHarness('lib.sh');
+    const wrapper = extractShellFunction(lib, 'ploinky');
+    assert.match(
+        wrapper,
+        /PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS="\$\{PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS:-5000\}"/,
+    );
+});
+
 test('graph startup fixtures do not enable their root agent before the Router lifecycle starts', () => {
     const graphFixtures = readHarness('test-functions/workspace_dependency_startup_tests.sh');
     assert.doesNotMatch(
@@ -75,6 +101,45 @@ test('graph startup fixtures do not enable their root agent before the Router li
         /^\s*ploinky enable agent graphRepo\/root\b/m,
         'fast_graph_start_workspace owns Router-first root/dependency startup',
     );
+});
+
+test('continuous health recovery follows the exact watchdog lifecycle events', () => {
+    const health = readHarness('test-functions/health_probes_negative.sh');
+    assert.match(health, /\.ploinky\/logs\/watchdog\.log/);
+    assert.match(health, /container_probe_failed/);
+    assert.match(health, /container_scheduling_restart/);
+    assert.match(health, /semantic_probe_failed/);
+    assert.match(health, /TEST_HEALTH_AGENT_CONT_NAME/);
+    assert.doesNotMatch(health, /TEST_AGENT_START_LOG/);
+});
+
+test('continuous health recovery accepts only exact active public-route responses', () => {
+    const healthHarness = path.join(testsDir, 'test-functions/health_probes_negative.sh');
+    const run = (status, body) => {
+        const result = spawnSync('bash', ['-c', `
+            set -euo pipefail
+            FAST_STATE_FILE=$(mktemp -t ploinky-health-response-state.XXXXXX)
+            export FAST_STATE_FILE
+            source "$1"
+            response_file=$(mktemp -t ploinky-active-response.XXXXXX)
+            trap 'rm -f "$FAST_STATE_FILE" "$response_file"' EXIT
+            printf '%s' "$3" > "$response_file"
+            health_probes_response_proves_edge_active "$2" "$response_file"
+        `, 'health-response-test', healthHarness, status, body], {
+            encoding: 'utf8',
+            env: process.env,
+        });
+        return result.status;
+    };
+
+    assert.equal(run('200', '{}'), 0, 'an open active route may return 200');
+    assert.equal(
+        run('401', JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED' } })),
+        0,
+        'an auth-protected active route must return the exact structured denial',
+    );
+    assert.notEqual(run('401', JSON.stringify({ error: { code: 'OTHER' } })), 0);
+    assert.notEqual(run('503', JSON.stringify({ error: { code: 'EDGE_GENERATION_INACTIVE' } })), 0);
 });
 
 test('each post-Router enable records its own completion marker', () => {

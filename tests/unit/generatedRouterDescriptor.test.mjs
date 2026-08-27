@@ -473,11 +473,23 @@ test('fixed public and managed attestation fixtures validate only in their exact
             ? { ...record, body: '{"ok":false,"error":{"code":"AUTH_REQUIRED"}}' }
             : record
     ));
-    assert.throws(() => validateRouterAuthorityObservation({
+    assert.doesNotThrow(() => validateRouterAuthorityObservation({
         intent: macosRemoteIntent,
         nonce: publicFixture.evidence.nonce,
         records: macosLoopbackRecords,
         external: macosExternal,
+        generationId: publicFixture.evidence.generationId,
+    }));
+    const inexactAdminExternal = macosExternal.map((record) => (
+        record.host === macosRemoteIntent.publicAuthority
+            ? { ...record, body: '{"ok":false,"error":{"code":"AUTH_REQUIRED "}}' }
+            : record
+    ));
+    assert.throws(() => validateRouterAuthorityObservation({
+        intent: macosRemoteIntent,
+        nonce: publicFixture.evidence.nonce,
+        records: macosLoopbackRecords,
+        external: inexactAdminExternal,
         generationId: publicFixture.evidence.generationId,
     }), /fixed topology cell/);
     assert.throws(() => validateRouterAuthorityObservation({

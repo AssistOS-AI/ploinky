@@ -107,7 +107,10 @@ const runtimeRelayManager = new RuntimeRelayManager({
 });
 const detailedHealthSocket = process.env.PLOINKY_ROUTER_HEALTH_SOCKET
     || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
-const interfaceClassifier = createListenerInterfaceClassifier();
+const insideBox = isInsideBox();
+const interfaceClassifier = createListenerInterfaceClassifier({
+    managedGatewayDiscovery: !insideBox,
+});
 const routerAuthorityAttestationRegistry = createRouterAuthorityAttestationRegistry();
 
 if (Object.prototype.hasOwnProperty.call(process.env, 'PORT') && process.env.PORT !== String(port)) {
@@ -301,7 +304,7 @@ async function handleRoutedAggregateAgentCard(req, res, routePlan) {
     }
     const apiRoutes = routePlan.lease.snapshot?.routing?.routes || {};
     const candidates = Object.entries(apiRoutes || {})
-        .filter(([, route]) => route && !route.disabled && route.hostPort);
+        .filter(([, route]) => route && !route.disabled && !route.draining && route.hostPort);
     const results = await Promise.all(candidates.map(([agentName, route]) =>
         requestAgentCard(route, agentName, req.headers, {
             beforeDial: () => routePlan?.lease?.commit?.() === true,
@@ -877,7 +880,7 @@ const privateListenerSet = createPrivateListenerSet({
     httpServer: privateServer,
     interfaceClassifier,
     port: privatePort,
-    wildcardHost: isInsideBox(),
+    wildcardHost: insideBox,
     audit: (event, value) => appendLog(event, value),
 });
 const cloudflaredRouterIntegration = createCloudflaredRouterIntegration({

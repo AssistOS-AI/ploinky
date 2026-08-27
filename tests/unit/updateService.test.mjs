@@ -7,10 +7,7 @@ import path from 'node:path';
 import {
     INTERACTIVE_PLOINKY_UPDATE_MESSAGE,
     PLOINKY_BOX_MARKER_PATH,
-    findAchillesDependencyPackages,
     parseGitDependencyRef,
-    refreshAchillesDependenciesInRepos,
-    refreshPloinkyRuntimeAchillesDependency,
     resolveMovingGitDepCommits,
     updatePloinkySelf,
 } from '../../cli/commands/updateService.js';
@@ -120,110 +117,6 @@ test('Ploinky box self-update skips the read-only source before running git oper
     }
 });
 
-test('findAchillesDependencyPackages finds packages in repos and ignores node_modules', () => {
-    const root = tempDir();
-
-    try {
-        writeJson(path.join(root, 'repoA', 'agentA', 'package.json'), {
-            dependencies: {
-                achillesAgentLib: 'git+https://example.invalid/achillesAgentLib.git',
-            },
-        });
-        writeJson(path.join(root, 'repoA', 'agentA', 'node_modules', 'nested', 'package.json'), {
-            dependencies: {
-                achillesAgentLib: 'should-be-ignored',
-            },
-        });
-        writeJson(path.join(root, 'repoB', 'agentB', 'package.json'), {
-            dependencies: {
-                leftpad: '1.0.0',
-            },
-        });
-        writeJson(path.join(root, 'repoC', 'package.json'), {
-            devDependencies: {
-                achillesAgentLib: 'git+https://example.invalid/achillesAgentLib.git',
-            },
-        });
-
-        const found = findAchillesDependencyPackages(root)
-            .map(entry => path.relative(root, entry.packageDir))
-            .sort();
-
-        assert.deepEqual(found, ['repoA/agentA', 'repoC']);
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
-test('refreshAchillesDependenciesInRepos updates installed git dependency or falls back to npm update', () => {
-    const root = tempDir();
-    const calls = [];
-
-    try {
-        const gitBacked = path.join(root, 'repoA', 'agentA');
-        const npmBacked = path.join(root, 'repoB', 'agentB');
-        writeJson(path.join(gitBacked, 'package.json'), {
-            dependencies: { achillesAgentLib: 'git+https://example.invalid/achillesAgentLib.git' },
-        });
-        writeJson(path.join(npmBacked, 'package.json'), {
-            dependencies: { achillesAgentLib: 'git+https://example.invalid/achillesAgentLib.git' },
-        });
-        fs.mkdirSync(path.join(gitBacked, 'node_modules', 'achillesAgentLib', '.git'), { recursive: true });
-
-        const result = refreshAchillesDependenciesInRepos({
-            reposRoot: root,
-            logger: { log() {}, error() {} },
-            stdio: 'ignore',
-            spawn(command, args, options) {
-                calls.push({ command, args, cwd: options.cwd });
-                return { status: 0 };
-            },
-        });
-
-        assert.equal(result.total, 2);
-        assert.equal(result.refreshed.length, 2);
-        assert.equal(result.failed.length, 0);
-        assert.deepEqual(calls.map(call => call.command).sort(), ['git', 'npm']);
-        assert.ok(calls.some(call => call.command === 'git'
-            && call.args.includes('pull')
-            && call.cwd.endsWith(path.join('node_modules', 'achillesAgentLib'))));
-        assert.ok(calls.some(call => call.command === 'npm'
-            && call.args.join(' ') === 'update achillesAgentLib --no-package-lock'
-            && call.cwd === npmBacked));
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
-test('refreshPloinkyRuntimeAchillesDependency pulls the canonical runtime checkout', () => {
-    const root = tempDir();
-    const calls = [];
-
-    try {
-        const installedPath = path.join(root, 'node_modules', 'achillesAgentLib');
-        fs.mkdirSync(path.join(installedPath, '.git'), { recursive: true });
-
-        const result = refreshPloinkyRuntimeAchillesDependency({
-            ploinkyRoot: root,
-            stdio: 'ignore',
-            spawn(command, args, options) {
-                calls.push({ command, args, cwd: options.cwd });
-                return { status: 0 };
-            },
-        });
-
-        assert.equal(result.method, 'git-pull');
-        assert.equal(result.installedPath, installedPath);
-        assert.deepEqual(calls, [{
-            command: 'git',
-            args: ['pull', '--rebase', '--autostash'],
-            cwd: installedPath,
-        }]);
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
 test('parseGitDependencyRef extracts url + ref for moving git specs and strips git+', () => {
     assert.deepEqual(
         parseGitDependencyRef('git+https://github.com/AssistOS-AI/achillesAgentLib.git#master'),
@@ -314,35 +207,3 @@ test('resolveMovingGitDepCommits omits deps with empty/non-sha ls-remote output'
     assert.deepEqual(commits, {});
 });
 
-test('refreshPloinkyRuntimeAchillesDependency reclones the canonical runtime checkout when missing', () => {
-    const root = tempDir();
-    const sourceUrl = 'https://example.invalid/achillesAgentLib.git';
-    const calls = [];
-
-    try {
-        const installedPath = path.join(root, 'node_modules', 'achillesAgentLib');
-
-        const result = refreshPloinkyRuntimeAchillesDependency({
-            ploinkyRoot: root,
-            sourceUrl,
-            stdio: 'ignore',
-            spawn(command, args, options) {
-                calls.push({ command, args, cwd: options.cwd });
-                if (command === 'git' && args[0] === 'clone') {
-                    fs.mkdirSync(path.join(args[args.length - 1], '.git'), { recursive: true });
-                }
-                return { status: 0 };
-            },
-        });
-
-        assert.equal(result.method, 'git-clone');
-        assert.equal(result.installedPath, installedPath);
-        assert.equal(fs.existsSync(path.join(installedPath, '.git')), true);
-        assert.equal(calls.length, 1);
-        assert.equal(calls[0].command, 'git');
-        assert.deepEqual(calls[0].args.slice(0, 3), ['clone', '--quiet', sourceUrl]);
-        assert.equal(calls[0].cwd, path.join(root, 'node_modules'));
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});

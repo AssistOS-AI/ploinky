@@ -9,9 +9,34 @@ import {
     buildSeatbeltProfile,
     collectLiteralPathAccess
 } from '../../cli/sandbox/seatbelt/seatbeltProfile.js';
+import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
+
+// Every seatbelt profile is generated for one selected achillesAgentLib source:
+// with no mount namespace, the read grant and the overriding write denial are
+// what confine it.
+function seatbeltGrantFor(workspaceRoot, { create = false } = {}) {
+    const contract = create
+        ? agentLibFixture(workspaceRoot)
+        : {
+            sourceDir: `${workspaceRoot}/achillesAgentLib`,
+            mode: 'local',
+            fingerprint: 'a1'.repeat(32),
+            sourceIdHash: 'b2'.repeat(32),
+        };
+    return {
+        sourceDir: contract.sourceDir,
+        runtimePath: contract.sourceDir,
+        mode: contract.mode,
+        fingerprint: contract.fingerprint,
+        commit: '',
+        sourceIdHash: contract.sourceIdHash,
+        namespaced: false,
+    };
+}
 
 test('buildSeatbeltProfile does not emit duplicate exec permissions', () => {
     const profile = buildSeatbeltProfile({
+        agentLibGrant: seatbeltGrantFor('/tmp'),
         agentCodePath: '/tmp/code',
         agentLibPath: '/tmp/Agent',
         nodeModulesDir: '/tmp/node_modules',
@@ -29,6 +54,7 @@ test('buildSeatbeltProfile does not emit duplicate exec permissions', () => {
 
 test('buildSeatbeltProfile grants root and parent literals for scoped paths', () => {
     const profile = buildSeatbeltProfile({
+        agentLibGrant: seatbeltGrantFor('/Users/alice/workspace'),
         agentCodePath: '/Users/alice/workspace/repo/agent',
         agentLibPath: '/Users/alice/tools/ploinky/Agent',
         nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/agent/node_modules',
@@ -62,6 +88,7 @@ test('buildSeatbeltProfile grants root and parent literals for scoped paths', ()
 
 test('buildSeatbeltProfile does not grant writes to read-only manifest volumes', () => {
     const profile = buildSeatbeltProfile({
+        agentLibGrant: seatbeltGrantFor('/Users/alice/workspace'),
         agentCodePath: '/Users/alice/workspace/.ploinky/repos/repo/agent',
         agentLibPath: '/Users/alice/workspace/Agent',
         nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/node_modules',
@@ -87,6 +114,7 @@ test('buildSeatbeltProfile does not grant writes to read-only manifest volumes',
 
 test('buildSeatbeltProfile protects read-only paths even under writable workspace', () => {
     const profile = buildSeatbeltProfile({
+        agentLibGrant: seatbeltGrantFor('/Users/alice/workspace'),
         agentCodePath: '/Users/alice/workspace/.ploinky/repos/AchillesIDE/explorer',
         agentLibPath: '/Users/alice/workspace/.ploinky/seatbelt-runtime/explorer/Agent-123',
         nodeModulesDir: '/Users/alice/workspace/.ploinky/deps/agents/AchillesIDE/explorer/seatbelt-darwin-arm64-node25/node_modules',
@@ -125,6 +153,7 @@ test('generated profile can launch a basic macOS command', { skip: process.platf
 
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-profile-'));
     const profile = buildSeatbeltProfile({
+        agentLibGrant: seatbeltGrantFor(workspace),
         agentCodePath: workspace,
         agentLibPath: workspace,
         nodeModulesDir: workspace,
@@ -176,8 +205,13 @@ test('generated profile denies writes to read-only code, cache, and staged lib',
         fs.writeFileSync(path.join(codeDir, 'README'), 'CODE');
         fs.writeFileSync(path.join(nodeModulesDir, 'MARKER'), 'CACHE');
         fs.writeFileSync(path.join(libDir, 'README'), 'LIB');
+        // A real selected source inside the workspace: the workspace itself is
+        // writable, so only the path-based denial keeps it read-only.
+        const agentLibSourceGrant = seatbeltGrantFor(workspace, { create: true });
+        fs.writeFileSync(path.join(agentLibSourceGrant.sourceDir, 'MARKER'), 'AGENTLIB');
 
         const profile = buildSeatbeltProfile({
+            agentLibGrant: agentLibSourceGrant,
             agentCodePath: codeDir,
             agentLibPath: libDir,
             nodeModulesDir,
@@ -204,6 +238,7 @@ test('generated profile denies writes to read-only code, cache, and staged lib',
             path.join(codeDir, 'README'),
             path.join(nodeModulesDir, 'MARKER'),
             path.join(libDir, 'README'),
+            path.join(agentLibSourceGrant.sourceDir, 'MARKER'),
         ]) {
             const result = spawnSync('sandbox-exec', ['-f', profilePath, '/bin/sh', '-c', `echo TAMPERED > ${target}`], {
                 cwd: workspace,
@@ -215,6 +250,11 @@ test('generated profile denies writes to read-only code, cache, and staged lib',
         assert.equal(fs.readFileSync(path.join(codeDir, 'README'), 'utf8'), 'CODE');
         assert.equal(fs.readFileSync(path.join(nodeModulesDir, 'MARKER'), 'utf8'), 'CACHE');
         assert.equal(fs.readFileSync(path.join(libDir, 'README'), 'utf8'), 'LIB');
+        assert.equal(
+            fs.readFileSync(path.join(agentLibSourceGrant.sourceDir, 'MARKER'), 'utf8'),
+            'AGENTLIB',
+            'the selected achillesAgentLib source must survive a write attempt through the writable workspace',
+        );
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
     }

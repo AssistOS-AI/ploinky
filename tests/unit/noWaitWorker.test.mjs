@@ -29,6 +29,7 @@ import {
     runNoWaitLifecycleTransaction,
     runNoWaitScriptReadinessWithControlPlaneRetry,
     waitForNoWaitLifecycle,
+    waitForNoWaitWorkerLifecycle,
     waitForNoWaitStatusBarrier,
     waitForNoWaitRouteActivation,
     waitForRunScopedStatus,
@@ -972,6 +973,68 @@ test('retryable publication recovery reacquires between exact worker lease attem
     assert.equal(leaseHeld, false);
 });
 
+test('source-changing peer publication is recaptured outside the exact worker lease', async () => {
+    const identity = { containerName: 'ploinky_demo_worker', routeKey: 'background' };
+    const beforePublication = {
+        generationDigest: 'sha256:before-publication',
+        selectorActivationId: 'activation-before-publication',
+    };
+    const afterPublication = {
+        generationDigest: 'sha256:after-publication',
+        selectorActivationId: 'activation-after-publication',
+    };
+    let now = 0;
+    let state = 'outside-source-change';
+    let leaseHeld = false;
+    let acquisitions = 0;
+    let releases = 0;
+    let launches = 0;
+
+    const sourceChanged = () => Object.assign(
+        new Error('edge routing sources changed since the active generation was selected'),
+        { code: 'EDGE_GENERATION_SOURCE_CHANGED' },
+    );
+    const result = await withActiveNoWaitWorkerLifecycleLease(identity, async (lifecycle) => {
+        launches += 1;
+        assert.equal(leaseHeld, true);
+        assert.deepEqual(lifecycle, afterPublication);
+        return lifecycle.selectorActivationId;
+    }, {
+        timeoutMs: 1_000,
+        pollIntervalMs: 10,
+        nowFn: () => now,
+        loadFn() {
+            if (state === 'outside-source-change' || state === 'inside-source-change') {
+                throw sourceChanged();
+            }
+            return state === 'before-publication' ? beforePublication : afterPublication;
+        },
+        async withLeaseFn(_options, callback) {
+            acquisitions += 1;
+            leaseHeld = true;
+            if (acquisitions === 1) state = 'inside-source-change';
+            try {
+                return await callback();
+            } finally {
+                leaseHeld = false;
+                releases += 1;
+            }
+        },
+        async sleepFn(delayMs) {
+            assert.equal(leaseHeld, false, 'publication recovery must occur outside the worker lease');
+            now += delayMs;
+            if (state === 'outside-source-change') state = 'before-publication';
+            else if (state === 'inside-source-change') state = 'after-publication';
+        },
+    });
+
+    assert.equal(result, 'activation-after-publication');
+    assert.equal(acquisitions, 2);
+    assert.equal(releases, 2);
+    assert.equal(launches, 1);
+    assert.equal(leaseHeld, false);
+});
+
 test('selector change inside the lease releases and retries the exact lifecycle capture', async () => {
     const identity = { containerName: 'ploinky_demo_worker', routeKey: 'background' };
     const initial = {
@@ -1038,6 +1101,80 @@ test('inactive selector polling fails closed within one bound without acquiring 
     assert.equal(leaseCalls, 0);
 });
 
+test('source-changing selector polling fails closed within one bound without acquiring a lease', async () => {
+    let now = 0;
+    let leaseCalls = 0;
+    await assert.rejects(
+        () => withActiveNoWaitWorkerLifecycleLease(
+            { containerName: 'ploinky_demo_worker', routeKey: 'background' },
+            async () => assert.fail('source-changing selector must not launch'),
+            {
+                timeoutMs: 1_000,
+                pollIntervalMs: 250,
+                nowFn: () => now,
+                loadFn() {
+                    throw Object.assign(new Error('publication source mutation is incomplete'), {
+                        code: 'EDGE_GENERATION_SOURCE_CHANGED',
+                    });
+                },
+                async withLeaseFn() { leaseCalls += 1; },
+                async sleepFn(delayMs) { now += delayMs; },
+            },
+        ),
+        (error) => error?.code === 'NO_WAIT_EDGE_LEASE_TIMEOUT',
+    );
+    assert.equal(now, 1_000);
+    assert.equal(leaseCalls, 0);
+});
+
+test('worker lifecycle lease does not retry a corrupt active generation', async () => {
+    let loads = 0;
+    let leaseCalls = 0;
+    await assert.rejects(
+        () => withActiveNoWaitWorkerLifecycleLease(
+            { containerName: 'ploinky_demo_worker', routeKey: 'background' },
+            async () => assert.fail('corrupt generation must not launch'),
+            {
+                loadFn() {
+                    loads += 1;
+                    throw Object.assign(new Error('active generation is corrupt'), {
+                        code: 'EDGE_GENERATION_CORRUPT',
+                    });
+                },
+                async withLeaseFn() { leaseCalls += 1; },
+            },
+        ),
+        /active generation is corrupt/,
+    );
+    assert.equal(loads, 1);
+    assert.equal(leaseCalls, 0);
+});
+
+test('worker lifecycle polling recaptures a source-changing generation exactly', async () => {
+    const expected = {
+        generationDigest: 'sha256:current',
+        selectorActivationId: 'activation-current',
+    };
+    let attempts = 0;
+    const lifecycle = await waitForNoWaitWorkerLifecycle({ routeKey: 'background' }, {
+        timeoutMs: 1_000,
+        pollIntervalMs: 1,
+        loadFn() {
+            attempts += 1;
+            if (attempts === 1) {
+                throw Object.assign(new Error('publication source mutation is incomplete'), {
+                    code: 'EDGE_GENERATION_SOURCE_CHANGED',
+                });
+            }
+            return expected;
+        },
+        async sleepFn() {},
+    });
+
+    assert.equal(attempts, 2);
+    assert.equal(lifecycle, expected);
+});
+
 test('no-wait launch waits for the staged edge generation to become active', async () => {
     const expected = { generationDigest: 'sha256:active' };
     const identity = { routeKey: 'background' };
@@ -1078,6 +1215,22 @@ test('no-wait launch does not retry a corrupt active edge generation', async () 
             async sleepFn() {},
         }),
         /active generation is corrupt/,
+    );
+    assert.equal(attempts, 1);
+});
+
+test('route lifecycle does not retry a source-changing active generation', async () => {
+    let attempts = 0;
+    await assert.rejects(
+        () => waitForNoWaitLifecycle({ routeKey: 'background' }, {
+            loadFn() {
+                attempts += 1;
+                throw Object.assign(new Error('active routing sources changed'), {
+                    code: 'EDGE_GENERATION_SOURCE_CHANGED',
+                });
+            },
+        }),
+        /active routing sources changed/,
     );
     assert.equal(attempts, 1);
 });
@@ -1747,10 +1900,9 @@ test('no-wait cleanup accepts an exited container only when its immutable contra
     };
     const dependencies = {
         createAdapter: () => ({
-            inspectContainerContract: () => ({ state: 'exact', id: containerId }),
+            inspectContainerContract: () => ({ state: 'exact', id: containerId, running: false }),
         }),
         getRuntime: () => 'podman',
-        isContainerRunning: () => false,
     };
     const context = {
         profileResolution: { network: { mode: 'default' } },

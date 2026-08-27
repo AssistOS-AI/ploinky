@@ -10,7 +10,12 @@ touch "$FAST_STATE_FILE"
 # The fast suite builds its fixture directly in a temporary host workspace.
 # Use the branch-local CLI so that every command sees that exact fixture,
 # instead of routing through a Box whose workspace mount points elsewhere.
+# Bound continuous-probe recurrence for this fixture as well: the production
+# default is five minutes, so a failure injected at an arbitrary point in that
+# interval cannot be observed reliably by a one-minute test. The assignment is
+# scoped to the CLI child and still permits an explicit caller override.
 ploinky() {
+  PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS="${PLOINKY_CONTAINER_MONITOR_CONTINUOUS_PROBE_INTERVAL_MS:-5000}" \
   PLOINKY_ROUTER_HEALTH_SOCKET="${PLOINKY_ROUTER_HEALTH_SOCKET:-${TEST_ROUTER_HEALTH_SOCKET:-}}" \
     "$PLOINKY_FAST_CLI" "$@"
 }

@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-import {
+// This module resolves config paths at import time. Pin it to a test-owned
+// workspace so a developer's ancestor ~/.ploinky secrets are never read.
+const isolatedWorkspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-runtime-key-test-'));
+process.env.PLOINKY_WORKSPACE_ROOT = isolatedWorkspaceRoot;
+process.once('exit', () => fs.rmSync(isolatedWorkspaceRoot, { recursive: true, force: true }));
+
+const {
     detectHostRuntimeKey,
     detectContainerRuntimeKey,
     isNoNodeRuntimeKey,
@@ -11,7 +20,7 @@ import {
     normalizeRuntimeFamily,
     buildRuntimeKey,
     SUPPORTED_FAMILIES,
-} from '../../cli/utils/dependencies/dependencyRuntimeKey.js';
+} = await import('../../cli/utils/dependencies/dependencyRuntimeKey.js');
 
 test('detectHostRuntimeKey returns <family>-<platform>-<arch>-node<major> for bwrap', () => {
     const key = detectHostRuntimeKey('bwrap');

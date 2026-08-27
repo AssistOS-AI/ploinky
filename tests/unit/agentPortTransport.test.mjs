@@ -149,7 +149,7 @@ function routePlan({
         unmatchedSuffix: '/api/items',
         query: 'page=2',
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: 'podman',
             containerId: 'a'.repeat(64),
             containerName: 'alpha-container',

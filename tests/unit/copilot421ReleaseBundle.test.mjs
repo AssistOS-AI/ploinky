@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
     LOCKED_ROOT_POSTINSTALL,
+    defaultPaths,
     parseCommandLine,
     parseExactGitCommitSpec,
     readBoundedJsonFile,
@@ -34,10 +35,15 @@ function manifest() {
     };
 }
 
-function globalPackage(ref = null) {
+// achillesAgentLib is direct-mounted from the selected workspace source, so a
+// release bundle's globalDeps must install mcp-sdk only.
+function globalPackage({ declaresAgentLib = false } = {}) {
     return {
         dependencies: {
-            achillesAgentLib: `git+https://github.com/AssistOS-AI/achillesAgentLib.git${ref ? `#${ref}` : ''}`,
+            'mcp-sdk': 'git+https://github.com/AssistOS-AI/MCPSDK.git#main',
+            ...(declaresAgentLib
+                ? { achillesAgentLib: 'git+https://github.com/AssistOS-AI/achillesAgentLib.git' }
+                : {}),
         },
     };
 }
@@ -98,6 +104,33 @@ test('release verifier accepts one complete, exact immutable bundle', () => {
     );
 });
 
+test('release verifier paths pin the deployed repositories without nesting AgentLib in Ploinky', () => {
+    const paths = defaultPaths('/candidate/ploinky', {
+        env: {
+            PLOINKY_RELEASE_AGENTLIB_DIR: '/workspace/achillesAgentLib',
+            PLOINKY_RELEASE_ACHILLESCLI_DIR: '/workspace/.ploinky/repos/AchillesCLI',
+            PLOINKY_RELEASE_EXPLORER_DIR: '/workspace/.ploinky/repos/AchillesIDE',
+        },
+    });
+    assert.equal(paths.ploinky, '/candidate/ploinky');
+    assert.equal(paths.achillesAgentLib, '/workspace/achillesAgentLib');
+    assert.equal(paths.achillesCLI, '/workspace/.ploinky/repos/AchillesCLI');
+    assert.equal(paths.explorer, '/workspace/.ploinky/repos/AchillesIDE');
+});
+
+test('release verifier repository pins are exact absolute paths', () => {
+    for (const [name, value] of [
+        ['PLOINKY_RELEASE_AGENTLIB_DIR', 'relative/achillesAgentLib'],
+        ['PLOINKY_RELEASE_ACHILLESCLI_DIR', ' /workspace/.ploinky/repos/AchillesCLI'],
+        ['PLOINKY_RELEASE_EXPLORER_DIR', '/workspace/.ploinky/repos/AchillesIDE '],
+    ]) {
+        assert.throws(
+            () => defaultPaths('/candidate/ploinky', { env: { [name]: value } }),
+            new RegExp(`${name} must be`),
+        );
+    }
+});
+
 test('release manifest rejects missing, extra, branch, and non-immutable identities', () => {
     const missing = manifest();
     delete missing.repositories.explorer;
@@ -137,7 +170,7 @@ test('release manifest rejects missing, extra, branch, and non-immutable identit
     }
 });
 
-test('delivery metadata requires an unpinned AgentLib source and exact locked release commit', () => {
+test('delivery metadata requires the Box lock alone and rejects a second installed AgentLib', () => {
     const result = validateAgentlibDeliveryMetadata({
         globalPackage: globalPackage(),
         dependencyLock: dependencyLock(),
@@ -145,23 +178,13 @@ test('delivery metadata requires an unpinned AgentLib source and exact locked re
     });
     assert.equal(result.commit, SHAS.achillesAgentLib);
 
+    // A bundle whose globalDeps still installs achillesAgentLib would ship a
+    // second, independently resolved copy alongside the direct mount.
     assert.throws(() => validateAgentlibDeliveryMetadata({
-        globalPackage: globalPackage('master'),
+        globalPackage: globalPackage({ declaresAgentLib: true }),
         dependencyLock: dependencyLock(),
         expectedCommit: SHAS.achillesAgentLib,
-    }), /must be an unpinned git\+https dependency spec/);
-
-    assert.throws(() => validateAgentlibDeliveryMetadata({
-        globalPackage: globalPackage(SHAS.achillesAgentLib),
-        dependencyLock: dependencyLock(),
-        expectedCommit: SHAS.achillesAgentLib,
-    }), /must be an unpinned git\+https dependency spec/);
-
-    assert.throws(() => validateAgentlibDeliveryMetadata({
-        globalPackage: { dependencies: {} },
-        dependencyLock: dependencyLock(),
-        expectedCommit: SHAS.achillesAgentLib,
-    }), /unpinned git\+https dependency spec/);
+    }), /must not declare achillesAgentLib/);
 
     assert.throws(() => validateAgentlibDeliveryMetadata({
         globalPackage: globalPackage(),
@@ -170,12 +193,12 @@ test('delivery metadata requires an unpinned AgentLib source and exact locked re
     }), /must name the same AgentLib commit/);
 
     const alternateRemote = dependencyLock();
-    alternateRemote.repositories.achillesAgentLib.url = 'https://github.com/other/AchillesAgentLib.git';
+    alternateRemote.repositories.achillesAgentLib.url = 'not-a-github-url';
     assert.throws(() => validateAgentlibDeliveryMetadata({
         globalPackage: globalPackage(),
         dependencyLock: alternateRemote,
         expectedCommit: SHAS.achillesAgentLib,
-    }), /must name the same AgentLib repository/);
+    }), /Box dependency lock achillesAgentLib/);
 });
 
 test('root package accepts only the exact immutable lock-driven installer contract', () => {

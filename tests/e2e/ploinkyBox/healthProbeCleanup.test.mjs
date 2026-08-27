@@ -11,9 +11,8 @@ import {
 
 // Opt-in native regression. This host must provide rootless Podman plus the
 // immutable Box candidate image; the probe image must be an immutable Linux
-// reference with POSIX sh, /proc, setsid, grep, tr, and fractional sleep. A
-// pinned BusyBox-based Alpine image is preferred because it exercises the
-// production runner without GNU-only setsid or timeout flags.
+// reference with POSIX sh, /proc, cat, dd, grep, mkfifo, mv, rm, setsid, tr,
+// and fractional sleep. A pinned BusyBox-based Alpine image is preferred.
 // Exact command on a capable Linux/nested-Podman host, from the ploinky root:
 //   PLOINKY_BOX_REQUIRE_PODMAN=1 \
 //   PLOINKY_BOX_CANDIDATE_DIGEST=sha256:<ploinky-box image digest> \
@@ -22,7 +21,33 @@ import {
 
 const repositoryRoot = path.resolve(import.meta.dirname, '../../..');
 
-test('native nested Podman probe timeout leaves no descendants, zombies, or exec conmon', {
+const WAIT_FOR_BROKER_SCRIPT = [
+    "const f=require('node:fs');",
+    'const ready=process.argv[1],deadline=Date.now()+30000;',
+    'while(!f.existsSync(ready)&&Date.now()<deadline)',
+    'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25);',
+    "if(!f.existsSync(ready)){process.stderr.write('broker readiness timed out');process.exit(1)}",
+].join('');
+
+const SUBMIT_REQUEST_SCRIPT = [
+    "const f=require('node:fs');",
+    'const [root,token,script,timeout,killAfter,cancelMode]=process.argv.slice(1);',
+    "const control=root+'/'+token;f.mkdirSync(control,{recursive:true,mode:0o700});",
+    "if(cancelMode==='pre')f.mkdirSync(control+'/cancelled',{mode:0o700});",
+    "const payload=['ploinky-health-probe/1',token,script,timeout,killAfter,''].join('\\n');",
+    "f.writeFileSync(control+'/request-tmp',payload,{flag:'wx',mode:0o600});",
+    "f.renameSync(control+'/request-tmp',control+'/request');",
+    'let active=false;',
+    "if(cancelMode==='active'){const activeDeadline=Date.now()+10000;while(Date.now()<activeDeadline){try{active=f.readdirSync(control+'/session').some(name=>name.startsWith('active-'))}catch{}if(active)break;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25)}if(active)f.mkdirSync(control+'/cancelled',{mode:0o700})}",
+    "const resultPath=control+'/result',deadline=Date.now()+45000;",
+    'while(!f.existsSync(resultPath)&&Date.now()<deadline)',
+    'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25);',
+    "const status=f.existsSync(resultPath)?Number(f.readFileSync(resultPath,'utf8').trim()):null;",
+    "const read=name=>f.existsSync(control+'/'+name)?f.readFileSync(control+'/'+name,'utf8'):'';",
+    "process.stdout.write(JSON.stringify({active,status,stdout:read('probe-stdout'),stderr:read('probe-stderr')+read('runner-stderr'),claimed:f.existsSync(control+'/claimed'),sessionExists:f.existsSync(control+'/session')}));",
+].join('');
+
+test('native mounted broker probes leave zero nested exec sessions and allow replacement', {
     timeout: 10 * 60_000,
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
@@ -35,14 +60,28 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
     );
 
     const harness = createPodmanHarness(t, candidateReference);
+    const agentLibSource = path.resolve(
+        process.env.PLOINKY_HEALTH_PROBE_AGENTLIB_SOURCE
+            || path.join(repositoryRoot, 'node_modules', 'achillesAgentLib'),
+    );
+    assert.equal(
+        fs.statSync(agentLibSource).isDirectory(),
+        true,
+        'native health gate requires a local validated achillesAgentLib checkout',
+    );
+    fs.cpSync(agentLibSource, path.join(harness.workspace, 'achillesAgentLib'), { recursive: true });
     const probeRoot = path.join(harness.workspace, 'health-probe-native');
     fs.mkdirSync(path.join(probeRoot, 'code'), { recursive: true });
+    fs.mkdirSync(path.join(probeRoot, 'code', 'slow-bin'), { recursive: true });
     fs.mkdirSync(path.join(probeRoot, 'Agent', 'server'), { recursive: true });
-    fs.copyFileSync(
-        path.join(repositoryRoot, 'Agent', 'server', 'HealthProbeRunner.sh'),
-        path.join(probeRoot, 'Agent', 'server', 'HealthProbeRunner.sh'),
-    );
-    fs.chmodSync(path.join(probeRoot, 'Agent', 'server', 'HealthProbeRunner.sh'), 0o755);
+    fs.mkdirSync(path.join(probeRoot, 'control'), { recursive: true });
+    for (const fileName of ['HealthProbeRunner.sh', 'AgentEntrypoint.sh']) {
+        fs.copyFileSync(
+            path.join(repositoryRoot, 'Agent', 'server', fileName),
+            path.join(probeRoot, 'Agent', 'server', fileName),
+        );
+        fs.chmodSync(path.join(probeRoot, 'Agent', 'server', fileName), 0o755);
+    }
     fs.writeFileSync(path.join(probeRoot, 'code', 'hang.sh'), [
         '#!/bin/sh',
         "trap '' TERM",
@@ -56,8 +95,54 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
         'exit 0',
         '',
     ].join('\n'), { mode: 0o755 });
+    fs.writeFileSync(path.join(probeRoot, 'code', 'slow-bin', 'grep'), [
+        '#!/bin/sh',
+        'if [ -f /run/ploinky-health-probes/.slow-token-scan ]; then sleep 2; fi',
+        'exec /bin/grep "$@"',
+        '',
+    ].join('\n'), { mode: 0o755 });
+    fs.writeFileSync(path.join(probeRoot, 'code', 'main.sh'), [
+        '#!/bin/sh',
+        'sh /code/hang.sh &',
+        'decoy_pid="$!"',
+        "printf '%s' \"$decoy_pid\" > /run/ploinky-health-probes/decoy.pid",
+        "trap 'kill -KILL \"$decoy_pid\" 2>/dev/null || true; exit 0' HUP INT TERM",
+        'while kill -0 "$decoy_pid" 2>/dev/null; do sleep 60 & wait "$!"; done',
+        'exit 1',
+        '',
+    ].join('\n'), { mode: 0o755 });
+    fs.writeFileSync(path.join(probeRoot, 'code', 'unacknowledged.sh'), [
+        '#!/bin/sh',
+        'while :; do sleep 60 & wait "$!"; done',
+        '',
+    ].join('\n'), { mode: 0o755 });
+    fs.writeFileSync(path.join(probeRoot, 'code', 'audit.sh'), [
+        '#!/bin/sh',
+        'decoy_pid="$(cat /run/ploinky-health-probes/decoy.pid)"',
+        'kill -0 "$decoy_pid" 2>/dev/null || exit 30',
+        'for p in /proc/[0-9]*; do',
+        '  test -r "$p/environ" || continue',
+        "  environment=\"$(tr '\\000' '\\n' < \"$p/environ\")\"",
+        "  printf '%s\\n' \"$environment\" | grep -Eq '^PLOINKY_PROBE_TOKEN=native-(timeout|pre-cancel|mounted-cancel):$' && exit 31",
+        'done',
+        "zombies=''",
+        'for p in /proc/[0-9]*/stat; do',
+        '  test -r "$p" || continue',
+        '  IFS= read -r stat < "$p" || continue',
+        '  fields="${stat##*) }"',
+        '  set -- $fields',
+        '  test "$1" = Z && zombies="$zombies ${p%/stat}"',
+        'done',
+        'test -z "$zombies" || { echo "$zombies"; exit 32; }',
+        "printf '%s' clean",
+        '',
+    ].join('\n'), { mode: 0o755 });
 
-    const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const prepared = await harness.supervisor.prepareBoxForCommand({
+        imageRef: candidateReference,
+        explicitPort: 19098,
+        explicitMediaPort: 17902,
+    });
     execInBox(harness.runner, prepared.containerId, [
         'mkdir', '-p', '/workspace/health-probe-native',
     ]);
@@ -71,7 +156,9 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
         `failed to stage native probe fixtures in the Box workspace bind: ${stagedProbe.stderr}`,
     );
     const containerName = `probe-cleanup-${process.pid}`;
+    let targetExists = false;
     t.after(() => {
+        if (!targetExists) return;
         try {
             execInBox(harness.runner, prepared.containerId, [
                 'podman', 'container', 'rm', '-f', '--time', '0', containerName,
@@ -81,141 +168,164 @@ test('native nested Podman probe timeout leaves no descendants, zombies, or exec
     execInBox(harness.runner, prepared.containerId, ['podman', 'pull', probeImage], {
         timeoutMs: 5 * 60_000,
     });
-    execInBox(harness.runner, prepared.containerId, [
-        'podman', 'run', '-d', '--init', '--name', containerName,
-        '-v', '/workspace/health-probe-native/code:/code:ro',
-        '-v', '/workspace/health-probe-native/Agent:/Agent:ro',
-        probeImage,
-        'sh', '-c', 'while :; do sleep 3600; done',
-    ]);
 
-    // An unrelated in-container process running the exact same script name must
-    // survive probe cleanup: cleanup is scoped by session + token, not by name.
-    execInBox(harness.runner, prepared.containerId, [
-        'podman', 'exec', '-d', containerName,
-        'sh', '-c', 'echo "$$" > /tmp/decoy.pid && exec sh /code/hang.sh',
-    ]);
-    const decoyPid = execInBox(harness.runner, prepared.containerId, [
-        'podman', 'exec', containerName, 'sh', '-c',
-        'i=0; while [ ! -s /tmp/decoy.pid ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done; cat /tmp/decoy.pid',
-    ]);
-    assert.match(decoyPid, /^\d+$/, 'the unrelated decoy process must have started');
-
-    const result = JSON.parse(execInBox(harness.runner, prepared.containerId, [
-        '/usr/local/bin/node', '-e', [
-            "const f=require('node:fs'),c=require('node:child_process');",
-            "const countConmon=()=>f.readdirSync('/proc').filter(x=>/^\\d+$/.test(x)).filter(x=>{try{return f.readFileSync('/proc/'+x+'/comm','utf8').trim()==='conmon'}catch{return false}}).length;",
-            'const before=countConmon();',
-            "const r=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run','/tmp/.ploinky-health-probe-native-timeout','native-timeout','hang.sh','0.2','0.2'],{encoding:'utf8',timeout:30000});",
-            "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500);",
-            'const after=countConmon();',
-            "process.stdout.write(JSON.stringify({status:r.status,error:r.error?.code||null,stdout:r.stdout,stderr:r.stderr,before,after}));",
-        ].join(''),
-        containerName,
-    ]));
-    assert.equal(result.error, null, JSON.stringify(result));
-    assert.equal(result.status, 124, result.stderr);
-    assert.equal(result.after, result.before, 'the timed-out exec must not leave a conmon process');
-
-    const preCancelled = JSON.parse(execInBox(harness.runner, prepared.containerId, [
-        '/usr/local/bin/node', '-e', [
-            "const c=require('node:child_process');",
-            "const marker='/tmp/.ploinky-health-probe-native-pre-cancel';",
-            "const cleanup=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','cleanup',marker,'native-pre-cancel'],{encoding:'utf8',timeout:30000});",
-            "const run=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run',marker,'native-pre-cancel','ok.sh','5','1'],{encoding:'utf8',timeout:30000});",
-            "process.stdout.write(JSON.stringify({cleanupStatus:cleanup.status,cleanupError:cleanup.error?.code||null,status:run.status,error:run.error?.code||null,stdout:run.stdout,stderr:run.stderr}));",
-        ].join(''),
-        containerName,
-    ]));
-    assert.equal(preCancelled.cleanupError, null, JSON.stringify(preCancelled));
-    assert.equal(preCancelled.cleanupStatus, 0, JSON.stringify(preCancelled));
-    assert.equal(preCancelled.error, null, JSON.stringify(preCancelled));
-    assert.equal(preCancelled.status, 125, 'a cancellation that wins before session setup must prevent execution');
-
-    const killedClient = JSON.parse(execInBox(harness.runner, prepared.containerId, [
-        '/usr/local/bin/node', '-e', [
-            "const f=require('node:fs'),c=require('node:child_process');",
-            "const countConmon=()=>f.readdirSync('/proc').filter(x=>/^\\d+$/.test(x)).filter(x=>{try{return f.readFileSync('/proc/'+x+'/comm','utf8').trim()==='conmon'}catch{return false}}).length;",
-            "(async()=>{",
-            "const marker='/tmp/.ploinky-health-probe-native-client-kill',token='native-client-kill';",
-            "const before=countConmon();",
-            "const child=c.spawn('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run',marker,token,'hang.sh','30','1'],{stdio:['ignore','pipe','pipe']});",
-            "let active=false;const deadline=Date.now()+10000;",
-            "while(Date.now()<deadline){const seen=c.spawnSync('podman',['exec',process.argv[1],'sh','-c','test -d \"$1\" && find \"$1\" -maxdepth 1 -type d -name \"active-*\" | grep -q .','sh',marker],{stdio:'ignore',timeout:5000});if(seen.status===0){active=true;break}Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,50)}",
-            "if(!active){child.kill('SIGKILL');throw new Error('probe session did not publish an active identity')}",
-            "child.kill('SIGKILL');",
-            "const close=await new Promise(resolve=>child.once('close',(status,signal)=>resolve({status,signal})));",
-            "const cleanup=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','cleanup',marker,token],{encoding:'utf8',timeout:30000});",
-            "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,500);",
-            "const after=countConmon();",
-            "process.stdout.write(JSON.stringify({active,close,cleanupStatus:cleanup.status,cleanupError:cleanup.error?.code||null,cleanupStdout:cleanup.stdout,cleanupStderr:cleanup.stderr,before,after}));",
-            "})().catch(error=>{process.stderr.write(error.stack||String(error));process.exit(1)});",
-        ].join(''),
-        containerName,
-    ], { timeoutMs: 60_000 }));
-    assert.equal(killedClient.active, true, JSON.stringify(killedClient));
-    assert.deepEqual(killedClient.close, { status: null, signal: 'SIGKILL' });
-    assert.equal(killedClient.cleanupError, null, JSON.stringify(killedClient));
-    assert.equal(killedClient.cleanupStatus, 0, killedClient.cleanupStderr);
-    assert.equal(
-        killedClient.after,
-        killedClient.before,
-        'external client death plus exact cleanup must not strand exec conmon',
-    );
-
-    const inspection = JSON.parse(execInBox(harness.runner, prepared.containerId, [
+    const startTarget = (mainScript = 'main.sh') => {
+        execInBox(harness.runner, prepared.containerId, [
+            'podman', 'run', '-d', '--init', '--name', containerName,
+            '--userns=keep-id:uid=1000,gid=1000', '--user', '1000:1000',
+            '-v', '/workspace/health-probe-native/code:/code:ro',
+            '-v', '/workspace/health-probe-native/Agent:/Agent:ro',
+            '-v', '/workspace/health-probe-native/control:/run/ploinky-health-probes',
+            '-e', 'PLOINKY_HEALTH_PROBE_BROKER=1',
+            '-e', 'PATH=/code/slow-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+            '--entrypoint', '/Agent/server/AgentEntrypoint.sh',
+            probeImage,
+            'sh', `/code/${mainScript}`,
+        ]);
+        targetExists = true;
+        execInBox(harness.runner, prepared.containerId, [
+            '/usr/local/bin/node', '-e', WAIT_FOR_BROKER_SCRIPT,
+            '/workspace/health-probe-native/control/.broker-ready',
+        ]);
+    };
+    const inspectTarget = () => JSON.parse(execInBox(harness.runner, prepared.containerId, [
         'podman', 'container', 'inspect', containerName,
     ]))[0];
-    assert.equal(inspection.HostConfig?.Init, true);
+    const assertNoTargetExecSessions = (stage) => {
+        const inspection = inspectTarget();
+        assert.equal(inspection.State?.Running, true, `${stage}: target must remain running`);
+        assert.deepEqual(inspection.ExecIDs || [], [], `${stage}: target acquired an OCI exec session`);
+        assert.deepEqual(
+            inspection.Config?.Entrypoint,
+            ['/Agent/server/AgentEntrypoint.sh'],
+            `${stage}: target must be launched through the mounted broker entrypoint`,
+        );
+        assert.equal(
+            inspection.Config?.User,
+            '1000:1000',
+            `${stage}: native broker regression must exercise a non-root image user`,
+        );
+    };
+    const submitRequest = ({ token, script, timeout, killAfter, cancelMode = 'none' }) => (
+        JSON.parse(execInBox(harness.runner, prepared.containerId, [
+            '/usr/local/bin/node', '-e', SUBMIT_REQUEST_SCRIPT,
+            '/workspace/health-probe-native/control', token, script,
+            String(timeout), String(killAfter), cancelMode,
+        ], { timeoutMs: 60_000 }))
+    );
+    const removeTarget = () => {
+        assertNoTargetExecSessions('before removal');
+        execInBox(harness.runner, prepared.containerId, [
+            'podman', 'container', 'rm', '-f', '--time', '0', containerName,
+        ]);
+        targetExists = false;
+        execInBox(harness.runner, prepared.containerId, [
+            'sh', '-c', 'podman container exists "$1"; test "$?" -ne 0',
+            'sh', containerName,
+        ]);
+    };
+    const stopTargetAndAssertExit = async (expectedExitCode) => {
+        assertNoTargetExecSessions('before signaled stop');
+        execInBox(harness.runner, prepared.containerId, [
+            'podman', 'kill', '--signal', 'TERM', containerName,
+        ]);
+        const deadline = Date.now() + 35_000;
+        let inspection = inspectTarget();
+        while (inspection.State?.Running === true && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            inspection = inspectTarget();
+        }
+        assert.equal(inspection.State?.Running, false, 'graceful main process did not stop');
+        assert.equal(
+            inspection.State?.ExitCode,
+            expectedExitCode,
+            expectedExitCode === 0
+                ? 'entrypoint replaced the main process drain acknowledgement'
+                : 'entrypoint incorrectly manufactured a drain acknowledgement',
+        );
+        assert.deepEqual(inspection.ExecIDs || [], [], 'signaled stop acquired an OCI exec session');
+    };
 
-    const processAudit = execInBox(harness.runner, prepared.containerId, [
-        'podman', 'exec', containerName, 'sh', '-c', [
-            'test ! -e /tmp/.ploinky-health-probe-native-timeout',
-            'test ! -e /tmp/.ploinky-health-probe-native-pre-cancel',
-            'test ! -e /tmp/.ploinky-health-probe-native-client-kill',
-            "for p in /proc/[0-9]*; do",
-            "  test -r \"$p/environ\" || continue",
-            "  environment=\"$(tr '\\000' '\\n' < \"$p/environ\")\"",
-            "  printf '%s\\n' \"$environment\" | grep -Fqx 'PLOINKY_PROBE_TOKEN=native-timeout:' && exit 20",
-            "  printf '%s\\n' \"$environment\" | grep -Fqx 'PLOINKY_PROBE_TOKEN=native-pre-cancel:' && exit 22",
-            "  printf '%s\\n' \"$environment\" | grep -Fqx 'PLOINKY_PROBE_TOKEN=native-client-kill:' && exit 23",
-            'done',
-            "zombies=''",
-            "for p in /proc/[0-9]*/stat; do",
-            "  test -r \"$p\" || continue",
-            "  IFS= read -r stat < \"$p\" || continue",
-            "  fields=\"${stat##*) }\"",
-            '  set -- $fields',
-            '  state="$1"',
-            "  test \"$state\" = Z && zombies=\"$zombies ${p%/stat}\"",
-            'done',
-            'test -z "$zombies" || { echo "$zombies"; exit 21; }',
-            "printf '%s' clean",
-        ].join('\n'),
+    startTarget();
+    assertNoTargetExecSessions('after startup');
+    const decoyPid = execInBox(harness.runner, prepared.containerId, [
+        'cat', '/workspace/health-probe-native/control/decoy.pid',
     ]);
-    assert.equal(processAudit, 'clean');
+    assert.match(decoyPid, /^\d+$/, 'the unrelated same-named process must have started');
 
-    const decoySurvival = execInBox(harness.runner, prepared.containerId, [
-        'podman', 'exec', containerName, 'sh', '-c',
-        `kill -0 "${decoyPid}" 2>/dev/null && printf '%s' alive`,
-    ]);
-    assert.equal(decoySurvival, 'alive', 'probe cleanup must not kill the unrelated same-named process');
+    const timedOut = submitRequest({
+        token: 'native-timeout', script: 'hang.sh', timeout: 0.2, killAfter: 0.2,
+    });
+    assert.equal(timedOut.claimed, true, JSON.stringify(timedOut));
+    assert.equal(timedOut.status, 124, JSON.stringify(timedOut));
+    assert.equal(timedOut.sessionExists, false, JSON.stringify(timedOut));
+    assertNoTargetExecSessions('after timeout');
 
-    // A subsequent probe on the same container must run normally end to end.
-    const recovery = JSON.parse(execInBox(harness.runner, prepared.containerId, [
-        '/usr/local/bin/node', '-e', [
-            "const c=require('node:child_process');",
-            "const r=c.spawnSync('podman',['exec',process.argv[1],'sh','/Agent/server/HealthProbeRunner.sh','run','/tmp/.ploinky-health-probe-native-recovery','native-recovery','ok.sh','5','1'],{encoding:'utf8',timeout:30000});",
-            "process.stdout.write(JSON.stringify({status:r.status,error:r.error?.code||null,stdout:r.stdout,stderr:r.stderr}));",
-        ].join(''),
-        containerName,
-    ]));
-    assert.equal(recovery.error, null, recovery.stderr);
+    const preCancelled = submitRequest({
+        token: 'native-pre-cancel', script: 'ok.sh', timeout: 5, killAfter: 1,
+        cancelMode: 'pre',
+    });
+    assert.equal(preCancelled.claimed, true, JSON.stringify(preCancelled));
+    assert.equal(preCancelled.status, 125, JSON.stringify(preCancelled));
+    assert.equal(preCancelled.sessionExists, false, JSON.stringify(preCancelled));
+    assertNoTargetExecSessions('after pre-cancellation');
+
+    const slowTokenScanMarker = path.join(probeRoot, 'control', '.slow-token-scan');
+    fs.writeFileSync(slowTokenScanMarker, 'enabled\n');
+    const cancellationStartedAt = Date.now();
+    let mountedCancellation;
+    try {
+        mountedCancellation = submitRequest({
+            token: 'native-mounted-cancel', script: 'hang.sh', timeout: 30, killAfter: 0.2,
+            cancelMode: 'active',
+        });
+    } finally {
+        fs.rmSync(slowTokenScanMarker, { force: true });
+    }
+    const cancellationElapsedMs = Date.now() - cancellationStartedAt;
+    assert.equal(mountedCancellation.active, true, JSON.stringify(mountedCancellation));
+    assert.equal(mountedCancellation.claimed, true, JSON.stringify(mountedCancellation));
+    assert.equal(mountedCancellation.status, 125, JSON.stringify(mountedCancellation));
+    assert.equal(mountedCancellation.sessionExists, false, JSON.stringify(mountedCancellation));
+    assert.ok(
+        cancellationElapsedMs < 5_000,
+        `exact cancellation waited ${cancellationElapsedMs}ms on a whole-container token scan`,
+    );
+    assertNoTargetExecSessions('after mounted cancellation');
+
+    const audit = submitRequest({
+        token: 'native-audit', script: 'audit.sh', timeout: 5, killAfter: 1,
+    });
+    assert.equal(audit.status, 0, audit.stderr);
+    assert.equal(audit.stdout.trim(), 'clean');
+    assertNoTargetExecSessions('after process audit');
+
+    const recovery = submitRequest({
+        token: 'native-recovery', script: 'ok.sh', timeout: 5, killAfter: 1,
+    });
     assert.equal(recovery.status, 0, recovery.stderr);
     assert.equal(recovery.stdout.trim(), 'healthy');
-    const recoveryAudit = execInBox(harness.runner, prepared.containerId, [
-        'podman', 'exec', containerName, 'sh', '-c',
-        'test ! -e /tmp/.ploinky-health-probe-native-recovery && printf \'%s\' clean',
+    assert.equal(recovery.sessionExists, false, JSON.stringify(recovery));
+    assertNoTargetExecSessions('after recovery');
+
+    await stopTargetAndAssertExit(0);
+    execInBox(harness.runner, prepared.containerId, [
+        'podman', 'container', 'rm', containerName,
     ]);
-    assert.equal(recoveryAudit, 'clean', 'a successful probe must remove its own marker');
+    targetExists = false;
+
+    // Reuse the same name and persistent control bind to prove a managed
+    // replacement can start after the predecessor without stale exec state.
+    startTarget();
+    assertNoTargetExecSessions('after replacement');
+    removeTarget();
+
+    // A main process without a graceful drain handler must retain its
+    // signal-style failure; the wrapper may not manufacture exit zero.
+    startTarget('unacknowledged.sh');
+    await stopTargetAndAssertExit(143);
+    execInBox(harness.runner, prepared.containerId, [
+        'podman', 'container', 'rm', containerName,
+    ]);
+    targetExists = false;
 });

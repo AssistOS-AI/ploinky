@@ -75,6 +75,9 @@ import {
 } from '../bwrap/bwrapFleet.js';
 // Reuse env map builder from bwrap (with runtimeName param)
 import { buildFullEnvMap } from '../bwrap/bwrapServiceManager.js';
+import { agentLibGrant, agentLibReuseProblem, agentLibRuntimeRecord } from '../agentLibGrant.js';
+import { attestSeatbeltAgentLib } from '../agentLibAttestation.js';
+import { detectHostRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 // Seatbelt profile generator
 import { buildSeatbeltProfile, writeSeatbeltProfile } from './seatbeltProfile.js';
 import { assertRouterEndpoint } from '../routerPort.js';
@@ -473,6 +476,9 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     });
     ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir);
     const seatbeltAgentLibPath = ensureSeatbeltAgentLibDir(agentName, nodeModulesDir);
+    // Seatbelt has no mount namespace, so the grant names the canonical host
+    // source directly and the cache symlink targets that same path.
+    const grant = agentLibGrant(detectHostRuntimeKey('seatbelt'));
 
     // Port resolution — with shared host network, hostPort === containerPort
     const { portMappings } = parseManifestPorts(manifest, profileConfig);
@@ -489,7 +495,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     ensurePersistentStorageHostDir(runtimeResourcePlan);
 
     // Build environment map (reuse bwrap's builder with 'seatbelt' runtimeName)
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
     assertSeatbeltGeneratedLocalDisabled(envMap);
 
     // Set PORT env var
@@ -516,6 +522,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     // Generate seatbelt profile
     const profileContent = buildSeatbeltProfile({
         agentCodePath,
+        agentLibGrant: grant,
         agentLibPath: seatbeltAgentLibPath,
         nodeModulesDir,
         agentWorkDir,
@@ -539,6 +546,15 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         ]
     });
     const profilePath = writeSeatbeltProfile(agentName, profileContent);
+
+    const agentLibAttestation = attestSeatbeltAgentLib({
+        profilePath,
+        agentRuntimePath: seatbeltAgentLibPath,
+        cwd: agentCodePath,
+        env: envMap,
+        grant,
+        spawn: spawnSync,
+    });
 
     // Build entry command with real paths
     const entryCmd = buildSeatbeltEntryCommand(agentName, manifest, profileConfig, {
@@ -641,6 +657,8 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         runtimeStaging: {
             agentLibPath: seatbeltAgentLibPath
         },
+        agentLib: agentLibRuntimeRecord(grant),
+        agentLibAttestation,
         runMode: existingRecord.runMode,
         develRepo: existingRecord.develRepo,
         profile: activeProfile,
@@ -650,6 +668,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         config: {
             binds: [
                 { source: AGENT_LIB_PATH, target: AGENT_LIB_PATH, ro: true },
+                { source: grant.sourceDir, target: grant.runtimePath, ro: true },
                 { source: agentCodePath, target: agentCodePath, ro: codeReadOnly },
                 { source: sharedDir, target: sharedDir },
                 ...(fs.existsSync(agentSkillsPath) ? [{ source: agentSkillsPath, target: agentSkillsPath, ro: skillsReadOnly }] : []),
@@ -784,8 +803,18 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
     if (exactRuntimeRunning) {
         const desired = computeEnvHash(manifest, profileConfig, routerEndpoint.env, { agentName, repoName });
         const current = existingRecord.envHash || '';
+        // Seatbelt regenerates its profile from the source path, which does not
+        // change when the same directory's content does, so the selection is
+        // compared explicitly.
+        const agentLibProblem = agentLibReuseProblem(
+            existingRecord,
+            agentLibGrant(detectHostRuntimeKey('seatbelt')),
+        );
         if (desired && desired !== current) {
             console.log(`[seatbelt] ${agentName}: env hash changed, restarting...`);
+            stopBwrapProcess(containerName);
+        } else if (agentLibProblem) {
+            console.log(`[seatbelt] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
             stopBwrapProcess(containerName);
         } else {
             debugLog(`[seatbelt] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
@@ -869,6 +898,9 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         needsCoreDeps,
     });
     ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir);
+    // An interactive attach receives exactly the same AgentLib grant as the
+    // detached service, so a shell cannot reach a different source.
+    const grant = agentLibGrant(detectHostRuntimeKey('seatbelt'));
     // Sweep stale interactive sessions whose owning processes have exited
     // before staging a new Agent dir for this attach. Keep the live service's
     // staged Agent dir: it was created by the launcher process, not by the
@@ -889,7 +921,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
 
     // Build environment (same as running agent)
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
     assertSeatbeltGeneratedLocalDisabled(envMap);
     const hostPort = record.config?.ports?.[0]?.hostPort;
     if (hostPort) envMap.PORT = String(hostPort);
@@ -909,6 +941,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     // Generate seatbelt profile
     const profileContent = buildSeatbeltProfile({
         agentCodePath,
+        agentLibGrant: grant,
         agentLibPath: seatbeltAgentLibPath,
         nodeModulesDir,
         agentWorkDir,

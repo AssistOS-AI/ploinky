@@ -22,7 +22,16 @@ const {
     clearTestLogs,
     getRouterNodeExecutable,
     performHealthCheck,
+    runHealthCheckTick,
+    resolveContainerSnapshotIntervalMs,
 } = await import('../../cli/server/Watchdog.js');
+
+test('Box container inventory uses a control-plane-safe snapshot cadence', () => {
+    assert.equal(resolveContainerSnapshotIntervalMs({ insideBox: false, configured: undefined }), 0);
+    assert.equal(resolveContainerSnapshotIntervalMs({ insideBox: true, configured: undefined }), 5 * 60 * 1000);
+    assert.equal(resolveContainerSnapshotIntervalMs({ insideBox: true, configured: '45000' }), 45_000);
+    assert.equal(resolveContainerSnapshotIntervalMs({ insideBox: true, configured: 'invalid' }), 5 * 60 * 1000);
+});
 
 const extractEvents = () => getTestLogs().map(entry => entry.event);
 
@@ -143,6 +152,98 @@ test('pendingHealthCheckRestart flag is cleared after restart decision', () => {
     const shouldRestart = determineShouldRestart(0, null);
     assert.equal(shouldRestart, false);
     assert.ok(extractEvents().includes('clean_exit'));
+});
+
+test('health monitoring sends only one termination signal while restart is pending', async () => {
+    resetManagerState();
+    clearTestLogs();
+    let kills = 0;
+    state.childProcess = {
+        pid: 4242,
+        kill(signal) {
+            assert.equal(signal, 'SIGTERM');
+            kills += 1;
+            return true;
+        },
+    };
+    state.healthCheckFailures = CONFIG.HEALTH_CHECK_FAILURES_THRESHOLD - 1;
+
+    const options = {
+        performHealthCheckImpl: async () => false,
+        inspectWorkspaceStartLockImpl: () => ({ active: false, stale: false, lock: null }),
+        appendLogImpl() {},
+    };
+    await runHealthCheckTick(options);
+    await runHealthCheckTick(options);
+
+    assert.equal(kills, 1);
+    assert.equal(state.pendingHealthCheckRestart, true);
+    assert.equal(state.healthCheckFailures, CONFIG.HEALTH_CHECK_FAILURES_THRESHOLD);
+    assert.equal(extractEvents().filter(event => event === 'health_check_threshold_exceeded').length, 1);
+});
+
+test('health monitoring defers failures for the exact active workspace-start lease', async () => {
+    resetManagerState();
+    clearTestLogs();
+    let healthChecks = 0;
+    state.childProcess = { pid: 4343, kill: () => assert.fail('deferred health must not kill Router') };
+    state.healthCheckFailures = CONFIG.HEALTH_CHECK_FAILURES_THRESHOLD - 1;
+    const activeWorkspaceStart = {
+        active: true,
+        stale: false,
+        lock: { ownerPid: 99, expiresAt: '2026-08-26T00:00:00.000Z' },
+    };
+
+    await runHealthCheckTick({
+        performHealthCheckImpl: async () => {
+            healthChecks += 1;
+            return false;
+        },
+        inspectWorkspaceStartLockImpl: () => activeWorkspaceStart,
+    });
+
+    assert.equal(healthChecks, 0);
+    assert.equal(state.healthCheckFailures, 0);
+    assert.equal(state.pendingHealthCheckRestart, false);
+    assert.equal(state.healthCheckWorkspaceStartDeferred, true);
+    assert.ok(extractEvents().includes('health_check_deferred_workspace_start'));
+
+    await runHealthCheckTick({
+        performHealthCheckImpl: async () => {
+            healthChecks += 1;
+            return true;
+        },
+        inspectWorkspaceStartLockImpl: () => ({ active: false, stale: false, lock: null }),
+    });
+
+    assert.equal(healthChecks, 1);
+    assert.equal(state.healthCheckWorkspaceStartDeferred, false);
+    assert.ok(extractEvents().includes('health_check_resumed_workspace_start'));
+});
+
+test('health monitoring rechecks a workspace-start lease acquired during the request', async () => {
+    resetManagerState();
+    clearTestLogs();
+    let inspections = 0;
+    let kills = 0;
+    state.childProcess = { pid: 4444, kill: () => { kills += 1; } };
+    state.healthCheckFailures = CONFIG.HEALTH_CHECK_FAILURES_THRESHOLD - 1;
+
+    await runHealthCheckTick({
+        performHealthCheckImpl: async () => false,
+        inspectWorkspaceStartLockImpl: () => {
+            inspections += 1;
+            return inspections === 1
+                ? { active: false, stale: false, lock: null }
+                : { active: true, stale: false, lock: { ownerPid: 100 } };
+        },
+    });
+
+    assert.equal(inspections, 2);
+    assert.equal(kills, 0);
+    assert.equal(state.healthCheckFailures, 0);
+    assert.equal(state.pendingHealthCheckRestart, false);
+    assert.equal(state.healthCheckWorkspaceStartDeferred, true);
 });
 
 test('watchdog reuses the current node executable for router launches', () => {

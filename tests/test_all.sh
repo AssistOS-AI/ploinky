@@ -73,6 +73,46 @@ if [[ -n "${PLOINKY_BRANCH:-}" ]]; then
 fi
 export PLOINKY_BRANCH="${PLOINKY_BRANCH:-}"
 
+# Establish the same explicit AgentLib contract for every suite stage. A Node
+# preload can modify only its own process environment; exporting here ensures
+# that action scripts, raw `node -e` probes, and processes spawned by the CLI
+# all inherit the one test-selected source.
+agentlib_contract_lines=$(node \
+  --import "$TESTS_DIR/helpers/agentlibTestContract.mjs" \
+  --input-type=module \
+  -e '
+    const names = [
+      "PLOINKY_AGENTLIB_DIR",
+      "PLOINKY_AGENTLIB_MODE",
+      "PLOINKY_AGENTLIB_FINGERPRINT",
+      "PLOINKY_AGENTLIB_COMMIT",
+      "PLOINKY_AGENTLIB_SOURCE_ID",
+    ];
+    for (const name of names) {
+      const value = String(process.env[name] ?? "");
+      if (/[\r\n]/.test(value)) throw new Error(`${name} contains a newline`);
+      process.stdout.write(`${name}=${value}\n`);
+    }
+  ')
+agentlib_contract_count=0
+while IFS='=' read -r contract_name contract_value; do
+  case "$contract_name" in
+    PLOINKY_AGENTLIB_DIR|PLOINKY_AGENTLIB_MODE|PLOINKY_AGENTLIB_FINGERPRINT|PLOINKY_AGENTLIB_COMMIT|PLOINKY_AGENTLIB_SOURCE_ID)
+      export "$contract_name=$contract_value"
+      agentlib_contract_count=$((agentlib_contract_count + 1))
+      ;;
+    *)
+      echo "[test] Invalid AgentLib contract field '${contract_name}'." >&2
+      exit 1
+      ;;
+  esac
+done <<< "$agentlib_contract_lines"
+if [[ "$agentlib_contract_count" -ne 5 ]]; then
+  echo "[test] Incomplete AgentLib test contract (${agentlib_contract_count}/5 fields)." >&2
+  exit 1
+fi
+unset agentlib_contract_count agentlib_contract_lines contract_name contract_value
+
 # State file for sharing variables between scripts
 # BSD mktemp (macOS) keeps the trailing literal `.env` and never substitutes
 # the X-template, leaving stale state files in TMPDIR after every run.
@@ -206,7 +246,11 @@ run_node_unit_tests() {
       return 1
     fi
 
-    node --test "${test_files[@]}"
+    # The direct-mount design gives achillesAgentLib no install-tree fallback, so
+    # the runner names one source explicitly (see the helper for how it is
+    # chosen). The helper exports the reserved environment, which test-spawned
+    # subprocesses inherit too.
+    node --test --import "$TESTS_DIR/helpers/agentlibTestContract.mjs" "${test_files[@]}"
 }
 
 # --- Main Test Execution Flow ---

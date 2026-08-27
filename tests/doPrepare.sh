@@ -42,16 +42,6 @@ test_info "Workspace root: $TEST_RUN_DIR"
 
 cd "$TEST_RUN_DIR"
 
-if command -v bwrap >/dev/null 2>&1; then
-  FAST_AGENT_RUNTIME="bwrap"
-elif [[ "$(uname -s)" == "Darwin" ]] && command -v sandbox-exec >/dev/null 2>&1; then
-  FAST_AGENT_RUNTIME="seatbelt"
-else
-  FAST_AGENT_RUNTIME="container"
-fi
-write_state_var "FAST_AGENT_RUNTIME" "$FAST_AGENT_RUNTIME"
-test_info "Agent runtime: $FAST_AGENT_RUNTIME"
-
 if [[ -z "${FAST_CONTAINER_RUNTIME:-}" ]]; then
   runtime=$(detect_container_runtime)
   write_state_var "FAST_CONTAINER_RUNTIME" "$runtime"
@@ -62,7 +52,7 @@ fi
 # customizes routing. A partial source set is intentionally rejected. Import
 # the initializer directly so fixture setup does not clone default boot repos.
 edge_generation_module="$TESTS_DIR/../cli/sandbox/edgeGeneration.js"
-node --input-type=module -e '
+node --import "$TESTS_DIR/helpers/agentlibTestContract.mjs" --input-type=module -e '
   import { pathToFileURL } from "node:url";
   const edge = await import(pathToFileURL(process.argv[1]).href);
   edge.initializeFreshEdgeRoutingSources({ workspaceRoot: process.cwd() });
@@ -79,6 +69,15 @@ cat >"$TEST_RUN_DIR/.ploinky/routing.json" <<EOF
   "port": ${router_port}
 }
 EOF
+
+# The graph exercises isolated managed networking and published loopback ports,
+# capabilities that host bwrap/Seatbelt cannot provide. Persist the container
+# policy explicitly so the fixture expectation matches product admission even
+# on hosts where a sandbox executable happens to be installed.
+ploinky disable sandbox
+FAST_AGENT_RUNTIME="container"
+write_state_var "FAST_AGENT_RUNTIME" "$FAST_AGENT_RUNTIME"
+test_info "Agent runtime: $FAST_AGENT_RUNTIME"
 
 repo_root=".ploinky/repos/${TEST_REPO_NAME}"
 agent_root="${repo_root}/${TEST_AGENT_NAME}"
@@ -398,13 +397,19 @@ health_agent_container_name=$(compute_container_name "$HEALTH_AGENT_NAME" "$TEST
 write_state_var "TEST_HEALTH_AGENT_CONT_NAME" "$health_agent_container_name"
 test_info "Health probe container will be named: $health_agent_container_name"
 
-workspace_project="$TEST_RUN_DIR/.data/$TEST_AGENT_NAME"
+isolated_agent_home="$TEST_RUN_DIR/.data/$TEST_AGENT_NAME"
+write_state_var "TEST_AGENT_DATA_DIR" "$isolated_agent_home"
+
+# The static agent owns the workspace-facing process contract. Its isolated
+# registry record is retained, but start transitions projectPath to the whole
+# workspace before the immutable generation is prepared.
+workspace_project="$TEST_RUN_DIR"
 write_state_var "TEST_AGENT_WORKSPACE" "$workspace_project"
 write_state_var "TEST_PERSIST_FILE" "$workspace_project/data/fast-persist.txt"
 write_state_var "TEST_AGENT_LOG" "$workspace_project/fast-start.log"
 write_state_var "TEST_PERSIST_MARKER" "$workspace_project/data/manual-marker.txt"
 write_state_var "TEST_AGENT_CONTAINER_PORT" "7000"
 
-mkdir -p "$workspace_project/data"
+mkdir -p "$isolated_agent_home" "$workspace_project/data"
 
 test_info "Preparation step complete."

@@ -37,6 +37,18 @@ test('resolveAgentExecutionMode detects explicit agent commands as MCP by defaul
     assert.equal(resolveAgentReadinessProtocol({ agent: 'node /code/server.mjs' }), 'mcp');
 });
 
+test('a declared readiness script overrides agent-command MCP inference', () => {
+    const manifest = {
+        agent: 'bash /code/startup.sh',
+        health: {
+            readiness: { script: 'healthcheck.sh' }
+        }
+    };
+
+    assert.equal(resolveAgentExecutionMode(manifest).type, 'agent_only');
+    assert.equal(resolveAgentReadinessProtocol(manifest), 'script');
+});
+
 test('resolveAgentExecutionMode falls back to implicit AgentServer when no explicit entrypoint exists', () => {
     const executionMode = resolveAgentExecutionMode({
         container: 'node:20-alpine'
@@ -51,6 +63,12 @@ test('resolveAgentReadinessProtocol honors explicit manifest overrides', () => {
     assert.equal(resolveAgentReadinessProtocol({
         agent: 'node /code/http-server.mjs',
         readiness: { protocol: 'tcp' }
+    }), 'tcp');
+
+    assert.equal(resolveAgentReadinessProtocol({
+        agent: 'node /code/http-server.mjs',
+        readiness: { protocol: 'tcp' },
+        health: { readiness: { script: 'healthcheck.sh' } }
     }), 'tcp');
 
     assert.equal(resolveAgentReadinessProtocol({

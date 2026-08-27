@@ -4,7 +4,7 @@ const CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
 const RUNTIMES = new Set(['podman', 'docker']);
 
 export function normalizeRelayDescriptor(input = {}) {
-    const kind = String(input.kind || 'container-exec-stdio');
+    const kind = String(input.kind || 'container-control-socket');
     const runtime = String(input.runtime || '');
     const containerId = String(input.containerId || '').trim().toLowerCase();
     const containerName = String(input.containerName || '').trim();
@@ -12,10 +12,11 @@ export function normalizeRelayDescriptor(input = {}) {
     const effectiveInstanceId = String(input.effectiveInstanceId || '').trim();
     const enableGeneration = String(input.enableGeneration || '').trim();
     const networkMode = String(input.networkMode || '').trim().toLowerCase();
-    if (kind !== 'container-exec-stdio') throw new Error('relayConfinement: unsupported relay kind');
+    if (kind !== 'container-control-socket') throw new Error('relayConfinement: unsupported relay kind');
     if (!RUNTIMES.has(runtime)) throw new Error('relayConfinement: docker or podman runtime required');
     if (!CONTAINER_ID_PATTERN.test(containerId)) throw new Error('relayConfinement: immutable full container id required');
-    if (!containerName || !targetAgentId || !effectiveInstanceId || !enableGeneration) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(containerName)
+        || !targetAgentId || !effectiveInstanceId || !enableGeneration) {
         throw new Error('relayConfinement: complete owner identity required');
     }
     return Object.freeze({

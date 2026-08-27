@@ -27,6 +27,12 @@ const REQUIRED_GATE_OPTIONS = Object.freeze([
     'boxDigest',
 ]);
 
+const RELEASE_REPOSITORY_PATH_ENV = Object.freeze({
+    achillesAgentLib: 'PLOINKY_RELEASE_AGENTLIB_DIR',
+    achillesCLI: 'PLOINKY_RELEASE_ACHILLESCLI_DIR',
+    explorer: 'PLOINKY_RELEASE_EXPLORER_DIR',
+});
+
 const repositoryRoot = path.resolve(import.meta.dirname, '../..');
 
 function bundleError(message, cause) {
@@ -191,19 +197,15 @@ function parseExactGitCommitSpec(value, label = 'dependency spec') {
     });
 }
 
-function parseUnpinnedGitDependencySpec(value, label = 'dependency spec') {
-    if (typeof value !== 'string' || value !== value.trim()) {
-        throw bundleError(`${label} must be an unpinned git+https dependency spec`);
-    }
-    const match = /^git\+(https:\/\/[^#\s]+)$/.exec(value);
-    if (!match) {
-        throw bundleError(`${label} must be an unpinned git+https dependency spec without a branch or commit fragment`);
-    }
-    return Object.freeze({
-        repositoryUrl: canonicalGitUrl(match[1], label),
-    });
-}
 
+/**
+ * achillesAgentLib delivery policy for a release bundle.
+ *
+ * The Box dependency lock is now the one canonical source policy: the library is
+ * direct-mounted from the selected workspace source, so `globalDeps` must NOT
+ * declare it as an npm dependency any more. A bundle that still does would ship
+ * a second, independently installed copy.
+ */
 function validateAgentlibDeliveryMetadata({
     globalPackage,
     dependencyLock,
@@ -212,10 +214,12 @@ function validateAgentlibDeliveryMetadata({
     assertExactSha(expectedCommit, 'expected AgentLib commit');
     assertPlainObject(globalPackage, 'globalDeps package');
     assertPlainObject(globalPackage.dependencies, 'globalDeps dependencies');
-    const configured = parseUnpinnedGitDependencySpec(
-        globalPackage.dependencies.achillesAgentLib,
-        'globalDeps achillesAgentLib dependency',
-    );
+    if (Object.hasOwn(globalPackage.dependencies, 'achillesAgentLib')) {
+        throw bundleError(
+            'globalDeps must not declare achillesAgentLib: it is direct-mounted from the '
+            + 'selected workspace source, not installed by npm',
+        );
+    }
 
     assertPlainObject(dependencyLock, 'Box dependency lock');
     assertPlainObject(dependencyLock.repositories, 'Box dependency lock repositories');
@@ -232,9 +236,6 @@ function validateAgentlibDeliveryMetadata({
 
     if (lockedCommit !== expectedCommit) {
         throw bundleError('manifest and Box lock must name the same AgentLib commit');
-    }
-    if (configured.repositoryUrl !== lockedUrl) {
-        throw bundleError('globalDeps source and Box lock must name the same AgentLib repository');
     }
     return Object.freeze({ commit: expectedCommit, repositoryUrl: lockedUrl });
 }
@@ -322,12 +323,39 @@ function verifyRepositoryState({ name, expectedCommit, repositoryPath, state }) 
     return Object.freeze({ name, repositoryPath, commit: actualCommit });
 }
 
-function defaultPaths(root = repositoryRoot) {
+function configuredRepositoryPath(env, name, fallback) {
+    const envName = RELEASE_REPOSITORY_PATH_ENV[name];
+    const rawValue = env?.[envName];
+    if (rawValue === undefined || rawValue === '') return fallback;
+    if (typeof rawValue !== 'string' || rawValue !== rawValue.trim()) {
+        throw bundleError(`${envName} must be one exact absolute repository path`);
+    }
+    if (!path.isAbsolute(rawValue)) {
+        throw bundleError(`${envName} must be an absolute repository path`);
+    }
+    return path.normalize(rawValue);
+}
+
+function defaultPaths(root = repositoryRoot, { env = process.env } = {}) {
     return Object.freeze({
         ploinky: root,
-        achillesAgentLib: path.join(root, 'node_modules', 'achillesAgentLib'),
-        achillesCLI: path.resolve(root, '..', 'AchillesCLI'),
-        explorer: path.resolve(root, '..', 'AssistOSExplorer'),
+        // Release gates can verify the exact deployed workspace checkouts without
+        // placing a second AgentLib tree inside the clean Ploinky candidate.
+        achillesAgentLib: configuredRepositoryPath(
+            env,
+            'achillesAgentLib',
+            path.join(root, 'achillesAgentLib'),
+        ),
+        achillesCLI: configuredRepositoryPath(
+            env,
+            'achillesCLI',
+            path.resolve(root, '..', 'AchillesCLI'),
+        ),
+        explorer: configuredRepositoryPath(
+            env,
+            'explorer',
+            path.resolve(root, '..', 'AssistOSExplorer'),
+        ),
         rootPackage: path.join(root, 'package.json'),
         globalPackage: path.join(root, 'globalDeps', 'package.json'),
         dependencyLock: path.join(root, 'ploinky-box', 'dependencies.lock.json'),

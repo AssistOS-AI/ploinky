@@ -185,7 +185,7 @@ test('waitForAgentReady probes a confined relay without requiring a published ho
     const progress = [];
     const ready = await waitForAgentReady({
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
             runtime: 'podman',
             containerId: 'b'.repeat(64),
             containerName: 'nested-api',
@@ -248,7 +248,7 @@ test('blocking startup readiness accepts a confined relay target without a host 
     const route = {
         container: 'api-container',
         relay: {
-            kind: 'container-exec-stdio',
+            kind: 'container-control-socket',
         },
         primaryService: { port: 7000 },
     };

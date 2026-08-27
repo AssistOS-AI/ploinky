@@ -1,13 +1,187 @@
 import { EventEmitter } from 'node:events';
 import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 
 import { normalizeCanonicalPortSet } from '../../../Agent/lib/requestHash.mjs';
+import { PLOINKY_DIR } from '../../utils/config.js';
 import { RelayFrameDecoder, encodeRelayFrame } from './protocol.js';
 import { normalizeRelayDescriptor, verifyInspectedContainer } from './confinement.js';
 
 const DEFAULT_CHANNEL_IDLE_TIMEOUT_MS = 30_000;
 const MAX_RELAY_STDERR_BYTES = 4096;
+export const RUNTIME_RELAY_CONTROL_DESTINATION = '/run/ploinky-health-probes';
+export const RUNTIME_RELAY_SOCKET_NAME = 'runtime-relay.sock';
+export const RUNTIME_RELAY_CONTROL_HOST_ROOT = path.join(PLOINKY_DIR, 'run', 'health-probes');
+
+function isPrivateRelaySocketMode(mode) {
+    const permissions = mode & 0o777;
+    return permissions === 0o600 || permissions === 0o755;
+}
+
+export function resolveRuntimeRelaySocket(relay, inspection, options = {}) {
+    const record = Array.isArray(inspection) ? inspection[0] : inspection;
+    const mounts = (record?.Mounts || []).filter(mount => (
+        String(mount?.Destination || '') === RUNTIME_RELAY_CONTROL_DESTINATION
+    ));
+    if (mounts.length !== 1 || mounts[0]?.RW !== true || mounts[0]?.Type !== 'bind') {
+        throw new Error('runtimeRelay: exact writable control bind is unavailable');
+    }
+    const source = String(mounts[0]?.Source || '');
+    const containerName = String(relay?.containerName || '');
+    const controlRoot = path.resolve(options.controlRoot || RUNTIME_RELAY_CONTROL_HOST_ROOT);
+    const expectedSource = path.join(controlRoot, containerName);
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(containerName)
+        || !path.isAbsolute(source)
+        || path.resolve(source) !== expectedSource) {
+        throw new Error('runtimeRelay: control bind source identity is invalid');
+    }
+    const directory = fs.lstatSync(source);
+    if (!directory.isDirectory() || directory.isSymbolicLink()
+        || (directory.mode & 0o777) !== 0o700
+        || directory.uid !== process.geteuid()) {
+        throw new Error('runtimeRelay: control bind ownership is invalid');
+    }
+    const socketPath = path.join(source, RUNTIME_RELAY_SOCKET_NAME);
+    const socket = fs.lstatSync(socketPath);
+    if (!socket.isSocket() || socket.isSymbolicLink()
+        || !isPrivateRelaySocketMode(socket.mode)
+        || socket.uid !== directory.uid) {
+        throw new Error('runtimeRelay: control socket identity is invalid');
+    }
+    return Object.freeze({
+        path: socketPath,
+        directoryPath: source,
+        socketName: RUNTIME_RELAY_SOCKET_NAME,
+        dev: socket.dev,
+        ino: socket.ino,
+        uid: socket.uid,
+        mode: socket.mode & 0o777,
+    });
+}
+
+class RuntimeRelaySocketTransport extends EventEmitter {
+    constructor(socket) {
+        super();
+        this.socket = socket;
+        this.stdin = socket;
+        this.stdout = socket;
+        this.stderr = null;
+        socket.on('error', error => this.emit('error', error));
+        socket.once('close', () => this.emit('exit', null, 'SOCKET_CLOSED'));
+    }
+
+    kill() {
+        this.socket.destroy();
+    }
+}
+
+export function openRuntimeRelaySocketTransport({ endpoint, timeoutMs }) {
+    return new Promise((resolve, reject) => {
+        // The mounted source can exceed Linux's AF_UNIX pathname budget even
+        // though the broker bound the same inode through its short in-container
+        // path. Resolve it through a private, process-owned directory alias so
+        // direct ploinky-local workspaces and long generated container names do
+        // not make the transport depend on host path length.
+        let aliasRoot = '';
+        let aliasDirectory = '';
+        let settled = false;
+        const cleanupAlias = () => {
+            if (aliasDirectory) {
+                try { fs.unlinkSync(aliasDirectory); } catch (_) {}
+            }
+            if (aliasRoot) {
+                try { fs.rmdirSync(aliasRoot); } catch (_) {}
+            }
+        };
+        let socket;
+        try {
+            aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-relay-'));
+            fs.chmodSync(aliasRoot, 0o700);
+            aliasDirectory = path.join(aliasRoot, 'control');
+            fs.symlinkSync(endpoint.directoryPath, aliasDirectory, 'dir');
+            socket = net.createConnection({
+                path: path.join(aliasDirectory, endpoint.socketName),
+            });
+        } catch (error) {
+            cleanupAlias();
+            reject(error);
+            return;
+        }
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            cleanupAlias();
+            reject(new Error('runtimeRelay: control socket connect timeout'));
+        }, Math.max(1, Number(timeoutMs) || 1));
+        timer.unref?.();
+        const onError = error => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            socket.off('connect', onConnect);
+            cleanupAlias();
+            reject(error);
+        };
+        const onConnect = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            socket.off('error', onError);
+            try {
+                const current = fs.lstatSync(endpoint.path);
+                if (!current.isSocket() || current.isSymbolicLink()
+                    || current.dev !== endpoint.dev
+                    || current.ino !== endpoint.ino
+                    || current.uid !== endpoint.uid
+                    || (current.mode & 0o777) !== endpoint.mode
+                    || !isPrivateRelaySocketMode(current.mode)) {
+                    throw new Error('runtimeRelay: control socket changed during connection');
+                }
+                cleanupAlias();
+                resolve(new RuntimeRelaySocketTransport(socket));
+            } catch (error) {
+                socket.destroy();
+                cleanupAlias();
+                reject(error);
+            }
+        };
+        socket.once('error', onError);
+        socket.once('connect', onConnect);
+    });
+}
+
+export function openRuntimeRelayExecTransport({ relay, spawnProcess = spawn }) {
+    const runtime = String(relay?.runtime || '').trim();
+    const containerId = String(relay?.containerId || '').trim().toLowerCase();
+    if (!['docker', 'podman'].includes(runtime) || !/^[a-f0-9]{64}$/.test(containerId)) {
+        throw new Error('runtimeRelay: direct macOS transport identity is invalid');
+    }
+    return spawnProcess(runtime, [
+        'exec', '-i', containerId,
+        'node', '/Agent/server/RuntimeHttpRelay.mjs', 'stdio',
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+export function openRuntimeRelayTransport(options = {}) {
+    const platform = String(options.platform || process.platform);
+    if (platform === 'darwin') {
+        // Public Ploinky runs the Router inside the Linux Box, where the exact
+        // bind-mounted Unix socket is connectable and remains exec-free. The
+        // internal ploinky-local lifecycle tests run directly on macOS while
+        // their containers live in a Linux VM: the projected socket keeps its
+        // inode and mode but cannot cross that kernel boundary (ECONNREFUSED).
+        // Preserve direct local development by using the authenticated stdio
+        // helper against the already-inspected immutable container identity.
+        return openRuntimeRelayExecTransport(options);
+    }
+    const openSocketTransport = options.openSocketTransport || openRuntimeRelaySocketTransport;
+    return openSocketTransport(options);
+}
 
 function staleGenerationError() {
     const error = new Error('runtimeRelay: generation lease is stale');
@@ -270,14 +444,16 @@ export class RuntimeRelayManager {
     constructor({
         minter,
         inspectContainer = defaultInspect,
-        spawnProcess = spawn,
+        resolveSocket = resolveRuntimeRelaySocket,
+        openTransport = openRuntimeRelayTransport,
         limits,
         channelIdleTimeoutMs = DEFAULT_CHANNEL_IDLE_TIMEOUT_MS,
     } = {}) {
         if (!minter) throw new Error('runtimeRelay: request minter required');
         this.minter = minter;
         this.inspectContainer = inspectContainer;
-        this.spawnProcess = spawnProcess;
+        this.resolveSocket = resolveSocket;
+        this.openTransport = openTransport;
         this.perAgentLimit = limits?.concurrentStreamsPerAgent || 64;
         this.totalLimit = limits?.concurrentStreamsTotal || 256;
         this.channelIdleTimeoutMs = Math.max(1, Number(channelIdleTimeoutMs) || DEFAULT_CHANNEL_IDLE_TIMEOUT_MS);
@@ -323,13 +499,17 @@ export class RuntimeRelayManager {
     }
 
     async _createChannel({ plan, relay, key }) {
-        verifyInspectedContainer(relay, await this.inspectContainer(relay.runtime, relay.containerId));
-        const child = this.spawnProcess(relay.runtime, [
-            'exec', '-i', relay.containerId,
-            'node', '/Agent/server/RuntimeHttpRelay.mjs',
-        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const inspection = await this.inspectContainer(relay.runtime, relay.containerId);
+        verifyInspectedContainer(relay, inspection);
+        const endpoint = this.resolveSocket(relay, inspection);
+        let child = null;
         let signingSecret = null;
         try {
+            child = await this.openTransport({
+                endpoint,
+                timeoutMs: plan.limits.connectTimeoutMs,
+                relay,
+            });
             // The relay receives a fresh channel key only after the route lease
             // and exact managed-container identity have been verified. It does
             // not need the target agent's reusable request-signing secret in
@@ -412,7 +592,7 @@ export class RuntimeRelayManager {
             return channel;
         } catch (error) {
             signingSecret?.fill?.(0);
-            try { child.kill(); } catch (_) {}
+            try { child?.kill(); } catch (_) {}
             throw error;
         }
     }

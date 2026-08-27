@@ -8,6 +8,11 @@ import {
     BOX_IMAGE_REFERENCE,
     BOX_LABELS,
 } from '../constants.mjs';
+import {
+    agentLibContractFromContainer,
+    agentLibSelectionChanged,
+    normalizeBoxAgentLib,
+} from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import {
     inspectAndValidateExistingImage,
@@ -15,6 +20,7 @@ import {
 } from '../contract/image.mjs';
 import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { preflightPublications, resolveEffectiveHostPort } from '../ports.mjs';
 import {
     ensureWorkspaceDataPaths,
@@ -45,6 +51,9 @@ function transactionError(message, cause, rollbackFailures = []) {
 }
 
 function oldDesired(identity, ownership, repositoryRoot, engine) {
+    // The AgentLib contract is reconstructed from the observed mount plus the
+    // Box labels, never from the caller's new selection: an existing Box has to
+    // prove which source it actually has before it can be reused.
     const container = ownership.handles.container;
     const hostPort = Number(container.labels[BOX_LABELS.routerHostPort]);
     const mediaHostPort = Number(container.labels[BOX_LABELS.mediaHostPort]);
@@ -54,6 +63,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         key,
         String(container.labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
     ])));
+    const agentLib = agentLibContractFromContainer(container);
     const desired = {
         identity,
         hostPort,
@@ -63,6 +73,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         repositoryRoot,
         hostKind: engine.hostKind,
         dataFingerprints,
+        agentLib,
     };
     validateContainerConfiguration(container, desired);
     return Object.freeze(desired);
@@ -109,6 +120,7 @@ async function createAndStart({
     hostPort,
     mediaHostPort,
     repositoryRoot,
+    agentLib,
     runner,
     lock,
     discover,
@@ -128,6 +140,7 @@ async function createAndStart({
     runner.run(engine.name, containerCreateArgs({
         identity,
         dataFingerprints: dataState.fingerprints,
+        agentLib,
         imageId: image.immutableId,
         imageRef,
         hostPort,
@@ -163,6 +176,7 @@ async function createAndStart({
         repositoryRoot,
         hostKind: engine.hostKind,
         dataFingerprints: dataState.fingerprints,
+        agentLib,
     });
     if (handle.id !== containerId) {
         throw transactionError('Created Box immutable ID changed during final validation');
@@ -180,6 +194,13 @@ async function restoreOldContainer({
     stdout,
     stderr,
 }) {
+    const observedSource = fingerprintSource(old.agentLib.sourceDir, { fsApi: dependencies.fsApi });
+    if (observedSource.fingerprint !== old.agentLib.fingerprint
+        || sourceIdHash(observedSource.sourceId) !== old.agentLib.sourceIdHash) {
+        throw transactionError(
+            `Refusing to restore the old Box because its achillesAgentLib source at ${old.agentLib.sourceDir} changed`,
+        );
+    }
     return createAndStart({
         engine,
         identity,
@@ -188,6 +209,7 @@ async function restoreOldContainer({
         hostPort: old.hostPort,
         mediaHostPort: old.mediaHostPort,
         repositoryRoot: old.repositoryRoot,
+        agentLib: old.agentLib,
         runner,
         lock,
         discover: dependencies.discover,
@@ -208,6 +230,7 @@ export async function reconcileBoxContainer({
     runner,
     lock,
     repositoryRoot,
+    agentLib,
     explicitPort,
     explicitMediaPort,
     imageRef = BOX_IMAGE_REFERENCE,
@@ -237,6 +260,10 @@ export async function reconcileBoxContainer({
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
+    if (!agentLib) {
+        throw transactionError('Box reconciliation requires a selected achillesAgentLib source');
+    }
+    const desiredAgentLib = normalizeBoxAgentLib(agentLib);
     const portPlan = resolveEffectiveHostPort({ explicitPort, explicitMediaPort, ownership });
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
@@ -266,6 +293,9 @@ export async function reconcileBoxContainer({
         || old.mediaHostPort !== portPlan.mediaHostPort
         || old.imageRef !== imageRef
         || dataPathsChanged
+        // A changed source directory, mode, identity, or fingerprint must never
+        // leave the old inode mounted in a reused Box.
+        || agentLibSelectionChanged(old.agentLib, desiredAgentLib)
     );
     if (old && !requiresReplacement) {
         // Reuse is valid only while the host directories are the exact bind
@@ -291,6 +321,20 @@ export async function reconcileBoxContainer({
             ownership: finalOwnership,
             hostPort: old.hostPort,
             mediaHostPort: old.mediaHostPort,
+            previousAgentLib: old.agentLib,
+            finalize() {},
+            async rollback() {
+                // Reuse did not replace an outer resource. The supervisor owns
+                // stopping any partially restarted inner graph.
+                return Object.freeze({
+                    action: 'reused-preserved',
+                    ownership: finalOwnership,
+                    containerId: currentContainer.id,
+                    hostPort: old.hostPort,
+                    mediaHostPort: old.mediaHostPort,
+                    agentLib: old.agentLib,
+                });
+            },
         });
     }
 
@@ -326,6 +370,7 @@ export async function reconcileBoxContainer({
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
             repositoryRoot,
+            agentLib: desiredAgentLib,
             runner,
             lock,
             discover: dependencies.discover,
@@ -338,12 +383,65 @@ export async function reconcileBoxContainer({
             stderr,
         });
         candidateId = created.containerId;
+        let settled = false;
+        const finalize = () => { settled = true; };
+        const rollback = async () => {
+            lock.assertHeld(identity.instance);
+            if (settled) return Object.freeze({ action: 'already-settled' });
+            settled = true;
+            const failures = [];
+            const observed = dependencies.discover(identity, { runner });
+            const observedId = observed?.state === 'owned'
+                ? observed.handles?.container?.id
+                : null;
+            if (observedId && observedId !== candidateId) {
+                throw transactionError(
+                    `Box changed before candidate rollback (${observedId} != ${candidateId})`,
+                );
+            }
+            if (observedId === candidateId) {
+                try { dependencies.removeContainer(engine, candidateId, runner); } catch (error) {
+                    failures.push(`candidate removal: ${error.message}`);
+                }
+            }
+            let restored = null;
+            if (oldRemoved) {
+                try {
+                    restored = await restoreOldContainer({
+                        engine,
+                        identity,
+                        old,
+                        runner,
+                        lock,
+                        dependencies,
+                        stdout,
+                        stderr,
+                    });
+                } catch (error) {
+                    failures.push(`old Box restoration: ${error.message}`);
+                }
+            }
+            if (failures.length) {
+                throw transactionError('Box post-reconcile rollback failed', null, failures);
+            }
+            return Object.freeze(oldRemoved ? {
+                action: 'restored',
+                ownership: restored.ownership,
+                containerId: restored.containerId,
+                hostPort: old.hostPort,
+                mediaHostPort: old.mediaHostPort,
+                agentLib: old.agentLib,
+            } : { action: 'candidate-removed' });
+        };
         return Object.freeze({
             action: old ? 'replaced' : 'created',
             ownership: created.ownership,
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
             imageId: image.immutableId,
+            previousAgentLib: old?.agentLib || null,
+            finalize,
+            rollback,
         });
     } catch (error) {
         const rollbackFailures = [];

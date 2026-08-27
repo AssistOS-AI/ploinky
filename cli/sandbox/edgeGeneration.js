@@ -755,6 +755,9 @@ function validateRoutingShape(routing, manifests) {
         if (!routeKey || RESERVED_OBJECT_KEYS.has(routeKey)) throw edgeError(`routing route key '${routeKey}' is invalid`);
         assertObject(route, `routing route '${routeKey}'`);
         if (route.hostPort !== undefined) normalizeServicePort(route.hostPort, `routing.routes.${routeKey}.hostPort`);
+        if (route.draining !== undefined && typeof route.draining !== 'boolean') {
+            throw edgeError(`routing.routes.${routeKey}.draining must be a boolean`);
+        }
         const manifest = manifests[routeKey];
         if (manifest) {
             assertObject(manifest, `manifest(${routeKey})`);

@@ -7,11 +7,17 @@ import test from 'node:test';
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../../ploinky-box/constants.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
+    captureConfiguredCoreStartArgv,
     checkBoxHealth,
     createBoxSupervisor,
     formatBoxStatus,
     runBoundedCoreStart,
 } from '../../ploinky-box/supervisor.mjs';
+import {
+    agentLibFixture,
+    agentLibFixtureLabels,
+    agentLibFixtureMounts,
+} from '../helpers/agentlibFixture.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -47,6 +53,7 @@ function fakeLockManager(root, events) {
 }
 
 function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
+    const agentLib = agentLibFixture(identity.workspaceRoot);
     return {
         state: 'owned',
         engine: { name: 'podman', identity: 'engine' },
@@ -54,9 +61,14 @@ function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
             container: {
                 id,
                 labels: {
+                    ...agentLibFixtureLabels(agentLib),
                     [BOX_LABELS.imageRef]: BOX_IMAGE_REFERENCE,
                 },
-                runtime: { running, imageId: 'b'.repeat(64) },
+                runtime: {
+                    running,
+                    imageId: 'b'.repeat(64),
+                    mounts: agentLibFixtureMounts(agentLib),
+                },
             },
         },
     };
@@ -559,16 +571,24 @@ test('failed ploinky-local stop still stops the outer Box', async (t) => {
     assert.equal(events.some((value) => value.includes('container stop --time 30')), true);
 });
 
-test('start passes the native host address into the bounded in-box runtime', async (t) => {
+test('start selects the AgentLib source and passes the host address into the bounded runtime', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
     const ownership = owned(identity);
     const events = [];
     let boundedOptions;
+    const agentLib = agentLibFixture(identity.workspaceRoot);
+    let selectedFor = null;
+    let revalidated = null;
+    let committed = null;
     const supervisor = createBoxSupervisor({
-        env: { PLOINKY_AGENTLIB_REF: 'master' },
+        env: {},
         resolveIdentity: () => identity,
+        selectAgentLib: async ({ workspaceRoot, branchPolicy }) => {
+            selectedFor = { workspaceRoot, branchPolicy };
+            return { selection: agentLib, mode: 'local' };
+        },
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
         platform: 'darwin',
@@ -588,14 +608,162 @@ test('start passes the native host address into the bounded in-box runtime', asy
             boundedOptions = options;
         },
         healthCheck: async (hostPort) => assert.equal(hostPort, 8080),
+        attestAgentLibGraph: async (_engine, containerId, selection) => {
+            assert.equal(containerId, ownership.handles.container.id);
+            assert.equal(selection, agentLib);
+            events.push('attest');
+            return { deploymentFingerprint: selection.contentFingerprint };
+        },
+        revalidateAgentLibSource: (selection) => { revalidated = selection; },
+        commitAgentLibSelection: (workspaceRoot, selection) => { committed = { workspaceRoot, selection }; },
     });
 
-    await supervisor.runStartTransaction(['start', 'explorer']);
+    await supervisor.runStartTransaction(['start', 'explorer'], {
+        branchPolicy: { branch: 'feature-agentlib', fallback: 'fail' },
+    });
     assert.equal(boundedOptions.hostReachableIpv4, '192.168.1.12');
-    assert.equal(boundedOptions.agentlibRef, 'master');
+    // The source is selected from the resolved workspace before Box
+    // reconciliation, and the same selection reaches the in-Box core.
+    assert.equal(selectedFor.workspaceRoot, identity.workspaceRoot);
+    assert.deepEqual(selectedFor.branchPolicy, { branch: 'feature-agentlib', fallback: 'fail' });
+    assert.equal(boundedOptions.agentLib, agentLib);
+    // The source is revalidated after the graph is ready, and `active.json` is
+    // committed only after that succeeds.
+    assert.equal(revalidated, agentLib);
+    assert.deepEqual(committed, { workspaceRoot: identity.workspaceRoot, selection: agentLib });
 });
 
-test('bounded start requires the external Router URL and preserves normalized argv', async () => {
+test('a source that changes during startup is not committed and is not declared ready', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const agentLib = agentLibFixture(identity.workspaceRoot);
+    let committed = false;
+    const supervisor = createBoxSupervisor({
+        env: {},
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, []),
+        discover: () => ownership,
+        platform: 'linux',
+        runner: { run() {} },
+        selectAgentLib: async () => ({ selection: agentLib, mode: 'local' }),
+        reconcile: async () => ({ action: 'reused', ownership, hostPort: 8080, mediaHostPort: 7882 }),
+        readEdgeDesired: () => null,
+        resolveHostReachableIpv4: async () => '',
+        startCore: async () => {},
+        healthCheck: async () => {},
+        attestAgentLibGraph: async () => ({ deploymentFingerprint: agentLib.contentFingerprint }),
+        revalidateAgentLibSource: () => {
+            const error = new Error('achillesAgentLib source changed during startup');
+            error.code = 'PLOINKY_AGENTLIB_SOURCE_CHANGED';
+            throw error;
+        },
+        commitAgentLibSelection: () => { committed = true; },
+    });
+
+    await assert.rejects(
+        () => supervisor.runStartTransaction(['start', 'explorer']),
+        /source changed during startup/,
+    );
+    assert.equal(committed, false, 'the active selection must not record an unready graph');
+});
+
+test('prior graph capture records an exact start command before mutation', (t) => {
+    const state = fixture(t);
+    const ploinkyDir = path.join(state.workspace, '.ploinky');
+    fs.mkdirSync(ploinkyDir);
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    fs.writeFileSync(path.join(ploinkyDir, 'routing.json'), JSON.stringify({
+        static: { agent: 'AssistOSExplorer/explorer' },
+        port: 8080,
+        routes: {},
+    }));
+
+    const argv = captureConfiguredCoreStartArgv(identity);
+
+    assert.deepEqual(argv, ['start', 'AssistOSExplorer/explorer', '8080']);
+    assert.equal(Object.isFrozen(argv), true);
+});
+
+test('a failed replacement restores and re-attests the prior Box graph before surfacing the failure', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const priorAgentLib = agentLibFixture(identity.workspaceRoot);
+    const candidateAgentLib = agentLibFixture(identity.workspaceRoot, {
+        sourceRelativePath: '.ploinky/agentlib/generations/candidate',
+    });
+    const oldOwnership = owned(identity, { id: 'a'.repeat(64) });
+    const candidateOwnership = owned(identity, { id: 'c'.repeat(64) });
+    const events = [];
+    let coreCalls = 0;
+    let committed = false;
+    const supervisor = createBoxSupervisor({
+        env: {},
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => oldOwnership,
+        runner: {
+            run(_command, args) { events.push(`run:${args.join(' ')}`); },
+        },
+        selectAgentLib: async () => ({ selection: candidateAgentLib, mode: 'managed' }),
+        captureCoreStartArgv: () => Object.freeze(['start', 'explorer', '8080']),
+        reconcile: async () => ({
+            action: 'replaced',
+            ownership: candidateOwnership,
+            hostPort: 8080,
+            mediaHostPort: 7882,
+            previousAgentLib: priorAgentLib,
+            async rollback() {
+                events.push('outer-rollback');
+                return {
+                    action: 'restored',
+                    ownership: oldOwnership,
+                    containerId: oldOwnership.handles.container.id,
+                    hostPort: 8080,
+                    mediaHostPort: 7882,
+                    agentLib: priorAgentLib,
+                };
+            },
+        }),
+        readEdgeDesired: () => null,
+        resolveHostReachableIpv4: async () => '192.168.1.12',
+        runCoreCommand: async (_engine, containerId, args, _host, _media, _runner, options) => {
+            coreCalls += 1;
+            events.push(`core:${containerId}:${args.join(' ')}:${options.agentLib.fingerprint}`);
+            if (coreCalls === 1) throw new Error('candidate restart failed');
+            assert.equal(containerId, oldOwnership.handles.container.id);
+            assert.equal(options.agentLib, priorAgentLib);
+        },
+        healthCheck: async () => { events.push('prior-health'); },
+        attestAgentLibGraph: async (_engine, containerId, selection) => {
+            events.push(`attest:${containerId}`);
+            assert.equal(selection, priorAgentLib);
+            return { deploymentFingerprint: selection.fingerprint };
+        },
+        commitAgentLibSelection: () => { committed = true; },
+    });
+
+    await assert.rejects(
+        () => supervisor.runRestartTransaction(['restart']),
+        /candidate restart failed/,
+    );
+    assert.equal(committed, false);
+    assert.equal(coreCalls, 2, 'the second bounded command restores the prior graph');
+    const rollbackIndex = events.indexOf('outer-rollback');
+    const priorStartIndex = events.findIndex((event) => (
+        event.startsWith(`core:${oldOwnership.handles.container.id}:start explorer 8080:`)
+    ));
+    assert.ok(rollbackIndex >= 0 && priorStartIndex > rollbackIndex);
+    assert.ok(events.indexOf('prior-health') > priorStartIndex);
+    assert.ok(events.indexOf(`attest:${oldOwnership.handles.container.id}`) > priorStartIndex);
+});
+
+test('bounded start requires the external Router URL and preserves normalized argv', async (t) => {
+    const boundedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-bounded-'));
+    t.after(() => fs.rmSync(boundedRoot, { recursive: true, force: true }));
+    const boundedAgentLib = agentLibFixture(boundedRoot);
     const output = { value: '', write(chunk) { this.value += String(chunk); } };
     const calls = [];
     const status = await runBoundedCoreStart(
@@ -622,17 +790,23 @@ test('bounded start requires the external Router URL and preserves normalized ar
             stderr: output,
             timeoutMs: 1000,
             hostReachableIpv4: '192.168.1.12',
-            agentlibRef: 'master',
+            agentLib: boundedAgentLib,
         },
     );
     assert.equal(status, 0);
     assert.deepEqual(calls[0][1].slice(-4), ['--debug', 'start', 'Agent', '8080']);
-    assert.deepEqual(calls[0][1].slice(0, 14), [
+    // The in-Box core learns the source only through the reserved environment,
+    // which names the stable mount path rather than any host path.
+    assert.deepEqual(calls[0][1].slice(0, 22), [
         'container', 'exec',
         '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
         '--env', 'PLOINKY_MEDIA_HOST_PORT=17891',
         '--env', 'PLOINKY_HOST_REACHABLE_IPV4=192.168.1.12',
-        '--env', 'PLOINKY_AGENTLIB_REF=master',
+        '--env', 'PLOINKY_AGENTLIB_DIR=/opt/ploinky-agentlib',
+        '--env', 'PLOINKY_AGENTLIB_MODE=local',
+        '--env', `PLOINKY_AGENTLIB_FINGERPRINT=${boundedAgentLib.fingerprint}`,
+        '--env', 'PLOINKY_AGENTLIB_COMMIT=',
+        '--env', `PLOINKY_AGENTLIB_SOURCE_ID=${boundedAgentLib.sourceIdHash}`,
         '--user', 'podman', '--workdir', '/workspace',
     ]);
     assert.equal(calls[0][2].stdout, output);
@@ -653,7 +827,7 @@ test('bounded start requires the external Router URL and preserves normalized ar
                 };
             },
         },
-        { stdout: { write() {} }, stderr: { write() {} } },
+        { stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
     );
     assert.equal(defaultTimeoutCalls[0].timeoutMs, 1_800_000);
     assert.equal(
@@ -674,8 +848,16 @@ test('bounded start requires the external Router URL and preserves normalized ar
     await assert.rejects(() => runBoundedCoreStart(
         { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090, 17891,
         { stream: async () => ({ ok: true, status: 0, stdout: '[start] Router: http://127.0.0.1:8080\n', stderr: '' }) },
-        { stdout: { write() {} }, stderr: { write() {} } },
+        { stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
     ), /public Router URL/);
+
+    // A start without a selected source is a contract error, not a start that
+    // lets the in-Box core resolve achillesAgentLib for itself.
+    await assert.rejects(() => runBoundedCoreStart(
+        { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 8080, 7882,
+        { stream: async () => { throw new Error('must fail before Podman'); } },
+        { stdout: { write() {} }, stderr: { write() {} } },
+    ), /requires the selected achillesAgentLib contract/);
 });
 
 test('public health connects to the published port with matching authority', async (t) => {

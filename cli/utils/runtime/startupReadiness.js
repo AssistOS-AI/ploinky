@@ -82,11 +82,12 @@ function resolveAgentReadinessProtocol(manifest, context = {}) {
         return explicit;
     }
 
+    if (readManifestReadinessScript(manifest)) {
+        return 'script';
+    }
+
     const executionMode = resolveAgentExecutionMode(manifest);
     if (executionMode.type === 'start_only') {
-        if (readManifestReadinessScript(manifest)) {
-            return 'script';
-        }
         return 'tcp';
     }
 

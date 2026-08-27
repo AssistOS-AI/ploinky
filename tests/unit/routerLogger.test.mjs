@@ -1,0 +1,77 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+
+import {
+    createAsyncLogWriter,
+    writeDurableLogRecord,
+} from '../../cli/server/utils/logger.js';
+
+test('router log writer batches ordered records without synchronous file writes', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-log-'));
+    const logPath = path.join(root, 'router.log');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+    const writer = createAsyncLogWriter({ logDir: root, logPath });
+    assert.equal(writer.appendLine('first\n'), true);
+    assert.equal(writer.appendLine('second\n'), true);
+    assert.deepEqual(writer.pendingState(), {
+        pendingRecords: 2,
+        pendingBytes: 13,
+        droppedRecords: 0,
+        flushing: false,
+    });
+
+    await writer.flush();
+
+    assert.equal(fs.readFileSync(logPath, 'utf8'), 'first\nsecond\n');
+    assert.deepEqual(writer.pendingState(), {
+        pendingRecords: 0,
+        pendingBytes: 0,
+        droppedRecords: 0,
+        flushing: false,
+    });
+});
+
+test('router log writer bounds pending diagnostics and records dropped entries', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-log-bounded-'));
+    const logPath = path.join(root, 'router.log');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+    const writer = createAsyncLogWriter({
+        logDir: root,
+        logPath,
+        maxPendingBytes: 13,
+    });
+    writer.appendLine('first\n');
+    writer.appendLine('second\n');
+    writer.appendLine('third\n');
+
+    await writer.flush();
+
+    const records = fs.readFileSync(logPath, 'utf8').trim().split('\n');
+    const dropped = JSON.parse(records[0]);
+    assert.equal(dropped.type, 'router_log_records_dropped');
+    assert.equal(dropped.dropped, 1);
+    assert.deepEqual(records.slice(1), ['second', 'third']);
+});
+
+test('short-lived lifecycle commands synchronously persist their terminal record', (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-router-durable-log-'));
+    const logPath = path.join(root, 'router.log');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+    assert.equal(writeDurableLogRecord('server_stop', {
+        pid: 123,
+        signal: 'SIGTERM',
+        source: 'pid_file',
+        port: 8080,
+    }, { logDir: root, logPath }), true);
+
+    const record = JSON.parse(fs.readFileSync(logPath, 'utf8'));
+    assert.equal(record.type, 'server_stop');
+    assert.equal(record.pid, 123);
+    assert.equal(record.port, 8080);
+});

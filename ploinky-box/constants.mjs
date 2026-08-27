@@ -28,6 +28,21 @@ export const BOX_LABELS = Object.freeze({
     imagesFingerprint: 'io.assistos.ploinky-box.images-fingerprint',
 });
 
+// The broad writable workspace bind. The selected achillesAgentLib source lives
+// inside it, so its alias there needs an explicit read-only shadow.
+export const BOX_WORKSPACE_MOUNT = '/workspace';
+
+// achillesAgentLib is direct-mounted from the one selected workspace source.
+// The Box never installs its own copy: `/opt/ploinky/node_modules` holds
+// `mcp-sdk` only.
+export const BOX_AGENTLIB_LABELS = Object.freeze({
+    mode: 'io.assistos.ploinky-box.agentlib-mode',
+    sourceIdHash: 'io.assistos.ploinky-box.agentlib-source-id',
+    fingerprint: 'io.assistos.ploinky-box.agentlib-fingerprint',
+    sourceRelativePath: 'io.assistos.ploinky-box.agentlib-source-path',
+    commit: 'io.assistos.ploinky-box.agentlib-commit',
+});
+
 export const BOX_ROLES = Object.freeze({
     container: 'box',
 });

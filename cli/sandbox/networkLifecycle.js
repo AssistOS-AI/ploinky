@@ -1291,7 +1291,11 @@ export function createNetworkLifecycleAdapter({
                 return { state: 'owned-drift', id };
             }
         }
-        return { state: 'exact', id };
+        return {
+            state: 'exact',
+            id,
+            running: record.State?.Running === true || record.State?.Status === 'running',
+        };
     }
 
     function verifyContainerContract(containerName, network, canonicalAgentId, options = {}) {

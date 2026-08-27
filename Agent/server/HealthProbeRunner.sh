@@ -7,6 +7,15 @@ PROBE_CLEANUP_INTERVAL_SECONDS='0.05'
 PROBE_ACTIVE_PREFIX='active-'
 PROBE_CANCEL_DIR='cancelled'
 PROBE_TIMEOUT_DIR='timed-out'
+PROBE_CONTROL_ROOT='/run/ploinky-health-probes'
+PROBE_RUNTIME_PARENT='/tmp'
+PROBE_RUNTIME_ROOT="$PROBE_RUNTIME_PARENT/ploinky-health-probe-runtime"
+PROBE_OUTPUT_BLOCK_SIZE=4096
+PROBE_OUTPUT_BLOCK_COUNT=256
+PROBE_REQUEST_FILE='request'
+PROBE_CLAIM_DIR='claimed'
+PROBE_BROKER_READY_DIR='.broker-ready'
+PROBE_BROKER_POLL_SECONDS='0.05'
 
 fail() {
     printf '%s\n' "ploinky health probe runner: $*" >&2
@@ -19,22 +28,26 @@ require_plain_token() {
     esac
 }
 
-require_marker_path() {
-    marker_path="${1:-}"
+require_control_path() {
+    control_path="${1:-}"
     token="${2:-}"
-    [ "$marker_path" = "/tmp/.ploinky-health-probe-${token}" ] \
-        || fail 'probe marker path is invalid'
+    [ "$control_path" = "${PROBE_CONTROL_ROOT}/${token}" ] \
+        || fail 'probe control path is invalid'
+}
+
+positive_duration_is_valid() {
+    value="${1:-}"
+    case "$value" in
+        ''|*[!0-9.]*|.*|*.*.*|*.) return 1 ;;
+    esac
+    case "$value" in
+        *[1-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 require_positive_duration() {
-    value="${1:-}"
-    case "$value" in
-        ''|*[!0-9.]*|.*|*.*.*|*.) fail 'probe duration is invalid' ;;
-    esac
-    case "$value" in
-        *[1-9]*) ;;
-        *) fail 'probe duration must be positive' ;;
-    esac
+    positive_duration_is_valid "${1:-}" || fail 'probe duration is invalid'
 }
 
 proc_stat_path_fields() {
@@ -132,11 +145,8 @@ append_candidate_proc_pid() {
     CANDIDATE_PROC_PIDS="${CANDIDATE_PROC_PIDS}${candidate_proc_pid} "
 }
 
-collect_candidate_proc_pids() {
+append_session_descendant_proc_pids() {
     session_id="$1"
-    token="$2"
-    collect_token_pids "$token"
-    CANDIDATE_PROC_PIDS="$TOKEN_PIDS"
     [ "$session_id" -gt 0 ] || return 0
 
     descendant_queue="$session_id"
@@ -171,6 +181,24 @@ collect_candidate_proc_pids() {
             done
         done
     done
+}
+
+collect_session_candidate_proc_pids() {
+    session_id="$1"
+    # Deadline and cancellation watchers are already inside the freshly
+    # created probe session. Walk only that exact tree here; a whole-container
+    # token scan is reserved for the final escaped-descendant proof.
+    TOKEN_PIDS=' '
+    CANDIDATE_PROC_PIDS=' '
+    append_session_descendant_proc_pids "$session_id"
+}
+
+collect_candidate_proc_pids() {
+    session_id="$1"
+    token="$2"
+    collect_token_pids "$token"
+    CANDIDATE_PROC_PIDS="$TOKEN_PIDS"
+    append_session_descendant_proc_pids "$session_id"
 }
 
 process_matches_probe() {
@@ -208,13 +236,31 @@ collect_matching_probe_identities() {
     done
 }
 
-signal_matching_probe_processes() {
+collect_matching_session_identities() {
+    session_id="$1"
+    token="$2"
+    collect_excluded_pattern=":${3:-}:"
+    MATCHING_PROBE_IDENTITIES=''
+    collect_session_candidate_proc_pids "$session_id"
+    for proc_pid in $CANDIDATE_PROC_PIDS; do
+        case "$collect_excluded_pattern" in
+            *":$proc_pid:"*) continue ;;
+        esac
+        if process_matches_probe "$proc_pid" "$session_id"; then
+            identity="${MATCHED_SIGNAL_PID}:${MATCHED_PROC_PID}:${MATCHED_START_TIME}"
+            if [ -n "$MATCHING_PROBE_IDENTITIES" ]; then
+                MATCHING_PROBE_IDENTITIES="$MATCHING_PROBE_IDENTITIES $identity"
+            else
+                MATCHING_PROBE_IDENTITIES="$identity"
+            fi
+        fi
+    done
+}
+
+signal_collected_probe_identities() {
     signal="$1"
     session_id="$2"
-    token="$3"
-    signal_excluded_proc_ids="${4:-}"
-    collect_matching_probe_identities "$session_id" "$token" "$signal_excluded_proc_ids"
-    identities="$MATCHING_PROBE_IDENTITIES"
+    identities="$3"
     for identity in $identities; do
         signal_pid="${identity%%:*}"
         identity_rest="${identity#*:}"
@@ -228,6 +274,16 @@ signal_matching_probe_processes() {
     done
 }
 
+signal_matching_session_processes() {
+    signal="$1"
+    session_id="$2"
+    token="$3"
+    signal_excluded_proc_ids="${4:-}"
+    collect_matching_session_identities "$session_id" "$token" "$signal_excluded_proc_ids"
+    identities="$MATCHING_PROBE_IDENTITIES"
+    signal_collected_probe_identities "$signal" "$session_id" "$identities"
+}
+
 cleanup_probe_processes() {
     session_id="$1"
     token="$2"
@@ -235,16 +291,22 @@ cleanup_probe_processes() {
 
     collect_matching_probe_identities "$session_id" "$token" "$cleanup_excluded_proc_ids"
     [ -z "$MATCHING_PROBE_IDENTITIES" ] && return 0
+    identities="$MATCHING_PROBE_IDENTITIES"
 
-    signal_matching_probe_processes TERM "$session_id" "$token" "$cleanup_excluded_proc_ids"
+    # One whole-container token scan snapshots escaped descendants. Revalidate
+    # the captured PID/start-time identities for both signals instead of
+    # repeating that expensive scan before TERM and again before KILL.
+    signal_collected_probe_identities TERM "$session_id" "$identities"
     sleep "$PROBE_CLEANUP_INTERVAL_SECONDS"
-    signal_matching_probe_processes KILL "$session_id" "$token" "$cleanup_excluded_proc_ids"
+    signal_collected_probe_identities KILL "$session_id" "$identities"
 
     attempt=0
     while [ "$attempt" -lt "$PROBE_CLEANUP_ATTEMPTS" ]; do
+        sleep "$PROBE_CLEANUP_INTERVAL_SECONDS"
         collect_matching_probe_identities "$session_id" "$token" "$cleanup_excluded_proc_ids"
         [ -z "$MATCHING_PROBE_IDENTITIES" ] && return 0
-        sleep "$PROBE_CLEANUP_INTERVAL_SECONDS"
+        identities="$MATCHING_PROBE_IDENTITIES"
+        signal_collected_probe_identities KILL "$session_id" "$identities"
         attempt=$((attempt + 1))
     done
 
@@ -268,29 +330,43 @@ remove_marker_dir() {
 }
 
 marker_is_cancelled() {
-    marker_path="$1"
-    [ -d "$marker_path/$PROBE_CANCEL_DIR" ]
+    control_path="$1"
+    [ -d "$control_path/$PROBE_CANCEL_DIR" ]
 }
 
-request_probe_cancellation() {
+bounded_output_reader() {
+    fifo_path="$1"
+    output_path="$2"
+    {
+        dd bs="$PROBE_OUTPUT_BLOCK_SIZE" count="$PROBE_OUTPUT_BLOCK_COUNT" 2>/dev/null
+        cat >/dev/null
+    } < "$fifo_path" > "$output_path"
+}
+
+remove_session_artifacts() {
     marker_path="$1"
-    umask 077
-    if mkdir "$marker_path" 2>/dev/null; then
-        mkdir "$marker_path/$PROBE_CANCEL_DIR"
-        return 0
+    runtime_path="$2"
+    runtime_owned="$3"
+    stdout_fifo="$4"
+    stderr_fifo="$5"
+    if [ "$runtime_owned" = 1 ]; then
+        rm -f "$stdout_fifo" "$stderr_fifo"
+        rmdir "$runtime_path" 2>/dev/null || true
     fi
-    [ -d "$marker_path" ] || fail 'probe marker is not a directory'
-    mkdir "$marker_path/$PROBE_CANCEL_DIR" 2>/dev/null \
-        || [ -d "$marker_path/$PROBE_CANCEL_DIR" ] \
-        || fail 'probe cancellation marker cannot be created'
+    remove_marker_dir "$marker_path"
 }
 
 session_run() {
-    marker_path="$1"
+    control_path="$1"
     token="$2"
     script_name="$3"
     timeout_seconds="$4"
     kill_after_seconds="$5"
+    marker_path="$control_path/session"
+    runtime_path="$PROBE_RUNTIME_ROOT/$token"
+    runtime_owned=0
+    stdout_fifo="$runtime_path/stdout-fifo"
+    stderr_fifo="$runtime_path/stderr-fifo"
 
     [ "${PLOINKY_PROBE_SESSION:-}" = 1 ] \
         || fail 'session runner requires exact setsid provenance'
@@ -307,36 +383,73 @@ session_run() {
     start_time="$PROC_START_TIME"
 
     umask 077
+    [ -d "$control_path" ] || fail 'probe control directory is unavailable'
     if ! mkdir "$marker_path" 2>/dev/null; then
-        if marker_is_cancelled "$marker_path"; then
+        if marker_is_cancelled "$control_path"; then
             remove_marker_dir "$marker_path"
             exit 125
         fi
         fail 'probe marker already exists'
     fi
-    trap 'remove_marker_dir "$marker_path"' EXIT
+    trap 'remove_session_artifacts "$marker_path" "$runtime_path" "$runtime_owned" "$stdout_fifo" "$stderr_fifo"' EXIT
     trap 'exit 125' HUP INT TERM
+
+    # macOS rootless Podman exposes host binds through virtiofs, which permits
+    # regular control files but rejects FIFO creation. Keep the authenticated
+    # request/result plane on the bind and create only the transient output
+    # pipes in this container-local runtime directory.
+    mkdir "$runtime_path" || fail 'probe runtime directory cannot be created'
+    runtime_owned=1
 
     active_identity="$marker_path/$PROBE_ACTIVE_PREFIX$session_proc_pid-$start_time-$session_signal_pid-$token"
     mkdir "$active_identity" || fail 'probe identity marker cannot be created'
-    if marker_is_cancelled "$marker_path"; then
+    if marker_is_cancelled "$control_path"; then
         exit 125
     fi
 
     set +e
     cd /code || fail 'probe workspace /code is unavailable'
-    sh "./${script_name}" &
+    if [ ! -f "./${script_name}" ]; then
+        printf '%s\n' "ploinky health probe runner: ${script_name} not found in /code" >&2
+        exit 127
+    fi
+    rm -f \
+        "$control_path/probe-stdout" \
+        "$control_path/probe-stderr" \
+        "$stdout_fifo" \
+        "$stderr_fifo"
+    mkfifo "$stdout_fifo" "$stderr_fifo" || fail 'probe output pipes cannot be created'
+    bounded_output_reader "$stdout_fifo" "$control_path/probe-stdout" &
+    stdout_reader_pid="$!"
+    bounded_output_reader "$stderr_fifo" "$control_path/probe-stderr" &
+    stderr_reader_pid="$!"
+    sh "./${script_name}" >"$stdout_fifo" 2>"$stderr_fifo" &
     probe_pid="$!"
+    (
+        while [ ! -d "$control_path/$PROBE_CANCEL_DIR" ]; do
+            sleep "$PROBE_CLEANUP_INTERVAL_SECONDS"
+        done
+        if proc_self_identity_fields; then
+            cancellation_proc_pid="$PROC_PID"
+            cancellation_excluded_proc_ids="$session_proc_pid:$cancellation_proc_pid"
+            signal_matching_session_processes \
+                TERM "$session_proc_pid" "$token" "$cancellation_excluded_proc_ids"
+            sleep "$kill_after_seconds"
+            signal_matching_session_processes \
+                KILL "$session_proc_pid" "$token" "$cancellation_excluded_proc_ids"
+        fi
+    ) &
+    cancellation_pid="$!"
     (
         sleep "$timeout_seconds"
         mkdir "$marker_path/$PROBE_TIMEOUT_DIR" 2>/dev/null || true
         if proc_self_identity_fields; then
             watchdog_proc_pid="$PROC_PID"
             watchdog_excluded_proc_ids="$session_proc_pid:$watchdog_proc_pid"
-            signal_matching_probe_processes \
+            signal_matching_session_processes \
                 TERM "$session_proc_pid" "$token" "$watchdog_excluded_proc_ids"
             sleep "$kill_after_seconds"
-            signal_matching_probe_processes \
+            signal_matching_session_processes \
                 KILL "$session_proc_pid" "$token" "$watchdog_excluded_proc_ids"
         else
             # The session is exact and freshly created. If procfs cannot identify
@@ -350,106 +463,196 @@ session_run() {
     wait "$probe_pid"
     status="$?"
     kill -s TERM "$deadline_pid" 2>/dev/null || true
+    kill -s TERM "$cancellation_pid" 2>/dev/null || true
     wait "$deadline_pid" 2>/dev/null || true
-    set -e
-
-    if [ -d "$marker_path/$PROBE_TIMEOUT_DIR" ]; then
-        status=124
-    elif [ "$status" -eq 125 ]; then
-        status=126
-    fi
+    wait "$cancellation_pid" 2>/dev/null || true
 
     if ! cleanup_probe_processes \
         "$session_proc_pid" "$token" "$session_proc_pid"; then
         exit 125
     fi
+    wait "$stdout_reader_pid" 2>/dev/null || true
+    wait "$stderr_reader_pid" 2>/dev/null || true
+
+    if marker_is_cancelled "$control_path"; then
+        status=125
+    elif [ -d "$marker_path/$PROBE_TIMEOUT_DIR" ]; then
+        status=124
+    elif [ "$status" -eq 125 ]; then
+        status=126
+    fi
+    set -e
     exit "$status"
 }
 
-cleanup_timed_out_session() {
-    marker_path="$1"
-    token="$2"
-    session_id=0
-    active_seen=false
+write_broker_failure() {
+    control_path="$1"
+    message="$2"
+    [ -d "$control_path" ] || return 0
+    printf '%s\n' "ploinky health probe broker: $message" \
+        > "$control_path/runner-stderr"
+    printf '%s\n' '125' > "$control_path/result-tmp"
+    mv "$control_path/result-tmp" "$control_path/result"
+}
 
-    request_probe_cancellation "$marker_path"
-    for active_path in "$marker_path"/"$PROBE_ACTIVE_PREFIX"*; do
-        [ -d "$active_path" ] || continue
-        active_seen=true
-        identity="${active_path##*/}"
-        identity="${identity#$PROBE_ACTIVE_PREFIX}"
-        marker_proc_pid="${identity%%-*}"
-        identity="${identity#*-}"
-        marker_start="${identity%%-*}"
-        identity="${identity#*-}"
-        marker_signal_pid="${identity%%-*}"
-        marker_token="${identity#*-}"
-        case "$marker_proc_pid:$marker_start:$marker_signal_pid" in
-            *[!0-9:]*|::*|*::|:*|*:) fail 'probe marker identity is invalid' ;;
-        esac
-        [ "$marker_token" = "$token" ] || fail 'probe marker token is inconsistent'
-        if proc_identity_fields "$marker_proc_pid" \
-            && [ "$PROC_START_TIME" = "$marker_start" ] \
-            && [ "$PROC_SESSION_ID" = "$marker_proc_pid" ] \
-            && [ "$PROC_NAMESPACE_PID" = "$marker_signal_pid" ]; then
-            session_id="$marker_proc_pid"
-        fi
-        break
+remove_broker_artifacts() {
+    [ -z "${ready_path:-}" ] || rmdir "$ready_path" 2>/dev/null || true
+    [ "${runtime_root_owned:-0}" != 1 ] \
+        || rmdir "$PROBE_RUNTIME_ROOT" 2>/dev/null \
+        || true
+}
+
+run_broker_request() {
+    control_path="$1"
+    token="$2"
+    request_path="$control_path/$PROBE_REQUEST_FILE"
+    request_version=''
+    request_token=''
+    request_script=''
+    request_timeout=''
+    request_kill_after=''
+    request_extra=''
+
+    if ! {
+        IFS= read -r request_version \
+            && IFS= read -r request_token \
+            && IFS= read -r request_script \
+            && IFS= read -r request_timeout \
+            && IFS= read -r request_kill_after
+    } < "$request_path"; then
+        write_broker_failure "$control_path" 'request is incomplete'
+        return 0
+    fi
+    request_lines="$(wc -l < "$request_path" 2>/dev/null || printf '0')"
+    [ "$request_lines" = '5' ] || {
+        write_broker_failure "$control_path" 'request has an invalid field count'
+        return 0
+    }
+    [ "$request_version" = 'ploinky-health-probe/1' ] || {
+        write_broker_failure "$control_path" 'request version is invalid'
+        return 0
+    }
+    require_plain_token "$token"
+    [ "$request_token" = "$token" ] || {
+        write_broker_failure "$control_path" 'request token is inconsistent'
+        return 0
+    }
+    case "$request_script" in
+        ''|*[!A-Za-z0-9._-]*|*..*)
+            write_broker_failure "$control_path" 'request script is invalid'
+            return 0
+            ;;
+    esac
+    if ! positive_duration_is_valid "$request_timeout"; then
+        write_broker_failure "$control_path" 'request timeout is invalid'
+        return 0
+    fi
+    if ! positive_duration_is_valid "$request_kill_after"; then
+        write_broker_failure "$control_path" 'request kill-after is invalid'
+        return 0
+    fi
+
+    if ! sh "$0" run \
+        "$control_path" "$token" "$request_script" \
+        "$request_timeout" "$request_kill_after"; then
+        [ -f "$control_path/result" ] \
+            || write_broker_failure "$control_path" 'runner failed before publishing a result'
+    fi
+}
+
+serve_broker() {
+    [ "$#" -eq 1 ] || fail 'serve requires the exact control root'
+    control_root="$1"
+    [ "$control_root" = "$PROBE_CONTROL_ROOT" ] \
+        || fail 'broker control root is invalid'
+    [ -d "$control_root" ] || fail 'broker control root is unavailable'
+    for command_name in mkdir mv rmdir sh sleep wc; do
+        command -v "$command_name" >/dev/null 2>&1 \
+            || fail "required broker command '$command_name' is unavailable"
     done
 
-    cleanup_probe_processes "$session_id" "$token" \
-        || fail 'timed-out probe process cleanup failed'
-    if [ "$active_seen" = true ]; then
-        remove_marker_dir "$marker_path"
-    fi
+    ready_path=''
+    runtime_root_owned=0
+    trap 'remove_broker_artifacts; exit 0' HUP INT TERM
+    trap 'remove_broker_artifacts' EXIT
+
+    umask 077
+    [ -d "$PROBE_RUNTIME_PARENT" ] && [ ! -L "$PROBE_RUNTIME_PARENT" ] \
+        && [ -w "$PROBE_RUNTIME_PARENT" ] \
+        || fail 'probe runtime parent is not one writable directory'
+    [ ! -e "$PROBE_RUNTIME_ROOT" ] && [ ! -L "$PROBE_RUNTIME_ROOT" ] \
+        || fail 'probe runtime root already exists'
+    mkdir "$PROBE_RUNTIME_ROOT" || fail 'probe runtime root cannot be created'
+    runtime_root_owned=1
+
+    ready_path="$control_root/$PROBE_BROKER_READY_DIR"
+    rmdir "$ready_path" 2>/dev/null || true
+    mkdir "$ready_path" || fail 'broker ready marker cannot be created'
+
+    while :; do
+        for control_path in "$control_root"/*; do
+            [ -d "$control_path" ] || continue
+            [ ! -L "$control_path" ] || continue
+            token="${control_path##*/}"
+            case "$token" in
+                ''|*[!A-Za-z0-9._-]*) continue ;;
+            esac
+            request_path="$control_path/$PROBE_REQUEST_FILE"
+            [ -f "$request_path" ] || continue
+            [ ! -L "$request_path" ] || continue
+            mkdir "$control_path/$PROBE_CLAIM_DIR" 2>/dev/null || continue
+            run_broker_request "$control_path" "$token"
+        done
+        sleep "$PROBE_BROKER_POLL_SECONDS"
+    done
 }
 
 mode="${1:-}"
 case "$mode" in
+    serve)
+        [ "$#" -eq 2 ] || fail 'serve requires the exact control root'
+        serve_broker "$2"
+        ;;
     run)
-        [ "$#" -eq 6 ] || fail 'run requires marker, token, script, timeout, and kill-after'
-        marker_path="$2"
+        [ "$#" -eq 6 ] || fail 'run requires control path, token, script, timeout, and kill-after'
+        control_path="$2"
         token="$3"
         script_name="$4"
         timeout_seconds="$5"
         kill_after_seconds="$6"
         require_plain_token "$token"
-        require_marker_path "$marker_path" "$token"
+        require_control_path "$control_path" "$token"
         case "$script_name" in
             ''|*[!A-Za-z0-9._-]*|*..*) fail 'probe script name is invalid' ;;
         esac
         require_positive_duration "$timeout_seconds"
         require_positive_duration "$kill_after_seconds"
-        for command_name in grep kill mkdir rmdir setsid sleep; do
+        [ -d "$control_path" ] || fail 'probe control directory is unavailable'
+        for command_name in cat dd grep kill mkdir mkfifo mv rm rmdir setsid sleep; do
             command -v "$command_name" >/dev/null 2>&1 \
                 || fail "required probe command '$command_name' is unavailable"
         done
+        rm -f \
+            "$control_path/result" \
+            "$control_path/result-tmp" \
+            "$control_path/runner-stdout" \
+            "$control_path/runner-stderr"
         set +e
         PLOINKY_PROBE_TOKEN="${token}:" PLOINKY_PROBE_SESSION=1 \
             setsid sh "$0" session-run \
-            "$marker_path" "$token" "$script_name" \
-            "$timeout_seconds" "$kill_after_seconds" &
-        session_pid="$!"
-        wait "$session_pid"
+            "$control_path" "$token" "$script_name" \
+            "$timeout_seconds" "$kill_after_seconds" \
+            >"$control_path/runner-stdout" \
+            2>"$control_path/runner-stderr"
         status="$?"
         set -e
-        exit "$status"
+        printf '%s\n' "$status" > "$control_path/result-tmp"
+        mv "$control_path/result-tmp" "$control_path/result"
+        exit 0
         ;;
     session-run)
         [ "$#" -eq 6 ] || fail 'session-run contract is invalid'
         session_run "$2" "$3" "$4" "$5" "$6"
-        ;;
-    cleanup)
-        [ "$#" -eq 3 ] || fail 'cleanup requires marker and token'
-        require_plain_token "$3"
-        require_marker_path "$2" "$3"
-        for command_name in grep kill mkdir rmdir sleep; do
-            command -v "$command_name" >/dev/null 2>&1 \
-                || fail "required cleanup command '$command_name' is unavailable"
-        done
-        proc_self_identity_fields \
-            || fail 'cannot inspect cleanup namespace identity'
-        cleanup_timed_out_session "$2" "$3"
         ;;
     *)
         fail "unsupported mode '${mode:-<missing>}'"

@@ -38,6 +38,9 @@ test('RoutingServer fixes public 8080 and delegates private 8081 to exact interf
     assert.match(source, /const port = 8080/);
     assert.match(source, /createPrivateListenerSet\(\{/);
     assert.match(source, /port: privatePort/);
+    assert.match(source, /const insideBox = isInsideBox\(\)/);
+    assert.match(source, /managedGatewayDiscovery: !insideBox/);
+    assert.match(source, /wildcardHost: insideBox/);
     assert.match(source, /privateListenerSet\.start\(\)/);
     const classifierStart = source.indexOf('await interfaceClassifier.start()');
     const privateStart = source.indexOf('await privateListenerSet.start()');

@@ -1,11 +1,21 @@
 import fs from 'fs';
 import path from 'path';
 import net from 'net';
-import { PLOINKY_DIR, ROUTING_FILE } from './config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
 import * as reposSvc from './repos.js';
 import { collectAgentRuntimeStates } from '../sandbox/agentRuntimeState.js';
+import { getAgentsRegistry } from '../sandbox/docker/containerRegistry.js';
+import {
+    createNoWaitRunBinding,
+    observeBoundNoWaitRun,
+    readNoWaitRunMarker,
+} from '../commands/noWaitLogObserver.js';
 import { findAgent } from './utils.js';
 import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
+import { inspectWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
+import { AGENTLIB_ENV } from '../../agentlib/contract.mjs';
+import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
+import { buildAgentLibAttestation } from '../../agentlib/runtime.mjs';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const PREDEFINED_REPOS = reposSvc.getPredefinedRepos();
@@ -88,7 +98,9 @@ export function listRepos() {
 }
 
 export function listCurrentAgents() {
-    const runtimes = collectAgentRuntimeStates();
+    const registry = getAgentsRegistry() || {};
+    const runtimes = collectAgentRuntimeStates({ registry })
+        .map((entry) => applyCurrentNoWaitReadiness(entry, registry));
     if (!runtimes.length) {
         console.log(styles.warn('No enabled or running agent runtimes detected.'));
         return;
@@ -105,6 +117,9 @@ export function listCurrentAgents() {
         const statusFormatter = ({
             running: styles.success,
             exited: styles.danger,
+            failed: styles.danger,
+            unknown: styles.danger,
+            starting: styles.warn,
             paused: styles.warn,
             restarting: styles.warn,
             created: styles.info
@@ -125,7 +140,99 @@ export function listCurrentAgents() {
             resourceParts.push(`${styles.label('ports')}: ${ports}`);
         }
         console.log(`     ${resourceParts.join('  ')}`);
+        const grant = entry.agentLib;
+        const attestation = entry.agentLibAttestation;
+        if (grant) {
+            console.log(`     ${styles.label('AgentLib selection')}: ${String(grant.fingerprint || '-').slice(0, 12)}`
+                + `  ${styles.label('source id')}: ${String(grant.sourceIdHash || '-').slice(0, 12)}`);
+        }
+        if (entry.state?.running && attestation) {
+            const matchesGrant = attestation.deploymentFingerprint === grant?.fingerprint
+                && attestation.sourceIdHash === grant?.sourceIdHash
+                && attestation.sourceRootRealpath === grant?.runtimePath;
+            console.log(`     ${styles.label('AgentLib resolved root')}: ${attestation.sourceRootRealpath || '-'}`);
+            console.log(`     ${styles.label('AgentLib proof')}: ${matchesGrant ? styles.success('admitted') : styles.danger('mismatch')}`);
+            for (const [subpath, hash] of Object.entries(attestation.entrypoints || {})) {
+                console.log(`       ${subpath}: ${String(hash).slice(0, 12)}`);
+            }
+        } else if (entry.state?.running) {
+            console.log(`     ${styles.label('AgentLib proof')}: ${styles.warn('missing — restart required')}`);
+        }
         console.log('');
+    }
+}
+
+/**
+ * Overlay a current detached launch's semantic readiness on the live runtime
+ * state shown to operators. OCI "running" proves only that the container
+ * process exists; a no-wait worker publishes "running" only after the exact
+ * manifest readiness probe and route activation have succeeded.
+ *
+ * Marker/status reads are identity-bound and fenced against the same registry
+ * snapshot used for runtime collection. Any malformed, stale, or otherwise
+ * unprovable current run fails closed instead of exposing a false-ready state.
+ */
+export function applyCurrentNoWaitReadiness(entry, registry, {
+    runningDir = RUNNING_DIR,
+    readMarker = readNoWaitRunMarker,
+    createBinding = createNoWaitRunBinding,
+    observeRun = observeBoundNoWaitRun,
+} = {}) {
+    const containerName = String(entry?.containerName || '');
+    const record = registry?.[containerName];
+    if (!containerName || !record || record.type !== 'agent') return entry;
+
+    let marker;
+    try {
+        marker = readMarker(containerName, { runningDir });
+    } catch (_) {
+        return {
+            ...entry,
+            state: {
+                ...(entry?.state || {}),
+                status: 'unknown',
+                ready: false,
+                noWaitState: 'unreadable',
+            },
+        };
+    }
+    if (!marker) return entry;
+
+    try {
+        const binding = createBinding(containerName, record, marker);
+        const observation = observeRun(binding, {
+            runningDir,
+            readRegistrySnapshot: () => registry,
+        });
+        if (observation.state === 'running') {
+            return {
+                ...entry,
+                state: {
+                    ...(entry?.state || {}),
+                    ready: Boolean(entry?.state?.running),
+                    noWaitState: 'running',
+                },
+            };
+        }
+        return {
+            ...entry,
+            state: {
+                ...(entry?.state || {}),
+                status: observation.state === 'failed' ? 'failed' : 'starting',
+                ready: false,
+                noWaitState: observation.state,
+            },
+        };
+    } catch (_) {
+        return {
+            ...entry,
+            state: {
+                ...(entry?.state || {}),
+                status: 'unknown',
+                ready: false,
+                noWaitState: 'unreadable',
+            },
+        };
     }
 }
 
@@ -344,8 +451,58 @@ function printRouterStatus(routerPort, isListening) {
     console.log(`- ${styles.label('Router')}: ${stateText} ${endpoint}`);
 }
 
+/**
+ * Report the selected achillesAgentLib source without mutating anything.
+ *
+ * A local checkout can change independently of Ploinky, so the bytes on disk
+ * are hashed here and compared against the active selection: a difference is a
+ * `restart required` state, not something status repairs.
+ */
+function printAgentLibStatus() {
+    let info;
+    try {
+        info = inspectWorkspaceAgentLibSource({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+    } catch (error) {
+        console.log(`AgentLib: ${styles.warn(`unavailable (${error?.message || error})`)}`);
+        return;
+    }
+    const where = info.sourceRelativePath || '(not selected)';
+    console.log(`AgentLib source: ${info.mode} ${where}`);
+    if (info.contentFingerprint) {
+        const revision = info.commit
+            ? `${info.commit.slice(0, 12)}${info.dirty ? ' (dirty)' : ''}${info.branch ? ` on ${info.branch}` : ''}`
+            : 'no git revision';
+        console.log(`AgentLib content:  ${info.contentFingerprint.slice(0, 12)} — ${revision}`);
+    }
+    if (info.active) {
+        console.log(`AgentLib active:   ${info.active.contentFingerprint.slice(0, 12)}`
+            + `${info.active.resolvedCommit ? ` @ ${info.active.resolvedCommit.slice(0, 12)}` : ''}`);
+        console.log(`AgentLib identity: ${sourceIdHash(info.active.sourceId).slice(0, 12)}`
+            + `  source ${info.active.sourceRelativePath}`
+            + `${info.active.requestedRef ? `  requested ${info.active.requestedRef}` : ''}`);
+    }
+    if (info.drifted) {
+        console.log(styles.warn('AgentLib: restart required — the local source no longer matches the active selection.'));
+    }
+    // Core proves which bytes it actually loaded, rather than reporting the
+    // descriptor it was handed.
+    try {
+        const attestation = buildAgentLibAttestation();
+        console.log(`AgentLib core:     ${attestation.sourceRootRealpath}`);
+        console.log(`AgentLib runtime:  ${String(process.env[AGENTLIB_ENV.fingerprint] || '').slice(0, 12)}`
+            + `  source-id ${String(process.env[AGENTLIB_ENV.sourceId] || '').slice(0, 12)}`);
+        for (const [entry, hash] of Object.entries(attestation.entrypoints)) {
+            console.log(`  ${entry}: ${hash.slice(0, 12)}`);
+        }
+    } catch (error) {
+        console.log(`AgentLib core: ${styles.warn(`not attested (${error?.message || error})`)}`);
+    }
+    if (info.detail) console.log(`AgentLib detail: ${info.detail}`);
+}
+
 export async function statusWorkspace() {
     console.log(styles.header('Workspace status:'));
+    printAgentLibStatus();
     const ssoStatus = gatherSsoStatus();
     printSsoStatusSummary(ssoStatus);
 

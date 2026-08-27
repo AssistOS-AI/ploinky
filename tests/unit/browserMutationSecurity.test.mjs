@@ -28,7 +28,7 @@ function request(headers = {}) {
     };
 }
 
-test('browser mutation proof binds session, exact routed origin, and selected host', () => {
+test('browser mutation proof binds session, exact routed origin, selected host, and active generation', () => {
     const routePlan = publicPlan();
     const authContext = { routeKey: 'identity-owner', boundHostRouteKey: 'example' };
     const req = request({ origin: 'https://app.example.test' });
@@ -56,8 +56,8 @@ test('browser mutation proof binds session, exact routed origin, and selected ho
             routePlan: publicPlan({ generation: 'edge-generation-b' }),
             authContext,
             sessionId: 'session-a',
-        }).ok,
-        true,
+        }).code,
+        'BROWSER_CSRF_INVALID',
     );
     assert.equal(
         verifyBrowserMutationRequest(req, {

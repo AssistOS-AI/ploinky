@@ -1628,7 +1628,10 @@ async function activatePreparedRuntimeAfterReadiness({
   shortAgentName,
   agentPath,
   alias = '',
-}) {
+}, {
+  mergeRouting = mergeRoutingConfig,
+  cleanupFailure = cleanupFailedPreparedRuntime,
+} = {}) {
   if (!result?.requiresEdgeActivation) return false;
   if (!result?.containerName || !result?.registryRecord) {
     throw new Error('runtime replacement activation requires one exact returned container and registry record');
@@ -1637,7 +1640,7 @@ async function activatePreparedRuntimeAfterReadiness({
     throw new Error('runtime replacement activation requires its exact preparation lease');
   }
   try {
-    await mergeRoutingConfig((cfg) => {
+    await mergeRouting((cfg) => {
       const agents = workspaceSvc.loadAgents();
       agents[result.containerName] = result.registryRecord;
       workspaceSvc.saveAgents(agents, { coordinate: false });
@@ -1659,40 +1662,49 @@ async function activatePreparedRuntimeAfterReadiness({
     });
     return true;
   } catch (error) {
-    try {
-      dockerSvc.cleanupExactAgentRuntimeCandidate(result);
-    } catch (cleanupError) {
-      error.message += `; exact activation-failure cleanup: ${cleanupError?.message || cleanupError}`;
-    }
-    try {
-      inactivateEdgeRoutingGeneration('runtime-replacement-activation-failed', {
-        preserveSelectedGeneration: true,
-      });
-    } catch (_) {}
-    try {
-      abortEdgeRoutingPreparation(result.preparationLease, {
-        reason: 'runtime-replacement-activation-failed',
-      });
-    } catch (_) {}
+    cleanupFailure(
+      result,
+      error,
+      'runtime-replacement-activation-failed',
+    );
     throw error;
   }
 }
 
-export function cleanupFailedPreparedRuntime(result, error, reason = 'runtime-replacement-readiness-failed') {
+const handledPreparedRuntimeFailures = new WeakSet();
+
+export function cleanupFailedPreparedRuntime(
+  result,
+  error,
+  reason = 'runtime-replacement-readiness-failed',
+  {
+    cleanupCandidate = dockerSvc.cleanupExactAgentRuntimeCandidate,
+    inactivate = inactivateEdgeRoutingGeneration,
+    abortPreparation = abortEdgeRoutingPreparation,
+  } = {},
+) {
   if (!result) return;
+  // The activation helper and its lifecycle caller see the same prepared
+  // runtime. Cleanup receipts are intentionally single-use authority, so the
+  // first failure owner consumes the transaction and every outer catch is a
+  // no-op for that exact result.
+  if (typeof result === 'object') {
+    if (handledPreparedRuntimeFailures.has(result)) return;
+    handledPreparedRuntimeFailures.add(result);
+  }
   if (result.preparationLease && result.containerName && result.containerId && result.registryRecord) {
     try {
-      dockerSvc.cleanupExactAgentRuntimeCandidate(result);
+      cleanupCandidate(result);
     } catch (cleanupError) {
-      error.message += `; exact readiness-failure cleanup: ${cleanupError?.message || cleanupError}`;
+      error.message += `; exact runtime-failure cleanup: ${cleanupError?.message || cleanupError}`;
     }
   }
   if (!result.preparationLease) return;
   try {
-    inactivateEdgeRoutingGeneration(reason, { preserveSelectedGeneration: true });
+    inactivate(reason, { preserveSelectedGeneration: true });
   } catch (_) {}
   try {
-    abortEdgeRoutingPreparation(result.preparationLease, { reason });
+    abortPreparation(result.preparationLease, { reason });
   } catch (_) {}
 }
 
@@ -1932,7 +1944,12 @@ async function startWorkspace(staticAgentArg, portArg, {
     const providerRegistry = lockedStart.registry;
     const dependencyGraph = lockedStart.graph;
 
-    let reg = providerRegistry;
+    // The locked admission intentionally precedes the first config mutation,
+    // so its registry snapshot cannot contain the static identity persisted
+    // above on an initial start. Refresh the non-authorizing workspace config
+    // before saving that admitted registry; otherwise this stale write removes
+    // `_config.static` and a later zero-argument start cannot recover it.
+    let reg = deduplicateAgentRegistry(providerRegistry, dockerSvc.getAgentContainerName);
     workspaceSvc.saveAgents(reg);
 
     const { getAgentContainerName, ensureAgentService } = dockerSvc;

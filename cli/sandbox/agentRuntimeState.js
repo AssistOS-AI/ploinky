@@ -62,6 +62,8 @@ function stoppedRuntimeEntry(containerName, record, runtime) {
         containerImage: record?.containerImage || '-',
         createdAt: record?.createdAt || '-',
         projectPath: record?.projectPath || '-',
+        agentLib: record?.agentLib || null,
+        agentLibAttestation: record?.agentLibAttestation || null,
         state: {
             status: 'stopped',
             running: false,
@@ -114,6 +116,8 @@ function collectAgentRuntimeStates(options = {}) {
                 repoName: String(record.repoName || liveEntry.repoName || '-'),
                 runtime,
                 enabled: true,
+                agentLib: record.agentLib || null,
+                agentLibAttestation: record.agentLibAttestation || null,
                 state: usableRuntimeState({
                     ...(liveEntry.state || {}),
                     status: String(liveEntry.state?.status || 'running').toLowerCase(),
