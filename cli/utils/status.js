@@ -1,15 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import net from 'net';
-import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE, RUNNING_DIR } from './config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
 import * as reposSvc from './repos.js';
 import { collectAgentRuntimeStates } from '../sandbox/agentRuntimeState.js';
 import { getAgentsRegistry } from '../sandbox/docker/containerRegistry.js';
-import {
-    createNoWaitRunBinding,
-    observeBoundNoWaitRun,
-    readNoWaitRunMarker,
-} from '../commands/noWaitLogObserver.js';
+import { applyCurrentNoWaitReadiness } from './noWaitReadiness.js';
 import { findAgent } from './utils.js';
 import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
 import { inspectWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
@@ -162,79 +158,7 @@ export function listCurrentAgents() {
     }
 }
 
-/**
- * Overlay a current detached launch's semantic readiness on the live runtime
- * state shown to operators. OCI "running" proves only that the container
- * process exists; a no-wait worker publishes "running" only after the exact
- * manifest readiness probe and route activation have succeeded.
- *
- * Marker/status reads are identity-bound and fenced against the same registry
- * snapshot used for runtime collection. Any malformed, stale, or otherwise
- * unprovable current run fails closed instead of exposing a false-ready state.
- */
-export function applyCurrentNoWaitReadiness(entry, registry, {
-    runningDir = RUNNING_DIR,
-    readMarker = readNoWaitRunMarker,
-    createBinding = createNoWaitRunBinding,
-    observeRun = observeBoundNoWaitRun,
-} = {}) {
-    const containerName = String(entry?.containerName || '');
-    const record = registry?.[containerName];
-    if (!containerName || !record || record.type !== 'agent') return entry;
-
-    let marker;
-    try {
-        marker = readMarker(containerName, { runningDir });
-    } catch (_) {
-        return {
-            ...entry,
-            state: {
-                ...(entry?.state || {}),
-                status: 'unknown',
-                ready: false,
-                noWaitState: 'unreadable',
-            },
-        };
-    }
-    if (!marker) return entry;
-
-    try {
-        const binding = createBinding(containerName, record, marker);
-        const observation = observeRun(binding, {
-            runningDir,
-            readRegistrySnapshot: () => registry,
-        });
-        if (observation.state === 'running') {
-            return {
-                ...entry,
-                state: {
-                    ...(entry?.state || {}),
-                    ready: Boolean(entry?.state?.running),
-                    noWaitState: 'running',
-                },
-            };
-        }
-        return {
-            ...entry,
-            state: {
-                ...(entry?.state || {}),
-                status: observation.state === 'failed' ? 'failed' : 'starting',
-                ready: false,
-                noWaitState: observation.state,
-            },
-        };
-    } catch (_) {
-        return {
-            ...entry,
-            state: {
-                ...(entry?.state || {}),
-                status: 'unknown',
-                ready: false,
-                noWaitState: 'unreadable',
-            },
-        };
-    }
-}
+export { applyCurrentNoWaitReadiness } from './noWaitReadiness.js';
 
 export function collectAgentsSummary({ includeInactive = true } = {}) {
     const repoList = includeInactive

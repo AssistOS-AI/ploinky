@@ -34,6 +34,8 @@ test('workspace metrics collection is asynchronous and publishes a safe projecti
     const registrySource = await fs.readFile(path.resolve('cli/sandbox/docker/containerRegistry.js'), 'utf8');
     const statusSource = await fs.readFile(path.resolve('cli/server/handlers/status.js'), 'utf8');
     assert.match(source, /collectAgentRuntimeStatesAsync/);
+    assert.match(source, /getAgentsRegistry/);
+    assert.match(source, /applyRuntimeReadinessProjection/);
     assert.doesNotMatch(source, /spawnSync|return \{ \.\.\.entry/);
     assert.match(source, /publicRuntimeEntry/);
     assert.match(source, /aggregateProcessTreeMetrics/);

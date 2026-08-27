@@ -3,7 +3,9 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import { collectAgentRuntimeStatesAsync } from '../sandbox/agentRuntimeState.js';
+import { getAgentsRegistry } from '../sandbox/docker/containerRegistry.js';
 import { getRuntime } from '../sandbox/docker/common.js';
+import { applyRuntimeReadinessProjection } from '../utils/noWaitReadiness.js';
 import { aggregateProcessTreeMetrics } from './workspaceProcessMetrics.js';
 
 const RECONCILE_INTERVAL_MS = 5_000;
@@ -38,6 +40,7 @@ async function collectHostMetrics(states) {
 }
 
 function publicRuntimeEntry(entry, metrics) {
+  const running = Boolean(entry?.state?.running);
   return {
     containerName: String(entry?.containerName || ''),
     agentName: String(entry?.agentName || '-'),
@@ -46,7 +49,8 @@ function publicRuntimeEntry(entry, metrics) {
     enabled: Boolean(entry?.enabled),
     state: {
       status: String(entry?.state?.status || 'unknown'),
-      running: Boolean(entry?.state?.running),
+      running,
+      ready: typeof entry?.state?.ready === 'boolean' ? entry.state.ready : running,
     },
     metrics,
   };
@@ -85,7 +89,9 @@ class WorkspaceMetricsMonitor extends EventEmitter {
     if (this.reconcileInFlight) return;
     this.reconcileInFlight = true;
     try {
-      this.states = await collectAgentRuntimeStatesAsync();
+      const registry = getAgentsRegistry() || {};
+      const states = await collectAgentRuntimeStatesAsync({ registry });
+      this.states = applyRuntimeReadinessProjection(states, registry);
     } catch (_) {
       this.publish();
       return;
