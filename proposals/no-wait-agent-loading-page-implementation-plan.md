@@ -1,6 +1,6 @@
 # Implementation Plan: Generic Loading Page for Booting No-Wait Agents
 
-Status: implemented on the dedicated feature branch; focused and live integration verification passed; pushed browser and fresh Explorer release evidence is pending.
+Status: implemented and pushed on the dedicated feature branch; focused and live integration verification, the feature-specific browser transition, and all three fresh canonical Explorer release gates passed. The complete canonical Ploinky suite remains an explicitly directed skip/deviation.
 
 Plan date: 2026-08-27.
 
@@ -651,8 +651,8 @@ Implementation began from the fetched canonical Ploinky remote-default state rec
 
 | Repository / role | Canonical remote | Symbolic default | Exact branch point or runner SHA |
 | --- | --- | --- | --- |
-| Ploinky production candidate | `https://github.com/AssistOS-AI/ploinky.git` | `origin/master` | `5d87b1668f07abd9617eb54a7808221a7c50e878` |
-| AssistOSExplorer feature-test branch | `https://github.com/AssistOS-AI/AssistOSExplorer.git` | `assistos-ai/main` | based on `6acfa0bf07592272d4a82bbe4e460f6dc4e1a233`; pushed test commit `d89b430a97a603308b8da853c9d64dc8fed02c77` |
+| Ploinky production candidate | `https://github.com/AssistOS-AI/ploinky.git` | `origin/master` | branch point `5d87b1668f07abd9617eb54a7808221a7c50e878`; pushed and tested candidate `61b8c7fd0034fc522ca86574ec844b003f40c26e` on `feature/no-wait-agent-loading-page` |
+| AssistOSExplorer feature-test branch | `https://github.com/AssistOS-AI/AssistOSExplorer.git` | `assistos-ai/main` | based on `6acfa0bf07592272d4a82bbe4e460f6dc4e1a233`; pushed test commit `2173bb06fafa070c019c6fc82d10927992ac6c22` on `test/no-wait-agent-loading-page-e2e` |
 | AssistOSExplorer canonical release runner | `https://github.com/AssistOS-AI/AssistOSExplorer.git` | `assistos-ai/main` | clean detached checkout at `6acfa0bf07592272d4a82bbe4e460f6dc4e1a233` |
 
 The Ploinky implementation binds the staged registry identity through worker arguments, marker, every status, structured process proof, admission, activation, and the final registry fence. Marker retirement is fail closed. The Router classifies pending ordinary-HTTP plans without lifecycle I/O, authorizes first, revalidates the immutable edge lease, then resolves one exact no-wait record. The self-contained page and same-route probe expose only fixed allowlisted browser states, preserve existing non-document behavior, strip the reserved header on both ordinary and agent-port forwarding, and require one opaque generation to remain ready for the complete settling window. Marketplace uses the factored one-record observer without becoming Router authority.
@@ -665,4 +665,26 @@ Pre-candidate verification completed on the integrated diff:
 - A final strict cleanup proof found no matching temporary workspace, Router listener on port 8080, detached no-wait worker, fixture container, or fixture network.
 - An independent read-only implementation verifier found no remaining P0-P3 production or security defect after its own `299/299` focused run, production syntax checks, and staged/unstaged diff audit; the primary then added and passed the one additional Bash-3.2 prelaunch-cleanup regression without changing production code.
 
-Deviation: the complete canonical Ploinky suite in section 16 step 4 and acceptance criterion 13 was not taken to a passing result. Two preserved attempts encountered an unrelated watchdog/test-harness sequencing race after the candidate's focused and live checks; the implementation does not modify the monitor/restart path. The task owner then explicitly directed the implementation run to skip the Ploinky suite and proceed to E2E. This deviation is recorded rather than represented as a passing gate. The feature-specific Playwright transition and the three separate canonical Explorer gates remain mandatory for the pushed candidate and will be recorded as external release evidence.
+The pushed candidate then passed the deterministic feature-specific browser transition from the tracked Explorer test branch:
+
+- Candidate `61b8c7fd0034fc522ca86574ec844b003f40c26e` and Explorer test commit `2173bb06fafa070c019c6fc82d10927992ac6c22` were committed, pushed, clean, and exactly equal to their upstreams before the run.
+- The final fresh-cycle attempt ran exactly one Chromium-headless test with one worker and zero retries: `1 passed (7.9s)`.
+- The test proved an initial Router-owned `503`, two same-route `202 starting` probes before the test-owned causal release, one opaque ready generation stable for 3,051 ms, automatic `200` application handoff, and removal of the reserved startup header before upstream forwarding.
+- The spec produced a sanitized trace and passed its credential-residue/input-value audit. The first fresh fixture was destroyed and audited clean before release testing.
+- Evidence: `/Users/danielsava/.codex/visualizations/2026/08/27/01a043ee-cf6c-74e2-9556-7f9c0278c246/no-wait-agent-loading-page-evidence/feature-e2e/no-wait-feature-61b8c7fd-attempt2`.
+
+A second genuinely fresh `~/work/testExplorerFresh` deployment used the literal command `cd ~/work/testExplorerFresh && ploinky start explorer`. The deployed Ploinky candidate remained `61b8c7fd0034fc522ca86574ec844b003f40c26e`; Explorer and the clean detached canonical release runner were `6acfa0bf07592272d4a82bbe4e460f6dc4e1a233`; managed achillesAgentLib was `838a64bf9c5faa9f1c21935686bcfea642a42fa4`. The release manifest pinned Box image `sha256:e633e9f39b2a03eff26d01c5d95ff064623541ed8e20d62db71dbad994571a7f` and passed the candidate verifier with branch fallback disabled. All 18 admitted runtimes passed AgentLib deployment attestation, and all 14 current no-wait markers passed bound identity observation as terminal `running`.
+
+The clean canonical Explorer runner then passed the three required gates separately, each as one Chromium-headless worker, zero retries, no skips, and exactly one selected test:
+
+| Gate | Exact result | Evidence directory |
+| --- | --- | --- |
+| OnlyOffice | `1 passed (1.3m)` | `release-e2e/release-61b8c7fd-attempt1/onlyoffice` |
+| Copilot | `1 passed (1.5m)` | `release-e2e/release-61b8c7fd-attempt1/copilot` |
+| WebMeet | `1 passed (42.4s)` with strict headless media enabled | `release-e2e/release-61b8c7fd-attempt1/webmeet` |
+
+The shared Podman VM stopped unexpectedly only after all browser gates and post-gate candidate evidence had completed. During a coordinated temporary restart, the same exited Box was stopped and destroyed through the candidate CLI. Final reachable-engine cleanup counts were zero for the exact Box name, path-hash-labelled containers, workspace-name networks and volumes, TCP 8080 listeners, and UDP 7882 users. `/Users/danielsava/work/testExplorerFresh` is absent and was moved recoverably to `/Users/danielsava/.Trash/testExplorerFresh-no-wait-passed-61b8c7fd-20260827T193316Z`; the VM was released stopped and idle.
+
+The consolidated external evidence index is `/Users/danielsava/.codex/visualizations/2026/08/27/01a043ee-cf6c-74e2-9556-7f9c0278c246/no-wait-agent-loading-page-evidence/release-evidence-summary.md`; the exact post-gate destruction/audit transcript is `release-e2e/release-61b8c7fd-attempt1/post-gate-cleanup-audit.txt` beneath that root. The independent review disposition record remains unchanged. Any final commit after the tested candidate is limited to this evidence/status documentation; production source and tests remain byte-identical to `61b8c7fd0034fc522ca86574ec844b003f40c26e`.
+
+Deviation: the complete canonical Ploinky suite in section 16 step 4 and acceptance criterion 13 was not taken to a passing result. Two preserved attempts encountered an unrelated watchdog/test-harness sequencing race after the candidate's focused and live checks; the implementation does not modify the monitor/restart path. The task owner then explicitly directed the implementation run to skip the Ploinky suite and proceed to E2E. This deviation is recorded rather than represented as a passing gate; focused/adjacent tests, the live latched integration, the feature-specific browser transition, and all three canonical Explorer gates passed.
