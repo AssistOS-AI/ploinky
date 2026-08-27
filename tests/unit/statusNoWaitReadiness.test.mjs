@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { applyCurrentNoWaitReadiness } from '../../cli/utils/status.js';
+import {
+    applyCurrentNoWaitReadiness,
+    applyRuntimeReadinessProjection,
+} from '../../cli/utils/noWaitReadiness.js';
 
 const CONTAINER = 'ploinky_Agents_onlyOffice_workspace_12345678';
 const RECORD = Object.freeze({
@@ -34,6 +37,22 @@ test('status keeps ordinary foreground runtime state when no no-wait marker exis
         readMarker: () => null,
     });
     assert.equal(result, LIVE);
+});
+
+test('runtime readiness projection applies one registry snapshot to every runtime', () => {
+    const seen = [];
+    const entries = [{ containerName: 'one' }, { containerName: 'two' }];
+    const result = applyRuntimeReadinessProjection(entries, REGISTRY, {
+        applyReadiness: (entry, registry) => {
+            seen.push(registry);
+            return { ...entry, projected: true };
+        },
+    });
+    assert.deepEqual(result, [
+        { containerName: 'one', projected: true },
+        { containerName: 'two', projected: true },
+    ]);
+    assert.deepEqual(seen, [REGISTRY, REGISTRY]);
 });
 
 test('status does not expose a live no-wait container as ready before semantic readiness', () => {
