@@ -408,11 +408,14 @@ function renderLocalAccountHtml({
 function renderLogoutConfirmationHtml({
     agentName = '',
     returnTo = '/',
+    cancelTo = returnTo,
     csrfToken = '',
     includeAgentSelector = true,
 } = {}) {
     const rawAgent = String(agentName || '').trim();
-    const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
+    const normalizedReturnTo = normalizeRelativePath(returnTo, '/');
+    const safeReturnTo = escapeHtml(normalizedReturnTo);
+    const safeCancelTo = escapeHtml(normalizeRelativePath(cancelTo, normalizedReturnTo));
     const safeCsrfToken = escapeHtml(csrfToken || '');
     const logoutAction = includeAgentSelector && rawAgent
         ? `/auth/logout?agent=${encodeURIComponent(rawAgent)}`
@@ -439,7 +442,7 @@ function renderLogoutConfirmationHtml({
         ${includeAgentSelector && rawAgent ? `<input type="hidden" name="agent" value="${escapeHtml(rawAgent)}" />` : ''}
         <button class="auth-btn" type="submit">Sign out</button>
       </form>
-      <a class="auth-btn secondary" href="${safeReturnTo}">Cancel</a>
+      <a class="auth-btn secondary" href="${safeCancelTo}">Cancel</a>
     </section>
   </main>
 </body>

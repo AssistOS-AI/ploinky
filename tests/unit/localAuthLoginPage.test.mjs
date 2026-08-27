@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 
-import { renderLocalLoginHtml } from '../../cli/server/authHandlers/authPages.js';
+import {
+    renderLocalLoginHtml,
+    renderLogoutConfirmationHtml,
+} from '../../cli/server/authHandlers/authPages.js';
 
 function executeLoginSubmit(html, locationHash) {
     const script = html.match(/<script>\s*([\s\S]*?)\s*<\/script>/)?.[1];
@@ -121,4 +124,16 @@ test('local login rendering replaces invalid return targets with the safe root f
         });
         assert.match(html, /<input type="hidden" name="returnTo" value="\/" \/>/, returnTo);
     }
+});
+
+test('logout confirmation keeps Cancel separate from the post-logout destination', () => {
+    const html = renderLogoutConfirmationHtml({
+        agentName: 'explorer',
+        returnTo: '/auth/logged-out?next=%2Fexplorer%2Findex.html',
+        cancelTo: '/explorer/index.html',
+        csrfToken: 'csrf-token',
+    });
+
+    assert.match(html, /name="returnTo" value="\/auth\/logged-out\?next=%2Fexplorer%2Findex\.html"/);
+    assert.match(html, /<a class="auth-btn secondary" href="\/explorer\/index\.html">Cancel<\/a>/);
 });
