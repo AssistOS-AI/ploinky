@@ -35,12 +35,14 @@ test('host and core lifecycle help have different scopes', () => {
     const host = captureHelp([], { surface: 'host' });
     const core = captureHelp([], { surface: 'core' });
     assert.match(host, /combined, read-only outer runtime and workspace status/i);
+    assert.match(host, /status \[--verbose\]/i);
     assert.match(host, /stop core services, then stop the outer runtime/i);
     assert.match(host, /destroy \[--delete-cache\]/i);
     assert.match(host, /remove the outer runtime without prompting/i);
     assert.match(host, /optionally delete \.ploinky\/box cache data/i);
     assert.doesNotMatch(host, /--delete-volumes/i);
     assert.match(core, /leave the outer runtime running/i);
+    assert.match(core, /status \[--verbose\]/i);
     assert.match(core, /exit the REPL before running host ploinky stop or ploinky destroy/i);
 });
 
@@ -53,6 +55,7 @@ test('detailed lifecycle help preserves the selected host or core scope', () => 
     const coreDestroy = captureHelp(['destroy'], { surface: 'core' });
 
     assert.match(hostStatus, /combined, read-only outer runtime and workspace status/i);
+    assert.match(hostStatus, /status \[--verbose\]/i);
     assert.match(hostStop, /stop core services, then stop the outer runtime/i);
     assert.match(
         hostDestroy,
@@ -70,6 +73,7 @@ test('detailed lifecycle help preserves the selected host or core scope', () => 
     assert.doesNotMatch(hostDestroy, /cache volumes/i);
     assert.doesNotMatch(hostDestroy, /anonymous volumes/i);
     assert.match(coreStatus, /workspace\/router\/agent state/i);
+    assert.match(coreStatus, /status \[--verbose\]/i);
     assert.match(coreStop, /leave the outer runtime running/i);
     assert.match(coreDestroy, /leave the outer runtime running/i);
 });

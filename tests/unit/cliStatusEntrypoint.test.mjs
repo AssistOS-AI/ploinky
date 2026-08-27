@@ -32,13 +32,45 @@ test('status dispatches to its read-only renderer before core initialization', a
             assert.equal(readOnly, true);
             calls.push('agentlib');
         },
-        statusWorkspaceImpl: async () => calls.push('status'),
+        statusWorkspaceImpl: async (options) => calls.push(['status', options]),
         importCoreImpl: async () => {
             throw new Error('core initialization must not be imported');
         },
     });
     assert.equal(code, 0);
-    assert.deepEqual(calls, ['agentlib', 'status']);
+    assert.deepEqual(calls, ['agentlib', ['status', { verbose: false }]]);
+});
+
+test('verbose and debug status remain read-only and request diagnostic detail', async () => {
+    for (const args of [['status', '--verbose'], ['--debug', 'status'], ['status', '-d']]) {
+        const calls = [];
+        const code = await launchCli(args, {
+            bootstrapAgentLibImpl: async ({ readOnly }) => {
+                assert.equal(readOnly, true);
+                calls.push('agentlib');
+            },
+            statusWorkspaceImpl: async (options) => calls.push(['status', options]),
+            importCoreImpl: async () => {
+                throw new Error('core initialization must not be imported');
+            },
+        });
+        assert.equal(code, 0, args.join(' '));
+        assert.deepEqual(calls, ['agentlib', ['status', { verbose: true }]], args.join(' '));
+    }
+});
+
+test('status rejects unsupported or repeated options before bootstrap', async () => {
+    for (const args of [['status', '--json'], ['status', '--verbose', '--verbose']]) {
+        let bootstrapped = false;
+        await assert.rejects(
+            launchCli(args, {
+                bootstrapAgentLibImpl: async () => { bootstrapped = true; },
+                statusWorkspaceImpl: async () => {},
+            }),
+            /Usage: status \[--verbose\]/,
+        );
+        assert.equal(bootstrapped, false, args.join(' '));
+    }
 });
 
 test('status renders terminal color intent without changing workspace state', (t) => {
@@ -71,7 +103,7 @@ test('status renders terminal color intent without changing workspace state', (t
             projectPath: '/workspace',
         },
     }));
-    const invokeStatus = (environmentOverrides = {}) => {
+    const invokeStatus = (environmentOverrides = {}, statusArgs = []) => {
         const environment = { ...process.env };
         delete environment.NO_COLOR;
         delete environment.PLOINKY_COLOR;
@@ -82,7 +114,7 @@ test('status renders terminal color intent without changing workspace state', (t
         const before = treeHash(root);
         const result = spawnSync(process.execPath, [
             path.resolve(import.meta.dirname, '../../cli/index.js'),
-            'status',
+            'status', ...statusArgs,
         ], {
             cwd: root,
             encoding: 'utf8',
@@ -96,6 +128,7 @@ test('status renders terminal color intent without changing workspace state', (t
     const plainOutput = invokeStatus();
     const coloredOutput = invokeStatus({ PLOINKY_COLOR: '1' });
     const noColorOutput = invokeStatus({ PLOINKY_COLOR: '1', NO_COLOR: '1' });
+    const verboseOutput = invokeStatus({}, ['--verbose']);
 
     for (const output of [plainOutput, noColorOutput]) {
         assert.doesNotMatch(output, /\u001B\[/);
@@ -105,6 +138,8 @@ test('status renders terminal color intent without changing workspace state', (t
         assert.match(output, /agent: exampleAgent  repo: exampleRepo/);
         assert.match(output, /^  - ploinky_example/m);
         assert.doesNotMatch(output, /\u2022/);
+        assert.doesNotMatch(output, /AgentLib core:/);
+        assert.doesNotMatch(output, /LLMAgents\/index\.mjs:/);
     }
 
     for (const expected of [
@@ -118,4 +153,6 @@ test('status renders terminal color intent without changing workspace state', (t
     }
     assert.match(coloredOutput, /Workspace status:/);
     assert.match(coloredOutput, /Agent runtimes:/);
+    assert.match(verboseOutput, /AgentLib core:/);
+    assert.match(verboseOutput, /LLMAgents\/index\.mjs:/);
 });

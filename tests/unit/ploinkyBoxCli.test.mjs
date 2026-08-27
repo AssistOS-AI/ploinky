@@ -133,6 +133,30 @@ test('running status uses the read-only core renderer without preparing the Box'
     assert.equal(output.value(), '');
 });
 
+test('running verbose and debug status preserve diagnostic intent without preparing the Box', async () => {
+    for (const argv of [['status', '--verbose'], ['--debug', 'status']]) {
+        const events = [];
+        const output = bufferStream();
+        const code = await runOuterCli(argv, {
+            env: {},
+            input: { isTTY: false },
+            output,
+            errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events, { statusState: 'running-initialized' }),
+            execute(command, args) {
+                events.push(['execute', command, args]);
+                return 0;
+            },
+        });
+        assert.equal(code, 0, argv.join(' '));
+        assert.equal(events.includes('prepare'), false, argv.join(' '));
+        assert.deepEqual(events[0], 'status', argv.join(' '));
+        assert.deepEqual(events[1][2].slice(-argv.length - 1), [
+            '/opt/ploinky/bin/ploinky-local', ...argv,
+        ], argv.join(' '));
+    }
+});
+
 test('running status propagates only derived terminal color intent without allocating a TTY', async () => {
     const cases = [
         {

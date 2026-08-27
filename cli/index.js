@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { showHelp } from './commands/help.js';
+import { parseStatusOptions } from './statusOptions.js';
 import { bootstrapAgentLibRuntime } from '../agentlib/bootstrap.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
 import { fingerprintSource, sourceIdEquals } from '../agentlib/fingerprint.mjs';
@@ -169,14 +170,16 @@ export async function launchCli(args = process.argv.slice(2), {
         showHelpImpl(args[0] === 'help' ? args.slice(1) : [], { surface: 'core' });
         return 0;
     }
-    if (args.length === 1 && args[0] === 'status') {
+    const { commandArgs, debug } = extractGlobalDebugFlag(args);
+    if (commandArgs[0] === 'status') {
+        const statusOptions = parseStatusOptions(commandArgs.slice(1), { debug });
         // Status reports the selected AgentLib source, so it needs the runtime
         // contract — but in read-only mode, which never clones, fetches, or
         // creates workspace state.
         await bootstrapAgentLibImpl({ env, readOnly: true });
         const renderStatus = statusWorkspaceImpl
             || (await import('./utils/status.js')).statusWorkspace;
-        await renderStatus();
+        await renderStatus(statusOptions);
         return 0;
     }
     if (args.length === 1 && args[0] === 'cli') {
@@ -191,7 +194,6 @@ export async function launchCli(args = process.argv.slice(2), {
     // Logs are observational, so they bypass dependency assertion, environment
     // initialization, and repository bootstrap. Stdout carries only log bytes;
     // every informational message goes to stderr.
-    const { commandArgs, debug } = extractGlobalDebugFlag(args);
     if (commandArgs[0] === 'logs') {
         if (debug) {
             const { setDebugMode } = await importConfigImpl();
