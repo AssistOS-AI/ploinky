@@ -150,6 +150,36 @@ export function revalidatePtyProcessIdentity(record, { readIdentityImpl = readLi
     return current;
 }
 
+export function revalidatePtyProcessLiveness(record, {
+    readIdentityImpl = readLinuxProcessIdentity,
+} = {}) {
+    const pid = positiveInteger(record?.pid, 'pid');
+    if (typeof record?.startToken !== 'string' || !/^linux-proc:[1-9][0-9]*$/.test(record.startToken)) {
+        throw processIdentityError('pty-start-token');
+    }
+    const readComparableIdentity = () => {
+        const identity = readIdentityImpl(pid);
+        if (!identity || typeof identity !== 'object'
+            || identity.pid !== pid
+            || typeof identity.state !== 'string'
+            || identity.state.length !== 1
+            || typeof identity.startToken !== 'string'
+            || !/^linux-proc:[1-9][0-9]*$/.test(identity.startToken)) {
+            throw processIdentityError('pty-liveness');
+        }
+        return identity;
+    };
+    const before = readComparableIdentity();
+    const after = readComparableIdentity();
+    if (before.state === 'Z'
+        || after.state === 'Z'
+        || before.startToken !== record.startToken
+        || after.startToken !== record.startToken) {
+        throw processIdentityError('pty-exited', { stale: true });
+    }
+    return after;
+}
+
 export function signalVerifiedPtyProcessGroup(record, signal, {
     readIdentityImpl = readLinuxProcessIdentity,
     killImpl = (target, selectedSignal) => process.kill(target, selectedSignal),
@@ -168,11 +198,16 @@ export async function waitForPtyProcessExit(record, {
     pollMs = 10,
     readIdentityImpl = readLinuxProcessIdentity,
     delayImpl = (duration) => new Promise((resolve) => setTimeout(resolve, duration)),
+    nowImpl = Date.now,
 } = {}) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() <= deadline) {
+    const deadline = nowImpl() + timeoutMs;
+    while (nowImpl() <= deadline) {
         try {
-            revalidatePtyProcessIdentity(record, { readIdentityImpl });
+            // PTY teardown can legitimately clear the controlling terminal
+            // before /proc removes the original process. Exit polling proves
+            // only that exact PID/start-token identity. Full PTY topology is
+            // revalidated separately immediately before every group signal.
+            revalidatePtyProcessLiveness(record, { readIdentityImpl });
         } catch (error) {
             if (error?.code === 'WEBTTY_PROCESS_IDENTITY_STALE') return true;
             throw error;

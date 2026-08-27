@@ -6,6 +6,7 @@ import {
     captureWorkerProcessIdentity,
     parseLinuxProcessStat,
     revalidatePtyProcessIdentity,
+    revalidatePtyProcessLiveness,
     revalidateWorkerProcessIdentity,
     signalVerifiedPtyProcessGroup,
     waitForPtyProcessExit,
@@ -120,16 +121,71 @@ test('worker identity binds executable, absolute script, argv, and stable start 
     }));
 });
 
-test('exit waiting treats only a proven gone identity as success', async () => {
+test('PTY liveness follows only the exact pid and start token during normal teardown', async () => {
     const record = capturePtyProcessIdentity(4242, { readIdentityImpl: () => identity() });
+    const teardownIdentity = identity(4242, {
+        processGroupId: 7,
+        sessionId: 7,
+        ttyNumber: 0,
+        foregroundProcessGroupId: -1,
+    });
+    assert.deepEqual(revalidatePtyProcessLiveness(record, {
+        readIdentityImpl: () => teardownIdentity,
+    }), teardownIdentity);
+
+    let reads = 0;
     assert.equal(await waitForPtyProcessExit(record, {
         readIdentityImpl: () => {
+            reads += 1;
+            if (reads <= 2) return teardownIdentity;
             const error = new Error('gone');
             error.code = 'WEBTTY_PROCESS_IDENTITY_STALE';
             throw error;
         },
+        delayImpl: async () => {},
     }), true);
-    await assert.rejects(() => waitForPtyProcessExit(record, {
+});
+
+test('exit waiting treats pid reuse and zombies as proof that the original process is gone', async () => {
+    const record = capturePtyProcessIdentity(4242, { readIdentityImpl: () => identity() });
+    assert.equal(await waitForPtyProcessExit(record, {
         readIdentityImpl: () => identity(4242, { startTicks: '777' }),
-    }));
+    }), true);
+    assert.equal(await waitForPtyProcessExit(record, {
+        readIdentityImpl: () => identity(4242, { state: 'Z' }),
+    }), true);
+});
+
+test('exit waiting rejects unreadable identity evidence and times out without weakening signal checks', async () => {
+    const record = capturePtyProcessIdentity(4242, { readIdentityImpl: () => identity() });
+    await assert.rejects(() => waitForPtyProcessExit(record, {
+        readIdentityImpl: () => {
+            const error = new Error('unreadable');
+            error.code = 'WEBTTY_PROCESS_IDENTITY_UNPROVEN';
+            throw error;
+        },
+    }), { code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN' });
+    await assert.rejects(() => waitForPtyProcessExit(record, {
+        readIdentityImpl: () => ({ ...identity(), startToken: 'malformed' }),
+    }), { code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN' });
+
+    const alteredTopology = identity(4242, {
+        processGroupId: 7,
+        sessionId: 7,
+        ttyNumber: 0,
+        foregroundProcessGroupId: -1,
+    });
+    let now = 0;
+    assert.equal(await waitForPtyProcessExit(record, {
+        timeoutMs: 20,
+        pollMs: 10,
+        nowImpl: () => now,
+        delayImpl: async (duration) => { now += duration; },
+        readIdentityImpl: () => alteredTopology,
+    }), false);
+
+    assert.throws(() => signalVerifiedPtyProcessGroup(record, 'SIGKILL', {
+        readIdentityImpl: () => alteredTopology,
+        killImpl: () => assert.fail('must not signal after topology becomes unsafe'),
+    }), { code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN' });
 });
