@@ -223,3 +223,137 @@ test('Marketplace reports an enabled bwrap agent as running from generic runtime
     });
     assert.equal(marketplace.enabledAgents[0].runtime, 'bwrap');
 });
+
+test('Marketplace normalizes agent lifecycle states without trusting arbitrary runtime labels', () => {
+    const normalize = marketplaceTestables.normalizeMarketplaceAgentStatus;
+    assert.deepEqual(normalize({ active: false }), { status: 'disabled', detail: '' });
+    assert.deepEqual(normalize({
+        active: true,
+        runtimeState: { status: 'stopped', running: false },
+        noWaitState: { status: 'starting', detail: 'Background startup is in progress.' },
+    }), { status: 'starting', detail: 'Background startup is in progress.' });
+    assert.deepEqual(normalize({
+        active: true,
+        runtimeState: { status: 'running', running: true },
+        noWaitState: { status: 'failed', detail: 'stale failure' },
+    }), { status: 'running', detail: '' });
+    assert.deepEqual(normalize({
+        active: true,
+        runtimeState: { status: 'stopped', running: false },
+        noWaitState: { status: 'failed', detail: 'phase: launch — exited' },
+    }), { status: 'failed', detail: 'phase: launch — exited' });
+    assert.deepEqual(normalize({ active: true, runtimeState: { status: 'paused' } }), {
+        status: 'paused',
+        detail: '',
+    });
+    assert.deepEqual(normalize({ active: true, runtimeState: { status: 'exited' } }), {
+        status: 'stopped',
+        detail: '',
+    });
+    assert.deepEqual(normalize({ active: true, runtimeState: { status: 'compromised' } }), {
+        status: 'unknown',
+        detail: '',
+    });
+});
+
+test('Marketplace reads the exact current no-wait run and publishes bounded lifecycle detail', () => {
+    const registry = {
+        searchKey: {
+            type: 'agent',
+            instanceId: 'instance-1',
+            enableGeneration: 'generation-1',
+        },
+    };
+    const marker = {
+        runId: 'run-1',
+        runStartedAtMs: 100,
+        waveIndex: 0,
+        statusFile: 'searchKey.run-1.json',
+    };
+    let observedBinding = null;
+    const states = marketplaceTestables.collectMarketplaceNoWaitStates(registry, {
+        readRunMarker: (containerName) => {
+            assert.equal(containerName, 'searchKey');
+            return marker;
+        },
+        createRunBinding: (containerName, record, currentMarker) => {
+            assert.equal(record, registry.searchKey);
+            assert.equal(currentMarker, marker);
+            return { containerName, marker: currentMarker };
+        },
+        observeRun: (binding, options) => {
+            observedBinding = binding;
+            assert.equal(options.readRegistrySnapshot(), registry);
+            return {
+                state: 'failed',
+                status: { phase: 'launch', error: { message: 'runtime exited' } },
+            };
+        },
+        summarizeFailure: (status) => `phase: ${status.phase} — ${status.error.message}`,
+        readRegistrySnapshot: () => registry,
+    });
+
+    assert.deepEqual(observedBinding, { containerName: 'searchKey', marker });
+    assert.deepEqual(states.get('searchKey'), {
+        status: 'failed',
+        detail: 'phase: launch — runtime exited',
+    });
+});
+
+test('Marketplace state exposes starting and disabled agents as distinct lifecycle states', () => {
+    const registry = {
+        searchKey: {
+            type: 'agent',
+            runtime: 'podman',
+            repoName: 'proxies',
+            agentName: 'searchAgent',
+            runMode: 'isolated',
+        },
+    };
+    const summaries = [{
+        repo: 'proxies',
+        installed: true,
+        agents: [
+            { repo: 'proxies', name: 'searchAgent', about: 'Search', manifestPath: '/search/manifest.json' },
+            { repo: 'proxies', name: 'otherAgent', about: 'Other', manifestPath: '/other/manifest.json' },
+        ],
+    }];
+    const marketplace = marketplaceTestables.buildMarketplaceState(null, {
+        registry,
+        runtimeEntries: [{
+            containerName: 'searchKey',
+            repoName: 'proxies',
+            agentName: 'searchAgent',
+            runtime: 'podman',
+            state: { status: 'stopped', running: false, pid: 0 },
+        }],
+        noWaitStates: new Map([['searchKey', {
+            status: 'starting',
+            detail: 'Background startup is in progress.',
+        }]]),
+        summaries,
+    });
+
+    assert.deepEqual(marketplace.agents.map((agent) => ({
+        ref: agent.ref,
+        active: agent.active,
+        status: agent.status,
+        statusDetail: agent.statusDetail || '',
+        running: agent.running,
+    })).sort((left, right) => left.ref.localeCompare(right.ref)), [
+        {
+            ref: 'proxies/otherAgent',
+            active: false,
+            status: 'disabled',
+            statusDetail: '',
+            running: false,
+        },
+        {
+            ref: 'proxies/searchAgent',
+            active: true,
+            status: 'starting',
+            statusDetail: 'Background startup is in progress.',
+            running: false,
+        },
+    ]);
+});
