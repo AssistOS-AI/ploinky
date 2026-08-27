@@ -31,6 +31,7 @@ const GENERATED_ROUTER_DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json'
 const GENERATED_ROUTER_DESCRIPTOR_ROOT = path.join(PLOINKY_DIR, 'run', 'router-descriptors');
 export const NETWORK_LOCK_STALE_GRACE_MS = 5_000;
 export const NETWORK_LOCK_WAIT_MS = 60_000;
+const PODMAN_RUNTIME_PROOF_RETRY_DELAYS_MS = Object.freeze([100, 250, 500]);
 const NETWORK_LIFECYCLE_CAPABILITIES = new WeakMap();
 const NETWORK_LIFECYCLE_CONTEXT = new AsyncLocalStorage();
 
@@ -404,6 +405,13 @@ function versionAtLeast(value, minimumMajor, minimumMinor) {
     return major > minimumMajor || (major === minimumMajor && minor >= minimumMinor);
 }
 
+function waitSynchronously(delayMs) {
+    const boundedDelayMs = Math.max(0, Number(delayMs) || 0);
+    if (boundedDelayMs > 0) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, boundedDelayMs);
+    }
+}
+
 function configFilesFromDirectory(directory) {
     try {
         return fs.readdirSync(directory)
@@ -512,8 +520,18 @@ export function createNetworkLifecycleAdapter({
     lockPath = LOCK_PATH,
     containersConfigPaths,
     inspectRunningHosts,
+    runtimeProofRetryDelaysMs = PODMAN_RUNTIME_PROOF_RETRY_DELAYS_MS,
+    waitForRuntimeProofRetry = waitSynchronously,
 } = {}) {
     if (!runtime) throw new Error('network lifecycle requires a container runtime');
+    if (!Array.isArray(runtimeProofRetryDelaysMs)
+        || runtimeProofRetryDelaysMs.some((delayMs) => !Number.isFinite(Number(delayMs)) || Number(delayMs) < 0)) {
+        throw new Error('network lifecycle runtime proof retry delays must be non-negative finite numbers');
+    }
+    if (typeof waitForRuntimeProofRetry !== 'function') {
+        throw new Error('network lifecycle runtime proof retry waiter must be a function');
+    }
+    const proofRetryDelays = runtimeProofRetryDelaysMs.map(Number);
     const identity = workspaceNetworkIdentity(workspaceRoot);
     const execute = (args, options) => run(runtime, args, options);
     let rootlessPodmanVerified = false;
@@ -546,14 +564,34 @@ export function createNetworkLifecycleAdapter({
         return firstRecord(result.stdout, `container '${name}'`);
     };
 
+    function executeRuntimeProof(args) {
+        let result = null;
+        for (let attempt = 0; attempt <= proofRetryDelays.length; attempt += 1) {
+            result = execute(args);
+            if (result.ok) return { attempts: attempt + 1, result };
+            if (attempt < proofRetryDelays.length) {
+                waitForRuntimeProofRetry(proofRetryDelays[attempt]);
+            }
+        }
+        return { attempts: proofRetryDelays.length + 1, result };
+    }
+
+    function runtimeProofFailure(probe) {
+        return `${failure(probe.result)} after ${probe.attempts} attempt${probe.attempts === 1 ? '' : 's'}`;
+    }
+
     function ensureRootlessPodman() {
         if (rootlessPodmanVerified) return;
         if (runtime !== 'podman') {
             throw new Error(`runtime '${runtime}' cannot prove the managed rootless bridge contract; rootless Podman is required`);
         }
-        const result = execute(['info', '--format', '{{json .Host.Security.Rootless}}']);
-        if (!result.ok || jsonScalar(result.stdout) !== 'true') {
-            throw new Error(`runtime '${runtime}' cannot prove rootless Podman ownership; refusing managed network mutation`);
+        const probe = executeRuntimeProof(['info', '--format', '{{json .Host.Security.Rootless}}']);
+        const observed = jsonScalar(probe.result.stdout);
+        if (!probe.result.ok) {
+            throw new Error(`runtime '${runtime}' cannot prove rootless Podman ownership; refusing managed network mutation: ${runtimeProofFailure(probe)}`);
+        }
+        if (observed !== 'true') {
+            throw new Error(`runtime '${runtime}' cannot prove rootless Podman ownership; refusing managed network mutation: observed '${observed || '<empty>'}'`);
         }
         rootlessPodmanVerified = true;
     }
@@ -561,15 +599,20 @@ export function createNetworkLifecycleAdapter({
     function ensureManagedPodman() {
         if (managedPodmanVerified) return managedPodmanProof;
         ensureRootlessPodman();
-        const version = execute(['version', '--format', '{{.Server.Version}}']);
-        if (!version.ok || !versionAtLeast(jsonScalar(version.stdout), 5, 4)) {
-            throw new Error(`managed networking requires Podman server 5.4 or newer; observed '${jsonScalar(version.stdout) || failure(version)}'`);
+        const versionProbe = executeRuntimeProof(['version', '--format', '{{.Server.Version}}']);
+        const version = versionProbe.result;
+        const versionValue = jsonScalar(version.stdout);
+        if (!version.ok || !versionAtLeast(versionValue, 5, 4)) {
+            throw new Error(`managed networking requires Podman server 5.4 or newer; observed '${version.ok ? versionValue || '<empty>' : runtimeProofFailure(versionProbe)}'`);
         }
-        const backend = execute(['info', '--format', '{{json .Host.NetworkBackend}}']);
-        if (!backend.ok || jsonScalar(backend.stdout).toLowerCase() !== 'netavark') {
-            throw new Error(`managed networking requires Netavark; observed '${jsonScalar(backend.stdout) || failure(backend)}'`);
+        const backendProbe = executeRuntimeProof(['info', '--format', '{{json .Host.NetworkBackend}}']);
+        const backend = backendProbe.result;
+        const backendValue = jsonScalar(backend.stdout);
+        if (!backend.ok || backendValue.toLowerCase() !== 'netavark') {
+            throw new Error(`managed networking requires Netavark; observed '${backend.ok ? backendValue || '<empty>' : runtimeProofFailure(backendProbe)}'`);
         }
-        const pasta = execute(['info', '--format', '{{json .Host.Pasta}}']);
+        const pastaProbe = executeRuntimeProof(['info', '--format', '{{json .Host.Pasta}}']);
+        const pasta = pastaProbe.result;
         let pastaRecord = null;
         try { pastaRecord = JSON.parse(String(pasta.stdout || 'null')); } catch (_) {}
         const pastaExecutable = String(pastaRecord?.executable || pastaRecord?.Executable || '').trim();
@@ -580,17 +623,19 @@ export function createNetworkLifecycleAdapter({
             || Array.isArray(pastaRecord)
             || !pastaExecutable
             || !pastaVersion) {
-            throw new Error(`managed networking requires operational pasta backend metadata: ${failure(pasta)}`);
+            throw new Error(`managed networking requires operational pasta backend metadata: ${pasta.ok ? failure(pasta) : runtimeProofFailure(pastaProbe)}`);
         }
-        const remoteService = execute(['info', '--format', '{{json .Host.ServiceIsRemote}}']);
+        const remoteServiceProbe = executeRuntimeProof(['info', '--format', '{{json .Host.ServiceIsRemote}}']);
+        const remoteService = remoteServiceProbe.result;
         const remoteServiceValue = jsonScalar(remoteService.stdout).toLowerCase();
         if (!remoteService.ok || !['true', 'false'].includes(remoteServiceValue)) {
-            throw new Error(`managed networking cannot determine whether Podman is local or remote: ${failure(remoteService)}`);
+            throw new Error(`managed networking cannot determine whether Podman is local or remote: ${remoteService.ok ? failure(remoteService) : runtimeProofFailure(remoteServiceProbe)}`);
         }
         if (remoteServiceValue === 'false') {
-            const pastaProbe = execute(['unshare', pastaExecutable, '--version']);
-            if (!pastaProbe.ok || !String(pastaProbe.stdout || '').trim()) {
-                throw new Error(`managed networking requires an operational pasta backend: ${failure(pastaProbe)}`);
+            const pastaOperationalProbe = executeRuntimeProof(['unshare', pastaExecutable, '--version']);
+            const pastaOperational = pastaOperationalProbe.result;
+            if (!pastaOperational.ok || !String(pastaOperational.stdout || '').trim()) {
+                throw new Error(`managed networking requires an operational pasta backend: ${pastaOperational.ok ? failure(pastaOperational) : runtimeProofFailure(pastaOperationalProbe)}`);
             }
             const hostsConfiguration = effectiveHostsConfiguration(env, containersConfigPaths);
             if (hostsConfiguration.noHosts) {
