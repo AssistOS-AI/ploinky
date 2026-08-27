@@ -324,6 +324,10 @@ export function prepareEntrypoint({
     installDependencies({
         targetRoot: paths.dependencies,
         markerPath: paths.marker,
+        // Container boot is source-neutral. A stopped Box may still contain a
+        // valid local selection, so only an explicit start transaction may
+        // replace AchillesAgentLib. Empty volumes still bootstrap the lock.
+        preserveAgentlib: true,
         fsApi,
         runner,
     });

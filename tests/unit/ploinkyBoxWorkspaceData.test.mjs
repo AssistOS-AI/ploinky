@@ -119,6 +119,24 @@ test('a missing workspace anchor fails closed before any directory is created', 
     assert.equal(fs.existsSync(path.join(workspace, '.ploinky')), false);
 });
 
+test('workspace data rejects root or anchor permission drift from the captured identity', (t) => {
+    const rootCase = setup(t);
+    ensureWorkspaceDataPaths(rootCase);
+    fs.chmodSync(rootCase.workspace, 0o775);
+    assert.throws(
+        () => revalidateWorkspaceDataPaths(rootCase),
+        /Workspace root changed before Box data mutation/,
+    );
+
+    const anchorCase = setup(t);
+    ensureWorkspaceDataPaths(anchorCase);
+    fs.chmodSync(path.join(anchorCase.workspace, '.ploinky'), 0o775);
+    assert.throws(
+        () => revalidateWorkspaceDataPaths(anchorCase),
+        /Workspace identity anchor changed before Box data mutation/,
+    );
+});
+
 test('a non-writable data directory is rejected rather than silently reused', (t) => {
     const { workspace, identity, lock } = setup(t);
     if (typeof process.getuid === 'function' && process.getuid() === 0) {

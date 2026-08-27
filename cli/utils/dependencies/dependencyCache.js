@@ -22,6 +22,9 @@ export const LOCK_FILENAME = '.lock';
 export const CORE_MARKER_MODULE = 'mcp-sdk';
 export const GIT_DEPS_MARKER_FILENAME = 'git-deps.json';
 export const NPM_INSTALL_ARGS = ['install', '--no-package-lock', '--no-audit', '--no-fund'];
+export const LOCAL_AGENTLIB_INPUT_DIRECTORY = '.ploinky-inputs';
+export const LOCAL_AGENTLIB_SOURCE_ROOT = '/opt/ploinky/node_modules/.ploinky-local-agentlib';
+export const LOCAL_AGENTLIB_SHA_PATTERN = /^[a-f0-9]{64}$/;
 const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 const LOCK_VERSION = 1;
 const MALFORMED_LOCK_GRACE_MS = 30 * 1000;
@@ -87,9 +90,126 @@ export function hashMergedPackage(mergedPackage) {
  * @param {NodeJS.ProcessEnv} [env=process.env]
  * @returns {{ pkg: object, hash: string }}
  */
-export function resolveGlobalCacheManifest(env = process.env) {
-    const pkg = readGlobalDepsPackage(env);
-    return { pkg, hash: hashMergedPackage(pkg) };
+export function resolveLocalAgentlibCacheInput(cachePath, {
+    env = process.env,
+    fsApi = fs,
+    sourceRoot = LOCAL_AGENTLIB_SOURCE_ROOT,
+} = {}) {
+    const sha = String(env.PLOINKY_LOCAL_AGENTLIB_SHA || '');
+    if (!sha) return null;
+    if (!LOCAL_AGENTLIB_SHA_PATTERN.test(sha)) {
+        throw new Error('PLOINKY_LOCAL_AGENTLIB_SHA must be 64 lowercase hexadecimal characters');
+    }
+    const resolvedSourceRoot = path.resolve(sourceRoot);
+    let sourceRootStat;
+    try { sourceRootStat = fsApi.lstatSync(resolvedSourceRoot); } catch (error) {
+        throw new Error(`Selected local AchillesAgentLib archive root is missing: ${resolvedSourceRoot}`, { cause: error });
+    }
+    if (sourceRootStat.isSymbolicLink() || !sourceRootStat.isDirectory()) {
+        throw new Error('Selected local AchillesAgentLib archive root is not a real directory');
+    }
+    const sourceArchivePath = path.join(resolvedSourceRoot, `${sha}.tgz`);
+    const expectedRef = `file:${sourceArchivePath}`;
+    if (String(env.PLOINKY_AGENTLIB_REF || '') !== expectedRef) {
+        throw new Error('PLOINKY_AGENTLIB_REF does not match the selected local AchillesAgentLib archive');
+    }
+    let sourceStat;
+    try { sourceStat = fsApi.lstatSync(sourceArchivePath); } catch (error) {
+        throw new Error(`Selected local AchillesAgentLib archive is missing: ${sourceArchivePath}`, { cause: error });
+    }
+    if (sourceStat.isSymbolicLink() || !sourceStat.isFile()
+        || sha256(fsApi.readFileSync(sourceArchivePath)) !== sha) {
+        throw new Error('Selected local AchillesAgentLib archive failed integrity validation');
+    }
+    const fileName = `achillesAgentLib-${sha}.tgz`;
+    return Object.freeze({
+        sha256: sha,
+        sourceArchivePath,
+        cacheArchivePath: path.join(path.resolve(cachePath), LOCAL_AGENTLIB_INPUT_DIRECTORY, fileName),
+        npmSpec: `file:./${LOCAL_AGENTLIB_INPUT_DIRECTORY}/${fileName}`,
+    });
+}
+
+export function localizeLocalAgentlibCacheInput(input, {
+    fsApi = fs,
+    token = `${process.pid}-${crypto.randomBytes(8).toString('hex')}`,
+} = {}) {
+    if (!input) return null;
+    const destination = path.resolve(input.cacheArchivePath);
+    const directory = path.dirname(destination);
+    const cacheRoot = path.dirname(directory);
+    fsApi.mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
+    const cacheRootStat = fsApi.lstatSync(cacheRoot);
+    if (cacheRootStat.isSymbolicLink() || !cacheRootStat.isDirectory()) {
+        throw new Error('Local AchillesAgentLib cache root is not a real directory');
+    }
+    try {
+        const directoryStat = fsApi.lstatSync(directory);
+        if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+            throw new Error('Local AchillesAgentLib cache input root is not a real directory');
+        }
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        fsApi.mkdirSync(directory, { recursive: false, mode: 0o700 });
+    }
+    const verify = () => {
+        const stat = fsApi.lstatSync(destination);
+        if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1
+            || sha256(fsApi.readFileSync(destination)) !== input.sha256) {
+            throw new Error('Cached local AchillesAgentLib archive failed integrity validation');
+        }
+    };
+    try {
+        verify();
+        return destination;
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+    }
+    const temporary = path.join(directory, `.${path.basename(destination)}.${token}.tmp`);
+    try {
+        fsApi.copyFileSync(input.sourceArchivePath, temporary, fsApi.constants.COPYFILE_EXCL);
+        const copied = fsApi.lstatSync(temporary);
+        const source = fsApi.lstatSync(input.sourceArchivePath);
+        if (copied.isSymbolicLink() || !copied.isFile() || copied.nlink !== 1
+            || (copied.dev === source.dev && copied.ino === source.ino)
+            || sha256(fsApi.readFileSync(temporary)) !== input.sha256) {
+            throw new Error('Copied local AchillesAgentLib cache input failed integrity validation');
+        }
+        try {
+            verify();
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+            fsApi.renameSync(temporary, destination);
+        }
+        verify();
+        return destination;
+    } finally {
+        try { fsApi.rmSync(temporary, { force: true }); } catch {}
+    }
+}
+
+export function resolveGlobalCacheManifest(env = process.env, {
+    cachePath = GLOBAL_DEPS_CACHE_DIR,
+    fsApi = fs,
+    sourceRoot = LOCAL_AGENTLIB_SOURCE_ROOT,
+} = {}) {
+    const base = readGlobalDepsPackage(env);
+    const localInput = resolveLocalAgentlibCacheInput(cachePath, { env, fsApi, sourceRoot });
+    const pkg = mergePackageJson(base, null, { agentlibSpec: localInput?.npmSpec || '' });
+    return { pkg, hash: hashMergedPackage(pkg), localInput };
+}
+
+export function resolveAgentCacheManifest(agentPackage, env = process.env, {
+    cachePath = AGENTS_DEPS_CACHE_DIR,
+    fsApi = fs,
+    sourceRoot = LOCAL_AGENTLIB_SOURCE_ROOT,
+} = {}) {
+    const base = readGlobalDepsPackage(env);
+    const localInput = resolveLocalAgentlibCacheInput(cachePath, { env, fsApi, sourceRoot });
+    const pkg = mergePackageJson(base, agentPackage, {
+        agentlibSpec: localInput?.npmSpec || '',
+    });
+    return { pkg, hash: hashMergedPackage(pkg), localInput };
 }
 
 function sortObject(obj) {
@@ -663,8 +783,12 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
     // reflected in BOTH the cache key and the installed package. Hashing/copying
     // the raw file here would serve the pinned #master to every agent that seeds
     // from this shared cache, regardless of the --branch override.
-    const { pkg: globalPkg, hash: globalPackageHash } = resolveGlobalCacheManifest();
     const cachePath = getGlobalCachePath(runtimeKey);
+    const {
+        pkg: globalPkg,
+        hash: globalPackageHash,
+        localInput,
+    } = resolveGlobalCacheManifest(process.env, { cachePath });
 
     if (!force) {
         const check = isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, installer: expectedInstaller });
@@ -678,6 +802,7 @@ export function prepareGlobalCache(runtimeKey, { force = false, log = debugLog, 
     const lock = acquireLock(cachePath);
     try {
         ensureCacheDir(cachePath);
+        if (localInput) localizeLocalAgentlibCacheInput(localInput);
         fs.writeFileSync(
             path.join(cachePath, 'package.json'),
             JSON.stringify(globalPkg, null, 2),
@@ -727,15 +852,17 @@ export function prepareAgentCache({
     const globalResult = prepareGlobalCache(runtimeKey, { force, log, image, runtime });
     const globalCachePath = globalResult.cachePath;
 
-    const globalPkg = readGlobalDepsPackage();
     const agentPkg = (agentPackagePath && fs.existsSync(agentPackagePath))
         ? JSON.parse(fs.readFileSync(agentPackagePath, 'utf8'))
         : null;
-    const mergedPkg = mergePackageJson(globalPkg, agentPkg);
-    const mergedPackageHash = hashMergedPackage(mergedPkg);
-    const agentPackageHash = agentPackagePath ? hashFile(agentPackagePath) : null;
-    const globalPackageHash = hashMergedPackage(globalPkg);
     const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
+    const {
+        pkg: mergedPkg,
+        hash: mergedPackageHash,
+        localInput,
+    } = resolveAgentCacheManifest(agentPkg, process.env, { cachePath });
+    const agentPackageHash = agentPackagePath ? hashFile(agentPackagePath) : null;
+    const globalPackageHash = resolveGlobalCacheManifest(process.env, { cachePath }).hash;
 
     if (!force) {
         const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer: expectedInstaller });
@@ -756,6 +883,7 @@ export function prepareAgentCache({
             }),
             useSystemCopy: shouldSeedAgentCacheWithSystemCopy(),
         });
+        if (agentPkg && localInput) localizeLocalAgentlibCacheInput(localInput);
         fs.writeFileSync(
             path.join(cachePath, 'package.json'),
             JSON.stringify(mergedPkg, null, 2),
@@ -822,8 +950,11 @@ export function verifyAgentCache({
     const agentPkg = hasAgentPkg
         ? JSON.parse(fs.readFileSync(agentPackagePath, 'utf8'))
         : null;
-    const mergedPkg = mergePackageJson(readGlobalDepsPackage(), agentPkg);
-    const mergedPackageHash = hashMergedPackage(mergedPkg);
+    const { hash: mergedPackageHash } = resolveAgentCacheManifest(
+        agentPkg,
+        process.env,
+        { cachePath },
+    );
     const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash });
     if (check.valid) return nm;
     throw new Error(

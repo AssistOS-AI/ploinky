@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 import {
     STAMP_VERSION,
@@ -30,7 +31,11 @@ import {
     shouldSeedAgentCacheWithHardlinks,
     shouldSeedAgentCacheWithSystemCopy,
     seedFromGlobalCache,
+    localizeLocalAgentlibCacheInput,
+    resolveAgentCacheManifest,
+    resolveLocalAgentlibCacheInput,
 } from '../../cli/utils/dependencies/dependencyCache.js';
+import { mergePackageJson } from '../../cli/utils/dependencies/dependencyInstaller.js';
 
 function tempDir(prefix = 'deps-cache-test-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -409,5 +414,154 @@ test('ensureAgentCacheForFamily prepares cache and returns node_modules path', (
     } finally {
         fs.rmSync(cachePath, { recursive: true, force: true });
         fs.rmSync(agentCodePath, { recursive: true, force: true });
+    }
+});
+
+test('local AgentLib cache input is a verified copy with one SHA-bearing relative spec', () => {
+    const root = tempDir('local-agentlib-cache-input-');
+    try {
+        const sourceRoot = path.join(root, 'published');
+        const cachePath = path.join(root, 'cache');
+        fs.mkdirSync(sourceRoot);
+        const bytes = Buffer.from('local-agentlib-cache-archive');
+        const digest = sha256(bytes);
+        const source = path.join(sourceRoot, `${digest}.tgz`);
+        fs.writeFileSync(source, bytes);
+        const env = {
+            PLOINKY_LOCAL_AGENTLIB_SHA: digest,
+            PLOINKY_AGENTLIB_REF: `file:${source}`,
+        };
+        const input = resolveLocalAgentlibCacheInput(cachePath, { env, sourceRoot });
+        assert.equal(input.npmSpec, `file:./.ploinky-inputs/achillesAgentLib-${digest}.tgz`);
+        assert.equal(localizeLocalAgentlibCacheInput(input), input.cacheArchivePath);
+        assert.equal(fs.readFileSync(input.cacheArchivePath, 'utf8'), bytes.toString());
+        const sourceStat = fs.statSync(source);
+        const copiedStat = fs.statSync(input.cacheArchivePath);
+        assert.equal(sourceStat.dev === copiedStat.dev && sourceStat.ino === copiedStat.ino, false);
+        assert.equal(localizeLocalAgentlibCacheInput(input), input.cacheArchivePath);
+
+        fs.writeFileSync(source, 'tampered');
+        assert.throws(
+            () => resolveLocalAgentlibCacheInput(cachePath, { env, sourceRoot }),
+            /integrity validation/,
+        );
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('local AgentLib selection wins after an agent dependency conflict and changes cache hashes by SHA', () => {
+    const root = tempDir('local-agentlib-merge-');
+    try {
+        const sourceRoot = path.join(root, 'published');
+        fs.mkdirSync(sourceRoot);
+        const resolve = (text) => {
+            const bytes = Buffer.from(text);
+            const digest = sha256(bytes);
+            const source = path.join(sourceRoot, `${digest}.tgz`);
+            fs.writeFileSync(source, bytes);
+            const env = {
+                PLOINKY_LOCAL_AGENTLIB_SHA: digest,
+                PLOINKY_AGENTLIB_REF: `file:${source}`,
+            };
+            return resolveAgentCacheManifest({
+                name: 'conflicting-agent',
+                dependencies: { achillesAgentLib: 'github:attacker/other', extra: '1.0.0' },
+                devDependencies: { achillesAgentLib: 'github:attacker/dev-override', devExtra: '2.0.0' },
+            }, env, { cachePath: path.join(root, 'cache'), sourceRoot });
+        };
+        const first = resolve('archive-one');
+        const second = resolve('archive-two');
+        assert.equal(first.pkg.dependencies.achillesAgentLib, first.localInput.npmSpec);
+        assert.equal(first.pkg.dependencies.extra, '1.0.0');
+        assert.equal(first.pkg.devDependencies.achillesAgentLib, undefined);
+        assert.equal(first.pkg.devDependencies.devExtra, '2.0.0');
+        assert.notEqual(first.hash, second.hash);
+        assert.notEqual(first.localInput.npmSpec, second.localInput.npmSpec);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('real npm keeps the selected local AgentLib ahead of an agent devDependency conflict', () => {
+    const root = tempDir('local-agentlib-real-npm-');
+    try {
+        const packageRoot = path.join(root, 'package');
+        const conflictingPackageRoot = path.join(root, 'conflicting-package');
+        const packed = path.join(root, 'packed');
+        const sourceRoot = path.join(root, 'published');
+        const cachePath = path.join(root, 'cache');
+        fs.mkdirSync(packageRoot);
+        fs.mkdirSync(conflictingPackageRoot);
+        fs.mkdirSync(packed);
+        fs.mkdirSync(sourceRoot);
+        fs.mkdirSync(cachePath);
+        fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({
+            name: 'ploinky-agent-lib',
+            version: '1.0.0',
+            type: 'module',
+            main: 'index.mjs',
+            files: ['index.mjs'],
+        }));
+        fs.writeFileSync(path.join(packageRoot, 'index.mjs'), 'export const aliasProof = "loaded-local-alias";\n');
+        fs.writeFileSync(path.join(conflictingPackageRoot, 'package.json'), JSON.stringify({
+            name: 'ploinky-agent-lib',
+            version: '9.0.0',
+            type: 'module',
+            main: 'index.mjs',
+            files: ['index.mjs'],
+        }));
+        fs.writeFileSync(
+            path.join(conflictingPackageRoot, 'index.mjs'),
+            'export const aliasProof = "agent-devdependency-overrode-local";\n',
+        );
+        const packedResult = spawnSync('npm', [
+            'pack', '--ignore-scripts', '--json', '--pack-destination', packed,
+        ], { cwd: packageRoot, encoding: 'utf8' });
+        assert.equal(packedResult.status, 0, packedResult.stderr);
+        const archive = path.join(packed, JSON.parse(packedResult.stdout)[0].filename);
+        const conflictingPackedResult = spawnSync('npm', [
+            'pack', '--ignore-scripts', '--json', '--pack-destination', packed,
+        ], { cwd: conflictingPackageRoot, encoding: 'utf8' });
+        assert.equal(conflictingPackedResult.status, 0, conflictingPackedResult.stderr);
+        const conflictingArchive = path.join(
+            packed,
+            JSON.parse(conflictingPackedResult.stdout)[0].filename,
+        );
+        const bytes = fs.readFileSync(archive);
+        const digest = sha256(bytes);
+        const source = path.join(sourceRoot, `${digest}.tgz`);
+        fs.copyFileSync(archive, source);
+        const env = {
+            PLOINKY_LOCAL_AGENTLIB_SHA: digest,
+            PLOINKY_AGENTLIB_REF: `file:${source}`,
+        };
+        const input = resolveLocalAgentlibCacheInput(cachePath, { env, sourceRoot });
+        localizeLocalAgentlibCacheInput(input);
+        const merged = mergePackageJson({
+            name: 'alias-fixture',
+            private: true,
+            type: 'module',
+            dependencies: {},
+        }, {
+            devDependencies: { achillesAgentLib: `file:${conflictingArchive}` },
+        }, { agentlibSpec: input.npmSpec });
+        assert.equal(merged.dependencies.achillesAgentLib, input.npmSpec);
+        assert.equal(merged.devDependencies.achillesAgentLib, undefined);
+        fs.writeFileSync(path.join(cachePath, 'package.json'), JSON.stringify(merged));
+        const installed = spawnSync('npm', NPM_INSTALL_ARGS, {
+            cwd: cachePath,
+            encoding: 'utf8',
+        });
+        assert.equal(installed.status, 0, installed.stderr);
+        const loaded = spawnSync(process.execPath, [
+            '--input-type=module',
+            '-e', 'import("achillesAgentLib").then((m) => process.stdout.write(m.aliasProof))',
+        ], { cwd: cachePath, encoding: 'utf8' });
+        assert.equal(loaded.status, 0, loaded.stderr);
+        assert.equal(loaded.stdout, 'loaded-local-alias');
+        assert.equal(fs.existsSync(path.join(cachePath, 'node_modules', 'achillesAgentLib')), true);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
     }
 });

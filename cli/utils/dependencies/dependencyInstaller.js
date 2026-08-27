@@ -11,9 +11,11 @@ import { remoteBranchExists } from '../repos.js';
  *
  * @param {object} globalPackage - ploinky/globalDeps/package.json contents
  * @param {object|null} agentPackage - agent's own package.json contents, or null
+ * @param {object} [options]
+ * @param {string} [options.agentlibSpec] - Fixed local archive spec selected for the whole graph.
  * @returns {object} Merged package.json
  */
-function mergePackageJson(globalPackage, agentPackage) {
+function mergePackageJson(globalPackage, agentPackage, { agentlibSpec = '' } = {}) {
     const merged = { ...globalPackage };
     const agent = agentPackage || {};
 
@@ -21,12 +23,46 @@ function mergePackageJson(globalPackage, agentPackage) {
         ...(globalPackage.dependencies || {}),
         ...(agent.dependencies || {}),
     };
+    if (agentlibSpec) {
+        // A bounded local start selects one archive for the whole graph. Apply
+        // it after the agent merge so an agent manifest cannot choose another
+        // AchillesAgentLib source.
+        merged.dependencies.achillesAgentLib = agentlibSpec;
+    }
 
     if (agent.devDependencies) {
         merged.devDependencies = {
             ...(globalPackage.devDependencies || {}),
             ...agent.devDependencies,
         };
+    }
+
+    if (agentlibSpec) {
+        // npm may prefer the same package name from devDependencies or
+        // optionalDependencies over dependencies. The bounded local archive
+        // is the one source for the whole graph, so remove every competing
+        // install-class declaration after all package merges. Clone first so
+        // a caller's package object is never mutated through the shallow copy.
+        for (const section of ['devDependencies', 'optionalDependencies', 'peerDependencies']) {
+            const entries = merged[section];
+            if (!entries || typeof entries !== 'object' || Array.isArray(entries)
+                || !Object.prototype.hasOwnProperty.call(entries, 'achillesAgentLib')) {
+                continue;
+            }
+            merged[section] = { ...entries };
+            delete merged[section].achillesAgentLib;
+        }
+        const peerMeta = merged.peerDependenciesMeta;
+        if (peerMeta && typeof peerMeta === 'object' && !Array.isArray(peerMeta)
+            && Object.prototype.hasOwnProperty.call(peerMeta, 'achillesAgentLib')) {
+            merged.peerDependenciesMeta = { ...peerMeta };
+            delete merged.peerDependenciesMeta.achillesAgentLib;
+        }
+        for (const section of ['bundleDependencies', 'bundledDependencies']) {
+            if (Array.isArray(merged[section])) {
+                merged[section] = merged[section].filter((name) => name !== 'achillesAgentLib');
+            }
+        }
     }
 
     if (agent.scripts) {

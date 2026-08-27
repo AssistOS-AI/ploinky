@@ -44,6 +44,7 @@ jobs:
     timeout-minutes: 120
     env:
       PLOINKY_BOX_REQUIRE_PODMAN: '1'
+      PLOINKY_PROD: 'true'
       PLOINKY_BOX_CANDIDATE_DIGEST: ${{ inputs.box_digest }}
       PLOINKY_BOX_EVIDENCE_DIR: ${{ runner.temp }}/ploinky-box-candidate-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.host }}
       PLOINKY_BOX_CANDIDATE_LOG_DIR: ${{ runner.temp }}/ploinky-box-candidate-logs/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.host }}

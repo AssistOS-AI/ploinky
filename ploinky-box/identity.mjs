@@ -39,6 +39,8 @@ function captureRootFingerprint(root, lstatSync, readlinkSync) {
         device: String(stat.dev),
         inode: String(stat.ino),
         mode: stat.mode,
+        uid: stat.uid,
+        directory: stat.isDirectory(),
         symlinkTarget: stat.isSymbolicLink() ? readlinkSync(root) : null,
     };
 }
@@ -47,7 +49,18 @@ function rootFingerprintsEqual(left, right) {
     return left.device === right.device
         && left.inode === right.inode
         && left.mode === right.mode
+        && left.uid === right.uid
+        && left.directory === right.directory
         && left.symlinkTarget === right.symlinkTarget;
+}
+
+function captureAnchorFingerprint(anchorPath, lstatSync, readlinkSync) {
+    try {
+        return captureRootFingerprint(anchorPath, lstatSync, readlinkSync);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+    }
 }
 
 export function workspaceSlug(workspaceRoot) {
@@ -72,6 +85,7 @@ export function buildWorkspaceIdentity(workspaceRoot, {
     readlinkSync = fs.readlinkSync,
 } = {}) {
     const selectedRoot = path.resolve(workspaceRoot);
+    const anchorPath = path.join(selectedRoot, '.ploinky');
     const pathHash = workspacePathHash(selectedRoot);
     const slug = workspaceSlug(selectedRoot);
     const instance = `ploinky-box-${slug}-${pathHash}`;
@@ -81,7 +95,12 @@ export function buildWorkspaceIdentity(workspaceRoot, {
         pathHash,
         slug,
         instance,
-        anchorPath: path.join(selectedRoot, '.ploinky'),
+        anchorPath,
+        anchorFingerprint: Object.freeze(captureAnchorFingerprint(
+            anchorPath,
+            lstatSync,
+            readlinkSync,
+        )),
         boxDataRoot: path.join(selectedRoot, '.ploinky', BOX_DATA_ROOT_NAME),
         dataPaths: Object.freeze(Object.fromEntries(BOX_DATA_KEYS.map((key) => [
             key,
@@ -154,6 +173,7 @@ function inspectAnchor(anchorPath, lstatSync) {
             exists: true,
             directory: stat.isDirectory(),
             symlink: stat.isSymbolicLink(),
+            stat,
         };
     } catch (error) {
         if (error.code === 'ENOENT') {
@@ -163,10 +183,91 @@ function inspectAnchor(anchorPath, lstatSync) {
     }
 }
 
+
+function assertCurrentUserOwnedDirectory(target, stat, uid, label) {
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new WorkspaceResolutionError(`${label} is not a real directory: ${target}`);
+    }
+    if (Number.isInteger(uid) && stat.uid !== uid) {
+        throw new WorkspaceResolutionError(`${label} is not owned by the current user: ${target}`);
+    }
+}
+
+function descriptorFingerprint(stat) {
+    return Object.freeze({
+        device: String(stat.dev),
+        inode: String(stat.ino),
+        mode: stat.mode,
+        uid: stat.uid,
+        directory: stat.isDirectory(),
+        symlinkTarget: null,
+    });
+}
+
+function normalizePinnedDirectory(target, {
+    expectedFingerprint,
+    desiredMode,
+    label,
+    fsApi,
+    lstatSync,
+    uid,
+}) {
+    const constants = fsApi.constants || fs.constants;
+    const flags = (constants.O_RDONLY || 0)
+        | (constants.O_DIRECTORY || 0)
+        | (constants.O_NOFOLLOW || 0);
+    let descriptor;
+    try {
+        descriptor = fsApi.openSync(target, flags);
+    } catch (error) {
+        throw new WorkspaceResolutionError(`${label} could not be opened safely: ${target}`, {
+            cause: error,
+        });
+    }
+    try {
+        const opened = fsApi.fstatSync(descriptor);
+        assertCurrentUserOwnedDirectory(target, opened, uid, label);
+        const openedFingerprint = descriptorFingerprint(opened);
+        if (!expectedFingerprint
+            || !rootFingerprintsEqual(expectedFingerprint, openedFingerprint)) {
+            throw new WorkspaceResolutionError(`${label} changed before permission normalization: ${target}`);
+        }
+
+        const namedBefore = lstatSync(target);
+        assertCurrentUserOwnedDirectory(target, namedBefore, uid, label);
+        if (String(namedBefore.dev) !== openedFingerprint.device
+            || String(namedBefore.ino) !== openedFingerprint.inode) {
+            throw new WorkspaceResolutionError(`${label} was replaced during validation: ${target}`);
+        }
+
+        fsApi.fchmodSync(descriptor, desiredMode);
+        const normalized = fsApi.fstatSync(descriptor);
+        assertCurrentUserOwnedDirectory(target, normalized, uid, label);
+        if ((normalized.mode & 0o7777) !== desiredMode
+            || normalized.dev !== opened.dev
+            || normalized.ino !== opened.ino) {
+            throw new WorkspaceResolutionError(`${label} permissions changed unexpectedly: ${target}`);
+        }
+        const namedAfter = lstatSync(target);
+        assertCurrentUserOwnedDirectory(target, namedAfter, uid, label);
+        if (namedAfter.dev !== normalized.dev
+            || namedAfter.ino !== normalized.ino
+            || namedAfter.mode !== normalized.mode
+            || namedAfter.uid !== normalized.uid) {
+            throw new WorkspaceResolutionError(`${label} was replaced during permission normalization: ${target}`);
+        }
+        return descriptorFingerprint(normalized);
+    } finally {
+        try { fsApi.closeSync(descriptor); } catch {}
+    }
+}
+
 export function materializeIdentityAnchor(identity, lock, {
-    lstatSync = fs.lstatSync,
-    readlinkSync = fs.readlinkSync,
-    mkdirSync = fs.mkdirSync,
+    fsApi = fs,
+    lstatSync = fsApi.lstatSync,
+    readlinkSync = fsApi.readlinkSync,
+    mkdirSync = fsApi.mkdirSync,
+    uid = typeof process.getuid === 'function' ? process.getuid() : undefined,
 } = {}) {
     lock?.assertHeld?.(identity.instance);
     if (!lock || typeof lock.assertHeld !== 'function') {
@@ -191,36 +292,80 @@ export function materializeIdentityAnchor(identity, lock, {
                 `Workspace identity anchor is not a directory: ${identity.anchorPath}`,
             );
         }
-        return { created: false, path: identity.anchorPath };
-    }
-
-    try {
-        mkdirSync(identity.anchorPath, { recursive: false });
-    } catch (error) {
-        if (error.code === 'EEXIST') {
+        if (!identity.anchorFingerprint
+            || !rootFingerprintsEqual(identity.anchorFingerprint, descriptorFingerprint(before.stat))) {
             throw new WorkspaceResolutionError(
-                `Workspace identity anchor changed concurrently: ${identity.anchorPath}`,
-                { cause: error },
+                `Workspace identity anchor changed before permission normalization: ${identity.anchorPath}`,
             );
         }
-        throw error;
-    }
-
-    const after = inspectAnchor(identity.anchorPath, lstatSync);
-    if (!after.exists || !after.directory || after.symlink) {
+    } else if (identity.anchorFingerprint) {
         throw new WorkspaceResolutionError(
-            `Workspace identity anchor was replaced during creation: ${identity.anchorPath}`,
+            `Workspace identity anchor disappeared before creation: ${identity.anchorPath}`,
         );
     }
+
+    assertCurrentUserOwnedDirectory(
+        identity.workspaceRoot,
+        lstatSync(identity.workspaceRoot),
+        uid,
+        'Workspace root',
+    );
+    const rootMode = (currentRoot.mode & 0o7777) & ~0o022;
+    const rootFingerprint = normalizePinnedDirectory(identity.workspaceRoot, {
+        expectedFingerprint: currentRoot,
+        desiredMode: rootMode,
+        label: 'Workspace root',
+        fsApi,
+        lstatSync,
+        uid,
+    });
+
+    let created = false;
+    if (!before.exists) {
+        try {
+            mkdirSync(identity.anchorPath, { recursive: false, mode: 0o700 });
+            created = true;
+        } catch (error) {
+            if (error.code === 'EEXIST') {
+                throw new WorkspaceResolutionError(
+                    `Workspace identity anchor changed concurrently: ${identity.anchorPath}`,
+                    { cause: error },
+                );
+            }
+            throw error;
+        }
+
+        const after = inspectAnchor(identity.anchorPath, lstatSync);
+        if (!after.exists || !after.directory || after.symlink) {
+            throw new WorkspaceResolutionError(
+                `Workspace identity anchor was replaced during creation: ${identity.anchorPath}`,
+            );
+        }
+    }
+
+    const anchorObserved = captureAnchorFingerprint(identity.anchorPath, lstatSync, readlinkSync);
+    const anchorFingerprint = normalizePinnedDirectory(identity.anchorPath, {
+        expectedFingerprint: anchorObserved,
+        desiredMode: 0o700,
+        label: 'Workspace identity anchor',
+        fsApi,
+        lstatSync,
+        uid,
+    });
     const finalRoot = captureRootFingerprint(
         identity.workspaceRoot,
         lstatSync,
         readlinkSync,
     );
-    if (!rootFingerprintsEqual(identity.rootFingerprint, finalRoot)) {
+    if (!rootFingerprintsEqual(rootFingerprint, finalRoot)) {
         throw new WorkspaceResolutionError('Workspace root changed during identity anchor creation');
     }
-    return { created: true, path: identity.anchorPath };
+    return Object.freeze({
+        created,
+        path: identity.anchorPath,
+        rootFingerprint,
+        anchorFingerprint,
+    });
 }
 
 export const __MISSING_CWD_MESSAGE = MISSING_CWD_MESSAGE;

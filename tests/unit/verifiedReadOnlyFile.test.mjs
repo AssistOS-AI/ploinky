@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
     ensureVerifiedProducerDirectory,
+    normalizeVerifiedProducerDirectory,
     openVerifiedRegularFile,
     readVerifiedJsonObject,
 } from '../../cli/utils/verifiedReadOnlyFile.js';
@@ -229,4 +230,20 @@ test('producer directories reject missing and symlinked parents', (t) => {
         trustedRoot: root,
         relativeSegments: ['logs', 'agents'],
     }), /parent .* does not exist/);
+});
+
+test('producer normalization repairs only the descriptor-pinned leaf', (t) => {
+    const root = fixture(t);
+    const parent = path.join(root, 'logs');
+    const leaf = path.join(parent, 'no-wait');
+    fs.mkdirSync(leaf, { recursive: true });
+    fs.chmodSync(parent, 0o700);
+    fs.chmodSync(leaf, 0o775);
+
+    assert.equal(normalizeVerifiedProducerDirectory({
+        trustedRoot: root,
+        relativeSegments: ['logs', 'no-wait'],
+    }), leaf);
+    assert.equal(fs.statSync(parent).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(leaf).mode & 0o777, 0o700);
 });

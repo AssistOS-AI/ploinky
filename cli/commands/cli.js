@@ -19,14 +19,17 @@ import {
     cleanupFailedPreparedRuntime,
     admitDirectAgentRuntimeManifest,
 } from './workspaceUtil.js';
-import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+import {
+    withMaintenanceLock,
+    withWorkspaceMutationLease,
+} from '../utils/runtime/maintenanceLocks.js';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
 import {
     getAgentContainerName,
     getRuntime,
     containerExists,
     isContainerRunning,
-    stopConfiguredAgents,
+    stopCoordinatedConfiguredAgents,
     destroyWorkspaceContainers,
     ensureAgentService
 } from '../sandbox/docker/index.js';
@@ -79,7 +82,15 @@ import {
 import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
 import { createNetworkLifecycleAdapter, withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
-import { inactivateEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import {
+    inactivateEdgeRoutingGeneration,
+    initializeFreshEdgeRoutingSources,
+} from '../sandbox/edgeGeneration.js';
+import {
+    assertNoLiveNoWaitWorkers,
+    quiesceNoWaitWorkers,
+    waitForNoWaitWorkersToSettle,
+} from './noWaitQuiescence.js';
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -382,15 +393,19 @@ async function handleCommand(args) {
                     throw new Error(profileResult.message);
                 }
             }
-            // The global --branch also drives the achillesAgentLib used by agent
-            // containers (when the branch is absent, the default fallback keeps
-            // the unpinned AgentLib dependency on its remote default branch).
-            // Propagated via PLOINKY_AGENTLIB_REF,
-            // read host-side by readGlobalDepsPackage and inherited by the
-            // Watchdog/router via buildRouterEnv.
-            const agentlibRef = resolveAgentlibBranchRef(startParsed.branchPolicy);
-            if (agentlibRef) {
-                process.env.PLOINKY_AGENTLIB_REF = agentlibRef;
+            // Outside bounded local development, the global --branch also
+            // drives the achillesAgentLib used by agent containers. A selected
+            // local archive is authoritative, so branch policy continues for
+            // repositories without replacing its fixed PLOINKY_AGENTLIB_REF.
+            const localAgentlibSha = String(process.env.PLOINKY_LOCAL_AGENTLIB_SHA || '');
+            if (localAgentlibSha && !/^[a-f0-9]{64}$/.test(localAgentlibSha)) {
+                throw new Error('PLOINKY_LOCAL_AGENTLIB_SHA must be 64 lowercase hexadecimal characters');
+            }
+            if (!localAgentlibSha) {
+                const agentlibRef = resolveAgentlibBranchRef(startParsed.branchPolicy);
+                if (agentlibRef) {
+                    process.env.PLOINKY_AGENTLIB_REF = agentlibRef;
+                }
             }
             await startWorkspace(startParsed.staticAgent, startParsed.port ?? undefined, {
                 enableAgent,
@@ -699,11 +714,20 @@ async function handleCommand(args) {
                 const cfg = workspaceSvc.getConfig();
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) { console.error('restart: start is not configured. Run: start <staticAgent> <port>'); break; }
                 resolvePersistedRouterPort();
-                inactivateEdgeRoutingGeneration('cli-workspace-restart');
-                console.log('[restart] Stopping Router and configured agents...');
-                killRouterIfRunning();
-                console.log('[restart] Stopping configured agent containers...');
-                const list = stopConfiguredAgents();
+                console.log('[restart] Stopping detached no-wait workers...');
+                await quiesceNoWaitWorkers();
+                const list = await withWorkspaceMutationLease({
+                    operation: 'workspace-restart-stop',
+                }, async () => {
+                    assertNoLiveNoWaitWorkers();
+                    inactivateEdgeRoutingGeneration('cli-workspace-restart');
+                    console.log('[restart] Stopping Router and configured agents...');
+                    killRouterIfRunning({ strict: true });
+                    console.log('[restart] Stopping configured agent containers...');
+                    const stopped = stopCoordinatedConfiguredAgents({ strict: true });
+                    assertNoLiveNoWaitWorkers();
+                    return stopped;
+                });
                 if (list.length) { console.log('[restart] Stopped containers:'); list.forEach(n => console.log(` - ${n}`)); }
                 else { console.log('[restart] No containers to stop.'); }
                 console.log('[restart] Starting workspace...');
@@ -732,15 +756,64 @@ async function handleCommand(args) {
             break;
         }
         case 'stop': {
-            if (options.length) {
+            const sourceTransition = options.length === 1
+                && options[0] === '--source-transition';
+            if (options.length && !sourceTransition) {
                 showHelp(['stop']);
                 break;
             }
-            inactivateEdgeRoutingGeneration('cli-workspace-stop');
-            console.log('[stop] Stopping RoutingServer...');
-            killRouterIfRunning();
-            console.log('[stop] Stopping configured agent containers...');
-            const list = stopConfiguredAgents();
+            if (sourceTransition) {
+                // A detached no-wait worker can own a not-yet-published runtime
+                // candidate. Killing that worker would bypass its exact cleanup
+                // receipt and can strand a same-name container that no registry
+                // record is authorized to remove. Let those bounded startup
+                // transactions settle before taking the mutation lease.
+                console.log('[stop] Waiting for detached startup workers to settle...');
+                await waitForNoWaitWorkersToSettle();
+                const list = await withWorkspaceMutationLease({
+                    operation: 'agentlib-source-transition-stop',
+                }, async () => {
+                    // Close the small race between the stable observation above
+                    // and lease acquisition before revoking or stopping anything.
+                    assertNoLiveNoWaitWorkers();
+                    // Development start reaches this hidden transition before
+                    // startWorkspace initializes a brand-new workspace. Create
+                    // the coordinated empty sources before inactivation so a
+                    // lone selector cannot make initialization look partial.
+                    initializeFreshEdgeRoutingSources();
+                    inactivateEdgeRoutingGeneration('cli-agentlib-source-transition-stop');
+                    console.log('[stop] Stopping RoutingServer...');
+                    killRouterIfRunning({ strict: true });
+                    console.log('[stop] Removing configured agent runtimes for source transition...');
+                    const removed = stopCoordinatedConfiguredAgents({ strict: true, remove: true });
+                    assertNoLiveNoWaitWorkers();
+                    return removed;
+                });
+                if (list.length) {
+                    console.log('[stop] Removed runtimes:');
+                    list.forEach(n => console.log(` - ${n}`));
+                }
+                console.log(`Removed ${list.length} configured agent runtimes for source transition.`);
+                break;
+            }
+            console.log('[stop] Stopping detached no-wait workers...');
+            const noWaitWorkers = await quiesceNoWaitWorkers();
+            if (noWaitWorkers.length) {
+                console.log('[stop] Stopped detached no-wait workers:');
+                noWaitWorkers.forEach((worker) => console.log(` - ${worker.containerName}`));
+            }
+            const list = await withWorkspaceMutationLease({
+                operation: 'workspace-stop',
+            }, async () => {
+                assertNoLiveNoWaitWorkers();
+                inactivateEdgeRoutingGeneration('cli-workspace-stop');
+                console.log('[stop] Stopping RoutingServer...');
+                killRouterIfRunning({ strict: true });
+                console.log('[stop] Stopping configured agent containers...');
+                const stopped = stopCoordinatedConfiguredAgents({ strict: true });
+                assertNoLiveNoWaitWorkers();
+                return stopped;
+            });
             if (list.length) {
                 console.log('[stop] Stopped containers:');
                 list.forEach(n => console.log(` - ${n}`));

@@ -20,6 +20,11 @@ import {
     runEntrypoint,
 } from '../../ploinky-box/entrypoint/entrypoint.mjs';
 import {
+    DEPENDENCY_MARKER_NAME,
+    installPinnedDependencies,
+    inspectInstalledAgentlibIdentity,
+} from '../../ploinky-box/entrypoint/install-dependencies.mjs';
+import {
     configureBoxTransport,
     parseExactTransport,
     writeTransportPair,
@@ -245,10 +250,11 @@ test('full preparation creates one stable key, resets only transient runtime, an
     const options = {
         root,
         runner: routeRunner({ paths }),
-        installDependencies({ targetRoot, markerPath }) {
+        installDependencies({ targetRoot, markerPath, preserveAgentlib }) {
             events.push('install');
             assert.equal(targetRoot, paths.dependencies);
             assert.equal(markerPath, paths.marker);
+            assert.equal(preserveAgentlib, true);
         },
     };
     const envPath = path.join(paths.workspace, '.env');
@@ -282,6 +288,77 @@ test('full preparation creates one stable key, resets only transient runtime, an
     prepareEntrypoint(options);
     assert.deepEqual(fs.readFileSync(keyPath), keyBytes);
     assert.deepEqual(fs.readFileSync(envPath), envBytes);
+});
+
+test('stopped-Box entrypoint boot preserves a validated local Achilles selection', (t) => {
+    const { root, paths } = fixture(t);
+    const repositoryInstalls = [];
+    const readInstalledHead = (directory) => {
+        try { return fs.readFileSync(path.join(directory, '.head'), 'utf8'); } catch { return ''; }
+    };
+    const installRepository = ({ name, repository, destination }) => {
+        repositoryInstalls.push(name);
+        fs.mkdirSync(destination);
+        fs.writeFileSync(path.join(destination, '.head'), repository.commit);
+    };
+    const installLocalAgentlib = ({ sha256, destination }) => {
+        fs.mkdirSync(destination);
+        fs.writeFileSync(path.join(destination, 'package.json'), JSON.stringify({
+            name: 'ploinky-agent-lib',
+            type: 'module',
+            main: 'index.mjs',
+        }));
+        fs.writeFileSync(path.join(destination, 'index.mjs'), `export const sha = '${sha256}';\n`);
+    };
+    const dependencyOptions = {
+        targetRoot: paths.dependencies,
+        markerPath: paths.marker,
+        fsApi: fs,
+        runner: routeRunner(),
+        installRepository,
+        installLocalAgentlib,
+        readInstalledHead,
+    };
+    installPinnedDependencies({ ...dependencyOptions, token: 'entrypoint-locked-base' });
+    const archiveBytes = Buffer.from('entrypoint-local-archive');
+    const sha = crypto.createHash('sha256').update(archiveBytes).digest('hex');
+    const archiveRoot = path.join(paths.dependencies, '.ploinky-local-agentlib');
+    fs.mkdirSync(archiveRoot);
+    fs.writeFileSync(path.join(archiveRoot, `${sha}.tgz`), archiveBytes);
+    installPinnedDependencies({
+        ...dependencyOptions,
+        localAgentlibSha: sha,
+        token: 'entrypoint-local-base',
+    });
+    const markerPath = path.join(paths.dependencies, DEPENDENCY_MARKER_NAME);
+    const beforeMarker = fs.readFileSync(markerPath, 'utf8');
+    const beforeEntry = fs.readFileSync(path.join(paths.dependencies, 'achillesAgentLib', 'index.mjs'), 'utf8');
+    repositoryInstalls.length = 0;
+
+    prepareEntrypoint({
+        root,
+        runner: routeRunner(),
+        initialize() {},
+        configureStorage() { return {}; },
+        configureTransport() { return {}; },
+        resetRuntime() {},
+        retireContainers() {},
+        installDependencies(options) {
+            return installPinnedDependencies({
+                ...dependencyOptions,
+                ...options,
+                token: 'entrypoint-preserve-local',
+            });
+        },
+    });
+
+    assert.deepEqual(repositoryInstalls, []);
+    assert.equal(fs.readFileSync(markerPath, 'utf8'), beforeMarker);
+    assert.equal(
+        fs.readFileSync(path.join(paths.dependencies, 'achillesAgentLib', 'index.mjs'), 'utf8'),
+        beforeEntry,
+    );
+    assert.equal(inspectInstalledAgentlibIdentity(dependencyOptions), `local:${sha}`);
 });
 
 test('ready line is emitted exactly once and only after every required stage', (t) => {

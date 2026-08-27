@@ -31,6 +31,11 @@ import {
     inspectWorkspaceDataPaths,
     removeWorkspaceDataPaths,
 } from './workspace-data.mjs';
+import { publishLocalAgentlibSnapshot } from './dev/local-agentlib-snapshot.mjs';
+import { readDependencyLock } from './entrypoint/install-dependencies.mjs';
+
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const COMMIT_PATTERN = /^[a-f0-9]{40}$/;
 
 function supervisorError(message, code = 'PLOINKY_BOX_SUPERVISOR_FAILED') {
     return new PloinkyBoxError(message, { code });
@@ -50,6 +55,34 @@ function defaultDiscovery(identity, runner, platform, env) {
     return discoverBoxOwnership(identity, { runner, platform, env });
 }
 
+function normalizeStartSource(source) {
+    if (source === undefined) return Object.freeze({ mode: 'locked' });
+    if (!source || typeof source !== 'object' || Array.isArray(source)) {
+        throw supervisorError('A typed AchillesAgentLib start source is required');
+    }
+    const keys = Object.keys(source).sort();
+    if (source.mode === 'locked' && JSON.stringify(keys) === JSON.stringify(['mode'])) {
+        return Object.freeze({ mode: 'locked' });
+    }
+    if (source.mode === 'resolved-ref'
+        && JSON.stringify(keys) === JSON.stringify(['mode', 'requestedRef'])
+        && typeof source.requestedRef === 'string'
+        && source.requestedRef.trim()) {
+        return Object.freeze({ mode: 'resolved-ref', requestedRef: source.requestedRef.trim() });
+    }
+    if (source.mode === 'local'
+        && JSON.stringify(keys) === JSON.stringify(['mode', 'sha256', 'tempArchivePath'])
+        && SHA256_PATTERN.test(String(source.sha256 || ''))
+        && path.isAbsolute(String(source.tempArchivePath || ''))) {
+        return Object.freeze({
+            mode: 'local',
+            sha256: source.sha256,
+            tempArchivePath: source.tempArchivePath,
+        });
+    }
+    throw supervisorError('AchillesAgentLib start source is malformed');
+}
+
 export function createBoxSupervisor({
     runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
     lockManager = createMutationLockManager(),
@@ -66,6 +99,11 @@ export function createBoxSupervisor({
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
+    ensureDependencies = ensureBoxDependencies,
+    inspectAgentlibIdentity = inspectBoxAgentlibIdentity,
+    publishLocalAgentlib = publishLocalAgentlibSnapshot,
+    stopCore = stopPloinkyLocalByContainerId,
+    lockedAgentlibCommit = readDependencyLock().repositories.achillesAgentLib.commit,
     destroyBoxCache = removeWorkspaceDataPaths,
     inspectBoxData = inspectWorkspaceDataPaths,
     stdout = process.stdout,
@@ -75,10 +113,13 @@ export function createBoxSupervisor({
         return discover(identity, runner, platform, env);
     }
 
-    async function lockedMutation(execute, authorize = assertMutableOwnership) {
+    async function lockedMutation(execute, authorize = assertMutableOwnership, {
+        materializeExistingAnchor = false,
+    } = {}) {
         return withWorkspaceMutationLock({
             resolveIdentity,
             lockManager,
+            materializeExistingAnchor,
             beforeAnchor(identity) {
                 return authorize(inspect(identity));
             },
@@ -108,12 +149,17 @@ export function createBoxSupervisor({
                 stderr,
             });
             const containerId = prepared.ownership.handles.container.id;
-            await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+            await ensureDependencies(ownership.engine, containerId, runner, {
+                stdout,
+                stderr,
+                preserveAgentlib: true,
+            });
             return Object.freeze({ identity, ...prepared, containerId, engine: ownership.engine });
-        });
+        }, assertMutableOwnership, { materializeExistingAnchor: true });
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
+        const source = normalizeStartSource(options.source);
         return lockedMutation(async (identity, lock, ownership) => {
             const prepared = await reconcile({
                 identity,
@@ -131,7 +177,27 @@ export function createBoxSupervisor({
                 stderr,
             });
             const containerId = prepared.ownership.handles.container.id;
-            await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+            if (source.mode === 'local') {
+                stopCore(ownership.engine, containerId, runner, { sourceTransition: true });
+                publishLocalAgentlib(source, {
+                    dependenciesRoot: identity.dataPaths.dependencies,
+                });
+                await ensureDependencies(ownership.engine, containerId, runner, {
+                    stdout,
+                    stderr,
+                    localAgentlibSha: source.sha256,
+                });
+            } else {
+                const installedIdentity = inspectAgentlibIdentity(
+                    ownership.engine,
+                    containerId,
+                    runner,
+                );
+                if (installedIdentity !== lockedAgentlibCommit) {
+                    stopCore(ownership.engine, containerId, runner, { sourceTransition: true });
+                }
+                await ensureDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+            }
             const edgeDesired = readEdgeDesired(identity);
             if (edgeDesired) {
                 stageEdgeDesired({
@@ -153,12 +219,13 @@ export function createBoxSupervisor({
                     stdout,
                     stderr,
                     hostReachableIpv4,
-                    agentlibRef: env.PLOINKY_AGENTLIB_REF,
+                    agentlibRef: source.mode === 'resolved-ref' ? source.requestedRef : '',
+                    localAgentlibSha: source.mode === 'local' ? source.sha256 : '',
                 },
             );
             await healthCheck(prepared.hostPort);
             return Object.freeze({ identity, ...prepared, containerId });
-        });
+        }, assertMutableOwnership, { materializeExistingAnchor: true });
     }
 
     async function runStopTransaction() {
@@ -347,6 +414,7 @@ export function createBoxSupervisor({
             desiredImage: options.imageRef || resolveBoxImageReference(env),
             desiredHostPort: options.explicitPort || null,
             desiredMediaHostPort: options.explicitMediaPort || null,
+            agentlibSourceMode: options.sourceMode || null,
             mutationPerformed: false,
         });
     }
@@ -365,13 +433,23 @@ export async function ensureBoxDependencies(engine, containerId, runner, {
     stdout = process.stdout,
     stderr = process.stderr,
     timeoutMs = 1_800_000,
+    localAgentlibSha = '',
+    preserveAgentlib = false,
 } = {}) {
+    if (localAgentlibSha && !SHA256_PATTERN.test(String(localAgentlibSha))) {
+        throw supervisorError('Local AchillesAgentLib SHA must be 64 lowercase hexadecimal characters');
+    }
+    if (localAgentlibSha && preserveAgentlib) {
+        throw supervisorError('Local AchillesAgentLib selection cannot preserve another installed identity');
+    }
     const args = [
         'container', 'exec',
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,
         '/opt/ploinky/bin/ploinky-install-deps',
+        ...(localAgentlibSha ? ['--local-agentlib-sha', localAgentlibSha] : []),
+        ...(preserveAgentlib ? ['--preserve-agentlib'] : []),
     ];
     stderr?.write?.('[ploinky] Verifying and installing Box dependencies...\n');
     if (typeof runner.stream !== 'function') {
@@ -382,6 +460,27 @@ export async function ensureBoxDependencies(engine, containerId, runner, {
     if (!result.ok) {
         throw supervisorError(`Box dependency installation failed with status ${result.status}`);
     }
+}
+
+export function inspectBoxAgentlibIdentity(engine, containerId, runner) {
+    const result = runner.query(engine.name, [
+        'container', 'exec',
+        '--user', 'podman',
+        '--workdir', '/workspace',
+        containerId,
+        '/opt/ploinky/bin/ploinky-install-deps',
+        '--print-agentlib-identity',
+    ]);
+    if (!result?.ok) {
+        throw supervisorError('Unable to inspect the installed AchillesAgentLib identity');
+    }
+    const identity = String(result.stdout || '').trim();
+    if (identity !== 'unknown'
+        && !COMMIT_PATTERN.test(identity)
+        && !/^local:[a-f0-9]{64}$/.test(identity)) {
+        throw supervisorError('Box reported a malformed installed AchillesAgentLib identity');
+    }
+    return identity;
 }
 
 export function formatBoxStatus(status) {
@@ -419,6 +518,7 @@ export async function runBoundedCoreStart(
         timeoutMs = 1_800_000,
         hostReachableIpv4 = '',
         agentlibRef = '',
+        localAgentlibSha = '',
     } = {},
 ) {
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
@@ -426,6 +526,13 @@ export async function runBoundedCoreStart(
     }
     const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
     const normalizedAgentlibRef = String(agentlibRef || '').trim();
+    const normalizedLocalAgentlibSha = String(localAgentlibSha || '');
+    if (normalizedLocalAgentlibSha && !SHA256_PATTERN.test(normalizedLocalAgentlibSha)) {
+        throw supervisorError('Local AchillesAgentLib SHA must be 64 lowercase hexadecimal characters');
+    }
+    if (normalizedLocalAgentlibSha && normalizedAgentlibRef) {
+        throw supervisorError('Local AchillesAgentLib selection cannot include an independent ref');
+    }
     if (normalizedHostReachableIpv4 && !isUsableHostIpv4(normalizedHostReachableIpv4)) {
         throw supervisorError(
             `${HOST_REACHABLE_IPV4_ENV} must be a usable canonical literal IPv4 address`,
@@ -441,6 +548,12 @@ export async function runBoundedCoreStart(
             : []),
         ...(normalizedAgentlibRef
             ? ['--env', `PLOINKY_AGENTLIB_REF=${normalizedAgentlibRef}`]
+            : []),
+        ...(normalizedLocalAgentlibSha
+            ? [
+                '--env', `PLOINKY_LOCAL_AGENTLIB_SHA=${normalizedLocalAgentlibSha}`,
+                '--env', `PLOINKY_AGENTLIB_REF=file:/opt/ploinky/node_modules/.ploinky-local-agentlib/${normalizedLocalAgentlibSha}.tgz`,
+            ]
             : []),
     ];
     const result = await runner.stream(engine.name, [

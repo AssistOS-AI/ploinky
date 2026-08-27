@@ -10,6 +10,17 @@ import { BOX_IMAGE_OVERRIDE_ENV, BOX_IMAGE_REFERENCE, BOX_LABELS } from '../cons
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { createBoxSupervisor, formatBoxStatus } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
+import { ensureAgentlibCheckout } from '../dev/agentlib-checkout.mjs';
+import {
+    cleanupLocalAgentlibSnapshot,
+    createLocalAgentlibSnapshot,
+} from '../dev/local-agentlib-snapshot.mjs';
+import { resolveStartSourcePolicy } from '../source-policy.mjs';
+
+export function prepareLocalAgentlibDevelopment({ repositoryRoot } = {}) {
+    const checkout = ensureAgentlibCheckout({ repositoryRoot });
+    return createLocalAgentlibSnapshot(checkout.checkoutPath);
+}
 
 export function publicUsageText() {
     return `ploinky - run Ploinky through its managed outer Box
@@ -41,6 +52,8 @@ The default Box image is ${BOX_IMAGE_REFERENCE}.
 Set ${BOX_IMAGE_OVERRIDE_ENV} to pull a different Box image reference.
 Public CLI image options, engine, instance-name, and master-key overrides are unsupported.
 If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/security authority.
+Host-side start uses the editable node_modules/achillesAgentLib checkout by default.
+Set PLOINKY_PROD=true for the locked/resolved production AchillesAgentLib source.
 `;
 }
 
@@ -89,22 +102,32 @@ export async function runOuterCli(argv, {
     repositoryRoot = path.resolve(import.meta.dirname, '../..'),
     updateHostSource = updateHostPloinkySource,
     relaunch = executeProcess,
+    resolveSourcePolicy = resolveStartSourcePolicy,
+    prepareLocalAgentlib = prepareLocalAgentlibDevelopment,
+    cleanupLocalAgentlib = cleanupLocalAgentlibSnapshot,
 } = {}) {
     if (detectInsideBox()) {
         return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
     }
-    const selectedSupervisor = supervisor || createBoxSupervisor({ env });
     const parsed = parseOuterArguments(argv);
     const route = routeOuterCommand(parsed);
     const engineEnv = buildEngineProcessEnvironment(env);
     outerDebug(parsed, route, output);
+    const sourcePolicy = ['start', 'dry-run'].includes(route.kind)
+        ? resolveSourcePolicy(env)
+        : null;
+    let supervisorInstance = supervisor || null;
+    const selectedSupervisor = () => {
+        if (!supervisorInstance) supervisorInstance = createBoxSupervisor({ env });
+        return supervisorInstance;
+    };
 
     if (route.kind === 'help') {
         output.write(publicUsageText());
         return 0;
     }
     if (route.kind === 'status') {
-        const status = selectedSupervisor.inspectBoxStatus();
+        const status = selectedSupervisor().inspectBoxStatus();
         const container = status.ownership?.handles?.container;
         if (status.state === 'running-initialized' && container) {
             const coreStatus = executePrepared({
@@ -127,11 +150,11 @@ export async function runOuterCli(argv, {
         return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
     }
     if (route.kind === 'stop') {
-        await selectedSupervisor.runStopTransaction();
+        await selectedSupervisor().runStopTransaction();
         return 0;
     }
     if (route.kind === 'destroy') {
-        const status = selectedSupervisor.inspectBoxStatus();
+        const status = selectedSupervisor().inspectBoxStatus();
         const container = status.ownership?.handles?.container;
         // Cache deletion is workspace-backed, so it stays available even when
         // the outer container is already gone.
@@ -139,7 +162,7 @@ export async function runOuterCli(argv, {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }
-        const destroyed = await selectedSupervisor.runDestroyTransaction(container?.id || null, {
+        const destroyed = await selectedSupervisor().runDestroyTransaction(container?.id || null, {
             deleteCache: route.deleteCache,
         });
         if (route.deleteCache) {
@@ -152,19 +175,31 @@ export async function runOuterCli(argv, {
         return 0;
     }
     if (route.kind === 'dry-run') {
-        const plan = selectedSupervisor.planDryRun({
+        const plan = selectedSupervisor().planDryRun({
             explicitPort: route.hostPort,
             explicitMediaPort: route.mediaHostPort,
+            sourceMode: sourcePolicy.mode,
         });
         output.write(`${JSON.stringify(plan, null, 2)}\n`);
         return 0;
     }
     if (route.kind === 'start') {
-        await selectedSupervisor.runStartTransaction(route.coreArgv, {
-            explicitPort: route.hostPort,
-            explicitMediaPort: route.mediaHostPort,
-        });
-        return 0;
+        let localAgentlib = null;
+        try {
+            if (sourcePolicy.mode === 'local') {
+                localAgentlib = await prepareLocalAgentlib({ repositoryRoot });
+            }
+            await selectedSupervisor().runStartTransaction(route.coreArgv, {
+                explicitPort: route.hostPort,
+                explicitMediaPort: route.mediaHostPort,
+                source: sourcePolicy.mode === 'local'
+                    ? Object.freeze({ mode: 'local', ...localAgentlib })
+                    : sourcePolicy,
+            });
+            return 0;
+        } finally {
+            if (localAgentlib) cleanupLocalAgentlib(localAgentlib);
+        }
     }
 
     // Logs are inspect-only at this boundary. The route reads Box status once
@@ -172,7 +207,7 @@ export async function runOuterCli(argv, {
     // never prepares, reconciles, installs dependencies, or takes a mutation
     // lock, so asking for logs can never create or repair a Box.
     if (route.kind === 'logs') {
-        const status = selectedSupervisor.inspectBoxStatus();
+        const status = selectedSupervisor().inspectBoxStatus();
         const container = status.ownership?.handles?.container;
         const engine = status.ownership?.engine;
         if (status.state !== 'running-initialized' || !container?.id || !engine?.name) {
@@ -205,10 +240,10 @@ export async function runOuterCli(argv, {
         }
         output.write('Host Ploinky checkout is already up to date.\n');
 
-        const priorStatus = selectedSupervisor.inspectBoxStatus();
+        const priorStatus = selectedSupervisor().inspectBoxStatus();
         const restartAfterUpdate = priorStatus.state === 'running-initialized'
             && priorStatus.inbox?.routingConfigured === true;
-        const prepared = await selectedSupervisor.prepareBoxForCommand();
+        const prepared = await selectedSupervisor().prepareBoxForCommand();
         const updateCode = executePrepared(prepared, route.coreArgv, {
             execute,
             input,
@@ -229,7 +264,7 @@ export async function runOuterCli(argv, {
         });
     }
 
-    const prepared = await selectedSupervisor.prepareBoxForCommand();
+    const prepared = await selectedSupervisor().prepareBoxForCommand();
     if (route.kind === 'bash') {
         return executePrepared(prepared, [], {
             execute,
