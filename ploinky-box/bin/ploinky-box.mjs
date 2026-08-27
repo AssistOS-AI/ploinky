@@ -20,7 +20,8 @@ Usage: ploinky [--debug] [--dry-run] [--port PORT] [--udp-port PORT] [--] COMMAN
 Commands:
   ploinky                         Prepare the Box and open the Ploinky REPL
   ploinky start AGENT [PORT]      Start the graph; the Router host port defaults to 8080
-  ploinky restart [AGENT]         Restart through the same source/readiness transaction
+  ploinky restart                 Reconcile sources and restart the whole workspace graph
+  ploinky restart AGENT           Restart one agent in the existing Box generation
   ploinky --udp-port PORT start AGENT [PORT]
                                   Select the media host UDP port; defaults to 7882
   ploinky status [--verbose]      Inspect Box and core state without mutation
@@ -170,9 +171,16 @@ export async function runOuterCli(argv, {
         return 0;
     }
     if (route.kind === 'restart') {
-        await selectedSupervisor.runRestartTransaction(stripBranchPolicyArgs(route.coreArgv), {
-            branchPolicy: parseBranchPolicy(route.coreArgv),
-        });
+        const coreArgv = stripBranchPolicyArgs(route.coreArgv);
+        const targeted = stripBranchPolicyArgs(parsed.commandArgs)
+            .some((argument) => !['--debug', '-d'].includes(argument));
+        if (targeted) {
+            await selectedSupervisor.runTargetedRestartTransaction(coreArgv);
+        } else {
+            await selectedSupervisor.runRestartTransaction(coreArgv, {
+                branchPolicy: parseBranchPolicy(route.coreArgv),
+            });
+        }
         return 0;
     }
 

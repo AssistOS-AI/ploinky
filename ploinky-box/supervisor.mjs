@@ -167,6 +167,31 @@ function defaultRevalidateAgentLibSource(selection) {
     return selection;
 }
 
+/**
+ * Prove that an existing Box still exposes the exact AgentLib generation it
+ * was admitted with. Targeted restarts deliberately do not select or advance
+ * source: the replacement agent must load the same mounted bytes as its peers.
+ */
+function revalidateMountedAgentLibSource(selection) {
+    const { fingerprint, sourceId } = fingerprintSource(selection.sourceDir);
+    if (sourceIdHash(sourceId) !== selection.sourceIdHash) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.sourceChanged,
+            `The mounted achillesAgentLib source at ${selection.sourceDir} was replaced; `
+            + 'the targeted restart was refused. Run a full `ploinky restart`.',
+        );
+    }
+    if (fingerprint !== selection.fingerprint) {
+        throw agentLibError(
+            AGENTLIB_ERROR_CODES.sourceChanged,
+            `The mounted achillesAgentLib source at ${selection.sourceDir} changed `
+            + `(${selection.fingerprint.slice(0, 12)} -> ${fingerprint.slice(0, 12)}); `
+            + 'the targeted restart was refused. Run a full `ploinky restart`.',
+        );
+    }
+    return selection;
+}
+
 export function createBoxSupervisor({
     runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
     lockManager = createMutationLockManager(),
@@ -485,6 +510,86 @@ export function createBoxSupervisor({
         });
     }
 
+    async function runTargetedRestartTransaction(coreArgs) {
+        const restartIndex = Array.isArray(coreArgs) ? coreArgs.indexOf('restart') : -1;
+        if (restartIndex < 0 || restartIndex >= coreArgs.length - 1) {
+            throw supervisorError(
+                'Targeted restart requires `restart AGENT`',
+                'PLOINKY_BOX_ARGUMENT_INVALID',
+            );
+        }
+        return lockedMutation(async (identity, lock, ownership) => {
+            const status = inspectBoxStatus();
+            const container = status.ownership?.handles?.container;
+            const engine = status.ownership?.engine;
+            if (status.identity?.instance !== identity.instance
+                || status.state !== 'running-initialized'
+                || !container?.id
+                || !engine?.name
+                || ownership.handles?.container?.id !== container.id
+                || ownership.engine?.identity !== engine.identity) {
+                throw supervisorError(
+                    'Targeted restart requires the exact owned Box to be running and initialized '
+                    + `(state: ${status.state || 'unknown'}). Run \`ploinky start AGENT\` first.`,
+                    'PLOINKY_BOX_TARGETED_RESTART_UNAVAILABLE',
+                );
+            }
+
+            // inspectBoxStatus validated the image, container contract, mounts,
+            // and ports without comparing them to today's default image tag.
+            // Reconstruct the generation from those observed mounts and labels
+            // so this path can neither pull nor replace the outer Box.
+            const selection = agentLibContractFromContainer(container);
+            revalidateMountedAgentLibSource(selection);
+            const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
+            const mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
+            const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+            await runCoreCommand(
+                engine,
+                container.id,
+                coreArgs,
+                hostPort,
+                mediaHostPort,
+                runner,
+                { stdout, stderr, hostReachableIpv4, agentLib: selection },
+            );
+
+            // Manual engine operations are outside the workspace lock. Refuse
+            // to attest a different Box if one appeared while Core restarted
+            // the target.
+            const revalidated = inspect(identity);
+            if (revalidated.state !== 'owned'
+                || revalidated.engine?.identity !== engine.identity
+                || revalidated.handles?.container?.id !== container.id
+                || revalidated.handles.container.runtime?.running !== true) {
+                throw supervisorError(
+                    'The outer Box changed during the targeted restart; readiness was not declared',
+                    'PLOINKY_BOX_TARGETED_RESTART_CHANGED',
+                );
+            }
+            await healthCheck(hostPort);
+            const attestation = await attestAgentLibGraph(
+                engine,
+                container.id,
+                selection,
+                runner,
+                { stdout, stderr },
+            );
+            revalidateMountedAgentLibSource(selection);
+            return Object.freeze({
+                identity,
+                action: 'targeted-restart',
+                ownership: revalidated,
+                containerId: container.id,
+                engine,
+                hostPort,
+                mediaHostPort,
+                agentLib: selection,
+                attestation,
+            });
+        });
+    }
+
     async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             const priorCoreStartArgv = captureCoreStartArgv(identity);
@@ -769,6 +874,7 @@ export function createBoxSupervisor({
         prepareBoxForCommand,
         runStartTransaction,
         runRestartTransaction,
+        runTargetedRestartTransaction,
         runUpdateTransaction,
         runStopTransaction,
         runDestroyTransaction,

@@ -272,6 +272,128 @@ test('prepare acquires once, reconciles under lock, validates dependencies, then
     ]);
 });
 
+test('targeted restart preserves the exact running Box and mounted AgentLib generation', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const ownership = owned(identity);
+    const container = ownership.handles.container;
+    const immutableImageRef = `docker.io/assistos/ploinky-box@sha256:${'c'.repeat(64)}`;
+    container.labels[BOX_LABELS.imageRef] = immutableImageRef;
+    container.labels[BOX_LABELS.routerHostPort] = '19090';
+    container.labels[BOX_LABELS.mediaHostPort] = '17891';
+    const supervisor = createBoxSupervisor({
+        env: {}, // Deliberately resolves to :latest, unlike the running Box.
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: {
+            query(_command, args) {
+                events.push(`query:${args.at(-1)}`);
+                return {
+                    ok: true,
+                    status: 0,
+                    stdout: JSON.stringify({
+                        state: 'running',
+                        initialized: true,
+                        routingConfigured: true,
+                        trackedAgents: 2,
+                        runningAgents: 2,
+                        warnings: [],
+                    }),
+                };
+            },
+        },
+        validateExistingImage(_engineName, imageId, imageRef) {
+            events.push(`validate-image:${imageRef}`);
+            assert.equal(imageId, 'b'.repeat(64));
+            assert.equal(imageRef, immutableImageRef);
+            return { immutableId: `sha256:${'b'.repeat(64)}` };
+        },
+        validateContainer(_container, options) {
+            events.push('validate-container');
+            assert.equal(options.imageRef, immutableImageRef);
+            assert.equal(options.hostPort, 19090);
+            assert.equal(options.mediaHostPort, 17891);
+        },
+        selectAgentLib: async () => assert.fail('targeted restart must not select source'),
+        reconcile: async () => assert.fail('targeted restart must not reconcile or replace the Box'),
+        resolveHostReachableIpv4: async () => '192.168.1.12',
+        runCoreCommand: async (_engine, containerId, argv, hostPort, mediaHostPort, _runner, options) => {
+            events.push(`core:${argv.join(' ')}`);
+            assert.equal(containerId, container.id);
+            assert.deepEqual(argv, ['restart', 'onlyOffice']);
+            assert.equal(hostPort, 19090);
+            assert.equal(mediaHostPort, 17891);
+            assert.equal(options.hostReachableIpv4, '192.168.1.12');
+            assert.equal(options.agentLib.fingerprint, agentLibFixture(identity.workspaceRoot).fingerprint);
+        },
+        healthCheck: async (hostPort) => {
+            events.push(`health:${hostPort}`);
+        },
+        attestAgentLibGraph: async (_engine, containerId, selection) => {
+            events.push(`attest:${containerId}`);
+            return { deploymentFingerprint: selection.fingerprint };
+        },
+        commitAgentLibSelection: () => assert.fail('targeted restart must not advance source state'),
+    });
+
+    const result = await supervisor.runTargetedRestartTransaction(['restart', 'onlyOffice']);
+
+    assert.equal(result.action, 'targeted-restart');
+    assert.equal(result.containerId, container.id);
+    assert.equal(result.agentLib.sourceDir, agentLibFixture(identity.workspaceRoot).sourceDir);
+    assert.equal(events.some((event) => event.startsWith('core:restart onlyOffice')), true);
+    assert.ok(events.indexOf('health:19090') > events.indexOf('core:restart onlyOffice'));
+    assert.ok(events.indexOf(`attest:${container.id}`) > events.indexOf('health:19090'));
+    assert.equal(events.at(-1), 'release');
+});
+
+test('targeted restart refuses stopped and uninitialized Boxes without mutation', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    for (const testCase of [
+        { name: 'stopped', running: false, initialized: false },
+        { name: 'running-uninitialized', running: true, initialized: false },
+    ]) {
+        const caseRoot = path.join(state.root, testCase.name);
+        fs.mkdirSync(caseRoot);
+        const ownership = owned(identity, { running: testCase.running });
+        ownership.handles.container.labels[BOX_LABELS.routerHostPort] = '8080';
+        ownership.handles.container.labels[BOX_LABELS.mediaHostPort] = '7882';
+        const supervisor = createBoxSupervisor({
+            resolveIdentity: () => identity,
+            lockManager: fakeLockManager(caseRoot, []),
+            discover: () => ownership,
+            runner: {
+                query() {
+                    return {
+                        ok: true,
+                        status: 0,
+                        stdout: JSON.stringify({ initialized: testCase.initialized }),
+                    };
+                },
+            },
+            validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+            validateContainer: () => {},
+            selectAgentLib: async () => assert.fail('must not select source'),
+            reconcile: async () => assert.fail('must not reconcile'),
+            runCoreCommand: async () => assert.fail('must not execute Core'),
+        });
+
+        await assert.rejects(
+            () => supervisor.runTargetedRestartTransaction(['restart', 'onlyOffice']),
+            {
+                code: 'PLOINKY_BOX_TARGETED_RESTART_UNAVAILABLE',
+                message: /running and initialized/,
+            },
+            testCase.name,
+        );
+    }
+});
+
 test('update pulls a workspace Ploinky checkout under the workspace lock before updating the graph', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
