@@ -94,9 +94,42 @@ function ensureManifestRepoCached(entry) {
     return reposSvc.installRepo(entry.url, entry.name, entry.branch, { stdio: 'inherit' }).path;
 }
 
+function copySkillTree(sourcePath, destinationPath) {
+    const stat = fs.lstatSync(sourcePath);
+    const finalMode = stat.mode & 0o777;
+
+    if (stat.isDirectory()) {
+        // Keep the directory owner-writable until its children are complete.
+        // Node's native recursive cp can leave transient mode-0200 files on a
+        // macOS virtiofs mount, after which the in-Box process cannot even stat
+        // them. Explicit creation avoids exposing those intermediate modes.
+        fs.mkdirSync(destinationPath, { mode: 0o700 });
+        for (const entry of fs.readdirSync(sourcePath).sort()) {
+            copySkillTree(path.join(sourcePath, entry), path.join(destinationPath, entry));
+        }
+        fs.chmodSync(destinationPath, finalMode);
+        return;
+    }
+
+    if (stat.isFile()) {
+        const descriptor = fs.openSync(destinationPath, 'wx', 0o600);
+        fs.closeSync(descriptor);
+        fs.copyFileSync(sourcePath, destinationPath);
+        fs.chmodSync(destinationPath, finalMode);
+        return;
+    }
+
+    if (stat.isSymbolicLink()) {
+        fs.symlinkSync(fs.readlinkSync(sourcePath), destinationPath);
+        return;
+    }
+
+    throw new Error(`Unsupported skill entry type: ${sourcePath}`);
+}
+
 export function copySkill(srcDir, destDir) {
     fs.rmSync(destDir, { recursive: true, force: true });
-    fs.cpSync(srcDir, destDir, { recursive: true, force: true });
+    copySkillTree(srcDir, destDir);
 }
 
 function pathExists(targetPath) {

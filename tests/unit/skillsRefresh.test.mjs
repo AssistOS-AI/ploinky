@@ -228,6 +228,10 @@ test('copySkill replaces destination so removed source files do not linger', () 
         fs.mkdirSync(src, { recursive: true });
         fs.writeFileSync(path.join(src, 'SKILL.md'), '# Current skill\n');
         fs.writeFileSync(path.join(src, 'tool.js'), 'export default 1;\n');
+        fs.chmodSync(path.join(src, 'tool.js'), 0o755);
+        fs.mkdirSync(path.join(src, 'assets'));
+        fs.writeFileSync(path.join(src, 'assets', 'prompt.txt'), 'nested asset\n');
+        fs.symlinkSync('SKILL.md', path.join(src, 'README.md'));
 
         fs.mkdirSync(dest, { recursive: true });
         fs.writeFileSync(path.join(dest, 'stale.js'), 'stale file\n');
@@ -237,6 +241,10 @@ test('copySkill replaces destination so removed source files do not linger', () 
         // Files from source are copied / overwritten
         assert.equal(fs.existsSync(path.join(dest, 'SKILL.md')), true);
         assert.equal(fs.existsSync(path.join(dest, 'tool.js')), true);
+        assert.equal(fs.readFileSync(path.join(dest, 'assets', 'prompt.txt'), 'utf8'), 'nested asset\n');
+        assert.equal(fs.statSync(path.join(dest, 'tool.js')).mode & 0o777, 0o755);
+        assert.equal(fs.lstatSync(path.join(dest, 'README.md')).isSymbolicLink(), true);
+        assert.equal(fs.readlinkSync(path.join(dest, 'README.md')), 'SKILL.md');
         // Files only in this owned destination skill are removed
         assert.equal(fs.existsSync(path.join(dest, 'stale.js')), false);
     } finally {
