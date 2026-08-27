@@ -9,7 +9,11 @@ import { applyCurrentNoWaitReadiness } from './noWaitReadiness.js';
 import { findAgent } from './utils.js';
 import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
 import { inspectWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
-import { AGENTLIB_ENV } from '../../agentlib/contract.mjs';
+import {
+    AGENTLIB_ATTESTATION_SCHEMA_VERSION,
+    AGENTLIB_ATTESTED_ENTRYPOINTS,
+    AGENTLIB_ENV,
+} from '../../agentlib/contract.mjs';
 import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { buildAgentLibAttestation } from '../../agentlib/runtime.mjs';
 
@@ -93,7 +97,65 @@ export function listRepos() {
     console.log("\nTip: install repos with 'install repo <url> [name]'. Agent repos are included in agent listings when installed.");
 }
 
-export function listCurrentAgents() {
+function isSha256(value) {
+    return /^[a-f0-9]{64}$/.test(String(value || ''));
+}
+
+function agentLibProofMatchesGrant(grant, attestation) {
+    return Boolean(grant
+        && attestation?.schemaVersion === AGENTLIB_ATTESTATION_SCHEMA_VERSION
+        && isSha256(grant.fingerprint)
+        && isSha256(grant.sourceIdHash)
+        && attestation.deploymentFingerprint === grant.fingerprint
+        && attestation.sourceIdHash === grant.sourceIdHash
+        && attestation.sourceRootRealpath === grant.runtimePath
+        && isSha256(attestation.packageJsonHash)
+        && AGENTLIB_ATTESTED_ENTRYPOINTS.every(
+            (subpath) => isSha256(attestation.entrypoints?.[subpath]),
+        ));
+}
+
+/**
+ * Render AgentLib admission detail for one runtime.
+ *
+ * Healthy proof is intentionally silent in ordinary status output. Missing or
+ * divergent proof remains operator-visible, while --verbose/debug restores the
+ * complete diagnostic record used before this output was made concise.
+ */
+export function formatAgentLibRuntimeProof(entry, { verbose = false } = {}) {
+    const lines = [];
+    const grant = entry?.agentLib;
+    const attestation = entry?.agentLibAttestation;
+    const running = Boolean(entry?.state?.running);
+    const matchesGrant = agentLibProofMatchesGrant(grant, attestation);
+
+    if (!verbose) {
+        if (!running) return lines;
+        if (!attestation) {
+            lines.push(`     ${styles.label('AgentLib proof')}: ${styles.warn('missing — restart required')}`);
+        } else if (!matchesGrant) {
+            lines.push(`     ${styles.label('AgentLib proof')}: ${styles.danger('mismatch — restart required')}`);
+        }
+        return lines;
+    }
+
+    if (grant) {
+        lines.push(`     ${styles.label('AgentLib selection')}: ${String(grant.fingerprint || '-').slice(0, 12)}`
+            + `  ${styles.label('source id')}: ${String(grant.sourceIdHash || '-').slice(0, 12)}`);
+    }
+    if (running && attestation) {
+        lines.push(`     ${styles.label('AgentLib resolved root')}: ${attestation.sourceRootRealpath || '-'}`);
+        lines.push(`     ${styles.label('AgentLib proof')}: ${matchesGrant ? styles.success('admitted') : styles.danger('mismatch — restart required')}`);
+        for (const [subpath, hash] of Object.entries(attestation.entrypoints || {})) {
+            lines.push(`       ${subpath}: ${String(hash).slice(0, 12)}`);
+        }
+    } else if (running) {
+        lines.push(`     ${styles.label('AgentLib proof')}: ${styles.warn('missing — restart required')}`);
+    }
+    return lines;
+}
+
+export function listCurrentAgents({ verbose = false } = {}) {
     const registry = getAgentsRegistry() || {};
     const runtimes = collectAgentRuntimeStates({ registry })
         .map((entry) => applyCurrentNoWaitReadiness(entry, registry));
@@ -136,24 +198,7 @@ export function listCurrentAgents() {
             resourceParts.push(`${styles.label('ports')}: ${ports}`);
         }
         console.log(`     ${resourceParts.join('  ')}`);
-        const grant = entry.agentLib;
-        const attestation = entry.agentLibAttestation;
-        if (grant) {
-            console.log(`     ${styles.label('AgentLib selection')}: ${String(grant.fingerprint || '-').slice(0, 12)}`
-                + `  ${styles.label('source id')}: ${String(grant.sourceIdHash || '-').slice(0, 12)}`);
-        }
-        if (entry.state?.running && attestation) {
-            const matchesGrant = attestation.deploymentFingerprint === grant?.fingerprint
-                && attestation.sourceIdHash === grant?.sourceIdHash
-                && attestation.sourceRootRealpath === grant?.runtimePath;
-            console.log(`     ${styles.label('AgentLib resolved root')}: ${attestation.sourceRootRealpath || '-'}`);
-            console.log(`     ${styles.label('AgentLib proof')}: ${matchesGrant ? styles.success('admitted') : styles.danger('mismatch')}`);
-            for (const [subpath, hash] of Object.entries(attestation.entrypoints || {})) {
-                console.log(`       ${subpath}: ${String(hash).slice(0, 12)}`);
-            }
-        } else if (entry.state?.running) {
-            console.log(`     ${styles.label('AgentLib proof')}: ${styles.warn('missing — restart required')}`);
-        }
+        for (const line of formatAgentLibRuntimeProof(entry, { verbose })) console.log(line);
         console.log('');
     }
 }
@@ -382,7 +427,7 @@ function printRouterStatus(routerPort, isListening) {
  * are hashed here and compared against the active selection: a difference is a
  * `restart required` state, not something status repairs.
  */
-function printAgentLibStatus() {
+function printAgentLibStatus({ verbose = false } = {}) {
     let info;
     try {
         info = inspectWorkspaceAgentLibSource({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
@@ -412,11 +457,13 @@ function printAgentLibStatus() {
     // descriptor it was handed.
     try {
         const attestation = buildAgentLibAttestation();
-        console.log(`AgentLib core:     ${attestation.sourceRootRealpath}`);
-        console.log(`AgentLib runtime:  ${String(process.env[AGENTLIB_ENV.fingerprint] || '').slice(0, 12)}`
-            + `  source-id ${String(process.env[AGENTLIB_ENV.sourceId] || '').slice(0, 12)}`);
-        for (const [entry, hash] of Object.entries(attestation.entrypoints)) {
-            console.log(`  ${entry}: ${hash.slice(0, 12)}`);
+        if (verbose) {
+            console.log(`AgentLib core:     ${attestation.sourceRootRealpath}`);
+            console.log(`AgentLib runtime:  ${String(process.env[AGENTLIB_ENV.fingerprint] || '').slice(0, 12)}`
+                + `  source-id ${String(process.env[AGENTLIB_ENV.sourceId] || '').slice(0, 12)}`);
+            for (const [entry, hash] of Object.entries(attestation.entrypoints)) {
+                console.log(`  ${entry}: ${hash.slice(0, 12)}`);
+            }
         }
     } catch (error) {
         console.log(`AgentLib core: ${styles.warn(`not attested (${error?.message || error})`)}`);
@@ -424,9 +471,9 @@ function printAgentLibStatus() {
     if (info.detail) console.log(`AgentLib detail: ${info.detail}`);
 }
 
-export async function statusWorkspace() {
+export async function statusWorkspace({ verbose = false } = {}) {
     console.log(styles.header('Workspace status:'));
-    printAgentLibStatus();
+    printAgentLibStatus({ verbose });
     const ssoStatus = gatherSsoStatus();
     printSsoStatusSummary(ssoStatus);
 
@@ -435,5 +482,5 @@ export async function statusWorkspace() {
     printRouterStatus(routerPort, routerListening);
 
     listReposForStatus();
-    listCurrentAgents();
+    listCurrentAgents({ verbose });
 }

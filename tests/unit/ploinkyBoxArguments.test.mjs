@@ -113,6 +113,30 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
     }
 });
 
+test('status accepts only verbose detail and preserves debug for read-only core forwarding', () => {
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['status'])), {
+        kind: 'status',
+        coreArgv: ['status'],
+    });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['status', '--verbose'])), {
+        kind: 'status',
+        coreArgv: ['status', '--verbose'],
+    });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['--debug', 'status'])), {
+        kind: 'status',
+        coreArgv: ['--debug', 'status'],
+    });
+    for (const argv of [
+        ['status', '--json'],
+        ['status', '--verbose', '--verbose'],
+    ]) {
+        assert.throws(
+            () => routeOuterCommand(parseOuterArguments(argv)),
+            /Usage: status \[--verbose\]/,
+        );
+    }
+});
+
 test('full update routes through the host while targeted update forms remain generic', () => {
     assert.deepEqual(routeOuterCommand(parseOuterArguments(['--debug', 'update'])), {
         kind: 'update',

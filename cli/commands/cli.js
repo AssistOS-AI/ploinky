@@ -4,6 +4,8 @@ import { spawn } from 'child_process';
 import { debugLog, findAgent } from '../utils/utils.js';
 import { isKnownCommand } from './commandRegistry.js';
 import { showHelp } from './help.js';
+import { parseStatusOptions } from '../statusOptions.js';
+import { isDebugMode } from '../utils/config.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import * as agentsSvc from '../utils/agents.js';
 import { listRepos, listAgents, listCurrentAgents, listRoutes, statusWorkspace } from '../utils/status.js';
@@ -421,7 +423,7 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
             else showHelp();
             break;
         case 'status':
-            await statusWorkspace();
+            await statusWorkspace(parseStatusOptions(options, { debug: isDebugMode() }));
             break;
         case 'network': {
             const subcommand = String(options[0] || '').trim();

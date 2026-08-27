@@ -23,7 +23,7 @@ Commands:
   ploinky restart [AGENT]         Restart through the same source/readiness transaction
   ploinky --udp-port PORT start AGENT [PORT]
                                   Select the media host UDP port; defaults to 7882
-  ploinky status                  Inspect Box and core state without mutation
+  ploinky status [--verbose]      Inspect Box and core state without mutation
   ploinky stop                    Stop core services and the outer Box
   ploinky update [all [PATH]]     Update host core, in-Box repos/deps/skills,
                                   then restart a configured running workspace
@@ -114,7 +114,7 @@ export async function runOuterCli(argv, {
                 engine: status.ownership.engine,
                 hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
                 mediaHostPort: Number(container.labels?.[BOX_LABELS.mediaHostPort]),
-            }, ['status'], {
+            }, route.coreArgv, {
                 execute,
                 input,
                 output,

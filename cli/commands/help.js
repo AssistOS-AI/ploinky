@@ -16,13 +16,13 @@ export function showHelp(args = [], { surface = 'core' } = {}) {
 function lifecycleHelpLines(surface) {
     if (surface === 'host') {
         return [
-            '  status                         Show combined, read-only outer runtime and workspace status',
+            '  status [--verbose]             Show combined, read-only outer runtime and workspace status',
             '  stop                           Stop core services, then stop the outer runtime',
             '  destroy [--delete-cache]       Remove the outer runtime without prompting; optionally delete .ploinky/box cache data',
         ];
     }
     return [
-        '  status                         Show workspace/router/agent state',
+        '  status [--verbose]             Show workspace/router/agent state',
         '  stop | shutdown | clean         Stop workspace services and leave the outer runtime running',
         '  destroy                        Remove workspace containers and leave the outer runtime running',
         '  Exit the REPL before running host ploinky stop or ploinky destroy.',
@@ -715,6 +715,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
         ? {
             status: {
                 description: 'Show combined, read-only outer runtime and workspace status.',
+                syntax: 'status [--verbose]',
                 notes: 'This host-level status inspects the outer runtime and available core state without starting or reconciling anything.',
             },
             stop: {
@@ -731,6 +732,7 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
         : {
             status: {
                 description: 'Show workspace/router/agent state.',
+                syntax: 'status [--verbose]',
                 notes: 'This core command leaves the outer runtime running.',
             },
             stop: {

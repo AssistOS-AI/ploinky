@@ -58,13 +58,29 @@ function routeUpdate(parsed) {
     });
 }
 
+function routeStatus(parsed) {
+    if (parsed.explicitPort !== null) {
+        throw routeError('status: --port is not supported');
+    }
+    if (parsed.explicitMediaPort !== null) {
+        throw routeError('status: --udp-port is not supported');
+    }
+    if (parsed.commandArgs.length > 1
+        || (parsed.commandArgs.length === 1 && parsed.commandArgs[0] !== '--verbose')) {
+        throw routeError('Usage: status [--verbose]');
+    }
+    return Object.freeze({
+        kind: 'status',
+        coreArgv: parsed.forwardingArgv,
+    });
+}
+
 export function routeOuterCommand(parsed) {
     if (parsed.help || parsed.command === 'help') {
         return Object.freeze({ kind: 'help', topic: parsed.commandArgs });
     }
     if (parsed.command === 'status') {
-        requireNoArgs(parsed, 'status');
-        return Object.freeze({ kind: 'status' });
+        return routeStatus(parsed);
     }
     if (parsed.command === 'stop') {
         requireNoArgs(parsed, 'stop');
