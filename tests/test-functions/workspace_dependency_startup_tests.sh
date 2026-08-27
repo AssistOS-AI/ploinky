@@ -1036,7 +1036,7 @@ EOF
     "default": {
       "env": {
         "LATCH_WATCHDOG_MS": "180000",
-        "READY_ELEMENT_ID": "${agent_name}-ready",
+        "READY_ELEMENT_ID": "${response_text}",
         "RESPONSE_TEXT": "${response_text}"
       }
     }
@@ -1323,7 +1323,7 @@ fast_test_latched_no_wait_loading_transition() (
     -H 'Sec-Fetch-Dest: document' \
     -H 'Sec-Fetch-Mode: navigate')
   [[ "$active_status" == "200" ]]
-  grep -Fq 'id="slowAgent-ready"' "$body_file"
+  grep -Fq 'id="slow-agent-ready"' "$body_file"
   grep -Eiq '^x-test-startup-probe-count: 0' "$headers_file"
   assert_file_contains "$workspace/.data/slowAgent/startup-probe-header-count" "0"
   active_status=$(fast_graph_startup_request \
