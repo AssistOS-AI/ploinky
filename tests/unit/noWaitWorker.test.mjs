@@ -89,6 +89,33 @@ test('no-wait status publication rejects unsafe or foreign producer directories'
 
 const RUN_ID = '11111111-1111-4111-8111-111111111111';
 const FOREIGN_RUN_ID = '99999999-9999-4999-8999-999999999999';
+const INSTANCE_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+const ENABLE_GENERATION = 'ffffffff-1111-4222-8333-444444444444';
+
+function workerIdentity(containerName, {
+    repoName = 'demo',
+    shortAgent = 'worker',
+    alias = '',
+    runId = RUN_ID,
+    runStartedAtMs = 1_700_000_000_000,
+    waveIndex = 0,
+    instanceId = INSTANCE_ID,
+    enableGeneration = ENABLE_GENERATION,
+} = {}) {
+    return {
+        containerName,
+        instanceId,
+        enableGeneration,
+        repoName,
+        shortAgent,
+        alias,
+        routeKey: alias || shortAgent,
+        runId,
+        runStartedAtMs,
+        waveIndex,
+        statusFile: `${containerName}.${runId}.json`,
+    };
+}
 
 const FAST_TIMEOUTS = resolveNoWaitBarrierTimeouts({
     activeTimeoutMs: 1000,
@@ -692,17 +719,19 @@ test('the worker parser accepts only recognized unique name-value pairs', (t) =>
     const containerName = 'contract-container';
     const argv = [
         '--container', containerName,
+        '--instance-id', INSTANCE_ID,
+        '--enable-generation', ENABLE_GENERATION,
         '--short-agent', 'worker',
         '--repo', 'demo',
+        '--alias', 'blue',
         '--manifest-path', '/workspace/demo/worker/manifest.json',
         '--agent-path', '/workspace/demo/worker',
-        '--route-key', 'worker',
+        '--route-key', 'blue',
         '--run-id', RUN_ID,
         '--run-started-at-ms', '1700000000000',
         '--wave-index', '0',
         '--status-file', coordinationPath(runningDir, containerName),
         '--wait-for-statuses', '[]',
-        '--alias', 'blue',
         '--profile', 'default',
         '--router-port', '8080',
         '--force-recreate', '1',
@@ -711,6 +740,47 @@ test('the worker parser accepts only recognized unique name-value pairs', (t) =>
     assert.equal(parsed.container, containerName);
     assert.equal(parsed.runScoped.runId, RUN_ID);
     assert.equal(parsed.routerPort, '8080');
+    assert.equal(parsed.identity.instanceId, INSTANCE_ID);
+    assert.equal(parsed.identity.routeKey, 'blue');
+
+    const emptyAlias = [...argv];
+    emptyAlias[emptyAlias.indexOf('--alias') + 1] = '';
+    emptyAlias[emptyAlias.indexOf('--route-key') + 1] = 'worker';
+    assert.equal(parseNoWaitWorkerArgs(emptyAlias, { runningDir }).identity.alias, '');
+
+    const supportedAgentName = [...emptyAlias];
+    supportedAgentName[supportedAgentName.indexOf('--short-agent') + 1] = 'agent+sidecar';
+    supportedAgentName[supportedAgentName.indexOf('--route-key') + 1] = 'agent+sidecar';
+    const supportedAgent = parseNoWaitWorkerArgs(supportedAgentName, { runningDir });
+    assert.equal(supportedAgent.identity.shortAgent, 'agent+sidecar');
+    assert.equal(supportedAgent.identity.routeKey, 'agent+sidecar');
+    assert.equal(Object.isFrozen(supportedAgent.identity), true);
+
+    for (const invalidAgentName of [
+        'agent/sidecar',
+        'agent:sidecar',
+        'agent sidecar',
+        'agent\tsidecar',
+        'agent\u0000sidecar',
+        'agent\u0085sidecar',
+    ]) {
+        const invalidAgent = [...emptyAlias];
+        invalidAgent[invalidAgent.indexOf('--short-agent') + 1] = invalidAgentName;
+        invalidAgent[invalidAgent.indexOf('--route-key') + 1] = invalidAgentName;
+        assert.throws(
+            () => parseNoWaitWorkerArgs(invalidAgent, { runningDir }),
+            /short agent name is not one exact canonical identity value/,
+        );
+    }
+
+    for (const flag of ['--instance-id', '--enable-generation', '--alias']) {
+        const index = argv.indexOf(flag);
+        const missing = argv.filter((_, tokenIndex) => tokenIndex !== index && tokenIndex !== index + 1);
+        assert.throws(
+            () => parseNoWaitWorkerArgs(missing, { runningDir }),
+            new RegExp(`requires ${flag}$`),
+        );
+    }
 
     for (const broken of [
         [...argv, '--container', containerName],
@@ -767,6 +837,7 @@ test('run-scoped worker status publishes the canonical view before the coordinat
         state: 'starting',
         sequencePhase: 'waiting-barrier',
     }, {
+        identity: workerIdentity(containerName, { runStartedAtMs, waveIndex: 2 }),
         runId: RUN_ID,
         runStartedAtMs,
         waveIndex: 2,
@@ -776,24 +847,39 @@ test('run-scoped worker status publishes the canonical view before the coordinat
     assert.deepEqual(document, {
         state: 'starting',
         sequencePhase: 'waiting-barrier',
-        runId: RUN_ID,
-        runStartedAtMs,
-        waveIndex: 2,
+        ...workerIdentity(containerName, { runStartedAtMs, waveIndex: 2 }),
     });
     for (const target of [canonical, coordination]) {
         assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), document);
     }
     assert.throws(
         () => writeNoWaitWorkerStatus(containerName, {}, {
+            identity: workerIdentity(containerName, { runStartedAtMs }),
             runId: RUN_ID, runStartedAtMs, waveIndex: 0, statusFile: canonical, runningDir,
         }),
         /must be the exact run-scoped file/,
     );
     assert.throws(
         () => writeNoWaitWorkerStatus(containerName, {}, {
+            identity: workerIdentity(containerName, { runStartedAtMs }),
             runId: RUN_ID, runStartedAtMs, statusFile: coordination, runningDir,
         }),
         /wave index must be an integer/,
+    );
+    assert.throws(
+        () => writeNoWaitWorkerStatus(containerName, {}, {
+            identity: workerIdentity(containerName, {
+                runStartedAtMs: runStartedAtMs + 1,
+                waveIndex: 2,
+            }),
+            runId: RUN_ID,
+            runStartedAtMs,
+            waveIndex: 2,
+            statusFile: coordination,
+            runningDir,
+        }),
+        /does not match/,
+        'a publisher may not replace the captured run start while retaining the run path',
     );
 
     // Content equality alone cannot detect a swapped write order, so fault the
@@ -807,6 +893,7 @@ test('run-scoped worker status publishes the canonical view before the coordinat
         state: 'running',
         sequencePhase: 'active',
     }, {
+        identity: workerIdentity(containerName, { runStartedAtMs, waveIndex: 2 }),
         runId: RUN_ID,
         runStartedAtMs,
         waveIndex: 2,
@@ -1614,6 +1701,8 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
     };
     const identity = {
         containerName: 'ploinky_demo_worker',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
         repoName: 'demo',
         shortAgent: 'worker',
         alias: 'background',
@@ -1655,11 +1744,21 @@ test('no-wait launch accepts only its exact active target-less identity', () => 
         }, active.generation.agents.ploinky_demo_worker, identity),
         /registry identity inconsistent/,
     );
+    assert.throws(
+        () => assertNoWaitRegistryRecord({
+            ...active.generation.agents.ploinky_demo_worker,
+            instanceId: { toString: () => 'instance-one' },
+        }, active.generation.agents.ploinky_demo_worker, identity),
+        /registry identity inconsistent/,
+        'registry admission must not coerce an identity-shaped value into the expected bytes',
+    );
 });
 
 test('queued no-wait launch adopts the exact ready runtime published by a foreground start', () => {
     const identity = {
         containerName: 'ploinky_demo_worker',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
         repoName: 'demo',
         shortAgent: 'worker',
         alias: 'background',
@@ -1767,6 +1866,8 @@ test('queued no-wait launch adopts the exact ready runtime published by a foregr
 test('queued no-wait launch rejects incomplete or foreign published targets', () => {
     const identity = {
         containerName: 'ploinky_demo_worker',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
         repoName: 'demo',
         shortAgent: 'worker',
         alias: '',
@@ -1837,6 +1938,8 @@ test('queued no-wait launch rejects incomplete or foreign published targets', ()
 test('no-wait immutable reinspection rejects disagreement with its registry receipt', () => {
     const expectedIdentity = {
         containerName: 'ploinky_demo_worker',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
         repoName: 'demo',
         shortAgent: 'worker',
         alias: '',
@@ -1879,6 +1982,8 @@ test('no-wait immutable reinspection rejects disagreement with its registry rece
 test('no-wait cleanup accepts an exited container only when its immutable contract stays exact', () => {
     const expectedIdentity = {
         containerName: 'ploinky_demo_worker',
+        instanceId: 'instance-one',
+        enableGeneration: 'enable-one',
         repoName: 'demo',
         shortAgent: 'worker',
         alias: '',
@@ -1995,6 +2100,11 @@ test('run-scoped no-wait status publishes canonical and unique files with one ru
     const statusFile = path.join(statusDir, `ploinky_demo_worker.${runId}.json`);
 
     writeNoWaitWorkerStatus('ploinky_demo_worker', { state: 'running' }, {
+        identity: workerIdentity('ploinky_demo_worker', {
+            runId,
+            runStartedAtMs,
+            waveIndex: 3,
+        }),
         runId,
         runStartedAtMs,
         waveIndex: 3,
@@ -2008,7 +2118,12 @@ test('run-scoped no-wait status publishes canonical and unique files with one ru
     ));
     const coordination = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
     assert.deepEqual(canonical, {
-        state: 'running', runId, runStartedAtMs, waveIndex: 3,
+        state: 'running',
+        ...workerIdentity('ploinky_demo_worker', {
+            runId,
+            runStartedAtMs,
+            waveIndex: 3,
+        }),
     });
     assert.deepEqual(coordination, canonical);
     assert.deepEqual(
@@ -2017,6 +2132,11 @@ test('run-scoped no-wait status publishes canonical and unique files with one ru
     );
     assert.throws(
         () => writeNoWaitWorkerStatus('ploinky_demo_worker', { state: 'failed' }, {
+            identity: workerIdentity('ploinky_demo_worker', {
+                runId,
+                runStartedAtMs,
+                waveIndex: 3,
+            }),
             runId,
             runStartedAtMs,
             waveIndex: 3,
@@ -2387,8 +2507,11 @@ test('a pre-start failure still publishes a terminal member of the wave barrier'
     const baseArgs = [
         workerScript,
         '--container', containerName,
+        '--instance-id', INSTANCE_ID,
+        '--enable-generation', ENABLE_GENERATION,
         '--short-agent', 'preStart',
         '--repo', 'demo',
+        '--alias', '',
         '--manifest-path', manifestPath,
         '--agent-path', workspaceRoot,
         '--route-key', 'preStart',
@@ -2409,6 +2532,18 @@ test('a pre-start failure still publishes a terminal member of the wave barrier'
     assert.equal(published.runId, RUN_ID);
     assert.equal(published.runStartedAtMs, runStartedAtMs);
     assert.equal(published.waveIndex, 1);
+    assert.deepEqual(
+        Object.fromEntries(Object.keys(workerIdentity(containerName, {
+            shortAgent: 'preStart',
+            runStartedAtMs,
+            waveIndex: 1,
+        })).map((field) => [field, published[field]])),
+        workerIdentity(containerName, {
+            shortAgent: 'preStart',
+            runStartedAtMs,
+            waveIndex: 1,
+        }),
+    );
     assert.deepEqual(
         JSON.parse(fs.readFileSync(path.join(runningDir, 'no-wait', `${containerName}.json`), 'utf8')),
         published,

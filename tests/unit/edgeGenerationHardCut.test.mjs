@@ -22,7 +22,12 @@ import {
     readCurrentEdgeTopology,
     withEdgeGenerationApplyLock,
 } from '../../cli/sandbox/edgeGeneration.js';
-import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
+import {
+    isActiveAgentRootPlan,
+    isAgentRootPlan,
+    isPendingAgentRootPlan,
+    resolveEdgeRoutePlan,
+} from '../../cli/server/edgeRoutePlan.js';
 
 function stableValue(value) {
     if (Array.isArray(value)) return value.map(stableValue);
@@ -371,6 +376,112 @@ test('a draining route rejects new selectors while retaining its exact identity 
     assert.equal(publicHost.ok, false);
     assert.equal(publicHost.code, 'HOST_SELECTOR_INACTIVE');
     assert.equal(publicHost.status, 503);
+});
+
+test('inactive ordinary HTTP targets retain exact policy and lease in a non-dialable pending plan', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'alpha.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: [],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+        alphaManifest: {
+            routerAccess: {
+                httpRoutes: [{ path: '/index.html', access: 'public' }],
+            },
+        },
+    });
+    const routingFile = path.join(fixture.ploinkyDir, 'routing.json');
+    const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    routing.routes.alpha.hostPort = null;
+    fs.writeFileSync(routingFile, JSON.stringify(routing, null, 2));
+    applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'pending-agent-http-route',
+        publicationState: 'ready',
+    });
+
+    const controlPlan = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/alpha/index.html',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+    });
+    assert.equal(controlPlan.ok, true);
+    assert.equal(controlPlan.kind, 'agent-root-pending');
+    assert.equal(controlPlan.routeKey, 'alpha');
+    assert.equal(controlPlan.canonicalPath, '/alpha/index.html');
+    assert.equal(controlPlan.upstreamPath, '/index.html');
+    assert.equal(controlPlan.decision.access, 'public');
+    assert.equal(controlPlan.target, null);
+    assert.equal(controlPlan.diagnosticCategory, 'TARGET_INACTIVE');
+    assert.match(controlPlan.lease.id, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(isPendingAgentRootPlan(controlPlan), true);
+    assert.equal(isActiveAgentRootPlan(controlPlan), false);
+    assert.equal(isAgentRootPlan(controlPlan), true);
+    assert.equal(isAgentRootPlan(controlPlan, { includePending: false }), false);
+
+    const dedicatedPlan = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/index.html',
+            headers: { host: 'alpha.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(dedicatedPlan.ok, true);
+    assert.equal(dedicatedPlan.kind, 'agent-root-pending');
+    assert.equal(dedicatedPlan.routeKey, 'alpha');
+    assert.equal(dedicatedPlan.pathname, '/index.html');
+    assert.equal(dedicatedPlan.canonicalPath, '/alpha/index.html');
+    assert.equal(dedicatedPlan.upstreamPath, '/index.html');
+    assert.equal(dedicatedPlan.hostSelection.source, 'public-host');
+    assert.equal(dedicatedPlan.decision.access, 'public');
+
+    const deniedWrite = resolveEdgeRoutePlan({
+        req: {
+            method: 'POST',
+            url: '/alpha/index.html',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+    });
+    assert.equal(deniedWrite.kind, 'agent-root-pending');
+    assert.equal(deniedWrite.decision.access, 'deny');
+    assert.equal(deniedWrite.decision.code, 'PUBLIC_ROUTE_WRITE_DENIED');
+
+    const websocketPlan = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/alpha/index.html',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+        transport: 'websocket',
+    });
+    assert.equal(websocketPlan.ok, false);
+    assert.equal(websocketPlan.code, 'TARGET_INACTIVE');
+    assert.equal(isAgentRootPlan(websocketPlan), false);
+
+    const activePlan = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/beta/index.html',
+            headers: { host: '127.0.0.1:18080' },
+        },
+        listener: 'public',
+    });
+    assert.equal(activePlan.kind, 'agent-root');
+    assert.equal(isActiveAgentRootPlan(activePlan), true);
+    assert.equal(isAgentRootPlan(activePlan), true);
 });
 
 test('agent-mcp exposes only the selected root manifest dependency closure', (t) => {

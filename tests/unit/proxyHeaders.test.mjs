@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { stripRouterIdentityHeaders } from '../../cli/server/routerHandlers.js';
 import { sanitizeRequestHeaders } from '../../cli/server/proxy/sanitizeRequestHeaders.js';
 import { sanitizeResponseHeaders } from '../../cli/server/proxy/sanitizeResponseHeaders.js';
 
@@ -27,6 +28,7 @@ test('request headers preserve permitted app credentials but remove Router prove
         forwarded: 'for=attacker',
         'x-forwarded-host': 'attacker.example',
         'x-ploinky-machine-assertion': 'spoof',
+        'x-ploinky-agent-startup-probe': '1',
         connection: 'keep-alive, x-remove-me',
         'x-remove-me': 'yes',
     }, plan, { authInfo: 'trusted-router-auth' });
@@ -37,7 +39,23 @@ test('request headers preserve permitted app credentials but remove Router prove
     assert.equal(headers['x-forwarded-prefix'], plan.forwardedPrefix);
     assert.equal(headers['x-ploinky-auth-info'], 'trusted-router-auth');
     assert.equal(headers['x-ploinky-machine-assertion'], undefined);
+    assert.equal(headers['x-ploinky-agent-startup-probe'], undefined);
     assert.equal(headers['x-remove-me'], undefined);
+});
+
+test('ordinary agent-root forwarding strips the reserved startup probe header', () => {
+    const headers = stripRouterIdentityHeaders({
+        accept: 'text/html',
+        cookie: 'app=ok',
+        authorization: 'Bearer application-token',
+        'x-ploinky-agent-startup-probe': '1',
+        'X-Ploinky-Agent-Startup-Probe': '1',
+    });
+    assert.equal(headers.accept, 'text/html');
+    assert.equal(headers.cookie, 'app=ok');
+    assert.equal(headers.authorization, 'Bearer application-token');
+    assert.equal(headers['x-ploinky-agent-startup-probe'], undefined);
+    assert.equal(headers['X-Ploinky-Agent-Startup-Probe'], undefined);
 });
 
 test('response headers suppress private topology, Router cookies, unsolicited CORS, and caching', () => {

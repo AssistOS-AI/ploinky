@@ -32,9 +32,16 @@ import {
     commitRouteGeneration,
     commitRoutePlan,
     httpAccessForEdgeRoutePlan,
+    isActiveAgentRootPlan,
+    isAgentRootPlan,
     normalizeExactHost,
     resolveEdgeRoutePlan,
 } from './edgeRoutePlan.js';
+import { dispatchAgentStartupAfterRouterSurfaces } from './agentStartupDispatch.js';
+import {
+    inspectNoWaitAgentPublication,
+    resolveNoWaitAgentStartupState,
+} from './noWaitAgentStartupState.js';
 import {
     authorizePrivateRoutePlan,
     mintTurnCredentials,
@@ -393,8 +400,8 @@ async function processRequest(req, res) {
     const pathname = routePlan.ok && routePlan.canonicalPath ? routePlan.canonicalPath : requestedUrl.pathname || '/';
     const routedAggregateAgentCard = pathname === '/agent-card' || pathname === '/agent-card/';
     const apiRoutes = routePlan.snapshot?.routing?.routes || routePlan.lease?.snapshot?.routing?.routes || {};
-    const agentName = routePlan.ok && routePlan.kind === 'agent-root' ? routePlan.routeKey : null;
-    const route = agentName ? apiRoutes[agentName] : null;
+    const agentName = isAgentRootPlan(routePlan) ? routePlan.routeKey : null;
+    const route = agentName ? routePlan.route : null;
     const agentProxyPath = agentName ? routePlan.upstreamPath : '';
     const isAgentMcpRoute = Boolean(agentName && (agentProxyPath === '/mcp' || agentProxyPath.startsWith('/mcp?') || agentProxyPath.startsWith('/mcp/')));
     // Path-exact delegated agent OpenAI bypass: ONLY POST /<routeKey>/v1/chat/completions
@@ -478,6 +485,25 @@ async function processRequest(req, res) {
         const handled = handleOpenAiAgentDiscoveryRoute(req, res, parsedUrl);
         if (handled) return;
     }
+
+    // Same-route startup handling is deliberately placed after Router-owned
+    // surface precedence, but before the general agent auth/dispatch chain.
+    // Its snapshot-only classifier performs no lifecycle I/O; the dispatcher
+    // authorizes the captured route and commits its lease before invoking the
+    // exact generation-bound observer, then commits the lease again before a
+    // lifecycle-derived response is written. Active probes also commit before
+    // reporting ready and never reach static-file or upstream dispatch.
+    const startupHandled = await dispatchAgentStartupAfterRouterSurfaces({
+        req,
+        res,
+        parsedUrl,
+        routePlan,
+        ensureRouteAccess: ensureHttpRouteAccess,
+        inspectPublication: inspectNoWaitAgentPublication,
+        resolveStartupState: resolveNoWaitAgentStartupState,
+        commitPlan: commitRoutePlan,
+    });
+    if (startupHandled) return;
 
     if (routedAggregateAgentCard) {
         // Public aggregate route
@@ -665,7 +691,7 @@ async function processRequest(req, res) {
         return;
     } else if (routedAggregateAgentCard) {
         return handleRoutedAggregateAgentCard(req, res, routePlan);
-    } else if (agentName) {
+    } else if (agentName && isActiveAgentRootPlan(routePlan)) {
         if (!route) {
             sendJsonResponse(res, 404, { error: 'agent_not_found', agent: agentName });
             return;

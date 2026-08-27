@@ -6,6 +6,8 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { dispatchAgentStartupRequest } from '../../cli/server/agentStartupDispatch.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
@@ -38,7 +40,15 @@ class MockResponse {
     }
 }
 
-function makeRequest({ method = 'GET', url, body, cookie = '', accept = 'application/json', host = 'localhost' }) {
+function makeRequest({
+    method = 'GET',
+    url,
+    body,
+    cookie = '',
+    accept = 'application/json',
+    host = 'localhost',
+    headers = {},
+}) {
     const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
     const req = Readable.from(chunks);
     req.method = method;
@@ -48,6 +58,7 @@ function makeRequest({ method = 'GET', url, body, cookie = '', accept = 'applica
         host,
         ...(cookie ? { cookie } : {}),
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...headers,
     };
     req.socket = { encrypted: false };
     return req;
@@ -1218,4 +1229,319 @@ test('authenticated guest route key without static user auth fails closed', asyn
     assert.equal(body.error, 'authenticated_http_route_auth_not_configured');
     assert.equal(body.detail, 'Authenticated HTTP routes require a user-authenticated route or static-agent auth policy.');
     assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+});
+
+test('startup dispatch preserves the real access and host matrix before lifecycle observation', async (t) => {
+    const { authHandlers, authService, localService, createRoutePlan } = await withAuthModules(t);
+    const generation = `sha256:${'b'.repeat(64)}`;
+    const roomId = 'room_33333333-3333-4333-8333-333333333333';
+    const user = {
+        id: 'local:admin',
+        username: 'admin',
+        name: 'Local Admin',
+        email: 'admin@example.test',
+        roles: ['user', 'admin'],
+    };
+    const guestToken = localService.mintGuestSessionJwt({
+        guestScope: `webmeet:room:${roomId}`,
+        routeKey: 'webAssist',
+    });
+    const liveSsoSessions = new Set(['sso-valid', 'sso-expiring']);
+    const originalIsConfigured = authService.isConfigured;
+    const originalGetSession = authService.getSession;
+    const originalRefreshSession = authService.refreshSession;
+    authService.isConfigured = () => true;
+    authService.getSession = (sessionId) => liveSsoSessions.has(sessionId)
+        ? { user, expiresAt: Date.now() + 60_000 }
+        : null;
+    authService.refreshSession = async () => null;
+    t.after(() => {
+        authService.isConfigured = originalIsConfigured;
+        authService.getSession = originalGetSession;
+        authService.refreshSession = originalRefreshSession;
+    });
+
+    function makeStartupPlan({
+        routeKey,
+        decision,
+        hostKind,
+        kind = 'agent-root-pending',
+        commit = () => true,
+    }) {
+        const dedicated = hostKind === 'dedicated';
+        const route = createRoutePlan().snapshot.routing.routes[routeKey];
+        const routePlan = createRoutePlan({
+            ok: true,
+            kind,
+            routeKey,
+            route,
+            target: kind === 'agent-root' ? { host: '127.0.0.1', port: route.hostPort } : null,
+            pathname: dedicated ? '/index.html' : `/${routeKey}/index.html`,
+            canonicalPath: `/${routeKey}/index.html`,
+            upstreamPath: '/index.html',
+            host: dedicated ? `${routeKey}.localhost` : 'localhost',
+            hostSelection: dedicated
+                ? {
+                    kind: 'agent-root',
+                    source: 'public-host',
+                    host: `${routeKey}.localhost`,
+                    record: { routeKey },
+                }
+                : { kind: 'control', host: 'localhost' },
+            decision,
+            transport: 'http',
+        });
+        routePlan.snapshot.generation = generation;
+        routePlan.snapshot.agents.explorer = {
+            ...routePlan.snapshot.agents.explorer,
+            auth: { mode: 'sso' },
+        };
+        routePlan.lease = {
+            id: generation,
+            snapshot: routePlan.snapshot,
+            commit,
+        };
+        return routePlan;
+    }
+
+    async function dispatch({
+        hostKind,
+        routeKey = 'explorer',
+        decision = { access: 'public', routeKey, source: 'policy' },
+        query = '',
+        cookie = '',
+        requestKind = 'navigation',
+        kind = 'agent-root-pending',
+        result = { state: 'starting' },
+        commitResults = [],
+    }) {
+        let commitIndex = 0;
+        let lifecycleReads = 0;
+        const routePlan = makeStartupPlan({
+            routeKey,
+            decision,
+            hostKind,
+            kind,
+            commit: () => commitResults[commitIndex++] ?? true,
+        });
+        const dedicated = hostKind === 'dedicated';
+        const pathname = dedicated ? '/index.html' : `/${routeKey}/index.html`;
+        const host = dedicated ? `${routeKey}.localhost` : 'localhost';
+        const req = makeRequest({
+            method: 'GET',
+            url: `${pathname}${query}`,
+            cookie,
+            accept: requestKind === 'probe' ? 'application/json' : 'text/html',
+            host,
+            headers: requestKind === 'probe'
+                ? {
+                    'x-ploinky-agent-startup-probe': '1',
+                    'sec-fetch-dest': 'empty',
+                    'sec-fetch-mode': 'cors',
+                }
+                : {
+                    'sec-fetch-dest': 'document',
+                    'sec-fetch-mode': 'navigate',
+                },
+        });
+        const parsedUrl = new URL(req.url, dedicated ? `https://${host}` : 'http://localhost');
+        routePlan.parsedUrl = parsedUrl;
+        const res = new MockResponse();
+        const handled = await dispatchAgentStartupRequest({
+            req,
+            res,
+            parsedUrl,
+            routePlan,
+            ensureRouteAccess: authHandlers.ensureHttpRouteAccess,
+            inspectPublication: () => ({ ok: true, canPublishHttp: true }),
+            resolveStartupState: async () => {
+                lifecycleReads += 1;
+                return result;
+            },
+        });
+        return { handled, req, res, lifecycleReads, commitCount: commitIndex };
+    }
+
+    function publicResponse(res) {
+        return {
+            statusCode: res.statusCode,
+            body: res.body,
+            contentType: res.getHeader('content-type'),
+            location: res.getHeader('location'),
+            cacheControl: res.getHeader('cache-control'),
+        };
+    }
+
+    const hiddenStates = [
+        { state: 'starting' },
+        { state: 'failed', code: 'startup_failed' },
+        { state: 'failed', code: 'startup_timed_out' },
+        { state: 'unavailable', code: 'route_unavailable' },
+        { state: 'generation_changed' },
+        { state: 'unverified' },
+    ];
+
+    for (const hostKind of ['control', 'dedicated']) {
+        const publicStarting = await dispatch({ hostKind });
+        assert.equal(publicStarting.handled, true);
+        assert.equal(publicStarting.lifecycleReads, 1);
+        assert.equal(publicStarting.res.statusCode, 503);
+        assert.match(publicStarting.res.body, /data-ploinky-agent-startup-page="starting"/);
+        assert.match(String(publicStarting.res.getHeader('cache-control') || ''), /(?:^|,\s*)no-store(?:,|$)/);
+
+        const publicFailed = await dispatch({
+            hostKind,
+            result: { state: 'failed', code: 'startup_failed' },
+        });
+        assert.equal(publicFailed.lifecycleReads, 1);
+        assert.equal(publicFailed.res.statusCode, 503);
+        assert.match(publicFailed.res.body, /Agent startup failed/);
+        assert.doesNotMatch(publicFailed.res.body, /container|instanceId|enableGeneration|hostPort/i);
+
+        const unavailable = await dispatch({
+            hostKind,
+            requestKind: 'probe',
+            result: { state: 'unavailable', code: 'route_unavailable' },
+        });
+        assert.equal(unavailable.lifecycleReads, 1);
+        assert.equal(unavailable.res.statusCode, 503);
+        assert.deepEqual(JSON.parse(unavailable.res.body), {
+            state: 'unavailable',
+            code: 'route_unavailable',
+            message: 'This agent does not provide a web page.',
+        });
+
+        const guestDecision = {
+            access: 'guest',
+            routeKey: 'webAssist',
+            source: 'manifest',
+            guestScope: 'webmeet:room',
+            guestScopeParam: 'roomId',
+        };
+        const guestAllowed = await dispatch({
+            hostKind,
+            routeKey: 'webAssist',
+            decision: guestDecision,
+            query: `?roomId=${roomId}`,
+            cookie: `ploinky_guest=${guestToken}`,
+        });
+        assert.equal(guestAllowed.req.authMode, 'guest');
+        assert.equal(guestAllowed.req.session?._jwtPayload?.gscope, `webmeet:room:${roomId}`);
+        assert.equal(guestAllowed.lifecycleReads, 1);
+        assert.equal(guestAllowed.res.statusCode, 503);
+
+        for (const query of ['', '?roomId=%2Fnot-a-capability']) {
+            let baseline = null;
+            for (const result of hiddenStates) {
+                const denied = await dispatch({
+                    hostKind,
+                    routeKey: 'webAssist',
+                    decision: guestDecision,
+                    query,
+                    cookie: `ploinky_guest=${guestToken}`,
+                    result,
+                });
+                assert.equal(denied.lifecycleReads, 0);
+                assert.equal(denied.res.statusCode, 403);
+                assert.equal(JSON.parse(denied.res.body).error, 'guest_scope_parameter_invalid');
+                const response = publicResponse(denied.res);
+                baseline ??= response;
+                assert.deepEqual(response, baseline);
+            }
+        }
+
+        const authenticatedDecision = {
+            access: 'authenticated',
+            routeKey: 'explorer',
+            source: 'policy',
+        };
+        const authenticated = await dispatch({
+            hostKind,
+            decision: authenticatedDecision,
+            cookie: 'ploinky_sso=sso-valid',
+        });
+        assert.equal(authenticated.req.authMode, 'sso');
+        assert.equal(authenticated.lifecycleReads, 1);
+        assert.equal(authenticated.res.statusCode, 503);
+
+        let unauthenticatedBaseline = null;
+        for (const result of hiddenStates) {
+            const unauthenticated = await dispatch({
+                hostKind,
+                decision: authenticatedDecision,
+                result,
+            });
+            assert.equal(unauthenticated.lifecycleReads, 0);
+            assert.equal(unauthenticated.res.statusCode, 302);
+            assert.match(String(unauthenticated.res.getHeader('location') || ''), /^\/auth\/login\?/);
+            const response = publicResponse(unauthenticated.res);
+            unauthenticatedBaseline ??= response;
+            assert.deepEqual(response, unauthenticatedBaseline);
+        }
+
+        let deniedBaseline = null;
+        for (const result of hiddenStates) {
+            const denied = await dispatch({
+                hostKind,
+                decision: {
+                    access: 'deny',
+                    status: 404,
+                    code: 'UNROUTABLE_PATH',
+                    routeKey: 'explorer',
+                    source: 'policy',
+                },
+                result,
+            });
+            assert.equal(denied.lifecycleReads, 0);
+            assert.equal(denied.res.statusCode, 404);
+            assert.deepEqual(JSON.parse(denied.res.body), { ok: false, error: 'UNROUTABLE_PATH' });
+            const response = publicResponse(denied.res);
+            deniedBaseline ??= response;
+            assert.deepEqual(response, deniedBaseline);
+        }
+
+        const activeProbe = await dispatch({
+            hostKind,
+            kind: 'agent-root',
+            requestKind: 'probe',
+        });
+        assert.equal(activeProbe.lifecycleReads, 0);
+        assert.equal(activeProbe.res.statusCode, 200);
+        assert.deepEqual(JSON.parse(activeProbe.res.body), {
+            state: 'ready',
+            generation,
+        });
+
+        const rotatedDuringLogin = await dispatch({
+            hostKind,
+            decision: authenticatedDecision,
+            cookie: 'ploinky_sso=sso-valid',
+            commitResults: [true, false],
+        });
+        assert.equal(rotatedDuringLogin.lifecycleReads, 0);
+        assert.equal(rotatedDuringLogin.res.statusCode, 503);
+        assert.deepEqual(JSON.parse(rotatedDuringLogin.res.body), {
+            error: 'edge_generation_changed',
+        });
+
+        liveSsoSessions.add('sso-expiring');
+        const beforeExpiry = await dispatch({
+            hostKind,
+            decision: authenticatedDecision,
+            cookie: 'ploinky_sso=sso-expiring',
+        });
+        assert.equal(beforeExpiry.lifecycleReads, 1);
+        assert.equal(beforeExpiry.res.statusCode, 503);
+
+        liveSsoSessions.delete('sso-expiring');
+        const afterExpiry = await dispatch({
+            hostKind,
+            decision: authenticatedDecision,
+            cookie: 'ploinky_sso=sso-expiring',
+            requestKind: 'probe',
+        });
+        assert.equal(afterExpiry.lifecycleReads, 0);
+        assert.equal(afterExpiry.res.statusCode, 401);
+        assert.equal(JSON.parse(afterExpiry.res.body).error, 'not_authenticated');
+    }
 });

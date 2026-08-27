@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const originalCwd = process.cwd();
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-'));
@@ -55,6 +57,7 @@ const {
     assertWorkspaceGraphAdmissionsCurrent,
     buildBlockingReadinessEntryFromNode,
     buildNoWaitLaunchSchedule,
+    bindNoWaitLaunchScheduleIdentity,
     computeRetainedManagedEnvHash,
     ensureGraphNodesEnabled,
     reprepareGraphAfterStartupProviders,
@@ -182,20 +185,94 @@ test('no-wait scheduling rejects non-exact coordination identities', () => {
     }
 });
 
+test('no-wait scheduling binds one complete immutable staged registry identity', () => {
+    const runningDir = path.join(tempDir, '.ploinky', 'binding-running');
+    const node = {
+        id: 'demo/worker#alias:blue',
+        dependencies: new Set(),
+        repoName: 'demo',
+        shortAgentName: 'worker',
+        alias: 'blue',
+    };
+    const schedule = buildNoWaitLaunchSchedule([[
+        { node, registryName: 'binding-container' },
+    ]], {
+        runId: SCHEDULE_RUN_ID,
+        runStartedAtMs: SCHEDULE_RUN_STARTED_AT_MS,
+        runningDir,
+    });
+    const record = {
+        type: 'agent',
+        instanceId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        enableGeneration: 'ffffffff-1111-4222-8333-444444444444',
+        repoName: 'demo',
+        agentName: 'worker',
+        alias: 'blue',
+    };
+    const [[bound]] = bindNoWaitLaunchScheduleIdentity(
+        schedule,
+        { 'binding-container': record },
+        { runningDir },
+    );
+    assert.deepEqual(bound.identity, {
+        containerName: 'binding-container',
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
+        repoName: 'demo',
+        shortAgent: 'worker',
+        alias: 'blue',
+        routeKey: 'blue',
+        runId: SCHEDULE_RUN_ID,
+        runStartedAtMs: SCHEDULE_RUN_STARTED_AT_MS,
+        waveIndex: 0,
+        statusFile: `binding-container.${SCHEDULE_RUN_ID}.json`,
+    });
+
+    for (const mutation of [
+        { instanceId: '' },
+        { enableGeneration: record.instanceId },
+        { repoName: 'other' },
+        { agentName: 'other' },
+        { alias: 'other' },
+    ]) {
+        assert.throws(
+            () => bindNoWaitLaunchScheduleIdentity(
+                schedule,
+                { 'binding-container': { ...record, ...mutation } },
+                { runningDir },
+            ),
+            /cannot bind|canonical identity|must be distinct/,
+            JSON.stringify(mutation),
+        );
+    }
+});
+
 test('a no-wait spawn failure is a valid terminal member of a wave barrier', async (t) => {
-    const runningDir = path.join(tempDir, '.ploinky', 'running');
+    // process.cwd() is the canonical real path on macOS (`/private/var/...`),
+    // matching the production RUNNING_DIR captured after chdir.
+    const runningDir = path.join(process.cwd(), '.ploinky', 'running');
     fs.mkdirSync(runningDir, { recursive: true, mode: 0o700 });
     const runId = SCHEDULE_RUN_ID;
     const runStartedAtMs = Date.now();
-    const [[scheduled]] = buildNoWaitLaunchSchedule([[{
+    const node = {
+        id: 'demo/spawn-failure',
+        dependencies: new Set(),
+        shortAgentName: 'spawnFailure',
+        repoName: 'demo',
+        alias: '',
+    };
+    const [[scheduled]] = bindNoWaitLaunchScheduleIdentity(buildNoWaitLaunchSchedule([[{
         registryName: 'spawn-failure-container',
-        node: {
-            id: 'demo/spawn-failure',
-            dependencies: new Set(),
-            shortAgentName: 'spawnFailure',
+        node,
+    }]], { runId, runStartedAtMs, runningDir }), {
+        'spawn-failure-container': {
+            type: 'agent',
+            instanceId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+            enableGeneration: 'ffffffff-1111-4222-8333-444444444444',
             repoName: 'demo',
+            agentName: 'spawnFailure',
         },
-    }]], { runId, runStartedAtMs, runningDir });
+    }, { runningDir });
 
     writeNoWaitSpawnFailure(
         scheduled,
@@ -236,6 +313,10 @@ test('a no-wait spawn failure is a valid terminal member of a wave barrier', asy
     assert.equal(canonical.error.message.includes('other-secret'), false);
     assert.ok(canonical.error.message.length <= 4_000);
     assert.equal(canonical.sequencePhase, 'active');
+    assert.deepEqual(
+        Object.fromEntries(Object.keys(scheduled.identity).map((field) => [field, canonical[field]])),
+        scheduled.identity,
+    );
 });
 
 test('workspace graph admission retains exact manifest bytes for under-lock revalidation', () => {
@@ -884,11 +965,13 @@ test('an empty legacy develRepo field does not force recreation of an otherwise 
         retained_container: {
             type: 'agent', repoName: 'demo', agentName: 'retained',
             runMode: 'global', projectPath: tempDir, develRepo: undefined, profile: 'default',
+            instanceId: 'retained-instance', enableGeneration: 'retained-generation',
         },
     };
     let removals = 0;
     let saves = 0;
     let routingSaves = 0;
+    let markerRetirements = 0;
     const routing = { routes: { retained: {
         container: 'retained_container',
         repo: 'demo',
@@ -906,6 +989,13 @@ test('an empty legacy develRepo field does not force recreation of an otherwise 
         removeAgentContainerForRecreate() { removals += 1; },
         saveAgents() { saves += 1; },
         inactivateGeneration() {},
+        retireNoWaitMarkers(entries) {
+            markerRetirements += 1;
+            assert.equal(entries.length, 1);
+            assert.equal(entries[0].containerName, 'retained_container');
+            assert.equal(entries[0].record.instanceId, 'retained-instance');
+            assert.equal(entries[0].record.enableGeneration, 'retained-generation');
+        },
         loadRouting() { return routing; },
         saveRouting(nextRouting) {
             routingSaves += 1;
@@ -922,6 +1012,7 @@ test('an empty legacy develRepo field does not force recreation of an otherwise 
     assert.equal(removals, 0);
     assert.equal(saves, 0);
     assert.equal(routingSaves, 1);
+    assert.equal(markerRetirements, 1, 'a successful no-replacement transition retires its prior marker');
 });
 
 test('a healthy retained blocking runtime is target-less before hooks without rotating its identity', () => {
@@ -1398,6 +1489,14 @@ test('an existing stopped no-wait node rotates identity and loses stale targets 
             assert.equal(Object.hasOwn(next.routes.background, 'hostPort'), false);
             assert.equal(Object.hasOwn(next.routes.background, 'serviceTargets'), false);
         },
+        retireNoWaitMarkers(entries) {
+            events.push('retire-marker');
+            assert.equal(entries.length, 1);
+            assert.equal(entries[0].containerName, 'background_container');
+            assert.equal(entries[0].record.instanceId, 'old-instance');
+            assert.equal(entries[0].record.enableGeneration, 'old-enable');
+            assert.equal(registry.background_container.instanceId, 'new-instance');
+        },
         saveAgents() { events.push('fresh-identity'); },
         prepareAgentEnableBatch(requests) {
             events.push('prepared');
@@ -1422,6 +1521,7 @@ test('an existing stopped no-wait node rotates identity and loses stale targets 
 
     assert.deepEqual(events, [
         'inactive',
+        'retire-marker',
         'fresh-identity',
         'targetless',
         'prepared',
@@ -2370,4 +2470,52 @@ test('a no-wait worker is never gated behind a prior-wave peer it does not depen
         gatewayBarrier.every(({ directDependency }) => directDependency === true),
         'every remaining barrier entry is a real dependency',
     );
+});
+
+test('latched fixture cleanup failure runs once and preserves its evidence', () => {
+    const cleanupFunctions = fileURLToPath(new URL(
+        '../test-functions/workspace_dependency_startup_tests.sh',
+        import.meta.url,
+    ));
+    const probeRoot = fs.mkdtempSync(path.join(tempDir, 'latched-cleanup-'));
+    const callsFile = path.join(probeRoot, 'calls');
+    const evidenceFile = path.join(probeRoot, 'preserved-evidence');
+    const workspace = path.join(probeRoot, 'workspace');
+    fs.mkdirSync(workspace);
+
+    const probe = spawnSync('/bin/bash', [
+        '-c',
+        String.raw`
+set -euo pipefail
+source "$1"
+cleanup_calls_file="$2"
+cleanup_evidence_file="$3"
+cleanup_workspace="$4"
+fast_graph_cleanup_latched_workspace() {
+  printf 'call\n' >>"$cleanup_calls_file"
+  printf 'preserved\n' >"$cleanup_evidence_file"
+  return 1
+}
+(
+  trap 'fast_graph_cleanup_latched_workspace "$cleanup_workspace"' EXIT
+  if fast_graph_finish_latched_workspace "$cleanup_workspace"; then
+    exit 41
+  fi
+)
+[[ $(wc -l <"$cleanup_calls_file") -eq 1 ]]
+[[ -f "$cleanup_evidence_file" ]]
+[[ -d "$cleanup_workspace" ]]
+`,
+        'latched-cleanup-test',
+        cleanupFunctions,
+        callsFile,
+        evidenceFile,
+        workspace,
+    ], {
+        encoding: 'utf8',
+    });
+
+    assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+    assert.equal(fs.readFileSync(callsFile, 'utf8'), 'call\n');
+    assert.equal(fs.readFileSync(evidenceFile, 'utf8'), 'preserved\n');
 });

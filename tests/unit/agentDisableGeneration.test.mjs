@@ -36,6 +36,7 @@ function lifecycleHarness({
     initialRouting,
     failRemoval = false,
     failApply = false,
+    failRetirement = false,
 } = {}) {
     let registry = structuredClone(initialRegistry);
     let routing = structuredClone(initialRouting);
@@ -65,6 +66,18 @@ function lifecycleHarness({
         },
         inactivateGeneration(reason) {
             events.push(`inactive:${reason}`);
+        },
+        retireNoWaitMarkersImpl(entries) {
+            events.push(`retire:${entries.map((entry) => (
+                typeof entry === 'string' ? entry : entry.containerName
+            )).join(',')}`);
+            if (failRetirement) throw new Error('marker retirement failed');
+            for (const entry of entries) {
+                if (typeof entry === 'string') continue;
+                const expected = initialRegistry[entry.containerName];
+                assert.deepEqual(entry.record, expected);
+            }
+            return [];
         },
         withApplyLock(callback) {
             events.push('edge-lock');
@@ -156,6 +169,10 @@ test('single disable commits exact registry and route removal before runtime rem
         options: { records: { old_container: oldRecord } },
     }]);
     assert.ok(
+        harness.events.indexOf('retire:old_container') < harness.events.indexOf('save-registry'),
+        'the exact prior marker must retire before the registry removal is persisted',
+    );
+    assert.ok(
         harness.events.indexOf('prepare') < harness.events.indexOf('remove:old_container'),
         'the inactive route-removal generation must exist before physical removal',
     );
@@ -217,6 +234,31 @@ test('selector commit failure after removal remains inactive and releases the ex
     );
 });
 
+test('marker retirement failure leaves routing inactive and prevents every registry, route, runtime, and selector commit', () => {
+    const harness = lifecycleHarness({
+        initialRegistry: { old_container: agentRecord('old') },
+        initialRouting: {
+            port: 8080,
+            routes: {
+                old: { container: 'old_container', repo: 'demo', agent: 'old', hostPort: 33500 },
+            },
+        },
+        failRetirement: true,
+    });
+
+    assert.throws(
+        () => agents.disableAgent('old_container', harness.dependencies),
+        /marker retirement failed/,
+    );
+    assert.deepEqual(harness.events, [
+        'edge-lock',
+        'inactive:agent-disable-prepare',
+        'retire:old_container',
+    ]);
+    assert.equal(harness.removalCalls.length, 0);
+    assert.equal(harness.snapshots.length, 0);
+});
+
 test('batch disable stages every exact route removal before one physical batch removal', () => {
     const alphaRecord = agentRecord('alpha');
     const betaRecord = agentRecord('beta', { alias: 'beta-alias' });
@@ -257,6 +299,11 @@ test('batch disable stages every exact route removal before one physical batch r
             },
         },
     }]);
+    assert.ok(
+        harness.events.indexOf('retire:beta_container,alpha_container')
+            < harness.events.indexOf('save-registry'),
+        'all exact prior markers retire before the batch registry write',
+    );
     assert.ok(
         harness.events.indexOf('prepare')
             < harness.events.indexOf('remove-many:beta_container,alpha_container'),

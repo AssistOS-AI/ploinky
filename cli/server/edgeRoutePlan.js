@@ -544,24 +544,41 @@ function routerSurfacePlan({ hostSelection, host, pathname, parsedUrl, lease, sn
     };
 }
 
-function agentRootPlan({ req, host, listener, pathname, parsedUrl, hostSelection, selectedRoot, routes, snapshot, lease }) {
+function agentRootPlan({
+    req,
+    host,
+    listener,
+    pathname,
+    parsedUrl,
+    hostSelection,
+    selectedRoot,
+    routes,
+    snapshot,
+    lease,
+    transport = 'http',
+}) {
     const agent = resolveAgentPath(pathname, routes, selectedRoot);
     if (!agent) return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
-    const hostPort = Number(agent.route?.hostPort || 0);
-    if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
-        return deny(503, 'TARGET_INACTIVE', { lease, hostSelection });
-    }
     const policy = snapshotPolicy(snapshot);
-    if (!policy) return deny(503, 'POLICY_GENERATION_INVALID', { lease, hostSelection });
+    if (!policy) return deny(503, 'POLICY_GENERATION_INVALID', {
+        matched: true,
+        lease,
+        hostSelection,
+    });
     const decision = policy.evaluate({
         pathname: agent.canonicalPath,
         method: req?.method || 'GET',
         routeKey: agent.routeKey,
     });
-    return {
+    const forwarding = canonicalForwardingMetadata({
+        snapshot,
+        host,
+        listener,
+        hostSelection,
+    });
+    const common = {
         matched: true,
         ok: true,
-        kind: 'agent-root',
         listener,
         host,
         hostSelection,
@@ -570,17 +587,34 @@ function agentRootPlan({ req, host, listener, pathname, parsedUrl, hostSelection
         parsedUrl,
         routeKey: agent.routeKey,
         route: agent.route,
-        target: { hostname: '127.0.0.1', hostPort },
         upstreamPath: `${agent.upstreamPath}${parsedUrl.search || ''}`,
         decision,
-        forwarding: canonicalForwardingMetadata({
-            snapshot,
-            host,
-            listener,
-            hostSelection,
-        }),
+        forwarding,
         lease,
         snapshot,
+        transport,
+    };
+    const hostPort = Number(agent.route?.hostPort || 0);
+    if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+        if (transport !== 'http') {
+            return deny(503, 'TARGET_INACTIVE', {
+                matched: true,
+                lease,
+                hostSelection,
+                decision,
+            });
+        }
+        return {
+            ...common,
+            kind: 'agent-root-pending',
+            target: null,
+            diagnosticCategory: 'TARGET_INACTIVE',
+        };
+    }
+    return {
+        ...common,
+        kind: 'agent-root',
+        target: { hostname: '127.0.0.1', hostPort },
     };
 }
 
@@ -725,6 +759,7 @@ export function resolveEdgeRoutePlan({
                 routes,
                 snapshot,
                 lease,
+                transport,
             });
         }
         const dependencyHttpRoute = selectedDependencyHttpRoute(
@@ -745,6 +780,7 @@ export function resolveEdgeRoutePlan({
                 routes,
                 snapshot,
                 lease,
+                transport,
             });
         }
         if (isReservedRouterSurface(pathname) && !surface) {
@@ -761,6 +797,7 @@ export function resolveEdgeRoutePlan({
             routes,
             snapshot,
             lease,
+            transport,
         });
     }
 
@@ -778,8 +815,9 @@ export function resolveEdgeRoutePlan({
         routes,
         snapshot,
         lease,
+        transport,
     });
-    if (agentPlan.ok || hostSelection.kind !== 'control') return agentPlan;
+    if (agentPlan.ok || agentPlan.matched || hostSelection.kind !== 'control') return agentPlan;
     return deny(404, 'ROUTE_NOT_FOUND', { lease, hostSelection });
 }
 
@@ -791,6 +829,18 @@ export function commitRouteGeneration(plan) {
     return Boolean(plan?.lease?.commit?.());
 }
 
+export function isActiveAgentRootPlan(plan) {
+    return Boolean(plan?.ok && plan?.kind === 'agent-root');
+}
+
+export function isPendingAgentRootPlan(plan) {
+    return Boolean(plan?.ok && plan?.kind === 'agent-root-pending');
+}
+
+export function isAgentRootPlan(plan, { includePending = true } = {}) {
+    return isActiveAgentRootPlan(plan) || (includePending && isPendingAgentRootPlan(plan));
+}
+
 export function httpAccessForEdgeRoutePlan(plan) {
     if (!plan?.ok) return null;
     return plan.kind === 'agent-port' ? (plan.access || null) : (plan.decision || null);
@@ -800,6 +850,9 @@ export default {
     commitRouteGeneration,
     commitRoutePlan,
     httpAccessForEdgeRoutePlan,
+    isActiveAgentRootPlan,
+    isAgentRootPlan,
+    isPendingAgentRootPlan,
     isPrivateInterfaceAllowed,
     normalizeExactHost,
     resolveEdgeRoutePlan,

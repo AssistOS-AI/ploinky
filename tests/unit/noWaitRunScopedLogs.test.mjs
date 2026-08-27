@@ -14,6 +14,64 @@ import {
 const RUN_A = '11111111-2222-4333-8444-555555555555';
 const RUN_B = '66666666-7777-4888-9999-aaaaaaaaaaaa';
 const CONTAINER = 'ploinky_demo_shared';
+const INSTANCE_A = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+const GENERATION_A = '11111111-aaaa-4bbb-8ccc-dddddddddddd';
+const INSTANCE_B = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+const GENERATION_B = '22222222-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+function identity(overrides = {}) {
+    const runId = overrides.runId ?? RUN_A;
+    return {
+        containerName: CONTAINER,
+        instanceId: overrides.instanceId ?? INSTANCE_A,
+        enableGeneration: overrides.enableGeneration ?? GENERATION_A,
+        repoName: 'demo',
+        shortAgent: 'shared',
+        alias: '',
+        routeKey: 'shared',
+        runId,
+        runStartedAtMs: overrides.runStartedAtMs ?? 10_000,
+        waveIndex: overrides.waveIndex ?? 0,
+        statusFile: `${CONTAINER}.${runId}.json`,
+        ...overrides,
+    };
+}
+
+function recordFor(runIdentity = identity()) {
+    return {
+        type: 'agent',
+        instanceId: runIdentity.instanceId,
+        enableGeneration: runIdentity.enableGeneration,
+        repoName: runIdentity.repoName,
+        agentName: runIdentity.shortAgent,
+        ...(runIdentity.alias ? { alias: runIdentity.alias } : {}),
+    };
+}
+
+function writeMarker(runningDir, runIdentity = identity()) {
+    fs.mkdirSync(path.join(runningDir, 'no-wait'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+        path.join(runningDir, 'no-wait', `${CONTAINER}.current.json`),
+        JSON.stringify(runIdentity),
+        { mode: 0o600 },
+    );
+}
+
+function writeStatus(runningDir, state, runIdentity = identity(), overrides = {}) {
+    const active = state !== 'starting' || overrides.sequencePhase !== 'waiting-barrier';
+    fs.writeFileSync(
+        path.join(runningDir, 'no-wait', runIdentity.statusFile),
+        JSON.stringify({
+            state,
+            sequencePhase: active ? 'active' : 'waiting-barrier',
+            sequencePhaseStartedAtMs: runIdentity.runStartedAtMs,
+            pid: 4242,
+            ...runIdentity,
+            ...overrides,
+        }),
+        { mode: 0o600 },
+    );
+}
 
 function workspace(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-nowait-logs-'));
@@ -153,25 +211,13 @@ test('the producer no longer downgrades a log-open failure to ignored stdio', as
 test('a marker without status expires at startup grace, not a cumulative wave deadline', (t) => {
     const root = workspace(t);
     const runningDir = path.join(root, '.ploinky', 'running');
-    fs.mkdirSync(path.join(runningDir, 'no-wait'), { recursive: true });
-    fs.writeFileSync(
-        path.join(runningDir, 'no-wait', `${CONTAINER}.current.json`),
-        JSON.stringify({
-            runId: RUN_A,
-            runStartedAtMs: 10_000,
-            waveIndex: 900,
-            statusFile: `${CONTAINER}.${RUN_A}.json`,
-        }),
-    );
-    const record = {
-        type: 'agent',
-        instanceId: 'instance-current',
-        enableGeneration: 'generation-current',
-    };
+    const runIdentity = identity({ waveIndex: 900 });
+    writeMarker(runningDir, runIdentity);
+    const record = recordFor(runIdentity);
     const marker = readNoWaitRunMarker(CONTAINER, { runningDir });
     assert.throws(
         () => createNoWaitRunBinding(CONTAINER, { ...record, instanceId: 123 }, marker),
-        /requires one exact registry and marker binding/,
+        (error) => error.code === 'NO_WAIT_RUN_SUPERSEDED',
     );
     const binding = createNoWaitRunBinding(CONTAINER, record, marker);
     const timeouts = {
@@ -200,27 +246,13 @@ test('a marker without status expires at startup grace, not a cumulative wave de
     );
 });
 
-test('a future or overflowing current marker fails closed instead of remaining pending', (t) => {
+test('a future, overflowing, or non-canonical current marker fails closed instead of remaining pending', (t) => {
     const root = workspace(t);
     const runningDir = path.join(root, '.ploinky', 'running');
-    fs.mkdirSync(path.join(runningDir, 'no-wait'), { recursive: true });
-    const markerPath = path.join(runningDir, 'no-wait', `${CONTAINER}.current.json`);
-    const record = {
-        type: 'agent',
-        instanceId: 'instance-current',
-        enableGeneration: 'generation-current',
-    };
+    const record = recordFor();
     const readRegistrySnapshot = () => ({ [CONTAINER]: record });
-    const writeMarker = (runStartedAtMs) => fs.writeFileSync(markerPath, JSON.stringify({
-        runId: RUN_A.toUpperCase(),
-        runStartedAtMs,
-        waveIndex: 0,
-        statusFile: `${CONTAINER}.${RUN_A}.json`,
-    }));
-
-    writeMarker(20_000);
+    writeMarker(runningDir, identity({ runStartedAtMs: 20_000 }));
     const marker = readNoWaitRunMarker(CONTAINER, { runningDir });
-    assert.equal(marker.runId, RUN_A, 'the bound run id is canonical lowercase');
     const binding = createNoWaitRunBinding(CONTAINER, record, marker);
     assert.throws(
         () => observeBoundNoWaitRun(binding, {
@@ -237,7 +269,7 @@ test('a future or overflowing current marker fails closed instead of remaining p
             && /implausible future start/.test(error.message),
     );
 
-    writeMarker(Number.MAX_SAFE_INTEGER);
+    writeMarker(runningDir, identity({ runStartedAtMs: Number.MAX_SAFE_INTEGER }));
     const overflowing = createNoWaitRunBinding(
         CONTAINER,
         record,
@@ -256,4 +288,123 @@ test('a future or overflowing current marker fails closed instead of remaining p
         }),
         /invalid clock or startup budget|implausible future start/,
     );
+
+    writeMarker(runningDir, identity({
+        runId: RUN_B.toUpperCase(),
+        statusFile: `${CONTAINER}.${RUN_B.toUpperCase()}.json`,
+    }));
+    assert.throws(
+        () => readNoWaitRunMarker(CONTAINER, { runningDir }),
+        (error) => error.code === 'NO_WAIT_OBSERVATION_INVALID'
+            && /canonical UUID/.test(error.message),
+    );
+});
+
+test('generation-A evidence is rejected against generation B for every lifecycle publication shape', (t) => {
+    const root = workspace(t);
+    const runningDir = path.join(root, '.ploinky', 'running');
+    const runA = identity();
+    const recordA = recordFor(runA);
+    const recordB = recordFor(identity({
+        instanceId: INSTANCE_B,
+        enableGeneration: GENERATION_B,
+    }));
+    const cases = [
+        ['marker-only pending', null, {}],
+        ['starting', 'starting', {}],
+        ['running', 'running', {}],
+        ['failed', 'failed', { phase: 'launch' }],
+        ['spawn-failure', 'failed', { phase: 'spawn' }],
+    ];
+    for (const [label, state, statusOverrides] of cases) {
+        fs.rmSync(runningDir, { recursive: true, force: true });
+        writeMarker(runningDir, runA);
+        if (state) writeStatus(runningDir, state, runA, statusOverrides);
+        const marker = readNoWaitRunMarker(CONTAINER, { runningDir });
+        assert.throws(
+            () => createNoWaitRunBinding(CONTAINER, recordB, marker),
+            (error) => error.code === 'NO_WAIT_RUN_SUPERSEDED',
+            `${label} must not bind generation-A evidence onto record B`,
+        );
+
+        const binding = createNoWaitRunBinding(CONTAINER, recordA, marker);
+        assert.throws(
+            () => observeBoundNoWaitRun(binding, {
+                runningDir,
+                nowMs: 10_500,
+                timeouts: {
+                    startupGraceMs: 1_000,
+                    activeTimeoutMs: 1_000,
+                    terminalPublicationGraceMs: 1_000,
+                },
+                requireWorkerProcess: false,
+                readRegistrySnapshot: () => ({ [CONTAINER]: recordB }),
+            }),
+            (error) => error.code === 'NO_WAIT_RUN_SUPERSEDED',
+            `${label} must fail the final generation fence`,
+        );
+    }
+
+    // Statusless means an already-bound A observation loses its status before
+    // the final record fence. It still cannot be converted into pending B.
+    fs.rmSync(runningDir, { recursive: true, force: true });
+    writeMarker(runningDir, runA);
+    const statuslessBinding = createNoWaitRunBinding(
+        CONTAINER,
+        recordA,
+        readNoWaitRunMarker(CONTAINER, { runningDir }),
+    );
+    assert.throws(
+        () => observeBoundNoWaitRun(statuslessBinding, {
+            runningDir,
+            nowMs: 10_500,
+            timeouts: {
+                startupGraceMs: 1_000,
+                activeTimeoutMs: 1_000,
+                terminalPublicationGraceMs: 1_000,
+            },
+            readRegistrySnapshot: () => ({ [CONTAINER]: recordB }),
+        }),
+        (error) => error.code === 'NO_WAIT_RUN_SUPERSEDED',
+    );
+});
+
+test('every status identity field is byte-for-byte fenced against the marker', (t) => {
+    const root = workspace(t);
+    const runningDir = path.join(root, '.ploinky', 'running');
+    const runIdentity = identity();
+    const record = recordFor(runIdentity);
+    const mutations = {
+        containerName: 'ploinky_demo_other',
+        instanceId: INSTANCE_B,
+        enableGeneration: GENERATION_B,
+        repoName: 'other',
+        shortAgent: 'other',
+        alias: 'blue',
+        routeKey: 'blue',
+        runId: RUN_B,
+        runStartedAtMs: 10_001,
+        waveIndex: 1,
+        statusFile: `${CONTAINER}.${RUN_B}.json`,
+    };
+    for (const [field, value] of Object.entries(mutations)) {
+        fs.rmSync(runningDir, { recursive: true, force: true });
+        writeMarker(runningDir, runIdentity);
+        writeStatus(runningDir, 'running', runIdentity, { [field]: value });
+        const binding = createNoWaitRunBinding(
+            CONTAINER,
+            record,
+            readNoWaitRunMarker(CONTAINER, { runningDir }),
+        );
+        assert.throws(
+            () => observeBoundNoWaitRun(binding, {
+                runningDir,
+                nowMs: 10_500,
+                requireWorkerProcess: false,
+                readRegistrySnapshot: () => ({ [CONTAINER]: record }),
+            }),
+            (error) => error.code === 'NO_WAIT_OBSERVATION_INVALID',
+            `${field} mismatch must be rejected`,
+        );
+    }
 });

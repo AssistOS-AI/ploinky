@@ -24,5 +24,6 @@ test_check "Dependency readiness.protocol override applies to dependency startup
 test_check "Static start-only TCP service becomes ready without MCP probing" fast_test_static_start_only_tcp_readiness
 test_check "Broken dependency leaves the generation inactive and static agent unstarted" fast_test_dependency_failure_blocks_router_startup
 test_check "Startup config provider preflight persists values before static start" fast_test_startup_config_provider_preflight
+test_check "Latched no-wait startup transitions from Router page to active route" fast_test_latched_no_wait_loading_transition
 
 finalize_checks

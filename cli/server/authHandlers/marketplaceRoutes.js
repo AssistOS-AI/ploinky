@@ -12,6 +12,10 @@ import {
     readNoWaitRunMarker,
     summarizeNoWaitFailure,
 } from '../../commands/noWaitLogObserver.js';
+import {
+    mapNoWaitObservationForMarketplace,
+    observeNoWaitAgentRecord,
+} from '../noWaitAgentStartupState.js';
 import { collectAgentsSummary } from '../../utils/status.js';
 import { isLocalAdminUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
@@ -231,32 +235,21 @@ function collectMarketplaceNoWaitStates(registry, {
     observeRun = observeBoundNoWaitRun,
     summarizeFailure = summarizeNoWaitFailure,
     readRegistrySnapshot = readAgentRegistrySnapshot,
+    observeRecord = observeNoWaitAgentRecord,
+    mapObservation = mapNoWaitObservationForMarketplace,
 } = {}) {
     const states = new Map();
     for (const [containerName, record] of Object.entries(registry || {})) {
         if (!record || record.type !== 'agent') continue;
         try {
-            const marker = readRunMarker(containerName);
-            if (!marker) continue;
-            const binding = createRunBinding(containerName, record, marker);
-            const observation = observeRun(binding, {
+            const observation = observeRecord(containerName, record, {
+                readRunMarker,
+                createRunBinding,
+                observeRun,
                 readRegistrySnapshot,
             });
-            if (observation.state === 'pending' || observation.state === 'starting') {
-                states.set(containerName, {
-                    status: 'starting',
-                    detail: observation.queued
-                        ? 'Waiting for an earlier startup wave.'
-                        : 'Background startup is in progress.',
-                });
-            } else if (observation.state === 'failed') {
-                states.set(containerName, {
-                    status: 'failed',
-                    detail: summarizeFailure(observation.status),
-                });
-            } else if (observation.state === 'running') {
-                states.set(containerName, { status: 'running', detail: '' });
-            }
+            const mapped = mapObservation(observation, { summarizeFailure });
+            if (mapped) states.set(containerName, mapped);
         } catch (error) {
             if (error?.code === 'NO_WAIT_RUN_SUPERSEDED') continue;
             if (error?.code === 'NO_WAIT_OBSERVATION_STALE') {
