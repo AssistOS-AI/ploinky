@@ -536,6 +536,10 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                     : authService.getSession(sessionId))
                 : null;
             const returnToFromQuery = normalizeRelativePath(parsedUrl.searchParams.get('returnTo') || '/', '/');
+            const cancelToFromQuery = normalizeRelativePath(
+                parsedUrl.searchParams.get('cancelTo') || returnToFromQuery,
+                returnToFromQuery,
+            );
             if (!session) {
                 res.writeHead(200, {
                     'Content-Type': 'text/html; charset=utf-8',
@@ -564,6 +568,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 res.end(renderLogoutConfirmationHtml({
                     agentName: authContext.routeKey,
                     returnTo: returnToFromQuery,
+                    cancelTo: cancelToFromQuery,
                     csrfToken,
                     includeAgentSelector: !isHostBoundAuthContext(authContext),
                 }));
