@@ -272,6 +272,87 @@ test('prepare acquires once, reconciles under lock, validates dependencies, then
     ]);
 });
 
+test('update pulls a workspace Ploinky checkout under the workspace lock before updating the graph', async (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const lockManager = fakeLockManager(state.root, events);
+    const ownership = owned(identity);
+    const selection = agentLibFixture(identity.workspaceRoot);
+    const workspacePloinky = Object.freeze({
+        found: true,
+        updated: true,
+        skipped: false,
+        repoPath: path.join(identity.workspaceRoot, 'ploinky'),
+        pullStrategy: 'rebase-autostash',
+    });
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager,
+        discover: () => ownership,
+        repositoryRoot: state.root,
+        stdout: { write() {} },
+        stderr: { write() {} },
+        runner: {
+            run() {
+                events.push('dependencies');
+            },
+        },
+        updateWorkspacePloinky(options) {
+            options.lock.assertHeld(identity.instance);
+            assert.equal(options.identity, identity);
+            assert.equal(options.repositoryRoot, state.root);
+            events.push('workspace-ploinky');
+            return workspacePloinky;
+        },
+        async updateAgentLib(options) {
+            assert.equal(options.workspaceRoot, identity.workspaceRoot);
+            events.push('agentlib');
+            return { selection, changed: false, previous: null };
+        },
+        async reconcile(options) {
+            options.lock.assertHeld(identity.instance);
+            events.push('reconcile');
+            return {
+                action: 'reused',
+                ownership,
+                hostPort: 8080,
+                mediaHostPort: 7882,
+                finalize() { events.push('finalize'); },
+            };
+        },
+        async runCoreCommand(engine, containerId, argv) {
+            assert.equal(engine, ownership.engine);
+            assert.equal(containerId, ownership.handles.container.id);
+            assert.deepEqual(argv, ['update']);
+            events.push('core-update');
+        },
+        async attestAgentLibGraph() {
+            events.push('attest');
+            return { ok: true };
+        },
+        revalidateAgentLibSource() {
+            events.push('revalidate-agentlib');
+        },
+        commitAgentLibSelection() {
+            events.push('commit-agentlib');
+        },
+        captureCoreStartArgv() {
+            return null;
+        },
+    });
+
+    const result = await supervisor.runUpdateTransaction(['update']);
+
+    assert.equal(result.workspacePloinky, workspacePloinky);
+    assert.equal(lockManager.acquisitions, 1);
+    assert.ok(events.indexOf('workspace-ploinky') < events.indexOf('agentlib'));
+    assert.ok(events.indexOf('agentlib') < events.indexOf('reconcile'));
+    assert.ok(events.indexOf('reconcile') < events.indexOf('core-update'));
+    assert.equal(events.at(-1), 'release');
+});
+
 test('stop relays to ploinky-local before stopping the outer Box without dependency repair', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));

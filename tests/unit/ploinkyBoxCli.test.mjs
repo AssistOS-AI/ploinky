@@ -421,6 +421,18 @@ test('full update refreshes in-Box state then restarts an already configured wor
         ...status(),
         inbox: { routingConfigured: true },
     });
+    supervisor.runUpdateTransaction = async (argv, options) => {
+        events.push(['update-transaction', argv, options]);
+        return {
+            workspacePloinky: {
+                found: true,
+                updated: true,
+                skipped: false,
+                repoPath: '/workspace/ploinky',
+                pullStrategy: 'rebase-autostash',
+            },
+        };
+    };
     const output = bufferStream();
     const code = await runOuterCli(['update'], {
         env: {},
@@ -448,6 +460,8 @@ test('full update refreshes in-Box state then restarts an already configured wor
             restartAfterUpdate: true,
         }],
     ]);
+    assert.match(output.value(), /Workspace Ploinky checkout at \/workspace\/ploinky is updated/);
+    assert.match(output.value(), /git pull --rebase --autostash/);
     assert.match(output.value(), /were restarted coherently/);
 });
 

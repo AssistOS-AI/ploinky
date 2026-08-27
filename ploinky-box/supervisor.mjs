@@ -41,6 +41,7 @@ import {
 import { resolveWorkspaceIdentity } from './identity.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
+import { updateWorkspacePloinkySource } from './command/hostUpdate.mjs';
 import {
     removeContainerById,
     stopPloinkyLocalByContainerId,
@@ -186,6 +187,7 @@ export function createBoxSupervisor({
     healthCheck = checkBoxHealth,
     selectAgentLib = selectWorkspaceAgentLibSource,
     updateAgentLib = updateWorkspaceAgentLibSource,
+    updateWorkspacePloinky = updateWorkspacePloinkySource,
     commitAgentLibSelection = writeActiveDescriptor,
     revalidateAgentLibSource = defaultRevalidateAgentLibSource,
     destroyBoxCache = removeWorkspaceDataPaths,
@@ -486,6 +488,11 @@ export function createBoxSupervisor({
     async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
             const priorCoreStartArgv = captureCoreStartArgv(identity);
+            const workspacePloinky = await updateWorkspacePloinky({
+                identity,
+                lock,
+                repositoryRoot,
+            });
             const { selection, changed, previous } = await updateAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -541,7 +548,7 @@ export function createBoxSupervisor({
                 });
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
-                    changed, previous, attestation,
+                    changed, previous, attestation, workspacePloinky,
                 });
             } catch (error) {
                 await rollbackPreparedGraph({

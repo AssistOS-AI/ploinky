@@ -25,8 +25,8 @@ Commands:
                                   Select the media host UDP port; defaults to 7882
   ploinky status [--verbose]      Inspect Box and core state without mutation
   ploinky stop                    Stop core services and the outer Box
-  ploinky update [all [PATH]]     Update host core, in-Box repos/deps/skills,
-                                  then restart a configured running workspace
+  ploinky update [all [PATH]]     Update host core, a workspace ./ploinky checkout,
+                                  in-Box repos/deps/skills, then restart if configured
   ploinky destroy                 Remove the outer Box without prompting; retain .ploinky/box
   ploinky destroy --delete-cache  Remove the outer Box and delete .ploinky/box/dependencies
                                   and .ploinky/box/images without prompting
@@ -217,10 +217,22 @@ export async function runOuterCli(argv, {
         const priorStatus = selectedSupervisor.inspectBoxStatus();
         const restartAfterUpdate = priorStatus.state === 'running-initialized'
             && priorStatus.inbox?.routingConfigured === true;
-        await selectedSupervisor.runUpdateTransaction(stripBranchPolicyArgs(route.coreArgv), {
+        const updateResult = await selectedSupervisor.runUpdateTransaction(stripBranchPolicyArgs(route.coreArgv), {
             branchPolicy: parseBranchPolicy(route.coreArgv),
             restartAfterUpdate,
         });
+        const workspacePloinky = updateResult?.workspacePloinky;
+        if (workspacePloinky?.found && !workspacePloinky.duplicateOfHost) {
+            if (workspacePloinky.skipped) {
+                output.write(`Workspace Ploinky checkout skipped: ${workspacePloinky.reason}.\n`);
+            } else {
+                const state = workspacePloinky.updated ? 'updated' : 'already up to date';
+                output.write(
+                    `Workspace Ploinky checkout at ${workspacePloinky.repoPath} is ${state} `
+                    + '(git pull --rebase --autostash).\n',
+                );
+            }
+        }
         if (!restartAfterUpdate) {
             output.write('Update complete; no configured running workspace required a restart.\n');
             return 0;
