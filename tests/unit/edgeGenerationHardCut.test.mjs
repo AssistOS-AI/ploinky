@@ -887,6 +887,91 @@ test('WebChat router mount remains closed without the webchat surface', (t) => {
     assert.equal(plan.code, 'ROUTE_SURFACE_DENIED');
 });
 
+test('WebTTY is a selected, reserved Router surface and never falls through to an agent', (t) => {
+    const fixture = createFixture(t, {
+        desired: {
+            hosts: {
+                'explorer.example.test': {
+                    agent: 'fixtures/alpha',
+                    routerSurfaces: ['webtty'],
+                },
+                'closed.example.test': {
+                    agent: 'fixtures/beta',
+                    routerSurfaces: [],
+                },
+            },
+            cloudflare: {
+                tunnelTokenSecret: 'publication/test-connector',
+            },
+        },
+    });
+    const applied = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'selected-root-webtty',
+        publicationState: 'ready',
+    });
+    assert.deepEqual(applied.generation.compiled.surfaces['explorer.example.test'], ['webtty']);
+
+    const local = resolveEdgeRoutePlan({
+        req: { method: 'GET', url: '/webtty', headers: { host: '127.0.0.1:18080' } },
+        listener: 'public',
+    });
+    assert.equal(local.ok, true);
+    assert.equal(local.kind, 'router-surface');
+    assert.equal(local.surface, 'webtty');
+    assert.equal(local.hostSelection.kind, 'control');
+
+    const wrongListener = resolveEdgeRoutePlan({
+        req: { method: 'GET', url: '/webtty', headers: { host: 'host.containers.internal' } },
+        listener: 'managed',
+    });
+    assert.equal(wrongListener.ok, false);
+    assert.equal(wrongListener.status, 404);
+    assert.equal(wrongListener.code, 'ROUTE_SURFACE_DENIED');
+
+    for (const pathname of ['/webtty', '/webtty/', '/webtty/assets/xterm.js', '/webtty/sessions/id/stream']) {
+        const plan = resolveEdgeRoutePlan({
+            req: { method: 'GET', url: pathname, headers: { host: 'explorer.example.test' } },
+            listener: 'public',
+        });
+        assert.equal(plan.ok, true, pathname);
+        assert.equal(plan.kind, 'router-surface', pathname);
+        assert.equal(plan.surface, 'webtty', pathname);
+
+        const closed = resolveEdgeRoutePlan({
+            req: { method: 'GET', url: pathname, headers: { host: 'closed.example.test' } },
+            listener: 'public',
+        });
+        assert.equal(closed.ok, false, pathname);
+        assert.equal(closed.status, 404, pathname);
+        assert.equal(closed.code, 'ROUTE_SURFACE_DENIED', pathname);
+    }
+
+    const agentShadow = resolveEdgeRoutePlan({
+        req: {
+            method: 'GET',
+            url: '/webtty?agent=beta',
+            headers: { host: 'closed.example.test' },
+        },
+        listener: 'public',
+    });
+    assert.equal(agentShadow.ok, false);
+    assert.equal(agentShadow.status, 404);
+    assert.equal(agentShadow.code, 'ROUTE_SURFACE_DENIED');
+
+    const captured = resolveEdgeRoutePlan({
+        req: { method: 'GET', url: '/webtty', headers: { host: 'explorer.example.test' } },
+        listener: 'public',
+    });
+    assert.equal(captured.lease.commit(), true);
+    applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'replace-webtty-activation',
+        publicationState: 'ready',
+    });
+    assert.equal(captured.lease.commit(), false);
+});
+
 test('legacy duplicate route and host-network authority is rejected', (t) => {
     const fixture = createFixture(t, {
         desired: {

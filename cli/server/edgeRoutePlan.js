@@ -493,6 +493,9 @@ function surfaceForPath(
     if (available.has('webchat') && isRouteMount(pathname, '/webchat')) {
         return { name: 'webchat', routerOwned: true };
     }
+    if (available.has('webtty') && isRouteMount(pathname, '/webtty')) {
+        return { name: 'webtty', routerOwned: true };
+    }
     return null;
 }
 
@@ -515,6 +518,7 @@ function isReservedRouterSurface(pathname) {
         || pathname.startsWith('/api/router/')
         || isRouteMount(pathname, '/status')
         || isRouteMount(pathname, '/webchat')
+        || isRouteMount(pathname, '/webtty')
         || isRouteMount(pathname, '/web-libs')
         || isRouteMount(pathname, '/workspace-files')
         || pathname === '/upload'
@@ -761,6 +765,18 @@ export function resolveEdgeRoutePlan({
             routes,
             snapshot,
             lease,
+        });
+    }
+
+    if (hostSelection.kind === 'control' && isRouteMount(pathname, '/webtty')) {
+        return routerSurfacePlan({
+            hostSelection,
+            host,
+            pathname,
+            parsedUrl: url,
+            lease,
+            snapshot,
+            surface: 'webtty',
         });
     }
 

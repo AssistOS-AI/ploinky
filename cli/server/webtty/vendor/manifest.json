@@ -1,0 +1,21 @@
+{
+  "schema": "ploinky-webtty-browser-assets/v1",
+  "packages": {
+    "@xterm/xterm": "6.0.0",
+    "@xterm/addon-fit": "0.11.0"
+  },
+  "files": {
+    "xterm.js": "14903579ff54664cd72f8e8699e6961a6272c21863ec1c3b118cdc8af5d4a972",
+    "xterm.css": "854a7c0fb70e8b1a083c16797ab827299fb18744f5ad34f227b48337e33293c6",
+    "addon-fit.js": "ba3ea256ce0620a0992a197d6c9baea64823fc93d8da07a9e366ca9943c18527",
+    "LICENSE.xterm": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+    "LICENSE.addon-fit": "e256f01188af527e4d06d21d06fbf785ae9c50d4b328bf03cbe0ba7f0aa4228f"
+  },
+  "sourcePaths": {
+    "xterm.js": "@xterm/xterm/lib/xterm.js",
+    "xterm.css": "@xterm/xterm/css/xterm.css",
+    "addon-fit.js": "@xterm/addon-fit/lib/addon-fit.js",
+    "LICENSE.xterm": "@xterm/xterm/LICENSE",
+    "LICENSE.addon-fit": "@xterm/addon-fit/LICENSE"
+  }
+}

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ploinky Administrative Terminal</title>
+  <link rel="stylesheet" href="/webtty/assets/xterm.css">
+  <link rel="stylesheet" href="/webtty/assets/webtty.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Workspace terminal</h1>
+      <p class="warning">Administrative shell — full workspace read/write</p>
+    </div>
+    <div class="status" aria-live="polite">
+      <span id="status-dot" class="status-dot"></span>
+      <span id="status">Starting…</span>
+    </div>
+  </header>
+  <main>
+    <div class="details">
+      <span>Directory: <strong id="directory">.</strong></span>
+      <span id="dimensions">80 × 24</span>
+    </div>
+    <div id="message" class="message" role="alert" hidden></div>
+    <div id="terminal" aria-label="Administrative workspace terminal"></div>
+  </main>
+  <script src="/webtty/assets/xterm.js"></script>
+  <script src="/webtty/assets/addon-fit.js"></script>
+  <script src="/webtty/assets/webtty.js"></script>
+</body>
+</html>

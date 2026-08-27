@@ -31,6 +31,7 @@ export const ROUTER_SURFACE_CATALOG = Object.freeze([
     'browser-auth',
     'marketplace-ui',
     'user-admin',
+    'webtty',
     'webchat',
     'workspace-assets',
 ]);

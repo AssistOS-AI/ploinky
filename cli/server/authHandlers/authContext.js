@@ -273,7 +273,8 @@ function routePlanSelectedRouteKey(routePlan) {
 }
 
 function isHostBoundRoutePlan(routePlan) {
-    return ['agent-root', 'dedicated-service'].includes(String(routePlan?.hostSelection?.kind || ''));
+    return ['agent-root', 'dedicated-service'].includes(String(routePlan?.hostSelection?.kind || ''))
+        || (routePlan?.kind === 'router-surface' && routePlan?.surface === 'webtty');
 }
 
 function requestedMutationRouteKey(parsedUrl) {
@@ -395,6 +396,14 @@ function resolveControlBrowserProofAuthContext(parsedUrl, options = {}) {
 export function resolveAuthContextForRoutePlan(parsedUrl, routePlan, { browserAuth = false } = {}) {
     const snapshot = snapshotFromOptions({ routePlan });
     const selectedRouteKey = routePlanSelectedRouteKey(routePlan);
+    if (routePlan?.kind === 'router-surface' && routePlan?.surface === 'webtty' && selectedRouteKey) {
+        return {
+            ...resolveAuthenticatedRouteAuthContext(selectedRouteKey, { snapshot }),
+            boundHostRouteKey: selectedRouteKey,
+            boundGeneration: String(routePlan?.lease?.id || snapshot?.generation || ''),
+            serviceRouteKey: 'webtty',
+        };
+    }
     if (browserAuth && isHostBoundRoutePlan(routePlan) && selectedRouteKey) {
         const mutationRouteKey = hostBoundMutationRouteKey(parsedUrl, routePlan, snapshot);
         if (mutationRouteKey === null) {

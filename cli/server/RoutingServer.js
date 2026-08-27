@@ -7,6 +7,7 @@ import { handleWebChat } from './handlers/webchat/index.js';
 import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
 import { executeWorkspaceLogOperation } from './workspaceLogFiles.js';
 import { handleBlobs, handleWorkspaceUpload } from './handlers/blobs.js';
+import { handleWebtty } from './handlers/webtty.js';
 import * as staticSrv from './static/index.js';
 
 // Authentication and routing
@@ -96,6 +97,7 @@ import { deriveAgentRequestSecret } from '../utils/security/masterKey.js';
 import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflared/index.mjs';
 import { requestAgentCard } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
+import { WebttySessionManager } from './webtty/sessionManager.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -145,8 +147,14 @@ if (!global.processKill) {
 // Global state for all services
 const globalState = {
     webchat: { sessions: new Map(), runtimes: new Map() },
+    webtty: { sessions: new Map() },
     status: { sessions: new Map() }
 };
+const webttySessionManager = new WebttySessionManager({
+    audit: (event, value) => appendLog(event, value),
+});
+await webttySessionManager.initialize();
+globalState.webtty.sessions = webttySessionManager.sessions;
 
 /**
  * Serve MCP Browser Client
@@ -231,6 +239,7 @@ function isRouterOwnedPath(pathname) {
         || pathname === '/__agent'
         || pathname.startsWith('/__agent/')
         || isRouteMount(pathname, '/webchat')
+        || isRouteMount(pathname, '/webtty')
         || isRouteMount(pathname, '/status')
         || pathname === '/upload'
         || isRouteMount(pathname, '/blobs')
@@ -598,6 +607,14 @@ async function processRequest(req, res) {
         return;
     }
 
+    if (isRouteMount(pathname, '/webtty')) {
+        await handleWebtty(req, res, parsedUrl, {
+            manager: webttySessionManager,
+            routePlan,
+        });
+        return;
+    }
+
     const method = String(req.method || 'GET').toUpperCase();
     if (!['GET', 'HEAD', 'OPTIONS'].includes(method)
         && (req.authMode === 'local' || req.authMode === 'sso')
@@ -853,6 +870,7 @@ function detailedHealthData() {
             webchat: globalState.webchat.sessions.size,
             status: globalState.status.sessions.size,
             agent: agentSessionStore.size,
+            webtty: webttySessionManager.activeCount(),
         },
         edgePublication,
     };
@@ -1001,6 +1019,7 @@ const lifecycle = setupProcessLifecycle(
     agentSessionStore,
     {
         beforeClose: [async () => {
+            await webttySessionManager.closeAll();
             runtimeRelayManager.close();
             await cloudflaredRouterIntegration.stop();
             await interfaceClassifier.close();
@@ -1087,6 +1106,7 @@ server.listen(port, '0.0.0.0', () => {
     cloudflaredRouterIntegration.markPublicListenerReady();
     console.log(`[RoutingServer] Ploinky server running on http://127.0.0.1:${port}`);
     console.log('  WebChat:         /webchat');
+    console.log('  WebTTY:          /webtty');
     console.log('  Status data:     /status/data');
     console.log('  Health:          /health');
     console.log('  Agent routes:    /<agent>/{mcp,task,agent-card,v1/models,v1/chat/completions}');

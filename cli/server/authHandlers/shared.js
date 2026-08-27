@@ -43,7 +43,11 @@ function wantsJsonResponse(req, pathname) {
     if (accept.includes('application/json')) return true;
     if (accept.includes('text/event-stream')) return true;
     if (!pathname) return false;
-    return pathname.startsWith('/apis/') || pathname.startsWith('/api/') || pathname.startsWith('/blobs');
+    return pathname.startsWith('/apis/')
+        || pathname.startsWith('/api/')
+        || pathname.startsWith('/blobs')
+        || pathname === '/webtty'
+        || pathname.startsWith('/webtty/');
 }
 
 const RELATIVE_PATH_BASE_URL = 'http://localhost';
