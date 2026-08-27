@@ -59,7 +59,7 @@ function withoutWebchatSessionEnv(baseEnv) {
 }
 
 function createTTYFactory({ runtime, containerName, workdir, entry }) {
-    const DEBUG = process.env.WEBTTY_DEBUG === '1';
+    const DEBUG = process.env.WEBCHAT_TTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty]', ...args); };
     const factory = (ssoUser) => {
         const wd = workdir || safeProcessCwd();
@@ -208,7 +208,7 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
 export { createTTYFactory, createLocalTTYFactory };
 
 function createLocalTTYFactory({ workdir, command }) {
-    const DEBUG = process.env.WEBTTY_DEBUG === '1';
+    const DEBUG = process.env.WEBCHAT_TTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty-local]', ...args); };
     const factory = (ssoUser) => {
         const wd = workdir || process.cwd();

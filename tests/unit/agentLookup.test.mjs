@@ -51,10 +51,10 @@ test('bare agent lookup falls back to inactive installed repos when enabled repo
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-lookup-'));
     try {
         writeManifest(workspace, 'AchillesIDE', 'explorer');
-        writeManifest(workspace, 'basic', 'webtty');
+        writeManifest(workspace, 'utilities', 'shellTool');
         fs.writeFileSync(
             path.join(workspace, '.ploinky', 'enabled_repos.json'),
-            JSON.stringify(['basic'], null, 2),
+            JSON.stringify(['utilities'], null, 2),
         );
 
         const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
