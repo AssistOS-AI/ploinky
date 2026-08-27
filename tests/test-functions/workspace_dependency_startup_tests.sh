@@ -36,6 +36,8 @@ fast_graph_cleanup_latched_workspace() {
   local labels
   local attached_containers
   local seen_scopes="|"
+  local container_count=0
+  local workspace_scope_count=0
   local -a runtimes=()
   local -a container_names=()
   local -a instance_ids=()
@@ -74,6 +76,7 @@ fast_graph_cleanup_latched_workspace() {
       container_names+=("$container_name")
       instance_ids+=("$instance_id")
       enable_generations+=("$enable_generation")
+      container_count=$((container_count + 1))
     done < <(jq -r '
       to_entries[]
       | select(.value.type == "agent" and .value.repoName == "noWaitFixtureRepo")
@@ -107,7 +110,8 @@ fast_graph_cleanup_latched_workspace() {
     fi
   done
 
-  for status_path in "${status_paths[@]}"; do
+  for status_path in "${status_paths[@]-}"; do
+    [[ -n "$status_path" ]] || continue
     terminal_observed=0
     for (( attempt=0; attempt<120; attempt++ )); do
       if [[ -f "$status_path" ]] \
@@ -176,7 +180,7 @@ fast_graph_cleanup_latched_workspace() {
   # Capture the exact managed network scope while at least one registered
   # fixture container still exists. Networks are test-owned teardown state,
   # but are not removed by the ordinary destroy command.
-  for (( attempt=0; attempt<${#container_names[@]}; attempt++ )); do
+  for (( attempt=0; attempt<container_count; attempt++ )); do
     runtime="${runtimes[$attempt]}"
     container_name="${container_names[$attempt]}"
     workspace_scope=$(
@@ -187,6 +191,7 @@ fast_graph_cleanup_latched_workspace() {
       workspace_scopes+=("$workspace_scope")
       workspace_scope_runtimes+=("$runtime")
       seen_scopes+="${workspace_scope}|"
+      workspace_scope_count=$((workspace_scope_count + 1))
     fi
   done
 
@@ -199,7 +204,7 @@ fast_graph_cleanup_latched_workspace() {
   # Prove every exact registered runtime is absent. If ordinary destroy left
   # one behind, remove only the record whose immutable labels still match and
   # fail the test so cleanup cannot silently mask the regression.
-  for (( attempt=0; attempt<${#container_names[@]}; attempt++ )); do
+  for (( attempt=0; attempt<container_count; attempt++ )); do
     runtime="${runtimes[$attempt]}"
     container_name="${container_names[$attempt]}"
     instance_id="${instance_ids[$attempt]}"
@@ -226,7 +231,7 @@ fast_graph_cleanup_latched_workspace() {
     fi
   done
 
-  for (( attempt=0; attempt<${#workspace_scopes[@]}; attempt++ )); do
+  for (( attempt=0; attempt<workspace_scope_count; attempt++ )); do
     workspace_scope="${workspace_scopes[$attempt]}"
     runtime="${workspace_scope_runtimes[$attempt]}"
     while IFS= read -r network_name; do

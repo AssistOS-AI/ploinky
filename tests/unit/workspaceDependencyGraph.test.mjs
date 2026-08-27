@@ -2519,3 +2519,29 @@ fast_graph_cleanup_latched_workspace() {
     assert.equal(fs.readFileSync(callsFile, 'utf8'), 'call\n');
     assert.equal(fs.readFileSync(evidenceFile, 'utf8'), 'preserved\n');
 });
+
+test('latched fixture cleanup accepts an empty prelaunch workspace under Bash nounset', () => {
+    const cleanupFunctions = fileURLToPath(new URL(
+        '../test-functions/workspace_dependency_startup_tests.sh',
+        import.meta.url,
+    ));
+    const workspace = fs.mkdtempSync(path.join(tempDir, 'latched-prelaunch-'));
+    const probe = spawnSync('/bin/bash', [
+        '-c',
+        String.raw`
+set -euo pipefail
+source "$1"
+ploinky() { return 0; }
+fast_graph_cleanup_latched_workspace "$2"
+[[ ! -e "$2" ]]
+`,
+        'latched-prelaunch-test',
+        cleanupFunctions,
+        workspace,
+    ], {
+        encoding: 'utf8',
+    });
+
+    assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+    assert.equal(fs.existsSync(workspace), false);
+});
