@@ -6,15 +6,23 @@ import test from 'node:test';
 import {
     IMAGE_CONTRACT,
     IMAGE_PROBE_TIMEOUT_MS,
+    WEBTTY_NATIVE_PROBE_TIMEOUT_MS,
+    inspectAndValidateImage,
     inspectAndValidateExistingImage,
     normalizeImageInspect,
     probeImageBinaries,
+    probeWebttyNativeRuntime,
     validateImageContract,
 } from '../../ploinky-box/contract/image.mjs';
+import {
+    nativeRuntimeExpectation,
+} from '../../core-services/webtty/native-runtime.mjs';
 
-function validRecord() {
+function validRecord({ architecture = 'arm64' } = {}) {
     return [{
         Id: 'sha256:image-id',
+        Os: 'linux',
+        Architecture: architecture,
         Config: {
             User: IMAGE_CONTRACT.user,
             WorkingDir: IMAGE_CONTRACT.workdir,
@@ -25,6 +33,58 @@ function validRecord() {
             Labels: {},
         },
     }];
+}
+
+function validNativeProbe({ architecture = 'arm64', ...overrides } = {}) {
+    return {
+        ...nativeRuntimeExpectation({ platform: 'linux', architecture }),
+        nativeArtifactSha256: 'a'.repeat(64),
+        sourceSha: 'b'.repeat(40),
+        uid: 1000,
+        gid: 1000,
+        pty: {
+            import: true,
+            input: true,
+            output: true,
+            resize: true,
+            exit: true,
+            reap: true,
+            identity: true,
+        },
+        ...overrides,
+    };
+}
+
+function admissionRunner({
+    firstRecord = validRecord(),
+    secondRecord = firstRecord,
+    nativeProbe = validNativeProbe({ architecture: firstRecord[0].Architecture }),
+} = {}) {
+    const calls = [];
+    let inspections = 0;
+    return {
+        calls,
+        query(engine, args, options) {
+            calls.push({ engine, args, options });
+            if (args[0] === 'image' && args[1] === 'inspect') {
+                const record = inspections++ === 0 ? firstRecord : secondRecord;
+                return { ok: true, stdout: JSON.stringify(record), stderr: '' };
+            }
+            if (args.includes('--entrypoint=/bin/bash')) {
+                return {
+                    ok: true,
+                    stdout: binaries.map((binary) => (
+                        binary.startsWith('/') ? binary : `/usr/bin/${binary}`
+                    )).join('\n'),
+                    stderr: '',
+                };
+            }
+            if (args.includes('--entrypoint=/usr/local/bin/node')) {
+                return { ok: true, stdout: JSON.stringify(nativeProbe), stderr: '' };
+            }
+            return { ok: false, stdout: '', stderr: `unexpected ${args.join(' ')}` };
+        },
+    };
 }
 
 const binaries = [
@@ -76,28 +136,136 @@ test('images with stale or unexpected labels hard-cut before any binary probe ma
     );
 });
 
-test('an existing owned image is inspected by immutable ID without a binary probe', () => {
+test('an existing owned image is probed by immutable ID and re-inspected before admission', () => {
     const record = validRecord();
-    const calls = [];
-    const runner = {
-        query(engine, args) {
-            calls.push([engine, ...args]);
-            return { ok: true, stdout: JSON.stringify(record), stderr: '' };
-        },
-    };
+    const runner = admissionRunner({ firstRecord: record });
     const image = inspectAndValidateExistingImage(
         'podman', 'sha256:image-id', 'runtime', runner,
     );
     assert.equal(image.immutableId, 'sha256:image-id');
-    assert.deepEqual(calls, [['podman', 'image', 'inspect', 'sha256:image-id']]);
+    assert.deepEqual(runner.calls.map(({ args }) => args.slice(0, 2)), [
+        ['image', 'inspect'],
+        ['run', '--rm'],
+        ['run', '--rm'],
+        ['image', 'inspect'],
+    ]);
+    assert.equal(runner.calls[1].args.includes('sha256:image-id'), true);
+    assert.equal(runner.calls[2].args.includes('sha256:image-id'), true);
+    assert.equal(runner.calls[2].args.includes('--network=none'), true);
+    assert.equal(runner.calls[2].args.includes('--pull=never'), true);
+    assert.equal(runner.calls[2].args.at(-1), '--verify');
 
     record[0].Config.Labels['io.assistos.ploinky.unexpected'] = 'retired';
+    const incompatibleRunner = admissionRunner({ firstRecord: record });
     assert.throws(
         () => inspectAndValidateExistingImage(
-            'podman', 'sha256:image-id', 'old-runtime', runner,
+            'podman', 'sha256:image-id', 'old-runtime', incompatibleRunner,
         ),
         (error) => error.code === 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT'
             && /destroy and recreate/i.test(error.message),
+    );
+    assert.equal(incompatibleRunner.calls.length, 1);
+});
+
+test('newly obtained images use the same immutable native admission path', () => {
+    const runner = admissionRunner();
+    const image = inspectAndValidateImage('podman', 'assistos/ploinky-box', runner);
+    assert.equal(image.immutableId, 'sha256:image-id');
+    assert.deepEqual(runner.calls.filter(({ args }) => args[0] === 'image').map(({ args }) => args[2]), [
+        'assistos/ploinky-box',
+        'sha256:image-id',
+    ]);
+    assert.equal(runner.calls.filter(({ args }) => args[0] === 'run').every(({ args }) => (
+        args.includes('sha256:image-id')
+    )), true);
+});
+
+test('native runtime contract is accepted for each supported architecture', () => {
+    for (const architecture of ['amd64', 'arm64']) {
+        const record = validRecord({ architecture });
+        const runner = admissionRunner({
+            firstRecord: record,
+            nativeProbe: validNativeProbe({ architecture }),
+        });
+        assert.equal(
+            inspectAndValidateExistingImage(
+                'podman', 'sha256:image-id', `runtime-${architecture}`, runner,
+            ).architecture,
+            architecture,
+        );
+    }
+});
+
+test('native runtime failures hard-cut Box admission with bounded categories and no install advice', () => {
+    for (const [category, nativeProbe] of [
+        ['architecture', validNativeProbe({ architecture: 'amd64' })],
+        ['native-artifact-sha256', validNativeProbe({ nativeArtifactSha256: 'tampered' })],
+        ['package-lock', validNativeProbe({ packageLockSha256: 'c'.repeat(64) })],
+    ]) {
+        const runner = admissionRunner({ nativeProbe });
+        assert.throws(
+            () => inspectAndValidateExistingImage(
+                'podman', 'sha256:image-id', 'runtime', runner,
+            ),
+            (error) => error.code === 'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID'
+                && error.message.includes(category)
+                && error.message.includes('sha256:image-id')
+                && !/npm/i.test(error.message),
+        );
+    }
+});
+
+test('native probe output is bounded and malformed output fails closed', () => {
+    for (const stdout of ['not-json', 'x'.repeat(16 * 1024 + 1)]) {
+        const runner = {
+            query() {
+                return { ok: true, stdout, stderr: '' };
+            },
+        };
+        assert.throws(
+            () => probeWebttyNativeRuntime(
+                'podman',
+                'sha256:image-id',
+                normalizeImageInspect(validRecord()),
+                runner,
+            ),
+            (error) => error.code === 'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID'
+                && /probe-output-(?:json|size)/.test(error.message),
+        );
+    }
+});
+
+test('native probe process failures expose only a bounded stable category', () => {
+    for (const [result, expected] of [
+        [{ ok: false, stdout: '', stderr: 'WebTTY native probe failed: contract-artifact-sha256\n' }, 'contract-artifact-sha256'],
+        [{ ok: false, stdout: '', stderr: 'untrusted diagnostic with /host/private/path' }, 'probe-failed'],
+        [{ ok: false, stdout: '', stderr: '', error: { code: 'ETIMEDOUT' } }, 'timeout'],
+    ]) {
+        const runner = { query: () => result };
+        assert.throws(
+            () => probeWebttyNativeRuntime(
+                'podman',
+                'sha256:image-id',
+                normalizeImageInspect(validRecord()),
+                runner,
+            ),
+            (error) => error.code === 'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID'
+                && error.message.includes(expected)
+                && !error.message.includes('/host/private/path')
+                && /build or pull a compatible runtime image and recreate the Box/.test(error.message),
+        );
+    }
+});
+
+test('image identity is rechecked after probes and an unexpected ID fails closed', () => {
+    const changed = validRecord();
+    changed[0].Id = 'sha256:different-id';
+    const runner = admissionRunner({ secondRecord: changed });
+    assert.throws(
+        () => inspectAndValidateExistingImage(
+            'podman', 'sha256:image-id', 'runtime', runner,
+        ),
+        /image ID.*sha256:image-id.*sha256:different-id/,
     );
 });
 
@@ -139,6 +307,24 @@ test('fresh image capability probes allow a cold rootless container start', () =
     assert.ok(IMAGE_PROBE_TIMEOUT_MS >= 60_000);
     assert.match(calls[0].args.at(-1), /test "\$\(id -u\)" -eq 1000/);
     assert.match(calls[0].args.at(-1), /test "\$\(id -g\)" -eq 1000/);
+});
+
+test('native image probes are time-bounded', () => {
+    const calls = [];
+    const runner = {
+        query(engine, args, options) {
+            calls.push({ engine, args, options });
+            return { ok: true, stdout: JSON.stringify(validNativeProbe()), stderr: '' };
+        },
+    };
+    probeWebttyNativeRuntime(
+        'podman',
+        'sha256:image-id',
+        normalizeImageInspect(validRecord()),
+        runner,
+    );
+    assert.equal(calls[0].options.timeoutMs, WEBTTY_NATIVE_PROBE_TIMEOUT_MS);
+    assert.ok(WEBTTY_NATIVE_PROBE_TIMEOUT_MS >= 60_000);
 });
 
 test('image contract requires cloudflared and entrypoint validates token-file support', () => {
