@@ -76,7 +76,6 @@ import {
 // Reuse env map builder from bwrap (with runtimeName param)
 import { buildFullEnvMap } from '../bwrap/bwrapServiceManager.js';
 import { agentLibGrant, agentLibReuseProblem, agentLibRuntimeRecord } from '../agentLibGrant.js';
-import { attestSeatbeltAgentLib } from '../agentLibAttestation.js';
 import { detectHostRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 // Seatbelt profile generator
 import { buildSeatbeltProfile, writeSeatbeltProfile } from './seatbeltProfile.js';
@@ -547,15 +546,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     });
     const profilePath = writeSeatbeltProfile(agentName, profileContent);
 
-    const agentLibAttestation = attestSeatbeltAgentLib({
-        profilePath,
-        agentRuntimePath: seatbeltAgentLibPath,
-        cwd: agentCodePath,
-        env: envMap,
-        grant,
-        spawn: spawnSync,
-    });
-
     // Build entry command with real paths
     const entryCmd = buildSeatbeltEntryCommand(agentName, manifest, profileConfig, {
         agentCodePath,
@@ -658,7 +648,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
             agentLibPath: seatbeltAgentLibPath
         },
         agentLib: agentLibRuntimeRecord(grant),
-        agentLibAttestation,
         runMode: existingRecord.runMode,
         develRepo: existingRecord.develRepo,
         profile: activeProfile,

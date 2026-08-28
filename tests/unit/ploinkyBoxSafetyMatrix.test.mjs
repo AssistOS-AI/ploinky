@@ -104,10 +104,6 @@ function matrixSupervisor(identity, events) {
         startCore: async () => { events.push('start-core'); },
         runCoreCommand: async () => { events.push('run-core-command'); },
         healthCheck: async () => { events.push('health'); },
-        attestAgentLibGraph: async () => {
-            events.push('attest-agentlib');
-            return { deploymentFingerprint: agentLib.contentFingerprint };
-        },
         revalidateAgentLibSource: () => { events.push('revalidate-agentlib'); },
         commitAgentLibSelection: () => { events.push('commit-agentlib'); },
     });
@@ -161,8 +157,8 @@ test('every public verb has the required single-lock depth and release boundary'
             assert.ok(events.indexOf('health') < events.indexOf('release'));
         }
         if (scenario.name === 'update') {
-            assert.ok(events.lastIndexOf('run-core-command') < events.indexOf('attest-agentlib'));
-            assert.ok(events.indexOf('attest-agentlib') < events.indexOf('release'));
+            assert.ok(events.lastIndexOf('run-core-command') < events.indexOf('revalidate-agentlib'));
+            assert.ok(events.indexOf('revalidate-agentlib') < events.indexOf('release'));
         }
         if (scenario.name === 'stop') {
             const outerStop = events.findIndex((event) => event.includes('container stop --time 30'));
@@ -226,10 +222,6 @@ test('start stages host-owned edge desired state under the Box lock before core 
         },
         startCore: async () => { events.push('start-core'); },
         healthCheck: async () => { events.push('health'); },
-        attestAgentLibGraph: async () => {
-            events.push('attest-agentlib');
-            return { deploymentFingerprint: agentLib.contentFingerprint };
-        },
         revalidateAgentLibSource: () => { events.push('revalidate-agentlib'); },
         commitAgentLibSelection: () => { events.push('commit-agentlib'); },
     });
@@ -240,8 +232,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
     assert.ok(events.indexOf('read-edge-desired') < events.indexOf('stage-edge-desired'));
     assert.ok(events.indexOf('stage-edge-desired') < events.indexOf('start-core'));
     assert.ok(events.indexOf('start-core') < events.indexOf('health'));
-    assert.ok(events.indexOf('health') < events.indexOf('attest-agentlib'));
-    assert.ok(events.indexOf('attest-agentlib') < events.indexOf('revalidate-agentlib'));
+    assert.ok(events.indexOf('health') < events.indexOf('revalidate-agentlib'));
     assert.ok(events.indexOf('revalidate-agentlib') < events.indexOf('commit-agentlib'));
     assert.ok(events.indexOf('commit-agentlib') < events.indexOf('release'));
 });

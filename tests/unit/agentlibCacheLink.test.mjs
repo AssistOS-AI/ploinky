@@ -217,21 +217,12 @@ test('the grant environment names the runtime path, never the host path, for nam
     });
 });
 
-test('reuse fails closed when a recorded grant differs', () => {
+test('runtime records retain only the generation identity needed for reuse', () => {
     const grant = grantMod.agentLibGrant('container-linux-x64-node25', SELECTION);
-    const shadows = [{ hostPath: grant.sourceDir, runtimePath: '/workspace/achillesAgentLib' }];
-    const desired = grantMod.agentLibRuntimeRecord(grant, shadows);
-
-    assert.equal(grantMod.agentLibRecordProblem(desired, desired), '');
-    assert.match(grantMod.agentLibRecordProblem(null, desired), /record missing/);
-    assert.match(
-        grantMod.agentLibRecordProblem({ ...desired, fingerprint: 'b2'.repeat(32) }, desired),
-        /fingerprint changed/,
-    );
-    assert.match(
-        grantMod.agentLibRecordProblem({ ...desired, aliasShadows: [] }, desired),
-        /alias shadows changed/,
-    );
+    assert.deepEqual(grantMod.agentLibRuntimeRecord(grant), {
+        fingerprint: SELECTION.fingerprint,
+        sourceIdHash: SOURCE_ID_HASH,
+    });
 });
 
 test('the reserved AgentLib environment cannot be set by a manifest or profile layer', async () => {
@@ -259,7 +250,7 @@ test('a stale fingerprint is not reusable in any runtime family', () => {
         'seatbelt-darwin-arm64-node25',
     ]) {
         const grant = grantMod.agentLibGrant(runtimeKey, SELECTION);
-        const running = { agentLib: grantMod.agentLibRuntimeRecord(grant, []) };
+        const running = { agentLib: grantMod.agentLibRuntimeRecord(grant) };
         assert.equal(grantMod.agentLibReuseProblem(running, grant), '', runtimeKey);
 
         // A local edit changes only the content fingerprint.
@@ -270,17 +261,16 @@ test('a stale fingerprint is not reusable in any runtime family', () => {
             `${runtimeKey} must replace a runtime running older AgentLib bytes`,
         );
 
-        // Provenance and source identity are equally disqualifying.
-        assert.match(
-            grantMod.agentLibReuseProblem(running, grantMod.agentLibGrant(runtimeKey, { ...SELECTION, mode: 'managed' })),
-            /mode changed/,
-        );
+        // A legacy full record remains reusable; only its generation identity
+        // is significant.
+        const legacy = { agentLib: { ...grant, aliasShadows: ['/workspace/achillesAgentLib'] } };
+        assert.equal(grantMod.agentLibReuseProblem(legacy, grant), '');
         assert.match(
             grantMod.agentLibReuseProblem(
                 running,
-                grantMod.agentLibGrant(runtimeKey, { ...SELECTION, sourceDir: '/other/achillesAgentLib' }),
+                grantMod.agentLibGrant(runtimeKey, { ...SELECTION, sourceIdHash: 'c3'.repeat(32) }),
             ),
-            /sourceIdHash changed|sourceDir changed/,
+            /sourceIdHash changed/,
         );
     }
 });

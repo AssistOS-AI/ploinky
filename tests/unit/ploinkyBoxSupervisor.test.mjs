@@ -332,10 +332,6 @@ test('targeted restart preserves the exact running Box and mounted AgentLib gene
         healthCheck: async (hostPort) => {
             events.push(`health:${hostPort}`);
         },
-        attestAgentLibGraph: async (_engine, containerId, selection) => {
-            events.push(`attest:${containerId}`);
-            return { deploymentFingerprint: selection.fingerprint };
-        },
         commitAgentLibSelection: () => assert.fail('targeted restart must not advance source state'),
     });
 
@@ -346,7 +342,6 @@ test('targeted restart preserves the exact running Box and mounted AgentLib gene
     assert.equal(result.agentLib.sourceDir, agentLibFixture(identity.workspaceRoot).sourceDir);
     assert.equal(events.some((event) => event.startsWith('core:restart onlyOffice')), true);
     assert.ok(events.indexOf('health:19090') > events.indexOf('core:restart onlyOffice'));
-    assert.ok(events.indexOf(`attest:${container.id}`) > events.indexOf('health:19090'));
     assert.equal(events.at(-1), 'release');
 });
 
@@ -449,10 +444,6 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
             assert.equal(containerId, ownership.handles.container.id);
             assert.deepEqual(argv, ['update']);
             events.push('core-update');
-        },
-        async attestAgentLibGraph() {
-            events.push('attest');
-            return { ok: true };
         },
         revalidateAgentLibSource() {
             events.push('revalidate-agentlib');
@@ -811,12 +802,6 @@ test('start selects the AgentLib source and passes the host address into the bou
             boundedOptions = options;
         },
         healthCheck: async (hostPort) => assert.equal(hostPort, 8080),
-        attestAgentLibGraph: async (_engine, containerId, selection) => {
-            assert.equal(containerId, ownership.handles.container.id);
-            assert.equal(selection, agentLib);
-            events.push('attest');
-            return { deploymentFingerprint: selection.contentFingerprint };
-        },
         revalidateAgentLibSource: (selection) => { revalidated = selection; },
         commitAgentLibSelection: (workspaceRoot, selection) => { committed = { workspaceRoot, selection }; },
     });
@@ -856,7 +841,6 @@ test('a source that changes during startup is not committed and is not declared 
         resolveHostReachableIpv4: async () => '',
         startCore: async () => {},
         healthCheck: async () => {},
-        attestAgentLibGraph: async () => ({ deploymentFingerprint: agentLib.contentFingerprint }),
         revalidateAgentLibSource: () => {
             const error = new Error('achillesAgentLib source changed during startup');
             error.code = 'PLOINKY_AGENTLIB_SOURCE_CHANGED';
@@ -889,7 +873,7 @@ test('prior graph capture records an exact start command before mutation', (t) =
     assert.equal(Object.isFrozen(argv), true);
 });
 
-test('a failed replacement restores and re-attests the prior Box graph before surfacing the failure', async (t) => {
+test('a failed replacement restores and health-checks the prior Box graph before surfacing the failure', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
@@ -940,11 +924,6 @@ test('a failed replacement restores and re-attests the prior Box graph before su
             assert.equal(options.agentLib, priorAgentLib);
         },
         healthCheck: async () => { events.push('prior-health'); },
-        attestAgentLibGraph: async (_engine, containerId, selection) => {
-            events.push(`attest:${containerId}`);
-            assert.equal(selection, priorAgentLib);
-            return { deploymentFingerprint: selection.fingerprint };
-        },
         commitAgentLibSelection: () => { committed = true; },
     });
 
@@ -960,7 +939,6 @@ test('a failed replacement restores and re-attests the prior Box graph before su
     ));
     assert.ok(rollbackIndex >= 0 && priorStartIndex > rollbackIndex);
     assert.ok(events.indexOf('prior-health') > priorStartIndex);
-    assert.ok(events.indexOf(`attest:${oldOwnership.handles.container.id}`) > priorStartIndex);
 });
 
 test('bounded start requires the external Router URL and preserves normalized argv', async (t) => {

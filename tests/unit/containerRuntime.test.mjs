@@ -12,7 +12,6 @@ import {
     resetPreinstallRunInProcess,
 } from '../../cli/utils/runtime/lifecycleHooks.js';
 import { buildExecArgs } from '../../cli/sandbox/docker/interactive.js';
-import { buildAgentLibAttestation } from '../../agentlib/runtime.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/agentServiceManager.js')).href;
@@ -505,14 +504,8 @@ test('global enabled agents keep workspace projectPath and declare persistent /r
         const stateFile = path.join(binDir, 'container-name.txt');
         const runningFile = path.join(binDir, 'container-running.txt');
         const argsFile = path.join(binDir, 'run-args.txt');
-        const attestationFile = path.join(binDir, 'agentlib-attestation.json');
         const inspectHelper = path.join(binDir, 'inspect-helper.mjs');
         const podmanPath = path.join(binDir, 'podman');
-        fs.writeFileSync(attestationFile, JSON.stringify({
-            ...buildAgentLibAttestation(),
-            sourceRootRealpath: '/opt/ploinky-agentlib',
-            loaded: {},
-        }));
         fs.writeFileSync(inspectHelper, `
 import fs from 'node:fs';
 const [argsPath, statePath, runningPath, mode = 'full'] = process.argv.slice(2);
@@ -597,7 +590,6 @@ case "$1" in
     exit 1
     ;;
   run)
-    cat ${JSON.stringify(attestationFile)}
     exit 0
     ;;
   *)

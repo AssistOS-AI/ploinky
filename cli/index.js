@@ -93,17 +93,11 @@ export async function launchCli(args = process.argv.slice(2), {
     writeTransactionImpl = writeTransactionDescriptor,
     clearTransactionImpl = clearTransactionDescriptor,
     readActiveImpl = readActiveDescriptor,
-    attestDeploymentImpl = null,
     input = process.stdin,
     env = process.env,
     errorOutput = process.stderr,
 } = {}) {
     const workspaceRoot = resolveWorkspaceRoot({ cwd: process.cwd(), env });
-    const attestDeployment = async () => {
-        const attest = attestDeploymentImpl
-            || (await import('./utils/agentLibDeploymentAttestation.js')).attestAgentLibDeployment;
-        return attest({ env, workspaceRoot });
-    };
     const restorePreviousDeployment = (error, previous, candidate, action = 'restart') => {
         if (!previous || !selectionsDiffer(previous, candidate)) return false;
         try {
@@ -149,10 +143,6 @@ export async function launchCli(args = process.argv.slice(2), {
                 ({ runCoreCli } = await importCoreImpl());
                 const code = await runCoreCli(['restart']);
                 if (commandFailed(code)) throw new Error(`restart failed with status ${code}`);
-                await attestDeployment();
-            } else {
-                const { buildAgentLibAttestation } = await import('../agentlib/runtime.mjs');
-                buildAgentLibAttestation({ env });
             }
             revalidateSelection(selection);
             writeActiveImpl(workspaceRoot, selection);
@@ -245,9 +235,7 @@ export async function launchCli(args = process.argv.slice(2), {
         // A graph/readiness failure deliberately leaves the diagnostic Router
         // running with its edge generation inactive. Tear it down here only
         // when this command displaced a different committed AgentLib source
-        // that must be restored. A successful core start which later fails the
-        // AgentLib deployment attestation is handled by the stricter teardown
-        // below.
+        // that must be restored.
         if (bootstrap.owned
             && ['start', 'restart'].includes(commandArgs[0])
             && previous
@@ -262,10 +250,9 @@ export async function launchCli(args = process.argv.slice(2), {
 
     if (['start', 'restart'].includes(commandArgs[0])) {
         try {
-            const attestation = await attestDeployment();
             revalidateSelection(bootstrap.selection);
             writeActiveImpl(workspaceRoot, bootstrap.selection);
-            return result ?? (attestation ? 0 : result);
+            return result;
         } catch (error) {
             try { await runCoreCli(['stop']); } catch (_) {}
             // A different prior managed/local source can be restored only when
