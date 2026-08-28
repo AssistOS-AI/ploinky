@@ -9,6 +9,319 @@ fast_graph_cleanup_workspace() {
   rm -rf "$workspace"
 }
 
+fast_graph_cleanup_latched_workspace() {
+  local workspace="$1"
+  local canonical_workspace
+  local running_dir
+  local cleanup_log
+  local cleanup_failed=0
+  local release_file
+  local temporary_file
+  local marker_file
+  local status_name
+  local status_path
+  local terminal_observed
+  local attempt
+  local worker_pid
+  local worker_command
+  local router_manager_pid=""
+  local router_listener_pid=""
+  local router_port=""
+  local runtime
+  local container_name
+  local instance_id
+  local enable_generation
+  local workspace_scope
+  local network_name
+  local labels
+  local attached_containers
+  local seen_scopes="|"
+  local container_count=0
+  local workspace_scope_count=0
+  local -a runtimes=()
+  local -a container_names=()
+  local -a instance_ids=()
+  local -a enable_generations=()
+  local -a status_paths=()
+  local -a workspace_scopes=()
+  local -a workspace_scope_runtimes=()
+
+  if [[ -z "$workspace" || ! -d "$workspace" ]]; then
+    return 0
+  fi
+  canonical_workspace=$(cd "$workspace" && pwd -P)
+  running_dir="$canonical_workspace/.ploinky/running/no-wait"
+  cleanup_log="$workspace/.ploinky/logs/latched-no-wait-cleanup.log"
+  mkdir -p "${cleanup_log%/*}"
+
+  if [[ -f "$workspace/.ploinky/running/router.pid" ]]; then
+    router_manager_pid=$(tr -d '[:space:]' <"$workspace/.ploinky/running/router.pid")
+    [[ "$router_manager_pid" =~ ^[1-9][0-9]*$ ]] || router_manager_pid=""
+  fi
+  router_port=$(jq -r '.port // empty' "$workspace/.ploinky/routing.json" 2>/dev/null || true)
+  if [[ "$router_port" =~ ^[1-9][0-9]*$ ]]; then
+    router_listener_pid=$(lsof -nP -t -iTCP:"$router_port" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)
+  else
+    router_port=""
+  fi
+
+  if [[ -f "$workspace/.ploinky/agents.json" ]]; then
+    while IFS=$'\t' read -r runtime container_name instance_id enable_generation; do
+      [[ -n "$runtime" && -n "$container_name" ]] || continue
+      case "$runtime" in
+        podman|docker) ;;
+        *) continue ;;
+      esac
+      runtimes+=("$runtime")
+      container_names+=("$container_name")
+      instance_ids+=("$instance_id")
+      enable_generations+=("$enable_generation")
+      container_count=$((container_count + 1))
+    done < <(jq -r '
+      to_entries[]
+      | select(.value.type == "agent" and .value.repoName == "noWaitFixtureRepo")
+      | [.value.runtime, .key, .value.instanceId, .value.enableGeneration]
+      | @tsv
+    ' "$workspace/.ploinky/agents.json")
+  fi
+
+  if [[ -d "$running_dir" ]]; then
+    while IFS= read -r marker_file; do
+      status_name=$(jq -r '.statusFile // empty' "$marker_file" 2>/dev/null || true)
+      if [[ -n "$status_name" && "$status_name" == "${status_name##*/}" ]]; then
+        status_paths+=("$running_dir/$status_name")
+      fi
+    done < <(find "$running_dir" -maxdepth 1 -type f -name '*.current.json' -print)
+  fi
+
+  # A failure can occur while detached no-wait workers are still blocked in
+  # the fixture. Release only those test-owned latches, then require every
+  # published worker to reach a terminal protocol state before destroy.
+  for release_file in \
+    "$workspace/.data/slowAgent/release-readiness" \
+    "$workspace/.data/rotatorAgent/release-readiness"; do
+    if [[ -d "${release_file%/*}" && ! -e "$release_file" ]]; then
+      temporary_file="${release_file}.cleanup.$$"
+      (
+        umask 077
+        printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$temporary_file"
+        mv "$temporary_file" "$release_file"
+      ) || true
+    fi
+  done
+
+  for status_path in "${status_paths[@]-}"; do
+    [[ -n "$status_path" ]] || continue
+    terminal_observed=0
+    for (( attempt=0; attempt<120; attempt++ )); do
+      if [[ -f "$status_path" ]] \
+        && jq -e '.state == "running" or .state == "failed"' "$status_path" >/dev/null 2>&1; then
+        terminal_observed=1
+        break
+      fi
+      sleep 0.25
+    done
+    if (( terminal_observed == 0 )); then
+      printf 'No terminal no-wait status was published at %s.\n' "$status_path" >>"$cleanup_log"
+      cleanup_failed=1
+    fi
+  done
+
+  # A terminal status is fenced before the detached worker exits. Wait for
+  # exact structured-argv workers from this workspace, then terminate only an
+  # exact survivor so it cannot cross a launch boundary after destroy.
+  for (( attempt=0; attempt<80; attempt++ )); do
+    if ! ps -axo pid=,command= | awk -v root="$running_dir" '
+      index($0, "/cli/commands/noWaitWorker.js ") &&
+        index($0, "--status-file " root "/") { found=1 }
+      END { exit(found ? 0 : 1) }
+    '; then
+      break
+    fi
+    sleep 0.25
+  done
+  while IFS= read -r worker_pid; do
+    [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] || continue
+    worker_command=$(ps -p "$worker_pid" -o command= 2>/dev/null || true)
+    if [[ "$worker_command" == *'/cli/commands/noWaitWorker.js '* \
+      && "$worker_command" == *"--status-file ${running_dir}/"* ]]; then
+      printf 'Detached no-wait worker %s survived terminal convergence.\n' "$worker_pid" >>"$cleanup_log"
+      cleanup_failed=1
+      kill -TERM "$worker_pid" 2>/dev/null || true
+    fi
+  done < <(ps -axo pid=,command= | awk -v root="$running_dir" '
+    index($0, "/cli/commands/noWaitWorker.js ") &&
+      index($0, "--status-file " root "/") { print $1 }
+  ')
+  for (( attempt=0; attempt<20; attempt++ )); do
+    if ! ps -axo pid=,command= | awk -v root="$running_dir" '
+      index($0, "/cli/commands/noWaitWorker.js ") &&
+        index($0, "--status-file " root "/") { found=1 }
+      END { exit(found ? 0 : 1) }
+    '; then
+      break
+    fi
+    sleep 0.25
+  done
+  while IFS= read -r worker_pid; do
+    [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] || continue
+    worker_command=$(ps -p "$worker_pid" -o command= 2>/dev/null || true)
+    if [[ "$worker_command" == *'/cli/commands/noWaitWorker.js '* \
+      && "$worker_command" == *"--status-file ${running_dir}/"* ]]; then
+      printf 'Detached no-wait worker %s ignored SIGTERM; sending SIGKILL.\n' "$worker_pid" >>"$cleanup_log"
+      cleanup_failed=1
+      kill -KILL "$worker_pid" 2>/dev/null || true
+    fi
+  done < <(ps -axo pid=,command= | awk -v root="$running_dir" '
+    index($0, "/cli/commands/noWaitWorker.js ") &&
+      index($0, "--status-file " root "/") { print $1 }
+  ')
+
+  # Capture the exact managed network scope while at least one registered
+  # fixture container still exists. Networks are test-owned teardown state,
+  # but are not removed by the ordinary destroy command.
+  for (( attempt=0; attempt<container_count; attempt++ )); do
+    runtime="${runtimes[$attempt]}"
+    container_name="${container_names[$attempt]}"
+    workspace_scope=$(
+      "$runtime" container inspect "$container_name" \
+        --format '{{ index .Config.Labels "io.assistos.ploinky.workspace" }}' 2>/dev/null || true
+    )
+    if [[ -n "$workspace_scope" && "$seen_scopes" != *"|${workspace_scope}|"* ]]; then
+      workspace_scopes+=("$workspace_scope")
+      workspace_scope_runtimes+=("$runtime")
+      seen_scopes+="${workspace_scope}|"
+      workspace_scope_count=$((workspace_scope_count + 1))
+    fi
+  done
+
+  if ! (
+    cd "$workspace" && ploinky destroy
+  ) >>"$cleanup_log" 2>&1; then
+    cleanup_failed=1
+  fi
+
+  # Prove every exact registered runtime is absent. If ordinary destroy left
+  # one behind, remove only the record whose immutable labels still match and
+  # fail the test so cleanup cannot silently mask the regression.
+  for (( attempt=0; attempt<container_count; attempt++ )); do
+    runtime="${runtimes[$attempt]}"
+    container_name="${container_names[$attempt]}"
+    instance_id="${instance_ids[$attempt]}"
+    enable_generation="${enable_generations[$attempt]}"
+    if "$runtime" container inspect "$container_name" >/dev/null 2>&1; then
+      if "$runtime" container inspect "$container_name" | jq -e \
+        --arg instance_id "$instance_id" \
+        --arg enable_generation "$enable_generation" '
+          .[0].Config.Labels["io.assistos.ploinky.managed"] == "1"
+          and .[0].Config.Labels["io.assistos.ploinky.instance-id"] == $instance_id
+          and .[0].Config.Labels["io.assistos.ploinky.enable-generation"] == $enable_generation
+        ' >/dev/null 2>&1; then
+        printf 'Ordinary destroy preserved exact fixture container %s.\n' "$container_name" >>"$cleanup_log"
+        cleanup_failed=1
+        "$runtime" container rm -f "$container_name" >>"$cleanup_log" 2>&1 || true
+      else
+        printf 'Refusing to remove container %s without exact fixture labels.\n' "$container_name" >>"$cleanup_log"
+        cleanup_failed=1
+      fi
+    fi
+    if "$runtime" container inspect "$container_name" >/dev/null 2>&1; then
+      printf 'Exact fixture container %s still exists after cleanup.\n' "$container_name" >>"$cleanup_log"
+      cleanup_failed=1
+    fi
+  done
+
+  for (( attempt=0; attempt<workspace_scope_count; attempt++ )); do
+    workspace_scope="${workspace_scopes[$attempt]}"
+    runtime="${workspace_scope_runtimes[$attempt]}"
+    while IFS= read -r network_name; do
+      [[ -n "$network_name" ]] || continue
+      labels=$("$runtime" network inspect "$network_name" --format '{{json .Labels}}' 2>/dev/null || true)
+      attached_containers=$("$runtime" network inspect "$network_name" --format '{{json .Containers}}' 2>/dev/null || true)
+      if [[ "$labels" == *'"io.assistos.ploinky.managed":"1"'* \
+        && "$labels" == *"\"io.assistos.ploinky.workspace\":\"${workspace_scope}\""* \
+        && $(jq -r 'if type == "object" and length == 0 then "empty" else "occupied" end' \
+          <<<"${attached_containers:-null}" 2>/dev/null || true) == 'empty' ]]; then
+        "$runtime" network rm "$network_name" >>"$cleanup_log" 2>&1 || cleanup_failed=1
+      else
+        printf 'Refusing to remove non-empty or foreign network %s.\n' "$network_name" >>"$cleanup_log"
+        cleanup_failed=1
+      fi
+    done < <("$runtime" network ls \
+      --filter "label=io.assistos.ploinky.workspace=${workspace_scope}" \
+      --format '{{.Name}}')
+    if "$runtime" network ls \
+      --filter "label=io.assistos.ploinky.workspace=${workspace_scope}" \
+      --format '{{.Name}}' | grep -q .; then
+      printf 'Managed fixture networks still exist for workspace scope %s.\n' "$workspace_scope" >>"$cleanup_log"
+      cleanup_failed=1
+    fi
+  done
+
+  # Destroy uses bounded Router shutdown. Give the exact processes, listener,
+  # and health socket the same bounded convergence window before proving they
+  # are absent, so teardown does not mistake normal asynchronous exit for a
+  # leak while still failing closed on a real survivor.
+  for (( attempt=0; attempt<80; attempt++ )); do
+    terminal_observed=1
+    for worker_pid in "$router_listener_pid" "$router_manager_pid"; do
+      if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$worker_pid" 2>/dev/null; then
+        terminal_observed=0
+      fi
+    done
+    if [[ -n "$router_port" ]] \
+      && lsof -nP -iTCP:"$router_port" -sTCP:LISTEN >/dev/null 2>&1; then
+      terminal_observed=0
+    fi
+    if [[ -n "${PLOINKY_ROUTER_HEALTH_SOCKET:-}" && -e "$PLOINKY_ROUTER_HEALTH_SOCKET" ]]; then
+      terminal_observed=0
+    fi
+    (( terminal_observed == 1 )) && break
+    sleep 0.25
+  done
+
+  for worker_pid in "$router_listener_pid" "$router_manager_pid"; do
+    [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] || continue
+    if kill -0 "$worker_pid" 2>/dev/null; then
+      printf 'Fixture Router process %s survived destroy.\n' "$worker_pid" >>"$cleanup_log"
+      cleanup_failed=1
+    fi
+  done
+  if ps -axo command= | awk -v root="$running_dir" '
+    index($0, "/cli/commands/noWaitWorker.js ") &&
+      index($0, "--status-file " root "/") { found=1 }
+    END { exit(found ? 0 : 1) }
+  '; then
+    printf 'A detached no-wait worker still names the fixture status root.\n' >>"$cleanup_log"
+    cleanup_failed=1
+  fi
+  if [[ -n "$router_port" ]] && lsof -nP -iTCP:"$router_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    printf 'Fixture Router port %s is still listening.\n' "$router_port" >>"$cleanup_log"
+    cleanup_failed=1
+  fi
+  if [[ -n "${PLOINKY_ROUTER_HEALTH_SOCKET:-}" && -e "$PLOINKY_ROUTER_HEALTH_SOCKET" ]]; then
+    printf 'Fixture Router health socket still exists at %s.\n' "$PLOINKY_ROUTER_HEALTH_SOCKET" >>"$cleanup_log"
+    cleanup_failed=1
+  fi
+
+  if (( cleanup_failed != 0 )); then
+    echo "Latched no-wait fixture cleanup failed; preserved evidence at '${workspace}'." >&2
+    cat "$cleanup_log" >&2
+    return 1
+  fi
+  rm -rf "$workspace"
+}
+
+fast_graph_finish_latched_workspace() {
+  local workspace="$1"
+
+  # The explicit final cleanup owns the only teardown attempt from this point.
+  # Disarm the failure trap first so a nonzero cleanup result preserves its
+  # evidence instead of invoking cleanup again against partially cleaned state.
+  trap - EXIT
+  fast_graph_cleanup_latched_workspace "$workspace"
+}
+
 fast_graph_init_workspace() {
   local workspace="$1"
   local router_port="$2"
@@ -609,5 +922,448 @@ EOF
   if grep -q "from-shell-provider" "$metadata_file"; then
     echo "Provider metadata must not contain raw output values." >&2
     return 1
+  fi
+)
+
+fast_graph_create_latched_no_wait_http_agent() {
+  local repo_root="$1"
+  local agent_name="$2"
+  local response_text="$3"
+  local agent_dir="${repo_root}/${agent_name}"
+
+  mkdir -p "$agent_dir"
+  cat >"$agent_dir/latched-http.js" <<'EOF'
+const fs = require('node:fs');
+const http = require('node:http');
+const path = require('node:path');
+
+const workspacePath = process.env.WORKSPACE_PATH || process.cwd();
+const blockedMarker = path.join(workspacePath, 'worker-starting-and-blocked');
+const releaseFile = path.join(workspacePath, 'release-readiness');
+const probeCountFile = path.join(workspacePath, 'startup-probe-header-count');
+const port = Number(process.env.PORT || 7000);
+const responseText = process.env.RESPONSE_TEXT || 'ready';
+const readyElementId = process.env.READY_ELEMENT_ID || 'agent-ready';
+const watchdogMs = Number(process.env.LATCH_WATCHDOG_MS || 180000);
+const startedAt = Date.now();
+let startupProbeHeaderCount = 0;
+
+fs.mkdirSync(workspacePath, { recursive: true });
+fs.writeFileSync(probeCountFile, '0\n', 'utf8');
+fs.writeFileSync(blockedMarker, `${new Date().toISOString()}\n`, { encoding: 'utf8', flag: 'wx' });
+
+function recordProbeHeader(req) {
+  if (Object.prototype.hasOwnProperty.call(req.headers, 'x-ploinky-agent-startup-probe')) {
+    startupProbeHeaderCount += 1;
+    fs.writeFileSync(probeCountFile, `${startupProbeHeaderCount}\n`, 'utf8');
+  }
+}
+
+function responseHeaders(contentType) {
+  return {
+    'cache-control': 'no-store',
+    'content-type': contentType,
+    'x-test-startup-probe-count': String(startupProbeHeaderCount),
+  };
+}
+
+function startServer() {
+  const server = http.createServer((req, res) => {
+    recordProbeHeader(req);
+    if (req.url === '/index.html' || req.url === '/') {
+      const body = `<!doctype html>
+<html lang="en" data-agent-asset="pending">
+<head><meta charset="utf-8"><title>Latched fixture ready</title></head>
+<body><main id="${readyElementId}" data-startup-probe-count="${startupProbeHeaderCount}">${responseText}</main><script src="ready-asset.js"></script></body>
+</html>`;
+      res.writeHead(200, responseHeaders('text/html; charset=utf-8'));
+      res.end(body);
+      return;
+    }
+    if (req.url === '/ready-asset.js') {
+      res.writeHead(200, responseHeaders('application/javascript; charset=utf-8'));
+      res.end("document.documentElement.dataset.agentAsset = 'loaded';\n");
+      return;
+    }
+    if (req.url === '/api/status' || req.url === '/health') {
+      res.writeHead(200, responseHeaders('application/json; charset=utf-8'));
+      res.end(JSON.stringify({ ok: true, startupProbeHeaderCount }));
+      return;
+    }
+    if (req.url === '/favicon.ico') {
+      res.writeHead(204, responseHeaders('image/x-icon'));
+      res.end();
+      return;
+    }
+    res.writeHead(404, responseHeaders('application/json; charset=utf-8'));
+    res.end(JSON.stringify({ error: 'NOT_FOUND' }));
+  });
+  server.listen(port, '0.0.0.0');
+}
+
+const latchPoll = setInterval(() => {
+  if (fs.existsSync(releaseFile)) {
+    clearInterval(latchPoll);
+    startServer();
+    return;
+  }
+  if (Date.now() - startedAt >= watchdogMs) {
+    clearInterval(latchPoll);
+    process.stderr.write('latched fixture watchdog expired before release\n');
+    process.exit(70);
+  }
+}, 50);
+EOF
+
+  cat >"$agent_dir/manifest.json" <<EOF
+{
+  "lite-sandbox": true,
+  "container": "node:20-bullseye",
+  "agent": "node /code/latched-http.js",
+  "readiness": {
+    "protocol": "tcp",
+    "port": 7000
+  },
+  "routerAccess": {
+    "httpRoutes": [
+      { "path": "/index.html", "access": "public" },
+      { "path": "/ready-asset.js", "access": "public" },
+      { "path": "/api/status", "access": "public" },
+      { "path": "/health", "access": "public" }
+    ]
+  },
+  "profiles": {
+    "default": {
+      "env": {
+        "LATCH_WATCHDOG_MS": "180000",
+        "READY_ELEMENT_ID": "${response_text}",
+        "RESPONSE_TEXT": "${response_text}"
+      }
+    }
+  }
+}
+EOF
+}
+
+fast_graph_create_targetless_no_wait_agent() {
+  local repo_root="$1"
+  local agent_dir="${repo_root}/targetlessAgent"
+
+  mkdir -p "$agent_dir"
+  cat >"$agent_dir/targetless.js" <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const workspacePath = process.env.WORKSPACE_PATH || process.cwd();
+fs.mkdirSync(workspacePath, { recursive: true });
+fs.writeFileSync(
+  path.join(workspacePath, 'targetless-running'),
+  `${new Date().toISOString()}\n`,
+  { encoding: 'utf8', flag: 'wx' }
+);
+setInterval(() => {}, 60000);
+EOF
+
+  cat >"$agent_dir/manifest.json" <<'EOF'
+{
+  "lite-sandbox": true,
+  "container": "node:20-bullseye",
+  "start": "node /code/targetless.js",
+  "readiness": {
+    "protocol": "none"
+  },
+  "routerAccess": {
+    "httpRoutes": [
+      { "path": "/index.html", "access": "public" }
+    ]
+  },
+  "profiles": {
+    "default": {
+      "network": {
+        "mode": "none"
+      }
+    }
+  }
+}
+EOF
+}
+
+fast_graph_create_latched_no_wait_fixture() {
+  local workspace="$1"
+  local router_port="$2"
+  local repo_root
+
+  fast_graph_init_workspace "$workspace" "$router_port" "noWaitFixtureRepo"
+  repo_root="$workspace/.ploinky/repos/noWaitFixtureRepo"
+  fast_graph_create_latched_no_wait_http_agent "$repo_root" "slowAgent" "slow-agent-ready"
+  fast_graph_create_latched_no_wait_http_agent "$repo_root" "rotatorAgent" "rotator-agent-ready"
+  fast_graph_create_targetless_no_wait_agent "$repo_root"
+  fast_graph_create_start_http_agent \
+    "$repo_root" \
+    "launcher" \
+    "0" \
+    '["slowAgent no-wait", "rotatorAgent no-wait", "targetlessAgent no-wait"]' \
+    'launcher-ready'
+}
+
+fast_graph_wait_for_exact_file() {
+  local target="$1"
+  local label="$2"
+  local attempts="${3:-480}"
+  local i
+
+  for (( i=0; i<attempts; i++ )); do
+    if [[ -f "$target" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "Timed out waiting for ${label} at '${target}'." >&2
+  return 1
+}
+
+fast_graph_release_latch_atomically() {
+  local release_file="$1"
+  local temporary_file="${release_file}.tmp.$$"
+
+  if [[ -e "$release_file" || -e "$temporary_file" ]]; then
+    echo "Latch release target already exists: '${release_file}'." >&2
+    return 1
+  fi
+  (
+    umask 077
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$temporary_file"
+    mv "$temporary_file" "$release_file"
+  )
+}
+
+fast_graph_startup_request() {
+  local url="$1"
+  local body_file="$2"
+  local headers_file="$3"
+  shift 3
+  curl --http1.1 -sS --max-time 5 \
+    -D "$headers_file" \
+    -o "$body_file" \
+    -w '%{http_code}' \
+    "$@" \
+    "$url"
+}
+
+fast_graph_wait_for_probe_state() {
+  local url="$1"
+  local expected_status="$2"
+  local expected_state="$3"
+  local body_file="$4"
+  local headers_file="$5"
+  local attempts="${6:-240}"
+  local status
+  local curl_exit=0
+  local i
+
+  for (( i=0; i<attempts; i++ )); do
+    : >"$body_file"
+    : >"$headers_file"
+    if status=$(fast_graph_startup_request \
+        "$url" "$body_file" "$headers_file" \
+        -H 'Accept: application/json' \
+        -H 'Sec-Fetch-Dest: empty' \
+        -H 'Sec-Fetch-Mode: cors' \
+        -H 'X-Ploinky-Agent-Startup-Probe: 1'); then
+      curl_exit=0
+    else
+      curl_exit=$?
+      status="curl_error"
+    fi
+    if [[ "$status" == "$expected_status" ]] \
+      && jq -e --arg state "$expected_state" '.state == $state' "$body_file" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "Probe did not reach state '${expected_state}' with HTTP ${expected_status}." >&2
+  echo "Last observed probe status: ${status} (curl exit ${curl_exit})." >&2
+  [[ -s "$body_file" ]] && cat "$body_file" >&2
+  return 1
+}
+
+fast_test_latched_no_wait_loading_transition() (
+  set -euo pipefail
+
+  local workspace
+  local router_port
+  local start_log
+  local slow_blocked
+  local slow_release
+  local rotator_blocked
+  local rotator_release
+  local targetless_marker
+  local body_file
+  local headers_file
+  local route_url
+  local targetless_url
+  local initial_status
+  local fetch_status
+  local mcp_status
+  local websocket_status
+  local active_status
+  local first_ready_generation
+  local rotated_generation
+  local fixture_socket
+
+  workspace=$(mktemp -d -t ploinky-no-wait-latched-XXXXXX)
+  trap "fast_graph_cleanup_latched_workspace $(printf '%q' "$workspace")" EXIT
+  # The managed routing topology is deliberately persisted at the canonical
+  # Router port. Test isolation comes from the temporary workspace and its
+  # loopback-only runtime, not from mutating that topology contract.
+  router_port=8080
+  fast_graph_create_latched_no_wait_fixture "$workspace" "$router_port"
+  fixture_socket="$PLOINKY_ROUTER_HEALTH_SOCKET"
+
+  (
+    cd "$workspace"
+    ploinky enable repo noWaitFixtureRepo >/dev/null 2>&1
+  )
+
+  start_log="$workspace/.ploinky/logs/latched-no-wait-start.log"
+  fast_graph_start_workspace "$workspace" "launcher" "$router_port" "$start_log"
+  fast_graph_wait_for_router_port "$router_port" "$start_log"
+  find_file_pattern_line "$start_log" "[start] launcher: ready after" >/dev/null
+
+  slow_blocked="$workspace/.data/slowAgent/worker-starting-and-blocked"
+  slow_release="$workspace/.data/slowAgent/release-readiness"
+  rotator_blocked="$workspace/.data/rotatorAgent/worker-starting-and-blocked"
+  rotator_release="$workspace/.data/rotatorAgent/release-readiness"
+  targetless_marker="$workspace/.data/targetlessAgent/targetless-running"
+  fast_graph_wait_for_exact_file "$slow_blocked" "slowAgent blocked marker"
+  fast_graph_wait_for_exact_file "$rotator_blocked" "rotatorAgent blocked marker"
+  fast_graph_wait_for_exact_file "$targetless_marker" "targetlessAgent running marker"
+  [[ ! -e "$slow_release" ]]
+  [[ ! -e "$rotator_release" ]]
+
+  body_file="$workspace/response-body.json"
+  headers_file="$workspace/response-headers.txt"
+  route_url="http://127.0.0.1:${router_port}/slowAgent/index.html"
+  targetless_url="http://127.0.0.1:${router_port}/targetlessAgent/index.html"
+
+  initial_status=$(fast_graph_startup_request \
+    "$route_url" "$body_file" "$headers_file" \
+    -H 'Accept: text/html' \
+    -H 'Sec-Fetch-Dest: document' \
+    -H 'Sec-Fetch-Mode: navigate')
+  [[ "$initial_status" == "503" ]]
+  grep -Eiq '^content-type: text/html' "$headers_file"
+  grep -Fq 'data-ploinky-agent-startup-page="starting"' "$body_file"
+  grep -Fq 'This page will open automatically when it is ready.' "$body_file"
+  if grep -Eiq 'runId|instanceId|enableGeneration|workerPid|statusFile|container(Id|Name)?|\.ploinky|/Users/|/root/|token|secret' "$body_file"; then
+    echo "Startup document exposed a raw lifecycle or credential-like value." >&2
+    return 1
+  fi
+
+  fast_graph_wait_for_probe_state "$route_url" "202" "starting" "$body_file" "$headers_file"
+  jq -e '
+    .state == "starting"
+    and (.generation | test("^sha256:[a-f0-9]{64}$"))
+    and .retryAfterMs == 1000
+    and ((keys - ["generation", "retryAfterMs", "state"]) | length == 0)
+  ' "$body_file" >/dev/null
+
+  fetch_status=$(fast_graph_startup_request \
+    "$route_url" "$body_file" "$headers_file" \
+    -H 'Accept: application/json' \
+    -H 'Sec-Fetch-Dest: empty' \
+    -H 'Sec-Fetch-Mode: cors')
+  [[ "$fetch_status" == "503" ]]
+  jq -e '. == {"error":"TARGET_INACTIVE"}' "$body_file" >/dev/null
+  grep -Eiq '^content-type: application/json' "$headers_file"
+
+  mcp_status=$(fast_graph_startup_request \
+    "http://127.0.0.1:${router_port}/slowAgent/mcp" "$body_file" "$headers_file" \
+    -H 'Accept: application/json')
+  [[ "$mcp_status" == "503" ]]
+  ! grep -Fq 'data-ploinky-agent-startup-page=' "$body_file"
+
+  websocket_status=$(fast_graph_startup_request \
+    "$route_url" "$body_file" "$headers_file" \
+    -H 'Connection: Upgrade' \
+    -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==')
+  [[ "$websocket_status" != "101" ]]
+  ! grep -Fq 'data-ploinky-agent-startup-page=' "$body_file"
+
+  initial_status=$(fast_graph_startup_request \
+    "$targetless_url" "$body_file" "$headers_file" \
+    -H 'Accept: text/html' \
+    -H 'Sec-Fetch-Dest: document' \
+    -H 'Sec-Fetch-Mode: navigate')
+  [[ "$initial_status" == "503" ]]
+  jq -e '. == {"error":"TARGET_INACTIVE"}' "$body_file" >/dev/null
+  fast_graph_wait_for_probe_state "$targetless_url" "503" "unavailable" "$body_file" "$headers_file"
+  jq -e '. == {
+    "state":"unavailable",
+    "code":"route_unavailable",
+    "message":"This agent does not provide a web page."
+  }' "$body_file" >/dev/null
+
+  fast_graph_release_latch_atomically "$slow_release"
+  fast_graph_wait_for_probe_state "$route_url" "200" "ready" "$body_file" "$headers_file"
+  first_ready_generation=$(jq -er '.generation | select(test("^sha256:[a-f0-9]{64}$"))' "$body_file")
+  jq -e '
+    .routes.slowAgent.hostPort as $port
+    | ($port | type) == "number"
+      and $port == ($port | floor)
+      and $port >= 1
+      and $port <= 65535
+  ' "$workspace/.ploinky/routing.json" >/dev/null
+
+  active_status=$(fast_graph_startup_request \
+    "$route_url" "$body_file" "$headers_file" \
+    -H 'Accept: text/html' \
+    -H 'Sec-Fetch-Dest: document' \
+    -H 'Sec-Fetch-Mode: navigate')
+  [[ "$active_status" == "200" ]]
+  grep -Fq 'id="slow-agent-ready"' "$body_file"
+  grep -Eiq '^x-test-startup-probe-count: 0' "$headers_file"
+  assert_file_contains "$workspace/.data/slowAgent/startup-probe-header-count" "0"
+  active_status=$(fast_graph_startup_request \
+    "http://127.0.0.1:${router_port}/slowAgent/ready-asset.js" "$body_file" "$headers_file" \
+    -H 'Accept: application/javascript')
+  [[ "$active_status" == "200" ]]
+  grep -Fq "dataset.agentAsset = 'loaded'" "$body_file"
+
+  fast_graph_release_latch_atomically "$rotator_release"
+  for (( active_status=0; active_status<240; active_status++ )); do
+    fast_graph_wait_for_probe_state "$route_url" "200" "ready" "$body_file" "$headers_file" "1" || true
+    rotated_generation=$(jq -r '.generation // ""' "$body_file" 2>/dev/null || true)
+    if [[ "$rotated_generation" =~ ^sha256:[a-f0-9]{64}$ ]] \
+      && [[ "$rotated_generation" != "$first_ready_generation" ]]; then
+      break
+    fi
+    sleep 0.25
+  done
+  if [[ -z "$rotated_generation" || "$rotated_generation" == "$first_ready_generation" ]]; then
+    echo "Explicit rotator release did not change the reported edge generation." >&2
+    return 1
+  fi
+  assert_file_contains "$workspace/.data/slowAgent/startup-probe-header-count" "0"
+
+  if ! fast_graph_finish_latched_workspace "$workspace"; then
+    return 1
+  fi
+  [[ ! -e "$workspace" ]]
+  [[ ! -e "$slow_blocked" ]]
+  [[ ! -e "$slow_release" ]]
+  [[ ! -e "$rotator_blocked" ]]
+  [[ ! -e "$rotator_release" ]]
+  [[ ! -e "$fixture_socket" ]]
+
+  if [[ -n "${PLOINKY_NO_WAIT_LATCH_EVIDENCE_FILE:-}" ]]; then
+    local ploinky_source_root
+    ploinky_source_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+    node "$ploinky_source_root/tests/release/noWaitLoadingEvidence.mjs" \
+      record-latch-pass \
+      --output "$PLOINKY_NO_WAIT_LATCH_EVIDENCE_FILE" \
+      --repo-root "$ploinky_source_root"
   fi
 )

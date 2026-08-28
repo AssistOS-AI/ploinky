@@ -70,6 +70,7 @@ import {
     RESERVED_AGENT_REGISTRY_KEYS,
     resolveEnabledAgentRecordFromMap,
 } from './agentRegistryResolver.js';
+import { retireNoWaitRunMarkers } from '../commands/noWaitMarkerLifecycle.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -683,6 +684,7 @@ function bootstrapPreparedMcpToolPolicy(routes) {
 export function prepareAgentEnableBatch(requests, {
     reason = 'agent-enable-batch-prelaunch',
     availabilityMode = 'additive',
+    retireNoWaitMarkers = retireNoWaitRunMarkers,
 } = {}) {
     if (!Array.isArray(requests)) {
         throw new Error('prepare agent enable batch: requests must be an array');
@@ -731,6 +733,17 @@ export function prepareAgentEnableBatch(requests, {
             && plans.some((plan) => previousAgents?.[plan.containerName]?.type === 'agent')
             ? 'replacement'
             : availabilityMode;
+        // A fixed current-marker may outlive a prior disable/remove, so a
+        // genuinely new registry key has no predecessor record with which to
+        // discover it. Retire every requested container: constrain an existing
+        // marker to its exact predecessor tuple, or retire a secure orphan by
+        // name before the new tuple can be persisted.
+        const supersededNoWaitRecords = plans.map(({ containerName }) => {
+            const predecessor = previousAgents?.[containerName];
+            return predecessor?.type === 'agent'
+                ? { containerName, record: predecessor }
+                : containerName;
+        });
         withEdgeGenerationApplyLock((applyLockCapability) => {
             for (const { input } of resolvedRequests) {
                 const currentBytes = fs.readFileSync(input.manifestPath);
@@ -745,6 +758,7 @@ export function prepareAgentEnableBatch(requests, {
             );
             if (effectiveAvailabilityMode === 'replacement') {
                 inactivateEdgeRoutingGeneration(`${reason}:source-stage`, { applyLockCapability });
+                retireNoWaitMarkers(supersededNoWaitRecords);
                 for (const plan of plans) {
                     if (!plan.credentialUpdate) continue;
                     setUsersPayload(plan.credentialUpdate.usersVar, plan.credentialUpdate.payload);
@@ -761,6 +775,7 @@ export function prepareAgentEnableBatch(requests, {
                 fs.writeFileSync(policyFile, JSON.stringify(policy, null, 2));
                 preparedGeneration = prepareEdgeRoutingGeneration({ reason, applyLockCapability });
             } else if (effectiveAvailabilityMode === 'additive') {
+                retireNoWaitMarkers(supersededNoWaitRecords);
                 preparedGeneration = prepareAdditiveEdgeRoutingGeneration({
                     reason,
                     routing,
@@ -986,9 +1001,15 @@ function stageAgentDisableGeneration(map, disabledRecords, {
     writeRoutingImpl = (routing) => writeRoutingConfig(routing, { coordinate: false }),
     prepareGeneration = prepareEdgeRoutingGeneration,
     withApplyLock = withEdgeGenerationApplyLock,
+    retireNoWaitMarkersImpl = retireNoWaitRunMarkers,
 } = {}) {
     return withApplyLock((applyLockCapability) => {
         inactivateGeneration(reason, { applyLockCapability });
+        retireNoWaitMarkersImpl(disabledRecords.map(({ containerName, record }) => (
+            record?.type === 'agent'
+                ? { containerName, record }
+                : containerName
+        )));
         const routing = removeDisabledRoutes(readRoutingImpl(), disabledRecords);
         saveAgentsImpl(map, { coordinate: false, applyLockCapability });
         writeRoutingImpl(routing, { coordinate: false, applyLockCapability });

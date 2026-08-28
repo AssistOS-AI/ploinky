@@ -21,6 +21,22 @@ const ENABLE_GENERATION = 'generation-0001';
 const RUN_STARTED_AT_MS = 1_760_000_000_000;
 const NOW_MS = RUN_STARTED_AT_MS + 1_000;
 
+function noWaitIdentity({ runId = RUN_A, waveIndex = 0 } = {}) {
+    return {
+        containerName: CONTAINER,
+        instanceId: INSTANCE_ID,
+        enableGeneration: ENABLE_GENERATION,
+        repoName: 'demo',
+        shortAgent: 'shared',
+        alias: '',
+        routeKey: 'shared',
+        runId,
+        runStartedAtMs: RUN_STARTED_AT_MS,
+        waveIndex,
+        statusFile: `${CONTAINER}.${runId}.json`,
+    };
+}
+
 function collector() {
     const chunks = [];
     return {
@@ -80,10 +96,7 @@ function writeMarker(runningDir, { runId = RUN_A, waveIndex = 0, ...overrides } 
     fs.writeFileSync(
         path.join(runningDir, 'no-wait', `${CONTAINER}.current.json`),
         JSON.stringify({
-            runId,
-            runStartedAtMs: RUN_STARTED_AT_MS,
-            statusFile: `${CONTAINER}.${runId}.json`,
-            waveIndex,
+            ...noWaitIdentity({ runId, waveIndex }),
             createdAt: new Date(RUN_STARTED_AT_MS).toISOString(),
             ...overrides,
         }),
@@ -94,14 +107,11 @@ function writeStatus(runningDir, { runId = RUN_A, state = 'starting', ...overrid
     fs.writeFileSync(
         path.join(runningDir, 'no-wait', `${CONTAINER}.${runId}.json`),
         JSON.stringify({
-            containerName: CONTAINER,
+            ...noWaitIdentity({ runId }),
             state,
             sequencePhase: 'active',
             sequencePhaseStartedAtMs: RUN_STARTED_AT_MS,
             sequencePhaseStartedAt: new Date(RUN_STARTED_AT_MS).toISOString(),
-            runId,
-            runStartedAtMs: RUN_STARTED_AT_MS,
-            waveIndex: 0,
             pid: 4242,
             ...overrides,
         }),
@@ -487,13 +497,10 @@ test('a foreign run id, container, wave, or phase in the status fails closed', a
         fs.writeFileSync(
             path.join(env.runningDir, 'no-wait', `${CONTAINER}.${RUN_A}.json`),
             JSON.stringify({
-                containerName: CONTAINER,
+                ...noWaitIdentity(),
                 state: 'starting',
                 sequencePhase: 'active',
                 sequencePhaseStartedAtMs: RUN_STARTED_AT_MS,
-                runId: RUN_A,
-                runStartedAtMs: RUN_STARTED_AT_MS,
-                waveIndex: 0,
                 pid: 4242,
                 ...overrides,
             }),
@@ -553,7 +560,9 @@ test('a dead pid, reused pid, or wrong worker argv fails closed', async (t) => {
                 // The observer must always ask for identity, not just liveness.
                 assert.equal(pid, 4242, label);
                 assert.ok(workerScriptPath.endsWith('/noWaitWorker.js'), label);
-                assert.equal(identity.container, CONTAINER, label);
+                assert.equal(identity.containerName, CONTAINER, label);
+                assert.equal(identity.instanceId, INSTANCE_ID, label);
+                assert.equal(identity.enableGeneration, ENABLE_GENERATION, label);
                 assert.equal(identity.runId, RUN_A, label);
                 const error = new Error(`worker process 4242 ${label}`);
                 error.code = label === 'not running'

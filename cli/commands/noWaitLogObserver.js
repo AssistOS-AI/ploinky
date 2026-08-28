@@ -16,16 +16,17 @@ import pathDefault from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-    MAX_NO_WAIT_WAVE_INDEX,
     noWaitQueuedStatusDeadline,
     resolveNoWaitBarrierTimeouts,
     resolveRunScopedObservation,
 } from './noWaitProtocol.js';
-import { exactRunId } from './noWaitIdentity.js';
 import {
-    NO_WAIT_RUN_ID_PATTERN,
+    NO_WAIT_IMMUTABLE_IDENTITY_FIELDS,
+    exactNoWaitImmutableIdentity,
+    sameNoWaitImmutableIdentity,
+} from './noWaitWorkerArgs.js';
+import {
     noWaitCurrentMarkerPath,
-    noWaitRunScopedStatusName,
     noWaitRunScopedStatusPath,
 } from './noWaitPaths.js';
 import { proveWorkerProcessIdentity } from '../sandbox/processIdentity.js';
@@ -77,57 +78,66 @@ export function readNoWaitRunMarker(containerName, {
         pathApi,
     });
     if (!marker) return null;
-
-    const rawRunId = String(marker.runId || '').trim();
-    if (!NO_WAIT_RUN_ID_PATTERN.test(rawRunId)) {
-        throw noWaitObservationError('the no-wait run marker has no exact run id');
+    let identity;
+    try {
+        identity = exactNoWaitImmutableIdentity(marker, { pathApi });
+    } catch (error) {
+        throw noWaitObservationError(`the no-wait run marker has no complete immutable identity: ${error.message}`);
     }
-    const runId = exactRunId(rawRunId);
-    const runStartedAtMs = publishedInteger(marker.runStartedAtMs);
-    if (!Number.isSafeInteger(runStartedAtMs) || runStartedAtMs < 0) {
-        throw noWaitObservationError('the no-wait run marker has no exact run start');
+    if (identity.containerName !== containerName) {
+        throw noWaitObservationError('the no-wait run marker names a different container');
     }
-    const waveIndex = publishedInteger(marker.waveIndex);
-    if (!Number.isSafeInteger(waveIndex) || waveIndex < 0 || waveIndex > MAX_NO_WAIT_WAVE_INDEX) {
-        throw noWaitObservationError('the no-wait run marker has no valid wave index');
-    }
-    const statusFile = String(marker.statusFile || '');
-    // The marker may only ever name the run-scoped status of its own run, and
-    // only as a basename inside the trusted no-wait status root.
-    if (!statusFile
-        || pathApi.basename(statusFile) !== statusFile
-        || statusFile !== noWaitRunScopedStatusName(containerName, runId)) {
-        throw noWaitObservationError('the no-wait run marker names a foreign status file');
-    }
-    return Object.freeze({ runId, runStartedAtMs, waveIndex, statusFile, markerPath });
+    return Object.freeze({ ...identity, markerPath });
 }
 
 export function sameNoWaitRun(left, right) {
-    return Boolean(left && right)
-        && left.runId === right.runId
-        && left.runStartedAtMs === right.runStartedAtMs
-        && left.waveIndex === right.waveIndex
-        && left.statusFile === right.statusFile;
+    return sameNoWaitImmutableIdentity(left, right);
+}
+
+function immutableIdentityFromRecord(containerName, record, marker) {
+    const alias = record?.alias === undefined || record?.alias === null ? '' : record.alias;
+    try {
+        return exactNoWaitImmutableIdentity({
+            containerName,
+            instanceId: record?.instanceId,
+            enableGeneration: record?.enableGeneration,
+            repoName: record?.repoName,
+            shortAgent: record?.agentName,
+            alias,
+            routeKey: alias || record?.agentName,
+            runId: marker?.runId,
+            runStartedAtMs: marker?.runStartedAtMs,
+            waveIndex: marker?.waveIndex,
+            statusFile: marker?.statusFile,
+        });
+    } catch (error) {
+        throw noWaitObservationError(
+            `the current registry cannot prove the marker identity: ${error.message}`,
+            { superseded: true },
+        );
+    }
 }
 
 export function createNoWaitRunBinding(containerName, record, marker) {
-    const instanceId = typeof record?.instanceId === 'string'
-        && record.instanceId === record.instanceId.trim() ? record.instanceId : '';
-    const enableGeneration = typeof record?.enableGeneration === 'string'
-        && record.enableGeneration === record.enableGeneration.trim() ? record.enableGeneration : '';
-    if (!containerName || record?.type !== 'agent' || !instanceId || !enableGeneration || !marker) {
+    if (!containerName || record?.type !== 'agent' || !marker) {
         throw noWaitObservationError('a no-wait observation requires one exact registry and marker binding');
     }
+    let markerIdentity;
+    try {
+        markerIdentity = exactNoWaitImmutableIdentity(marker);
+    } catch (error) {
+        throw noWaitObservationError(`the no-wait marker identity is invalid: ${error.message}`);
+    }
+    const recordIdentity = immutableIdentityFromRecord(containerName, record, markerIdentity);
+    if (!sameNoWaitRun(recordIdentity, markerIdentity)) {
+        throw noWaitObservationError(
+            'the no-wait marker belongs to a different registry generation',
+            { superseded: true },
+        );
+    }
     return Object.freeze({
-        containerName,
-        instanceId,
-        enableGeneration,
-        marker: Object.freeze({
-            runId: marker.runId,
-            runStartedAtMs: marker.runStartedAtMs,
-            waveIndex: marker.waveIndex,
-            statusFile: marker.statusFile,
-        }),
+        ...markerIdentity,
+        marker: markerIdentity,
     });
 }
 
@@ -156,8 +166,15 @@ export function observeBoundNoWaitRun(binding, {
     readRegistrySnapshot,
 } = {}) {
     const containerName = String(binding?.containerName || '');
-    const boundMarker = binding?.marker;
-    if (!containerName || !boundMarker || typeof readRegistrySnapshot !== 'function') {
+    const rawBoundMarker = binding?.marker;
+    let boundMarker;
+    try {
+        boundMarker = exactNoWaitImmutableIdentity(rawBoundMarker, { pathApi });
+    } catch (_) {
+        throw noWaitObservationError('the no-wait observer received no complete immutable binding');
+    }
+    if (!containerName || typeof readRegistrySnapshot !== 'function'
+        || !NO_WAIT_IMMUTABLE_IDENTITY_FIELDS.every((field) => binding[field] === boundMarker[field])) {
         throw noWaitObservationError('the no-wait observer received no complete immutable binding');
     }
     const observationNowMs = publishedInteger(nowMs);
@@ -200,8 +217,14 @@ export function observeBoundNoWaitRun(binding, {
         }
         classified = { state: 'pending', status: null, statusPath };
     } else {
-        if (String(status.containerName || '') !== containerName) {
-            throw noWaitObservationError('the run-scoped status names a different container');
+        let statusIdentity;
+        try {
+            statusIdentity = exactNoWaitImmutableIdentity(status, { pathApi });
+        } catch (error) {
+            throw noWaitObservationError(`the run-scoped status has no complete immutable identity: ${error.message}`);
+        }
+        if (!sameNoWaitRun(statusIdentity, boundMarker)) {
+            throw noWaitObservationError('the run-scoped status belongs to a different immutable identity');
         }
         let observation;
         try {
@@ -251,11 +274,7 @@ export function observeBoundNoWaitRun(binding, {
             workerScriptPath: fileURLToPath(new URL('./noWaitWorker.js', import.meta.url)),
             runningDir: stateRoot,
             identity: {
-                container: containerName,
-                runId: boundMarker.runId,
-                runStartedAtMs: boundMarker.runStartedAtMs,
-                waveIndex: boundMarker.waveIndex,
-                statusFile: statusPath,
+                ...boundMarker,
             },
         });
     }
@@ -279,8 +298,8 @@ export function observeBoundNoWaitRun(binding, {
     if (!record || record.type !== 'agent') {
         throw noWaitObservationError(`'${containerName}' is no longer an enabled agent`, { superseded: true });
     }
-    if (record.instanceId !== binding.instanceId
-        || record.enableGeneration !== binding.enableGeneration) {
+    const finalRecordIdentity = immutableIdentityFromRecord(containerName, record, boundMarker);
+    if (!sameNoWaitRun(finalRecordIdentity, boundMarker)) {
         throw noWaitObservationError(
             `the runtime generation for '${containerName}' changed during observation`,
             { superseded: true },

@@ -58,10 +58,17 @@ test('one batch stages a non-host dependency and exact host owner before either 
         hosts: {},
     }));
 
+    let retirementEntries = null;
     const prepared = agents.prepareAgentEnableBatch([
         { agentName: 'demo/nonHostDependency', mode: 'global' },
         { agentName: 'media/livekit', mode: 'global' },
-    ], { reason: 'test-complete-graph-prelaunch' });
+    ], {
+        reason: 'test-complete-graph-prelaunch',
+        retireNoWaitMarkers(entries) {
+            retirementEntries = structuredClone(entries);
+            return [];
+        },
+    });
 
     assert.equal(prepared.plans.length, 2);
     const predecessorRegistry = JSON.parse(fs.readFileSync(initialized.paths.agentsFile, 'utf8'));
@@ -72,6 +79,11 @@ test('one batch stages a non-host dependency and exact host owner before either 
     const hostPlan = prepared.plans.find((plan) => plan.shortAgentName === 'livekit');
     assert.ok(nonHostPlan);
     assert.ok(hostPlan);
+    assert.deepEqual(
+        retirementEntries.slice().sort(),
+        prepared.plans.map((plan) => plan.containerName).sort(),
+        'fresh enables retire secure orphan markers before publishing new registry tuples',
+    );
     for (const plan of prepared.plans) {
         assert.equal(Object.hasOwn(routingState.routes[plan.routeKey], 'hostPort'), false);
         assert.equal(Object.hasOwn(routingState.routes[plan.routeKey], 'serviceTargets'), false);
@@ -230,10 +242,50 @@ test('a later batch validation failure cannot mutate credentials consumed by the
     );
 });
 
+test('same-name retirement failure occurs after inactivation but before candidate source persistence', () => {
+    const initialized = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    const registryBefore = fs.readFileSync(initialized.paths.agentsFile, 'utf8');
+    const routingBefore = fs.readFileSync(initialized.paths.routingFile, 'utf8');
+    let retirementEntries = null;
+
+    assert.throws(() => agents.prepareAgentEnableBatch([
+        { agentName: 'demo/nonHostDependency', mode: 'global' },
+    ], {
+        reason: 'test-same-name-retirement-failure',
+        retireNoWaitMarkers(entries) {
+            retirementEntries = structuredClone(entries);
+            throw new Error('test marker retirement failed');
+        },
+    }), /test marker retirement failed/);
+
+    assert.equal(retirementEntries.length, 1);
+    const predecessorRegistry = JSON.parse(registryBefore);
+    assert.deepEqual(
+        predecessorRegistry[retirementEntries[0].containerName],
+        retirementEntries[0].record,
+    );
+    assert.equal(retirementEntries[0].record.type, 'agent');
+    assert.equal(fs.readFileSync(initialized.paths.agentsFile, 'utf8'), registryBefore);
+    assert.equal(fs.readFileSync(initialized.paths.routingFile, 'utf8'), routingBefore);
+    const selector = JSON.parse(fs.readFileSync(initialized.paths.activeSelectorFile, 'utf8'));
+    assert.equal(selector.state, 'inactive');
+
+    // Restore the unchanged predecessor sources as the active baseline so the
+    // following successful replacement test begins from a valid generation.
+    coordinated.applyEdgeRoutingGeneration({ reason: 'test-retirement-failure-baseline-restore' });
+});
+
 test('same-name re-enable uses fail-closed replacement instead of an additive shadow', () => {
+    let retirementEntries = null;
     const prepared = agents.prepareAgentEnableBatch([
         { agentName: 'demo/nonHostDependency', mode: 'global' },
-    ], { reason: 'test-same-name-replacement' });
+    ], {
+        reason: 'test-same-name-replacement',
+        retireNoWaitMarkers(entries) {
+            retirementEntries = structuredClone(entries);
+            return [];
+        },
+    });
 
     assert.equal(prepared.availabilityMode, 'replacement');
     assert.equal(prepared.preparedGeneration.preparationLease.mode, 'replacement');
@@ -241,6 +293,13 @@ test('same-name re-enable uses fail-closed replacement instead of an additive sh
     assert.throws(
         () => edge.loadActiveEdgeRoutingGeneration({ workspaceRoot: workspace }),
         { code: 'EDGE_GENERATION_INACTIVE' },
+    );
+    assert.equal(retirementEntries.length, 1);
+    assert.equal(retirementEntries[0].containerName, prepared.plans[0].containerName);
+    assert.notEqual(
+        retirementEntries[0].record.enableGeneration,
+        prepared.plans[0].enableGeneration,
+        'the retired marker constraint must name the predecessor generation',
     );
     edge.abortEdgeRoutingPreparation(prepared.preparedGeneration.preparationLease, {
         reason: 'test-same-name-replacement-complete',

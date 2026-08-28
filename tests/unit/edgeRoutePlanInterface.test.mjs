@@ -71,5 +71,11 @@ test('edge route access keeps the original relay plan access contract', () => {
         kind: 'agent-root',
         decision: authenticatedAgentAccess,
     }), authenticatedAgentAccess);
+    assert.equal(httpAccessForEdgeRoutePlan({
+        ok: true,
+        kind: 'agent-root-pending',
+        decision: authenticatedAgentAccess,
+        target: null,
+    }), authenticatedAgentAccess);
     assert.equal(httpAccessForEdgeRoutePlan({ ok: false, access: publicConventionAccess }), null);
 });

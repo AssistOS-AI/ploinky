@@ -50,12 +50,17 @@ _logs_write_no_wait_run() {
   local started=1760000000000
   printf '%s' "$body" > "$root/.ploinky/logs/no-wait/${container}.${run_id}.log"
   cat > "$root/.ploinky/running/no-wait/${container}.current.json" <<EOF
-{"runId":"${run_id}","runStartedAtMs":${started},"statusFile":"${container}.${run_id}.json","waveIndex":0}
+{"containerName":"${container}","instanceId":"instance-fixture","enableGeneration":"generation-fixture",
+ "repoName":"logsFixture","shortAgent":"fixture","alias":"","routeKey":"fixture",
+ "runId":"${run_id}","runStartedAtMs":${started},"waveIndex":0,
+ "statusFile":"${container}.${run_id}.json"}
 EOF
   cat > "$root/.ploinky/running/no-wait/${container}.${run_id}.json" <<EOF
-{"containerName":"${container}","state":"${state}","sequencePhase":"active",
- "sequencePhaseStartedAtMs":${started},"runId":"${run_id}","runStartedAtMs":${started},
- "waveIndex":0,"pid":1,"phase":"readiness",
+{"containerName":"${container}","instanceId":"instance-fixture","enableGeneration":"generation-fixture",
+ "repoName":"logsFixture","shortAgent":"fixture","alias":"","routeKey":"fixture",
+ "runId":"${run_id}","runStartedAtMs":${started},"waveIndex":0,
+ "statusFile":"${container}.${run_id}.json","state":"${state}","sequencePhase":"active",
+ "sequencePhaseStartedAtMs":${started},"pid":1,"phase":"readiness",
  "error":{"message":"probe never became ready","stack":"Error: probe never became ready\\n    at internal"}}
 EOF
   # The reference has to resolve before any observation happens, so the
@@ -272,7 +277,10 @@ test_logs_startup_runtime_handoff_order() {
   mkdir -p "$root/.ploinky/logs/agents"
   printf '%s\n' "$startup_sentinel" > "$root/.ploinky/logs/no-wait/${container}.${run_id}.log"
   cat > "$root/.ploinky/running/no-wait/${container}.current.json" <<EOF
-{"runId":"${run_id}","runStartedAtMs":${started},"statusFile":"${container}.${run_id}.json","waveIndex":0}
+{"containerName":"${container}","instanceId":"instance-handoff","enableGeneration":"generation-handoff",
+ "repoName":"logsFixture","shortAgent":"handoff","alias":"","routeKey":"handoff",
+ "runId":"${run_id}","runStartedAtMs":${started},"waveIndex":0,
+ "statusFile":"${container}.${run_id}.json"}
 EOF
   cat > "$root/.ploinky/agents.json" <<EOF
 {"${container}":{"type":"agent","repoName":"logsFixture","agentName":"handoff",
@@ -289,9 +297,11 @@ EOF
     printf '%s\n' "$runtime_sentinel" > "$root/.ploinky/logs/agents/${container}.${digest}.log"
     local temporary="$root/.ploinky/running/no-wait/.${container}.${run_id}.tmp"
     cat > "$temporary" <<EOF
-{"containerName":"${container}","state":"running","sequencePhase":"active",
- "sequencePhaseStartedAtMs":${started},"runId":"${run_id}","runStartedAtMs":${started},
- "waveIndex":0,"pid":${pid}}
+{"containerName":"${container}","instanceId":"instance-handoff","enableGeneration":"generation-handoff",
+ "repoName":"logsFixture","shortAgent":"handoff","alias":"","routeKey":"handoff",
+ "runId":"${run_id}","runStartedAtMs":${started},"waveIndex":0,
+ "statusFile":"${container}.${run_id}.json","state":"running","sequencePhase":"active",
+ "sequencePhaseStartedAtMs":${started},"pid":${pid}}
 EOF
     mv "$temporary" "$root/.ploinky/running/no-wait/${container}.${run_id}.json"
   ) &

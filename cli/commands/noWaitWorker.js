@@ -79,6 +79,7 @@ import {
     exactEpochMs,
     exactNoWaitBarrierEntry,
     exactNoWaitCoordinationStatusPath,
+    exactNoWaitImmutableIdentity,
     exactNoWaitStatusPath,
     exactRunId,
     exactWaveIndex,
@@ -144,6 +145,7 @@ export function writeStatus(containerName, payload, { runningDir = RUNNING_DIR }
 }
 
 export function writeNoWaitWorkerStatus(containerName, payload, {
+    identity,
     runId,
     runStartedAtMs,
     waveIndex,
@@ -151,16 +153,27 @@ export function writeNoWaitWorkerStatus(containerName, payload, {
     runningDir = RUNNING_DIR,
 } = {}) {
     const normalizedRunId = exactRunId(runId);
+    if (runId !== normalizedRunId) {
+        throw new Error('no-wait worker status requires one exact canonical run id');
+    }
     const coordinationStatusFile = exactNoWaitCoordinationStatusPath(statusFile, {
         containerName,
         runId: normalizedRunId,
         runningDir,
     });
+    const immutableIdentity = exactNoWaitImmutableIdentity(identity);
+    const exactRunStartedAtMs = exactEpochMs(runStartedAtMs, 'no-wait run start');
+    const exactWave = exactWaveIndex(waveIndex, 'no-wait worker wave index');
+    if (immutableIdentity.containerName !== containerName
+        || immutableIdentity.runId !== normalizedRunId
+        || immutableIdentity.runStartedAtMs !== exactRunStartedAtMs
+        || immutableIdentity.waveIndex !== exactWave
+        || immutableIdentity.statusFile !== path.basename(coordinationStatusFile)) {
+        throw new Error('no-wait worker status identity does not match its exact coordination binding');
+    }
     const document = {
         ...payload,
-        runId: normalizedRunId,
-        runStartedAtMs: exactEpochMs(runStartedAtMs, 'no-wait run start'),
-        waveIndex: exactWaveIndex(waveIndex, 'no-wait worker wave index'),
+        ...immutableIdentity,
     };
     const canonicalStatusFile = statusPathFor(containerName, { runningDir });
     if (coordinationStatusFile === canonicalStatusFile) {
@@ -496,25 +509,36 @@ async function upsertRoute(routeKey, route, {
 
 export function assertNoWaitRegistryRecord(record, stagedRecord, {
     containerName,
+    instanceId,
+    enableGeneration,
     repoName,
     shortAgent,
     alias,
 }) {
-    const invariantFields = [
+    const exactIdentityFields = [
         ['type', 'agent'],
         ['repoName', repoName],
         ['agentName', shortAgent],
-        ['alias', alias],
-        ['instanceId', stagedRecord?.instanceId],
-        ['enableGeneration', stagedRecord?.enableGeneration],
+        ['instanceId', instanceId],
+        ['enableGeneration', enableGeneration],
+    ];
+    const stagedInvariantFields = [
         ['profile', stagedRecord?.profile],
         ['runMode', stagedRecord?.runMode],
         ['projectPath', stagedRecord?.projectPath],
         ['develRepo', stagedRecord?.develRepo],
     ];
-    const mismatch = !record || invariantFields.some(([field, expected]) => (
-        String(record?.[field] || '') !== String(expected || '')
-    )) || String(record?.auth?.mode || '') !== String(stagedRecord?.auth?.mode || '');
+    const mismatch = !containerName || !instanceId || !enableGeneration
+        || !record || !stagedRecord
+        || exactIdentityFields.some(([field, expected]) => (
+            record[field] !== expected || stagedRecord[field] !== expected
+        ))
+        || (record.alias ?? '') !== alias
+        || (stagedRecord.alias ?? '') !== alias
+        || stagedInvariantFields.some(([field, expected]) => (
+            String(record?.[field] || '') !== String(expected || '')
+        ))
+        || String(record?.auth?.mode || '') !== String(stagedRecord?.auth?.mode || '');
     if (mismatch) {
         throw new Error(`no-wait runtime returned a registry identity inconsistent with '${containerName}'`);
     }
@@ -566,19 +590,21 @@ export function assertNoWaitRuntimeStillExact(result, {
     isSandboxRunning = isBwrapProcessRunning,
     requireRunning = true,
 } = {}) {
-    const containerName = String(result?.containerName || '').trim();
+    const containerName = result?.containerName;
     const record = result?.registryRecord;
-    if (!containerName || containerName !== String(expectedIdentity?.containerName || '')
+    if (typeof containerName !== 'string' || !containerName
+        || containerName !== expectedIdentity?.containerName
         || !record || record.type !== 'agent') {
         throw new Error('no-wait runtime reinspection requires its exact returned identity');
     }
     assertNoWaitRegistryRecord(record, record, expectedIdentity);
     const runtime = String(record.runtime || '').trim();
     const runtimeIdentity = {
-        instanceId: String(record.instanceId || '').trim(),
-        enableGeneration: String(record.enableGeneration || '').trim(),
+        instanceId: record.instanceId,
+        enableGeneration: record.enableGeneration,
     };
-    if (!runtimeIdentity.instanceId || !runtimeIdentity.enableGeneration) {
+    if (typeof runtimeIdentity.instanceId !== 'string' || !runtimeIdentity.instanceId
+        || typeof runtimeIdentity.enableGeneration !== 'string' || !runtimeIdentity.enableGeneration) {
         throw new Error(`no-wait runtime '${containerName}' lost its immutable identity before publication`);
     }
     if (isSandboxRuntime(runtime)) {
@@ -636,10 +662,13 @@ function noWaitLifecyclePublishesCandidate(lifecycle, candidate) {
     const activeRecord = lifecycle.record;
     const candidateRecord = candidate?.registryRecord;
     if (!activeRecord || !candidateRecord
-        || String(lifecycle.route?.container || '') !== String(candidate?.containerName || '')
-        || String(activeRecord.instanceId || '') !== String(candidateRecord.instanceId || '')
-        || String(activeRecord.enableGeneration || '') !== String(candidateRecord.enableGeneration || '')
-        || String(activeRecord.runtime || '') !== String(candidateRecord.runtime || '')) {
+        || typeof lifecycle.route?.container !== 'string'
+        || lifecycle.route.container !== candidate?.containerName
+        || activeRecord.instanceId !== candidateRecord.instanceId
+        || activeRecord.enableGeneration !== candidateRecord.enableGeneration
+        || typeof activeRecord.runtime !== 'string'
+        || !activeRecord.runtime
+        || activeRecord.runtime !== candidateRecord.runtime) {
         return false;
     }
     if (isSandboxRuntime(activeRecord.runtime)) return true;
@@ -856,6 +885,8 @@ export async function runNoWaitLifecycleTransaction(identity, {
 
 function assertNoWaitLifecycleIdentity(active, {
     containerName,
+    instanceId,
+    enableGeneration,
     repoName,
     shortAgent,
     alias,
@@ -864,22 +895,24 @@ function assertNoWaitLifecycleIdentity(active, {
 }) {
     const record = active?.generation?.agents?.[containerName];
     if (!record || record.type !== 'agent'
-        || String(record.repoName || '') !== repoName
-        || String(record.agentName || '') !== shortAgent
-        || String(record.alias || '') !== alias
-        || !String(record.instanceId || '')
-        || !String(record.enableGeneration || '')) {
+        || record.repoName !== repoName
+        || record.agentName !== shortAgent
+        || (record.alias ?? '') !== alias
+        || record.instanceId !== instanceId
+        || record.enableGeneration !== enableGeneration) {
         throw new Error(`no-wait lifecycle requires the exact staged registry identity for '${containerName}'`);
     }
     const route = active?.generation?.routing?.routes?.[routeKey];
     if (!route
-        || String(route.container || '') !== containerName
-        || String(route.repo || '') !== repoName
-        || String(route.agent || '') !== shortAgent
-        || String(route.alias || '') !== alias
-        || !String(route.hostPath || '')
-        || !String(agentPath || '')
-        || path.resolve(String(route.hostPath)) !== path.resolve(String(agentPath))) {
+        || route.container !== containerName
+        || route.repo !== repoName
+        || route.agent !== shortAgent
+        || (route.alias ?? '') !== alias
+        || typeof route.hostPath !== 'string'
+        || typeof agentPath !== 'string'
+        || !route.hostPath
+        || !agentPath
+        || path.resolve(route.hostPath) !== path.resolve(agentPath)) {
         throw new Error(`no-wait lifecycle requires one exact staged route identity for '${routeKey}'`);
     }
     const manifest = active?.generation?.manifests?.[routeKey];
@@ -1442,11 +1475,14 @@ async function main() {
         process.exit(2);
         return;
     }
-    const containerName = args.container;
-    const shortAgent = args.shortAgent;
-    const repoName = args.repo;
-    const alias = args.alias || '';
-    const routeKey = args.routeKey || alias || shortAgent;
+    const immutableIdentity = args.identity;
+    const {
+        containerName,
+        shortAgent,
+        repoName,
+        alias,
+        routeKey,
+    } = immutableIdentity;
     const manifestPath = args.manifestPath;
     const agentPath = args.agentPath || (manifestPath ? path.dirname(manifestPath) : '');
     const routerPort = args.routerPort || '';
@@ -1466,8 +1502,8 @@ async function main() {
         statusFile: coordinationStatusFile,
         waitForStatuses,
     } = runScoped;
-
     const publishStatus = (payload) => writeNoWaitWorkerStatus(containerName, payload, {
+        identity: immutableIdentity,
         runId,
         runStartedAtMs,
         waveIndex,
@@ -1486,7 +1522,7 @@ async function main() {
                 containerName,
                 shortAgent,
                 repoName,
-                alias: alias || null,
+                alias,
                 routeKey,
                 manifestPath,
                 agentPath,
@@ -1586,7 +1622,7 @@ async function main() {
         containerName,
         shortAgent,
         repoName,
-        alias: alias || null,
+        alias,
         routeKey,
         manifestPath,
         agentPath,
@@ -1653,11 +1689,7 @@ async function main() {
         });
 
         const expectedIdentity = Object.freeze({
-            containerName,
-            repoName,
-            shortAgent,
-            alias,
-            routeKey,
+            ...immutableIdentity,
             agentPath,
         });
         await runNoWaitLifecycleTransaction(expectedIdentity, {

@@ -7,7 +7,10 @@ import fsDefault from 'node:fs';
 import pathDefault from 'node:path';
 import { execFileSync as execFileSyncDefault } from 'node:child_process';
 
-import { parseNoWaitWorkerArgs } from '../commands/noWaitWorkerArgs.js';
+import {
+    NO_WAIT_IMMUTABLE_IDENTITY_FIELDS,
+    parseNoWaitWorkerArgs,
+} from '../commands/noWaitWorkerArgs.js';
 
 export const DARWIN_PROCARGS_TIMEOUT_MS = 1_000;
 export const DARWIN_PROCARGS_MAX_BYTES = 1024 * 1024;
@@ -57,7 +60,7 @@ export function parseDarwinKernProcArgs2(raw) {
     const argv = [];
     for (let index = 0; index < argc; index += 1) {
         const entry = nulTerminated(buffer, offset);
-        if (!entry || entry.value === '') return null;
+        if (!entry) return null;
         argv.push(entry.value);
         offset = entry.next;
     }
@@ -75,8 +78,9 @@ export function readProcessArgv(pid, {
             const raw = fsApi.readFileSync(`/proc/${pid}/cmdline`);
             const buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw));
             if (!buffer.length) return null;
-            const argv = buffer.toString('utf8').split('\0').filter((entry) => entry.length > 0);
-            return argv.length ? argv : null;
+            const argv = buffer.toString('utf8').split('\0');
+            if (argv.at(-1) === '') argv.pop();
+            return argv.length && argv[0] ? argv : null;
         } catch (_) {
             return null;
         }
@@ -216,11 +220,9 @@ export function proveWorkerProcessIdentity({
         throw processIdentityError(`worker process ${pid} has invalid arguments: ${error.message}`);
     }
     const expected = identity || {};
-    if (parsed.container !== expected.container
-        || parsed.runScoped.runId !== expected.runId
-        || parsed.runScoped.runStartedAtMs !== expected.runStartedAtMs
-        || parsed.runScoped.waveIndex !== expected.waveIndex
-        || parsed.runScoped.statusFile !== expected.statusFile) {
+    if (!NO_WAIT_IMMUTABLE_IDENTITY_FIELDS.every((field) => (
+        parsed.identity[field] === expected[field]
+    ))) {
         throw processIdentityError(`worker process ${pid} does not match the bound no-wait run`);
     }
     return Object.freeze({

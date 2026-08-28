@@ -29,6 +29,11 @@ import {
   noWaitRunScopedLogPath,
   noWaitRunScopedStatusPath,
 } from './noWaitPaths.js';
+import {
+  exactNoWaitCoordinationStatusPath,
+  exactNoWaitImmutableIdentity,
+} from './noWaitWorkerArgs.js';
+import { retireNoWaitRunMarkers } from './noWaitMarkerLifecycle.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
@@ -211,26 +216,42 @@ export function buildRouterEnv({ managedBox } = {}) {
 
 async function spawnNoWaitWorker({
   node,
-  registryName,
-  routeKey,
-  registryAlias,
+  identity,
   routerPort,
   forceRecreate = false,
-  runId,
-  runStartedAtMs,
-  waveIndex,
   statusFile,
   waitForStatuses = [],
 }) {
-  const containerName = registryName;
+  const immutableIdentity = exactNoWaitImmutableIdentity(identity);
+  const {
+    containerName,
+    instanceId,
+    enableGeneration,
+    repoName,
+    shortAgent,
+    alias,
+    routeKey,
+    runId,
+    runStartedAtMs,
+    waveIndex,
+  } = immutableIdentity;
+  if (node?.repoName !== repoName
+      || node?.shortAgentName !== shortAgent
+      || String(node?.alias || '') !== alias) {
+    throw new Error(`no-wait worker '${containerName}' was scheduled with a foreign graph identity`);
+  }
   const noWaitStatusDir = path.join(RUNNING_DIR, 'no-wait');
   // Derived from the same validated container name and run UUID as the
   // run-scoped status, so a marker, a status, and a log always agree on which
   // run they describe.
   const logFile = noWaitRunScopedLogPath(containerName, runId);
   const canonicalStatusFile = path.join(noWaitStatusDir, `${containerName}.json`);
-  const resolvedStatusFile = noWaitCoordinationStatusPath(containerName, runId);
-  if (statusFile && path.resolve(statusFile) !== resolvedStatusFile) {
+  const resolvedStatusFile = exactNoWaitCoordinationStatusPath(statusFile, {
+    containerName,
+    runId,
+    runningDir: RUNNING_DIR,
+  });
+  if (path.basename(resolvedStatusFile) !== immutableIdentity.statusFile) {
     throw new Error(`no-wait worker '${containerName}' was scheduled with a foreign coordination status file`);
   }
   if (!Number.isSafeInteger(waveIndex) || waveIndex < 0
@@ -245,20 +266,20 @@ async function spawnNoWaitWorker({
   const args = [
     workerScript,
     '--container', containerName,
-    '--short-agent', node.shortAgentName,
-    '--repo', node.repoName,
+    '--instance-id', instanceId,
+    '--enable-generation', enableGeneration,
+    '--short-agent', shortAgent,
+    '--repo', repoName,
+    '--alias', alias,
     '--manifest-path', node.manifestPath,
     '--agent-path', node.agentPath,
-    '--route-key', String(routeKey || registryAlias || node.shortAgentName),
+    '--route-key', routeKey,
     '--run-id', runId,
     '--run-started-at-ms', String(exactNoWaitRunStartedAtMs(runStartedAtMs)),
     '--wave-index', String(waveIndex),
     '--status-file', resolvedStatusFile,
     '--wait-for-statuses', JSON.stringify(waitForStatuses || []),
   ];
-  if (registryAlias) {
-    args.push('--alias', registryAlias);
-  }
   if (node.profile) {
     args.push('--profile', node.profile);
   }
@@ -274,10 +295,7 @@ async function spawnNoWaitWorker({
   const logStdio = createRunScopedLogStdio(logFile);
   try {
     writeNoWaitRunMarker({
-      registryName,
-      runId,
-      runStartedAtMs,
-      waveIndex,
+      identity: immutableIdentity,
       statusFile: resolvedStatusFile,
     });
   } catch (error) {
@@ -427,6 +445,48 @@ export function buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
   });
 }
 
+// Bind a pure graph schedule to the exact staged registry tuple before any
+// marker, status, log, or worker process is created. Later launch code consumes
+// this captured identity rather than re-reading mutable registry fields.
+export function bindNoWaitLaunchScheduleIdentity(schedule, registry, {
+  runningDir = RUNNING_DIR,
+} = {}) {
+  if (!Array.isArray(schedule) || !registry || typeof registry !== 'object') {
+    throw new Error('no-wait launch identity binding requires one schedule and registry snapshot');
+  }
+  return Object.freeze(schedule.map((wave) => Object.freeze(wave.map((entry) => {
+    const containerName = String(entry?.registryName || '');
+    const node = entry?.node;
+    const record = registry[containerName];
+    const alias = record?.alias === undefined || record?.alias === null ? '' : record.alias;
+    if (!node || record?.type !== 'agent'
+        || record.repoName !== node.repoName
+        || record.agentName !== node.shortAgentName
+        || alias !== String(node.alias || '')) {
+      throw new Error(`no-wait launch cannot bind '${containerName}' to the staged registry identity`);
+    }
+    const statusPath = exactNoWaitCoordinationStatusPath(entry.statusFile, {
+      containerName,
+      runId: entry.runId,
+      runningDir,
+    });
+    const identity = exactNoWaitImmutableIdentity({
+      containerName,
+      instanceId: record.instanceId,
+      enableGeneration: record.enableGeneration,
+      repoName: record.repoName,
+      shortAgent: record.agentName,
+      alias,
+      routeKey: alias || record.agentName,
+      runId: entry.runId,
+      runStartedAtMs: entry.runStartedAtMs,
+      waveIndex: entry.waveIndex,
+      statusFile: path.basename(statusPath),
+    });
+    return Object.freeze({ ...entry, identity });
+  }))));
+}
+
 function writeNoWaitAtomicJson(target, payload) {
   const resolvedTarget = path.resolve(String(target || ''));
   const targetDirectory = path.dirname(resolvedTarget);
@@ -462,13 +522,17 @@ function writeNoWaitAtomicJson(target, payload) {
 }
 
 function writeNoWaitRunMarker(entry) {
-  const target = path.join(RUNNING_DIR, 'no-wait', `${entry.registryName}.current.json`);
+  const identity = exactNoWaitImmutableIdentity(entry?.identity);
+  const target = path.join(RUNNING_DIR, 'no-wait', `${identity.containerName}.current.json`);
+  if (path.resolve(String(entry?.statusFile || '')) !== noWaitCoordinationStatusPath(
+    identity.containerName,
+    identity.runId,
+  )) {
+    throw new Error('no-wait run marker requires the exact coordination status path');
+  }
   writeNoWaitAtomicJson(target, {
-    runId: entry.runId,
-    runStartedAtMs: exactNoWaitRunStartedAtMs(entry.runStartedAtMs),
-    statusFile: path.basename(entry.statusFile),
-    waveIndex: entry.waveIndex,
     createdAt: new Date().toISOString(),
+    ...identity,
   });
 }
 
@@ -477,8 +541,13 @@ export function writeNoWaitSpawnFailure(entry, error) {
   // This runs inside the spawn loop's catch. Without an exact coordination
   // path there is nothing to publish, and throwing here would replace the
   // original spawn failure with an unrelated rename error and abort the start.
-  const coordinationStatusFile = String(entry?.statusFile || '');
-  if (!coordinationStatusFile || !entry?.registryName) {
+  const identity = exactNoWaitImmutableIdentity(entry?.identity);
+  const coordinationStatusFile = exactNoWaitCoordinationStatusPath(entry?.statusFile, {
+    containerName: identity.containerName,
+    runId: identity.runId,
+    runningDir: RUNNING_DIR,
+  });
+  if (path.basename(coordinationStatusFile) !== identity.statusFile) {
     throw new Error('no-wait spawn failure requires the exact run-scoped status identity');
   }
   // A spawn failure has to be a valid terminal member of a wave barrier so a
@@ -488,12 +557,6 @@ export function writeNoWaitSpawnFailure(entry, error) {
     state: 'failed',
     sequencePhase: 'active',
     phase: 'spawn',
-    runId: entry.runId,
-    runStartedAtMs: exactNoWaitRunStartedAtMs(entry.runStartedAtMs),
-    containerName: entry.registryName,
-    shortAgent: entry.node.shortAgentName,
-    repoName: entry.node.repoName,
-    waveIndex: entry.waveIndex,
     startedAt: new Date(finishedAtMs).toISOString(),
     startedAtMs: finishedAtMs,
     sequencePhaseStartedAt: new Date(finishedAtMs).toISOString(),
@@ -501,11 +564,12 @@ export function writeNoWaitSpawnFailure(entry, error) {
     finishedAt: new Date(finishedAtMs).toISOString(),
     finishedAtMs,
     error: { message: sanitizeDiagnosticText(error) },
+    ...identity,
   };
-  const canonical = path.join(RUNNING_DIR, 'no-wait', `${entry.registryName}.json`);
+  const canonical = path.join(RUNNING_DIR, 'no-wait', `${identity.containerName}.json`);
   // Match the worker's publication protocol: the canonical monitor view must
   // be durable before the run-scoped file releases a dependent wave.
-  for (const target of new Set([canonical, entry.statusFile])) {
+  for (const target of new Set([canonical, coordinationStatusFile])) {
     writeNoWaitAtomicJson(target, payload);
   }
 }
@@ -1144,6 +1208,7 @@ function ensureGraphNodesEnabled(graph, reg, {
   saveRouting = (routing) => writeRoutingConfig(routing, { coordinate: false }),
   inactivateGeneration = inactivateEdgeRoutingGeneration,
   abortPreparation = abortEdgeRoutingPreparation,
+  retireNoWaitMarkers = retireNoWaitRunMarkers,
   uuid = randomUUID,
   deferredNodeIds = new Set(),
   runtimeReplacementReason = graphNodeRuntimeReplacementReason,
@@ -1215,6 +1280,10 @@ function ensureGraphNodesEnabled(graph, reg, {
     routing.routes = routing.routes || {};
   }
 
+  const missingContainerNames = missingNodes.map((node) => (
+    dockerSvc.getAgentContainerName(node.alias || node.shortAgentName, node.repoName)
+  ));
+
   for (const plan of stagedPlans) {
     const identityChanged = plan.executionChanged || plan.profileChanged || plan.runtimeReason;
     const freshIdentity = identityChanged
@@ -1251,8 +1320,23 @@ function ensureGraphNodesEnabled(graph, reg, {
   }
 
   if (stagedPlans.length) {
+    // The fixed marker is an observer capability for one exact staged tuple.
+    // Retire it before either desired-state file can select a replacement or
+    // a successful target-less transition can complete without a new worker.
+    retireNoWaitMarkers([
+      ...stagedPlans.map((plan) => ({
+        containerName: plan.existing.key,
+        record: plan.predecessorRecord,
+      })),
+      ...missingContainerNames,
+    ]);
     if (changedPlans.length) saveAgents(reg, { coordinate: false });
     saveRouting(routing);
+  } else if (missingContainerNames.length) {
+    // prepareAgentEnableBatch persists the new registry tuple, so stale marker
+    // retirement must precede that call even when this graph has no retained
+    // records to stage itself.
+    retireNoWaitMarkers(missingContainerNames);
   }
 
   const prepared = prepareAgentEnableBatch(missingNodes.map((node) => ({
@@ -2334,10 +2418,13 @@ async function startWorkspace(staticAgentArg, portArg, {
 
     const noWaitRunId = randomUUID();
     const noWaitRunStartedAtMs = Date.now();
-    const noWaitSchedule = buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
-      runId: noWaitRunId,
-      runStartedAtMs: noWaitRunStartedAtMs,
-    });
+    const noWaitSchedule = bindNoWaitLaunchScheduleIdentity(
+      buildNoWaitLaunchSchedule(deferredNoWaitWaves, {
+        runId: noWaitRunId,
+        runStartedAtMs: noWaitRunStartedAtMs,
+      }),
+      reg,
+    );
     // Clear every public and run-scoped status before spawning any worker.
     // The UUID-scoped coordination paths prevent a late writer from an older
     // detached invocation from satisfying this run's wave barrier.
@@ -2364,19 +2451,12 @@ async function startWorkspace(staticAgentArg, portArg, {
           console.warn(`[start] no-wait node '${formatGraphNodeLabel(node, staticAgent)}' missing registry entry; skipping background launch.`);
           continue;
         }
-        const rec = reg[registryName] || {};
-        const routeKey = rec.alias || node.shortAgentName;
         try {
           const { pid, logFile, statusFile } = await spawnNoWaitWorker({
             node,
-            registryName,
-            routeKey,
-            registryAlias: rec.alias || node.alias || '',
+            identity: entry.identity,
             routerPort: staticPort,
             forceRecreate: newlyPreparedContainers.has(registryName),
-            runId: entry.runId,
-            runStartedAtMs: entry.runStartedAtMs,
-            waveIndex: entry.waveIndex,
             statusFile: entry.statusFile,
             waitForStatuses: entry.waitForStatuses,
           });
