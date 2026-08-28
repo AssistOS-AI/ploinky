@@ -1357,4 +1357,13 @@ fast_test_latched_no_wait_loading_transition() (
   [[ ! -e "$rotator_blocked" ]]
   [[ ! -e "$rotator_release" ]]
   [[ ! -e "$fixture_socket" ]]
+
+  if [[ -n "${PLOINKY_NO_WAIT_LATCH_EVIDENCE_FILE:-}" ]]; then
+    local ploinky_source_root
+    ploinky_source_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+    node "$ploinky_source_root/tests/release/noWaitLoadingEvidence.mjs" \
+      record-latch-pass \
+      --output "$PLOINKY_NO_WAIT_LATCH_EVIDENCE_FILE" \
+      --repo-root "$ploinky_source_root"
+  fi
 )
