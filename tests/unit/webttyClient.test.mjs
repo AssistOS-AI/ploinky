@@ -5,6 +5,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const webttyDirectory = path.resolve('cli/server/webtty');
+const bootstrapSource = fs.readFileSync(path.join(webttyDirectory, 'webtty-bootstrap.js'), 'utf8');
 const clientSource = fs.readFileSync(path.join(webttyDirectory, 'webtty.js'), 'utf8');
 const pageSource = fs.readFileSync(path.join(webttyDirectory, 'webtty.html'), 'utf8');
 const handlerSource = fs.readFileSync(path.resolve('cli/server/handlers/webtty.js'), 'utf8');
@@ -18,13 +19,16 @@ function flushTasks(count = 8) {
 
 function createHarness({
     search = '?dir=Projects%2F%3Cimg%20src%3Dx%20onerror%3D1%3E',
+    hash = '#launch=abcdefghijklmnopqrstuvwxyzABCDEF',
     deferredCreate = false,
+    historyThrows = false,
     initialCols = 80,
     initialRows = 24,
 } = {}) {
     const requests = [];
     const sources = [];
     const windowListeners = new Map();
+    const historyCalls = [];
     const elements = new Map();
     let createResolve;
     const createPromise = deferredCreate
@@ -44,7 +48,7 @@ function createHarness({
         elements.set(id, value);
         return value;
     }
-    for (const id of ['directory', 'status', 'status-dot', 'dimensions', 'message', 'terminal']) element(id);
+    for (const id of ['directory', 'target', 'access', 'status', 'status-dot', 'dimensions', 'message', 'terminal']) element(id);
 
     class FakeTerminal {
         constructor() {
@@ -73,7 +77,14 @@ function createHarness({
         }
     }
     const windowRef = {
-        location: { search },
+        location: { pathname: '/webtty/', search, hash },
+        history: {
+            replaceState(...args) {
+                if (historyThrows) throw new Error('history unavailable');
+                historyCalls.push(args);
+                windowRef.location.hash = '';
+            },
+        },
         Terminal: FakeTerminal,
         FitAddon: { FitAddon: FakeFitAddon },
         setTimeout(callback) { queueMicrotask(callback); return 1; },
@@ -91,12 +102,21 @@ function createHarness({
             return {
                 ok: true,
                 status: 201,
-                async json() { return { session: { id: 'terminal-abcdefghijklmnop' } }; },
+                async json() {
+                    return {
+                        session: {
+                            id: 'terminal-abcdefghijklmnop',
+                            target: {
+                                kind: 'agent', label: '<agent>', detail: 'repo/agent', access: 'ro', cwdDisplay: '/code/<folder>',
+                            },
+                        },
+                    };
+                },
             };
         }
         return { ok: true, status: 200, async json() { return { ok: true }; } };
     }
-    vm.runInNewContext(clientSource, {
+    const context = {
         document: documentRef,
         window: windowRef,
         EventSource: FakeEventSource,
@@ -109,32 +129,46 @@ function createHarness({
         Promise,
         JSON,
         Error,
-    });
+    };
+    vm.runInNewContext(bootstrapSource, context);
+    vm.runInNewContext(clientSource, context);
     return {
         elements,
+        historyCalls,
         requests,
         sources,
         terminal: FakeTerminal.instance,
+        windowRef,
         windowListeners,
         resolveCreate() {
             createResolve({
                 ok: true,
                 status: 201,
-                async json() { return { session: { id: 'terminal-abcdefghijklmnop' } }; },
+                async json() {
+                    return {
+                        session: {
+                            id: 'terminal-abcdefghijklmnop',
+                            target: {
+                                kind: 'agent', label: '<agent>', detail: 'repo/agent', access: 'ro', cwdDisplay: '/code/<folder>',
+                            },
+                        },
+                    };
+                },
             });
         },
     };
 }
 
-test('requested directory uses textContent and JSON, and session POST completes before SSE attach', async () => {
-    const requested = 'Projects/<img src=x onerror=1>';
-    const harness = createHarness({ deferredCreate: true });
-    assert.equal(harness.elements.get('directory').textContent, requested);
+test('fragment launch is stripped immediately, sent only in JSON, and POST completes before SSE attach', async () => {
+    const launch = 'abcdefghijklmnopqrstuvwxyzABCDEF';
+    const harness = createHarness({ search: `?launch=${launch}`, deferredCreate: true });
+    assert.deepEqual(harness.historyCalls, [[null, '', '/webtty/']]);
+    assert.equal(Object.hasOwn(harness.windowRef, '__ploinkyTakeWebttyLaunch'), false);
     assert.equal(harness.requests.length, 1);
     assert.equal(harness.requests[0].url, '/webtty/sessions');
     assert.equal(harness.requests[0].options.method, 'POST');
     assert.deepEqual(JSON.parse(harness.requests[0].options.body), {
-        dir: requested,
+        launch,
         cols: 80,
         rows: 24,
     });
@@ -142,8 +176,33 @@ test('requested directory uses textContent and JSON, and session POST completes 
 
     harness.resolveCreate();
     await flushTasks();
+    assert.equal(harness.elements.get('target').textContent, '<agent> — repo/agent');
+    assert.equal(harness.elements.get('access').textContent, 'Read only folder mapping');
+    assert.equal(harness.elements.get('directory').textContent, '/code/<folder>');
     assert.equal(harness.sources.length, 1);
     assert.equal(harness.sources[0].url, '/webtty/sessions/terminal-abcdefghijklmnop/stream');
+});
+
+test('pagehide before deferred creation deletes the learned session without attaching SSE', async () => {
+    const harness = createHarness({ deferredCreate: true });
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.sources.length, 0);
+
+    harness.windowListeners.get('pagehide')();
+    await flushTasks(2);
+    assert.equal(harness.requests.filter((entry) => entry.options.method === 'DELETE').length, 0);
+
+    harness.resolveCreate();
+    await flushTasks();
+    assert.equal(harness.sources.length, 0);
+    const deletions = harness.requests.filter((entry) => entry.options.method === 'DELETE');
+    assert.equal(deletions.length, 1);
+    assert.equal(deletions[0].url, '/webtty/sessions/terminal-abcdefghijklmnop');
+    assert.equal(deletions[0].options.keepalive, true);
+
+    harness.windowListeners.get('pagehide')();
+    await flushTasks(2);
+    assert.equal(harness.requests.filter((entry) => entry.options.method === 'DELETE').length, 1);
 });
 
 test('EventSource reconnect never creates a terminal and explicit exit stops input', async () => {
@@ -196,7 +255,7 @@ test('initial and resized terminal dimensions are clamped to protocol bounds', a
     const harness = createHarness({ initialCols: 50_000, initialRows: 50_000 });
     await flushTasks();
     assert.deepEqual(JSON.parse(harness.requests[0].options.body), {
-        dir: 'Projects/<img src=x onerror=1>',
+        launch: 'abcdefghijklmnopqrstuvwxyzABCDEF',
         cols: 1024,
         rows: 512,
     });
@@ -208,12 +267,47 @@ test('initial and resized terminal dimensions are clamped to protocol bounds', a
     assert.deepEqual(JSON.parse(resize.options.body), { cols: 2, rows: 2 });
 });
 
+test('missing or malformed fragment is stripped and creates no terminal', async () => {
+    for (const hash of [
+        '',
+        '#launch=short',
+        '#launch=' + 'a'.repeat(31),
+        '#launch=' + 'a'.repeat(33),
+        '#launch=' + 'a'.repeat(32) + '&extra=1',
+    ]) {
+        const harness = createHarness({ hash });
+        await flushTasks();
+        assert.equal(harness.requests.length, 0, hash);
+        assert.equal(harness.sources.length, 0, hash);
+        assert.equal(harness.elements.get('status').textContent, 'Invalid launch', hash);
+        assert.match(harness.elements.get('message').textContent, /Return to Explorer/, hash);
+        assert.equal(harness.historyCalls.length, 1, hash);
+    }
+});
+
+test('history stripping failure never sends the fragment bearer', async () => {
+    const harness = createHarness({ historyThrows: true });
+    await flushTasks();
+    assert.equal(harness.requests.length, 0);
+    assert.equal(harness.sources.length, 0);
+    assert.equal(harness.elements.get('status').textContent, 'Invalid launch');
+});
+
 test('page, assets, and CSP admit no external or inline script execution', () => {
     for (const match of pageSource.matchAll(/(?:src|href)="([^"]+)"/g)) {
         assert.match(match[1], /^\/webtty\/assets\//);
     }
     assert.doesNotMatch(pageSource, /https?:\/\/|<script(?:\s[^>]*)?>\s*[^<]/i);
+    assert.doesNotMatch(bootstrapSource, /https?:\/\/|\beval\s*\(|new Function\s*\(/);
     assert.doesNotMatch(clientSource, /https?:\/\/|\beval\s*\(|new Function\s*\(/);
+    const bootstrapIndex = pageSource.indexOf('/webtty/assets/webtty-bootstrap.js');
+    const xtermIndex = pageSource.indexOf('/webtty/assets/xterm.js');
+    const addonIndex = pageSource.indexOf('/webtty/assets/addon-fit.js');
+    const clientIndex = pageSource.indexOf('/webtty/assets/webtty.js');
+    assert.ok(bootstrapIndex >= 0);
+    assert.ok(bootstrapIndex < xtermIndex);
+    assert.ok(xtermIndex < addonIndex);
+    assert.ok(addonIndex < clientIndex);
     const csp = handlerSource.match(/'Content-Security-Policy':\s*"([^"]+)"/)?.[1] || '';
     assert.ok(csp);
     const directives = new Map(csp.split(';').map((entry) => {

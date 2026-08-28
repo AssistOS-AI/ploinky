@@ -321,7 +321,7 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         imageId: 'b'.repeat(64),
         imageRef: 'docker.io/assistos/ploinky-box:runtime',
         hostPort: 8080,
-        repositoryRoot: '/opt/source',
+        repositoryRoot: path.resolve(import.meta.dirname, '../..'),
         cidfile: '/private/lock/candidate.cid',
     });
     const execArgs = buildContainerExecArgs('a'.repeat(64), ['status'], {

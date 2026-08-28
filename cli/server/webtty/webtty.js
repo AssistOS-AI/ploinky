@@ -10,20 +10,33 @@
   const MIN_ROWS = 2;
   const MAX_ROWS = 512;
   const encoder = new TextEncoder();
-  const query = new URLSearchParams(window.location.search);
-  const requestedDirectory = query.get('dir') || '';
+
+  function consumeLaunchFragment() {
+    try {
+      const take = window.__ploinkyTakeWebttyLaunch;
+      return typeof take === 'function' ? take() : '';
+    } catch (_) { }
+    return '';
+  }
+
+  const launch = consumeLaunchFragment();
   const directoryElement = document.getElementById('directory');
+  const targetElement = document.getElementById('target');
+  const accessElement = document.getElementById('access');
   const statusElement = document.getElementById('status');
   const statusDot = document.getElementById('status-dot');
   const dimensionsElement = document.getElementById('dimensions');
   const messageElement = document.getElementById('message');
   const terminalElement = document.getElementById('terminal');
 
-  directoryElement.textContent = requestedDirectory || '.';
+  directoryElement.textContent = 'Not selected';
+  targetElement.textContent = 'Not selected';
+  accessElement.textContent = '';
 
   let terminalSessionId = '';
   let eventSource = null;
   let closed = false;
+  let deletionStarted = false;
   let inputQueue = '';
   let inputQueueBytes = 0;
   let inputTimer = null;
@@ -62,7 +75,8 @@
     if (status === 400) return 'The requested workspace directory is invalid.';
     if (status === 401) return 'Your authentication session has expired.';
     if (status === 403) return 'Administrator access is required.';
-    if (status === 404) return 'This terminal is no longer available.';
+    if (status === 404) return 'This terminal launch is missing, invalid, expired, or already used. Return to Explorer and choose a terminal target again.';
+    if (status === 409) return 'This terminal target changed. Close this tab and choose again from Explorer.';
     if (status === 429) return 'Terminal capacity has been reached. Close another terminal and retry.';
     if (status === 503) return 'The terminal runtime is temporarily unavailable.';
     return fallback;
@@ -201,10 +215,10 @@
   }
 
   async function closeTerminal({ keepalive = false } = {}) {
-    if (closed) return;
     closed = true;
     eventSource?.close();
-    if (!terminalSessionId) return;
+    if (!terminalSessionId || deletionStarted) return;
+    deletionStarted = true;
     try {
       await fetch(`/webtty/sessions/${encodeURIComponent(terminalSessionId)}`, {
         method: 'DELETE',
@@ -217,21 +231,47 @@
   }
 
   async function start() {
+    if (!launch) {
+      setStatus('Invalid launch', 'error');
+      showMessage('This terminal launch is missing, invalid, expired, or already used. Return to Explorer and choose a terminal target again.');
+      return;
+    }
     setStatus('Creating terminal…');
     fit();
     const dimensions = boundedDimensions();
     const result = await jsonRequest('/webtty/sessions', {
       method: 'POST',
       headers: mutationHeaders(),
-      body: JSON.stringify({ dir: requestedDirectory, ...dimensions }),
+      body: JSON.stringify({ launch, ...dimensions }),
     });
-    terminalSessionId = result.session.id;
+    const session = result?.session;
+    const target = session?.target;
+    if (!session || !/^[A-Za-z0-9_-]{16,128}$/.test(String(session.id || ''))) {
+      throw new Error('The terminal response was invalid.');
+    }
+    terminalSessionId = session.id;
+    if (!target || !['box', 'agent'].includes(target.kind)
+      || typeof target.label !== 'string' || !target.label
+      || !['rw', 'ro'].includes(target.access)
+      || typeof target.cwdDisplay !== 'string' || !target.cwdDisplay) {
+      await closeTerminal({ keepalive: true });
+      throw new Error('The terminal response was invalid.');
+    }
+    if (closed) {
+      await closeTerminal({ keepalive: true });
+      return;
+    }
+    targetElement.textContent = `${target.label}${target.detail ? ` — ${target.detail}` : ''}`;
+    accessElement.textContent = target.access === 'ro' ? 'Read only folder mapping' : 'Read and write folder mapping';
+    accessElement.className = `access-badge access-${target.access}`;
+    directoryElement.textContent = target.cwdDisplay;
     attachStream();
     terminal.focus();
   }
 
   window.addEventListener('pagehide', () => { void closeTerminal({ keepalive: true }); });
-  start().catch((error) => {
+  start().catch(async (error) => {
+    await closeTerminal({ keepalive: true });
     setStatus('Unavailable', 'error');
     showMessage(error.message);
   });

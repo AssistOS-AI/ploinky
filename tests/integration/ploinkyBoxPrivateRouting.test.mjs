@@ -8,8 +8,15 @@ import {
     execInBox,
     requirePodmanCandidate,
 } from '../e2e/ploinkyBox/nativeHelpers.mjs';
+import {
+    BOX_AGENTLIB_LABELS,
+    BOX_LABELS,
+    BOX_MEDIA_PORT,
+    BOX_ROUTER_CONTAINER_PORT,
+} from '../../ploinky-box/constants.mjs';
 
 const MINIMAL_NODE_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
+const REPOSITORY_ROOT = path.resolve(import.meta.dirname, '../..');
 
 function queryInBox(harness, containerId, argv, timeoutMs = 120_000) {
     return harness.runner.query('podman', [
@@ -98,6 +105,9 @@ test('one nested rootless-Podman container reaches the unpublished private liste
         const sourceMount = (outerInspection?.Mounts || []).find((mount) => (
             mount.Destination === '/opt/ploinky'
         ));
+        assert.ok(sourceMount, 'the Box must mount the exact candidate checkout at /opt/ploinky');
+        assert.equal(sourceMount.Type, 'bind');
+        assert.equal(path.resolve(sourceMount.Source), REPOSITORY_ROOT);
         evidence.physicalPodman.version = queryJson(
             harness.runner, 'podman', ['version', '--format', 'json'],
         );
@@ -122,17 +132,12 @@ test('one nested rootless-Podman container reaches the unpublished private liste
             Object.keys(outerInspection?.Config?.Labels || {})
                 .filter((key) => key.startsWith('io.assistos.ploinky-box.'))
                 .sort(),
-            [
-                'io.assistos.ploinky-box.dependencies-fingerprint',
-                'io.assistos.ploinky-box.image-ref',
-                'io.assistos.ploinky-box.images-fingerprint',
-                'io.assistos.ploinky-box.media-host-port',
-                'io.assistos.ploinky-box.path-hash',
-                'io.assistos.ploinky-box.role',
-                'io.assistos.ploinky-box.router-host-port',
-            ],
+            [...Object.values(BOX_LABELS), ...Object.values(BOX_AGENTLIB_LABELS)].sort(),
         );
-        assert.equal(evidence.outerBox.exposedPorts, null);
+        assert.deepEqual(evidence.outerBox.exposedPorts, {
+            [`${BOX_MEDIA_PORT}/udp`]: {},
+            [`${BOX_ROUTER_CONTAINER_PORT}/tcp`]: {},
+        });
         assert.deepEqual(evidence.outerBox.portBindings, {
             '7882/udp': [{ HostIp: '0.0.0.0', HostPort: '7882' }],
             '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }],
@@ -173,14 +178,24 @@ test('one nested rootless-Podman container reaches the unpublished private liste
         nestedContainerId = String(launched.stdout || '').trim();
         assert.match(nestedContainerId, /^[a-f0-9]{64}$/);
 
+        // The helper performs several independently bounded Podman queries
+        // before its five-second application request and emits one final
+        // frame. Its aggregate deadline must exceed those one-shot bounds.
         const probe = queryInBox(harness, prepared.containerId, [
             '/usr/local/bin/node',
             '/opt/ploinky/tests/helpers/ploinkyBoxPrivateRoutingProbe.mjs',
             nestedContainerId,
             JSON.stringify(networkArguments),
-        ], 30_000);
-        const probeOutput = String(probe.stdout || '').trim().split(/\n/).at(-1);
-        evidence.probe = JSON.parse(probeOutput);
+        ], 120_000);
+        const probeFrames = String(probe.stdout || '').trim().split(/\n/).filter(Boolean);
+        assert.equal(probeFrames.length, 1, JSON.stringify({
+            status: probe.status,
+            signal: probe.signal,
+            errorCode: probe.error?.code || null,
+            stdoutBytes: Buffer.byteLength(String(probe.stdout || '')),
+            stderr: String(probe.stderr || '').trim(),
+        }));
+        evidence.probe = JSON.parse(probeFrames[0]);
         writeEvidence(evidence);
         assert.equal(probe.ok, true, probe.stderr || evidence.probe?.error);
         assert.equal(evidence.probe.privateRequest.ok, true);

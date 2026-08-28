@@ -3,34 +3,45 @@
 | Field | Value |
 | --- | --- |
 | Date | 2026-08-28 |
-| Result | **Blocked: no backend selected** |
+| Result | **Passed: controlled persistent `podman exec -it` under Box `node-pty` selected** |
 | Production Box source | Ploinky `e73c3189652841362669d433a2c8f442ae59b269` |
 | Production image definition | `container-image-builds` `1751b13705c5b6e6eb371c267f37dd4b8bcc184e` |
 | Candidate image ID | `sha256:2470a215b6f647c15560cf39bb738e21484ba7fd8bbe8a28133f1df3f4c0b507` |
 | Candidate OCI digest | `sha256:ec456ef3a07e7b664c7a08136e844f60e0d3125408e3dbfd375648cb2359921f` |
 | Local-only tag | `localhost/ploinky-box-phase0-webtty:e73c3189-1751b137-20260828t1001c` |
-| Production agent image | `docker.io/assistos/ploinky-node:24-bookworm-tools` |
+| Pinned agent image | `docker.io/assistos/ploinky-node@sha256:d7b9594f73c8f9eead6c5b1717e504bf6c65458e27daf77bb6022085c82faf03` |
+| Selected backend | `controlled-podman-exec-persistent-session-under-box-node-pty` |
 
 ## Decision
 
-Neither allowed candidate passes the mandatory lifecycle gate in the exact production
-`ploinky-box`/nested-rootless-Podman topology. No production agent PTY provider,
-worker protocol, init argv, readiness frame, or recovery record is selected.
+An independent reproduction corrected the original spike setup and reran the
+complete admission harness from a clean fixture:
 
-- Controlled `podman exec -it` under Box `node-pty` creates an exact exec and a
-  marker-bearing inner shell, but interactive input/output does not cross the
-  double-PTY boundary. The server-owned numeric readiness frame times out.
-- The Podman REST candidate creates and attaches an exact exec, but no
-  non-echoable numeric readiness frame returns across the upgraded socket. An
-  explicit application input roundtrip is required before resize and is not
-  reached.
-- Exact termination, foreground-child reclamation, worker-crash recovery, and
-  post-close orphan proof therefore cannot be demonstrated for either candidate.
+1. The readiness command depended on `ps`, `id`, and `tr`, which are absent from
+   the pinned agent image. The corrected command uses Bash builtins and
+   `/proc/$$/stat`, and the harness requires a fresh post-spawn cryptographic
+   challenge plus numeric fields that match independently observed process
+   identity. Terminal echo and hostile startup hooks cannot satisfy it.
+2. Nested rootless Podman could not reopen PID handles because the enclosing Box
+   denied `open_by_handle_at`. The production Box now uses the exact Podman
+   v6.0.1 default seccomp profile transformed to return `ENOTSUP` for
+   `name_to_handle_at`. Nested Podman then uses its existing `/proc` start-time
+   identity fallback. The profile removes access; it adds no privilege, bind,
+   helper, broker, or runtime topology.
+3. Rootless user namespaces make the Box-visible owner UID differ from the
+   target-visible UID. The harness derives the latter from the exact process's
+   `/proc/<pid>/uid_map` and requires it to match the readiness frame.
 
-Section 6.3 of the implementation plan requires the implementation to stop and
-request an architecture decision in this state. The spike did not add a broker,
-helper image, privilege, host bind, generic exec endpoint, or agent-side
-`node-pty`.
+With those corrections, the controlled persistent CLI candidate passed every
+mandatory Phase 0 admission and lifecycle gate. The REST candidate demonstrated
+exact create/attach, echo-resistant I/O, resize, attach-socket close, and exact
+exec removal. It remains unselected because it was intentionally only a
+viability probe and was not run through the full lifecycle matrix.
+
+The narrower CLI `--no-session` alternative was also investigated. It avoided a
+persistent exec record, but resize did not propagate: after resizing the outer
+PTY to 101 by 33, the inner shell still reported `0 0`. It is rejected and the
+harness fails closed if it ever completes unexpectedly.
 
 ## Reproducible inputs
 
@@ -45,6 +56,7 @@ checkout was clean at commit `e73c3189652841362669d433a2c8f442ae59b269`
 | `images/ploinky-box/Dockerfile` | `b8052316422c76e27aba3756fc5a9096da8d74b8d589a12166ff8a464b5281a4` |
 | `core-services/webtty/package-lock.json` | `3eec51e517db1ba30c6ef523be83640cd0484b910adfa54a11692e020ea06a6a` |
 | `core-services/webtty/native-probe.mjs` | `d5d87c7a0c2abb00f303fe4092aef44712e1567c8f0f1c0522c302af2953d20e` |
+| `ploinky-box/seccomp/podman-nested-pid-fallback.json` | `4a226832feffda3ad82f745b0595cdd23f65a6203041ba5b4487cda43e838f99` |
 
 The retained local-only candidate was built from the unmodified production
 Dockerfile final stage with:
@@ -63,7 +75,7 @@ podman build \
 
 No public tag was moved and the image was not pushed. The candidate has no
 configuration labels. A first local build that accidentally retained Buildah's
-automatic identity label was rejected before admission and subsequently removed.
+automatic identity label was rejected before admission and removed.
 
 ## Runtime inventory and prerequisite gates
 
@@ -94,135 +106,169 @@ node --test \
   tests/unit/ploinkyBoxImageContract.test.mjs
 ```
 
-## Candidate 1: controlled CLI under Box `node-pty`
+## Selected candidate: persistent CLI under Box `node-pty`
 
-The exact server-owned launch shape used the full immutable 64-hex container ID:
+The server-owned launch shape uses the full immutable container ID and a fixed
+shell argv:
 
 ```text
 /usr/bin/podman container exec --interactive --tty
   --user <0:0-or-1000:1000>
-  --workdir /tmp
+  --workdir <server-translated-container-cwd>
   --env PLOINKY_WEBTTY_MARKER=<server-random-marker>
   --env TERM=xterm-256color
   <full-container-id>
-  /bin/bash -c
-  'exec -a "$PLOINKY_WEBTTY_MARKER" /bin/bash --noprofile --norc'
+  /bin/bash --noprofile --norc -p -c
+  '/bin/bash --noprofile --norc; status=$?;
+   case "$status" in 126|127) exit 124 ;; *) exit "$status" ;; esac'
+  ploinky-webtty-marker:<server-random-marker>
 ```
 
-Before accepting browser traffic, the harness required all of the following:
+Before accepting browser traffic, the harness requires all of the following:
 
-1. The Box-side Podman client PID/start token existed.
-2. Inspecting the exact container returned exactly one engine exec ID.
-3. An exact-container `/proc/*/environ` scan found the random marker in the inner
-   shell and recorded its PID, process group, session, and start token.
-4. The worker wrote a server-owned frame through Box `node-pty` and required an
-   exact numeric response:
+1. The Box-side Podman client PID, process group, session, foreground process
+   group, controlling TTY, UID, and `/proc` start token are captured.
+2. Inspecting the exact container returns exactly one engine exec ID.
+3. An exact-container PID-namespace scan finds exactly one live fixed wrapper
+   whose final argv element carries the random marker. Identity never depends on
+   target-readable environment bytes. The scan correlates Box PID, PID namespace,
+   nested PID/process-group/session vectors, mapped inner UID, and start token.
+4. Only after capturing the exact Box-side Podman client does the worker write a
+   fresh server-owned challenge. The returned frame contains that challenge plus
+   numeric PID, process-group, session, UID, and `/proc` start token. Every field
+   must match independent process evidence, and the challenge is not persisted.
+5. A separate application marker roundtrip and `stty size` observation prove
+   bidirectional I/O and actual inner resize.
 
-```text
-__PLOINKY_READY__<marker>|<pid>|<pgrp>|<session>|<uid>
-```
-
-The first three checks passed. The fourth timed out after 10 seconds with no
-numeric frame, so root-agent interactive I/O failed before resize or normal
-close. The error path then reproduced a second defect while stopping the live
-target:
-
-```text
-getting the PID handle for pid <pid> from 'name-to-handle:<token>':
-openByHandleAt failed: operation not permitted
-```
-
-This result was reproduced with the candidate selector below. It is intentionally
-a failing stop-gate test, not a skipped test:
+The final REST-first admission run passed 1 of 1 tests in 79 seconds with run ID
+`wtty-323-8da5f55e2e`. Running REST first proves that its service/socket cleanup
+does not make the subsequently selected CLI lifecycle pass.
 
 ```sh
 PLOINKY_BOX_REQUIRE_PODMAN=1 \
 PLOINKY_BOX_CANDIDATE_DIGEST=sha256:ec456ef3a07e7b664c7a08136e844f60e0d3125408e3dbfd375648cb2359921f \
-PLOINKY_WEBTTY_AGENT_IMAGE=docker.io/assistos/ploinky-node:24-bookworm-tools \
-PLOINKY_WEBTTY_PHASE0_FIRST_CANDIDATE=cli \
+PLOINKY_WEBTTY_AGENT_IMAGE=docker.io/assistos/ploinky-node@sha256:d7b9594f73c8f9eead6c5b1717e504bf6c65458e27daf77bb6022085c82faf03 \
+PLOINKY_WEBTTY_PHASE0_FIRST_CANDIDATE=rest \
+PLOINKY_WEBTTY_PHASE0_CLI_EXEC_MODE=persistent-session \
 node --test tests/integration/webttyAgentPtyLifecycle.test.mjs
 ```
 
-Result: 0 passed, 1 failed, 0 skipped; failure stage `root-normal`.
+The exact executed source SHA-256 values were
+`7ede70b3e279a8c14477d2cd4a76c2b19814770ebd130fd773ec8a5e21b2f64a`
+for the driver,
+`b289941568bd05abaf748e0307ff1c428d3dd13f490651ef59dedad7cc116b83`
+for the readiness builder, and
+`dd7959f9a77668d44ad23ac508ec0dfd381e554c1c1d1a39126641813be1a197`
+for the shared agent runtime.
 
-## Candidate 2: local Podman REST exec
+The successful matrix covered root and non-root normal exit; root and non-root
+controlled close; Box Podman-client loss; foreground descendants; exact target
+stop/remove; same-name replacement; worker crash/recovery; and an orphan audit
+after every close. Every case revalidated the immutable container and exec IDs
+and ended with no marker process, client process, session member, or exec record.
 
-The harness created a unique service directory with mode `0700`, exposed a
-unique Unix socket readable only by the Box user, verified `/_ping` and
-`/version`, and used the full immutable container ID for `POST
-/v5.0.0/containers/<id>/exec`. The returned 64-hex exec ID was attached via a
-101 Upgrade response.
+## Rejected alternatives
 
-The corrected harness then wrote a server-owned command whose echo cannot match
-the required numeric frame:
+### CLI `--no-session`
 
-```text
-__PLOINKY_REST_READY__<marker>|<pid>|<pgrp>|<session>|<uid>
-```
+The same CLI matrix can be run with
+`PLOINKY_WEBTTY_PHASE0_CLI_EXEC_MODE=no-session`. Exact identity, echo-resistant
+I/O, and zero engine exec records were observed, but root-normal resize failed:
+the required 101 by 33 resize left the inner `stty size` value at `0 0` until
+the deadline. The run failed rather than weakening or skipping resize.
 
-That exact readiness frame timed out after 10 seconds. The harness requires the
-numeric PID/session evidence, an actual marker-bearing process match, engine
-correlation to the returned exec ID, and an explicit application input
-roundtrip before it will call resize. None of those downstream checks was
-credited, and resize was not attempted in the corrected run.
+### Local Podman REST exec
 
-An earlier echo-vulnerable probe had mistaken the echoed readiness command for
-application output and proceeded to a resize call. Its apparent readiness and
-I/O results are invalid and are not evidence for either backend. The corrected
-regression prevents that false positive.
+The harness created a mode-0700 service directory and unique Unix socket,
+verified `/_ping` and `/version`, created an exec against the full immutable
+container ID, and attached the returned 64-hex exec ID through a 101 Upgrade.
+The corrected echo-resistant numeric readiness frame, independent marker
+identity, application I/O, and a 97 by 29 inner resize all succeeded.
 
-During error cleanup, stopping the live target also returned the nested-rootless
-runtime error `openByHandleAt failed: operation not permitted`. The enclosing
-Box removal still reclaimed the disposable nested runtime.
-
-The retained default command reproduces the REST-first failure:
-
-```sh
-PLOINKY_BOX_REQUIRE_PODMAN=1 \
-PLOINKY_BOX_CANDIDATE_DIGEST=sha256:ec456ef3a07e7b664c7a08136e844f60e0d3125408e3dbfd375648cb2359921f \
-PLOINKY_WEBTTY_AGENT_IMAGE=docker.io/assistos/ploinky-node:24-bookworm-tools \
-node --test tests/integration/webttyAgentPtyLifecycle.test.mjs
-```
-
-Result: 0 passed, 1 failed, 0 skipped; failure stage `rest-candidate`.
+After the upgraded attach socket closed, the exact exec still reported
+`Running: true`; exact removal through
+`POST /v5.0.0/libpod/exec/<id>/remove` then succeeded and the exec became absent.
+The executable evidence records `viabilityProbePassed: true` and
+`fullPhase0Admission: false`. The full REST lifecycle matrix was not run or
+credited, so REST cannot displace the fully admitted CLI candidate.
 
 ## Matrix disposition
 
-| Required case | CLI/node-pty | REST |
+| Required case | Persistent CLI/node-pty | REST |
 | --- | --- | --- |
 | Exact image/runtime inventory | Passed | Passed |
-| Immutable container and exec identity | Passed | Exact container create and 64-hex exec attach passed; post-readiness engine correlation blocked |
-| Marker present in an actual inner process | Passed | Blocked by numeric readiness failure |
-| Bidirectional interactive I/O | **Failed** | **Failed**: no numeric readiness; explicit application roundtrip not reached |
-| Resize verified by inner `stty size` | Not reachable after I/O failure | Not attempted after corrected readiness failure |
-| Root and non-root normal close | Blocked by earlier mandatory failure | Blocked by earlier mandatory failure |
-| Box client death/reclaim | Blocked by earlier mandatory failure | Not applicable to this transport; service/attach crash gate blocked |
-| Foreground-child cleanup | Blocked by earlier mandatory failure | Blocked by earlier mandatory failure |
-| Target stop/remove and same-name replacement | Error path exposed `openByHandleAt` defect; full proof blocked | Blocked by earlier mandatory failure |
-| Worker crash/recovery | Blocked by earlier mandatory failure | Blocked by earlier mandatory failure |
-| Orphan audit after every close | Not proven | Not proven |
+| Immutable container and exec identity | Passed | Passed for create/attach |
+| Marker present in exact inner process | Passed | Passed in viability probe |
+| Echo-resistant bidirectional I/O | Passed | Passed in viability probe |
+| Resize verified by inner `stty size` | Passed | Passed in viability probe |
+| Root and non-root normal close | Passed | Not admitted beyond viability probe |
+| Box client death/reclaim | Passed | Not applicable; attach/service lifecycle not admitted |
+| Foreground-child cleanup | Passed | Not admitted |
+| Target stop/remove and same-name replacement | Passed | Not admitted |
+| Worker crash/recovery | Passed | Not admitted |
+| Orphan audit after every close | Passed | Passed after exact viability-probe removal |
 
-The unexecuted rows are not skips reported as success. They are downstream cases
-that the Phase 0 stop gate deliberately prevents after a prerequisite lifecycle
-operation fails.
+The unexecuted REST rows are outside the deliberately limited viability probe;
+they are not skips reported as success.
+
+## Production worker and default-recovery evidence
+
+The production `AgentTerminalWorker`, client, durable store, and default restart
+recovery path passed the real pinned-image lifecycle test 1 of 1 with run ID
+`prod_322_94420b10e7`. Its six clean fixtures proved normal non-root application
+I/O and resize, controlled cleanup, crash recovery from both `pty-starting` and
+`pty-ready`, foreign-exec isolation and self-heal, foreground-descendant cleanup,
+stop plus force-remove recovery, and Bash-absence `/bin/sh` fallback. The
+fallback fixture proves Bash absent before the first terminal exec.
+
+The final rerun also corrected and proved default restart recovery after exact
+target removal. Nested `podman container inspect` returns status 125, the exact
+immutable-ID absence message on stderr, and the JSON empty array `[]` on stdout.
+The production classifier now validates those streams separately and rejects
+any additional stdout or prefixed/suffixed stderr. Its executed source SHA-256
+values were
+`a483409d83baffbb50ffd74132651c8bf1d1335f2e9126767a35e5c7c5cf855b`
+(driver),
+`cc359634256c862d558ab3b694759bc43ee41ebadfdc46aa6308ff6c3b790f42`
+(worker),
+`dd7959f9a77668d44ad23ac508ec0dfd381e554c1c1d1a39126641813be1a197`
+(runtime), and
+`f57ac9ca49570c8124a95456c0d467b30038d7895e9b2d29417ad20fab49dc14`
+(durable records).
+
+The production evidence ended with zero labeled containers, recovery records,
+exact workers, exact Podman clients, marker processes, and exec records.
+
+## Seccomp fallback evidence
+
+The committed profile is byte-for-byte the Podman v6.0.1 default seccomp JSON
+after removing `name_to_handle_at` from the allow list and adding an exact
+`SCMP_ACT_ERRNO` rule returning errno 95 (`ENOTSUP`) for that syscall. Its SHA-256
+is `4a226832feffda3ad82f745b0595cdd23f65a6203041ba5b4487cda43e838f99`.
+
+The outer Box container receives it through a fixed absolute `seccomp=` security
+option. Discovery and adoption require that exact option and the exact profile
+digest label. This proves the intended behavior for the pinned Podman v6.0.1
+profile provenance; broader native-Linux compatibility remains subject to the
+repository's native deployment matrix.
 
 ## Cleanup proof
 
 Every run used a random `io.assistos.ploinky.phase0=<run-id>` label, unique inner
 container names, a unique REST socket directory, and a unique outer Box fixture
-root. After each failed run, the enclosing exact Box was removed, the unique
-fixture root was removed, and the host was audited.
+root. After each run the exact Box was removed and the host was audited.
 
-Final audit:
+The final Phase 0 audit found:
 
 - zero host containers with an `io.assistos.ploinky.phase0` label;
-- zero `ploinky-box-podman-*` fixture roots under the host temporary directory;
-- no retained Phase 0 REST service or socket directory;
-- the rejected identity-labeled image ID was removed;
-- only the pinned local-only candidate image and its two local references remain
-  for independent inspection;
-- the shared Podman machine remains `running` and was not restarted.
+- zero Phase 0 networks or volumes;
+- zero retained Box fixture roots or REST service/socket directories;
+- zero Phase 0 service processes or listeners;
+- only the pinned local-only candidate image retained for later fresh-deployment
+  testing;
+- the shared Podman machine still running and never restarted.
 
 The executable regression remains at
 `tests/integration/webttyAgentPtyLifecycle.test.mjs`, with its Box-side driver at
-`tests/integration/webttyAgentPtyLifecycleDriver.mjs`.
+`tests/integration/webttyAgentPtyLifecycleDriver.mjs` and its echo-resistant
+frame builder at `tests/integration/webttyAgentPtyReadiness.mjs`.

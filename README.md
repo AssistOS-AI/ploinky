@@ -120,6 +120,34 @@ State follows these stop/start and destroy boundaries:
 | Inner Podman named volumes | Under the same disposable graphroot | Yes | No |
 | Transient runtime metadata | Tmpfs path `/tmp/storage-run-1000` | No; `/tmp` is fresh each boot | No |
 
+## WebTTY terminal targets
+
+Explorer's folder menu can open a terminal at that folder in the Ploinky Box or
+in an eligible live agent. The Router discovers targets with
+`POST /webtty/target-discoveries`, creates the selected terminal with
+`POST /webtty/sessions`, streams output over SSE, and accepts bounded input and
+resize POSTs. Discovery returns only safe display data and random launch IDs;
+container identities, translated paths, shell arguments, users, environment,
+and runtime flags remain server-controlled.
+
+The launch ID is carried to `/webtty/` only in the URL fragment and is removed
+from browser history before the page creates a session. It is short-lived,
+bound to the administrator login and active route generation, single-use, and
+invalidates its sibling target choices when consumed. All mutations require the
+same-origin, session-bound browser CSRF proof.
+
+WebTTY records exact Box or agent process evidence in the transient
+`/run/ploinky/webtty` recovery directory using the v2 target-discriminated
+schema. Startup recovery runs before the surface becomes available. Ambiguity
+confined to one immutable agent target quarantines only that target; systemic
+agent-provider evidence failure disables agent targets while leaving Box
+terminals available. Unclassifiable or Box cleanup ambiguity fails all WebTTY
+closed. Quarantines are never cleared by a timer. If retained evidence cannot
+be reclaimed safely, recreate the exact managed Box with `ploinky destroy`
+followed by the normal `ploinky start` workflow; recreation discards both the
+ephemeral recovery records and nested runtime state while preserving the host
+workspace and retained caches.
+
 Nested container records, writable layers, networks, and inner Podman named
 volumes are discarded with the outer Box, so persistent agent data must use
 explicit `/workspace` binds. A Box created by an older layout is not recognized
