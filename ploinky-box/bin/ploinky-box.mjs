@@ -20,13 +20,14 @@ Usage: ploinky [--debug] [--dry-run] [--port PORT] [--udp-port PORT] [--] COMMAN
 Commands:
   ploinky                         Prepare the Box and open the Ploinky REPL
   ploinky start AGENT [PORT]      Start the graph; the Router host port defaults to 8080
-  ploinky restart [AGENT]         Restart through the same source/readiness transaction
+  ploinky restart                 Reconcile sources and restart the whole workspace graph
+  ploinky restart AGENT           Restart one agent in the existing Box generation
   ploinky --udp-port PORT start AGENT [PORT]
                                   Select the media host UDP port; defaults to 7882
   ploinky status [--verbose]      Inspect Box and core state without mutation
   ploinky stop                    Stop core services and the outer Box
-  ploinky update [all [PATH]]     Update host core, in-Box repos/deps/skills,
-                                  then restart a configured running workspace
+  ploinky update [all [PATH]]     Update host core, a workspace ./ploinky checkout,
+                                  in-Box repos/deps/skills, then restart if configured
   ploinky destroy                 Remove the outer Box without prompting; retain .ploinky/box
   ploinky destroy --delete-cache  Remove the outer Box and delete .ploinky/box/dependencies
                                   and .ploinky/box/images without prompting
@@ -170,9 +171,16 @@ export async function runOuterCli(argv, {
         return 0;
     }
     if (route.kind === 'restart') {
-        await selectedSupervisor.runRestartTransaction(stripBranchPolicyArgs(route.coreArgv), {
-            branchPolicy: parseBranchPolicy(route.coreArgv),
-        });
+        const coreArgv = stripBranchPolicyArgs(route.coreArgv);
+        const targeted = stripBranchPolicyArgs(parsed.commandArgs)
+            .some((argument) => !['--debug', '-d'].includes(argument));
+        if (targeted) {
+            await selectedSupervisor.runTargetedRestartTransaction(coreArgv);
+        } else {
+            await selectedSupervisor.runRestartTransaction(coreArgv, {
+                branchPolicy: parseBranchPolicy(route.coreArgv),
+            });
+        }
         return 0;
     }
 
@@ -217,10 +225,22 @@ export async function runOuterCli(argv, {
         const priorStatus = selectedSupervisor.inspectBoxStatus();
         const restartAfterUpdate = priorStatus.state === 'running-initialized'
             && priorStatus.inbox?.routingConfigured === true;
-        await selectedSupervisor.runUpdateTransaction(stripBranchPolicyArgs(route.coreArgv), {
+        const updateResult = await selectedSupervisor.runUpdateTransaction(stripBranchPolicyArgs(route.coreArgv), {
             branchPolicy: parseBranchPolicy(route.coreArgv),
             restartAfterUpdate,
         });
+        const workspacePloinky = updateResult?.workspacePloinky;
+        if (workspacePloinky?.found && !workspacePloinky.duplicateOfHost) {
+            if (workspacePloinky.skipped) {
+                output.write(`Workspace Ploinky checkout skipped: ${workspacePloinky.reason}.\n`);
+            } else {
+                const state = workspacePloinky.updated ? 'updated' : 'already up to date';
+                output.write(
+                    `Workspace Ploinky checkout at ${workspacePloinky.repoPath} is ${state} `
+                    + '(git pull --rebase --autostash).\n',
+                );
+            }
+        }
         if (!restartAfterUpdate) {
             output.write('Update complete; no configured running workspace required a restart.\n');
             return 0;

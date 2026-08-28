@@ -57,6 +57,7 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
         prepareBoxForCommand: async () => { events.push('prepare'); return prepared; },
         runStartTransaction: async (argv, options) => events.push(['start', argv, options]),
         runRestartTransaction: async (argv, options) => events.push(['restart', argv, options]),
+        runTargetedRestartTransaction: async (argv) => events.push(['targeted-restart', argv]),
         runUpdateTransaction: async (argv, options) => events.push(['update-transaction', argv, options]),
         runStopTransaction: async () => events.push('stop'),
         runDestroyTransaction: async (id, options) => {
@@ -280,26 +281,61 @@ test('explicit start is reachable and retains normalized debug argv', async () =
 });
 
 test('restart is a supervisor transaction and branch policy is consumed at the outer boundary', async () => {
+    for (const argv of [
+        [
+            'restart', '--branch', 'candidate', '--repo-branch=Agent=agent-candidate',
+            '--branch-fallback', 'fail', '--reset-repos',
+        ],
+        ['restart', '--debug'],
+    ]) {
+        const events = [];
+        const code = await runOuterCli(argv, {
+            env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events),
+        });
+        assert.equal(code, 0);
+        if (argv.includes('--branch')) {
+            assert.deepEqual(events, [[
+                'restart',
+                ['restart'],
+                {
+                    branchPolicy: {
+                        branch: 'candidate',
+                        repoBranches: { Agent: 'agent-candidate' },
+                        fallback: 'fail',
+                        resetRepos: true,
+                    },
+                },
+            ]]);
+        } else {
+            assert.deepEqual(events, [[
+                'restart',
+                ['restart', '--debug'],
+                {
+                    branchPolicy: {
+                        branch: null,
+                        repoBranches: {},
+                        fallback: 'default',
+                        resetRepos: false,
+                    },
+                },
+            ]]);
+        }
+    }
+});
+
+test('targeted restart preserves the existing Box generation and exact core argv', async () => {
     const events = [];
     const code = await runOuterCli([
-        'restart', '--branch', 'candidate', '--repo-branch=Agent=agent-candidate',
-        '--branch-fallback', 'fail', '--reset-repos',
+        '--debug', 'restart', 'onlyOffice', '--branch', 'candidate', '--reset-repos',
     ], {
         env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
     });
     assert.equal(code, 0);
     assert.deepEqual(events, [[
-        'restart',
-        ['restart'],
-        {
-            branchPolicy: {
-                branch: 'candidate',
-                repoBranches: { Agent: 'agent-candidate' },
-                fallback: 'fail',
-                resetRepos: true,
-            },
-        },
+        'targeted-restart',
+        ['--debug', 'restart', 'onlyOffice'],
     ]]);
 });
 
@@ -421,6 +457,18 @@ test('full update refreshes in-Box state then restarts an already configured wor
         ...status(),
         inbox: { routingConfigured: true },
     });
+    supervisor.runUpdateTransaction = async (argv, options) => {
+        events.push(['update-transaction', argv, options]);
+        return {
+            workspacePloinky: {
+                found: true,
+                updated: true,
+                skipped: false,
+                repoPath: '/workspace/ploinky',
+                pullStrategy: 'rebase-autostash',
+            },
+        };
+    };
     const output = bufferStream();
     const code = await runOuterCli(['update'], {
         env: {},
@@ -448,6 +496,8 @@ test('full update refreshes in-Box state then restarts an already configured wor
             restartAfterUpdate: true,
         }],
     ]);
+    assert.match(output.value(), /Workspace Ploinky checkout at \/workspace\/ploinky is updated/);
+    assert.match(output.value(), /git pull --rebase --autostash/);
     assert.match(output.value(), /were restarted coherently/);
 });
 

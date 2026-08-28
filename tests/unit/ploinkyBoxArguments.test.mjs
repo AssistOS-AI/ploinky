@@ -94,6 +94,8 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
         [['stop'], 'stop'],
         [['destroy'], 'destroy'],
         [['start', 'Agent'], 'start'],
+        [['restart'], 'restart'],
+        [['restart', 'Agent'], 'restart'],
         [['update'], 'update'],
         [['update', 'all'], 'update'],
         [['update', 'repos'], 'generic'],

@@ -287,6 +287,79 @@ test('managed preflight requires Podman 5.4+, rootless Netavark, operational pas
     assert.doesNotThrow(() => overriddenGateway.adapter.preflight({ mode: 'default' }, 'demo'));
 });
 
+test('managed preflight retries transient Podman ownership proof failures before mutating', (t) => {
+    const harness = networkHarness(t);
+    const waits = [];
+    let transientFailures = 2;
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run(runtime, args) {
+            if (args[0] === 'info'
+                && args[2]?.includes('Rootless')
+                && transientFailures > 0) {
+                transientFailures -= 1;
+                harness.calls.push([...args]);
+                return {
+                    ok: false,
+                    status: 125,
+                    stdout: '',
+                    stderr: 'database is locked by a concurrent image pull',
+                };
+            }
+            return harness.run(runtime, args);
+        },
+        workspaceRoot: path.join(harness.dir, 'workspace'),
+        lockPath: path.join(harness.dir, 'retry-network.lock'),
+        containersConfigPaths: [],
+        runtimeProofRetryDelaysMs: [10, 20],
+        waitForRuntimeProofRetry: (delayMs) => waits.push(delayMs),
+    });
+
+    assert.doesNotThrow(() => adapter.preflight({ mode: 'default' }, 'demo'));
+    assert.equal(harness.calls.filter((args) => (
+        args[0] === 'info' && args[2]?.includes('Rootless')
+    )).length, 3);
+    assert.deepEqual(waits, [10, 20]);
+    assert.equal(harness.calls.some((args) => args[0] === 'network' && args[1] === 'create'), false);
+});
+
+test('managed preflight exhausts transient ownership retries and never retries rootful proof', (t) => {
+    const harness = networkHarness(t);
+    const waits = [];
+    let transientProbeCount = 0;
+    const unavailable = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run(_runtime, args) {
+            harness.calls.push([...args]);
+            transientProbeCount += 1;
+            return {
+                ok: false,
+                status: 125,
+                stdout: '',
+                stderr: 'database is locked by a concurrent image pull',
+            };
+        },
+        workspaceRoot: path.join(harness.dir, 'workspace'),
+        lockPath: path.join(harness.dir, 'failed-retry-network.lock'),
+        containersConfigPaths: [],
+        runtimeProofRetryDelaysMs: [10, 20],
+        waitForRuntimeProofRetry: (delayMs) => waits.push(delayMs),
+    });
+    assert.throws(
+        () => unavailable.preflight({ mode: 'default' }, 'demo'),
+        /database is locked by a concurrent image pull after 3 attempts/,
+    );
+    assert.equal(transientProbeCount, 3);
+    assert.deepEqual(waits, [10, 20]);
+    assert.equal(harness.calls.some((args) => args[0] === 'network' && args[1] === 'create'), false);
+
+    const rootful = networkHarness(t, { platform: { rootless: 'false' } });
+    assert.throws(() => rootful.adapter.preflight({ mode: 'default' }, 'demo'), /observed 'false'/);
+    assert.equal(rootful.calls.filter((args) => (
+        args[0] === 'info' && args[2]?.includes('Rootless')
+    )).length, 1);
+});
+
 test('remote managed preflight uses server pasta metadata without invoking client-side unshare', (t) => {
     const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-remote-client-conf-'));
     t.after(() => fs.rmSync(configDir, { recursive: true, force: true }));
