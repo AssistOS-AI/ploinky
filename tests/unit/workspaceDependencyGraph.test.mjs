@@ -1710,10 +1710,10 @@ test('saved start stages static promotion and former-static isolation before gen
 });
 
 test('resolveWorkspaceDependencyGraph resolves same-repo bare dependencies when enabled repos are filtered', (t) => {
-    writeEnabledRepos(['basic']);
+    writeEnabledRepos(['utilities']);
     t.after(clearEnabledRepos);
 
-    writeManifest('basic', 'webtty', { container: 'node:20-alpine' });
+    writeManifest('utilities', 'shellTool', { container: 'node:20-alpine' });
     writeManifest('AchillesIDE', 'gitAgent', {
         container: 'node:20-alpine',
         profiles: { default: {}, embedded: {} },
@@ -1725,14 +1725,14 @@ test('resolveWorkspaceDependencyGraph resolves same-repo bare dependencies when 
                 agent: 'gitAgent global',
                 profile: 'embedded',
             },
-            'basic/webtty',
+            'utilities/shellTool',
         ],
     });
 
     const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'AchillesIDE/explorer' });
 
     assert.ok(graph.nodes.has('AchillesIDE/gitAgent'));
-    assert.ok(graph.nodes.has('basic/webtty'));
+    assert.ok(graph.nodes.has('utilities/shellTool'));
     assert.equal(graph.nodes.get('AchillesIDE/gitAgent').enableSpec, 'AchillesIDE/gitAgent global');
     assert.equal(graph.nodes.get('AchillesIDE/gitAgent').profile, 'embedded');
     assert.ok(graph.nodes.get('AchillesIDE/explorer').dependencies.has('AchillesIDE/gitAgent'));

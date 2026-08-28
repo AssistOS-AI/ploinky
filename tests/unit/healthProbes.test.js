@@ -765,7 +765,7 @@ test('blocking readiness preserves a typed running-state control-plane timeout',
 test('continuous health preserves a typed startup-state control-plane timeout', () => {
     const timeout = new Error('podman inspect timed out');
     timeout.code = 'ETIMEDOUT';
-    assert.throws(() => runHealthProbes('webtty', 'webtty-container', {}, {
+    assert.throws(() => runHealthProbes('terminal-tool', 'terminal-tool-container', {}, {
         waitForContainerRunningImpl() { throw timeout; },
     }), (error) => {
         assert.equal(error.code, 'PLOINKY_PROBE_CONTROL_PLANE_TIMEOUT');

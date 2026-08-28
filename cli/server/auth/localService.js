@@ -6,6 +6,7 @@ import { hashPassword, verifyPasswordHash } from '../../utils/security/localAuth
 import { JwsCodec } from '../security/tokens/JwsCodec.js';
 import { createSessionStore } from './sessionStore.js';
 import { isSessionRevoked } from './sessionRevocations.js';
+import { emitAuthenticationSessionInvalidated } from './sessionEvents.js';
 
 const sessionStore = createSessionStore();
 const jwsCodec = new JwsCodec();
@@ -336,6 +337,14 @@ function getSession(sessionId, options = {}) {
 
 function revokeSession(sessionId) {
     sessionStore.deleteSession(sessionId);
+    let sessionBindingId = '';
+    try { sessionBindingId = String(verifySessionJwt(sessionId)?.sid || ''); } catch (_) { }
+    emitAuthenticationSessionInvalidated({
+        mode: 'local',
+        sessionId,
+        sessionBindingId,
+        reason: 'revoked',
+    });
 }
 
 function revokeSessionsForLocalPolicy(policy = {}) {
@@ -344,6 +353,7 @@ function revokeSessionsForLocalPolicy(policy = {}) {
         const localAuth = session?.localAuth || {};
         return localAuth.usersVar === usersVar;
     });
+    emitAuthenticationSessionInvalidated({ mode: 'local', all: true, reason: 'policy_changed' });
 }
 
 function updateLocalCredentials({

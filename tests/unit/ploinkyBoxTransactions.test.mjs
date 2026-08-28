@@ -878,7 +878,7 @@ test('a replaced live bind source forces outer-container replacement', async (t)
     assert.equal(h.calls.some((call) => call.join(' ').includes('container create')), true);
 });
 
-test('an incompatible owned image hard-cuts before any engine mutation', async (t) => {
+test('an incompatible owned WebTTY native runtime hard-cuts before any engine mutation', async (t) => {
     const state = fixture(t);
     const current = containerHandle({
         identity: state.identity,
@@ -892,8 +892,10 @@ test('an incompatible owned image hard-cuts before any engine mutation', async (
     });
     const h = harness(state, { initial: current });
     h.seams.validateExistingImage = () => {
-        const error = new Error('image configuration is incompatible; destroy and recreate the Box');
-        error.code = 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT';
+        const error = new Error(
+            `WebTTY native contract mismatch for ${'d'.repeat(64)}; build or pull a compatible runtime image and recreate the Box`,
+        );
+        error.code = 'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID';
         throw error;
     };
     await assert.rejects(() => reconcileBoxContainer({
@@ -908,8 +910,8 @@ test('an incompatible owned image hard-cuts before any engine mutation', async (
         lock: state.lock,
         repositoryRoot: state.root,
     }, h.seams), (error) => (
-        error.code === 'PLOINKY_BOX_IMAGE_CONTRACT_HARD_CUT'
-            && /destroy and recreate/i.test(error.message)
+        error.code === 'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID'
+            && /compatible runtime image and recreate the Box/i.test(error.message)
     ));
     assert.deepEqual(h.calls, []);
 });

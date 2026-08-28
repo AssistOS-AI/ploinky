@@ -701,7 +701,7 @@ test('collector fails closed when box root cannot enter a nested network namespa
 
 test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expected graph', () => {
     const profile = loadListenerProfile(FULL_PROFILE);
-    assert.equal(profile.requiredContainers.length, 20);
+    assert.equal(profile.requiredContainers.length, 19);
     const livekitContainer = profile.requiredContainers.find(entry => entry.id === 'livekit');
     assert.equal(livekitContainer.networkModePattern.test('host'), true);
     assert.equal(livekitContainer.networkModePattern.test('bridge'), false);
@@ -716,6 +716,17 @@ test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expe
     assert.equal(privateRouter.dynamicBindSet, 'loopback-and-managed-gateways');
     assert.deepEqual(privateRouter.bindAddresses, []);
     assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').minMatches, 16);
+    assert.equal(profile.controlPorts.includes(7681), false);
+    assert.equal(profile.requiredContainers.some(entry => (
+        entry.id === 'webtty'
+        || entry.namePattern.test('ploinky_basic_webtty_fixture')
+        || entry.effectiveInstance === 'agent:basic/webtty'
+    )), false);
+    assert.equal(profile.rules.some(rule => (
+        rule.id === 'webtty-service'
+        || rule.ports.includes(7681)
+        || rule.containerPattern?.test('ploinky_basic_webtty_fixture')
+    )), false);
     for (const [id, port, owner] of [
         ['onlyoffice-redis', 6379, 'redis-server'],
         ['onlyoffice-adminpanel', 9000, 'node'],

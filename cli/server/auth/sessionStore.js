@@ -85,6 +85,12 @@ function createSessionStore({ sessionTtlMs = DEFAULT_SESSION_TTL_MS, pendingTtlM
         if (updates.refreshExpiresAt !== undefined) {
             session.refreshExpiresAt = updates.refreshExpiresAt;
         }
+        if (updates.user && typeof updates.user === 'object') {
+            session.user = updates.user;
+        }
+        if (updates.providerSession && typeof updates.providerSession === 'object') {
+            session.providerSession = updates.providerSession;
+        }
         session.updatedAt = Date.now();
         sessions.set(sessionId, session);
         return session;

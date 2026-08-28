@@ -149,12 +149,12 @@ test('manifest route access validates parameter-bound guest scopes', () => {
 test('manifest route access accepts only convention paths owned by the declaring agent', () => {
     assert.deepEqual(
         normalizeManifestHttpRouteAccess({
-            path: '/base-agent-additional-server/explorer/7681/*',
+            path: '/base-agent-additional-server/explorer/7654/*',
             access: 'authenticated',
         }, { routeKey: 'explorer' }),
         {
             ok: true,
-            path: '/base-agent-additional-server/explorer/7681/*',
+            path: '/base-agent-additional-server/explorer/7654/*',
             access: 'authenticated',
             routeKey: 'explorer',
             source: 'manifest',
@@ -162,7 +162,7 @@ test('manifest route access accepts only convention paths owned by the declaring
     );
     assert.equal(
         normalizeManifestHttpRouteAccess({
-            path: '/base-agent-additional-server/other/7681/*',
+            path: '/base-agent-additional-server/other/7654/*',
             access: 'public',
         }, { routeKey: 'explorer' }).code,
         'ROUTE_OWNERSHIP_MISMATCH',

@@ -66,8 +66,15 @@ export function createProvider({ getConfig }) {
         },
         async sso_refresh_session({ providerSession }) {
             recordCall('sso_refresh_session', { providerSession });
+            if (process.env.__FAKE_PROVIDER_REFRESH_DELAY === '1') {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            if (process.env.__FAKE_PROVIDER_REFRESH_FAIL === '1') throw new Error('refresh rejected');
+            const roles = process.env.__FAKE_PROVIDER_ROLES
+                ? process.env.__FAKE_PROVIDER_ROLES.split(',')
+                : undefined;
             return {
-                user: { id: 'u1', sub: 'u1', username: 'alice' },
+                user: { id: 'u1', sub: 'u1', username: 'alice', ...(roles ? { roles } : {}) },
                 providerSession: { ...providerSession, tokens: { ...providerSession.tokens, accessToken: 'AT2' } }
             };
         },
@@ -175,4 +182,70 @@ test('bridge rejects unknown state on callback', async () => {
         bridge.handleCallback({ code: 'x', state: 'bogus', baseUrl: 'http://127.0.0.1:8080' }),
         /Invalid or expired/
     );
+});
+
+test('response-free validation refreshes and persists current SSO identity, then fails closed', async (t) => {
+    writeWorkspaceSsoConfig({
+        enabled: true,
+        providerAgent: 'fake/fakeProvider',
+        providerConfig: {
+            issuerBaseUrl: 'https://fake.test',
+            clientId: 'fake-client'
+        }
+    });
+    t.after(() => {
+        delete process.env.__FAKE_PROVIDER_ROLES;
+        delete process.env.__FAKE_PROVIDER_REFRESH_FAIL;
+        delete process.env.__FAKE_PROVIDER_REFRESH_DELAY;
+    });
+    const bridge = createGenericAuthBridge({ ssoValidationIntervalMs: 0 });
+    const { state } = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
+    const callback = await bridge.handleCallback({
+        code: 'auth-code',
+        state,
+        baseUrl: 'http://127.0.0.1:8080'
+    });
+
+    process.env.__FAKE_PROVIDER_ROLES = 'user,admin';
+    const validated = await bridge.validateSession(callback.sessionId);
+    assert.deepEqual(validated.user.roles, ['user', 'admin']);
+    assert.equal(validated.providerSession.tokens.accessToken, 'AT2');
+    assert.deepEqual(bridge.getSession(callback.sessionId).user.roles, ['user', 'admin']);
+
+    process.env.__FAKE_PROVIDER_REFRESH_FAIL = '1';
+    assert.equal(await bridge.validateSession(callback.sessionId, { forceRemote: true }), null);
+    assert.equal(bridge.getSession(callback.sessionId), null);
+    const refreshCalls = readCalls().filter((call) => call.op === 'sso_refresh_session');
+    assert.ok(refreshCalls.length >= 2);
+});
+
+test('response-free SSO validation is single-flight per auth session', async (t) => {
+    writeWorkspaceSsoConfig({
+        enabled: true,
+        providerAgent: 'fake/fakeProvider',
+        providerConfig: {
+            issuerBaseUrl: 'https://fake.test',
+            clientId: 'fake-client'
+        }
+    });
+    t.after(() => { delete process.env.__FAKE_PROVIDER_REFRESH_DELAY; });
+    const bridge = createGenericAuthBridge({ ssoValidationIntervalMs: 0 });
+    const { state } = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
+    const callback = await bridge.handleCallback({
+        code: 'auth-code',
+        state,
+        baseUrl: 'http://127.0.0.1:8080'
+    });
+    const before = readCalls().filter((call) => call.op === 'sso_refresh_session').length;
+    process.env.__FAKE_PROVIDER_REFRESH_DELAY = '1';
+    const [first, second, third] = await Promise.all([
+        bridge.validateSession(callback.sessionId),
+        bridge.validateSession(callback.sessionId),
+        bridge.validateSession(callback.sessionId),
+    ]);
+    const after = readCalls().filter((call) => call.op === 'sso_refresh_session').length;
+    assert.equal(after - before, 1);
+    assert.equal(first.providerSession.tokens.accessToken, 'AT2');
+    assert.equal(second, first);
+    assert.equal(third, first);
 });

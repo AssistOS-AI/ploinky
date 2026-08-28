@@ -320,9 +320,9 @@ test('implicit AgentServer publication follows the effective profile PORT', () =
   shouldCreateImplicitAgentServerPublish,
 } = await import(${JSON.stringify(agentServiceManagerUrl)});
 const configuredPort = resolveImplicitAgentServerPort({ env: { PORT: '8888' } });
-const descriptorPort = resolveImplicitAgentServerPort({ env: { PORT: { default: '7681' } } });
+const descriptorPort = resolveImplicitAgentServerPort({ env: { PORT: { default: '8761' } } });
 const resolvedOverridePort = resolveImplicitAgentServerPort(
-  { env: { PORT: { default: '7681' } } },
+  { env: { PORT: { default: '8761' } } },
   { PORT: '8765' },
 );
 process.stdout.write(JSON.stringify({
@@ -345,7 +345,7 @@ process.stdout.write(JSON.stringify({
     assert.deepEqual(JSON.parse(result.stdout), {
       defaultPort: 7000,
       configuredPort: 8888,
-      descriptorPort: 7681,
+      descriptorPort: 8761,
       resolvedOverridePort: 8765,
         needsConfiguredPublish: true,
         reusesConfiguredPublish: false,

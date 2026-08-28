@@ -4,6 +4,10 @@ import {
     BOX_RUNTIME_UID,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import {
+    WEBTTY_NATIVE_PROBE_PATH,
+    parseAndValidateNativeProbeOutput,
+} from '../../core-services/webtty/native-runtime.mjs';
 
 export const IMAGE_CONTRACT = Object.freeze({
     user: 'podman',
@@ -35,6 +39,8 @@ export const IMAGE_CONTRACT = Object.freeze({
     networkHelpers: Object.freeze(['pasta', 'slirp4netns']),
 });
 export const IMAGE_PROBE_TIMEOUT_MS = 60_000;
+export const WEBTTY_NATIVE_PROBE_TIMEOUT_MS = 60_000;
+const WEBTTY_NATIVE_PROBE_FAILURE = /(?:^|\n)WebTTY native probe failed: ([a-z0-9-]{1,64})(?:\n|$)/;
 
 function contractError(
     imageRef,
@@ -98,6 +104,8 @@ export function normalizeImageInspect(raw) {
     const config = record.Config;
     return Object.freeze({
         id: String(record.Id ?? record.ID ?? '').trim(),
+        os: String(record.Os ?? record.OS ?? '').trim().toLowerCase(),
+        architecture: String(record.Architecture ?? '').trim().toLowerCase(),
         user: String(config.User ?? ''),
         workdir: String(config.WorkingDir ?? ''),
         environment: envMap(config.Env),
@@ -233,25 +241,59 @@ export function probeImageBinaries(engine, imageId, runner) {
     return validateImageBinaries(available, imageId);
 }
 
-export function inspectAndValidateImage(engine, imageRef, runner) {
-    const result = runner.query(engine, ['image', 'inspect', imageRef]);
+export function probeWebttyNativeRuntime(engine, imageId, image, runner) {
+    const result = runner.query(engine, [
+        'run',
+        '--rm',
+        '--network=none',
+        '--pull=never',
+        '--entrypoint=/usr/local/bin/node',
+        imageId,
+        WEBTTY_NATIVE_PROBE_PATH,
+        '--verify',
+    ], { timeoutMs: WEBTTY_NATIVE_PROBE_TIMEOUT_MS });
     if (!result.ok) {
-        throw new PloinkyBoxError(`Unable to inspect runtime image '${imageRef}'`, {
-            code: 'PLOINKY_BOX_IMAGE_INSPECT_FAILED',
-        });
+        const failureCategory = result?.error?.code === 'ETIMEDOUT'
+            ? 'timeout'
+            : String(result.stderr || '').slice(0, 16 * 1024).match(WEBTTY_NATIVE_PROBE_FAILURE)?.[1]
+                || 'probe-failed';
+        throw contractError(
+            imageId,
+            'WebTTY native runtime probe',
+            'a successful immutable node-pty import and PTY lifecycle',
+            `failure category: ${failureCategory}`,
+            'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID',
+            '; build or pull a compatible runtime image and recreate the Box',
+        );
     }
-    const image = normalizeImageInspect(result.stdout);
-    validateImageContract(image, imageRef);
-    const availableBinaries = probeImageBinaries(engine, image.id, runner);
-    return validateImageContract(image, imageRef, { availableBinaries });
+    try {
+        return parseAndValidateNativeProbeOutput(result.stdout, {
+            platform: image.os,
+            architecture: image.architecture,
+            uid: BOX_RUNTIME_UID,
+            gid: BOX_RUNTIME_GID,
+        });
+    } catch (error) {
+        const categories = Array.isArray(error?.categories)
+            ? error.categories.join(', ')
+            : 'invalid-result';
+        throw contractError(
+            imageId,
+            'WebTTY native runtime contract',
+            'the exact supported schema, Node ABI, architecture, lock, artifact, user, and PTY lifecycle',
+            `mismatch categories: ${categories}`,
+            'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID',
+            '; build or pull a compatible runtime image and recreate the Box',
+        );
+    }
 }
 
-export function inspectAndValidateExistingImage(engine, imageId, imageRef, runner) {
+function inspectImmutableImage(engine, imageId, imageRef, runner, errorCode) {
     const result = runner.query(engine, ['image', 'inspect', imageId]);
     if (!result.ok) {
         throw new PloinkyBoxError(
             `Unable to verify the owned Box image '${imageId}'; destroy and recreate the Box`,
-            { code: 'PLOINKY_BOX_EXISTING_IMAGE_INSPECT_FAILED' },
+            { code: errorCode },
         );
     }
     const image = validateImageContract(normalizeImageInspect(result.stdout), imageRef);
@@ -264,4 +306,39 @@ export function inspectAndValidateExistingImage(engine, imageId, imageRef, runne
         );
     }
     return image;
+}
+
+function probeAndReinspectImage(engine, image, imageRef, runner) {
+    const availableBinaries = probeImageBinaries(engine, image.immutableId, runner);
+    validateImageContract(image, imageRef, { availableBinaries });
+    probeWebttyNativeRuntime(engine, image.immutableId, image, runner);
+    return inspectImmutableImage(
+        engine,
+        image.immutableId,
+        imageRef,
+        runner,
+        'PLOINKY_BOX_IMAGE_REINSPECT_FAILED',
+    );
+}
+
+export function inspectAndValidateImage(engine, imageRef, runner) {
+    const result = runner.query(engine, ['image', 'inspect', imageRef]);
+    if (!result.ok) {
+        throw new PloinkyBoxError(`Unable to inspect runtime image '${imageRef}'`, {
+            code: 'PLOINKY_BOX_IMAGE_INSPECT_FAILED',
+        });
+    }
+    const image = validateImageContract(normalizeImageInspect(result.stdout), imageRef);
+    return probeAndReinspectImage(engine, image, imageRef, runner);
+}
+
+export function inspectAndValidateExistingImage(engine, imageId, imageRef, runner) {
+    const image = inspectImmutableImage(
+        engine,
+        imageId,
+        imageRef,
+        runner,
+        'PLOINKY_BOX_EXISTING_IMAGE_INSPECT_FAILED',
+    );
+    return probeAndReinspectImage(engine, image, imageRef, runner);
 }

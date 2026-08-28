@@ -1,0 +1,9 @@
+{
+  "name": "@ploinky/webtty-native-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "node-pty": "1.0.0"
+  }
+}
