@@ -205,10 +205,24 @@ export class WebttySessionManager {
             terminalCleanupProven: false,
             initRequested: false,
         };
+        let subscriptionActive = false;
+        try {
+            const unsubscribe = this.auth.subscribeInvalidation(lease, (reason) => {
+                if (subscriptionActive) void this.closeSession(session, `auth_${reason}`);
+            });
+            if (typeof unsubscribe !== 'function') {
+                throw errorWithCode('WEBTTY_AUTH_SUBSCRIPTION_INVALID');
+            }
+            session.unsubscribeAuth = () => {
+                subscriptionActive = false;
+                unsubscribe();
+            };
+        } catch (error) {
+            releaseQuota();
+            throw error;
+        }
         this.sessions.set(id, session);
-        session.unsubscribeAuth = this.auth.subscribeInvalidation(lease, (reason) => {
-            void this.closeSession(session, `auth_${reason}`);
-        });
+        subscriptionActive = true;
         worker.on('output', (message) => this.onOutput(session, message));
         worker.on('terminal-exit', (message) => {
             session.terminalCleanupProven = true;
@@ -362,6 +376,7 @@ export class WebttySessionManager {
             const removed = session.replay.shift();
             session.replayBytes -= removed.bytes;
         }
+        this.touch(session);
         this.writeStream(session, encoded);
     }
 
@@ -480,15 +495,28 @@ export class WebttySessionManager {
             try { await session.worker.close(); } catch (_) { }
         }
         const exited = workerExited || await session.worker.waitForExit();
-        const cleanupProven = session.terminalCleanupProven === true;
+        let cleanupProven = session.terminalCleanupProven === true;
+        let cleanupFailureCategory = '';
+        if (exited && session.recordHandle
+            && session.recordHandle.record?.ptyState !== 'pty-starting') {
+            try {
+                cleanupProven = await this.recordStore.confirmReclaimed(
+                    session.recordHandle.record,
+                    { waitForExit: true },
+                );
+            } catch (_) {
+                cleanupProven = false;
+                cleanupFailureCategory = 'terminal_reclamation_check_failed';
+            }
+        }
         const mustPreserve = preserveRecord || session.preserveRecord || !cleanupProven;
         if (!exited) {
             session.preserveRecord = true;
             this.disableForUnprovenCleanup('worker_exit_unconfirmed', session);
         } else if ((session.recordHandle || session.initRequested) && mustPreserve) {
-            const category = session.preserveRecord && this.disabledCategory
+            const category = cleanupFailureCategory || (session.preserveRecord && this.disabledCategory
                 ? this.disabledCategory
-                : 'terminal_cleanup_unproven';
+                : 'terminal_cleanup_unproven');
             session.preserveRecord = true;
             this.disableForUnprovenCleanup(category, session);
         } else if (session.recordHandle) {

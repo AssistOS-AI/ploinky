@@ -289,6 +289,9 @@ export class TerminalWorker {
     }
 
     async performCleanup(category, { ptyAlreadyExited }) {
+        // This proves the recorded shell/session leader has exited. The Router
+        // separately verifies that no process remains in the recorded Linux
+        // terminal session before deleting durable recovery evidence.
         let cleanupProven = Boolean(ptyAlreadyExited || this.ptyExited);
         let safeToDispose = cleanupProven;
         if (this.pty && !this.ptyIdentity && !cleanupProven) this.reportCleanupUnproven();

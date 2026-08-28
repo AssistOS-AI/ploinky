@@ -6,6 +6,7 @@ export const WEBTTY_RECOVERY_RECORD_SCHEMA = 'ploinky-webtty-recovery/v1';
 export const DEFAULT_WEBTTY_RUNTIME_DIRECTORY = '/run/ploinky/webtty';
 const MAX_RECORD_BYTES = 16 * 1024;
 const RECORD_NAME = /^[a-zA-Z0-9_-]{20,80}\.json$/;
+const RECLAMATION_STABILITY_MS = 25;
 
 function modeBits(stat) {
     return stat.mode & 0o777;
@@ -72,6 +73,26 @@ function validateRecord(value) {
     });
 }
 
+function parseLinuxProcStat(statText, expectedPid) {
+    if (typeof statText !== 'string' || statText.length === 0 || statText.length > 64 * 1024) {
+        throw new Error('invalid proc stat');
+    }
+    const open = statText.indexOf('(');
+    const close = statText.lastIndexOf(')');
+    if (open <= 0 || close <= open || Number(statText.slice(0, open).trim()) !== expectedPid) {
+        throw new Error('invalid proc stat');
+    }
+    const fields = statText.slice(close + 1).trim().split(/\s+/);
+    if (fields.length < 20) throw new Error('incomplete proc stat');
+    return {
+        pid: expectedPid,
+        state: String(fields[0] || ''),
+        pgrp: Number(fields[2]),
+        session: Number(fields[3]),
+        rawStartToken: String(fields[19] || ''),
+    };
+}
+
 export async function readLinuxProcessIdentity(pid, { procRoot = '/proc' } = {}) {
     if (!safeInteger(pid)) return null;
     try {
@@ -82,26 +103,19 @@ export async function readLinuxProcessIdentity(pid, { procRoot = '/proc' } = {})
             fs.readFile(path.join(procRoot, String(pid), 'cmdline')),
         ]);
         const statAfter = await fs.readFile(statPath, 'utf8');
-        const parseStat = (statText) => {
-            const close = statText.lastIndexOf(')');
-            if (close < 0) throw new Error('invalid proc stat');
-            const fields = statText.slice(close + 2).trim().split(/\s+/);
-            return {
-                pgrp: Number(fields[2]),
-                session: Number(fields[3]),
-                rawStartToken: String(fields[19] || ''),
-            };
-        };
-        const before = parseStat(statBefore);
-        const after = parseStat(statAfter);
+        const before = parseLinuxProcStat(statBefore, pid);
+        const after = parseLinuxProcStat(statAfter, pid);
         const uidMatch = statusText.match(/^Uid:\s+(\d+)/m);
-        const { pgrp, session, rawStartToken } = after;
+        const {
+            state, pgrp, session, rawStartToken,
+        } = after;
         const uid = Number(uidMatch?.[1]);
         if (before.rawStartToken !== rawStartToken) throw new Error('proc identity changed while reading');
-        if (!safeInteger(pgrp) || !safeInteger(session) || !/^\d+$/.test(rawStartToken)
+        if (!/^[A-Za-z]$/.test(state) || !safeInteger(pgrp) || !safeInteger(session) || !/^\d+$/.test(rawStartToken)
             || !Number.isSafeInteger(uid) || uid < 0) throw new Error('incomplete proc identity');
         return {
             pid,
+            state,
             pgrp,
             session,
             startToken: `linux-proc:${rawStartToken}`,
@@ -114,6 +128,38 @@ export async function readLinuxProcessIdentity(pid, { procRoot = '/proc' } = {})
     }
 }
 
+export async function listLinuxSessionMembers(sessionId, { procRoot = '/proc' } = {}) {
+    if (!safeInteger(sessionId)) throw new Error('invalid Linux session id');
+    const entries = await fs.readdir(procRoot, { withFileTypes: true });
+    const members = [];
+    for (const entry of entries) {
+        if (!/^\d+$/.test(entry.name)) continue;
+        const pid = Number(entry.name);
+        if (!safeInteger(pid)) continue;
+        const statPath = path.join(procRoot, entry.name, 'stat');
+        try {
+            const before = parseLinuxProcStat(await fs.readFile(statPath, 'utf8'), pid);
+            if (before.session !== sessionId) continue;
+            const after = parseLinuxProcStat(await fs.readFile(statPath, 'utf8'), pid);
+            if (before.rawStartToken !== after.rawStartToken) {
+                throw new Error('proc identity changed while enumerating session');
+            }
+            if (after.session === sessionId && after.state !== 'Z') {
+                members.push(Object.freeze({
+                    pid,
+                    state: after.state,
+                    pgrp: after.pgrp,
+                    session: after.session,
+                    startToken: `linux-proc:${after.rawStartToken}`,
+                }));
+            }
+        } catch (error) {
+            if (error?.code !== 'ENOENT' && error?.code !== 'ESRCH') throw error;
+        }
+    }
+    return Object.freeze(members);
+}
+
 function identityMatches(observed, expected) {
     return Boolean(observed
         && observed.pid === expected.pid
@@ -121,6 +167,10 @@ function identityMatches(observed, expected) {
         && observed.startToken === expected.startToken
         && (!expected.pgrp || observed.pgrp === expected.pgrp)
         && (!expected.session || observed.session === expected.session));
+}
+
+function liveIdentityMatches(observed, expected) {
+    return observed?.state !== 'Z' && identityMatches(observed, expected);
 }
 
 function sleep(ms) {
@@ -132,14 +182,18 @@ export class RuntimeRecordStore {
         directory = DEFAULT_WEBTTY_RUNTIME_DIRECTORY,
         uid = process.getuid?.() ?? 0,
         readIdentity = readLinuxProcessIdentity,
+        listSessionMembers = listLinuxSessionMembers,
         signal = process.kill.bind(process),
         graceMs = 750,
+        delay = sleep,
     } = {}) {
         this.directory = path.resolve(directory);
         this.uid = uid;
         this.readIdentity = readIdentity;
+        this.listSessionMembers = listSessionMembers;
         this.signal = signal;
         this.graceMs = graceMs;
+        this.delay = delay;
     }
 
     async ensureDirectory() {
@@ -257,19 +311,49 @@ export class RuntimeRecordStore {
         return true;
     }
 
-    async recoverEntry(fileName, record) {
-        if (record.cleanupState === 'unproven') {
-            return { recovered: false, category: 'cleanup_unproven' };
+    async reclamationSnapshot(record) {
+        if (record.ptyState === 'pty-starting') return false;
+        const worker = await this.readIdentity(record.worker.pid);
+        if (liveIdentityMatches(worker, record.worker)) return false;
+        if (!record.pty) return true;
+        const pty = await this.readIdentity(record.pty.pid);
+        if (liveIdentityMatches(pty, record.pty)) return false;
+        const members = await this.listSessionMembers(record.pty.session);
+        if (!Array.isArray(members)) throw new Error('session membership evidence is invalid');
+        return members.length === 0;
+    }
+
+    async confirmReclaimed(recordValue, { waitForExit = false } = {}) {
+        const record = validateRecord(recordValue);
+        if (record.ptyState === 'pty-starting') return false;
+        let reclaimed = await this.reclamationSnapshot(record);
+        if (!reclaimed && waitForExit) {
+            await this.delay(this.graceMs);
+            reclaimed = await this.reclamationSnapshot(record);
         }
+        if (!reclaimed) return false;
+        await this.delay(RECLAMATION_STABILITY_MS);
+        return this.reclamationSnapshot(record);
+    }
+
+    async recoverEntry(fileName, record) {
         if (record.ptyState === 'pty-starting') {
             return { recovered: false, category: 'pty_startup_unproven' };
         }
+        if (await this.confirmReclaimed(record)) {
+            await this.remove({ fileName, record });
+            return {
+                recovered: true,
+                category: record.cleanupState === 'unproven'
+                    ? 'dead_unproven_record_removed'
+                    : 'dead_record_removed',
+            };
+        }
+        if (record.cleanupState === 'unproven') {
+            return { recovered: false, category: 'cleanup_unproven' };
+        }
         let worker = await this.readIdentity(record.worker.pid);
         let pty = record.pty ? await this.readIdentity(record.pty.pid) : null;
-        if (!worker && !pty) {
-            await this.remove({ fileName, record });
-            return { recovered: true, category: 'dead_record_removed' };
-        }
         if (worker) {
             const markerArg = `--ploinky-webtty-marker=${record.marker}`;
             if (!identityMatches(worker, record.worker) || !worker.cmdline.includes(markerArg)) {
@@ -289,7 +373,7 @@ export class RuntimeRecordStore {
                 return { recovered: false, category: 'pty_identity_ambiguous' };
             }
         }
-        await sleep(this.graceMs);
+        await this.delay(this.graceMs);
         worker = await this.readIdentity(record.worker.pid);
         pty = record.pty ? await this.readIdentity(record.pty.pid) : null;
         if (worker && identityMatches(worker, record.worker)) {
@@ -303,17 +387,16 @@ export class RuntimeRecordStore {
             return { recovered: false, category: 'pty_revalidation_failed' };
         }
         if (pty) {
-            await sleep(this.graceMs);
+            await this.delay(this.graceMs);
             if (await this.readIdentity(record.pty.pid)) {
                 if (!(await this.signalVerifiedPty(record, 'SIGKILL'))) {
                     return { recovered: false, category: 'pty_force_revalidation_failed' };
                 }
             }
         }
-        await sleep(25);
-        worker = await this.readIdentity(record.worker.pid);
-        pty = record.pty ? await this.readIdentity(record.pty.pid) : null;
-        if (worker || pty) return { recovered: false, category: 'process_cleanup_unconfirmed' };
+        if (!(await this.confirmReclaimed(record, { waitForExit: true }))) {
+            return { recovered: false, category: 'process_cleanup_unconfirmed' };
+        }
         await this.remove({ fileName, record });
         return { recovered: true, category: 'verified_reclaimed' };
     }

@@ -123,6 +123,15 @@ function requirePtyTopology(identity) {
     return identity;
 }
 
+function requirePtySignalTopology(identity) {
+    if (identity.state === 'Z') throw processIdentityError('pty-zombie', { stale: true });
+    if (identity.ttyNumber <= 0) throw processIdentityError('pty-tty');
+    if (identity.processGroupId !== identity.pid || identity.sessionId !== identity.pid) {
+        throw processIdentityError('pty-group-topology');
+    }
+    return identity;
+}
+
 export function capturePtyProcessIdentity(pid, { readIdentityImpl = readLinuxProcessIdentity } = {}) {
     const { identity } = stableInspection(pid, requirePtyTopology, { readIdentityImpl });
     requirePtyTopology(identity);
@@ -148,6 +157,37 @@ export function revalidatePtyProcessIdentity(record, { readIdentityImpl = readLi
         if (current[field] !== record?.[field]) throw processIdentityError(`pty-${field}`);
     }
     return current;
+}
+
+export function revalidatePtyProcessGroupIdentity(record, {
+    readIdentityImpl = readLinuxProcessIdentity,
+} = {}) {
+    const pid = positiveInteger(record?.pid, 'pid');
+    positiveInteger(record?.processGroupId, 'pty-process-group');
+    positiveInteger(record?.sessionId, 'pty-session');
+    positiveInteger(record?.foregroundProcessGroupId, 'pty-foreground-group');
+    positiveInteger(record?.ttyNumber, 'pty-tty');
+    if (typeof record?.startToken !== 'string' || !/^linux-proc:[1-9][0-9]*$/.test(record.startToken)) {
+        throw processIdentityError('pty-start-token');
+    }
+    const { identity } = stableInspection(pid, requirePtySignalTopology, { readIdentityImpl });
+    requirePtySignalTopology(identity);
+    for (const [field, observed] of [
+        ['startToken', identity.startToken],
+        ['processGroupId', identity.processGroupId],
+        ['sessionId', identity.sessionId],
+        ['ttyNumber', identity.ttyNumber],
+    ]) {
+        if (observed !== record[field]) throw processIdentityError(`pty-${field}`);
+    }
+    return Object.freeze({
+        pid: identity.pid,
+        startToken: identity.startToken,
+        processGroupId: identity.processGroupId,
+        sessionId: identity.sessionId,
+        foregroundProcessGroupId: identity.foregroundProcessGroupId,
+        ttyNumber: identity.ttyNumber,
+    });
 }
 
 export function revalidatePtyProcessLiveness(record, {
@@ -185,7 +225,10 @@ export function signalVerifiedPtyProcessGroup(record, signal, {
     killImpl = (target, selectedSignal) => process.kill(target, selectedSignal),
 } = {}) {
     if (!WEBTTY_ALLOWED_GROUP_SIGNALS.includes(signal)) throw processIdentityError('signal');
-    const current = revalidatePtyProcessIdentity(record, { readIdentityImpl });
+    // The terminal foreground group is job-control state. It legitimately
+    // changes while bash waits for a foreground command, so it is observed but
+    // is not part of the shell process-group identity being signaled here.
+    const current = revalidatePtyProcessGroupIdentity(record, { readIdentityImpl });
     if (current.processGroupId !== current.pid) throw processIdentityError('group-leader');
     // No filesystem, logging, or asynchronous operation belongs between this
     // final identity proof and the negative-PID signal.

@@ -87,6 +87,21 @@ test('negative-PID signals happen only after immediate exact revalidation', () =
     }));
 });
 
+test('foreground job-control changes do not invalidate the recorded shell process group', () => {
+    const record = capturePtyProcessIdentity(4242, { readIdentityImpl: () => identity() });
+    const calls = [];
+    const result = signalVerifiedPtyProcessGroup(record, 'SIGTERM', {
+        readIdentityImpl: () => identity(4242, { foregroundProcessGroupId: 5252 }),
+        killImpl: (target, signal) => calls.push([target, signal]),
+    });
+    assert.deepEqual(result, {
+        signaled: true,
+        signal: 'SIGTERM',
+        processGroupId: 4242,
+    });
+    assert.deepEqual(calls, [[-4242, 'SIGTERM']]);
+});
+
 test('worker identity binds executable, absolute script, argv, and stable start token', () => {
     const executablePath = '/usr/local/bin/node';
     const workerScriptPath = '/opt/ploinky/core-services/webtty/terminal-worker.mjs';

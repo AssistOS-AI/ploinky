@@ -128,7 +128,7 @@ function mapOperationError(res, error) {
         sendError(res, 401, 'authentication_required');
     } else if (code === 'WEBTTY_ADMIN_REQUIRED') {
         sendError(res, 403, 'administrator_required');
-    } else if (code.includes('QUOTA') || code.includes('RATE')) {
+    } else if (code.includes('QUOTA') || code.includes('RATE') || code === 'WEBTTY_IPC_BACKPRESSURE') {
         sendError(res, 429, code.toLowerCase(), { 'Retry-After': '5' });
     } else if (code === 'WEBTTY_CWD_INVALID' || code.endsWith('_INVALID')) {
         sendError(res, 400, code.toLowerCase());
@@ -165,8 +165,8 @@ export async function handleWebtty(req, res, parsedUrl, {
 
     if (pathname.startsWith('/webtty/assets/') && method === 'GET') {
         const name = pathname.slice('/webtty/assets/'.length);
+        if (!Object.hasOwn(ASSETS, name)) { sendError(res, 404, 'not_found'); return true; }
         const asset = ASSETS[name];
-        if (!asset) { sendError(res, 404, 'not_found'); return true; }
         try {
             const body = fs.readFileSync(asset.path);
             res.writeHead(200, {

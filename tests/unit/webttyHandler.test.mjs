@@ -235,6 +235,17 @@ test('page, asset, and stream GETs never allocate and assets use a fixed allowli
         routePlan,
     });
     assert.equal(unknownRes.statusCode, 404);
+    for (const inheritedName of ['__proto__', 'constructor']) {
+        const inheritedRes = new MockResponse();
+        await handleWebtty({
+            method: 'GET', headers: {}, user: { id: 'local:admin', roles: ['admin'] },
+        }, inheritedRes, new URL(`/webtty/assets/${inheritedName}`, 'http://localhost'), {
+            manager: service,
+            routePlan,
+        });
+        assert.equal(inheritedRes.statusCode, 404, inheritedName);
+        assert.equal(JSON.parse(inheritedRes.body).error, 'not_found', inheritedName);
+    }
 
     const streamRes = new MockResponse();
     await handleWebtty({
@@ -262,4 +273,28 @@ test('declared oversized JSON is rejected before body reads or allocation', asyn
     assert.equal(res.statusCode, 413);
     assert.equal(input.wasConsumed(), false);
     assert.equal(allocations, 0);
+});
+
+test('worker IPC backpressure is exposed as a retryable 429', async () => {
+    const routePlan = plan();
+    const input = request({
+        routePlan,
+        url: '/webtty/sessions/terminal-abcdefghijklmnop/input',
+        body: { data: 'x' },
+    });
+    const res = new MockResponse();
+    await handleWebtty(input.req, res, new URL(input.req.url, 'https://app.example.test'), {
+        manager: manager({
+            async validateOwnership() { return { id: 'terminal-abcdefghijklmnop' }; },
+            async input() {
+                const error = new Error('worker IPC high-water limit exceeded');
+                error.code = 'WEBTTY_IPC_BACKPRESSURE';
+                throw error;
+            },
+        }),
+        routePlan,
+    });
+    assert.equal(res.statusCode, 429);
+    assert.equal(res.headers['Retry-After'], '5');
+    assert.equal(JSON.parse(res.body).error, 'webtty_ipc_backpressure');
 });

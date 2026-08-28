@@ -108,7 +108,9 @@ class FakeWorker extends EventEmitter {
 }
 
 function recordStore() {
-    const calls = { created: 0, updated: 0, removed: 0, marked: 0 };
+    const calls = {
+        created: 0, updated: 0, removed: 0, marked: 0, confirmed: 0,
+    };
     return {
         calls,
         async recover() { return { ok: true, evidence: [] }; },
@@ -129,6 +131,10 @@ function recordStore() {
         async markCleanupUnproven(handle) {
             calls.marked += 1;
             handle.record.cleanupState = 'unproven';
+            return true;
+        },
+        async confirmReclaimed() {
+            calls.confirmed += 1;
             return true;
         },
     };
@@ -175,6 +181,25 @@ test('throwing worker factory rolls back reserved quotas exactly once', async (t
         manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24 }),
         /factory failed/,
     );
+    assert.equal(manager.activeCount(), 0);
+    assert.deepEqual([...manager.userCounts], []);
+    assert.deepEqual([...manager.authCounts], []);
+});
+
+test('throwing auth invalidation subscription rolls back admission before session registration', async (t) => {
+    let workerAllocations = 0;
+    const manager = await createManager(t, {
+        auth: {
+            ...authAdapter(),
+            subscribeInvalidation: () => { throw new Error('subscription failed'); },
+        },
+        workerFactory: () => { workerAllocations += 1; return new FakeWorker(); },
+    });
+    await assert.rejects(
+        manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24 }),
+        /subscription failed/,
+    );
+    assert.equal(workerAllocations, 1);
     assert.equal(manager.activeCount(), 0);
     assert.deepEqual([...manager.userCounts], []);
     assert.deepEqual([...manager.authCounts], []);
@@ -322,8 +347,26 @@ test('cleanup-unproven disables WebTTY and preserves durable recovery evidence',
     assert.equal(manager.activeCount(), 0);
 });
 
-test('abrupt worker exit without terminal cleanup proof preserves evidence and disables WebTTY', async (t) => {
+test('abrupt worker exit is contained when the recorded terminal session is proven reclaimed', async (t) => {
     const store = recordStore();
+    const worker = new FakeWorker();
+    const manager = await createManager(t, {
+        recordStore: store,
+        workerFactory: () => worker,
+    });
+    await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24 });
+    worker.emit('process-exit', { category: 'worker_process_exit' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(manager.activeCount(), 0);
+    assert.deepEqual(manager.availability(), { ok: true });
+    assert.equal(store.calls.confirmed, 1);
+    assert.equal(store.calls.removed, 1);
+});
+
+test('abrupt worker exit preserves evidence and disables WebTTY when session cleanup is unproven', async (t) => {
+    const store = recordStore();
+    store.confirmReclaimed = async () => false;
     const worker = new FakeWorker();
     const manager = await createManager(t, {
         recordStore: store,
@@ -378,6 +421,7 @@ test('unconfirmed worker exit and recovery-record removal failures fail WebTTY c
 
 test('one unproven cleanup quiesces every other live WebTTY session', async (t) => {
     const store = recordStore();
+    store.confirmReclaimed = async () => false;
     const workers = [new FakeWorker(), new FakeWorker()];
     const manager = await createManager(t, {
         recordStore: store,
@@ -429,6 +473,36 @@ test('idle and absolute lifetimes reclaim sessions at their configured bounds', 
         await manager.validateLiveSessions();
         assert.equal(manager.activeCount(), 0);
     });
+});
+
+test('validated PTY output refreshes idle activity while absolute lifetime remains authoritative', async (t) => {
+    let now = 3_000;
+    const worker = new FakeWorker();
+    const manager = new WebttySessionManager({
+        now: () => now,
+        limits: {
+            authenticationIntervalMs: 60_000,
+            streamDetachGraceMs: 60_000,
+            idleLifetimeMs: 10,
+            absoluteLifetimeMs: 100,
+        },
+        auth: authAdapter(),
+        recordStore: recordStore(),
+        workerFactory: () => worker,
+    });
+    await manager.initialize();
+    t.after(() => manager.closeAll('test_cleanup'));
+    await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '' });
+
+    now = 3_009;
+    worker.emit('output', { sequence: 1, data: 'still running' });
+    now = 3_018;
+    await manager.validateLiveSessions();
+    assert.equal(manager.activeCount(), 1);
+
+    now = 3_020;
+    await manager.validateLiveSessions();
+    assert.equal(manager.activeCount(), 0);
 });
 
 test('output sequence, replay gap, and SSE high-water limits fail closed', async (t) => {
