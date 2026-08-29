@@ -1646,8 +1646,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     } else {
         // Run preinstall + install in main container before default agent server
         if (combinedInstallCmd) {
-            args.push('sh', '-c', `${combinedInstallCmd} && sh /Agent/server/AgentServer.sh`);
-            entrySummary = `sh -c "<install> && sh /Agent/server/AgentServer.sh"`;
+            args.push('sh', '-c', `${combinedInstallCmd} && exec sh /Agent/server/AgentServer.sh`);
+            entrySummary = `sh -c "<install> && exec sh /Agent/server/AgentServer.sh"`;
         } else {
             args.push('sh', '/Agent/server/AgentServer.sh');
         }

@@ -1350,6 +1350,7 @@ async function main() {
         return finish;
     };
 
+    let shuttingDown = false;
     const serverHttp = http.createServer(async (req, res) => {
         const { method, url } = req;
         const sendJson = (code, obj, extraHeaders = {}) => {
@@ -1357,6 +1358,10 @@ async function main() {
             res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': data.length, ...extraHeaders });
             res.end(data);
         };
+        if (shuttingDown) {
+            sendJson(503, { error: 'agent_server_shutting_down' }, { Connection: 'close' });
+            return;
+        }
         try {
             const u = new URL(url || '/', 'http://localhost');
             if (method === 'GET' && u.pathname === '/health') {
@@ -1538,6 +1543,43 @@ async function main() {
 
     const isContainerRuntime = Boolean(process.env.PLOINKY_CONTAINER_ID || process.env.PLOINKY_CONTAINER_NAME);
     const HOST = process.env.PLOINKY_AGENT_BIND_HOST || (isContainerRuntime ? '0.0.0.0' : '127.0.0.1');
+    let shutdownPromise = null;
+    const shutdown = (signal) => {
+        if (shutdownPromise) return shutdownPromise;
+        shutdownPromise = (async () => {
+            shuttingDown = true;
+            clearInterval(sessionGcTimer);
+
+            // Stop accepting new work first. Existing MCP transports are then
+            // closed through their application API; serverHttp.close() does not
+            // acknowledge until every remaining HTTP connection has drained.
+            const listenerClosed = new Promise((resolve, reject) => {
+                serverHttp.close((error) => {
+                    if (error) reject(error);
+                    else resolve();
+                });
+            });
+            serverHttp.closeIdleConnections?.();
+            const transports = [...new Set(Object.values(sessions)
+                .map((entry) => entry?.transport)
+                .filter(Boolean))];
+            const transportResults = await Promise.allSettled(
+                transports.map((transport) => Promise.resolve(transport.close())),
+            );
+            const rejectedTransport = transportResults.find((result) => result.status === 'rejected');
+            if (rejectedTransport) throw rejectedTransport.reason;
+            await taskQueue.shutdown({ timeoutMs: 20_000, pollMs: 10 });
+            await listenerClosed;
+            process.exitCode = 0;
+        })().catch((error) => {
+            process.exitCode = 1;
+            console.error(`[AgentServer/MCP] graceful ${signal} shutdown failed:`, error);
+        });
+        return shutdownPromise;
+    };
+    for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+        process.once(signal, () => { void shutdown(signal); });
+    }
     serverHttp.listen(PORT, HOST, () => {
         console.log(`[AgentServer/MCP] Streamable HTTP listening on ${HOST}:${PORT} (/mcp)`);
     });

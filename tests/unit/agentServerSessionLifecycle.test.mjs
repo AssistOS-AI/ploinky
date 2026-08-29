@@ -88,7 +88,7 @@ async function startAgentServer(t, { tmp, configPath, env = {} }) {
     });
 
     await waitForHealth(port, () => output);
-    return { port, output: () => output };
+    return { child, port, output: () => output };
 }
 
 async function mcpPost(port, body, options = {}) {
@@ -182,6 +182,22 @@ test('AgentServer routes DELETE /mcp to the active SDK transport', async (t) => 
     }, { sessionId });
     assert.equal(afterDelete.status, 400);
     assert.match(afterDelete.text, /Missing session/);
+});
+
+test('AgentServer acknowledges SIGTERM only after closing its listener', async (t) => {
+    const tmp = await createTempDir(t);
+    const configPath = path.join(tmp, 'mcp-config.json');
+    await fs.writeFile(configPath, JSON.stringify({}, null, 2));
+    const { child, port, output } = await startAgentServer(t, { tmp, configPath });
+
+    assert.equal(child.kill('SIGTERM'), true);
+    const [code, signal] = await once(child, 'exit');
+    assert.equal(signal, null, output());
+    assert.equal(code, 0, output());
+    await assert.rejects(
+        fetch(`http://127.0.0.1:${port}/health`),
+        /fetch failed|ECONNREFUSED/,
+    );
 });
 
 test('AgentServer serves static files from the agent code directory', async (t) => {
