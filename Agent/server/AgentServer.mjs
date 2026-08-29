@@ -32,7 +32,14 @@ const { isOptOutModel, runOpenAiAgenticResponse } = await importAgentLibFile(
 
 const DEFAULT_MAX_CONCURRENT_TASKS = 10;
 const DEFAULT_TASK_LOG_TAIL_BYTES = 128 * 1024;
-const TASK_QUEUE_FILE = path.resolve(process.cwd(), '.tasksQueue');
+// The agent code directory is read-only in production. Every supported
+// runtime supplies a dedicated writable HOME for this exact agent, so durable
+// restart state belongs there rather than beside the staged code.
+const taskQueueHome = String(process.env.HOME || '').trim();
+const TASK_QUEUE_FILE = path.join(
+    taskQueueHome && path.isAbsolute(taskQueueHome) ? taskQueueHome : process.cwd(),
+    '.tasksQueue',
+);
 const invocationReplayCache = createMemoryReplayCache({ maxSize: 4096 });
 const OPENAI_CHAT_COMPLETIONS_PATH = '/v1/chat/completions';
 const OPENAI_MODELS_PATH = '/v1/models';

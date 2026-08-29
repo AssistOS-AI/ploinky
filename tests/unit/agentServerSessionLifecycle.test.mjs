@@ -59,12 +59,13 @@ async function waitForHealth(port, output) {
     throw new Error(`AgentServer did not become healthy:\n${output()}`);
 }
 
-async function startAgentServer(t, { tmp, configPath, env = {} }) {
+async function startAgentServer(t, { tmp, cwd = tmp, configPath, env = {} }) {
     const port = await getFreePort();
     const child = spawn(process.execPath, [AGENT_SERVER], {
-        cwd: tmp,
+        cwd,
         env: {
             ...isolatedAgentServerEnv(),
+            HOME: tmp,
             PORT: String(port),
             PLOINKY_AGENT_BIND_HOST: '127.0.0.1',
             PLOINKY_AGENT_CONFIG: configPath,
@@ -198,6 +199,65 @@ test('AgentServer acknowledges SIGTERM only after closing its listener', async (
         fetch(`http://127.0.0.1:${port}/health`),
         /fetch failed|ECONNREFUSED/,
     );
+});
+
+test('AgentServer persists restart state in writable HOME when its code cwd is read-only', async (t) => {
+    const tmp = await createTempDir(t);
+    const codeDir = path.join(tmp, 'code');
+    const homeDir = path.join(tmp, 'home');
+    const configPath = path.join(codeDir, 'mcp-config.json');
+    await fs.mkdir(codeDir);
+    await fs.mkdir(homeDir);
+    await fs.writeFile(configPath, JSON.stringify({}, null, 2));
+    const persistedTask = {
+        id: 'restored-task',
+        toolName: 'demo',
+        commandSpec: { command: '/bin/false', args: [], cwd: '/', env: {} },
+        payload: { source: 'restart-regression' },
+        status: 'failed',
+        timeoutMs: null,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:01.000Z',
+        error: 'expected persisted failure',
+        logRetention: 'bounded',
+        continuationTool: '',
+    };
+    await fs.writeFile(
+        path.join(homeDir, '.tasksQueue'),
+        JSON.stringify([persistedTask], null, 2),
+    );
+    await fs.chmod(codeDir, 0o555);
+    try {
+        for (let generation = 0; generation < 2; generation += 1) {
+            const { child, output } = await startAgentServer(t, {
+                tmp,
+                cwd: codeDir,
+                configPath,
+                env: {
+                    HOME: homeDir,
+                    PLOINKY_CODE_DIR: codeDir,
+                },
+            });
+
+            assert.equal(child.kill('SIGTERM'), true);
+            const [code, signal] = await once(child, 'exit');
+            assert.equal(signal, null, output());
+            assert.equal(code, 0, output());
+            const persisted = JSON.parse(
+                await fs.readFile(path.join(homeDir, '.tasksQueue'), 'utf8'),
+            );
+            assert.equal(persisted.length, 1);
+            assert.equal(persisted[0].id, persistedTask.id);
+            assert.equal(persisted[0].status, 'failed');
+            assert.equal(persisted[0].error, persistedTask.error);
+        }
+        await assert.rejects(
+            fs.access(path.join(codeDir, '.tasksQueue')),
+            error => error?.code === 'ENOENT',
+        );
+    } finally {
+        await fs.chmod(codeDir, 0o755).catch(() => {});
+    }
 });
 
 test('AgentServer serves static files from the agent code directory', async (t) => {
