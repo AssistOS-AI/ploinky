@@ -21,6 +21,7 @@ import {
 } from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
     revalidateWorkspaceDataPaths,
     workspaceDataMountArgs,
@@ -79,6 +80,7 @@ export function containerCreateArgs({
     hostKind = 'native-linux',
 }) {
     const source = path.resolve(repositoryRoot);
+    const seccompProfile = nestedPodmanSeccompProfileContract(source);
     if (!agentLib) {
         throw lifecycleError('Container creation requires a selected achillesAgentLib source');
     }
@@ -89,6 +91,7 @@ export function containerCreateArgs({
         [BOX_LABELS.imageRef]: imageRef,
         [BOX_LABELS.routerHostPort]: String(hostPort),
         [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
+        [BOX_LABELS.seccompFingerprint]: seccompProfile.fingerprint,
     };
     for (const key of BOX_DATA_KEYS) {
         const value = String(dataFingerprints?.[key] || '');
@@ -108,6 +111,7 @@ export function containerCreateArgs({
         '--device', '/dev/net/tun',
         '--security-opt', 'unmask=ALL',
         '--security-opt', 'label=disable',
+        '--security-opt', `seccomp=${seccompProfile.path}`,
         '--publish', `127.0.0.1:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
         '--publish', `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
         '--tmpfs', tmpfsCreateArgument(),

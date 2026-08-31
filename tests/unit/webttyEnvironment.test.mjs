@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
     SHELL_ENVIRONMENT_KEYS,
+    WEBTTY_SHELL_PROMPT,
     WORKER_ENVIRONMENT_KEYS,
     assertExactShellEnvironment,
     buildShellEnvironment,
@@ -20,6 +21,7 @@ const inheritedSecrets = {
     PATH: '/attacker/bin',
     HOME: '/root',
     LANG: 'attacker-locale',
+    PS1: '$(printf inherited-prompt)',
 };
 
 test('worker and shell environments ignore every inherited value', () => {
@@ -31,8 +33,9 @@ test('worker and shell environments ignore every inherited value', () => {
     assert.equal(worker.PATH, '/opt/ploinky/bin:/usr/local/bin:/usr/bin:/bin');
     assert.equal(shell.SHELL, '/bin/bash');
     assert.equal(shell.PLOINKY_WORKSPACE_ROOT, '/workspace');
+    assert.equal(shell.PS1, WEBTTY_SHELL_PROMPT);
     for (const key of Object.keys(inheritedSecrets)) {
-        if (['PATH', 'HOME', 'LANG'].includes(key)) assert.notEqual(shell[key], inheritedSecrets[key]);
+        if (['PATH', 'HOME', 'LANG', 'PS1'].includes(key)) assert.notEqual(shell[key], inheritedSecrets[key]);
         else assert.equal(shell[key], undefined, key);
     }
 });
@@ -45,6 +48,7 @@ test('the worker rejects additions, omissions, and altered fixed values', () => 
         Object.fromEntries(Object.entries(shell).filter(([key]) => key !== 'HOME')),
         { ...shell, PATH: `${shell.PATH}:/workspace/bin` },
         { ...shell, PLOINKY_WORKSPACE_ROOT: '/physical/host/path' },
+        { ...shell, PS1: 'bash-5.3$ ' },
     ]) {
         assert.throws(
             () => assertExactShellEnvironment(changed),

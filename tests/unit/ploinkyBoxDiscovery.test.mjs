@@ -27,6 +27,7 @@ function labels(identity, role) {
         result[BOX_LABELS.imageRef] = 'runtime';
         result[BOX_LABELS.routerHostPort] = '18080';
         result[BOX_LABELS.mediaHostPort] = '17891';
+        result[BOX_LABELS.seccompFingerprint] = 'e'.repeat(64);
         result[BOX_LABELS.dependenciesFingerprint] = 'd'.repeat(64);
         result[BOX_LABELS.imagesFingerprint] = 'f'.repeat(64);
         result[BOX_AGENTLIB_LABELS.mode] = 'local';

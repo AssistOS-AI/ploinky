@@ -2,6 +2,7 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { execFileSync } from 'node:child_process';
 
 import { handleWebChat } from './handlers/webchat/index.js';
 import { handleStatus, streamWorkspaceMetrics } from './handlers/status.js';
@@ -98,6 +99,11 @@ import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflare
 import { requestAgentCard } from './agentCardFanout.js';
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { WebttySessionManager } from './webtty/sessionManager.mjs';
+import { buildAgentWorkerEnvironment } from './webtty/agentWorkerEnvironment.mjs';
+import {
+    probeNestedPodmanRuntime,
+    resolveWebttyProviderLocality,
+} from './webtty/providerLocality.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -150,10 +156,25 @@ const globalState = {
     webtty: { sessions: new Map() },
     status: { sessions: new Map() }
 };
+const webttyProviderLocality = resolveWebttyProviderLocality({
+    boxProviderAvailable: true,
+    isPloinkyBoxRuntime: insideBox,
+    probeRuntime: () => probeNestedPodmanRuntime({
+        execFileSync,
+        environment: buildAgentWorkerEnvironment(),
+    }),
+});
 const webttySessionManager = new WebttySessionManager({
+    agentProviderAvailable: webttyProviderLocality.agentAvailable,
     audit: (event, value) => appendLog(event, value),
 });
-await webttySessionManager.initialize();
+const webttyRecovery = await webttySessionManager.initialize();
+appendLog('webtty_provider_locality', {
+    surfaceAvailable: webttySessionManager.availability().ok,
+    agentAvailable: webttySessionManager.providerAvailability().agentAvailable,
+    locality: webttyProviderLocality.agentReason,
+    recovery: webttyRecovery.ok === true ? 'ready' : 'unproven',
+});
 globalState.webtty.sessions = webttySessionManager.sessions;
 
 /**

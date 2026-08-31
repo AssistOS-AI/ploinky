@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -367,4 +368,134 @@ test('TaskQueue force-kills cleanup that exceeds the cancellation grace period',
     await waitFor(() => queue.getTask(id)?.status === 'cancelled');
 
     assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('TaskQueue shutdown cancels pending and active work before acknowledging drain', async (t) => {
+    const storagePath = makeTempStorage(t);
+    const signals = [];
+    let complete;
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        cancelGraceMs: 50,
+        executor: (_spec, _payload, options = {}) => new Promise((resolve) => {
+            complete = resolve;
+            options.onSpawn?.({
+                pid: null,
+                kill(signal) {
+                    signals.push(signal);
+                    if (signal === 'SIGTERM') {
+                        setTimeout(() => resolve({ code: 143, signal, stdout: '', stderr: '' }), 5);
+                    }
+                    return true;
+                },
+            });
+        }),
+    });
+    const runningId = queue.enqueueTask(dummyTaskConfig({ order: 1 })).id;
+    const pendingId = queue.enqueueTask(dummyTaskConfig({ order: 2 })).id;
+    await waitFor(() => typeof complete === 'function');
+
+    assert.deepEqual(await queue.shutdown({ timeoutMs: 1_000, pollMs: 5 }), { state: 'drained' });
+    assert.deepEqual(signals, ['SIGTERM']);
+    assert.equal(queue.getTask(runningId)?.status, 'cancelled');
+    assert.equal(queue.getTask(pendingId)?.status, 'cancelled');
+    assert.throws(
+        () => queue.enqueueTask(dummyTaskConfig({ order: 3 })),
+        (error) => error?.code === 'PLOINKY_TASK_QUEUE_SHUTTING_DOWN',
+    );
+});
+
+test('TaskQueue shutdown refuses to acknowledge drain when final state cannot persist', async (t) => {
+    const storageDirectory = path.dirname(makeTempStorage(t));
+    const logged = t.mock.method(console, 'error', () => {});
+    const queue = new TaskQueue({
+        storagePath: storageDirectory,
+        executor: async () => ({ code: 0, signal: null, stdout: '', stderr: '' }),
+    });
+
+    await assert.rejects(
+        queue.shutdown({ timeoutMs: 1_000, pollMs: 5 }),
+        (error) => error?.code === 'EISDIR',
+    );
+    assert.ok(logged.mock.callCount() >= 1);
+});
+
+test('TaskQueue shutdown proves a detached process group absent after its leader exits', {
+    skip: process.platform === 'win32',
+}, async (t) => {
+    const storagePath = makeTempStorage(t);
+    const descendantPath = path.join(path.dirname(storagePath), 'descendant.pid');
+    let leaderPid = null;
+    let descendantPid = null;
+    const processGroupExists = () => {
+        if (!Number.isInteger(leaderPid)) return false;
+        try {
+            process.kill(-leaderPid, 0);
+            return true;
+        } catch (error) {
+            if (error?.code === 'ESRCH') return false;
+            throw error;
+        }
+    };
+    t.after(() => {
+        if (!processGroupExists()) return;
+        try {
+            process.kill(-leaderPid, 'SIGKILL');
+        } catch (error) {
+            if (error?.code !== 'ESRCH') throw error;
+        }
+    });
+
+    const queue = new TaskQueue({
+        maxConcurrent: 1,
+        storagePath,
+        cancelGraceMs: 50,
+        executor: (_spec, _payload, options = {}) => new Promise((resolve, reject) => {
+            const script = [
+                "trap 'exit 0' TERM",
+                '(',
+                "  trap '' TERM",
+                '  exec </dev/null >/dev/null 2>&1',
+                '  while :; do sleep 1; done',
+                ') &',
+                'printf "%s\\n" "$!" > "$1"',
+                'while :; do sleep 1; done',
+            ].join('\n');
+            const child = spawn('/bin/sh', ['-c', script, 'task-group', descendantPath], {
+                detached: true,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            leaderPid = child.pid;
+            options.onSpawn?.(child);
+            child.once('error', reject);
+            child.once('close', (code, signal) => resolve({
+                code,
+                signal,
+                stdout: '',
+                stderr: '',
+            }));
+        }),
+    });
+    const taskId = queue.enqueueTask(dummyTaskConfig()).id;
+    await waitFor(() => {
+        try {
+            descendantPid = Number.parseInt(readFileSync(descendantPath, 'utf8'), 10);
+            return Number.isInteger(descendantPid) && descendantPid > 0;
+        } catch {
+            return false;
+        }
+    });
+    assert.equal(processGroupExists(), true);
+    assert.doesNotThrow(() => process.kill(descendantPid, 0));
+
+    assert.deepEqual(await queue.shutdown({ timeoutMs: 2_000, pollMs: 5 }), { state: 'drained' });
+    assert.equal(processGroupExists(), false, 'the exact detached process group must be absent');
+    assert.throws(
+        () => process.kill(descendantPid, 0),
+        (error) => error?.code === 'ESRCH',
+    );
+    assert.equal(queue.getTask(taskId)?.status, 'cancelled');
+    const persisted = JSON.parse(readFileSync(storagePath, 'utf8'));
+    assert.equal(persisted.find((entry) => entry.id === taskId)?.status, 'cancelled');
 });

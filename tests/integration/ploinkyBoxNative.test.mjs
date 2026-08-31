@@ -8,10 +8,12 @@ import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
 import { routeOuterCommand } from '../../ploinky-box/command/route.mjs';
 import {
+    BOX_AGENTLIB_LABELS,
     BOX_MEDIA_PORT,
     BOX_TMPFS,
     BOX_USERNS,
 } from '../../ploinky-box/constants.mjs';
+import { AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
 import { resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     removeContainerById,
@@ -126,6 +128,24 @@ function repeatedArgument(argv, option) {
 
 function assertExactOuterStorage(harness, containerId, repositoryRoot) {
     const record = boxInspection(harness, containerId);
+    const agentLibSourceRelativePath = String(
+        record.Config?.Labels?.[BOX_AGENTLIB_LABELS.sourceRelativePath] || '',
+    );
+    assert.match(
+        agentLibSourceRelativePath,
+        /^\.ploinky\/agentlib\/generations\/[A-Za-z0-9._-]+$/,
+        'the native fixture must use one managed AgentLib generation',
+    );
+    const agentLibSource = fs.realpathSync(path.join(
+        harness.identity.workspaceRoot,
+        agentLibSourceRelativePath,
+    ));
+    assert.equal(
+        path.relative(harness.identity.workspaceRoot, agentLibSource).startsWith('..'),
+        false,
+        'the selected AgentLib generation must remain inside the exact workspace',
+    );
+    const agentLibAlias = `/workspace/${agentLibSourceRelativePath}`;
     const transientMounts = record.Mounts.filter((mount) => (
         String(mount.Destination || '') === BOX_TMPFS.destination
     ));
@@ -160,11 +180,23 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
         { type: 'bind', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
         {
             type: 'bind',
+            source: agentLibSource,
+            destination: AGENTLIB_STABLE_MOUNT_PATH,
+            rw: false,
+        },
+        {
+            type: 'bind',
             source: harness.identity.dataPaths.dependencies,
             destination: '/opt/ploinky/node_modules',
             rw: true,
         },
         { type: 'bind', source: harness.identity.workspaceRoot, destination: '/workspace', rw: true },
+        {
+            type: 'bind',
+            source: agentLibSource,
+            destination: agentLibAlias,
+            rw: false,
+        },
     ]);
     const inspectedTmpfs = record.HostConfig?.Tmpfs;
     assert.deepEqual(Object.keys(inspectedTmpfs || {}), [BOX_TMPFS.destination]);
@@ -364,8 +396,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.match(candidateImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky')), true);
     assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')).sort(),
-        ['box', 'master-key'],
-        'the host identity anchor must retain only the Box master key and cache root');
+        ['agentlib', 'box', 'master-key'],
+        'the host identity anchor must retain only AgentLib state, the Box master key, and cache root');
     assert.equal(fs.existsSync(path.join(harness.child, '.ploinky')), false);
     // Workspace-backed persistence: both cache directories exist on the real
     // host, back the Box through exact bind mounts, and no named volume exists.

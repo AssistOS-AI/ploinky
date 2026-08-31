@@ -64,8 +64,12 @@ export class TaskQueue {
         this.pending = [];
         this.running = new Set();
         this.activeChildren = new Map();
+        this.cancelCleanups = new Map();
+        this.cancellationFailures = new Map();
         this.cancelTimers = new Map();
         this.initialized = false;
+        this.shuttingDown = false;
+        this.shutdownPromise = null;
     }
 
     initialize() {
@@ -151,7 +155,7 @@ export class TaskQueue {
         }
     }
 
-    persistTasks() {
+    persistTasks({ required = false } = {}) {
         if (!this.storagePath) {
             return;
         }
@@ -171,6 +175,7 @@ export class TaskQueue {
             }));
             fs.writeFileSync(this.storagePath, JSON.stringify(snapshot, null, 2));
         } catch (err) {
+            if (required) throw err;
             console.error('[AgentServer/MCP] Failed to persist task queue:', err);
         }
     }
@@ -265,6 +270,11 @@ export class TaskQueue {
         continuationTool = '',
     }) {
         this.initialize();
+        if (this.shuttingDown) {
+            const error = new Error('Task queue is shutting down');
+            error.code = 'PLOINKY_TASK_QUEUE_SHUTTING_DOWN';
+            throw error;
+        }
         const id = this.generateId();
         const payloadWithId = { ...payload, taskId: id };
         const task = {
@@ -317,6 +327,7 @@ export class TaskQueue {
     }
 
     processQueue() {
+        if (this.shuttingDown) return;
         while (this.running.size < this.maxConcurrent && this.pending.length > 0) {
             const nextId = this.pending.shift();
             if (!nextId) {
@@ -350,17 +361,73 @@ export class TaskQueue {
         }
     }
 
+    processGroupExists(pid) {
+        if (!Number.isInteger(pid) || pid < 1 || process.platform === 'win32') return false;
+        try {
+            process.kill(-pid, 0);
+            return true;
+        } catch (error) {
+            if (error?.code === 'ESRCH') return false;
+            if (error?.code === 'EPERM') return true;
+            throw error;
+        }
+    }
+
+    async waitForProcessGroupAbsence(pid, timeoutMs) {
+        const deadline = Date.now() + timeoutMs;
+        while (this.processGroupExists(pid)) {
+            if (Date.now() >= deadline) return false;
+            await new Promise((resolve) => setTimeout(
+                resolve,
+                Math.min(10, Math.max(1, deadline - Date.now())),
+            ));
+        }
+        return true;
+    }
+
     requestRunningTaskCancellation(task, child) {
-        if (!task || !child) return;
+        if (!task || !child) return null;
+        const existing = this.cancelCleanups.get(task.id);
+        if (existing) return existing;
+        if (this.cancelTimers.has(task.id)) return null;
         this.signalTaskProcess(child, 'SIGTERM');
-        if (this.cancelTimers.has(task.id)) return;
-        const timer = setTimeout(() => {
-            this.cancelTimers.delete(task.id);
-            const activeChild = this.activeChildren.get(task.id);
-            if (activeChild) this.signalTaskProcess(activeChild, 'SIGKILL');
-        }, this.cancelGraceMs);
-        timer.unref?.();
-        this.cancelTimers.set(task.id, timer);
+        const pid = Number(child.pid);
+        if (!Number.isInteger(pid) || pid < 1 || process.platform === 'win32') {
+            const timer = setTimeout(() => {
+                this.cancelTimers.delete(task.id);
+                const activeChild = this.activeChildren.get(task.id);
+                if (activeChild) this.signalTaskProcess(activeChild, 'SIGKILL');
+            }, this.cancelGraceMs);
+            timer.unref?.();
+            this.cancelTimers.set(task.id, timer);
+            return null;
+        }
+
+        // The tracked leader can exit and close its stdio before a stubborn
+        // same-group descendant. Keep group cleanup independent of the child
+        // handle so shutdown cannot acknowledge until that exact process group
+        // is positively absent.
+        const cleanup = (async () => {
+            if (await this.waitForProcessGroupAbsence(pid, this.cancelGraceMs)) return;
+            try {
+                process.kill(-pid, 'SIGKILL');
+            } catch (error) {
+                if (error?.code !== 'ESRCH') throw error;
+            }
+            if (await this.waitForProcessGroupAbsence(pid, this.cancelGraceMs)) return;
+            const error = new Error(`Task process group ${pid} did not drain after SIGKILL`);
+            error.code = 'PLOINKY_TASK_PROCESS_GROUP_DRAIN_TIMEOUT';
+            throw error;
+        })().catch((cause) => {
+            if (cause?.code === 'PLOINKY_TASK_PROCESS_GROUP_DRAIN_TIMEOUT') throw cause;
+            const error = new Error(`Task process group ${pid} cleanup could not be proven`);
+            error.code = 'PLOINKY_TASK_PROCESS_GROUP_DRAIN_FAILED';
+            error.cause = cause;
+            throw error;
+        });
+        cleanup.catch(() => {});
+        this.cancelCleanups.set(task.id, cleanup);
+        return cleanup;
     }
 
     cancelTask(taskId) {
@@ -383,6 +450,37 @@ export class TaskQueue {
         const child = this.activeChildren.get(task.id);
         if (child) this.requestRunningTaskCancellation(task, child);
         return this.getTask(task.id);
+    }
+
+    shutdown({ timeoutMs = 20_000, pollMs = 10 } = {}) {
+        if (this.shutdownPromise) return this.shutdownPromise;
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1
+            || !Number.isSafeInteger(pollMs) || pollMs < 1 || pollMs > timeoutMs) {
+            throw new Error('Task queue shutdown bounds are invalid');
+        }
+        this.initialize();
+        this.shuttingDown = true;
+        for (const taskId of [...this.pending, ...this.running]) this.cancelTask(taskId);
+        this.persistTasks();
+
+        const startedAt = Date.now();
+        this.shutdownPromise = (async () => {
+            while (this.running.size > 0 || this.activeChildren.size > 0) {
+                const cancellationFailure = this.cancellationFailures.values().next().value;
+                if (cancellationFailure) throw cancellationFailure;
+                if (Date.now() - startedAt >= timeoutMs) {
+                    const error = new Error('Task queue did not drain before shutdown timeout');
+                    error.code = 'PLOINKY_TASK_QUEUE_DRAIN_TIMEOUT';
+                    throw error;
+                }
+                await new Promise((resolve) => setTimeout(resolve, pollMs));
+            }
+            const cancellationFailure = this.cancellationFailures.values().next().value;
+            if (cancellationFailure) throw cancellationFailure;
+            this.persistTasks({ required: true });
+            return Object.freeze({ state: 'drained' });
+        })();
+        return this.shutdownPromise;
     }
 
     startTask(task) {
@@ -452,6 +550,11 @@ export class TaskQueue {
                 detached: true,
             });
 
+            if (task.cancelRequested || task.status === 'cancelling') {
+                const cleanup = this.cancelCleanups.get(task.id);
+                if (cleanup) await cleanup;
+            }
+
             if (timer) {
                 clearTimeout(timer);
             }
@@ -505,7 +608,13 @@ export class TaskQueue {
             if (timer) {
                 clearTimeout(timer);
             }
-            if (task.cancelRequested || task.status === 'cancelling') {
+            if ((task.cancelRequested || task.status === 'cancelling')
+                && /^PLOINKY_TASK_PROCESS_GROUP_DRAIN_/.test(String(err?.code || ''))) {
+                task.status = 'failed';
+                task.error = err.message;
+                task.result = null;
+                this.cancellationFailures.set(task.id, err);
+            } else if (task.cancelRequested || task.status === 'cancelling') {
                 task.status = 'cancelled';
                 task.error = null;
                 task.result = null;
@@ -516,6 +625,7 @@ export class TaskQueue {
             }
         } finally {
             this.activeChildren.delete(task.id);
+            this.cancelCleanups.delete(task.id);
             const cancelTimer = this.cancelTimers.get(task.id);
             if (cancelTimer) clearTimeout(cancelTimer);
             this.cancelTimers.delete(task.id);

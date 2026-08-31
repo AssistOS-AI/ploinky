@@ -367,6 +367,63 @@ The router does not provide aliases, migration translation, or compatibility shi
 
 Guest-facing responses stay generic and do not confirm private resource existence. Audit logs may retain structured deny codes but must not log tokens, cookies, grants, or raw secrets.
 
+## WebTTY Launch and Session Boundary
+
+WebTTY is a Router-owned administrator surface. Target discovery allocates
+bounded, short-lived server records, so it is a POST rather than a navigation
+side effect. The browser API is deliberately narrower than either terminal
+provider:
+
+| Route | Exact browser body or role |
+| --- | --- |
+| `POST /webtty/target-discoveries` | `{ "dir": "canonical/relative/folder" }`; returns safe target display rows and opaque launch IDs. |
+| `DELETE /webtty/target-discoveries/:id` | Best-effort cancellation of the caller's unused discovery batch. |
+| `POST /webtty/sessions` | `{ "launch": "opaque-single-use-id", "cols": 120, "rows": 32 }`; revalidates the server record before allocating. |
+| `GET /webtty/sessions/:id/stream` | Ownership-checked SSE output and replay. |
+| `POST /webtty/sessions/:id/input` | Bounded `{ "data": "..." }` input to the owned session. |
+| `POST /webtty/sessions/:id/resize` | Bounded `{ "cols": 120, "rows": 32 }` resize of the owned session. |
+| `DELETE /webtty/sessions/:id` | Close the owned terminal and start exact cleanup. |
+
+Every route requires an authenticated administrator. Every POST and DELETE also
+requires exact same-origin, session-bound CSRF proof before its bounded body is
+read, and mutations commit the captured route generation before allocation or
+I/O. Browser values never select a container identity, translated cwd, shell,
+argv, user, environment, or runtime flags.
+
+Explorer hands a selected launch ID to `/webtty/` only as `#launch=...`. URL
+fragments do not enter HTTP requests, access logs, or referrers, and the page
+removes the fragment from history before using it; failure to strip it prevents
+session creation. The CSPRNG launch record remains server-side and is bound to
+the exact user, auth-session fingerprint, host route, generation, activation,
+directory identity, and selected immutable target. Consumption is atomic and
+single-use and invalidates every sibling choice. Unknown, foreign, expired,
+revoked, replaced-generation, and replayed IDs share a non-enumerating 404.
+Internal validation and provider failures collapse to generic 503 responses.
+
+### Provider isolation and recovery
+
+The transient `/run/ploinky/webtty` store uses the target-discriminated v2
+schema with `worker-only`, `pty-starting`, and `pty-ready` lifecycle states.
+Router startup completes recovery before WebTTY becomes available. Recovery
+signals processes only after exact identity checks and retains records whenever
+reclamation cannot be proved.
+
+| Evidence scope | Fail-closed result |
+| --- | --- |
+| Exact immutable agent container plus enable generation | Quarantine only that target; Box and unrelated proven agents remain available. |
+| Systemic agent-provider or evidence mechanism | Disable all agent targets; keep the Box provider available. |
+| Box cleanup ambiguity or unclassifiable record | Disable the entire WebTTY surface. |
+
+Neither target quarantine nor provider disable is cleared by a timer. Recovery
+may clear exact evidence only after proving the recorded worker, client, inner
+shell, exec session, and foreground members are gone as applicable, or after
+proving the old immutable container was replaced and its evidence is absent.
+When this proof is not possible, the supported operator recovery is
+`ploinky destroy` followed by the normal `ploinky start` workflow. Recreating
+the Box clears the ephemeral v2 records and nested runtime state while
+preserving the host workspace and retained caches. Operators must not delete
+records or signal numeric PIDs as a shortcut.
+
 ## Operator Examples
 
 ### Declare Agent-Owned Routes

@@ -11,6 +11,7 @@ import {
     BOX_USERNS,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
     agentLibBoxEnv,
     expectedAgentLibMounts,
@@ -222,6 +223,7 @@ export function validateContainerConfiguration(containerHandle, {
 }) {
     const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort);
     const runtime = containerHandle.runtime;
+    const seccompProfile = nestedPodmanSeccompProfileContract(repositoryRoot);
     if (containerHandle.id === '' || runtime.imageId !== imageId) {
         throw publicationError('Owned Box image ID does not match the validated immutable image');
     }
@@ -241,6 +243,7 @@ export function validateContainerConfiguration(containerHandle, {
         [BOX_LABELS.imageRef]: imageRef,
         [BOX_LABELS.routerHostPort]: String(hostPort),
         [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
+        [BOX_LABELS.seccompFingerprint]: seccompProfile.fingerprint,
     };
     const selectedFingerprints = dataFingerprints || Object.fromEntries(BOX_DATA_KEYS.map((key) => [
         key,
@@ -293,10 +296,21 @@ export function validateContainerConfiguration(containerHandle, {
     const expectedSecurityOptions = [
         'unmask=all',
         'label=disable',
+        `seccomp=${seccompProfile.path}`,
     ].sort();
+    const observedSecurityOptions = Array.isArray(runtime.securityOptions)
+        ? runtime.securityOptions.map((value) => {
+            const option = String(value);
+            const separator = option.indexOf('=');
+            const key = (separator === -1 ? option : option.slice(0, separator)).toLowerCase();
+            const optionValue = separator === -1 ? '' : option.slice(separator + 1);
+            return key === 'seccomp'
+                ? `${key}=${optionValue}`
+                : option.toLowerCase();
+        }).sort()
+        : null;
     if (!Array.isArray(runtime.securityOptions)
-        || JSON.stringify(runtime.securityOptions.map((value) => value.toLowerCase()).sort())
-            !== JSON.stringify(expectedSecurityOptions)) {
+        || JSON.stringify(observedSecurityOptions) !== JSON.stringify(expectedSecurityOptions)) {
         throw publicationError('Owned Box security options are incompatible');
     }
     const expectedDevices = ['/dev/fuse', '/dev/net/tun'];

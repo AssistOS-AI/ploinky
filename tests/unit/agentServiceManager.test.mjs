@@ -487,6 +487,11 @@ test('drain-aware replacement is explicit and does not rewrite ordinary fleet li
     assert.match(managerSource, /if \(runtimeNetworkPlan\.requiresManagedNetwork\)[\s\S]*drainTargetedContainer[\s\S]*else \{[\s\S]*drainAndRemoveTargetedContainer/);
     assert.doesNotMatch(fleetSource, /targetedContainerLifecycle|drainTargetedContainer|targetedRestart/);
     assert.doesNotMatch(drainSource, /inactivateEdgeRoutingGeneration/);
+    assert.match(
+        managerSource,
+        /combinedInstallCmd} && exec sh \/Agent\/server\/AgentServer\.sh/,
+        'the default server must replace the transient installer shell before it can acknowledge targeted drain',
+    );
 });
 
 test('fleet cleanup never expands an exact registry key to a derived alias or canonical name', () => {

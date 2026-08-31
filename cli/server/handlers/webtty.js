@@ -2,9 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import {
-    resolveWorkspaceDirectory,
-} from '../../../core-services/webtty/cwd.mjs';
 import { WEBTTY_PROTOCOL_LIMITS } from '../../../core-services/webtty/worker-protocol.mjs';
 import { isLocalAdminUser } from '../auth/localService.js';
 import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
@@ -14,6 +11,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEBTTY_ROOT = path.resolve(__dirname, '../webtty');
 const ASSETS = Object.freeze({
     'webtty.css': { path: path.join(WEBTTY_ROOT, 'webtty.css'), type: 'text/css; charset=utf-8' },
+    'webtty-bootstrap.js': { path: path.join(WEBTTY_ROOT, 'webtty-bootstrap.js'), type: 'application/javascript; charset=utf-8' },
     'webtty.js': { path: path.join(WEBTTY_ROOT, 'webtty.js'), type: 'application/javascript; charset=utf-8' },
     'xterm.css': { path: path.join(WEBTTY_ROOT, 'vendor/xterm.css'), type: 'text/css; charset=utf-8' },
     'xterm.js': { path: path.join(WEBTTY_ROOT, 'vendor/xterm.js'), type: 'application/javascript; charset=utf-8' },
@@ -77,18 +75,30 @@ function requireAdministrator(req, res) {
 }
 
 function requireAvailable(manager, res) {
-    const availability = manager?.availability?.() || { ok: false };
+    let availability;
+    try {
+        availability = manager?.availability?.() || { ok: false };
+    } catch (error) {
+        mapOperationError(res, error);
+        return false;
+    }
     if (availability.ok) return true;
     sendError(res, 503, 'webtty_unavailable', { 'Retry-After': '5' });
     return false;
 }
 
 function verifyMutationBeforeBody(req, res, routePlan) {
-    const proof = verifyBrowserMutationRequest(req, {
-        routePlan,
-        authContext: req.edgeAuthContext,
-        sessionId: req.sessionId,
-    });
+    let proof;
+    try {
+        proof = verifyBrowserMutationRequest(req, {
+            routePlan,
+            authContext: req.edgeAuthContext,
+            sessionId: req.sessionId,
+        });
+    } catch (error) {
+        mapOperationError(res, error);
+        return false;
+    }
     if (!proof.ok) {
         sendError(res, 403, String(proof.code || 'browser_mutation_denied').toLowerCase());
         return false;
@@ -97,7 +107,12 @@ function verifyMutationBeforeBody(req, res, routePlan) {
 }
 
 function commitMutation(routePlan, res) {
-    if (commitRouteGeneration(routePlan)) return true;
+    try {
+        if (commitRouteGeneration(routePlan)) return true;
+    } catch (error) {
+        mapOperationError(res, error);
+        return false;
+    }
     sendError(res, 503, 'edge_generation_changed');
     return false;
 }
@@ -122,17 +137,44 @@ function sessionPath(pathname) {
     return match ? { id: match[1], operation: match[2] || '' } : null;
 }
 
+function discoveryPath(pathname) {
+    const match = pathname.match(/^\/webtty\/target-discoveries\/([A-Za-z0-9_-]{16,128})$/);
+    return match ? { id: match[1] } : null;
+}
+
+const RETRYABLE_CLIENT_OPERATION_ERRORS = new Set([
+    'WEBTTY_LAUNCH_QUOTA',
+    'WEBTTY_GLOBAL_QUOTA',
+    'WEBTTY_USER_QUOTA',
+    'WEBTTY_SESSION_QUOTA',
+    'WEBTTY_CREATION_RATE',
+    'WEBTTY_INPUT_RATE',
+    'WEBTTY_IPC_BACKPRESSURE',
+    'WEBTTY_AGENT_IPC_BACKPRESSURE',
+]);
+
+const STALE_TARGET_ERRORS = new Set([
+    'WEBTTY_TARGET_STALE',
+    'WEBTTY_TARGET_DIRECTORY_STALE',
+    'WEBTTY_TARGET_GENERATION_STALE',
+    'WEBTTY_TARGET_IDENTITY_STALE',
+]);
+
 function mapOperationError(res, error) {
     const code = String(error?.code || '');
-    if (code === 'WEBTTY_AUTH_INVALID') {
+    if (code === 'WEBTTY_AUTH_INVALID' || code === 'WEBTTY_AUTH_SESSION_REQUIRED') {
         sendError(res, 401, 'authentication_required');
     } else if (code === 'WEBTTY_ADMIN_REQUIRED') {
         sendError(res, 403, 'administrator_required');
-    } else if (code.includes('QUOTA') || code.includes('RATE') || code === 'WEBTTY_IPC_BACKPRESSURE') {
+    } else if (RETRYABLE_CLIENT_OPERATION_ERRORS.has(code)) {
         sendError(res, 429, code.toLowerCase(), { 'Retry-After': '5' });
-    } else if (code === 'WEBTTY_CWD_INVALID' || code.endsWith('_INVALID')) {
-        sendError(res, 400, code.toLowerCase());
-    } else if (code === 'WEBTTY_UNAVAILABLE') {
+    } else if (code === 'WEBTTY_LAUNCH_NOT_FOUND') {
+        sendError(res, 404, 'terminal_launch_unavailable');
+    } else if (code === 'WEBTTY_SESSION_NOT_FOUND') {
+        sendError(res, 404, 'not_found');
+    } else if (STALE_TARGET_ERRORS.has(code)) {
+        sendError(res, 409, 'terminal_target_stale');
+    } else if (code === 'WEBTTY_UNAVAILABLE' || code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE') {
         sendError(res, 503, 'webtty_unavailable', { 'Retry-After': '5' });
     } else if (code === 'WEBTTY_GENERATION_CHANGED') {
         sendError(res, 503, 'edge_generation_changed');
@@ -144,7 +186,6 @@ function mapOperationError(res, error) {
 export async function handleWebtty(req, res, parsedUrl, {
     manager,
     routePlan,
-    directoryResolver = resolveWorkspaceDirectory,
 } = {}) {
     const pathname = parsedUrl.pathname || '/';
     if (!(pathname === '/webtty' || pathname.startsWith('/webtty/'))) return false;
@@ -181,6 +222,49 @@ export async function handleWebtty(req, res, parsedUrl, {
         return true;
     }
 
+    if (pathname === '/webtty/target-discoveries' && method === 'POST') {
+        if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
+        let body;
+        try { body = await readJsonBody(req, 8 * 1024); }
+        catch (error) {
+            sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
+            return true;
+        }
+        if (!exactBodyKeys(body, ['dir']) || typeof body.dir !== 'string') {
+            sendError(res, 400, 'invalid_discovery_request');
+            return true;
+        }
+        try {
+            const discovery = await manager.discoverTargets({
+                req,
+                routePlan,
+                directory: body.dir,
+            });
+            sendJson(res, 201, { ok: true, discovery });
+        } catch (error) {
+            mapOperationError(res, error);
+        }
+        return true;
+    }
+
+    const selectedDiscovery = discoveryPath(pathname);
+    if (selectedDiscovery && method === 'DELETE') {
+        if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
+        if (!commitMutation(routePlan, res)) return true;
+        try {
+            const cancelled = await manager.cancelTargetDiscovery({
+                req,
+                routePlan,
+                id: selectedDiscovery.id,
+            });
+            if (!cancelled) sendError(res, 404, 'not_found');
+            else sendJson(res, 200, { ok: true });
+        } catch (error) {
+            mapOperationError(res, error);
+        }
+        return true;
+    }
+
     if (pathname === '/webtty/sessions' && method === 'POST') {
         if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
         let body;
@@ -189,21 +273,18 @@ export async function handleWebtty(req, res, parsedUrl, {
             sendError(res, error.code === 'UNSUPPORTED_MEDIA_TYPE' ? 415 : error.code === 'BODY_TOO_LARGE' ? 413 : 400, error.code.toLowerCase());
             return true;
         }
-        if (!exactBodyKeys(body, ['dir', 'cols', 'rows'])
-            || typeof body.dir !== 'string'
+        if (!exactBodyKeys(body, ['launch', 'cols', 'rows'])
+            || typeof body.launch !== 'string'
+            || !/^[A-Za-z0-9_-]{32}$/.test(body.launch)
             || !validateDimensions(body.cols, body.rows)) {
             sendError(res, 400, 'invalid_session_request');
             return true;
         }
-        let cwd;
-        try { cwd = directoryResolver(body.dir); }
-        catch (error) { mapOperationError(res, error); return true; }
-        if (!commitMutation(routePlan, res)) return true;
         try {
             const created = await manager.create({
                 req,
                 routePlan,
-                cwdRelative: cwd.relativePath,
+                launch: body.launch,
                 cols: body.cols,
                 rows: body.rows,
             });
@@ -221,7 +302,9 @@ export async function handleWebtty(req, res, parsedUrl, {
     }
 
     if (selected.operation === 'stream' && method === 'GET') {
-        const session = await manager.validateOwnership(req, routePlan, selected.id);
+        let session;
+        try { session = await manager.validateOwnership(req, routePlan, selected.id); }
+        catch (error) { mapOperationError(res, error); return true; }
         if (!session) { sendError(res, 404, 'not_found'); return true; }
         res.writeHead(200, {
             ...SECURITY_HEADERS,
@@ -229,7 +312,13 @@ export async function handleWebtty(req, res, parsedUrl, {
             Connection: 'keep-alive',
             'X-Accel-Buffering': 'no',
         });
-        manager.attachStream(session, req, res, req.headers?.['last-event-id']);
+        let attached = false;
+        try {
+            attached = manager.attachStream(session, req, res, req.headers?.['last-event-id']);
+        } catch (_) { }
+        if (!attached && !res.writableEnded && !res.destroyed) {
+            try { res.end(); } catch (_) { }
+        }
         return true;
     }
 
@@ -247,7 +336,9 @@ export async function handleWebtty(req, res, parsedUrl, {
             sendError(res, 400, 'invalid_input');
             return true;
         }
-        const session = await manager.validateOwnership(req, routePlan, selected.id);
+        let session;
+        try { session = await manager.validateOwnership(req, routePlan, selected.id); }
+        catch (error) { mapOperationError(res, error); return true; }
         if (!session) { sendError(res, 404, 'not_found'); return true; }
         if (!commitMutation(routePlan, res)) return true;
         try { await manager.input(session, body.data); sendJson(res, 200, { ok: true }); }
@@ -267,7 +358,9 @@ export async function handleWebtty(req, res, parsedUrl, {
             sendError(res, 400, 'invalid_dimensions');
             return true;
         }
-        const session = await manager.validateOwnership(req, routePlan, selected.id);
+        let session;
+        try { session = await manager.validateOwnership(req, routePlan, selected.id); }
+        catch (error) { mapOperationError(res, error); return true; }
         if (!session) { sendError(res, 404, 'not_found'); return true; }
         if (!commitMutation(routePlan, res)) return true;
         try { await manager.resize(session, body.cols, body.rows); sendJson(res, 200, { ok: true }); }
@@ -278,7 +371,9 @@ export async function handleWebtty(req, res, parsedUrl, {
     if (!selected.operation && method === 'DELETE') {
         if (!verifyMutationBeforeBody(req, res, routePlan)) return true;
         if (!commitMutation(routePlan, res)) return true;
-        const closed = await manager.closeOwned(req, routePlan, selected.id);
+        let closed;
+        try { closed = await manager.closeOwned(req, routePlan, selected.id); }
+        catch (error) { mapOperationError(res, error); return true; }
         if (!closed) { sendError(res, 404, 'not_found'); return true; }
         sendJson(res, 200, { ok: true });
         return true;
