@@ -68,6 +68,10 @@ macOS Podman Machine.
 Dependency-cache seeding inside the Box likewise uses `cp -a` copies instead
 of hard links or Node's recursive copy because shared macOS bind mounts cannot
 preserve those operations reliably across the outer and nested containers.
+The lock-pinned MCP SDK source is sealed into `ploinky-box` at image-build time.
+On startup the Box verifies that immutable bundle and copies it into
+`/opt/ploinky/node_modules`; a fresh workspace therefore performs no MCP SDK
+Git or npm operation and needs no GitHub credentials.
 
 | Invocation | Documented effect |
 | --- | --- |

@@ -111,6 +111,12 @@ Each instance has four durable host binds and one transient `/tmp` tmpfs:
 | `<workspace>/.ploinky/box/images` | `/home/podman/.local/share/ploinky-images` | Read-write durable bind |
 | tmpfs | `/tmp` | `rw,exec,nosuid,nodev,mode=1777,notmpcopyup`; recreated empty on every outer boot |
 
+The image carries the exact lock-pinned MCP SDK at
+`/usr/local/lib/ploinky/mcp-sdk`, without `.git` or credentials and with a
+content-hash contract. Box startup verifies that bundle and transactionally
+copies it into the dependency bind. It does not clone from GitHub or run npm,
+including when `.ploinky/box/dependencies` is empty.
+
 Nested container records, writable layers, networks, and inner Podman named
 volumes are deliberately not persisted. They live on the outer container's
 writable layer under `/home/podman/.local/share/containers/storage` and are

@@ -12,6 +12,12 @@ import {
     validateDependencyLock,
 } from '../../ploinky-box/entrypoint/install-dependencies.mjs';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
+import {
+    createMcpSdkBundleMetadata,
+    MCP_SDK_BUNDLE_METADATA_NAME,
+    validateMcpSdkBundle,
+} from '../../ploinky-box/mcp-sdk-bundle.mjs';
+import { createProcessRunner } from '../../ploinky-box/process.mjs';
 import { AGENTLIB_ENV, AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
 import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
@@ -36,7 +42,36 @@ function fixture(t) {
         [AGENTLIB_ENV.fingerprint]: MOUNT_FINGERPRINT,
         [AGENTLIB_ENV.commit]: '',
     };
-    return { root, targetRoot, markerPath, agentLibPath, agentLibEnv };
+    const lock = readDependencyLock();
+    const bundledMcpSdkPath = path.join(root, 'bundled-mcp-sdk');
+    fs.mkdirSync(bundledMcpSdkPath);
+    fs.writeFileSync(path.join(bundledMcpSdkPath, 'package.json'), JSON.stringify({
+        name: '@modelcontextprotocol/sdk',
+        version: '1.19.1',
+        type: 'module',
+        exports: { '.': './index.mjs' },
+    }));
+    fs.writeFileSync(
+        path.join(bundledMcpSdkPath, 'index.mjs'),
+        'export const bundled = true;\n',
+    );
+    const bundleMetadata = createMcpSdkBundleMetadata({
+        sourceRoot: bundledMcpSdkPath,
+        repository: lock.repositories['mcp-sdk'],
+    });
+    fs.writeFileSync(
+        path.join(bundledMcpSdkPath, MCP_SDK_BUNDLE_METADATA_NAME),
+        `${JSON.stringify(bundleMetadata)}\n`,
+    );
+    return {
+        root,
+        targetRoot,
+        markerPath,
+        agentLibPath,
+        agentLibEnv,
+        bundledMcpSdkPath,
+        lock,
+    };
 }
 
 function fakeInstaller(counter, { failName = '' } = {}) {
@@ -100,6 +135,78 @@ test('empty-volume install is transactional and repeat runs are no-ops', (t) => 
     const second = installPinnedDependencies({ ...options, token: 'second' });
     assert.equal(second.changed, false);
     assert.deepEqual(installs, []);
+});
+
+test('default install copies the verified image bundle without Git or npm', (t) => {
+    const state = fixture(t);
+    const commands = [];
+    const processRunner = createProcessRunner();
+    const runner = {
+        run(command, args, options) {
+            commands.push(command);
+            return processRunner.run(command, args, options);
+        },
+        query(command, args, options) {
+            commands.push(command);
+            return processRunner.query(command, args, options);
+        },
+    };
+    const first = installPinnedDependencies({
+        ...state,
+        runner,
+        token: 'bundled-first',
+    });
+    assert.equal(first.changed, true);
+    assert.deepEqual(commands, ['cp', 'chmod']);
+    const installed = path.join(state.targetRoot, 'mcp-sdk');
+    assert.equal(fs.readFileSync(path.join(installed, 'index.mjs'), 'utf8'), 'export const bundled = true;\n');
+    assert.equal(fs.existsSync(path.join(installed, '.git')), false);
+    assert.notEqual(fs.statSync(installed).mode & 0o200, 0);
+    const verified = validateMcpSdkBundle({
+        sourceRoot: installed,
+        expectedRepository: state.lock.repositories['mcp-sdk'],
+    });
+    assert.equal(verified.repository.commit, state.lock.repositories['mcp-sdk'].commit);
+
+    commands.length = 0;
+    const second = installPinnedDependencies({
+        ...state,
+        runner,
+        token: 'bundled-second',
+    });
+    assert.equal(second.changed, false);
+    assert.deepEqual(commands, []);
+
+    fs.writeFileSync(path.join(installed, 'index.mjs'), 'tampered\n');
+    const repaired = installPinnedDependencies({
+        ...state,
+        runner,
+        token: 'bundled-repair',
+    });
+    assert.equal(repaired.changed, true);
+    assert.deepEqual(commands, ['cp', 'chmod']);
+    assert.equal(fs.readFileSync(path.join(installed, 'index.mjs'), 'utf8'), 'export const bundled = true;\n');
+});
+
+test('missing or tampered image bundle fails before cache mutation', (t) => {
+    const state = fixture(t);
+    const missing = path.join(state.root, 'missing-bundle');
+    assert.throws(
+        () => installPinnedDependencies({
+            ...state,
+            bundledMcpSdkPath: missing,
+            token: 'missing-bundle',
+        }),
+        /no valid bundled MCP SDK/,
+    );
+    assert.deepEqual(fs.readdirSync(state.targetRoot), []);
+
+    fs.appendFileSync(path.join(state.bundledMcpSdkPath, 'index.mjs'), '// tampered\n');
+    assert.throws(
+        () => installPinnedDependencies({ ...state, token: 'tampered-bundle' }),
+        /no valid bundled MCP SDK/,
+    );
+    assert.deepEqual(fs.readdirSync(state.targetRoot), []);
 });
 
 test('partial or wrong-pin installs are repaired as one replacement', (t) => {

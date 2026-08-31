@@ -34,8 +34,8 @@ export const BOX_LABELS = Object.freeze({
 export const BOX_WORKSPACE_MOUNT = '/workspace';
 
 // achillesAgentLib is direct-mounted from the one selected workspace source.
-// The Box never installs its own copy: `/opt/ploinky/node_modules` holds
-// `mcp-sdk` only.
+// The Box never installs its own copy. `/opt/ploinky/node_modules` is the
+// workspace-backed cache where the image-bundled mcp-sdk is materialized.
 export const BOX_AGENTLIB_LABELS = Object.freeze({
     mode: 'io.assistos.ploinky-box.agentlib-mode',
     sourceIdHash: 'io.assistos.ploinky-box.agentlib-source-id',

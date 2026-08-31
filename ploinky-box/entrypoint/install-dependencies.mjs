@@ -13,14 +13,18 @@ import {
 import { BOX_MARKER_CONTENT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
+import {
+    MCP_SDK_BUNDLE_PATH,
+    validateMcpSdkBundle,
+} from '../mcp-sdk-bundle.mjs';
 
 const LOCK_PATH = path.resolve(import.meta.dirname, '../dependencies.lock.json');
 export const DEPENDENCY_MARKER_NAME = '.ploinky-box-dependencies.json';
 const PIN_PATTERN = /^[a-f0-9]{40}$/;
 
-// achillesAgentLib is direct-mounted from the selected workspace source, so the
-// Box installs only mcp-sdk. Its lock entry stays canonical source policy for
-// the host-side selector.
+// achillesAgentLib is direct-mounted from the selected workspace source. The
+// only dependency materialized into the workspace-backed Box cache is mcp-sdk,
+// copied from the immutable image bundle rather than fetched during startup.
 export const BOX_INSTALLED_DEPENDENCIES = Object.freeze(['mcp-sdk']);
 
 function dependencyError(message, cause) {
@@ -136,43 +140,55 @@ function markerMatches(actual, expected) {
     return JSON.stringify(canonicalize(actual)) === JSON.stringify(canonicalize(expected));
 }
 
-function defaultReadInstalledHead(directory, runner, options = {}) {
-    const result = runner.query('git', ['-C', directory, 'rev-parse', 'HEAD'], options);
-    if (!result.ok) return '';
-    return String(result.stdout || '').trim();
+function defaultReadInstalledHead(directory, _runner, {
+    expectedRepository,
+    expectedBundle,
+    fsApi = fs,
+} = {}) {
+    try {
+        const installed = validateMcpSdkBundle({
+            sourceRoot: directory,
+            expectedRepository,
+            fsApi,
+        });
+        return installed.contentSha256 === expectedBundle?.contentSha256
+            ? installed.repository.commit
+            : '';
+    } catch {
+        return '';
+    }
 }
 
-function defaultInstallRepository({ name, repository, destination, runner, fsApi = fs }) {
-    const privateHome = path.join(destination, '.installer-home');
-    const privateTmp = path.join(destination, '.installer-tmp');
-    const npmCache = path.join(destination, '.npm-cache');
-    fsApi.mkdirSync(privateHome, { recursive: true, mode: 0o700 });
-    fsApi.mkdirSync(privateTmp, { recursive: true, mode: 0o700 });
-    const toolEnvironment = {
-        PATH: String(process.env.PATH || '/usr/local/bin:/usr/bin:/bin'),
-        HOME: privateHome,
-        TMPDIR: privateTmp,
-        GIT_CONFIG_NOSYSTEM: '1',
-        GIT_CONFIG_GLOBAL: '/dev/null',
-        npm_config_cache: npmCache,
-        npm_config_update_notifier: 'false',
-    };
-    runner.run('git', ['init', destination], { env: toolEnvironment });
-    runner.run('git', ['-C', destination, 'remote', 'add', 'origin', repository.url], { env: toolEnvironment });
-    runner.run('git', ['-C', destination, 'fetch', '--depth', '1', 'origin', repository.commit], { env: toolEnvironment });
-    runner.run('git', ['-C', destination, 'checkout', '--detach', repository.commit], { env: toolEnvironment });
-    runner.run('npm', [
-        'install',
-        '--no-package-lock',
-        '--no-audit',
-        '--no-fund',
-    ], { cwd: destination, env: toolEnvironment });
-    const head = defaultReadInstalledHead(destination, runner, { env: toolEnvironment });
-    if (head !== repository.commit) {
-        throw dependencyError(`Installed ${name} HEAD does not match its immutable pin`);
+function defaultInstallRepository({
+    name,
+    repository,
+    destination,
+    sourcePath,
+    expectedBundle,
+    runner = createProcessRunner(),
+    fsApi = fs,
+}) {
+    if (name !== 'mcp-sdk') {
+        throw dependencyError(`The Box image has no bundled source for ${name}`);
     }
-    for (const transient of [privateHome, privateTmp, npmCache]) {
-        fsApi.rmSync(transient, { recursive: true, force: true });
+    const source = validateMcpSdkBundle({
+        sourceRoot: sourcePath,
+        expectedRepository: repository,
+        fsApi,
+    });
+    if (source.contentSha256 !== expectedBundle?.contentSha256) {
+        throw dependencyError('The MCP SDK image bundle changed during dependency preparation');
+    }
+    // GNU cp is intentional. Node's recursive copy is unreliable when the
+    // destination is a macOS Podman Machine bind mount.
+    try {
+        runner.run('cp', ['-a', source.sourceRoot, destination]);
+        // The image bundle is root-owned and read-only. Its cache copy belongs
+        // to the Box user and must be movable/reparable across VirtioFS.
+        runner.run('chmod', ['-R', 'u+w', destination]);
+    } catch (error) {
+        try { runner.run('chmod', ['-R', 'u+w', destination]); } catch {}
+        throw error;
     }
 }
 
@@ -270,7 +286,15 @@ function readMarker(markerPath, fsApi) {
     }
 }
 
-function installationMatches({ targetRoot, expected, lock, fsApi, runner, readInstalledHead }) {
+function installationMatches({
+    targetRoot,
+    expected,
+    lock,
+    fsApi,
+    runner,
+    readInstalledHead,
+    bundle,
+}) {
     if (!markerMatches(readMarker(path.join(targetRoot, DEPENDENCY_MARKER_NAME), fsApi), expected)) {
         return false;
     }
@@ -282,7 +306,11 @@ function installationMatches({ targetRoot, expected, lock, fsApi, runner, readIn
         } catch {
             return false;
         }
-        if (readInstalledHead(directory, runner) !== repository.commit) {
+        if (readInstalledHead(directory, runner, {
+            expectedRepository: repository,
+            expectedBundle: bundle,
+            fsApi,
+        }) !== repository.commit) {
             return false;
         }
     }
@@ -316,6 +344,8 @@ export function installPinnedDependencies({
     lock = readDependencyLock({ fsApi }),
     installRepository = defaultInstallRepository,
     readInstalledHead = defaultReadInstalledHead,
+    validateBundle = validateMcpSdkBundle,
+    bundledMcpSdkPath = MCP_SDK_BUNDLE_PATH,
     token = crypto.randomBytes(12).toString('hex'),
     agentLibEnv = process.env,
     agentLibPath = AGENTLIB_STABLE_MOUNT_PATH,
@@ -327,9 +357,19 @@ export function installPinnedDependencies({
     validateMountedAgentLib({ fsApi, env: agentLibEnv, sourcePath: agentLibPath });
     removeForbiddenBoxAgentLib({ root, fsApi });
     const installable = boxInstallableRepositories(lock);
+    let bundle;
+    try {
+        bundle = validateBundle({
+            sourceRoot: bundledMcpSdkPath,
+            expectedRepository: lock.repositories['mcp-sdk'],
+            fsApi,
+        });
+    } catch (error) {
+        throw dependencyError('The ploinky-box image has no valid bundled MCP SDK', error);
+    }
     const expected = markerFor(lock);
     if (installationMatches({
-        targetRoot: root, expected, lock, fsApi, runner, readInstalledHead,
+        targetRoot: root, expected, lock, fsApi, runner, readInstalledHead, bundle,
     })) {
         return Object.freeze({ changed: false, marker: expected });
     }
@@ -347,9 +387,21 @@ export function installPinnedDependencies({
     try {
         for (const [name, repository] of Object.entries(installable)) {
             const destination = path.join(transactionRoot, name);
-            installRepository({ name, repository, destination, runner, fsApi });
-            if (readInstalledHead(destination, runner) !== repository.commit) {
-                throw dependencyError(`Staged ${name} HEAD does not match its immutable pin`);
+            installRepository({
+                name,
+                repository,
+                destination,
+                runner,
+                fsApi,
+                sourcePath: bundle.sourceRoot,
+                expectedBundle: bundle,
+            });
+            if (readInstalledHead(destination, runner, {
+                expectedRepository: repository,
+                expectedBundle: bundle,
+                fsApi,
+            }) !== repository.commit) {
+                throw dependencyError(`Staged ${name} does not match its immutable image bundle`);
             }
             staged.set(name, destination);
         }
