@@ -1767,28 +1767,33 @@ export function cleanupFailedPreparedRuntime(
     abortPreparation = abortEdgeRoutingPreparation,
   } = {},
 ) {
-  if (!result) return;
+  const failedResult = result || error?.ploinkyRestartCandidate || null;
+  if (!failedResult) return;
   // The activation helper and its lifecycle caller see the same prepared
-  // runtime. Cleanup receipts are intentionally single-use authority, so the
-  // first failure owner consumes the transaction and every outer catch is a
-  // no-op for that exact result.
-  if (typeof result === 'object') {
-    if (handledPreparedRuntimeFailures.has(result)) return;
-    handledPreparedRuntimeFailures.add(result);
+  // runtime. A launch failure can instead surface the exact candidate only on
+  // the error, before the caller receives a result. Cleanup receipts are
+  // intentionally single-use authority, so the first failure owner consumes
+  // the transaction and every outer catch is a no-op for that exact object.
+  if (typeof failedResult === 'object') {
+    if (handledPreparedRuntimeFailures.has(failedResult)) return;
+    handledPreparedRuntimeFailures.add(failedResult);
   }
-  if (result.preparationLease && result.containerName && result.containerId && result.registryRecord) {
+  if (failedResult.preparationLease
+    && failedResult.containerName
+    && failedResult.containerId
+    && failedResult.registryRecord) {
     try {
-      cleanupCandidate(result);
+      cleanupCandidate(failedResult);
     } catch (cleanupError) {
       error.message += `; exact runtime-failure cleanup: ${cleanupError?.message || cleanupError}`;
     }
   }
-  if (!result.preparationLease) return;
+  if (!failedResult.preparationLease) return;
   try {
     inactivate(reason, { preserveSelectedGeneration: true });
   } catch (_) {}
   try {
-    abortPreparation(result.preparationLease, { reason });
+    abortPreparation(failedResult.preparationLease, { reason });
   } catch (_) {}
 }
 

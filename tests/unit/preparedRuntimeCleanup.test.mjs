@@ -90,3 +90,38 @@ test('a cleanup error is reported once even when an outer catch retries cleanup'
         'activation failed; exact runtime-failure cleanup: candidate cleanup refused',
     );
 });
+
+test('a launch failure cleans the exact error candidate and aborts its preparation once', () => {
+    const candidate = Object.freeze(preparedRuntime());
+    const failure = new Error('managed semantic adoption failed');
+    Object.defineProperty(failure, 'ploinkyRestartCandidate', {
+        configurable: true,
+        enumerable: false,
+        writable: false,
+        value: candidate,
+    });
+    const calls = [];
+    const seams = {
+        cleanupCandidate(current) {
+            assert.equal(current, candidate);
+            calls.push('cleanup');
+        },
+        inactivate(reason, options) {
+            calls.push(`inactivate:${reason}:${options.preserveSelectedGeneration}`);
+        },
+        abortPreparation(lease, options) {
+            assert.equal(lease, candidate.preparationLease);
+            calls.push(`abort:${options.reason}`);
+        },
+    };
+
+    cleanupFailedPreparedRuntime(null, failure, 'cli-start-failed', seams);
+    cleanupFailedPreparedRuntime(null, failure, 'outer-catch', seams);
+
+    assert.deepEqual(calls, [
+        'cleanup',
+        'inactivate:cli-start-failed:true',
+        'abort:cli-start-failed',
+    ]);
+    assert.equal(failure.message, 'managed semantic adoption failed');
+});
