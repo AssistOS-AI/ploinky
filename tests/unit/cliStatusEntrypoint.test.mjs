@@ -153,6 +153,6 @@ test('status renders terminal color intent without changing workspace state', (t
     }
     assert.match(coloredOutput, /Workspace status:/);
     assert.match(coloredOutput, /Agent runtimes:/);
-    assert.match(verboseOutput, /AgentLib core:/);
-    assert.match(verboseOutput, /LLMAgents\/index\.mjs:/);
+    assert.doesNotMatch(verboseOutput, /AgentLib core:/);
+    assert.doesNotMatch(verboseOutput, /LLMAgents\/index\.mjs:/);
 });

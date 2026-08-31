@@ -76,7 +76,6 @@ import {
 // Reuse env map builder from bwrap (with runtimeName param)
 import { buildFullEnvMap } from '../bwrap/bwrapServiceManager.js';
 import { agentLibGrant, agentLibReuseProblem, agentLibRuntimeRecord } from '../agentLibGrant.js';
-import { attestSeatbeltAgentLib } from '../agentLibAttestation.js';
 import { detectHostRuntimeKey } from '../../utils/dependencies/dependencyRuntimeKey.js';
 // Seatbelt profile generator
 import { buildSeatbeltProfile, writeSeatbeltProfile } from './seatbeltProfile.js';
@@ -417,18 +416,48 @@ function resolveSeatbeltAgentNodeModules({
     });
 }
 
+function resolveSeatbeltRuntimeLayout({ agentName, alias, cwd }) {
+    const canonicalAgentName = String(agentName || '').trim();
+    const instanceName = String(alias || canonicalAgentName).trim();
+    const cwdInput = String(cwd || '').trim();
+    if (!canonicalAgentName || !instanceName || !path.isAbsolute(cwdInput)) {
+        throw new Error('[seatbelt] agent runtime layout is invalid');
+    }
+    return Object.freeze({
+        instanceName,
+        cwd: path.resolve(cwdInput),
+        agentWorkDir: getAgentWorkDir(instanceName),
+    });
+}
+
+function applySeatbeltRuntimeEnvironment(envMap, layout) {
+    envMap.WORKSPACE_PATH = layout.cwd;
+    envMap.HOME = layout.agentWorkDir;
+    return envMap;
+}
+
+function buildSeatbeltRuntimeBinds(layout) {
+    return Array.from(new Set([layout.agentWorkDir, layout.cwd].map(value => path.resolve(value))))
+        .map(value => ({ source: value, target: value }));
+}
+
 /**
  * Start a seatbelt-sandboxed agent process.
  */
 function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const repoName = path.basename(path.dirname(agentPath));
-    const alias = options.alias;
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
+    const profileRecord = loadAgentsMap()[containerName] || {};
+    const alias = options.alias || profileRecord.alias;
     const runtimeIdentity = normalizeSandboxRuntimeIdentity(options);
-    const cwd = getConfiguredProjectPath(agentName, repoName, alias);
+    const layout = resolveSeatbeltRuntimeLayout({
+        agentName,
+        alias,
+        cwd: getConfiguredProjectPath(agentName, repoName, alias),
+    });
+    const { instanceName, cwd, agentWorkDir } = layout;
 
     // Profile and network are resolved atomically before any sandbox work.
-    const profileRecord = loadAgentsMap()[containerName] || {};
     const profileResolution = resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, options, profileRecord);
     const activeProfile = profileResolution.resolvedProfileName;
     const profileConfig = profileResolution.profileConfig;
@@ -437,7 +466,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         agentId: deriveAgentPrincipalId(repoName, agentName),
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
-        routeKey: options.alias || profileRecord.alias || agentName,
+        routeKey: instanceName,
         containerName,
     }, { preparedCapability: options.preparedHostModeCapability });
     assertBwrapPidSlotAvailable(containerName);
@@ -451,8 +480,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     // Resolve paths (real host paths — no mount namespaces)
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
     const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
-    const agentWorkDir = cwd;
-
     // Pre-container lifecycle
     const preLifecycle = runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile);
     if (!preLifecycle.success) {
@@ -461,7 +488,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     // Ensure work directory and MCP config
     fs.mkdirSync(agentWorkDir, { recursive: true });
-    syncAgentMcpConfig(containerName, path.resolve(agentPath), alias || agentName, { workDir: agentWorkDir });
+    syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentWorkDir });
 
     // Prepare or reuse the host dependency cache (see dependencyCache.js).
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
@@ -495,7 +522,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     ensurePersistentStorageHostDir(runtimeResourcePlan);
 
     // Build environment map (reuse bwrap's builder with 'seatbelt' runtimeName)
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, cwd, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
     assertSeatbeltGeneratedLocalDisabled(envMap);
 
     // Set PORT env var
@@ -510,7 +537,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
 
     // NODE_PATH for module resolution
     envMap.NODE_PATH = nodeModulesDir;
-    envMap.HOME = agentWorkDir;
+    applySeatbeltRuntimeEnvironment(envMap, layout);
     envMap.PATH = buildSeatbeltPathEnv();
 
     // Rewrite mcp-config.json for real paths
@@ -547,15 +574,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     });
     const profilePath = writeSeatbeltProfile(agentName, profileContent);
 
-    const agentLibAttestation = attestSeatbeltAgentLib({
-        profilePath,
-        agentRuntimePath: seatbeltAgentLibPath,
-        cwd: agentCodePath,
-        env: envMap,
-        grant,
-        spawn: spawnSync,
-    });
-
     // Build entry command with real paths
     const entryCmd = buildSeatbeltEntryCommand(agentName, manifest, profileConfig, {
         agentCodePath,
@@ -573,7 +591,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         agentId: deriveAgentPrincipalId(repoName, agentName),
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
-        routeKey: options.alias || profileRecord.alias || agentName,
+        routeKey: instanceName,
         containerName,
     }, { preparedCapability: options.preparedHostModeCapability });
     // The final log name is derived from this launch's identity tuple and its
@@ -658,7 +676,6 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
             agentLibPath: seatbeltAgentLibPath
         },
         agentLib: agentLibRuntimeRecord(grant),
-        agentLibAttestation,
         runMode: existingRecord.runMode,
         develRepo: existingRecord.develRepo,
         profile: activeProfile,
@@ -672,7 +689,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
                 { source: agentCodePath, target: agentCodePath, ro: codeReadOnly },
                 { source: sharedDir, target: sharedDir },
                 ...(fs.existsSync(agentSkillsPath) ? [{ source: agentSkillsPath, target: agentSkillsPath, ro: skillsReadOnly }] : []),
-                { source: cwd, target: cwd }
+                ...buildSeatbeltRuntimeBinds(layout)
             ],
             env: Array.from(new Set(declaredEnvNames)).map((name) => ({ name })),
             ports: allPortMappings,
@@ -706,7 +723,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         console.warn(`[seatbelt] ${agentName}: lifecycle hook error: ${error.message}`);
     }
 
-    syncAgentMcpConfig(containerName, path.resolve(agentPath), agentName);
+    syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentWorkDir });
 
     const returnPort = allPortMappings.find((p) => p.containerPort === 7000)?.hostPort || allPortMappings[0]?.hostPort || 0;
     return {
@@ -753,6 +770,11 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
     if (!aliasOverride && existingRecord.alias) {
         aliasOverride = existingRecord.alias;
     }
+    const reuseLayout = resolveSeatbeltRuntimeLayout({
+        agentName,
+        alias: aliasOverride,
+        cwd: getConfiguredProjectPath(agentName, repoName, aliasOverride),
+    });
 
     // Profile config and host-network compatibility are validated even when the
     // existing sandbox can otherwise be reused.
@@ -819,7 +841,10 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         } else {
             debugLog(`[seatbelt] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;
-            syncAgentMcpConfig(containerName, agentPath, agentName);
+            fs.mkdirSync(reuseLayout.agentWorkDir, { recursive: true });
+            syncAgentMcpConfig(containerName, agentPath, reuseLayout.instanceName, {
+                workDir: reuseLayout.agentWorkDir,
+            });
             return {
                 containerName,
                 hostPort,
@@ -885,7 +910,13 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     // Resolve paths
     const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
     const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
-    const agentWorkDir = record.projectPath || getAgentWorkDir(agentName);
+    const layout = resolveSeatbeltRuntimeLayout({
+        agentName,
+        alias: record.alias,
+        cwd: record.projectPath || getConfiguredProjectPath(agentName, repoName, record.alias),
+    });
+    const { instanceName, cwd, agentWorkDir } = layout;
+    fs.mkdirSync(agentWorkDir, { recursive: true });
     const sharedDir = ensureSharedHostDir();
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
@@ -921,7 +952,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
 
     // Build environment (same as running agent)
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
-    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, agentWorkDir, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
+    const envMap = buildFullEnvMap(agentName, manifest, profileConfig, cwd, repoName, activeProfile, 'seatbelt', runtimeResourcePlan, routerEndpoint, runtimeIdentity, grant);
     assertSeatbeltGeneratedLocalDisabled(envMap);
     const hostPort = record.config?.ports?.[0]?.hostPort;
     if (hostPort) envMap.PORT = String(hostPort);
@@ -929,7 +960,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     envMap.PLOINKY_INVOCATION_AUTH_MODULE = path.join(seatbeltAgentLibPath, 'lib/invocation-auth.mjs');
     envMap.PLOINKY_CODE_DIR = agentCodePath;
     envMap.NODE_PATH = nodeModulesDir;
-    envMap.HOME = agentWorkDir;
+    applySeatbeltRuntimeEnvironment(envMap, layout);
     envMap.PATH = buildSeatbeltPathEnv();
 
     // Rewrite mcp-config
@@ -946,7 +977,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         nodeModulesDir,
         agentWorkDir,
         sharedDir,
-        cwd: record.projectPath || agentWorkDir,
+        cwd,
         skillsPath: agentSkillsPath,
         codeReadOnly,
         skillsReadOnly,
@@ -991,7 +1022,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     const result = spawnSync('sandbox-exec', ['-f', profilePath, 'sh', '-lc', `cd '${wd}' && ${rewrittenCmd}`], {
         stdio: 'inherit',
         env: envMap,
-        cwd: record.projectPath || agentWorkDir
+        cwd
     });
     return result.status ?? 0;
 }
@@ -1006,5 +1037,8 @@ export {
     buildSeatbeltPathEnv,
     getSeatbeltExtraReadPaths,
     ensureSeatbeltAgentLibDir,
-    ensureSeatbeltCodeNodeModules
+    ensureSeatbeltCodeNodeModules,
+    resolveSeatbeltRuntimeLayout,
+    applySeatbeltRuntimeEnvironment,
+    buildSeatbeltRuntimeBinds
 };

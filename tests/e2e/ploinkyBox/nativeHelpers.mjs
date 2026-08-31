@@ -125,6 +125,12 @@ export function createPodmanHarness(t, candidateReference, {
 } = {}) {
     const createdRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-podman-'));
     const root = fs.realpathSync(createdRoot);
+    let finalCleanup = null;
+    t.after(async () => {
+        if (finalCleanup) await finalCleanup();
+        fs.rmSync(root, { recursive: true, force: false });
+        assert.equal(fs.existsSync(root), false, 'native Box fixture root must be removed');
+    });
     const workspace = path.join(root, 'workspace');
     const child = path.join(workspace, 'child');
     const lockHome = path.join(root, 'lock-home');
@@ -192,7 +198,7 @@ export function createPodmanHarness(t, candidateReference, {
             env: {},
         });
     }
-    t.after(cleanup);
+    finalCleanup = cleanup;
     return {
         root,
         workspace,

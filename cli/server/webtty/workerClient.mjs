@@ -27,8 +27,10 @@ export class WebttyWorkerClient extends EventEmitter {
         workerPath = DEFAULT_WEBTTY_WORKER_PATH,
         forkImpl = forkDefault,
         workerEnv = buildWorkerEnvironment(),
+        readProcessIdentity = readLinuxProcessIdentity,
         startupTimeoutMs = 10_000,
         closeGraceMs = 2_000,
+        ipcSendTimeoutMs = 2_000,
     } = {}) {
         super();
         this.terminalId = terminalId;
@@ -36,8 +38,10 @@ export class WebttyWorkerClient extends EventEmitter {
         this.workerPath = workerPath;
         this.forkImpl = forkImpl;
         this.workerEnv = workerEnv;
+        this.readProcessIdentity = readProcessIdentity;
         this.startupTimeoutMs = startupTimeoutMs;
         this.closeGraceMs = closeGraceMs;
+        this.ipcSendTimeoutMs = ipcSendTimeoutMs;
         this.child = null;
         this.initialized = false;
         this.closing = false;
@@ -46,6 +50,7 @@ export class WebttyWorkerClient extends EventEmitter {
         this.queuedBytes = 0;
         this.diagnosticBytes = 0;
         this.readyMessage = null;
+        this.closePromise = null;
         this.exitPromise = new Promise((resolve) => { this.resolveExit = resolve; });
     }
 
@@ -85,7 +90,7 @@ export class WebttyWorkerClient extends EventEmitter {
                 category: this.closing ? 'requested' : 'worker_process_exit',
             });
         });
-        const identity = await readLinuxProcessIdentity(child.pid);
+        const identity = await this.readProcessIdentity(child.pid);
         if (!identity) throw new Error('worker process identity unavailable');
         return identity;
     }
@@ -113,7 +118,7 @@ export class WebttyWorkerClient extends EventEmitter {
         else this.emit(message.type, message);
     }
 
-    async send(type, fields = {}) {
+    async send(type, fields = {}, { timeoutMs = this.ipcSendTimeoutMs } = {}) {
         if (!this.child || !this.child.connected || this.exited) throw new Error('worker IPC is unavailable');
         const message = workerMessage(type, this.terminalId, fields);
         validateRouterToWorkerMessage(message, {
@@ -130,15 +135,25 @@ export class WebttyWorkerClient extends EventEmitter {
         this.queuedBytes += bytes;
         if (type === 'init') this.initialized = true;
         await new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                this.queuedBytes = Math.max(0, this.queuedBytes - bytes);
+                if (error) reject(error); else resolve();
+            };
+            const timer = setTimeout(() => {
+                const error = new Error('worker IPC send timed out');
+                error.code = 'WEBTTY_IPC_SEND_TIMEOUT';
+                finish(error);
+            }, timeoutMs);
             try {
                 this.child.send(message, (error) => {
-                    this.queuedBytes = Math.max(0, this.queuedBytes - bytes);
-                    if (error) reject(error);
-                    else resolve();
+                    finish(error || null);
                 });
             } catch (error) {
-                this.queuedBytes = Math.max(0, this.queuedBytes - bytes);
-                reject(error);
+                finish(error);
             }
         });
     }
@@ -181,17 +196,24 @@ export class WebttyWorkerClient extends EventEmitter {
         void this.close();
     }
 
-    async close() {
-        if (this.closing) return;
+    close() {
+        if (this.closePromise) return this.closePromise;
         this.closing = true;
-        try {
-            if (this.child?.connected && !this.exited) await this.send('close');
-        } catch (_) { }
         const child = this.child;
         const timer = setTimeout(() => {
             try { if (!this.exited) child?.kill('SIGKILL'); } catch (_) { }
         }, this.closeGraceMs);
         timer.unref?.();
+        this.closePromise = (async () => {
+            try {
+                if (this.child?.connected && !this.exited) {
+                    await this.send('close', {}, {
+                        timeoutMs: Math.min(this.ipcSendTimeoutMs, this.closeGraceMs),
+                    });
+                }
+            } catch (_) { }
+        })();
+        return this.closePromise;
     }
 
     async waitForExit(timeoutMs = this.closeGraceMs + 500) {

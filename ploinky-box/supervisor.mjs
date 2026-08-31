@@ -13,11 +13,9 @@ import {
 import { AGENTLIB_ERROR_CODES, agentLibError } from '../agentlib/contract.mjs';
 import {
     fingerprintSource,
-    hashFileBytes,
     sourceIdEquals,
     sourceIdHash,
 } from '../agentlib/fingerprint.mjs';
-import { agentLibEntrypointHashes, compareAgentLibAttestation } from '../agentlib/runtime.mjs';
 import { canonicalWorkspaceRoot, managedRootPath, writeActiveDescriptor } from '../agentlib/source.mjs';
 import fsPromisesFree from 'node:fs';
 import {
@@ -205,7 +203,6 @@ export function createBoxSupervisor({
     validateContainer = validateContainerConfiguration,
     startCore = runBoundedCoreStart,
     runCoreCommand = runBoundedCoreCommand,
-    attestAgentLibGraph = runBoundedAgentLibAttestation,
     resolveHostReachableIpv4 = detectHostReachableIpv4,
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
@@ -333,13 +330,6 @@ export function createBoxSupervisor({
                     },
                 );
                 await healthCheck(outerRollback.hostPort);
-                await attestAgentLibGraph(
-                    ownership.engine,
-                    outerRollback.containerId,
-                    prior,
-                    runner,
-                    { stdout, stderr },
-                );
             } catch (restoreError) {
                 failures.push(`prior graph restoration: ${restoreError.message}`);
             }
@@ -355,24 +345,14 @@ export function createBoxSupervisor({
 
     async function completeGraphAdmission({
         identity,
-        ownership,
         prepared,
         selection,
-        containerId,
         requireHealth = true,
     }) {
         if (requireHealth) await healthCheck(prepared.hostPort);
-        const attestation = await attestAgentLibGraph(
-            ownership.engine,
-            containerId,
-            selection,
-            runner,
-            { stdout, stderr },
-        );
         revalidateAgentLibSource(selection);
         commitAgentLibSelection(identity.workspaceRoot, selection);
         prepared.finalize?.();
-        return attestation;
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
@@ -427,11 +407,11 @@ export function createBoxSupervisor({
                         agentLib: selection,
                     },
                 );
-                const attestation = await completeGraphAdmission({
+                await completeGraphAdmission({
                     identity, ownership, prepared, selection, containerId,
                 });
                 return Object.freeze({
-                    identity, ...prepared, containerId, agentLib: selection, attestation,
+                    identity, ...prepared, containerId, agentLib: selection,
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -488,11 +468,11 @@ export function createBoxSupervisor({
                     runner,
                     { stdout, stderr, hostReachableIpv4, agentLib: selection },
                 );
-                const attestation = await completeGraphAdmission({
+                await completeGraphAdmission({
                     identity, ownership, prepared, selection, containerId,
                 });
                 return Object.freeze({
-                    identity, ...prepared, containerId, agentLib: selection, attestation,
+                    identity, ...prepared, containerId, agentLib: selection,
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -555,8 +535,8 @@ export function createBoxSupervisor({
             );
 
             // Manual engine operations are outside the workspace lock. Refuse
-            // to attest a different Box if one appeared while Core restarted
-            // the target.
+            // to declare a different Box ready if one appeared while Core
+            // restarted the target.
             const revalidated = inspect(identity);
             if (revalidated.state !== 'owned'
                 || revalidated.engine?.identity !== engine.identity
@@ -568,13 +548,6 @@ export function createBoxSupervisor({
                 );
             }
             await healthCheck(hostPort);
-            const attestation = await attestAgentLibGraph(
-                engine,
-                container.id,
-                selection,
-                runner,
-                { stdout, stderr },
-            );
             revalidateMountedAgentLibSource(selection);
             return Object.freeze({
                 identity,
@@ -585,7 +558,6 @@ export function createBoxSupervisor({
                 hostPort,
                 mediaHostPort,
                 agentLib: selection,
-                attestation,
             });
         });
     }
@@ -643,7 +615,7 @@ export function createBoxSupervisor({
                         { stdout, stderr, hostReachableIpv4, agentLib: selection },
                     );
                 }
-                const attestation = await completeGraphAdmission({
+                await completeGraphAdmission({
                     identity,
                     ownership,
                     prepared,
@@ -653,7 +625,7 @@ export function createBoxSupervisor({
                 });
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
-                    changed, previous, attestation, workspacePloinky,
+                    changed, previous, workspacePloinky,
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -983,55 +955,6 @@ export async function runBoundedCoreCommand(
         throw supervisorError(`In-box ${coreArgv[0] || 'command'} failed with status ${result.status}`);
     }
     return result;
-}
-
-export async function runBoundedAgentLibAttestation(
-    engine,
-    containerId,
-    selection,
-    runner,
-    { stderr = process.stderr, timeoutMs = 120_000 } = {},
-) {
-    const normalized = normalizeBoxAgentLib(selection);
-    const args = [
-        ...boundedCoreEnvironment(0, 0, selection),
-        '--user', 'podman',
-        '--workdir', '/workspace',
-        containerId,
-        '/usr/local/bin/node',
-        '/opt/ploinky/cli/agentlib-attest.mjs',
-    ];
-    const sink = { write() {} };
-    const result = typeof runner.stream === 'function'
-        ? await runner.stream(engine.name, args, { timeoutMs, stdout: sink, stderr })
-        : runner.query(engine.name, args);
-    if (!result?.ok) {
-        throw supervisorError(`In-box AgentLib graph attestation failed with status ${String(result?.status)}`);
-    }
-    let proof;
-    try {
-        proof = JSON.parse(String(result.stdout || '').trim());
-    } catch (error) {
-        throw supervisorError('In-box AgentLib graph attestation returned malformed JSON');
-    }
-    const expected = {
-        fingerprint: normalized.fingerprint,
-        sourceIdHash: normalized.sourceIdHash,
-        sourceRoot: '/opt/ploinky-agentlib',
-        packageJsonHash: hashFileBytes(path.join(selection.sourceDir, 'package.json')),
-        entrypoints: agentLibEntrypointHashes(selection.sourceDir),
-    };
-    const compared = compareAgentLibAttestation(proof.core, expected);
-    if (!compared.ok
-        || proof.deploymentFingerprint !== normalized.fingerprint
-        || proof.sourceIdHash !== normalized.sourceIdHash) {
-        const detail = compared.problems.join(' ') || 'deployment identity differs';
-        throw supervisorError(`In-box AgentLib graph attestation mismatch: ${detail}`);
-    }
-    if (!Array.isArray(proof.agents)) {
-        throw supervisorError('In-box AgentLib graph attestation omitted the managed agent proofs');
-    }
-    return Object.freeze(proof);
 }
 
 export async function runBoundedCoreStart(

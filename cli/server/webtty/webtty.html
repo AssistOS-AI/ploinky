@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ploinky Administrative Terminal</title>
+  <script src="/webtty/assets/webtty-bootstrap.js"></script>
   <link rel="stylesheet" href="/webtty/assets/xterm.css">
   <link rel="stylesheet" href="/webtty/assets/webtty.css">
 </head>
@@ -11,7 +12,7 @@
   <header>
     <div>
       <h1>Workspace terminal</h1>
-      <p class="warning">Administrative shell — full workspace read/write</p>
+      <p class="warning">Administrative shell — commands run inside the selected target</p>
     </div>
     <div class="status" aria-live="polite">
       <span id="status-dot" class="status-dot"></span>
@@ -20,7 +21,9 @@
   </header>
   <main>
     <div class="details">
-      <span>Directory: <strong id="directory">.</strong></span>
+      <span>Target: <strong id="target">Not selected</strong></span>
+      <span id="access" class="access-badge"></span>
+      <span>Directory: <strong id="directory">Not selected</strong></span>
       <span id="dimensions">80 × 24</span>
     </div>
     <div id="message" class="message" role="alert" hidden></div>

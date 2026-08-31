@@ -20,7 +20,7 @@ Ploinky design specifications must not contain a `Conclusion` section. New DS fi
 6. Serialize workspace mutations with the workspace lock. Revalidate immutable identity immediately before mutation, bound rollback, and declare readiness only when the complete manifest graph is ready or has reached its declared no-wait terminal state and every required external health check passes.
 7. Routing fails closed. Apply the same authenticated route policy, caller ACL, exact active generation/lease checks, and replay protection to HTTP, SSE, and WebSocket traffic.
 8. Confine credentials. Never inject reusable agent credentials into host or `none` runtimes. Relay/channel credentials must be fresh, generation-bound, delivered only through the private confined channel, and absent from logs, persisted state, and test artifacts.
-9. A release-candidate deployment must use the exact pushed commit of Ploinky's current branch. Every other deployed repository must use its recorded remote default branch and exact commit, including the AchillesAgentLib checkout actually loaded at runtime. Prove the loaded AgentLib bytes and repository revisions; a manifest claim alone is insufficient. Falling back to a non-default dependency branch is forbidden.
+9. A release-candidate deployment must use the exact pushed commit of Ploinky's current branch. Every other deployed repository must use its recorded remote default branch and exact commit. Falling back to a non-default dependency branch is forbidden.
 10. Preserve the versionless semantic Box identity. Do not turn schema or runtime revisions into incrementing public Box names.
 
 ## On-demand cross-repository release gate
@@ -55,8 +55,7 @@ Before testing, prove all of the following:
 1. The entire declared Explorer graph is ready, including required external health checks.
 2. Ploinky is clean, tracks the pushed current branch, and is at its recorded candidate commit. Every other deployed repository is clean, tracks its recorded `origin/<default-branch>`, and is at the recorded default-branch commit.
 3. The running Box has the expected immutable image identity and fresh generation.
-4. The running AchillesAgentLib bytes come from its recorded remote-default-branch revision.
-5. The network publications and runtime privileges still satisfy the invariants above.
+4. The network publications and runtime privileges still satisfy the invariants above.
 
 Any fallback, detached/mixed revision, stale generation, unclean checkout, missing agent, or readiness exception invalidates the deployment.
 

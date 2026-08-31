@@ -271,6 +271,7 @@ function hasExactResourceLabels(labels, pathHash, role) {
     const hostPort = String(labels?.[BOX_LABELS.routerHostPort] || '');
     const mediaHostPort = String(labels?.[BOX_LABELS.mediaHostPort] || '');
     const imageRef = String(labels?.[BOX_LABELS.imageRef] || '');
+    const seccompFingerprint = String(labels?.[BOX_LABELS.seccompFingerprint] || '');
     const dataFingerprints = Object.fromEntries(BOX_DATA_KEYS.map((key) => [
         key,
         String(labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
@@ -302,6 +303,7 @@ function hasExactResourceLabels(labels, pathHash, role) {
         && /^[1-9][0-9]{0,4}$/.test(mediaHostPort)
         && Number(mediaHostPort) <= 65535
         && imageRef.length > 0
+        && /^[a-f0-9]{64}$/.test(seccompFingerprint)
         && hasCompleteFingerprints
         && hasCompleteAgentLib
         && hasExactLabels(labels, {
@@ -309,6 +311,7 @@ function hasExactResourceLabels(labels, pathHash, role) {
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: hostPort,
             [BOX_LABELS.mediaHostPort]: mediaHostPort,
+            [BOX_LABELS.seccompFingerprint]: seccompFingerprint,
             ...expectedFingerprints,
             ...agentLibLabels,
         });

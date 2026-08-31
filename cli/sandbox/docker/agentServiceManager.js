@@ -167,7 +167,6 @@ import {
     agentLibReuseProblem,
     agentLibRuntimeRecord,
 } from '../agentLibGrant.js';
-import { attestContainerAgentLib } from '../agentLibAttestation.js';
 import {
     assertCandidateLifecycleTransition,
     isCandidateCleanupReceiptDocument,
@@ -1646,8 +1645,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     } else {
         // Run preinstall + install in main container before default agent server
         if (combinedInstallCmd) {
-            args.push('sh', '-c', `${combinedInstallCmd} && sh /Agent/server/AgentServer.sh`);
-            entrySummary = `sh -c "<install> && sh /Agent/server/AgentServer.sh"`;
+            args.push('sh', '-c', `${combinedInstallCmd} && exec sh /Agent/server/AgentServer.sh`);
+            entrySummary = `sh -c "<install> && exec sh /Agent/server/AgentServer.sh"`;
         } else {
             args.push('sh', '/Agent/server/AgentServer.sh');
         }
@@ -2136,18 +2135,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             exactCleanupPerformed,
         });
     };
-    let agentLibAttestation;
-    try {
-        agentLibAttestation = attestContainerAgentLib({
-            runtime,
-            containerId: launchedContainerId,
-            grant: containerAgentLibGrant,
-            helperImage: ROUTER_AUTHORITY_HELPER_IMAGE,
-            spawn: spawnSync,
-        });
-    } catch (error) {
-        cleanupExactLaunch(error);
-    }
     const agents = loadAgentsMap();
     const declaredEnvNames2 = [
         ...getManifestEnvNames(manifest, profileConfig, { forRuntime: true }),
@@ -2182,16 +2169,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         type: 'agent',
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
-        agentLib: agentLibRuntimeRecord(containerAgentLibGrant, agentLibAliasShadows(
-            containerAgentLibGrant,
-            [
-                ...(codeMountMode.includes('ro') ? [] : [{ hostPath: codeMountPath, runtimePath: '/code' }]),
-                { hostPath: sharedDir, runtimePath: '/shared' },
-                { hostPath: cwd, runtimePath: cwdMountTarget },
-                ...(isolatedHome || !agentHomeDir ? [] : [{ hostPath: agentHomeDir, runtimePath: '/root' }]),
-            ],
-        )),
-        agentLibAttestation,
+        agentLib: agentLibRuntimeRecord(containerAgentLibGrant),
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
@@ -3334,9 +3312,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             `[ensureAgentService] ${agentName}: missing podman bind record after startAgentContainer; refusing to write a fallback bind list.`
         );
     }
-    if (!startedRecord.agentLib || !startedRecord.agentLibAttestation) {
+    if (!startedRecord.agentLib) {
         throw new Error(
-            `[ensureAgentService] ${agentName}: physical runtime admission returned no complete AgentLib proof.`
+            `[ensureAgentService] ${agentName}: runtime admission returned no AgentLib generation record.`
         );
     }
     agents[containerName] = {
@@ -3356,7 +3334,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         agentLib: structuredClone(startedRecord.agentLib),
-        agentLibAttestation: structuredClone(startedRecord.agentLibAttestation),
         config: {
             binds: hasStartedBinds ? startedRecord.config.binds : [
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },

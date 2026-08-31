@@ -226,7 +226,7 @@ test('a malformed branch policy does not pre-empt the command that owns the erro
     assert.deepEqual(coreArgs, ['start', 'demo', '--branch-fallback', 'maybe']);
 });
 
-test('direct start commits active.json only after graph attestation and source revalidation', async () => {
+test('direct start commits active.json after core startup and source revalidation', async () => {
     const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
     const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
     const workspace = makeWorkspace();
@@ -250,15 +250,13 @@ test('direct start commits active.json only after graph attestation and source r
                 return 0;
             },
         }),
-        attestDeploymentImpl: () => { events.push('attest'); return { ok: true }; },
         writeActiveImpl: (_workspaceRoot, active) => events.push(['commit', active]),
     });
     assert.equal(result, 0);
     assert.equal(events[0][0], 'core');
     assert.deepEqual(events[0][1], ['start', 'demo']);
-    assert.equal(events[1], 'attest');
-    assert.equal(events[2][0], 'commit');
-    assert.equal(events[2][1], selection);
+    assert.equal(events[1][0], 'commit');
+    assert.equal(events[1][1], selection);
 });
 
 test('direct start preserves an inactive diagnostic Router after a core graph failure', async () => {
@@ -272,7 +270,6 @@ test('direct start preserves an inactive diagnostic Router after a core graph fa
     });
     const env = { PLOINKY_WORKSPACE_ROOT: workspace };
     const coreCalls = [];
-    let attested = false;
     let committed = false;
     await assert.rejects(
         launchCli(['start', 'demo'], {
@@ -288,13 +285,11 @@ test('direct start preserves an inactive diagnostic Router after a core graph fa
                     throw new Error('dependency readiness failed');
                 },
             }),
-            attestDeploymentImpl: () => { attested = true; },
             writeActiveImpl: () => { committed = true; },
         }),
         /dependency readiness failed/,
     );
     assert.deepEqual(coreCalls, [['start', 'demo']]);
-    assert.equal(attested, false);
     assert.equal(committed, false);
 });
 
@@ -351,7 +346,7 @@ test('direct start restores a different prior AgentLib selection after a core gr
     assert.equal(activation.options.env.PLOINKY_WORKSPACE_ROOT, workspace);
 });
 
-test('direct start tears down a failed admission and never commits the candidate', async () => {
+test('direct start tears down when the selected source changes before commit', async () => {
     const { launchCli } = await import(path.join(repoRoot, 'cli/index.js'));
     const { buildSelection } = await import(path.join(repoRoot, 'agentlib/source.mjs'));
     const workspace = makeWorkspace();
@@ -372,12 +367,17 @@ test('direct start tears down a failed admission and never commits the candidate
             },
             readActiveImpl: () => null,
             importCoreImpl: async () => ({
-                runCoreCli: async (args) => { coreCalls.push(args); return 0; },
+                runCoreCli: async (args) => {
+                    coreCalls.push(args);
+                    if (args[0] === 'start') {
+                        fs.appendFileSync(path.join(selection.sourceDir, 'LLMAgents', 'index.mjs'), '\n// changed\n');
+                    }
+                    return 0;
+                },
             }),
-            attestDeploymentImpl: () => { throw new Error('agent proof diverged'); },
             writeActiveImpl: () => { committed = true; },
         }),
-        /agent proof diverged/,
+        /changed during deployment/,
     );
     assert.deepEqual(coreCalls, [['start', 'demo'], ['stop']]);
     assert.equal(committed, false);

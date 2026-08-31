@@ -24,6 +24,7 @@ export const BOX_LABELS = Object.freeze({
     imageRef: 'io.assistos.ploinky-box.image-ref',
     routerHostPort: 'io.assistos.ploinky-box.router-host-port',
     mediaHostPort: 'io.assistos.ploinky-box.media-host-port',
+    seccompFingerprint: 'io.assistos.ploinky-box.seccomp-fingerprint',
     dependenciesFingerprint: 'io.assistos.ploinky-box.dependencies-fingerprint',
     imagesFingerprint: 'io.assistos.ploinky-box.images-fingerprint',
 });

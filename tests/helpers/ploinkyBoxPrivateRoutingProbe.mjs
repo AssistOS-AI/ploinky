@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 import { execFile, execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 
-import { createPrivateListener } from '../../cli/server/privateListener.js';
-import { proveContainerLoopbackBinding } from '../../cli/server/privateListenerBindings/containerLoopbackBinding.js';
+import {
+    classifyPrivateListenerRequest,
+    createPrivateListenerSet,
+} from '../../cli/server/privateListenerSet.js';
 
 const nestedContainerId = String(process.argv[2] || '');
 const networkArguments = JSON.parse(String(process.argv[3] || '[]'));
@@ -19,6 +23,7 @@ function commandText(command, args, options = {}) {
     return String(execFileSync(command, args, {
         encoding: 'utf8',
         timeout: 10_000,
+        killSignal: 'SIGKILL',
         maxBuffer: 1024 * 1024,
         ...options,
     })).trim();
@@ -61,6 +66,28 @@ const nestedNetworkScript = [
     "d.lookup('host.containers.internal',{all:true},(error,addresses)=>{clearTimeout(timer);result.resolution=error?{error:error.code||error.message}:{addresses};process.stdout.write(JSON.stringify(result));});",
 ].join('');
 
+const nestedPrivateRequestScript = [
+    "const h=require('node:http');",
+    "const u=process.argv[1];",
+    "const q=h.get(u,r=>{let b='';r.setEncoding('utf8');r.on('data',c=>b+=c);r.on('end',()=>{process.stdout.write(b);process.exit(r.statusCode===200?0:2)});});",
+    "q.setTimeout(4000,()=>q.destroy(new Error('timeout')));",
+    "q.on('error',()=>process.exit(3));",
+].join('');
+
+function executeNestedPrivateRequest(containerId, url) {
+    return new Promise((resolve) => {
+        execFile('podman', [
+            'container', 'exec', containerId,
+            'node', '-e', nestedPrivateRequestScript, url,
+        ], {
+            encoding: 'utf8',
+            timeout: 5_000,
+            killSignal: 'SIGKILL',
+            maxBuffer: 64 * 1024,
+        }, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
+    });
+}
+
 const evidence = {
     kind: 'ploinky-box-private-routing-probe',
     networkArguments,
@@ -75,7 +102,7 @@ const evidence = {
     },
 };
 
-let listener;
+let listenerSet;
 try {
     evidence.box.addresses = commandJson('ip', ['-j', '-4', 'address', 'show']);
     evidence.box.routes = commandJson('ip', ['-j', '-4', 'route', 'show']);
@@ -96,53 +123,69 @@ try {
         'node', '-e', nestedNetworkScript,
     ]);
 
-    listener = await createPrivateListener({
-        host: String(process.env.PLOINKY_PRIVATE_BIND || '127.0.0.1'),
-        handler: (_request, response) => {
-            response.writeHead(404, { 'content-type': 'application/json' });
-            response.end(JSON.stringify({ error: 'proof_only' }));
-        },
-        proveBinding: async (proof) => {
-            evidence.box.listeningSockets = commandText('ss', ['-ltnup']);
-            const startedAt = Date.now();
-            const captureExecFile = (command, args, options, callback) => {
-                execFile(command, args, options, (error, stdout, stderr) => {
-                    evidence.privateRequest.elapsedMs = Date.now() - startedAt;
-                    evidence.privateRequest.exitCode = error
-                        ? (Number.isInteger(error.code) ? error.code : null)
-                        : 0;
-                    evidence.privateRequest.signal = error?.signal || null;
-                    evidence.privateRequest.responseMatched = String(stdout) === String(proof.expectedBody);
-                    evidence.privateRequest.stderr = String(stderr || '').trim();
-                    callback(error, stdout, stderr);
-                });
-            };
-            try {
-                await proveContainerLoopbackBinding({
-                    runtime: 'podman',
-                    containerId: nestedContainerId,
-                    hostAlias: 'host.containers.internal',
-                    ...proof,
-                    execFile: captureExecFile,
-                });
-                evidence.privateRequest.ok = true;
-                return true;
-            } catch (error) {
-                evidence.privateRequest.error = error?.message || String(error);
-                throw error;
-            }
-        },
+    const privateBind = String(process.env.PLOINKY_PRIVATE_BIND || '');
+    if (privateBind !== '0.0.0.0') {
+        throw new Error('private-routing probe requires the Box wildcard private-listener bind');
+    }
+    const proofPath = `/.well-known/ploinky-private-proof/${crypto.randomBytes(18).toString('base64url')}`;
+    const expectedBody = crypto.randomBytes(18).toString('base64url');
+    const privateServer = http.createServer((request, response) => {
+        if (classifyPrivateListenerRequest(request) !== 'private') {
+            response.writeHead(403, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+            response.end(JSON.stringify({ error: 'private_listener_required' }));
+            return;
+        }
+        if (request.method === 'GET' && request.url === proofPath) {
+            response.writeHead(200, { 'content-type': 'text/plain', 'cache-control': 'no-store' });
+            response.end(expectedBody);
+            return;
+        }
+        response.writeHead(404, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        response.end(JSON.stringify({ error: 'proof_only' }));
     });
+    const interfaceClassifier = Object.freeze({
+        refresh: async () => Object.freeze({ gateways: Object.freeze([]), lastError: '' }),
+        snapshot: () => Object.freeze({ gateways: Object.freeze([]), lastError: '' }),
+        classify: () => 'unmanaged',
+    });
+    listenerSet = createPrivateListenerSet({
+        httpServer: privateServer,
+        interfaceClassifier,
+        port: 8081,
+        wildcardHost: true,
+    });
+    const listenerSnapshot = await listenerSet.start();
     evidence.listener = {
-        address: listener.address(),
-        privateBind: String(process.env.PLOINKY_PRIVATE_BIND || '127.0.0.1'),
+        addresses: listenerSnapshot.addresses,
+        port: listenerSnapshot.port,
+        privateBind,
     };
+    if (JSON.stringify(listenerSnapshot.addresses) !== JSON.stringify(['0.0.0.0'])
+        || listenerSnapshot.port !== 8081) {
+        throw new Error('private-routing probe did not bind the exact Box wildcard listener');
+    }
+    evidence.box.listeningSockets = commandText('ss', ['-ltnup']);
+    const startedAt = Date.now();
+    const requestResult = await executeNestedPrivateRequest(
+        nestedContainerId,
+        `http://host.containers.internal:8081${proofPath}`,
+    );
+    evidence.privateRequest.elapsedMs = Date.now() - startedAt;
+    evidence.privateRequest.exitCode = requestResult.error
+        ? (Number.isInteger(requestResult.error.code) ? requestResult.error.code : null)
+        : 0;
+    evidence.privateRequest.signal = requestResult.error?.signal || null;
+    evidence.privateRequest.responseMatched = String(requestResult.stdout) === expectedBody;
+    evidence.privateRequest.stderr = String(requestResult.stderr || '').trim();
+    if (requestResult.error) throw requestResult.error;
+    if (!evidence.privateRequest.responseMatched) {
+        throw new Error('private-routing application proof response did not match');
+    }
+    evidence.privateRequest.ok = true;
 } catch (error) {
     evidence.error = error?.message || String(error);
     process.exitCode = 1;
 } finally {
-    if (listener) {
-        await new Promise((resolve) => listener.close(resolve));
-    }
+    if (listenerSet) await listenerSet.close();
     process.stdout.write(`${JSON.stringify(evidence)}\n`);
 }

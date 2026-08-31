@@ -1,9 +1,8 @@
-// Phase 5 of the direct-mount AgentLib plan: lifecycle, update, status, and
-// loaded-byte proof.
+// Direct-mount AgentLib lifecycle, update, and status behavior.
 //
 // The theme is that nothing declares success from a descriptor: readiness
-// revalidates the source, update never mutates a local checkout, status reports
-// drift without repairing it, and every attestation hashes real files.
+// revalidates the source, update never mutates a local checkout, and status
+// reports drift without repairing it.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,8 +17,6 @@ const contract = await import(path.join(repoRoot, 'agentlib/contract.mjs'));
 const fingerprintMod = await import(path.join(repoRoot, 'agentlib/fingerprint.mjs'));
 const source = await import(path.join(repoRoot, 'agentlib/source.mjs'));
 const boxSource = await import(path.join(repoRoot, 'ploinky-box/agentlib-source.mjs'));
-const runtime = await import(path.join(repoRoot, 'agentlib/runtime.mjs'));
-const attest = await import(path.join(repoRoot, 'Agent/lib/agentlibAttest.mjs'));
 const { writeAgentLibCheckout } = await import(path.join(repoRoot, 'tests/helpers/agentlibFixture.mjs'));
 
 const tempRoots = [];
@@ -235,99 +232,6 @@ test('a local source that disappears switches provenance on the next lifecycle c
     });
     assert.equal(managed.mode, 'managed');
     assert.equal(managed.selection.resolvedCommit, LOCK_COMMIT);
-});
-
-// --- loaded-byte proof -----------------------------------------------------
-
-test('a local edit changes every attested entry-point hash together', () => {
-    const workspace = makeWorkspace();
-    const checkout = fs.realpathSync(path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME));
-    const before = runtime.agentLibEntrypointHashes(checkout);
-    fs.writeFileSync(path.join(checkout, 'LLMAgents/index.mjs'), 'export const marker = "restarted";\n');
-    const after = runtime.agentLibEntrypointHashes(checkout);
-    assert.notEqual(after['LLMAgents/index.mjs'], before['LLMAgents/index.mjs']);
-    assert.equal(after['jwt/jwtSign.mjs'], before['jwt/jwtSign.mjs']);
-});
-
-test('an agent probe resolves through its own node_modules and proves confinement', () => {
-    const workspace = makeWorkspace();
-    const grantedRoot = fs.realpathSync(path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME));
-    // Model the runtime layout: the agent resolves the bare specifier through
-    // its cache's node_modules, which is a symlink into the granted source.
-    const agentRoot = path.join(workspace, 'agent-runtime');
-    fs.mkdirSync(path.join(agentRoot, 'node_modules'), { recursive: true });
-    fs.symlinkSync(grantedRoot, path.join(agentRoot, 'node_modules', 'achillesAgentLib'));
-
-    const env = {
-        [contract.AGENTLIB_ENV.dir]: grantedRoot,
-        [contract.AGENTLIB_ENV.mode]: 'local',
-        [contract.AGENTLIB_ENV.fingerprint]: fingerprintMod.fingerprintSource(grantedRoot).fingerprint,
-        [contract.AGENTLIB_ENV.commit]: '',
-        [contract.AGENTLIB_ENV.sourceId]: fingerprintMod.sourceIdHash(
-            fingerprintMod.fingerprintSource(grantedRoot).sourceId,
-        ),
-    };
-    const attestation = attest.buildAgentAttestation({ env, resolveFrom: agentRoot });
-    assert.equal(attestation.sourceRootRealpath, grantedRoot);
-    assert.equal(attestation.sourceIdHash, env[contract.AGENTLIB_ENV.sourceId]);
-    assert.deepEqual(
-        Object.keys(attestation.entrypoints).sort(),
-        [...attest.ATTESTED_ENTRYPOINTS].sort(),
-    );
-    // The probe hashes real files, so its hashes match the desired selection.
-    assert.deepEqual(attestation.entrypoints, runtime.agentLibEntrypointHashes(grantedRoot));
-});
-
-test('an agent whose cache link points elsewhere is reported as unconfined', () => {
-    const workspace = makeWorkspace();
-    const grantedRoot = fs.realpathSync(path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME));
-    const foreign = path.join(workspace, 'foreign-agentlib');
-    fs.mkdirSync(foreign);
-    writeAgentLibCheckout(foreign);
-
-    const agentRoot = path.join(workspace, 'agent-runtime');
-    fs.mkdirSync(path.join(agentRoot, 'node_modules'), { recursive: true });
-    fs.symlinkSync(foreign, path.join(agentRoot, 'node_modules', 'achillesAgentLib'));
-
-    assert.throws(
-        () => attest.buildAgentAttestation({
-            env: {
-                [contract.AGENTLIB_ENV.dir]: grantedRoot,
-                [contract.AGENTLIB_ENV.fingerprint]: 'a'.repeat(64),
-                [contract.AGENTLIB_ENV.sourceId]: 'b'.repeat(64),
-            },
-            resolveFrom: agentRoot,
-        }),
-        (error) => error.code === contract.AGENTLIB_ERROR_CODES.attestationMismatch,
-        'a link outside the grant must fail admission',
-    );
-});
-
-test('attestation comparison rejects a divergent or unconfined load', () => {
-    const workspace = makeWorkspace();
-    const sourceDir = fs.realpathSync(path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME));
-    const selection = source.buildSelection({ workspaceRoot: workspace, sourceDir, mode: 'local' });
-    const expected = {
-        fingerprint: selection.contentFingerprint,
-        sourceRoot: sourceDir,
-        entrypoints: runtime.agentLibEntrypointHashes(sourceDir),
-    };
-    const good = {
-        schemaVersion: 1,
-        deploymentFingerprint: selection.contentFingerprint,
-        sourceRootRealpath: sourceDir,
-        entrypoints: expected.entrypoints,
-        loaded: { 'LLMAgents': { realPath: path.join(sourceDir, 'LLMAgents/index.mjs'), sha256: 'x' } },
-    };
-    assert.equal(runtime.compareAgentLibAttestation(good, expected).ok, true);
-
-    const wrongEntry = { ...good, entrypoints: { ...expected.entrypoints, 'jwt/jwtSign.mjs': 'f'.repeat(64) } };
-    assert.match(runtime.compareAgentLibAttestation(wrongEntry, expected).problems.join(' '), /hash mismatch/);
-
-    const unconfined = { ...good, loaded: { 'LLMAgents': { realPath: '/elsewhere/index.mjs', sha256: 'x' } } };
-    assert.match(runtime.compareAgentLibAttestation(unconfined, expected).problems.join(' '), /outside the selected source/);
-
-    assert.equal(runtime.compareAgentLibAttestation(null, expected).ok, false);
 });
 
 // --- retired paths ---------------------------------------------------------

@@ -105,11 +105,9 @@ test('prepared graph launches suppress intermediate registry persistence only fo
     assert.match(source, /createdByThisLaunch:\s*started\?\.createdByThisLaunch !== false/);
     assert.match(source, /const registryRecord = \{\s*\.\.\.existingRecord,\s*runtime,\s*containerId: reuseInspection\.id,/);
     assert.match(source, /type: 'agent',\s*runtime,\s*containerId: started\.containerId,/);
-    assert.match(source, /physical runtime admission returned no complete AgentLib proof/);
+    assert.match(source, /runtime admission returned no AgentLib generation record/);
     assert.match(source, /agentLib:\s*structuredClone\(startedRecord\.agentLib\)/);
-    assert.match(source, /agentLibAttestation:\s*structuredClone\(startedRecord\.agentLibAttestation\)/);
     assert.match(source, /ensureAgentLibCacheLink\(\s*path\.dirname\(preparedNodeModulesDir\),\s*containerAgentLibGrant\.runtimePath,\s*\)/);
-    assert.match(source, /ensureImagePresent\(ROUTER_AUTHORITY_HELPER_IMAGE, \{ runtime \}\);[\s\S]*helperImage:\s*ROUTER_AUTHORITY_HELPER_IMAGE/);
     assert.match(source, /assertHostModeGenerationCapability\(\{[\s\S]*containerName,\s*\}, \{ preparedCapability: options\.preparedHostModeCapability \}\)/);
 
     for (const runtime of ['bwrap', 'seatbelt']) {
@@ -489,6 +487,11 @@ test('drain-aware replacement is explicit and does not rewrite ordinary fleet li
     assert.match(managerSource, /if \(runtimeNetworkPlan\.requiresManagedNetwork\)[\s\S]*drainTargetedContainer[\s\S]*else \{[\s\S]*drainAndRemoveTargetedContainer/);
     assert.doesNotMatch(fleetSource, /targetedContainerLifecycle|drainTargetedContainer|targetedRestart/);
     assert.doesNotMatch(drainSource, /inactivateEdgeRoutingGeneration/);
+    assert.match(
+        managerSource,
+        /combinedInstallCmd} && exec sh \/Agent\/server\/AgentServer\.sh/,
+        'the default server must replace the transient installer shell before it can acknowledge targeted drain',
+    );
 });
 
 test('fleet cleanup never expands an exact registry key to a derived alias or canonical name', () => {

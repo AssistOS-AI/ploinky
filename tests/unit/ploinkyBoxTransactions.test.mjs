@@ -19,6 +19,10 @@ import {
 import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
+    nestedPodmanSeccompProfileContract,
+    nestedPodmanSeccompProfilePath,
+} from '../../ploinky-box/seccomp.mjs';
+import {
     ensureWorkspaceDataPaths,
     inspectWorkspaceDataPaths,
 } from '../../ploinky-box/workspace-data.mjs';
@@ -56,6 +60,12 @@ function fixture(t) {
     fs.mkdirSync(workspace);
     fs.mkdirSync(path.join(workspace, '.ploinky'));
     fs.mkdirSync(lockPath);
+    const seccompProfile = nestedPodmanSeccompProfilePath(root);
+    fs.mkdirSync(path.dirname(seccompProfile), { recursive: true });
+    fs.copyFileSync(
+        new URL('../../ploinky-box/seccomp/podman-nested-pid-fallback.json', import.meta.url),
+        seccompProfile,
+    );
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const lock = {
         path: lockPath,
@@ -93,6 +103,7 @@ function containerHandle({
             [BOX_LABELS.imageRef]: imageRef,
             [BOX_LABELS.routerHostPort]: String(hostPort),
             [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
+            [BOX_LABELS.seccompFingerprint]: nestedPodmanSeccompProfileContract(repositoryRoot).fingerprint,
             [BOX_LABELS.dependenciesFingerprint]: dataFingerprints.dependencies,
             [BOX_LABELS.imagesFingerprint]: dataFingerprints.images,
         },
@@ -126,7 +137,11 @@ function containerHandle({
             init: true,
             usernsMode: 'private',
             privileged: false,
-            securityOptions: ['label=disable', 'unmask=ALL'],
+            securityOptions: [
+                'label=disable',
+                'unmask=ALL',
+                `seccomp=${nestedPodmanSeccompProfilePath(repositoryRoot)}`,
+            ],
             devices: [
                 { hostPath: '/dev/fuse', containerPath: '/dev/fuse', permissions: 'rwm' },
                 { hostPath: '/dev/net/tun', containerPath: '/dev/net/tun', permissions: 'rwm' },
@@ -285,9 +300,49 @@ test('Box container argv disables outer SELinux label confinement on every suppo
         });
         assert.deepEqual(args.flatMap((value, index) => (
             value === '--security-opt' ? [args[index + 1]] : []
-        )), ['unmask=ALL', 'label=disable']);
+        )), [
+            'unmask=ALL',
+            'label=disable',
+            `seccomp=${nestedPodmanSeccompProfilePath(state.root)}`,
+        ]);
         assert.equal(args.includes('--privileged'), false);
     }
+});
+
+test('Box validation preserves seccomp path case while normalizing option keywords', (t) => {
+    const state = fixture(t);
+    const handle = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'runtime',
+        hostPort: 19090,
+        id: 'b'.repeat(64),
+    });
+    const desired = {
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'runtime',
+        hostPort: 19090,
+    };
+
+    handle.runtime.securityOptions = handle.runtime.securityOptions.map((option) => (
+        option.startsWith('seccomp=') ? option : option.toUpperCase()
+    ));
+    assert.doesNotThrow(() => validateContainerConfiguration(handle, desired));
+
+    handle.runtime.securityOptions = handle.runtime.securityOptions.map((option) => (
+        option.startsWith('seccomp=')
+            ? `seccomp=${option.slice('seccomp='.length).toUpperCase()}`
+            : option
+    ));
+    assert.throws(
+        () => validateContainerConfiguration(handle, desired),
+        /security options are incompatible/,
+    );
 });
 
 function harness(state, {
@@ -436,8 +491,12 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
     assert.equal(args.includes('127.0.0.1:19090:8080/tcp'), true);
     assert.equal(args.includes('0.0.0.0:17891:7882/udp'), true);
     assert.equal(args.includes(`${BOX_LABELS.mediaHostPort}=17891`), true);
+    assert.equal(args.includes(
+        `${BOX_LABELS.seccompFingerprint}=${nestedPodmanSeccompProfileContract(state.root).fingerprint}`,
+    ), true);
     assert.equal(args.includes('unmask=ALL'), true);
     assert.equal(args.includes('label=disable'), true);
+    assert.equal(args.includes(`seccomp=${nestedPodmanSeccompProfilePath(state.root)}`), true);
     assert.equal(args.includes(`PLOINKY_ROUTER_HEALTH_SOCKET=${BOX_ROUTER_HEALTH_SOCKET}`), true);
     assert.equal(args.includes('/dev/fuse'), true);
     assert.equal(args.includes('/dev/net/tun'), true);
@@ -773,6 +832,31 @@ test('stopped reuse captures logs before start and validates the same running ID
     assert.equal(events.some((value) => value.includes('pull')), false);
     assert.equal(events.some((value) => value.includes('container create')), false);
     assert.equal(events.some((value) => value.includes('container rm')), false);
+});
+
+test('a stale seccomp fingerprint is rejected before stopped Box reuse or start', (t) => {
+    const state = fixture(t);
+    const current = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+        running: false,
+    });
+    current.labels[BOX_LABELS.seccompFingerprint] = '0'.repeat(64);
+    assert.throws(() => validateContainerConfiguration(current, {
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+    }), /label set is incompatible/);
+    assert.equal(current.runtime.running, false);
+    assert.equal(current.runtime.status, 'exited');
 });
 
 test('stopped reuse baseline failure mutates no container or image state', async (t) => {

@@ -105,38 +105,16 @@ export function agentLibAliasShadows(grant, writableBinds = []) {
 }
 
 /**
- * The complete structured record stored with a managed runtime.
+ * The minimal generation identity stored with a managed runtime.
  *
- * Reuse and adoption compare this whole section, so a runtime that is missing a
- * required alias shadow — or that carries a different selection — fails closed
- * instead of being adopted.
+ * Mount paths and aliases are derived from the runtime configuration at launch;
+ * persisting them duplicates configuration without improving reuse decisions.
  */
-export function agentLibRuntimeRecord(grant, aliasShadows = []) {
+export function agentLibRuntimeRecord(grant) {
     return {
-        mode: grant.mode,
         fingerprint: grant.fingerprint,
-        commit: grant.commit,
         sourceIdHash: grant.sourceIdHash,
-        sourceDir: grant.sourceDir,
-        runtimePath: grant.runtimePath,
-        aliasShadows: aliasShadows.map((shadow) => shadow.runtimePath).sort(),
     };
-}
-
-/** Why a recorded grant no longer matches the desired one, or an empty string. */
-export function agentLibRecordProblem(recorded, desired) {
-    if (!recorded) return 'agentLib runtime record missing';
-    for (const key of ['mode', 'fingerprint', 'sourceIdHash', 'sourceDir', 'runtimePath']) {
-        if (String(recorded[key] ?? '') !== String(desired[key] ?? '')) {
-            return `agentLib ${key} changed (${recorded[key] ?? 'null'} != ${desired[key] ?? 'null'})`;
-        }
-    }
-    const recordedAliases = JSON.stringify([...(recorded.aliasShadows || [])].sort());
-    const desiredAliases = JSON.stringify([...(desired.aliasShadows || [])].sort());
-    if (recordedAliases !== desiredAliases) {
-        return `agentLib alias shadows changed (${recordedAliases} != ${desiredAliases})`;
-    }
-    return '';
 }
 
 export { AGENTLIB_ENV };
@@ -150,10 +128,6 @@ export { AGENTLIB_ENV };
  * plus `ploinky restart` must replace core AND every agent, never leave them on
  * different active selections.
  *
- * Only the grant identity is compared here. Alias shadows follow from the
- * runtime's writable binds, which the caller has not necessarily recomputed at
- * reuse time; adoption compares the full record through `agentLibRecordProblem`.
- *
  * @param {object} existingRecord - the persisted runtime record
  * @param {object} grant
  * @returns {string}
@@ -161,7 +135,7 @@ export { AGENTLIB_ENV };
 export function agentLibReuseProblem(existingRecord, grant) {
     const recorded = existingRecord?.agentLib;
     if (!recorded) return 'agentLib runtime record missing';
-    for (const key of ['mode', 'fingerprint', 'sourceIdHash', 'sourceDir', 'runtimePath']) {
+    for (const key of ['fingerprint', 'sourceIdHash']) {
         if (String(recorded[key] ?? '') !== String(grant[key] ?? '')) {
             return `agentLib ${key} changed (${recorded[key] ?? 'null'} != ${grant[key] ?? 'null'})`;
         }

@@ -11,7 +11,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const AGENTLIB_SELECTION_SCHEMA_VERSION = 1;
-export const AGENTLIB_ATTESTATION_SCHEMA_VERSION = 1;
 
 /** npm package name that a valid achillesAgentLib checkout must declare. */
 export const AGENTLIB_PACKAGE_NAME = 'ploinky-agent-lib';
@@ -49,8 +48,7 @@ export const AGENTLIB_RESERVED_ENV_NAMES = Object.freeze(Object.values(AGENTLIB_
 export const AGENTLIB_REMOVED_ENV_NAMES = Object.freeze(['PLOINKY_AGENTLIB_REF']);
 
 /**
- * Entry points Ploinky actually loads. They are validated at selection time and
- * hashed for loaded-byte attestation.
+ * Entry points Ploinky actually loads. They are validated at selection time.
  */
 export const AGENTLIB_REQUIRED_ENTRYPOINTS = Object.freeze([
     'package.json',
@@ -59,11 +57,6 @@ export const AGENTLIB_REQUIRED_ENTRYPOINTS = Object.freeze([
     'jwt/jwtSign.mjs',
     'jwt/jwtVerify.mjs',
 ]);
-
-/** Attested entry points, excluding `package.json` which is hashed separately. */
-export const AGENTLIB_ATTESTED_ENTRYPOINTS = Object.freeze(
-    AGENTLIB_REQUIRED_ENTRYPOINTS.filter((entry) => entry !== 'package.json'),
-);
 
 /** Directory names excluded from the deterministic content fingerprint. */
 export const AGENTLIB_FINGERPRINT_EXCLUDED_DIRS = Object.freeze(['.git']);
@@ -80,7 +73,6 @@ export const AGENTLIB_ERROR_CODES = Object.freeze({
     materializeFailed: 'PLOINKY_AGENTLIB_MATERIALIZE_FAILED',
     branchMissing: 'PLOINKY_AGENTLIB_BRANCH_MISSING',
     lockFailed: 'PLOINKY_AGENTLIB_LOCK_FAILED',
-    attestationMismatch: 'PLOINKY_AGENTLIB_ATTESTATION_MISMATCH',
     unsupportedSetting: 'PLOINKY_AGENTLIB_UNSUPPORTED_SETTING',
     reservedDependency: 'PLOINKY_AGENTLIB_RESERVED_DEPENDENCY',
 });

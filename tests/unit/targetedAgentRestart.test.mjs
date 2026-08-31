@@ -137,7 +137,6 @@ test('a failed draining restart is retryable and commits the ready successor und
         ...fixture.registry[fixture.containerName],
         containerId: 'b'.repeat(64),
         agentLib: { source: 'workspace' },
-        agentLibAttestation: { fingerprint: 'sha256:fixture' },
     };
     await commitTargetedAgentRestart({
         transition: retryTransition,

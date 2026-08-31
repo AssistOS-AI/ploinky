@@ -566,7 +566,7 @@ test('a subpath escaping the selected root is refused', () => {
     );
 });
 
-test('imports are attested with real paths and hashes, and compare against the selection', async () => {
+test('imports resolve from the selected source', async () => {
     const workspace = makeWorkspace();
     const dir = fs.realpathSync(localCheckout(workspace, { marker: 'attested' }));
     const selection = source.buildSelection({ workspaceRoot: workspace, sourceDir: dir, mode: 'local' });
@@ -575,24 +575,6 @@ test('imports are attested with real paths and hashes, and compare against the s
     const namespace = await runtime.importAgentLib('LLMAgents', { env });
     assert.equal(namespace.marker, 'attested');
 
-    const attestation = runtime.buildAgentLibAttestation({ env });
-    assert.equal(attestation.sourceRootRealpath, dir);
-    assert.equal(attestation.deploymentFingerprint, selection.contentFingerprint);
-
-    const verdict = runtime.compareAgentLibAttestation(attestation, {
-        fingerprint: selection.contentFingerprint,
-        sourceRoot: dir,
-        entrypoints: runtime.agentLibEntrypointHashes(dir),
-    });
-    assert.deepEqual(verdict.problems, []);
-    assert.equal(verdict.ok, true);
-
-    const mismatch = runtime.compareAgentLibAttestation(attestation, {
-        fingerprint: 'c'.repeat(64),
-        sourceRoot: dir,
-        entrypoints: {},
-    });
-    assert.equal(mismatch.ok, false);
 });
 
 // --- shared policy --------------------------------------------------------

@@ -15,7 +15,7 @@
     <div data-include="partials/header.html"></div>
     <main>
         <div class="container"><nav class="breadcrumbs" aria-label="Breadcrumb"><a href="index.html">Ploinky Documentation</a> / Workspace Lifecycle</nav><div class="doc-layout">
-            <aside class="sidebar"><h3>Workspace lifecycle</h3><ul><li><a href="#start">Start a workspace</a></li><li><a href="#manage">Manage agents</a></li><li><a href="#observe">Observe runtime state</a></li><li><a href="#stop">Stop and destroy</a></li></ul></aside>
+            <aside class="sidebar"><h3>Workspace lifecycle</h3><ul><li><a href="#start">Start a workspace</a></li><li><a href="#manage">Manage agents</a></li><li><a href="#webtty">Recover WebTTY</a></li><li><a href="#observe">Observe runtime state</a></li><li><a href="#stop">Stop and destroy</a></li></ul></aside>
             <div class="content-wrapper">
                 <div class="doc-section"><h1>Workspace Lifecycle</h1><p class="subtitle">The operator workflows that prepare a workspace, run its agents, inspect its state, and remove only the resources selected by a lifecycle command.</p></div>
                 <div class="doc-section" id="start">
@@ -39,6 +39,12 @@
                         <tr><td><code>update</code></td><td>Refreshes managed repositories and invalidates prepared dependency caches when their resolved inputs change.</td></tr>
                     </tbody></table>
                     <p>Disabling an agent removes its registry record before runtime teardown. This preserves the precise selected identity for cleanup and prevents the Watchdog from treating the intentional stop as a failed runtime to recreate.</p>
+                </div>
+                <div class="doc-section" id="webtty">
+                    <h2>Recover WebTTY terminals</h2>
+                    <p>Explorer's folder menu offers the Ploinky Box first, followed only by live agents whose effective mounts prove access to that exact folder. A read-only badge describes the selected folder mapping. Closing a tab normally reclaims the exact terminal and its foreground descendants.</p>
+                    <p>At Router startup, WebTTY v2 recovery records distinguish a worker-only allocation, a PTY that was starting, and a PTY with complete Box or agent evidence. Recovery verifies immutable process and container identities before signaling anything and retains ambiguous evidence instead of guessing. An ambiguity confined to one immutable agent container and enable generation quarantines only that target; a systemic agent-provider evidence failure removes all agent choices but preserves the Box choice. Unsafe unclassifiable or Box evidence keeps the entire WebTTY surface unavailable.</p>
+                    <div class="alert alert-warning"><strong>Operator recovery:</strong> target quarantines do not expire. If normal exact-identity recovery cannot prove cleanup, run <code>ploinky destroy</code> for the affected workspace and then recreate it through the normal <code>ploinky start</code> workflow. Box recreation clears the transient <code>/run/ploinky/webtty</code> records and nested containers; it preserves host workspace data and the retained dependency/image caches. Do not edit recovery records or kill numeric PIDs by hand.</div>
                 </div>
                 <div class="doc-section" id="observe">
                     <h2>Observe runtime state</h2>
