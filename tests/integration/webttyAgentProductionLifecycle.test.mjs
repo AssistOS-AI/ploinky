@@ -130,7 +130,7 @@ test('production AgentTerminalWorker and default recovery reclaim exact non-root
         assert.equal(evidence.cases.clean.markerProof.innerUid, 1000);
         assert.deepEqual(evidence.cases.clean.markerProof.argv, [
             '/bin/bash', '--noprofile', '--norc', '-p', '-c',
-            '/bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac',
+            'PS1=\'$PWD $ \'; export PS1; /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac',
             `ploinky-webtty-marker:production_marker_${evidence.runId}_clean`,
         ]);
         assert.deepEqual(evidence.cases.clean.io,
@@ -170,7 +170,7 @@ test('production AgentTerminalWorker and default recovery reclaim exact non-root
         assert.equal(evidence.cases.fallback.markerProof.innerUid, 1000);
         assert.deepEqual(evidence.cases.fallback.markerProof.argv, [
             '/bin/sh', '-p', '-c',
-            '/bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"',
+            'PS1=\'$PWD $ \'; export PS1; /bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"',
             `ploinky-webtty-marker:production_marker_${evidence.runId}_fallback`,
         ]);
         assert.deepEqual(evidence.cases.fallback.readinessChallenge, {

@@ -29,8 +29,8 @@ const READINESS_CHALLENGE = 'c'.repeat(43);
 const FALLBACK_READINESS_CHALLENGE = 'd'.repeat(43);
 const STALE_READINESS_CHALLENGE = 's'.repeat(43);
 const MARKER_ARGUMENT = `ploinky-webtty-marker:${MARKER}`;
-const BASH_WRAPPER_COMMAND = '/bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac';
-const SH_WRAPPER_COMMAND = '/bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"';
+const BASH_WRAPPER_COMMAND = 'PS1=\'$PWD $ \'; export PS1; /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac';
+const SH_WRAPPER_COMMAND = 'PS1=\'$PWD $ \'; export PS1; /bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"';
 const CLIENT = Object.freeze({
     pid: 4200,
     uid: 1000,

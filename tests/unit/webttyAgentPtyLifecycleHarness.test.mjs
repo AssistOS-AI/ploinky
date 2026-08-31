@@ -92,7 +92,7 @@ test('Phase 0 CLI admission imports the production exact argv builder', () => {
         '--env', 'PLOINKY_WEBTTY_MARKER=phase0-regression-marker',
         'a'.repeat(64),
         '/bin/bash', '--noprofile', '--norc', '-p', '-c',
-        '/bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac',
+        'PS1=\'$PWD $ \'; export PS1; /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac',
         'ploinky-webtty-marker:phase0-regression-marker',
     ]);
     assert.deepEqual(fixedAgentShellWrapperArgv(
@@ -100,7 +100,42 @@ test('Phase 0 CLI admission imports the production exact argv builder', () => {
         '/bin/sh',
     ), [
         '/bin/sh', '-p', '-c',
-        '/bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"',
+        'PS1=\'$PWD $ \'; export PS1; /bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"',
         'ploinky-webtty-marker:phase0-regression-marker',
     ]);
+});
+
+test('agent wrapper exports a dynamic working-directory prompt into the nested shell', (t) => {
+    const promptDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webtty prompt folder-'));
+    t.after(() => fs.rmSync(promptDirectory, { recursive: true, force: true }));
+    for (const shellPath of ['/bin/bash', '/bin/sh']) {
+        const wrapperArgv = [...fixedAgentShellWrapperArgv(
+            'phase0-regression-marker',
+            shellPath,
+        )];
+        const wrapperIndex = wrapperArgv.length - 2;
+        if (shellPath === '/bin/bash') {
+            // Production Bash is interactive because Podman supplies a PTY.
+            // Force interactive mode here because spawnSync uses pipes.
+            wrapperArgv[wrapperIndex] = wrapperArgv[wrapperIndex].replace(
+                '/bin/bash --noprofile --norc;',
+                '/bin/bash --noprofile --norc -i;',
+            );
+        }
+        const result = spawnSync(wrapperArgv[0], wrapperArgv.slice(1), {
+            encoding: 'utf8',
+            env: {
+                HOME: os.tmpdir(),
+                PATH: process.env.PATH,
+                TERM: 'xterm-256color',
+            },
+            input: `cd ${JSON.stringify(promptDirectory)}\nexit\n`,
+        });
+        assert.equal(result.status, 0, `${shellPath}: ${result.stderr}`);
+        assert.match(
+            `${result.stdout}${result.stderr}`,
+            new RegExp(`${escapeRegExp(promptDirectory)} \\$ `),
+            shellPath,
+        );
+    }
 });

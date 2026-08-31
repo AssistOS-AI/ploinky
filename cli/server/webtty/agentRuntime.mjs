@@ -56,8 +56,16 @@ export function projectExactAgentProcessTarget(record, containerId, errorFactory
 // Podman itself returns 126/127 when the selected outer /bin/bash cannot be
 // executed.  Never let target-controlled behavior inside the admitted Bash
 // session reproduce those fallback-authorizing statuses.
-const BASH_WRAPPER = '/bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac';
-const SH_WRAPPER = '/bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"';
+function shellSingleQuote(value) {
+    return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+// Podman injects PS1 into the non-interactive wrapper shell. Bash and sh remove
+// that special variable before launching the nested interactive shell, so the
+// wrapper must restore and export the fixed prompt immediately before launch.
+const SHELL_PROMPT_BOOTSTRAP = `PS1=${shellSingleQuote(WEBTTY_SHELL_PROMPT)}; export PS1;`;
+const BASH_WRAPPER = `${SHELL_PROMPT_BOOTSTRAP} /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac`;
+const SH_WRAPPER = `${SHELL_PROMPT_BOOTSTRAP} /bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"`;
 const SHELLS = Object.freeze({
     '/bin/bash': Object.freeze({
         wrapper: Object.freeze(['--noprofile', '--norc', '-p', '-c', BASH_WRAPPER]),
