@@ -1,3 +1,7 @@
+import { WEBTTY_SHELL_PROMPT } from '../../../core-services/webtty/environment.mjs';
+
+export { WEBTTY_SHELL_PROMPT };
+
 const CONTAINER_ID = /^[a-f0-9]{64}$/;
 const EXEC_ID = /^[a-f0-9]{64}$/;
 const MARKER = /^[A-Za-z0-9_-]{24,128}$/;
@@ -98,6 +102,8 @@ export function fixedAgentPodmanArgv(spec, shellPath = '/bin/bash') {
         spec.translatedCwd,
         '--env',
         'TERM=xterm-256color',
+        '--env',
+        `PS1=${WEBTTY_SHELL_PROMPT}`,
         '--env',
         `PLOINKY_WEBTTY_MARKER=${spec.marker}`,
         spec.containerId,

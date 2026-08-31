@@ -225,6 +225,7 @@ test('fixed backend argv contains no browser-controlled shell, flags, env, or no
         '--user', '1000:1000',
         '--workdir', '/workspace/demo',
         '--env', 'TERM=xterm-256color',
+        '--env', 'PS1=$PWD $ ',
         '--env', `PLOINKY_WEBTTY_MARKER=${MARKER}`,
         CONTAINER_ID,
         '/bin/bash', '--noprofile', '--norc', '-p', '-c',

@@ -88,6 +88,7 @@ test('Phase 0 CLI admission imports the production exact argv builder', () => {
         'container', 'exec', '--interactive', '--tty',
         '--user', '1000:1000', '--workdir', '/tmp',
         '--env', 'TERM=xterm-256color',
+        '--env', 'PS1=$PWD $ ',
         '--env', 'PLOINKY_WEBTTY_MARKER=phase0-regression-marker',
         'a'.repeat(64),
         '/bin/bash', '--noprofile', '--norc', '-p', '-c',

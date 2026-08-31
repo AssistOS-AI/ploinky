@@ -10,6 +10,7 @@ import path from 'node:path';
 
 import { buildAgentWorkerEnvironment } from '../../cli/server/webtty/agentWorkerEnvironment.mjs';
 import {
+    WEBTTY_SHELL_PROMPT,
     bashExecutableLookupFailed,
     fixedAgentInteractiveShellArgv,
     fixedAgentPodmanArgv,
@@ -1642,7 +1643,11 @@ async function runRestCandidate({ containerId, user, marker, runId }) {
                 AttachStdout: true,
                 AttachStderr: true,
                 Cmd: fixedAgentShellWrapperArgv(marker, '/bin/bash'),
-                Env: [`PLOINKY_WEBTTY_MARKER=${marker}`, 'TERM=xterm-256color'],
+                Env: [
+                    `PLOINKY_WEBTTY_MARKER=${marker}`,
+                    'TERM=xterm-256color',
+                    `PS1=${WEBTTY_SHELL_PROMPT}`,
+                ],
                 Privileged: false,
                 Tty: true,
                 User: user,

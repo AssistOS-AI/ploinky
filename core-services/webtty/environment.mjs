@@ -1,3 +1,5 @@
+export const WEBTTY_SHELL_PROMPT = '$PWD $ ';
+
 const FIXED_BASE_ENVIRONMENT = Object.freeze({
     HOME: '/home/podman',
     USER: 'podman',
@@ -13,6 +15,7 @@ const FIXED_SHELL_ENVIRONMENT = Object.freeze({
     SHELL: '/bin/bash',
     TERM: 'xterm-256color',
     COLORTERM: 'truecolor',
+    PS1: WEBTTY_SHELL_PROMPT,
 });
 
 export const WORKER_ENVIRONMENT_KEYS = Object.freeze(Object.keys(FIXED_BASE_ENVIRONMENT).sort());
