@@ -81,6 +81,11 @@ The outer storage boundary has four durable host binds and one transient `/tmp` 
 | `<workspace>/.ploinky/box/images` | `/home/podman/.local/share/ploinky-images` | Read-write bind |
 | tmpfs | `/tmp` | `rw,exec,nosuid,nodev,mode=1777,notmpcopyup`; empty each outer boot |
 
+The image contains the dependency-lock-selected MCP SDK as a sealed,
+content-hashed tree at `/usr/local/lib/ploinky/mcp-sdk`. Entrypoint preparation
+validates and transactionally copies those local bytes into the dependency
+bind. No Box startup path fetches or installs MCP SDK content from the network.
+
 A missing box causes an unconditional pull and full configuration validation. The supervisor creates the box from the validated image ID, closing a mutable-tag race. A stopped compatible box starts on the same immutable container ID and a running compatible box is reused without pulling. Before every start, the supervisor captures cumulative stdout and stderr. Only appended current-boot bytes can contain the exact `PLOINKY_BOX_READY` line, and the same poll plus final rediscovery must prove the container is running.
 
 Here, compatible means an exact normalized creation-configuration match. Changing the requested image or physical ports performs a validated transactional replacement and restores the previous immutable container if the candidate fails. Other creation drift is reported as recreate-required before registry or container mutation and requires an explicit `ploinky destroy`.

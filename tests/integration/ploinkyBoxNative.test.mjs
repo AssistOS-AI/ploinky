@@ -486,13 +486,17 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ]).split(/\n/);
     assert.equal(keyEvidence[0], '600');
     assert.match(keyEvidence[1], /^[a-f0-9]{64}\s/);
-    // The Box installs mcp-sdk only. achillesAgentLib is the direct-mounted
-    // workspace source, so it has no pinned Box checkout to inspect.
+    // The Box materializes mcp-sdk from the immutable image bundle only.
+    // achillesAgentLib is the direct-mounted workspace source, so it has no
+    // pinned Box checkout to inspect.
     for (const [repository, revision] of [
         ['mcp-sdk', '7efe9d17f52a625743e411089d3a6879f6f89156'],
     ]) {
         assert.equal(execInBox(harness.runner, prepared.containerId, [
-            'git', '-C', `/opt/ploinky/node_modules/${repository}`, 'rev-parse', 'HEAD',
+            'node', '-e', [
+                `const metadata=require('/opt/ploinky/node_modules/${repository}/.ploinky-box-mcp-sdk.json');`,
+                'process.stdout.write(metadata.repository.commit);',
+            ].join(''),
         ]), revision);
     }
     // The selected source is present read-only at the stable path, and the
