@@ -36,6 +36,20 @@ test('maintenance lock creation is atomic and does not overwrite an active owner
     assert.equal(locks.removeMaintenanceLock(containerName, first.token), true);
 });
 
+test('replacement candidate names share their predecessor maintenance identity', () => {
+    const predecessorName = 'stable-runtime';
+    const candidateName = `${predecessorName}__candidate_123456789abc`;
+    const first = locks.createMaintenanceLock(predecessorName, { operation: 'cli-start' });
+
+    assert.equal(locks.inspectMaintenanceLock(candidateName).active, true);
+    assert.throws(
+        () => locks.createMaintenanceLock(candidateName, { operation: 'restart' }),
+        (error) => error?.code === 'PLOINKY_MAINTENANCE_BUSY',
+    );
+    assert.equal(locks.removeMaintenanceLock(candidateName, first.token), true);
+    assert.equal(locks.inspectMaintenanceLock(predecessorName).active, false);
+});
+
 test('maintenance lock release cannot remove a different owner lock', () => {
     const containerName = 'owned-container';
     const lock = locks.createMaintenanceLock(containerName, { operation: 'restart' });

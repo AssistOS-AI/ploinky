@@ -29,6 +29,7 @@ function existingRecord() {
         type: 'agent',
         repoName: 'fixtures',
         agentName: 'caller',
+        profile: 'qa-profile',
         instanceId: oldIdentity.instanceId,
         enableGeneration: oldIdentity.enableGeneration,
         config: { ports: [] },
@@ -37,6 +38,8 @@ function existingRecord() {
 
 function rotationHarness(reason, request = {}) {
     let registry = { [containerName]: existingRecord() };
+    let preparedRegistry = null;
+    let preparedRouting = null;
     const events = [];
     const networkLifecycleCapability = Object.freeze({ fixture: 'network-capability' });
     const minted = [`instance-new-${reason}`, `enable-new-${reason}`];
@@ -46,22 +49,24 @@ function rotationHarness(reason, request = {}) {
             events.push('network-capability');
         },
         withApplyLock: (callback) => callback(Object.freeze({})),
-        inactivate: (value) => {
-            events.push(`inactivate:${value}`);
-        },
         loadRegistry: () => {
             events.push('load');
             return structuredClone(registry);
         },
-        saveRegistry: (value) => {
-            events.push('save');
-            registry = structuredClone(value);
-        },
-        prepare: ({ reason: preparedReason }) => {
+        loadRouting: () => ({ routes: { caller: { container: containerName } } }),
+        prepare: ({ agents, routing, reason: preparedReason }) => {
             events.push(`prepare:${preparedReason}`);
+            preparedRegistry = structuredClone(agents);
+            preparedRouting = structuredClone(routing);
             return {
-                selector: { state: 'inactive' },
-                generation: { agents: structuredClone(registry) },
+                selector: { state: 'active', generation: 'active-predecessor' },
+                preparationLease: {
+                    mode: 'additive',
+                    transactionId: `lease-${reason}`,
+                    predecessorGeneration: 'active-predecessor',
+                    preparedGeneration: `candidate-${reason}`,
+                },
+                generation: { agents: structuredClone(agents) },
             };
         },
         uuid: () => minted.shift(),
@@ -72,31 +77,95 @@ function rotationHarness(reason, request = {}) {
         existingRuntime: true,
         recreateReason: reason,
         networkLifecycleCapability,
+        stageAlongsidePredecessor: true,
         ...request,
     }, dependencies);
-    return { dependencies, events, registry, runtimeIdentity };
+    return { dependencies, events, registry, preparedRegistry, preparedRouting, runtimeIdentity };
 }
 
-test('every ordinary existing-container recreate rotates both identities before physical replacement', () => {
+test('every ordinary existing-container recreate stages a fresh additive identity while its predecessor remains active', () => {
     for (const reason of [
         'forceRecreate',
         'envHashChanged',
         'networkContractDrift',
         'serviceTargetMappingChanged',
     ]) {
-        const { events, registry, runtimeIdentity } = rotationHarness(reason);
+        const { events, registry, preparedRegistry, preparedRouting, runtimeIdentity } = rotationHarness(reason);
+        const candidateName = runtimeIdentity.candidateContainerName;
         assert.notEqual(runtimeIdentity.instanceId, oldIdentity.instanceId, reason);
         assert.notEqual(runtimeIdentity.enableGeneration, oldIdentity.enableGeneration, reason);
-        assert.equal(registry[containerName].instanceId, runtimeIdentity.instanceId, reason);
-        assert.equal(registry[containerName].enableGeneration, runtimeIdentity.enableGeneration, reason);
+        assert.equal(runtimeIdentity.preparationLease.mode, 'additive', reason);
+        assert.notEqual(candidateName, containerName, reason);
+        assert.equal(runtimeIdentity.predecessorContainerName, containerName, reason);
+        assert.equal(registry[containerName].instanceId, oldIdentity.instanceId, reason);
+        assert.equal(registry[containerName].enableGeneration, oldIdentity.enableGeneration, reason);
+        assert.equal(preparedRegistry[containerName], undefined, reason);
+        assert.equal(preparedRegistry[candidateName].instanceId, runtimeIdentity.instanceId, reason);
+        assert.equal(preparedRegistry[candidateName].enableGeneration, runtimeIdentity.enableGeneration, reason);
+        assert.equal(preparedRouting.routes.caller.container, candidateName, reason);
+        assert.deepEqual(runtimeIdentity.preparedRegistryRecord, preparedRegistry[candidateName], reason);
         assert.deepEqual(events.map((entry) => entry.split(':')[0]), [
             'network-capability',
-            'inactivate',
             'load',
-            'save',
             'prepare',
         ], reason);
     }
+});
+
+test('replacement paths that cannot stage a second physical runtime retain the inactive same-name contract', () => {
+    let registry = { [containerName]: existingRecord() };
+    const events = [];
+    const networkLifecycleCapability = Object.freeze({ fixture: 'network-capability' });
+    const values = ['instance-unmanaged-candidate', 'enable-unmanaged-candidate'];
+    const runtimeIdentity = resolveReplacementRuntimeIdentity({
+        containerName,
+        existingRecord: existingRecord(),
+        existingRuntime: true,
+        recreateReason: 'sandboxRuntimeStopped',
+        networkLifecycleCapability,
+        stageAlongsidePredecessor: false,
+    }, {
+        assertNetworkCapability: (received) => {
+            assert.equal(received, networkLifecycleCapability);
+            events.push('network-capability');
+        },
+        withApplyLock: (callback) => callback(Object.freeze({})),
+        inactivate: () => events.push('inactivate'),
+        loadRegistry: () => {
+            events.push('load');
+            return structuredClone(registry);
+        },
+        saveRegistry: (next) => {
+            events.push('save');
+            registry = structuredClone(next);
+        },
+        prepareReplacement: () => {
+            events.push('prepare-replacement');
+            return {
+                selector: { state: 'inactive' },
+                preparationLease: { mode: 'replacement', transactionId: 'unmanaged-lease' },
+                generation: { agents: structuredClone(registry) },
+            };
+        },
+        prepare: () => assert.fail('same-name replacement must not use additive preparation'),
+        loadRouting: () => assert.fail('same-name replacement must not rewrite routes additively'),
+        uuid: () => values.shift(),
+    });
+
+    assert.equal(runtimeIdentity.candidateContainerName, containerName);
+    assert.equal(runtimeIdentity.predecessorContainerName, containerName);
+    assert.equal(runtimeIdentity.instanceId, 'instance-unmanaged-candidate');
+    assert.equal(runtimeIdentity.enableGeneration, 'enable-unmanaged-candidate');
+    assert.equal(registry[containerName].instanceId, runtimeIdentity.instanceId);
+    assert.equal(registry[containerName].enableGeneration, runtimeIdentity.enableGeneration);
+    assert.deepEqual(runtimeIdentity.preparedRegistryRecord, registry[containerName]);
+    assert.deepEqual(events, [
+        'network-capability',
+        'inactivate',
+        'load',
+        'save',
+        'prepare-replacement',
+    ]);
 });
 
 test('ordinary exact runtime reuse preserves the registered tuple without coordination or minting', () => {
@@ -119,7 +188,7 @@ test('ordinary exact runtime reuse preserves the registered tuple without coordi
 });
 
 test('an assertion from the predecessor tuple is stale after coordinated replacement rotation', () => {
-    const { registry } = rotationHarness('envHashChanged');
+    const { preparedRegistry } = rotationHarness('envHashChanged');
     const body = Buffer.from('{"room":"fixture"}');
     const pathname = '/base-agent-additional-server/private-owner/7000/private/rooms';
     const token = signPrivateRouterAssertion({
@@ -146,7 +215,7 @@ test('an assertion from the predecessor tuple is stale after coordinated replace
         parsedUrl: new URL(`http://host.containers.internal${pathname}`),
         access: { access: 'authenticated' },
         snapshot: {
-            agents: registry,
+            agents: preparedRegistry,
             compiled: { security: {} },
         },
     };
@@ -234,9 +303,8 @@ test('the explicit targeted restart contract preserves its captured tuple', () =
     });
 });
 
-test('failed coordinated prepare retains the new candidate tuple and leaves the selector inactive', () => {
-    let registry = { [containerName]: existingRecord() };
-    const inactivations = [];
+test('failed coordinated prepare leaves the active predecessor registry untouched', () => {
+    const registry = { [containerName]: existingRecord() };
     const networkLifecycleCapability = Object.freeze({ fixture: 'network-capability' });
     assert.throws(() => resolveReplacementRuntimeIdentity({
         containerName,
@@ -244,22 +312,20 @@ test('failed coordinated prepare retains the new candidate tuple and leaves the 
         existingRuntime: true,
         recreateReason: 'networkContractDrift',
         networkLifecycleCapability,
+        stageAlongsidePredecessor: true,
     }, {
         assertNetworkCapability: (received) => assert.equal(received, networkLifecycleCapability),
         withApplyLock: (callback) => callback(Object.freeze({})),
-        inactivate: (reason) => inactivations.push(reason),
         loadRegistry: () => structuredClone(registry),
-        saveRegistry: (value) => { registry = structuredClone(value); },
+        loadRouting: () => ({ routes: { caller: { container: containerName } } }),
         prepare: () => { throw new Error('candidate rejected'); },
         uuid: (() => {
             const values = ['instance-failed-candidate', 'enable-failed-candidate'];
             return () => values.shift();
         })(),
     }), /candidate rejected/);
-    assert.equal(registry[containerName].instanceId, 'instance-failed-candidate');
-    assert.equal(registry[containerName].enableGeneration, 'enable-failed-candidate');
-    assert.equal(inactivations.length, 2);
-    assert.match(inactivations[1], /prepare-failed/);
+    assert.equal(registry[containerName].instanceId, oldIdentity.instanceId);
+    assert.equal(registry[containerName].enableGeneration, oldIdentity.enableGeneration);
 });
 
 test('coordinated replacement rejects a missing network capability before mutation', () => {

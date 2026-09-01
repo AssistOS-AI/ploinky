@@ -71,9 +71,11 @@ import {
 } from '../server/routingFile.js';
 import {
   abortEdgeRoutingPreparation,
+  commitAdditiveEdgeRoutingGeneration,
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
+  withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import {
@@ -1712,8 +1714,18 @@ async function activatePreparedRuntimeAfterReadiness({
   shortAgentName,
   agentPath,
   alias = '',
+  networkLifecycleCapability,
 }, {
   mergeRouting = mergeRoutingConfig,
+  mergeRoute = mergeRuntimeRoute,
+  loadAgents = workspaceSvc.loadAgents,
+  readRouting = readRoutingConfig,
+  commitAdditive = commitAdditiveEdgeRoutingGeneration,
+  withApplyLock = withEdgeGenerationApplyLock,
+  retirePredecessor = dockerSvc.retireExactAgentRuntimePredecessor,
+  reportRetirementFailure = (predecessor, error) => console.warn(
+    `[edge] active replacement committed, but exact predecessor '${predecessor?.containerName || '<unknown>'}' retirement failed: ${error?.message || error}`,
+  ),
   cleanupFailure = cleanupFailedPreparedRuntime,
 } = {}) {
   if (!result?.requiresEdgeActivation) return false;
@@ -1724,6 +1736,43 @@ async function activatePreparedRuntimeAfterReadiness({
     throw new Error('runtime replacement activation requires its exact preparation lease');
   }
   try {
+    if (result.preparationLease.mode === 'additive') {
+      await withApplyLock((applyLockCapability) => {
+        const agents = loadAgents();
+        const predecessorName = String(result.replacementPredecessor?.containerName || '');
+        if (predecessorName && predecessorName !== result.containerName) {
+          delete agents[predecessorName];
+        }
+        agents[result.containerName] = structuredClone(result.registryRecord);
+        const routing = readRouting();
+        routing.routes = routing.routes || {};
+        for (const route of Object.values(routing.routes)) {
+          if (route && predecessorName && route.container === predecessorName) {
+            route.container = result.containerName;
+          }
+        }
+        routing.routes[routeKey] = mergeRoute(routing.routes[routeKey], {
+          container: result.containerName,
+          hostPath: agentPath,
+          repo: repoName,
+          agent: shortAgentName,
+          ...(alias ? { alias } : {}),
+        }, { hostPort: result.hostPort || 0 });
+        return commitAdditive(result.preparationLease, {
+          agents,
+          routing,
+          applyLockCapability,
+        });
+      }, { preparationLease: result.preparationLease });
+      if (result.replacementPredecessor) {
+        try {
+          retirePredecessor(result.replacementPredecessor, { networkLifecycleCapability });
+        } catch (retirementError) {
+          try { reportRetirementFailure(result.replacementPredecessor, retirementError); } catch (_) {}
+        }
+      }
+      return true;
+    }
     await mergeRouting((cfg) => {
       const agents = workspaceSvc.loadAgents();
       agents[result.containerName] = result.registryRecord;
@@ -1789,9 +1838,11 @@ export function cleanupFailedPreparedRuntime(
     }
   }
   if (!failedResult.preparationLease) return;
-  try {
-    inactivate(reason, { preserveSelectedGeneration: true });
-  } catch (_) {}
+  if (failedResult.preparationLease.mode !== 'additive') {
+    try {
+      inactivate(reason, { preserveSelectedGeneration: true });
+    } catch (_) {}
+  }
   try {
     abortPreparation(failedResult.preparationLease, { reason });
   } catch (_) {}
@@ -2583,13 +2634,14 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     enableAgent,
     readManifest,
     ensureAgentService,
-    getAgentContainerName,
+    getAgentContainerName: getAgentContainerNameImpl = dockerSvc.getAgentContainerName,
     resolveAgentReadinessProtocol: resolveAgentReadinessProtocolImpl = resolveAgentReadinessProtocol,
     waitForManifestReadiness: waitForManifestReadinessImpl = waitForManifestReadiness,
     waitForAgentReady: waitForAgentReadyImpl,
     activateRuntimeAfterReadiness: activateRuntimeAfterReadinessImpl = activatePreparedRuntimeAfterReadiness,
     loadAgentsMap: loadAgentsMapImpl,
     withMaintenanceLock: withMaintenanceLockImpl = withMaintenanceLock,
+    withNetworkLifecycleLock: withNetworkLifecycleLockImpl = withNetworkLifecycleLock,
     attachInteractive,
     attachBwrapInteractive,
     attachSeatbeltInteractive,
@@ -2687,22 +2739,40 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   const cmd = wrapCliWithWebchat(rawCmd, env);
   const agentDir = path.dirname(manifestPath);
   const repoName = path.basename(path.dirname(agentDir));
-  const initialContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
-  debugLog(`[runCli] agent=${agentName} container=${initialContainerName}`);
+  const initialContainerName = registryRecord?.containerName || getAgentContainerNameImpl(shortAgentName, repoName);
+  const expectedAlias = String(registryRecord?.record?.alias || '');
+  const maintenanceContainerName = initialContainerName;
+  debugLog(`[runCli] agent=${agentName} container=${initialContainerName} maintenance=${maintenanceContainerName}`);
   let containerInfo = null;
   let containerName = initialContainerName;
-  await withMaintenanceLockImpl(initialContainerName, {
+  await withMaintenanceLockImpl(maintenanceContainerName, {
     operation: 'cli-start',
     metadata: {
       agent: shortAgentName,
       repo: repoName,
     },
   }, async () => {
-    const refreshedRecord = loadAgentsMapImpl()?.[initialContainerName];
-    if (refreshedRecord?.type === 'agent') {
-      registryRecord = { containerName: initialContainerName, record: refreshedRecord };
+    const refreshedAgents = loadAgentsMapImpl() || {};
+    const initialRefreshedRecord = refreshedAgents[initialContainerName];
+    if (initialRefreshedRecord) {
+      if (initialRefreshedRecord.type === 'agent') {
+        registryRecord = { containerName: initialContainerName, record: initialRefreshedRecord };
+      }
+    } else {
+      const refreshedMatches = Object.entries(refreshedAgents).filter(([, record]) => (
+        record?.type === 'agent'
+        && String(record.repoName || '') === repoName
+        && String(record.agentName || '') === shortAgentName
+        && String(record.alias || '') === expectedAlias
+      ));
+      if (refreshedMatches.length !== 1) {
+        throw new Error(
+          `CLI startup for '${expectedAlias || shortAgentName}' requires one exact refreshed runtime identity; found ${refreshedMatches.length}.`,
+        );
+      }
+      registryRecord = { containerName: refreshedMatches[0][0], record: refreshedMatches[0][1] };
     }
-    const lifecycleResult = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+    const lifecycleResult = await withNetworkLifecycleLockImpl(async (networkLifecycleCapability) => {
       let result = null;
       try {
         result = ensureAgentService(shortAgentName, manifest, agentDir, {
@@ -2898,6 +2968,7 @@ async function runShell(agentName) {
         shortAgentName,
         agentPath: agentDir,
         alias: registryRecord?.record?.alias || '',
+        networkLifecycleCapability,
       });
       return { containerInfo: result, containerName: exactContainerName };
     } catch (error) {
@@ -3052,6 +3123,7 @@ async function reinstallAgent(agentName) {
                 shortAgentName: short,
                 agentPath,
                 alias: registryRecord?.record?.alias || '',
+                networkLifecycleCapability,
             });
 
             const isRouterUp = (p) => {

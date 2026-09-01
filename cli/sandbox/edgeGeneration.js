@@ -2749,10 +2749,17 @@ export function captureEdgeRoutingLease(options = {}) {
     const active = loadActiveEdgeRoutingGeneration(options);
     const generationId = active.selector.generation;
     const activationId = active.selector.activationId;
+    const owner = options.expectedOwner
+        ? assertRouterAttestationOwner(active.generation, options.expectedOwner, {
+            mismatchCode: 'EDGE_GENERATION_STALE',
+            mismatchMessage: 'active Router attestation owner does not match its immutable generation record',
+        })
+        : null;
     return Object.freeze({
         id: generationId,
         activationId,
         snapshot: active.generation,
+        ...(owner ? { owner } : {}),
         commit() {
             try {
                 const current = loadActiveEdgeRoutingGeneration(options);
@@ -2860,6 +2867,38 @@ const ROUTER_ATTESTATION_CHECKPOINTS = Object.freeze([
     'post-inspection',
 ]);
 
+function assertRouterAttestationOwner(generation, expectedOwner, {
+    mismatchCode,
+    mismatchMessage,
+} = {}) {
+    const owner = Object.freeze({
+        containerName: String(expectedOwner?.containerName || '').trim(),
+        principal: String(expectedOwner?.principal || '').trim(),
+        instanceId: String(expectedOwner?.instanceId || '').trim(),
+        enableGeneration: String(expectedOwner?.enableGeneration || '').trim(),
+    });
+    if (Object.values(owner).some((value) => !value)) {
+        throw edgeError(
+            'Router attestation requires one complete exact runtime owner',
+            'EDGE_GENERATION_INVALID',
+        );
+    }
+    const record = generation?.agents?.[owner.containerName];
+    const recordPrincipal = record
+        ? `agent:${String(record.repoName || '')}/${String(record.agentName || '')}`
+        : '';
+    if (!record || record.type !== 'agent'
+        || recordPrincipal !== owner.principal
+        || String(record.instanceId || '') !== owner.instanceId
+        || String(record.enableGeneration || '') !== owner.enableGeneration) {
+        throw edgeError(
+            mismatchMessage || 'Router attestation owner does not match its immutable generation record',
+            mismatchCode || 'EDGE_GENERATION_STALE',
+        );
+    }
+    return owner;
+}
+
 function preparedRouterAttestationSnapshot(paths, preparationLease, expectedOwner) {
     const current = assertPreparationLeaseForApply(paths, preparationLease);
     assertPreparedSelectorStillSelected(paths, current);
@@ -2892,31 +2931,10 @@ function preparedRouterAttestationSnapshot(paths, preparationLease, expectedOwne
             );
         }
     }
-    const owner = Object.freeze({
-        containerName: String(expectedOwner?.containerName || '').trim(),
-        principal: String(expectedOwner?.principal || '').trim(),
-        instanceId: String(expectedOwner?.instanceId || '').trim(),
-        enableGeneration: String(expectedOwner?.enableGeneration || '').trim(),
+    const owner = assertRouterAttestationOwner(generation, expectedOwner, {
+        mismatchCode: 'EDGE_PREPARATION_STALE',
+        mismatchMessage: 'prepared Router attestation owner does not match its immutable generation record',
     });
-    if (Object.values(owner).some((value) => !value)) {
-        throw edgeError(
-            'prepared Router attestation requires one complete exact runtime owner',
-            'EDGE_GENERATION_INVALID',
-        );
-    }
-    const record = generation.agents?.[owner.containerName];
-    const recordPrincipal = record
-        ? `agent:${String(record.repoName || '')}/${String(record.agentName || '')}`
-        : '';
-    if (!record || record.type !== 'agent'
-        || recordPrincipal !== owner.principal
-        || String(record.instanceId || '') !== owner.instanceId
-        || String(record.enableGeneration || '') !== owner.enableGeneration) {
-        throw edgeError(
-            'prepared Router attestation owner does not match its immutable generation record',
-            'EDGE_PREPARATION_STALE',
-        );
-    }
     return Object.freeze({
         current,
         generation,

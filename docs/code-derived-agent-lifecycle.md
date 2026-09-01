@@ -357,16 +357,27 @@ flowchart TD
   D -- "disabled or unsupported" --> G["container service manager"]
   G --> H["resolve image and env hash"]
   H --> I{"existing container usable?"}
-  I -- yes --> J["start/reuse container and launch sidecar if needed"]
-  I -- no --> K["run pre-container lifecycle"]
-  K --> L["prepare dependency cache"]
+  I -- yes --> J{"managed default/bridge?"}
+  J -- yes --> JA["validate exact active-generation owner and semantic descriptor; adopt without mutation"]
+  J -- no --> JB["return exact running runtime"]
+  I -- no --> K["retain a supplied graph lease or prepare an additive direct-replacement candidate"]
+  K --> KA["run pre-container lifecycle"]
+  KA --> L["prepare dependency cache"]
   L --> M["prepare volumes/staging/env/ports"]
-  M --> N["runtime run container"]
+  M --> N["create a separately named exact candidate under canonical network lock"]
   N --> O["run post-creation lifecycle"]
-  O --> P["sync mcp-config and save record"]
+  O --> P["return candidate; caller waits for readiness and commits its exact generation"]
+  JA --> P
+  JB --> P
   E --> P
   F --> P
 ```
+
+Direct CLI startup holds the logical runtime maintenance lock from its refreshed registry read through network reconciliation, readiness, generation activation, and predecessor retirement. Generation-specific candidate container names normalize to the same maintenance key as their predecessor. Concurrent launches for the same workspace/runtime identity therefore serialize on one key. After the first launch commits, the waiter refreshes the registry and normally takes the unchanged-runtime adoption path; attachment happens after the maintenance transaction, so both callers can attach. Unrelated logical runtime keys are not coalesced, while their network mutations still use the canonical workspace network-lifecycle lock.
+
+For a healthy managed `default` or `bridge` container, reuse is validation-only. Ploinky checks exact workspace/network/runtime-identity labels, running state, immutable container ID, active-generation owner tuple, generated Router descriptor, signed topology payload, image/user/entrypoint/user namespace, working directory, environment hash, mounts, singleton managed environment values, and the already-existing MCP/config, dependency-cache, staging, volume, health-control, and LLM-state artifacts. Exact adoption performs no container stop/remove/create, lifecycle hook, sidecar launch, liveness reset, registry save, preparation lease, selector transition, directory/config write, cache preparation, image pull, dependency runtime-key probe, or shell-probe container launch. It derives the dependency runtime key from the exact registered cache mount and validates that admitted cache read-only. Any read-only artifact drift enters the separately named staged-replacement path instead.
+
+A genuine managed direct replacement instead mints a fresh `instanceId`/`enableGeneration` pair and a generation-specific physical candidate name, then captures an immutable additive generation while the predecessor selector, mutable route/registry sources, and predecessor process remain active. The separately named candidate is created under the existing network lifecycle lock and attested against that additive lease, so the active generation remains bound to the still-serving predecessor's immutable container ID throughout candidate readiness. Only after semantic readiness succeeds does one apply-lock transaction write the final runtime locator and registry metadata and atomically select the candidate generation. The exact predecessor is retired after that commit under the same network-lifecycle capability. Candidate or readiness failure removes only the exactly proved candidate, consumes cleanup authority once, and aborts the additive lease without inactivating or stopping the predecessor generation.
 
 Runtime selection details:
 
@@ -514,7 +525,7 @@ The sole outer `-p` emission constructs exactly two publications for every box:
 
 Profile `openPorts` remains private inner-runtime metadata. A normal bridged launch rejects TCP intervals overlapping Router `8080`/`8081` and UDP intervals overlapping reserved `7882`. Other declarations can create private Box targets but never a physical-host mapping. AgentServer gets an engine-assigned private mapping to port `7000` when its execution mode needs one; a start-only service instead uses a blocking health script, an admitted `/base-agent-additional-server/<agentName>/<port>/<path>` target, another intentional private readiness target, or `readiness.protocol: "none"`.
 
-Additional private agent servers use the agent-port convention and must have a matching `routerAccess.httpRoutes` declaration. Each target is installed into one immutable exact-byte route-and-policy authorization generation used by HTTP and WebSocket. Candidate route or policy files do not change live decisions until coordinated apply inactivates affected selectors, validates the complete candidate, and atomically installs it. Every request revalidates its captured authorization generation immediately before upstream dial.
+Additional private agent servers use the agent-port convention and must have a matching `routerAccess.httpRoutes` declaration. Each target is installed into one immutable exact-byte route-and-policy authorization generation used by HTTP and WebSocket. General route/policy additions and removals do not change live decisions until coordinated apply inactivates affected selectors, validates the complete candidate, and atomically installs it. An exact direct runtime replacement instead uses an additive immutable candidate, keeps its predecessor selected through readiness, and flips the selector only in the final atomic commit. Every request revalidates its captured authorization generation immediately before upstream dial.
 
 RoutingServer owns public/control `8080` and managed-private `8081`; the latter is not outer-published. Detailed health is on an unmounted supervisor Unix socket. Cloudflared is pinned in the outer image and always targets in-box `http://127.0.0.1:8080`; no separate publication agent or nginx layer exists. Credential absence is explicit local-only mode with no connector or public HTTP hostname. Existing-tunnel API mode uses separate connector-token and least-privilege DNS/ingress API-token handles. Connector-only mode supervises a token-selected tunnel while an operator maintains its Cloudflare routes. Ploinky-managed mode takes account, zone, requested tunnel name, and an API-token handle; it persists a unique ownership intent before creation, retrieves the connector token only in memory, and reconciles ingress and DNS. Deletion is opt-in and is allowed only for the exact registry-owned tunnel. Changing the requested name retains the former allocation until its own empty-host teardown is selected. Partial or invalid state fails closed, and Ploinky never creates a quick tunnel. An already-selected `local-ready` generation is adopted by the publication supervisor without a duplicate route apply when no previous Cloudflare ownership journal exists. Cloudflare activation and teardown still inactivate first and use the serialized coordinated-apply path.
 

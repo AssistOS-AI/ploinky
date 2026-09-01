@@ -565,6 +565,7 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
                                         shortAgentName: resolved.shortAgentName,
                                         agentPath: path.dirname(resolved.manifestPath),
                                         alias: registryRecord?.record?.alias || '',
+                                        networkLifecycleCapability,
                                     });
                                 } catch (error) {
                                     cleanupFailedPreparedRuntime(result, error, 'manual-start-readiness-failed');
@@ -622,6 +623,7 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
                                     shortAgentName: resolved.shortAgentName,
                                     agentPath,
                                     alias: registryRecord?.record?.alias || '',
+                                    networkLifecycleCapability,
                                 });
                             } catch (error) {
                                 cleanupFailedPreparedRuntime(restartResult, error, 'manual-restart-readiness-failed');

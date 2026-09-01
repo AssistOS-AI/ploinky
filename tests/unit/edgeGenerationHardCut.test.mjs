@@ -1165,6 +1165,39 @@ test('prepared runtime identity returns the immutable staged registry record', (
     abortEdgeRoutingPreparation(prepared.preparationLease, { workspaceRoot: fixture.workspace });
 });
 
+test('active Router attestation binds the exact unchanged runtime owner without preparing a generation', (t) => {
+    const fixture = createFixture(t);
+    const active = applyEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+        reason: 'active-attestation-owner',
+    });
+    const owner = {
+        containerName: 'alpha-container',
+        principal: 'agent:fixtures/alpha',
+        instanceId: 'alpha-instance',
+        enableGeneration: 'alpha-enable-generation',
+    };
+    const lease = createRouterAttestationGenerationLease({
+        workspaceRoot: fixture.workspace,
+        expectedOwner: owner,
+    });
+    assert.equal(lease.id, active.selector.generation);
+    assert.deepEqual(lease.owner, owner);
+    assert.equal(lease.commit(), true);
+    assert.equal(lease.checkpoint('pre-credentials'), true);
+    assert.equal(lease.checkpoint('pre-runtime'), true);
+    assert.equal(lease.checkpoint('post-inspection'), true);
+    assert.equal(lease.complete, true);
+    assert.equal(loadActiveEdgeRoutingGeneration({
+        workspaceRoot: fixture.workspace,
+    }).selector.generation, active.selector.generation);
+
+    assert.throws(() => createRouterAttestationGenerationLease({
+        workspaceRoot: fixture.workspace,
+        expectedOwner: { ...owner, instanceId: 'unrelated-instance' },
+    }), { code: 'EDGE_GENERATION_STALE' });
+});
+
 test('prepared Router attestation remains inactive and binds exact lease, owner, sources, and checkpoint order', (t) => {
     const fixture = createFixture(t);
     const prepared = prepareEdgeRoutingGeneration({

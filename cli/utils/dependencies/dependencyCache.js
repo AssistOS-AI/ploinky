@@ -878,6 +878,59 @@ export function prepareAgentCache({
     }
 }
 
+/**
+ * Resolve and validate the exact agent cache that a running container should
+ * already be using, without creating, repairing, locking, or restamping it.
+ * Healthy runtime adoption uses this read-only check so a CLI attachment can
+ * remain a true no-op; an invalid cache instead forces the ordinary staged
+ * replacement path, where mutation is authorized.
+ */
+export function inspectAgentCache({
+    repoName,
+    agentName,
+    runtimeKey,
+    agentPackagePath = null,
+    image = '',
+    runtime = null,
+    agentLib = null,
+} = {}) {
+    if (!repoName || !agentName) {
+        throw new Error('inspectAgentCache requires repoName and agentName');
+    }
+    const selection = agentLib || activeAgentLibSelection();
+    const backend = resolveInstallBackend(runtimeKey, { image, runtime });
+    const expectedInstaller = installerMetadata(runtimeKey, backend);
+    const globalPkg = readGlobalDepsPackage();
+    const agentPkg = (agentPackagePath && fs.existsSync(agentPackagePath))
+        ? JSON.parse(fs.readFileSync(agentPackagePath, 'utf8'))
+        : null;
+    const mergedPackageHash = hashMergedPackage(mergePackageJson(globalPkg, agentPkg));
+    const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
+    const cache = isAgentCacheValid(cachePath, {
+        runtimeKey,
+        mergedPackageHash,
+        installer: expectedInstaller,
+    });
+    if (!cache.valid) {
+        return Object.freeze({
+            cachePath,
+            valid: false,
+            reason: cache.reason,
+            mergedPackageHash,
+        });
+    }
+    const link = isAgentLibLinkValid(cachePath, {
+        runtimeKey,
+        agentLib: selection,
+    });
+    return Object.freeze({
+        cachePath,
+        valid: link.valid,
+        reason: link.reason,
+        mergedPackageHash,
+    });
+}
+
 function seedFromGlobalCache(globalCachePath, agentCachePath, {
     log = debugLog,
     allowHardlinks = true,
