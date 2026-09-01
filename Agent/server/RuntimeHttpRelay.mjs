@@ -39,6 +39,14 @@ function removeStaleRelaySocket(socketPath) {
         identity = fs.lstatSync(socketPath);
     } catch (error) {
         if (error?.code === 'ENOENT') return;
+        if (isUnsupportedRelaySocketIdentity(error)) {
+            // This fixed filename lives inside the exact per-container 0700
+            // control directory validated by the caller. unlink(2) never
+            // follows a substituted symlink, so the macOS projection fallback
+            // remains confined to that broker-only namespace.
+            fs.unlinkSync(socketPath);
+            return;
+        }
         throw error;
     }
     if (!identity.isSocket() || identity.isSymbolicLink()) {
@@ -58,14 +66,22 @@ function relaySocketIdentity(socketPath) {
     return Object.freeze({ dev: identity.dev, ino: identity.ino, uid: identity.uid });
 }
 
-function removeOwnedRelaySocket(socketPath, ownedIdentity) {
-    if (!ownedIdentity) return;
+function removeOwnedRelaySocket(socketPath, ownedIdentity, ownsUnsupportedSocketProjection = false) {
+    if (!ownedIdentity && !ownsUnsupportedSocketProjection) return;
     let current;
     try {
         current = fs.lstatSync(socketPath);
     } catch (error) {
         if (error?.code === 'ENOENT') return;
+        if (ownsUnsupportedSocketProjection && isUnsupportedRelaySocketIdentity(error)) {
+            fs.unlinkSync(socketPath);
+            return;
+        }
         throw error;
+    }
+    if (!ownedIdentity && ownsUnsupportedSocketProjection) {
+        if (current.isSocket() && !current.isSymbolicLink()) fs.unlinkSync(socketPath);
+        return;
     }
     if (current.isSocket() && !current.isSymbolicLink()
         && current.dev === ownedIdentity.dev
@@ -118,6 +134,7 @@ async function serveSocketBroker(socketPath, readyPath) {
     const workers = new Set();
     const sockets = new Set();
     let ownedSocketIdentity = null;
+    let ownsUnsupportedSocketProjection = false;
     const server = net.createServer(socket => {
         sockets.add(socket);
         const worker = spawn(process.execPath, [relayScriptPath, 'stdio'], {
@@ -163,10 +180,11 @@ async function serveSocketBroker(socketPath, readyPath) {
                 // that object with ENOTSUP. The successful bind is sufficient
                 // to publish readiness in that one projection mode: the Router
                 // separately validates the authoritative outer directory and
-                // socket identity before every connection. Retain no cleanup
-                // identity in this case, so this process can never unlink a
-                // path it could not classify; the owning Router removes the
-                // exact socket from the 0700 control directory before launch.
+                // socket identity before every connection. Record this exact
+                // projection mode so cleanup can unlink only the fixed broker
+                // filename inside its validated 0700 control directory even
+                // when metadata remains unavailable; unlink does not follow a
+                // substituted symlink outside that private namespace.
                 try {
                     ownedSocketIdentity = await readRelaySocketIdentityWithRetry(
                         () => relaySocketIdentity(socketPath),
@@ -178,6 +196,7 @@ async function serveSocketBroker(socketPath, readyPath) {
                 } catch (error) {
                     if (!isUnsupportedRelaySocketIdentity(error)) throw error;
                     ownedSocketIdentity = null;
+                    ownsUnsupportedSocketProjection = true;
                 }
                 fs.mkdirSync(readyPath, { mode: 0o700 });
                 server.off('error', onError);
@@ -186,7 +205,13 @@ async function serveSocketBroker(socketPath, readyPath) {
                 restoreUmask();
                 server.off('error', onError);
                 server.close(() => {
-                    try { removeOwnedRelaySocket(socketPath, ownedSocketIdentity); } catch (_) {}
+                    try {
+                        removeOwnedRelaySocket(
+                            socketPath,
+                            ownedSocketIdentity,
+                            ownsUnsupportedSocketProjection,
+                        );
+                    } catch (_) {}
                     try { removeRelayReadyMarker(readyPath); } catch (_) {}
                     reject(error);
                 });
@@ -212,7 +237,13 @@ async function serveSocketBroker(socketPath, readyPath) {
         for (const socket of sockets) socket.destroy();
         for (const worker of workers) worker.kill('SIGTERM');
         server.close(() => {
-            try { removeOwnedRelaySocket(socketPath, ownedSocketIdentity); } catch (_) {}
+            try {
+                removeOwnedRelaySocket(
+                    socketPath,
+                    ownedSocketIdentity,
+                    ownsUnsupportedSocketProjection,
+                );
+            } catch (_) {}
             try { removeRelayReadyMarker(readyPath); } catch (_) {}
         });
     };
@@ -225,7 +256,13 @@ async function serveSocketBroker(socketPath, readyPath) {
     process.once('SIGINT', stop);
     process.once('SIGHUP', stop);
     process.once('exit', () => {
-        try { removeOwnedRelaySocket(socketPath, ownedSocketIdentity); } catch (_) {}
+        try {
+            removeOwnedRelaySocket(
+                socketPath,
+                ownedSocketIdentity,
+                ownsUnsupportedSocketProjection,
+            );
+        } catch (_) {}
         try { removeRelayReadyMarker(readyPath); } catch (_) {}
     });
 }

@@ -963,6 +963,8 @@ test('runtime relay retries shared-filesystem bind release and unlinks only its 
     assert.match(source, /removeOwnedRelaySocket/);
     assert.match(source, /current\.dev === ownedIdentity\.dev/);
     assert.match(source, /current\.ino === ownedIdentity\.ino/);
+    assert.match(source, /ownsUnsupportedSocketProjection/);
+    assert.match(source, /isUnsupportedRelaySocketIdentity\(error\)[\s\S]*fs\.unlinkSync\(socketPath\)/);
     assert.match(source, /requireRelayReadyPath/);
     assert.doesNotMatch(
         source,
