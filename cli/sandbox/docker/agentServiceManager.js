@@ -2231,13 +2231,14 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         // shared-filesystem socket projection cannot leak across generations.
         // Per-request directories remain untouched and fail closed separately.
         prepareHealthProbeHostDirForLaunch(containerName);
-        const cleanupLegacyMountpoints = prepareLegacyGuardMountpointCleanup();
-        let res;
-        try {
-            res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
-        } finally {
-            cleanupLegacyMountpoints();
-        }
+        const res = withNetworkLifecycleLock(() => {
+            const cleanupLegacyMountpoints = prepareLegacyGuardMountpointCleanup();
+            try {
+                return spawnSync(runtime, createArgs, { stdio: 'inherit' });
+            } finally {
+                cleanupLegacyMountpoints();
+            }
+        }, { waitMs: 15 * 60 * 1000 });
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
     };
     let cleanupReceipt = beginCandidateLifecycle({

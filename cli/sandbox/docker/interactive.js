@@ -32,6 +32,7 @@ import {
     legacyAgentGuardTargets,
     prepareLegacyGuardMountpointCleanup,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
+import { withNetworkLifecycleLock } from '../networkLifecycle.js';
 import {
     agentLibAliasShadows,
     agentLibGrant,
@@ -60,12 +61,14 @@ function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
 }
 
 function createWithLegacyMountpointCleanup(create) {
-    const cleanup = prepareLegacyGuardMountpointCleanup();
-    try {
-        return create();
-    } finally {
-        cleanup();
-    }
+    return withNetworkLifecycleLock(() => {
+        const cleanup = prepareLegacyGuardMountpointCleanup();
+        try {
+            return create();
+        } finally {
+            cleanup();
+        }
+    }, { waitMs: 15 * 60 * 1000 });
 }
 
 function buildInteractiveCommandCreateCommand({
