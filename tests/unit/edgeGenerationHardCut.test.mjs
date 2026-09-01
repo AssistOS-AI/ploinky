@@ -1117,6 +1117,24 @@ test('legacy manifest service inventory is rejected instead of silently retained
     );
 });
 
+test('invalid manifest capability requirements fail edge compilation', (t) => {
+    const fixture = createFixture(t, {
+        alphaManifest: {
+            routerAccess: {
+                requiredCapability: 'invalid capability',
+                httpRoutes: [{
+                    path: '/base-agent-additional-server/alpha/7000/*',
+                    access: 'authenticated',
+                }],
+            },
+        },
+    });
+    assert.throws(
+        () => applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'invalid-capability' }),
+        /requiredCapability must be a non-empty capability identifier/i,
+    );
+});
+
 test('durable preparation remains inactive until its exact lease commits', (t) => {
     const fixture = createFixture(t);
     const prepared = prepareEdgeRoutingGeneration({

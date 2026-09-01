@@ -393,6 +393,33 @@ export function createGenericAuthBridge(options = {}) {
         throw new Error('authenticateAgent via client_credentials is not supported by the generic bridge. Use caller-assertion signed requests instead.');
     }
 
+    async function runProviderAdminOperation(operationName, payload = {}) {
+        const { provider } = await ensureProvider();
+        const operation = provider?.[operationName];
+        if (typeof operation !== 'function') {
+            const error = new Error('provider_user_admin_unsupported');
+            error.code = 'provider_user_admin_unsupported';
+            throw error;
+        }
+        return operation.call(provider, payload);
+    }
+
+    async function listUsers(payload = {}) {
+        return runProviderAdminOperation('sso_admin_list_users', payload);
+    }
+
+    async function createUser(payload = {}) {
+        return runProviderAdminOperation('sso_admin_create_user', payload);
+    }
+
+    async function updateUser(payload = {}) {
+        return runProviderAdminOperation('sso_admin_update_user', payload);
+    }
+
+    async function deleteUser(payload = {}) {
+        return runProviderAdminOperation('sso_admin_delete_user', payload);
+    }
+
     return {
         isConfigured,
         reloadConfig,
@@ -404,6 +431,10 @@ export function createGenericAuthBridge(options = {}) {
         logout,
         revokeSession,
         getSessionCookieMaxAge,
-        authenticateAgent
+        authenticateAgent,
+        listUsers,
+        createUser,
+        updateUser,
+        deleteUser
     };
 }

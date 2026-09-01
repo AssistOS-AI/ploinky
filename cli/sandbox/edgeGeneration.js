@@ -10,6 +10,7 @@ import {
     ROUTING_FILE,
 } from '../utils/config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
+import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import {
@@ -764,6 +765,10 @@ function validateRoutingShape(routing, manifests) {
             assertObject(manifest, `manifest(${routeKey})`);
             if (Object.prototype.hasOwnProperty.call(manifest, 'httpServices')) {
                 throw edgeError(`manifest(${routeKey}).httpServices is unsupported; use routerAccess.httpRoutes with agent-port convention paths`);
+            }
+            if (manifest?.routerAccess?.requiredCapability !== undefined
+                && normalizeRequiredCapability(manifest.routerAccess.requiredCapability) === null) {
+                throw edgeError(`manifest(${routeKey}).routerAccess.requiredCapability must be a non-empty capability identifier of at most 128 characters`);
             }
         }
     }

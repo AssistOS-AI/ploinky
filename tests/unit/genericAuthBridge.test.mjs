@@ -82,6 +82,22 @@ export function createProvider({ getConfig }) {
             recordCall('sso_logout', { providerSession, postLogoutRedirectUri });
             return { redirectUrl: 'https://fake.test/logout' };
         },
+        async sso_admin_list_users(payload) {
+            recordCall('sso_admin_list_users', payload);
+            return { users: [{ id: 'u1', username: 'alice', roles: ['admin'] }], availableRoles: ['admin', 'user'] };
+        },
+        async sso_admin_create_user(payload) {
+            recordCall('sso_admin_create_user', payload);
+            return { id: 'u2', username: payload.username, roles: payload.roles || ['user'] };
+        },
+        async sso_admin_update_user(payload) {
+            recordCall('sso_admin_update_user', payload);
+            return { id: payload.userId, username: payload.username, roles: payload.roles || ['user'] };
+        },
+        async sso_admin_delete_user(payload) {
+            recordCall('sso_admin_delete_user', payload);
+            return { id: payload.userId, status: 'blocked' };
+        },
         invalidateCaches() {}
     };
 }
@@ -248,4 +264,20 @@ test('response-free SSO validation is single-flight per auth session', async (t)
     assert.equal(first.providerSession.tokens.accessToken, 'AT2');
     assert.equal(second, first);
     assert.equal(third, first);
+});
+
+test('provider-neutral admin operations are delegated without interpreting provider payloads', async () => {
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    const bridge = createGenericAuthBridge();
+    const listed = await bridge.listUsers({ actorUserId: 'admin-1' });
+    const created = await bridge.createUser({ actorUserId: 'admin-1', username: 'bob', roles: ['user'] });
+    const updated = await bridge.updateUser({ actorUserId: 'admin-1', userId: 'u2', username: 'robert' });
+    const deleted = await bridge.deleteUser({ actorUserId: 'admin-1', userId: 'u2' });
+
+    assert.deepEqual(listed.availableRoles, ['admin', 'user']);
+    assert.equal(created.id, 'u2');
+    assert.equal(updated.username, 'robert');
+    assert.equal(deleted.status, 'blocked');
+    const adminCalls = readCalls().filter((call) => call.op.startsWith('sso_admin_'));
+    assert.deepEqual(adminCalls.map((call) => call.payload.actorUserId), ['admin-1', 'admin-1', 'admin-1', 'admin-1']);
 });

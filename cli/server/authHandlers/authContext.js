@@ -9,6 +9,7 @@ import { waitForAgentReady } from '../utils/agentReadiness.js';
 import { BROWSER_CSRF_COOKIE_NAME, mintBrowserCsrfToken } from '../browserMutationSecurity.js';
 import { HttpRouteAccessPath } from '../policy/HttpRouteAccessPath.js';
 import { HttpRouteAccessPolicy } from '../policy/HttpRouteAccessPolicy.js';
+import { evaluateRequiredCapabilities } from './requiredCapability.js';
 import {
     appendLog,
     appendSetCookie,
@@ -677,6 +678,30 @@ export async function ensureAgentAuthenticated(req, res, parsedUrl) {
 }
 
 function finalizeAuthenticatedRequest(req, res, authContext, options, session) {
+    const routes = readRouting(options).routes || {};
+    const capabilityRouteKeys = [...new Set([
+        String(authContext?.routeKey || '').trim(),
+        String(authContext?.serviceRouteKey || '').trim(),
+    ].filter(Boolean))];
+    const privilegedLocalCli = req.authMode === 'local'
+        && req.authChannel === 'cli'
+        && req.user?.id === 'local:admin';
+    const capabilityDecision = privilegedLocalCli
+        ? { ok: true, requiredCapabilities: [] }
+        : evaluateRequiredCapabilities(
+            capabilityRouteKeys.map((routeKey) => readEnabledAgentManifest(routeKey, routes, options)),
+            req.user,
+        );
+    if (!capabilityDecision.ok) {
+        sendJson(res, 403, {
+            ok: false,
+            error: capabilityDecision.error,
+            ...(capabilityDecision.requiredCapability
+                ? { requiredCapability: capabilityDecision.requiredCapability }
+                : {}),
+        });
+        return { ok: false, error: capabilityDecision.error };
+    }
     req.edgeAuthContext = authContext;
     if (req.sessionId && options.routePlan?.lease?.id) {
         try {
@@ -771,7 +796,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
         }
         const ssoCookie = cookies.get(SSO_AUTH_COOKIE_NAME);
         if (ssoCookie && authService.isConfigured()) {
-            const ssoSession = authService.getSession(ssoCookie);
+            const ssoSession = await authService.validateSession(ssoCookie);
             if (ssoSession && (!ssoSession.expiresAt || Date.now() <= ssoSession.expiresAt)) {
                 req.user = ssoSession.user;
                 req.session = ssoSession;
@@ -829,7 +854,7 @@ async function ensureAuthenticatedWithContext(req, res, parsedUrl, authContext, 
     }
     let session = authContext.mode === 'local'
         ? await sessionTokenService.getUserSession(sessionId, { policy: authContext.policy })
-        : authService.getSession(sessionId);
+        : await authService.validateSession(sessionId);
     if (authContext.mode === 'sso' && (!session || (session.expiresAt && Date.now() > session.expiresAt))) {
         try {
             await authService.refreshSession(sessionId);

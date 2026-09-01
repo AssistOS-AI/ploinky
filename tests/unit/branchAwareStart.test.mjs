@@ -54,6 +54,7 @@ const {
     applyManifestDirectives,
     manifestEnableEntries,
     prepareExplicitRepositoryBranches,
+    resolveManifestSsoProvider,
 } = bootstrapManifestMod;
 const { bootstrap } = ploinkybootMod;
 
@@ -708,6 +709,52 @@ test('manifestEnableEntries: default profile enable is used when active profile 
     });
 
     assert.deepEqual(entries, ['base-agent', 'default-profile-agent']);
+});
+
+test('resolveManifestSsoProvider: qualifies a same-repository provider without hard-coding its identity', () => {
+    writeAgentManifest('manifestSsoRepo', 'provider', {
+        container: 'node:20',
+        ssoProvider: true,
+    });
+
+    assert.equal(resolveManifestSsoProvider({
+        ploinky: 'sso enable',
+        sso: { providerAgent: 'provider' },
+    }, 'manifestSsoRepo'), 'manifestSsoRepo/provider');
+    assert.equal(resolveManifestSsoProvider({
+        ploinky: 'pwd enable',
+        sso: { providerAgent: 'provider' },
+    }, 'manifestSsoRepo'), '');
+    assert.throws(
+        () => resolveManifestSsoProvider({ ploinky: 'sso enable', sso: { providerAgent: ' ' } }, 'manifestSsoRepo'),
+        /non-empty agent reference/i,
+    );
+});
+
+test('applyManifestDirectives: declarative SSO provider is enabled and bound after dependencies', async () => {
+    writeAgentManifest('manifestSsoBind', 'provider', {
+        container: 'node:20',
+        ssoProvider: true,
+    });
+    writeAgentManifest('manifestSsoBind', 'app', {
+        container: 'node:20',
+        ploinky: 'sso enable',
+        sso: { providerAgent: 'provider' },
+        enable: ['provider'],
+    });
+
+    await applyManifestDirectives('manifestSsoBind/app', {
+        enableAgentImpl: recordEnabledAgentWithoutRuntime,
+    });
+
+    const agents = JSON.parse(fs.readFileSync(path.join(tempDir, '.ploinky', 'agents.json'), 'utf8'));
+    assert.equal(agents._config?.sso?.enabled, true);
+    assert.equal(agents._config?.sso?.providerAgent, 'manifestSsoBind/provider');
+    assert.ok(Object.values(agents).some((record) => (
+        record?.type === 'agent'
+        && record.repoName === 'manifestSsoBind'
+        && record.agentName === 'provider'
+    )));
 });
 
 test('applyManifestDirectives: child manifest repos are applied before recursive enables resolve', async () => {

@@ -984,7 +984,7 @@ test('auth mode none preserves valid local sessions for router policy', async (t
 });
 
 test('local CLI channel crosses configured surface auth without weakening browser sessions', async (t) => {
-    const { authHandlers, localService } = await withAuthModules(t);
+    const { authHandlers, localService, createRoutePlan } = await withAuthModules(t);
     const user = {
         id: 'local:admin',
         username: 'admin',
@@ -999,10 +999,15 @@ test('local CLI channel crosses configured surface auth without weakening browse
         cookie: `ploinky_jwt=${cliToken}`,
     });
     const cliRes = new MockResponse();
+    const snapshot = createRoutePlan().snapshot;
+    snapshot.manifests.explorer = {
+        routerAccess: { requiredCapability: 'explorer.access' },
+    };
     const cliResult = await authHandlers.ensureAuthenticated(
         cliReq,
         cliRes,
         new URL(cliReq.url, 'http://localhost'),
+        { snapshot },
     );
 
     assert.equal(cliResult.ok, true);
@@ -1140,13 +1145,17 @@ test('an SSO user session takes precedence over guest minting on guest routes', 
     const { authHandlers, authService } = await withAuthModules(t);
     const originalIsConfigured = authService.isConfigured;
     const originalGetSession = authService.getSession;
+    const originalValidateSession = authService.validateSession;
     authService.isConfigured = () => true;
-    authService.getSession = (id) => id === 'sso-cookie-1'
+    const sessionFor = (id) => id === 'sso-cookie-1'
         ? { user: { id: 'sso:alice', username: 'alice', roles: ['user'] }, expiresAt: Date.now() + 60_000 }
         : null;
+    authService.getSession = sessionFor;
+    authService.validateSession = async (id) => sessionFor(id);
     t.after(() => {
         authService.isConfigured = originalIsConfigured;
         authService.getSession = originalGetSession;
+        authService.validateSession = originalValidateSession;
     });
 
     const req = makeRequest({ method: 'GET', url: '/webAssist/page', cookie: 'ploinky_sso=sso-cookie-1' });
@@ -1161,6 +1170,64 @@ test('an SSO user session takes precedence over guest minting on guest routes', 
     assert.equal(req.authMode, 'sso');
     assert.equal(req.user.username, 'alice');
     assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+});
+
+test('an authenticated route enforces its manifest capability against the live SSO identity', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    const originalIsConfigured = authService.isConfigured;
+    const originalValidateSession = authService.validateSession;
+    authService.isConfigured = () => true;
+    let capabilities = [];
+    authService.validateSession = async (sessionId) => sessionId === 'sso-capability-session'
+        ? {
+            user: { id: 'sso:member', username: 'member', roles: ['user'], capabilities },
+            expiresAt: Date.now() + 60_000,
+        }
+        : null;
+    t.after(() => {
+        authService.isConfigured = originalIsConfigured;
+        authService.validateSession = originalValidateSession;
+    });
+
+    const routePlan = createRoutePlan();
+    routePlan.snapshot.manifests.explorer = {
+        routerAccess: { requiredCapability: 'explorer.access' },
+    };
+    const decision = { access: 'authenticated', routeKey: 'explorer', source: 'policy' };
+
+    const deniedReq = makeRequest({
+        method: 'GET',
+        url: '/explorer/index.html',
+        cookie: 'ploinky_sso=sso-capability-session',
+    });
+    const deniedRes = new MockResponse();
+    const denied = await authHandlers.ensureHttpRouteAccess(
+        deniedReq,
+        deniedRes,
+        new URL(deniedReq.url, 'http://localhost'),
+        decision,
+        { routePlan },
+    );
+    assert.equal(denied.ok, false);
+    assert.equal(deniedRes.statusCode, 403);
+    assert.equal(JSON.parse(deniedRes.body).error, 'required_capability_missing');
+
+    capabilities = ['explorer.access'];
+    const allowedReq = makeRequest({
+        method: 'GET',
+        url: '/explorer/index.html',
+        cookie: 'ploinky_sso=sso-capability-session',
+    });
+    const allowedRes = new MockResponse();
+    const allowed = await authHandlers.ensureHttpRouteAccess(
+        allowedReq,
+        allowedRes,
+        new URL(allowedReq.url, 'http://localhost'),
+        decision,
+        { routePlan },
+    );
+    assert.equal(allowed.ok, true);
+    assert.deepEqual(allowedReq.user.capabilities, ['explorer.access']);
 });
 
 test('authenticated route key with guest auth falls back to static route auth instead of minting guest', async (t) => {

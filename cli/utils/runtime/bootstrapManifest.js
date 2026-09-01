@@ -5,6 +5,7 @@ import { enableAgent } from '../agents.js';
 import { findAgent } from '../utils.js';
 import { loadAgents, saveAgents } from '../workspace.js';
 import { isSsoProviderManifest } from '../agentRegistry.js';
+import { bindSsoProvider } from '../security/sso.js';
 import { PLOINKY_DIR } from '../config.js';
 import { getActiveProfile } from './profileService.js';
 
@@ -114,6 +115,16 @@ function resolveManifestAuthMode(manifest) {
         return 'sso';
     }
     return 'none';
+}
+
+export function resolveManifestSsoProvider(manifest, repoName = '') {
+    if (resolveManifestAuthMode(manifest) !== 'sso') return '';
+    const raw = manifest?.sso?.providerAgent;
+    if (raw === undefined || raw === null) return '';
+    if (typeof raw !== 'string' || !raw.trim()) {
+        throw new Error('manifest sso.providerAgent must be a non-empty agent reference');
+    }
+    return agentRefFromEnableSpec(qualifyEnableSpecForRepo(raw.trim(), repoName));
 }
 
 function agentRefFromEnableSpec(spec) {
@@ -406,6 +417,11 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 logError(`[manifest enable] Failed to ${enableAgents ? 'enable' : 'prepare'} agent '${rawEntry}': ${message}`);
             }
         }
+    }
+
+    if (enableAgents) {
+        const providerAgent = resolveManifestSsoProvider(manifest, repoName);
+        if (providerAgent) bindSsoProvider(providerAgent);
     }
 }
 

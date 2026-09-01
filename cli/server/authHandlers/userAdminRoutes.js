@@ -7,11 +7,13 @@ import {
 import { readRouterSettings, updateRouterSettings } from '../auth/routerSettings.js';
 import {
     appendSetCookie,
+    authService,
     buildCookie,
     LOCAL_AUTH_COOKIE_NAME,
     parseCookies,
     readJsonBody,
     sendJson,
+    SSO_AUTH_COOKIE_NAME,
 } from './shared.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
 
@@ -24,13 +26,28 @@ function getUserAdminErrorStatus(code = '') {
             return 401;
         case 'admin_required':
             return 403;
+        case 'sso_not_configured':
+            return 503;
         case 'local_auth_disabled':
+        case 'provider_user_admin_unsupported':
         case 'user_not_found':
         case 'not_found':
             return 404;
+        case 'email_taken':
         case 'username_taken':
         case 'last_admin_required':
         case 'roles_must_be_array':
+        case 'roles_required':
+        case 'unknown_role':
+        case 'invalid_email':
+        case 'invalid_username':
+        case 'invalid_status':
+        case 'invalid_password':
+        case 'invalid_auth_method':
+        case 'auth_method_required':
+        case 'invalid_redirect_origin':
+        case 'registration_role_required':
+        case 'registration_role_must_be_non_admin':
         case 'username_required':
         case 'password_required':
         case 'user_id_required':
@@ -48,14 +65,26 @@ function getUserAdminErrorMessage(code = '') {
             return 'Authentication required.';
         case 'admin_required':
             return 'Admin access is required.';
+        case 'sso_not_configured':
+            return 'The configured SSO provider is not available.';
         case 'local_auth_disabled':
             return 'Local auth is not enabled for this agent.';
+        case 'provider_user_admin_unsupported':
+            return 'The configured SSO provider does not support user administration.';
         case 'user_not_found':
             return 'User not found.';
         case 'not_found':
             return 'Not found.';
         case 'username_taken':
             return 'Username is already in use.';
+        case 'email_taken':
+            return 'Email is already in use.';
+        case 'invalid_status':
+            return 'User status is invalid.';
+        case 'invalid_password':
+            return 'Password does not meet the configured requirements.';
+        case 'registration_role_must_be_non_admin':
+            return 'The registration role must not grant administrative capabilities.';
         case 'last_admin_required':
             return 'At least one admin user is required.';
         case 'roles_must_be_array':
@@ -142,19 +171,28 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     const authContext = resolveAuthContextForRouteKey(route.agent, {
         snapshot: routePlan?.snapshot || routePlan?.lease?.snapshot || null,
     });
-    if (authContext.mode !== 'local' || !authContext.policy?.usersVar) {
-        sendUserAdminError(res, 'local_auth_disabled');
+    const usesLocalAuth = authContext.mode === 'local' && Boolean(authContext.policy?.usersVar);
+    const usesSsoAuth = authContext.mode === 'sso' && authService.isConfigured();
+    if (!usesLocalAuth && !usesSsoAuth) {
+        sendUserAdminError(res, authContext.mode === 'sso' ? 'sso_not_configured' : 'local_auth_disabled');
         return true;
     }
 
     const cookies = parseCookies(req);
-    const sessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME) || '';
-    const session = getLocalSession(sessionId, { policy: authContext.policy });
+    const cookieName = usesLocalAuth ? LOCAL_AUTH_COOKIE_NAME : SSO_AUTH_COOKIE_NAME;
+    const sessionId = cookies.get(cookieName) || '';
+    const session = usesLocalAuth
+        ? getLocalSession(sessionId, { policy: authContext.policy })
+        : await authService.validateSession(sessionId, { forceRemote: true });
     if (!session) {
         sendUserAdminError(res, 'authentication_required');
         return true;
     }
-    if (!isLocalAdminUser(session.user)) {
+    const isAdmin = usesLocalAuth
+        ? isLocalAdminUser(session.user)
+        : Array.isArray(session.user?.capabilities)
+            && session.user.capabilities.includes('admin.users.manage');
+    if (!isAdmin) {
         sendUserAdminError(res, 'admin_required');
         return true;
     }
@@ -187,8 +225,11 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     }
 
     try {
-        const cookie = buildCookie(LOCAL_AUTH_COOKIE_NAME, sessionId, req, '/', {
-            maxAge: getLocalSessionCookieMaxAge(),
+        const cookieMaxAge = usesLocalAuth
+            ? getLocalSessionCookieMaxAge()
+            : authService.getSessionCookieMaxAge();
+        const cookie = buildCookie(cookieName, sessionId, req, '/', {
+            maxAge: cookieMaxAge,
             sameSite: 'Lax'
         });
         res.setHeader('Set-Cookie', cookie);
@@ -205,7 +246,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 req,
                 `/api/agents/${encodeURIComponent(route.agent)}`,
                 {
-                    maxAge: getLocalSessionCookieMaxAge(),
+                    maxAge: cookieMaxAge,
                     sameSite: 'Strict',
                 },
             ));
@@ -246,12 +287,18 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
         }
 
         if (method === 'GET' && !route.userId) {
-            const users = listLocalAuthUsers(authContext.policy)
-                .sort((left, right) => String(left.username || '').localeCompare(String(right.username || '')));
+            const result = usesLocalAuth
+                ? {
+                    users: listLocalAuthUsers(authContext.policy),
+                    availableRoles: listLocalAuthRoles(authContext.policy),
+                }
+                : await authService.listUsers({ actorUserId: session.user.id, start: 0, pageSize: 500 });
+            const users = (result.users || [])
+                .sort((left, right) => String(left.username || left.email || '').localeCompare(String(right.username || right.email || '')));
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
-                availableRoles: listLocalAuthRoles(authContext.policy),
+                availableRoles: result.availableRoles || [],
                 users
             });
             return true;
@@ -263,14 +310,17 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
                 return true;
             }
-            const user = createLocalAuthUser({
-                policy: authContext.policy,
+            const input = {
                 username: body?.username,
                 password: body?.password,
                 name: body?.name,
+                displayName: body?.displayName ?? body?.name,
                 email: body?.email,
-                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined
-            });
+                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined,
+            };
+            const user = usesLocalAuth
+                ? createLocalAuthUser({ policy: authContext.policy, ...input })
+                : await authService.createUser({ ...input, actorUserId: session.user.id });
             sendJson(res, 201, {
                 ok: true,
                 agent: authContext.routeKey,
@@ -285,15 +335,19 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
                 return true;
             }
-            const user = updateLocalAuthUser({
-                policy: authContext.policy,
-                id: route.userId,
+            const input = {
                 username: Object.prototype.hasOwnProperty.call(body || {}, 'username') ? body.username : undefined,
                 password: Object.prototype.hasOwnProperty.call(body || {}, 'password') ? body.password : undefined,
                 name: Object.prototype.hasOwnProperty.call(body || {}, 'name') ? body.name : undefined,
+                displayName: Object.prototype.hasOwnProperty.call(body || {}, 'displayName')
+                    ? body.displayName
+                    : (Object.prototype.hasOwnProperty.call(body || {}, 'name') ? body.name : undefined),
                 email: Object.prototype.hasOwnProperty.call(body || {}, 'email') ? body.email : undefined,
-                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined
-            });
+                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined,
+            };
+            const user = usesLocalAuth
+                ? updateLocalAuthUser({ policy: authContext.policy, id: route.userId, ...input })
+                : await authService.updateUser({ ...input, userId: route.userId, actorUserId: session.user.id });
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
@@ -307,10 +361,9 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
                 return true;
             }
-            const user = deleteLocalAuthUser({
-                policy: authContext.policy,
-                id: route.userId
-            });
+            const user = usesLocalAuth
+                ? deleteLocalAuthUser({ policy: authContext.policy, id: route.userId })
+                : await authService.deleteUser({ userId: route.userId, actorUserId: session.user.id });
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
@@ -329,7 +382,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
             sendJson(res, 400, { ok: false, error: code, message: 'Request body must be valid JSON.' });
             return true;
         }
-        sendUserAdminError(res, code, error?.message || String(error));
+        sendUserAdminError(res, code);
         return true;
     }
 }

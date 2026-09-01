@@ -62,7 +62,10 @@ function makeRequest({
     req.socket = { encrypted: false };
     if (['POST', 'PATCH', 'DELETE'].includes(method) && csrf !== 'missing') {
         req.headers.origin = origin || 'http://localhost';
-        const sessionId = String(cookie).split(';').map((part) => part.trim()).find((part) => part.startsWith('ploinky_jwt='))?.slice('ploinky_jwt='.length) || '';
+        const authCookiePart = String(cookie).split(';').map((part) => part.trim()).find((part) => (
+            part.startsWith('ploinky_jwt=') || part.startsWith('ploinky_sso=')
+        ));
+        const sessionId = authCookiePart ? authCookiePart.slice(authCookiePart.indexOf('=') + 1) : '';
         req.session = getLocalSession?.(sessionId) || null;
         if (csrf !== 'browser') req.headers['x-ploinky-csrf-token'] = csrf === 'valid' && mintAdminCsrfToken
             ? mintAdminCsrfToken({ sessionId, req })
@@ -497,4 +500,103 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     assert.equal(result.statusCode, 403);
     assert.equal(result.body.error, 'admin_required');
     assert.equal(responseCookie(result, 'ploinky_user_admin_csrf'), '');
+
+    const ssoSnapshot = {
+        generation: 'sso-user-admin-generation',
+        routing: {
+            static: { agent: 'explorer' },
+            routes: { explorer: { repo: 'AssistOSExplorer', agent: 'explorer' } },
+        },
+        agents: {
+            explorer: {
+                type: 'agent',
+                agentName: 'explorer',
+                repoName: 'AssistOSExplorer',
+                auth: { mode: 'sso' },
+            },
+        },
+        manifests: {},
+    };
+    const ssoRoutePlan = {
+        snapshot: ssoSnapshot,
+        lease: { id: ssoSnapshot.generation, snapshot: ssoSnapshot, commit: () => true },
+    };
+    const authService = authHandlers.authService;
+    const originals = {
+        isConfigured: authService.isConfigured,
+        validateSession: authService.validateSession,
+        listUsers: authService.listUsers,
+        createUser: authService.createUser,
+    };
+    const providerCalls = [];
+    authService.isConfigured = () => true;
+    authService.validateSession = async (sessionId, options) => {
+        providerCalls.push({ operation: 'validateSession', sessionId, options });
+        if (sessionId === 'sso-role-only-session') {
+            return {
+                user: {
+                    id: 'role-only-admin',
+                    roles: ['admin'],
+                    capabilities: [],
+                },
+                expiresAt: Date.now() + 60_000,
+            };
+        }
+        return sessionId === 'sso-admin-session'
+            ? {
+                user: {
+                    id: 'persisto-admin',
+                    username: 'owner@example.test',
+                    roles: ['owner'],
+                    capabilities: ['admin.users.manage'],
+                },
+                expiresAt: Date.now() + 60_000,
+            }
+            : null;
+    };
+    authService.listUsers = async (payload) => {
+        providerCalls.push({ operation: 'listUsers', payload });
+        return {
+            users: [{ id: 'persisto-user', email: 'member@example.test', roles: ['user'] }],
+            availableRoles: ['admin', 'user'],
+        };
+    };
+    authService.createUser = async (payload) => {
+        providerCalls.push({ operation: 'createUser', payload });
+        return { id: 'persisto-new-user', email: payload.email, roles: payload.roles };
+    };
+    try {
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            url: '/api/agents/explorer/users',
+            cookie: 'ploinky_sso=sso-role-only-session',
+            routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.statusCode, 403);
+        assert.equal(result.body.error, 'admin_required');
+
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            url: '/api/agents/explorer/users',
+            cookie: 'ploinky_sso=sso-admin-session',
+            routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+        assert.equal(result.body.users[0].email, 'member@example.test');
+
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            method: 'POST',
+            url: '/api/agents/explorer/users',
+            cookie: 'ploinky_sso=sso-admin-session',
+            body: { email: 'new@example.test', password: 'new-user-pass', roles: ['user'] },
+            routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.statusCode, 201, JSON.stringify(result.body));
+        assert.equal(result.body.user.id, 'persisto-new-user');
+        assert.equal(providerCalls.filter((call) => call.operation === 'validateSession').length, 3);
+        assert.ok(providerCalls
+            .filter((call) => call.operation === 'validateSession')
+            .every((call) => call.options?.forceRemote === true));
+        assert.equal(providerCalls.find((call) => call.operation === 'createUser').payload.actorUserId, 'persisto-admin');
+    } finally {
+        Object.assign(authService, originals);
+    }
 });
