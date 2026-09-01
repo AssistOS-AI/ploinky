@@ -2,8 +2,11 @@ export const TRANSIENT_RELAY_SOCKET_ERRORS = new Set([
     'EADDRINUSE',
     'EAGAIN',
     'EBUSY',
-    'ENOTSUP',
 ]);
+
+export function isUnsupportedRelaySocketIdentity(error) {
+    return error?.code === 'ENOTSUP';
+}
 
 export async function readRelaySocketIdentityWithRetry(readIdentity, {
     attempts,

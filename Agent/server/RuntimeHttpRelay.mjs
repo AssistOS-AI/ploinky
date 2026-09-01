@@ -11,6 +11,7 @@ import {
     encodeRelayFrame,
 } from '../lib/runtimeRelayProtocol.mjs';
 import {
+    isUnsupportedRelaySocketIdentity,
     readRelaySocketIdentityWithRetry,
     TRANSIENT_RELAY_SOCKET_ERRORS,
 } from './lib/runtimeRelaySocket.mjs';
@@ -157,18 +158,27 @@ async function serveSocketBroker(socketPath, readyPath) {
         const onListening = async () => {
             try {
                 restoreUmask();
-                // A nested Podman socket becomes visible through the macOS
-                // shared-filesystem projection before lstat is guaranteed to
-                // succeed. Keep the bound server alive while that exact inode
-                // settles. Closing and rebinding here strands an unstatable
-                // socket which no later generation can safely classify.
-                ownedSocketIdentity = await readRelaySocketIdentityWithRetry(
-                    () => relaySocketIdentity(socketPath),
-                    {
-                        attempts: RUNTIME_RELAY_BIND_ATTEMPTS,
-                        wait: waitForBindRetry,
-                    },
-                );
+                // A nested Podman socket can be usable while the macOS
+                // shared-filesystem bridge permanently rejects lstat(2) for
+                // that object with ENOTSUP. The successful bind is sufficient
+                // to publish readiness in that one projection mode: the Router
+                // separately validates the authoritative outer directory and
+                // socket identity before every connection. Retain no cleanup
+                // identity in this case, so this process can never unlink a
+                // path it could not classify; the owning Router removes the
+                // exact socket from the 0700 control directory before launch.
+                try {
+                    ownedSocketIdentity = await readRelaySocketIdentityWithRetry(
+                        () => relaySocketIdentity(socketPath),
+                        {
+                            attempts: RUNTIME_RELAY_BIND_ATTEMPTS,
+                            wait: waitForBindRetry,
+                        },
+                    );
+                } catch (error) {
+                    if (!isUnsupportedRelaySocketIdentity(error)) throw error;
+                    ownedSocketIdentity = null;
+                }
                 fs.mkdirSync(readyPath, { mode: 0o700 });
                 server.off('error', onError);
                 resolve();

@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+    isUnsupportedRelaySocketIdentity,
     readRelaySocketIdentityWithRetry,
 } from '../../Agent/server/lib/runtimeRelaySocket.mjs';
 
@@ -977,7 +978,7 @@ test('runtime relay keeps one bound socket while transient identity projection s
         reads += 1;
         if (reads < 3) {
             const transient = new Error('shared socket projection is not ready');
-            transient.code = 'ENOTSUP';
+            transient.code = 'EAGAIN';
             throw transient;
         }
         return expected;
@@ -996,7 +997,7 @@ test('runtime relay fails closed when socket identity never becomes observable',
     await assert.rejects(
         readRelaySocketIdentityWithRetry(() => {
             const transient = new Error('shared socket projection is not ready');
-            transient.code = 'ENOTSUP';
+            transient.code = 'EBUSY';
             throw transient;
         }, {
             attempts: 3,
@@ -1005,6 +1006,23 @@ test('runtime relay fails closed when socket identity never becomes observable',
         (error) => error?.code === 'PLOINKY_RELAY_SOCKET_IDENTITY_UNAVAILABLE',
     );
     assert.equal(waits, 2);
+});
+
+test('runtime relay recognizes a permanent unsupported socket identity projection', async () => {
+    let waits = 0;
+    const unsupported = new Error('socket metadata is not projected');
+    unsupported.code = 'ENOTSUP';
+
+    await assert.rejects(
+        readRelaySocketIdentityWithRetry(() => { throw unsupported; }, {
+            attempts: 3,
+            wait: async () => { waits += 1; },
+        }),
+        error => error === unsupported,
+    );
+    assert.equal(waits, 0);
+    assert.equal(isUnsupportedRelaySocketIdentity(unsupported), true);
+    assert.equal(isUnsupportedRelaySocketIdentity(Object.assign(new Error(), { code: 'EBUSY' })), false);
 });
 
 test('probe runner rejects control-path substitution and malformed durations before execution', () => {
