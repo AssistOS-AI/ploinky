@@ -60,11 +60,11 @@ function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
     return targets.map(guard => `-v "${sources.get(guard.key)}:${guard.target}${suffix}"`);
 }
 
-function createWithLegacyMountpointCleanup(create) {
+function withLegacyMountpointCleanup(operation) {
     return withNetworkLifecycleLock(() => {
         const cleanup = prepareLegacyGuardMountpointCleanup();
         try {
-            return create();
+            return operation();
         } finally {
             cleanup();
         }
@@ -224,7 +224,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 containerImage,
             });
             debugLog(`Executing create command: ${createCommand}`);
-            createOutput = createWithLegacyMountpointCleanup(() => (
+            createOutput = withLegacyMountpointCleanup(() => (
                 execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim()
             ));
             containerId = createOutput;
@@ -250,7 +250,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 debugLog(`Executing retry command: ${retryCommand}`);
 
                 try {
-                    createOutput = createWithLegacyMountpointCleanup(() => (
+                    createOutput = withLegacyMountpointCleanup(() => (
                         execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim()
                     ));
                     containerId = createOutput;
@@ -314,7 +314,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
         const startCommand = `${runtime} start ${containerName}`;
         debugLog(`Executing start command: ${startCommand}`);
         try {
-            execSync(startCommand, { stdio: 'inherit' });
+            withLegacyMountpointCleanup(() => execSync(startCommand, { stdio: 'inherit' }));
         } catch (error) {
             console.error(`Error starting container. Try removing it with: ${runtime} rm ${containerName}`);
             throw error;
@@ -438,7 +438,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                 containerImage,
             });
             debugLog(`Executing create command: ${createCommand}`);
-            createWithLegacyMountpointCleanup(() => (
+            withLegacyMountpointCleanup(() => (
                 execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] })
             ));
             createdNew = true;
@@ -463,7 +463,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                     containerImage,
                 });
                 debugLog(`Executing retry command: ${retryCommand}`);
-                createWithLegacyMountpointCleanup(() => (
+                withLegacyMountpointCleanup(() => (
                     execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] })
                 ));
                 manifest.container = containerImage;
@@ -501,7 +501,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     if (!isContainerRunning(containerName)) {
         const startCommand = `${runtime} start ${containerName}`;
         debugLog(`Executing start command: ${startCommand}`);
-        try { execSync(startCommand, { stdio: 'inherit' }); }
+        try { withLegacyMountpointCleanup(() => execSync(startCommand, { stdio: 'inherit' })); }
         catch (e) { console.error('[docker.ensureAgentContainer] start failed:', e.message || e); throw e; }
     }
     syncAgentMcpConfig(containerName, absAgentPath);

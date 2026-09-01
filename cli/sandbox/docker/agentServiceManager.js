@@ -2156,9 +2156,24 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     };
 
+    let cleanupLegacyGuardMountpointsAfterStart = null;
+    const prepareLegacyGuardMountpointCleanupBeforeStart = () => {
+        if (cleanupLegacyGuardMountpointsAfterStart) {
+            throw new Error('legacy guard mountpoint cleanup is already pending');
+        }
+        cleanupLegacyGuardMountpointsAfterStart = prepareLegacyGuardMountpointCleanup();
+    };
+    const cleanupLegacyGuardMountpointCleanupAfterStart = () => {
+        const cleanup = cleanupLegacyGuardMountpointsAfterStart;
+        cleanupLegacyGuardMountpointsAfterStart = null;
+        if (!cleanup) throw new Error('legacy guard mountpoint cleanup was not prepared before runtime start');
+        cleanup();
+    };
+
     const preStartGeneratedRouterLaunch = ({ launch }) => {
         if (!launch) throw new Error('managed generated-local launch is missing before runtime start');
         launch.generationLease.checkpoint('pre-runtime');
+        prepareLegacyGuardMountpointCleanupBeforeStart();
     };
 
     const finalizeGeneratedRouterLaunch = ({ launch, record }) => {
@@ -2234,7 +2249,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const res = withNetworkLifecycleLock(() => {
             const cleanupLegacyMountpoints = prepareLegacyGuardMountpointCleanup();
             try {
-                return spawnSync(runtime, createArgs, { stdio: 'inherit' });
+                const res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
+                return res;
             } finally {
                 cleanupLegacyMountpoints();
             }
@@ -2298,6 +2314,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 createContainer,
                 prepareLaunch: prepareGeneratedRouterLaunch,
                 preStartLaunch: preStartGeneratedRouterLaunch,
+                postStartLaunch: cleanupLegacyGuardMountpointCleanupAfterStart,
                 finalizeLaunch: finalizeGeneratedRouterLaunch,
             });
         if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
@@ -2330,11 +2347,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             predecessorId: String(existingRecord.containerId || ''),
             ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
         });
-        createContainer(unmanagedNetworkLifecyclePlan);
-        launchedContainerId = String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
-            network: manifestNetwork,
-            runtimeIdentity,
-        }) || '');
+        launchedContainerId = withNetworkLifecycleLock(() => {
+            createContainer(unmanagedNetworkLifecyclePlan);
+            return String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
+                network: manifestNetwork,
+                runtimeIdentity,
+                beforeStart: prepareLegacyGuardMountpointCleanupBeforeStart,
+                afterStart: cleanupLegacyGuardMountpointCleanupAfterStart,
+            }) || '');
+        }, { waitMs: 15 * 60 * 1000 });
     }
     if (!launchedContainerId) {
         throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
