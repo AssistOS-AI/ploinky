@@ -2,7 +2,7 @@ fast_assert_volume_mount() {
   require_var "TEST_RUN_DIR"
   require_var "TEST_AGENT_CONT_NAME"
 
-  local host_dir="$TEST_RUN_DIR/.ploinky/data/test-volumes/data"
+  local host_dir="$TEST_RUN_DIR/.data/test-volumes/data"
   local marker_file="$host_dir/marker.txt"
   mkdir -p "$host_dir"
   echo "volumes-ok" >"$marker_file"

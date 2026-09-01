@@ -469,6 +469,40 @@ process.stdout.write(getConfiguredProjectPath('demo', 'repo', 'demoAlias'));`,
     }
 });
 
+test('configured project and MCP sync reject symlinked agent data homes before writing', () => {
+    const workspaceDir = tempDir();
+    const externalDir = tempDir();
+    try {
+        const agentSource = path.join(workspaceDir, 'agent-source');
+        fs.mkdirSync(path.join(workspaceDir, '.ploinky'), { recursive: true });
+        fs.mkdirSync(path.join(workspaceDir, '.data'), { recursive: true });
+        fs.mkdirSync(agentSource, { recursive: true });
+        fs.writeFileSync(path.join(agentSource, 'mcp-config.json'), '{}');
+        fs.symlinkSync(externalDir, path.join(workspaceDir, '.data', 'demo'), 'dir');
+        fs.writeFileSync(path.join(workspaceDir, '.ploinky', 'agents.json'), JSON.stringify({
+            demoContainer: {
+                type: 'agent',
+                agentName: 'demo',
+                repoName: 'repo',
+                runMode: 'isolated',
+            },
+        }));
+
+        for (const snippet of [
+            `const { getConfiguredProjectPath } = await import(${JSON.stringify(dockerCommonUrl)});\ngetConfiguredProjectPath('demo', 'repo');`,
+            `const { syncAgentMcpConfig } = await import(${JSON.stringify(dockerCommonUrl)});\nsyncAgentMcpConfig('demoContainer', ${JSON.stringify(agentSource)}, 'demo', { workDir: ${JSON.stringify(path.join(workspaceDir, '.data', 'demo'))} });`,
+        ]) {
+            const result = runModuleSnippet(snippet, {}, { cwd: workspaceDir });
+            assert.notEqual(result.status, 0, 'symlinked .data home must fail closed');
+            assert.match(result.stderr, /PLOINKY_AGENT_DATA_POLICY_VIOLATION|contains symlink component/);
+        }
+        assert.deepEqual(fs.readdirSync(externalDir), []);
+    } finally {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+        fs.rmSync(externalDir, { recursive: true, force: true });
+    }
+});
+
 test('getConfiguredProjectPath recognizes a qualified static agent identity', () => {
     const workspaceDir = tempDir();
     try {

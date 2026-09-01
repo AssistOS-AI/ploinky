@@ -6,7 +6,7 @@ import path from 'node:path';
 
 const originalCwd = process.cwd();
 const originalMasterKey = process.env.PLOINKY_MASTER_KEY;
-const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-runtime-'));
+const tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-runtime-')));
 fs.mkdirSync(path.join(tempDir, '.ploinky'), { recursive: true });
 process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = '6'.repeat(64);
@@ -47,9 +47,35 @@ test('planRuntimeResources resolves persistentStorage and templated env', () => 
         }
     });
     assert.equal(plan.persistentStorage.containerPath, '/dpu-data');
-    assert.match(plan.persistentStorage.hostPath, /dpu-data$/);
+    assert.equal(plan.persistentStorage.hostPath, path.join(tempDir, '.data', 'dpu-data'));
     assert.equal(plan.env.DPU_DATA_ROOT, '/dpu-data');
     assert.equal(plan.env.DPU_MASTER_KEY, 'test-master-key-123');
+});
+
+test('persistent storage keys are mandatory single path segments and legacy host overrides are inert', () => {
+    const previousOverride = process.env.PLOINKY_RESOURCE_DPU_DATA_HOST;
+    const previousDpuRoot = process.env.DPU_DATA_ROOT;
+    process.env.PLOINKY_RESOURCE_DPU_DATA_HOST = path.join(tempDir, 'override');
+    process.env.DPU_DATA_ROOT = path.join(tempDir, 'legacy-dpu-root');
+    try {
+        const plan = planRuntimeResources({
+            runtime: { resources: { persistentStorage: { key: 'dpu-data', containerPath: '/data' } } },
+        });
+        assert.equal(plan.persistentStorage.hostPath, path.join(tempDir, '.data', 'dpu-data'));
+        for (const key of ['', ' dpu-data ', '.', '..', 'a/b', 'a\\b', 'space key']) {
+            assert.throws(() => planRuntimeResources({
+                runtime: { resources: { persistentStorage: { key, containerPath: '/data' } } },
+            }), error => {
+                assert.equal(error.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+                return true;
+            });
+        }
+    } finally {
+        if (previousOverride === undefined) delete process.env.PLOINKY_RESOURCE_DPU_DATA_HOST;
+        else process.env.PLOINKY_RESOURCE_DPU_DATA_HOST = previousOverride;
+        if (previousDpuRoot === undefined) delete process.env.DPU_DATA_ROOT;
+        else process.env.DPU_DATA_ROOT = previousDpuRoot;
+    }
 });
 
 test('planRuntimeResources resolves generatedSecret templates', () => {

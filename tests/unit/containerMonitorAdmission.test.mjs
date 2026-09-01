@@ -73,6 +73,40 @@ test('watchdog policy rejection is terminal before target or timer creation and 
     assert.equal(respawned.targets.get('unsafe_runtime').pendingRestartTimer, null);
 });
 
+test('watchdog treats selected-profile legacy storage as terminal agent-data policy', () => {
+    fs.writeFileSync(manifestFile, JSON.stringify({
+        container: 'node:20-alpine',
+        profiles: {
+            default: { volumes: { '.ploinky/shared/legacy': '/legacy' } },
+        },
+    }));
+    const ledger = path.join(ploinkyDir, 'running', 'agent-data-terminal-ledger.json');
+    const monitor = createContainerMonitor({ terminalLedgerFile: ledger });
+    syncManagedContainers(monitor);
+    assert.equal(monitor.targets.size, 0);
+    assert.equal(monitor.terminalLedger.get('unsafe_runtime')?.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+    assert.equal(monitor.terminalLedger.get('unsafe_runtime')?.classification, 'policy');
+
+    const respawned = createContainerMonitor({ terminalLedgerFile: ledger });
+    syncManagedContainers(respawned);
+    assert.equal(respawned.targets.size, 0);
+    assert.equal(respawned.terminalLedger.get('unsafe_runtime')?.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+
+    fs.writeFileSync(manifestFile, JSON.stringify({
+        container: 'node:20-alpine',
+        volumes: { '.ploinky/data/legacy': '/legacy' },
+    }));
+    syncManagedContainers(respawned);
+    assert.equal(respawned.targets.size, 0);
+    assert.equal(respawned.terminalLedger.get('unsafe_runtime')?.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+
+    fs.writeFileSync(manifestFile, JSON.stringify({ container: 'node:20-alpine' }));
+    syncManagedContainers(respawned);
+    assert.equal(respawned.terminalLedger.has('unsafe_runtime'), false);
+    assert.equal(respawned.targets.has('unsafe_runtime'), true);
+    assert.equal(respawned.targets.get('unsafe_runtime').pendingRestartTimer, null);
+});
+
 test('watchdog expires an absent terminal tombstone using its documented bounded retention', () => {
     fs.writeFileSync(manifestFile, JSON.stringify({
         container: 'node:20-alpine',

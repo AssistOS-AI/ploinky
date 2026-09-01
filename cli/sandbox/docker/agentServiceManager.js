@@ -82,6 +82,14 @@ import {
     applyRuntimeResourceEnv,
     ensurePersistentStorageHostDir
 } from '../../utils/runtime/runtimeResourcePlanner.js';
+import {
+    assertCanonicalAgentDataPath,
+    ensureAgentDataDirectory,
+} from '../../utils/runtime/agentDataPathPolicy.js';
+import {
+    ensureLegacyAgentGuardSources,
+    legacyAgentGuardTargets,
+} from '../../utils/runtime/legacyAgentDataGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
@@ -128,6 +136,7 @@ import {
     runtimeSegment
 } from '../../utils/runtime/runtimeStaging.js';
 import {
+    assertManifestStorageAdmission,
     ensureManifestVolumeHostPath,
     resolveManifestVolumeHostPath
 } from '../../utils/runtime/manifestVolumePolicy.js';
@@ -460,7 +469,7 @@ function shouldPodmanChownManifestVolume(resolvedHostPath, options = {}) {
     if (options?.podmanChown === true) return true;
     if (options?.podmanChown === false) return false;
 
-    const dataRoot = path.resolve(PLOINKY_DIR, 'data');
+    const dataRoot = path.resolve(AGENTS_DATA_DIR);
     const resolved = path.resolve(resolvedHostPath);
     return isPathWithin(resolved, dataRoot);
 }
@@ -915,6 +924,10 @@ function buildPersistentAgentRunArgs({
     if (!healthProbeHostDir) {
         throw new Error('agent admission requires its dedicated health-probe control directory');
     }
+    const storageWorkspaceRoot = path.dirname(path.dirname(path.resolve(sharedDir)));
+    assertCanonicalAgentDataPath(sharedDir, { workspaceRoot: storageWorkspaceRoot });
+    if (isolatedHome) assertCanonicalAgentDataPath(cwd, { workspaceRoot: storageWorkspaceRoot });
+    else assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const readOnlyMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const args = [
@@ -994,6 +1007,22 @@ function appendExactManagedBindMount(args, value) {
     }
     args.push('-v', String(value));
     return true;
+}
+
+function appendLegacyAgentDataGuards(args, runtime, { workspaceRoot } = {}) {
+    const bindings = expectedBindMountsFromArgs(args).map(mount => ({
+        hostPath: mount.source,
+        runtimePath: mount.destination,
+    }));
+    const guardOptions = workspaceRoot ? { workspaceRoot } : {};
+    const targets = legacyAgentGuardTargets(bindings, guardOptions);
+    if (!targets.length) return [];
+    const sources = ensureLegacyAgentGuardSources(guardOptions);
+    const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
+    for (const guard of targets) {
+        appendExactManagedBindMount(args, `${sources.get(guard.key)}:${guard.target}${suffix}`);
+    }
+    return targets;
 }
 
 function expectedBindMountsFromArgs(args, descriptorHostFile = '') {
@@ -1425,7 +1454,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         assertManagedAdoptionMcpConfig(path.resolve(agentPath), agentWorkDir);
     } else {
         // Ensure persistent state and MCP config before creating a runtime.
-        fs.mkdirSync(agentHomeDir, { recursive: true });
+        ensureAgentDataDirectory(agentHomeDir);
         syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentWorkDir });
     }
 
@@ -1492,7 +1521,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             if (adoptManagedRuntimeOnly) {
                 requireManagedAdoptionDirectory(preparedNodeModulesDir, 'agent node_modules directory');
             } else if (!fs.existsSync(preparedNodeModulesDir)) {
-                fs.mkdirSync(preparedNodeModulesDir, { recursive: true });
+                ensureAgentDataDirectory(preparedNodeModulesDir);
             }
         }
     } else {
@@ -1500,7 +1529,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         if (adoptManagedRuntimeOnly) {
             requireManagedAdoptionDirectory(preparedNodeModulesDir, 'agent node_modules directory');
         } else if (!fs.existsSync(preparedNodeModulesDir)) {
-            fs.mkdirSync(preparedNodeModulesDir, { recursive: true });
+            ensureAgentDataDirectory(preparedNodeModulesDir);
         }
     }
 
@@ -1595,7 +1624,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
 
     if (!adoptManagedRuntimeOnly) {
-        fs.mkdirSync(agentHomeDir, { recursive: true });
+        ensureAgentDataDirectory(agentHomeDir);
     }
     const healthProbeDirectory = adoptManagedRuntimeOnly
         ? requireManagedAdoptionDirectory(
@@ -1690,6 +1719,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     args.splice(1, 0, ...networkLifecycle.agentIdentityLabelArgs(manifestNetwork, runtimeIdentity));
 
     for (const { resolvedHostPath, containerPath, options } of manifestVolumeMounts) {
+        ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options);
         const mountSuffix = manifestVolumeMountSuffix(runtime, resolvedHostPath, options);
         appendExactManagedBindMount(args, `${resolvedHostPath}:${containerPath}${mountSuffix}`);
     }
@@ -1731,8 +1761,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         } else {
             ensurePersistentStorageHostDir(resourcePlan);
         }
+        assertCanonicalAgentDataPath(resourcePlan.persistentStorage.hostPath);
         args.push('-v', `${resourcePlan.persistentStorage.hostPath}:${resourcePlan.persistentStorage.containerPath}${runtime === 'podman' ? ':z' : ''}`);
     }
+
+    // Apply opaque legacy-root guards after every broad, manifest, staged, and
+    // resource bind so no later agent-controlled mount can expose old state.
+    appendLegacyAgentDataGuards(args, runtime);
 
     const envStrings = [
         ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile, forRuntime: true }),
@@ -2945,6 +2980,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         persistedProfileName: preflightRecord.profile,
         path: `manifest(${preflightRepoName}/${agentName})`,
     });
+    assertManifestStorageAdmission(manifest, preflightProfile.profileConfig);
     // Reject manifest-declared capabilities before even selecting a backend.
     // A second admission below adds the read-only catalog selection.
     admitManifestRuntimeCapabilities(manifest, {
@@ -4108,6 +4144,7 @@ export function isGenerationCapabilityRuntimeEffective({
 
 export {
     assertPodmanCodeMountAllowed,
+    appendLegacyAgentDataGuards,
     appendExactManagedBindMount,
     appendUniquePortMapping,
     buildPersistentAgentRunArgs,

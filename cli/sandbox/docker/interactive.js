@@ -26,6 +26,11 @@ import {
 import { loadAgents } from '../../utils/workspace.js';
 import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
 import { SHARED_DIR } from '../../utils/config.js';
+import { ensureAgentDataDirectory } from '../../utils/runtime/agentDataPathPolicy.js';
+import {
+    ensureLegacyAgentGuardSources,
+    legacyAgentGuardTargets,
+} from '../../utils/runtime/legacyAgentDataGuards.js';
 import {
     agentLibAliasShadows,
     agentLibGrant,
@@ -37,12 +42,20 @@ const __dirname = path.dirname(__filename);
 
 function ensureSharedHostDir() {
     const dir = SHARED_DIR;
-    try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+    ensureAgentDataDirectory(dir);
     return dir;
 }
 
 function joinShellCommandParts(parts) {
     return parts.filter((part) => String(part || '').trim()).join(' ');
+}
+
+function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
+    const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
+    if (!targets.length) return [];
+    const sources = ensureLegacyAgentGuardSources({ workspaceRoot });
+    const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
+    return targets.map(guard => `-v "${sources.get(guard.key)}:${guard.target}${suffix}"`);
 }
 
 function buildInteractiveCommandCreateCommand({
@@ -84,6 +97,7 @@ function buildInteractiveAgentCreateCommand({
     envVars = '',
     containerImage,
     agentLibGrant: grant = agentLibGrant('container'),
+    workspaceRoot,
 } = {}) {
     // The interactive shell receives exactly the same achillesAgentLib grant as
     // the detached service: the source read-only at the stable path, plus a
@@ -95,6 +109,17 @@ function buildInteractiveAgentCreateCommand({
             : [{ hostPath: homeDir, runtimePath: '/root' }]),
         { hostPath: sharedDir, runtimePath: '/shared' },
     ]);
+    const legacyGuards = legacyGuardMountOptions(runtime, [
+        { hostPath: projectDir, runtimePath: projectDir },
+        ...(path.resolve(projectDir) === path.resolve(homeDir)
+            ? []
+            : [{ hostPath: homeDir, runtimePath: '/root' }]),
+        { hostPath: sharedDir, runtimePath: '/shared' },
+        { hostPath: agentLibPath, runtimePath: '/Agent' },
+        { hostPath: absAgentPath, runtimePath: '/code' },
+        { hostPath: grant.sourceDir, runtimePath: grant.runtimePath },
+        ...agentLibShadows,
+    ], { workspaceRoot });
     return joinShellCommandParts([
         runtime,
         'create',
@@ -114,6 +139,7 @@ function buildInteractiveAgentCreateCommand({
         `-v "${sharedDir}:/shared${volumeSuffix}"`,
         `-v "${grant.sourceDir}:${grant.runtimePath}${readOnlySuffix}"`,
         ...agentLibShadows.map((shadow) => `-v "${shadow.hostPath}:${shadow.runtimePath}${readOnlySuffix}"`),
+        ...legacyGuards,
         ...Object.entries(agentLibGrantEnv(grant)).map(([key, value]) => formatEnvFlag(key, value)),
         portOptions,
         envVars,
@@ -130,7 +156,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
     const homeDir = getAgentWorkDir(agentName);
 
     const sharedDir = ensureSharedHostDir();
-    try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
+    ensureAgentDataDirectory(homeDir);
 
     let firstRun = false;
     debugLog(`Checking if container '${containerName}' exists...`);
@@ -159,6 +185,13 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 ]),
                 `-v "${sharedDir}:/shared"`
             ];
+        mountOptions.push(...legacyGuardMountOptions(runtime, [
+            { hostPath: projectDir, runtimePath: projectDir },
+            ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [
+                { hostPath: homeDir, runtimePath: '/root' },
+            ]),
+            { hostPath: sharedDir, runtimePath: '/shared' },
+        ]));
         const mountOption = mountOptions.join(' ');
 
         const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest);
@@ -338,7 +371,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     const agentPath = path.join(REPOS_DIR, repoName, agentName);
     const absAgentPath = path.resolve(agentPath);
     const sharedDir = ensureSharedHostDir();
-    try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
+    ensureAgentDataDirectory(homeDir);
     let agents = loadAgentsMap();
 
     // Resolve profile config for env hash computation

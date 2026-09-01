@@ -4,6 +4,11 @@ import crypto from 'crypto';
 
 import { loadAgents } from '../../utils/workspace.js';
 import { SHARED_DIR } from '../../utils/config.js';
+import {
+    assertCanonicalAgentDataPath,
+    ensureAgentDataDirectory,
+    resolveAgentDataPath,
+} from '../../utils/runtime/agentDataPathPolicy.js';
 import { getWorkspaceRoot, resolveWorkspacePath } from '../utils/workspacePaths.js';
 import {
     streamAdmittedUpload,
@@ -12,7 +17,7 @@ import {
 
 function ensureSharedHostDir() {
     const dir = SHARED_DIR;
-    try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+    ensureAgentDataDirectory(dir);
     return dir;
 }
 
@@ -32,7 +37,21 @@ function normalizeAgentSegment(segment) {
     }
 }
 
-function resolveAgentRecord(agentSegment) {
+export function resolveAgentBlobStorage(record, { workspaceRoot } = {}) {
+    const canonicalName = String(record?.agentName || '');
+    const agentDataDir = resolveAgentDataPath(canonicalName, {
+        ...(workspaceRoot ? { workspaceRoot } : {}),
+        label: 'blob agent name',
+    });
+    return Object.freeze({
+        agentDataDir,
+        blobsDir: assertCanonicalAgentDataPath(path.join(agentDataDir, 'blobs'), {
+            ...(workspaceRoot ? { workspaceRoot } : {}),
+        }),
+    });
+}
+
+export function resolveAgentRecord(agentSegment, { agentMap, workspaceRoot } = {}) {
     const name = normalizeAgentSegment(agentSegment);
     if (!name) {
         return { ok: false, status: 400, message: 'Missing agent name in path.' };
@@ -49,11 +68,13 @@ function resolveAgentRecord(agentSegment) {
         }
     }
 
-    let map;
-    try {
-        map = loadAgents() || {};
-    } catch (_) {
-        map = {};
+    let map = agentMap;
+    if (!map) {
+        try {
+            map = loadAgents() || {};
+        } catch (_) {
+            map = {};
+        }
     }
 
     const entries = Object.entries(map)
@@ -84,7 +105,9 @@ function resolveAgentRecord(agentSegment) {
 
     const record = matches[0];
     const projectPath = path.resolve(record.projectPath);
-    const blobsDir = path.join(projectPath, 'blobs');
+    const { blobsDir } = resolveAgentBlobStorage(record, {
+        ...(workspaceRoot ? { workspaceRoot } : {}),
+    });
 
     return {
         ok: true,
@@ -94,6 +117,7 @@ function resolveAgentRecord(agentSegment) {
             repoName: record.repoName || null,
             projectPath,
             blobsDir,
+            ...(workspaceRoot ? { workspaceRoot } : {}),
             isShared: false
         }
     };
@@ -127,11 +151,20 @@ function getLocalPath(agent, id) {
     if (agent?.isShared) {
         return `/shared/${id}`;
     }
-    return `blobs/${id}`;
+    return `.data/${agent.canonicalName}/blobs/${id}`;
 }
 
 function ensureAgentBlobsDir(agent) {
-    try { fs.mkdirSync(agent.blobsDir, { recursive: true }); } catch (_) { }
+    if (agent?.isShared) {
+        try { fs.mkdirSync(agent.blobsDir, { recursive: true }); } catch (_) { }
+        return;
+    }
+    const agentDataDir = path.dirname(agent.blobsDir);
+    const pathOptions = agent.workspaceRoot ? { workspaceRoot: agent.workspaceRoot } : {};
+    ensureAgentDataDirectory(agentDataDir, pathOptions);
+    assertCanonicalAgentDataPath(agent.blobsDir, pathOptions);
+    fs.mkdirSync(agent.blobsDir, { recursive: true });
+    assertCanonicalAgentDataPath(agent.blobsDir, pathOptions);
 }
 
 function getAgentPaths(agent, id) {

@@ -10,6 +10,7 @@ import { getProfileConfig } from '../utils/runtime/profileService.js';
 import { buildEnvMap, getManifestEnvSpecs } from '../utils/security/secretVars.js';
 import { findAgent } from '../utils/utils.js';
 import { parseManifestDependencyRef } from '../utils/workspaceDependencyGraph.js';
+import { resolveAgentDataPath } from '../utils/runtime/agentDataPathPolicy.js';
 
 const PROVIDER_SCHEMA_VERSION = 1;
 const METADATA_DIR = 'config-providers';
@@ -161,7 +162,10 @@ export function buildProviderSubprocessEnv({
         PLOINKY_PROVIDER_AGENT_ID: providerAgentId(provider),
         PLOINKY_PROVIDER_REPO: provider.repoName,
         PLOINKY_PROVIDER_NAME: provider.shortAgentName,
-        PLOINKY_PROVIDER_DATA_DIR: path.join(workspaceRoot, '.ploinky', 'data', provider.shortAgentName),
+        PLOINKY_PROVIDER_DATA_DIR: resolveAgentDataPath(provider.shortAgentName, {
+            workspaceRoot,
+            label: 'config provider shortAgentName',
+        }),
         ...manifestEnv,
     };
     return stripReservedAgentEnv(env);

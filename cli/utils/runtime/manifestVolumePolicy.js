@@ -4,6 +4,12 @@ import path from 'path';
 import { PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 import { isManagedManifestVolumeSource } from '../../sandbox/runtimeCapabilities.js';
+import {
+    assertCanonicalAgentDataPath,
+    assertManifestVolumeStoragePolicy,
+    ensureAgentDataDirectory,
+    isPathWithin,
+} from './agentDataPathPolicy.js';
 
 export function readManifestVolumeOptions(manifest) {
     return manifest?.volumeOptions && typeof manifest.volumeOptions === 'object'
@@ -12,19 +18,38 @@ export function readManifestVolumeOptions(manifest) {
 }
 
 export function resolveManifestVolumeHostPath(hostPath, workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
+    const resolved = assertManifestVolumeStoragePolicy(hostPath, { workspaceRoot });
     if (isInsideBox() && !isManagedManifestVolumeSource(String(hostPath), { workspaceRoot })) {
         const error = new Error(`manifest volume source '${hostPath}' is outside the managed Ploinky workspace`);
         error.code = 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED';
         error.status = 422;
         throw error;
     }
-    return path.isAbsolute(hostPath)
-        ? path.resolve(hostPath)
-        : path.resolve(workspaceRoot, hostPath);
+    const dataRoot = path.join(path.resolve(workspaceRoot), '.data');
+    if (isPathWithin(resolved, dataRoot)) {
+        assertCanonicalAgentDataPath(resolved, { workspaceRoot });
+    }
+    return resolved;
 }
 
-export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, options = {}) {
+export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, options = {}, {
+    workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+} = {}) {
     if (!resolvedHostPath) return;
+    const dataRoot = path.join(path.resolve(workspaceRoot), '.data');
+    const dataBacked = isPathWithin(resolvedHostPath, dataRoot);
+    const revalidate = () => {
+        assertManifestVolumeStoragePolicy(resolvedHostPath, { workspaceRoot });
+        if (dataBacked) assertCanonicalAgentDataPath(resolvedHostPath, { workspaceRoot });
+    };
+    const ensureDirectory = (directory) => {
+        if (dataBacked) {
+            ensureAgentDataDirectory(directory, { workspaceRoot });
+        } else {
+            fs.mkdirSync(directory, { recursive: true });
+        }
+    };
+    revalidate();
     const containerPath = typeof _containerPath === 'string' ? _containerPath.trim() : '';
     const hostLooksLikeFile = path.extname(resolvedHostPath) !== '';
     const containerLooksLikeFile = path.extname(containerPath) !== '';
@@ -37,15 +62,18 @@ export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, o
                 );
             }
             const parentDir = shouldCreateFile ? path.dirname(resolvedHostPath) : resolvedHostPath;
-            fs.mkdirSync(parentDir, { recursive: true });
+            ensureDirectory(parentDir);
+            revalidate();
             return;
         }
         if (shouldCreateFile) {
-            fs.mkdirSync(path.dirname(resolvedHostPath), { recursive: true });
+            ensureDirectory(path.dirname(resolvedHostPath));
+            revalidate();
             fs.writeFileSync(resolvedHostPath, '');
         } else {
-            fs.mkdirSync(resolvedHostPath, { recursive: true });
+            ensureDirectory(resolvedHostPath);
         }
+        revalidate();
     }
     if (options?.generated === true && options.required === true) {
         try {
@@ -75,12 +103,16 @@ export function ensureManifestVolumeHostPath(resolvedHostPath, _containerPath, o
             for (const sub of options.makeWorldWritableSubdirs) {
                 const subDir = path.join(resolvedHostPath, String(sub));
                 try {
-                    fs.mkdirSync(subDir, { recursive: true });
+                    if (dataBacked) ensureAgentDataDirectory(subDir, { workspaceRoot });
+                    else fs.mkdirSync(subDir, { recursive: true });
                     fs.chmodSync(subDir, options.chmod);
-                } catch (_) {}
+                } catch (error) {
+                    if (error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION') throw error;
+                }
             }
         }
     }
+    revalidate();
 }
 
 export function normalizeManifestVolumeHostPaths(volumes, options = {}) {
@@ -92,4 +124,19 @@ export function normalizeManifestVolumeHostPaths(volumes, options = {}) {
         paths.push(resolvedHostPath);
     }
     return Array.from(new Set(paths));
+}
+
+export function assertManifestStorageAdmission(manifest, profileConfig = null, {
+    workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+} = {}) {
+    const rootVolumes = manifest?.volumes && typeof manifest.volumes === 'object'
+        ? manifest.volumes
+        : {};
+    const profileVolumes = profileConfig?.volumes && typeof profileConfig.volumes === 'object'
+        ? profileConfig.volumes
+        : {};
+    for (const source of [...Object.keys(rootVolumes), ...Object.keys(profileVolumes)]) {
+        resolveManifestVolumeHostPath(source, workspaceRoot);
+    }
+    return true;
 }

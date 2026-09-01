@@ -1,9 +1,13 @@
 import fs from 'fs';
-import path from 'path';
 
-import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../config.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../config.js';
 import { ensurePersistentSecret, resolveVarValue } from '../security/secretVars.js';
 import { deriveAgentSecret } from '../security/masterKey.js';
+import {
+    assertCanonicalAgentDataPath,
+    ensureAgentDataDirectory,
+    resolveAgentDataPath,
+} from './agentDataPathPolicy.js';
 
 /**
  * runtimeResourcePlanner.js
@@ -14,10 +18,7 @@ import { deriveAgentSecret } from '../security/masterKey.js';
  *
  * Supported resources:
  *   - persistentStorage: per-agent writable host dir mounted at containerPath,
- *     optionally chmod'd. Host dir lives under
- *     <workspace>/.ploinky/data/<key>/ by default, overridable by env
- *     "PLOINKY_RESOURCE_<KEY>_HOST" (for compatibility with existing setups
- *     such as DPU_DATA_ROOT).
+ *     optionally chmod'd. Host dir lives under <workspace>/.data/<key>/.
  *   - env: declarative environment variables supporting template placeholders:
  *       {{PLOINKY_WORKSPACE_ROOT}}
  *       {{STORAGE_CONTAINER_PATH}}   (only when persistentStorage declared)
@@ -30,24 +31,12 @@ import { deriveAgentSecret } from '../security/masterKey.js';
  * the plan (creating host dirs, setting env) is done by the caller.
  */
 
-const DEFAULT_DATA_ROOT = path.join(PLOINKY_DIR, 'data');
-
 function toNonEmptyString(value) {
     return typeof value === 'string' && value.trim() ? value.trim() : '';
 }
 
 function resolveDataRootForKey(key) {
-    const upper = String(key || '').toUpperCase().replace(/[^A-Z0-9]/g, '_');
-    const envOverride = process.env[`PLOINKY_RESOURCE_${upper}_HOST`];
-    if (envOverride && envOverride.trim()) {
-        return path.resolve(envOverride.trim());
-    }
-    if (key === 'dpu-data' && process.env.DPU_DATA_ROOT) {
-        // Back-compat alias so existing DPU installs keep working until the
-        // operator explicitly renames it.
-        return path.resolve(process.env.DPU_DATA_ROOT);
-    }
-    return path.join(DEFAULT_DATA_ROOT, String(key || 'default'));
+    return resolveAgentDataPath(key, { label: 'persistentStorage.key' });
 }
 
 function expandTemplate(raw, { hostPath, containerPath, useHostStoragePath = false, agentName = '', repoName = '' }) {
@@ -103,17 +92,21 @@ export function planRuntimeResources(manifest, options = {}) {
 
     if (resources.persistentStorage && typeof resources.persistentStorage === 'object') {
         const ps = resources.persistentStorage;
-        const key = toNonEmptyString(ps.key);
+        const key = typeof ps.key === 'string' ? ps.key : '';
         const containerPath = toNonEmptyString(ps.containerPath);
-        if (key && containerPath) {
-            const hostPath = resolveDataRootForKey(key);
-            plan.persistentStorage = {
-                key,
-                hostPath,
-                containerPath,
-                chmod: typeof ps.chmod === 'number' ? ps.chmod : null
-            };
+        const hostPath = resolveDataRootForKey(key);
+        if (!containerPath) {
+            const error = new Error('persistentStorage.containerPath must be a non-empty path');
+            error.code = 'PLOINKY_AGENT_DATA_POLICY_VIOLATION';
+            error.status = 422;
+            throw error;
         }
+        plan.persistentStorage = {
+            key,
+            hostPath,
+            containerPath,
+            chmod: typeof ps.chmod === 'number' ? ps.chmod : null
+        };
     }
 
     const rawEnv = resources.env && typeof resources.env === 'object' ? resources.env : {};
@@ -135,12 +128,12 @@ export function planRuntimeResources(manifest, options = {}) {
 export function ensurePersistentStorageHostDir(plan) {
     const ps = plan?.persistentStorage;
     if (!ps) return null;
-    if (!fs.existsSync(ps.hostPath)) {
-        fs.mkdirSync(ps.hostPath, { recursive: true });
-    }
+    assertCanonicalAgentDataPath(ps.hostPath);
+    ensureAgentDataDirectory(ps.hostPath);
     if (typeof ps.chmod === 'number') {
         try { fs.chmodSync(ps.hostPath, ps.chmod); } catch (_) {}
     }
+    assertCanonicalAgentDataPath(ps.hostPath);
     return ps.hostPath;
 }
 

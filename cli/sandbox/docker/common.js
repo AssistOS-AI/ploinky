@@ -5,6 +5,11 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { REPOS_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
 import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
+import {
+    AGENT_DATA_POLICY_CODE,
+    assertCanonicalAgentDataPath,
+    ensureAgentDataDirectory,
+} from '../../utils/runtime/agentDataPathPolicy.js';
 import { buildEnvFlags, buildEnvMap } from '../../utils/security/secretVars.js';
 import { loadAgents, saveAgents } from '../../utils/workspace.js';
 import { debugLog } from '../../utils/utils.js';
@@ -60,8 +65,7 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
             const aliasRec = Object.values(map || {}).find(r => r && r.type === 'agent' && r.alias === alias);
             if (aliasRec && (aliasRec.runMode || 'isolated') === 'isolated') {
                 const isolatedPath = getAgentWorkDir(alias);
-                try { fs.mkdirSync(isolatedPath, { recursive: true }); } catch (_) {}
-                return isolatedPath;
+                return ensureAgentDataDirectory(isolatedPath);
             }
             if (aliasRec && aliasRec.projectPath && typeof aliasRec.projectPath === 'string') {
                 const normalized = normalizeProjectPath(aliasRec.projectPath, aliasRec.runMode);
@@ -71,17 +75,17 @@ function getConfiguredProjectPath(agentName, repoName, alias) {
         const rec = Object.values(map || {}).find(r => r && r.type === 'agent' && r.agentName === agentName && r.repoName === repoName);
         if (rec && (rec.runMode || 'isolated') === 'isolated') {
             const isolatedPath = getAgentWorkDir(rec.alias || agentName);
-            try { fs.mkdirSync(isolatedPath, { recursive: true }); } catch (_) {}
-            return isolatedPath;
+            return ensureAgentDataDirectory(isolatedPath);
         }
         if (rec && rec.projectPath && typeof rec.projectPath === 'string') {
             const normalized = normalizeProjectPath(rec.projectPath, rec.runMode);
             if (normalized) return normalized;
         }
-    } catch (_) {}
+    } catch (error) {
+        if (error?.code === AGENT_DATA_POLICY_CODE) throw error;
+    }
     const fallback = getAgentWorkDir(agentName);
-    try { fs.mkdirSync(fallback, { recursive: true }); } catch (_) {}
-    return fallback;
+    return ensureAgentDataDirectory(fallback);
 }
 
 function isRuntimeInstalled(runtime) {
@@ -465,13 +469,14 @@ function syncAgentMcpConfig(_containerName, agentPath, agentName, options = {}) 
         const resolvedAgentName = agentName || path.basename(agentPath || '');
         if (!resolvedAgentName) return false;
         const workDir = options.workDir || getAgentWorkDir(resolvedAgentName);
-        if (!fs.existsSync(workDir)) {
-            fs.mkdirSync(workDir, { recursive: true });
-        }
+        ensureAgentDataDirectory(workDir);
         const target = path.join(workDir, 'mcp-config.json');
+        assertCanonicalAgentDataPath(target);
         fs.copyFileSync(source, target);
+        assertCanonicalAgentDataPath(target);
         return true;
-    } catch (_) {
+    } catch (error) {
+        if (error?.code === AGENT_DATA_POLICY_CODE) throw error;
         return false;
     }
 }

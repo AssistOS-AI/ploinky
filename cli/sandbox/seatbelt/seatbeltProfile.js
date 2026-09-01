@@ -11,7 +11,12 @@ import {
     SERVERS_CONFIG_FILE,
     PLOINKY_WORKSPACE_ROOT,
 } from '../../utils/config.js';
-import { normalizeManifestVolumeHostPaths } from '../../utils/runtime/manifestVolumePolicy.js';
+import {
+    normalizeManifestVolumeHostPaths,
+    resolveManifestVolumeHostPath,
+} from '../../utils/runtime/manifestVolumePolicy.js';
+import { protectedLegacyAgentRoots } from '../../utils/runtime/legacyAgentDataGuards.js';
+import { projectedCanonicalPath } from '../../utils/runtime/agentDataPathPolicy.js';
 
 const SEATBELT_PROFILES_DIR = path.join(PLOINKY_DIR, 'seatbelt-profiles');
 
@@ -55,11 +60,17 @@ function buildSeatbeltProfile(options) {
             || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
             || {};
         return {
-            hostPath: path.isAbsolute(hostPath) ? path.resolve(hostPath) : path.resolve(workspaceRoot, hostPath),
+            hostPath: resolveManifestVolumeHostPath(hostPath, workspaceRoot),
             readOnly: options.readOnly === true,
         };
     });
     const writableVolumes = volumeAccess.filter(entry => !entry.readOnly).map(entry => entry.hostPath);
+    const protectedLegacyRoots = Array.from(new Set(
+        protectedLegacyAgentRoots(workspaceRoot).flatMap(entry => [
+            entry.hostPath,
+            projectedCanonicalPath(entry.hostPath),
+        ]),
+    ));
     const protectedWritePaths = [
         ...collectProtectedWritePaths({
         agentCodePath,
@@ -76,6 +87,7 @@ function buildSeatbeltProfile(options) {
         // path-based and therefore applies through every workspace alias that
         // reaches the same directory.
         { kind: 'subpath', path: grant.sourceDir },
+        ...protectedLegacyRoots.map(value => ({ kind: 'subpath', path: value })),
     ];
     const lines = [];
     lines.push('(version 1)');
@@ -214,6 +226,14 @@ function buildSeatbeltProfile(options) {
         lines.push(')');
         lines.push('');
     }
+
+    lines.push('; Protected legacy agent data is opaque even through a broad workspace grant');
+    lines.push('(deny file-read*');
+    for (const protectedRoot of protectedLegacyRoots) {
+        lines.push(`    (subpath ${sbplQuote(protectedRoot)})`);
+    }
+    lines.push(')');
+    lines.push('');
 
     return lines.join('\n') + '\n';
 }

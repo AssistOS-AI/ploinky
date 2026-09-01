@@ -46,6 +46,14 @@ import {
     applyRuntimeResourceEnv,
     ensurePersistentStorageHostDir
 } from '../../utils/runtime/runtimeResourcePlanner.js';
+import {
+    ensureLegacyAgentGuardSources,
+    legacyAgentGuardTargets,
+} from '../../utils/runtime/legacyAgentDataGuards.js';
+import {
+    assertCanonicalAgentDataPath,
+    ensureAgentDataDirectory,
+} from '../../utils/runtime/agentDataPathPolicy.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir } from '../docker/agentHooks.js';
 import {
@@ -201,9 +209,7 @@ function resolveBwrapAgentNodeModules({
 }) {
     if (!needsCoreDeps) {
         const fallback = path.join(agentWorkDir, 'node_modules');
-        if (!fs.existsSync(fallback)) {
-            fs.mkdirSync(fallback, { recursive: true });
-        }
+        ensureAgentDataDirectory(fallback);
         return fallback;
     }
     return ensureAgentCacheForFamily({
@@ -344,6 +350,35 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
     return binds;
 }
 
+function appendLegacyAgentDataGuards(args) {
+    const bindings = [];
+    for (let index = 0; index < args.length - 2; index += 1) {
+        if (args[index] !== '--bind' && args[index] !== '--ro-bind') continue;
+        bindings.push({ hostPath: args[index + 1], runtimePath: args[index + 2] });
+        index += 2;
+    }
+    const targets = legacyAgentGuardTargets(bindings);
+    if (!targets.length) return [];
+    const sources = ensureLegacyAgentGuardSources();
+    for (const guard of targets) {
+        args.push('--ro-bind', sources.get(guard.key), guard.target);
+    }
+    return targets;
+}
+
+function mergeBwrapManifestVolumes(manifest, profileConfig) {
+    return {
+        volumes: {
+            ...(manifest?.volumes || {}),
+            ...(profileConfig?.volumes || {}),
+        },
+        volumeOptions: {
+            ...readManifestVolumeOptions(manifest),
+            ...readManifestVolumeOptions(profileConfig),
+        },
+    };
+}
+
 function buildBwrapArgs(options) {
     const {
         agentCodePath,
@@ -460,6 +495,9 @@ function buildBwrapArgs(options) {
     // devel agents retain the selected project at its host-absolute path.
     const projectTarget = cwdMountTarget || cwd;
     const homeDir = agentHomeDir || cwd;
+    const storageWorkspaceRoot = path.dirname(path.dirname(path.resolve(sharedDir)));
+    assertCanonicalAgentDataPath(sharedDir, { workspaceRoot: storageWorkspaceRoot });
+    if (agentHomeDir) assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
     if (cwd !== homeDir || projectTarget !== '/root') {
         args.push('--bind', cwd, projectTarget);
     }
@@ -515,6 +553,9 @@ function buildBwrapArgs(options) {
     }))) {
         args.push('--ro-bind', shadow.hostPath, shadow.runtimePath);
     }
+
+    // Apply the old-root opacity boundary after every ordinary bind.
+    appendLegacyAgentDataGuards(args);
 
     // Process isolation — do NOT unshare network (agents need host network)
     // NOTE: --die-with-parent is intentionally omitted. Agent processes must survive
@@ -761,7 +802,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     }
 
     // Ensure work directory and MCP config
-    fs.mkdirSync(agentHomeDir, { recursive: true });
+    ensureAgentDataDirectory(agentHomeDir);
     syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentHomeDir });
 
     // Prepare node dependencies via prepared cache (see dependencyCache.js).
@@ -805,6 +846,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     }
 
     // Build bwrap arguments
+    const manifestStorage = mergeBwrapManifestVolumes(manifest, profileConfig);
     const bwrapArgs = buildBwrapArgs({
         agentCodePath,
         agentLibPath,
@@ -818,8 +860,8 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
         envMap,
         codeReadOnly,
         skillsReadOnly,
-        volumes: manifest.volumes,
-        volumeOptions: readManifestVolumeOptions(manifest),
+        volumes: manifestStorage.volumes,
+        volumeOptions: manifestStorage.volumeOptions,
         runtimeResourcePlan,
         agentPrivateKeyPath,
         agentLibGrant: grant,
@@ -1161,7 +1203,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     const cwdMountTarget = isolatedHome ? '/root' : projectPath;
     const workspacePath = isolatedHome ? '/root' : projectPath;
     const sharedDir = ensureSharedHostDir();
-    fs.mkdirSync(agentHomeDir, { recursive: true });
+    ensureAgentDataDirectory(agentHomeDir);
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
     const needsCoreDeps = !startCmd || agentHasPackageJson;
@@ -1202,6 +1244,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     }
 
     // Build bwrap args (same mounts as the running agent)
+    const manifestStorage = mergeBwrapManifestVolumes(manifest, profileConfig);
     const bwrapArgs = buildBwrapArgs({
         agentCodePath,
         agentLibPath,
@@ -1215,10 +1258,11 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
         envMap,
         codeReadOnly,
         skillsReadOnly,
-        volumes: manifest.volumes,
-        volumeOptions: readManifestVolumeOptions(manifest),
+        volumes: manifestStorage.volumes,
+        volumeOptions: manifestStorage.volumeOptions,
         runtimeResourcePlan,
-        agentPrivateKeyPath
+        agentPrivateKeyPath,
+        agentLibGrant: grant,
     });
 
     // For interactive sessions, die-with-parent IS appropriate
@@ -1253,6 +1297,8 @@ export {
     ensureBwrapService,
     resolveBwrapRuntimeProfile,
     startBwrapProcess,
+    appendLegacyAgentDataGuards,
+    mergeBwrapManifestVolumes,
     buildBwrapArgs,
     buildFullEnvMap,
     buildBwrapInteractiveCommand,

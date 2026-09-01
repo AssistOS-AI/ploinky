@@ -13,7 +13,7 @@
     "globalAgentForAlias global as globalAgentAlias"
   ],
   "volumes": {
-    ".ploinky/data/test-volumes/data": "/mnt/test-data"
+    ".data/test-volumes/data": "/mnt/test-data"
   },
   "profiles": {
     "default": {

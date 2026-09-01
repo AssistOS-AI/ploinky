@@ -23,6 +23,7 @@ import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.j
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { assertManifestStorageAdmission } from '../utils/runtime/manifestVolumePolicy.js';
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
@@ -59,6 +60,7 @@ const TRANSIENT_PROBE_INFRASTRUCTURE_CODES = new Set([
 ]);
 const LOGGED_RESTART_FAILURES = new WeakSet();
 const TERMINAL_POLICY_CODES = new Set([
+    'PLOINKY_AGENT_DATA_POLICY_VIOLATION',
     'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
     'PLOINKY_MANIFEST_SECURITY_INVALID',
     'PLOINKY_MANIFEST_SECURITY_PROFILE_UNSUPPORTED',
@@ -271,6 +273,7 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         profileName: info.profile || undefined,
         path: `manifest(${info.repoName}/${info.agentName})`,
     });
+    assertManifestStorageAdmission(manifest, profileResolution.profileConfig);
     const runtimeKind = info.runtime === 'bwrap' || info.runtime === 'seatbelt'
         ? info.runtime
         : 'container';

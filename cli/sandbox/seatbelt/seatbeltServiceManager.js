@@ -24,7 +24,16 @@ import { openSandboxLogHandle, readSandboxCrashLog } from '../sandboxLogFiles.js
 import { sanitizeDiagnosticText } from '../../utils/diagnosticText.js';
 import { guardSpawnedChild } from '../../utils/childSpawn.js';
 import { ensureSharedHostDir } from '../docker/agentHooks.js';
-import { readManifestVolumeOptions } from '../../utils/runtime/manifestVolumePolicy.js';
+import {
+    ensureManifestVolumeHostPath,
+    readManifestVolumeOptions,
+    resolveManifestVolumeHostPath,
+} from '../../utils/runtime/manifestVolumePolicy.js';
+import {
+    AGENT_DATA_POLICY_CODE,
+    assertCanonicalAgentDataPath,
+    ensureAgentDataDirectory,
+} from '../../utils/runtime/agentDataPathPolicy.js';
 import {
     runPreContainerLifecycle,
     runProfileLifecycle
@@ -325,6 +334,7 @@ function getProfileMountModes(profile, profileConfig = {}) {
  */
 function rewriteMcpConfig(agentName, agentCodePath, agentWorkDir, agentLibPath = AGENT_LIB_PATH) {
     const sourcePath = path.join(agentWorkDir, 'mcp-config.json');
+    assertCanonicalAgentDataPath(sourcePath);
     if (!fs.existsSync(sourcePath)) return null;
 
     try {
@@ -335,11 +345,28 @@ function rewriteMcpConfig(agentName, agentCodePath, agentWorkDir, agentLibPath =
         content = content.replace(/\/Agent\//g, agentLibPath + '/');
         content = content.replace(/\/Agent"/g, agentLibPath + '"');
         const rewrittenPath = path.join(agentWorkDir, 'mcp-config.seatbelt.json');
+        assertCanonicalAgentDataPath(rewrittenPath);
         fs.writeFileSync(rewrittenPath, content, 'utf8');
+        assertCanonicalAgentDataPath(rewrittenPath);
         return rewrittenPath;
     } catch (err) {
+        if (err?.code === AGENT_DATA_POLICY_CODE) throw err;
         debugLog(`[seatbelt] ${agentName}: failed to rewrite mcp-config: ${err.message}`);
         return null;
+    }
+}
+
+function ensureSeatbeltManifestVolumePaths(manifest, profileConfig) {
+    for (const source of [manifest, profileConfig]) {
+        const volumes = source?.volumes && typeof source.volumes === 'object' ? source.volumes : {};
+        const volumeOptions = readManifestVolumeOptions(source);
+        for (const [hostPath, containerPath] of Object.entries(volumes)) {
+            const options = volumeOptions[containerPath]
+                || volumeOptions[String(containerPath || '').replace(/\/+$/, '')]
+                || {};
+            const resolvedHostPath = resolveManifestVolumeHostPath(hostPath, PLOINKY_WORKSPACE_ROOT);
+            ensureManifestVolumeHostPath(resolvedHostPath, containerPath, options);
+        }
     }
 }
 
@@ -403,9 +430,7 @@ function resolveSeatbeltAgentNodeModules({
 }) {
     if (!needsCoreDeps) {
         const fallback = path.join(agentWorkDir, 'node_modules');
-        if (!fs.existsSync(fallback)) {
-            fs.mkdirSync(fallback, { recursive: true });
-        }
+        ensureAgentDataDirectory(fallback);
         return fallback;
     }
     return ensureAgentCacheForFamily({
@@ -487,7 +512,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     }
 
     // Ensure work directory and MCP config
-    fs.mkdirSync(agentWorkDir, { recursive: true });
+    ensureAgentDataDirectory(agentWorkDir);
     syncAgentMcpConfig(containerName, path.resolve(agentPath), instanceName, { workDir: agentWorkDir });
 
     // Prepare or reuse the host dependency cache (see dependencyCache.js).
@@ -547,6 +572,9 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     }
 
     // Generate seatbelt profile
+    ensureSeatbeltManifestVolumePaths(manifest, profileConfig);
+    assertCanonicalAgentDataPath(agentWorkDir);
+    assertCanonicalAgentDataPath(sharedDir);
     const profileContent = buildSeatbeltProfile({
         agentCodePath,
         agentLibGrant: grant,
@@ -841,7 +869,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         } else {
             debugLog(`[seatbelt] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
             const hostPort = allPortMappings[0]?.hostPort || 0;
-            fs.mkdirSync(reuseLayout.agentWorkDir, { recursive: true });
+            ensureAgentDataDirectory(reuseLayout.agentWorkDir);
             syncAgentMcpConfig(containerName, agentPath, reuseLayout.instanceName, {
                 workDir: reuseLayout.agentWorkDir,
             });
@@ -916,7 +944,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         cwd: record.projectPath || getConfiguredProjectPath(agentName, repoName, record.alias),
     });
     const { instanceName, cwd, agentWorkDir } = layout;
-    fs.mkdirSync(agentWorkDir, { recursive: true });
+    ensureAgentDataDirectory(agentWorkDir);
     const sharedDir = ensureSharedHostDir();
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
@@ -970,6 +998,9 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     }
 
     // Generate seatbelt profile
+    ensureSeatbeltManifestVolumePaths(manifest, profileConfig);
+    assertCanonicalAgentDataPath(agentWorkDir);
+    assertCanonicalAgentDataPath(sharedDir);
     const profileContent = buildSeatbeltProfile({
         agentCodePath,
         agentLibGrant: grant,

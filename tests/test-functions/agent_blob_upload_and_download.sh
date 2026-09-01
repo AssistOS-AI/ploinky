@@ -68,36 +68,8 @@ fast_check_agent_blob_upload() {
     blob_download_url="http://127.0.0.1:${TEST_ROUTER_PORT}${blob_url}"
   fi
 
-  # The runtime agent registry overwrites `projectPath` to the workspace root
-  # (cli/sandbox/docker/agentServiceManager.js:454), so the blob handler stores
-  # files under $TEST_RUN_DIR/blobs/<id> rather than the per-agent workdir the
-  # tests originally pointed at. Resolve the actual location from the running
-  # agents.json instead of guessing — this also keeps the test correct on Linux
-  # where the same code path runs.
-  local agents_json="$TEST_RUN_DIR/.ploinky/agents.json"
-  local server_project_path=""
-  if [[ -f "$agents_json" ]]; then
-    server_project_path=$(AGENTS_JSON="$agents_json" AGENT_NAME="$TEST_AGENT_NAME" node <<'NODE'
-const fs = require('node:fs');
-try {
-  const data = JSON.parse(fs.readFileSync(process.env.AGENTS_JSON, 'utf8') || '{}');
-  const match = Object.values(data).find((rec) => (
-    rec
-    && rec.type === 'agent'
-    && rec.agentName === process.env.AGENT_NAME
-    && rec.projectPath
-  ));
-  if (match) {
-    process.stdout.write(String(match.projectPath));
-  }
-} catch (_) {}
-NODE
-)
-  fi
-  if [[ -z "$server_project_path" ]]; then
-    server_project_path="$TEST_RUN_DIR"
-  fi
-  local blob_path="$server_project_path/blobs/$blob_id"
+  # Non-shared blobs are owned by the canonical short agent name in .data.
+  local blob_path="$TEST_RUN_DIR/.data/$TEST_AGENT_NAME/blobs/$blob_id"
   local blob_meta="${blob_path}.json"
 
   if [[ ! -f "$blob_path" ]]; then
@@ -171,7 +143,7 @@ fast_check_shared_blob_upload() {
   require_var "TEST_RUN_DIR"
   require_var "TEST_ROUTER_PORT"
 
-  local shared_dir="$TEST_RUN_DIR/.ploinky/shared"
+  local shared_dir="$TEST_RUN_DIR/.data/shared"
   local upload_file
   if ! upload_file=$(mktemp "$TEST_RUN_DIR/fast-shared-upload.XXXXXX"); then
     echo "Failed to allocate temporary upload file for shared blobs." >&2
