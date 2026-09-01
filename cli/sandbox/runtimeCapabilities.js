@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
 import { BOX_MARKER_PATH } from '../../ploinky-box/constants.mjs';
+import { NESTED_PODMAN_SECCOMP_BOX_PATH } from '../../ploinky-box/seccomp.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import {
     buildEffectivePolicy,
@@ -16,7 +17,7 @@ import {
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
 
-const CONTAINER_SECURITY_KEYS = new Set(['privileged']);
+const CONTAINER_SECURITY_KEYS = new Set(['privileged', 'nestedPodman']);
 const DIRECT_CAPABILITY_FIELDS = new Set([
     'privileged',
     'devices',
@@ -137,7 +138,12 @@ function securityError(message, context = {}) {
 }
 
 function validateContainerSecurityBlock(value, context) {
-    if (value === undefined) return Object.freeze({ privileged: false });
+    if (value === undefined) {
+        return Object.freeze({
+            privileged: false,
+            nestedPodman: false,
+        });
+    }
     if (!isPlainObject(value)) {
         throw securityError('manifest.containerSecurity must be a plain object', context);
     }
@@ -149,7 +155,19 @@ function validateContainerSecurityBlock(value, context) {
     if (value.privileged !== undefined && typeof value.privileged !== 'boolean') {
         throw securityError('manifest.containerSecurity.privileged must be boolean', context);
     }
-    return Object.freeze({ privileged: value.privileged === true });
+    if (value.nestedPodman !== undefined && typeof value.nestedPodman !== 'boolean') {
+        throw securityError('manifest.containerSecurity.nestedPodman must be boolean', context);
+    }
+    if (value.privileged === true && value.nestedPodman === true) {
+        throw securityError(
+            'manifest.containerSecurity.privileged and nestedPodman cannot both be true',
+            context,
+        );
+    }
+    return Object.freeze({
+        privileged: value.privileged === true,
+        nestedPodman: value.nestedPodman === true,
+    });
 }
 
 function profileEntries(manifest) {
@@ -318,6 +336,7 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
     }, { workspaceRoot });
     const capabilities = {
         privileged: validated.containerSecurity.privileged,
+        nestedPodman: validated.containerSecurity.nestedPodman,
         devices: Array.isArray(runtimePolicy.devices) ? runtimePolicy.devices.length : 0,
         cdi: Array.isArray(runtimePolicy.devices)
             ? runtimePolicy.devices.filter((entry) => entry?.type === 'cdi').length
@@ -349,6 +368,9 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
 function unsupportedDimensions(descriptor, runtimeKind) {
     const unsupported = [];
     if (descriptor.capabilities.privileged) unsupported.push('privileged');
+    if (runtimeKind !== 'container' && descriptor.capabilities.nestedPodman) {
+        unsupported.push('nested-podman');
+    }
     if (descriptor.capabilities.devices) unsupported.push('devices');
     if (descriptor.capabilities.cdi) unsupported.push('cdi');
     if (descriptor.capabilities.gpu) unsupported.push('gpu');
@@ -530,7 +552,16 @@ export function renderContainerSecurityArgs(descriptor) {
             code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
         });
     }
-    return descriptor.containerSecurity.privileged ? ['--privileged'] : [];
+    if (descriptor.containerSecurity.privileged) return ['--privileged'];
+    if (!descriptor.containerSecurity.nestedPodman) return [];
+    return [
+        '--cap-add', 'SYS_ADMIN',
+        '--cap-add', 'NET_ADMIN',
+        '--device', '/dev/fuse',
+        '--device', '/dev/net/tun',
+        '--security-opt', 'label=disable',
+        '--security-opt', `seccomp=${NESTED_PODMAN_SECCOMP_BOX_PATH}`,
+    ];
 }
 
 export function renderRuntimePolicyArgs(descriptor, { runtime } = {}) {

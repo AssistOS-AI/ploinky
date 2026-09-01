@@ -235,7 +235,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `profiles.<name>.secrets` | No | Profile secrets are validated and injected at runtime. |
 | `profiles.<name>.mounts` | No | Controls code/skills mount mode. Default and dev profiles are read-write by default; other profiles are read-only by default. |
 | `profiles.<name>.network` | No | Overrides top-level `network`. |
-| `profiles.<name>.containerSecurity` | No | Overrides top-level `containerSecurity`. Currently only `privileged: true` is implemented. |
+| `profiles.<name>.containerSecurity` | No | Rejected. Container security declarations are root-only. |
 | `profiles.<name>.configProviders` | No | Replaces default-profile startup config providers for the active profile. Entries name provider agents and may select the provider profile. |
 | `profiles.<name>.preinstall` | No | Host hook run before container/sandbox creation. For the static agent, `startWorkspace` runs it only after recursive repository/graph preparation and the early inactive targetless generation; failure is fatal and prevents provider execution. |
 | `profiles.<name>.hosthook_aftercreation` | No | Host hook run after runtime creation. |
@@ -269,6 +269,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `volumeOptions` | No | Per-container-path options for `volumes`: `generated`, `required`, numeric `chmod`, and `makeWorldWritableSubdirs`. |
 | `network` | No | Exact modes are `default`, `bridge`, `host`, and `none`. Omission means a private per-instance managed bridge. `bridge` requires logical `attachments` with exactly one primary; legacy `name`/`aliases` are rejected. Managed bridge modes use the exact host-gateway mapping and router env, `host` uses box loopback, and `none` receives no router endpoint. |
 | `containerSecurity.privileged` | No | Adds `--privileged` for container runtime when true. |
+| `containerSecurity.nestedPodman` | No | Adds the bounded nested-Podman capability set, devices, label disablement, and the repository-owned seccomp profile. It cannot be combined with `privileged`. |
 | `mcp-config.json` beside manifest/code | No | Copied/synchronized into the persistent agent home, `.data/<agent-or-alias>/mcp-config.json`. Seatbelt writes a rewritten `.seatbelt` config in the same work directory. Default AgentServer also searches `/code/mcp-config.json`. |
 | `routerAccess.httpRoutes` | No | Declares agent-relative HTTP route access using `access` only. Valid values are `public`, `guest`, and `authenticated`; public entries expose anonymous `GET`/`HEAD`, guest entries use or mint a guest session, and authenticated entries require a user session before transparent proxying. |
 | `routerAccess.workspaceLogs` | No | Boolean capability granting the exact enabled generation access to the private Router/Policy log-file operation; it publishes no HTTP route and accepts no filesystem path. |

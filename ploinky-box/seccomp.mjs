@@ -5,6 +5,8 @@ import path from 'node:path';
 
 export const NESTED_PODMAN_SECCOMP_RELATIVE_PATH =
     'ploinky-box/seccomp/podman-nested-pid-fallback.json';
+export const NESTED_PODMAN_SECCOMP_BOX_PATH =
+    path.posix.join('/opt/ploinky', NESTED_PODMAN_SECCOMP_RELATIVE_PATH);
 
 export function nestedPodmanSeccompProfilePath(repositoryRoot) {
     const root = path.resolve(String(repositoryRoot || ''));

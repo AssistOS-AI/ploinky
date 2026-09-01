@@ -104,6 +104,7 @@ An agent is discoverable only when its agent directory contains a readable, vali
 | `health.<probe>.successThreshold` | Positive integer; default `1`. Sets consecutive successes before the probe is considered healthy. |
 | `health.<probe>.continuous` | Boolean; default `true`. For readiness, `false` makes the check activation-only and requires recurring liveness coverage. |
 | `containerSecurity.privileged` | Boolean. Requests a privileged container through runtime capability admission. It is unavailable as a profile field and may be rejected by the Box boundary. |
+| `containerSecurity.nestedPodman` | Boolean. Requests the bounded nested-Podman contract: `SYS_ADMIN`, `NET_ADMIN`, `/dev/fuse`, `/dev/net/tun`, SELinux label disablement, and Ploinky's fixed nested-Podman seccomp profile. It is root-only and cannot be combined with `privileged`. |
 | `llmRuntime.enabled` | Boolean. Activates the container LLM runtime integration. |
 | `llmRuntime.allowExperimental` | Boolean. Allows catalog/runtime features marked experimental. |
 | `llmRuntime.runtimePolicy.platform` | `"linux/amd64"` or `"linux/arm64"`. Selects the OCI platform. |
