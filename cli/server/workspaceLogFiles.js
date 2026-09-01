@@ -264,7 +264,11 @@ export async function searchWorkspaceLogs(source, {
         if (!opened) continue;
         const fileMatches = [];
         let lineNumber = 0;
-        const input = fsSync.createReadStream(null, { fd: opened.handle.fd, autoClose: true, encoding: 'utf8' });
+        // FileHandle.createReadStream keeps descriptor ownership coordinated
+        // with the FileHandle object. Passing its numeric fd to fs.createReadStream
+        // lets the stream close the descriptor behind the FileHandle and causes
+        // an uncaught EBADF when current Node releases finalize the handle.
+        const input = opened.handle.createReadStream({ encoding: 'utf8' });
         const lines = readline.createInterface({ input, crlfDelay: Infinity });
         try {
             for await (const line of lines) {
@@ -283,7 +287,13 @@ export async function searchWorkspaceLogs(source, {
             }
         } finally {
             lines.close();
-            input.destroy();
+            if (!input.closed) {
+                await new Promise((resolve, reject) => {
+                    input.once('close', resolve);
+                    input.once('error', reject);
+                    input.destroy();
+                });
+            }
         }
         const remaining = boundedLimit - matches.length;
         if (fileMatches.length > remaining) truncated = true;

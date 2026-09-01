@@ -2,6 +2,12 @@ import path from 'path';
 import { showHelp } from './help.js';
 import * as envSvc from '../utils/security/secretVars.js';
 import { findAgent } from '../utils/utils.js';
+import {
+    assertActiveEdgeRoutingSourcesCurrent,
+    inactivateEdgeRoutingGeneration,
+    readEdgeRoutingSelection,
+    withEdgeGenerationApplyLock,
+} from '../sandbox/edgeGeneration.js';
 
 const INLINE_ASSIGNMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -104,7 +110,16 @@ function handleExposeCommand(options = []) {
     }
 
     try {
-        const res = envSvc.exposeEnv(exposedName, valueArg, agentArg);
+        const res = withEdgeGenerationApplyLock((applyLockCapability) => {
+            const selection = readEdgeRoutingSelection();
+            if (selection.selector.state === 'active') {
+                assertActiveEdgeRoutingSourcesCurrent({ applyLockCapability });
+                inactivateEdgeRoutingGeneration('agent-expose-manifest-change', {
+                    applyLockCapability,
+                });
+            }
+            return envSvc.exposeEnv(exposedName, valueArg, agentArg);
+        });
         console.log(`✓ Exposed '${exposedName}' for agent '${res.agentName}'.`);
     } catch (err) {
         throw new Error(`expose failed: ${err?.message || err}`);

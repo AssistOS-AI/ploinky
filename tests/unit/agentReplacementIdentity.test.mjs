@@ -168,6 +168,71 @@ test('replacement paths that cannot stage a second physical runtime retain the i
     ]);
 });
 
+test('inactive health recovery stages a distinct successor without requiring active authorization', () => {
+    let registry = { [containerName]: existingRecord() };
+    let routing = { routes: { caller: { container: containerName } } };
+    const events = [];
+    const networkLifecycleCapability = Object.freeze({ fixture: 'network-capability' });
+    const values = ['instance-health-candidate', 'enable-health-candidate'];
+    const runtimeIdentity = resolveReplacementRuntimeIdentity({
+        containerName,
+        existingRecord: existingRecord(),
+        existingRuntime: true,
+        recreateReason: 'semantic_probe_failed',
+        networkLifecycleCapability,
+        stageAlongsidePredecessor: true,
+        preserveActiveAuthorization: false,
+    }, {
+        assertNetworkCapability: (received) => {
+            assert.equal(received, networkLifecycleCapability);
+            events.push('network-capability');
+        },
+        withApplyLock: (callback) => callback(Object.freeze({})),
+        inactivate: () => events.push('inactivate'),
+        loadRegistry: () => {
+            events.push('load');
+            return structuredClone(registry);
+        },
+        loadRouting: () => structuredClone(routing),
+        saveRegistry: (next) => {
+            events.push('save-registry');
+            registry = structuredClone(next);
+        },
+        saveRouting: (next) => {
+            events.push('save-routing');
+            routing = structuredClone(next);
+        },
+        prepareReplacement: () => {
+            events.push('prepare-replacement');
+            return {
+                selector: { state: 'inactive' },
+                preparationLease: { mode: 'replacement', transactionId: 'health-lease' },
+                generation: { agents: structuredClone(registry) },
+            };
+        },
+        prepare: () => assert.fail('inactive recovery must not require additive preparation'),
+        uuid: () => values.shift(),
+    });
+
+    const candidateName = runtimeIdentity.candidateContainerName;
+    assert.notEqual(candidateName, containerName);
+    assert.equal(runtimeIdentity.predecessorContainerName, containerName);
+    assert.equal(runtimeIdentity.preparationLease.mode, 'replacement');
+    assert.equal(registry[containerName], undefined);
+    assert.equal(registry[candidateName].instanceId, 'instance-health-candidate');
+    assert.equal(registry[candidateName].enableGeneration, 'enable-health-candidate');
+    assert.equal(routing.routes.caller.container, candidateName);
+    assert.deepEqual(runtimeIdentity.preparedRegistryRecord, registry[candidateName]);
+    assert.deepEqual(events, [
+        'network-capability',
+        'inactivate',
+        'load',
+        'save-registry',
+        'save-routing',
+        'prepare-replacement',
+    ]);
+});
+
 test('ordinary exact runtime reuse preserves the registered tuple without coordination or minting', () => {
     const staged = existingRecord();
     assert.deepEqual(resolveReplacementRuntimeIdentity({

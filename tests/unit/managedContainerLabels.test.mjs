@@ -68,6 +68,7 @@ test('persistent agent run builder carries the exact managed label', () => {
         healthProbeHostDir: '/workspace/.ploinky/run/health-probes/ploinky_demo',
         cwd: '/workspace/.data/demo',
         cwdMountTarget: '/root',
+        agentHomeDir: '/workspace/.data/demo',
         // Every container admission now carries the selected achillesAgentLib grant.
         agentLibGrant: {
             sourceDir: '/workspace/achillesAgentLib',
@@ -97,6 +98,34 @@ test('persistent agent run builder carries the exact managed label', () => {
     );
 });
 
+test('static workspace projection keeps its persistent home beneath .data', () => {
+    const args = buildPersistentAgentRunArgs({
+        runtime: 'podman',
+        containerName: 'ploinky_static',
+        envHash: 'hash',
+        containerWorkdir: '/root',
+        agentLibMountPath: '/workspace/.ploinky/runtime/Agent',
+        codeMountPath: '/workspace/.ploinky/runtime/code',
+        codeMountMode: ':z,ro',
+        sharedDir: '/workspace/.data/shared',
+        healthProbeHostDir: '/workspace/.ploinky/run/health-probes/ploinky_static',
+        cwd: '/workspace',
+        cwdMountTarget: '/root',
+        isolatedHome: true,
+        agentHomeDir: '/workspace/.data/static',
+        agentLibGrant: {
+            sourceDir: '/workspace/achillesAgentLib',
+            runtimePath: '/opt/ploinky-agentlib',
+            mode: 'local',
+            fingerprint: 'a1'.repeat(32),
+            commit: '',
+            sourceIdHash: 'b2'.repeat(32),
+            namespaced: true,
+        },
+    });
+    assert.equal(args.includes('/workspace:/root:z'), true);
+});
+
 test('container runtimes append final read-only opacity guards for broad workspace mounts', () => {
     for (const runtime of ['docker', 'podman']) {
         const args = ['-v', `${PLOINKY_WORKSPACE_ROOT}:/workspace${runtime === 'podman' ? ':z' : ''}`];
@@ -111,6 +140,26 @@ test('container runtimes append final read-only opacity guards for broad workspa
             assert.ok(match, `missing guard ${target.target}`);
             assert.match(match, runtime === 'podman' ? /:z,ro$/ : /:ro$/);
             assert.doesNotMatch(match, new RegExp(`^${target.protectedHostPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`));
+        }
+    }
+});
+
+test('container runtimes guard canonical legacy paths for narrow repository mounts', () => {
+    for (const runtime of ['docker', 'podman']) {
+        const repository = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'repos', 'AchillesCLI', 'roboTeamAgent');
+        const args = ['-v', `${repository}:${repository}${runtime === 'podman' ? ':z' : ''}`];
+        const targets = appendLegacyAgentDataGuards(args, runtime, {
+            canonicalRuntimeWorkspaceGuards: true,
+        });
+        assert.deepEqual(targets.map(entry => entry.target), [
+            path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'data'),
+            path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'shared'),
+        ]);
+        const mounts = args.filter((_value, index) => args[index - 1] === '-v');
+        for (const target of targets) {
+            const match = mounts.find(value => value.includes(`:${target.target}:`));
+            assert.ok(match, `missing narrow-workspace guard ${target.target}`);
+            assert.match(match, runtime === 'podman' ? /:z,ro$/ : /:ro$/);
         }
     }
 });

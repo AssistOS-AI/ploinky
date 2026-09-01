@@ -528,7 +528,7 @@ test('healthy managed reuse is validation-only while replacement remains an expl
     assert.match(source, /const preflightRecord = options\.preservePreparedRegistryRecord === true[\s\S]*options\.preparedRegistryRecord[\s\S]*mutablePreflightRecord/);
     assert.match(source, /prepareAdditiveEdgeRoutingGeneration/);
     assert.match(source, /prepareEdgeRoutingGeneration as prepareEdgeRoutingGenerationRaw/);
-    assert.match(source, /if \(stageAlongsidePredecessor\) \{[\s\S]*prepared = prepare\(\{[\s\S]*saveRegistry\(agents[\s\S]*prepared = prepareReplacement/);
+    assert.match(source, /if \(preserveActiveAuthorization\) \{[\s\S]*prepared = prepare\(\{[\s\S]*saveRegistry\(agents[\s\S]*prepared = prepareReplacement/);
     assert.match(source, /writeState:\s*!adoptManagedRuntimeOnly,\s*createDirectories:\s*!adoptManagedRuntimeOnly/);
     assert.match(source, /const runtimeKey = adoptManagedRuntimeOnly\s*\? \(adoptionCacheMount\?\.runtimeKey \|\| NO_NODE_RUNTIME_KEY\)\s*:\s*detectRuntimeKeyForAgent/);
     assert.match(source, /if \(adoptManagedRuntimeOnly\) \{[\s\S]*inspectAgentCache\([\s\S]*\} else \{\s*const prepared = prepareAgentCache/);

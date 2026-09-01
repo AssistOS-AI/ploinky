@@ -75,6 +75,7 @@ import {
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
+  readEdgeRoutingSelection,
   withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
@@ -706,7 +707,13 @@ function deduplicateAgentRegistry(reg, getAgentContainerName) {
     const agentKey = `${repo}::${rec.agentName}`;
     const existing = canonical.get(agentKey);
     if (!existing || key === expectedKey) {
-      canonical.set(agentKey, { key: expectedKey, rec });
+      // A coordinated additive replacement has a deliberately distinct
+      // __candidate_<identity> runtime name.  Preserve that exact registry
+      // key when it is the sole record for this logical agent; rewriting it
+      // to the conventional name severs the registry/runtime binding and
+      // makes the next workspace start treat the live candidate as stopped.
+      // If both records exist, the real conventional key still wins.
+      canonical.set(agentKey, { key, rec });
     }
   }
 
@@ -759,6 +766,24 @@ function findRegistryEntryForGraphNode(reg, node, getAgentContainerName) {
     }
   }
   return null;
+}
+
+function resolveStaticRouterContainerName({
+  registry,
+  staticNode,
+  staticAgent,
+  staticRepoName,
+  getAgentContainerName,
+}) {
+  const registryEntry = findRegistryEntryForGraphNode(
+    registry,
+    staticNode,
+    getAgentContainerName,
+  );
+  return registryEntry?.key || getAgentContainerName(
+    staticNode?.shortAgentName || staticAgent,
+    staticNode?.repoName || staticRepoName || '',
+  );
 }
 
 function resolveGraphNodeExecutionRecord(node, {
@@ -1972,8 +1997,15 @@ async function startWorkspace(staticAgentArg, portArg, {
   let routerReadyForStart = false;
   let routerPortForStart = 0;
   let routerContainerForStart = '';
-  const ensureRouterReadyForStart = async ({ staticAgent, staticPort, repoName, shortAgentName }) => {
-    const container = dockerSvc.getAgentContainerName(shortAgentName || staticAgent, repoName || '');
+  const ensureRouterReadyForStart = async ({
+    staticAgent,
+    staticPort,
+    repoName,
+    shortAgentName,
+    containerName,
+  }) => {
+    const container = containerName
+      || dockerSvc.getAgentContainerName(shortAgentName || staticAgent, repoName || '');
     if (routerReadyForStart) {
       if (routerPortForStart !== staticPort || routerContainerForStart !== container) {
         throw new Error('start: resolved static routing identity changed after the router listener became ready');
@@ -2069,11 +2101,20 @@ async function startWorkspace(staticAgentArg, portArg, {
     } catch (e) {
       throw new Error(`start: Agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
     }
+    const admittedStaticNode = lockedStart.graph.nodes.get(lockedStart.graph.staticNodeId);
+    const admittedStaticContainer = resolveStaticRouterContainerName({
+      registry: lockedStart.registry,
+      staticNode: admittedStaticNode,
+      staticAgent,
+      staticRepoName,
+      getAgentContainerName: dockerSvc.getAgentContainerName,
+    });
     await ensureRouterReadyForStart({
       staticAgent,
       staticPort,
       repoName: staticRepoName,
       shortAgentName: staticShortAgent,
+      containerName: admittedStaticContainer,
     });
 
     // Compile the already prepared and admitted complete manifest graph into
@@ -2207,8 +2248,13 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
 
     const staticNode = dependencyGraph.nodes.get(dependencyGraph.staticNodeId);
-    const staticRegistryEntry = findRegistryEntryForGraphNode(reg, staticNode, getAgentContainerName);
-    const staticContainer = staticRegistryEntry?.key || getAgentContainerName(staticShortAgent || staticAgent, staticRepoName || '');
+    const staticContainer = resolveStaticRouterContainerName({
+      registry: reg,
+      staticNode,
+      staticAgent,
+      staticRepoName,
+      getAgentContainerName,
+    });
 
     if (Number(cfg.port) !== staticPort
         || cfg.static?.agent !== staticAgent
@@ -3082,6 +3128,14 @@ async function reinstallAgent(agentName) {
             try {
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
+            const edgeSelection = readEdgeRoutingSelection();
+            const stageAlongsidePredecessor = edgeSelection.selector.state === 'active';
+            if (!stageAlongsidePredecessor && !isSandboxRuntime(agentRuntime)) {
+              dockerSvc.removeAgentContainerForRecreate(
+                containerName,
+                'inactiveManifestReplacement',
+              );
+            }
 
             // The shared runtime manager owns inactivation and physical
             // replacement for every backend, including host sandboxes.
@@ -3092,6 +3146,7 @@ async function reinstallAgent(agentName) {
                 routerEndpoint,
                 runtimeAdmission: directAdmission.runtimeAdmission,
                 networkLifecycleCapability,
+                stageAlongsidePredecessor,
             });
             const { containerName: newContainerName, hostPort } = reinstallResult;
 
@@ -3166,9 +3221,11 @@ export {
   buildBlockingReadinessEntryFromNode,
   computeRetainedManagedEnvHash,
   activatePreparedRuntimeAfterReadiness,
+  deduplicateAgentRegistry,
   ensureGraphNodesEnabled,
   removeGraphContainerForRecreate,
   reprepareGraphAfterStartupProviders,
+  resolveStaticRouterContainerName,
   resolveExtraEnabledRuntimeNodes,
   resolveManifestRouterEndpoint,
   resolveAndPersistStartRouterPort,

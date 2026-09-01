@@ -59,9 +59,11 @@ const {
     buildNoWaitLaunchSchedule,
     bindNoWaitLaunchScheduleIdentity,
     computeRetainedManagedEnvHash,
+    deduplicateAgentRegistry,
     ensureGraphNodesEnabled,
     reprepareGraphAfterStartupProviders,
     reinstallAgent,
+    resolveStaticRouterContainerName,
     resolveGraphNodeExecutionRecord,
     resolveRetainedGraphNodeExecutionRecord,
     resolveManifestRouterEndpoint,
@@ -365,6 +367,62 @@ test('resolveEnabledAgentRegistryRecord matches core direct, alias, canonical, a
     );
 });
 
+test('workspace registry deduplication preserves an additive replacement runtime name', () => {
+    const candidateName = 'ploinky_demo_solo_workspace_hash__candidate_0123456789ab';
+    const conventionalName = 'ploinky_demo_solo_workspace_hash';
+    const candidate = {
+        type: 'agent', repoName: 'demo', agentName: 'solo',
+        instanceId: 'candidate-instance', enableGeneration: 'candidate-generation',
+    };
+    const getAgentContainerName = () => conventionalName;
+
+    assert.deepEqual(
+        deduplicateAgentRegistry({ [candidateName]: candidate }, getAgentContainerName),
+        { [candidateName]: candidate },
+    );
+
+    const conventional = {
+        ...candidate,
+        instanceId: 'conventional-instance',
+        enableGeneration: 'conventional-generation',
+    };
+    assert.deepEqual(
+        deduplicateAgentRegistry({
+            [candidateName]: candidate,
+            [conventionalName]: conventional,
+        }, getAgentContainerName),
+        { [conventionalName]: conventional },
+    );
+});
+
+test('static Router identity uses the admitted additive replacement runtime name', () => {
+    const candidateName = 'ploinky_demo_solo_workspace_hash__candidate_0123456789ab';
+    const conventionalName = 'ploinky_demo_solo_workspace_hash';
+    const staticNode = {
+        id: 'demo/solo', repoName: 'demo', shortAgentName: 'solo', alias: '',
+    };
+    const getAgentContainerName = () => conventionalName;
+    const candidate = {
+        type: 'agent', repoName: 'demo', agentName: 'solo',
+        instanceId: 'candidate-instance', enableGeneration: 'candidate-generation',
+    };
+
+    assert.equal(resolveStaticRouterContainerName({
+        registry: { [candidateName]: candidate },
+        staticNode,
+        staticAgent: 'demo/solo',
+        staticRepoName: 'demo',
+        getAgentContainerName,
+    }), candidateName);
+    assert.equal(resolveStaticRouterContainerName({
+        registry: {},
+        staticNode,
+        staticAgent: 'demo/solo',
+        staticRepoName: 'demo',
+        getAgentContainerName,
+    }), conventionalName);
+});
+
 test('resolveWorkspaceDependencyGraph collects recursive dependencies and preserves aliases', () => {
     writeManifest('demo', 'leaf', { container: 'node:20-alpine' });
     writeManifest('demo', 'dep', {
@@ -584,10 +642,10 @@ test('prepared runtime records and routes commit together before activation, inc
     assert.match(noWaitSource, /forceRecreate:\s*args\.forceRecreate === '1'/);
     assert.match(noWaitSource, /assertActiveEdgeRoutingSourcesCurrent\(\)/);
     assert.doesNotMatch(noWaitSource, /prepareEdgeRoutingGeneration|inactivateEdgeRoutingGeneration/);
-    assert.match(noWaitSource, /waitForNoWaitRouteActivation\([\s\S]*validatedActivationSelector/);
-    assert.match(noWaitSource, /validateActiveGeneration\(\)[\s\S]*selector\.activationId !== validatedActivationSelector\.activationId/);
+    assert.match(noWaitSource, /waitForActivation\([\s\S]*validatedActivationSelector/);
+    assert.match(noWaitSource, /const active = assertActive\(\)[\s\S]*active\.selector\.activationId !== validatedActivationSelector\.activationId/);
     assert.match(noWaitSource, /preparationLease: result\?\.preparationLease/);
-    assert.match(noWaitSource, /captureExpectedGeneration\(active\)[\s\S]*captureEdgeRoutingLifecycleMutationGeneration\(active\)/);
+    assert.match(noWaitSource, /observedLifecycle = loadFn\(identity\)[\s\S]*lockedLifecycle = loadFn\(identity\)[\s\S]*isDeepStrictEqual\(lockedLifecycle, observedLifecycle\)/);
     assert.match(
         noWaitSource,
         /profileResolution\.network\.mode === 'host'[\s\S]*launchNoWaitHostRuntime\(expectedIdentity, lifecycle, launch\)/,

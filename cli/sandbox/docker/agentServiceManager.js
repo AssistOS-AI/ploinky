@@ -47,6 +47,7 @@ import {
     ensureImagePresent,
     imageExists,
     isContainerRunning,
+    isPloinkyBoxRuntime,
     isSandboxRuntime,
     loadAgentsMap,
     managedContainerLabelArgs,
@@ -91,6 +92,7 @@ import {
     ensureLegacyAgentGuardSources,
     legacyAgentGuardTargets,
     prepareLegacyGuardMountpointCleanup,
+    protectedLegacyAgentRoots,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
@@ -179,7 +181,7 @@ import {
     prepareHostModeCapabilityForInactiveGeneration,
     withEdgeGenerationApplyLock,
 } from '../edgeGeneration.js';
-import { readRoutingConfig } from '../../server/routingFile.js';
+import { readRoutingConfig, writeRoutingConfig } from '../../server/routingFile.js';
 import {
     attestRouterAuthority,
     buildRouterAuthorityTopologyIntent,
@@ -928,8 +930,11 @@ function buildPersistentAgentRunArgs({
     }
     const storageWorkspaceRoot = path.dirname(path.dirname(path.resolve(sharedDir)));
     assertCanonicalAgentDataPath(sharedDir, { workspaceRoot: storageWorkspaceRoot });
-    if (isolatedHome) assertCanonicalAgentDataPath(cwd, { workspaceRoot: storageWorkspaceRoot });
-    else assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
+    // The static workspace agent intentionally receives the workspace root as
+    // its /root projection even though its registration mode is isolated. Its
+    // persistent home is still agentHomeDir; project/workspace grants are
+    // admitted separately and receive legacy-root opacity guards below.
+    assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const readOnlyMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const args = [
@@ -1011,14 +1016,28 @@ function appendExactManagedBindMount(args, value) {
     return true;
 }
 
-function appendLegacyAgentDataGuards(args, runtime, { workspaceRoot } = {}) {
+function appendLegacyAgentDataGuards(args, runtime, {
+    workspaceRoot,
+    canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
+} = {}) {
     const bindings = expectedBindMountsFromArgs(args).map(mount => ({
         hostPath: mount.source,
         runtimePath: mount.destination,
     }));
     const guardOptions = workspaceRoot ? { workspaceRoot } : {};
     const targets = legacyAgentGuardTargets(bindings, guardOptions);
-    if (!targets.length) return [];
+    // Narrow repository grants can still cause the container engine to create
+    // the canonical workspace parents. Guard those synthetic parents too so
+    // the retired paths remain read-only even when no broad bind exposes them.
+    if (!targets.length && canonicalRuntimeWorkspaceGuards) {
+        for (const protectedRoot of protectedLegacyAgentRoots(workspaceRoot)) {
+            targets.push(Object.freeze({
+                key: protectedRoot.key,
+                target: protectedRoot.hostPath,
+                protectedHostPath: protectedRoot.hostPath,
+            }));
+        }
+    }
     const sources = ensureLegacyAgentGuardSources(guardOptions);
     const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
     for (const guard of targets) {
@@ -2806,6 +2825,7 @@ export function coordinateReplacementRuntimeIdentity({
     reason = 'runtime-replacement',
     networkLifecycleCapability,
     stageAlongsidePredecessor = false,
+    preserveActiveAuthorization = stageAlongsidePredecessor,
 } = {}, {
     assertNetworkCapability = assertNetworkLifecycleCapability,
     prepare = prepareAdditiveEdgeRoutingGeneration,
@@ -2814,12 +2834,16 @@ export function coordinateReplacementRuntimeIdentity({
     loadRegistry = loadAgentsMap,
     loadRouting = readRoutingConfig,
     saveRegistry = saveAgentsMap,
+    saveRouting = writeRoutingConfig,
     withApplyLock = withEdgeGenerationApplyLock,
     uuid = randomUUID,
 } = {}) {
     const exactContainerName = String(containerName || '').trim();
     if (!exactContainerName) {
         throw new Error('coordinated runtime replacement requires an exact container name');
+    }
+    if (preserveActiveAuthorization && !stageAlongsidePredecessor) {
+        throw new Error('preserving active replacement authorization requires a distinct staged runtime');
     }
     assertNetworkCapability(networkLifecycleCapability);
 
@@ -2828,7 +2852,7 @@ export function coordinateReplacementRuntimeIdentity({
     let candidateContainerName = exactContainerName;
     let prepared;
     withApplyLock((applyLockCapability) => {
-        if (!stageAlongsidePredecessor) {
+        if (!preserveActiveAuthorization) {
             inactivate(coordinationReason, { applyLockCapability });
         }
         const agents = loadRegistry();
@@ -2854,13 +2878,15 @@ export function coordinateReplacementRuntimeIdentity({
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
         };
-        if (stageAlongsidePredecessor) {
-            const routing = loadRouting();
+        const routing = candidateContainerName !== exactContainerName ? loadRouting() : null;
+        if (routing) {
             for (const route of Object.values(routing?.routes || {})) {
                 if (route && route.container === exactContainerName) {
                     route.container = candidateContainerName;
                 }
             }
+        }
+        if (preserveActiveAuthorization) {
             prepared = prepare({
                 agents,
                 routing,
@@ -2870,6 +2896,7 @@ export function coordinateReplacementRuntimeIdentity({
             return;
         }
         saveRegistry(agents, { coordinate: false, applyLockCapability });
+        if (routing) saveRouting(routing, { coordinate: false });
         try {
             prepared = prepareReplacement({
                 reason: coordinationReason,
@@ -2886,11 +2913,11 @@ export function coordinateReplacementRuntimeIdentity({
         }
     });
     const preparedRecord = prepared?.generation?.agents?.[candidateContainerName];
-    const preparationMatchesMode = stageAlongsidePredecessor
+    const preparationMatchesMode = preserveActiveAuthorization
         ? prepared?.selector?.state === 'active' && prepared?.preparationLease?.mode === 'additive'
-        : prepared?.selector?.state === 'inactive';
+        : prepared?.selector?.state === 'inactive' && prepared?.preparationLease?.mode !== 'additive';
     if (!preparationMatchesMode
-        || (stageAlongsidePredecessor
+        || (candidateContainerName !== exactContainerName
             && prepared?.generation?.agents?.[exactContainerName] !== undefined)
         || String(preparedRecord?.instanceId || '') !== runtimeIdentity.instanceId
         || String(preparedRecord?.enableGeneration || '') !== runtimeIdentity.enableGeneration) {
@@ -2903,14 +2930,14 @@ export function coordinateReplacementRuntimeIdentity({
                 aborted = true;
             }
         } catch (_) {}
-        if (!stageAlongsidePredecessor && !aborted) {
+        if (!preserveActiveAuthorization && !aborted) {
             try {
                 inactivate(`${coordinationReason}:identity-mismatch`, {
                     preserveSelectedGeneration: true,
                 });
             } catch (_) {}
         }
-        throw new Error(stageAlongsidePredecessor
+        throw new Error(preserveActiveAuthorization
             ? `coordinated replacement candidate did not retain the active predecessor with the fresh runtime identity for '${exactContainerName}'`
             : `coordinated replacement candidate did not remain inactive with the fresh runtime identity for '${exactContainerName}'`);
     }
@@ -2934,6 +2961,7 @@ export function resolveReplacementRuntimeIdentity({
     requestedEnableGeneration = '',
     networkLifecycleCapability,
     stageAlongsidePredecessor = false,
+    preserveActiveAuthorization = stageAlongsidePredecessor,
 } = {}, dependencies = {}) {
     if (!targetedRestart && !preservePreparedRegistryRecord
         && existingRuntime && !recreateReason) {
@@ -2960,6 +2988,7 @@ export function resolveReplacementRuntimeIdentity({
             reason: recreateReason || 'registered-runtime-missing',
             networkLifecycleCapability,
             stageAlongsidePredecessor,
+            preserveActiveAuthorization,
         }, dependencies);
     }
     if (targetedRestart || preservePreparedRegistryRecord) {
@@ -3603,7 +3632,14 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         targetedRestart: Boolean(targetedRestart),
         requestedInstanceId,
         requestedEnableGeneration,
-        stageAlongsidePredecessor: runtimeNetworkPlan.requiresManagedNetwork,
+        stageAlongsidePredecessor: options.stageAlongsidePredecessor === undefined
+            ? runtimeNetworkPlan.requiresManagedNetwork
+            : options.stageAlongsidePredecessor === true,
+        preserveActiveAuthorization: options.preserveActiveAuthorization === undefined
+            ? (options.stageAlongsidePredecessor === undefined
+                ? runtimeNetworkPlan.requiresManagedNetwork
+                : options.stageAlongsidePredecessor === true)
+            : options.preserveActiveAuthorization === true,
     }, { preparationLease: managedReconciliationPreparationLease });
     if (runtimeIdentity.candidateContainerName
         && runtimeIdentity.candidateContainerName !== containerName) {
