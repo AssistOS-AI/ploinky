@@ -10,12 +10,15 @@ import {
     RelayFrameDecoder,
     encodeRelayFrame,
 } from '../lib/runtimeRelayProtocol.mjs';
+import {
+    readRelaySocketIdentityWithRetry,
+    TRANSIENT_RELAY_SOCKET_ERRORS,
+} from './lib/runtimeRelaySocket.mjs';
 
 export const RUNTIME_RELAY_SOCKET_PATH = '/run/ploinky-health-probes/runtime-relay.sock';
 const RUNTIME_RELAY_READY_PREFIX = '/run/ploinky-health-probes/.runtime-relay-ready-';
 const RUNTIME_RELAY_BIND_ATTEMPTS = 600;
 const RUNTIME_RELAY_BIND_RETRY_MS = 50;
-const TRANSIENT_RELAY_BIND_ERRORS = new Set(['EADDRINUSE', 'EAGAIN', 'EBUSY', 'ENOTSUP']);
 
 const relayScriptPath = fileURLToPath(import.meta.url);
 
@@ -151,10 +154,21 @@ async function serveSocketBroker(socketPath, readyPath) {
             reject(error);
         };
         startupErrorHandler = onError;
-        const onListening = () => {
+        const onListening = async () => {
             try {
                 restoreUmask();
-                ownedSocketIdentity = relaySocketIdentity(socketPath);
+                // A nested Podman socket becomes visible through the macOS
+                // shared-filesystem projection before lstat is guaranteed to
+                // succeed. Keep the bound server alive while that exact inode
+                // settles. Closing and rebinding here strands an unstatable
+                // socket which no later generation can safely classify.
+                ownedSocketIdentity = await readRelaySocketIdentityWithRetry(
+                    () => relaySocketIdentity(socketPath),
+                    {
+                        attempts: RUNTIME_RELAY_BIND_ATTEMPTS,
+                        wait: waitForBindRetry,
+                    },
+                );
                 fs.mkdirSync(readyPath, { mode: 0o700 });
                 server.off('error', onError);
                 resolve();
@@ -212,7 +226,7 @@ async function serveSocketBrokerWithRetry(socketPath, readyPath) {
             await serveSocketBroker(socketPath, readyPath);
             return;
         } catch (error) {
-            if (!TRANSIENT_RELAY_BIND_ERRORS.has(error?.code)
+            if (!TRANSIENT_RELAY_SOCKET_ERRORS.has(error?.code)
                 || attempt === RUNTIME_RELAY_BIND_ATTEMPTS) {
                 throw error;
             }
