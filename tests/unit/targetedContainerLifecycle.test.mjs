@@ -27,6 +27,7 @@ function fixture({ runningChecks = [true, false], exitCode = 0 } = {}) {
                 events.push(['selector-check', ...affectedSelectors]);
                 return true;
             },
+            retireControlSocket: (name) => { events.push(['retire-relay', name]); },
             signal: (_runtime, name) => { events.push(['signal', name]); return { status: 0 }; },
             inspect: () => ({ State: { ExitCode: exitCode, OOMKilled: false, Error: '' } }),
             now: () => time,
@@ -46,7 +47,7 @@ test('targeted drain proves exact selectors inactive before SIGTERM and removes 
         affectedSelectors: ['service:route/editor'],
         removed: true,
     });
-    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'signal', 'remove']);
+    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'retire-relay', 'signal', 'remove']);
 });
 
 test('failed application drain remains running and blocks force removal, recreate, and activation', () => {
@@ -57,8 +58,8 @@ test('failed application drain remains running and blocks force removal, recreat
             && /refusing SIGKILL, removal, recreate, or selector activation/.test(error.message),
     );
     const eventNames = state.events.map(([event]) => event);
-    assert.deepEqual(eventNames.slice(0, 2), ['selector-check', 'signal']);
-    assert.ok(eventNames.slice(2).every((event) => event === 'wait'));
+    assert.deepEqual(eventNames.slice(0, 3), ['selector-check', 'retire-relay', 'signal']);
+    assert.ok(eventNames.slice(3).every((event) => event === 'wait'));
     assert.ok(!eventNames.includes('remove'));
 });
 
@@ -68,7 +69,7 @@ test('signal-style exit 143 is not an application acknowledgement and blocks rem
         () => drainAndRemoveTargetedContainer('ploinky_agent', state.options),
         (error) => error?.code === 'TARGETED_DRAIN_FAILED',
     );
-    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'signal']);
+    assert.deepEqual(state.events.map(([event]) => event), ['selector-check', 'retire-relay', 'signal']);
 });
 
 test('an already-stopped predecessor still requires an exit-zero acknowledgement', () => {

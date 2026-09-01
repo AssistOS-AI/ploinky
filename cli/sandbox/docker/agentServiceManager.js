@@ -61,6 +61,7 @@ import {
     ensureHealthProbeHostDir,
     healthProbeHostDir,
     prepareHealthProbeHostDirForLaunch,
+    retireRuntimeRelaySocket,
     runContainerScriptReadiness,
 } from './healthProbes.js';
 import { removeExactRegisteredContainer, stopAndRemove } from './containerFleet.js';
@@ -3669,6 +3670,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             acknowledgement: targetedRestart.acknowledgement,
             affectedSelectors: targetedRestart.affectedSelectors,
             assertSelectorsInactive: targetedRestart.assertSelectorsInactive,
+            retireControlSocket: retireRuntimeRelaySocket,
             ...(targetedRestart.timeoutMs === undefined ? {} : { timeoutMs: targetedRestart.timeoutMs }),
         };
         if (runtimeNetworkPlan.requiresManagedNetwork) {

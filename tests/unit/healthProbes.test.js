@@ -26,6 +26,7 @@ const {
     runContainerScriptReadiness,
     healthProbeHostDir,
     prepareHealthProbeHostDirForLaunch,
+    retireRuntimeRelaySocket,
     submitProbeRequest,
     computeBackoffDelay,
     maybeResetBackoff,
@@ -101,6 +102,26 @@ test('launch preparation retires only exact fixed broker artifacts', async (t) =
     assert.equal(fs.readFileSync(path.join(preservedRequest, 'request'), 'utf8'), 'preserve-me');
     await new Promise(resolve => server.close(resolve));
     serverClosed = true;
+});
+
+test('runtime relay socket retires while its producer still owns the projected path', async (t) => {
+    const root = fs.mkdtempSync('/tmp/ploinky-probe-retire-');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const name = 'agent-runtime-retire';
+    const control = path.join(root, name);
+    fs.mkdirSync(control, { recursive: true, mode: 0o700 });
+    const socketPath = path.join(control, 'runtime-relay.sock');
+    const server = net.createServer();
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socketPath, resolve);
+    });
+    t.after(() => server.close());
+
+    assert.equal(retireRuntimeRelaySocket(name, { probeControlHostRoot: root }), true);
+    assert.equal(fs.existsSync(socketPath), false);
+    assert.equal(retireRuntimeRelaySocket(name, { probeControlHostRoot: root }), false);
+    await new Promise(resolve => server.close(resolve));
 });
 
 test('launch preparation fails closed on a substituted relay socket', (t) => {
