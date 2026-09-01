@@ -49,7 +49,11 @@ import {
   prepareLlmStartup,
   resolveLlmRuntimeAdmissionContext,
 } from '../sandbox/docker/llmRuntimeIntegration.js';
-import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
+import {
+  resolveAgentExecutionMode,
+  resolveAgentReadinessProtocol,
+  resolveAgentReadinessWaitOptions,
+} from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
 import { createWorkspaceStartLock, releaseWorkspaceStartLock, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
@@ -1456,21 +1460,23 @@ function formatGraphNodeLabel(node, staticLabel) {
 }
 
 function buildReadinessEntryFromNode(node, route, staticLabel) {
-  const timeoutMs = Number.parseInt(
-    process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_TIMEOUT_MS']
-      || '120000',
-    10
-  );
-  const intervalMs = Number.parseInt(
-    process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_INTERVAL_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_INTERVAL_MS']
-      || '250',
-    10
-  );
-  const probeTimeoutMs = Number.parseInt(
-    process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_PROBE_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_PROBE_TIMEOUT_MS']
-      || '1000',
-    10
-  );
+  const waitOptions = resolveAgentReadinessWaitOptions(node.manifest, {
+    timeoutMs: Number.parseInt(
+      process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_TIMEOUT_MS']
+        || '120000',
+      10
+    ),
+    intervalMs: Number.parseInt(
+      process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_INTERVAL_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_INTERVAL_MS']
+        || '250',
+      10
+    ),
+    probeTimeoutMs: Number.parseInt(
+      process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_PROBE_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_PROBE_TIMEOUT_MS']
+        || '1000',
+      10
+    ),
+  });
 
   const protocol = resolveAgentReadinessProtocol(node.manifest);
   const entry = {
@@ -1479,38 +1485,12 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
     kind: node.isStatic ? 'static' : 'dependency',
     route,
     protocol,
-    timeoutMs,
-    intervalMs,
-    probeTimeoutMs
+    ...waitOptions,
   };
   if (protocol === 'script') {
     entry.scriptProbe = normalizeProbeConfig('readiness', node.manifest?.health?.readiness);
   }
   return entry;
-}
-
-function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 120000) {
-  const probe = manifest?.health?.readiness && typeof manifest.health.readiness === 'object'
-    ? manifest.health.readiness
-    : null;
-  if (!probe) {
-    return {
-      timeoutMs: fallbackTimeoutMs,
-      intervalMs: 250,
-      probeTimeoutMs: 1000
-    };
-  }
-  const intervalSeconds = Number.parseInt(probe.interval ?? '1', 10);
-  const timeoutSeconds = Number.parseInt(probe.timeout ?? '1', 10);
-  const failureThreshold = Number.parseInt(probe.failureThreshold ?? '120', 10);
-  const intervalMs = Math.max(1, Number.isFinite(intervalSeconds) ? intervalSeconds : 1) * 1000;
-  const probeTimeoutMs = Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : 1) * 1000;
-  const attempts = Math.max(1, Number.isFinite(failureThreshold) ? failureThreshold : 120);
-  return {
-    timeoutMs: Math.max(fallbackTimeoutMs, attempts * (intervalMs + probeTimeoutMs)),
-    intervalMs,
-    probeTimeoutMs
-  };
 }
 
 function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
@@ -1695,7 +1675,12 @@ async function waitForManifestReadiness({ key, label, kind = 'dependency', manif
     entry.kind = kind;
     entry.label = label;
     if (kind === 'reinstall' && entry.protocol !== 'script') {
-      Object.assign(entry, resolveManifestReadinessWaitOptions(manifest, 15000));
+      Object.assign(entry, resolveAgentReadinessWaitOptions(manifest, {
+        timeoutMs: 15000,
+        intervalMs: 250,
+        probeTimeoutMs: 1000,
+        includeHealthProbeTiming: true,
+      }));
     }
     await waitForReadinessEntries([entry], options);
   } catch (error) {
@@ -2747,7 +2732,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
               log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol})...`);
             }
             const ready = await waitForAgentReadyImpl(cliReadinessRoute, {
-              timeoutMs: 600000,
+              ...resolveAgentReadinessWaitOptions(manifest, { timeoutMs: 600000 }),
               protocol: readinessProtocol,
             });
             if (!ready) {

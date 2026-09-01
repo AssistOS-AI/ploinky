@@ -6,7 +6,8 @@ import {
     readManifestStartCommand,
     resolveAgentExecutionMode,
     resolveAgentReadinessPort,
-    resolveAgentReadinessProtocol
+    resolveAgentReadinessProtocol,
+    resolveAgentReadinessWaitOptions,
 } from '../../cli/utils/runtime/startupReadiness.js';
 
 test('read manifest commands trims explicit start and agent values', () => {
@@ -93,6 +94,61 @@ test('resolveAgentReadinessPort accepts only an explicit valid container port', 
         () => resolveAgentReadinessPort({ readiness: { port: '7000/tcp' } }),
         /integer from 1 through 65535/,
     );
+});
+
+test('manifest startup timeout raises a short caller budget without shortening broader callers', () => {
+    const manifest = {
+        readiness: {
+            protocol: 'mcp',
+            timeoutSeconds: 45,
+        },
+    };
+
+    assert.deepEqual(resolveAgentReadinessWaitOptions(manifest, {
+        timeoutMs: 15000,
+        intervalMs: 125,
+        probeTimeoutMs: 750,
+    }), {
+        timeoutMs: 45000,
+        intervalMs: 125,
+        probeTimeoutMs: 750,
+    });
+    assert.equal(resolveAgentReadinessWaitOptions(manifest, {
+        timeoutMs: 120000,
+    }).timeoutMs, 120000);
+});
+
+test('manifest startup timeout is an explicit positive integer contract', () => {
+    for (const timeoutSeconds of [0, -1, 1.5, '45', Number.MAX_SAFE_INTEGER]) {
+        assert.throws(
+            () => resolveAgentReadinessWaitOptions({
+                readiness: { protocol: 'mcp', timeoutSeconds },
+            }),
+            /readiness\.timeoutSeconds must be a positive integer number of seconds/,
+        );
+    }
+});
+
+test('targeted recovery can preserve legacy health probe timing in the shared resolver', () => {
+    assert.deepEqual(resolveAgentReadinessWaitOptions({
+        readiness: { protocol: 'mcp', timeoutSeconds: 18 },
+        health: {
+            readiness: {
+                interval: 2,
+                timeout: 3,
+                failureThreshold: 4,
+            },
+        },
+    }, {
+        timeoutMs: 15000,
+        intervalMs: 250,
+        probeTimeoutMs: 1000,
+        includeHealthProbeTiming: true,
+    }), {
+        timeoutMs: 20000,
+        intervalMs: 2000,
+        probeTimeoutMs: 3000,
+    });
 });
 
 test('top-level manifest.run does not affect startup readiness inference', () => {

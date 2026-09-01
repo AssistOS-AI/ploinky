@@ -29,6 +29,7 @@ import {
     runNoWaitLifecycleTransaction,
     runNoWaitScriptReadinessWithControlPlaneRetry,
     waitForNoWaitLifecycle,
+    waitForNoWaitReadiness,
     waitForNoWaitWorkerLifecycle,
     waitForNoWaitStatusBarrier,
     waitForNoWaitRouteActivation,
@@ -116,6 +117,41 @@ function workerIdentity(containerName, {
         statusFile: `${containerName}.${runId}.json`,
     };
 }
+
+test('no-wait MCP readiness uses the shared manifest-aware startup budget', async (t) => {
+    const previousTimeout = process.env.PLOINKY_NO_WAIT_READY_TIMEOUT_MS;
+    process.env.PLOINKY_NO_WAIT_READY_TIMEOUT_MS = '120000';
+    t.after(() => {
+        if (previousTimeout === undefined) delete process.env.PLOINKY_NO_WAIT_READY_TIMEOUT_MS;
+        else process.env.PLOINKY_NO_WAIT_READY_TIMEOUT_MS = previousTimeout;
+    });
+    let observed = null;
+
+    await waitForNoWaitReadiness({
+        manifest: {
+            agent: 'node /code/server.mjs',
+            readiness: { protocol: 'mcp', timeoutSeconds: 45 },
+        },
+        profileConfig: {},
+        shortAgent: 'roboTeamAgent',
+        containerName: 'roboteam-cold-candidate',
+        hostPort: 31000,
+        runtimeResult: {},
+        networkMode: 'default',
+        generationDigest: '',
+        runtime: 'podman',
+        runtimeKind: 'container',
+    }, {
+        waitForAgentReadyImpl(route, options) {
+            observed = { route, options };
+            return true;
+        },
+    });
+
+    assert.equal(observed.options.timeoutMs, 120000);
+    assert.equal(observed.options.protocol, 'mcp');
+    assert.equal(observed.route.hostPort, 31000);
+});
 
 const FAST_TIMEOUTS = resolveNoWaitBarrierTimeouts({
     activeTimeoutMs: 1000,
@@ -2225,6 +2261,58 @@ function noWaitTransactionFixture() {
     };
     return { lifecycle, candidate };
 }
+
+test('cold MCP timeout removes the exact producer candidate and blocks its direct dependent', async (t) => {
+    const { runningDir } = fixture(t);
+    const { lifecycle, candidate } = noWaitTransactionFixture();
+    let cleanupCandidateId = '';
+    let cleanupInspectionId = '';
+    let dependentStarted = false;
+
+    await assert.rejects(
+        () => runNoWaitLifecycleTransaction({ containerName: candidate.containerName }, {
+            capture: () => ({}),
+            ensure: () => candidate,
+            readiness() { throw new Error("readiness protocol 'mcp' did not succeed"); },
+            revalidate() { assert.fail('timed-out producer must not revalidate for activation'); },
+            inspectRuntime(result, _context, _lifecycle, _capability, options) {
+                assert.equal(options.cleanup, true);
+                cleanupInspectionId = result.containerId;
+            },
+            activate() { assert.fail('timed-out producer must not activate'); },
+            cleanupCandidate(result) { cleanupCandidateId = result.containerId; },
+            withLifecycleLease: (_identity, callback) => callback(lifecycle),
+            withNetworkLock: (callback) => callback({ exact: 'network-capability' }),
+            loadCurrentLifecycle: () => lifecycle,
+        }),
+        /readiness protocol 'mcp' did not succeed/,
+    );
+    assert.equal(cleanupInspectionId, candidate.containerId);
+    assert.equal(cleanupCandidateId, candidate.containerId);
+
+    const runStartedAtMs = Date.now();
+    publishRunScoped(runningDir, candidate.containerName, {
+        runStartedAtMs,
+        waveIndex: 0,
+        state: 'failed',
+    });
+    await assert.rejects(
+        () => waitForNoWaitStatusBarrier([
+            barrierEntry(runningDir, candidate.containerName, {
+                waveIndex: 0,
+                directDependency: true,
+            }),
+        ], {
+            runId: RUN_ID,
+            runStartedAtMs,
+            waveIndex: 1,
+            runningDir,
+            waitOptions: { timeouts: FAST_TIMEOUTS, pollIntervalMs: 10 },
+        }).then(() => { dependentStarted = true; }),
+        (error) => error?.code === 'PLOINKY_NO_WAIT_DIRECT_DEPENDENCY_FAILED',
+    );
+    assert.equal(dependentStarted, false);
+});
 
 test('ordinary no-wait readiness runs outside locks and activation is exactly reserialized', async () => {
     const { lifecycle, candidate } = noWaitTransactionFixture();

@@ -29,7 +29,10 @@ import {
     RUNTIME_CAPABILITY_POLICY_VERSION,
 } from '../sandbox/runtimeCapabilities.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
-import { resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
+import {
+    resolveAgentReadinessProtocol,
+    resolveAgentReadinessWaitOptions,
+} from '../utils/runtime/startupReadiness.js';
 import { runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import {
     buildRelayReadinessRoute,
@@ -1094,21 +1097,23 @@ async function waitForRestartedContainerReadiness(
     }
     const waitUntilReady = monitor.waitForAgentReady || waitForAgentReady;
     const ready = await waitUntilReady(readinessRoute, {
-        timeoutMs: positiveInteger(
-            monitor?.config?.CONTAINER_RESTART_READY_TIMEOUT_MS
-                ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_TIMEOUT_MS,
-            120000,
-        ),
-        intervalMs: positiveInteger(
-            monitor?.config?.CONTAINER_RESTART_READY_INTERVAL_MS
-                ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_INTERVAL_MS,
-            250,
-        ),
-        probeTimeoutMs: positiveInteger(
-            monitor?.config?.CONTAINER_RESTART_READY_PROBE_TIMEOUT_MS
-                ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_PROBE_TIMEOUT_MS,
-            1000,
-        ),
+        ...resolveAgentReadinessWaitOptions(manifest, {
+            timeoutMs: positiveInteger(
+                monitor?.config?.CONTAINER_RESTART_READY_TIMEOUT_MS
+                    ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_TIMEOUT_MS,
+                120000,
+            ),
+            intervalMs: positiveInteger(
+                monitor?.config?.CONTAINER_RESTART_READY_INTERVAL_MS
+                    ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_INTERVAL_MS,
+                250,
+            ),
+            probeTimeoutMs: positiveInteger(
+                monitor?.config?.CONTAINER_RESTART_READY_PROBE_TIMEOUT_MS
+                    ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_PROBE_TIMEOUT_MS,
+                1000,
+            ),
+        }),
         protocol,
     });
     if (!ready) {

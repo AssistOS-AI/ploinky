@@ -142,7 +142,7 @@ test('enabled agent readiness stops immediately when the exact container exits',
 
     await assert.rejects(
         waitForEnabledAgentReadiness('searchAgent', {
-            readiness: { protocol: 'mcp', port: 7000 },
+            readiness: { protocol: 'mcp', port: 7000, timeoutSeconds: 180 },
         }, {
             containerName: 'ploinky_proxies_searchAgent_workspace_deadbeef',
             containerId: exactContainerId,
@@ -173,6 +173,7 @@ test('enabled agent readiness stops immediately when the exact container exits',
 
     assert.equal(observedTarget, exactContainerId);
     assert.equal(typeof readinessOptions.beforeProbe, 'function');
+    assert.equal(readinessOptions.timeoutMs, 180000);
 });
 
 test('enabled agent readiness tolerates an inconclusive runtime control-plane timeout', async () => {

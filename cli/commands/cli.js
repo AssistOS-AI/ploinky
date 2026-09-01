@@ -28,6 +28,7 @@ import {
 } from './targetedAgentRestart.js';
 import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import { printComponentAccess } from '../server/utils/routerEnv.js';
+import { buildRelayReadinessRoute } from '../server/utils/agentReadiness.js';
 import {
     getAgentContainerName,
     getRuntime,
@@ -553,10 +554,16 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
                                         label: resolved.shortAgentName,
                                         kind: 'reinstall',
                                         manifest,
-                                        route: {
-                                            container: result?.containerName || containerName,
-                                            hostPort: result?.hostPort || 0,
-                                        },
+                                        route: buildRelayReadinessRoute({
+                                            route: {
+                                                container: result?.containerName || containerName,
+                                                hostPort: result?.hostPort || 0,
+                                            },
+                                            manifest,
+                                            runtimeResult: result,
+                                            networkMode: routerEndpoint?.mode || '',
+                                            generationDigest: result?.preparationLease?.preparedGeneration || '',
+                                        }),
                                     });
                                     await activatePreparedRuntimeAfterReadiness({
                                         result,
@@ -609,10 +616,16 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
                                     label: resolved.shortAgentName,
                                     kind: 'reinstall',
                                     manifest,
-                                    route: {
-                                        container: newContainerName,
-                                        hostPort: hostPort || 0,
-                                    },
+                                    route: buildRelayReadinessRoute({
+                                        route: {
+                                            container: newContainerName,
+                                            hostPort: hostPort || 0,
+                                        },
+                                        manifest,
+                                        runtimeResult: restartResult,
+                                        networkMode: routerEndpoint?.mode || '',
+                                        generationDigest: restartResult?.preparationLease?.preparedGeneration || '',
+                                    }),
                                 });
 
                                 await activatePreparedRuntimeAfterReadiness({
@@ -687,10 +700,16 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
                                         label: resolved.shortAgentName,
                                         kind: 'reinstall',
                                         manifest,
-                                        route: {
-                                            container: result?.containerName || containerName,
-                                            hostPort: result?.hostPort || 0,
-                                        },
+                                        route: buildRelayReadinessRoute({
+                                            route: {
+                                                container: result?.containerName || containerName,
+                                                hostPort: result?.hostPort || 0,
+                                            },
+                                            manifest,
+                                            runtimeResult: result,
+                                            networkMode: routerEndpoint?.mode || '',
+                                            generationDigest: result?.preparationLease?.preparedGeneration || '',
+                                        }),
                                     });
                                     await commitTargetedAgentRestart({
                                         transition,

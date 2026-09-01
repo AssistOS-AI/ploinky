@@ -186,7 +186,9 @@ test('monitor waits for exact semantic readiness before committing the returned 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-ready-'));
     try {
         const manifestPath = path.join(root, 'manifest.json');
-        fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'mcp' } }));
+        fs.writeFileSync(manifestPath, JSON.stringify({
+            readiness: { protocol: 'mcp', timeoutSeconds: 180 },
+        }));
         const result = preparedRestartResult();
         const events = [];
         let savedAgents = null;
@@ -215,6 +217,7 @@ test('monitor waits for exact semantic readiness before committing the returned 
                 events.push('readiness-start');
                 assert.deepEqual(route, { hostPort: 43123 });
                 assert.equal(options.protocol, 'mcp');
+                assert.equal(options.timeoutMs, 180000);
                 return readinessGate;
             },
             loadAgents() {

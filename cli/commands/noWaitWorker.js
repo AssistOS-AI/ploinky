@@ -47,7 +47,10 @@ import {
 } from '../sandbox/runtimeCapabilities.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { mergeRoutingConfig, mergeRuntimeRoute } from '../server/routingFile.js';
-import { resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
+import {
+    resolveAgentReadinessProtocol,
+    resolveAgentReadinessWaitOptions,
+} from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { loadAgents, saveAgents } from '../utils/workspace.js';
 import {
@@ -1399,7 +1402,7 @@ function readinessFailure(message, {
     return failure;
 }
 
-async function waitForNoWaitReadiness({
+export async function waitForNoWaitReadiness({
     manifest,
     profileConfig,
     shortAgent,
@@ -1410,7 +1413,9 @@ async function waitForNoWaitReadiness({
     generationDigest,
     runtime,
     runtimeKind,
-}) {
+}, {
+    waitForAgentReadyImpl = waitForAgentReady,
+} = {}) {
     const protocol = resolveAgentReadinessProtocol(manifest);
     if (protocol === 'none') return;
     if (protocol === 'script') {
@@ -1449,10 +1454,12 @@ async function waitForNoWaitReadiness({
     if (!readinessRoute.hostPort && !readinessRoute.relay) {
         throw new Error(`readiness protocol '${protocol}' requires one resolved private target or readiness.port`);
     }
-    const ready = await waitForAgentReady(readinessRoute, {
-        timeoutMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_TIMEOUT_MS || '120000', 10),
-        intervalMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_INTERVAL_MS || '250', 10),
-        probeTimeoutMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_PROBE_TIMEOUT_MS || '1000', 10),
+    const ready = await waitForAgentReadyImpl(readinessRoute, {
+        ...resolveAgentReadinessWaitOptions(manifest, {
+            timeoutMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_TIMEOUT_MS || '120000', 10),
+            intervalMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_INTERVAL_MS || '250', 10),
+            probeTimeoutMs: Number.parseInt(process.env.PLOINKY_NO_WAIT_READY_PROBE_TIMEOUT_MS || '1000', 10),
+        }),
         protocol,
     });
     if (!ready) {
