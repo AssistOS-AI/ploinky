@@ -89,6 +89,7 @@ import {
 import {
     ensureLegacyAgentGuardSources,
     legacyAgentGuardTargets,
+    prepareLegacyGuardMountpointCleanup,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
@@ -2230,7 +2231,13 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         // shared-filesystem socket projection cannot leak across generations.
         // Per-request directories remain untouched and fail closed separately.
         prepareHealthProbeHostDirForLaunch(containerName);
-        const res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
+        const cleanupLegacyMountpoints = prepareLegacyGuardMountpointCleanup();
+        let res;
+        try {
+            res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
+        } finally {
+            cleanupLegacyMountpoints();
+        }
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
     };
     let cleanupReceipt = beginCandidateLifecycle({

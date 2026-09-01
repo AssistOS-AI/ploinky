@@ -62,6 +62,35 @@ export function ensureLegacyAgentGuardSources({
     return sources;
 }
 
+export function prepareLegacyGuardMountpointCleanup({
+    workspaceRoot = PLOINKY_WORKSPACE_ROOT,
+} = {}) {
+    const missingRoots = protectedLegacyAgentRoots(workspaceRoot)
+        .filter(({ hostPath }) => !fs.existsSync(hostPath));
+    return () => {
+        for (const { hostPath } of missingRoots) {
+            let stat;
+            try {
+                stat = fs.lstatSync(hostPath);
+            } catch (error) {
+                if (error?.code === 'ENOENT') continue;
+                throw error;
+            }
+            if (stat.isSymbolicLink() || !stat.isDirectory() || fs.readdirSync(hostPath).length !== 0) {
+                throw guardError(
+                    `runtime created an unexpected non-empty legacy guard mountpoint '${hostPath}'`,
+                    { hostPath },
+                );
+            }
+            try {
+                fs.rmdirSync(hostPath);
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+            }
+        }
+    };
+}
+
 function runtimeDescendant(target, relativeHostPath) {
     const segments = relativeHostPath.split(path.sep).filter(Boolean);
     return path.posix.join(String(target || '/'), ...segments);

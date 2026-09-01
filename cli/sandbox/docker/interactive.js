@@ -30,6 +30,7 @@ import { ensureAgentDataDirectory } from '../../utils/runtime/agentDataPathPolic
 import {
     ensureLegacyAgentGuardSources,
     legacyAgentGuardTargets,
+    prepareLegacyGuardMountpointCleanup,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import {
     agentLibAliasShadows,
@@ -56,6 +57,15 @@ function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
     const sources = ensureLegacyAgentGuardSources({ workspaceRoot });
     const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
     return targets.map(guard => `-v "${sources.get(guard.key)}:${guard.target}${suffix}"`);
+}
+
+function createWithLegacyMountpointCleanup(create) {
+    const cleanup = prepareLegacyGuardMountpointCleanup();
+    try {
+        return create();
+    } finally {
+        cleanup();
+    }
 }
 
 function buildInteractiveCommandCreateCommand({
@@ -211,7 +221,9 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 containerImage,
             });
             debugLog(`Executing create command: ${createCommand}`);
-            createOutput = execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim();
+            createOutput = createWithLegacyMountpointCleanup(() => (
+                execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim()
+            ));
             containerId = createOutput;
         } catch (error) {
             if (runtime === 'podman' && error.message.includes('short-name')) {
@@ -235,7 +247,9 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 debugLog(`Executing retry command: ${retryCommand}`);
 
                 try {
-                    createOutput = execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim();
+                    createOutput = createWithLegacyMountpointCleanup(() => (
+                        execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim()
+                    ));
                     containerId = createOutput;
                     manifest.container = containerImage;
                 } catch (retryError) {
@@ -421,7 +435,9 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                 containerImage,
             });
             debugLog(`Executing create command: ${createCommand}`);
-            execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] });
+            createWithLegacyMountpointCleanup(() => (
+                execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] })
+            ));
             createdNew = true;
         } catch (error) {
             if (runtime === 'podman' && String(error.message || '').includes('short-name')) {
@@ -444,7 +460,9 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                     containerImage,
                 });
                 debugLog(`Executing retry command: ${retryCommand}`);
-                execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] });
+                createWithLegacyMountpointCleanup(() => (
+                    execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] })
+                ));
                 manifest.container = containerImage;
                 createdNew = true;
             } else {

@@ -15,6 +15,7 @@ import {
 import {
     ensureLegacyAgentGuardSources,
     legacyAgentGuardTargets,
+    prepareLegacyGuardMountpointCleanup,
 } from '../../cli/utils/runtime/legacyAgentDataGuards.js';
 import {
     ensureManifestVolumeHostPath,
@@ -133,6 +134,35 @@ test('legacy guard targets are derived from broad mounts without creating legacy
                 true,
             );
         }
+    } finally {
+        cleanup();
+    }
+});
+
+test('legacy guard mountpoint cleanup removes only empty roots created after admission', () => {
+    const { root, cleanup } = fixture();
+    try {
+        const controllerData = path.join(root, '.ploinky', 'data');
+        const legacyShared = path.join(root, '.ploinky', 'shared');
+        fs.mkdirSync(path.join(controllerData, 'edge-routing'), { recursive: true });
+        const cleanupMountpoints = prepareLegacyGuardMountpointCleanup({ workspaceRoot: root });
+        fs.mkdirSync(legacyShared, { recursive: true });
+        cleanupMountpoints();
+        assert.equal(fs.existsSync(legacyShared), false);
+        assert.equal(fs.existsSync(controllerData), true);
+
+        fs.mkdirSync(legacyShared, { recursive: true });
+        const preserveExisting = prepareLegacyGuardMountpointCleanup({ workspaceRoot: root });
+        preserveExisting();
+        assert.equal(fs.existsSync(legacyShared), true);
+
+        fs.rmSync(legacyShared, { recursive: true });
+        const rejectUnexpectedData = prepareLegacyGuardMountpointCleanup({ workspaceRoot: root });
+        fs.mkdirSync(legacyShared, { recursive: true });
+        fs.writeFileSync(path.join(legacyShared, 'unexpected'), 'data');
+        assert.throws(rejectUnexpectedData, error => (
+            error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION'
+        ));
     } finally {
         cleanup();
     }
