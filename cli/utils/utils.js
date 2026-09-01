@@ -53,13 +53,20 @@ function findAgent(agentName) {
         debugLog(`Searching ${label} repos: ${repos.join(', ')}`);
         for (const repo of repos) {
             const repoPath = path.join(REPOS_DIR, repo);
-            if (fs.statSync(repoPath).isDirectory()) {
-                const agentPath = path.join(repoPath, agentName);
-                const manifestPath = path.join(agentPath, 'manifest.json');
-                if (fs.existsSync(manifestPath)) {
-                    debugLog(`Found potential match in repo '${repo}': ${manifestPath}`);
-                    foundAgents.push({ manifestPath, repo: repo, shortAgentName: agentName });
-                }
+            let isDirectory = false;
+            try {
+                isDirectory = fs.statSync(repoPath).isDirectory();
+            } catch (error) {
+                if (!['ENOENT', 'ENOTDIR'].includes(error?.code)) throw error;
+                debugLog(`Skipping inaccessible repo entry '${repo}': ${error?.message || error}`);
+                continue;
+            }
+            if (!isDirectory) continue;
+            const agentPath = path.join(repoPath, agentName);
+            const manifestPath = path.join(agentPath, 'manifest.json');
+            if (fs.existsSync(manifestPath)) {
+                debugLog(`Found potential match in repo '${repo}': ${manifestPath}`);
+                foundAgents.push({ manifestPath, repo: repo, shortAgentName: agentName });
             }
         }
     };

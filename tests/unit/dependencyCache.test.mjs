@@ -411,3 +411,20 @@ test('ensureAgentCacheForFamily prepares cache and returns node_modules path', (
         fs.rmSync(agentCodePath, { recursive: true, force: true });
     }
 });
+
+test('inspectAgentCache remains a read-only cache admission path', () => {
+    const source = fs.readFileSync(
+        new URL('../../cli/utils/dependencies/dependencyCache.js', import.meta.url),
+        'utf8',
+    );
+    const start = source.indexOf('export function inspectAgentCache');
+    const end = source.indexOf('\nfunction seedFromGlobalCache', start);
+    assert.ok(start >= 0 && end > start);
+    const body = source.slice(start, end);
+    assert.match(body, /isAgentCacheValid/);
+    assert.match(body, /isAgentLibLinkValid/);
+    assert.doesNotMatch(
+        body,
+        /acquireLock|prepareGlobalCache|ensureAgentLibCacheLink|fs\.(?:mkdirSync|writeFileSync|rmSync|renameSync|symlinkSync)|\.install\(/,
+    );
+});

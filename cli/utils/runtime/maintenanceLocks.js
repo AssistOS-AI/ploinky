@@ -15,7 +15,12 @@ const WORKSPACE_START_TTL_MS = 24 * 60 * 60 * 1000;
 const LOCK_STALE_GRACE_MS = 5_000;
 
 function lockPathFor(containerName) {
-    const safeName = String(containerName || '').replace(/[^A-Za-z0-9_.-]/g, '_');
+    // Direct replacement candidates use an immutable physical name so the
+    // predecessor can remain live through readiness. All generations of that
+    // one logical runtime must still serialize on the predecessor's stable
+    // maintenance identity.
+    const logicalName = String(containerName || '').replace(/__candidate_[a-f0-9]{12}$/i, '');
+    const safeName = logicalName.replace(/[^A-Za-z0-9_.-]/g, '_');
     return path.join(MAINTENANCE_DIR, `${safeName}.json`);
 }
 

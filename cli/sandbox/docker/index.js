@@ -24,6 +24,7 @@ export {
     cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
     removeAgentContainerForRecreate,
+    retireExactAgentRuntimePredecessor,
     resolveHostPort,
     resolveHostPortFromRecord,
     resolveHostPortFromRuntime,

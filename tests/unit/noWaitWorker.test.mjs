@@ -28,6 +28,7 @@ import {
     resolveRunScopedObservation,
     runNoWaitLifecycleTransaction,
     runNoWaitScriptReadinessWithControlPlaneRetry,
+    upsertRoute,
     waitForNoWaitLifecycle,
     waitForNoWaitWorkerLifecycle,
     waitForNoWaitStatusBarrier,
@@ -917,6 +918,11 @@ test('no-wait main delegates route activation to the serialized lifecycle transa
     const routeMutation = source.indexOf('await upsertRoute(', activation);
     const transactionEnd = source.indexOf('\n        });\n    } catch (err)', routeMutation);
     assert.ok(transaction > 0, 'no-wait worker must enter the serialized lifecycle transaction');
+    assert.match(
+        source.slice(transaction, activation),
+        /retainLifecycleLocksThroughReadiness:\s*hasWaveBarrier/,
+        'a dependency-ordered worker must keep its proven Router generation stable through readiness',
+    );
     assert.ok(activation > transaction, 'route activation must be owned by the transaction callback');
     assert.ok(routeMutation > activation, 'route mutation must occur only within activation');
     assert.ok(transactionEnd > routeMutation, 'activation must finish before the transaction releases');
@@ -925,6 +931,120 @@ test('no-wait main delegates route activation to the serialized lifecycle transa
         /networkLifecycleCapability[\s\S]*await upsertRoute\([\s\S]*networkLifecycleCapability/,
         'activation must pass its exact live network capability into the route transaction',
     );
+});
+
+test('staged no-wait route publication uses an additive atomic cutover', async () => {
+    const agentPath = path.join(os.tmpdir(), 'ploinky-demo-worker');
+    const identity = {
+        containerName: 'ploinky_demo_worker',
+        instanceId: INSTANCE_ID,
+        enableGeneration: ENABLE_GENERATION,
+        repoName: 'demo',
+        shortAgent: 'worker',
+        alias: '',
+        routeKey: 'worker',
+        agentPath,
+    };
+    const stagedRecord = {
+        type: 'agent',
+        repoName: identity.repoName,
+        agentName: identity.shortAgent,
+        instanceId: identity.instanceId,
+        enableGeneration: identity.enableGeneration,
+    };
+    const stagedRoute = {
+        container: identity.containerName,
+        repo: identity.repoName,
+        agent: identity.shortAgent,
+        hostPath: agentPath,
+    };
+    const active = {
+        selector: {
+            state: 'active',
+            generation: 'sha256:predecessor',
+            activationId: 'predecessor-activation',
+        },
+        generation: {
+            agents: { [identity.containerName]: stagedRecord },
+            routing: { port: 8080, routes: { worker: stagedRoute } },
+            manifests: { worker: { name: 'worker' } },
+            routerHostPort: 8080,
+        },
+    };
+    const lifecycle = assertNoWaitLifecycleSnapshot(active, identity);
+    const registryRecord = {
+        ...stagedRecord,
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
+    };
+    const finalRoute = { ...stagedRoute, hostPort: 45123 };
+    const lease = { mode: 'additive', transactionId: 'no-wait-additive' };
+    const calls = [];
+    let applyLockHeld = false;
+
+    await upsertRoute('worker', finalRoute, {
+        containerName: identity.containerName,
+        registryRecord,
+        expectedIdentity: identity,
+        expectedLifecycle: lifecycle,
+        expectedSelector: {
+            generation: lifecycle.generationDigest,
+            activationId: lifecycle.selectorActivationId,
+        },
+        networkLifecycleCapability: { token: 'network' },
+    }, {
+        async waitForActivation(receivedIdentity, receivedSelector) {
+            calls.push('wait');
+            assert.equal(receivedIdentity, identity);
+            assert.equal(receivedSelector.generation, lifecycle.generationDigest);
+            return lifecycle;
+        },
+        async withApplyLock(callback) {
+            calls.push('lock');
+            applyLockHeld = true;
+            try {
+                return await callback({ token: 'apply' });
+            } finally {
+                applyLockHeld = false;
+            }
+        },
+        assertActive() {
+            calls.push('assert-active');
+            assert.equal(applyLockHeld, true);
+            return active;
+        },
+        prepareAdditive(options) {
+            calls.push('prepare-additive');
+            assert.equal(applyLockHeld, true);
+            assert.equal(options.expectedActiveGeneration, lifecycle.generationDigest);
+            assert.deepEqual(options.agents[identity.containerName], registryRecord);
+            assert.deepEqual(options.routing.routes.worker, finalRoute);
+            return { preparationLease: lease };
+        },
+        commitAdditive(receivedLease, options) {
+            calls.push('commit-additive');
+            assert.equal(applyLockHeld, true);
+            assert.equal(receivedLease, lease);
+            assert.deepEqual(options.agents[identity.containerName], registryRecord);
+            assert.deepEqual(options.routing.routes.worker, finalRoute);
+            return { selector: { state: 'active' } };
+        },
+        mergeRouting() {
+            assert.fail('a staged no-wait route must not enter the inactive generic apply path');
+        },
+        abortPreparation() {
+            assert.fail('a successful additive cutover must not abort its preparation');
+        },
+    });
+
+    assert.equal(applyLockHeld, false);
+    assert.deepEqual(calls, [
+        'wait',
+        'lock',
+        'assert-active',
+        'prepare-additive',
+        'commit-additive',
+    ]);
 });
 
 test('no-wait worker never owns the workspace lease while waiting for an active generation', async () => {
@@ -2294,6 +2414,49 @@ test('ordinary no-wait readiness runs outside locks and activation is exactly re
         { waitMs: 300000, pollMs: 1000 },
         { waitMs: 300000, pollMs: 1000 },
     ]);
+});
+
+test('dependency-ordered no-wait readiness retains lifecycle locks through activation', async () => {
+    const { lifecycle, candidate } = noWaitTransactionFixture();
+    let workspaceHeld = false;
+    let networkHeld = false;
+    let lifecycleLeases = 0;
+    let networkLeases = 0;
+
+    const value = await runNoWaitLifecycleTransaction({ containerName: candidate.containerName }, {
+        retainLifecycleLocksThroughReadiness: true,
+        capture: () => ({}),
+        ensure() {
+            assert.equal(workspaceHeld && networkHeld, true);
+            return candidate;
+        },
+        readiness() {
+            assert.equal(workspaceHeld && networkHeld, true);
+        },
+        revalidate() { assert.fail('a retained dependency launch must not reacquire/rebase'); },
+        inspectRuntime() {
+            assert.equal(workspaceHeld && networkHeld, true);
+        },
+        activate(_current, _context, _result, { onCommitted }) {
+            assert.equal(workspaceHeld && networkHeld, true);
+            onCommitted();
+            return 'dependency-activation';
+        },
+        async withLifecycleLease(_identity, callback) {
+            lifecycleLeases += 1;
+            workspaceHeld = true;
+            try { return await callback(lifecycle); } finally { workspaceHeld = false; }
+        },
+        async withNetworkLock(callback) {
+            networkLeases += 1;
+            networkHeld = true;
+            try { return await callback({ lock: 'network' }); } finally { networkHeld = false; }
+        },
+    });
+
+    assert.equal(value, 'dependency-activation');
+    assert.equal(lifecycleLeases, 1);
+    assert.equal(networkLeases, 1);
 });
 
 test('stale no-wait lifecycle cleans only after locked immutable reinspection', async () => {

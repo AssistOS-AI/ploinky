@@ -819,6 +819,59 @@ test('managed transaction creates multiple attachments, verifies start, and comm
     assert.equal(Object.keys(candidate.NetworkSettings.Networks).length, 2);
 });
 
+test('separately named managed candidate starts without stopping its active predecessor', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const predecessorIdentity = {
+        instanceId: 'instance-predecessor',
+        enableGeneration: 'enable-predecessor',
+    };
+    const candidateIdentity = {
+        instanceId: 'instance-candidate',
+        enableGeneration: 'enable-candidate',
+    };
+    const plan = harness.adapter.prepare(network, 'demo');
+    const primary = plan.attachments[0];
+    const predecessorId = 'predecessor1234567890';
+    const predecessor = managedAgentRecord({
+        id: predecessorId,
+        name: 'demo-container',
+        labels: managedAgentLabels(harness.identity, network, networkContractHash(network), {}, predecessorIdentity),
+        networks: { [primary.name]: { Aliases: [plan.alias, predecessorId.slice(0, 12)] } },
+        running: true,
+    });
+    harness.containers.set(predecessorId, predecessor);
+    harness.networks.get(primary.name).Containers[predecessorId] = { Name: predecessor.Name };
+
+    const result = harness.adapter.runManagedContainerTransaction({
+        network,
+        canonicalAgentId: 'demo',
+        containerName: 'demo-container__candidate_123456789abc',
+        runtimeIdentity: candidateIdentity,
+        createContainer(candidatePlan) {
+            const candidateId = 'candidate1234567890123';
+            const record = managedAgentRecord({
+                id: candidateId,
+                name: 'demo-container__candidate_123456789abc',
+                labels: managedAgentLabels(harness.identity, network, networkContractHash(network), {}, candidateIdentity),
+                networks: {
+                    [candidatePlan.attachments[0].name]: {
+                        Aliases: [candidatePlan.alias, candidateId.slice(0, 12)],
+                    },
+                },
+            });
+            harness.containers.set(candidateId, record);
+            harness.networks.get(candidatePlan.attachments[0].name).Containers[candidateId] = { Name: record.Name };
+        },
+    });
+
+    assert.equal(result.containerId, 'candidate1234567890123');
+    assert.equal(harness.containers.get(predecessorId).State.Running, true);
+    assert.equal(harness.calls.some((args) => (
+        ['stop', 'rm'].includes(args[0]) && args.includes(predecessorId)
+    )), false);
+});
+
 test('managed launch hooks remain ordered under the transaction and failed attestation creates no runtime', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'default' });
@@ -902,7 +955,7 @@ test('managed launch hooks remain ordered under the transaction and failed attes
     );
 });
 
-test('fresh semantic adoption reuses one exact immutable runtime without stop, remove, or create', (t) => {
+test('validation-only managed adoption reuses one exact immutable runtime without stop, remove, or create', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'default' });
     const plan = harness.adapter.prepare(network, 'demo');
@@ -916,7 +969,7 @@ test('fresh semantic adoption reuses one exact immutable runtime without stop, r
     }));
     const callsBefore = harness.calls.length;
     let finalized = false;
-    const result = harness.adapter.runManagedContainerTransaction({
+    const result = harness.adapter.adoptManagedContainerTransaction({
         network,
         canonicalAgentId: 'demo',
         containerName: 'demo-container',
@@ -933,10 +986,10 @@ test('fresh semantic adoption reuses one exact immutable runtime without stop, r
                 },
             };
         },
-        createContainer: () => assert.fail('exact adoption must not create a runtime'),
     });
     assert.equal(result.adopted, true);
     assert.equal(result.containerId, id);
+    assert.match(result.adoption.launch.semanticTopologyDigest, /^sha256:[a-f0-9]{64}$/);
     assert.equal(finalized, true);
     assert.equal(harness.calls.slice(callsBefore).some((args) => ['stop', 'rm', 'create'].includes(args[0])), false);
 });
