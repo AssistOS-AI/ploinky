@@ -9,6 +9,7 @@ import { buildEnvFlags, buildEnvMap } from '../../utils/security/secretVars.js';
 import { loadAgents, saveAgents } from '../../utils/workspace.js';
 import { debugLog } from '../../utils/utils.js';
 import { isHostSandboxDisabled } from '../../utils/runtime/sandboxRuntime.js';
+import { withImageOperationLock } from '../../utils/runtime/imageOperationLock.js';
 import { intervalsOverlap, parseManifestOpenPortSpec } from '../../../container/publish-spec.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
@@ -263,33 +264,73 @@ function ensureImagePresent(image, options = {}) {
     const rt = options.runtime || getRuntime();
     const img = String(image || '').trim();
     if (!img) throw new Error('ensureImagePresent: image is required');
-    if (imageExists(img, rt)) return false;
+    const imageExistsImpl = options.imageExists || imageExists;
+    const pullImageImpl = options.pullImage || pullImage;
+    const buildLocalImageImpl = options.buildLocalImage || buildLocalImage;
+    const resolveLocalImageBuildSourceImpl = options.resolveLocalImageBuildSource
+        || resolveLocalImageBuildSource;
+    const withImageOperationLockImpl = options.withImageOperationLock || withImageOperationLock;
+    if (imageExistsImpl(img, rt)) return false;
     const log = typeof options.log === 'function' ? options.log : ((msg) => console.log(msg));
-    log(`[pull] image '${img}' not present locally — pulling before runtime probe...`);
+    const now = typeof options.now === 'function' ? options.now : Date.now;
+    const pullBudgetMs = boundedImageOperationTimeout(options.pullTimeoutMs, imagePullTimeoutMs());
+    const requestedWaitMs = boundedImageOperationTimeout(options.imageOperationWaitMs, pullBudgetMs);
+    const lockWaitMs = Math.min(requestedWaitMs, pullBudgetMs);
+    const pullDeadlineMs = now() + pullBudgetMs;
+    let pullError = null;
+
     try {
-        pullImage(img, { runtime: rt, log, timeoutMs: options.pullTimeoutMs });
-    } catch (pullError) {
-        // A local build is far more expensive than a pull and is not safe to
-        // run concurrently for one tag. Callers that resolve images outside the
-        // serializing lock opt out and leave the build to the locked path.
-        if (options.allowLocalBuild === false) throw pullError;
-        const source = resolveLocalImageBuildSource(img, options);
-        if (!source) throw pullError;
-        log(`[pull] ${img} could not be pulled (${pullError.message}); building from ${source.repoName}/${source.context}...`);
-        try {
-            buildLocalImage(img, {
-                ...options,
-                runtime: rt,
-                log,
-                source,
-                timeoutMs: options.buildTimeoutMs,
-            });
-        } catch (buildError) {
-            throw new Error(
-                `Image pull for '${img}' failed and local build fallback failed: ${buildError.message} `
-                + `Original pull error: ${pullError.message}`
-            );
-        }
+        return withImageOperationLockImpl(() => {
+            // A peer can populate the image while this process waits for the
+            // cross-worker lock. Recheck under the lock so identical images are
+            // never pulled twice and distinct cold pulls cannot overwhelm nested
+            // Podman's process/thread budget.
+            if (imageExistsImpl(img, rt)) return false;
+            const remainingPullMs = Math.floor(pullDeadlineMs - now());
+            if (remainingPullMs <= 0) {
+                const error = new Error(
+                    `image pull budget for '${img}' expired while waiting for serialized image resolution`,
+                );
+                error.code = 'PLOINKY_IMAGE_OPERATION_BUSY';
+                throw error;
+            }
+            log(`[pull] image '${img}' not present locally — pulling before runtime probe...`);
+            pullImageImpl(img, { runtime: rt, log, timeoutMs: remainingPullMs });
+            return true;
+        }, {
+            waitMs: lockWaitMs,
+            now,
+            onWait(owner) {
+                log(`[pull] waiting for serialized image operation${owner?.pid ? ` owned by pid ${owner.pid}` : ''} before resolving '${img}'...`);
+            },
+        });
+    } catch (error) {
+        pullError = error;
+    }
+
+    // Lock contention is an explicit pull failure, not permission to start a
+    // second expensive operation. A source build has its own configured budget
+    // and runs after the global pull lock is released.
+    if (pullError?.code === 'PLOINKY_IMAGE_OPERATION_BUSY' || options.allowLocalBuild === false) {
+        throw pullError;
+    }
+    if (imageExistsImpl(img, rt)) return false;
+    const source = resolveLocalImageBuildSourceImpl(img, options);
+    if (!source) throw pullError;
+    log(`[pull] ${img} could not be pulled (${pullError.message}); building from ${source.repoName}/${source.context}...`);
+    try {
+        buildLocalImageImpl(img, {
+            ...options,
+            runtime: rt,
+            log,
+            source,
+            timeoutMs: options.buildTimeoutMs,
+        });
+    } catch (buildError) {
+        throw new Error(
+            `Image pull for '${img}' failed and local build fallback failed: ${buildError.message} `
+            + `Original pull error: ${pullError.message}`
+        );
     }
     return true;
 }
