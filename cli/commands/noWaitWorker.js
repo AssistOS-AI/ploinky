@@ -1278,9 +1278,9 @@ export function prefetchNoWaitRuntimeImage({
     }
     if (!image) return Object.freeze({ prefetched: false, reason: 'unresolved-image' });
     try {
-        // Pull only. Same-wave workers run this concurrently and unlocked, so
-        // the local-build fallback stays with the serialized in-lease path
-        // rather than racing several builds of one tag.
+        // Pull only. Same-wave workers enter prefetch concurrently outside the
+        // lifecycle locks; ensureImagePresent serializes only the actual pulls.
+        // The local-build fallback stays with the in-lease authoritative path.
         const pulled = ensureImage(image, {
             ...(runtime ? { runtime } : {}),
             allowLocalBuild: false,
