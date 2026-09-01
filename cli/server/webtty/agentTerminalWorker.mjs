@@ -427,7 +427,6 @@ export class AgentTerminalWorker {
         this.sequence = 0;
         this.queuedIpcBytes = 0;
         this.pendingOutput = '';
-        this.startupProbeCommand = '';
         this.readinessChallenge = '';
         this.pty = null;
         this.clientProcess = null;
@@ -496,13 +495,11 @@ export class AgentTerminalWorker {
     }
 
     flushStartupOutput(readyMatch) {
-        const echoedProbe = this.startupProbeCommand.replace(/\r$/, '');
+        const readinessEnd = readyMatch.index + readyMatch[0].length;
         const cleaned = this.pendingOutput
-            .replace(echoedProbe, '')
-            .replace(readyMatch[0], '')
-            .replace(/^\r?\n/, '');
+            .slice(readinessEnd)
+            .replace(/^(?:\r\n|\r|\n)+/, '');
         this.pendingOutput = '';
-        this.startupProbeCommand = '';
         this.readinessChallenge = '';
         for (const chunk of outputChunks(cleaned)) {
             if (!chunk) continue;
@@ -563,7 +560,6 @@ export class AgentTerminalWorker {
     resetAttemptState() {
         this.attemptGeneration += 1;
         this.pendingOutput = '';
-        this.startupProbeCommand = '';
         this.readinessChallenge = '';
         this.pty = null;
         this.clientProcess = null;
@@ -619,7 +615,6 @@ export class AgentTerminalWorker {
         const readinessCommand = fallback
             ? agentFallbackReadinessCommand(challenge)
             : agentReadinessCommand(challenge);
-        this.startupProbeCommand = readinessCommand;
         this.pty.write(readinessCommand);
         const timeout = delay(this.startupTimeoutMs).then(() => {
             throw new Error('agent shell readiness timed out');

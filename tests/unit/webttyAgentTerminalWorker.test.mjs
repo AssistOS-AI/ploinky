@@ -160,9 +160,17 @@ function harness(overrides = {}) {
         write(data) {
             ptyState.writes.push(data);
             if (data.includes('__PLOINKY_AGENT_READY__')) {
-                ptyState.onData(`${data.replace(/\r$/, '')}\r\n`);
+                const echoedProbe = data.replace(/\r$/, '');
+                const probeEchoCount = overrides.probeEchoCount ?? 1;
+                for (let index = 0; index < probeEchoCount; index += 1) {
+                    const prompt = index === 0 ? '' : 'bash-5.3$ ';
+                    ptyState.onData(`${prompt}${echoedProbe}\r\n`);
+                }
                 if (overrides.autoReady !== false) {
                     ptyState.onData(`__PLOINKY_AGENT_READY__${MARKER}|${READINESS_CHALLENGE}|42|42|42|1000|43000\r\n`);
+                    if (overrides.readySuffixOutput) {
+                        ptyState.onData(overrides.readySuffixOutput);
+                    }
                 }
             }
         },
@@ -437,6 +445,24 @@ test('worker proves numeric marker readiness, exact ExecID, and inner namespace 
     h.worker.handleMessage(agentWorkerMessage('resize', TERMINAL_ID, { cols: 120, rows: 40 }));
     assert.equal(h.ptyState.writes.at(-1), 'pwd\r');
     assert.deepEqual(h.ptyState.resizes, [[120, 40]]);
+});
+
+test('worker hides duplicate nested-PTY readiness echoes and exposes only the usable prompt', async () => {
+    for (const usableOutput of ['/workspace/demo $ ', '/workspace/Δ folder $ ', '']) {
+        const h = harness({
+            probeEchoCount: 2,
+            readySuffixOutput: usableOutput,
+        });
+        await h.worker.initialize(init());
+        await h.worker.launch();
+
+        const output = h.processApi.sent
+            .filter((message) => message.type === 'output')
+            .map((message) => message.data)
+            .join('');
+        assert.equal(output, usableOutput);
+        assert.doesNotMatch(output, /PLOINKY_AGENT_READY|ploinky_agent_stat|bash-5\.3/);
+    }
 });
 
 test('Bash PROMPT_COMMAND cannot pre-emit readiness without the post-spawn challenge', async () => {
