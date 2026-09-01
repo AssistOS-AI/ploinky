@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { buildContainerExecArgs } from '../../ploinky-box/command/execute.mjs';
@@ -9,6 +12,8 @@ import {
     resolveBoxImageReference,
 } from '../../ploinky-box/constants.mjs';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
+
+const UPDATE_SCOPE_ROOT = fs.realpathSync.native(process.cwd());
 
 function bufferStream(isTTY = false) {
     let value = '';
@@ -440,7 +445,10 @@ test('full update pulls the host source and relaunches before touching the Box w
         execute() { throw new Error('changed host update must not execute stale in-Box code'); },
     });
     assert.equal(code, 19);
-    assert.deepEqual(events[0], ['host-update', { repositoryRoot: '/source/ploinky' }]);
+    assert.deepEqual(events[0], ['host-update', {
+        repositoryRoot: '/source/ploinky',
+        updateScopeRoot: UPDATE_SCOPE_ROOT,
+    }]);
     assert.equal(events[1][0], 'relaunch');
     assert.equal(events[1][1], process.execPath);
     assert.deepEqual(events[1][2].slice(-3), ['--debug', 'update', 'all']);
@@ -494,6 +502,7 @@ test('full update refreshes in-Box state then restarts an already configured wor
                 resetRepos: false,
             },
             restartAfterUpdate: true,
+            updateScopeRoot: UPDATE_SCOPE_ROOT,
         }],
     ]);
     assert.match(output.value(), /Workspace Ploinky checkout at \/workspace\/ploinky is updated/);
@@ -524,6 +533,7 @@ test('full update does not restart an unconfigured workspace or continue after u
                 resetRepos: false,
             },
             restartAfterUpdate: false,
+            updateScopeRoot: UPDATE_SCOPE_ROOT,
         }],
     ]);
     assert.match(output.value(), /no configured running workspace required a restart/);
@@ -543,6 +553,90 @@ test('full update does not restart an unconfigured workspace or continue after u
         /candidate update failed/,
     );
     assert.deepEqual(failedEvents, ['status', 'update-failed']);
+});
+
+test('full update skips an out-of-scope host checkout and continues the remaining update', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-update-scope-'));
+    const scope = path.join(root, 'workspace');
+    fs.mkdirSync(scope);
+    const events = [];
+    const output = bufferStream();
+    try {
+        const code = await runOuterCli(['update'], {
+            env: {},
+            cwd: () => scope,
+            input: { isTTY: false }, output, errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events, { statusState: 'absent' }),
+            repositoryRoot: '/installed/ploinky',
+            async updateHostSource(options) {
+                events.push(['host-update', options]);
+                return {
+                    updated: false,
+                    skipped: true,
+                    repoPath: '/installed/ploinky',
+                    reason: 'Ploinky checkout is outside the selected update folder',
+                };
+            },
+        });
+
+        assert.equal(code, 0);
+        assert.deepEqual(events[0], ['host-update', {
+            repositoryRoot: '/installed/ploinky',
+            updateScopeRoot: fs.realpathSync.native(scope),
+        }]);
+        assert.equal(events[1], 'status');
+        assert.equal(events[2][0], 'update-transaction');
+        assert.equal(events[2][2].updateScopeRoot, fs.realpathSync.native(scope));
+        assert.match(output.value(), /was not updated/);
+        assert.match(output.value(), /Update complete/);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('update all PATH uses PATH as the Ploinky update folder', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-update-path-'));
+    const selected = path.join(root, 'selected');
+    fs.mkdirSync(selected);
+    const events = [];
+    try {
+        const code = await runOuterCli(['update', 'all', 'selected'], {
+            env: {},
+            cwd: () => root,
+            input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events, { statusState: 'absent' }),
+            async updateHostSource(options) {
+                events.push(['host-update', options]);
+                return { updated: false, skipped: true, reason: 'outside scope' };
+            },
+        });
+        assert.equal(code, 0);
+        assert.equal(events[0][1].updateScopeRoot, fs.realpathSync.native(selected));
+        assert.equal(events[2][2].updateScopeRoot, fs.realpathSync.native(selected));
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('update PATH uses the documented shorthand update folder', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-update-short-path-'));
+    const events = [];
+    try {
+        const code = await runOuterCli(['update', root], {
+            env: {},
+            input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events, { statusState: 'absent' }),
+            async updateHostSource(options) {
+                events.push(['host-update', options]);
+                return { updated: false, skipped: true, reason: 'outside scope' };
+            },
+        });
+        assert.equal(code, 0);
+        assert.equal(events[0][1].updateScopeRoot, fs.realpathSync.native(root));
+        assert.equal(events[2][2].updateScopeRoot, fs.realpathSync.native(root));
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test('targeted update forms retain generic forwarding without a host pull', async () => {
@@ -668,6 +762,8 @@ test('public help documents non-interactive destroy and explicit cache deletion'
     });
     assert.equal(code, 0);
     assert.match(output.value(), /destroy --delete-cache/);
+    assert.match(output.value(), /ploinky update \[PATH\]/);
+    assert.match(output.value(), /ploinky update all \[PATH\]/);
     assert.doesNotMatch(output.value(), /--delete-volumes/);
     assert.match(output.value(), /\.ploinky\/box/);
     assert.match(output.value(), /destroy\s+Remove the outer Box without prompting/);

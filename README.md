@@ -82,7 +82,7 @@ Git or npm operation and needs no GitHub credentials.
 | `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
-| `ploinky update` / `ploinky update all [PATH]` | Pull the cloned host Ploinky checkout and a separate `<workspace>/ploinky` checkout with `--rebase --autostash`, refresh in-Box repositories/dependencies/skills, then restart an already configured running workspace |
+| `ploinky update` / `ploinky update all [PATH]` | Pull Ploinky with `--rebase --autostash` only when its checkout is inside the selected folder (or the command is run from inside that checkout); still refresh AgentLib, agents, repositories, dependencies, and skills, then restart an already configured running workspace |
 | `ploinky destroy` | Without prompting, stop nested agents and remove the outer container; retain the host workspace and `.ploinky/box` |
 | `ploinky destroy --delete-cache` | Remove the outer container without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
@@ -270,7 +270,7 @@ node cli/index.js <args>
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
-- `update [folderPath]`: update the Ploinky checkout, refresh `node_modules/achillesAgentLib`, update managed repos, refresh `AchillesCopilotBasicSkills` in eligible managed repos, and refresh discovered project repositories and default skills.
+- `update [folderPath]`: use the current directory as the update folder, or `folderPath` when supplied. A Ploinky checkout is pulled only when it is inside that folder or contains the launch folder. Ploinky being out of scope does not stop `node_modules/achillesAgentLib`, managed repositories, discovered project repositories, dependencies, or default skills from being refreshed.
 - `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the loopback physical-host selection and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.

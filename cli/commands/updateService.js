@@ -3,6 +3,8 @@ import path from 'path';
 import { execFileSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
+import { resolvePloinkyUpdateEligibility } from './ploinkyUpdateScope.js';
+
 export const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 export const INTERACTIVE_PLOINKY_UPDATE_MESSAGE = [
     'A newer Ploinky version is available, but this interactive session is already running loaded code.',
@@ -106,6 +108,7 @@ export function checkGitUpstreamUpdate(repoPath, {
 
 export function updatePloinkySelf({
     repoPath = resolvePloinkyRoot(),
+    updateScopePath,
     interactiveSession = false,
     logger = defaultLogger(),
     boxMarkerPath = PLOINKY_BOX_MARKER_PATH,
@@ -114,6 +117,21 @@ export function updatePloinkySelf({
     pull = pullGitRepo,
     getRef = getGitRef,
 } = {}) {
+    if (updateScopePath) {
+        const scope = resolvePloinkyUpdateEligibility({ repoPath, updateScopePath });
+        repoPath = scope.checkoutRoot;
+        if (!scope.eligible) {
+            logger.warn?.(`Skipping Ploinky self-update: ${scope.reason}.`);
+            return {
+                skipped: true,
+                scopeExcluded: true,
+                reason: scope.reason,
+                repoPath,
+                updateScopePath: scope.scopeRoot,
+            };
+        }
+    }
+
     if (exists(boxMarkerPath)) {
         logger.warn?.(
             `Skipping Ploinky self-update inside ploinky-box: ${repoPath} is mounted read-only.`,

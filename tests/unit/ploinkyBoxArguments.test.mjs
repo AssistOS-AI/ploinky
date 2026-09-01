@@ -148,9 +148,23 @@ test('full update routes through the host while targeted update forms remain gen
         kind: 'update',
         coreArgv: ['update', 'all', '/workspace/projects'],
     });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', process.cwd()])), {
+        kind: 'update',
+        coreArgv: ['update', process.cwd()],
+    });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments([
+        'update', '--branch', 'candidate', 'all', '/workspace/projects',
+    ])), {
+        kind: 'update',
+        coreArgv: ['update', '--branch', 'candidate', 'all', '/workspace/projects'],
+    });
     assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', 'repos'])), {
         kind: 'generic',
         coreArgv: ['update', 'repos'],
+    });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', 'missing-managed-repo'])), {
+        kind: 'generic',
+        coreArgv: ['update', 'missing-managed-repo'],
     });
     assert.equal(routeOuterCommand(parseOuterArguments(['--dry-run', 'update'])).kind, 'dry-run');
 });

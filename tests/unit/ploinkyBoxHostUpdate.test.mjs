@@ -7,10 +7,22 @@ import test from 'node:test';
 
 import {
     hostSourceLockIdentity,
+    isPloinkySourceCheckout,
     updateHostPloinkySource,
     updateWorkspacePloinkySource,
 } from '../../ploinky-box/command/hostUpdate.mjs';
 import { updatePloinkySelf } from '../../cli/commands/updateService.js';
+
+function seedPloinkySource(repoPath) {
+    fs.mkdirSync(path.join(repoPath, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(repoPath, 'ploinky-box', 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(repoPath, 'package.json'), JSON.stringify({
+        name: 'ploinky-cloud',
+        bin: { ploinky: './bin/ploinky' },
+    }));
+    fs.writeFileSync(path.join(repoPath, 'bin', 'ploinky'), '#!/bin/sh\n');
+    fs.writeFileSync(path.join(repoPath, 'ploinky-box', 'bin', 'ploinky-box.mjs'), '// fixture\n');
+}
 
 test('host source update uses one canonical source lock and releases it after the pull', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-host-update-'));
@@ -22,6 +34,7 @@ test('host source update uses one canonical source lock and releases it after th
         assert.deepEqual(hostSourceLockIdentity(alias), expected);
         const result = await updateHostPloinkySource({
             repositoryRoot: alias,
+            updateScopeRoot: root,
             lockManager: {
                 async acquire(identity) {
                     events.push(['acquire', identity]);
@@ -41,6 +54,7 @@ test('host source update uses one canonical source lock and releases it after th
         assert.deepEqual(events.map((entry) => entry[0]), ['acquire', 'held', 'update', 'release']);
         assert.equal(events[0][1], expected.lockIdentity);
         assert.equal(events[2][1].repoPath, expected.canonicalRoot);
+        assert.equal(events[2][1].updateScopePath, expected.canonicalRoot);
         assert.equal(events[2][1].interactiveSession, false);
     } finally {
         fs.rmSync(alias, { force: true });
@@ -58,6 +72,7 @@ test('host source update releases its lock on failure and rejects skipped update
             let released = false;
             await assert.rejects(() => updateHostPloinkySource({
                 repositoryRoot: root,
+                updateScopeRoot: root,
                 lockManager: {
                     async acquire() {
                         return {
@@ -113,6 +128,7 @@ test('host source update pulls its configured upstream and is idempotent', async
 
         const options = {
             repositoryRoot: checkout,
+            updateScopeRoot: checkout,
             lockManager,
             boxMarkerPath: path.join(root, 'not-a-box'),
         };
@@ -126,6 +142,33 @@ test('host source update pulls its configured upstream and is idempotent', async
 
         const second = await updateHostPloinkySource(options);
         assert.equal(second.updated, false);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('host source update outside the selected folder skips before locking or running git', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-host-update-scope-'));
+    const checkout = path.join(root, 'checkout');
+    const scope = path.join(root, 'workspace');
+    fs.mkdirSync(checkout);
+    fs.mkdirSync(scope);
+    try {
+        const result = await updateHostPloinkySource({
+            repositoryRoot: checkout,
+            updateScopeRoot: scope,
+            lockManager: {
+                async acquire() {
+                    throw new Error('an excluded checkout must not acquire a source lock');
+                },
+            },
+            updateSelf() {
+                throw new Error('an excluded checkout must not run git');
+            },
+        });
+        assert.equal(result.skipped, true);
+        assert.equal(result.scopeExcluded, true);
+        assert.match(result.reason, /outside the selected update folder/);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -149,6 +192,7 @@ test('workspace Ploinky update skips an absent checkout and avoids pulling the h
             identity,
             lock,
             repositoryRoot: root,
+            updateScopeRoot: workspaceRoot,
             updateSelf() {
                 throw new Error('an absent checkout must not be pulled');
             },
@@ -159,10 +203,13 @@ test('workspace Ploinky update skips an absent checkout and avoids pulling the h
         const checkout = path.join(workspaceRoot, 'ploinky');
         fs.mkdirSync(checkout);
         execFileSync('git', ['init', '-q', checkout], { stdio: 'ignore' });
+        seedPloinkySource(checkout);
+        assert.equal(isPloinkySourceCheckout(checkout), true);
         const duplicate = updateWorkspacePloinkySource({
             identity,
             lock,
             repositoryRoot: checkout,
+            updateScopeRoot: workspaceRoot,
             updateSelf() {
                 throw new Error('the host checkout must not be pulled twice');
             },
@@ -170,6 +217,7 @@ test('workspace Ploinky update skips an absent checkout and avoids pulling the h
         assert.equal(duplicate.found, true);
         assert.equal(duplicate.skipped, true);
         assert.equal(duplicate.duplicateOfHost, true);
+        assert.equal(duplicate.boxRepoPath, '/workspace/ploinky');
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -204,9 +252,10 @@ test('workspace Ploinky update pulls remote commits and restores dirty tracked c
         git(seed, ['init', '-q']);
         git(seed, ['config', 'user.email', 'ploinky-test@example.invalid']);
         git(seed, ['config', 'user.name', 'Ploinky Test']);
+        seedPloinkySource(seed);
         fs.writeFileSync(path.join(seed, 'remote.txt'), 'one\n');
         fs.writeFileSync(path.join(seed, 'local.txt'), 'clean\n');
-        git(seed, ['add', 'remote.txt', 'local.txt']);
+        git(seed, ['add', '.']);
         git(seed, ['commit', '-q', '-m', 'initial']);
         git(seed, ['branch', '-M', 'master']);
         git(seed, ['remote', 'add', 'origin', remote]);
@@ -226,6 +275,7 @@ test('workspace Ploinky update pulls remote commits and restores dirty tracked c
             identity,
             lock,
             repositoryRoot: installedSource,
+            updateScopeRoot: workspaceRoot,
             updateSelf(options) {
                 return updatePloinkySelf({
                     ...options,
@@ -236,12 +286,64 @@ test('workspace Ploinky update pulls remote commits and restores dirty tracked c
 
         assert.equal(result.found, true);
         assert.equal(result.updated, true);
+        assert.equal(result.boxRepoPath, '/workspace/ploinky');
         assert.equal(result.pullStrategy, 'rebase-autostash');
         assert.equal(fs.readFileSync(path.join(checkout, 'remote.txt'), 'utf8'), 'two\n');
         assert.equal(fs.readFileSync(path.join(checkout, 'local.txt'), 'utf8'), 'dirty local edit\n');
         assert.match(String(git(checkout, ['status', '--short'])), /local\.txt/);
         assert.equal(String(git(checkout, ['stash', 'list'])).trim(), '');
         assert.ok(lockChecks >= 2);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('workspace update accepts a command launched inside Ploinky and rejects a symlink escape', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-workspace-update-scope-'));
+    const workspaceRoot = path.join(root, 'workspace');
+    const checkout = path.join(workspaceRoot, 'ploinky');
+    const nested = path.join(checkout, 'src', 'nested');
+    const outsideCheckout = path.join(root, 'outside-ploinky');
+    const identity = {
+        workspaceRoot,
+        instance: 'ploinky-box-workspace-123456789abc',
+    };
+    const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
+    try {
+        fs.mkdirSync(nested, { recursive: true });
+        execFileSync('git', ['init', '-q', checkout], { stdio: 'ignore' });
+        seedPloinkySource(checkout);
+        fs.mkdirSync(outsideCheckout);
+        execFileSync('git', ['init', '-q', outsideCheckout], { stdio: 'ignore' });
+        seedPloinkySource(outsideCheckout);
+
+        let updatedPath = '';
+        const nestedResult = updateWorkspacePloinkySource({
+            identity,
+            lock,
+            repositoryRoot: outsideCheckout,
+            updateScopeRoot: nested,
+            updateSelf(options) {
+                updatedPath = options.repoPath;
+                return { updated: false };
+            },
+        });
+        assert.equal(nestedResult.skipped, undefined);
+        assert.equal(updatedPath, fs.realpathSync.native(checkout));
+
+        fs.rmSync(checkout, { recursive: true, force: true });
+        fs.symlinkSync(outsideCheckout, checkout, 'dir');
+        const escaped = updateWorkspacePloinkySource({
+            identity,
+            lock,
+            repositoryRoot: root,
+            updateScopeRoot: workspaceRoot,
+            updateSelf() {
+                throw new Error('a symlink escape must not be updated');
+            },
+        });
+        assert.equal(escaped.skipped, true);
+        assert.match(escaped.reason, /not a real directory/);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }

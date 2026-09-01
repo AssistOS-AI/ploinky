@@ -6,6 +6,7 @@ import { parseOuterArguments } from '../command/parse.mjs';
 import { routeOuterCommand } from '../command/route.mjs';
 import { buildContainerExecArgs, executeProcess, executeProcessStreaming } from '../command/execute.mjs';
 import { updateHostPloinkySource } from '../command/hostUpdate.mjs';
+import { resolvePloinkyUpdateScope } from '../../cli/commands/ploinkyUpdateScope.js';
 import { BOX_IMAGE_OVERRIDE_ENV, BOX_IMAGE_REFERENCE, BOX_LABELS } from '../constants.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { createBoxSupervisor, formatBoxStatus } from '../supervisor.mjs';
@@ -26,8 +27,8 @@ Commands:
                                   Select the media host UDP port; defaults to 7882
   ploinky status [--verbose]      Inspect Box and core state without mutation
   ploinky stop                    Stop core services and the outer Box
-  ploinky update [all [PATH]]     Update host core, a workspace ./ploinky checkout,
-                                  in-Box repos/deps/skills, then restart if configured
+  ploinky update [PATH]           Update Ploinky only when its checkout is within
+  ploinky update all [PATH]       the selected folder; always refresh repos/deps/skills
   ploinky destroy                 Remove the outer Box without prompting; retain .ploinky/box
   ploinky destroy --delete-cache  Remove the outer Box and delete .ploinky/box/dependencies
                                   and .ploinky/box/images without prompting
@@ -89,6 +90,7 @@ export async function runOuterCli(argv, {
     execute = executeProcess,
     executeStreaming = executeProcessStreaming,
     detectInsideBox = isInsideBox,
+    cwd = () => process.cwd(),
     repositoryRoot = path.resolve(import.meta.dirname, '../..'),
     updateHostSource = updateHostPloinkySource,
     relaunch = executeProcess,
@@ -214,13 +216,26 @@ export async function runOuterCli(argv, {
     }
 
     if (route.kind === 'update') {
-        output.write(`Updating host Ploinky checkout at ${repositoryRoot}...\n`);
-        const hostUpdate = await updateHostSource({ repositoryRoot });
+        const normalizedUpdateArgs = stripBranchPolicyArgs(parsed.commandArgs);
+        const updateScopeArg = String(normalizedUpdateArgs[0] || '');
+        const updateFolderPath = updateScopeArg.toLowerCase() === 'all'
+            ? normalizedUpdateArgs[1]
+            : updateScopeArg || undefined;
+        const updateScopeRoot = resolvePloinkyUpdateScope(updateFolderPath, { cwd });
+        output.write(`Using Ploinky update folder ${updateScopeRoot}.\n`);
+        const hostUpdate = await updateHostSource({ repositoryRoot, updateScopeRoot });
         if (hostUpdate.updated) {
             output.write('Host Ploinky checkout updated; continuing with the updated CLI.\n');
             return relaunch(process.execPath, [fileURLToPath(import.meta.url), ...argv], { env });
         }
-        output.write('Host Ploinky checkout is already up to date.\n');
+        if (hostUpdate.skipped) {
+            output.write(
+                `Host Ploinky checkout at ${hostUpdate.repoPath || repositoryRoot} was not updated: `
+                + `${hostUpdate.reason}.\n`,
+            );
+        } else {
+            output.write('Host Ploinky checkout is already up to date.\n');
+        }
 
         const priorStatus = selectedSupervisor.inspectBoxStatus();
         const restartAfterUpdate = priorStatus.state === 'running-initialized'
@@ -228,6 +243,7 @@ export async function runOuterCli(argv, {
         const updateResult = await selectedSupervisor.runUpdateTransaction(stripBranchPolicyArgs(route.coreArgv), {
             branchPolicy: parseBranchPolicy(route.coreArgv),
             restartAfterUpdate,
+            updateScopeRoot,
         });
         const workspacePloinky = updateResult?.workspacePloinky;
         if (workspacePloinky?.found && !workspacePloinky.duplicateOfHost) {

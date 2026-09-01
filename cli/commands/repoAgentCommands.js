@@ -17,6 +17,7 @@ import { collectAgentsSummary } from '../utils/status.js';
 import { findAgent } from '../utils/utils.js';
 import { updateWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
 import { isInsideBoxRuntime } from '../../agentlib/bootstrap.mjs';
+import { PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV } from './ploinkyUpdateScope.js';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const DEFAULT_SKILLS_REPO_NAMES = [
@@ -378,8 +379,13 @@ async function updatePloinkyRepos(options = {}) {
 async function updateAllRepos(folderPath, options = {}) {
     const projectsRoot = resolveUpdateProjectsRoot(folderPath);
     const ploinkyRoot = resolvePloinkyRoot();
+    const hostUpdatedWorkspaceCheckout = String(
+        process.env[PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV] || '',
+    ).trim();
     const workspaceRepos = reposSvc.findWorkspaceGitRepos(projectsRoot)
-        .filter(repo => !pathsReferToSameLocation(repo.path, ploinkyRoot));
+        .filter(repo => !pathsReferToSameLocation(repo.path, ploinkyRoot))
+        .filter(repo => !hostUpdatedWorkspaceCheckout
+            || !pathsReferToSameLocation(repo.path, hostUpdatedWorkspaceCheckout));
     const workspaceManifestFolders = skillsSvc.findWorkspaceFoldersWithSkillsManifest(projectsRoot)
         .filter(folderPath => !pathsReferToSameLocation(folderPath, ploinkyRoot))
         .filter(folderPath => {
@@ -396,6 +402,8 @@ async function updateAllRepos(folderPath, options = {}) {
     let selfUpdate = null;
     try {
         selfUpdate = updatePloinkySelf({
+            repoPath: ploinkyRoot,
+            updateScopePath: projectsRoot,
             interactiveSession: options.interactiveSession === true,
         });
         if (selfUpdate.deferred) {

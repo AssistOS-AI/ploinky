@@ -80,6 +80,38 @@ test('non-interactive Ploinky self-update pulls and reports changed HEAD', () =>
     }
 });
 
+test('Ploinky self-update skips an installed checkout outside the selected folder before git', () => {
+    const root = tempDir('ploinky-update-scope-');
+    const checkout = path.join(root, 'installed', 'ploinky');
+    const scope = path.join(root, 'workspace');
+    const warnings = [];
+    const unexpected = () => {
+        throw new Error('an out-of-scope checkout must not run git');
+    };
+
+    try {
+        fs.mkdirSync(path.join(checkout, '.git'), { recursive: true });
+        fs.mkdirSync(scope);
+        const result = updatePloinkySelf({
+            repoPath: checkout,
+            updateScopePath: scope,
+            logger: { warn(message) { warnings.push(message); } },
+            checkUpdate: unexpected,
+            pull: unexpected,
+            getRef: unexpected,
+        });
+
+        assert.equal(result.skipped, true);
+        assert.equal(result.scopeExcluded, true);
+        assert.match(result.reason, /outside the selected update folder/);
+        assert.equal(result.repoPath, fs.realpathSync.native(checkout));
+        assert.equal(result.updateScopePath, fs.realpathSync.native(scope));
+        assert.match(warnings[0], /Skipping Ploinky self-update/);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test('Ploinky box self-update skips the read-only source before running git operations', () => {
     const root = tempDir();
     const warnings = [];
@@ -206,4 +238,3 @@ test('resolveMovingGitDepCommits omits deps with empty/non-sha ls-remote output'
     );
     assert.deepEqual(commits, {});
 });
-

@@ -1,4 +1,8 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { PloinkyBoxError } from '../errors.mjs';
+import { stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 
 function routeError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
@@ -45,12 +49,25 @@ function routeUpdate(parsed) {
     if (parsed.dryRun) {
         return Object.freeze({ kind: 'dry-run' });
     }
-    const scope = String(parsed.commandArgs[0] || '').trim().toLowerCase();
+    const updateArgs = stripBranchPolicyArgs(parsed.commandArgs);
+    const scope = String(updateArgs[0] || '').trim().toLowerCase();
     if (!scope || scope === 'all') {
         return Object.freeze({
             kind: 'update',
             coreArgv: parsed.forwardingArgv,
         });
+    }
+    if (!['repo', 'repository', 'repos', 'repositories'].includes(scope)) {
+        try {
+            if (fs.statSync(path.resolve(updateArgs[0])).isDirectory()) {
+                return Object.freeze({
+                    kind: 'update',
+                    coreArgv: parsed.forwardingArgv,
+                });
+            }
+        } catch (_) {
+            // Core treats a non-existent bare value as a managed repo name.
+        }
     }
     return Object.freeze({
         kind: 'generic',

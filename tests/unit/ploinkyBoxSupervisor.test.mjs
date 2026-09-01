@@ -11,6 +11,7 @@ import {
     checkBoxHealth,
     createBoxSupervisor,
     formatBoxStatus,
+    runBoundedCoreCommand,
     runBoundedCoreStart,
 } from '../../ploinky-box/supervisor.mjs';
 import {
@@ -402,6 +403,7 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
         updated: true,
         skipped: false,
         repoPath: path.join(identity.workspaceRoot, 'ploinky'),
+        boxRepoPath: '/workspace/ploinky',
         pullStrategy: 'rebase-autostash',
     });
     const supervisor = createBoxSupervisor({
@@ -420,6 +422,7 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
             options.lock.assertHeld(identity.instance);
             assert.equal(options.identity, identity);
             assert.equal(options.repositoryRoot, state.root);
+            assert.equal(options.updateScopeRoot, identity.workspaceRoot);
             events.push('workspace-ploinky');
             return workspacePloinky;
         },
@@ -439,10 +442,11 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
                 finalize() { events.push('finalize'); },
             };
         },
-        async runCoreCommand(engine, containerId, argv) {
+        async runCoreCommand(engine, containerId, argv, _hostPort, _mediaHostPort, _runner, options) {
             assert.equal(engine, ownership.engine);
             assert.equal(containerId, ownership.handles.container.id);
             assert.deepEqual(argv, ['update']);
+            assert.equal(options.updateExcludedRepoPath, '/workspace/ploinky');
             events.push('core-update');
         },
         revalidateAgentLibSource() {
@@ -1039,6 +1043,34 @@ test('bounded start requires the external Router URL and preserves normalized ar
         { stream: async () => { throw new Error('must fail before Podman'); } },
         { stdout: { write() {} }, stderr: { write() {} } },
     ), /requires the selected achillesAgentLib contract/);
+});
+
+test('bounded update excludes the exact workspace Ploinky checkout already handled on the host', async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-update-exclusion-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const calls = [];
+    await runBoundedCoreCommand(
+        { name: 'podman' },
+        'a'.repeat(64),
+        ['update'],
+        8080,
+        7882,
+        {
+            async stream(command, args) {
+                calls.push([command, args]);
+                return { ok: true, status: 0, stdout: '', stderr: '' };
+            },
+        },
+        {
+            agentLib: agentLibFixture(root),
+            updateExcludedRepoPath: '/workspace/ploinky',
+        },
+    );
+    const exclusionIndex = calls[0][1].indexOf(
+        'PLOINKY_UPDATED_WORKSPACE_CHECKOUT=/workspace/ploinky',
+    );
+    assert.ok(exclusionIndex > 0);
+    assert.equal(calls[0][1][exclusionIndex - 1], '--env');
 });
 
 test('public health connects to the published port with matching authority', async (t) => {

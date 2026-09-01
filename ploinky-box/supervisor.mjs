@@ -11,6 +11,7 @@ import {
     updateWorkspaceAgentLibSource,
 } from './agentlib-source.mjs';
 import { AGENTLIB_ERROR_CODES, agentLibError } from '../agentlib/contract.mjs';
+import { PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV } from '../cli/commands/ploinkyUpdateScope.js';
 import {
     fingerprintSource,
     sourceIdEquals,
@@ -569,6 +570,7 @@ export function createBoxSupervisor({
                 identity,
                 lock,
                 repositoryRoot,
+                updateScopeRoot: options.updateScopeRoot || identity.workspaceRoot,
             });
             const { selection, changed, previous } = await updateAgentLib({
                 workspaceRoot: identity.workspaceRoot,
@@ -600,7 +602,12 @@ export function createBoxSupervisor({
                     prepared.hostPort,
                     prepared.mediaHostPort,
                     runner,
-                    { stdout, stderr, agentLib: selection },
+                    {
+                        stdout,
+                        stderr,
+                        agentLib: selection,
+                        updateExcludedRepoPath: workspacePloinky?.boxRepoPath || '',
+                    },
                 );
                 if (options.restartAfterUpdate === true) {
                     const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
@@ -900,7 +907,13 @@ export function formatBoxStatus(status) {
     return `${lines.join('\n')}\n`;
 }
 
-function boundedCoreEnvironment(hostPort, mediaHostPort, agentLib, hostReachableIpv4 = '') {
+function boundedCoreEnvironment(
+    hostPort,
+    mediaHostPort,
+    agentLib,
+    hostReachableIpv4 = '',
+    updateExcludedRepoPath = '',
+) {
     if (!agentLib) {
         throw supervisorError('Bounded core command requires the selected achillesAgentLib contract');
     }
@@ -911,6 +924,9 @@ function boundedCoreEnvironment(hostPort, mediaHostPort, agentLib, hostReachable
         '--env', `PLOINKY_MEDIA_HOST_PORT=${mediaHostPort}`,
         ...(hostReachableIpv4
             ? ['--env', `${HOST_REACHABLE_IPV4_ENV}=${hostReachableIpv4}`]
+            : []),
+        ...(updateExcludedRepoPath
+            ? ['--env', `${PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV}=${updateExcludedRepoPath}`]
             : []),
         ...Object.entries(agentLibEnvironment).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
     ];
@@ -929,6 +945,7 @@ export async function runBoundedCoreCommand(
         timeoutMs = 1_800_000,
         hostReachableIpv4 = '',
         agentLib = null,
+        updateExcludedRepoPath = '',
     } = {},
 ) {
     const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
@@ -944,6 +961,7 @@ export async function runBoundedCoreCommand(
             mediaHostPort,
             agentLib,
             normalizedHostReachableIpv4,
+            updateExcludedRepoPath,
         ),
         '--user', 'podman',
         '--workdir', '/workspace',
