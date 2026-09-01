@@ -77,6 +77,35 @@ process.stdout.write(JSON.stringify(found));
     }
 });
 
+test('bare agent lookup skips a dangling repo entry', () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-lookup-'));
+    try {
+        writeManifest(workspace, 'AchillesIDE', 'explorer');
+        fs.symlinkSync(
+            path.join(workspace, 'missing-candidate-checkout'),
+            path.join(workspace, '.ploinky', 'repos', 'candidate'),
+        );
+
+        const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+const { findAgent } = await import(${JSON.stringify(utilsUrl)});
+const found = findAgent('explorer');
+process.stdout.write(JSON.stringify(found));
+`], {
+            cwd: workspace,
+            encoding: 'utf8',
+            env: {
+                ...process.env,
+                PLOINKY_WORKSPACE_ROOT: workspace,
+            },
+        });
+
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(JSON.parse(result.stdout).repo, 'AchillesIDE');
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
 test('manifest repos are enabled even when their checkouts already exist', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-manifest-repos-'));
     try {
