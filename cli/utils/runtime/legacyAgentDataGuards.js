@@ -29,12 +29,11 @@ export function protectedLegacyAgentRoots(workspaceRoot = PLOINKY_WORKSPACE_ROOT
 function guardBase(workspaceRoot) {
     const root = path.resolve(workspaceRoot);
     const digest = crypto.createHash('sha256').update(root).digest('hex').slice(0, 24);
-    const candidates = [
-        path.join(path.dirname(root), `.ploinky-runtime-guards-${digest}`),
-        path.join(os.tmpdir(), 'ploinky-runtime-guards', digest),
-    ];
-    const selected = candidates.find(candidate => !isPathWithin(candidate, root));
-    if (!selected) throw guardError('unable to place runtime guard outside the agent-visible workspace', { root });
+    const temporaryRoot = fs.realpathSync.native(os.tmpdir());
+    const selected = path.join(temporaryRoot, 'ploinky-runtime-guards', digest);
+    if (isPathWithin(selected, projectedCanonicalPath(root))) {
+        throw guardError('unable to place runtime guard outside the agent-visible workspace', { root });
+    }
     return selected;
 }
 

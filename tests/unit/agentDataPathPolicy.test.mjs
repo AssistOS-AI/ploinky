@@ -128,6 +128,10 @@ test('legacy guard targets are derived from broad mounts without creating legacy
             assert.equal(fs.readdirSync(source).length, 0);
             assert.equal(fs.statSync(source).mode & 0o777, 0o555);
             assert.equal(source.startsWith(`${root}${path.sep}`), false);
+            assert.equal(
+                source.startsWith(`${fs.realpathSync.native(os.tmpdir())}${path.sep}ploinky-runtime-guards${path.sep}`),
+                true,
+            );
         }
     } finally {
         cleanup();
