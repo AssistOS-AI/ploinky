@@ -379,6 +379,8 @@ For a healthy managed `default` or `bridge` container, reuse is validation-only.
 
 A genuine managed direct replacement instead mints a fresh `instanceId`/`enableGeneration` pair and a generation-specific physical candidate name, then captures an immutable additive generation while the predecessor selector, mutable route/registry sources, and predecessor process remain active. The separately named candidate is created under the existing network lifecycle lock and attested against that additive lease, so the active generation remains bound to the still-serving predecessor's immutable container ID throughout candidate readiness. Only after semantic readiness succeeds does one apply-lock transaction write the final runtime locator and registry metadata and atomically select the candidate generation. The exact predecessor is retired after that commit under the same network-lifecycle capability. Candidate or readiness failure removes only the exactly proved candidate, consumes cleanup authority once, and aborts the additive lease without inactivating or stopping the predecessor generation.
 
+Cold scheduler pressure may delay the already-started confined authority helper beyond one observation nonce's fixed ten-second lifetime. That specific expiry is retried at most three times with a new helper and cryptographically fresh nonce after revalidating the unchanged edge generation; every attempt retains the same ten-second limit, and exhaustion or any other attestation error still fails closed without minting Router credentials.
+
 Runtime selection details:
 
 | Manifest/config state | Runtime |

@@ -19,6 +19,9 @@ import {
     attestRouterAuthority,
     buildRouterAuthorityTopologyIntent,
     createPrivateAuthorityRegistryClient,
+    ROUTER_AUTHORITY_ATTESTATION_MAX_ATTEMPTS,
+    ROUTER_AUTHORITY_OBSERVATION_EXPIRED,
+    RouterAuthorityAttestationError,
     validateRouterAuthorityObservation,
 } from '../../cli/sandbox/routerAuthorityAttestation.js';
 import {
@@ -552,6 +555,89 @@ test('attestation brackets only live observations with registration and consumpt
     assert.deepEqual(result.evidence.target, { image: 'sha256:target', user: 'root' });
 });
 
+test('expired authority observations retry with fresh nonces and one generation commit', () => {
+    const fixture = fixtureJson('public-attestation.json');
+    const intent = buildRouterAuthorityTopologyIntent({
+        networkMode: 'default',
+        runtimeProof,
+        networkFingerprint,
+        routerHostPort: 18080,
+        edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
+        platform: 'linux',
+        fsApi: presentBoxFs(),
+        authRouteKey: 'explorer',
+    });
+    const nonces = [];
+    let attempt = 0;
+    let commits = 0;
+    let currentChecks = 0;
+    const result = attestRouterAuthority({
+        intent,
+        generationLease: {
+            id: fixture.evidence.generationId,
+            commit() { commits += 1; return true; },
+            isCurrent() { currentChecks += 1; return true; },
+        },
+        registryClient: {
+            register(nonce) { nonces.push(nonce); },
+            consume() {
+                if (attempt === 1) {
+                    throw new RouterAuthorityAttestationError(
+                        ROUTER_AUTHORITY_OBSERVATION_EXPIRED,
+                        'fixture observation expired',
+                    );
+                }
+                return fixture.evidence.records;
+            },
+        },
+        runProbe({ registerObservation, consumeObservation }) {
+            attempt += 1;
+            registerObservation();
+            consumeObservation();
+            return {
+                external: fixture.evidence.external,
+                helper: fixture.evidence.helper,
+                target: { image: 'sha256:target', user: 'root' },
+            };
+        },
+        now: () => fixture.evidence.observedAtUnixMs,
+    });
+
+    assert.equal(attempt, 2);
+    assert.equal(new Set(nonces).size, 2);
+    assert.equal(currentChecks, 1);
+    assert.equal(commits, 1);
+    assert.match(result.attestationId, /^sha256:[a-f0-9]{64}$/);
+});
+
+test('authority observation expiry retries remain bounded and fail closed', () => {
+    const fixture = fixtureJson('public-attestation.json');
+    let attempts = 0;
+    assert.throws(() => attestRouterAuthority({
+        intent: { fixture: true },
+        generationLease: {
+            id: fixture.evidence.generationId,
+            commit: () => assert.fail('expired evidence must never commit'),
+            isCurrent: () => true,
+        },
+        registryClient: {
+            register() {},
+            consume() {
+                throw new RouterAuthorityAttestationError(
+                    ROUTER_AUTHORITY_OBSERVATION_EXPIRED,
+                    'fixture observation expired',
+                );
+            },
+        },
+        runProbe({ registerObservation, consumeObservation }) {
+            attempts += 1;
+            registerObservation();
+            consumeObservation();
+        },
+    }), (error) => error?.code === ROUTER_AUTHORITY_OBSERVATION_EXPIRED);
+    assert.equal(attempts, ROUTER_AUTHORITY_ATTESTATION_MAX_ATTEMPTS);
+});
+
 test('slow helper preparation and cleanup do not consume the ten-second observation lifetime', () => {
     const fixture = fixtureJson('public-attestation.json');
     const intent = buildRouterAuthorityTopologyIntent({
@@ -654,6 +740,7 @@ test('attestation rejects missing and repeated observation lifecycle transitions
 
 test('private registry client preserves only sanitized HTTP rejection details', () => {
     const responses = [
+        { status: 404, body: '{"ok":false,"error":"AUTHORITY_ATTESTATION_NOT_FOUND"}' },
         { status: 409, body: '{"ok":false,"error":"AUTHORITY_ATTESTATION_INCOMPLETE"}' },
         { status: 503, body: '{"error":"secret bearer value"}' },
     ];
@@ -663,10 +750,15 @@ test('private registry client preserves only sanitized HTTP rejection details', 
     });
     assert.throws(
         () => client.consume('a'.repeat(64)),
+        (error) => error?.code === ROUTER_AUTHORITY_OBSERVATION_EXPIRED
+            && /HTTP 404 AUTHORITY_ATTESTATION_NOT_FOUND/.test(error.message),
+    );
+    assert.throws(
+        () => client.consume('b'.repeat(64)),
         /authority observation consumption failed \(HTTP 409 AUTHORITY_ATTESTATION_INCOMPLETE\)/,
     );
     assert.throws(
-        () => client.register('b'.repeat(64), fixtureJson('public-attestation.json').evidence.generationId),
+        () => client.register('c'.repeat(64), fixtureJson('public-attestation.json').evidence.generationId),
         (error) => error.message === 'authority nonce registration failed (HTTP 503)',
     );
 });

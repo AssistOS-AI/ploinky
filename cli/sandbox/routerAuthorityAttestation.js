@@ -23,6 +23,8 @@ const AUTHORITY_HELPER_RECONCILE_ATTEMPTS = 5;
 const AUTHORITY_HELPER_RECONCILE_DELAY_MS = 250;
 const AUTHORITY_HELPER_IDLE_SCRIPT = `setTimeout(() => process.exit(0), ${ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS});`;
 export const ROUTER_AUTHORITY_HELPER_IMAGE = 'docker.io/library/node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d';
+export const ROUTER_AUTHORITY_ATTESTATION_MAX_ATTEMPTS = 3;
+export const ROUTER_AUTHORITY_OBSERVATION_EXPIRED = 'PLOINKY_ROUTER_ATTESTATION_OBSERVATION_EXPIRED';
 
 const PROBE_SCRIPT = String.raw`
 const fs = require('node:fs');
@@ -510,8 +512,12 @@ export function createPrivateAuthorityRegistryClient({
         consume(nonce) {
             const result = request(socketPath, 'GET', `/authority-attestations/${nonce}`);
             if (result.status !== 200) {
+                let rejectionCode = '';
+                try { rejectionCode = String(JSON.parse(String(result?.body || ''))?.error || ''); } catch (_) {}
                 fail(
-                    'PLOINKY_ROUTER_ATTESTATION_REGISTRY',
+                    result.status === 404 && rejectionCode === 'AUTHORITY_ATTESTATION_NOT_FOUND'
+                        ? ROUTER_AUTHORITY_OBSERVATION_EXPIRED
+                        : 'PLOINKY_ROUTER_ATTESTATION_REGISTRY',
                     `authority observation consumption failed (${rejectionDetail(result)})`,
                 );
             }
@@ -823,55 +829,68 @@ export function attestRouterAuthority({
     if (!intent || !generationLease?.id || typeof generationLease.commit !== 'function' || typeof runProbe !== 'function') {
         fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'attestation requires fixed intent, generation lease, registry, and exact probe runner');
     }
-    const nonce = crypto.randomBytes(32).toString('hex');
-    let observationState = 'prepared';
-    let records = null;
-    const registerObservation = () => {
-        if (observationState !== 'prepared') {
-            fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority observation registration must occur exactly once');
+    let lastExpiredError = null;
+    for (let attempt = 0; attempt < ROUTER_AUTHORITY_ATTESTATION_MAX_ATTEMPTS; attempt += 1) {
+        const nonce = crypto.randomBytes(32).toString('hex');
+        let observationState = 'prepared';
+        let records = null;
+        const registerObservation = () => {
+            if (observationState !== 'prepared') {
+                fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority observation registration must occur exactly once');
+            }
+            registryClient.register(nonce, generationLease.id);
+            observationState = 'registered';
+        };
+        const consumeObservation = () => {
+            if (observationState !== 'registered') {
+                fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority observation consumption must follow registration exactly once');
+            }
+            records = registryClient.consume(nonce);
+            observationState = 'consumed';
+            return records;
+        };
+        try {
+            const probe = runProbe({
+                intent,
+                nonce,
+                registerObservation,
+                consumeObservation,
+            });
+            if (observationState !== 'consumed' || !Array.isArray(records)) {
+                fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority probe did not complete its exact observation lifecycle');
+            }
+            const evidence = validateRouterAuthorityObservation({
+                intent,
+                nonce,
+                records,
+                external: probe.external,
+                generationId: generationLease.id,
+            });
+            if (generationLease.commit() !== true) fail('PLOINKY_ROUTER_ATTESTATION_GENERATION', 'edge generation changed after authority observation');
+            const completeEvidence = Object.freeze({
+                nonce,
+                records: evidence.records,
+                external: evidence.external,
+                helper: probe.helper,
+                target: probe.target,
+                generationId: generationLease.id,
+                observedAtUnixMs: now(),
+            });
+            return Object.freeze({
+                ...intent,
+                attestationId: digest(completeEvidence),
+                evidence: completeEvidence,
+            });
+        } catch (error) {
+            if (error?.code !== ROUTER_AUTHORITY_OBSERVATION_EXPIRED) throw error;
+            lastExpiredError = error;
+            if (attempt + 1 >= ROUTER_AUTHORITY_ATTESTATION_MAX_ATTEMPTS) throw error;
+            if (typeof generationLease.isCurrent === 'function' && generationLease.isCurrent() !== true) {
+                fail('PLOINKY_ROUTER_ATTESTATION_GENERATION', 'edge generation changed before authority observation retry');
+            }
         }
-        registryClient.register(nonce, generationLease.id);
-        observationState = 'registered';
-    };
-    const consumeObservation = () => {
-        if (observationState !== 'registered') {
-            fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority observation consumption must follow registration exactly once');
-        }
-        records = registryClient.consume(nonce);
-        observationState = 'consumed';
-        return records;
-    };
-    const probe = runProbe({
-        intent,
-        nonce,
-        registerObservation,
-        consumeObservation,
-    });
-    if (observationState !== 'consumed' || !Array.isArray(records)) {
-        fail('PLOINKY_ROUTER_ATTESTATION_INVALID', 'authority probe did not complete its exact observation lifecycle');
     }
-    const evidence = validateRouterAuthorityObservation({
-        intent,
-        nonce,
-        records,
-        external: probe.external,
-        generationId: generationLease.id,
-    });
-    if (generationLease.commit() !== true) fail('PLOINKY_ROUTER_ATTESTATION_GENERATION', 'edge generation changed after authority observation');
-    const completeEvidence = Object.freeze({
-        nonce,
-        records: evidence.records,
-        external: evidence.external,
-        helper: probe.helper,
-        target: probe.target,
-        generationId: generationLease.id,
-        observedAtUnixMs: now(),
-    });
-    return Object.freeze({
-        ...intent,
-        attestationId: digest(completeEvidence),
-        evidence: completeEvidence,
-    });
+    throw lastExpiredError;
 }
 
 export default {
