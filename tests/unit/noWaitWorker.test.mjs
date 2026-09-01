@@ -917,6 +917,11 @@ test('no-wait main delegates route activation to the serialized lifecycle transa
     const routeMutation = source.indexOf('await upsertRoute(', activation);
     const transactionEnd = source.indexOf('\n        });\n    } catch (err)', routeMutation);
     assert.ok(transaction > 0, 'no-wait worker must enter the serialized lifecycle transaction');
+    assert.match(
+        source.slice(transaction, activation),
+        /retainLifecycleLocksThroughReadiness:\s*hasWaveBarrier/,
+        'a dependency-ordered worker must keep its proven Router generation stable through readiness',
+    );
     assert.ok(activation > transaction, 'route activation must be owned by the transaction callback');
     assert.ok(routeMutation > activation, 'route mutation must occur only within activation');
     assert.ok(transactionEnd > routeMutation, 'activation must finish before the transaction releases');
@@ -2294,6 +2299,49 @@ test('ordinary no-wait readiness runs outside locks and activation is exactly re
         { waitMs: 300000, pollMs: 1000 },
         { waitMs: 300000, pollMs: 1000 },
     ]);
+});
+
+test('dependency-ordered no-wait readiness retains lifecycle locks through activation', async () => {
+    const { lifecycle, candidate } = noWaitTransactionFixture();
+    let workspaceHeld = false;
+    let networkHeld = false;
+    let lifecycleLeases = 0;
+    let networkLeases = 0;
+
+    const value = await runNoWaitLifecycleTransaction({ containerName: candidate.containerName }, {
+        retainLifecycleLocksThroughReadiness: true,
+        capture: () => ({}),
+        ensure() {
+            assert.equal(workspaceHeld && networkHeld, true);
+            return candidate;
+        },
+        readiness() {
+            assert.equal(workspaceHeld && networkHeld, true);
+        },
+        revalidate() { assert.fail('a retained dependency launch must not reacquire/rebase'); },
+        inspectRuntime() {
+            assert.equal(workspaceHeld && networkHeld, true);
+        },
+        activate(_current, _context, _result, { onCommitted }) {
+            assert.equal(workspaceHeld && networkHeld, true);
+            onCommitted();
+            return 'dependency-activation';
+        },
+        async withLifecycleLease(_identity, callback) {
+            lifecycleLeases += 1;
+            workspaceHeld = true;
+            try { return await callback(lifecycle); } finally { workspaceHeld = false; }
+        },
+        async withNetworkLock(callback) {
+            networkLeases += 1;
+            networkHeld = true;
+            try { return await callback({ lock: 'network' }); } finally { networkHeld = false; }
+        },
+    });
+
+    assert.equal(value, 'dependency-activation');
+    assert.equal(lifecycleLeases, 1);
+    assert.equal(networkLeases, 1);
 });
 
 test('stale no-wait lifecycle cleans only after locked immutable reinspection', async () => {

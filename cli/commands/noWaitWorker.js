@@ -692,6 +692,7 @@ export async function runNoWaitLifecycleTransaction(identity, {
     withLifecycleLease = withActiveNoWaitWorkerLifecycleLease,
     withNetworkLock = withNetworkLifecycleLock,
     loadCurrentLifecycle = loadNoWaitWorkerLifecycle,
+    retainLifecycleLocksThroughReadiness = false,
     lifecycleLeaseTimeoutMs = resolveNoWaitLifecycleLeaseTimeoutMs(),
     networkWaitMs = boundedPositiveInteger(
         process.env.PLOINKY_NO_WAIT_NETWORK_LOCK_TIMEOUT_MS,
@@ -813,12 +814,18 @@ export async function runNoWaitLifecycleTransaction(identity, {
                     if (result?.requiresEdgeActivation === true && !result?.preparationLease) {
                         throw new Error('no-wait runtime replacement requires its exact preparation lease');
                     }
-                    if (!result?.preparationLease) return { completed: false };
+                    if (!result?.preparationLease
+                        && retainLifecycleLocksThroughReadiness !== true) {
+                        return { completed: false };
+                    }
 
-                    // A preparation lease selected an inactive generation.
+                    // A preparation lease selected an inactive generation, and
+                    // a dependency-ordered launch may need the active Router
+                    // generation to remain stable while its process bootstraps.
                     // Retain both workspace and network locks through readiness
-                    // and activation; releasing either can deadlock or expose a
-                    // replacement whose selector is not active yet.
+                    // and activation for either case. Releasing either can
+                    // expose the process to a peer's fail-closed generation
+                    // transition before its own readiness contract settles.
                     await readiness(lifecycle, context, result);
                     await inspectRuntime(result, context, lifecycle, networkLifecycleCapability, {
                         cleanup: false,
@@ -1693,6 +1700,12 @@ async function main() {
             agentPath,
         });
         await runNoWaitLifecycleTransaction(expectedIdentity, {
+            // A consumer becomes eligible when its declared producers are
+            // ready. Keep the routing generation that proved those producers
+            // stable until the consumer itself passes readiness; unrelated
+            // workers may continue cold preparation but cannot interrupt its
+            // bootstrap with a fail-closed route publication.
+            retainLifecycleLocksThroughReadiness: hasWaveBarrier,
             capture(lifecycle) {
                 const manifest = lifecycle.manifest;
                 const activeProfile = String(lifecycle.record.profile || '');
