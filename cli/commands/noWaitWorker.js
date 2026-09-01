@@ -57,7 +57,8 @@ import {
 import {
     abortEdgeRoutingPreparation,
     assertActiveEdgeRoutingSourcesCurrent,
-    captureEdgeRoutingLifecycleMutationGeneration,
+    commitAdditiveEdgeRoutingGeneration,
+    prepareAdditiveEdgeRoutingGeneration,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import {
@@ -442,7 +443,7 @@ export async function waitForNoWaitStatusBarrier(entries, {
     return Object.freeze(settled.map(({ entry, status }) => Object.freeze({ entry, status })));
 }
 
-async function upsertRoute(routeKey, route, {
+export async function upsertRoute(routeKey, route, {
     containerName,
     registryRecord,
     expectedIdentity,
@@ -450,24 +451,87 @@ async function upsertRoute(routeKey, route, {
     expectedSelector,
     preparationLease,
     networkLifecycleCapability,
+} = {}, {
+    abortPreparation = abortEdgeRoutingPreparation,
+    assertActive = assertActiveEdgeRoutingSourcesCurrent,
+    commitAdditive = commitAdditiveEdgeRoutingGeneration,
+    mergeRouting = mergeRoutingConfig,
+    prepareAdditive = prepareAdditiveEdgeRoutingGeneration,
+    waitForActivation = waitForNoWaitRouteActivation,
+    withApplyLock = withEdgeGenerationApplyLock,
 } = {}) {
     if (!containerName || !registryRecord || !expectedIdentity || !expectedLifecycle
         || !expectedSelector?.generation || !expectedSelector?.activationId) {
         throw new Error('no-wait route activation requires one exact runtime registry record and active selector');
     }
-    let validatedActivationSelector = null;
     if (!preparationLease) {
-        const activationLifecycle = await waitForNoWaitRouteActivation(
+        const activationLifecycle = await waitForActivation(
             expectedIdentity,
             expectedSelector,
             { expectedLifecycle },
         );
-        validatedActivationSelector = Object.freeze({
+        const validatedActivationSelector = Object.freeze({
             generation: activationLifecycle.generationDigest,
             activationId: activationLifecycle.selectorActivationId,
         });
+        let additiveLease = null;
+        let additiveCommitted = false;
+        try {
+            await withApplyLock((applyLockCapability) => {
+                const active = assertActive();
+                if (active.selector.generation !== validatedActivationSelector.generation
+                    || active.selector.activationId !== validatedActivationSelector.activationId) {
+                    throw new Error(`no-wait lifecycle generation changed before route activation for '${routeKey}'`);
+                }
+                if (expectedLifecycle.targetState === 'ready') {
+                    assertNoWaitAdoptableLifecycleSnapshot(active, expectedIdentity);
+                } else {
+                    assertNoWaitLifecycleSnapshot(active, expectedIdentity);
+                }
+
+                const agents = structuredClone(active.generation.agents);
+                const routing = structuredClone(active.generation.routing);
+                agents[containerName] = structuredClone(registryRecord);
+                routing.routes = routing.routes || {};
+                routing.routes[routeKey] = mergeRuntimeRoute(
+                    routing.routes[routeKey],
+                    route,
+                    { hostPort: route.hostPort },
+                );
+
+                const prepared = prepareAdditive({
+                    agents,
+                    routing,
+                    reason: `no-wait-runtime-ready:${routeKey}`,
+                    expectedActiveGeneration: validatedActivationSelector.generation,
+                    applyLockCapability,
+                    networkLifecycleCapability,
+                });
+                additiveLease = prepared.preparationLease;
+                const committed = commitAdditive(additiveLease, {
+                    agents,
+                    routing,
+                    applyLockCapability,
+                    networkLifecycleCapability,
+                });
+                additiveCommitted = true;
+                return committed;
+            });
+            return;
+        } catch (error) {
+            if (additiveLease && !additiveCommitted) {
+                try {
+                    await Promise.resolve(abortPreparation(additiveLease, {
+                        reason: `no-wait-runtime-ready-aborted:${routeKey}`,
+                    }));
+                } catch (abortError) {
+                    error.message += `; additive route preparation abort failed: ${abortError?.message || abortError}`;
+                }
+            }
+            throw error;
+        }
     }
-    await mergeRoutingConfig((cfg) => {
+    await mergeRouting((cfg) => {
         const agents = loadAgents();
         const snapshot = {
             generation: {
@@ -492,18 +556,7 @@ async function upsertRoute(routeKey, route, {
     }, {
         reason: `no-wait-runtime-ready:${routeKey}`,
         networkLifecycleCapability,
-        ...(preparationLease ? { preparationLease } : {}),
-        ...(preparationLease ? {} : { validateActiveGeneration() {
-            const active = assertActiveEdgeRoutingSourcesCurrent();
-            if (active.selector.generation !== validatedActivationSelector.generation
-                || active.selector.activationId !== validatedActivationSelector.activationId) {
-                throw new Error(`no-wait lifecycle generation changed before route activation for '${routeKey}'`);
-            }
-            assertNoWaitLifecycleSnapshot(active, expectedIdentity);
-            return active;
-        }, captureExpectedGeneration(active) {
-            return captureEdgeRoutingLifecycleMutationGeneration(active);
-        } }),
+        preparationLease,
     });
 }
 

@@ -28,6 +28,7 @@ import {
     resolveRunScopedObservation,
     runNoWaitLifecycleTransaction,
     runNoWaitScriptReadinessWithControlPlaneRetry,
+    upsertRoute,
     waitForNoWaitLifecycle,
     waitForNoWaitWorkerLifecycle,
     waitForNoWaitStatusBarrier,
@@ -930,6 +931,120 @@ test('no-wait main delegates route activation to the serialized lifecycle transa
         /networkLifecycleCapability[\s\S]*await upsertRoute\([\s\S]*networkLifecycleCapability/,
         'activation must pass its exact live network capability into the route transaction',
     );
+});
+
+test('staged no-wait route publication uses an additive atomic cutover', async () => {
+    const agentPath = path.join(os.tmpdir(), 'ploinky-demo-worker');
+    const identity = {
+        containerName: 'ploinky_demo_worker',
+        instanceId: INSTANCE_ID,
+        enableGeneration: ENABLE_GENERATION,
+        repoName: 'demo',
+        shortAgent: 'worker',
+        alias: '',
+        routeKey: 'worker',
+        agentPath,
+    };
+    const stagedRecord = {
+        type: 'agent',
+        repoName: identity.repoName,
+        agentName: identity.shortAgent,
+        instanceId: identity.instanceId,
+        enableGeneration: identity.enableGeneration,
+    };
+    const stagedRoute = {
+        container: identity.containerName,
+        repo: identity.repoName,
+        agent: identity.shortAgent,
+        hostPath: agentPath,
+    };
+    const active = {
+        selector: {
+            state: 'active',
+            generation: 'sha256:predecessor',
+            activationId: 'predecessor-activation',
+        },
+        generation: {
+            agents: { [identity.containerName]: stagedRecord },
+            routing: { port: 8080, routes: { worker: stagedRoute } },
+            manifests: { worker: { name: 'worker' } },
+            routerHostPort: 8080,
+        },
+    };
+    const lifecycle = assertNoWaitLifecycleSnapshot(active, identity);
+    const registryRecord = {
+        ...stagedRecord,
+        runtime: 'podman',
+        containerId: 'a'.repeat(64),
+    };
+    const finalRoute = { ...stagedRoute, hostPort: 45123 };
+    const lease = { mode: 'additive', transactionId: 'no-wait-additive' };
+    const calls = [];
+    let applyLockHeld = false;
+
+    await upsertRoute('worker', finalRoute, {
+        containerName: identity.containerName,
+        registryRecord,
+        expectedIdentity: identity,
+        expectedLifecycle: lifecycle,
+        expectedSelector: {
+            generation: lifecycle.generationDigest,
+            activationId: lifecycle.selectorActivationId,
+        },
+        networkLifecycleCapability: { token: 'network' },
+    }, {
+        async waitForActivation(receivedIdentity, receivedSelector) {
+            calls.push('wait');
+            assert.equal(receivedIdentity, identity);
+            assert.equal(receivedSelector.generation, lifecycle.generationDigest);
+            return lifecycle;
+        },
+        async withApplyLock(callback) {
+            calls.push('lock');
+            applyLockHeld = true;
+            try {
+                return await callback({ token: 'apply' });
+            } finally {
+                applyLockHeld = false;
+            }
+        },
+        assertActive() {
+            calls.push('assert-active');
+            assert.equal(applyLockHeld, true);
+            return active;
+        },
+        prepareAdditive(options) {
+            calls.push('prepare-additive');
+            assert.equal(applyLockHeld, true);
+            assert.equal(options.expectedActiveGeneration, lifecycle.generationDigest);
+            assert.deepEqual(options.agents[identity.containerName], registryRecord);
+            assert.deepEqual(options.routing.routes.worker, finalRoute);
+            return { preparationLease: lease };
+        },
+        commitAdditive(receivedLease, options) {
+            calls.push('commit-additive');
+            assert.equal(applyLockHeld, true);
+            assert.equal(receivedLease, lease);
+            assert.deepEqual(options.agents[identity.containerName], registryRecord);
+            assert.deepEqual(options.routing.routes.worker, finalRoute);
+            return { selector: { state: 'active' } };
+        },
+        mergeRouting() {
+            assert.fail('a staged no-wait route must not enter the inactive generic apply path');
+        },
+        abortPreparation() {
+            assert.fail('a successful additive cutover must not abort its preparation');
+        },
+    });
+
+    assert.equal(applyLockHeld, false);
+    assert.deepEqual(calls, [
+        'wait',
+        'lock',
+        'assert-active',
+        'prepare-additive',
+        'commit-additive',
+    ]);
 });
 
 test('no-wait worker never owns the workspace lease while waiting for an active generation', async () => {
