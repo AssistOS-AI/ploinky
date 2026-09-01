@@ -1,9 +1,4 @@
-import { isDeepStrictEqual } from 'node:util';
-
 import {
-    BOX_AGENTLIB_LABELS,
-    BOX_DATA_FINGERPRINT_LABELS,
-    BOX_DATA_KEYS,
     BOX_LABELS,
     BOX_ROLES,
 } from '../constants.mjs';
@@ -61,29 +56,12 @@ function podmanBackendFields(info) {
     ];
 }
 
-function engineIdentity(name, info) {
-    const stableFields = name === 'podman'
-        ? podmanBackendFields(info)
-        : [info.ID, info.DockerRootDir, info.ServerVersion, info.OSType];
-    return sha256(Buffer.from(JSON.stringify([name, ...stableFields])));
+function engineIdentity(info) {
+    return sha256(Buffer.from(JSON.stringify(['podman', ...podmanBackendFields(info)])));
 }
 
-function isSamePodmanBackend(podmanInfo, dockerInfo) {
-    const canonical = (info) => podmanBackendFields(info)
-        .map((value) => String(value ?? '').trim());
-    const podmanFields = canonical(podmanInfo);
-    const dockerFields = canonical(dockerInfo);
-    // GraphRoot, RunRoot, and the Podman API version establish that `docker`
-    // exposes the same Podman storage/runtime rather than a separate Docker
-    // engine that happens to report one coincidentally similar host field.
-    if (podmanFields.slice(1).some((value) => value === '')
-        || dockerFields.slice(1).some((value) => value === '')) {
-        return false;
-    }
-    return isDeepStrictEqual(podmanFields, dockerFields);
-}
-
-function probeEngine(name, runner) {
+function probePodman(runner) {
+    const name = 'podman';
     const result = query(runner, name, ['info', '--format', 'json']);
     if (!result.ok) {
         if (result.error?.code === 'ENOENT') {
@@ -112,7 +90,7 @@ function probeEngine(name, runner) {
     return {
         name,
         state: 'reachable',
-        identity: engineIdentity(name, info),
+        identity: engineIdentity(info),
         info,
     };
 }
@@ -196,20 +174,15 @@ function labelsFrom(value) {
     }));
 }
 
-function recordName(value) {
-    const raw = value?.Name ?? value?.Names ?? value?.name ?? '';
-    return String(Array.isArray(raw) ? raw[0] : raw).replace(/^\//, '');
-}
-
-function inspectExact(engine, kind, name, runner) {
-    const result = query(runner, engine.name, [kind, 'inspect', name]);
+function inspectExactContainer(engine, name, runner) {
+    const result = query(runner, engine.name, ['container', 'inspect', name]);
     if (!result.ok) {
         if (ABSENT_PATTERN.test(`${result.stderr}\n${result.stdout}`)) {
             return { state: 'absent' };
         }
         return {
             state: 'unknown',
-            message: `${engine.name} could not determine whether ${kind} ${name} exists`,
+            message: `${engine.name} could not determine whether container ${name} exists`,
         };
     }
     try {
@@ -221,100 +194,14 @@ function inspectExact(engine, kind, name, runner) {
     } catch {
         return {
             state: 'unknown',
-            message: `${engine.name} returned malformed ${kind} inspection for ${name}`,
+            message: `${engine.name} returned malformed container inspection for ${name}`,
         };
     }
 }
 
-function inventory(engine, kind, pathHash, runner) {
-    const result = query(runner, engine.name, [
-        kind,
-        'ls',
-        ...(kind === 'container' ? ['-a'] : []),
-        '--filter',
-        `label=${BOX_LABELS.pathHash}=${pathHash}`,
-        '--format',
-        '{{json .}}',
-    ]);
-    if (!result.ok) {
-        return {
-            state: 'unknown',
-            message: `${engine.name} could not inventory Box ${kind} ownership`,
-        };
-    }
-    try {
-        return { state: 'known', records: parseJsonRecords(result.stdout) };
-    } catch {
-        return {
-            state: 'unknown',
-            message: `${engine.name} returned malformed Box ${kind} inventory`,
-        };
-    }
-}
-
-function expectedImmutableLabels(pathHash, role) {
-    return {
-        [BOX_LABELS.pathHash]: pathHash,
-        [BOX_LABELS.role]: role,
-    };
-}
-
-function hasExactLabels(labels, expected) {
-    const observed = Object.fromEntries(Object.entries(labels || {})
-        .filter(([key]) => key.startsWith('io.assistos.ploinky-box.'))
-        .sort());
-    const wanted = Object.fromEntries(Object.entries(expected).sort());
-    return isDeepStrictEqual(observed, wanted);
-}
-
-function hasExactResourceLabels(labels, pathHash, role) {
-    const hostPort = String(labels?.[BOX_LABELS.routerHostPort] || '');
-    const mediaHostPort = String(labels?.[BOX_LABELS.mediaHostPort] || '');
-    const imageRef = String(labels?.[BOX_LABELS.imageRef] || '');
-    const seccompFingerprint = String(labels?.[BOX_LABELS.seccompFingerprint] || '');
-    const dataFingerprints = Object.fromEntries(BOX_DATA_KEYS.map((key) => [
-        key,
-        String(labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
-    ]));
-    const fingerprintValues = Object.values(dataFingerprints);
-    const hasCompleteFingerprints = fingerprintValues.every((value) => /^[a-f0-9]{64}$/.test(value));
-    const expectedFingerprints = Object.fromEntries(BOX_DATA_KEYS.map((key) => [
-        BOX_DATA_FINGERPRINT_LABELS[key],
-        dataFingerprints[key],
-    ]));
-    const agentLibLabels = {
-        [BOX_AGENTLIB_LABELS.mode]: String(labels?.[BOX_AGENTLIB_LABELS.mode] || ''),
-        [BOX_AGENTLIB_LABELS.sourceIdHash]: String(labels?.[BOX_AGENTLIB_LABELS.sourceIdHash] || ''),
-        [BOX_AGENTLIB_LABELS.fingerprint]: String(labels?.[BOX_AGENTLIB_LABELS.fingerprint] || ''),
-        [BOX_AGENTLIB_LABELS.sourceRelativePath]: String(labels?.[BOX_AGENTLIB_LABELS.sourceRelativePath] || ''),
-        [BOX_AGENTLIB_LABELS.commit]: String(labels?.[BOX_AGENTLIB_LABELS.commit] || ''),
-    };
-    const sourceRelativePath = agentLibLabels[BOX_AGENTLIB_LABELS.sourceRelativePath];
-    const commit = agentLibLabels[BOX_AGENTLIB_LABELS.commit];
-    const hasCompleteAgentLib = ['local', 'managed'].includes(agentLibLabels[BOX_AGENTLIB_LABELS.mode])
-        && /^[a-f0-9]{64}$/.test(agentLibLabels[BOX_AGENTLIB_LABELS.sourceIdHash])
-        && /^[a-f0-9]{64}$/.test(agentLibLabels[BOX_AGENTLIB_LABELS.fingerprint])
-        && sourceRelativePath.length > 0
-        && !sourceRelativePath.startsWith('/')
-        && !sourceRelativePath.split('/').includes('..')
-        && (commit === '' || /^[a-f0-9]{40}$/.test(commit));
-    return /^[1-9][0-9]{0,4}$/.test(hostPort)
-        && Number(hostPort) <= 65535
-        && /^[1-9][0-9]{0,4}$/.test(mediaHostPort)
-        && Number(mediaHostPort) <= 65535
-        && imageRef.length > 0
-        && /^[a-f0-9]{64}$/.test(seccompFingerprint)
-        && hasCompleteFingerprints
-        && hasCompleteAgentLib
-        && hasExactLabels(labels, {
-            ...expectedImmutableLabels(pathHash, role),
-            [BOX_LABELS.imageRef]: imageRef,
-            [BOX_LABELS.routerHostPort]: hostPort,
-            [BOX_LABELS.mediaHostPort]: mediaHostPort,
-            [BOX_LABELS.seccompFingerprint]: seccompFingerprint,
-            ...expectedFingerprints,
-            ...agentLibLabels,
-        });
+function hasWorkspaceOwnership(labels, pathHash, role) {
+    return String(labels?.[BOX_LABELS.pathHash] || '') === pathHash
+        && String(labels?.[BOX_LABELS.role] || '') === role;
 }
 
 function containerHandle(engine, identity, name, record) {
@@ -341,38 +228,20 @@ function expectedContainer(identity) {
     };
 }
 
-// Box persistence is workspace-backed, so the outer container is the only
-// engine resource this Box owns. Labelled named volumes left behind by the
-// retired design are inert: they neither establish ownership nor block a Box.
-function inspectEngineResources(engine, identity, runner) {
+// Ownership discovery is intentionally narrow: Podman is authoritative, and
+// only the exact workspace-derived name plus the workspace/role labels establish
+// provenance. Detailed image, mount, port, confinement, and AgentLib validation
+// belongs to reconciliation and status admission, not engine discovery.
+function inspectOwnedContainer(engine, identity, runner) {
     const expected = expectedContainer(identity);
-    const containerInventory = inventory(engine, 'container', identity.pathHash, runner);
-    if (containerInventory.state === 'unknown') {
-        return {
-            state: 'unknown',
-            message: containerInventory.message,
-        };
-    }
-
-    for (const record of containerInventory.records) {
-        const name = recordName(record);
-        const role = labelsFrom(record)[BOX_LABELS.role];
-        if (name !== expected.name || role !== expected.role) {
-            return {
-                state: 'foreign',
-                message: `${engine.name} has an unexpected resource claiming this Box identity`,
-            };
-        }
-    }
-
-    const containerInspection = inspectExact(engine, 'container', expected.name, runner);
+    const containerInspection = inspectExactContainer(engine, expected.name, runner);
     if (containerInspection.state === 'unknown') {
         return containerInspection;
     }
     if (containerInspection.state !== 'present') {
         return { state: 'absent', handles: null };
     }
-    if (!hasExactResourceLabels(
+    if (!hasWorkspaceOwnership(
         labelsFrom(containerInspection.record),
         identity.pathHash,
         expected.role,
@@ -403,19 +272,6 @@ function inspectEngineResources(engine, identity, runner) {
     }
 }
 
-function inventoriesIdentifySameContainer(left, right) {
-    if (left?.state !== right?.state) return false;
-    if (left.state === 'absent') return true;
-    if (left.state !== 'owned') return false;
-    const leftContainer = left.handles?.container;
-    const rightContainer = right.handles?.container;
-    return Boolean(leftContainer && rightContainer)
-        && leftContainer.id === rightContainer.id
-        && leftContainer.name === rightContainer.name
-        && leftContainer.pathHash === rightContainer.pathHash
-        && isDeepStrictEqual(leftContainer.labels, rightContainer.labels);
-}
-
 export function discoverBoxOwnership(identity, {
     platform = process.platform,
     env = process.env,
@@ -437,7 +293,7 @@ export function discoverBoxOwnership(identity, {
         };
     }
 
-    const podman = probeEngine('podman', runner);
+    const podman = probePodman(runner);
     if (podman.state === 'absent') {
         return {
             state: 'unsupported',
@@ -489,60 +345,20 @@ export function discoverBoxOwnership(identity, {
         };
     }
 
-    const docker = probeEngine('docker', runner);
-    if (docker.state === 'unknown') {
+    const ownership = inspectOwnedContainer(podman, identity, runner);
+    if (ownership.state === 'unknown') {
         return {
             state: 'unknown',
-            message: docker.message,
-            engines: { podman, docker },
+            message: ownership.message,
+            engines: { podman },
         };
-    }
-
-    const podmanInventory = inspectEngineResources(podman, identity, runner);
-    if (podmanInventory.state === 'unknown') {
-        return {
-            state: 'unknown',
-            message: podmanInventory.message,
-            engines: { podman, docker },
-        };
-    }
-
-    let dockerInventory = { state: 'absent', handles: null };
-    if (docker.state === 'reachable') {
-        dockerInventory = inspectEngineResources(docker, identity, runner);
-        if (dockerInventory.state === 'unknown') {
-            return {
-                state: 'unknown',
-                message: dockerInventory.message,
-                engines: { podman, docker },
-            };
-        }
-        const samePodmanBackend = isSamePodmanBackend(podman.info, docker.info);
-        if (samePodmanBackend
-            && !inventoriesIdentifySameContainer(podmanInventory, dockerInventory)) {
-            return {
-                state: 'foreign',
-                message: 'Docker Podman-compatibility frontend returned an inconsistent Box inventory',
-                engines: { podman, docker },
-                inventories: { podman: podmanInventory, docker: dockerInventory },
-            };
-        }
-        if (!samePodmanBackend && dockerInventory.state !== 'absent') {
-            return {
-                state: 'foreign',
-                message: 'Docker has an exact-name or labeled resource conflicting with this Box',
-                engines: { podman, docker },
-                inventories: { podman: podmanInventory, docker: dockerInventory },
-            };
-        }
     }
 
     return {
-        state: podmanInventory.state,
-        message: podmanInventory.message || '',
+        state: ownership.state,
+        message: ownership.message || '',
         engine: Object.freeze({ name: 'podman', identity: podman.identity, hostKind }),
-        handles: podmanInventory.handles || null,
-        engines: { podman, docker },
-        inventories: { podman: podmanInventory, docker: dockerInventory },
+        handles: ownership.handles || null,
+        engines: { podman },
     };
 }
