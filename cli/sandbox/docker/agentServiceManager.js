@@ -89,7 +89,7 @@ import {
     ensureAgentDataDirectory,
 } from '../../utils/runtime/agentDataPathPolicy.js';
 import {
-    ensureLegacyAgentGuardSources,
+    legacyAgentGuardMounts,
     legacyAgentGuardTargets,
     prepareLegacyGuardMountpointCleanup,
     protectedLegacyAgentRoots,
@@ -1023,8 +1023,9 @@ function appendLegacyAgentDataGuards(args, runtime, {
     const bindings = expectedBindMountsFromArgs(args).map(mount => ({
         hostPath: mount.source,
         runtimePath: mount.destination,
+        readOnly: !mount.rw,
     }));
-    const guardOptions = workspaceRoot ? { workspaceRoot } : {};
+    const guardOptions = { workspaceRoot, bindings };
     const targets = legacyAgentGuardTargets(bindings, guardOptions);
     // Narrow repository grants can still cause the container engine to create
     // the canonical workspace parents. Guard those synthetic parents too so
@@ -1038,29 +1039,22 @@ function appendLegacyAgentDataGuards(args, runtime, {
             }));
         }
     }
-    const sources = ensureLegacyAgentGuardSources(guardOptions);
-    const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
-    // A nested bind whose destination did not exist before `create` is mounted
-    // on a container-engine-created host directory. Removing that directory
-    // after create makes the mount unreachable by pathname, even though it is
-    // still present in inspect output. Protect the existing `.ploinky` parent
-    // read-only whenever a broad workspace grant covers an absent legacy root.
-    // Existing protected roots are still overlaid with the empty guard below.
-    const parentGuards = new Map();
-    for (const guard of targets) {
-        if (!guard.parentTarget || fs.existsSync(guard.protectedHostPath)) continue;
-        const key = `${guard.protectedParentHostPath}\0${guard.parentTarget}`;
-        parentGuards.set(key, Object.freeze({
-            source: guard.protectedParentHostPath,
-            target: guard.parentTarget,
-        }));
-    }
-    for (const parent of parentGuards.values()) {
-        appendExactManagedBindMount(args, `${parent.source}:${parent.target}${suffix}`);
-    }
-    for (const guard of targets) {
-        if (guard.parentTarget && !fs.existsSync(guard.protectedHostPath)) continue;
-        appendExactManagedBindMount(args, `${sources.get(guard.key)}:${guard.target}${suffix}`);
+    for (const guard of legacyAgentGuardMounts(targets, guardOptions)) {
+        if (guard.replaceExisting) {
+            for (let index = 0; index < args.length - 1; index += 1) {
+                if (args[index] !== '-v' && args[index] !== '--volume') continue;
+                const mount = managedBindMountFromValue(args[index + 1]);
+                if (mount.destination !== guard.target) continue;
+                const parts = String(args[index + 1]).split(':');
+                const options = parts.slice(2).join(':').split(',').filter(option => option && option !== 'rw' && option !== 'ro');
+                if (guard.readOnly) options.push('ro');
+                args[index + 1] = `${parts[0]}:${parts[1]}${options.length ? `:${options.join(',')}` : ''}`;
+            }
+            continue;
+        }
+        const suffix = runtime === 'podman'
+            ? (guard.readOnly ? ':z,ro' : ':z') : (guard.readOnly ? ':ro' : '');
+        appendExactManagedBindMount(args, `${guard.source}:${guard.target}${suffix}`);
     }
     return targets;
 }

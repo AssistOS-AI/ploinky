@@ -47,7 +47,7 @@ import {
     ensurePersistentStorageHostDir
 } from '../../utils/runtime/runtimeResourcePlanner.js';
 import {
-    ensureLegacyAgentGuardSources,
+    legacyAgentGuardMounts,
     legacyAgentGuardTargets,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import {
@@ -350,19 +350,41 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
     return binds;
 }
 
-function appendLegacyAgentDataGuards(args) {
+function appendLegacyAgentDataGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
     const bindings = [];
+    const remainder = [];
+    let insertionIndex = 0;
     for (let index = 0; index < args.length - 2; index += 1) {
         if (args[index] !== '--bind' && args[index] !== '--ro-bind') continue;
-        bindings.push({ hostPath: args[index + 1], runtimePath: args[index + 2] });
+        bindings.push({ hostPath: args[index + 1], runtimePath: args[index + 2], readOnly: args[index] === '--ro-bind' });
         index += 2;
     }
-    const targets = legacyAgentGuardTargets(bindings);
-    if (!targets.length) return [];
-    const sources = ensureLegacyAgentGuardSources();
-    for (const guard of targets) {
-        args.push('--ro-bind', sources.get(guard.key), guard.target);
+    const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
+    const guards = legacyAgentGuardMounts(targets, { workspaceRoot, bindings });
+    if (!guards.length) return targets;
+    for (const guard of guards) {
+        if (guard.replaceExisting) {
+            for (const binding of bindings) {
+                if (binding.runtimePath === guard.target) binding.readOnly = guard.readOnly;
+            }
+        } else {
+            bindings.push({ hostPath: guard.source, runtimePath: guard.target, readOnly: guard.readOnly });
+        }
     }
+    // Bubblewrap applies mounts sequentially. Parent pins must precede existing
+    // descendant grants, otherwise they hide dependency/source alias overlays.
+    // Keep equal-target precedence and every non-bind argument unchanged.
+    for (let index = 0; index < args.length; index += 1) {
+        if (args[index] === '--bind' || args[index] === '--ro-bind') {
+            index += 2;
+            insertionIndex = remainder.length;
+        } else remainder.push(args[index]);
+    }
+    const ordered = bindings.sort((left, right) => left.runtimePath.split('/').filter(Boolean).length - right.runtimePath.split('/').filter(Boolean).length);
+    remainder.splice(insertionIndex, 0, ...ordered.flatMap(binding => [
+        binding.readOnly ? '--ro-bind' : '--bind', binding.hostPath, binding.runtimePath,
+    ]));
+    args.splice(0, args.length, ...remainder);
     return targets;
 }
 
@@ -555,7 +577,7 @@ function buildBwrapArgs(options) {
     }
 
     // Apply the old-root opacity boundary after every ordinary bind.
-    appendLegacyAgentDataGuards(args);
+    appendLegacyAgentDataGuards(args, { workspaceRoot: options.workspaceRoot });
 
     // Process isolation — do NOT unshare network (agents need host network)
     // NOTE: --die-with-parent is intentionally omitted. Agent processes must survive

@@ -111,14 +111,17 @@ function handleExposeCommand(options = []) {
 
     try {
         const res = withEdgeGenerationApplyLock((applyLockCapability) => {
-            const selection = readEdgeRoutingSelection();
-            if (selection.selector.state === 'active') {
-                assertActiveEdgeRoutingSourcesCurrent({ applyLockCapability });
-                inactivateEdgeRoutingGeneration('agent-expose-manifest-change', {
-                    applyLockCapability,
-                });
-            }
-            return envSvc.exposeEnv(exposedName, valueArg, agentArg);
+            return envSvc.exposeEnv(exposedName, valueArg, agentArg, {
+                beforeWrite() {
+                    const selection = readEdgeRoutingSelection();
+                    if (selection.selector.state === 'active') {
+                        assertActiveEdgeRoutingSourcesCurrent({ applyLockCapability });
+                        inactivateEdgeRoutingGeneration('agent-expose-manifest-change', {
+                            applyLockCapability,
+                        });
+                    }
+                },
+            });
         });
         console.log(`✓ Exposed '${exposedName}' for agent '${res.agentName}'.`);
     } catch (err) {

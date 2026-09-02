@@ -28,7 +28,7 @@ import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
 import { SHARED_DIR } from '../../utils/config.js';
 import { ensureAgentDataDirectory } from '../../utils/runtime/agentDataPathPolicy.js';
 import {
-    ensureLegacyAgentGuardSources,
+    legacyAgentGuardMounts,
     legacyAgentGuardTargets,
     prepareLegacyGuardMountpointCleanup,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
@@ -54,10 +54,24 @@ function joinShellCommandParts(parts) {
 
 function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
     const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
-    if (!targets.length) return [];
-    const sources = ensureLegacyAgentGuardSources({ workspaceRoot });
-    const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
-    return targets.map(guard => `-v "${sources.get(guard.key)}:${guard.target}${suffix}"`);
+    const mounts = bindings.map(binding => ({ ...binding }));
+    for (const guard of legacyAgentGuardMounts(targets, { workspaceRoot, bindings })) {
+        if (guard.replaceExisting) {
+            for (const binding of mounts) {
+                if (binding.runtimePath !== guard.target) continue;
+                binding.readOnly = guard.readOnly;
+                binding.suffix = runtime === 'podman' ? ':z,ro' : ':ro';
+            }
+        } else {
+            mounts.push({
+                hostPath: guard.source,
+                runtimePath: guard.target,
+                suffix: runtime === 'podman'
+                    ? (guard.readOnly ? ':z,ro' : ':z') : (guard.readOnly ? ':ro' : ''),
+            });
+        }
+    }
+    return mounts.map(binding => `-v "${binding.hostPath}:${binding.runtimePath}${binding.suffix || ''}"`);
 }
 
 function withLegacyMountpointCleanup(operation) {
@@ -122,16 +136,16 @@ function buildInteractiveAgentCreateCommand({
             : [{ hostPath: homeDir, runtimePath: '/root' }]),
         { hostPath: sharedDir, runtimePath: '/shared' },
     ]);
-    const legacyGuards = legacyGuardMountOptions(runtime, [
-        { hostPath: projectDir, runtimePath: projectDir },
+    const mountOptions = legacyGuardMountOptions(runtime, [
+        { hostPath: projectDir, runtimePath: projectDir, suffix: volumeSuffix },
         ...(path.resolve(projectDir) === path.resolve(homeDir)
             ? []
-            : [{ hostPath: homeDir, runtimePath: '/root' }]),
-        { hostPath: sharedDir, runtimePath: '/shared' },
-        { hostPath: agentLibPath, runtimePath: '/Agent' },
-        { hostPath: absAgentPath, runtimePath: '/code' },
-        { hostPath: grant.sourceDir, runtimePath: grant.runtimePath },
-        ...agentLibShadows,
+            : [{ hostPath: homeDir, runtimePath: '/root', suffix: volumeSuffix }]),
+        { hostPath: agentLibPath, runtimePath: '/Agent', readOnly: true, suffix: readOnlySuffix },
+        { hostPath: absAgentPath, runtimePath: '/code', readOnly: true, suffix: readOnlySuffix },
+        { hostPath: sharedDir, runtimePath: '/shared', suffix: volumeSuffix },
+        { hostPath: grant.sourceDir, runtimePath: grant.runtimePath, readOnly: true, suffix: readOnlySuffix },
+        ...agentLibShadows.map(shadow => ({ ...shadow, readOnly: true, suffix: readOnlySuffix })),
     ], { workspaceRoot });
     return joinShellCommandParts([
         runtime,
@@ -143,16 +157,7 @@ function buildInteractiveAgentCreateCommand({
         PLOINKY_MANAGED_LABEL,
         '--label',
         `ploinky.envhash=${envHash}`,
-        `-v "${projectDir}:${projectDir}${volumeSuffix}"`,
-        path.resolve(projectDir) === path.resolve(homeDir)
-            ? ''
-            : `-v "${homeDir}:/root${volumeSuffix}"`,
-        `-v "${agentLibPath}:/Agent${readOnlySuffix}"`,
-        `-v "${absAgentPath}:/code${readOnlySuffix}"`,
-        `-v "${sharedDir}:/shared${volumeSuffix}"`,
-        `-v "${grant.sourceDir}:${grant.runtimePath}${readOnlySuffix}"`,
-        ...agentLibShadows.map((shadow) => `-v "${shadow.hostPath}:${shadow.runtimePath}${readOnlySuffix}"`),
-        ...legacyGuards,
+        ...mountOptions,
         ...Object.entries(agentLibGrantEnv(grant)).map(([key, value]) => formatEnvFlag(key, value)),
         portOptions,
         envVars,
@@ -183,28 +188,14 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
             formatEnvFlag('NODE_PATH', `${projectDir}/node_modules`)
         ];
         const envVars = envVarParts.join(' ');
-        const mountOptions = runtime === 'podman'
-            ? [
-                `--mount type=bind,source="${projectDir}",destination="${projectDir}",relabel=shared`,
-                ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [
-                    `--mount type=bind,source="${homeDir}",destination="/root",relabel=shared`
-                ]),
-                `--mount type=bind,source="${sharedDir}",destination="/shared",relabel=shared`
-            ]
-            : [
-                `-v "${projectDir}:${projectDir}"`,
-                ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [
-                    `-v "${homeDir}:/root"`
-                ]),
-                `-v "${sharedDir}:/shared"`
-            ];
-        mountOptions.push(...legacyGuardMountOptions(runtime, [
-            { hostPath: projectDir, runtimePath: projectDir },
+        const volumeSuffix = runtime === 'podman' ? ':z' : '';
+        const mountOptions = legacyGuardMountOptions(runtime, [
+            { hostPath: projectDir, runtimePath: projectDir, suffix: volumeSuffix },
             ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [
-                { hostPath: homeDir, runtimePath: '/root' },
+                { hostPath: homeDir, runtimePath: '/root', suffix: volumeSuffix },
             ]),
-            { hostPath: sharedDir, runtimePath: '/shared' },
-        ]));
+            { hostPath: sharedDir, runtimePath: '/shared', suffix: volumeSuffix },
+        ]);
         const mountOption = mountOptions.join(' ');
 
         const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest);

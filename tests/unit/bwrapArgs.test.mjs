@@ -89,18 +89,40 @@ function hasBind(args, source, target = source) {
 }
 
 test('bwrap appends final read-only opacity guards for broad workspace binds', () => {
-    const args = ['--bind', PLOINKY_WORKSPACE_ROOT, '/workspace'];
-    const targets = appendLegacyAgentDataGuards(args);
-    assert.deepEqual(targets.map(entry => entry.target), [
-        '/workspace/.ploinky/data',
-        '/workspace/.ploinky/shared',
-    ]);
-    for (const target of targets) {
-        assert.equal(args.at(-3), '--ro-bind');
-        assert.equal(args.at(-1), targets.at(-1).target);
-        assert.notEqual(args.at(-2), target.protectedHostPath);
+    const root = tempDir('bwrap-existing-legacy-');
+    try {
+        for (const child of ['data', 'shared']) fs.mkdirSync(path.join(root, '.ploinky', child), { recursive: true });
+        const args = ['--bind', root, '/workspace'];
+        const targets = appendLegacyAgentDataGuards(args, { workspaceRoot: root });
+        assert.deepEqual(targets.map(entry => entry.target), [
+            '/workspace/.ploinky/data',
+            '/workspace/.ploinky/shared',
+        ]);
+        for (const target of targets) {
+            assert.equal(args.at(-3), '--ro-bind');
+            assert.equal(args.at(-1), targets.at(-1).target);
+            assert.notEqual(args.at(-2), target.protectedHostPath);
+        }
+        assert.ok(args.lastIndexOf('--ro-bind') > args.lastIndexOf('--bind'));
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
     }
-    assert.ok(args.lastIndexOf('--ro-bind') > args.lastIndexOf('--bind'));
+});
+
+test('bwrap keeps missing legacy roots absent by protecting their existing parent', () => {
+    const root = tempDir('bwrap-missing-legacy-');
+    try {
+        const controllerDir = path.join(root, '.ploinky');
+        fs.mkdirSync(path.join(controllerDir, 'data'), { recursive: true });
+        const args = ['--bind', root, '/workspace'];
+        appendLegacyAgentDataGuards(args, { workspaceRoot: root });
+        assert.ok(hasRoBind(args, fs.realpathSync(controllerDir), '/workspace/.ploinky'));
+        assert.equal(args.includes('/workspace/.ploinky/shared'), false);
+        assert.equal(args.at(-1), '/workspace/.ploinky/data');
+        assert.equal(fs.existsSync(path.join(controllerDir, 'shared')), false);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test('bwrap rejects a project bind sourced below a protected legacy root', () => {
@@ -154,29 +176,35 @@ test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind
     }
 });
 
-test('real bwrap production args make both legacy roots opaque to every operation', { skip: !hasUsableBwrap() }, () => {
-    const root = tempDir('bwrap-live-legacy-');
+for (const sharedExists of [true, false]) {
+test(`real bwrap production args pin ancestors and keep existing data and ${sharedExists ? 'existing' : 'absent'} shared opaque`, { skip: !hasUsableBwrap() }, () => {
+    const outer = tempDir('bwrap-live-legacy-');
+    const root = path.join(outer, 'projects', 'current');
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agent', 'node_modules');
         const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const agentHomeDir = path.join(root, '.data', 'demo');
-        for (const directory of [agentCodePath, nodeModulesDir, sharedDir, agentLibPath, agentHomeDir]) {
+        for (const directory of [path.join(agentCodePath, 'node_modules'), nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir]) {
             fs.mkdirSync(directory, { recursive: true });
         }
+        fs.writeFileSync(path.join(agentCodePath, 'source'), 'source');
+        fs.writeFileSync(path.join(nodeModulesDir, 'dependency-sentinel'), 'prepared');
         for (const relative of ['.ploinky/data', '.ploinky/shared']) {
+            if (!sharedExists && relative === '.ploinky/shared') continue;
             const directory = path.join(root, relative);
             fs.mkdirSync(directory, { recursive: true });
             fs.writeFileSync(path.join(directory, 'sentinel'), 'controller');
         }
         const args = buildBwrapArgs({
+            workspaceRoot: root,
             agentCodePath,
             agentLibGrant: grantFor(root),
             agentLibPath,
             nodeModulesDir,
             sharedDir,
-            cwd: root,
+            cwd: outer,
             agentHomeDir,
             skillsPath: null,
             envMap: {},
@@ -185,25 +213,45 @@ test('real bwrap production args make both legacy roots opaque to every operatio
             volumes: {},
         });
         const probe = [
+            'set -eu',
             'test -z "$(ls -A "$1/.ploinky/data")"',
-            'test -z "$(ls -A "$1/.ploinky/shared")"',
+            sharedExists ? 'test -z "$(ls -A "$1/.ploinky/shared")"' : 'test ! -e "$1/.ploinky/shared"',
             'if cat "$1/.ploinky/data/sentinel" 2>/dev/null; then exit 61; fi',
             'if cat "$1/.ploinky/shared/sentinel" 2>/dev/null; then exit 62; fi',
             'if touch "$1/.ploinky/data/file" 2>/dev/null; then exit 63; fi',
             'if touch "$1/.ploinky/shared/file" 2>/dev/null; then exit 64; fi',
             'if mkdir "$1/.ploinky/data/dir" 2>/dev/null; then exit 65; fi',
             'if mkdir "$1/.ploinky/shared/dir" 2>/dev/null; then exit 66; fi',
+            ...(sharedExists ? [] : ['if mkdir "$1/.ploinky/shared" 2>/dev/null; then exit 67; fi']),
+            'if mv "$1/.ploinky" "$1/moved" 2>/dev/null; then exit 68; fi',
+            'if rm -rf "$1/.ploinky" 2>/dev/null; then exit 69; fi',
+            'if ln -sfn "$1/replacement" "$1/.ploinky" 2>/dev/null; then exit 70; fi',
+            'if mv "$1" "$2/moved" 2>/dev/null; then exit 71; fi',
+            'if mv "$2/projects" "$2/moved" 2>/dev/null; then exit 72; fi',
+            'test "$(cat /code/source)" = source',
+            'test "$(cat /code/node_modules/dependency-sentinel)" = prepared',
+            'test "$(cat /Agent/node_modules/dependency-sentinel)" = prepared',
+            'if touch /code/source /code/node_modules/dependency-sentinel 2>/dev/null; then exit 73; fi',
+            // mv may copy/delete writable project siblings before failing on
+            // a mounted ancestor; recreating the private home remains allowed.
+            'mkdir -p "$1/.data/demo"',
+            'touch "$1/project-write" "$1/.data/demo/persisted"',
             'echo BWRAP_OPAQUE_OK',
         ].join('; ');
         const result = spawnSync('bwrap', [
-            ...args, '/bin/sh', '-lc', probe, 'probe', root,
+            ...args, '/bin/sh', '-lc', probe, 'probe', root, outer,
         ], { encoding: 'utf8' });
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.match(result.stdout, /BWRAP_OPAQUE_OK/);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), sharedExists);
+        assert.equal(fs.existsSync(path.join(root, 'moved')), false);
+        assert.equal(fs.existsSync(path.join(root, 'project-write')), true);
+        assert.equal(fs.existsSync(path.join(agentHomeDir, 'persisted')), true);
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(outer, { recursive: true, force: true });
     }
 });
+}
 
 test('resolveBwrapNodeRuntime exposes the complete distribution containing node', () => {
     const root = tempDir('bwrap-node-runtime-');

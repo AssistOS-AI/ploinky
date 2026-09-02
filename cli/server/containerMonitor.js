@@ -1433,7 +1433,14 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         const agentDir = path.dirname(target.manifestPath);
         const ensureAgentServiceImpl = monitor.ensureAgentService || ensureAgentService;
         const readEdgeSelection = monitor.readEdgeRoutingSelection || readEdgeRoutingSelection;
-        const preserveActiveAuthorization = readEdgeSelection().selector.state === 'active';
+        // Only managed networks can stage a distinct runtime while its
+        // predecessor remains authorized. Host/none recovery replaces the
+        // same runtime name and must revoke the old identity first, under the
+        // replacement coordinator's lifecycle and generation locks.
+        const canStageReplacement = profileResolution.network.mode === 'default'
+            || profileResolution.network.mode === 'bridge';
+        const preserveActiveAuthorization = canStageReplacement
+            && readEdgeSelection().selector.state === 'active';
         if (target.runtimeAdmission) {
             assertRuntimeAdmissionCurrent(target.runtimeAdmission, {
                 manifestBytes,

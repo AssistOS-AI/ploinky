@@ -293,6 +293,45 @@ test('interactive container creation rejects a project below protected legacy ag
     }
 });
 
+test('interactive containers protect the legacy parent without mounting an absent child', () => {
+    const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-missing-legacy-')));
+    try {
+        const controllerDir = path.join(workspaceRoot, '.ploinky');
+        fs.mkdirSync(path.join(controllerDir, 'data'), { recursive: true });
+        for (const runtime of ['podman', 'docker']) {
+            const command = buildInteractiveAgentCreateCommand({
+                runtime,
+                containerName: 'ploinky_demo',
+                envHash: 'hash',
+                projectDir: workspaceRoot,
+                homeDir: path.join(workspaceRoot, '.data', 'demo'),
+                agentLibPath: path.join(workspaceRoot, 'Agent'),
+                absAgentPath: path.join(workspaceRoot, 'agent-code'),
+                sharedDir: path.join(workspaceRoot, '.data', 'shared'),
+                containerImage: 'node:24',
+                workspaceRoot,
+                agentLibGrant: {
+                    sourceDir: path.join(workspaceRoot, 'achillesAgentLib'),
+                    runtimePath: '/opt/ploinky-agentlib',
+                    mode: 'local',
+                    fingerprint: 'a1'.repeat(32),
+                    commit: '',
+                    sourceIdHash: 'b2'.repeat(32),
+                    namespaced: true,
+                },
+            });
+            const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
+            const parentMount = `${controllerDir}:${controllerDir}${suffix}`;
+            assert.ok(command.includes(parentMount), command);
+            assert.equal(command.includes(`:${controllerDir}/shared${suffix}`), false);
+            assert.ok(command.indexOf(parentMount) < command.lastIndexOf(`:${controllerDir}/data${suffix}`));
+            assert.equal(fs.existsSync(path.join(controllerDir, 'shared')), false);
+        }
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
 test('interactive agent guards canonical legacy aliases exposed by read-only code mounts', () => {
     const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-legacy-alias-')));
     try {
