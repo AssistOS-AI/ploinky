@@ -17,8 +17,9 @@ import {
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
 
-const CONTAINER_SECURITY_KEYS = new Set(['privileged', 'nestedPodman']);
+const CONTAINER_SECURITY_KEYS = new Set(['nestedPodman', 'privileged']);
 const DIRECT_CAPABILITY_FIELDS = new Set([
+    'nestedPodman',
     'privileged',
     'devices',
     'device',
@@ -160,7 +161,7 @@ function validateContainerSecurityBlock(value, context) {
     }
     if (value.privileged === true && value.nestedPodman === true) {
         throw securityError(
-            'manifest.containerSecurity.privileged and nestedPodman cannot both be true',
+            'manifest.containerSecurity.privileged and nestedPodman are mutually exclusive',
             context,
         );
     }
@@ -399,6 +400,7 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
     let box = insideBox;
     if (box === undefined) box = isInsideBox(boxMarkerOptions);
     const unsupported = unsupportedDimensions(descriptor, runtimeKind);
+    if (!box && descriptor.capabilities.nestedPodman) unsupported.push('nested-podman-outside-box');
     // Host networking is not an ordinary Box capability: the runtime boundary
     // separately requires an exact prepared or active generation grant before
     // it can render `--network host`.  Keep it in the immutable descriptor so
@@ -410,7 +412,7 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
     if (runtimeKind !== 'container' && descriptor.capabilities.hostNetwork !== true) {
         unsupported.push('isolated-network-host-sandbox');
     }
-    if ((box || runtimeKind !== 'container') && unsupported.length) {
+    if ((box || runtimeKind !== 'container' || descriptor.capabilities.nestedPodman) && unsupported.length) {
         throw new RuntimeCapabilityError(
             `runtime capabilities are unsupported for ${box ? 'Ploinky Box' : runtimeKind}: ${unsupported.join(', ')}`,
             {

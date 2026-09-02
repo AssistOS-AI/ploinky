@@ -154,7 +154,7 @@
                             </tr>
                             <tr>
                                 <td><code>containerSecurity</code></td>
-                                <td>Allowlisted whole-container OCI security policy. The supported field is <code>privileged: true</code>; unknown raw runtime flags are rejected. This is trusted manifest power.</td>
+                                <td>Root-only allowlisted OCI security policy. The boolean fields <code>privileged</code> and <code>nestedPodman</code> default to <code>false</code> and are mutually exclusive. Unknown fields and raw runtime flags are rejected. This is trusted manifest power.</td>
                             </tr>
                             <tr>
                                 <td><code>network</code></td>
@@ -189,6 +189,15 @@
                                 <td>Ploinky directives as a string or array of strings (e.g., <code>"pwd enable"</code>, <code>"sso enable"</code>).</td>
                             </tr>
                         </table>
+
+                        <h4 style="margin-top: 2rem;">The <code>containerSecurity</code> Property</h4>
+                        <p>Set <a href="wiki.html#definition-nested-podman-security"><code>nestedPodman: true</code></a> only when an agent's OCI container must launch Podman inside a Ploinky Box. The setting is accepted only at the manifest root, only for the <code>container</code> runtime, and only when Ploinky is running inside a marked Box. Ploinky rejects it for Bubblewrap, Seatbelt, and containers outside the Box, and rejects a manifest that also sets <code>privileged: true</code>.</p>
+                        <pre><code>{
+  "containerSecurity": {
+    "nestedPodman": true
+  }
+}</code></pre>
+                        <p>For an admitted manifest, Ploinky adds only <code>SYS_ADMIN</code> and <code>NET_ADMIN</code>, passes through <code>/dev/fuse</code> and <code>/dev/net/tun</code>, applies <code>label=disable</code>, and selects the fixed <code>/opt/ploinky/ploinky-box/seccomp/podman-nested-pid-fallback.json</code> seccomp profile. Manifests cannot replace or extend this fixed argument set through direct capability fields or <code>llmRuntime.runtimePolicy</code>.</p>
 
                         <h4 style="margin-top: 2rem;">The <code>env</code> Property</h4>
                         <p>The <code>env</code> property declares the environment inputs an agent may receive, including optional imports, explicit requirements, defaults, and generated values.</p>

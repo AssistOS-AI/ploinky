@@ -14,11 +14,11 @@ export function resolveContainerSecurity(manifest, profileConfig) {
     return resolveEffectiveRuntimeCapabilities(manifest, { profileConfig }).containerSecurity;
 }
 
-export function buildContainerSecurityArgs(containerSecurity) {
+export function buildContainerSecurityArgs(containerSecurity, { insideBox = false } = {}) {
     const manifest = { containerSecurity };
     const admission = admitManifestRuntimeCapabilities(manifest, {
         manifestBytes: Buffer.from(JSON.stringify(manifest), 'utf8'),
-        insideBox: false,
+        insideBox,
     });
     return renderContainerSecurityArgs(admission.descriptor);
 }
