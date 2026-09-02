@@ -2,7 +2,6 @@ import {
     buildContainerRecord,
     parsePidNamespaceInventory,
     parsePodmanPsJson,
-    parseSsOutput,
 } from './listener-inventory.mjs';
 import {
     buildManagedNetworkRecord,
@@ -11,9 +10,10 @@ import {
     parseManagedNetworkList,
     sameManagedNetworkGeneration,
 } from './listener-network-inventory.mjs';
-import { mergeOuterListenerOwners } from './listener-owner-merge.mjs';
+import { mergeOuterListenerOwners, parseOwnerAwareSsOutput } from './listener-owner-merge.mjs';
+import { collectCoherentSocketOwners, parseSocketOwnerProofBatch } from './listener-owner-proof.mjs';
 
-const SS_ARGS = Object.freeze(['ss', '-H', '-lntup']);
+const SS_ARGS = Object.freeze(['ss', '-H', '-O', '-lntupe']);
 const OUTER_SS_ARGS = Object.freeze(['ss', '-H', '-O', '-lntupe']);
 const COLLECTOR_TOOLS = Object.freeze([
     Object.freeze({ binary: 'node', packageName: 'the pinned Node runtime' }),
@@ -36,6 +36,10 @@ for (const entry of fs.readdirSync('/proc')) {
 }
 pids.sort((left, right) => left - right);
 process.stdout.write(JSON.stringify({ initPid, pidNamespace, pids }));
+`;
+const OWNER_PROOF_SCRIPT = String.raw`
+import { readSocketOwnerProofBatch } from '/opt/ploinky/container/listener-owner-proof.mjs';
+process.stdout.write(JSON.stringify(readSocketOwnerProofBatch(JSON.parse(process.argv[1]))));
 `;
 
 function resultDiagnostic(result) {
@@ -111,7 +115,25 @@ function inspectSs({ run, outerContainer, namespace, container = null }) {
         `${namespace} owner-aware listener inventory`,
         `The Ploinky box runtime user must use its nested Podman user namespace to permit entry into managed nested container '${container.name}' network namespace and retain the outer PID namespace for owner correlation`,
     );
-    return parseSsOutput(result.stdout, { namespace, containerName: container.name });
+    return parseOwnerAwareSsOutput(result.stdout, { namespace, containerName: container.name });
+}
+
+function collectNamespaceOwners({ run, outerContainer, namespace, containers, container = null }) {
+    return collectCoherentSocketOwners({
+        containers,
+        containerName: container?.name || null,
+        capture: () => inspectSs({ run, outerContainer, namespace, container }),
+        observe(context, request) {
+            const result = requireCommand(
+                run(['exec', '--user', 'podman', outerContainer,
+                    ...(context === 'unshare' ? ['podman', 'unshare'] : []),
+                    'node', '--input-type=module', '--eval', OWNER_PROOF_SCRIPT, JSON.stringify(request)]),
+                `${namespace} ${context} exact socket-owner process proof`,
+                'The existing box runtime owner context must read the reported process identity, PID namespace, and socket descriptors without additional privileges',
+            );
+            return parseSocketOwnerProofBatch(result.stdout, request);
+        },
+    });
 }
 
 function nestedContainers({ run, outerContainer }) {
@@ -246,21 +268,27 @@ export function collectBoxListenerInventory({
         workspaceRoot,
     });
     const containers = nestedContainers({ run, outerContainer: name });
-    const listeners = [...inspectSs({
+    const outer = collectNamespaceOwners({
         run,
         outerContainer: name,
         namespace: 'outer',
-    })];
+        containers,
+    });
+    const listeners = [...outer.listeners];
+    const memberships = new Map(outer.memberships);
     const inspectedNamespaces = new Set(['outer']);
     for (const container of containers) {
         if (inspectedNamespaces.has(container.namespace)) continue;
         inspectedNamespaces.add(container.namespace);
-        listeners.push(...inspectSs({
+        const observed = collectNamespaceOwners({
             run,
             outerContainer: name,
             namespace: container.namespace,
+            containers,
             container,
-        }));
+        });
+        listeners.push(...observed.listeners);
+        for (const [id, pids] of observed.memberships) memberships.set(id, pids);
     }
     assertContainersStillCurrent({ run, outerContainer: name, containers });
     assertManagedNetworkInventoryCurrent({
@@ -271,7 +299,11 @@ export function collectBoxListenerInventory({
     });
     return Object.freeze({
         listeners: Object.freeze(listeners),
-        containers: Object.freeze(containers),
+        containers: Object.freeze(containers.map(container => Object.freeze({
+            ...container,
+            pids: Object.freeze([...memberships.get(container.id)].sort((left, right) => left - right)),
+            pidMembership: 'verified-listener-owners-and-init',
+        }))),
         managedNetworks,
     });
 }

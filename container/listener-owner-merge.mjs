@@ -52,9 +52,9 @@ function endpointKey(record) {
     return JSON.stringify([record.state, record.bindAddress, record.port, record.peerEndpoint]);
 }
 
-function snapshot(stdout, label) {
+function snapshot(stdout, label, options = { namespace: 'outer' }) {
     const records = new Map();
-    for (const parsed of parseSsOutput(stdout, { namespace: 'outer' })) {
+    for (const parsed of parseSsOutput(stdout, options)) {
         const { owners, extended } = parseOwners(parsed.processDetails);
         const record = Object.freeze({
             ...parsed,
@@ -68,6 +68,11 @@ function snapshot(stdout, label) {
         records.set(key, record);
     }
     return records;
+}
+
+/** Parse exact kernel socket identities and process descriptors in one observation. */
+export function parseOwnerAwareSsOutput(stdout, options) {
+    return Object.freeze([...snapshot(stdout, 'listener snapshot', options).values()]);
 }
 
 function assertSameSockets(expected, observed, label) {
