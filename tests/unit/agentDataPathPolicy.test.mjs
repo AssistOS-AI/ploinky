@@ -16,6 +16,7 @@ import {
     ensureLegacyAgentGuardSources,
     legacyAgentGuardMounts,
     legacyAgentGuardTargets,
+    normalizeRuntimeMountTarget,
     prepareLegacyGuardMountpointCleanup,
 } from '../../cli/utils/runtime/legacyAgentDataGuards.js';
 import {
@@ -31,6 +32,38 @@ function fixture() {
 function policyFailure(fn) {
     assert.throws(fn, error => error?.code === AGENT_DATA_POLICY_CODE);
 }
+
+test('runtime mount targets use one absolute POSIX identity', () => {
+    for (const spelling of ['/framework', '/framework/', '/framework/.', '/framework/././', '/framework/child/../']) {
+        assert.equal(normalizeRuntimeMountTarget(spelling), '/framework');
+    }
+    for (const invalid of ['', undefined, null, 'framework', '../framework', '/framework\0']) {
+        policyFailure(() => normalizeRuntimeMountTarget(invalid));
+    }
+});
+
+test('equivalent guard-parent targets tighten every bind and reject conflicting sources', () => {
+    const { root, cleanup } = fixture();
+    try {
+        const controllerDir = path.join(root, '.ploinky');
+        fs.mkdirSync(path.join(controllerDir, 'data'), { recursive: true });
+        const bindings = [
+            { hostPath: controllerDir, runtimePath: '/framework/', readOnly: true },
+            { hostPath: controllerDir, runtimePath: '/framework/././', readOnly: false },
+        ];
+        const targets = legacyAgentGuardTargets(bindings, { workspaceRoot: root });
+        const mounts = legacyAgentGuardMounts(targets, { workspaceRoot: root, bindings });
+        const parent = mounts.find(mount => mount.target === '/framework');
+        assert.equal(parent.readOnly, true);
+        assert.equal(parent.replaceExisting, true);
+        assert.equal(mounts.filter(mount => mount.target === '/framework').length, 1);
+        assert.equal(mounts.some(mount => mount.target === '/framework/shared'), false);
+        policyFailure(() => legacyAgentGuardMounts(targets, {
+            workspaceRoot: root,
+            bindings: [...bindings, { hostPath: root, runtimePath: '/framework/.' }],
+        }));
+    } finally { cleanup(); }
+});
 
 test('agent data keys are one validated segment', () => {
     for (const value of ['', '.', '..', '../escape', '/absolute', 'a/b', 'a\\b', '\0', ' name']) {

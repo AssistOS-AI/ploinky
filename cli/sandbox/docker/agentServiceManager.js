@@ -91,6 +91,7 @@ import {
 import {
     legacyAgentGuardMounts,
     legacyAgentGuardTargets,
+    normalizeRuntimeMountTarget,
     prepareLegacyGuardMountpointCleanup,
     protectedLegacyAgentRoots,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
@@ -997,7 +998,7 @@ function managedBindMountFromValue(value) {
     const parts = text.split(':');
     if (parts.length < 2) throw new Error(`managed runtime volume '${text}' is invalid`);
     const source = path.resolve(parts.shift());
-    const destination = String(parts.shift() || '');
+    const destination = normalizeRuntimeMountTarget(parts.shift());
     const options = parts.join(':').split(',').filter(Boolean);
     return Object.freeze({ source, destination, rw: !options.includes('ro') });
 }
@@ -1009,7 +1010,8 @@ function appendExactManagedBindMount(args, value) {
         const existingValue = String(args[index + 1] || '');
         const existing = managedBindMountFromValue(existingValue);
         if (existing.destination !== incoming.destination) continue;
-        if (existingValue === String(value)) return false;
+        const mountOptions = spec => String(spec).split(':').slice(2).join(':').split(',').filter(Boolean).sort().join(',');
+        if (existing.source === incoming.source && mountOptions(existingValue) === mountOptions(value)) return false;
         throw new Error(`managed runtime volume target '${incoming.destination}' has conflicting bind grants`);
     }
     args.push('-v', String(value));
@@ -1048,7 +1050,7 @@ function appendLegacyAgentDataGuards(args, runtime, {
                 const parts = String(args[index + 1]).split(':');
                 const options = parts.slice(2).join(':').split(',').filter(option => option && option !== 'rw' && option !== 'ro');
                 if (guard.readOnly) options.push('ro');
-                args[index + 1] = `${parts[0]}:${parts[1]}${options.length ? `:${options.join(',')}` : ''}`;
+                args[index + 1] = `${parts[0]}:${mount.destination}${options.length ? `:${options.join(',')}` : ''}`;
             }
             continue;
         }
@@ -1080,12 +1082,15 @@ function hasExactManagedMountContract(record, expectedMounts) {
     if (actual.length !== expectedMounts.length) return false;
     const expectedByTarget = new Map();
     for (const mount of expectedMounts) {
-        if (!mount.destination || expectedByTarget.has(mount.destination)) return false;
-        expectedByTarget.set(mount.destination, mount);
+        let destination;
+        try { destination = normalizeRuntimeMountTarget(mount.destination); } catch { return false; }
+        if (expectedByTarget.has(destination)) return false;
+        expectedByTarget.set(destination, mount);
     }
     const observedTargets = new Set();
     for (const mount of actual) {
-        const destination = String(mount?.Destination || '');
+        let destination;
+        try { destination = normalizeRuntimeMountTarget(mount?.Destination); } catch { return false; }
         const expected = expectedByTarget.get(destination);
         if (!expected || observedTargets.has(destination)
             || String(mount?.Type || 'bind') !== 'bind'

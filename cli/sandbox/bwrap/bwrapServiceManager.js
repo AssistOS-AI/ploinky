@@ -49,6 +49,7 @@ import {
 import {
     legacyAgentGuardMounts,
     legacyAgentGuardTargets,
+    normalizeRuntimeMountTarget,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import {
     assertCanonicalAgentDataPath,
@@ -356,7 +357,11 @@ function appendLegacyAgentDataGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_R
     let insertionIndex = 0;
     for (let index = 0; index < args.length - 2; index += 1) {
         if (args[index] !== '--bind' && args[index] !== '--ro-bind') continue;
-        bindings.push({ hostPath: args[index + 1], runtimePath: args[index + 2], readOnly: args[index] === '--ro-bind' });
+        bindings.push({
+            hostPath: args[index + 1],
+            runtimePath: normalizeRuntimeMountTarget(args[index + 2]),
+            readOnly: args[index] === '--ro-bind',
+        });
         index += 2;
     }
     const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });

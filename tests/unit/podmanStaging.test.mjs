@@ -732,7 +732,8 @@ test('real podman guards ancestor renames while leaving project and data writes 
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('real podman keeps canonical legacy aliases opaque and coalesces exact parent binds', { skip: !hasLocalPodmanBusybox() }, () => {
+for (const parentTarget of ['/framework', '/framework/', '/framework/.', '/framework/././']) {
+test(`real podman keeps legacy aliases opaque and coalesces parent bind ${parentTarget}`, { skip: !hasLocalPodmanBusybox() }, () => {
     const root = fs.realpathSync(tempDir('podman-legacy-alias-'));
     try {
         const code = path.join(root, 'code');
@@ -743,7 +744,7 @@ test('real podman keeps canonical legacy aliases opaque and coalesces exact pare
         fs.writeFileSync(path.join(code, 'legacy-data', 'sentinel'), 'controller');
         const args = [
             'run', '--rm', '-v', `${root}:/workspace:z`,
-            '-v', `${path.join(root, '.ploinky')}:/framework:z`,
+            '-v', `${path.join(root, '.ploinky')}:${parentTarget}:z`,
             '-v', `${code}:/code:z,ro`,
         ];
         appendLegacyAgentDataGuards(args, 'podman', { workspaceRoot: root });
@@ -772,6 +773,7 @@ test('real podman keeps canonical legacy aliases opaque and coalesces exact pare
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+}
 
 test('real docker run uses production final guards for both legacy roots', { skip: !hasLocalDockerBusybox() }, () => {
     const root = tempDir('docker-legacy-guard-');
@@ -807,7 +809,8 @@ test('real docker run uses production final guards for both legacy roots', { ski
     }
 });
 
-test('real interactive podman guards survive start with an absent legacy shared root', { skip: !hasLocalPodmanBusybox() }, () => {
+for (const projectIsControllerParent of [false, true]) {
+test(`real interactive podman protects absent shared with ${projectIsControllerParent ? 'noncanonical controller-parent' : 'workspace'} bind`, { skip: !hasLocalPodmanBusybox() }, () => {
     const root = fs.realpathSync(tempDir('podman-interactive-legacy-'));
     const containerName = `ploinky_interactive_guard_${process.pid}_${Date.now()}`;
     try {
@@ -823,7 +826,8 @@ test('real interactive podman guards survive start with an absent legacy shared 
         fs.writeFileSync(path.join(controllerData, 'sentinel'), 'controller');
         const command = buildInteractiveAgentCreateCommand({
             runtime: 'podman', containerName, envHash: 'test', workspaceRoot: root,
-            projectDir: root, homeDir, sharedDir, agentLibPath, absAgentPath,
+            projectDir: projectIsControllerParent ? `${root}/.ploinky/././` : root,
+            homeDir, sharedDir, agentLibPath, absAgentPath,
             volumeSuffix: ':z', readOnlySuffix: ':z,ro',
             containerImage: 'docker.io/library/busybox:1.36',
             agentLibGrant: {
@@ -857,6 +861,7 @@ test('real interactive podman guards survive start with an absent legacy shared 
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
+}
 
 test('persistent runtime production wiring appends guards after all writable mount families', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');

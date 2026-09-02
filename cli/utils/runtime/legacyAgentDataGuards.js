@@ -91,9 +91,17 @@ export function prepareLegacyGuardMountpointCleanup({
     };
 }
 
+export function normalizeRuntimeMountTarget(value) {
+    const target = String(value || '');
+    if (!path.posix.isAbsolute(target) || target.includes('\0')) {
+        throw guardError('runtime bind target must be an absolute POSIX path', { target });
+    }
+    return path.posix.resolve(target);
+}
+
 function runtimeDescendant(target, relativeHostPath) {
     const segments = relativeHostPath.split(path.sep).filter(Boolean);
-    return path.posix.join(String(target || '/'), ...segments);
+    return normalizeRuntimeMountTarget(path.posix.join(normalizeRuntimeMountTarget(target), ...segments));
 }
 
 function legacyRootSymlinks(target) {
@@ -124,8 +132,9 @@ export function legacyAgentGuardTargets(bindings, {
     const frameworkRoot = projectedCanonicalPath(path.join(workspaceRoot, '.ploinky'));
     for (const binding of bindings || []) {
         const rawSource = String(binding?.hostPath || binding?.source || '').trim();
-        const destination = String(binding?.runtimePath || binding?.destination || '').trim();
-        if (!rawSource || !destination) continue;
+        const rawDestination = String(binding?.runtimePath || binding?.destination || '');
+        if (!rawSource || !rawDestination) continue;
+        const destination = normalizeRuntimeMountTarget(rawDestination);
         const source = path.resolve(rawSource);
         const canonicalSource = projectedCanonicalPath(source);
         for (const protectedRoot of protectedLegacyAgentRoots(workspaceRoot)) {
@@ -167,7 +176,7 @@ export function legacyAgentGuardTargets(bindings, {
 export function legacyAgentGuardMounts(targets, options = {}) {
     const bindings = (options.bindings || []).map(binding => ({
         source: projectedCanonicalPath(binding.hostPath || binding.source),
-        target: path.posix.resolve(binding.runtimePath || binding.destination),
+        target: normalizeRuntimeMountTarget(binding.runtimePath || binding.destination),
         readOnly: binding.readOnly === true,
     }));
     if (!targets.length && !bindings.length) return [];
@@ -193,11 +202,11 @@ export function legacyAgentGuardMounts(targets, options = {}) {
             // A bind already pins its own root against renames. Only tighten it
             // when this is the protected controller parent; never turn a broad
             // writable project bind read-only merely because it contains data.
-            const existing = bindings.find(entry => entry.target === target);
-            if (existing && existing.source !== source) {
+            const existing = bindings.filter(entry => entry.target === target);
+            if (existing.some(entry => entry.source !== source)) {
                 throw guardError(`runtime guard parent '${target}' conflicts with a bind source`);
             }
-            if (existing && (!pinReadOnly || existing.readOnly)) continue;
+            if (existing.length && (!pinReadOnly || existing.every(entry => entry.readOnly))) continue;
             const guardSource = fs.existsSync(source) ? source : sources.get('data');
             const previous = parents.get(target);
             if (previous && previous.source !== guardSource) {
@@ -208,7 +217,7 @@ export function legacyAgentGuardMounts(targets, options = {}) {
                 target,
                 readOnly: pinReadOnly || previous?.readOnly === true,
                 parent: true,
-                replaceExisting: Boolean(existing),
+                replaceExisting: existing.length > 0,
             });
         }
     }

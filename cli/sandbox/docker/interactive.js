@@ -30,6 +30,7 @@ import { ensureAgentDataDirectory } from '../../utils/runtime/agentDataPathPolic
 import {
     legacyAgentGuardMounts,
     legacyAgentGuardTargets,
+    normalizeRuntimeMountTarget,
     prepareLegacyGuardMountpointCleanup,
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import { withNetworkLifecycleLock } from '../networkLifecycle.js';
@@ -54,7 +55,10 @@ function joinShellCommandParts(parts) {
 
 function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
     const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
-    const mounts = bindings.map(binding => ({ ...binding }));
+    const mounts = bindings.map(binding => ({
+        ...binding,
+        runtimePath: normalizeRuntimeMountTarget(binding.runtimePath),
+    }));
     for (const guard of legacyAgentGuardMounts(targets, { workspaceRoot, bindings })) {
         if (guard.replaceExisting) {
             for (const binding of mounts) {

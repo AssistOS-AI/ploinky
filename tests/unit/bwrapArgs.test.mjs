@@ -125,6 +125,24 @@ test('bwrap keeps missing legacy roots absent by protecting their existing paren
     }
 });
 
+test('bwrap normalizes guard-parent matching and orders logical parents before children', () => {
+    const root = tempDir('bwrap-normalized-parent-');
+    try {
+        const controllerDir = path.join(root, '.ploinky');
+        fs.mkdirSync(path.join(controllerDir, 'data'), { recursive: true });
+        for (const spelling of ['/framework/', '/framework/.', '/framework/././', '/framework/child/../']) {
+            const args = ['--bind', root, '/workspace', '--bind', controllerDir, spelling];
+            appendLegacyAgentDataGuards(args, { workspaceRoot: root });
+            assert.ok(hasRoBind(args, controllerDir, '/framework'));
+            assert.equal(hasBind(args, controllerDir, '/framework'), false);
+            assert.equal(args.includes(spelling), false);
+            assert.ok(args.indexOf('/framework') < args.indexOf('/framework/data'));
+            assert.equal(args.includes('/framework/shared'), false);
+        }
+        assert.equal(fs.existsSync(path.join(controllerDir, 'shared')), false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('bwrap rejects a project bind sourced below a protected legacy root', () => {
     const source = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'data', 'legacy-agent');
     const args = ['--bind', source, '/project'];
@@ -210,11 +228,15 @@ test(`real bwrap production args pin ancestors and keep existing data and ${shar
             envMap: {},
             codeReadOnly: true,
             skillsReadOnly: true,
-            volumes: {},
+            volumes: { [path.join(root, '.ploinky')]: '/framework/././' },
         });
         const probe = [
             'set -eu',
             'test -z "$(ls -A "$1/.ploinky/data")"',
+            'test -z "$(ls -A /framework/data)"',
+            'if touch /framework/data/escaped 2>/dev/null; then exit 76; fi',
+            'if mkdir /framework/shared/dir 2>/dev/null; then exit 77; fi',
+            ...(sharedExists ? [] : ['if mkdir /framework/shared 2>/dev/null; then exit 78; fi']),
             sharedExists ? 'test -z "$(ls -A "$1/.ploinky/shared")"' : 'test ! -e "$1/.ploinky/shared"',
             'if cat "$1/.ploinky/data/sentinel" 2>/dev/null; then exit 61; fi',
             'if cat "$1/.ploinky/shared/sentinel" 2>/dev/null; then exit 62; fi',
