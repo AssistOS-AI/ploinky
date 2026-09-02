@@ -78,6 +78,8 @@ import {
     renderRuntimePolicyArgs,
 } from '../runtimeCapabilities.js';
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
+import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
+import { buildAgentShellArgs } from './agentShell.js';
 import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, SHARED_DIR } from '../../utils/config.js';
 import {
     planRuntimeResources,
@@ -920,7 +922,6 @@ function buildPersistentAgentRunArgs({
     healthProbeHostDir,
     cwd,
     cwdMountTarget,
-    isolatedHome = true,
     agentHomeDir = '',
     agentLibGrant: grant = null,
 } = {}) {
@@ -932,11 +933,8 @@ function buildPersistentAgentRunArgs({
     }
     const storageWorkspaceRoot = path.dirname(path.dirname(path.resolve(sharedDir)));
     assertCanonicalAgentDataPath(sharedDir, { workspaceRoot: storageWorkspaceRoot });
-    // The static workspace agent intentionally receives the workspace root as
-    // its /root projection even though its registration mode is isolated. Its
-    // persistent home is still agentHomeDir; project/workspace grants are
-    // admitted separately and receive legacy-root opacity guards below.
     assertCanonicalAgentDataPath(agentHomeDir, { workspaceRoot: storageWorkspaceRoot });
+    const homeLayout = resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
     const nodeModulesMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const readOnlyMount = runtime === 'podman' ? ':z,ro' : ':ro';
     const args = [
@@ -963,12 +961,10 @@ function buildPersistentAgentRunArgs({
         // cancellation to the broker in the container's main process tree.
         // Health checks therefore create no target OCI exec sessions.
         '-v', `${healthProbeHostDir}:${PROBE_CONTROL_CONTAINER_ROOT}${runtime === 'podman' ? ':z' : ''}`,
-        // CWD passthrough. Isolated agents receive their host data dir as /root.
-        '-v', `${cwd}:${cwdMountTarget}${runtime === 'podman' ? ':z' : ''}`,
+        ...homeLayout.binds.flatMap(({ source, target }) => [
+            '-v', `${source}:${target}${runtime === 'podman' ? ':z' : ''}`,
+        ]),
     ];
-    if (!isolatedHome) {
-        args.push('-v', `${agentHomeDir}:/root${runtime === 'podman' ? ':z' : ''}`);
-    }
     // The one selected achillesAgentLib source at the stable path, followed by a
     // read-only shadow over every writable alias that already exposes the same
     // inode. Both come after the writable binds so the shadows actually win.
@@ -977,8 +973,7 @@ function buildPersistentAgentRunArgs({
         ...(codeMountMode.includes('ro') ? [] : [{ hostPath: codeMountPath, runtimePath: '/code' }]),
         { hostPath: sharedDir, runtimePath: '/shared' },
         { hostPath: healthProbeHostDir, runtimePath: PROBE_CONTROL_CONTAINER_ROOT },
-        { hostPath: cwd, runtimePath: cwdMountTarget },
-        ...(isolatedHome || !agentHomeDir ? [] : [{ hostPath: agentHomeDir, runtimePath: '/root' }]),
+        ...homeLayout.binds.map(({ source, target }) => ({ hostPath: source, runtimePath: target })),
     ];
     for (const shadow of agentLibAliasShadows(grant, writableBinds)) {
         args.push('-v', `${shadow.hostPath}:${shadow.runtimePath}${readOnlyMount}`);
@@ -1377,6 +1372,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const agentHomeDir = getAgentWorkDir(instanceName);
     const containerCwd = isolatedHome ? '/root' : cwd;
     const cwdMountTarget = isolatedHome ? '/root' : cwd;
+    const homeLayout = resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir });
     const llmRuntimeSharedPath = resolveLlmRuntimeSharedPath(agentPath);
     assertNetworkStartupCompatibility(manifest, profileConfig, manifestNetwork, {
         path: `manifest(${repoName}/${agentName})`,
@@ -1691,7 +1687,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         healthProbeHostDir: healthProbeDirectory,
         cwd,
         cwdMountTarget,
-        isolatedHome,
         agentHomeDir,
         agentLibGrant: containerAgentLibGrant,
     });
@@ -1816,7 +1811,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     envStrings.push(formatEnvFlag('AGENT_NAME', agentName));
     envStrings.push(formatEnvFlag('WORKSPACE_PATH', isolatedHome ? '/root' : cwd));
     envStrings.push(formatEnvFlag('PLOINKY_WORKSPACE_ROOT', PLOINKY_WORKSPACE_ROOT));
-    envStrings.push(formatEnvFlag('HOME', '/root'));
+    envStrings.push(formatEnvFlag('HOME', homeLayout.containerHome));
     // Apply env from manifest.runtime.resources.env (templates expanded).
     for (const [envKey, envValue] of Object.entries(applyRuntimeResourceEnv(resourcePlan))) {
         envStrings.push(formatEnvFlag(envKey, envValue));
@@ -1887,7 +1882,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     ))) {
         envStrings.push(formatEnvFlag(key, value));
     }
-    envStrings.push(formatEnvFlag('HOME', '/root'));
+    envStrings.push(formatEnvFlag('HOME', homeLayout.containerHome));
     // The achillesAgentLib contract is asserted at the same final authoritative
     // layer, after stripReservedAndRestoreRuntimeRouterEnvFlags has removed any
     // config-layer attempt to point the agent at a different source.
@@ -1952,10 +1947,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             const fullCmd = combinedInstallCmd
                 ? `cd ${containerCwd} && ${combinedInstallCmd} && ${explicitAgentCmd}`
                 : `cd ${containerCwd} && ${explicitAgentCmd}`;
-            args.push(shellPath, '-lc', fullCmd);
+            args.push(...buildAgentShellArgs(fullCmd, shellPath));
             entrySummary = combinedInstallCmd
-                ? `${shellPath} -lc "cd ${containerCwd} && <install> && ${explicitAgentCmd}"`
-                : `${shellPath} -lc "cd ${containerCwd} && ${explicitAgentCmd}"`;
+                ? `${shellPath} -c "cd ${containerCwd} && <install> && ${explicitAgentCmd}"`
+                : `${shellPath} -c "cd ${containerCwd} && ${explicitAgentCmd}"`;
         } else {
             // Run preinstall + install in main container before default agent server
             if (combinedInstallCmd) {
@@ -2571,12 +2566,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ] : []),
                 ...(runtime === 'podman' ? podmanStagedTargetMounts : []),
                 { source: sharedDir, target: '/shared' },
-                ...(!isolatedHome ? [{ source: agentHomeDir, target: '/root' }] : []),
                 ...(llmStartup.enabled && llmStartup.modelDir ? [{ source: llmStartup.modelDir, target: '/models' }] : []),
                 ...(llmStartup.enabled && llmStartup.stateDir ? [{ source: llmStartup.stateDir, target: '/runtime' }] : []),
                 ...(llmStartup.enabled && fs.existsSync(llmRuntimeSharedPath) ? [{ source: llmRuntimeSharedPath, target: '/Agent/llm-runtime', ro: true }] : []),
                 ...(skillsPathExists && !skillsPathInsideCode && runtime !== 'podman' ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
-                { source: cwd, target: cwdMountTarget }
+                ...homeLayout.binds,
             ],
             env: Array.from(new Set([...declaredEnvNames2, ...llmRuntimeEnvNames])).map((name) => ({ name })),
             ports: runtimeNetworkPlan.mode === 'host' || runtimeNetworkPlan.mode === 'none'
@@ -2853,6 +2847,7 @@ export function coordinateReplacementRuntimeIdentity({
     preserveActiveAuthorization = stageAlongsidePredecessor,
     runtimeNetwork = null,
     predecessorContainerId = '',
+    portMappings = [],
 } = {}, {
     assertNetworkCapability = assertNetworkLifecycleCapability,
     prepare = prepareAdditiveEdgeRoutingGeneration,
@@ -2868,6 +2863,13 @@ export function coordinateReplacementRuntimeIdentity({
     const exactContainerName = String(containerName || '').trim();
     if (!exactContainerName) {
         throw new Error('coordinated runtime replacement requires an exact container name');
+    }
+    // Fixed host publications cannot be acquired by a staged candidate while
+    // its predecessor owns them. Rotate through the inactive same-name path,
+    // whose managed transaction removes the exact predecessor before launch.
+    if (portMappings.some((mapping) => Number(mapping?.hostPort) > 0)) {
+        stageAlongsidePredecessor = false;
+        preserveActiveAuthorization = false;
     }
     if (preserveActiveAuthorization && !stageAlongsidePredecessor) {
         throw new Error('preserving active replacement authorization requires a distinct staged runtime');
@@ -3015,6 +3017,7 @@ export function resolveReplacementRuntimeIdentity({
     preserveActiveAuthorization = stageAlongsidePredecessor,
     runtimeNetwork = null,
     predecessorContainerId = '',
+    portMappings = [],
 } = {}, dependencies = {}) {
     if (!targetedRestart && !preservePreparedRegistryRecord
         && existingRuntime && !recreateReason) {
@@ -3044,6 +3047,7 @@ export function resolveReplacementRuntimeIdentity({
             preserveActiveAuthorization,
             runtimeNetwork,
             predecessorContainerId,
+            portMappings,
         }, dependencies);
     }
     if (targetedRestart || preservePreparedRegistryRecord) {
@@ -3620,6 +3624,33 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             adoptManagedRuntimeOnly = !managedReconciliationPreparationLease;
             canReuseExisting = false;
         }
+        if (canReuseExisting && !runtimeNetworkPlan.requiresManagedNetwork) {
+            // Host/none skip semantic managed-network adoption. Verify their
+            // actual HOME and project binds before taking the early reuse path,
+            // including containers created with the former static HOME layout.
+            const desiredProject = preservePreparedRegistryRecord && launchRecord.projectPath
+                ? launchRecord.projectPath
+                : getConfiguredProjectPath(agentName, repoName, aliasOverride);
+            const desiredHomeLayout = resolveAgentHomeLayout({
+                cwd: desiredProject,
+                cwdMountTarget: (launchRecord.runMode || 'isolated') === 'isolated' ? '/root' : desiredProject,
+                agentHomeDir: getAgentWorkDir(aliasOverride || agentName),
+            });
+            const inspection = spawnSync(runtime, ['inspect', reuseInspection.id], {
+                encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5_000,
+            });
+            let inspectedRecords;
+            try { inspectedRecords = JSON.parse(inspection.stdout || ''); } catch (_) {}
+            if (inspection.error || inspection.status !== 0 || !Array.isArray(inspectedRecords)
+                || inspectedRecords.length !== 1
+                || String(inspectedRecords[0]?.Id || inspectedRecords[0]?.ID || '') !== reuseInspection.id) {
+                throw new Error(`cannot verify exact HOME layout for '${containerName}'; preserving existing runtime`);
+            }
+            if (!hasExactAgentHomeLayout(inspectedRecords[0], desiredHomeLayout)) {
+                canReuseExisting = false;
+                recreateReason ||= 'agentHomeLayoutChanged';
+            }
+        }
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
             if (runtimeNetworkPlan.mode === 'host') {
@@ -3683,6 +3714,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         || (!existingRuntimeAtEntry && existingRecord?.type === 'agent' && !preservePreparedRegistryRecord)
         || Boolean(managedReconciliationPreparationLease)
     );
+    const replacementPolicy = {
+        portMappings: allPortMappings,
+        stageAlongsidePredecessor: options.stageAlongsidePredecessor === undefined
+            ? runtimeNetworkPlan.requiresManagedNetwork
+            : options.stageAlongsidePredecessor === true,
+        preserveActiveAuthorization: options.preserveActiveAuthorization === undefined
+            ? (options.stageAlongsidePredecessor === undefined
+                ? runtimeNetworkPlan.requiresManagedNetwork
+                : options.stageAlongsidePredecessor === true)
+            : options.preserveActiveAuthorization === true,
+    };
     const runtimeIdentity = resolveReplacementRuntimeIdentity({
         containerName,
         existingRecord,
@@ -3695,14 +3737,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         targetedRestart: Boolean(targetedRestart),
         requestedInstanceId,
         requestedEnableGeneration,
-        stageAlongsidePredecessor: options.stageAlongsidePredecessor === undefined
-            ? runtimeNetworkPlan.requiresManagedNetwork
-            : options.stageAlongsidePredecessor === true,
-        preserveActiveAuthorization: options.preserveActiveAuthorization === undefined
-            ? (options.stageAlongsidePredecessor === undefined
-                ? runtimeNetworkPlan.requiresManagedNetwork
-                : options.stageAlongsidePredecessor === true)
-            : options.preserveActiveAuthorization === true,
+        ...replacementPolicy,
     }, { preparationLease: managedReconciliationPreparationLease });
     if (runtimeIdentity.candidateContainerName
         && runtimeIdentity.candidateContainerName !== containerName) {
@@ -3849,6 +3884,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     const finalIsolatedHome = (launchRecord.runMode || 'isolated') === 'isolated';
     const finalAgentWorkDir = getAgentWorkDir(finalInstanceName);
     const finalWorkTarget = finalIsolatedHome ? '/root' : projPath;
+    const finalHomeLayout = resolveAgentHomeLayout({
+        cwd: projPath,
+        cwdMountTarget: finalWorkTarget,
+        agentHomeDir: finalAgentWorkDir,
+    });
     const hasStartedBinds = Array.isArray(startedRecord.config?.binds) && startedRecord.config.binds.length > 0;
     const startedEnvNames = Array.isArray(startedRecord.config?.env)
         ? startedRecord.config.env.map((entry) => String(entry?.name || '').trim()).filter(Boolean)
@@ -3889,8 +3929,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
                 { source: agentCodePath, target: '/code', ro: codeReadOnly },
                 ...(fs.existsSync(agentSkillsPath) ? [{ source: agentSkillsPath, target: '/code/skills', ro: skillsReadOnly }] : []),
-                { source: projPath, target: finalWorkTarget },
-                ...(!finalIsolatedHome ? [{ source: finalAgentWorkDir, target: '/root' }] : [])
+                ...finalHomeLayout.binds,
             ],
             env: Array.from(new Set([...declaredEnvNames3, ...startedEnvNames])).map((name) => ({ name })),
             ports: runtimeNetworkPlan.mode === 'host' || runtimeNetworkPlan.mode === 'none' ? [] : allPortMappings,
@@ -3947,7 +3986,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 runtimeNetwork: manifestNetwork,
                 predecessorContainerId: String(inspectedContainerId || existingRecord.containerId || ''),
                 networkLifecycleCapability: options.networkLifecycleCapability,
-                stageAlongsidePredecessor: true,
+                ...replacementPolicy,
             });
             return ensureAgentService(agentName, manifest, agentPath, {
                 ...options,
@@ -3958,7 +3997,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 enableGeneration: rotated.enableGeneration,
                 preparationLease: rotated.preparationLease,
                 preparedRegistryRecord: rotated.preparedRegistryRecord,
-                replacementPredecessor: {
+                replacementPredecessor: rotated.candidateContainerName !== containerName ? {
                     containerName,
                     containerId: String(inspectedContainerId || existingRecord.containerId || ''),
                     runtimeNetwork: structuredClone(manifestNetwork),
@@ -3967,7 +4006,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                         runtime,
                         containerId: String(inspectedContainerId || existingRecord.containerId || ''),
                     }),
-                },
+                } : undefined,
                 semanticAdoptionRetry: true,
             });
         }
@@ -4310,6 +4349,7 @@ export {
     resolveImplicitAgentServerPort,
     resolvePublishedPortMappings,
     resolveManagedAdoptionAgentCacheMount,
+    resolveAgentHomeLayout,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,
     shouldCreateImplicitAgentServerPublish,

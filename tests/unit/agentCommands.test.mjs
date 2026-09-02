@@ -11,7 +11,7 @@ test('start+agent sidecars preserve compound manifest commands through a shell',
         '-d',
         'publishing',
         'sh',
-        '-lc',
+        '-c',
         command
     ]);
 });

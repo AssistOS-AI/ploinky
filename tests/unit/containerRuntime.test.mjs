@@ -11,7 +11,7 @@ import {
     markPreinstallRunInProcess,
     resetPreinstallRunInProcess,
 } from '../../cli/utils/runtime/lifecycleHooks.js';
-import { buildExecArgs } from '../../cli/sandbox/docker/interactive.js';
+import { buildExecArgs, resolveContainerWorkdir } from '../../cli/sandbox/docker/interactive.js';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/agentServiceManager.js')).href;
@@ -729,6 +729,26 @@ await enableAgent('repo/demo', 'global');`,
     }
 });
 
+test('shell and one-shot commands use recorded project CWD without selecting the private HOME', () => {
+    const staticRecord = {
+        type: 'agent', runMode: 'isolated', projectPath: '/workspace',
+        config: { binds: [
+            { source: '/workspace', target: '/root' },
+            { source: '/workspace/.data/staticAlias', target: '/home/agent' },
+        ] },
+    };
+    assert.equal(resolveContainerWorkdir('static', '/workspace/', { static: staticRecord }), '/root');
+    const interactiveRecord = {
+        type: 'interactive', projectPath: '/workspace/.data/demo',
+        config: { binds: [
+            { source: '/workspace/.data/demo', target: '/workspace/.data/demo' },
+            { source: '/workspace/.data/demo', target: '/root' },
+        ] },
+    };
+    assert.equal(resolveContainerWorkdir('demo', '/workspace/.data/demo', { demo: interactiveRecord }), '/workspace/.data/demo');
+    assert.equal(resolveContainerWorkdir('static', '/workspace/explicit-subdir', { static: staticRecord }), '/workspace/explicit-subdir');
+});
+
 test('buildExecArgs prefers interactive bash for direct shell TTY sessions', () => {
     const args = buildExecArgs('agent-container', '/work', '/bin/sh', true, true, {
         env: {
@@ -752,7 +772,7 @@ test('buildExecArgs prefers interactive bash for direct shell TTY sessions', () 
         '-e', 'HISTFILESIZE=10000',
         'agent-container',
         'sh',
-        '-lc',
+        '-c',
         "cd '/work' && export PS1='# '; if command -v /bin/bash >/dev/null 2>&1; then exec /bin/bash --noprofile --norc -i; else exec /bin/sh -i; fi",
     ]);
 });
@@ -768,7 +788,7 @@ test('buildExecArgs preserves non-tty shell sessions for webchat stdin EOF handl
             '-i',
             'agent-container',
             'sh',
-            '-lc',
+            '-c',
             "cd '/work' && /bin/sh",
         ],
     );
@@ -788,7 +808,7 @@ test('buildExecArgs forwards only validated WebChat history metadata to non-tty 
             '-e', 'PLOINKY_WEBCHAT_HAS_HISTORY=1',
             'agent-container',
             'sh',
-            '-lc',
+            '-c',
             "cd '/work' && node /code/src/index.mjs",
         ],
     );
@@ -804,7 +824,7 @@ test('buildExecArgs forwards only validated WebChat history metadata to non-tty 
             '-i',
             'agent-container',
             'sh',
-            '-lc',
+            '-c',
             "cd '/work' && node /code/src/index.mjs",
         ],
     );
@@ -821,7 +841,7 @@ test('buildExecArgs does not rewrite non-shell commands and quotes workdir', () 
             '-it',
             'agent-container',
             'sh',
-            '-lc',
+            '-c',
             "cd '/tmp/it'\\''s-here' && node /code/src/index.mjs",
         ],
     );

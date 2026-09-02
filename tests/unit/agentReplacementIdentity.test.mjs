@@ -5,8 +5,10 @@ import { signPrivateRouterAssertion } from '../../Agent/lib/agentAssertion.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { authorizePrivateRoutePlan } from '../../cli/server/privateRouter.js';
 import {
+    coordinateReplacementRuntimeIdentity,
     resolveReplacementRuntimeIdentity,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
+import { parseManifestPorts } from '../../cli/sandbox/docker/common.js';
 import { derivePrivateAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
 
 const previousMasterKey = process.env.PLOINKY_MASTER_KEY;
@@ -166,6 +168,90 @@ test('replacement paths that cannot stage a second physical runtime retain the i
         'save',
         'prepare-replacement',
     ]);
+});
+
+function fixedPublicationHarness(portMappings, boundary = resolveReplacementRuntimeIdentity, overrides = {}) {
+    let registry = { [containerName]: existingRecord() };
+    const events = [];
+    const capability = Object.freeze({ fixture: 'fixed-publication-capability' });
+    const values = ['instance-fixed-publication', 'enable-fixed-publication'];
+    const runtimeIdentity = boundary({
+        containerName,
+        existingRecord: existingRecord(),
+        existingRuntime: true,
+        recreateReason: 'forceRecreate',
+        reason: 'semanticDescriptorMismatch',
+        networkLifecycleCapability: capability,
+        runtimeNetwork: { mode: 'default' },
+        portMappings,
+        stageAlongsidePredecessor: true,
+        preserveActiveAuthorization: true,
+        ...overrides,
+    }, {
+        assertNetworkCapability: (received) => assert.equal(received, capability),
+        withApplyLock: (callback) => callback(Object.freeze({})),
+        inactivate: () => events.push('inactivate'),
+        loadRegistry: () => structuredClone(registry),
+        saveRegistry: (next) => {
+            events.push('save');
+            registry = structuredClone(next);
+        },
+        loadRouting: () => assert.fail('fixed publications must retain the same runtime name'),
+        prepare: () => assert.fail('fixed publications cannot keep an active predecessor on the same port'),
+        prepareReplacement: () => {
+            events.push('prepare-replacement');
+            return {
+                selector: { state: 'inactive' },
+                preparationLease: { mode: 'replacement', transactionId: 'fixed-publication-lease' },
+                generation: { agents: structuredClone(registry) },
+            };
+        },
+        uuid: () => values.shift(),
+    });
+    assert.equal(runtimeIdentity.candidateContainerName, containerName);
+    assert.equal(runtimeIdentity.predecessorContainerName, containerName);
+    assert.equal(runtimeIdentity.preparationLease.mode, 'replacement');
+    assert.equal(runtimeIdentity.instanceId, 'instance-fixed-publication');
+    assert.equal(runtimeIdentity.enableGeneration, 'enable-fixed-publication');
+    assert.deepEqual(Object.keys(registry), [containerName]);
+    assert.deepEqual(runtimeIdentity.preparedRegistryRecord, registry[containerName]);
+    assert.deepEqual(events, ['inactivate', 'save', 'prepare-replacement']);
+}
+
+test('fixed profile host publications replace inactively even when the caller requests active staging', () => {
+    for (const openPorts of [
+        ['127.0.0.1:18082:8082'],
+        ['18100-18102:8100-8102/udp'],
+    ]) {
+        const { portMappings } = parseManifestPorts({}, { openPorts });
+        fixedPublicationHarness(portMappings);
+    }
+});
+
+test('a nonzero implicit preferred host port requires same-name replacement', () => {
+    fixedPublicationHarness([
+        { hostPort: 17300, containerPort: 7000, hostIp: '127.0.0.1', protocol: 'tcp' },
+    ]);
+});
+
+test('semantic adoption recovery honors fixed publications and clears active authorization', () => {
+    const { portMappings } = parseManifestPorts({}, { openPorts: ['18082:8082'] });
+    fixedPublicationHarness(portMappings, coordinateReplacementRuntimeIdentity);
+    fixedPublicationHarness(portMappings, coordinateReplacementRuntimeIdentity, {
+        stageAlongsidePredecessor: false,
+    });
+});
+
+test('dynamic implicit ports retain additive replacement with the active predecessor', () => {
+    for (const hostPort of [0, '0', undefined]) {
+        const { runtimeIdentity, events } = rotationHarness('dynamicPort', {
+            portMappings: [{ hostPort, containerPort: 7000, hostIp: '127.0.0.1', protocol: 'tcp' }],
+            preserveActiveAuthorization: true,
+        });
+        assert.notEqual(runtimeIdentity.candidateContainerName, containerName);
+        assert.equal(runtimeIdentity.preparationLease.mode, 'additive');
+        assert.equal(events.some(event => event === 'inactivate'), false);
+    }
 });
 
 test('inactive health recovery stages a distinct successor without requiring active authorization', () => {

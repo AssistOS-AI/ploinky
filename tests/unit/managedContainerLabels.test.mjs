@@ -124,6 +124,64 @@ test('static workspace projection keeps its persistent home beneath .data', () =
         },
     });
     assert.equal(args.includes('/workspace:/root:z'), true);
+    assert.equal(args.includes('/workspace/.data/static:/home/agent:z'), true);
+});
+
+test('interactive isolated agents mount their private HOME while preserving project passthrough', () => {
+    const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-home-')));
+    try {
+        const homeDir = path.join(workspaceRoot, '.data', 'namedAlias');
+        const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+        const grantSource = path.join(workspaceRoot, 'achillesAgentLib');
+        for (const directory of [homeDir, sharedDir, grantSource]) fs.mkdirSync(directory, { recursive: true });
+        const command = buildInteractiveAgentCreateCommand({
+            runtime: 'podman',
+            containerName: 'namedAlias',
+            envHash: 'hash',
+            projectDir: homeDir,
+            homeDir,
+            sharedDir,
+            agentLibPath: '/opt/ploinky/Agent',
+            absAgentPath: '/opt/ploinky/code',
+            containerImage: 'node:24',
+            volumeSuffix: ':z',
+            workspaceRoot,
+            envVars: '-e HOME=/incorrect',
+            agentLibGrant: {
+                sourceDir: grantSource, runtimePath: '/opt/ploinky-agentlib',
+                mode: 'local', fingerprint: 'a1'.repeat(32), commit: '',
+                sourceIdHash: 'b2'.repeat(32), namespaced: true,
+            },
+        });
+        assert.ok(command.includes(`-v "${homeDir}:${homeDir}:z"`));
+        assert.ok(command.includes(`-v "${homeDir}:/root:z"`));
+        assert.match(command, /HOME=\/incorrect[\s\S]*HOME=["']?\/root/);
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('static HOME layout retains opaque legacy storage under the project projection', () => {
+    const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'static-home-guards-')));
+    try {
+        const homeDir = path.join(workspaceRoot, '.data', 'static');
+        for (const dir of [homeDir, path.join(workspaceRoot, '.ploinky', 'data'), path.join(workspaceRoot, '.ploinky', 'shared')]) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        const args = ['-v', `${workspaceRoot}:/root:z`, '-v', `${homeDir}:/home/agent:z`];
+        const targets = appendLegacyAgentDataGuards(args, 'podman', { workspaceRoot });
+        assert.deepEqual(targets.map(target => target.target), ['/root/.ploinky/data', '/root/.ploinky/shared']);
+        for (const target of targets) {
+            const mount = args.find(value => value.includes(`:${target.target}:`));
+            assert.ok(mount);
+            assert.match(mount, /:z,ro$/);
+            assert.equal(mount.startsWith(`${target.protectedHostPath}:`), false);
+        }
+        assert.ok(args.includes(`${workspaceRoot}:/root:z`));
+        assert.ok(args.includes(`${homeDir}:/home/agent:z`));
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
 });
 
 test('container runtimes append final read-only opacity guards for broad workspace mounts', () => {
