@@ -25,7 +25,7 @@ import {
     normalizeBoxAgentLib,
 } from './contract/agentlib.mjs';
 import { validateContainerConfiguration } from './contract/container.mjs';
-import { inspectAndValidateExistingImage } from './contract/image.mjs';
+import { IMAGE_OBSERVATION_UNAVAILABLE, inspectAndValidateExistingImage } from './contract/image.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import {
     readWorkspaceEdgeDesired,
@@ -783,7 +783,7 @@ export function createBoxSupervisor({
             return Object.freeze({
                 identity,
                 ownership,
-                state: 'incompatible',
+                state: error?.code === IMAGE_OBSERVATION_UNAVAILABLE ? 'unknown' : 'incompatible',
                 detail: String(error.message || 'Owned Box image is incompatible'),
             });
         }

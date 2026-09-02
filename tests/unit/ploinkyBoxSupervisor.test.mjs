@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { BOX_IMAGE_REFERENCE, BOX_LABELS } from '../../ploinky-box/constants.mjs';
+import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     captureConfiguredCoreStartArgv,
@@ -709,6 +710,41 @@ test('status reports an older owned image as incompatible while destroy remains 
 
     await supervisor.runDestroyTransaction(ownership.handles.container.id);
     assert.equal(events.some((value) => /container rm -f [a-f0-9]{64}$/.test(value)), true);
+});
+
+test('status reports a timed-out image probe as unknown without admitting or entering the Box', (t) => {
+    const state = fixture(t);
+    fs.mkdirSync(path.join(state.workspace, '.ploinky'));
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    const calls = [];
+    const image = [{
+        Id: 'b'.repeat(64), Os: 'linux', Architecture: 'arm64',
+        Config: {
+            User: IMAGE_CONTRACT.user, WorkingDir: IMAGE_CONTRACT.workdir,
+            Env: Object.entries(IMAGE_CONTRACT.environment).map(([key, value]) => `${key}=${value}`),
+            Entrypoint: [IMAGE_CONTRACT.entrypoint], Cmd: [], Volumes: {}, Labels: {},
+        },
+    }];
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        discover: () => ownership,
+        validateContainer() { throw new Error('an unavailable image observation cannot admit a container'); },
+        runner: {
+            query(_command, args) {
+                calls.push(args);
+                if (args[0] === 'image') return { ok: true, stdout: JSON.stringify(image) };
+                return { ok: false, stdout: '', stderr: '', error: { code: 'ETIMEDOUT' }, signal: 'SIGTERM' };
+            },
+            run() { throw new Error('status cannot mutate the Box'); },
+        },
+    });
+    const status = supervisor.inspectBoxStatus();
+    assert.equal(status.state, 'unknown');
+    assert.equal(status.inbox, undefined);
+    assert.match(status.detail, /runtime capability probe unavailable \(timeout\)/);
+    assert.doesNotMatch(formatBoxStatus(status), /destroy|recreate/);
+    assert.deepEqual(calls.map(args => args.slice(0, 2)), [['image', 'inspect'], ['run', '--rm']]);
 });
 
 test('status validates the complete mount contract before entering the Box', (t) => {
