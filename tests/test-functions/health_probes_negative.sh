@@ -142,24 +142,53 @@ health_probes_response_proves_edge_active() {
   ' "$body_file" >/dev/null 2>&1
 }
 
+health_probes_current_container() {
+  load_state
+  require_var "TEST_RUN_DIR" || return 1
+  require_var "TEST_REPO_NAME" || return 1
+  require_var "TEST_HEALTH_AGENT_NAME" || return 1
+
+  jq -er \
+    --arg repo "$TEST_REPO_NAME" \
+    --arg agent "$TEST_HEALTH_AGENT_NAME" \
+    'to_entries
+      | map(select(
+          .value.type == "agent"
+          and .value.repoName == $repo
+          and .value.agentName == $agent
+        ))
+      | if length == 1 and (.[0].key | length) > 0
+        then .[0].key
+        else error("Expected one current health probe runtime") end' \
+    "$TEST_RUN_DIR/.ploinky/agents.json"
+}
+
 health_probes_wait_for_edge_recovery() {
   load_state
-  require_var "TEST_HEALTH_AGENT_CONT_NAME" || return 1
+  require_var "TEST_RUN_DIR" || return 1
   require_var "TEST_ROUTER_PORT" || return 1
-
-  wait_for_container "$TEST_HEALTH_AGENT_CONT_NAME" || return 1
+  local network_lock="$TEST_RUN_DIR/.ploinky/run/network.lock"
 
   local attempts=240
   local body_file
   body_file=$(mktemp -t ploinky-edge-active.XXXXXX)
   local i
   for (( i=0; i<attempts; i++ )); do
-    local status
-    status=$(curl -sS -o "$body_file" -w '%{http_code}' \
-      "http://127.0.0.1:${TEST_ROUTER_PORT}/status" 2>/dev/null || true)
-    if health_probes_response_proves_edge_active "$status" "$body_file"; then
-      rm -f "$body_file"
-      return 0
+    local current_container
+    current_container=$(health_probes_current_container 2>/dev/null || true)
+    if [[ -n "$current_container" && ! -e "$network_lock" ]] \
+      && assert_container_running "$current_container" >/dev/null 2>&1; then
+      local status
+      status=$(curl -sS -o "$body_file" -w '%{http_code}' \
+        "http://127.0.0.1:${TEST_ROUTER_PORT}/status" 2>/dev/null || true)
+      if health_probes_response_proves_edge_active "$status" "$body_file" \
+        && [[ ! -e "$network_lock" ]] \
+        && [[ "$current_container" == "$(health_probes_current_container 2>/dev/null || true)" ]]; then
+        TEST_HEALTH_AGENT_CONT_NAME="$current_container"
+        write_state_var "TEST_HEALTH_AGENT_CONT_NAME" "$current_container"
+        rm -f "$body_file"
+        return 0
+      fi
     fi
     sleep 0.5
   done
@@ -174,43 +203,43 @@ health_probes_wait_for_restart_completion() {
   require_var "TEST_RUN_DIR" || return 1
   require_var "TEST_REPO_NAME" || return 1
   require_var "TEST_HEALTH_AGENT_NAME" || return 1
-  local baseline_successes="${1:-0}"
+  local baseline_log_lines="${1:-0}"
   local log_file="$TEST_RUN_DIR/.ploinky/logs/watchdog.log"
   local network_lock="$TEST_RUN_DIR/.ploinky/run/network.lock"
 
-  local attempts=120
+  # The caller already proved this exact agent's semantic failure and initial
+  # scheduled restart. Recovery can complete in that attempt or a subsequent
+  # restart_failed retry if the injected script failed readiness first.
+  # This wait precedes the public-route check and covers the entire startup.
+  local attempts=240
   local i
   for (( i=0; i<attempts; i++ )); do
-    local current_successes
-    current_successes=$(jq -Rr '
-      fromjson?
-        | select(.event == "container_restart_success")
-        | select((.reason // "") == "semantic_probe_failed")
-        | 1
-    ' "$log_file" 2>/dev/null | awk '{ count += $1 } END { print count + 0 }')
-    if (( current_successes > baseline_successes )) && [[ ! -e "$network_lock" ]]; then
-      local current_container
-      current_container=$(jq -r \
+    local current_container
+    current_container=$(health_probes_current_container 2>/dev/null || true)
+    if [[ -n "$current_container" && ! -e "$network_lock" ]]; then
+      local current_successes
+      current_successes=$(tail -n "+$((baseline_log_lines + 1))" "$log_file" | jq -Rr \
+        --arg container "$current_container" \
         --arg repo "$TEST_REPO_NAME" \
         --arg agent "$TEST_HEALTH_AGENT_NAME" \
-        'to_entries
-          | map(select(
-              .value.type == "agent"
-              and .value.repoName == $repo
-              and .value.agentName == $agent
-            ))
-          | if length == 1 then .[0].key else empty end' \
-        "$TEST_RUN_DIR/.ploinky/agents.json" 2>/dev/null || true)
-      if [[ -n "$current_container" ]] && assert_container_running "$current_container"; then
+        'fromjson?
+          | select(.event == "container_restart_success")
+          | select(.reason == "semantic_probe_failed" or .reason == "restart_failed")
+          | select(.container == $container and .repo == $repo and .agent == $agent)
+          | 1' 2>/dev/null | awk '{ count += $1 } END { print count + 0 }')
+      if (( current_successes > 0 )) \
+        && assert_container_running "$current_container" >/dev/null 2>&1 \
+        && [[ ! -e "$network_lock" ]] \
+        && [[ "$current_container" == "$(health_probes_current_container 2>/dev/null || true)" ]]; then
         TEST_HEALTH_AGENT_CONT_NAME="$current_container"
         write_state_var "TEST_HEALTH_AGENT_CONT_NAME" "$current_container"
         return 0
       fi
     fi
-    sleep 0.1
+    sleep 0.5
   done
 
-  echo "Health recovery became routable but its watchdog lifecycle transaction did not complete." >&2
+  echo "The current health runtime did not complete its exact watchdog recovery transaction." >&2
   tail -n 40 "$log_file" >&2
   return 1
 }
@@ -249,6 +278,10 @@ health_probes_fail_closed_and_recovers() {
     echo "Log file '$log_file' not found." >&2
     return 1
   fi
+  # An earlier legitimate replacement can retire the name recorded at startup.
+  # Establish the current healthy runtime before binding the injected failure
+  # to exact watchdog events; never accept events for an unrelated agent.
+  health_probes_wait_for_edge_recovery || return 1
   local baseline_failures
   baseline_failures=$(health_probe_watchdog_event_count \
     "$log_file" \
@@ -262,13 +295,8 @@ health_probes_fail_closed_and_recovers() {
     "container_scheduling_restart" \
     "$TEST_HEALTH_AGENT_CONT_NAME" \
     "semantic_probe_failed")
-  local baseline_successes
-  baseline_successes=$(jq -Rr '
-    fromjson?
-      | select(.event == "container_restart_success")
-      | select((.reason // "") == "semantic_probe_failed")
-      | 1
-  ' "$log_file" 2>/dev/null | awk '{ count += $1 } END { print count + 0 }')
+  local baseline_log_lines
+  baseline_log_lines=$(wc -l < "$log_file")
 
   health_probes_force_failure || return 1
   if ! health_probes_wait_for_failure_logs "$baseline_failures" "$baseline_restarts"; then
@@ -280,10 +308,10 @@ health_probes_fail_closed_and_recovers() {
     return 1
   fi
 
-  # Restore the trusted probe source before the scheduled managed replacement
-  # reaches semantic readiness. The watchdog must then reactivate the exact
-  # generation without an unrelated CLI mutation racing its preparation.
+  # Restore the trusted probe source as soon as revocation is observed. If the
+  # first candidate already saw the failing script, its bounded retry must
+  # recover without an unrelated CLI mutation racing the preparation.
   health_probes_write_success_scripts || return 1
-  health_probes_wait_for_edge_recovery || return 1
-  health_probes_wait_for_restart_completion "$baseline_successes"
+  health_probes_wait_for_restart_completion "$baseline_log_lines" || return 1
+  health_probes_wait_for_edge_recovery
 }

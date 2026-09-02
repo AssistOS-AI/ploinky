@@ -195,6 +195,9 @@ cat >"${disable_agent_root}/manifest.json" <<'EOF'
 }
 EOF
 # Agent used to verify health probe behaviour
+# The probes still fail on their first unsuccessful exit. Give healthy fixture
+# processes enough scheduling time on the shared container VM; this is not a
+# production health-policy override or a timeout-specific test.
 health_agent_root="${repo_root}/${HEALTH_AGENT_NAME}"
 mkdir -p "$health_agent_root"
 write_state_var "TEST_HEALTH_AGENT_REPO_PATH" "$health_agent_root"
@@ -208,14 +211,14 @@ cat >"${health_agent_root}/manifest.json" <<'EOF'
     "liveness": {
       "script": "liveness_probe.sh",
       "interval": 0.2,
-      "timeout": 1,
+      "timeout": 5,
       "failureThreshold": 1,
       "successThreshold": 1
     },
     "readiness": {
       "script": "readiness_probe.sh",
       "interval": 0.2,
-      "timeout": 1,
+      "timeout": 5,
       "failureThreshold": 1,
       "successThreshold": 1
     }
