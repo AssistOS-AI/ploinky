@@ -11,8 +11,10 @@ import {
     parseManagedNetworkList,
     sameManagedNetworkGeneration,
 } from './listener-network-inventory.mjs';
+import { mergeOuterListenerOwners } from './listener-owner-merge.mjs';
 
 const SS_ARGS = Object.freeze(['ss', '-H', '-lntup']);
+const OUTER_SS_ARGS = Object.freeze(['ss', '-H', '-O', '-lntupe']);
 const COLLECTOR_TOOLS = Object.freeze([
     Object.freeze({ binary: 'node', packageName: 'the pinned Node runtime' }),
     Object.freeze({ binary: 'ss', packageName: 'iproute' }),
@@ -64,11 +66,11 @@ function collectPidNamespace({ run, outerContainer, containerName, initPid }) {
     }
     const result = requireCommand(
         run([
-            'exec', '--user', '0', outerContainer,
+            'exec', '--user', 'podman', outerContainer,
             'node', '-e', PID_NAMESPACE_SCRIPT, String(initPid),
         ]),
         `nested container '${containerName}' PID-namespace inventory`,
-        'The Ploinky box root must retain read access to managed descendant /proc PID-namespace links for exact socket-owner attribution',
+        'The Ploinky box runtime user must retain read access to managed descendant /proc PID-namespace links for exact socket-owner attribution',
     );
     return parsePidNamespaceInventory(result.stdout, containerName);
 }
@@ -79,31 +81,37 @@ export function assertBoxListenerCollectorContract({ run, outerContainer } = {})
     if (typeof run !== 'function') throw new Error('listener collector contract run(args) function is required');
     for (const tool of COLLECTOR_TOOLS) {
         requireCommand(
-            run(['exec', '--user', '0', name, tool.binary, '--version']),
+            run(['exec', '--user', 'podman', name, tool.binary, '--version']),
             `Ploinky box listener collector dependency '${tool.binary}'`,
             `The Ploinky box image must install ${tool.packageName} and its entrypoint must reject an image without '${tool.binary}'`,
         );
     }
+    requireCommand(
+        run(['exec', '--user', 'podman', name, 'podman', 'unshare', 'ss', '--version']),
+        'Ploinky box listener collector rootless owner context',
+        'The Ploinky box runtime user must be able to inspect sockets in its existing nested Podman user namespace',
+    );
 }
 
 function inspectSs({ run, outerContainer, namespace, container = null }) {
-    const args = container
-        ? [
-            'exec', '--user', '0', outerContainer,
-            'nsenter', '-t', String(container.initPid), '-n', ...SS_ARGS,
-        ]
-        : ['exec', '--user', '0', outerContainer, ...SS_ARGS];
+    const prefix = ['exec', '--user', 'podman', outerContainer];
+    if (!container) {
+        const capture = (unshare, label) => requireCommand(
+            run([...prefix, ...(unshare ? ['podman', 'unshare'] : []), ...OUTER_SS_ARGS]),
+            `${namespace} ${label} owner-aware listener inventory`,
+            'The Ploinky box runtime user and its nested Podman user namespace must provide complementary procfs socket-owner visibility',
+        ).stdout;
+        const ownerBefore = capture(false, 'owner-before');
+        const ownerUnshare = capture(true, 'owner-unshare');
+        const ownerAfter = capture(false, 'owner-after');
+        return mergeOuterListenerOwners({ ownerBefore, ownerUnshare, ownerAfter });
+    }
     const result = requireCommand(
-        run(args),
+        run([...prefix, 'podman', 'unshare', 'nsenter', '-t', String(container.initPid), '-n', ...SS_ARGS]),
         `${namespace} owner-aware listener inventory`,
-        container
-            ? `The Ploinky box must provide util-linux nsenter and iproute ss, permit entry into managed nested container '${container.name}' network namespace, and retain the outer PID namespace for owner correlation`
-            : 'The Ploinky box must provide iproute ss and permit box root to read procfs socket owners',
+        `The Ploinky box runtime user must use its nested Podman user namespace to permit entry into managed nested container '${container.name}' network namespace and retain the outer PID namespace for owner correlation`,
     );
-    return parseSsOutput(result.stdout, {
-        namespace,
-        containerName: container?.name || null,
-    });
+    return parseSsOutput(result.stdout, { namespace, containerName: container.name });
 }
 
 function nestedContainers({ run, outerContainer }) {

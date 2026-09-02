@@ -465,7 +465,7 @@ export function validateListenerInventory({ listeners, containers, managedNetwor
     for (const record of normalizedListeners) {
         if (profile.requireProcessOwners && (!record.ownerProcesses.length || !record.ownerPids.length)) {
             errors.push(
-                `${socketDescription(record)} has no owner PID/process; run ss as container root with procfs visibility`,
+                `${socketDescription(record)} has no owner PID/process; collect ss with the owning runtime user and its nested user-namespace visibility`,
             );
         }
         if (record.containerName) {
