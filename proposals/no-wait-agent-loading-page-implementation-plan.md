@@ -1,6 +1,6 @@
 # Implementation Plan: Generic Loading Page for Booting No-Wait Agents
 
-Status: implemented and pushed on the dedicated feature branch; focused and live integration verification, the feature-specific browser transition, and all three fresh canonical Explorer release gates passed. The complete canonical Ploinky suite remains an explicitly directed skip/deviation.
+Status: independently reviewed and amended; ready for implementation. Implementation has not started.
 
 Plan date: 2026-08-27.
 
@@ -644,69 +644,3 @@ The production change can remain Ploinky-only. The only anticipated cross-reposi
 Independent review completed with eight substantiated findings: three P1, three P2, and two P3. All are incorporated in this revision and recorded in the companion review disposition. A read-only closure pass returned final `APPROVE` after verifying the corrected targetless-probe terminal path and the other seven closures.
 
 Before editing, the independent implementation task must fetch canonical remotes, record exact base SHAs, re-open every named seam, and confirm the crash-consistent marker-retirement sequence. It must then treat this amended document as authoritative for scope and acceptance while continuing to prefer executable code/tests over historical specifications when current behavior differs.
-
-## 25. Implementation status, evidence, and deviations
-
-Implementation began from the fetched canonical Ploinky remote-default state recorded on 2026-08-27:
-
-| Repository / role | Canonical remote | Symbolic default | Exact branch point or runner SHA |
-| --- | --- | --- | --- |
-| Ploinky production candidate | `https://github.com/AssistOS-AI/ploinky.git` | `origin/master` | branch point `5d87b1668f07abd9617eb54a7808221a7c50e878`; pushed and tested candidate `61b8c7fd0034fc522ca86574ec844b003f40c26e` on `feature/no-wait-agent-loading-page` |
-| AssistOSExplorer feature-test branch | `https://github.com/AssistOS-AI/AssistOSExplorer.git` | `assistos-ai/main` | based on `6acfa0bf07592272d4a82bbe4e460f6dc4e1a233`; pushed test commit `2173bb06fafa070c019c6fc82d10927992ac6c22` on `test/no-wait-agent-loading-page-e2e` |
-| AssistOSExplorer canonical release runner | `https://github.com/AssistOS-AI/AssistOSExplorer.git` | `assistos-ai/main` | clean detached checkout at `6acfa0bf07592272d4a82bbe4e460f6dc4e1a233` |
-
-The Ploinky implementation binds the staged registry identity through worker arguments, marker, every status, structured process proof, admission, activation, and the final registry fence. Marker retirement is fail closed. The Router classifies pending ordinary-HTTP plans without lifecycle I/O, authorizes first, revalidates the immutable edge lease, then resolves one exact no-wait record. The self-contained page and same-route probe expose only fixed allowlisted browser states, preserve existing non-document behavior, strip the reserved header on both ordinary and agent-port forwarding, and require one opaque generation to remain ready for the complete settling window. Marketplace uses the factored one-record observer without becoming Router authority.
-
-Pre-candidate verification completed on the integrated diff:
-
-- The final 16-file focused and adjacent unit matrix passed `300/300`, including generation-A/generation-B identity rejection, the full host/auth/surface matrix, startup-page/client settling behavior, ordinary and agent-port header stripping, a real Bash regression proving cleanup failure is attempted once and preserves evidence, and Bash-3.2 nounset coverage for an empty prelaunch fixture.
-- The broader unit corpus passed before the final cleanup-only test additions; all subsequently modified test files are included in the final `300/300` matrix.
-- The deterministic live latched integration passed after proving the initial document `503`, at least one `202 starting` probe, causal readiness release, active `200`, targetless terminalization, generation rotation, and ordinary upstream header hygiene.
-- A final strict cleanup proof found no matching temporary workspace, Router listener on port 8080, detached no-wait worker, fixture container, or fixture network.
-- An independent read-only implementation verifier found no remaining P0-P3 production or security defect after its own `299/299` focused run, production syntax checks, and staged/unstaged diff audit; the primary then added and passed the one additional Bash-3.2 prelaunch-cleanup regression without changing production code.
-
-The pushed candidate then passed the deterministic feature-specific browser transition from the tracked Explorer test branch:
-
-- Candidate `61b8c7fd0034fc522ca86574ec844b003f40c26e` and Explorer test commit `2173bb06fafa070c019c6fc82d10927992ac6c22` were committed, pushed, clean, and exactly equal to their upstreams before the run.
-- The final fresh-cycle attempt ran exactly one Chromium-headless test with one worker and zero retries: `1 passed (7.9s)`.
-- The test proved an initial Router-owned `503`, two same-route `202 starting` probes before the test-owned causal release, one opaque ready generation stable for 3,051 ms, automatic `200` application handoff, and removal of the reserved startup header before upstream forwarding.
-- The spec produced a sanitized trace and passed its credential-residue/input-value audit. The implementation run destroyed the first fresh fixture before release testing, but the retained `fixture-state.env` and `cleanup-state.env` files are zero bytes. The historical bundle therefore does not independently prove that fixture's state or destruction and must not be cited as doing so.
-- Evidence: `/Users/danielsava/.codex/visualizations/2026/08/27/01a043ee-cf6c-74e2-9556-7f9c0278c246/no-wait-agent-loading-page-evidence/feature-e2e/no-wait-feature-61b8c7fd-attempt2`.
-
-A second `~/work/testExplorerFresh` deployment was reported as using the literal command `cd ~/work/testExplorerFresh && ploinky start explorer`. The deployed Ploinky candidate remained `61b8c7fd0034fc522ca86574ec844b003f40c26e`; Explorer and the canonical release runner were reported at `6acfa0bf07592272d4a82bbe4e460f6dc4e1a233`; managed achillesAgentLib was `838a64bf9c5faa9f1c21935686bcfea642a42fa4`. The retained release manifest pins Box image `sha256:e633e9f39b2a03eff26d01c5d95ff064623541ed8e20d62db71dbad994571a7f` and the browser-result bundles prove the three selected Playwright tests passed. The raw deployment command, gate-time runner assertions, loaded-AgentLib attestation/readiness transcript, marker observations, and network/runtime-boundary transcript were not retained. Claims about 18 admitted runtimes, 14 terminal markers, loaded bytes, readiness, and the network boundary are therefore contemporaneous operator reports, not release-grade evidence.
-
-The clean canonical Explorer runner then passed the three required gates separately, each as one Chromium-headless worker, zero retries, no skips, and exactly one selected test:
-
-| Gate | Exact result | Evidence directory |
-| --- | --- | --- |
-| OnlyOffice | `1 passed (1.3m)` | `release-e2e/release-61b8c7fd-attempt1/onlyoffice` |
-| Copilot | `1 passed (1.5m)` | `release-e2e/release-61b8c7fd-attempt1/copilot` |
-| WebMeet | `1 passed (42.4s)` with strict headless media enabled | `release-e2e/release-61b8c7fd-attempt1/webmeet` |
-
-The shared Podman VM stopped unexpectedly only after all browser gates and post-gate candidate evidence had completed. During a coordinated temporary restart, the same exited Box was stopped and destroyed through the candidate CLI. Final reachable-engine cleanup counts were zero for the exact Box name, path-hash-labelled containers, workspace-name networks and volumes, TCP 8080 listeners, and UDP 7882 users. `/Users/danielsava/work/testExplorerFresh` is absent and was moved recoverably to `/Users/danielsava/.Trash/testExplorerFresh-no-wait-passed-61b8c7fd-20260827T193316Z`; the VM was released stopped and idle.
-
-The consolidated external evidence index is `/Users/danielsava/.codex/visualizations/2026/08/27/01a043ee-cf6c-74e2-9556-7f9c0278c246/no-wait-agent-loading-page-evidence/release-evidence-summary.md`; the exact post-gate destruction/audit transcript is `release-e2e/release-61b8c7fd-attempt1/post-gate-cleanup-audit.txt` beneath that root. The independent review disposition record remains unchanged. Commit `ab9de7c7577b1c7d7ab65627d022731be5331332` was documentation-only after the tested candidate. The post-review corrective commit adds only evidence/test tooling and this disposition; production files under `cli/` remain byte-identical to `61b8c7fd0034fc522ca86574ec844b003f40c26e`.
-
-Deviation: the complete canonical Ploinky suite in section 16 step 4 and acceptance criterion 13 was not taken to a passing result. Two preserved attempts encountered an unrelated watchdog/test-harness sequencing race after the candidate's focused and live checks; the implementation does not modify the monitor/restart path. The task owner then explicitly directed the implementation run to skip the Ploinky suite and proceed to E2E. This deviation is recorded rather than represented as a passing gate; focused/adjacent tests, the live latched integration, the feature-specific browser transition, and all three canonical Explorer gates passed.
-
-## 26. Post-review evidence disposition and fail-closed retention
-
-The 2026-08-28 adversarial review approved the production implementation and found no correctness or security defect. Its three valid findings concern evidence retention. Destroyed fixtures make the missing historical observations impossible to reconstruct, so this plan accepts those historical gaps explicitly and does not synthesize replacement artifacts.
-
-| Finding | Disposition | Enforced correction |
-| --- | --- | --- |
-| P2-1: release deployment, per-gate command/runner state, and attestation/readiness transcripts were not retained | Accepted as an evidence gap for the 2026-08-27 cycle; the browser results remain valid, but the missing deployment assertions are not release-grade proof | `tests/release/noWaitLoadingEvidence.mjs run` writes a redacted exact argv/`SMOKE_*` environment record, asserts and records the clean expected runner SHA and canonical remote before execution, requires named non-empty cycle artifacts, captures console output, and records the exit result. `verify --kind release` fails unless deployment plus all three gate records, fixture/cleanup state, attestation/readiness, manifest, cleanup audit, and Playwright results are non-empty. |
-| P3-2: feature `fixture-state.env` and `cleanup-state.env` are empty | Accepted as an evidence gap for the destroyed feature fixture; neither file may be cited as cleanup proof | `capture` writes through an exclusive temporary file and refuses to publish a zero-byte result. `verify --kind feature` requires both populated state files, their exact capture commands, runner/command/result/console records, and the Playwright result. |
-| P3-3: live latch pass was not bound to a candidate SHA and predates the final marker rename | Resolved by a fresh scoped run at a clean branch HEAD | The latch harness writes an opt-in immutable JSON pass record only after strict cleanup. It includes the exact `git rev-parse HEAD`, raw `git status --short`, branch, test name, timestamp, and result. The corrective record is retained outside source at `no-wait-agent-loading-page-evidence/post-review/live-latched-integration-head.json`. |
-
-Every future feature or release cycle for this change must use the repository-owned evidence wrapper from the beginning of a fresh attempt. State-producing commands run through `capture`; deployment and browser commands run through `run` with the expected full runner SHA, canonical remote name/URL, and required cycle artifacts; cleanup state is captured only after destruction; and the cycle is accepted only after the matching `verify` mode passes. A successful browser process without a complete bundle is a failed evidence gate.
-
-| Cycle phase | Wrapper contract |
-| --- | --- |
-| Fixture, attestation/readiness, cleanup | `capture --output <absolute-bundle-file> -- <state-command> ...`; the command must emit the raw state to stdout, and an empty/whitespace-only result is rejected |
-| Feature browser gate | `run --kind feature --bundle-dir <absolute-attempt> --step playwright --runner-root <feature-runner> --expected-sha <full-sha> --remote-name <canonical-remote> --expected-remote-url <exact-url> --expected-ref refs/remotes/<canonical-remote>/<default> -- <playwright-command> ...` |
-| Release deployment | The same `run` contract with `--kind deployment --step deployment`; the fixture-state capture must already exist |
-| Each release browser gate | The same `run` contract with `--kind release`; fixture state and `attestation-readiness.txt` are automatic preconditions, and `SMOKE_RUN_ID` plus `SMOKE_ARTIFACT_DIR=<attempt>/<step>` are mandatory |
-| Final acceptance | `verify --kind <feature-or-release> --bundle-dir <absolute-attempt>` after cleanup; any missing, empty, failed, or misplaced required artifact rejects the cycle |
-
-The 2026-08-27 feature and release fixtures are not being recreated as part of this corrective pass. A later merge or release decision that requires raw deployment-grade proof must run a wholly fresh feature and release cycle under this wrapper; it must not reuse or amend the historical attempt directories.
