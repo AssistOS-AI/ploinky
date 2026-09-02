@@ -492,6 +492,18 @@ test('coordinated graph topology precedes startup preinstall and config provider
     assert.doesNotMatch(source, /applyManifestDirectives/, 'workspace start must not use sequential manifest enable/start');
 });
 
+test('canonical startup validates provider binding under the workspace lock before mutation and persists it before the Router', () => {
+    const source = startWorkspace.toString();
+    const lock = source.indexOf('createWorkspaceStartLock()');
+    const admission = source.indexOf('assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions)');
+    const resolution = source.indexOf('resolveWorkspaceGraphSsoConfig(lockedStart.graph');
+    const inactivation = source.indexOf("inactivateEdgeRoutingGeneration('workspace-start-prepare'");
+    const save = source.indexOf('workspaceSvc.setConfig({ ...workspaceConfigForAuth, sso: graphSsoConfig })');
+    const router = source.indexOf('await ensureRouterReadyForStart({');
+    assert.ok(lock >= 0 && admission > lock && resolution > admission);
+    assert.ok(inactivation > resolution && save > inactivation && router > save);
+});
+
 test('initial start refreshes persisted static identity before saving its stale admitted registry', () => {
     const source = startWorkspace.toString();
     const persistIndex = source.indexOf('workspaceSvc.setConfig(cfg)');
@@ -551,7 +563,7 @@ test('workspace router TCP listener and both inactive graph preparations precede
     assert.match(source, /finally\s*\{\s*releaseWorkspaceStartLock\(workspaceStartLock\)/);
 });
 
-test('prepared runtime records and routes commit together before activation, including no-wait workers', () => {
+test('prepared runtime records and routes commit together before activation, including no-wait workers', async () => {
     const source = startWorkspace.toString();
     assert.match(source, /reg\[result\.containerName\] = result\.registryRecord/);
     assert.ok(
@@ -584,10 +596,106 @@ test('prepared runtime records and routes commit together before activation, inc
     assert.match(noWaitSource, /forceRecreate:\s*args\.forceRecreate === '1'/);
     assert.match(noWaitSource, /assertActiveEdgeRoutingSourcesCurrent\(\)/);
     assert.doesNotMatch(noWaitSource, /prepareEdgeRoutingGeneration|inactivateEdgeRoutingGeneration/);
-    assert.match(noWaitSource, /waitForNoWaitRouteActivation\([\s\S]*validatedActivationSelector/);
-    assert.match(noWaitSource, /validateActiveGeneration\(\)[\s\S]*selector\.activationId !== validatedActivationSelector\.activationId/);
+    const { upsertRoute, assertNoWaitLifecycleSnapshot } = await import(
+        `${noWaitWorkerModuleUrl.href}${moduleSuffix}`
+    );
+    const identity = {
+        containerName: 'ploinky_demo_worker', repoName: 'demo', shortAgent: 'worker',
+        instanceId: 'worker-instance', enableGeneration: 'worker-enable', alias: '',
+        routeKey: 'worker', agentPath: path.join(tempDir, 'worker'),
+    };
+    const record = {
+        type: 'agent', repoName: 'demo', agentName: 'worker',
+        instanceId: identity.instanceId, enableGeneration: identity.enableGeneration,
+    };
+    const route = {
+        container: identity.containerName, repo: 'demo', agent: 'worker',
+        hostPath: identity.agentPath,
+    };
+    const active = {
+        selector: { state: 'active', generation: 'generation-1', activationId: 'activation-1' },
+        generation: {
+            agents: { [identity.containerName]: record },
+            routing: { port: 8080, routes: { worker: route } },
+            manifests: { worker: { name: 'worker' } },
+        },
+    };
+    const lifecycle = assertNoWaitLifecycleSnapshot(active, identity);
+    const finalRecord = { ...record, runtime: 'podman', containerId: 'a'.repeat(64) };
+    const finalRoute = { ...route, hostPort: 45123 };
+    const originalActive = structuredClone(active);
+    for (const staleField of [null, 'generation', 'activationId']) {
+        const calls = [];
+        const applyCapability = {};
+        const networkCapability = {};
+        const lease = {};
+        let lockHeld = false;
+        let candidate;
+        let ready;
+        const readiness = new Promise((resolve) => { ready = resolve; });
+        const publication = upsertRoute('worker', finalRoute, {
+            containerName: identity.containerName, registryRecord: finalRecord,
+            expectedIdentity: identity, expectedLifecycle: lifecycle,
+            expectedSelector: active.selector, networkLifecycleCapability: networkCapability,
+        }, {
+            async waitForActivation(receivedIdentity, receivedSelector, options) {
+                calls.push('wait');
+                assert.equal(receivedIdentity, identity);
+                assert.equal(receivedSelector, active.selector);
+                assert.equal(options.expectedLifecycle, lifecycle);
+                await readiness;
+                return lifecycle;
+            },
+            async withApplyLock(callback) {
+                calls.push('lock');
+                lockHeld = true;
+                try { return await callback(applyCapability); }
+                finally { lockHeld = false; calls.push('unlock'); }
+            },
+            assertActive() {
+                calls.push('validate');
+                assert.equal(lockHeld, true, 'selector validation requires the apply lock');
+                return staleField
+                    ? { ...active, selector: { ...active.selector, [staleField]: 'changed' } }
+                    : active;
+            },
+            prepareAdditive(options) {
+                calls.push('prepare');
+                assert.equal(lockHeld, true);
+                assert.equal(options.expectedActiveGeneration, lifecycle.generationDigest);
+                assert.equal(options.applyLockCapability, applyCapability);
+                assert.equal(options.networkLifecycleCapability, networkCapability);
+                assert.deepEqual(options.agents[identity.containerName], finalRecord);
+                assert.deepEqual(options.routing.routes.worker, finalRoute);
+                candidate = options;
+                return { preparationLease: lease };
+            },
+            commitAdditive(receivedLease, options) {
+                calls.push('commit');
+                assert.equal(lockHeld, true);
+                assert.equal(receivedLease, lease, 'commit must use the prepared lease');
+                assert.deepEqual(options.agents, candidate.agents);
+                assert.deepEqual(options.routing, candidate.routing);
+                assert.equal(options.applyLockCapability, applyCapability);
+                assert.equal(options.networkLifecycleCapability, networkCapability);
+            },
+            mergeRouting() { assert.fail('staged publication must use the additive transaction'); },
+            abortPreparation() { assert.fail('no preparation should need aborting in these cases'); },
+        });
+        assert.deepEqual(calls, ['wait'], 'publication must wait for readiness');
+        ready();
+        if (staleField) {
+            await assert.rejects(publication, /lifecycle generation changed before route activation/);
+            assert.deepEqual(calls, ['wait', 'lock', 'validate', 'unlock'],
+                `a stale ${staleField} must prevent candidate creation and publication`);
+        } else {
+            await publication;
+            assert.deepEqual(calls, ['wait', 'lock', 'validate', 'prepare', 'commit', 'unlock']);
+        }
+        assert.equal(lockHeld, false);
+        assert.deepEqual(active, originalActive, 'publication must not mutate the active predecessor');
+    }
     assert.match(noWaitSource, /preparationLease: result\?\.preparationLease/);
-    assert.match(noWaitSource, /captureExpectedGeneration\(active\)[\s\S]*captureEdgeRoutingLifecycleMutationGeneration\(active\)/);
     assert.match(
         noWaitSource,
         /profileResolution\.network\.mode === 'host'[\s\S]*launchNoWaitHostRuntime\(expectedIdentity, lifecycle, launch\)/,

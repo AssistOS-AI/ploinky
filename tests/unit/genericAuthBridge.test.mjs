@@ -45,7 +45,7 @@ export function createProvider({ getConfig }) {
             return {
                 authorizationUrl: 'https://fake.test/auth?state=PROVIDER_STATE',
                 providerState: 'PROVIDER_STATE',
-                expiresAt: Date.now() + 60_000
+                expiresAt: process.env.__FAKE_PROVIDER_ISO_EXPIRY === '1' ? new Date(Date.now() + 60_000).toISOString() : Date.now() + 60_000
             };
         },
         async sso_handle_callback({ redirectUri, query, providerState }) {
@@ -154,7 +154,7 @@ test('generic bridge orchestrates begin/callback/refresh/logout through provider
     });
 
     const bridge = createGenericAuthBridge();
-    const { redirectUrl, state } = await bridge.beginLogin({
+    const { redirectUrl, state, browserBinding } = await bridge.beginLogin({
         baseUrl: 'http://127.0.0.1:8080',
         returnTo: '/webchat/'
     });
@@ -165,6 +165,7 @@ test('generic bridge orchestrates begin/callback/refresh/logout through provider
     const callback = await bridge.handleCallback({
         code: 'auth-code',
         state,
+        browserBinding,
         baseUrl: 'http://127.0.0.1:8080'
     });
     assert.equal(callback.user.username, 'alice');
@@ -200,6 +201,48 @@ test('bridge rejects unknown state on callback', async () => {
     );
 });
 
+test('callbacks require the initiating browser proof and remain single-use across concurrent tabs', async () => {
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    const bridge = createGenericAuthBridge();
+    const first = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080', returnTo: '/first' });
+    const second = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080', returnTo: '/second' });
+    assert.notEqual(first.browserBinding, second.browserBinding);
+    assert.equal(first.redirectUrl.includes(first.browserBinding), false);
+    const callbacksBefore = readCalls().filter((call) => call.op === 'sso_handle_callback').length;
+    for (const browserBinding of [undefined, '', second.browserBinding, `${first.browserBinding}x`]) {
+        await assert.rejects(bridge.handleCallback({ code: 'code', state: first.state, browserBinding }), /browser binding/);
+    }
+    assert.equal(readCalls().filter((call) => call.op === 'sso_handle_callback').length, callbacksBefore);
+    const results = await Promise.allSettled([
+        bridge.handleCallback({ code: 'code', state: first.state, browserBinding: first.browserBinding }),
+        bridge.handleCallback({ code: 'code', state: first.state, browserBinding: first.browserBinding }),
+    ]);
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(results.find((result) => result.status === 'fulfilled').value.redirectTo, '/first');
+    const callback = await bridge.handleCallback({ code: 'code', state: second.state, browserBinding: second.browserBinding });
+    assert.equal(callback.redirectTo, '/second');
+});
+
+test('pending login expires at numeric or ISO provider expiry and cannot survive a configuration reload', async (t) => {
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    let now = Date.now();
+    const bridge = createGenericAuthBridge({ now: () => now });
+    const login = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
+    now = login.expiresAt;
+    await assert.rejects(bridge.handleCallback({ code: 'code', ...login }), /Invalid or expired/);
+    t.after(() => { delete process.env.__FAKE_PROVIDER_ISO_EXPIRY; });
+    process.env.__FAKE_PROVIDER_ISO_EXPIRY = '1';
+    now = Date.now();
+    const isoLogin = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
+    assert.ok(isoLogin.expiresAt <= now + 61_000);
+    now = isoLogin.expiresAt;
+    await assert.rejects(bridge.handleCallback({ code: 'code', ...isoLogin }), /Invalid or expired/);
+    now = Date.now();
+    const second = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
+    bridge.reloadConfig();
+    await assert.rejects(bridge.handleCallback({ code: 'code', ...second }), /Invalid or expired/);
+});
+
 test('response-free validation refreshes and persists current SSO identity, then fails closed', async (t) => {
     writeWorkspaceSsoConfig({
         enabled: true,
@@ -215,10 +258,11 @@ test('response-free validation refreshes and persists current SSO identity, then
         delete process.env.__FAKE_PROVIDER_REFRESH_DELAY;
     });
     const bridge = createGenericAuthBridge({ ssoValidationIntervalMs: 0 });
-    const { state } = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
+    const { state, browserBinding } = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
     const callback = await bridge.handleCallback({
         code: 'auth-code',
         state,
+        browserBinding,
         baseUrl: 'http://127.0.0.1:8080'
     });
 
@@ -246,10 +290,11 @@ test('response-free SSO validation is single-flight per auth session', async (t)
     });
     t.after(() => { delete process.env.__FAKE_PROVIDER_REFRESH_DELAY; });
     const bridge = createGenericAuthBridge({ ssoValidationIntervalMs: 0 });
-    const { state } = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
+    const { state, browserBinding } = await bridge.beginLogin({ baseUrl: 'http://127.0.0.1:8080' });
     const callback = await bridge.handleCallback({
         code: 'auth-code',
         state,
+        browserBinding,
         baseUrl: 'http://127.0.0.1:8080'
     });
     const before = readCalls().filter((call) => call.op === 'sso_refresh_session').length;
@@ -280,4 +325,74 @@ test('provider-neutral admin operations are delegated without interpreting provi
     assert.equal(deleted.status, 'blocked');
     const adminCalls = readCalls().filter((call) => call.op.startsWith('sso_admin_'));
     assert.deepEqual(adminCalls.map((call) => call.payload.actorUserId), ['admin-1', 'admin-1', 'admin-1', 'admin-1']);
+});
+
+
+test('real bridge and browser routes reject copied callbacks and issue a session only to the initiating browser', async () => {
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    const { handleAuthRoutes } = await import('../../cli/server/authHandlers/authRoutes.js');
+    const { authService } = await import('../../cli/server/authHandlers/shared.js');
+    authService.reloadConfig();
+    const snapshot = {
+        generation: 'binding-test-generation',
+        agents: { explorer: { type: 'agent', agentName: 'explorer', repoName: 'fixture', auth: { mode: 'sso' } } },
+        routing: { static: { agent: 'explorer' }, routes: { explorer: { agent: 'explorer', repo: 'fixture', hostPort: 0 } } },
+        manifests: {},
+    };
+    const routePlan = {
+        ok: false,
+        hostSelection: { kind: 'control', host: 'localhost' },
+        snapshot,
+        lease: { id: snapshot.generation, snapshot, commit: () => true },
+    };
+    const request = async (url, cookie = '') => {
+        const req = { method: 'GET', url, headers: { host: 'localhost', cookie, accept: 'application/json' }, socket: {} };
+        const res = {
+            statusCode: 200, headers: new Map(), body: '',
+            setHeader(name, value) { this.headers.set(name.toLowerCase(), value); },
+            getHeader(name) { return this.headers.get(name.toLowerCase()); },
+            writeHead(status, headers = {}) { this.statusCode = status; for (const [name, value] of Object.entries(headers)) this.setHeader(name, value); },
+            end(chunk = '') { this.body += chunk; },
+        };
+        await handleAuthRoutes(req, res, new URL(url, 'http://localhost'), { routePlan });
+        return res;
+    };
+    const login = await request('/auth/login?returnTo=%2Fexplorer%2F');
+    assert.equal(login.statusCode, 200, login.body);
+    const loginCookie = String(login.getHeader('set-cookie'));
+    assert.match(loginCookie, /^ploinky_sso_login_[A-Za-z0-9_-]{22}=/);
+    assert.match(loginCookie, /Path=\/; HttpOnly; SameSite=Lax; Max-Age=60/);
+    assert.doesNotMatch(loginCookie, /Domain=/);
+    const browserCookie = loginCookie.split(';')[0];
+    const [cookieName, browserProof] = browserCookie.split('=');
+    assert.equal(login.body.includes(browserProof), false);
+    const state = cookieName.slice('ploinky_sso_login_'.length);
+    const callbackUrl = `/auth/callback?code=fixture-code&state=${state}`;
+    for (const cookie of ['', `${cookieName}=wrong-browser-proof`]) {
+        const rejected = await request(callbackUrl, cookie);
+        assert.equal(rejected.statusCode, 400);
+        assert.equal(JSON.parse(rejected.body).error, 'invalid_authorization_browser');
+        assert.equal(rejected.getHeader('set-cookie'), undefined);
+    }
+    const callback = await request(callbackUrl, browserCookie);
+    assert.equal(callback.statusCode, 302, callback.body);
+    assert.equal(callback.getHeader('location'), '/explorer/');
+    const cookies = callback.getHeader('set-cookie');
+    assert.ok(cookies.some((cookie) => cookie.startsWith('ploinky_sso=')));
+    assert.ok(cookies.some((cookie) => cookie.startsWith(`${cookieName}=`) && cookie.includes('Max-Age=0')));
+    const replay = await request(callbackUrl, browserCookie);
+    assert.equal(replay.statusCode, 400);
+    assert.equal(replay.getHeader('set-cookie'), undefined);
+
+    routePlan.ok = true;
+    routePlan.kind = 'router-surface';
+    routePlan.surface = 'browser-auth';
+    routePlan.hostSelection = { kind: 'agent-root', host: 'explorer.example.test', record: { routeKey: 'explorer' } };
+    routePlan.forwarding = { protocol: 'https', authority: 'explorer.example.test' };
+    const secureLogin = await request('/auth/login');
+    assert.equal(secureLogin.statusCode, 200, secureLogin.body);
+    const secureCookie = String(secureLogin.getHeader('set-cookie'));
+    assert.match(secureCookie, /^__Host-ploinky_sso_login_/);
+    assert.match(secureCookie, /; Secure;/);
+    assert.match(secureCookie, /; Path=\//);
 });

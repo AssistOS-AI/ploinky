@@ -217,6 +217,14 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     assert.equal(result.statusCode, 200, JSON.stringify(result.body));
     assert.deepEqual(result.body.users.map((user) => user.username), ['admin', 'user']);
     assert.match(String(result.headers.get('set-cookie') || ''), /ploinky_jwt=/);
+    result = await invoke(authHandlers.handleUserAdminRoutes, {
+        url: '/api/agents/explorer/users?start=1&pageSize=1',
+        cookie: authCookie(explorerAdmin.sessionId),
+    });
+    assert.deepEqual(result.body.users.map((user) => user.username), ['user']);
+    assert.equal(result.body.totalCount, 2);
+    assert.equal(result.body.start, 1);
+    assert.equal(result.body.hasMore, false);
 
     result = await invoke(authHandlers.handleUserAdminRoutes, {
         url: '/api/agents/explorer/settings',
@@ -556,8 +564,12 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     };
     authService.listUsers = async (payload) => {
         providerCalls.push({ operation: 'listUsers', payload });
+        const users = Array.from({ length: 601 }, (_, index) => ({
+            id: `persisto-user-${index}`, email: index ? `member-${index}@example.test` : 'member@example.test', roles: ['user'],
+        }));
         return {
-            users: [{ id: 'persisto-user', email: 'member@example.test', roles: ['user'] }],
+            users: users.slice(payload.start, payload.start + payload.pageSize),
+            totalCount: users.length,
             availableRoles: ['admin', 'user'],
         };
     };
@@ -596,6 +608,35 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
             .filter((call) => call.operation === 'validateSession')
             .every((call) => call.options?.forceRemote === true));
         assert.equal(providerCalls.find((call) => call.operation === 'createUser').payload.actorUserId, 'persisto-admin');
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            url: '/api/agents/explorer/users?start=500&pageSize=100',
+            cookie: 'ploinky_sso=sso-admin-session',
+            routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.statusCode, 200);
+        assert.equal(result.body.users[0].id, 'persisto-user-500');
+        assert.equal(result.body.totalCount, 601);
+        assert.equal(result.body.hasMore, true);
+        assert.deepEqual(providerCalls.filter((call) => call.operation === 'listUsers').at(-1).payload,
+            { actorUserId: 'persisto-admin', start: 500, pageSize: 100 });
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            url: '/api/agents/explorer/users?start=600&pageSize=100',
+            cookie: 'ploinky_sso=sso-admin-session',
+            routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.body.users[0].id, 'persisto-user-600');
+        assert.equal(result.body.hasMore, false);
+        const listCallsBefore = providerCalls.filter((call) => call.operation === 'listUsers').length;
+        for (const query of ['start=-1', 'start=1.5', 'start=9007199254740992', 'pageSize=0', 'pageSize=501', 'pageSize=oops']) {
+            result = await invoke(authHandlers.handleUserAdminRoutes, {
+                url: `/api/agents/explorer/users?${query}`,
+                cookie: 'ploinky_sso=sso-admin-session',
+                routePlan: ssoRoutePlan,
+            });
+            assert.equal(result.statusCode, 400, query);
+            assert.equal(result.body.error, 'invalid_pagination');
+        }
+        assert.equal(providerCalls.filter((call) => call.operation === 'listUsers').length, listCallsBefore);
     } finally {
         Object.assign(authService, originals);
     }

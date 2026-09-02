@@ -1,4 +1,4 @@
-import { HOP_BY_HOP, ROUTER_COOKIES, ROUTER_HEADERS } from './sanitizeRequestHeaders.js';
+import { HOP_BY_HOP, isRouterCookie, ROUTER_HEADERS } from './sanitizeRequestHeaders.js';
 
 function isPrivateIpv4(host) {
     const octets = host.split('.').map(Number);
@@ -35,7 +35,44 @@ function isPrivateLocation(value) {
 }
 
 function routerCookie(setCookie) {
-    return ROUTER_COOKIES.has(String(setCookie || '').split('=', 1)[0].trim());
+    return isRouterCookie(String(setCookie || '').split('=', 1)[0].trim());
+}
+
+function allowedProtocolLocation(value, protocol) {
+    const raw = String(value || '');
+    if (raw.startsWith('/') && !raw.startsWith('//') && !raw.includes('\\')) return true;
+    try {
+        const url = new URL(raw);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return false;
+        if (!isPrivateLocation(raw)) return true;
+        return protocol.allowLoopbackRedirects === true
+            && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    } catch (_) { return false; }
+}
+
+function protocolCorsHeaders(headers, policy) {
+    if (policy.publicProtocol?.allowCors !== true) return {};
+    const origin = String(policy.requestOrigin || '');
+    try {
+        const url = new URL(origin);
+        if (!['https:', 'http:'].includes(url.protocol) || url.origin !== origin) return {};
+    } catch (_) { return {}; }
+    const normalized = Object.fromEntries(Object.entries(headers || {}).map(([name, value]) => [name.toLowerCase(), value]));
+    // The application validates the registered client origin. Never turn a
+    // wildcard, opaque origin, or unrelated response origin into permission.
+    if (normalized['access-control-allow-origin'] !== origin) return {};
+    const result = { 'access-control-allow-origin': origin };
+    const pickTokens = (name, allowed, normalize) => {
+        const tokens = String(normalized[name] || '').split(',').map(value => normalize(value.trim())).filter(Boolean);
+        const permitted = [...new Set(tokens.filter(value => allowed.includes(value)))];
+        if (permitted.length) result[name] = permitted.join(', ');
+    };
+    pickTokens('access-control-allow-methods', policy.publicProtocol.methods, value => value.toUpperCase());
+    pickTokens('access-control-allow-headers', ['authorization', 'content-type'], value => value.toLowerCase());
+    pickTokens('access-control-expose-headers', ['www-authenticate'], value => value.toLowerCase());
+    const maxAge = String(normalized['access-control-max-age'] || '');
+    if (/^\d+$/.test(maxAge)) result['access-control-max-age'] = String(Math.min(Number(maxAge), 600));
+    return result;
 }
 
 export function sanitizeResponseHeaders(headers, plan) {
@@ -46,7 +83,9 @@ export function sanitizeResponseHeaders(headers, plan) {
         if (!name || HOP_BY_HOP.has(name) || name === 'proxy-connection') continue;
         if (ROUTER_HEADERS.has(name) || name.startsWith('x-ploinky-')) continue;
         if (name === 'location') {
-            if (isPrivateLocation(value)) continue;
+            if (policy.publicProtocol) {
+                if (!allowedProtocolLocation(value, policy.publicProtocol)) continue;
+            } else if (isPrivateLocation(value)) continue;
             if (policy.allowRedirects !== true && /^https?:/i.test(String(value || ''))) continue;
         }
         if (name === 'set-cookie') {
@@ -58,6 +97,11 @@ export function sanitizeResponseHeaders(headers, plan) {
         }
         if (name.startsWith('access-control-')) continue;
         result[name] = value;
+    }
+    const protocolCors = protocolCorsHeaders(headers, policy);
+    Object.assign(result, protocolCors);
+    if (protocolCors['access-control-allow-origin']) {
+        result.vary = result.vary ? `${result.vary}, Origin` : 'Origin';
     }
     if (policy.corsOrigin) {
         result['access-control-allow-origin'] = String(policy.corsOrigin);

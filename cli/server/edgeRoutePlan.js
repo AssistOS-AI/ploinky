@@ -96,12 +96,12 @@ function snapshotPolicy(snapshot) {
     const repository = {
         listHttpRoutes: () => ({
             corrupt: false,
-            entries: compiled.entries.map((entry) => ({ ...entry })),
+            entries: compiled.entries.filter(entry => entry.source !== 'manifest').map((entry) => ({ ...entry })),
         }),
     };
     return new HttpRouteAccessPolicy({
         repository,
-        manifestRouteProvider: () => [],
+        manifestRouteProvider: () => compiled.entries.filter(entry => entry.source === 'manifest'),
         routeDefaultProvider: ({ routeKey }) => compiled.routeDefaults[routeKey] || null,
     });
 }
@@ -260,6 +260,9 @@ function agentPortPlan({
             decision,
         });
     }
+    if (decision.publicProtocol && transport !== 'http') {
+        return deny(403, 'PUBLIC_PROTOCOL_TRANSPORT_DENIED', { matched: true, listener, lease, hostSelection });
+    }
     const forwarding = canonicalForwardingMetadata({
         snapshot,
         host,
@@ -340,6 +343,10 @@ function agentPortPlan({
             allowApplicationCookies: true,
             allowRedirects: true,
             allowCaching: true,
+            ...(decision.publicProtocol ? {
+                publicProtocol: decision.publicProtocol,
+                requestOrigin: String(req?.headers?.origin || ''),
+            } : {}),
         },
         originPolicy: {
             allowedOrigins: [`${forwarding.protocol}://${forwarding.authority}`],

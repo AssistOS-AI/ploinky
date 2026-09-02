@@ -508,6 +508,9 @@ test('SSO login and callback keep every return target inside the normalized same
         observedReturnTargets.push(returnTo);
         return {
             redirectUrl: 'https://identity.example.test/authorize',
+            state: 'test-state-12345678901',
+            browserBinding: 'test-browser-proof',
+            expiresAt: Date.now() + 60_000,
         };
     };
 
@@ -566,7 +569,8 @@ test('SSO login and callback keep every return target inside the normalized same
     callbackPlan.snapshot.routing.routes.explorer.hostPort = 0;
     const callbackReq = makeRequest({
         method: 'GET',
-        url: '/auth/callback?code=test-code&state=test-state',
+        url: '/auth/callback?code=test-code&state=test-state-12345678901',
+        cookie: 'ploinky_sso_login_test-state-12345678901=test-browser-proof',
         accept: 'text/html',
     });
     const callbackRes = new MockResponse();

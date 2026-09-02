@@ -10,7 +10,7 @@ import {
     ROUTING_FILE,
 } from '../utils/config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
-import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
+import { normalizeRequiredCapability, normalizeLocalAuthRoles } from '../server/authHandlers/requiredCapability.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import {
@@ -546,6 +546,7 @@ function collectStrictManifestPolicyEntries(routing, manifests) {
                 access: normalized.access,
                 routeKey: normalized.routeKey,
                 source: 'manifest',
+                ...(normalized.publicProtocol ? { publicProtocol: normalized.publicProtocol } : {}),
                 ...(normalized.guestScope ? { guestScope: normalized.guestScope } : {}),
                 ...(normalized.guestScopeParam ? { guestScopeParam: normalized.guestScopeParam } : {}),
             });
@@ -770,6 +771,9 @@ function validateRoutingShape(routing, manifests) {
                 && normalizeRequiredCapability(manifest.routerAccess.requiredCapability) === null) {
                 throw edgeError(`manifest(${routeKey}).routerAccess.requiredCapability must be a non-empty capability identifier of at most 128 characters`);
             }
+            if (normalizeLocalAuthRoles(manifest?.routerAccess?.localAuthRoles) === null) {
+                throw edgeError(`manifest(${routeKey}).routerAccess.localAuthRoles must be an array of at most 64 role identifiers`);
+            }
         }
     }
 }
@@ -991,9 +995,18 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
         });
     }
     const manifestPolicyEntries = collectStrictManifestPolicyEntries(routing, manifests);
+    for (const [index, entry] of manifestPolicyEntries.entries()) {
+        if (!entry.publicProtocol) continue;
+        policyNamespaces.push({
+            id: `public-protocol:${entry.routeKey}:${index}`,
+            kind: 'agent-port',
+            routeKey: entry.routeKey,
+            prefix: entry.path.endsWith('/*') ? entry.path.slice(0, -2) : entry.path,
+        });
+    }
     const compiledPolicy = compileHttpRoutePolicy({
         entries: [
-            ...policy.httpRoutes.map((entry) => ({ ...entry, source: String(entry.source || 'policy') })),
+            ...policy.httpRoutes.map((entry) => ({ ...entry, source: 'policy' })),
             ...manifestPolicyEntries,
         ],
         namespaces: policyNamespaces,

@@ -39,6 +39,20 @@ import {
     renderSsoLoginHtml,
 } from './authPages.js';
 
+function loginBindingCookieName(state, baseUrl) {
+    const prefix = baseUrl.startsWith('https:') ? '__Host-' : '';
+    return /^[A-Za-z0-9_-]{22}$/.test(String(state || '')) ? `${prefix}ploinky_sso_login_${state}` : '';
+}
+
+function buildLoginBindingCookie(name, value, baseUrl, maxAge) {
+    // Use the admitted origin for Secure, including when TLS terminates before
+    // the router. The __Host- prefix also prevents sibling-domain overwrites.
+    return buildCookie(name, value, { headers: {}, socket: { encrypted: baseUrl.startsWith('https:') } }, '/', {
+        maxAge,
+        sameSite: 'Lax',
+    });
+}
+
 function getLocalAccountErrorMessage(code = '') {
     switch (String(code || '').trim()) {
         case 'current_password_required':
@@ -282,8 +296,12 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             const returnTo = normalizeRelativePath(parsedUrl.searchParams.get('returnTo') || '/', '/');
             const prompt = parsedUrl.searchParams.get('prompt') || undefined;
             if (!requireCurrentGeneration(res, routePlan)) return true;
-            const { redirectUrl } = await authService.beginLogin({ baseUrl, returnTo, prompt });
+            const { redirectUrl, state, browserBinding, expiresAt } = await authService.beginLogin({ baseUrl, returnTo, prompt });
             if (!requireCurrentGeneration(res, routePlan)) return true;
+            const bindingCookieName = loginBindingCookieName(state, baseUrl);
+            if (!bindingCookieName || !browserBinding) throw new Error('Invalid authorization browser binding');
+            appendSetCookie(res, buildLoginBindingCookie(bindingCookieName, browserBinding, baseUrl,
+                Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000))));
             res.writeHead(200, {
                 'Content-Type': 'text/html; charset=utf-8',
                 'Cache-Control': 'no-store'
@@ -502,7 +520,14 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 return true;
             }
             if (!requireCurrentGeneration(res, routePlan)) return true;
-            const result = await authService.handleCallback({ code, state, baseUrl });
+            const bindingCookieName = loginBindingCookieName(state, baseUrl);
+            const browserBinding = bindingCookieName ? parseCookies(req).get(bindingCookieName) : '';
+            if (!browserBinding) {
+                sendJson(res, 400, { ok: false, error: 'invalid_authorization_browser' });
+                return true;
+            }
+            const result = await authService.handleCallback({ code, state, browserBinding, baseUrl });
+            appendSetCookie(res, buildLoginBindingCookie(bindingCookieName, '', baseUrl, 0));
             await waitForAgentRedirectReady(authContext.routeKey || '', { routePlan });
             if (!requireCurrentGeneration(res, routePlan)) return true;
             const cookie = buildCookie(SSO_AUTH_COOKIE_NAME, result.sessionId, req, '/', {
@@ -762,6 +787,10 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
         }
     } catch (err) {
         appendLog('auth_error', { error: err?.message || String(err) });
+        if (['Invalid or expired authorization state', 'Invalid authorization browser binding'].includes(err?.message)) {
+            sendJson(res, 400, { ok: false, error: 'invalid_authorization_browser' });
+            return true;
+        }
         if ((err?.message || '').includes('SSO is not configured')) {
             sendJson(res, 503, { ok: false, error: 'sso_not_configured', detail: err?.message || String(err) });
             return true;

@@ -287,19 +287,36 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
         }
 
         if (method === 'GET' && !route.userId) {
+            const start = Number(parsedUrl.searchParams.get('start') ?? 0);
+            const pageSize = Number(parsedUrl.searchParams.get('pageSize') ?? 100);
+            if (!Number.isSafeInteger(start) || start < 0
+                || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 500) {
+                sendJson(res, 400, { ok: false, error: 'invalid_pagination' });
+                return true;
+            }
+            const localUsers = usesLocalAuth
+                ? listLocalAuthUsers(authContext.policy).sort((left, right) => String(left.username || left.email || '').localeCompare(String(right.username || right.email || '')))
+                : null;
             const result = usesLocalAuth
                 ? {
-                    users: listLocalAuthUsers(authContext.policy),
+                    users: localUsers.slice(start, start + pageSize),
+                    totalCount: localUsers.length,
                     availableRoles: listLocalAuthRoles(authContext.policy),
                 }
-                : await authService.listUsers({ actorUserId: session.user.id, start: 0, pageSize: 500 });
-            const users = (result.users || [])
-                .sort((left, right) => String(left.username || left.email || '').localeCompare(String(right.username || right.email || '')));
+                : await authService.listUsers({ actorUserId: session.user.id, start, pageSize });
+            const users = result.users || [];
+            const totalCount = Number.isSafeInteger(result.totalCount) && result.totalCount >= 0
+                ? result.totalCount
+                : null;
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
                 availableRoles: result.availableRoles || [],
-                users
+                users,
+                start,
+                pageSize,
+                totalCount,
+                hasMore: totalCount === null ? users.length === pageSize : start + users.length < totalCount,
             });
             return true;
         }

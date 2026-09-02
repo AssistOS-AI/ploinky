@@ -127,6 +127,45 @@ export function resolveManifestSsoProvider(manifest, repoName = '') {
     return agentRefFromEnableSpec(qualifyEnableSpecForRepo(raw.trim(), repoName));
 }
 
+// Compute auth configuration from the admitted graph, without mutating the
+// workspace during repository discovery. Retained local-auth records keep
+// their identity store; changing a provider requires an explicit migration.
+export function resolveWorkspaceGraphSsoConfig(graph, currentSso = {}) {
+    const nodes = Array.from(graph?.nodes?.values?.() || []);
+    const providers = new Set();
+    for (const node of nodes) {
+        if (node.authMode !== 'sso') continue;
+        const providerRef = resolveManifestSsoProvider(node.manifest, node.repoName);
+        if (!providerRef) continue;
+        const resolved = findAgent(providerRef);
+        const canonicalRef = `${resolved.repo}/${resolved.shortAgentName}`;
+        const providerNode = nodes.find((candidate) => candidate.agentRef === canonicalRef && !candidate.alias);
+        if (!providerNode || !isSsoProviderManifest(providerNode.manifest)) {
+            throw new Error(`manifest SSO provider '${canonicalRef}' must be an enabled ssoProvider dependency in the workspace graph`);
+        }
+        providers.add(canonicalRef);
+    }
+    if (!providers.size) return null;
+    if (providers.size !== 1) {
+        throw new Error(`workspace graph declares conflicting SSO providers: ${[...providers].sort().join(', ')}`);
+    }
+    const [providerAgent] = providers;
+    const previousRef = String(currentSso?.providerAgent || '').trim();
+    if (previousRef) {
+        const resolved = findAgent(previousRef);
+        if (`${resolved.repo}/${resolved.shortAgentName}` !== providerAgent) {
+            throw new Error('workspace SSO provider change requires an explicit account migration and provider selection');
+        }
+    }
+    return {
+        ...currentSso,
+        enabled: true,
+        providerAgent,
+        providerAgentShort: providerAgent.split('/').at(-1),
+        providerConfig: currentSso?.providerConfig || {},
+    };
+}
+
 function agentRefFromEnableSpec(spec) {
     const raw = String(spec || '').trim();
     if (!raw) return '';

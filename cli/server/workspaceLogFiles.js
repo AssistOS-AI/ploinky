@@ -264,7 +264,7 @@ export async function searchWorkspaceLogs(source, {
         if (!opened) continue;
         const fileMatches = [];
         let lineNumber = 0;
-        const input = fsSync.createReadStream(null, { fd: opened.handle.fd, autoClose: true, encoding: 'utf8' });
+        const input = opened.handle.createReadStream({ autoClose: false, encoding: 'utf8' });
         const lines = readline.createInterface({ input, crlfDelay: Infinity });
         try {
             for await (const line of lines) {
@@ -284,6 +284,7 @@ export async function searchWorkspaceLogs(source, {
         } finally {
             lines.close();
             input.destroy();
+            await opened.handle.close();
         }
         const remaining = boundedLimit - matches.length;
         if (fileMatches.length > remaining) truncated = true;

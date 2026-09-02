@@ -35,7 +35,7 @@ import {
 } from './noWaitWorkerArgs.js';
 import { retireNoWaitRunMarkers } from './noWaitMarkerLifecycle.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
-import { prepareManifestRepositories } from '../utils/runtime/bootstrapManifest.js';
+import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
 import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
@@ -1964,8 +1964,13 @@ async function startWorkspace(staticAgentArg, portArg, {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
+  const workspaceConfigForAuth = workspaceSvc.getConfig() || {};
+  const graphSsoConfig = resolveWorkspaceGraphSsoConfig(lockedStart.graph, workspaceConfigForAuth.sso);
   initializeFreshEdgeRoutingSources({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
   inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  if (graphSsoConfig) {
+    workspaceSvc.setConfig({ ...workspaceConfigForAuth, sso: graphSsoConfig });
+  }
   const resolvedStartPort = await resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
     coordinate: false,
   });

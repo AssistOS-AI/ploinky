@@ -10,6 +10,7 @@ import {
 import { hasInternalAgentSegment } from '../internalAgentPath.js';
 import { normalizeHttpRouteAccess } from './HttpRouteAccessDecision.js';
 import { HttpRouteAccessPath } from './HttpRouteAccessPath.js';
+import { normalizePublicProtocol } from './PublicProtocolPolicy.js';
 
 function readJsonFileIfExists(filePath) {
     try {
@@ -113,15 +114,27 @@ export function normalizeManifestHttpRouteAccess(spec, { routeKey } = {}) {
                 error: 'agent-port convention path must name the declaring route',
             };
         }
+        let publicProtocol;
+        try {
+            publicProtocol = normalizePublicProtocol(spec.publicProtocol, {
+                access, source: 'manifest', path: normalized.path, routeKey: normalizedRouteKey,
+            });
+        } catch (error) {
+            return { ok: false, code: 'INVALID_PUBLIC_PROTOCOL', error: error.message };
+        }
         return {
             ok: true,
             path: normalized.path,
             access,
             routeKey: normalizedRouteKey,
             source: 'manifest',
+            ...(publicProtocol ? { publicProtocol } : {}),
             ...(guestScope ? { guestScope } : {}),
             ...(guestScopeParam ? { guestScopeParam } : {}),
         };
+    }
+    if (spec?.publicProtocol !== undefined) {
+        return { ok: false, code: 'INVALID_PUBLIC_PROTOCOL', error: 'publicProtocol requires an owned agent-port path' };
     }
     if (agentRelativePath === '/' || agentRelativePath === '/*') {
         return { ok: false, code: 'INVALID_PATH', error: 'root path cannot be declared public, guest, or authenticated' };
@@ -159,6 +172,7 @@ export function collectManifestHttpRouteAccess(routes = {}, { manifests = null }
                 access: normalized.access,
                 routeKey: normalized.routeKey,
                 source: 'manifest',
+                ...(normalized.publicProtocol ? { publicProtocol: normalized.publicProtocol } : {}),
                 ...(normalized.guestScope ? { guestScope: normalized.guestScope } : {}),
                 ...(normalized.guestScopeParam ? { guestScopeParam: normalized.guestScopeParam } : {}),
             });
