@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 import {
     STAMP_VERSION,
@@ -30,6 +31,7 @@ import {
     shouldSeedAgentCacheWithHardlinks,
     shouldSeedAgentCacheWithSystemCopy,
     seedFromGlobalCache,
+    runNpmInstall,
 } from '../../cli/utils/dependencies/dependencyCache.js';
 
 function tempDir(prefix = 'deps-cache-test-') {
@@ -79,6 +81,92 @@ test('container dependency installer disables audit/fund and emits a heartbeat',
     assert.match(script, /still running/);
     assert.match(script, /sleep 7/);
     assert.deepEqual(NPM_INSTALL_ARGS, ['install', '--no-package-lock', '--no-audit', '--no-fund']);
+});
+
+function installerTransportFixture(t) {
+    const root = tempDir('deps-git-transport-');
+    const bin = path.join(root, 'bin');
+    const config = path.join(root, 'gitconfig');
+    const observed = path.join(root, 'observed.json');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(config, '[http]\n\tversion = HTTP/2\n');
+    // The npm stand-in runs real Git under the exact subprocess environment
+    // it receives, without depending on network availability in unit tests.
+    fs.writeFileSync(path.join(bin, 'npm'), `#!${process.execPath}
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+function git(args) {
+    const result = spawnSync('git', args, { encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+}
+const observed = {
+    transport: git(['config', '--get', 'http.version']),
+    url: git(['ls-remote', '--get-url', 'ssh://git@github.com/AssistOS-AI/soplang.git']),
+    args: process.argv.slice(2),
+};
+fs.writeFileSync(process.env.DEPS_TEST_OBSERVED, JSON.stringify(observed));
+process.exit(observed.transport === 'HTTP/1.1' ? Number(process.env.DEPS_TEST_NPM_EXIT || '0') : 73);
+`, { mode: 0o755 });
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_CONFIG_')));
+    Object.assign(env, {
+        HOME: root,
+        PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+        GIT_CONFIG_GLOBAL: config,
+        GIT_CONFIG_NOSYSTEM: '1',
+        DEPS_TEST_OBSERVED: observed,
+    });
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    return { root, config, observed, env };
+}
+
+test('disposable install shell gives npm HTTP/1.1 Git transport and preserves its failure status', (t) => {
+    const fixture = installerTransportFixture(t);
+    const before = spawnSync('npm', NPM_INSTALL_ARGS, { cwd: fixture.root, env: fixture.env, encoding: 'utf8' });
+    assert.equal(before.status, 73, before.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(fixture.observed)).transport, 'HTTP/2');
+    const script = buildContainerInstallScript({ installDir: fixture.root, heartbeatSeconds: 0.01 });
+    for (const exitCode of [0, 29]) {
+        // Each dependency install gets a fresh container home.
+        fs.writeFileSync(fixture.config, '[http]\n\tversion = HTTP/2\n');
+        const result = spawnSync('/bin/sh', ['-c', script], {
+            cwd: fixture.root,
+            env: { ...fixture.env, DEPS_TEST_NPM_EXIT: String(exitCode) },
+            encoding: 'utf8', timeout: 5000,
+        });
+        assert.equal(result.status, exitCode, `${result.stdout}\n${result.stderr}`);
+        assert.deepEqual(JSON.parse(fs.readFileSync(fixture.observed)), {
+            transport: 'HTTP/1.1',
+            url: 'https://github.com/AssistOS-AI/soplang.git',
+            args: NPM_INSTALL_ARGS,
+        });
+    }
+});
+
+test('host npm transport is subprocess-local and overrides inherited HTTP/2 parameters', (t) => {
+    const fixture = installerTransportFixture(t);
+    const oldEnv = process.env;
+    const inheritedParameters = "'http.version=HTTP/2' 'test.inherited=retained'";
+    process.env = {
+        ...fixture.env,
+        GIT_CONFIG_PARAMETERS: inheritedParameters,
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'test.counted',
+        GIT_CONFIG_VALUE_0: 'also-retained',
+    };
+    t.after(() => { process.env = oldEnv; });
+    const originalConfig = fs.readFileSync(fixture.config, 'utf8');
+    const before = spawnSync('npm', NPM_INSTALL_ARGS, { cwd: fixture.root, env: process.env, encoding: 'utf8' });
+    assert.equal(before.status, 73, before.stderr);
+    runNpmInstall(fixture.root, { log() {} });
+    assert.deepEqual(JSON.parse(fs.readFileSync(fixture.observed)), {
+        transport: 'HTTP/1.1',
+        url: 'https://github.com/AssistOS-AI/soplang.git',
+        args: NPM_INSTALL_ARGS,
+    });
+    assert.equal(fs.readFileSync(fixture.config, 'utf8'), originalConfig, 'host Git config must never be rewritten');
+    assert.equal(process.env.GIT_CONFIG_PARAMETERS, inheritedParameters, 'parent environment must stay unchanged');
+    assert.equal(process.env.GIT_CONFIG_COUNT, '1');
 });
 
 test('container dependency install runs as root for non-root runtime images', () => {
