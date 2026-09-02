@@ -572,11 +572,6 @@ function withGithubHttpsGitConfig(env = process.env, { cwd = '' } = {}) {
     const baseCount = Number.isFinite(rawCount) && rawCount >= 0 ? rawCount : 0;
     return {
         ...env,
-        // Scope the transport to this npm process and its Git children. The
-        // legacy parameter format also works with Git versions that predate
-        // GIT_CONFIG_COUNT and takes precedence over inherited parameters.
-        GIT_CONFIG_PARAMETERS: [env.GIT_CONFIG_PARAMETERS, shellQuote('http.version=HTTP/1.1')]
-            .filter(Boolean).join(' '),
         GIT_CEILING_DIRECTORIES: mergePathList(env.GIT_CEILING_DIRECTORIES, [
             PLOINKY_WORKSPACE_ROOT,
             cwd && path.resolve(cwd),
@@ -628,9 +623,6 @@ export function buildContainerInstallScript({ installDir = '/install', heartbeat
         ') 2>/dev/null',
         '&& git config --global url.https://github.com/.insteadOf ssh://git@github.com/',
         '&& git config --global --add url.https://github.com/.insteadOf git@github.com:',
-        // This home belongs only to the disposable dependency installer. Some
-        // supported images' Git/libcurl builds fail GitHub HTTP/2 ref listing.
-        '&& git config --global http.version HTTP/1.1',
         '&& (',
         `  printf '[deps-cache] npm install started in %s; cold native dependency caches can take several minutes.\\n' ${installLabel};`,
         `  (while true; do sleep ${interval}; printf '[deps-cache] npm install still running in %s at %s\\n' ${installLabel} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; done) &`,

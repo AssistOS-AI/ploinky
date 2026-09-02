@@ -193,7 +193,6 @@ import {
     runContainerAuthorityProbe,
 } from '../routerAuthorityAttestation.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
-import { initializeBoxGitTransport } from '../../../ploinky-box/lib/gitTransport.mjs';
 import {
     agentLibAliasShadows,
     agentLibGrant,
@@ -638,36 +637,6 @@ function getLastFormattedEnvValue(envStrings, name) {
         }
     }
     return '';
-}
-
-function applyBoxGitTransportEnvFlags(envStrings, { insideBox = isInsideBox() } = {}) {
-    if (!insideBox) return {};
-    // Nested containers receive an explicit environment. Apply Box policy to
-    // the agent's resolved Git settings without forwarding the CLI environment.
-    const prefix = 'GIT_CONFIG_PARAMETERS=';
-    let parameters = '';
-    for (const argument of flagsToArgs(envStrings)) {
-        if (argument.startsWith(prefix)) parameters = argument.slice(prefix.length);
-    }
-    const gitEnv = initializeBoxGitTransport({
-        env: { GIT_CONFIG_PARAMETERS: parameters },
-        insideBox,
-    });
-    for (let index = envStrings.length - 1; index >= 0; index -= 1) {
-        if (String(envStrings[index] || '').startsWith('-e GIT_CONFIG_PARAMETERS=')) {
-            envStrings.splice(index, 1);
-        }
-    }
-    appendEnvFlagsFromMap(envStrings, gitEnv);
-    return gitEnv;
-}
-
-function hasBoxGitTransport(record, options = {}) {
-    const prefix = 'GIT_CONFIG_PARAMETERS=';
-    const envStrings = (record?.Config?.Env || [])
-        .filter(entry => String(entry).startsWith(prefix))
-        .map(entry => formatEnvFlag('GIT_CONFIG_PARAMETERS', String(entry).slice(prefix.length)));
-    return hasExactManagedEnv(record, applyBoxGitTransportEnvFlags(envStrings, options));
 }
 
 function mergeNodeOptions(existingValue, requiredOptions = []) {
@@ -1924,7 +1893,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         envStrings.push(formatEnvFlag(key, value));
     }
 
-    const boxGitEnv = applyBoxGitTransportEnvFlags(envStrings);
     const envFlags = flagsToArgs(envStrings);
     if (envFlags.length) args.push(...envFlags);
     if (runtime === 'podman') {
@@ -2167,7 +2135,6 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 ...descriptorEnv,
                 ...credentialEnv,
                 ...managedControlEnv,
-                ...boxGitEnv,
             });
             const expectedMounts = expectedBindMountsFromArgs(args, descriptorHostFile);
             const expectedEnvHash = computeSemanticEnvHash(payload);
@@ -2246,7 +2213,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const finalizeGeneratedRouterLaunch = ({ launch, record }) => {
         if (!launch) throw new Error('managed generated-local launch is missing its attested launch state');
         const expectedMounts = expectedBindMountsFromArgs(args, launch.descriptorHostFile);
-        if (!hasExactManagedEnv(record, { ...launch.env, ...managedControlEnv, ...boxGitEnv })) {
+        if (!hasExactManagedEnv(record, { ...launch.env, ...managedControlEnv })) {
             throw new Error('managed candidate generated Router env failed exact inspection');
         }
         const descriptorMounts = (record?.Mounts || []).filter((mount) => (
@@ -3683,10 +3650,6 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 canReuseExisting = false;
                 recreateReason ||= 'agentHomeLayoutChanged';
             }
-            if (!hasBoxGitTransport(inspectedRecords[0])) {
-                canReuseExisting = false;
-                recreateReason ||= 'boxGitTransportChanged';
-            }
         }
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
@@ -4358,7 +4321,6 @@ export {
     appendLegacyAgentDataGuards,
     appendExactManagedBindMount,
     appendUniquePortMapping,
-    applyBoxGitTransportEnvFlags,
     buildPersistentAgentRunArgs,
     buildBoxPodmanHostArgs,
     buildDefaultPodmanNetworkArgs,
@@ -4373,7 +4335,6 @@ export {
     resolveReusablePodmanStagedMounts,
     expectedBindMountsFromArgs,
     hasExactManagedEnv,
-    hasBoxGitTransport,
     hasExactManagedMountContract,
     inspectImageEntrypoint,
     manifestUsesHealthProbeBroker,

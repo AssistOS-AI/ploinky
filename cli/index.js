@@ -8,7 +8,6 @@ import { parseStatusOptions } from './statusOptions.js';
 import { bootstrapAgentLibRuntime } from '../agentlib/bootstrap.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
 import { fingerprintSource, sourceIdEquals } from '../agentlib/fingerprint.mjs';
-import { initializeBoxGitTransport } from '../ploinky-box/lib/gitTransport.mjs';
 import {
     clearTransactionDescriptor,
     readActiveDescriptor,
@@ -98,7 +97,6 @@ export async function launchCli(args = process.argv.slice(2), {
     env = process.env,
     errorOutput = process.stderr,
 } = {}) {
-    initializeBoxGitTransport({ env });
     const workspaceRoot = resolveWorkspaceRoot({ cwd: process.cwd(), env });
     const restorePreviousDeployment = (error, previous, candidate, action = 'restart') => {
         if (!previous || !selectionsDiffer(previous, candidate)) return false;
