@@ -39,7 +39,7 @@ test('container security emits the bounded nested Podman runtime contract', () =
         privileged: false,
         nestedPodman: true,
     });
-    assert.deepEqual(buildContainerSecurityArgs(security), [
+    assert.deepEqual(buildContainerSecurityArgs(security, { insideBox: true }), [
         '--cap-add', 'SYS_ADMIN',
         '--cap-add', 'NET_ADMIN',
         '--device', '/dev/fuse',

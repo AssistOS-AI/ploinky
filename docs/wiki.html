@@ -60,6 +60,11 @@
                             <p>A nested agent runtime is the isolated process environment created for one enabled agent instance inside the Ploinky Box. Managed Box execution uses rootless Podman and supplies only the generated mounts, declared environment, private network placement, resource limits, and exact identity admitted for that instance. Its writable container layer and inner named volumes do not survive Box destruction, so durable data must use a workspace-backed bind.</p>
                         </article>
 
+                        <article id="definition-nested-podman-security">
+                            <h3>Nested Podman container security</h3>
+                            <p>Nested Podman container security is the fixed OCI permission contract selected by the root-level manifest setting <code>containerSecurity.nestedPodman: true</code> when an agent container must launch Podman inside a Ploinky Box. Ploinky validates the setting during runtime-capability admission, accepts it only for the <code>container</code> backend inside a marked Box, and rejects it when <code>privileged</code> is also enabled. An admitted runtime receives only <code>SYS_ADMIN</code>, <code>NET_ADMIN</code>, <code>/dev/fuse</code>, <code>/dev/net/tun</code>, disabled container labeling, and the fixed nested-Podman seccomp profile. Profiles, direct capability fields, and <code>llmRuntime.runtimePolicy</code> cannot select or broaden this contract, and Bubblewrap, Seatbelt, or a container outside the Box cannot use it.</p>
+                        </article>
+
                         <article id="definition-runtime-backend">
                             <h3>Runtime backend</h3>
                             <p>A runtime backend is the implementation that creates and controls an agent process. Direct development may select an OCI container, Bubblewrap on Linux, or Seatbelt on macOS according to manifest and workspace policy, while a marked Ploinky Box forces nested rootless Podman for managed agent, helper, probe, and installation work. Backend selection changes process and mount mechanics but does not weaken workspace identity, environment filtering, readiness, or routing admission.</p>
