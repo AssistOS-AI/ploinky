@@ -1040,7 +1040,26 @@ function appendLegacyAgentDataGuards(args, runtime, {
     }
     const sources = ensureLegacyAgentGuardSources(guardOptions);
     const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
+    // A nested bind whose destination did not exist before `create` is mounted
+    // on a container-engine-created host directory. Removing that directory
+    // after create makes the mount unreachable by pathname, even though it is
+    // still present in inspect output. Protect the existing `.ploinky` parent
+    // read-only whenever a broad workspace grant covers an absent legacy root.
+    // Existing protected roots are still overlaid with the empty guard below.
+    const parentGuards = new Map();
     for (const guard of targets) {
+        if (!guard.parentTarget || fs.existsSync(guard.protectedHostPath)) continue;
+        const key = `${guard.protectedParentHostPath}\0${guard.parentTarget}`;
+        parentGuards.set(key, Object.freeze({
+            source: guard.protectedParentHostPath,
+            target: guard.parentTarget,
+        }));
+    }
+    for (const parent of parentGuards.values()) {
+        appendExactManagedBindMount(args, `${parent.source}:${parent.target}${suffix}`);
+    }
+    for (const guard of targets) {
+        if (guard.parentTarget && !fs.existsSync(guard.protectedHostPath)) continue;
         appendExactManagedBindMount(args, `${sources.get(guard.key)}:${guard.target}${suffix}`);
     }
     return targets;

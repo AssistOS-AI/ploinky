@@ -125,6 +125,8 @@ export function legacyAgentGuardTargets(bindings, {
                 key: protectedRoot.key,
                 target,
                 protectedHostPath: protectedRoot.hostPath,
+                protectedParentHostPath: path.dirname(protectedRoot.hostPath),
+                parentTarget: path.posix.dirname(target),
             }));
         }
     }

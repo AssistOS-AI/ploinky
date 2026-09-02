@@ -122,6 +122,14 @@ test('legacy guard targets are derived from broad mounts without creating legacy
             '/workspace/.ploinky/data',
             '/workspace/.ploinky/shared',
         ]);
+        assert.deepEqual(targets.map(entry => entry.parentTarget), [
+            '/workspace/.ploinky',
+            '/workspace/.ploinky',
+        ]);
+        assert.deepEqual(targets.map(entry => entry.protectedParentHostPath), [
+            path.join(root, '.ploinky'),
+            path.join(root, '.ploinky'),
+        ]);
         const sources = ensureLegacyAgentGuardSources({ workspaceRoot: root });
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data')), false);
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);

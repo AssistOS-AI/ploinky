@@ -137,9 +137,16 @@ test('container runtimes append final read-only opacity guards for broad workspa
         const mounts = args.filter((_value, index) => args[index - 1] === '-v');
         for (const target of targets) {
             const match = mounts.find(value => value.includes(`:${target.target}:`));
-            assert.ok(match, `missing guard ${target.target}`);
-            assert.match(match, runtime === 'podman' ? /:z,ro$/ : /:ro$/);
-            assert.doesNotMatch(match, new RegExp(`^${target.protectedHostPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`));
+            if (fs.existsSync(target.protectedHostPath)) {
+                assert.ok(match, `missing guard ${target.target}`);
+                assert.match(match, runtime === 'podman' ? /:z,ro$/ : /:ro$/);
+                assert.doesNotMatch(match, new RegExp(`^${target.protectedHostPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`));
+            } else {
+                assert.equal(match, undefined, `absent target must not receive a removable child mount ${target.target}`);
+                const parent = mounts.find(value => value.startsWith(`${target.protectedParentHostPath}:${target.parentTarget}:`));
+                assert.ok(parent, `missing read-only parent guard ${target.parentTarget}`);
+                assert.match(parent, runtime === 'podman' ? /:z,ro$/ : /:ro$/);
+            }
         }
     }
 });
