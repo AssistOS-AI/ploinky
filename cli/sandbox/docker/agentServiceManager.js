@@ -211,6 +211,7 @@ const AGENT_CONTROL_ENTRYPOINT = '/Agent/server/AgentEntrypoint.sh';
 const LLM_RUNTIME_SHARED_PATH = path.join(PLOINKY_WORKSPACE_ROOT, 'llm-runtime', 'shared');
 const AUTHORIZED_CLEANUP_RECEIPTS = new WeakMap();
 const CONSUMED_CLEANUP_RECEIPTS = new WeakSet();
+const FAILED_RUNTIME_IDENTITY_ROTATIONS = new WeakMap();
 
 function freezeCleanupReceipt(value) {
     if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
@@ -2837,6 +2838,12 @@ export function replacementCandidateContainerName(containerName, instanceId) {
     return `${stableBase}__candidate_${suffix}`;
 }
 
+export function getFailedRuntimeIdentityRotation(error) {
+    return error && typeof error === 'object'
+        ? FAILED_RUNTIME_IDENTITY_ROTATIONS.get(error) || null
+        : null;
+}
+
 export function coordinateReplacementRuntimeIdentity({
     containerName,
     existingRecord,
@@ -2844,6 +2851,8 @@ export function coordinateReplacementRuntimeIdentity({
     networkLifecycleCapability,
     stageAlongsidePredecessor = false,
     preserveActiveAuthorization = stageAlongsidePredecessor,
+    runtimeNetwork = null,
+    predecessorContainerId = '',
 } = {}, {
     assertNetworkCapability = assertNetworkLifecycleCapability,
     prepare = prepareAdditiveEdgeRoutingGeneration,
@@ -2869,6 +2878,9 @@ export function coordinateReplacementRuntimeIdentity({
     let runtimeIdentity;
     let candidateContainerName = exactContainerName;
     let prepared;
+    let stagedRotation = null;
+    let rotationPhase = 'registry-save';
+    try {
     withApplyLock((applyLockCapability) => {
         if (!preserveActiveAuthorization) {
             inactivate(coordinationReason, { applyLockCapability });
@@ -2913,8 +2925,22 @@ export function coordinateReplacementRuntimeIdentity({
             });
             return;
         }
+        // Capture before the write: persistence can succeed and then throw.
+        // This receipt records only this coordinator's attempted rotation;
+        // consumers must still match the exact live staged registry record.
+        // Additive preparation never claims a mutable registry rotation.
+        stagedRotation = freezeCleanupReceipt({
+            containerName: candidateContainerName,
+            stagedRegistryRecord: structuredClone(agents[candidateContainerName]),
+            predecessorContainerName: exactContainerName,
+            predecessorRegistryRecord: structuredClone(current),
+            predecessorContainerId: String(predecessorContainerId || current.containerId || ''),
+            runtimeNetwork: runtimeNetwork ? structuredClone(runtimeNetwork) : null,
+        });
         saveRegistry(agents, { coordinate: false, applyLockCapability });
+        rotationPhase = 'route-save';
         if (routing) saveRouting(routing, { coordinate: false });
+        rotationPhase = 'prepare';
         try {
             prepared = prepareReplacement({
                 reason: coordinationReason,
@@ -2930,6 +2956,7 @@ export function coordinateReplacementRuntimeIdentity({
             throw error;
         }
     });
+    rotationPhase = 'validation';
     const preparedRecord = prepared?.generation?.agents?.[candidateContainerName];
     const preparationMatchesMode = preserveActiveAuthorization
         ? prepared?.selector?.state === 'active' && prepared?.preparationLease?.mode === 'additive'
@@ -2966,6 +2993,12 @@ export function coordinateReplacementRuntimeIdentity({
         ...(prepared?.preparationLease ? { preparationLease: prepared.preparationLease } : {}),
         preparedRegistryRecord: structuredClone(preparedRecord),
     });
+    } catch (error) {
+        if (!stagedRotation) throw error;
+        const failure = error && typeof error === 'object' ? error : new Error(String(error));
+        FAILED_RUNTIME_IDENTITY_ROTATIONS.set(failure, Object.freeze({ ...stagedRotation, phase: rotationPhase }));
+        throw failure;
+    }
 }
 
 export function resolveReplacementRuntimeIdentity({
@@ -2980,6 +3013,8 @@ export function resolveReplacementRuntimeIdentity({
     networkLifecycleCapability,
     stageAlongsidePredecessor = false,
     preserveActiveAuthorization = stageAlongsidePredecessor,
+    runtimeNetwork = null,
+    predecessorContainerId = '',
 } = {}, dependencies = {}) {
     if (!targetedRestart && !preservePreparedRegistryRecord
         && existingRuntime && !recreateReason) {
@@ -3007,6 +3042,8 @@ export function resolveReplacementRuntimeIdentity({
             networkLifecycleCapability,
             stageAlongsidePredecessor,
             preserveActiveAuthorization,
+            runtimeNetwork,
+            predecessorContainerId,
         }, dependencies);
     }
     if (targetedRestart || preservePreparedRegistryRecord) {
@@ -3257,6 +3294,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 existingRecord,
                 existingRuntime: anyRuntimeRunning,
                 recreateReason: sandboxRecreateReason,
+                runtimeNetwork: manifestNetwork,
+                predecessorContainerId: existingRecord.containerId || '',
                 networkLifecycleCapability: options.networkLifecycleCapability,
                 preservePreparedRegistryRecord,
                 requestedInstanceId: String(options.instanceId || existingRecord.instanceId || ''),
@@ -3341,6 +3380,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                     : {}),
             };
         } catch (err) {
+            // Identity staging failed before a sandbox candidate was launched.
+            // Preserve the coordinator's provenance and never mistake the
+            // predecessor's still-running process for a failed new candidate.
+            if (getFailedRuntimeIdentityRotation(err)) throw err;
             const failure = createHostSandboxStartupError(agentName, agentRuntime, err);
             const identity = {
                 instanceId: String(sandboxRuntimeIdentity?.instanceId || options.instanceId || existingRecord.instanceId || ''),
@@ -3645,6 +3688,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         existingRecord,
         existingRuntime: existingRuntimeAtEntry,
         recreateReason,
+        runtimeNetwork: manifestNetwork,
+        predecessorContainerId: String(inspectedContainerId || existingRecord.containerId || ''),
         networkLifecycleCapability: options.networkLifecycleCapability,
         preservePreparedRegistryRecord,
         targetedRestart: Boolean(targetedRestart),
@@ -3688,7 +3733,10 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 containerName: runtimeIdentity.candidateContainerName,
                 runtimeNetwork: structuredClone(manifestNetwork),
                 registryRecord: structuredClone(runtimeIdentity.preparedRegistryRecord),
+                stagedRegistryRecord: structuredClone(runtimeIdentity.preparedRegistryRecord),
+                requiresEdgeActivation: true,
                 preparationLease: runtimeIdentity.preparationLease,
+                replacementPredecessor,
                 exactCleanupPerformed: error?.ploinkyRestartCandidate?.exactCleanupPerformed === true,
             });
         }
@@ -3896,6 +3944,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 containerName,
                 existingRecord,
                 reason: 'semanticDescriptorMismatch',
+                runtimeNetwork: manifestNetwork,
+                predecessorContainerId: String(inspectedContainerId || existingRecord.containerId || ''),
                 networkLifecycleCapability: options.networkLifecycleCapability,
                 stageAlongsidePredecessor: true,
             });
