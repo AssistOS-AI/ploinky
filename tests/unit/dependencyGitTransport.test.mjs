@@ -63,6 +63,8 @@ for (const transport of [null, 'HTTP/2']) {
         const f = fixture(t, transport);
         const script = buildContainerInstallScript({ installDir: f.root, heartbeatSeconds: 0.01 });
         for (const exitCode of [0, 29]) {
+            // Each actual install starts with a fresh disposable container home.
+            fs.writeFileSync(f.config, transport ? `[http]\n\tversion = ${transport}\n` : '');
             const result = spawnSync('/bin/sh', ['-c', script], {
                 cwd: f.root,
                 env: { ...f.env, DEPS_TEST_NPM_EXIT: String(exitCode) },
