@@ -219,10 +219,9 @@ export async function exercisePtyTerminal(terminal, {
     });
 
     try {
-        terminal.resize(93, 31);
         // The readiness marker comes from the environment so terminal echo of
         // this command cannot be mistaken for proof that bash reached `read`.
-        terminal.write("stty -echo; printf '%s\\n' \"$PLOINKY_PTY_READY\"; stty size; IFS= read -r webtty_value; printf '__ploinky_input_%s__' \"$webtty_value\"; exit 7\r");
+        terminal.write("stty -echo; printf '%s\\n' \"$PLOINKY_PTY_READY\"; IFS= read -r webtty_value; stty size; printf '__ploinky_input_%s__' \"$webtty_value\"; exit 7\r");
         const firstPhase = await Promise.race([
             outputReady.then(() => 'ready'),
             exitPromise.then(() => 'exit'),
@@ -231,9 +230,10 @@ export async function exercisePtyTerminal(terminal, {
         ]);
         if (firstPhase !== 'ready') fail('pty-output');
 
-        // Do not enqueue input until the shell has executed the command and
-        // emitted the non-echoable readiness marker. This avoids the input
-        // line being consumed as a second shell command during startup.
+        // Shell terminal setup may restore an earlier window size. Resize only
+        // after the executed marker; the input read then keeps `stty size`
+        // behind that resize without returning to the interactive prompt.
+        terminal.resize(93, 31);
         terminal.write(`${inputValue}\r`);
         const exit = await Promise.race([exitPromise, outputBound, timeoutPromise]);
         if (captureBytes > MAX_CAPTURE_BYTES) fail('pty-output-bound');
