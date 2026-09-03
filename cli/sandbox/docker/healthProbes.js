@@ -318,7 +318,17 @@ function requestProbeCancellation(control) {
 }
 
 function removeCompletedProbeControl(control) {
-    fs.rmSync(control.hostPath, { recursive: true, force: true });
+    // Retire the whole path before removing its claim marker. Otherwise the
+    // broker can reclaim a completed request during recursive deletion. The
+    // hidden parent excludes new scans; stale old-path claims cannot succeed.
+    const retiredParent = fs.mkdtempSync(path.join(path.dirname(control.hostPath), '.completed-'));
+    try {
+        fs.renameSync(control.hostPath, path.join(retiredParent, 'control'));
+    } catch (error) {
+        try { fs.rmdirSync(retiredParent); } catch {}
+        throw error;
+    }
+    fs.rmSync(retiredParent, { recursive: true, force: true });
 }
 
 function cancelAndAwaitProbe(control, options = {}) {
