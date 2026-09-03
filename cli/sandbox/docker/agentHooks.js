@@ -1,13 +1,14 @@
 import { spawnSync } from 'child_process';
-import fs from 'fs';
 import { normalizeLifecycleCommands } from './agentCommands.js';
 import { getRuntime, waitForContainerRunning, isContainerRunning } from './common.js';
 import { SHARED_DIR } from '../../utils/config.js';
+import { ensureAgentDataDirectory } from '../../utils/runtime/agentDataPathPolicy.js';
+import { buildAgentShellArgs } from './agentShell.js';
 
 
 function ensureSharedHostDir() {
     const dir = SHARED_DIR;
-    try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+    ensureAgentDataDirectory(dir);
     return dir;
 }
 
@@ -30,7 +31,7 @@ function runPostinstallHook(agentName, containerName, manifest, cwd) {
             return;
         }
         console.log(`[postinstall] ${agentName}: cd '${cwd}' && ${cmd}`);
-        const res = spawnSync(runtime, ['exec', containerName, 'sh', '-lc', `cd '${cwd}' && ${cmd}`], { stdio: 'inherit' });
+        const res = spawnSync(runtime, ['exec', containerName, ...buildAgentShellArgs(`cd '${cwd}' && ${cmd}`)], { stdio: 'inherit' });
         if (res.status !== 0) {
             // If exec failed because container exited, warn instead of failing
             if (!isContainerRunning(containerName)) {

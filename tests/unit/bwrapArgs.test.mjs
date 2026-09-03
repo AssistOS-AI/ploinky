@@ -1,21 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import {
+    appendLegacyAgentDataGuards,
     buildBwrapArgs,
     buildBwrapInteractiveCommand,
     buildShellCommand,
     ensureBwrapAgentLibDir,
+    mergeBwrapManifestVolumes,
     resolveBwrapNodeRuntime,
 } from '../../cli/sandbox/bwrap/bwrapServiceManager.js';
 import { AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
+import { PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 import { agentLibFixture, writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
 function tempDir(prefix = 'bwrap-args-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function hasUsableBwrap() {
+    const probe = spawnSync('bwrap', [
+        '--ro-bind', '/', '/', '--proc', '/proc', '--dev', '/dev', '/bin/true',
+    ], { stdio: 'ignore' });
+    return probe.status === 0;
 }
 
 /**
@@ -45,6 +56,29 @@ function hasRoBind(args, source, target = source) {
     return false;
 }
 
+test('selected-profile bwrap volumes and options override root declarations', () => {
+    const merged = mergeBwrapManifestVolumes({
+        volumes: { '.data/root': '/root-data', '.data/replaced': '/value' },
+        volumeOptions: { '/root-data': { readOnly: true }, '/value': { readOnly: false } },
+    }, {
+        volumes: { '.data/profile': '/profile-data', '.data/profile-replaced': '/value' },
+        volumeOptions: { '/profile-data': { readOnly: true }, '/value': { readOnly: true } },
+    });
+    assert.deepEqual(merged, {
+        volumes: {
+            '.data/root': '/root-data',
+            '.data/replaced': '/value',
+            '.data/profile': '/profile-data',
+            '.data/profile-replaced': '/value',
+        },
+        volumeOptions: {
+            '/root-data': { readOnly: true },
+            '/value': { readOnly: true },
+            '/profile-data': { readOnly: true },
+        },
+    });
+});
+
 function hasBind(args, source, target = source) {
     for (let index = 0; index < args.length - 2; index += 1) {
         if (args[index] === '--bind' && args[index + 1] === source && args[index + 2] === target) {
@@ -54,13 +88,77 @@ function hasBind(args, source, target = source) {
     return false;
 }
 
+test('bwrap appends final read-only opacity guards for broad workspace binds', () => {
+    const root = tempDir('bwrap-existing-legacy-');
+    try {
+        for (const child of ['data', 'shared']) fs.mkdirSync(path.join(root, '.ploinky', child), { recursive: true });
+        const args = ['--bind', root, '/workspace'];
+        const targets = appendLegacyAgentDataGuards(args, { workspaceRoot: root });
+        assert.deepEqual(targets.map(entry => entry.target), [
+            '/workspace/.ploinky/data',
+            '/workspace/.ploinky/shared',
+        ]);
+        for (const target of targets) {
+            assert.equal(args.at(-3), '--ro-bind');
+            assert.equal(args.at(-1), targets.at(-1).target);
+            assert.notEqual(args.at(-2), target.protectedHostPath);
+        }
+        assert.ok(args.lastIndexOf('--ro-bind') > args.lastIndexOf('--bind'));
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('bwrap keeps missing legacy roots absent by protecting their existing parent', () => {
+    const root = tempDir('bwrap-missing-legacy-');
+    try {
+        const controllerDir = path.join(root, '.ploinky');
+        fs.mkdirSync(path.join(controllerDir, 'data'), { recursive: true });
+        const args = ['--bind', root, '/workspace'];
+        appendLegacyAgentDataGuards(args, { workspaceRoot: root });
+        assert.ok(hasRoBind(args, fs.realpathSync(controllerDir), '/workspace/.ploinky'));
+        assert.equal(args.includes('/workspace/.ploinky/shared'), false);
+        assert.equal(args.at(-1), '/workspace/.ploinky/data');
+        assert.equal(fs.existsSync(path.join(controllerDir, 'shared')), false);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('bwrap normalizes guard-parent matching and orders logical parents before children', () => {
+    const root = tempDir('bwrap-normalized-parent-');
+    try {
+        const controllerDir = path.join(root, '.ploinky');
+        fs.mkdirSync(path.join(controllerDir, 'data'), { recursive: true });
+        for (const spelling of ['/framework/', '/framework/.', '/framework/././', '/framework/child/../']) {
+            const args = ['--bind', root, '/workspace', '--bind', controllerDir, spelling];
+            appendLegacyAgentDataGuards(args, { workspaceRoot: root });
+            assert.ok(hasRoBind(args, controllerDir, '/framework'));
+            assert.equal(hasBind(args, controllerDir, '/framework'), false);
+            assert.equal(args.includes(spelling), false);
+            assert.ok(args.indexOf('/framework') < args.indexOf('/framework/data'));
+            assert.equal(args.includes('/framework/shared'), false);
+        }
+        assert.equal(fs.existsSync(path.join(controllerDir, 'shared')), false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('bwrap rejects a project bind sourced below a protected legacy root', () => {
+    const source = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'data', 'legacy-agent');
+    const args = ['--bind', source, '/project'];
+    assert.throws(
+        () => appendLegacyAgentDataGuards(args),
+        error => error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION',
+    );
+});
+
 test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind', () => {
     const root = tempDir();
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const cacheRoot = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25');
         const nodeModulesDir = path.join(cacheRoot, 'node_modules');
-        const sharedDir = path.join(root, '.ploinky', 'shared');
+        const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const agentHomeDir = path.join(root, '.data', 'demo');
         const nodeRuntimePath = path.join(root, 'node-runtime');
@@ -96,6 +194,87 @@ test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind
     }
 });
 
+for (const sharedExists of [true, false]) {
+test(`real bwrap production args pin ancestors and keep existing data and ${sharedExists ? 'existing' : 'absent'} shared opaque`, { skip: !hasUsableBwrap() }, () => {
+    const outer = tempDir('bwrap-live-legacy-');
+    const root = path.join(outer, 'projects', 'current');
+    try {
+        const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
+        const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agent', 'node_modules');
+        const sharedDir = path.join(root, '.data', 'shared');
+        const agentLibPath = path.join(root, 'Agent');
+        const agentHomeDir = path.join(root, '.data', 'demo');
+        for (const directory of [path.join(agentCodePath, 'node_modules'), nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir]) {
+            fs.mkdirSync(directory, { recursive: true });
+        }
+        fs.writeFileSync(path.join(agentCodePath, 'source'), 'source');
+        fs.writeFileSync(path.join(nodeModulesDir, 'dependency-sentinel'), 'prepared');
+        for (const relative of ['.ploinky/data', '.ploinky/shared']) {
+            if (!sharedExists && relative === '.ploinky/shared') continue;
+            const directory = path.join(root, relative);
+            fs.mkdirSync(directory, { recursive: true });
+            fs.writeFileSync(path.join(directory, 'sentinel'), 'controller');
+        }
+        const args = buildBwrapArgs({
+            workspaceRoot: root,
+            agentCodePath,
+            agentLibGrant: grantFor(root),
+            agentLibPath,
+            nodeModulesDir,
+            sharedDir,
+            cwd: outer,
+            agentHomeDir,
+            skillsPath: null,
+            envMap: {},
+            codeReadOnly: true,
+            skillsReadOnly: true,
+            volumes: { [path.join(root, '.ploinky')]: '/framework/././' },
+        });
+        const probe = [
+            'set -eu',
+            'test -z "$(ls -A "$1/.ploinky/data")"',
+            'test -z "$(ls -A /framework/data)"',
+            'if touch /framework/data/escaped 2>/dev/null; then exit 76; fi',
+            'if mkdir /framework/shared/dir 2>/dev/null; then exit 77; fi',
+            ...(sharedExists ? [] : ['if mkdir /framework/shared 2>/dev/null; then exit 78; fi']),
+            sharedExists ? 'test -z "$(ls -A "$1/.ploinky/shared")"' : 'test ! -e "$1/.ploinky/shared"',
+            'if cat "$1/.ploinky/data/sentinel" 2>/dev/null; then exit 61; fi',
+            'if cat "$1/.ploinky/shared/sentinel" 2>/dev/null; then exit 62; fi',
+            'if touch "$1/.ploinky/data/file" 2>/dev/null; then exit 63; fi',
+            'if touch "$1/.ploinky/shared/file" 2>/dev/null; then exit 64; fi',
+            'if mkdir "$1/.ploinky/data/dir" 2>/dev/null; then exit 65; fi',
+            'if mkdir "$1/.ploinky/shared/dir" 2>/dev/null; then exit 66; fi',
+            ...(sharedExists ? [] : ['if mkdir "$1/.ploinky/shared" 2>/dev/null; then exit 67; fi']),
+            'if mv "$1/.ploinky" "$1/moved" 2>/dev/null; then exit 68; fi',
+            'if rm -rf "$1/.ploinky" 2>/dev/null; then exit 69; fi',
+            'if ln -sfn "$1/replacement" "$1/.ploinky" 2>/dev/null; then exit 70; fi',
+            'if mv "$1" "$2/moved" 2>/dev/null; then exit 71; fi',
+            'if mv "$2/projects" "$2/moved" 2>/dev/null; then exit 72; fi',
+            'test "$(cat /code/source)" = source',
+            'test "$(cat /code/node_modules/dependency-sentinel)" = prepared',
+            'test "$(cat /Agent/node_modules/dependency-sentinel)" = prepared',
+            'if touch /code/source /code/node_modules/dependency-sentinel 2>/dev/null; then exit 73; fi',
+            // mv may copy/delete writable project siblings before failing on
+            // a mounted ancestor; recreating the private home remains allowed.
+            'mkdir -p "$1/.data/demo"',
+            'touch "$1/project-write" "$1/.data/demo/persisted"',
+            'echo BWRAP_OPAQUE_OK',
+        ].join('; ');
+        const result = spawnSync('bwrap', [
+            ...args, '/bin/sh', '-lc', probe, 'probe', root, outer,
+        ], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /BWRAP_OPAQUE_OK/);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), sharedExists);
+        assert.equal(fs.existsSync(path.join(root, 'moved')), false);
+        assert.equal(fs.existsSync(path.join(root, 'project-write')), true);
+        assert.equal(fs.existsSync(path.join(agentHomeDir, 'persisted')), true);
+    } finally {
+        fs.rmSync(outer, { recursive: true, force: true });
+    }
+});
+}
+
 test('resolveBwrapNodeRuntime exposes the complete distribution containing node', () => {
     const root = tempDir('bwrap-node-runtime-');
     try {
@@ -118,7 +297,7 @@ test('buildBwrapArgs allows manifest volumes outside .ploinky', () => {
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
-        const sharedDir = path.join(root, '.ploinky', 'shared');
+        const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const agentHomeDir = path.join(root, '.data', 'demo');
         const dataDir = path.join(root, 'workspace-data', 'uploads');
@@ -154,9 +333,9 @@ test('buildBwrapArgs enforces read-only manifest volume options', () => {
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
-        const sharedDir = path.join(root, '.ploinky', 'shared');
+        const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
-        const secretDir = path.join(root, '.ploinky', 'data', 'secret');
+        const secretDir = path.join(root, '.data', 'secret');
         for (const dir of [agentCodePath, nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), secretDir]) {
             fs.mkdirSync(dir, { recursive: true });
         }
@@ -188,7 +367,7 @@ test('buildBwrapArgs uses the persistent home as /root for isolated agents', () 
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agent', 'node_modules');
-        const sharedDir = path.join(root, '.ploinky', 'shared');
+        const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const agentHomeDir = path.join(root, '.data', 'demoAlias');
         for (const dir of [agentCodePath, nodeModulesDir, sharedDir, path.join(agentLibPath, 'node_modules'), agentHomeDir]) {
@@ -275,7 +454,7 @@ test('buildBwrapArgs grants the selected AgentLib source read-only and shadows i
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
         const nodeModulesDir = path.join(root, '.ploinky', 'deps', 'agents', 'repo', 'agent', 'bwrap-linux-x64-node25', 'node_modules');
-        const sharedDir = path.join(root, '.ploinky', 'shared');
+        const sharedDir = path.join(root, '.data', 'shared');
         const agentLibPath = path.join(root, 'Agent');
         const agentHomeDir = path.join(root, '.data', 'demo');
         const nodeRuntimePath = path.join(root, 'node-runtime');

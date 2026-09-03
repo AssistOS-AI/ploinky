@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+    appendLegacyAgentDataGuards,
     assertPodmanCodeMountAllowed,
     buildPodmanStagedTargetMounts,
     codeRelativeMountPath,
@@ -18,8 +19,13 @@ import {
     podmanMountSuffix,
     resolveReusablePodmanStagedMounts,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
-import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
-import { resolveManifestVolumeHostPath } from '../../cli/utils/runtime/manifestVolumePolicy.js';
+import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
+import {
+    assertManifestStorageAdmission,
+    resolveManifestVolumeHostPath,
+} from '../../cli/utils/runtime/manifestVolumePolicy.js';
+import { prepareLegacyGuardMountpointCleanup } from '../../cli/utils/runtime/legacyAgentDataGuards.js';
+import { buildInteractiveAgentCreateCommand } from '../../cli/sandbox/docker/interactive.js';
 import {
     prepareFreshRuntimeRoot,
     pruneStaleRuntimeEntries,
@@ -33,6 +39,13 @@ function hasLocalPodmanBusybox() {
     const podman = spawnSync('podman', ['--version'], { stdio: 'ignore' });
     if (podman.status !== 0) return false;
     const image = spawnSync('podman', ['image', 'exists', 'docker.io/library/busybox:1.36'], { stdio: 'ignore' });
+    return image.status === 0;
+}
+
+function hasLocalDockerBusybox() {
+    const docker = spawnSync('docker', ['info'], { stdio: 'ignore' });
+    if (docker.status !== 0) return false;
+    const image = spawnSync('docker', ['image', 'inspect', 'docker.io/library/busybox:1.36'], { stdio: 'ignore' });
     return image.status === 0;
 }
 
@@ -285,7 +298,7 @@ test('podmanMountSuffix places z before ro for absolute self-mount targets', () 
 test('profile manifest volumes are collected with profile volume options', () => {
     const entries = collectManifestVolumeEntries({
         volumes: {
-            '.ploinky/data/root-state': '/root-state',
+            '.data/root-state': '/root-state',
         },
         volumeOptions: {
             '/root-state': { readOnly: true },
@@ -293,7 +306,7 @@ test('profile manifest volumes are collected with profile volume options', () =>
         },
     }, {
         volumes: {
-            '.ploinky/data/example-service': '/data',
+            '.data/example-service': '/data',
         },
         volumeOptions: {
             '/data': { podmanChown: true },
@@ -302,15 +315,15 @@ test('profile manifest volumes are collected with profile volume options', () =>
 
     assert.deepEqual(entries, [
         {
-            hostPath: '.ploinky/data/root-state',
+            hostPath: '.data/root-state',
             containerPath: '/root-state',
-            resolvedHostPath: path.join(PLOINKY_DIR, 'data', 'root-state'),
+            resolvedHostPath: path.join(AGENTS_DATA_DIR, 'root-state'),
             options: { readOnly: true },
         },
         {
-            hostPath: '.ploinky/data/example-service',
+            hostPath: '.data/example-service',
             containerPath: '/data',
-            resolvedHostPath: path.join(PLOINKY_DIR, 'data', 'example-service'),
+            resolvedHostPath: path.join(AGENTS_DATA_DIR, 'example-service'),
             options: { podmanChown: true },
         },
     ]);
@@ -318,7 +331,7 @@ test('profile manifest volumes are collected with profile volume options', () =>
 
 test('podman manifest data volumes chown only managed writable data mounts by default', () => {
     assert.equal(
-        podmanManifestVolumeMountSuffix(path.join(PLOINKY_DIR, 'data', 'example-service'), {}),
+        podmanManifestVolumeMountSuffix(path.join(AGENTS_DATA_DIR, 'example-service'), {}),
         ':z,U',
     );
     assert.equal(
@@ -326,11 +339,11 @@ test('podman manifest data volumes chown only managed writable data mounts by de
         ':z',
     );
     assert.equal(
-        podmanManifestVolumeMountSuffix(path.join(PLOINKY_DIR, 'data', 'readonly'), { readOnly: true }),
+        podmanManifestVolumeMountSuffix(path.join(AGENTS_DATA_DIR, 'readonly'), { readOnly: true }),
         ':z,ro',
     );
     assert.equal(
-        podmanManifestVolumeMountSuffix(path.join(PLOINKY_DIR, 'data', 'optout'), { podmanChown: false }),
+        podmanManifestVolumeMountSuffix(path.join(AGENTS_DATA_DIR, 'optout'), { podmanChown: false }),
         ':z',
     );
     assert.equal(
@@ -340,16 +353,16 @@ test('podman manifest data volumes chown only managed writable data mounts by de
 });
 
 test('read-only manifest volumes are enforced across container runtimes', () => {
-    const hostPath = path.join(PLOINKY_DIR, 'data', 'readonly');
+    const hostPath = path.join(AGENTS_DATA_DIR, 'readonly');
     assert.equal(manifestVolumeMountSuffix('podman', hostPath, { readOnly: true }), ':z,ro');
     assert.equal(manifestVolumeMountSuffix('docker', hostPath, { readOnly: true }), ':ro');
     assert.equal(manifestVolumeMountSuffix('docker', hostPath, {}), '');
 });
 
-test('manifest volume host paths may resolve outside workspace .ploinky', () => {
+test('manifest volume host paths accept canonical data and external sources but reject legacy storage', () => {
     assert.equal(
-        resolveManifestVolumeHostPath('.ploinky/data/demo/state'),
-        path.join(PLOINKY_DIR, 'data', 'demo', 'state'),
+        resolveManifestVolumeHostPath('.data/demo/state'),
+        path.join(AGENTS_DATA_DIR, 'demo', 'state'),
     );
     assert.equal(
         resolveManifestVolumeHostPath('demo/state'),
@@ -361,6 +374,29 @@ test('manifest volume host paths may resolve outside workspace .ploinky', () => 
         resolveManifestVolumeHostPath(absoluteVolume),
         path.resolve(absoluteVolume),
     );
+    for (const legacy of ['.ploinky/data/demo/state', '.ploinky/shared/file']) {
+        assert.throws(() => resolveManifestVolumeHostPath(legacy), error => {
+            assert.equal(error.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+            return true;
+        });
+    }
+});
+
+test('manifest admission validates both root and selected profile volumes', () => {
+    assert.equal(assertManifestStorageAdmission({
+        volumes: { '.data/root-owned': '/root-owned' },
+    }, {
+        volumes: { '.data/profile-owned': '/profile-owned' },
+    }), true);
+    for (const [manifest, profile] of [
+        [{ volumes: { '.ploinky/data/root-owned': '/data' } }, null],
+        [{}, { volumes: { '.ploinky/shared/profile-owned': '/shared-old' } }],
+    ]) {
+        assert.throws(() => assertManifestStorageAdmission(manifest, profile), error => {
+            assert.equal(error.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+            return true;
+        });
+    }
 });
 
 test('generated required manifest volumes must be produced by hooks', () => {
@@ -488,6 +524,7 @@ test('real podman run keeps staged symlink code and dependency targets read-only
         fs.symlinkSync(cacheNodeModules, path.join(stagedCodePath, 'node_modules'), 'dir');
 
         const script = [
+            'set -eu',
             'cat /code/file.txt >/dev/null',
             'cat /code/node_modules/pkg/file.txt >/dev/null',
             'if sh -c "echo bad >/code/file.txt" 2>/dev/null; then echo CODE_WRITE_SUCCEEDED; exit 10; fi',
@@ -558,6 +595,314 @@ test('real podman run with rw code keeps dependency cache read-only (dev profile
         // Sanity: code write should have succeeded, so the file content changed.
         assert.equal(fs.readFileSync(path.join(agentCodePath, 'file.txt'), 'utf8').trim(), 'updated');
     } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('real podman run keeps controller legacy trees opaque while controller writes remain possible', { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = tempDir('podman-legacy-guard-');
+    try {
+        const protectedTrees = [
+            path.join(root, '.ploinky', 'data', 'edge-routing'),
+            path.join(root, '.ploinky', 'data', 'edge-publication'),
+            path.join(root, '.ploinky', 'data', 'router-security'),
+            path.join(root, '.ploinky', 'shared'),
+        ];
+        for (const directory of protectedTrees) {
+            fs.mkdirSync(directory, { recursive: true });
+            fs.writeFileSync(path.join(directory, 'sentinel'), 'controller');
+        }
+        const runtimeArgs = ['run', '--rm', '-v', `${root}:/workspace:z`];
+        const guards = appendLegacyAgentDataGuards(runtimeArgs, 'podman', { workspaceRoot: root });
+        assert.deepEqual(guards.map(guard => guard.target), [
+            '/workspace/.ploinky/data',
+            '/workspace/.ploinky/shared',
+        ]);
+        const script = [
+            'test -z "$(ls -A /workspace/.ploinky/data)"',
+            'test -z "$(ls -A /workspace/.ploinky/shared)"',
+            'if cat /workspace/.ploinky/data/edge-routing/sentinel 2>/dev/null; then exit 31; fi',
+            'if cat /workspace/.ploinky/shared/sentinel 2>/dev/null; then exit 32; fi',
+            'if touch /workspace/.ploinky/data/exposed 2>/dev/null; then exit 33; fi',
+            'if touch /workspace/.ploinky/shared/exposed 2>/dev/null; then exit 34; fi',
+            'if mkdir /workspace/.ploinky/data/exposed-dir 2>/dev/null; then exit 35; fi',
+            'if mkdir /workspace/.ploinky/shared/exposed-dir 2>/dev/null; then exit 36; fi',
+            'if mv /workspace/.ploinky /workspace/moved 2>/dev/null; then exit 37; fi',
+            'if rm -rf /workspace/.ploinky 2>/dev/null; then exit 38; fi',
+            'if ln -sfn /workspace/replacement /workspace/.ploinky 2>/dev/null; then exit 39; fi',
+            'touch /workspace/project-write',
+            'echo OPAQUE_OK',
+        ].join('; ');
+        const result = spawnSync('podman', [
+            ...runtimeArgs,
+            'docker.io/library/busybox:1.36',
+            'sh', '-lc', script,
+        ], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /OPAQUE_OK/);
+        for (const directory of protectedTrees) {
+            assert.equal(fs.readFileSync(path.join(directory, 'sentinel'), 'utf8'), 'controller');
+            fs.writeFileSync(path.join(directory, 'controller-after'), 'updated');
+            assert.equal(fs.readFileSync(path.join(directory, 'controller-after'), 'utf8'), 'updated');
+        }
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data', 'exposed')), false);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared', 'exposed')), false);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data', 'exposed-dir')), false);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared', 'exposed-dir')), false);
+        assert.equal(fs.existsSync(path.join(root, 'moved')), false);
+        assert.equal(fs.existsSync(path.join(root, 'project-write')), true);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('real podman create keeps an absent shared root absent and uncreatable after mountpoint cleanup', { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = tempDir('podman-missing-legacy-guard-');
+    const containerName = `ploinky_missing_legacy_guard_${process.pid}_${Date.now()}`;
+    try {
+        const controllerData = path.join(root, '.ploinky', 'data', 'edge-routing');
+        fs.mkdirSync(controllerData, { recursive: true });
+        fs.writeFileSync(path.join(controllerData, 'sentinel'), 'controller');
+        fs.chmodSync(path.join(root, '.ploinky'), 0o777);
+
+        const runtimeArgs = [
+            'create', '--name', containerName, '--user', '1000:1000',
+            '-v', `${root}:/workspace:z`,
+        ];
+        appendLegacyAgentDataGuards(runtimeArgs, 'podman', { workspaceRoot: root });
+        const mounts = runtimeArgs.filter((_value, index) => runtimeArgs[index - 1] === '-v');
+        assert.ok(mounts.includes(`${fs.realpathSync(path.join(root, '.ploinky'))}:/workspace/.ploinky:z,ro`));
+        assert.equal(mounts.some(value => value.includes(':/workspace/.ploinky/shared:')), false);
+
+        const cleanupMountpoints = prepareLegacyGuardMountpointCleanup({ workspaceRoot: root });
+        const created = spawnSync('podman', [
+            ...runtimeArgs,
+            'docker.io/library/busybox:1.36', 'sh', '-lc', 'sleep 30',
+        ], { encoding: 'utf8' });
+        assert.equal(created.status, 0, created.stderr || created.stdout);
+        cleanupMountpoints();
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
+
+        const started = spawnSync('podman', ['start', containerName], { encoding: 'utf8' });
+        assert.equal(started.status, 0, started.stderr || started.stdout);
+        const probe = spawnSync('podman', [
+            'exec', containerName, 'sh', '-lc', [
+                'test ! -e /workspace/.ploinky/shared',
+                'if mkdir /workspace/.ploinky/shared 2>/tmp/shared-error; then exit 41; fi',
+                'grep -qi "read-only" /tmp/shared-error',
+                'test -z "$(ls -A /workspace/.ploinky/data)"',
+                'if mkdir /workspace/.ploinky/data/exposed 2>/dev/null; then exit 42; fi',
+                'echo MISSING_LEGACY_OPAQUE_OK',
+            ].join('; '),
+        ], { encoding: 'utf8' });
+        assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+        assert.match(probe.stdout, /MISSING_LEGACY_OPAQUE_OK/);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
+    } finally {
+        spawnSync('podman', ['rm', '-f', containerName], { stdio: 'ignore' });
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('real podman guards ancestor renames while leaving project and data writes available', { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = fs.realpathSync(tempDir('podman-ancestor-guard-'));
+    try {
+        const workspaceRoot = path.join(root, 'projects', 'current');
+        const controllerData = path.join(workspaceRoot, '.ploinky', 'data');
+        fs.mkdirSync(controllerData, { recursive: true });
+        fs.mkdirSync(path.join(workspaceRoot, '.data', 'demo'), { recursive: true });
+        fs.writeFileSync(path.join(controllerData, 'sentinel'), 'controller');
+        const args = ['run', '--rm', '-v', `${root}:/home:z`];
+        appendLegacyAgentDataGuards(args, 'podman', { workspaceRoot });
+        const result = spawnSync('podman', [...args, 'docker.io/library/busybox:1.36', 'sh', '-c', [
+            'set -eu',
+            'if mv /home/projects /home/moved; then exit 81; fi',
+            'if mv /home/projects/current /home/projects/moved; then exit 82; fi',
+            'if mv /home/projects/current/.ploinky /home/projects/current/moved; then exit 83; fi',
+            'if mkdir /home/projects/current/.ploinky/shared; then exit 84; fi',
+            'touch /home/projects/current/project-write /home/projects/current/.data/demo/persisted',
+            'echo ANCESTOR_GUARD_OK',
+        ].join('; ')], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /ANCESTOR_GUARD_OK/);
+        assert.equal(fs.readFileSync(path.join(controllerData, 'sentinel'), 'utf8'), 'controller');
+        assert.equal(fs.existsSync(path.join(workspaceRoot, '.ploinky', 'shared')), false);
+        assert.equal(fs.existsSync(path.join(workspaceRoot, 'project-write')), true);
+        assert.equal(fs.existsSync(path.join(workspaceRoot, '.data', 'demo', 'persisted')), true);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const parentTarget of ['/framework', '/framework/', '/framework/.', '/framework/././']) {
+test(`real podman keeps legacy aliases opaque and coalesces parent bind ${parentTarget}`, { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = fs.realpathSync(tempDir('podman-legacy-alias-'));
+    try {
+        const code = path.join(root, 'code');
+        fs.mkdirSync(path.join(code, 'legacy-data'), { recursive: true });
+        fs.mkdirSync(path.join(root, '.ploinky'));
+        fs.symlinkSync('../code/legacy-data', path.join(root, '.ploinky', 'data'));
+        fs.writeFileSync(path.join(code, 'source'), 'source');
+        fs.writeFileSync(path.join(code, 'legacy-data', 'sentinel'), 'controller');
+        const args = [
+            'run', '--rm', '-v', `${root}:/workspace:z`,
+            '-v', `${path.join(root, '.ploinky')}:${parentTarget}:z`,
+            '-v', `${code}:/code:z,ro`,
+        ];
+        appendLegacyAgentDataGuards(args, 'podman', { workspaceRoot: root });
+        const mounts = args.filter((_value, index) => args[index - 1] === '-v');
+        assert.equal(mounts.filter(value => value.includes(':/code:')).length, 1);
+        assert.equal(mounts.filter(value => value.includes(':/framework:')).length, 1);
+        assert.ok(mounts.includes(`${path.join(root, '.ploinky')}:/framework:z,ro`));
+        const result = spawnSync('podman', [...args, 'docker.io/library/busybox:1.36', 'sh', '-c', [
+            'set -eu',
+            'test "$(cat /code/source)" = source',
+            'test -z "$(ls -A /code/legacy-data)"',
+            'test -z "$(ls -A /workspace/.ploinky/data)"',
+            'if cat /code/legacy-data/sentinel; then exit 85; fi',
+            'if touch /code/source; then exit 86; fi',
+            'if mv /workspace/code /workspace/moved; then exit 87; fi',
+            'if mv /workspace/.ploinky /workspace/moved; then exit 88; fi',
+            'if rm /workspace/.ploinky/data; then exit 89; fi',
+            'if mkdir /framework/shared; then exit 90; fi',
+            'touch /workspace/project-write',
+            'echo ALIAS_GUARD_OK',
+        ].join('; ')], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /ALIAS_GUARD_OK/);
+        assert.equal(fs.readFileSync(path.join(code, 'legacy-data', 'sentinel'), 'utf8'), 'controller');
+        assert.equal(fs.lstatSync(path.join(root, '.ploinky', 'data')).isSymbolicLink(), true);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+}
+
+test('real docker run uses production final guards for both legacy roots', { skip: !hasLocalDockerBusybox() }, () => {
+    const root = tempDir('docker-legacy-guard-');
+    try {
+        for (const relative of ['.ploinky/data', '.ploinky/shared']) {
+            const directory = path.join(root, relative);
+            fs.mkdirSync(directory, { recursive: true });
+            fs.writeFileSync(path.join(directory, 'sentinel'), 'controller');
+        }
+        const runtimeArgs = ['run', '--rm', '-v', `${root}:/workspace`];
+        appendLegacyAgentDataGuards(runtimeArgs, 'docker', { workspaceRoot: root });
+        const probe = [
+            'test -z "$(ls -A /workspace/.ploinky/data)"',
+            'test -z "$(ls -A /workspace/.ploinky/shared)"',
+            'if cat /workspace/.ploinky/data/sentinel 2>/dev/null; then exit 51; fi',
+            'if cat /workspace/.ploinky/shared/sentinel 2>/dev/null; then exit 52; fi',
+            'if touch /workspace/.ploinky/data/file 2>/dev/null; then exit 53; fi',
+            'if touch /workspace/.ploinky/shared/file 2>/dev/null; then exit 54; fi',
+            'if mkdir /workspace/.ploinky/data/dir 2>/dev/null; then exit 55; fi',
+            'if mkdir /workspace/.ploinky/shared/dir 2>/dev/null; then exit 56; fi',
+            'if mv /workspace/.ploinky /workspace/moved 2>/dev/null; then exit 57; fi',
+            'if rm -rf /workspace/.ploinky 2>/dev/null; then exit 58; fi',
+            'echo DOCKER_OPAQUE_OK',
+        ].join('; ');
+        const result = spawnSync('docker', [
+            ...runtimeArgs,
+            'docker.io/library/busybox:1.36', 'sh', '-lc', probe,
+        ], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /DOCKER_OPAQUE_OK/);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+for (const projectIsControllerParent of [false, true]) {
+test(`real interactive podman protects absent shared with ${projectIsControllerParent ? 'noncanonical controller-parent' : 'workspace'} bind`, { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = fs.realpathSync(tempDir('podman-interactive-legacy-'));
+    const containerName = `ploinky_interactive_guard_${process.pid}_${Date.now()}`;
+    try {
+        const controllerData = path.join(root, '.ploinky', 'data');
+        const homeDir = path.join(root, '.data', 'demo');
+        const sharedDir = path.join(root, '.data', 'shared');
+        const agentLibPath = path.join(root, 'Agent');
+        const absAgentPath = path.join(root, 'agent-code');
+        const grantSource = path.join(root, 'achillesAgentLib');
+        for (const dir of [controllerData, homeDir, sharedDir, agentLibPath, absAgentPath, grantSource]) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(path.join(controllerData, 'sentinel'), 'controller');
+        const command = buildInteractiveAgentCreateCommand({
+            runtime: 'podman', containerName, envHash: 'test', workspaceRoot: root,
+            projectDir: projectIsControllerParent ? `${root}/.ploinky/././` : root,
+            homeDir, sharedDir, agentLibPath, absAgentPath,
+            volumeSuffix: ':z', readOnlySuffix: ':z,ro',
+            containerImage: 'docker.io/library/busybox:1.36',
+            agentLibGrant: {
+                sourceDir: grantSource, runtimePath: '/opt/ploinky-agentlib',
+                mode: 'local', fingerprint: 'a1'.repeat(32), commit: '',
+                sourceIdHash: 'b2'.repeat(32), namespaced: true,
+            },
+        });
+        const created = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf8' });
+        assert.equal(created.status, 0, created.stderr || created.stdout);
+        const started = spawnSync('podman', ['start', containerName], { encoding: 'utf8' });
+        assert.equal(started.status, 0, started.stderr || started.stdout);
+        const probe = spawnSync('podman', ['exec', containerName, 'sh', '-lc', [
+            'set -eu',
+            'test ! -e "$1/.ploinky/shared"',
+            'if mkdir "$1/.ploinky/shared" 2>/dev/null; then exit 71; fi',
+            'if cat "$1/.ploinky/data/sentinel" 2>/dev/null; then exit 72; fi',
+            'if touch "$1/.ploinky/data/escaped" 2>/dev/null; then exit 73; fi',
+            'if mv "$1/.ploinky" "$1/moved" 2>/dev/null; then exit 74; fi',
+            'if rm -rf "$1/.ploinky" 2>/dev/null; then exit 75; fi',
+            'touch /root/persisted',
+            'echo INTERACTIVE_GUARD_OK',
+        ].join('; '), 'probe', root], { encoding: 'utf8' });
+        assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+        assert.match(probe.stdout, /INTERACTIVE_GUARD_OK/);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
+        assert.equal(fs.existsSync(path.join(homeDir, 'persisted')), true);
+        assert.equal(fs.readFileSync(path.join(controllerData, 'sentinel'), 'utf8'), 'controller');
+    } finally {
+        spawnSync('podman', ['rm', '-f', '--time', '0', containerName], { stdio: 'ignore' });
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+}
+
+test('persistent runtime production wiring appends guards after all writable mount families', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    assert.match(
+        source,
+        /for \(const \{ resolvedHostPath[\s\S]*resourcePlan\.persistentStorage[\s\S]*appendLegacyAgentDataGuards\(args, runtime\);[\s\S]*const envStrings/,
+    );
+});
+
+test('real podman numeric user writes manifest :U and plain resource :z but not read-only storage', { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = tempDir('podman-storage-owner-');
+    try {
+        const manifestDir = path.join(root, 'manifest');
+        const resourceDir = path.join(root, 'resource');
+        const readOnlyDir = path.join(root, 'readonly');
+        fs.mkdirSync(manifestDir, { mode: 0o700 });
+        fs.mkdirSync(resourceDir, { mode: 0o777 });
+        fs.mkdirSync(readOnlyDir, { mode: 0o777 });
+        const result = spawnSync('podman', [
+            'run', '--rm', '--user', '10001:10001',
+            '-v', `${manifestDir}:/manifest:z,U`,
+            '-v', `${resourceDir}:/resource:z`,
+            '-v', `${readOnlyDir}:/readonly:z,ro`,
+            'docker.io/library/busybox:1.36',
+            'sh', '-lc', [
+                'touch /manifest/owned',
+                'touch /resource/plain',
+                'if touch /readonly/blocked 2>/dev/null; then exit 41; fi',
+                'echo STORAGE_OK',
+            ].join('; '),
+        ], { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stdout, /STORAGE_OK/);
+        assert.equal(fs.existsSync(path.join(manifestDir, 'owned')), true);
+        assert.equal(fs.existsSync(path.join(resourceDir, 'plain')), true);
+        assert.equal(fs.existsSync(path.join(readOnlyDir, 'blocked')), false);
+    } finally {
+        try { fs.chmodSync(root, 0o700); } catch (_) {}
+        for (const directory of ['manifest', 'resource', 'readonly']) {
+            try { fs.chmodSync(path.join(root, directory), 0o700); } catch (_) {}
+        }
         fs.rmSync(root, { recursive: true, force: true });
     }
 });

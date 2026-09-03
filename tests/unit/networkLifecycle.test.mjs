@@ -525,6 +525,44 @@ test('managed host transaction accepts the Podman 6 synthetic host attachment', 
     assert.equal(harness.containers.get(id).State.Running, true);
 });
 
+test('finalize runs the post-start checkpoint even when runtime start fails', (t) => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'host' });
+    const id = 'failedstart123456';
+    harness.containers.set(id, managedAgentRecord({
+        id,
+        name: 'failed-start-container',
+        labels: managedAgentLabels(harness.identity, network),
+        networks: { host: { NetworkID: 'host' } },
+        networkMode: 'host',
+    }));
+    const checkpoints = [];
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        run(runtime, args) {
+            if (args[0] === 'start') {
+                checkpoints.push('start');
+                return { ...absent('container start'), stderr: 'injected start failure' };
+            }
+            return harness.run(runtime, args);
+        },
+        workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'failed-start.lock'),
+    });
+
+    assert.throws(() => adapter.finalizeContainer(
+        'failed-start-container',
+        adapter.preflight(network, 'demo'),
+        {
+            network,
+            runtimeIdentity: TEST_RUNTIME_IDENTITY,
+            beforeStart() { checkpoints.push('before'); },
+            afterStart() { checkpoints.push('after'); },
+        },
+    ), /injected start failure/);
+    assert.deepEqual(checkpoints, ['before', 'start', 'after']);
+});
+
 test('runtime identity labels bind inspection and label construction to the exact registry tuple', (t) => {
     const harness = networkHarness(t);
     const network = canonicalizeNetwork({ mode: 'host' });
@@ -904,6 +942,11 @@ test('managed launch hooks remain ordered under the transaction and failed attes
             assert.match(launch.proof, /^sha256:[a-f0-9]{64}$/);
             assert.equal(record.State.Running, false);
         },
+        postStartLaunch({ launch, record }) {
+            order.push('cleanup-after-start');
+            assert.match(launch.proof, /^sha256:[a-f0-9]{64}$/);
+            assert.equal(record.State.Running, false);
+        },
         finalizeLaunch({ launch, record }) {
             order.push('inspect-and-commit');
             assert.match(launch.proof, /^sha256:[a-f0-9]{64}$/);
@@ -915,6 +958,7 @@ test('managed launch hooks remain ordered under the transaction and failed attes
         'attest-and-credentials',
         'create',
         'generation-check-before-start',
+        'cleanup-after-start',
         'inspect-and-commit',
     ]);
 

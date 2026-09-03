@@ -6,6 +6,11 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+    isUnsupportedRelaySocketIdentity,
+    readRelaySocketIdentityWithRetry,
+} from '../../Agent/server/lib/runtimeRelaySocket.mjs';
+
 const module = await import('../../cli/sandbox/docker/healthProbes.js');
 const {
     clearLivenessState,
@@ -21,6 +26,7 @@ const {
     runContainerScriptReadiness,
     healthProbeHostDir,
     prepareHealthProbeHostDirForLaunch,
+    retireRuntimeRelaySocket,
     submitProbeRequest,
     computeBackoffDelay,
     maybeResetBackoff,
@@ -96,6 +102,26 @@ test('launch preparation retires only exact fixed broker artifacts', async (t) =
     assert.equal(fs.readFileSync(path.join(preservedRequest, 'request'), 'utf8'), 'preserve-me');
     await new Promise(resolve => server.close(resolve));
     serverClosed = true;
+});
+
+test('runtime relay socket retires while its producer still owns the projected path', async (t) => {
+    const root = fs.mkdtempSync('/tmp/ploinky-probe-retire-');
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const name = 'agent-runtime-retire';
+    const control = path.join(root, name);
+    fs.mkdirSync(control, { recursive: true, mode: 0o700 });
+    const socketPath = path.join(control, 'runtime-relay.sock');
+    const server = net.createServer();
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socketPath, resolve);
+    });
+    t.after(() => server.close());
+
+    assert.equal(retireRuntimeRelaySocket(name, { probeControlHostRoot: root }), true);
+    assert.equal(fs.existsSync(socketPath), false);
+    assert.equal(retireRuntimeRelaySocket(name, { probeControlHostRoot: root }), false);
+    await new Promise(resolve => server.close(resolve));
 });
 
 test('launch preparation fails closed on a substituted relay socket', (t) => {
@@ -951,17 +977,75 @@ test('agent entrypoint owns health and relay brokers without creating runtime ex
 test('runtime relay retries shared-filesystem bind release and unlinks only its own socket', () => {
     const relayUrl = new URL('../../Agent/server/RuntimeHttpRelay.mjs', import.meta.url);
     const source = fs.readFileSync(relayUrl, 'utf8');
-    assert.match(source, /TRANSIENT_RELAY_BIND_ERRORS/);
-    assert.match(source, /'ENOTSUP'/);
+    assert.match(source, /TRANSIENT_RELAY_SOCKET_ERRORS/);
+    assert.match(source, /readRelaySocketIdentityWithRetry/);
+    assert.match(source, /ownedSocketIdentity = await readRelaySocketIdentityWithRetry/);
     assert.match(source, /serveSocketBrokerWithRetry/);
     assert.match(source, /removeOwnedRelaySocket/);
     assert.match(source, /current\.dev === ownedIdentity\.dev/);
     assert.match(source, /current\.ino === ownedIdentity\.ino/);
+    assert.match(source, /ownsUnsupportedSocketProjection/);
+    assert.match(source, /isUnsupportedRelaySocketIdentity\(error\)[\s\S]*fs\.unlinkSync\(socketPath\)/);
     assert.match(source, /requireRelayReadyPath/);
     assert.doesNotMatch(
         source,
         /process\.once\('exit',[\s\S]{0,160}removeStaleRelaySocket/,
     );
+});
+
+test('runtime relay keeps one bound socket while transient identity projection settles', async () => {
+    const expected = Object.freeze({ dev: 7, ino: 11, uid: 1000 });
+    let reads = 0;
+    let waits = 0;
+    const observed = await readRelaySocketIdentityWithRetry(() => {
+        reads += 1;
+        if (reads < 3) {
+            const transient = new Error('shared socket projection is not ready');
+            transient.code = 'EAGAIN';
+            throw transient;
+        }
+        return expected;
+    }, {
+        attempts: 4,
+        wait: async () => { waits += 1; },
+    });
+
+    assert.equal(observed, expected);
+    assert.equal(reads, 3);
+    assert.equal(waits, 2);
+});
+
+test('runtime relay fails closed when socket identity never becomes observable', async () => {
+    let waits = 0;
+    await assert.rejects(
+        readRelaySocketIdentityWithRetry(() => {
+            const transient = new Error('shared socket projection is not ready');
+            transient.code = 'EBUSY';
+            throw transient;
+        }, {
+            attempts: 3,
+            wait: async () => { waits += 1; },
+        }),
+        (error) => error?.code === 'PLOINKY_RELAY_SOCKET_IDENTITY_UNAVAILABLE',
+    );
+    assert.equal(waits, 2);
+});
+
+test('runtime relay recognizes a permanent unsupported socket identity projection', async () => {
+    let waits = 0;
+    const unsupported = new Error('socket metadata is not projected');
+    unsupported.code = 'ENOTSUP';
+
+    await assert.rejects(
+        readRelaySocketIdentityWithRetry(() => { throw unsupported; }, {
+            attempts: 3,
+            wait: async () => { waits += 1; },
+        }),
+        error => error === unsupported,
+    );
+    assert.equal(waits, 0);
+    assert.equal(isUnsupportedRelaySocketIdentity(unsupported), true);
+    assert.equal(isUnsupportedRelaySocketIdentity(Object.assign(new Error(), { code: 'EBUSY' })), false);
 });
 
 test('probe runner rejects control-path substitution and malformed durations before execution', () => {

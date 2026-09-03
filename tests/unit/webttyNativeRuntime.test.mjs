@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -185,6 +187,74 @@ test('the PTY proof waits for an executed readiness marker before sending input'
     const result = await proof;
     assert.equal(writes.length, 2);
     assert.equal(result.exit.exitCode, 7);
+});
+
+function shellWithLateTerminalSetup(t, { applyResize = true } = {}) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'webtty-probe-ordering-'));
+    const sizeFile = path.join(directory, 'size');
+    fs.writeFileSync(sizeFile, '24 80\n');
+    const outputMarker = '__ready_after_terminal_setup__';
+    const inputValue = 'roundtrip_after_resize';
+    const inputMarker = `__ploinky_input_${inputValue}__`;
+    // Run the actual command and read barriers in Bash. The size file models
+    // terminal geometry so late child setup can deterministically overwrite an
+    // early parent resize without requiring a native addon in the unit suite.
+    const child = spawn('/bin/bash', ['--noprofile', '--norc', '-c', `
+        IFS= read -r probe_command
+        printf '24 80\\n' > "$PLOINKY_TEST_SIZE"
+        stty() {
+            case "$1" in
+                -echo) return 0 ;;
+                size) cat "$PLOINKY_TEST_SIZE" ;;
+                *) return 1 ;;
+            esac
+        }
+        eval "$probe_command"
+    `], {
+        env: {
+            PATH: '/usr/bin:/bin',
+            PLOINKY_TEST_SIZE: sizeFile,
+            PLOINKY_PTY_READY: outputMarker,
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (data) => { stderr += data; });
+    child.stdin.on('error', () => {});
+    const closed = new Promise((resolve) => child.once('close', resolve));
+    t.after(async () => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        await closed;
+        fs.rmSync(directory, { recursive: true, force: true });
+        assert.equal(stderr, '', 'controlled Bash fixture must execute without shell errors');
+    });
+    const terminal = {
+        onData(handler) { child.stdout.on('data', handler); },
+        onExit(handler) {
+            child.once('close', (exitCode, signal) => handler({ exitCode, signal: signal || 0 }));
+        },
+        resize(cols, rows) {
+            if (applyResize) fs.writeFileSync(sizeFile, `${rows} ${cols}\n`);
+        },
+        write(value) { child.stdin.write(value.replaceAll('\r', '\n')); },
+    };
+    return { terminal, outputMarker, inputValue, inputMarker };
+}
+
+test('late shell terminal setup cannot overwrite the resize proven after readiness', async (t) => {
+    const fixture = shellWithLateTerminalSetup(t);
+    const result = await exercisePtyTerminal(fixture.terminal, { ...fixture, timeoutMs: 2_000 });
+    assert.match(result.captured, /(?:^|[\r\n])31 93(?:[\r\n]|$)/);
+    assert.ok(result.captured.includes(fixture.inputMarker));
+    assert.equal(result.exit.exitCode, 7);
+});
+
+test('a resize that leaves the shell geometry unchanged still fails admission', async (t) => {
+    const fixture = shellWithLateTerminalSetup(t, { applyResize: false });
+    await assert.rejects(
+        exercisePtyTerminal(fixture.terminal, { ...fixture, timeoutMs: 2_000 }),
+        (error) => error.category === 'pty-resize',
+    );
 });
 
 test('the self-contained admission probe rejects altered stored uid/gid and PTY evidence', () => {

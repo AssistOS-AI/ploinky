@@ -24,7 +24,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 
 ## Workspace State
 
-`initEnvironment()` creates the local Ploinky workspace. The canonical state directory is `.ploinky`.
+`initEnvironment()` creates the local Ploinky workspace. Controller-owned state lives under `.ploinky`; agent-owned persisted data lives under `.data`.
 
 | Path | Purpose |
 | --- | --- |
@@ -34,7 +34,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | `.data/<agent-or-alias>` | Per-instance persistent agent home. Containers and Linux bwrap mount it at `/root` in every run mode. Disable preserves it. |
 | `.ploinky/code/<agent>` | Symlink to the agent's `code/` directory when present, otherwise to the agent root. |
 | `.ploinky/skills/<agent>` | Symlink to the agent's `skills/` directory when present. |
-| `.ploinky/shared` | Shared writable host directory mounted as `/shared` in containers and host sandboxes. |
+| `.data/shared` | Shared writable agent-data directory mounted as `/shared` in containers and host sandboxes. |
 | `.ploinky/deps/global/<runtimeKey>` | Runtime-specific global Node dependency cache. |
 | `.ploinky/deps/agents/<repo>/<agent>/<runtimeKey>` | Runtime-specific merged agent dependency cache. |
 | `.ploinky/deps/bwrap-runtime/<agent-or-alias>` | Regenerated Bubblewrap Agent runtime copies with a pre-created nested dependency mount point. |
@@ -43,7 +43,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | `.ploinky/routing.json` | Router route table written during start/restart. |
 | `.ploinky/.secrets` | Encrypted secret store used by `var`, authentication configuration, and manifest env. |
 | `.ploinky/profile` | Active profile name, defaulting to `default`. |
-| `.ploinky/data/<key>` | Default host location for `runtime.resources.persistentStorage`. |
+| `.data/<key>` | Mandatory host location for `runtime.resources.persistentStorage`; the key must be one safe path segment. |
 | `.ploinky/container-runtime/<container>` | Podman staging directory used when symlink-heavy code needs a real mounted tree. |
 | `.ploinky/seatbelt-runtime/<agent>` | macOS seatbelt staging area for copied `Agent/` runtime files. |
 
@@ -226,7 +226,7 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `container` | No | Preferred container image field. Used before `image`. Supports `${VAR}` interpolation during startup. |
 | `image` | No | Secondary image field. Fallback is `node:18-alpine`. Supports `${VAR}` interpolation during startup. |
 | `runtime` | No | Must be an object when used for resources. A string `runtime` selector is explicitly rejected as legacy/unsupported. |
-| `runtime.resources.persistentStorage` | No | If `key` and `containerPath` exist, creates/mounts host storage. Default host path is `.ploinky/data/<key>`, overridable by `PLOINKY_RESOURCE_<KEY>_HOST`; `dpu-data` also honors `DPU_DATA_ROOT`. |
+| `runtime.resources.persistentStorage` | No | A declaration requires a one-segment `key` and non-empty `containerPath`, then creates/mounts `.data/<key>`. Environment-based host-path overrides are not accepted. |
 | `runtime.resources.env` | No | Adds env vars with templates such as `{{PLOINKY_WORKSPACE_ROOT}}`, `{{STORAGE_CONTAINER_PATH}}`, `{{STORAGE_HOST_PATH}}`, `{{secret:NAME}}`, `{{generatedSecret:NAME}}`, and `{{var:NAME}}`. |
 | `lite-sandbox` | No | If true and host sandbox is enabled, selects bwrap on Linux or seatbelt on macOS. If host sandbox is disabled, it falls back to container runtime. |
 | `profiles` | No | If present, `profiles.default` is required. Active profile comes from record profile or `.ploinky/profile`; non-default profiles are merged over default. |
@@ -487,7 +487,7 @@ For Docker-style runtime, the main mounts are:
 | Agent code path (`<agent>/code` if present, otherwise agent root) | `/code` | profile-controlled read-write/read-only |
 | Prepared agent dependency cache | `/code/node_modules` | read-only |
 | Prepared agent dependency cache | `/Agent/node_modules` | read-only |
-| `.ploinky/shared` | `/shared` | read-write |
+| `.data/shared` | `/shared` | read-write |
 | Agent home (`.data/<agent-or-alias>`) | `/root` | read-write |
 | Global or devel `projectPath` / current working directory | Same absolute path inside container | read-write |
 | Agent `skills/`, when it exists outside code | `/code/skills` | profile-controlled read-write/read-only |
@@ -509,7 +509,7 @@ Podman uses a staging directory under `.ploinky/container-runtime/<container>`:
 | Override code dependencies | prepared dependency cache | staged `code/node_modules` |
 | Apply `/code/...` manifest volume links | `.ploinky` volume host paths | staged code entries |
 
-Podman receives `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main`. It also receives extra self-mounts for real symlink targets. Manifest volumes that target `/code/node_modules` are rejected. Writable Podman manifest volumes under `.ploinky/data/` are mounted with `:U` so non-root images can own their private runtime state; arbitrary external manifest volumes keep the normal `:z` suffix unless `volumeOptions.<containerPath>.podmanChown` opts in.
+Podman receives `NODE_OPTIONS=--preserve-symlinks --preserve-symlinks-main`. It also receives extra self-mounts for real symlink targets. Manifest volumes that target `/code/node_modules` are rejected. Writable Podman manifest volumes under `.data/` are mounted with `:U` so non-root images can own their private runtime state; arbitrary external manifest volumes keep the normal `:z` suffix unless `volumeOptions.<containerPath>.podmanChown` opts in.
 
 Inside the Box, managed `default` and `bridge` modes require rootless Podman 5.4 or newer, Netavark, and operational `pasta`. There is no `slirp4netns` fallback. Each managed bridge is created with exact schema-2 ownership labels and `isolate=true`; same-network peers can communicate by derived alias, cross-bridge direct-IP traffic is denied, and outbound egress is preserved. Containers receive exactly `--hosts-file=none --add-host host.containers.internal:host-gateway` plus the matching `PLOINKY_ROUTER_HOST`, `PLOINKY_ROUTER_PORT`, and `PLOINKY_ROUTER_URL`. Consumers also receive `PLOINKY_INTERNAL_ROUTER_URL` and the read-only snapshot named by `PLOINKY_EDGE_TOPOLOGY_FILE`. `host` requires an exact current- generation capability and uses `127.0.0.1`; `none` receives no endpoint. Reuse validates the versioned network-contract hash and exact attachment/alias/hosts policy. An older hash remains foreign and is neither adopted nor recreated. Only exact-owned current-hash runtime drift may trigger recreation; the hash is never weakened.
 
@@ -570,13 +570,15 @@ Important bwrap mounts:
 | Staged Agent runtime under `.ploinky/deps/bwrap-runtime/` | `/Agent` read-only. |
 | Agent code path | `/code`, read-write or read-only by profile. |
 | Prepared dependency cache | `/code/node_modules` and `/Agent/node_modules` read-only. |
-| `.ploinky/shared` | `/shared`. |
+| `.data/shared` | `/shared`. |
 | Agent private key when present | `/run/ploinky-agent.key`. |
 | Agent home (`.data/<agent-or-alias>`) | `/root` read-write. |
 | Project path/current working directory | `/root` in isolated mode; the same absolute workspace or repository path in global and development modes. |
 | Agent skills path | `/code/skills` when present. |
 | Manifest volumes | Configured target paths from the root manifest and active profile, with relative host paths resolved against the workspace root and absolute host paths honored as declared. |
 | Runtime persistent storage | Configured container path. |
+
+Manifest admission rejects root-level and selected-profile volume sources below `.ploinky/data` or `.ploinky/shared`, including normalized absolute and symlink aliases. Runtime admission also rejects a project or other bind whose source is canonically equal to or inside either protected tree. Container and bwrap launches append final read-only empty-directory guards over either old path when a broader bind would expose it; Seatbelt applies final read and write denials. These guards do not create either legacy path in the workspace. Watchdog restarts classify the same admission failure as terminal policy state instead of retrying it.
 
 The bwrap process does not unshare networking, so agent ports bind on the host. It does unshare PID. The runtime explicitly sets env vars with `--clearenv` plus `--setenv`, including `PORT`, router URL, manifest env, profile env/secrets, runtime resource env, `NODE_PATH=/code/node_modules`, `HOME=/root`, `PATH`, and identity variables. `WORKSPACE_PATH` is `/root` in isolated mode and remains the separately mounted workspace or development checkout in global and development modes.
 

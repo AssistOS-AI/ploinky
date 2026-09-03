@@ -16,20 +16,23 @@ import {
 import {
     cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
+    getFailedRuntimeIdentityRotation,
     listRunningContainerNames,
+    retireExactAgentRuntimePredecessor,
 } from '../sandbox/docker/index.js';
 import { shouldMonitorManifestRuntime } from '../utils/runtime/manifestStartup.js';
 import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.js';
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
+import { assertManifestStorageAdmission } from '../utils/runtime/manifestVolumePolicy.js';
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
     RUNTIME_CAPABILITY_POLICY_VERSION,
 } from '../sandbox/runtimeCapabilities.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
-import { resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
+import { resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from '../utils/runtime/startupReadiness.js';
 import { runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import {
     buildRelayReadinessRoute,
@@ -39,7 +42,9 @@ import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import {
     abortEdgeRoutingPreparation,
+    commitAdditiveEdgeRoutingGeneration,
     inactivateEdgeRoutingGeneration,
+    readEdgeRoutingSelection,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 
@@ -59,6 +64,7 @@ const TRANSIENT_PROBE_INFRASTRUCTURE_CODES = new Set([
 ]);
 const LOGGED_RESTART_FAILURES = new WeakSet();
 const TERMINAL_POLICY_CODES = new Set([
+    'PLOINKY_AGENT_DATA_POLICY_VIOLATION',
     'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
     'PLOINKY_MANIFEST_SECURITY_INVALID',
     'PLOINKY_MANIFEST_SECURITY_PROFILE_UNSUPPORTED',
@@ -163,8 +169,37 @@ function pruneTerminalLedger(monitor, presentRegistryNames, now = Date.now()) {
 function classifyTerminalFailure(error) {
     const code = String(error?.code || '');
     if (TERMINAL_POLICY_CODES.has(code)) return 'policy';
-    if (code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS') return 'identity';
+    if (code === 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS'
+        || code === 'PLOINKY_RUNTIME_PREPARATION_REQUIRED') return 'identity';
+    if (code === 'PLOINKY_PREDECESSOR_CLEANUP_REQUIRED') return 'cleanup';
     return '';
+}
+
+function runtimeCleanupEvidence(candidate) {
+    if (!candidate) return null;
+    const record = candidate.registryRecord || {};
+    return deepFreezeSnapshot({
+        containerName: candidate.containerName,
+        containerId: candidate.containerId || null,
+        runtimeNetwork: candidate.runtimeNetwork ? structuredClone(candidate.runtimeNetwork) : null,
+        identity: {
+            type: record.type,
+            runtime: record.runtime || 'container',
+            repoName: record.repoName,
+            agentName: record.agentName,
+            alias: record.alias || null,
+            instanceId: record.instanceId,
+            enableGeneration: record.enableGeneration,
+        },
+    });
+}
+
+function runtimeCleanupFailureEvidence(result, publicationCommitted = false) {
+    return Object.freeze({
+        publicationCommitted,
+        candidate: runtimeCleanupEvidence(result),
+        predecessor: runtimeCleanupEvidence(result?.replacementPredecessor),
+    });
 }
 
 function recordTerminalFailure(monitor, info, error, restartInputDigest) {
@@ -189,6 +224,7 @@ function recordTerminalFailure(monitor, info, error, restartInputDigest) {
         blockerFingerprint,
         code,
         classification: classifyTerminalFailure(error) || 'policy',
+        ...(error?.ploinkyCleanupEvidence ? { cleanupEvidence: error.ploinkyCleanupEvidence } : {}),
         recordedAt: new Date().toISOString(),
         absentSince: null,
         expiresAt: null,
@@ -255,6 +291,8 @@ function createContainerTarget(info, monitor) {
         runtimeAdmission: info.runtimeAdmission,
         restartSnapshot: info.restartSnapshot,
         terminalState: null,
+        pendingRestartPreparation: null,
+        pendingPredecessorRetirement: null,
     };
 }
 
@@ -271,6 +309,7 @@ function resolveWatchdogRestartInput(record, info, monitor) {
         profileName: info.profile || undefined,
         path: `manifest(${info.repoName}/${info.agentName})`,
     });
+    assertManifestStorageAdmission(manifest, profileResolution.profileConfig);
     const runtimeKind = info.runtime === 'bwrap' || info.runtime === 'seatbelt'
         ? info.runtime
         : 'container';
@@ -962,7 +1001,7 @@ function scheduleContainerRestart(monitor, target, reason) {
                     monitor,
                     target,
                     error,
-                    attempt?.digest || target.restartInputDigest || '',
+                    target.restartInputDigest || attempt?.digest || '',
                 );
                 target.circuitBreakerTripped = true;
                 return;
@@ -974,6 +1013,7 @@ function scheduleContainerRestart(monitor, target, reason) {
 
 function assertRestartAttemptCurrent(monitor, target, attempt, checkpoint, {
     expectedRegistryRecord = null,
+    expectedContainerName = null,
 } = {}) {
     if (!attempt) return;
     let currentBytes;
@@ -993,7 +1033,9 @@ function assertRestartAttemptCurrent(monitor, target, attempt, checkpoint, {
     let registryRecordMatches = true;
     try {
         const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
-        const currentRecord = loadAgents()?.[attempt.snapshot.info.containerName];
+        const currentRecord = loadAgents()?.[
+            String(expectedContainerName || attempt.snapshot.info.containerName)
+        ];
         const expectedDigest = digestValue(expectedRegistryRecord || attempt.snapshot.registryRecord);
         registryRecordMatches = Boolean(currentRecord) && digestValue(currentRecord) === expectedDigest;
     } catch (_) {
@@ -1021,7 +1063,14 @@ function positiveInteger(value, fallback) {
 function assertRestartPreparationResult(target, result) {
     const containerName = String(result?.containerName || '').trim();
     const record = result?.registryRecord;
-    if (!containerName || containerName !== String(target.containerName || '')
+    const targetContainerName = String(target.containerName || '');
+    const replacementPredecessor = result?.replacementPredecessor || null;
+    const containerIdentityMatches = containerName === targetContainerName
+        || (Boolean(replacementPredecessor)
+            && containerName !== targetContainerName
+            && String(replacementPredecessor?.containerName || '') === targetContainerName
+            && replacementPredecessor?.registryRecord?.type === 'agent');
+    if (!containerName || !containerIdentityMatches
         || !record || typeof record !== 'object' || Array.isArray(record)
         || record.type !== 'agent'
         || String(record.repoName || '') !== String(target.repoName || '')
@@ -1045,13 +1094,263 @@ function assertRestartPreparationResult(target, result) {
     if (!result.preparationLease) {
         throw new Error('watchdog runtime replacement requires its exact preparation lease');
     }
+    if (containerName !== targetContainerName
+        && (!replacementPredecessor?.containerId
+            || String(replacementPredecessor.registryRecord?.repoName || '') !== String(target.repoName || '')
+            || String(replacementPredecessor.registryRecord?.agentName || '') !== String(target.agentName || '')
+            || String(replacementPredecessor.registryRecord?.alias || '') !== String(target.alias || ''))) {
+        throw new Error(`watchdog distinct replacement requires the exact predecessor identity for '${targetContainerName}'`);
+    }
     return { containerName, record, stagedRecord };
 }
 
-function preActivationRegistryRecord(result) {
+function preActivationRegistryRecord(result, attempt = null) {
+    if (result?.preparationLease?.mode === 'additive') {
+        return attempt?.snapshot?.registryRecord || null;
+    }
     return result?.requiresEdgeActivation === true
         ? result?.stagedRegistryRecord || null
         : result?.registryRecord || null;
+}
+
+function rekeyOwnedRestartTarget(monitor, target, attempt, result, expectedRegistryRecord) {
+    if (!attempt || result?.requiresEdgeActivation !== true
+        || !result.preparationLease || result.preparationLease.mode === 'additive') return false;
+    const predecessorName = attempt.snapshot.info.containerName;
+    const prepared = assertRestartPreparationResult({ ...target, containerName: predecessorName }, result);
+    const candidateName = prepared.containerName;
+    if (candidateName !== predecessorName) {
+        const predecessor = result.replacementPredecessor;
+        const original = attempt.snapshot.registryRecord;
+        if (String(predecessor.registryRecord.instanceId || '') !== String(original.instanceId || '')
+            || String(predecessor.registryRecord.enableGeneration || '') !== String(original.enableGeneration || '')
+            || String(predecessor.registryRecord.containerId || '') !== String(predecessor.containerId || '')
+            || (original.containerId && String(original.containerId) !== String(predecessor.containerId || ''))
+            || digestValue(predecessor.runtimeNetwork || null) !== digestValue(attempt.snapshot.profileResolution.network)) {
+            throw new Error('watchdog replacement predecessor differs from its immutable restart attempt');
+        }
+        const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
+        if (loadAgents()?.[predecessorName] !== undefined
+            || (monitor.targets.has(candidateName) && monitor.targets.get(candidateName) !== target)) {
+            const error = new Error('watchdog replacement identity changed before target rekey');
+            error.code = 'PLOINKY_RESTART_ATTEMPT_STALE';
+            throw error;
+        }
+    }
+    assertRestartAttemptCurrent(monitor, target, attempt, 'pre-target-rekey', {
+        expectedRegistryRecord,
+        expectedContainerName: candidateName,
+    });
+    if (target.containerName !== candidateName) {
+        monitor.targets.delete(target.containerName);
+        target.containerName = candidateName;
+        monitor.targets.set(candidateName, target);
+        monitor.runtimeSnapshotTakenAt = 0;
+    }
+    // Only the index changes while readiness is in flight. The original
+    // immutable attempt remains authoritative at every lifecycle checkpoint;
+    // sync now sees isRestarting on this same target instead of starting a
+    // second watch with an empty retry history for the staged registry key.
+    return true;
+}
+
+function refreshFailedRestartInput(monitor, target, record) {
+    const readRouting = monitor.readRoutingConfig || readRoutingConfig;
+    const info = {
+        containerName: target.containerName,
+        agentName: target.agentName,
+        repoName: target.repoName,
+        alias: record.alias || null,
+        profile: record.profile || null,
+        runtime: record.runtime || 'container',
+        instanceId: String(record.instanceId || '').trim() || null,
+        enableGeneration: String(record.enableGeneration || '').trim() || null,
+        manifestPath: target.manifestPath,
+        routing: readRouting(),
+    };
+    const input = resolveWatchdogRestartInput(record, info, monitor);
+    if (!input) throw new Error('watchdog failed replacement no longer has a monitored runtime');
+    target.alias = info.alias;
+    target.profile = info.profile;
+    target.runtime = info.runtime;
+    target.instanceId = info.instanceId;
+    target.enableGeneration = info.enableGeneration;
+    target.restartInputDigest = input.restartInputDigest;
+    target.runtimeAdmission = input.runtimeAdmission;
+    target.restartSnapshot = input.restartSnapshot;
+    stopProbeWorker(target);
+    target.probeState = 'pending';
+    target.probeLastSuccessAt = null;
+}
+
+function quarantineFailedRuntimeIdentityRotation(monitor, target, attempt, failure, rotation) {
+    if (!attempt) throw failure;
+    const original = attempt.snapshot.registryRecord;
+    const predecessorName = attempt.snapshot.info.containerName;
+    const candidateName = rotation.containerName;
+    const staged = rotation.stagedRegistryRecord;
+    const network = rotation.runtimeNetwork || attempt.snapshot.profileResolution.network;
+    const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
+    if (target.containerName !== predecessorName
+        || rotation.predecessorContainerName !== predecessorName
+        || digestValue(rotation.predecessorRegistryRecord) !== digestValue(original)
+        || !staged?.instanceId || !staged.enableGeneration
+        || digestValue(staged) !== digestValue({
+            ...original,
+            instanceId: staged.instanceId,
+            enableGeneration: staged.enableGeneration,
+        })
+        || digestValue(network) !== digestValue(attempt.snapshot.profileResolution.network)
+        || (original.containerId && String(original.containerId) !== String(rotation.predecessorContainerId || ''))
+        || (candidateName !== predecessorName && loadAgents()?.[predecessorName] !== undefined)
+        || (monitor.targets.has(candidateName) && monitor.targets.get(candidateName) !== target)) {
+        const error = new Error('watchdog failed identity rotation no longer matches its exact immutable attempt');
+        error.code = 'PLOINKY_RESTART_ATTEMPT_STALE';
+        throw error;
+    }
+    assertRestartAttemptCurrent(monitor, target, attempt, 'pre-unprepared-rotation-quarantine', {
+        expectedRegistryRecord: staged,
+        expectedContainerName: candidateName,
+    });
+    if (target.containerName !== candidateName) {
+        monitor.targets.delete(target.containerName);
+        target.containerName = candidateName;
+        monitor.targets.set(candidateName, target);
+        monitor.runtimeSnapshotTakenAt = 0;
+    }
+    refreshFailedRestartInput(monitor, target, staged);
+    const error = new Error('watchdog runtime identity was staged but preparation failed before launch; explicit reconciliation is required', { cause: failure });
+    error.code = 'PLOINKY_RUNTIME_PREPARATION_REQUIRED';
+    const cleanupEvidence = Object.freeze({
+        ...runtimeCleanupFailureEvidence({
+            containerName: candidateName,
+            // The staged record can still contain the predecessor's ID. No
+            // new physical candidate exists at this coordinator boundary.
+            containerId: null,
+            registryRecord: staged,
+            runtimeNetwork: network,
+            replacementPredecessor: {
+                containerName: predecessorName,
+                containerId: rotation.predecessorContainerId || null,
+                registryRecord: original,
+                runtimeNetwork: network,
+            },
+        }),
+        launchAttempted: false,
+        preparationPhase: rotation.phase,
+    });
+    Object.defineProperty(error, 'ploinkyCleanupEvidence', { value: cleanupEvidence });
+    // A provenance-bound failed write is evidence for quarantine only. It is
+    // not a preparation lease or cleanup receipt, and never authorizes abort,
+    // predecessor restoration, or removal of either physical runtime.
+    target.terminalState = recordTerminalFailure(monitor, target, error, target.restartInputDigest);
+    target.circuitBreakerTripped = true;
+    target.lastError = error.message;
+    logEvent(monitor, 'error', 'container_restart_preparation_failed_before_launch', {
+        container: candidateName,
+        agent: target.agentName,
+        repo: target.repoName,
+        code: error.code,
+        cleanupEvidence,
+        error: failure?.message || failure,
+    });
+    LOGGED_RESTART_FAILURES.add(error);
+    throw error;
+}
+
+function retainFailedRestartPreparation(monitor, target, result, failure) {
+    const retainedResult = { ...result };
+    for (const field of ['registryRecord', 'stagedRegistryRecord', 'runtimeNetwork', 'replacementPredecessor']) {
+        if (retainedResult[field]) retainedResult[field] = deepFreezeSnapshot(structuredClone(retainedResult[field]));
+    }
+    // These capabilities are provenance-bound, not serializable documents.
+    // Preserve the original preparationLease and cleanupReceipt references;
+    // cloning a field-identical receipt does not authorize exact cleanup.
+    target.pendingRestartPreparation = Object.freeze({
+        result: Object.freeze(retainedResult),
+        failure,
+        restartInputDigest: target.restartInputDigest,
+    });
+    logEvent(monitor, 'error', 'container_restart_preparation_retained', {
+        ...runtimeCleanupEvidence(retainedResult),
+        container: retainedResult.containerName,
+        predecessor: runtimeCleanupEvidence(retainedResult.replacementPredecessor),
+        code: failure?.code || null,
+    });
+}
+
+async function retryFailedRestartPreparation(monitor, target, reason, assertCurrent) {
+    const pending = target.pendingRestartPreparation;
+    if (!pending || pending.restartInputDigest !== target.restartInputDigest) return;
+    assertCurrent();
+    // Cleanup may have consumed its one-shot receipt before physical removal
+    // failed. Keep the evidence, but never retry that capability or launch a
+    // further candidate automatically after ownership becomes ambiguous.
+    if (pending.result.candidateCleanupFailed === true) throw pending.failure;
+    try {
+        await abortFailedRestartPreparation(monitor, target, pending.result, reason, pending.failure);
+    } catch (error) {
+        retainFailedRestartPreparation(monitor, target, error.ploinkyRestartCandidate || pending.result, error);
+        throw error;
+    }
+    target.pendingRestartPreparation = null;
+    if (pending.result.preparationLease?.mode !== 'additive' && pending.result.replacementPredecessor) {
+        target.pendingPredecessorRetirement = Object.freeze({
+            predecessor: pending.result.replacementPredecessor,
+            restartInputDigest: target.restartInputDigest,
+        });
+    }
+    // The completed candidate cleanup must not be repeated if this check
+    // detects drift. Its separately retained predecessor remains fenced by
+    // the original input digest and inactive, unregistered identity checks.
+    assertCurrent();
+}
+
+async function retryFailedPredecessorRetirement(monitor, target, networkLifecycleCapability, assertCurrent) {
+    const pending = target.pendingPredecessorRetirement;
+    if (!pending) return;
+    // An external replacement must not inherit either this cleanup authority
+    // or the failed attempt's retry budget. The logged immutable receipt
+    // remains available for explicit reconciliation if the input changed.
+    if (pending.restartInputDigest !== target.restartInputDigest) return;
+    // A published successor stays active. This is terminal reconciliation
+    // evidence, not permission to run inactive-generation recovery against it.
+    if (pending.publicationCommitted === true) throw pending.failure;
+    const predecessor = pending.predecessor;
+    const readSelection = monitor.readEdgeRoutingSelection || readEdgeRoutingSelection;
+    const loadAgents = monitor.loadAgents || workspaceSvc.loadAgents;
+    assertCurrent();
+    if (readSelection()?.selector?.state !== 'inactive'
+        || loadAgents()?.[predecessor.containerName] !== undefined) {
+        const error = new Error('watchdog failed predecessor is no longer revoked and unregistered');
+        error.code = 'PLOINKY_RESTART_ATTEMPT_STALE';
+        throw error;
+    }
+    const retire = monitor.retireExactAgentRuntimePredecessor || retireExactAgentRuntimePredecessor;
+    try {
+        await Promise.resolve(retire(predecessor, { networkLifecycleCapability }));
+        target.pendingPredecessorRetirement = null;
+    } catch (cause) {
+        // Preserve the exact receipt before surfacing a failed cleanup. The
+        // next attempt retries it before it may create another replacement.
+        logEvent(monitor, 'error', 'container_restart_predecessor_retirement_failed', {
+            container: predecessor.containerName,
+            containerId: predecessor.containerId,
+            replacement: target.containerName,
+            runtimeNetwork: predecessor.runtimeNetwork,
+            identity: {
+                repoName: predecessor.registryRecord.repoName,
+                agentName: predecessor.registryRecord.agentName,
+                alias: predecessor.registryRecord.alias || null,
+                instanceId: predecessor.registryRecord.instanceId,
+                enableGeneration: predecessor.registryRecord.enableGeneration,
+            },
+            error: cause?.message || cause,
+        });
+        const error = new Error('watchdog could not retire its exact revoked predecessor; preserving its cleanup receipt', { cause });
+        error.code = 'PLOINKY_RECOVERY_PREDECESSOR_RETIREMENT_FAILED';
+        throw error;
+    }
 }
 
 async function waitForRestartedContainerReadiness(
@@ -1094,21 +1393,14 @@ async function waitForRestartedContainerReadiness(
     }
     const waitUntilReady = monitor.waitForAgentReady || waitForAgentReady;
     const ready = await waitUntilReady(readinessRoute, {
-        timeoutMs: positiveInteger(
-            monitor?.config?.CONTAINER_RESTART_READY_TIMEOUT_MS
+        ...resolveManifestReadinessWaitOptions(manifest, 120000, {
+            timeoutMs: monitor?.config?.CONTAINER_RESTART_READY_TIMEOUT_MS
                 ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_TIMEOUT_MS,
-            120000,
-        ),
-        intervalMs: positiveInteger(
-            monitor?.config?.CONTAINER_RESTART_READY_INTERVAL_MS
+            intervalMs: monitor?.config?.CONTAINER_RESTART_READY_INTERVAL_MS
                 ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_INTERVAL_MS,
-            250,
-        ),
-        probeTimeoutMs: positiveInteger(
-            monitor?.config?.CONTAINER_RESTART_READY_PROBE_TIMEOUT_MS
+            probeTimeoutMs: monitor?.config?.CONTAINER_RESTART_READY_PROBE_TIMEOUT_MS
                 ?? process.env.PLOINKY_CONTAINER_MONITOR_READY_PROBE_TIMEOUT_MS,
-            1000,
-        ),
+        }),
         protocol,
     });
     if (!ready) {
@@ -1116,10 +1408,39 @@ async function waitForRestartedContainerReadiness(
     }
 }
 
+function publishedPredecessorCleanupFailure(monitor, target, result, cause) {
+    const cleanupEvidence = runtimeCleanupFailureEvidence(result, true);
+    const evidence = cleanupEvidence.predecessor;
+    const predecessor = deepFreezeSnapshot({
+        containerName: evidence.containerName,
+        containerId: evidence.containerId,
+        runtimeNetwork: evidence.runtimeNetwork,
+        registryRecord: { ...evidence.identity, containerId: evidence.containerId },
+    });
+    const error = new Error('watchdog activated its successor but could not retire the exact predecessor; explicit cleanup is required', { cause });
+    error.code = 'PLOINKY_PREDECESSOR_CLEANUP_REQUIRED';
+    Object.defineProperty(error, 'ploinkyCleanupEvidence', { value: cleanupEvidence });
+    target.pendingPredecessorRetirement = Object.freeze({
+        predecessor,
+        publicationCommitted: true,
+        failure: error,
+        restartInputDigest: target.restartInputDigest,
+    });
+    logEvent(monitor, 'error', 'container_restart_predecessor_retirement_failed', {
+        container: predecessor.containerName,
+        containerId: predecessor.containerId,
+        replacement: result.containerName,
+        cleanupEvidence,
+        error: cause?.message || cause,
+    });
+    return error;
+}
+
 async function activateRestartedContainerRoute(monitor, target, agentDir, result, networkMode, {
     assertCurrent = () => {},
     onRegistryCommitted = () => {},
     onCommitted = () => {},
+    networkLifecycleCapability = null,
 } = {}) {
     const prepared = assertRestartPreparationResult(target, result);
     if (!prepared) return false;
@@ -1141,6 +1462,55 @@ async function activateRestartedContainerRoute(monitor, target, agentDir, result
         || (monitor.applyEdgeRoutingGeneration
             ? (callback) => callback(Object.freeze({ testOnly: true }))
             : withEdgeGenerationApplyLock);
+    const retirePredecessor = monitor.retireExactAgentRuntimePredecessor
+        || retireExactAgentRuntimePredecessor;
+    if (result.preparationLease?.mode === 'additive') {
+        const readRouting = monitor.readRoutingConfig || readRoutingConfig;
+        const commitAdditive = monitor.commitAdditiveEdgeRoutingGeneration
+            || commitAdditiveEdgeRoutingGeneration;
+        const predecessorName = String(result.replacementPredecessor?.containerName || '');
+        if (!predecessorName || predecessorName === prepared.containerName) {
+            throw new Error(`watchdog additive replacement requires one distinct exact predecessor for '${prepared.containerName}'`);
+        }
+        await runWithApplyLock(async (applyLockCapability) => {
+            assertCurrent('additive-route-registry-commit', result.replacementPredecessor.registryRecord);
+            const agents = loadAgents();
+            const predecessor = agents?.[predecessorName];
+            if (!predecessor || predecessor.type !== 'agent'
+                || digestValue(predecessor) !== digestValue(result.replacementPredecessor.registryRecord)) {
+                throw new Error(`watchdog additive replacement lost its active predecessor registry identity for '${predecessorName}'`);
+            }
+            delete agents[predecessorName];
+            agents[prepared.containerName] = structuredClone(prepared.record);
+            const routing = readRouting();
+            routing.routes = routing.routes || {};
+            for (const currentRoute of Object.values(routing.routes)) {
+                if (currentRoute && currentRoute.container === predecessorName) {
+                    currentRoute.container = prepared.containerName;
+                }
+            }
+            routing.routes[routeKey] = mergeRuntimeRoute(
+                routing.routes[routeKey],
+                route,
+                { hostPort: route.hostPort },
+            );
+            await Promise.resolve(commitAdditive(result.preparationLease, {
+                agents,
+                routing,
+                applyLockCapability,
+            }));
+            onRegistryCommitted();
+            onCommitted();
+        }, { preparationLease: result.preparationLease });
+        try {
+            await Promise.resolve(retirePredecessor(result.replacementPredecessor, {
+                networkLifecycleCapability,
+            }));
+        } catch (error) {
+            throw publishedPredecessorCleanupFailure(monitor, target, result, error);
+        }
+        return true;
+    }
     await runWithApplyLock(async (applyLockCapability) => {
         await mergeRoute((cfg) => {
             assertCurrent('route-registry-commit', prepared.stagedRecord);
@@ -1174,6 +1544,16 @@ async function activateRestartedContainerRoute(monitor, target, agentDir, result
         }));
         onCommitted();
     }, { preparationLease: result.preparationLease });
+    if (result.replacementPredecessor
+        && String(result.replacementPredecessor.containerName || '') !== prepared.containerName) {
+        try {
+            await Promise.resolve(retirePredecessor(result.replacementPredecessor, {
+                networkLifecycleCapability,
+            }));
+        } catch (error) {
+            throw publishedPredecessorCleanupFailure(monitor, target, result, error);
+        }
+    }
     return true;
 }
 
@@ -1208,7 +1588,7 @@ async function abortFailedRestartPreparation(monitor, target, result, reason, or
                 writable: false,
                 value: Object.freeze({
                     ...result,
-                    exactCleanupPerformed: false,
+                    exactCleanupPerformed: result.exactCleanupPerformed === true,
                     preparationAbortFailed: true,
                     preparationAbortedBeforeCleanup: false,
                 }),
@@ -1221,19 +1601,41 @@ async function abortFailedRestartPreparation(monitor, target, result, reason, or
             || cleanupExactAgentRuntimeCandidate;
         try {
             await Promise.resolve(cleanupCandidate(result));
-        } catch (error) {
+        } catch (cause) {
             logEvent(monitor, 'error', 'container_restart_candidate_cleanup_failed', {
                 container: result.containerName || target.containerName,
                 agent: target.agentName,
                 repo: target.repoName,
-                error: error?.message || error,
+                error: cause?.message || cause,
             });
+            const error = new Error('watchdog could not prove exact candidate cleanup; preserving its runtime ownership evidence for reconciliation', { cause });
+            error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
+            Object.defineProperty(error, 'originalFailure', { value: originalFailure });
+            Object.defineProperty(error, 'ploinkyCleanupEvidence', { value: runtimeCleanupFailureEvidence(result) });
+            Object.defineProperty(error, 'ploinkyRestartCandidate', {
+                value: Object.freeze({
+                    ...result,
+                    exactCleanupPerformed: false,
+                    preparationAbortFailed: false,
+                    preparationAbortedBeforeCleanup: Boolean(result.preparationLease),
+                    candidateCleanupFailed: true,
+                }),
+            });
+            throw error;
         }
     }
 }
 
 export async function performContainerRestart(monitor, target, reason, attempt = null) {
     if (!monitor || !target) return;
+    if (!attempt && target.restartInputDigest && target.restartSnapshot) {
+        attempt = Object.freeze({
+            target,
+            epoch: target.attemptEpoch,
+            digest: target.restartInputDigest,
+            snapshot: target.restartSnapshot,
+        });
+    }
     assertRestartAttemptCurrent(monitor, target, attempt, 'pre-mutation-lock');
     if (monitor.isShuttingDown()) {
         target.isRestarting = false;
@@ -1291,8 +1693,18 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         let result = null;
         let activationCommitted = false;
         let registryCandidateCommitted = false;
+        let ownedCandidate = false;
+        let retryingPreparation = false;
         try {
         assertRestartAttemptCurrent(monitor, target, attempt, 'pre-physical-ensure');
+        retryingPreparation = true;
+        await retryFailedRestartPreparation(monitor, target, reason, () => {
+            assertRestartAttemptCurrent(monitor, target, attempt, 'pre-pending-preparation-cleanup');
+        });
+        retryingPreparation = false;
+        await retryFailedPredecessorRetirement(monitor, target, networkLifecycleCapability, () => {
+            assertRestartAttemptCurrent(monitor, target, attempt, 'pre-pending-predecessor-retirement');
+        });
         let manifestBytes;
         let manifest;
         try {
@@ -1338,6 +1750,15 @@ export async function performContainerRestart(monitor, target, reason, attempt =
         const routerEndpoint = resolveEndpoint(profileResolution.network.mode);
         const agentDir = path.dirname(target.manifestPath);
         const ensureAgentServiceImpl = monitor.ensureAgentService || ensureAgentService;
+        const readEdgeSelection = monitor.readEdgeRoutingSelection || readEdgeRoutingSelection;
+        // Only managed networks can stage a distinct runtime while its
+        // predecessor remains authorized. Host/none recovery replaces the
+        // same runtime name and must revoke the old identity first, under the
+        // replacement coordinator's lifecycle and generation locks.
+        const canStageReplacement = profileResolution.network.mode === 'default'
+            || profileResolution.network.mode === 'bridge';
+        const preserveActiveAuthorization = canStageReplacement
+            && readEdgeSelection().selector.state === 'active';
         if (target.runtimeAdmission) {
             assertRuntimeAdmissionCurrent(target.runtimeAdmission, {
                 manifestBytes,
@@ -1355,11 +1776,15 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             profileResolution,
             routerEndpoint,
             forceRecreate: reason === 'semantic_probe_failed',
+            preserveActiveAuthorization,
             networkLifecycleCapability,
             runtimeAdmission: target.runtimeAdmission,
         }));
         assertRestartAttemptCurrent(monitor, target, attempt, 'post-physical-ensure', {
-            expectedRegistryRecord: preActivationRegistryRecord(result),
+            expectedRegistryRecord: preActivationRegistryRecord(result, attempt),
+            expectedContainerName: result?.preparationLease?.mode === 'additive'
+                ? target.containerName
+                : result?.containerName,
         });
         // Preparation rereads the manifest for generation capture, while the
         // physical launch consumes the object above. Exact-byte comparisons on
@@ -1380,6 +1805,9 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             target.isRestarting = false;
             return;
         }
+        ownedCandidate = rekeyOwnedRestartTarget(
+            monitor, target, attempt, result, preActivationRegistryRecord(result, attempt),
+        );
 
         await waitForRestartedContainerReadiness(
             monitor,
@@ -1389,11 +1817,17 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             profileResolution.network.mode,
         );
         assertRestartAttemptCurrent(monitor, target, attempt, 'post-readiness', {
-            expectedRegistryRecord: prepared.stagedRecord,
+            expectedRegistryRecord: preActivationRegistryRecord(result, attempt),
+            expectedContainerName: result?.preparationLease?.mode === 'additive'
+                ? target.containerName
+                : result?.containerName,
         });
         assertManifestUnchanged();
         assertRestartAttemptCurrent(monitor, target, attempt, 'pre-route-activation', {
-            expectedRegistryRecord: prepared.stagedRecord,
+            expectedRegistryRecord: preActivationRegistryRecord(result, attempt),
+            expectedContainerName: result?.preparationLease?.mode === 'additive'
+                ? target.containerName
+                : result?.containerName,
         });
         await activateRestartedContainerRoute(
             monitor,
@@ -1402,9 +1836,13 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             result,
             profileResolution.network.mode,
             {
+                networkLifecycleCapability,
                 assertCurrent(checkpoint, expectedRegistryRecord) {
                     assertRestartAttemptCurrent(monitor, target, attempt, checkpoint, {
                         expectedRegistryRecord,
+                        expectedContainerName: result?.preparationLease?.mode === 'additive'
+                            ? target.containerName
+                            : result?.containerName,
                     });
                     assertManifestUnchanged();
                 },
@@ -1444,14 +1882,98 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             reason
         });
         } catch (error) {
-        const failedResult = result || error?.ploinkyRestartCandidate || null;
+        const failedRotation = getFailedRuntimeIdentityRotation(error);
+        if (failedRotation) {
+            try {
+                quarantineFailedRuntimeIdentityRotation(monitor, target, attempt, error, failedRotation);
+            } finally {
+                target.isRestarting = false;
+            }
+        }
+        // A retained transaction has already handled its exact abort/cleanup.
+        // Its failure must not be processed again as a newly launched result.
+        const failedResult = retryingPreparation ? null : result || error?.ploinkyRestartCandidate || null;
+        const expectedRegistryRecord = registryCandidateCommitted
+            ? failedResult?.registryRecord || null
+            : preActivationRegistryRecord(failedResult, attempt);
+        const expectedContainerName = failedResult?.preparationLease?.mode === 'additive'
+            && !registryCandidateCommitted
+            ? target.containerName
+            : failedResult?.containerName;
         let surfacedError = error;
+        let preparationAborted = false;
+        if (!activationCommitted && !ownedCandidate) {
+            try {
+                ownedCandidate = rekeyOwnedRestartTarget(
+                    monitor, target, attempt, failedResult, expectedRegistryRecord,
+                );
+            } catch (_) {
+                // Cleanup still owns its exact launch receipt after external
+                // drift. The existing failure checkpoint below rejects stale
+                // registry/manifest state before any target can adopt it.
+            }
+        }
         if (!activationCommitted) {
             try {
                 await abortFailedRestartPreparation(monitor, target, failedResult, reason, error);
+                preparationAborted = Boolean(failedResult?.preparationLease);
             } catch (recoveryError) {
                 surfacedError = recoveryError;
             }
+        }
+        const assertFailureCurrent = () => assertRestartAttemptCurrent(
+            monitor, target, attempt, 'pre-failure-record', {
+                expectedRegistryRecord,
+                expectedContainerName,
+            },
+        );
+        assertFailureCurrent();
+        const recoveryCandidate = surfacedError?.ploinkyRestartCandidate;
+        if (!activationCommitted && !retryingPreparation && attempt
+            && (recoveryCandidate?.preparationAbortFailed || recoveryCandidate?.candidateCleanupFailed)
+            && (ownedCandidate || (failedResult?.preparationLease?.mode === 'additive'
+                && assertRestartPreparationResult(target, failedResult)))) {
+            retainFailedRestartPreparation(monitor, target, recoveryCandidate, surfacedError);
+        }
+        if (!activationCommitted && ownedCandidate) {
+            if (preparationAborted && failedResult.replacementPredecessor) {
+                target.pendingPredecessorRetirement = deepFreezeSnapshot({
+                    predecessor: structuredClone(failedResult.replacementPredecessor),
+                    restartInputDigest: target.restartInputDigest,
+                });
+                try {
+                    await retryFailedPredecessorRetirement(
+                        monitor, target, networkLifecycleCapability, assertFailureCurrent,
+                    );
+                } catch (recoveryError) {
+                    surfacedError = recoveryError;
+                }
+            }
+        }
+        const publishedCleanupRequired = activationCommitted
+            && surfacedError?.code === 'PLOINKY_PREDECESSOR_CLEANUP_REQUIRED';
+        if ((!activationCommitted && ownedCandidate) || publishedCleanupRequired) {
+            assertFailureCurrent();
+            refreshFailedRestartInput(monitor, target, expectedRegistryRecord);
+            if (attempt && target.pendingRestartPreparation?.restartInputDigest === attempt.digest) {
+                target.pendingRestartPreparation = Object.freeze({
+                    ...target.pendingRestartPreparation,
+                    restartInputDigest: target.restartInputDigest,
+                });
+            }
+            if (attempt && target.pendingPredecessorRetirement?.restartInputDigest === attempt.digest) {
+                target.pendingPredecessorRetirement = Object.freeze({
+                    ...target.pendingPredecessorRetirement,
+                    restartInputDigest: target.restartInputDigest,
+                });
+            }
+        }
+        if (publishedCleanupRequired) {
+            // Persist the sanitized immutable predecessor evidence while the
+            // exact committed successor is still fenced. Never abort its
+            // successful publication or let a cleanup failure restart it.
+            target.terminalState = recordTerminalFailure(monitor, target, surfacedError, target.restartInputDigest);
+            target.circuitBreakerTripped = true;
         }
         target.lastError = surfacedError?.message || surfacedError;
         logEvent(monitor, 'error', 'container_restart_failed', {
@@ -1463,11 +1985,6 @@ export async function performContainerRestart(monitor, target, reason, attempt =
             code: surfacedError?.code || null,
         });
         if (surfacedError && typeof surfacedError === 'object') LOGGED_RESTART_FAILURES.add(surfacedError);
-        assertRestartAttemptCurrent(monitor, target, attempt, 'pre-failure-record', {
-            expectedRegistryRecord: registryCandidateCommitted
-                ? failedResult?.registryRecord || null
-                : preActivationRegistryRecord(failedResult),
-        });
         target.isRestarting = false;
         throw surfacedError;
         }

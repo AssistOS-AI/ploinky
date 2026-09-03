@@ -28,7 +28,7 @@ import { isBwrapProcessRunning, stopBwrapProcess } from '../sandbox/bwrap/bwrapF
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
 import { resolveManifestRuntimeProfile } from './runtime/profileService.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
-import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from './runtime/startupReadiness.js';
+import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from './runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import {
     buildRelayReadinessRoute,
@@ -231,9 +231,11 @@ export async function waitForEnabledAgentReadiness(shortAgentName, manifest, sta
         }
     };
     const ready = await waitUntilReady(readinessRoute, {
-        timeoutMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_TIMEOUT_MS || '120000', 10),
-        intervalMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_INTERVAL_MS || '250', 10),
-        probeTimeoutMs: Number.parseInt(process.env.PLOINKY_ENABLE_AGENT_READY_PROBE_TIMEOUT_MS || '1000', 10),
+        ...resolveManifestReadinessWaitOptions(manifest, 120000, {
+            timeoutMs: process.env.PLOINKY_ENABLE_AGENT_READY_TIMEOUT_MS,
+            intervalMs: process.env.PLOINKY_ENABLE_AGENT_READY_INTERVAL_MS,
+            probeTimeoutMs: process.env.PLOINKY_ENABLE_AGENT_READY_PROBE_TIMEOUT_MS,
+        }),
         protocol,
         beforeProbe,
     });

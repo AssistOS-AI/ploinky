@@ -1,5 +1,6 @@
 import { spawnSync } from 'child_process';
 import { flagsToArgs, getRuntime, waitForContainerRunning } from './common.js';
+import { buildAgentShellArgs } from './agentShell.js';
 
 const DEFAULT_AGENT_ENTRY = 'sh /Agent/server/AgentServer.sh';
 
@@ -49,7 +50,7 @@ function buildAgentSidecarExecArgs(containerName, command) {
     const normalizedContainer = String(containerName || '').trim();
     const normalizedCommand = String(command || '').trim();
     if (!normalizedContainer || !normalizedCommand) return [];
-    return ['exec', '-d', normalizedContainer, 'sh', '-lc', normalizedCommand];
+    return ['exec', '-d', normalizedContainer, ...buildAgentShellArgs(normalizedCommand)];
 }
 
 function normalizeLifecycleCommands(entry) {

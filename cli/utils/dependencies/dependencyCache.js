@@ -23,6 +23,14 @@ import {
 import { getRuntime, managedContainerLabelArgs } from '../../sandbox/docker/common.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from '../../sandbox/docker/shellDetection.js';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
+import {
+    activeBoxMcpSdkBundle,
+    boxMcpSdkCacheProblem,
+    boxMcpSdkStampSection,
+    finalizeBoxMcpSdkCache,
+    installWithBoxMcpSdk,
+    needsNpmInstall,
+} from '../../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
 
 // v2 records the direct-mounted achillesAgentLib selection, so a cache prepared
 // against a different source — or for a different runtime family's link target
@@ -83,7 +91,22 @@ export function hashMergedPackage(mergedPackage) {
         dependencies: sortObject(mergedPackage?.dependencies || {}),
         devDependencies: sortObject(mergedPackage?.devDependencies || {}),
     };
+    if (isInsideBox()) {
+        // The Box may skip npm entirely for an SDK-only cache. Adding an npm
+        // lifecycle script or other install input must invalidate that cache.
+        for (const field of ['optionalDependencies', 'peerDependencies', 'peerDependenciesMeta', 'overrides', 'scripts', 'bundleDependencies', 'bundledDependencies']) {
+            if (mergedPackage?.[field] !== undefined) ordered[field] = canonicalValue(mergedPackage[field]);
+        }
+    }
     return sha256(JSON.stringify(ordered));
+}
+
+function canonicalValue(value) {
+    if (Array.isArray(value)) return value.map(canonicalValue);
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalValue(value[key])]));
+    }
+    return value;
 }
 
 /**
@@ -282,7 +305,9 @@ export function isAgentLibLinkValid(cachePath, { runtimeKey, agentLib = null } =
     return { valid: true, reason: 'ok' };
 }
 
-export function isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, installer = null }) {
+export function isGlobalCacheValid(cachePath, {
+    runtimeKey, globalPackageHash, installer = null, mcpSdk = activeBoxMcpSdkBundle(),
+}) {
     const stamp = readStamp(cachePath);
     if (!stamp) return { valid: false, reason: 'stamp missing' };
     if (stamp.version !== STAMP_VERSION) return { valid: false, reason: `stamp version ${stamp.version} != ${STAMP_VERSION}` };
@@ -292,10 +317,14 @@ export function isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, i
     if (installerReason) return { valid: false, reason: installerReason };
     const marker = path.join(cachePath, 'node_modules', CORE_MARKER_MODULE);
     if (!fs.existsSync(marker)) return { valid: false, reason: `core marker ${CORE_MARKER_MODULE} missing` };
+    const sdkProblem = boxMcpSdkCacheProblem(cachePath, stamp, mcpSdk);
+    if (sdkProblem) return { valid: false, reason: sdkProblem };
     return { valid: true, reason: 'ok' };
 }
 
-export function isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer = null }) {
+export function isAgentCacheValid(cachePath, {
+    runtimeKey, mergedPackageHash, installer = null, mcpSdk = activeBoxMcpSdkBundle(),
+}) {
     const stamp = readStamp(cachePath);
     if (!stamp) return { valid: false, reason: 'stamp missing' };
     if (stamp.version !== STAMP_VERSION) return { valid: false, reason: `stamp version ${stamp.version} != ${STAMP_VERSION}` };
@@ -305,6 +334,8 @@ export function isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, in
     if (installerReason) return { valid: false, reason: installerReason };
     const marker = path.join(cachePath, 'node_modules', CORE_MARKER_MODULE);
     if (!fs.existsSync(marker)) return { valid: false, reason: `core marker ${CORE_MARKER_MODULE} missing` };
+    const sdkProblem = boxMcpSdkCacheProblem(cachePath, stamp, mcpSdk);
+    if (sdkProblem) return { valid: false, reason: sdkProblem };
     return { valid: true, reason: 'ok' };
 }
 
@@ -553,9 +584,9 @@ function withGithubHttpsGitConfig(env = process.env, { cwd = '' } = {}) {
     };
 }
 
-function runNpmInstall(cwd, { log = debugLog } = {}) {
+function runNpmInstall(cwd, { log = debugLog, linkBoxMcpSdk = false } = {}) {
     log(`[deps-cache] npm install in ${cwd}`);
-    const result = spawnSync('npm', NPM_INSTALL_ARGS, {
+    const result = spawnSync('npm', npmInstallArgs({ linkBoxMcpSdk }), {
         cwd,
         env: withGithubHttpsGitConfig(process.env, { cwd }),
         stdio: 'inherit',
@@ -569,13 +600,17 @@ function runNpmInstall(cwd, { log = debugLog } = {}) {
     }
 }
 
+function npmInstallArgs({ linkBoxMcpSdk = false } = {}) {
+    return linkBoxMcpSdk ? [...NPM_INSTALL_ARGS, '--install-links=false'] : NPM_INSTALL_ARGS;
+}
+
 function shellQuote(value) {
     return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-export function buildContainerInstallScript({ installDir = '/install', heartbeatSeconds = 30 } = {}) {
+export function buildContainerInstallScript({ installDir = '/install', heartbeatSeconds = 30, linkBoxMcpSdk = false } = {}) {
     const installLabel = shellQuote(installDir);
-    const npmArgs = NPM_INSTALL_ARGS.map(shellQuote).join(' ');
+    const npmArgs = npmInstallArgs({ linkBoxMcpSdk }).map(shellQuote).join(' ');
     const interval = Number.isFinite(Number(heartbeatSeconds)) && Number(heartbeatSeconds) > 0
         ? String(Number(heartbeatSeconds))
         : '30';
@@ -607,8 +642,8 @@ function resolveInstallBackend(runtimeKey, { image = '', runtime = null, log = d
     if (parsed.family === 'bwrap' || parsed.family === 'seatbelt') {
         assertHostMatchesRuntimeKey(runtimeKey);
         return {
-            install(cwd) {
-                return runNpmInstall(cwd, { log });
+            install(cwd, options = {}) {
+                return runNpmInstall(cwd, { log, ...options });
             },
             installerRuntime: parsed.family,
         };
@@ -620,8 +655,8 @@ function resolveInstallBackend(runtimeKey, { image = '', runtime = null, log = d
             throw new Error(`Container cache preparation for ${runtimeKey} requires an image.`);
         }
         return {
-            install(cwd) {
-                return runNpmInstallInContainer(cwd, { image: resolvedImage, runtime: resolvedRuntime, log });
+            install(cwd, options = {}) {
+                return runNpmInstallInContainer(cwd, { image: resolvedImage, runtime: resolvedRuntime, log, ...options });
             },
             installerRuntime: resolvedRuntime,
             image: resolvedImage,
@@ -654,7 +689,7 @@ export function buildContainerInstallRunArgs({
     ];
 }
 
-function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog } = {}) {
+function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog, linkBoxMcpSdk = false } = {}) {
     if (!image) {
         throw new Error('Container dependency install requires an image.');
     }
@@ -668,6 +703,7 @@ function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog }
         image,
         runtime: resolvedRuntime,
         shellPath,
+        installScript: buildContainerInstallScript({ linkBoxMcpSdk }),
     });
     log(`[deps-cache] npm install in container ${image} at ${cwd}`);
     const result = spawnSync(resolvedRuntime, args, { stdio: 'inherit', timeout: INSTALL_TIMEOUT_MS });
@@ -686,6 +722,8 @@ export function prepareGlobalCache(runtimeKey, {
     runtime = null,
     agentLib = null,
 } = {}) {
+    const mcpSdk = activeBoxMcpSdkBundle();
+    const sdkStamp = mcpSdk ? { mcpSdk: boxMcpSdkStampSection(mcpSdk) } : {};
     const selection = agentLib || activeAgentLibSelection();
     const agentLibSection = agentLibStampSection(runtimeKey, selection);
     const backend = resolveInstallBackend(runtimeKey, { image, runtime, log });
@@ -699,7 +737,7 @@ export function prepareGlobalCache(runtimeKey, {
     const cachePath = getGlobalCachePath(runtimeKey);
 
     if (!force) {
-        const check = isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, installer: expectedInstaller });
+        const check = isGlobalCacheValid(cachePath, { runtimeKey, globalPackageHash, installer: expectedInstaller, mcpSdk });
         const linkCheck = check.valid
             ? isAgentLibLinkValid(cachePath, { runtimeKey, agentLib: selection })
             : { valid: false, reason: check.reason };
@@ -712,12 +750,14 @@ export function prepareGlobalCache(runtimeKey, {
             // repair the link and restamp instead of reinstalling packages.
             const lock = acquireLock(cachePath);
             try {
+                finalizeBoxMcpSdkCache(cachePath, mcpSdk);
                 ensureAgentLibCacheLink(cachePath, agentLibSection.linkTarget);
                 const stamp = writeStamp(cachePath, {
                     runtimeKey,
                     globalPackageHash,
                     installer: expectedInstaller,
                     agentLib: agentLibSection,
+                    ...sdkStamp,
                 });
                 log(`[deps-cache] global cache AgentLib link refreshed (${linkCheck.reason})`);
                 return { cachePath, reused: true, reason: linkCheck.reason, stamp };
@@ -731,11 +771,20 @@ export function prepareGlobalCache(runtimeKey, {
     const lock = acquireLock(cachePath);
     try {
         ensureCacheDir(cachePath);
+        if (mcpSdk) fs.rmSync(stampPath(cachePath), { force: true });
         fs.writeFileSync(
             path.join(cachePath, 'package.json'),
             JSON.stringify(globalPkg, null, 2),
         );
-        backend.install(cachePath);
+        if (!mcpSdk || needsNpmInstall(globalPkg)) {
+            installWithBoxMcpSdk(cachePath, globalPkg, mcpSdk, backend.install);
+        } else {
+            // npm normally prunes removed dependencies. On the no-npm Box
+            // path, discard the stale managed tree before restoring providers.
+            fs.rmSync(nodeModulesDir(cachePath), { recursive: true, force: true });
+            fs.mkdirSync(nodeModulesDir(cachePath), { recursive: true });
+        }
+        finalizeBoxMcpSdkCache(cachePath, mcpSdk);
         // Last cache step, after every npm operation: npm prunes node_modules
         // entries it does not know about, and this link is one of them.
         finalizeAgentLibCacheLink(cachePath, agentLibSection);
@@ -744,6 +793,7 @@ export function prepareGlobalCache(runtimeKey, {
             globalPackageHash,
             installer: expectedInstaller,
             agentLib: agentLibSection,
+            ...sdkStamp,
         });
         log(`[deps-cache] global cache prepared at ${cachePath}`);
         return { cachePath, reused: false, stamp };
@@ -790,6 +840,8 @@ export function prepareAgentCache({
     runtime = null,
     agentLib = null,
 } = {}) {
+    const mcpSdk = activeBoxMcpSdkBundle();
+    const sdkStamp = mcpSdk ? { mcpSdk: boxMcpSdkStampSection(mcpSdk) } : {};
     const selection = agentLib || activeAgentLibSelection();
     const agentLibSection = agentLibStampSection(runtimeKey, selection);
     const backend = resolveInstallBackend(runtimeKey, { image, runtime, log });
@@ -798,23 +850,23 @@ export function prepareAgentCache({
         throw new Error('prepareAgentCache requires repoName and agentName');
     }
 
-    const globalResult = prepareGlobalCache(runtimeKey, {
-        force, log, image, runtime, agentLib: selection,
-    });
-    const globalCachePath = globalResult.cachePath;
-
     const globalPkg = readGlobalDepsPackage();
     const agentPkg = (agentPackagePath && fs.existsSync(agentPackagePath))
         ? JSON.parse(fs.readFileSync(agentPackagePath, 'utf8'))
         : null;
     const mergedPkg = mergePackageJson(globalPkg, agentPkg);
+    // Validate agent overrides before even the shared cache can invoke npm.
+    const globalResult = prepareGlobalCache(runtimeKey, {
+        force, log, image, runtime, agentLib: selection,
+    });
+    const globalCachePath = globalResult.cachePath;
     const mergedPackageHash = hashMergedPackage(mergedPkg);
     const agentPackageHash = agentPackagePath ? hashFile(agentPackagePath) : null;
     const globalPackageHash = hashMergedPackage(globalPkg);
     const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
 
     if (!force) {
-        const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer: expectedInstaller });
+        const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer: expectedInstaller, mcpSdk });
         const linkCheck = check.valid
             ? isAgentLibLinkValid(cachePath, { runtimeKey, agentLib: selection })
             : { valid: false, reason: check.reason };
@@ -825,6 +877,7 @@ export function prepareAgentCache({
         if (check.valid) {
             const lock = acquireLock(cachePath);
             try {
+                finalizeBoxMcpSdkCache(cachePath, mcpSdk);
                 ensureAgentLibCacheLink(cachePath, agentLibSection.linkTarget);
                 const stamp = writeStamp(cachePath, {
                     runtimeKey,
@@ -833,6 +886,7 @@ export function prepareAgentCache({
                     mergedPackageHash,
                     installer: expectedInstaller,
                     agentLib: agentLibSection,
+                    ...sdkStamp,
                 });
                 log(`[deps-cache] agent cache AgentLib link refreshed ${repoName}/${agentName} (${linkCheck.reason})`);
                 return {
@@ -848,6 +902,7 @@ export function prepareAgentCache({
     const lock = acquireLock(cachePath);
     try {
         ensureCacheDir(cachePath);
+        if (mcpSdk) fs.rmSync(stampPath(cachePath), { force: true });
         seedFromGlobalCache(globalCachePath, cachePath, {
             log,
             allowHardlinks: shouldSeedAgentCacheWithHardlinks({
@@ -859,9 +914,10 @@ export function prepareAgentCache({
             path.join(cachePath, 'package.json'),
             JSON.stringify(mergedPkg, null, 2),
         );
-        if (agentPkg) {
-            backend.install(cachePath);
+        if (agentPkg && (!mcpSdk || needsNpmInstall(mergedPkg))) {
+            installWithBoxMcpSdk(cachePath, mergedPkg, mcpSdk, backend.install);
         }
+        finalizeBoxMcpSdkCache(cachePath, mcpSdk);
         finalizeAgentLibCacheLink(cachePath, agentLibSection);
         const stamp = writeStamp(cachePath, {
             runtimeKey,
@@ -870,6 +926,7 @@ export function prepareAgentCache({
             mergedPackageHash,
             installer: expectedInstaller,
             agentLib: agentLibSection,
+            ...sdkStamp,
         });
         log(`[deps-cache] agent cache prepared at ${cachePath}`);
         return { cachePath, reused: false, stamp, mergedPackageHash };

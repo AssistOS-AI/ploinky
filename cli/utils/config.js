@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { ensureAgentDataDirectory } from './runtime/agentDataPathPolicy.js';
 
 function resolveWorkspaceRoot() {
     let cwd;
@@ -73,7 +74,7 @@ export const AGENTS_DATA_DIR = path.join(PLOINKY_WORKSPACE_ROOT, '.data');
 export const CODE_DIR = path.join(PLOINKY_DIR, 'code');
 export const SKILLS_DIR = path.join(PLOINKY_DIR, 'skills');
 export const LOGS_DIR = path.join(PLOINKY_DIR, 'logs');
-export const SHARED_DIR = path.join(PLOINKY_DIR, 'shared');
+export const SHARED_DIR = path.join(AGENTS_DATA_DIR, 'shared');
 export const RUNNING_DIR = path.join(PLOINKY_DIR, 'running');
 export const ROUTING_FILE = path.join(PLOINKY_DIR, 'routing.json');
 export const SERVERS_CONFIG_FILE = path.join(PLOINKY_DIR, 'servers.json');
@@ -115,15 +116,14 @@ export function initEnvironment() {
         CODE_DIR,
         SKILLS_DIR,
         LOGS_DIR,
-        SHARED_DIR,
         RUNNING_DIR,
-        AGENTS_DATA_DIR,
     ];
     for (const dir of requiredDirs) {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
     }
+    ensureAgentDataDirectory(SHARED_DIR, { workspaceRoot: PLOINKY_WORKSPACE_ROOT });
 
     if (!fs.existsSync(HISTORY_FILE)) {
         fs.writeFileSync(HISTORY_FILE, '');

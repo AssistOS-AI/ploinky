@@ -894,6 +894,7 @@ export function createNetworkLifecycleAdapter({
         network = null,
         runtimeIdentity = null,
         beforeStart = null,
+        afterStart = null,
     } = {}) {
         const exactLabels = expectedLabels || (network && runtimeIdentity
             ? expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity)
@@ -925,8 +926,16 @@ export function createNetworkLifecycleAdapter({
             if (beforeStart !== null && typeof beforeStart !== 'function') {
                 throw new Error(`finalizing managed container '${containerName}' received an invalid pre-start checkpoint`);
             }
+            if (afterStart !== null && typeof afterStart !== 'function') {
+                throw new Error(`finalizing managed container '${containerName}' received an invalid post-start checkpoint`);
+            }
             if (beforeStart) beforeStart({ plan, containerId: ownedContainerId, record: configured });
-            const started = execute(['start', ownedContainerId], { inherit: true });
+            let started;
+            try {
+                started = execute(['start', ownedContainerId], { inherit: true });
+            } finally {
+                if (afterStart) afterStart({ plan, containerId: ownedContainerId, record: configured });
+            }
             if (!started.ok) throw new Error(`cannot start '${containerName}': ${failure(started)}`);
             const running = inspectContainer(ownedContainerId);
             if (!running || !(running.State?.Running === true || running.State?.Status === 'running')) {
@@ -964,6 +973,7 @@ export function createNetworkLifecycleAdapter({
         inspectAdoption = null,
         prepareLaunch = null,
         preStartLaunch = null,
+        postStartLaunch = null,
         finalizeLaunch = null,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
         networkLifecycleCapability,
@@ -977,6 +987,9 @@ export function createNetworkLifecycleAdapter({
         }
         if (preStartLaunch !== null && typeof preStartLaunch !== 'function') {
             throw new Error('managed container transaction preStartLaunch must be a function');
+        }
+        if (postStartLaunch !== null && typeof postStartLaunch !== 'function') {
+            throw new Error('managed container transaction postStartLaunch must be a function');
         }
         if (finalizeLaunch !== null && typeof finalizeLaunch !== 'function') {
             throw new Error('managed container transaction finalizeLaunch must be a function');
@@ -1082,6 +1095,9 @@ export function createNetworkLifecycleAdapter({
                     expectedLabels: agentLabels,
                     beforeStart: preStartLaunch
                         ? (context) => preStartLaunch({ ...context, launch })
+                        : null,
+                    afterStart: postStartLaunch
+                        ? (context) => postStartLaunch({ ...context, launch })
                         : null,
                 });
                 const finalRecord = inspectContainer(containerId);

@@ -40,7 +40,24 @@ export const IMAGE_CONTRACT = Object.freeze({
 });
 export const IMAGE_PROBE_TIMEOUT_MS = 60_000;
 export const WEBTTY_NATIVE_PROBE_TIMEOUT_MS = 60_000;
+export const IMAGE_OBSERVATION_UNAVAILABLE = 'PLOINKY_BOX_IMAGE_OBSERVATION_UNAVAILABLE';
+const RUNTIME_PROBE_FAILURE = /(?:^|\n)Ploinky Box runtime probe failed: ([a-z0-9-]{1,64})(?:\n|$)/;
 const WEBTTY_NATIVE_PROBE_FAILURE = /(?:^|\n)WebTTY native probe failed: ([a-z0-9-]{1,64})(?:\n|$)/;
+
+function observationError(imageRef, operation, result) {
+    const category = result?.error?.code === 'ETIMEDOUT'
+        ? 'timeout'
+        : result?.error ? 'process-error' : result?.signal ? 'signal' : 'command-failed';
+    return new PloinkyBoxError(
+        `Unable to verify runtime image '${imageRef}': ${operation} unavailable (${category})`,
+        { code: IMAGE_OBSERVATION_UNAVAILABLE, cause: result?.error },
+    );
+}
+
+function explicitProbeFailure(result, pattern) {
+    if (result?.error || result?.signal) return null;
+    return String(result.stderr || '').slice(0, 16 * 1024).match(pattern)?.[1] || null;
+}
 
 function contractError(
     imageRef,
@@ -216,22 +233,25 @@ export function probeImageBinaries(engine, imageId, runner) {
         '-c',
         [
             'set -eu',
-            `test "$(id -u)" -eq ${BOX_RUNTIME_UID}`,
-            `test "$(id -g)" -eq ${BOX_RUNTIME_GID}`,
-            "for name in node podman bash ip fuse-overlayfs cloudflared; do command -v \"$name\"; done",
-            'test -x /usr/local/bin/ploinky-box-entrypoint',
+            'contract_failure() { printf "Ploinky Box runtime probe failed: %s\\n" "$1" >&2; exit 1; }',
+            `test "$(id -u)" -eq ${BOX_RUNTIME_UID} || contract_failure runtime-uid`,
+            `test "$(id -g)" -eq ${BOX_RUNTIME_GID} || contract_failure runtime-gid`,
+            "for name in node podman bash ip fuse-overlayfs cloudflared; do command -v \"$name\" || contract_failure required-binary; done",
+            'test -x /usr/local/bin/ploinky-box-entrypoint || contract_failure entrypoint',
             "printf '%s\\n' /usr/local/bin/ploinky-box-entrypoint",
-            `test "$(wc -c < /etc/ploinky-box)" -eq ${Buffer.byteLength(BOX_MARKER_CONTENT)}`,
-            `test "$(cat /etc/ploinky-box)" = '${BOX_MARKER_CONTENT.trim()}'`,
-            "if command -v pasta >/dev/null 2>&1; then command -v pasta; elif command -v slirp4netns >/dev/null 2>&1; then command -v slirp4netns; else exit 17; fi",
+            `test "$(wc -c < /etc/ploinky-box)" -eq ${Buffer.byteLength(BOX_MARKER_CONTENT)} || contract_failure marker-size`,
+            `test "$(cat /etc/ploinky-box)" = '${BOX_MARKER_CONTENT.trim()}' || contract_failure marker-content`,
+            "if command -v pasta >/dev/null 2>&1; then command -v pasta; elif command -v slirp4netns >/dev/null 2>&1; then command -v slirp4netns; else contract_failure network-helper; fi",
         ].join('; '),
     ], { timeoutMs: IMAGE_PROBE_TIMEOUT_MS });
     if (!result.ok) {
+        const failureCategory = explicitProbeFailure(result, RUNTIME_PROBE_FAILURE);
+        if (!failureCategory) throw observationError(imageId, 'runtime capability probe', result);
         throw contractError(
             imageId,
             'runtime capabilities and marker',
             'all required tools and exact marker content',
-            'probe failed',
+            `failure category: ${failureCategory}`,
         );
     }
     const observedPaths = String(result.stdout || '').split(/\r?\n/).filter(Boolean);
@@ -253,10 +273,8 @@ export function probeWebttyNativeRuntime(engine, imageId, image, runner) {
         '--verify',
     ], { timeoutMs: WEBTTY_NATIVE_PROBE_TIMEOUT_MS });
     if (!result.ok) {
-        const failureCategory = result?.error?.code === 'ETIMEDOUT'
-            ? 'timeout'
-            : String(result.stderr || '').slice(0, 16 * 1024).match(WEBTTY_NATIVE_PROBE_FAILURE)?.[1]
-                || 'probe-failed';
+        const failureCategory = explicitProbeFailure(result, WEBTTY_NATIVE_PROBE_FAILURE);
+        if (!failureCategory) throw observationError(imageId, 'WebTTY native runtime probe', result);
         throw contractError(
             imageId,
             'WebTTY native runtime probe',
@@ -288,13 +306,10 @@ export function probeWebttyNativeRuntime(engine, imageId, image, runner) {
     }
 }
 
-function inspectImmutableImage(engine, imageId, imageRef, runner, errorCode) {
+function inspectImmutableImage(engine, imageId, imageRef, runner, operation) {
     const result = runner.query(engine, ['image', 'inspect', imageId]);
     if (!result.ok) {
-        throw new PloinkyBoxError(
-            `Unable to verify the owned Box image '${imageId}'; destroy and recreate the Box`,
-            { code: errorCode },
-        );
+        throw observationError(imageId, operation, result);
     }
     const image = validateImageContract(normalizeImageInspect(result.stdout), imageRef);
     if (image.immutableId !== imageId) {
@@ -317,16 +332,14 @@ function probeAndReinspectImage(engine, image, imageRef, runner) {
         image.immutableId,
         imageRef,
         runner,
-        'PLOINKY_BOX_IMAGE_REINSPECT_FAILED',
+        'image reinspection',
     );
 }
 
 export function inspectAndValidateImage(engine, imageRef, runner) {
     const result = runner.query(engine, ['image', 'inspect', imageRef]);
     if (!result.ok) {
-        throw new PloinkyBoxError(`Unable to inspect runtime image '${imageRef}'`, {
-            code: 'PLOINKY_BOX_IMAGE_INSPECT_FAILED',
-        });
+        throw observationError(imageRef, 'image inspection', result);
     }
     const image = validateImageContract(normalizeImageInspect(result.stdout), imageRef);
     return probeAndReinspectImage(engine, image, imageRef, runner);
@@ -338,7 +351,7 @@ export function inspectAndValidateExistingImage(engine, imageId, imageRef, runne
         imageId,
         imageRef,
         runner,
-        'PLOINKY_BOX_EXISTING_IMAGE_INSPECT_FAILED',
+        'owned image inspection',
     );
     return probeAndReinspectImage(engine, image, imageRef, runner);
 }

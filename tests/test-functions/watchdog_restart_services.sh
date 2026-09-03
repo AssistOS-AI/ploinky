@@ -13,6 +13,16 @@ watchdog_restart_services() {
 
   local original_container_pid
   original_container_pid=$(get_container_pid "$TEST_AGENT_CONT_NAME" 2>/dev/null || true)
+  local original_repo_name
+  local original_agent_name
+  original_repo_name=$(jq -r --arg name "$TEST_AGENT_CONT_NAME" '.[$name].repoName // empty' \
+    "$TEST_RUN_DIR/.ploinky/agents.json")
+  original_agent_name=$(jq -r --arg name "$TEST_AGENT_CONT_NAME" '.[$name].agentName // empty' \
+    "$TEST_RUN_DIR/.ploinky/agents.json")
+  if [[ -z "$original_repo_name" || -z "$original_agent_name" ]]; then
+    echo "Unable to resolve the exact registry identity for '${TEST_AGENT_CONT_NAME}'." >&2
+    return 1
+  fi
 
   # Get the Watchdog PID from the pid file
   local watchdog_pid_file="$TEST_RUN_DIR/.ploinky/running/router.pid"
@@ -102,9 +112,48 @@ watchdog_restart_services() {
     return 1
   fi
 
-  if ! wait_for_container "$TEST_AGENT_CONT_NAME"; then
-    echo "Watchdog did not restart container '${TEST_AGENT_CONT_NAME}' within expected time." >&2
+  local restarted_container_name=""
+  local attempt
+  for (( attempt=0; attempt<60; attempt++ )); do
+    restarted_container_name=$(jq -r \
+      --arg repo "$original_repo_name" \
+      --arg agent "$original_agent_name" \
+      'to_entries
+       | map(select(.value.type == "agent"
+           and .value.repoName == $repo
+           and .value.agentName == $agent))
+       | if length == 1 then .[0].key else empty end' \
+      "$TEST_RUN_DIR/.ploinky/agents.json" 2>/dev/null || true)
+    if [[ -n "$restarted_container_name" ]] \
+      && assert_container_running "$restarted_container_name" >/dev/null 2>&1; then
+      break
+    fi
+    restarted_container_name=""
+    sleep 1
+  done
+  if [[ -z "$restarted_container_name" ]]; then
+    echo "Watchdog did not publish one running replacement for '${original_repo_name}/${original_agent_name}' within expected time." >&2
     return 1
+  fi
+
+  # Managed-network recovery is an additive cutover, so the exact successor
+  # may have a fresh container name and host port. Carry that authoritative
+  # registry identity into every later lifecycle check in this suite.
+  TEST_AGENT_CONT_NAME="$restarted_container_name"
+  export TEST_AGENT_CONT_NAME
+  write_state_var "TEST_AGENT_CONT_NAME" "$TEST_AGENT_CONT_NAME"
+  local restarted_host_port
+  restarted_host_port=$(jq -r \
+    --arg name "$TEST_AGENT_CONT_NAME" \
+    --argjson port "$TEST_AGENT_CONTAINER_PORT" \
+    '.[$name].config.ports
+     | map(select(.containerPort == $port and (.protocol // "tcp") == "tcp"))
+     | if length == 1 then .[0].hostPort else empty end' \
+    "$TEST_RUN_DIR/.ploinky/agents.json" 2>/dev/null || true)
+  if [[ "$restarted_host_port" =~ ^[1-9][0-9]*$ ]]; then
+    TEST_AGENT_HOST_PORT="$restarted_host_port"
+    export TEST_AGENT_HOST_PORT
+    write_state_var "TEST_AGENT_HOST_PORT" "$TEST_AGENT_HOST_PORT"
   fi
 
   if ! assert_container_running "$TEST_AGENT_CONT_NAME"; then

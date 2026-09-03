@@ -481,17 +481,33 @@ test('missing, additional, and unmanaged nested containers fail the profile', ()
     );
 });
 
+function ownerProofResponse(args) {
+    const request = JSON.parse(args.at(-1));
+    const pids = [...new Set([...request.inits, ...request.owners].map(process => process.pid))];
+    return { status: 0, stdout: JSON.stringify({ outerPidNamespace: 'pid:[90000]', processes: pids.map(pid => ({
+        pid,
+        name: request.owners.find(owner => owner.pid === pid)?.name || 'tini',
+        startTimeTicks: '12345',
+        pidNamespace: `pid:[${100000 + pid}]`,
+        descriptors: request.owners.filter(owner => owner.pid === pid).map(({ fd, socketInode }) => ({ fd, socketInode })),
+    })) }) };
+}
+
 test('collector inventories one outer namespace and each distinct nested namespace', () => {
     const responses = new Map([
-        [JSON.stringify(['exec', '--user', '0', 'box', 'node', '--version']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'node', '--version']), {
             status: 0,
             stdout: 'v24.0.0\n',
         }],
-        [JSON.stringify(['exec', '--user', '0', 'box', 'ss', '--version']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'ss', '--version']), {
             status: 0,
             stdout: 'ss utility, iproute2-6.17.0\n',
         }],
-        [JSON.stringify(['exec', '--user', '0', 'box', 'nsenter', '--version']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'podman', 'unshare', 'ss', '--version']), {
+            status: 0,
+            stdout: 'ss utility, iproute2-6.17.0\n',
+        }],
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'nsenter', '--version']), {
             status: 0,
             stdout: 'nsenter from util-linux 2.41.4\n',
         }],
@@ -526,13 +542,17 @@ test('collector inventories one outer namespace and each distinct nested namespa
                 State: { Running: true, Pid: 300, StartedAt: 'app-start' },
             }]),
         }],
-        [JSON.stringify(['exec', '--user', '0', 'box', 'ss', '-H', '-lntup']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'ss', '-H', '-O', '-lntupe']), {
             status: 0,
-            stdout: 'udp UNCONN 0 0 0.0.0.0:7882 0.0.0.0:* users:(("livekit-server",pid=200,fd=7))\n',
+            stdout: 'udp UNCONN 0 0 0.0.0.0:7882 0.0.0.0:* users:(("livekit-server",pid=200,fd=7)) ino:99 sk:7\n',
         }],
-        [JSON.stringify(['exec', '--user', '0', 'box', 'nsenter', '-t', '300', '-n', 'ss', '-H', '-lntup']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'podman', 'unshare', 'ss', '-H', '-O', '-lntupe']), {
             status: 0,
-            stdout: 'tcp LISTEN 0 10 0.0.0.0:7000 0.0.0.0:* users:(("node",pid=300,fd=8))\n',
+            stdout: 'udp UNCONN 0 0 0.0.0.0:7882 0.0.0.0:* users:(("livekit-server",pid=200,fd=7)) ino:99 sk:7\n',
+        }],
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'podman', 'unshare', 'nsenter', '-t', '300', '-n', 'ss', '-H', '-O', '-lntupe']), {
+            status: 0,
+            stdout: 'tcp LISTEN 0 10 0.0.0.0:7000 0.0.0.0:* users:(("node",pid=300,fd=8)) ino:100 sk:8\n',
         }],
     ]);
     const calls = [];
@@ -540,6 +560,7 @@ test('collector inventories one outer namespace and each distinct nested namespa
         outerContainer: 'box',
         run(args) {
             calls.push(args);
+            if (args.includes('--eval')) return ownerProofResponse(args);
             if (args[4] === 'node' && args[5] === '-e') {
                 const initPid = Number(args.at(-1));
                 return {
@@ -558,8 +579,18 @@ test('collector inventories one outer namespace and each distinct nested namespa
     assert.equal(calls.some(args => args.includes('livekit-current') && args.includes('ss')), false);
     assert.equal(calls.some(args => args.includes('app-current') && args.includes('ss')), false);
     assert.equal(calls.some(args => args.includes('nsenter') && args.includes('300')), true);
+    assert.equal(calls.some(args => args[1] === '--user' && args[2] !== 'podman'), false);
+    assert.deepEqual(calls.filter(args => args.includes('-lntupe') && !args.includes('nsenter')).map(args => args.includes('unshare')),
+        [false, true, false, false, true, false]);
+    assert.deepEqual(calls.filter(args => args.includes('--eval')).map(args => args.includes('unshare')),
+        [false, false, true, true]);
+    const nestedSs = calls.find(args => args.includes('nsenter') && args.includes('300'));
+    assert.deepEqual(nestedSs.slice(4, 9), ['podman', 'unshare', 'nsenter', '-t', '300']);
+    assert.equal(nestedSs.includes('-p'), false);
     assert.equal(result.containers.find(value => value.name === 'livekit-current').namespace, 'outer');
     assert.equal(result.containers.find(value => value.name === 'app-current').initPid, 300);
+    assert.deepEqual(result.containers.map(value => value.pids), [[200], [300]]);
+    assert.ok(result.containers.every(value => value.pidMembership === 'verified-listener-owners-and-init'));
 });
 
 test('managed-network collector rejects a generation change around listener collection', () => {
@@ -605,6 +636,7 @@ test('collector rejects a nested graph membership change during collection', () 
             outerContainer: 'box',
             verifyTools: false,
             run(args) {
+                if (args.includes('--eval')) return ownerProofResponse(args);
                 if (args[2] === 'podman' && args[3] === 'network') {
                     return { status: 0, stdout: '[]' };
                 }
@@ -636,15 +668,19 @@ test('collector rejects a nested graph membership change during collection', () 
 
 test('collector reports a missing box nsenter dependency with contractual remediation', () => {
     const responses = new Map([
-        [JSON.stringify(['exec', '--user', '0', 'box', 'node', '--version']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'node', '--version']), {
             status: 0,
             stdout: 'v24.0.0\n',
         }],
-        [JSON.stringify(['exec', '--user', '0', 'box', 'ss', '--version']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'ss', '--version']), {
             status: 0,
             stdout: 'ss utility, iproute2-6.17.0\n',
         }],
-        [JSON.stringify(['exec', '--user', '0', 'box', 'nsenter', '--version']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'podman', 'unshare', 'ss', '--version']), {
+            status: 0,
+            stdout: 'ss utility, iproute2-6.17.0\n',
+        }],
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'nsenter', '--version']), {
             status: 127,
             stderr: 'exec: nsenter: executable file not found',
         }],
@@ -658,7 +694,7 @@ test('collector reports a missing box nsenter dependency with contractual remedi
     );
 });
 
-test('collector fails closed when box root cannot enter a nested network namespace', () => {
+test('collector fails closed when its rootless owner cannot enter a nested network namespace', () => {
     const responses = new Map([
         [JSON.stringify(['exec', 'box', 'podman', 'network', 'ls', '--format', 'json']), {
             status: 0,
@@ -672,11 +708,15 @@ test('collector fails closed when box root cannot enter a nested network namespa
             status: 0,
             stdout: '[{"Id":"app-id","Name":"/app-current","Config":{"Labels":{"io.assistos.ploinky.managed":"1"}},"HostConfig":{"NetworkMode":"bridge","PidMode":""},"State":{"Running":true,"Pid":300,"StartedAt":"app-start"}}]',
         }],
-        [JSON.stringify(['exec', '--user', '0', 'box', 'ss', '-H', '-lntup']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'ss', '-H', '-O', '-lntupe']), {
             status: 0,
             stdout: '',
         }],
-        [JSON.stringify(['exec', '--user', '0', 'box', 'nsenter', '-t', '300', '-n', 'ss', '-H', '-lntup']), {
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'podman', 'unshare', 'ss', '-H', '-O', '-lntupe']), {
+            status: 0,
+            stdout: '',
+        }],
+        [JSON.stringify(['exec', '--user', 'podman', 'box', 'podman', 'unshare', 'nsenter', '-t', '300', '-n', 'ss', '-H', '-O', '-lntupe']), {
             status: 1,
             stderr: 'nsenter: reassociate to namespace failed: Operation not permitted',
         }],
@@ -685,6 +725,7 @@ test('collector fails closed when box root cannot enter a nested network namespa
         () => collectBoxListenerInventory({
             outerContainer: 'box',
             run(args) {
+                if (args.includes('--eval')) return ownerProofResponse(args);
                 if (args[4] === 'node' && args[5] === '-e') {
                     return {
                         status: 0,

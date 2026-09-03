@@ -712,7 +712,10 @@ function reapStaleAuthorityHelpers(commandRunner, runtime, helperImageId) {
         }
         const oldEnough = commandRunner.now() - createdAt
             > ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS + AUTHORITY_HELPER_STALE_GRACE_MS;
-        if ((inspected.running === true || inspected.status === 'running') && !oldEnough) continue;
+        // Parallel dependency waves can observe a peer helper after `create`
+        // and before `start`.  Age, not transient runtime state, is the proof
+        // that a helper is abandoned and therefore eligible for reaping.
+        if (!oldEnough) continue;
         removeProvenAuthorityHelper(commandRunner, runtime, {
             expectedId: id,
             expectedName,

@@ -1,15 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
     PLOINKY_MANAGED_LABEL,
     managedContainerLabelArgs,
 } from '../../cli/sandbox/docker/common.js';
 import {
+    appendLegacyAgentDataGuards,
     buildPersistentAgentRunArgs,
     inspectImageEntrypoint,
     manifestUsesHealthProbeBroker,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
+import { PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 import {
     buildInteractiveAgentCreateCommand,
     buildInteractiveCommandCreateCommand,
@@ -59,10 +64,11 @@ test('persistent agent run builder carries the exact managed label', () => {
         agentLibMountPath: '/workspace/.ploinky/runtime/Agent',
         codeMountPath: '/workspace/.ploinky/runtime/code',
         codeMountMode: ':z,ro',
-        sharedDir: '/workspace/.ploinky/shared',
+        sharedDir: '/workspace/.data/shared',
         healthProbeHostDir: '/workspace/.ploinky/run/health-probes/ploinky_demo',
         cwd: '/workspace/.data/demo',
         cwdMountTarget: '/root',
+        agentHomeDir: '/workspace/.data/demo',
         // Every container admission now carries the selected achillesAgentLib grant.
         agentLibGrant: {
             sourceDir: '/workspace/achillesAgentLib',
@@ -90,6 +96,148 @@ test('persistent agent run builder carries the exact managed label', () => {
         dockerArgs.includes('/workspace/.ploinky/run/health-probes/ploinky_demo:/run/ploinky-health-probes'),
         true,
     );
+});
+
+test('static workspace projection keeps its persistent home beneath .data', () => {
+    const args = buildPersistentAgentRunArgs({
+        runtime: 'podman',
+        containerName: 'ploinky_static',
+        envHash: 'hash',
+        containerWorkdir: '/root',
+        agentLibMountPath: '/workspace/.ploinky/runtime/Agent',
+        codeMountPath: '/workspace/.ploinky/runtime/code',
+        codeMountMode: ':z,ro',
+        sharedDir: '/workspace/.data/shared',
+        healthProbeHostDir: '/workspace/.ploinky/run/health-probes/ploinky_static',
+        cwd: '/workspace',
+        cwdMountTarget: '/root',
+        isolatedHome: true,
+        agentHomeDir: '/workspace/.data/static',
+        agentLibGrant: {
+            sourceDir: '/workspace/achillesAgentLib',
+            runtimePath: '/opt/ploinky-agentlib',
+            mode: 'local',
+            fingerprint: 'a1'.repeat(32),
+            commit: '',
+            sourceIdHash: 'b2'.repeat(32),
+            namespaced: true,
+        },
+    });
+    assert.equal(args.includes('/workspace:/root:z'), true);
+    assert.equal(args.includes('/workspace/.data/static:/home/agent:z'), true);
+});
+
+test('interactive isolated agents mount their private HOME while preserving project passthrough', () => {
+    const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-home-')));
+    try {
+        const homeDir = path.join(workspaceRoot, '.data', 'namedAlias');
+        const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+        const grantSource = path.join(workspaceRoot, 'achillesAgentLib');
+        for (const directory of [homeDir, sharedDir, grantSource]) fs.mkdirSync(directory, { recursive: true });
+        const command = buildInteractiveAgentCreateCommand({
+            runtime: 'podman',
+            containerName: 'namedAlias',
+            envHash: 'hash',
+            projectDir: homeDir,
+            homeDir,
+            sharedDir,
+            agentLibPath: '/opt/ploinky/Agent',
+            absAgentPath: '/opt/ploinky/code',
+            containerImage: 'node:24',
+            volumeSuffix: ':z',
+            workspaceRoot,
+            envVars: '-e HOME=/incorrect',
+            agentLibGrant: {
+                sourceDir: grantSource, runtimePath: '/opt/ploinky-agentlib',
+                mode: 'local', fingerprint: 'a1'.repeat(32), commit: '',
+                sourceIdHash: 'b2'.repeat(32), namespaced: true,
+            },
+        });
+        assert.ok(command.includes(`-v "${homeDir}:${homeDir}:z"`));
+        assert.ok(command.includes(`-v "${homeDir}:/root:z"`));
+        assert.match(command, /HOME=\/incorrect[\s\S]*HOME=["']?\/root/);
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('static HOME layout retains opaque legacy storage under the project projection', () => {
+    const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'static-home-guards-')));
+    try {
+        const homeDir = path.join(workspaceRoot, '.data', 'static');
+        for (const dir of [homeDir, path.join(workspaceRoot, '.ploinky', 'data'), path.join(workspaceRoot, '.ploinky', 'shared')]) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        const args = ['-v', `${workspaceRoot}:/root:z`, '-v', `${homeDir}:/home/agent:z`];
+        const targets = appendLegacyAgentDataGuards(args, 'podman', { workspaceRoot });
+        assert.deepEqual(targets.map(target => target.target), ['/root/.ploinky/data', '/root/.ploinky/shared']);
+        for (const target of targets) {
+            const mount = args.find(value => value.includes(`:${target.target}:`));
+            assert.ok(mount);
+            assert.match(mount, /:z,ro$/);
+            assert.equal(mount.startsWith(`${target.protectedHostPath}:`), false);
+        }
+        assert.ok(args.includes(`${workspaceRoot}:/root:z`));
+        assert.ok(args.includes(`${homeDir}:/home/agent:z`));
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('container runtimes append final read-only opacity guards for broad workspace mounts', () => {
+    for (const runtime of ['docker', 'podman']) {
+        const args = ['-v', `${PLOINKY_WORKSPACE_ROOT}:/workspace${runtime === 'podman' ? ':z' : ''}`];
+        const targets = appendLegacyAgentDataGuards(args, runtime);
+        assert.deepEqual(targets.map(entry => entry.target), [
+            '/workspace/.ploinky/data',
+            '/workspace/.ploinky/shared',
+        ]);
+        const mounts = args.filter((_value, index) => args[index - 1] === '-v');
+        for (const target of targets) {
+            const match = mounts.find(value => value.includes(`:${target.target}:`));
+            if (fs.existsSync(target.protectedHostPath)) {
+                assert.ok(match, `missing guard ${target.target}`);
+                assert.match(match, runtime === 'podman' ? /:z,ro$/ : /:ro$/);
+                assert.doesNotMatch(match, new RegExp(`^${target.protectedHostPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`));
+            } else {
+                assert.equal(match, undefined, `absent target must not receive a removable child mount ${target.target}`);
+                const parent = mounts.find(value => value.startsWith(`${target.protectedParentHostPath}:${target.parentTarget}:`));
+                assert.ok(parent, `missing read-only parent guard ${target.parentTarget}`);
+                assert.match(parent, runtime === 'podman' ? /:z,ro$/ : /:ro$/);
+            }
+        }
+    }
+});
+
+test('container runtimes guard canonical legacy paths for narrow repository mounts', () => {
+    for (const runtime of ['docker', 'podman']) {
+        const repository = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'repos', 'AchillesCLI', 'roboTeamAgent');
+        const args = ['-v', `${repository}:${repository}${runtime === 'podman' ? ':z' : ''}`];
+        const targets = appendLegacyAgentDataGuards(args, runtime, {
+            canonicalRuntimeWorkspaceGuards: true,
+        });
+        assert.deepEqual(targets.map(entry => entry.target), [
+            path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'data'),
+            path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'shared'),
+        ]);
+        const mounts = args.filter((_value, index) => args[index - 1] === '-v');
+        for (const target of targets) {
+            const match = mounts.find(value => value.includes(`:${target.target}:`));
+            assert.ok(match, `missing narrow-workspace guard ${target.target}`);
+            assert.match(match, runtime === 'podman' ? /:z,ro$/ : /:ro$/);
+        }
+    }
+});
+
+test('container runtimes reject project mounts sourced below a protected legacy root', () => {
+    for (const runtime of ['docker', 'podman']) {
+        const source = path.join(PLOINKY_WORKSPACE_ROOT, '.ploinky', 'data', 'legacy-agent');
+        const args = ['-v', `${source}:/project${runtime === 'podman' ? ':z' : ''}`];
+        assert.throws(
+            () => appendLegacyAgentDataGuards(args, runtime),
+            error => error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION',
+        );
+    }
 });
 
 test('only script-backed health manifests require the in-container broker', () => {
@@ -145,14 +293,144 @@ test('both interactive create/retry command families carry the exact managed lab
             projectDir: '/workspace',
             homeDir: '/workspace/.data/demo',
             agentLibPath: '/opt/ploinky/Agent',
+            agentLibGrant: {
+                sourceDir: '/workspace/achillesAgentLib',
+                runtimePath: '/opt/ploinky-agentlib',
+                mode: 'local',
+                fingerprint: 'a1'.repeat(32),
+                commit: '',
+                sourceIdHash: 'b2'.repeat(32),
+                namespaced: true,
+            },
             absAgentPath: '/workspace/.ploinky/repos/demo/agent',
-            sharedDir: '/workspace/.ploinky/shared',
+            sharedDir: '/workspace/.data/shared',
             volumeSuffix: ':z',
             readOnlySuffix: ':ro,z',
             portOptions: '-p 127.0.0.1:17002:7000',
             envVars: '-e HOME=/root',
             containerImage,
         }));
+    }
+});
+
+test('interactive container creation rejects a project below protected legacy agent data', () => {
+    const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-legacy-child-')));
+    try {
+        const projectDir = path.join(workspaceRoot, '.ploinky', 'data', 'legacy-agent');
+        const homeDir = path.join(workspaceRoot, '.data', 'demo');
+        const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+        const agentLibPath = path.join(workspaceRoot, 'Agent');
+        const absAgentPath = path.join(workspaceRoot, 'agent-code');
+        const grantSource = path.join(workspaceRoot, 'achillesAgentLib');
+        for (const directory of [projectDir, homeDir, sharedDir, agentLibPath, absAgentPath, grantSource]) {
+            fs.mkdirSync(directory, { recursive: true });
+        }
+        assert.throws(() => buildInteractiveAgentCreateCommand({
+            runtime: 'podman',
+            containerName: 'ploinky_demo',
+            envHash: 'hash',
+            projectDir,
+            homeDir,
+            agentLibPath,
+            absAgentPath,
+            sharedDir,
+            containerImage: 'node:24',
+            workspaceRoot,
+            agentLibGrant: {
+                sourceDir: grantSource,
+                runtimePath: '/opt/ploinky-agentlib',
+                mode: 'local',
+                fingerprint: 'a1'.repeat(32),
+                commit: '',
+                sourceIdHash: 'b2'.repeat(32),
+                namespaced: true,
+            },
+        }), error => error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('interactive containers protect the legacy parent without mounting an absent child', () => {
+    const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-missing-legacy-')));
+    try {
+        const controllerDir = path.join(workspaceRoot, '.ploinky');
+        fs.mkdirSync(path.join(controllerDir, 'data'), { recursive: true });
+        for (const runtime of ['podman', 'docker']) {
+            const command = buildInteractiveAgentCreateCommand({
+                runtime,
+                containerName: 'ploinky_demo',
+                envHash: 'hash',
+                projectDir: workspaceRoot,
+                homeDir: path.join(workspaceRoot, '.data', 'demo'),
+                agentLibPath: path.join(workspaceRoot, 'Agent'),
+                absAgentPath: path.join(workspaceRoot, 'agent-code'),
+                sharedDir: path.join(workspaceRoot, '.data', 'shared'),
+                containerImage: 'node:24',
+                workspaceRoot,
+                agentLibGrant: {
+                    sourceDir: path.join(workspaceRoot, 'achillesAgentLib'),
+                    runtimePath: '/opt/ploinky-agentlib',
+                    mode: 'local',
+                    fingerprint: 'a1'.repeat(32),
+                    commit: '',
+                    sourceIdHash: 'b2'.repeat(32),
+                    namespaced: true,
+                },
+            });
+            const suffix = runtime === 'podman' ? ':z,ro' : ':ro';
+            const parentMount = `${controllerDir}:${controllerDir}${suffix}`;
+            assert.ok(command.includes(parentMount), command);
+            assert.equal(command.includes(`:${controllerDir}/shared${suffix}`), false);
+            assert.ok(command.indexOf(parentMount) < command.lastIndexOf(`:${controllerDir}/data${suffix}`));
+            assert.equal(fs.existsSync(path.join(controllerDir, 'shared')), false);
+        }
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('interactive agent guards canonical legacy aliases exposed by read-only code mounts', () => {
+    const workspaceRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interactive-legacy-alias-')));
+    try {
+        const agentCode = path.join(workspaceRoot, 'agent-code');
+        const canonicalLegacyData = path.join(agentCode, 'legacy-data');
+        const homeDir = path.join(workspaceRoot, '.data', 'demo');
+        const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+        const agentLibPath = path.join(workspaceRoot, 'Agent');
+        const grantSource = path.join(workspaceRoot, 'achillesAgentLib');
+        fs.mkdirSync(path.join(workspaceRoot, '.ploinky'), { recursive: true });
+        for (const directory of [canonicalLegacyData, homeDir, sharedDir, agentLibPath, grantSource]) {
+            fs.mkdirSync(directory, { recursive: true });
+        }
+        fs.symlinkSync(canonicalLegacyData, path.join(workspaceRoot, '.ploinky', 'data'), 'dir');
+        const command = buildInteractiveAgentCreateCommand({
+            runtime: 'podman',
+            containerName: 'ploinky_demo',
+            envHash: 'hash',
+            projectDir: homeDir,
+            homeDir,
+            agentLibPath,
+            absAgentPath: agentCode,
+            sharedDir,
+            volumeSuffix: ':z',
+            readOnlySuffix: ':z,ro',
+            containerImage: 'node:24',
+            workspaceRoot,
+            agentLibGrant: {
+                sourceDir: grantSource,
+                runtimePath: '/opt/ploinky-agentlib',
+                mode: 'local',
+                fingerprint: 'a1'.repeat(32),
+                commit: '',
+                sourceIdHash: 'b2'.repeat(32),
+                namespaced: true,
+            },
+        });
+        assert.match(command, /:\/code\/legacy-data:z,ro"/);
+        assert.ok(command.lastIndexOf(':/code/legacy-data:z,ro"') > command.indexOf(`${agentCode}:/code:z,ro`));
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
     }
 });
 

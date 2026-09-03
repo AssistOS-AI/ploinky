@@ -25,7 +25,17 @@ import {
 } from './common.js';
 import { loadAgents } from '../../utils/workspace.js';
 import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
+import { resolveAgentHomeLayout } from './agentHomeLayout.js';
+import { buildAgentShellArgs } from './agentShell.js';
 import { SHARED_DIR } from '../../utils/config.js';
+import { ensureAgentDataDirectory } from '../../utils/runtime/agentDataPathPolicy.js';
+import {
+    legacyAgentGuardMounts,
+    legacyAgentGuardTargets,
+    normalizeRuntimeMountTarget,
+    prepareLegacyGuardMountpointCleanup,
+} from '../../utils/runtime/legacyAgentDataGuards.js';
+import { withNetworkLifecycleLock } from '../networkLifecycle.js';
 import {
     agentLibAliasShadows,
     agentLibGrant,
@@ -37,12 +47,48 @@ const __dirname = path.dirname(__filename);
 
 function ensureSharedHostDir() {
     const dir = SHARED_DIR;
-    try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+    ensureAgentDataDirectory(dir);
     return dir;
 }
 
 function joinShellCommandParts(parts) {
     return parts.filter((part) => String(part || '').trim()).join(' ');
+}
+
+function legacyGuardMountOptions(runtime, bindings, { workspaceRoot } = {}) {
+    const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
+    const mounts = bindings.map(binding => ({
+        ...binding,
+        runtimePath: normalizeRuntimeMountTarget(binding.runtimePath),
+    }));
+    for (const guard of legacyAgentGuardMounts(targets, { workspaceRoot, bindings })) {
+        if (guard.replaceExisting) {
+            for (const binding of mounts) {
+                if (binding.runtimePath !== guard.target) continue;
+                binding.readOnly = guard.readOnly;
+                binding.suffix = runtime === 'podman' ? ':z,ro' : ':ro';
+            }
+        } else {
+            mounts.push({
+                hostPath: guard.source,
+                runtimePath: guard.target,
+                suffix: runtime === 'podman'
+                    ? (guard.readOnly ? ':z,ro' : ':z') : (guard.readOnly ? ':ro' : ''),
+            });
+        }
+    }
+    return mounts.map(binding => `-v "${binding.hostPath}:${binding.runtimePath}${binding.suffix || ''}"`);
+}
+
+function withLegacyMountpointCleanup(operation) {
+    return withNetworkLifecycleLock(() => {
+        const cleanup = prepareLegacyGuardMountpointCleanup();
+        try {
+            return operation();
+        } finally {
+            cleanup();
+        }
+    }, { waitMs: 15 * 60 * 1000 });
 }
 
 function buildInteractiveCommandCreateCommand({
@@ -65,7 +111,7 @@ function buildInteractiveCommandCreateCommand({
         portOptions,
         envVars,
         containerImage,
-        '/bin/sh -lc "while :; do sleep 3600; done"',
+        ...buildAgentShellArgs('while :; do sleep 3600; done', '/bin/sh').map(shellQuote),
     ]);
 }
 
@@ -84,17 +130,29 @@ function buildInteractiveAgentCreateCommand({
     envVars = '',
     containerImage,
     agentLibGrant: grant = agentLibGrant('container'),
+    workspaceRoot,
 } = {}) {
     // The interactive shell receives exactly the same achillesAgentLib grant as
     // the detached service: the source read-only at the stable path, plus a
     // read-only shadow over every writable alias that reaches the same inode.
+    const homeLayout = resolveAgentHomeLayout({
+        cwd: projectDir, cwdMountTarget: projectDir, agentHomeDir: homeDir,
+    });
+    const workspaceBinds = homeLayout.binds.map(({ source, target }) => ({
+        hostPath: source, runtimePath: target,
+    }));
     const agentLibShadows = agentLibAliasShadows(grant, [
-        { hostPath: projectDir, runtimePath: projectDir },
-        ...(path.resolve(projectDir) === path.resolve(homeDir)
-            ? []
-            : [{ hostPath: homeDir, runtimePath: '/root' }]),
+        ...workspaceBinds,
         { hostPath: sharedDir, runtimePath: '/shared' },
     ]);
+    const mountOptions = legacyGuardMountOptions(runtime, [
+        ...workspaceBinds.map(binding => ({ ...binding, suffix: volumeSuffix })),
+        { hostPath: agentLibPath, runtimePath: '/Agent', readOnly: true, suffix: readOnlySuffix },
+        { hostPath: absAgentPath, runtimePath: '/code', readOnly: true, suffix: readOnlySuffix },
+        { hostPath: sharedDir, runtimePath: '/shared', suffix: volumeSuffix },
+        { hostPath: grant.sourceDir, runtimePath: grant.runtimePath, readOnly: true, suffix: readOnlySuffix },
+        ...agentLibShadows.map(shadow => ({ ...shadow, readOnly: true, suffix: readOnlySuffix })),
+    ], { workspaceRoot });
     return joinShellCommandParts([
         runtime,
         'create',
@@ -105,20 +163,13 @@ function buildInteractiveAgentCreateCommand({
         PLOINKY_MANAGED_LABEL,
         '--label',
         `ploinky.envhash=${envHash}`,
-        `-v "${projectDir}:${projectDir}${volumeSuffix}"`,
-        path.resolve(projectDir) === path.resolve(homeDir)
-            ? ''
-            : `-v "${homeDir}:/root${volumeSuffix}"`,
-        `-v "${agentLibPath}:/Agent${readOnlySuffix}"`,
-        `-v "${absAgentPath}:/code${readOnlySuffix}"`,
-        `-v "${sharedDir}:/shared${volumeSuffix}"`,
-        `-v "${grant.sourceDir}:${grant.runtimePath}${readOnlySuffix}"`,
-        ...agentLibShadows.map((shadow) => `-v "${shadow.hostPath}:${shadow.runtimePath}${readOnlySuffix}"`),
+        ...mountOptions,
         ...Object.entries(agentLibGrantEnv(grant)).map(([key, value]) => formatEnvFlag(key, value)),
         portOptions,
         envVars,
+        formatEnvFlag('HOME', homeLayout.containerHome),
         containerImage,
-        '/bin/sh -lc "while :; do sleep 3600; done"',
+        ...buildAgentShellArgs('while :; do sleep 3600; done', '/bin/sh').map(shellQuote),
     ]);
 }
 
@@ -128,9 +179,12 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
     let agents = loadAgentsMap();
     const projectDir = getConfiguredProjectPath(agentName, repoName);
     const homeDir = getAgentWorkDir(agentName);
+    const homeLayout = resolveAgentHomeLayout({
+        cwd: projectDir, cwdMountTarget: projectDir, agentHomeDir: homeDir,
+    });
 
     const sharedDir = ensureSharedHostDir();
-    try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
+    ensureAgentDataDirectory(homeDir);
 
     let firstRun = false;
     debugLog(`Checking if container '${containerName}' exists...`);
@@ -139,26 +193,18 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
         const envVarParts = [
             ...getSecretsForAgent(manifest, { agentName, repoName }),
             formatEnvFlag('PLOINKY_MCP_CONFIG_PATH', CONTAINER_CONFIG_PATH),
-            formatEnvFlag('HOME', '/root'),
+            formatEnvFlag('HOME', homeLayout.containerHome),
             // Set NODE_PATH to project directory node_modules (in the passthrough mount)
             formatEnvFlag('NODE_PATH', `${projectDir}/node_modules`)
         ];
         const envVars = envVarParts.join(' ');
-        const mountOptions = runtime === 'podman'
-            ? [
-                `--mount type=bind,source="${projectDir}",destination="${projectDir}",relabel=shared`,
-                ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [
-                    `--mount type=bind,source="${homeDir}",destination="/root",relabel=shared`
-                ]),
-                `--mount type=bind,source="${sharedDir}",destination="/shared",relabel=shared`
-            ]
-            : [
-                `-v "${projectDir}:${projectDir}"`,
-                ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [
-                    `-v "${homeDir}:/root"`
-                ]),
-                `-v "${sharedDir}:/shared"`
-            ];
+        const volumeSuffix = runtime === 'podman' ? ':z' : '';
+        const mountOptions = legacyGuardMountOptions(runtime, [
+            ...homeLayout.binds.map(({ source, target }) => ({
+                hostPath: source, runtimePath: target, suffix: volumeSuffix,
+            })),
+            { hostPath: sharedDir, runtimePath: '/shared', suffix: volumeSuffix },
+        ]);
         const mountOption = mountOptions.join(' ');
 
         const { publishArgs: manifestPorts, portMappings } = parseManifestPorts(manifest);
@@ -178,7 +224,9 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 containerImage,
             });
             debugLog(`Executing create command: ${createCommand}`);
-            createOutput = execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim();
+            createOutput = withLegacyMountpointCleanup(() => (
+                execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim()
+            ));
             containerId = createOutput;
         } catch (error) {
             if (runtime === 'podman' && error.message.includes('short-name')) {
@@ -202,7 +250,9 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
                 debugLog(`Executing retry command: ${retryCommand}`);
 
                 try {
-                    createOutput = execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim();
+                    createOutput = withLegacyMountpointCleanup(() => (
+                        execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] }).toString().trim()
+                    ));
                     containerId = createOutput;
                     manifest.container = containerImage;
                 } catch (retryError) {
@@ -228,8 +278,7 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
             type: 'interactive',
             config: {
                 binds: [
-                    { source: projectDir, target: projectDir },
-                    ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [{ source: homeDir, target: '/root' }]),
+                    ...homeLayout.binds,
                     { source: sharedDir, target: '/shared' }
                 ],
                 env: Array.from(new Set(declaredEnvNames)).map(name => ({ name })),
@@ -264,20 +313,21 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
         const startCommand = `${runtime} start ${containerName}`;
         debugLog(`Executing start command: ${startCommand}`);
         try {
-            execSync(startCommand, { stdio: 'inherit' });
+            withLegacyMountpointCleanup(() => execSync(startCommand, { stdio: 'inherit' }));
         } catch (error) {
             console.error(`Error starting container. Try removing it with: ${runtime} rm ${containerName}`);
             throw error;
         }
     }
 
+    const containerWorkdir = resolveContainerWorkdir(containerName, projectDir);
     if (firstRun && manifest.install) {
         const ready = waitForContainerRunning(containerName);
         if (!ready) {
             console.warn(`[install] ${agentName}: container not running after creation; skipping install.`);
         } else {
             console.log(`[install] ${agentName}: cd '${projectDir}' && ${manifest.install}`);
-            const installCommand = `${runtime} exec ${interactive ? '-it' : ''} ${containerName} sh -lc "cd '${projectDir}' && ${manifest.install}"`;
+            const installCommand = `${runtime} exec ${interactive ? '-it' : ''} ${containerName} ${buildAgentShellArgs(`cd ${shellQuote(containerWorkdir)} && ${manifest.install}`).map(shellQuote).join(' ')}`;
             debugLog(`Executing install command: ${installCommand}`);
             execSync(installCommand, { stdio: 'inherit' });
         }
@@ -288,22 +338,22 @@ function runCommandInContainer(agentName, repoName, manifest, command, interacti
     let envVars = '';
 
     if (interactive && command === '/bin/sh') {
-        bashCommand = `cd '${projectDir}' && exec sh`;
+        bashCommand = `cd ${shellQuote(containerWorkdir)} && exec sh`;
     } else {
-        bashCommand = `cd '${projectDir}' && ${command}`;
+        bashCommand = `cd ${shellQuote(containerWorkdir)} && ${command}`;
     }
 
-    const execCommand = `${runtime} exec ${interactive ? '-it' : ''} ${envVars} ${containerName} sh -lc "${bashCommand}"`;
+    const execCommand = `${runtime} exec ${interactive ? '-it' : ''} ${envVars} ${containerName} ${buildAgentShellArgs(bashCommand).map(shellQuote).join(' ')}`;
     debugLog(`Executing run command: ${execCommand}`);
 
     if (interactive) {
         console.log(`[Ploinky] Attaching to container '${containerName}' (interactive TTY).`);
-        console.log(`[Ploinky] Working directory in container: ${projectDir}`);
+        console.log(`[Ploinky] Working directory in container: ${containerWorkdir}`);
         console.log(`[Ploinky] Exit the program or shell to return to the Ploinky prompt.`);
         const args = ['exec'];
         if (interactive) args.push('-it');
         if (envVars) args.push(...envVars.split(' '));
-        args.push(containerName, 'sh', '-lc', bashCommand);
+        args.push(containerName, ...buildAgentShellArgs(bashCommand));
 
         debugLog(`Running interactive session with args: ${args.join(' ')}`);
 
@@ -334,11 +384,14 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     const containerName = getAgentContainerName(agentName, repoName);
     const projectDir = getConfiguredProjectPath(agentName, repoName);
     const homeDir = getAgentWorkDir(agentName);
+    const homeLayout = resolveAgentHomeLayout({
+        cwd: projectDir, cwdMountTarget: projectDir, agentHomeDir: homeDir,
+    });
     const agentLibPath = path.resolve(__dirname, '../../../Agent');
     const agentPath = path.join(REPOS_DIR, repoName, agentName);
     const absAgentPath = path.resolve(agentPath);
     const sharedDir = ensureSharedHostDir();
-    try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
+    ensureAgentDataDirectory(homeDir);
     let agents = loadAgentsMap();
 
     // Resolve profile config for env hash computation
@@ -360,7 +413,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
         console.log(`Creating container '${containerName}' for agent '${agentName}'...`);
         const envVarParts = [
             ...getSecretsForAgent(manifest, { agentName, repoName }),
-            formatEnvFlag('HOME', '/root'),
+            formatEnvFlag('HOME', homeLayout.containerHome),
             // Set NODE_PATH to project directory node_modules (in the passthrough mount)
             formatEnvFlag('NODE_PATH', `${projectDir}/node_modules`)
         ];
@@ -388,7 +441,9 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                 containerImage,
             });
             debugLog(`Executing create command: ${createCommand}`);
-            execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] });
+            withLegacyMountpointCleanup(() => (
+                execSync(createCommand, { stdio: ['pipe', 'pipe', 'inherit'] })
+            ));
             createdNew = true;
         } catch (error) {
             if (runtime === 'podman' && String(error.message || '').includes('short-name')) {
@@ -411,7 +466,9 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                     containerImage,
                 });
                 debugLog(`Executing retry command: ${retryCommand}`);
-                execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] });
+                withLegacyMountpointCleanup(() => (
+                    execSync(retryCommand, { stdio: ['pipe', 'pipe', 'inherit'] })
+                ));
                 manifest.container = containerImage;
                 createdNew = true;
             } else {
@@ -432,8 +489,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
             type: 'interactive',
             config: {
                 binds: [
-                    { source: projectDir, target: projectDir },
-                    ...(path.resolve(projectDir) === path.resolve(homeDir) ? [] : [{ source: homeDir, target: '/root' }]),
+                    ...homeLayout.binds,
                     { source: agentLibPath, target: '/Agent', ro: true },
                     { source: absAgentPath, target: '/code', ro: true },
                     { source: sharedDir, target: '/shared' }
@@ -447,7 +503,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
     if (!isContainerRunning(containerName)) {
         const startCommand = `${runtime} start ${containerName}`;
         debugLog(`Executing start command: ${startCommand}`);
-        try { execSync(startCommand, { stdio: 'inherit' }); }
+        try { withLegacyMountpointCleanup(() => execSync(startCommand, { stdio: 'inherit' })); }
         catch (e) { console.error('[docker.ensureAgentContainer] start failed:', e.message || e); throw e; }
     }
     syncAgentMcpConfig(containerName, absAgentPath);
@@ -458,7 +514,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
                 console.warn(`[install] ${agentName}: container not running after creation; skipping install.`);
             } else {
                 console.log(`[install] ${agentName}: cd '${projectDir}' && ${manifest.install}`);
-                const installCommand = `${runtime} exec ${containerName} sh -lc "cd '${projectDir}' && ${manifest.install}"`;
+                const installCommand = `${runtime} exec ${containerName} ${buildAgentShellArgs(`cd ${shellQuote(projectDir)} && ${manifest.install}`).map(shellQuote).join(' ')}`;
                 debugLog(`Executing install command: ${installCommand}`);
                 execSync(installCommand, { stdio: 'inherit' });
             }
@@ -523,14 +579,19 @@ function buildExecArgs(containerName, workdir, entryCommand, interactive = true,
         args.push('-i');   // Interactive stdin only, no TTY (for webchat - ensures stdin EOF propagates)
     }
     args.push(...buildWebchatEnvArgs(options.env || process.env));
-    args.push(containerName, 'sh', '-lc', `cd ${shellQuote(wd)} && ${cmd}`);
+    args.push(containerName, ...buildAgentShellArgs(`cd ${shellQuote(wd)} && ${cmd}`));
     return args;
 }
 
-function resolveContainerWorkdir(containerName, workdir) {
+function resolveContainerWorkdir(containerName, workdir, agents) {
     try {
-        const record = loadAgents()?.[containerName];
-        if (record?.runMode === 'isolated' && record.projectPath && path.resolve(record.projectPath) === path.resolve(workdir)) {
+        const record = (agents || loadAgents())?.[containerName];
+        const projectBind = record?.config?.binds?.find(bind => (
+            bind?.source && bind?.target && path.resolve(bind.source) === path.resolve(workdir)
+        ));
+        if (projectBind) return normalizeRuntimeMountTarget(projectBind.target);
+        if (record?.type === 'agent' && (record.runMode || 'isolated') === 'isolated'
+            && record.projectPath && path.resolve(record.projectPath) === path.resolve(workdir)) {
             return '/root';
         }
     } catch (_) {}
@@ -556,5 +617,6 @@ export {
     buildInteractiveAgentCreateCommand,
     buildInteractiveCommandCreateCommand,
     ensureAgentContainer,
+    resolveContainerWorkdir,
     runCommandInContainer
 };

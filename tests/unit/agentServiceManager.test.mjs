@@ -7,6 +7,7 @@ import {
     appendExactManagedBindMount,
     assertPreparedRegistryRecordPreservation,
     buildBoxPodmanHostArgs,
+    buildPersistentAgentRunArgs,
     buildRuntimeNetworkPlan,
     buildRuntimeRouterEnv,
     ensureAgentService,
@@ -22,6 +23,44 @@ import {
 import { getAgentCachePath } from '../../cli/utils/dependencies/dependencyCache.js';
 import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
+
+test('static workspace agents keep project output and private HOME on distinct binds', () => {
+    for (const runtime of ['docker', 'podman']) {
+        const args = buildPersistentAgentRunArgs({
+            runtime,
+            containerName: 'ploinky_static',
+            envHash: 'hash',
+            containerWorkdir: '/root',
+            agentLibMountPath: '/workspace/.ploinky/runtime/Agent',
+            codeMountPath: '/workspace/.ploinky/runtime/code',
+            codeMountMode: ':ro',
+            sharedDir: '/workspace/.data/shared',
+            healthProbeHostDir: '/workspace/.ploinky/run/health-probes/static',
+            cwd: '/workspace',
+            cwdMountTarget: '/root',
+            isolatedHome: true,
+            agentHomeDir: '/workspace/.data/staticAlias',
+            agentLibGrant: {
+                sourceDir: '/workspace/achillesAgentLib',
+                runtimePath: '/opt/ploinky-agentlib',
+                mode: 'local',
+                fingerprint: 'a1'.repeat(32),
+                commit: '',
+                sourceIdHash: 'b2'.repeat(32),
+                namespaced: true,
+            },
+        });
+        const mounts = expectedBindMountsFromArgs(args);
+        assert.deepEqual(mounts.filter(mount => mount.destination === '/root'), [{
+            source: '/workspace', destination: '/root', rw: true,
+        }]);
+        assert.deepEqual(mounts.filter(mount => mount.source === '/workspace/.data/staticAlias'), [{
+            source: '/workspace/.data/staticAlias', destination: '/home/agent', rw: true,
+        }]);
+        assert.equal(args[args.indexOf('-w') + 1], '/root');
+        assert.equal(new Set(mounts.map(mount => mount.destination)).size, mounts.length);
+    }
+});
 
 function boxMarkerFs(contents = BOX_MARKER_CONTENT) {
     return {
@@ -479,6 +518,13 @@ test('existing-container ownership inspection is unconditional across network mo
     assert.match(source, /recreateReason \|\|= 'runtimeStoppedAfterInspection'/);
     assert.match(source, /recreateReason \|\|= 'runtimeDisappearedAfterInspection'/);
     assert.doesNotMatch(source, /execSync\(`\$\{runtime\} start \$\{containerName\}`/);
+    const homeVerification = source.indexOf('if (canReuseExisting && !runtimeNetworkPlan.requiresManagedNetwork)');
+    const earlyReuse = source.indexOf('returning early (container exists)', homeVerification);
+    assert.ok(homeVerification > 0 && earlyReuse > homeVerification);
+    const homeVerificationSource = source.slice(homeVerification, earlyReuse);
+    assert.match(homeVerificationSource, /spawnSync\(runtime, \['inspect', reuseInspection\.id\]/);
+    assert.match(homeVerificationSource, /!hasExactAgentHomeLayout\(inspectedRecords\[0\], desiredHomeLayout\)/);
+    assert.match(homeVerificationSource, /canReuseExisting = false;\s*recreateReason \|\|= 'agentHomeLayoutChanged'/);
 });
 
 test('managed adoption derives one exact dependency runtime key from registered cache mounts', () => {
@@ -528,7 +574,7 @@ test('healthy managed reuse is validation-only while replacement remains an expl
     assert.match(source, /const preflightRecord = options\.preservePreparedRegistryRecord === true[\s\S]*options\.preparedRegistryRecord[\s\S]*mutablePreflightRecord/);
     assert.match(source, /prepareAdditiveEdgeRoutingGeneration/);
     assert.match(source, /prepareEdgeRoutingGeneration as prepareEdgeRoutingGenerationRaw/);
-    assert.match(source, /if \(stageAlongsidePredecessor\) \{[\s\S]*prepared = prepare\(\{[\s\S]*saveRegistry\(agents[\s\S]*prepared = prepareReplacement/);
+    assert.match(source, /if \(preserveActiveAuthorization\) \{[\s\S]*prepared = prepare\(\{[\s\S]*saveRegistry\(agents[\s\S]*prepared = prepareReplacement/);
     assert.match(source, /writeState:\s*!adoptManagedRuntimeOnly,\s*createDirectories:\s*!adoptManagedRuntimeOnly/);
     assert.match(source, /const runtimeKey = adoptManagedRuntimeOnly\s*\? \(adoptionCacheMount\?\.runtimeKey \|\| NO_NODE_RUNTIME_KEY\)\s*:\s*detectRuntimeKeyForAgent/);
     assert.match(source, /if \(adoptManagedRuntimeOnly\) \{[\s\S]*inspectAgentCache\([\s\S]*\} else \{\s*const prepared = prepareAgentCache/);

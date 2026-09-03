@@ -12,7 +12,7 @@ import {
     loadAgentsMap,
     probeContainerRuntime
 } from './common.js';
-import { clearLivenessState } from './healthProbes.js';
+import { clearLivenessState, retireRuntimeRelaySocket } from './healthProbes.js';
 import { stopBwrapProcesses, isBwrapProcessRunning } from '../bwrap/bwrapFleet.js';
 import {
     withNetworkLifecycleLock,
@@ -111,6 +111,7 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     pause = defaultPause,
     now = Date.now,
     workspaceIdentity = workspaceNetworkIdentity,
+    retireRelay = retireRuntimeRelaySocket,
 } = {}) {
     const expectedId = String(record?.containerId || '').trim();
     if (!/^[a-f0-9]{64}$/.test(expectedId)) {
@@ -146,6 +147,10 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         assertExactDescriptorMount(name, inspected, artifact);
 
         if (inspected?.State?.Running === true) {
+            // Retire the projected pathname while the producer is still alive.
+            // On macOS nested Podman, metadata and unlink can both become
+            // permanently unsupported after the owning container exits.
+            retireRelay(name);
             const signaled = control(runtime, ['kill', '--signal', 'SIGTERM', expectedId]);
             if (!controlSucceeded(signaled)) {
                 const raced = revalidate();

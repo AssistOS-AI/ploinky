@@ -1210,6 +1210,7 @@ fast_test_latched_no_wait_loading_transition() (
   local first_ready_generation
   local rotated_generation
   local fixture_socket
+  local marker_attempts=960
 
   workspace=$(mktemp -d -t ploinky-no-wait-latched-XXXXXX)
   trap "fast_graph_cleanup_latched_workspace $(printf '%q' "$workspace")" EXIT
@@ -1235,9 +1236,13 @@ fast_test_latched_no_wait_loading_transition() (
   rotator_blocked="$workspace/.data/rotatorAgent/worker-starting-and-blocked"
   rotator_release="$workspace/.data/rotatorAgent/release-readiness"
   targetless_marker="$workspace/.data/targetlessAgent/targetless-running"
-  fast_graph_wait_for_exact_file "$slow_blocked" "slowAgent blocked marker"
-  fast_graph_wait_for_exact_file "$rotator_blocked" "rotatorAgent blocked marker"
-  fast_graph_wait_for_exact_file "$targetless_marker" "targetlessAgent running marker"
+  # A loaded rootless Podman VM can serialize cold container creation while it
+  # reclaims the preceding dependency fixtures. Keep the lifecycle assertion
+  # bounded, but give this three-runtime integration fixture the same four
+  # minute cold-start budget used by release smoke tests.
+  fast_graph_wait_for_exact_file "$slow_blocked" "slowAgent blocked marker" "$marker_attempts"
+  fast_graph_wait_for_exact_file "$rotator_blocked" "rotatorAgent blocked marker" "$marker_attempts"
+  fast_graph_wait_for_exact_file "$targetless_marker" "targetlessAgent running marker" "$marker_attempts"
   [[ ! -e "$slow_release" ]]
   [[ ! -e "$rotator_release" ]]
 

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { GLOBAL_DEPS_PATH } from '../config.js';
 import { assertNoReservedAgentLibDependency } from './agentLibLink.js';
+import { withoutBoxMcpSdk } from '../../../ploinky-box/agent-dependencies/mcp-sdk.mjs';
 
 /**
  * Merge global and agent package.json objects.
@@ -17,17 +18,21 @@ import { assertNoReservedAgentLibDependency } from './agentLibLink.js';
  * @returns {object} Merged package.json
  */
 function mergePackageJson(globalPackage, agentPackage) {
-    const merged = { ...globalPackage };
-    const agent = assertNoReservedAgentLibDependency(agentPackage || {}, 'agent package.json');
+    const global = withoutBoxMcpSdk(globalPackage, { source: 'globalDeps/package.json' });
+    const merged = { ...global };
+    const agent = withoutBoxMcpSdk(
+        assertNoReservedAgentLibDependency(agentPackage || {}, 'agent package.json'),
+        { source: 'agent package.json' },
+    );
 
     merged.dependencies = {
-        ...(globalPackage.dependencies || {}),
+        ...(global.dependencies || {}),
         ...(agent.dependencies || {}),
     };
 
     if (agent.devDependencies) {
         merged.devDependencies = {
-            ...(globalPackage.devDependencies || {}),
+            ...(global.devDependencies || {}),
             ...agent.devDependencies,
         };
     }
@@ -47,11 +52,9 @@ function mergePackageJson(globalPackage, agentPackage) {
  * Read the global dependencies package.json.
  *
  * `globalDeps/package.json` is the single source of truth for every
- * agent's npm-installed core dependencies (mcp-sdk). achillesAgentLib is
- * deliberately absent: it is direct-mounted from the selected workspace source
- * and linked into each cache instead of installed. The file is copied into each
- * agent's workspace package.json at install time and then read from there on
- * every container start.
+ * agent's core dependencies. Inside a Box, mcp-sdk is supplied by the validated
+ * image bundle and excluded from this npm manifest. achillesAgentLib is direct-
+ * mounted from the selected workspace source and linked into each cache.
  *
  * There is deliberately NO hardcoded fallback here — if this file is
  * missing, the deployment is broken and we want to fail loudly rather
@@ -66,13 +69,15 @@ function readGlobalDepsPackage() {
     if (!fs.existsSync(globalPackagePath)) {
         throw new Error(
             `ploinky globalDeps package.json not found at ${globalPackagePath}. `
-            + `This file is required — it defines the core npm dependencies `
-            + `(mcp-sdk) that every agent installs on setup.`
+            + `This file is required — it defines the global dependency contract.`
         );
     }
-    return assertNoReservedAgentLibDependency(
-        JSON.parse(fs.readFileSync(globalPackagePath, 'utf8')),
-        globalPackagePath,
+    return withoutBoxMcpSdk(
+        assertNoReservedAgentLibDependency(
+            JSON.parse(fs.readFileSync(globalPackagePath, 'utf8')),
+            globalPackagePath,
+        ),
+        { source: globalPackagePath },
     );
 }
 

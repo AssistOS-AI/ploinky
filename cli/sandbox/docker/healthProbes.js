@@ -167,12 +167,31 @@ export function prepareHealthProbeHostDirForLaunch(containerName, options = {}) 
         }
     }
 
+    retireRuntimeRelaySocket(containerName, options);
+    return hostDir;
+}
+
+export function retireRuntimeRelaySocket(containerName, options = {}) {
+    const hostDir = healthProbeHostDir(containerName, options);
+    let directoryIdentity;
+    try {
+        directoryIdentity = fs.lstatSync(hostDir);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+    if (!directoryIdentity.isDirectory() || directoryIdentity.isSymbolicLink()
+        || directoryIdentity.uid !== process.geteuid()
+        || (directoryIdentity.mode & 0o777) !== 0o700) {
+        throw new Error('[probe] health-probe control directory identity is invalid');
+    }
+
     const socketPath = path.join(hostDir, RUNTIME_RELAY_SOCKET_FILE);
     let socketIdentity;
     try {
         socketIdentity = fs.lstatSync(socketPath);
     } catch (error) {
-        if (error?.code === 'ENOENT') return hostDir;
+        if (error?.code === 'ENOENT') return false;
         throw error;
     }
     if (!socketIdentity.isSocket() || socketIdentity.isSymbolicLink()
@@ -180,7 +199,7 @@ export function prepareHealthProbeHostDirForLaunch(containerName, options = {}) 
         throw new Error('[probe] stale runtime relay socket identity is invalid');
     }
     fs.unlinkSync(socketPath);
-    return hostDir;
+    return true;
 }
 
 function createProbeControl(containerName, token, options = {}) {
@@ -299,7 +318,17 @@ function requestProbeCancellation(control) {
 }
 
 function removeCompletedProbeControl(control) {
-    fs.rmSync(control.hostPath, { recursive: true, force: true });
+    // Retire the whole path before removing its claim marker. Otherwise the
+    // broker can reclaim a completed request during recursive deletion. The
+    // hidden parent excludes new scans; stale old-path claims cannot succeed.
+    const retiredParent = fs.mkdtempSync(path.join(path.dirname(control.hostPath), '.completed-'));
+    try {
+        fs.renameSync(control.hostPath, path.join(retiredParent, 'control'));
+    } catch (error) {
+        try { fs.rmdirSync(retiredParent); } catch {}
+        throw error;
+    }
+    fs.rmSync(retiredParent, { recursive: true, force: true });
 }
 
 function cancelAndAwaitProbe(control, options = {}) {
@@ -670,6 +699,7 @@ export const __testHooks = {
     healthProbeHostDir,
     ensureHealthProbeHostDir,
     prepareHealthProbeHostDirForLaunch,
+    retireRuntimeRelaySocket,
     createProbeControl,
     submitProbeRequest,
     probeWasClaimed,

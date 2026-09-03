@@ -142,6 +142,202 @@ test('continuous health recovery accepts only exact active public-route response
     assert.notEqual(run('503', JSON.stringify({ error: { code: 'EDGE_GENERATION_INACTIVE' } })), 0);
 });
 
+function healthRegistry(container = 'current-runtime') {
+    return { [container]: { type: 'agent', repoName: 'testRepo', agentName: 'healthAgent' } };
+}
+
+function runHealthHarness(script, { registry = healthRegistry(), events = [], env = {} } = {}) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-health-identity-'));
+    try {
+        fs.mkdirSync(path.join(root, '.ploinky', 'logs'), { recursive: true });
+        fs.mkdirSync(path.join(root, '.ploinky', 'run'));
+        fs.writeFileSync(path.join(root, '.ploinky', 'agents.json'), JSON.stringify(registry));
+        fs.writeFileSync(path.join(root, '.ploinky', 'logs', 'watchdog.log'), events.map((event) => JSON.stringify(event)).join('\n') + '\n');
+        const state = path.join(root, 'state.sh');
+        fs.writeFileSync(state, '');
+        const result = spawnSync('bash', ['-c', `
+            source "$1"
+            assert_container_running() { [[ "$1" == "$EXPECTED_RUNNING_CONTAINER" ]]; }
+            wait_for_container() { assert_container_running "$1"; }
+            sleep() { exit 89; }
+            curl() {
+                local body_file=""
+                while (( $# > 0 )); do
+                    if [[ "$1" == "-o" ]]; then body_file="$2"; shift; fi
+                    shift
+                done
+                printf '%s' "$FAKE_HTTP_BODY" > "$body_file"
+                if [[ -n "\${FAKE_REGISTRY_AFTER_CURL:-}" ]]; then
+                    printf '%s' "$FAKE_REGISTRY_AFTER_CURL" > "$TEST_RUN_DIR/.ploinky/agents.json"
+                fi
+                printf '%s' "$FAKE_HTTP_STATUS"
+            }
+            ${script}
+        `, 'health-identity-test', path.join(testsDir, 'test-functions/health_probes_negative.sh')], {
+            encoding: 'utf8',
+            timeout: 5000,
+            env: {
+                ...process.env,
+                TMPDIR: root,
+                FAST_STATE_FILE: state,
+                TEST_RUN_DIR: root,
+                TEST_REPO_NAME: 'testRepo',
+                TEST_HEALTH_AGENT_NAME: 'healthAgent',
+                TEST_HEALTH_AGENT_CONT_NAME: 'retired-runtime',
+                TEST_ROUTER_PORT: '18080',
+                EXPECTED_RUNNING_CONTAINER: 'current-runtime',
+                FAKE_HTTP_STATUS: '401',
+                FAKE_HTTP_BODY: JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED' } }),
+                ...env,
+            },
+        });
+        return { ...result, state: fs.readFileSync(state, 'utf8') };
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+test('health recovery resolves the unique current runtime instead of a retired fixture name', () => {
+    const resolved = runHealthHarness('health_probes_current_container');
+    assert.equal(resolved.status, 0, resolved.stderr);
+    assert.equal(resolved.stdout.trim(), 'current-runtime');
+
+    const active = runHealthHarness('health_probes_wait_for_edge_recovery');
+    assert.equal(active.status, 0, active.stderr);
+    assert.match(active.state, /^TEST_HEALTH_AGENT_CONT_NAME=current-runtime$/m);
+});
+
+test('health recovery rejects missing, unrelated, and ambiguous runtime records', () => {
+    for (const registry of [
+        {},
+        { other: { type: 'agent', repoName: 'anotherRepo', agentName: 'healthAgent' } },
+        { ...healthRegistry(), ...healthRegistry('another-runtime') },
+    ]) {
+        const result = runHealthHarness('health_probes_current_container', { registry });
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /Expected one current health probe runtime/);
+        assert.equal(result.state, '');
+    }
+});
+
+test('active health recovery cannot accept a stopped or concurrently replaced runtime', () => {
+    for (const env of [
+        { EXPECTED_RUNNING_CONTAINER: 'another-runtime' },
+        { FAKE_REGISTRY_AFTER_CURL: JSON.stringify(healthRegistry('another-runtime')) },
+    ]) {
+        const result = runHealthHarness('health_probes_wait_for_edge_recovery', { env });
+        assert.equal(result.status, 89, result.stderr);
+        assert.equal(result.state, '', 'an unproven runtime must not update fixture identity');
+    }
+});
+
+test('health restart completion requires a new event for the exact selected runtime and agent', () => {
+    const success = {
+        event: 'container_restart_success',
+        reason: 'semantic_probe_failed',
+        container: 'current-runtime',
+        repo: 'testRepo',
+        agent: 'healthAgent',
+    };
+    const accepted = runHealthHarness('health_probes_wait_for_restart_completion 1', {
+        events: [{ event: 'old-event' }, success],
+    });
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.state, /^TEST_HEALTH_AGENT_CONT_NAME=current-runtime$/m);
+
+    for (const events of [
+        [success],
+        [{ event: 'old-event' }, { ...success, container: 'retired-runtime' }],
+        [{ event: 'old-event' }, { ...success, repo: 'anotherRepo' }],
+        [{ event: 'old-event' }, { ...success, agent: 'anotherAgent' }],
+        [{ event: 'old-event' }, { ...success, reason: 'not_running' }],
+    ]) {
+        const rejected = runHealthHarness('health_probes_wait_for_restart_completion 1', { events });
+        assert.equal(rejected.status, 89, JSON.stringify({ events, stderr: rejected.stderr }));
+        assert.equal(rejected.state, '');
+    }
+});
+
+test('health recovery accepts a successful retry of the already-observed semantic failure', () => {
+    const retriedSuccess = {
+        event: 'container_restart_success',
+        reason: 'restart_failed',
+        container: 'current-runtime',
+        repo: 'testRepo',
+        agent: 'healthAgent',
+    };
+    const accepted = runHealthHarness('health_probes_wait_for_restart_completion 1', {
+        events: [{ event: 'old-event' }, retriedSuccess],
+    });
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.match(accepted.state, /^TEST_HEALTH_AGENT_CONT_NAME=current-runtime$/m);
+
+    for (const events of [
+        [retriedSuccess],
+        [{ event: 'old-event' }, { ...retriedSuccess, container: 'retired-runtime' }],
+        [{ event: 'old-event' }, { ...retriedSuccess, repo: 'anotherRepo' }],
+        [{ event: 'old-event' }, { ...retriedSuccess, agent: 'anotherAgent' }],
+    ]) {
+        const rejected = runHealthHarness('health_probes_wait_for_restart_completion 1', { events });
+        assert.equal(rejected.status, 89, JSON.stringify({ events, stderr: rejected.stderr }));
+        assert.equal(rejected.state, '');
+    }
+});
+
+test('negative health injection refreshes identity and waits for replacement completion before route recovery', () => {
+    const result = runHealthHarness(`
+        edge_checks=0
+        health_probes_wait_for_edge_recovery() {
+            edge_checks=$((edge_checks + 1))
+            if (( edge_checks == 1 )); then
+                TEST_HEALTH_AGENT_CONT_NAME=current-runtime
+                write_state_var TEST_HEALTH_AGENT_CONT_NAME "$TEST_HEALTH_AGENT_CONT_NAME"
+                echo ready-before-injection
+            else
+                [[ "$TEST_HEALTH_AGENT_CONT_NAME" == recovered-runtime ]] || return 1
+                echo ready-after-replacement
+            fi
+        }
+        health_probes_force_failure() {
+            [[ "$TEST_HEALTH_AGENT_CONT_NAME" == current-runtime ]] || return 1
+            echo failure-injected
+        }
+        health_probes_wait_for_failure_logs() { echo exact-failure-observed; }
+        health_probes_assert_edge_inactive() { echo edge-inactive; }
+        health_probes_write_success_scripts() { echo source-restored; }
+        health_probes_wait_for_restart_completion() {
+            TEST_HEALTH_AGENT_CONT_NAME=recovered-runtime
+            write_state_var TEST_HEALTH_AGENT_CONT_NAME "$TEST_HEALTH_AGENT_CONT_NAME"
+            echo replacement-completed
+        }
+        health_probes_fail_closed_and_recovers
+    `);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.stdout.trim().split('\n'), [
+        'ready-before-injection',
+        'failure-injected',
+        'exact-failure-observed',
+        'edge-inactive',
+        'source-restored',
+        'replacement-completed',
+        'ready-after-replacement',
+    ]);
+});
+
+test('the disposable health fixture keeps strict failure thresholds with a VM scheduling budget', () => {
+    const source = readHarness('doPrepare.sh');
+    const marker = 'cat >"${health_agent_root}/manifest.json" <<\'EOF\'\n';
+    const start = source.indexOf(marker);
+    assert.notEqual(start, -1);
+    const end = source.indexOf('\nEOF', start + marker.length);
+    const manifest = JSON.parse(source.slice(start + marker.length, end));
+    for (const probe of Object.values(manifest.health)) {
+        assert.equal(probe.timeout, 5);
+        assert.equal(probe.failureThreshold, 1);
+        assert.equal(probe.successThreshold, 1);
+    }
+});
+
 test('each post-Router enable records its own completion marker', () => {
     const lib = readHarness('lib.sh');
     const body = extractShellFunction(lib, 'enable_fast_suite_agents_after_router');

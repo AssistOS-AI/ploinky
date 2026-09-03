@@ -402,6 +402,21 @@ test('runCli no-tty suppresses banners but preserves attachment', async () => {
     assert.ok(harness.events.some(event => event[0] === 'attach'));
 });
 
+test('CLI attach honors a longer declared readiness budget while preserving its undeclared default', async () => {
+    for (const health of [undefined, { readiness: { interval: 1, timeout: 5, failureThreshold: 180 } }]) {
+        const harness = agentCliHarness();
+        const readManifest = harness.dependencies.readManifest;
+        harness.dependencies.readManifest = () => ({ ...readManifest(), ...(health ? { health } : {}) });
+        harness.dependencies.waitForAgentReady = async (_route, options) => {
+            assert.deepEqual(options, { timeoutMs: health ? 1080000 : 600000, protocol: 'mcp' });
+            assert.equal(harness.events.some(([event]) => event === 'attach'), false);
+            return true;
+        };
+        await runCliWithDependencies('explorer', [], harness.dependencies);
+        assert.ok(harness.events.some(([event]) => event === 'attach'));
+    }
+});
+
 test('runCli holds its maintenance transaction through readiness and activation', async () => {
     const harness = agentCliHarness();
     let releaseReadiness;

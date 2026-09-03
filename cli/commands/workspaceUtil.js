@@ -49,7 +49,7 @@ import {
   prepareLlmStartup,
   resolveLlmRuntimeAdmissionContext,
 } from '../sandbox/docker/llmRuntimeIntegration.js';
-import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
+import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
 import { createWorkspaceStartLock, releaseWorkspaceStartLock, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
@@ -75,6 +75,7 @@ import {
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
+  readEdgeRoutingSelection,
   withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
@@ -706,7 +707,13 @@ function deduplicateAgentRegistry(reg, getAgentContainerName) {
     const agentKey = `${repo}::${rec.agentName}`;
     const existing = canonical.get(agentKey);
     if (!existing || key === expectedKey) {
-      canonical.set(agentKey, { key: expectedKey, rec });
+      // A coordinated additive replacement has a deliberately distinct
+      // __candidate_<identity> runtime name.  Preserve that exact registry
+      // key when it is the sole record for this logical agent; rewriting it
+      // to the conventional name severs the registry/runtime binding and
+      // makes the next workspace start treat the live candidate as stopped.
+      // If both records exist, the real conventional key still wins.
+      canonical.set(agentKey, { key, rec });
     }
   }
 
@@ -759,6 +766,24 @@ function findRegistryEntryForGraphNode(reg, node, getAgentContainerName) {
     }
   }
   return null;
+}
+
+function resolveStaticRouterContainerName({
+  registry,
+  staticNode,
+  staticAgent,
+  staticRepoName,
+  getAgentContainerName,
+}) {
+  const registryEntry = findRegistryEntryForGraphNode(
+    registry,
+    staticNode,
+    getAgentContainerName,
+  );
+  return registryEntry?.key || getAgentContainerName(
+    staticNode?.shortAgentName || staticAgent,
+    staticNode?.repoName || staticRepoName || '',
+  );
 }
 
 function resolveGraphNodeExecutionRecord(node, {
@@ -1457,23 +1482,7 @@ function formatGraphNodeLabel(node, staticLabel) {
   return node.shortAgentName;
 }
 
-function buildReadinessEntryFromNode(node, route, staticLabel) {
-  const timeoutMs = Number.parseInt(
-    process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_TIMEOUT_MS']
-      || '120000',
-    10
-  );
-  const intervalMs = Number.parseInt(
-    process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_INTERVAL_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_INTERVAL_MS']
-      || '250',
-    10
-  );
-  const probeTimeoutMs = Number.parseInt(
-    process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_PROBE_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_PROBE_TIMEOUT_MS']
-      || '1000',
-    10
-  );
-
+function buildReadinessEntryFromNode(node, route, staticLabel, fallbackTimeoutMs = 120000) {
   const protocol = resolveAgentReadinessProtocol(node.manifest);
   const entry = {
     key: node.id,
@@ -1481,9 +1490,15 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
     kind: node.isStatic ? 'static' : 'dependency',
     route,
     protocol,
-    timeoutMs,
-    intervalMs,
-    probeTimeoutMs
+    ...resolveManifestReadinessWaitOptions(
+      protocol === 'mcp' || protocol === 'tcp' ? node.manifest : null,
+      fallbackTimeoutMs,
+      {
+        timeoutMs: process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_TIMEOUT_MS'],
+        intervalMs: process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_INTERVAL_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_INTERVAL_MS'],
+        probeTimeoutMs: process.env[node.isStatic ? 'PLOINKY_STATIC_AGENT_READY_PROBE_TIMEOUT_MS' : 'PLOINKY_DEPENDENCY_AGENT_READY_PROBE_TIMEOUT_MS'],
+      },
+    ),
   };
   if (protocol === 'script') {
     entry.scriptProbe = normalizeProbeConfig('readiness', node.manifest?.health?.readiness);
@@ -1491,32 +1506,8 @@ function buildReadinessEntryFromNode(node, route, staticLabel) {
   return entry;
 }
 
-function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 120000) {
-  const probe = manifest?.health?.readiness && typeof manifest.health.readiness === 'object'
-    ? manifest.health.readiness
-    : null;
-  if (!probe) {
-    return {
-      timeoutMs: fallbackTimeoutMs,
-      intervalMs: 250,
-      probeTimeoutMs: 1000
-    };
-  }
-  const intervalSeconds = Number.parseInt(probe.interval ?? '1', 10);
-  const timeoutSeconds = Number.parseInt(probe.timeout ?? '1', 10);
-  const failureThreshold = Number.parseInt(probe.failureThreshold ?? '120', 10);
-  const intervalMs = Math.max(1, Number.isFinite(intervalSeconds) ? intervalSeconds : 1) * 1000;
-  const probeTimeoutMs = Math.max(1, Number.isFinite(timeoutSeconds) ? timeoutSeconds : 1) * 1000;
-  const attempts = Math.max(1, Number.isFinite(failureThreshold) ? failureThreshold : 120);
-  return {
-    timeoutMs: Math.max(fallbackTimeoutMs, attempts * (intervalMs + probeTimeoutMs)),
-    intervalMs,
-    probeTimeoutMs
-  };
-}
-
-function buildBlockingReadinessEntryFromNode(node, route, staticLabel) {
-  const entry = buildReadinessEntryFromNode(node, route, staticLabel);
+function buildBlockingReadinessEntryFromNode(node, route, staticLabel, fallbackTimeoutMs = 120000) {
+  const entry = buildReadinessEntryFromNode(node, route, staticLabel, fallbackTimeoutMs);
   if (entry.protocol === 'script' && !route?.container) {
     throw new Error(`${node.isStatic ? 'Static agent' : 'Dependent agent'} '${formatGraphNodeLabel(node, staticLabel)}' did not resolve its service container for script readiness.`);
   }
@@ -1693,12 +1684,12 @@ async function waitForManifestReadiness({ key, label, kind = 'dependency', manif
       isStatic: kind === 'static',
       manifest
     };
-    const entry = buildBlockingReadinessEntryFromNode(node, route, label);
+    const fallbackTimeoutMs = kind === 'reinstall' && resolveAgentReadinessProtocol(manifest) !== 'script'
+      ? 15000
+      : 120000;
+    const entry = buildBlockingReadinessEntryFromNode(node, route, label, fallbackTimeoutMs);
     entry.kind = kind;
     entry.label = label;
-    if (kind === 'reinstall' && entry.protocol !== 'script') {
-      Object.assign(entry, resolveManifestReadinessWaitOptions(manifest, 15000));
-    }
     await waitForReadinessEntries([entry], options);
   } catch (error) {
     const readinessError = new Error(error?.message || String(error), { cause: error });
@@ -1977,8 +1968,15 @@ async function startWorkspace(staticAgentArg, portArg, {
   let routerReadyForStart = false;
   let routerPortForStart = 0;
   let routerContainerForStart = '';
-  const ensureRouterReadyForStart = async ({ staticAgent, staticPort, repoName, shortAgentName }) => {
-    const container = dockerSvc.getAgentContainerName(shortAgentName || staticAgent, repoName || '');
+  const ensureRouterReadyForStart = async ({
+    staticAgent,
+    staticPort,
+    repoName,
+    shortAgentName,
+    containerName,
+  }) => {
+    const container = containerName
+      || dockerSvc.getAgentContainerName(shortAgentName || staticAgent, repoName || '');
     if (routerReadyForStart) {
       if (routerPortForStart !== staticPort || routerContainerForStart !== container) {
         throw new Error('start: resolved static routing identity changed after the router listener became ready');
@@ -2074,11 +2072,20 @@ async function startWorkspace(staticAgentArg, portArg, {
     } catch (e) {
       throw new Error(`start: Agent '${staticAgent}' not found in any repo. Use 'enable agent <repo/name>' or check repos.`);
     }
+    const admittedStaticNode = lockedStart.graph.nodes.get(lockedStart.graph.staticNodeId);
+    const admittedStaticContainer = resolveStaticRouterContainerName({
+      registry: lockedStart.registry,
+      staticNode: admittedStaticNode,
+      staticAgent,
+      staticRepoName,
+      getAgentContainerName: dockerSvc.getAgentContainerName,
+    });
     await ensureRouterReadyForStart({
       staticAgent,
       staticPort,
       repoName: staticRepoName,
       shortAgentName: staticShortAgent,
+      containerName: admittedStaticContainer,
     });
 
     // Compile the already prepared and admitted complete manifest graph into
@@ -2212,8 +2219,13 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
 
     const staticNode = dependencyGraph.nodes.get(dependencyGraph.staticNodeId);
-    const staticRegistryEntry = findRegistryEntryForGraphNode(reg, staticNode, getAgentContainerName);
-    const staticContainer = staticRegistryEntry?.key || getAgentContainerName(staticShortAgent || staticAgent, staticRepoName || '');
+    const staticContainer = resolveStaticRouterContainerName({
+      registry: reg,
+      staticNode,
+      staticAgent,
+      staticRepoName,
+      getAgentContainerName,
+    });
 
     if (Number(cfg.port) !== staticPort
         || cfg.static?.agent !== staticAgent
@@ -2822,7 +2834,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
               log(`[cli] Waiting for '${shortAgentName}' readiness (${readinessProtocol})...`);
             }
             const ready = await waitForAgentReadyImpl(cliReadinessRoute, {
-              timeoutMs: 600000,
+              timeoutMs: resolveManifestReadinessWaitOptions(manifest, 600000).timeoutMs,
               protocol: readinessProtocol,
             });
             if (!ready) {
@@ -3087,6 +3099,14 @@ async function reinstallAgent(agentName) {
             try {
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
+            const edgeSelection = readEdgeRoutingSelection();
+            const stageAlongsidePredecessor = edgeSelection.selector.state === 'active';
+            if (!stageAlongsidePredecessor && !isSandboxRuntime(agentRuntime)) {
+              dockerSvc.removeAgentContainerForRecreate(
+                containerName,
+                'inactiveManifestReplacement',
+              );
+            }
 
             // The shared runtime manager owns inactivation and physical
             // replacement for every backend, including host sandboxes.
@@ -3097,6 +3117,7 @@ async function reinstallAgent(agentName) {
                 routerEndpoint,
                 runtimeAdmission: directAdmission.runtimeAdmission,
                 networkLifecycleCapability,
+                stageAlongsidePredecessor,
             });
             const { containerName: newContainerName, hostPort } = reinstallResult;
 
@@ -3171,9 +3192,11 @@ export {
   buildBlockingReadinessEntryFromNode,
   computeRetainedManagedEnvHash,
   activatePreparedRuntimeAfterReadiness,
+  deduplicateAgentRegistry,
   ensureGraphNodesEnabled,
   removeGraphContainerForRecreate,
   reprepareGraphAfterStartupProviders,
+  resolveStaticRouterContainerName,
   resolveExtraEnabledRuntimeNodes,
   resolveManifestRouterEndpoint,
   resolveAndPersistStartRouterPort,

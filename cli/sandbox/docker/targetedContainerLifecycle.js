@@ -133,6 +133,7 @@ export function drainTargetedContainer(name, {
     exists = containerExists,
     isRunning = isContainerRunning,
     signal = defaultSignal,
+    retireControlSocket = () => {},
     inspect = defaultInspect,
     now = () => Date.now(),
     sleep = sleepSync,
@@ -184,6 +185,7 @@ export function drainTargetedContainer(name, {
         return Object.freeze({ state: 'already-stopped', containerName, exitCode, affectedSelectors: selectors });
     }
 
+    retireControlSocket(containerName);
     const signaled = signal(runtime, containerName);
     if (signaled?.error || signaled?.status !== 0) {
         throw lifecycleError(

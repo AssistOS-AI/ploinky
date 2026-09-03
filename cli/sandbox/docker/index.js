@@ -23,6 +23,7 @@ export {
 export {
     cleanupExactAgentRuntimeCandidate,
     ensureAgentService,
+    getFailedRuntimeIdentityRotation,
     removeAgentContainerForRecreate,
     retireExactAgentRuntimePredecessor,
     resolveHostPort,

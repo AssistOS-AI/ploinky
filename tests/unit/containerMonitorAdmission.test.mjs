@@ -73,6 +73,40 @@ test('watchdog policy rejection is terminal before target or timer creation and 
     assert.equal(respawned.targets.get('unsafe_runtime').pendingRestartTimer, null);
 });
 
+test('watchdog treats selected-profile legacy storage as terminal agent-data policy', () => {
+    fs.writeFileSync(manifestFile, JSON.stringify({
+        container: 'node:20-alpine',
+        profiles: {
+            default: { volumes: { '.ploinky/shared/legacy': '/legacy' } },
+        },
+    }));
+    const ledger = path.join(ploinkyDir, 'running', 'agent-data-terminal-ledger.json');
+    const monitor = createContainerMonitor({ terminalLedgerFile: ledger });
+    syncManagedContainers(monitor);
+    assert.equal(monitor.targets.size, 0);
+    assert.equal(monitor.terminalLedger.get('unsafe_runtime')?.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+    assert.equal(monitor.terminalLedger.get('unsafe_runtime')?.classification, 'policy');
+
+    const respawned = createContainerMonitor({ terminalLedgerFile: ledger });
+    syncManagedContainers(respawned);
+    assert.equal(respawned.targets.size, 0);
+    assert.equal(respawned.terminalLedger.get('unsafe_runtime')?.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+
+    fs.writeFileSync(manifestFile, JSON.stringify({
+        container: 'node:20-alpine',
+        volumes: { '.ploinky/data/legacy': '/legacy' },
+    }));
+    syncManagedContainers(respawned);
+    assert.equal(respawned.targets.size, 0);
+    assert.equal(respawned.terminalLedger.get('unsafe_runtime')?.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+
+    fs.writeFileSync(manifestFile, JSON.stringify({ container: 'node:20-alpine' }));
+    syncManagedContainers(respawned);
+    assert.equal(respawned.terminalLedger.has('unsafe_runtime'), false);
+    assert.equal(respawned.targets.has('unsafe_runtime'), true);
+    assert.equal(respawned.targets.get('unsafe_runtime').pendingRestartTimer, null);
+});
+
 test('watchdog expires an absent terminal tombstone using its documented bounded retention', () => {
     fs.writeFileSync(manifestFile, JSON.stringify({
         container: 'node:20-alpine',
@@ -177,14 +211,16 @@ test('watchdog restart attempt preserves its staged successor across monitor syn
     monitor.createWorkspaceMutationLease = () => Object.freeze({ operation: 'watchdog' });
     monitor.releaseWorkspaceMutationLease = () => {};
     monitor.withNetworkLifecycleLock = (callback) => callback(Object.freeze({ network: true }));
+    monitor.readEdgeRoutingSelection = () => ({ selector: { state: 'inactive' } });
     monitor.resolveRouterEndpoint = () => Object.freeze({
         mode: 'default',
         host: 'host.containers.internal',
         port: 8080,
         url: 'http://host.containers.internal:8080',
     });
-    monitor.ensureAgentService = () => {
+    monitor.ensureAgentService = (_agentName, _manifest, _agentDir, options) => {
         events.push('ensure');
+        assert.equal(options.preserveActiveAuthorization, false);
         fs.writeFileSync(agentsFile, JSON.stringify({ unsafe_runtime: stagedRecord }, null, 2));
         return {
             containerName: 'unsafe_runtime',
@@ -232,5 +268,145 @@ test('watchdog restart attempt preserves its staged successor across monitor syn
     assert.deepEqual(events, ['ensure', 'readiness', 'registry-save', 'route-save', 'apply']);
     assert.equal(target.instanceId, 'instance-new');
     assert.equal(target.enableGeneration, 'enable-new');
+    assert.equal(target.isRestarting, false);
+});
+
+test('watchdog keeps an additive predecessor live through readiness and atomically commits its distinct candidate', async () => {
+    fs.writeFileSync(manifestFile, JSON.stringify({
+        container: 'node:20-alpine',
+        readiness: { protocol: 'mcp' },
+    }));
+    const originalRecord = {
+        type: 'agent',
+        repoName: 'demo',
+        agentName: 'unsafe',
+        runtime: 'container',
+        containerId: 'container-old',
+        instanceId: 'instance-old',
+        enableGeneration: 'enable-old',
+    };
+    const candidateName = 'unsafe_runtime--candidate';
+    const stagedRecord = {
+        ...originalRecord,
+        containerId: undefined,
+        instanceId: 'instance-new',
+        enableGeneration: 'enable-new',
+    };
+    delete stagedRecord.containerId;
+    const finalRecord = {
+        ...stagedRecord,
+        containerId: 'container-new',
+        config: { ports: [{ containerPort: 7000, hostPort: 43123 }] },
+    };
+    const agentsFile = path.join(ploinkyDir, 'agents.json');
+    const routingFile = path.join(ploinkyDir, 'routing.json');
+    fs.writeFileSync(agentsFile, JSON.stringify({ unsafe_runtime: originalRecord }, null, 2));
+    fs.writeFileSync(routingFile, JSON.stringify({
+        routes: {
+            unsafe: {
+                repo: 'demo',
+                agent: 'unsafe',
+                container: 'unsafe_runtime',
+                hostPath: agentDir,
+            },
+        },
+    }, null, 2));
+    const monitor = createContainerMonitor({
+        terminalLedgerFile: path.join(ploinkyDir, 'running', 'additive-attempt-ledger.json'),
+    });
+    syncManagedContainers(monitor);
+    const target = monitor.targets.get('unsafe_runtime');
+    target.attemptEpoch = 1;
+    target.isRestarting = true;
+    const attempt = Object.freeze({
+        target,
+        epoch: 1,
+        digest: target.restartInputDigest,
+        snapshot: target.restartSnapshot,
+    });
+    const networkLifecycleCapability = Object.freeze({ network: true });
+    const applyLockCapability = Object.freeze({ apply: true });
+    const preparationLease = Object.freeze({
+        mode: 'additive',
+        transactionId: 'additive-watchdog',
+        preparedGeneration: 'prepared-generation',
+    });
+    const replacementPredecessor = Object.freeze({
+        containerName: 'unsafe_runtime',
+        containerId: 'container-old',
+        runtimeNetwork: { mode: 'default' },
+        registryRecord: structuredClone(originalRecord),
+    });
+    const events = [];
+    monitor.createWorkspaceMutationLease = () => Object.freeze({ operation: 'watchdog' });
+    monitor.releaseWorkspaceMutationLease = () => {};
+    monitor.withNetworkLifecycleLock = (callback) => callback(networkLifecycleCapability);
+    monitor.readEdgeRoutingSelection = () => ({ selector: { state: 'active' } });
+    monitor.resolveRouterEndpoint = () => Object.freeze({
+        mode: 'default',
+        host: 'host.containers.internal',
+        port: 8080,
+        url: 'http://host.containers.internal:8080',
+    });
+    monitor.ensureAgentService = (_agentName, _manifest, _agentDir, options) => {
+        events.push('ensure');
+        assert.equal(options.preserveActiveAuthorization, true);
+        assert.deepEqual(JSON.parse(fs.readFileSync(agentsFile, 'utf8')), {
+            unsafe_runtime: originalRecord,
+        });
+        return {
+            containerName: candidateName,
+            containerId: 'container-new',
+            hostPort: 43123,
+            registryRecord: structuredClone(finalRecord),
+            stagedRegistryRecord: structuredClone(stagedRecord),
+            requiresEdgeActivation: true,
+            preparationLease,
+            replacementPredecessor,
+        };
+    };
+    monitor.resolveAgentReadinessProtocol = () => 'mcp';
+    monitor.waitForAgentReady = () => {
+        events.push('readiness');
+        assert.deepEqual(JSON.parse(fs.readFileSync(agentsFile, 'utf8')), {
+            unsafe_runtime: originalRecord,
+        });
+        syncManagedContainers(monitor);
+        assert.equal(monitor.targets.get('unsafe_runtime'), target);
+        return true;
+    };
+    monitor.loadAgents = () => JSON.parse(fs.readFileSync(agentsFile, 'utf8'));
+    monitor.readRoutingConfig = () => JSON.parse(fs.readFileSync(routingFile, 'utf8'));
+    monitor.withEdgeGenerationApplyLock = (callback, options) => {
+        assert.equal(options.preparationLease, preparationLease);
+        return callback(applyLockCapability);
+    };
+    monitor.commitAdditiveEdgeRoutingGeneration = (lease, options) => {
+        assert.equal(lease, preparationLease);
+        assert.equal(options.applyLockCapability, applyLockCapability);
+        assert.equal(options.agents.unsafe_runtime, undefined);
+        assert.deepEqual(options.agents[candidateName], finalRecord);
+        assert.equal(options.routing.routes.unsafe.container, candidateName);
+        fs.writeFileSync(agentsFile, JSON.stringify(options.agents, null, 2));
+        fs.writeFileSync(routingFile, JSON.stringify(options.routing, null, 2));
+        events.push('commit');
+    };
+    monitor.retireExactAgentRuntimePredecessor = (predecessor, options) => {
+        assert.equal(predecessor, replacementPredecessor);
+        assert.equal(options.networkLifecycleCapability, networkLifecycleCapability);
+        events.push('retire');
+    };
+    monitor.applyEdgeRoutingGeneration = () => assert.fail('additive commit must not use replacement apply');
+    monitor.abortEdgeRoutingPreparation = () => assert.fail('successful additive restart must not abort');
+    monitor.cleanupFailedRuntime = () => assert.fail('successful additive restart must not clean its candidate');
+
+    await performContainerRestart(monitor, target, 'not_running', attempt);
+
+    assert.deepEqual(JSON.parse(fs.readFileSync(agentsFile, 'utf8')), {
+        [candidateName]: finalRecord,
+    });
+    assert.deepEqual(events, ['ensure', 'readiness', 'commit', 'retire']);
+    assert.equal(monitor.targets.has('unsafe_runtime'), false);
+    assert.equal(monitor.targets.get(candidateName), target);
     assert.equal(target.isRestarting, false);
 });

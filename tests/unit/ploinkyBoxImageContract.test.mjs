@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
 
 import {
     IMAGE_CONTRACT,
+    IMAGE_OBSERVATION_UNAVAILABLE,
     IMAGE_PROBE_TIMEOUT_MS,
     WEBTTY_NATIVE_PROBE_TIMEOUT_MS,
     inspectAndValidateImage,
@@ -235,25 +237,82 @@ test('native probe output is bounded and malformed output fails closed', () => {
     }
 });
 
-test('native probe process failures expose only a bounded stable category', () => {
-    for (const [result, expected] of [
-        [{ ok: false, stdout: '', stderr: 'WebTTY native probe failed: contract-artifact-sha256\n' }, 'contract-artifact-sha256'],
-        [{ ok: false, stdout: '', stderr: 'untrusted diagnostic with /host/private/path' }, 'probe-failed'],
-        [{ ok: false, stdout: '', stderr: '', error: { code: 'ETIMEDOUT' } }, 'timeout'],
+test('explicit native probe contract failures retain a bounded hard-cut diagnostic', () => {
+    const runner = {
+        query: () => ({ ok: false, stdout: '', stderr: 'WebTTY native probe failed: contract-artifact-sha256\n' }),
+    };
+    assert.throws(
+        () => probeWebttyNativeRuntime(
+            'podman', 'sha256:image-id', normalizeImageInspect(validRecord()), runner,
+        ),
+        (error) => error.code === 'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID'
+            && error.message.includes('contract-artifact-sha256')
+            && /build or pull a compatible runtime image and recreate the Box/.test(error.message),
+    );
+});
+
+test('image command failures remain unavailable at every admission stage', () => {
+    for (const result of [
+        { ok: false, stdout: '', stderr: 'untrusted diagnostic with /host/private/path', status: 125 },
+        { ok: false, stdout: '', stderr: '', error: { code: 'ETIMEDOUT' } },
+        { ok: false, stdout: '', stderr: '', error: { code: 'ENOENT' } },
+        { ok: false, stdout: '', stderr: '', signal: 'SIGKILL', status: 137 },
     ]) {
-        const runner = { query: () => result };
+        for (let failedCall = 0; failedCall < 4; failedCall += 1) {
+            const healthy = admissionRunner();
+            let calls = 0;
+            const runner = {
+                query(...args) {
+                    return calls++ === failedCall ? result : healthy.query(...args);
+                },
+            };
+            assert.throws(
+                () => inspectAndValidateExistingImage('podman', 'sha256:image-id', 'runtime', runner),
+                (error) => error.code === IMAGE_OBSERVATION_UNAVAILABLE
+                    && !error.message.includes('/host/private/path')
+                    && !/destroy|recreate|compatible runtime/.test(error.message),
+            );
+            assert.equal(calls, failedCall + 1, 'failed observation cannot admit or continue probing');
+        }
         assert.throws(
-            () => probeWebttyNativeRuntime(
-                'podman',
-                'sha256:image-id',
-                normalizeImageInspect(validRecord()),
-                runner,
-            ),
-            (error) => error.code === 'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID'
-                && error.message.includes(expected)
-                && !error.message.includes('/host/private/path')
-                && /build or pull a compatible runtime image and recreate the Box/.test(error.message),
+            () => inspectAndValidateImage('podman', 'runtime', { query: () => result }),
+            (error) => error.code === IMAGE_OBSERVATION_UNAVAILABLE,
         );
+    }
+});
+
+test('binary probe assertion failures remain incompatible instead of unavailable', () => {
+    for (const category of ['runtime-uid', 'runtime-gid', 'required-binary', 'entrypoint', 'marker-size', 'marker-content', 'network-helper']) {
+        const runner = {
+            query: () => ({ ok: false, stdout: '', stderr: `Ploinky Box runtime probe failed: ${category}\n`, status: 1 }),
+        };
+        assert.throws(
+            () => probeImageBinaries('podman', 'sha256:image-id', runner),
+            (error) => error.code === 'PLOINKY_BOX_IMAGE_CONTRACT_INVALID' && error.message.includes(category),
+        );
+    }
+});
+
+test('the binary probe emits its contract marker when a shell assertion fails', () => {
+    const runner = {
+        query(_engine, args) {
+            const result = spawnSync('bash', ['-c', 'id() { printf "999\\n"; }; ' + args.at(-1)], { encoding: 'utf8' });
+            return { ...result, ok: result.status === 0 && !result.error };
+        },
+    };
+    assert.throws(
+        () => probeImageBinaries('podman', 'sha256:image-id', runner),
+        (error) => error.code === 'PLOINKY_BOX_IMAGE_CONTRACT_INVALID' && /runtime-uid/.test(error.message),
+    );
+});
+
+test('interrupted probes do not use partial assertion output as a completed observation', () => {
+    for (const [probe, stderr] of [
+        [(runner) => probeImageBinaries('podman', 'sha256:image-id', runner), 'Ploinky Box runtime probe failed: marker-content\n'],
+        [(runner) => probeWebttyNativeRuntime('podman', 'sha256:image-id', normalizeImageInspect(validRecord()), runner), 'WebTTY native probe failed: contract-artifact-sha256\n'],
+    ]) {
+        const runner = { query: () => ({ ok: false, stdout: '', stderr, error: { code: 'ETIMEDOUT' } }) };
+        assert.throws(() => probe(runner), (error) => error.code === IMAGE_OBSERVATION_UNAVAILABLE && /timeout/.test(error.message));
     }
 });
 

@@ -112,11 +112,42 @@ test('argument renderers reject a forged public-version descriptor', () => {
     );
 });
 
-test('strict Box marker rejects unsupported capabilities but defers host-network authority to the exact generation grant', () => {
+test('strict Box marker admits only the fixed nested Podman capability contract', () => {
     const fixture = markerFixture();
     try {
+        const privileged = resolveEffectiveRuntimeCapabilities({
+            containerSecurity: { privileged: true },
+        });
+        assert.throws(
+            () => assertRuntimeCapabilitiesAllowed(privileged, {
+                boxMarkerOptions: { markerPath: fixture.markerPath },
+            }),
+            (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED'
+                && error.context.unsupported.includes('privileged'),
+        );
+        const nestedManifest = { containerSecurity: { nestedPodman: true } };
+        const nestedBytes = Buffer.from(JSON.stringify(nestedManifest));
+        const nestedAdmission = admitManifestRuntimeCapabilities(nestedManifest, {
+            manifestBytes: nestedBytes,
+            boxMarkerOptions: { markerPath: fixture.markerPath },
+        });
+        assert.deepEqual(renderContainerSecurityArgs(nestedAdmission.descriptor), [
+            '--cap-add', 'SYS_ADMIN',
+            '--cap-add', 'NET_ADMIN',
+            '--device', '/dev/fuse',
+            '--device', '/dev/net/tun',
+            '--security-opt', 'label=disable',
+            '--security-opt', 'seccomp=/opt/ploinky/ploinky-box/seccomp/podman-nested-pid-fallback.json',
+        ]);
+        assert.throws(
+            () => assertRuntimeCapabilitiesAllowed(nestedAdmission.descriptor, {
+                runtimeKind: 'bwrap',
+                boxMarkerOptions: { markerPath: fixture.markerPath },
+            }),
+            (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED'
+                && error.context.unsupported.includes('nested-podman'),
+        );
         const cases = [
-            { containerSecurity: { privileged: true } },
             { llmRuntime: { runtimePolicy: { devices: [{ type: 'cdi', value: 'nvidia.com/gpu=all' }] } } },
             { llmRuntime: { runtimePolicy: { ipc: 'host' } } },
             { llmRuntime: { runtimePolicy: { securityOpt: ['label=disable'] } } },
@@ -169,7 +200,7 @@ test('production environment cannot redirect the canonical Box marker decision',
     process.env.PLOINKY_BOX_MARKER_PATH = path.join(fixture.root, 'absent-attacker-marker');
     try {
         const descriptor = resolveEffectiveRuntimeCapabilities({
-            containerSecurity: { privileged: true },
+            llmRuntime: { runtimePolicy: { securityOpt: ['label=disable'] } },
         });
         assert.throws(
             () => assertRuntimeCapabilitiesAllowed(descriptor, {
@@ -210,5 +241,25 @@ test('host sandboxes reject container-only capabilities and isolated networking'
             insideBox: false,
         }),
         (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
+    );
+});
+
+test('nested Podman is Box-only and mutually exclusive with privileged mode', () => {
+    assert.throws(
+        () => validateManifestRuntimeCapabilities({
+            containerSecurity: { nestedPodman: true, privileged: true },
+        }),
+        (error) => error.code === 'PLOINKY_MANIFEST_SECURITY_INVALID',
+    );
+    const descriptor = resolveEffectiveRuntimeCapabilities({
+        containerSecurity: { nestedPodman: true },
+    });
+    assert.throws(
+        () => assertRuntimeCapabilitiesAllowed(descriptor, {
+            runtimeKind: 'container',
+            insideBox: false,
+        }),
+        (error) => error.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED'
+            && error.context.unsupported.includes('nested-podman-outside-box'),
     );
 });

@@ -8,6 +8,8 @@ import { PassThrough, Readable, Writable } from 'node:stream';
 import {
     handleBlobs,
     handleWorkspaceUpload,
+    resolveAgentBlobStorage,
+    resolveAgentRecord,
 } from '../../cli/server/handlers/blobs.js';
 import {
     handleWebchatUploadPost,
@@ -127,6 +129,88 @@ function sharedBlobResolver(blobsDir) {
         },
     });
 }
+
+test('agent blob storage is rooted in canonical .data and ignores projectPath', (t) => {
+    const workspaceRoot = fs.realpathSync(temporaryDirectory(t, 'blob-agent-root'));
+    const first = resolveAgentBlobStorage({ agentName: 'webassist', projectPath: '/first/project' }, { workspaceRoot });
+    const second = resolveAgentBlobStorage({ agentName: 'webassist', projectPath: '/different/project' }, { workspaceRoot });
+    assert.deepEqual(first, second);
+    assert.equal(first.agentDataDir, path.join(workspaceRoot, '.data', 'webassist'));
+    assert.equal(first.blobsDir, path.join(workspaceRoot, '.data', 'webassist', 'blobs'));
+    assert.equal(fs.existsSync(path.join(workspaceRoot, '.ploinky', 'data')), false);
+    assert.throws(
+        () => resolveAgentBlobStorage({ agentName: '../escape', projectPath: workspaceRoot }, { workspaceRoot }),
+        error => {
+            assert.equal(error.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
+            return true;
+        },
+    );
+});
+
+test('agent blob endpoint keeps selectors and run modes on one short-name storage root', async (t) => {
+    const runModes = ['isolated', 'global', 'static', 'devel'];
+    const selectors = ['webassist', 'explorer-repo:webassist'];
+
+    for (const runMode of runModes) {
+        for (const selector of selectors) {
+            const workspaceRoot = fs.realpathSync(temporaryDirectory(t, `blob-${runMode}`));
+            const record = {
+                type: 'agent',
+                agentName: 'webassist',
+                repoName: 'explorer-repo',
+                projectPath: path.join(workspaceRoot, '.ploinky', 'repos', runMode, 'webassist'),
+                runMode,
+            };
+            const blobsDir = path.join(workspaceRoot, '.data', 'webassist', 'blobs');
+            const agentMap = { [`${runMode}-webassist`]: record };
+            const agentRecordResolver = requestSegment => resolveAgentRecord(requestSegment, {
+                agentMap,
+                workspaceRoot,
+            });
+            const request = endedRequest({
+                url: `/blobs/${encodeURIComponent(selector)}`,
+                headers: {
+                    host: '127.0.0.1:8080',
+                    'content-length': '3',
+                    'x-file-name': `${runMode}.txt`,
+                    'x-mime-type': 'text/plain',
+                },
+                chunks: ['abc'],
+            });
+            const response = new MockResponse();
+            handleBlobs(request, response, {
+                policy: testPolicy('/blobs'),
+                agentRecordResolver,
+            });
+            await responseFinished(response);
+
+            assert.equal(response.statusCode, 201, `${runMode} ${selector}`);
+            const payload = JSON.parse(response.bodyText());
+            assert.equal(payload.localPath, `.data/webassist/blobs/${payload.id}`);
+            assert.equal(payload.agent, 'webassist');
+            assert.equal(fs.readFileSync(path.join(blobsDir, payload.id), 'utf8'), 'abc');
+            const metadata = JSON.parse(fs.readFileSync(path.join(blobsDir, `${payload.id}.json`), 'utf8'));
+            assert.equal(metadata.localPath, payload.localPath);
+            assert.equal(metadata.repo, 'explorer-repo');
+            assert.equal(metadata.filename, `${runMode}.txt`);
+
+            const beforeFailure = regularFiles(blobsDir);
+            const failedRequest = endedRequest({
+                url: `/blobs/${encodeURIComponent(selector)}`,
+                headers: { 'content-length': '4' },
+                chunks: ['12'],
+            });
+            const failedResponse = new MockResponse();
+            handleBlobs(failedRequest, failedResponse, {
+                policy: testPolicy('/blobs'),
+                agentRecordResolver,
+            });
+            await responseFinished(failedResponse);
+            assert.equal(failedResponse.statusCode, 400, `${runMode} ${selector} cleanup response`);
+            assert.deepEqual(regularFiles(blobsDir), beforeFailure, `${runMode} ${selector} cleanup`);
+        }
+    }
+});
 
 function manualTimers() {
     const callbacks = new Map();

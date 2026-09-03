@@ -331,23 +331,31 @@ test('create timeout reconciles delayed completion by name and removes the prove
     assert.equal(runtime.containers.size, 0);
 });
 
-test('stale reconciliation removes old or exited helpers but preserves a young live probe', () => {
+test('stale reconciliation removes only old helpers and preserves young created or running peer probes', () => {
     const runtime = new FakeAuthorityRuntime();
-    const oldNonce = '1'.repeat(64);
-    const exitedNonce = '2'.repeat(64);
-    const youngNonce = '3'.repeat(64);
+    const oldRunningNonce = '1'.repeat(64);
+    const oldExitedNonce = '2'.repeat(64);
+    const youngCreatedNonce = '3'.repeat(64);
+    const youngRunningNonce = '4'.repeat(64);
     runtime.seedHelper({
-        nonce: oldNonce,
+        nonce: oldRunningNonce,
         id: '1'.repeat(64),
         running: true,
         createdAt: runtime.now() - ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS - 20_000,
     });
-    runtime.seedHelper({ nonce: exitedNonce, id: '2'.repeat(64), running: false, createdAt: runtime.now() });
-    runtime.seedHelper({ nonce: youngNonce, id: '3'.repeat(64), running: true, createdAt: runtime.now() });
+    runtime.seedHelper({
+        nonce: oldExitedNonce,
+        id: '2'.repeat(64),
+        running: false,
+        createdAt: runtime.now() - ROUTER_AUTHORITY_HELPER_MAX_LIFETIME_MS - 20_000,
+    });
+    runtime.seedHelper({ nonce: youngCreatedNonce, id: '3'.repeat(64), running: false, createdAt: runtime.now() });
+    runtime.seedHelper({ nonce: youngRunningNonce, id: '4'.repeat(64), running: true, createdAt: runtime.now() });
     runProbe(runtime).invoke();
     assert.equal(runtime.findContainer('1'.repeat(64)), null);
     assert.equal(runtime.findContainer('2'.repeat(64)), null);
     assert.notEqual(runtime.findContainer('3'.repeat(64)), null);
+    assert.notEqual(runtime.findContainer('4'.repeat(64)), null);
 });
 
 test('cleanup identity mismatch never stops or removes an ambiguous container', () => {

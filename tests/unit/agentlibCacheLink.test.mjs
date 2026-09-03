@@ -297,9 +297,45 @@ test('every runtime manager consults the reuse comparison', async () => {
     }
 });
 
-test('the interactive container carries the same grant as the detached service', () => {
-    const text = fs.readFileSync(path.join(repoRoot, 'cli/sandbox/docker/interactive.js'), 'utf8');
-    assert.match(text, /grant\.sourceDir\}:\$\{grant\.runtimePath\}/);
-    assert.match(text, /agentLibAliasShadows\(grant/);
-    assert.match(text, /agentLibGrantEnv\(grant\)/);
+test('the interactive container carries the same grant as the detached service', async () => {
+    const { buildInteractiveAgentCreateCommand } = await import(
+        path.join(repoRoot, 'cli/sandbox/docker/interactive.js')
+    );
+    const workspaceRoot = tempDir('interactive-agentlib-grant-');
+    const sourceDir = path.join(workspaceRoot, 'achillesAgentLib');
+    const homeDir = path.join(workspaceRoot, '.data', 'demo');
+    const sharedDir = path.join(workspaceRoot, '.data', 'shared');
+    const agentLibPath = path.join(workspaceRoot, 'Agent');
+    const absAgentPath = path.join(workspaceRoot, '.ploinky', 'repos', 'demo');
+    for (const dir of [sourceDir, homeDir, sharedDir, agentLibPath, absAgentPath]) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    const grant = grantMod.agentLibGrant('container-linux-x64-node25', { ...SELECTION, sourceDir });
+    for (const runtime of ['docker', 'podman']) {
+        const suffix = runtime === 'podman' ? ':ro,z' : ':ro';
+        const command = buildInteractiveAgentCreateCommand({
+            runtime,
+            containerName: 'interactive-grant-test',
+            envHash: 'test-hash',
+            workspaceRoot,
+            projectDir: workspaceRoot,
+            homeDir,
+            sharedDir,
+            agentLibPath,
+            absAgentPath,
+            agentLibGrant: grant,
+            volumeSuffix: runtime === 'podman' ? ':z' : '',
+            readOnlySuffix: suffix,
+            containerImage: 'node:24',
+        });
+        const mounts = Array.from(command.matchAll(/-v "([^"]+)"/g), match => match[1]);
+        assert.ok(mounts.includes(`${sourceDir}:${grant.runtimePath}${suffix}`),
+            `${runtime} must grant the stable source read-only`);
+        assert.ok(mounts.includes(`${sourceDir}:${sourceDir}${suffix}`),
+            `${runtime} must shadow the otherwise-writable project alias`);
+        for (const [name, value] of Object.entries(grantMod.agentLibGrantEnv(grant))) {
+            assert.ok(command.includes(`-e ${name}="${value}"`),
+                `${runtime} must carry the exact ${name} grant field`);
+        }
+    }
 });

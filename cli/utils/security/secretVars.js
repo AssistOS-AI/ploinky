@@ -786,23 +786,41 @@ export function resolveManifestImage(manifest, profileConfig, options = {}) {
     });
 }
 
-export function updateAgentExpose(manifestPath, exposedName, src) {
+export function updateAgentExpose(manifestPath, exposedName, src, { beforeWrite } = {}) {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-    if (!manifest.expose) manifest.expose = [];
-    if (!Array.isArray(manifest.expose)) {
-        const obj = manifest.expose;
-        manifest.expose = Object.entries(obj).map(([name, val]) =>
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+        throw new Error('Agent manifest must be a JSON object.');
+    }
+    if (manifest.expose != null && typeof manifest.expose !== 'object') {
+        throw new Error('Agent manifest expose must be an array or object.');
+    }
+    const entries = Array.isArray(manifest.expose)
+        ? manifest.expose
+        : Object.entries(manifest.expose || {}).map(([name, val]) =>
             typeof val === 'string' && val.startsWith('$')
                 ? { name, ref: val.slice(1) }
                 : { name, value: val }
         );
-    }
-    manifest.expose = manifest.expose.filter(e => e && e.name !== exposedName);
-    if (src && typeof src === 'string') {
-        if (src.startsWith('$')) manifest.expose.push({ name: exposedName, ref: src.slice(1) });
-        else manifest.expose.push({ name: exposedName, value: src });
-    }
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    const nextEntry = src && typeof src === 'string'
+        ? (src.startsWith('$')
+            ? { name: exposedName, ref: src.slice(1) }
+            : { name: exposedName, value: src })
+        : null;
+    const existing = entries.filter(entry => entry && entry.name === exposedName);
+    const unchanged = nextEntry
+        ? existing.length === 1
+            && Object.keys(existing[0]).length === Object.keys(nextEntry).length
+            && Object.entries(nextEntry).every(([key, value]) => existing[0][key] === value)
+        : existing.length === 0;
+    // Do not change formatting, representation, or entry order for a no-op:
+    // routing generations bind to the exact manifest bytes.
+    if (unchanged) return;
+
+    manifest.expose = entries.filter(entry => entry && entry.name !== exposedName);
+    if (nextEntry) manifest.expose.push(nextEntry);
+    const nextBytes = JSON.stringify(manifest, null, 2);
+    beforeWrite?.();
+    fs.writeFileSync(manifestPath, nextBytes);
 }
 
 export function echoVar(nameOrAlias) {
@@ -833,7 +851,7 @@ function resolveAgentName(agentNameOpt) {
     return null;
 }
 
-export function exposeEnv(exposedName, valueOrRef, agentNameOpt) {
+export function exposeEnv(exposedName, valueOrRef, agentNameOpt, options = {}) {
     const agentName = resolveAgentName(agentNameOpt);
     if (!agentName) {
         throw new Error('Missing agent name. Provide [agentName] or configure static with start <agent> <port>.');
@@ -843,7 +861,7 @@ export function exposeEnv(exposedName, valueOrRef, agentNameOpt) {
         source = `$${exposedName}`;
     }
     const { manifestPath } = findAgent(agentName);
-    updateAgentExpose(manifestPath, exposedName, source);
+    updateAgentExpose(manifestPath, exposedName, source, options);
     return { agentName, manifestPath };
 }
 
