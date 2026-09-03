@@ -182,11 +182,25 @@ test('monitor rejects manifest bytes changed during ensure before readiness or a
     }
 });
 
-test('monitor waits for exact semantic readiness before committing the returned registry and preparation lease', async () => {
+for (const scenario of [
+    { name: 'default budget', manifest: {}, config: {}, timeoutMs: 120000, intervalMs: 250, probeTimeoutMs: 1000 },
+    {
+        name: 'declared cold-start budget',
+        manifest: { health: { readiness: { interval: 1, timeout: 5, failureThreshold: 180 } } },
+        config: {}, timeoutMs: 1080000, intervalMs: 1000, probeTimeoutMs: 5000,
+    },
+    {
+        name: 'explicit operator budget',
+        manifest: { health: { readiness: { interval: 1, timeout: 5, failureThreshold: 180 } } },
+        config: { CONTAINER_RESTART_READY_TIMEOUT_MS: 45000, CONTAINER_RESTART_READY_INTERVAL_MS: 75, CONTAINER_RESTART_READY_PROBE_TIMEOUT_MS: 600 },
+        timeoutMs: 45000, intervalMs: 75, probeTimeoutMs: 600,
+    },
+]) {
+test(`monitor waits for exact semantic readiness before committing the returned registry and preparation lease (${scenario.name})`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-ready-'));
     try {
         const manifestPath = path.join(root, 'manifest.json');
-        fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'mcp' } }));
+        fs.writeFileSync(manifestPath, JSON.stringify({ ...scenario.manifest, readiness: { protocol: 'mcp' } }));
         const result = preparedRestartResult();
         const events = [];
         let savedAgents = null;
@@ -195,7 +209,7 @@ test('monitor waits for exact semantic readiness before committing the returned 
         let releaseReadiness;
         const readinessGate = new Promise((resolve) => { releaseReadiness = resolve; });
         const monitor = {
-            config: {},
+            config: scenario.config,
             targets: new Map(),
             isShuttingDown: () => false,
             log(_level, event) { events.push(event); },
@@ -215,6 +229,9 @@ test('monitor waits for exact semantic readiness before committing the returned 
                 events.push('readiness-start');
                 assert.deepEqual(route, { hostPort: 43123 });
                 assert.equal(options.protocol, 'mcp');
+                assert.equal(options.timeoutMs, scenario.timeoutMs);
+                assert.equal(options.intervalMs, scenario.intervalMs);
+                assert.equal(options.probeTimeoutMs, scenario.probeTimeoutMs);
                 return readinessGate;
             },
             loadAgents() {
@@ -277,6 +294,7 @@ test('monitor waits for exact semantic readiness before committing the returned 
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
+}
 
 test('monitor rejects staged registry metadata drift before committing the runtime candidate', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-staged-drift-'));

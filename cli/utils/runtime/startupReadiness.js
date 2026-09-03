@@ -94,11 +94,55 @@ function resolveAgentReadinessProtocol(manifest, context = {}) {
     return 'mcp';
 }
 
+const MAX_READINESS_TIMER_MS = 2 ** 31 - 1;
+
+function readinessInteger(value, fallback, label, maximum = MAX_READINESS_TIMER_MS) {
+    if (value === undefined || value === null || value === '') return fallback;
+    const number = typeof value === 'number' || typeof value === 'string'
+        ? Number(value)
+        : NaN;
+    if (!Number.isSafeInteger(number) || number <= 0 || number > maximum) {
+        throw new Error(`${label} must be a finite positive integer no greater than ${maximum}`);
+    }
+    return number;
+}
+
+// The declared health attempts include both the probe and the delay between
+// attempts. Startup still has to pass its selected MCP/TCP protocol; this only
+// gives a cold service the same finite budget already used by reinstall.
+function resolveManifestReadinessWaitOptions(manifest, fallbackTimeoutMs = 120000, overrides = {}) {
+    const fallback = readinessInteger(fallbackTimeoutMs, 120000, 'readiness timeout');
+    const probe = manifest?.health?.readiness;
+    let timeoutMs = fallback;
+    let intervalMs = 250;
+    let probeTimeoutMs = 1000;
+    if (probe !== undefined && probe !== null) {
+        if (typeof probe !== 'object' || Array.isArray(probe)) {
+            throw new Error('health.readiness must be an object');
+        }
+        intervalMs = readinessInteger(probe.interval, 1, 'health.readiness.interval') * 1000;
+        probeTimeoutMs = readinessInteger(probe.timeout, 1, 'health.readiness.timeout') * 1000;
+        const attempts = readinessInteger(probe.failureThreshold, 120, 'health.readiness.failureThreshold');
+        timeoutMs = Math.max(fallback, attempts * (intervalMs + probeTimeoutMs));
+    }
+    // Validate derived values before overrides too: malformed declarations must
+    // not silently become an unbounded deadline or an overflowing Node timer.
+    readinessInteger(timeoutMs, fallback, 'manifest readiness timeout');
+    readinessInteger(intervalMs, 250, 'manifest readiness interval');
+    readinessInteger(probeTimeoutMs, 1000, 'manifest readiness probe timeout', Math.floor(MAX_READINESS_TIMER_MS / 2));
+    return {
+        timeoutMs: readinessInteger(overrides.timeoutMs, timeoutMs, 'readiness timeout override'),
+        intervalMs: readinessInteger(overrides.intervalMs, intervalMs, 'readiness interval override'),
+        probeTimeoutMs: readinessInteger(overrides.probeTimeoutMs, probeTimeoutMs, 'readiness probe timeout override', Math.floor(MAX_READINESS_TIMER_MS / 2)),
+    };
+}
+
 export {
     readManifestAgentCommand,
     readManifestReadinessScript,
     readManifestStartCommand,
     resolveAgentExecutionMode,
     resolveAgentReadinessPort,
-    resolveAgentReadinessProtocol
+    resolveAgentReadinessProtocol,
+    resolveManifestReadinessWaitOptions
 };
