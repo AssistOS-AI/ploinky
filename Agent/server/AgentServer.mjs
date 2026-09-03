@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { zod } from 'mcp-sdk';
 import { TaskQueue } from './TaskQueue.mjs';
+import { buildJsonSchema, isJsonSchema, preserveJsonSchemaToolListings } from './inputSchema.mjs';
 import {
     createMemoryReplayCache
 } from '../lib/jwtVerify.mjs';
@@ -1094,6 +1095,8 @@ async function registerFromConfig(server, config, helpers) {
     if (!config || typeof config !== 'object') return;
     const { ResourceTemplate, McpError, ErrorCode } = helpers;
     const defaultCwd = process.env.PLOINKY_CODE_DIR || '/code';
+    const jsonSchemas = new Map();
+    preserveJsonSchemaToolListings(server, jsonSchemas);
 
     if (Array.isArray(config.tools)) {
         for (const tool of config.tools) {
@@ -1184,16 +1187,21 @@ async function registerFromConfig(server, config, helpers) {
                 return { content, metadata: { agent: process.env.AGENT_NAME || name } };
             };
 
-            const registeredTool = server.registerTool(name, definition, invocation);
-
             let configuredSchema = null;
-            if (tool.inputSchema && typeof tool.inputSchema === 'object') {
+            if (tool.inputSchema !== undefined) {
                 try {
-                    configuredSchema = buildZodObjectSchema(tool.inputSchema);
+                    if (!tool.inputSchema || typeof tool.inputSchema !== 'object' || Array.isArray(tool.inputSchema)) {
+                        throw new Error('inputSchema must be an object');
+                    }
+                    const standardSchema = isJsonSchema(tool.inputSchema);
+                    configuredSchema = standardSchema
+                        ? buildJsonSchema(tool.inputSchema) : buildZodObjectSchema(tool.inputSchema);
+                    if (standardSchema) jsonSchemas.set(name, structuredClone(tool.inputSchema));
                 } catch (err) {
-                    console.error(`[AgentServer/MCP] Failed to build inputSchema for tool '${name}': ${err.message}`);
+                    throw new Error(`[AgentServer/MCP] Failed to build inputSchema for tool '${name}': ${err.message}`);
                 }
             }
+            const registeredTool = server.registerTool(name, definition, invocation);
 
             if (configuredSchema) {
                 registeredTool.inputSchema = configuredSchema;
