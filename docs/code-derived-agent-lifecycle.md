@@ -521,7 +521,7 @@ The sole outer `-p` emission constructs exactly two publications for every box:
 | Mapping | Meaning |
 | --- | --- |
 | `127.0.0.1:<selectedRouterHostPort>:8080/tcp` | Loopback-only physical Router access. `--port` selects only the host side. |
-| `0.0.0.0:<selectedMediaHostPort>:7882/udp` | Unconditional reserved LiveKit UDP slot. `--udp-port` selects only the physical-host side and defaults to `7882`; the in-Box listener remains fixed. |
+| `0.0.0.0:<selectedMediaHostPort>:<selectedMediaHostPort>/udp` | Unconditional reserved LiveKit UDP slot. `--udp-port` selects the same media UDP port on the physical host and inside the Box, defaulting to `7882`; the immutable topology carries it as `mediaUdpPort` and LiveKit binds that selected port. |
 
 `--publish`, `--expose`, and `--listen-lan` are rejected before engine discovery. Workspace, graph, profile, manifest, `openPorts`, readiness, environment, labels, and persisted state never participate in outer arguments. Incompatible managed Box configuration is rejected and requires explicit destroy/recreate; no publication provenance or compatibility reader remains.
 
