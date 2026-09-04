@@ -7,7 +7,7 @@ import {
     waitForContainerRunning,
     sleepMs
 } from './common.js';
-import { PLOINKY_DIR } from '../../utils/config.js';
+import { HEALTH_PROBE_CONTROL_HOST_ROOT } from '../../utils/runtime/healthProbeControlPath.js';
 
 const DEFAULT_INTERVAL_SECONDS = 1;
 const DEFAULT_TIMEOUT_SECONDS = 5;
@@ -28,7 +28,7 @@ const PROBE_RESULT_POLL_MS = 50;
 const PROBE_OUTPUT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
 const DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS = 10_000;
-const PROBE_CONTROL_HOST_ROOT = path.join(PLOINKY_DIR, 'run', 'health-probes');
+export const PROBE_CONTROL_HOST_ROOT = HEALTH_PROBE_CONTROL_HOST_ROOT;
 export const PROBE_CONTROL_CONTAINER_ROOT = '/run/ploinky-health-probes';
 const PROBE_BROKER_READY_DIR = '.broker-ready';
 const RUNTIME_RELAY_SOCKET_FILE = 'runtime-relay.sock';
