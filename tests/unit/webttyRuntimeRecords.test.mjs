@@ -350,6 +350,199 @@ test('Linux process identity rejects oversized proc files before parsing', async
     );
 });
 
+function deferred() {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+}
+
+async function sessionProcFixture(t, count = 9) {
+    const procRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ploinky-webtty-session-scan-'));
+    t.after(() => fs.rm(procRoot, { recursive: true, force: true }));
+    const pids = Array.from({ length: count }, (_, index) => 302 + index);
+    await Promise.all(pids.map(async pid => {
+        await fs.mkdir(path.join(procRoot, String(pid)));
+        await fs.writeFile(path.join(procRoot, String(pid), 'stat'), procStat(pid, { session: 301 }));
+    }));
+    return { procRoot, pids };
+}
+
+test('session scans overlap at most four complete stat visits and cover every entry', { timeout: 5_000 }, async t => {
+    const { procRoot, pids } = await sessionProcFixture(t);
+    const originalOpen = fs.open.bind(fs);
+    const release = deferred();
+    const fourOpened = deferred();
+    let openCount = 0;
+    let active = 0;
+    let maximum = 0;
+    t.mock.method(fs, 'open', async (...args) => {
+        const handle = await originalOpen(...args);
+        openCount += 1;
+        active += 1;
+        maximum = Math.max(maximum, active);
+        if (active === 4) fourOpened.resolve();
+        return {
+            async read(...readArgs) { await release.promise; return handle.read(...readArgs); },
+            async close() { try { await handle.close(); } finally { active -= 1; } },
+        };
+    });
+    const scan = listLinuxSessionMembers(301, { procRoot });
+    try {
+        await Promise.race([fourOpened.promise, new Promise(resolve => setTimeout(resolve, 500))]);
+        assert.equal(active, 4, 'independent stat reads must progress while the first read is held');
+        release.resolve();
+        const members = await scan;
+        assert.deepEqual(members.map(member => member.pid).sort((a, b) => a - b), pids);
+        assert.equal(openCount, pids.length * 2, 'every member requires both identity snapshots');
+        assert.equal(maximum, 4);
+        assert.equal(active, 0);
+    } finally {
+        release.resolve();
+        await scan.catch(() => {});
+    }
+});
+
+test('session scan deadline closes late opens without starting reads or later batches', { timeout: 5_000 }, async t => {
+    const { procRoot } = await sessionProcFixture(t);
+    const originalOpen = fs.open.bind(fs);
+    const release = deferred();
+    const closed = deferred();
+    let opens = 0;
+    let reads = 0;
+    let closes = 0;
+    t.mock.method(fs, 'open', async (...args) => {
+        const handle = await originalOpen(...args);
+        opens += 1;
+        await release.promise;
+        return {
+            async read(...readArgs) { reads += 1; return handle.read(...readArgs); },
+            async close() { await handle.close(); if (++closes === 4) closed.resolve(); },
+        };
+    });
+    try {
+        await assert.rejects(listLinuxSessionMembers(301, { procRoot, scanTimeoutMs: 100 }), {
+            code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN', category: 'proc-scan-timeout',
+        });
+        assert.equal(opens, 4);
+        release.resolve();
+        await closed.promise;
+        assert.equal(reads, 0);
+        assert.equal(opens, 4, 'settlement must not schedule another batch');
+    } finally { release.resolve(); }
+});
+
+test('session scan deadline closes a late directory open without enumerating it', { timeout: 5_000 }, async t => {
+    const { procRoot } = await sessionProcFixture(t);
+    const release = deferred();
+    const closed = deferred();
+    let closes = 0;
+    let enumerations = 0;
+    t.mock.method(fs, 'opendir', async () => {
+        await release.promise;
+        return {
+            async close() { closes += 1; closed.resolve(); },
+            [Symbol.asyncIterator]() { enumerations += 1; throw new Error('late directory must not be enumerated'); },
+        };
+    });
+    try {
+        await assert.rejects(listLinuxSessionMembers(301, { procRoot, scanTimeoutMs: 50 }), {
+            code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN', category: 'proc-scan-timeout',
+        });
+        release.resolve();
+        await Promise.race([closed.promise, new Promise(resolve => setTimeout(resolve, 100))]);
+        assert.equal(closes, 1);
+        assert.equal(enumerations, 0);
+    } finally { release.resolve(); }
+});
+
+test('a pending directory iteration cannot extend the scan deadline or start late visits', { timeout: 5_000 }, async t => {
+    const { procRoot } = await sessionProcFixture(t);
+    const release = deferred();
+    let closes = 0;
+    let visits = 0;
+    t.mock.method(fs, 'open', async () => { visits += 1; throw new Error('late entry must not be visited'); });
+    t.mock.method(fs, 'opendir', async () => ({
+        [Symbol.asyncIterator]() { return this; },
+        async next() {
+            await release.promise;
+            return { done: false, value: { name: '302', isDirectory: () => true } };
+        },
+        async close() { closes += 1; await release.promise; },
+    }));
+    const scan = listLinuxSessionMembers(301, { procRoot, scanTimeoutMs: 50 });
+    const outcome = scan.then(() => 'unexpected success', error => error);
+    try {
+        const result = await Promise.race([outcome, new Promise(resolve => setTimeout(() => resolve('hung'), 300))]);
+        assert.equal(result?.category, 'proc-scan-timeout', 'directory cleanup must not extend the scan deadline');
+        release.resolve();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(closes, 1);
+        assert.equal(visits, 0);
+    } finally { release.resolve(); await outcome; }
+});
+
+test('failed session scans stop sibling identity reads and close every held handle', { timeout: 5_000 }, async t => {
+    const { procRoot } = await sessionProcFixture(t);
+    const originalOpen = fs.open.bind(fs);
+    const release = deferred();
+    const closed = deferred();
+    let opens = 0;
+    let closes = 0;
+    t.mock.method(fs, 'open', async (...args) => {
+        const handle = await originalOpen(...args);
+        opens += 1;
+        const malformed = opens === 1;
+        return {
+            async read(...readArgs) {
+                if (malformed) {
+                    readArgs[0].write('bad');
+                    return { bytesRead: 3 };
+                }
+                await release.promise;
+                return handle.read(...readArgs);
+            },
+            async close() { await handle.close(); if (++closes === 4) closed.resolve(); },
+        };
+    });
+    try {
+        await assert.rejects(listLinuxSessionMembers(301, { procRoot }), /invalid proc stat/);
+        release.resolve();
+        await closed.promise;
+        assert.equal(opens, 4, 'no second identity read or later batch may start after failure');
+    } finally { release.resolve(); await closed.promise; }
+});
+
+test('concurrent session scans retain file, PID, and start-token evidence checks', async t => {
+    for (const scenario of ['file-limit', 'wrong-pid', 'recycled-pid', 'changed-session']) {
+        await t.test(scenario, async t => {
+            const { procRoot, pids } = await sessionProcFixture(t, 4);
+            const selectedPath = path.join(procRoot, String(pids[0]), 'stat');
+            if (scenario === 'file-limit') await fs.writeFile(selectedPath, Buffer.alloc(64 * 1024 + 1));
+            if (scenario === 'wrong-pid') await fs.writeFile(selectedPath, procStat(999, { session: 301 }));
+            if (scenario === 'recycled-pid' || scenario === 'changed-session') {
+                const originalOpen = fs.open.bind(fs);
+                let snapshots = 0;
+                t.mock.method(fs, 'open', async (...args) => {
+                    if (args[0] === selectedPath && ++snapshots === 2) {
+                        await fs.writeFile(selectedPath, procStat(pids[0], {
+                            session: scenario === 'changed-session' ? 999 : 301,
+                            startToken: scenario === 'recycled-pid' ? '99999' : '12345',
+                        }));
+                    }
+                    return originalOpen(...args);
+                });
+            }
+            const scan = listLinuxSessionMembers(301, { procRoot });
+            if (scenario === 'file-limit') await assert.rejects(scan, {
+                code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN', category: 'proc-file-limit',
+            });
+            else if (scenario === 'wrong-pid') await assert.rejects(scan, /invalid proc stat/);
+            else if (scenario === 'recycled-pid') await assert.rejects(scan, /identity changed while enumerating session/);
+            else assert.deepEqual((await scan).map(member => member.pid).sort((a, b) => a - b), pids.slice(1));
+        });
+    }
+});
+
 test('restart reclaims only exact owned atomic-write temp residue', async (t) => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'ploinky-webtty-temp-record-'));
     t.after(() => fs.rm(directory, { recursive: true, force: true }));

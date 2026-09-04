@@ -169,6 +169,15 @@ followed by the normal `ploinky start` workflow; recreation discards both the
 ephemeral recovery records and nested runtime state while preserving the host
 workspace and retained caches.
 
+Box session enumeration overlaps at most four process-stat visits at a time.
+It retains the one-second scan deadline, 8,192-entry limit, 64 KiB per-file
+limit, and before/after process-start checks. A failed or expired scan cannot
+start another batch or another stat read; pending file and directory handles
+are still closed when their operations finish. Directory cleanup does not
+extend the scan deadline. Agent startup-client enumeration remains serial.
+This reduces serial I/O latency without treating incomplete process evidence
+as successful reclamation.
+
 Nested container records, writable layers, networks, and inner Podman named
 volumes are discarded with the outer Box, so persistent agent data must use
 explicit `/workspace` binds. A Box created by an older layout is not recognized
