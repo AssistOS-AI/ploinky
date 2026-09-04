@@ -40,7 +40,6 @@ const routing = await import(new URL('../../cli/server/routingFile.js', import.m
 const agents = await import(new URL('../../cli/utils/agents.js', import.meta.url).href);
 const manager = await import(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url).href);
 const coordinated = await import(new URL('../../cli/sandbox/coordinatedEdgeApply.js', import.meta.url).href);
-const passwordStore = await import(new URL('../../cli/utils/security/encryptedPasswordStore.js', import.meta.url).href);
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -49,6 +48,46 @@ test.after(() => {
     if (originalRouterHostPort === undefined) delete process.env.PLOINKY_ROUTER_HOST_PORT;
     else process.env.PLOINKY_ROUTER_HOST_PORT = originalRouterHostPort;
     fs.rmSync(workspace, { recursive: true, force: true });
+});
+
+test('explicit auth options cannot disable a manifest-required identity provider', () => {
+    edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    routing.writeRoutingConfig({ port: 8080, routes: {} }, { coordinate: false });
+    writeManifest('demo', 'ssoApp', {
+        container: 'node:20-alpine', network: { mode: 'default' }, ploinky: 'sso enable',
+        sso: { providerAgent: 'identity' },
+    });
+    for (const authModeParam of ['none', 'guest']) {
+        assert.throws(() => agents.prepareAgentEnableBatch([
+            { agentName: 'demo/ssoApp', mode: 'global', authModeParam },
+        ]), /Manifest requires SSO authentication/);
+    }
+});
+
+test('enable rejects retired local authentication declarations and options before staging', () => {
+    const initialized = edge.initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    const selectorBefore = fs.readFileSync(initialized.paths.activeSelectorFile, 'utf8');
+    const registryBefore = fs.readFileSync(initialized.paths.agentsFile, 'utf8');
+    for (const authModeParam of ['local', 'pwd']) {
+        assert.throws(() => agents.prepareAgentEnableBatch([
+            { agentName: 'demo/nonHostDependency', authModeParam },
+        ]), /Local password authentication is no longer supported/);
+    }
+    for (const authOptions of [{ username: 'example' }, { password: 'example' }]) {
+        assert.throws(() => agents.prepareAgentEnableBatch([
+            { agentName: 'demo/nonHostDependency', authOptions },
+        ]), /Local password authentication options are no longer supported/);
+    }
+    for (const retiredDeclaration of [{ ploinky: 'pwd enable' }, { pwd: { users: [] } }]) {
+        writeManifest('demo', 'retiredAuthApp', {
+            container: 'node:20-alpine', network: { mode: 'default' }, ...retiredDeclaration,
+        });
+        assert.throws(() => agents.prepareAgentEnableBatch([
+            { agentName: 'demo/retiredAuthApp' },
+        ]), /Local password authentication is no longer supported/);
+    }
+    assert.equal(fs.readFileSync(initialized.paths.activeSelectorFile, 'utf8'), selectorBefore);
+    assert.equal(fs.readFileSync(initialized.paths.agentsFile, 'utf8'), registryBefore);
 });
 
 test('one batch stages a non-host dependency and exact host owner before either can launch', () => {
@@ -202,21 +241,7 @@ test('a configured static agent stages the workspace root as its immutable proje
     });
 });
 
-test('a later batch validation failure cannot mutate credentials consumed by the active generation', () => {
-    const usersVar = 'PLOINKY_AUTH_LOCAL_ONE_USERS';
-    passwordStore.setUsersPayload(usersVar, {
-        version: 1,
-        users: [{
-            id: 'local:existing',
-            username: 'existing',
-            name: 'Existing',
-            email: null,
-            passwordHash: 'scrypt$unchanged',
-            roles: ['local', 'admin'],
-            rev: 7,
-        }],
-    });
-    const storeBefore = fs.readFileSync(passwordStore.PASSWORD_STORE_FILE, 'utf8');
+test('a later batch validation failure cannot mutate the active generation', () => {
     const selectorBefore = fs.readFileSync(edge.resolveEdgeGenerationPaths({ workspaceRoot: workspace }).activeSelectorFile, 'utf8');
     assert.equal(JSON.parse(selectorBefore).state, 'active');
 
@@ -224,18 +249,16 @@ test('a later batch validation failure cannot mutate credentials consumed by the
         {
             agentName: 'demo/nonHostDependency',
             mode: 'global',
-            aliasParam: 'local-one',
-            authModeParam: 'local',
-            authOptions: { username: 'replacement', password: 'replacement-password' },
+            aliasParam: 'same-alias',
+            authModeParam: 'sso',
         },
         {
             agentName: 'media/livekit',
             mode: 'global',
-            aliasParam: 'local-one',
+            aliasParam: 'same-alias',
         },
     ], { reason: 'test-invalid-auth-batch' }), /alias already exists/);
 
-    assert.equal(fs.readFileSync(passwordStore.PASSWORD_STORE_FILE, 'utf8'), storeBefore);
     assert.equal(
         fs.readFileSync(edge.resolveEdgeGenerationPaths({ workspaceRoot: workspace }).activeSelectorFile, 'utf8'),
         selectorBefore,

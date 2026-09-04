@@ -42,11 +42,10 @@ test('an inherited service route cannot bypass the authentication owner capabili
     );
 });
 
-test('explicit local role compatibility preserves existing accounts without weakening SSO or guest policy', () => {
+test('local role names never substitute for required capabilities', () => {
     const manifest = { routerAccess: { requiredCapability: 'app.access', localAuthRoles: ['admin', 'user'] } };
     const identity = { id: 'retained-user', roles: ['user'], capabilities: [] };
-    assert.equal(evaluateRequiredCapability(manifest, identity, { authMode: 'local' }).ok, true);
-    for (const authMode of ['sso', 'guest', 'none', undefined]) {
+    for (const authMode of ['local', 'sso', 'guest', 'none', undefined]) {
         assert.equal(evaluateRequiredCapability(manifest, identity, { authMode }).ok, false);
     }
     assert.equal(evaluateRequiredCapability(manifest, { ...identity, authMode: 'local' }).ok, false,
@@ -55,14 +54,4 @@ test('explicit local role compatibility preserves existing accounts without weak
     assert.equal(evaluateRequiredCapabilities([manifest, {
         routerAccess: { requiredCapability: 'other.access' },
     }], identity, { authMode: 'local' }).ok, false, 'one mapping cannot grant another manifest capability');
-});
-
-test('invalid local compatibility declarations fail closed', () => {
-    for (const localAuthRoles of ['admin', ['*'], [null], Array(65).fill('admin')]) {
-        assert.deepEqual(evaluateRequiredCapability({
-            routerAccess: { requiredCapability: 'app.access', localAuthRoles },
-        }, { roles: ['admin'], capabilities: ['app.access'] }, { authMode: 'local' }), {
-            ok: false, error: 'local_auth_roles_invalid',
-        });
-    }
 });

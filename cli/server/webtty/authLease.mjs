@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-import { isLocalAdminUser } from '../auth/localService.js';
+import { isAdminUser } from '../auth/localService.js';
 import { onAuthenticationSessionInvalidated } from '../auth/sessionEvents.js';
 import { authService, sessionTokenService } from '../authHandlers/shared.js';
 import { resolveSessionBindingId } from '../sessionBinding.js';
@@ -14,14 +14,6 @@ function fingerprint(mode, value) {
         .digest('base64url');
 }
 
-function localPolicyForLease(req) {
-    const policy = req?.edgeAuthContext?.policy || {};
-    return Object.freeze({
-        usersVar: String(policy.usersVar || req?.session?.localAuth?.usersVar || '').trim(),
-        routeKey: String(policy.routeKey || '').trim(),
-    });
-}
-
 export function createBrowserSessionLease(req) {
     const mode = String(req?.authMode || '').trim();
     const sessionId = String(req?.sessionId || '').trim();
@@ -32,7 +24,7 @@ export function createBrowserSessionLease(req) {
         error.code = 'WEBTTY_AUTH_SESSION_REQUIRED';
         throw error;
     }
-    if (!isLocalAdminUser(req.user)) {
+    if (!isAdminUser(req.user)) {
         const error = new Error('administrator authority is required');
         error.code = 'WEBTTY_ADMIN_REQUIRED';
         throw error;
@@ -44,7 +36,6 @@ export function createBrowserSessionLease(req) {
         sessionBindingId,
         sessionFingerprint: fingerprint(mode, sessionBindingId),
         userId,
-        localPolicy: mode === 'local' ? localPolicyForLease(req) : null,
         createdAt: Date.now(),
     });
 }
@@ -64,9 +55,7 @@ export async function validateBrowserSessionLease(lease) {
     let session = null;
     try {
         if (lease.mode === 'local') {
-            session = await sessionTokenService.getUserSession(lease.sessionId, {
-                policy: lease.localPolicy || {},
-            });
+            session = await sessionTokenService.getUserSession(lease.sessionId);
         } else if (typeof authService.validateSession === 'function') {
             session = await authService.validateSession(lease.sessionId);
         } else {
@@ -86,7 +75,7 @@ export async function validateBrowserSessionLease(lease) {
     if (!bindingId || fingerprint(lease.mode, bindingId) !== lease.sessionFingerprint) {
         return { ok: false, reason: 'session_changed' };
     }
-    if (!isLocalAdminUser(session.user)) {
+    if (!isAdminUser(session.user)) {
         return { ok: false, reason: 'administrator_revoked' };
     }
     return { ok: true, session };

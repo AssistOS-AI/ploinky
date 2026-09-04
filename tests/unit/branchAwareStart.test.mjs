@@ -723,10 +723,10 @@ test('resolveManifestSsoProvider: qualifies a same-repository provider without h
         ploinky: 'sso enable',
         sso: { providerAgent: 'provider' },
     }, 'manifestSsoRepo'), 'manifestSsoRepo/provider');
-    assert.equal(resolveManifestSsoProvider({
+    assert.throws(() => resolveManifestSsoProvider({
         ploinky: 'pwd enable',
         sso: { providerAgent: 'provider' },
-    }, 'manifestSsoRepo'), '');
+    }, 'manifestSsoRepo'), /Local password authentication is no longer supported/);
     assert.throws(
         () => resolveManifestSsoProvider({ ploinky: 'sso enable', sso: { providerAgent: ' ' } }, 'manifestSsoRepo'),
         /non-empty agent reference/i,
@@ -759,7 +759,7 @@ test('applyManifestDirectives: declarative SSO provider is enabled and bound aft
     )));
 });
 
-test('canonical startup preparation binds only the admitted graph and preserves local ownership on upgrade', async () => {
+test('canonical startup preparation binds manifest SSO despite a saved local auth mode', async () => {
     const { resolveWorkspaceDependencyGraph } = await import('../../cli/utils/workspaceDependencyGraph.js');
     const { evaluateRequiredCapability } = await import('../../cli/server/authHandlers/requiredCapability.js');
     const { setConfig, getConfig } = await import('../../cli/utils/workspace.js');
@@ -767,7 +767,7 @@ test('canonical startup preparation binds only the admitted graph and preserves 
     writeAgentManifest('startupSso', 'otherProvider', { container: 'node:20', ssoProvider: true });
     const appManifest = {
         container: 'node:20', ploinky: 'sso enable', sso: { providerAgent: 'provider' }, enable: ['provider'],
-        routerAccess: { requiredCapability: 'app.access', localAuthRoles: ['admin', 'user'] },
+        routerAccess: { requiredCapability: 'app.access' },
     };
     writeAgentManifest('startupSso', 'app', appManifest);
     setConfig({ static: { agent: 'startupSso/app', port: 8080 } });
@@ -782,17 +782,17 @@ test('canonical startup preparation binds only the admitted graph and preserves 
     assert.deepEqual(resolveWorkspaceGraphSsoConfig(freshGraph, { ...sso, providerConfig: { retained: 'value' } }).providerConfig,
         { retained: 'value' });
     assert.throws(() => resolveWorkspaceGraphSsoConfig(freshGraph, { providerAgent: 'startupSso/otherProvider' }),
-        /explicit account migration/);
+        /conflicts with the manifest-declared provider/);
 
     const localRecord = { type: 'agent', repoName: 'startupSso', agentName: 'app', auth: { mode: 'local' } };
     const upgradedGraph = resolveWorkspaceDependencyGraph({
         staticAgentRef: 'startupSso/app', registry: { retained: localRecord },
     });
-    assert.equal(upgradedGraph.nodes.get('startupSso/app').authMode, 'local');
-    assert.equal(upgradedGraph.nodes.has('startupSso/provider'), false);
-    assert.equal(resolveWorkspaceGraphSsoConfig(upgradedGraph), null);
+    assert.equal(upgradedGraph.nodes.get('startupSso/app').authMode, 'sso');
+    assert.equal(upgradedGraph.nodes.has('startupSso/provider'), true);
+    assert.equal(resolveWorkspaceGraphSsoConfig(upgradedGraph).providerAgent, 'startupSso/provider');
     assert.deepEqual(localRecord.auth, { mode: 'local' });
-    assert.equal(evaluateRequiredCapability(appManifest, { id: 'existing-id', roles: ['user'] }, { authMode: 'local' }).ok, true);
+    assert.equal(evaluateRequiredCapability(appManifest, { id: 'existing-id', roles: ['user'] }, { authMode: 'local' }).ok, false);
 });
 
 test('workspace graph rejects missing and conflicting provider dependencies', async () => {
@@ -812,6 +812,27 @@ test('workspace graph rejects missing and conflicting provider dependencies', as
     });
     assert.throws(() => resolveWorkspaceGraphSsoConfig(resolveWorkspaceDependencyGraph({ staticAgentRef: 'conflictSso/missing' })),
         /enabled ssoProvider dependency/);
+});
+
+test('workspace graph rejects saved local policies and retired manifest declarations', async () => {
+    const { resolveWorkspaceDependencyGraph } = await import('../../cli/utils/workspaceDependencyGraph.js');
+    writeAgentManifest('retiredAuth', 'app', { container: 'node:20' });
+    for (const mode of ['local', 'pwd']) {
+        assert.throws(() => resolveWorkspaceDependencyGraph({
+            staticAgentRef: 'retiredAuth/app',
+            registry: { app: { type: 'agent', repoName: 'retiredAuth', agentName: 'app', auth: { mode } } },
+        }), /Local password authentication is no longer supported/);
+    }
+    for (const retiredDeclaration of [{ ploinky: 'pwd enable' }, { pwd: { users: [] } }]) {
+        writeAgentManifest('retiredAuth', 'app', { container: 'node:20', ...retiredDeclaration });
+        assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'retiredAuth/app' }),
+            /Local password authentication is no longer supported/);
+    }
+    writeAgentManifest('retiredAuth', 'app', {
+        container: 'node:20', routerAccess: { localAuthRoles: ['user'] },
+    });
+    assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'retiredAuth/app' }),
+        /localAuthRoles is unsupported/);
 });
 
 test('applyManifestDirectives: child manifest repos are applied before recursive enables resolve', async () => {

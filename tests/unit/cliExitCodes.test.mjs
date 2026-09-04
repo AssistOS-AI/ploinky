@@ -61,6 +61,19 @@ test('one-shot enable agent failure exits nonzero', (t) => {
     assert.match(`${result.stdout}\n${result.stderr}`, /Agent 'nonexistent-agent-xyz' not found/);
 });
 
+test('enable rejects removed local authentication flags before resolving an agent', (t) => {
+    for (const flags of [
+        ['--auth', 'pwd'], ['--auth', 'local'], ['--user', 'example'],
+        ['--password', 'example'], ['--password=example'],
+    ]) {
+        const result = runPloinky(t, ['enable', 'agent', 'nonexistent-agent-xyz', ...flags]);
+        assert.notEqual(result.status, 0);
+        const output = `${result.stdout}\n${result.stderr}`;
+        assert.match(output, /Local password authentication(?: options)? (?:is|are) no longer supported/);
+        assert.doesNotMatch(output, /Agent 'nonexistent-agent-xyz' not found/);
+    }
+});
+
 test('one-shot start failure exits nonzero', (t) => {
     const result = runPloinky(t, ['start', 'demo', '8080']);
 

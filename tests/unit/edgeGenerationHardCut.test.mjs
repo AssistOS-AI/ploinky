@@ -98,7 +98,7 @@ function createFixture(t, {
             agentName: 'alpha',
             instanceId: 'alpha-instance',
             enableGeneration: 'alpha-enable-generation',
-            auth: { mode: 'local' },
+            auth: { mode: 'sso' },
         },
         'beta-container': {
             type: 'agent',
@@ -106,7 +106,7 @@ function createFixture(t, {
             agentName: 'beta',
             instanceId: 'beta-instance',
             enableGeneration: 'beta-enable-generation',
-            auth: { mode: 'local' },
+            auth: { mode: 'sso' },
         },
     }, null, 2));
     fs.writeFileSync(path.join(edgeDir, 'desired.json'), JSON.stringify(desired, null, 2));
@@ -577,7 +577,7 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
         agentName: 'gamma',
         instanceId: 'gamma-instance',
         enableGeneration: 'gamma-enable-generation',
-        auth: { mode: 'local' },
+        auth: { mode: 'sso' },
     };
     agents['unrelated-container'] = {
         type: 'agent',
@@ -585,7 +585,7 @@ test('agent-mcp exposes only the selected root manifest dependency closure', (t)
         agentName: 'unrelated',
         instanceId: 'unrelated-instance',
         enableGeneration: 'unrelated-enable-generation',
-        auth: { mode: 'local' },
+        auth: { mode: 'sso' },
     };
     fs.writeFileSync(agentsFile, JSON.stringify(agents, null, 2));
 
@@ -1115,6 +1115,27 @@ test('legacy manifest service inventory is rejected instead of silently retained
         }),
         /httpServices is unsupported.*agent-port convention/i,
     );
+});
+
+test('manifest SSO keeps compiled routes authenticated despite saved guest or disabled mode', (t) => {
+    const fixture = createFixture(t, { alphaManifest: { ploinky: 'sso enable' } });
+    const agentsPath = path.join(fixture.ploinkyDir, 'agents.json');
+    const agents = JSON.parse(fs.readFileSync(agentsPath, 'utf8'));
+    for (const mode of ['guest', 'none']) {
+        agents['alpha-container'].auth = { mode };
+        agents['beta-container'].auth = { mode: 'none' };
+        fs.writeFileSync(agentsPath, JSON.stringify(agents));
+        applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'manifest-sso' });
+        const active = loadActiveEdgeRoutingGeneration({ workspaceRoot: fixture.workspace });
+        assert.equal(active.generation.compiled.policy.routeDefaults.alpha.access, 'authenticated');
+        assert.equal(active.generation.compiled.policy.routeDefaults.beta.access, 'authenticated');
+    }
+});
+
+test('retired local role compatibility is rejected during edge compilation', (t) => {
+    const fixture = createFixture(t, { alphaManifest: { routerAccess: { localAuthRoles: ['admin'] } } });
+    assert.throws(() => applyEdgeRoutingGeneration({ workspaceRoot: fixture.workspace, reason: 'retired-role-mapping' }),
+        /localAuthRoles is unsupported/);
 });
 
 test('invalid manifest capability requirements fail edge compilation', (t) => {

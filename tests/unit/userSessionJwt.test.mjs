@@ -16,7 +16,7 @@ const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${mo
 const { signHmacJwt } = await import(`../../Agent/lib/jwtSign.mjs${moduleSuffix}`);
 const { revokeSessionId } = await import(`../../cli/server/auth/sessionRevocations.js${moduleSuffix}`);
 
-const USER = { id: 'local:daniel', username: 'daniel', name: 'Daniel', email: '', roles: ['user'] };
+const USER = { id: 'local:admin', username: 'admin', name: 'CLI Operator', email: '', roles: ['admin'] };
 
 test.after(() => {
     process.chdir(originalCwd);
@@ -41,8 +41,8 @@ function signSession(payloadOverrides = {}) {
     return signHmacJwt({ payload, secret: deriveSubkey('session') });
 }
 
-test('mintSessionJwt issues a user-session bound to the router audience with a sid', () => {
-    const token = localService.mintSessionJwt(USER, 1);
+test('mintSessionJwt issues only an operator user-session bound to the router audience with a sid', () => {
+    const token = localService.mintSessionJwt(USER, 1, { channel: 'cli' });
     const payload = localService.verifySessionJwt(token);
     assert.equal(payload.typ, 'user-session');
     assert.equal(payload.aud, 'ploinky-router');
@@ -52,11 +52,11 @@ test('mintSessionJwt issues a user-session bound to the router audience with a s
 });
 
 test('sid is stable when an existing sid is supplied (sliding-window refresh)', () => {
-    const first = localService.verifySessionJwt(localService.mintSessionJwt(USER, 1));
-    const refreshed = localService.verifySessionJwt(localService.mintSessionJwt(USER, 1, { sid: first.sid }));
+    const first = localService.verifySessionJwt(localService.mintSessionJwt(USER, 1, { channel: 'cli' }));
+    const refreshed = localService.verifySessionJwt(localService.mintSessionJwt(USER, 1, { sid: first.sid, channel: 'cli' }));
     assert.equal(refreshed.sid, first.sid);
     // A fresh login without a supplied sid gets a different sid.
-    const other = localService.verifySessionJwt(localService.mintSessionJwt(USER, 1));
+    const other = localService.verifySessionJwt(localService.mintSessionJwt(USER, 1, { channel: 'cli' }));
     assert.notEqual(other.sid, first.sid);
 });
 
@@ -71,11 +71,11 @@ test('verifySessionJwt rejects a token with an unknown type', () => {
 });
 
 test('getSession resolves a valid user-session, then null after sid revocation', () => {
-    const token = localService.mintSessionJwt(USER, 1);
+    const token = localService.mintSessionJwt(USER, 1, { channel: 'cli' });
     const payload = localService.verifySessionJwt(token);
     const session = localService.getSession(token);
     assert.ok(session, 'expected a resolved session before revocation');
-    assert.equal(session.user.username, 'daniel');
+    assert.equal(session.user.username, 'admin');
 
     revokeSessionId({ sid: payload.sid, reason: 'logout' });
 
@@ -111,4 +111,14 @@ test('getSession resolves a guest-session and honors jti revocation', () => {
     assert.equal(localService.getSession(guestToken, {
         policy: { mode: 'guest', routeKey: 'demoAgent', guestScope: 'demo-scope' },
     }), null);
+});
+
+test('router session APIs reject password-browser tokens even when correctly signed', () => {
+    assert.throws(() => localService.mintSessionJwt(USER, 1), /signed CLI operator/);
+    assert.throws(() => localService.mintSessionJwt({ ...USER, id: 'local:other' }, 1, { channel: 'cli' }), /signed CLI operator/);
+    const retiredBrowser = signSession();
+    assert.throws(() => localService.verifySessionJwt(retiredBrowser), /Local browser sessions/);
+    assert.equal(localService.getSession(retiredBrowser), null);
+    const wrongOperator = signSession({ chn: 'cli' });
+    assert.equal(localService.getSession(wrongOperator), null);
 });

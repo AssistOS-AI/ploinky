@@ -5,12 +5,6 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { loadAgents, saveAgents } from './workspace.js';
 import {
-    resolveMasterKey,
-    setUsersPayload,
-    setUsersPayloadBatchTransactional,
-} from './security/encryptedPasswordStore.js';
-import { hashPassword } from './security/localAuthPasswords.js';
-import {
     getAgentContainerName,
     parseManifestPorts,
     containerExists,
@@ -71,13 +65,14 @@ import {
     resolveEnabledAgentRecordFromMap,
 } from './agentRegistryResolver.js';
 import { retireNoWaitRunMarkers } from '../commands/noWaitMarkerLifecycle.js';
+import { resolveManifestAuthMode } from './manifestAuth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const AGENT_LIB_PATH = path.resolve(__dirname, '../../Agent');
 const RESERVED_AGENT_KEYS = RESERVED_AGENT_REGISTRY_KEYS;
 const ALIAS_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
-const AUTH_MODES = new Set(['none', 'local', 'pwd', 'sso', 'guest']);
+const AUTH_MODES = new Set(['none', 'sso', 'guest']);
 export const DEFAULT_ENABLE_AGENT_MODE = 'isolated';
 export const ENABLE_AGENT_MODES = Object.freeze(['isolated', 'global', 'devel']);
 const ENABLE_AGENT_MODE_SET = new Set(ENABLE_AGENT_MODES);
@@ -123,21 +118,13 @@ function normalizeAlias(aliasInput) {
 
 function normalizeAuthMode(authMode) {
     const normalized = String(authMode || 'none').trim().toLowerCase();
-    if (!AUTH_MODES.has(normalized)) {
-        throw new Error(`Unknown auth mode '${authMode}'. Allowed: none | pwd | sso`);
+    if (normalized === 'local' || normalized === 'pwd') {
+        throw new Error('Local password authentication is no longer supported; use --auth sso.');
     }
-    return normalized === 'pwd' ? 'local' : normalized;
-}
-
-function buildDefaultLocalAuthVars(routeKey) {
-    const suffix = String(routeKey || 'agent')
-        .trim()
-        .replace(/[^a-zA-Z0-9]+/g, '_')
-        .replace(/^_+|_+$/g, '')
-        .toUpperCase() || 'AGENT';
-    return {
-        usersVar: `PLOINKY_AUTH_${suffix}_USERS`
-    };
+    if (!AUTH_MODES.has(normalized)) {
+        throw new Error(`Unknown auth mode '${authMode}'. Allowed: none | guest | sso`);
+    }
+    return normalized;
 }
 
 export function verifyEnabledAgentStarted(shortAgentName, runtimeInstanceName, {
@@ -250,58 +237,6 @@ export async function waitForEnabledAgentReadiness(shortAgentName, manifest, sta
             : '';
         throw new Error(`readiness protocol '${protocol}' did not succeed${warning}`);
     }
-}
-
-function parsePloinkyDirectives(rawValue) {
-    if (Array.isArray(rawValue)) {
-        return rawValue.flatMap((item) => parsePloinkyDirectives(item)).filter(Boolean);
-    }
-    if (typeof rawValue !== 'string') {
-        return [];
-    }
-    return rawValue
-        .split(/[,\n;]+/)
-        .map((entry) => entry.trim().toLowerCase())
-        .filter(Boolean);
-}
-
-function normalizeManifestPwdUsers(manifest) {
-    const users = Array.isArray(manifest?.pwd?.users) ? manifest.pwd.users : [];
-    return users
-        .map((entry) => {
-            const username = String(entry?.username ?? entry?.user ?? '').trim();
-            const password = String(entry?.password ?? '');
-            const name = String(entry?.name ?? username).trim();
-            const email = String(entry?.email ?? '').trim();
-            const roles = Array.isArray(entry?.roles) ? entry.roles.map((role) => String(role || '').trim()).filter(Boolean) : [];
-            if (!username || !password) {
-                return null;
-            }
-            return {
-                id: `local:${username}`,
-                username,
-                name: name || username,
-                email: email || null,
-                passwordHash: hashPassword(password),
-                roles: roles.length ? Array.from(new Set(['local', ...roles])) : ['local'],
-                rev: 1
-            };
-        })
-        .filter(Boolean);
-}
-
-function resolveManifestAuthMode(manifest) {
-    if (manifest?.guest === true) {
-        return 'guest';
-    }
-    const ploinkyDirectives = parsePloinkyDirectives(manifest?.ploinky);
-    if (ploinkyDirectives.includes('pwd enable')) {
-        return 'local';
-    }
-    if (ploinkyDirectives.includes('sso enable')) {
-        return 'sso';
-    }
-    return 'none';
 }
 
 export function normalizeEnableArgs(agentName, mode, repoNameParam) {
@@ -470,21 +405,15 @@ function planAgentEnable({
     const containerName = getAgentContainerName(containerBaseName, repoName);
     const routeKey = alias || shortAgentName;
     const instanceName = alias || shortAgentName;
+    const manifestAuthMode = resolveManifestAuthMode(manifest);
     const authMode = authModeParam === undefined || authModeParam === null || String(authModeParam).trim() === ''
-        ? resolveManifestAuthMode(manifest)
+        ? manifestAuthMode
         : normalizeAuthMode(authModeParam);
-    const manifestPwdUsers = normalizeManifestPwdUsers(manifest);
-    const username = typeof authOptions?.username === 'string' && authOptions.username.trim()
-        ? authOptions.username.trim()
-        : '';
-    const password = typeof authOptions?.password === 'string' && authOptions.password.length
-        ? authOptions.password
-        : '';
-    if ((username || password) && authMode !== 'local') {
-        throw new Error('The --user and --password options are only valid with --auth pwd.');
+    if (manifestAuthMode === 'sso' && authMode !== 'sso') {
+        throw new Error('Manifest requires SSO authentication; --auth cannot override it.');
     }
-    if ((username && !password) || (!username && password)) {
-        throw new Error('Use --user and --password together.');
+    if (Object.hasOwn(authOptions, 'username') || Object.hasOwn(authOptions, 'password')) {
+        throw new Error('Local password authentication options are no longer supported.');
     }
 
     const normalizedMode = (normalized.mode || '').toLowerCase();
@@ -535,7 +464,6 @@ function planAgentEnable({
     const homePath = getAgentDataDir(instanceName);
     const instanceId = randomUUID();
     const enableGeneration = randomUUID();
-    let credentialUpdate = null;
     
     const record = {
         agentName: shortAgentName,
@@ -559,40 +487,7 @@ function planAgentEnable({
             ports
         }
     };
-    if (authMode === 'local') {
-        resolveMasterKey();
-        record.auth = {
-            mode: authMode,
-            ...buildDefaultLocalAuthVars(routeKey)
-        };
-        if (username && password) {
-            credentialUpdate = {
-                usersVar: record.auth.usersVar,
-                payload: {
-                version: 1,
-                users: [{
-                    id: `local:${username}`,
-                    username,
-                    name: username,
-                    email: null,
-                    passwordHash: hashPassword(password),
-                    roles: ['local', 'admin'],
-                    rev: 1
-                }]
-                }
-            };
-        } else if (manifestPwdUsers.length) {
-            credentialUpdate = {
-                usersVar: record.auth.usersVar,
-                payload: {
-                    version: 1,
-                    users: manifestPwdUsers
-                }
-            };
-        }
-    } else {
-        record.auth = { mode: authMode };
-    }
+    record.auth = { mode: authMode };
     if (alias) {
         record.alias = alias;
     }
@@ -633,7 +528,6 @@ function planAgentEnable({
         agentPath,
         alias,
         containerName,
-        credentialUpdate,
         enableGeneration,
         existingRoute,
         instanceId,
@@ -761,10 +655,6 @@ export function prepareAgentEnableBatch(requests, {
             if (effectiveAvailabilityMode === 'replacement') {
                 inactivateEdgeRoutingGeneration(`${reason}:source-stage`, { applyLockCapability });
                 retireNoWaitMarkers(supersededNoWaitRecords);
-                for (const plan of plans) {
-                    if (!plan.credentialUpdate) continue;
-                    setUsersPayload(plan.credentialUpdate.usersVar, plan.credentialUpdate.payload);
-                }
                 saveAgents(map, { coordinate: false, applyLockCapability });
                 writeRoutingConfig(routing, { coordinate: false });
                 const policyFile = path.join(
@@ -911,27 +801,18 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             const finalLease = started?.preparationLease
                 || prepared.preparedGeneration?.preparationLease;
             withEdgeGenerationApplyLock((applyLockCapability) => {
-                const commitCredentials = () => {
-                    return setUsersPayloadBatchTransactional(
-                        prepared.plans
-                            .filter((candidate) => candidate.credentialUpdate)
-                            .map((candidate) => candidate.credentialUpdate),
-                    );
-                };
                 if (finalLease?.mode === 'additive') {
                     commitAdditiveEdgeRoutingGeneration(finalLease, {
                         routing: finalRouting,
                         agents: finalAgents,
                         applyLockCapability,
-                        beforeSelectorCommit: commitCredentials,
                     });
                     return;
                 }
                 // Same-name re-enable cannot shadow its predecessor. Its earlier
                 // replacement preparation already made routing inactive; publish
-                // the ready locator and credentials, then activate only the exact
+                // the ready locator, then activate only the exact
                 // replacement lease. No stale predecessor selector is restored.
-                commitCredentials();
                 saveAgents(finalAgents, { coordinate: false, applyLockCapability });
                 writeRoutingConfig(finalRouting, { coordinate: false });
                 applyEdgeRoutingGeneration({

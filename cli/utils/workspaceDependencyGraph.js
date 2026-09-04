@@ -12,42 +12,7 @@ import {
 } from '../sandbox/networkContract.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
 import { resolveEnabledAgentRecordFromMap } from './agentRegistryResolver.js';
-
-function normalizeAuthMode(value) {
-    const normalized = String(value || '').trim().toLowerCase();
-    if (normalized === 'local' || normalized === 'pwd') return 'local';
-    if (normalized === 'sso') return 'sso';
-    return 'none';
-}
-
-function parsePloinkyDirectives(rawValue) {
-    if (Array.isArray(rawValue)) {
-        return rawValue.flatMap((item) => parsePloinkyDirectives(item)).filter(Boolean);
-    }
-    if (typeof rawValue !== 'string') {
-        return [];
-    }
-    return rawValue
-        .split(/[,\n;]+/)
-        .map((entry) => entry.trim().toLowerCase())
-        .filter(Boolean);
-}
-
-function resolveManifestAuthMode(manifest, registryRecord = null) {
-    const registryMode = normalizeAuthMode(registryRecord?.auth?.mode);
-    if (registryMode !== 'none') {
-        return registryMode;
-    }
-
-    const ploinkyDirectives = parsePloinkyDirectives(manifest?.ploinky);
-    if (ploinkyDirectives.includes('pwd enable')) {
-        return 'local';
-    }
-    if (ploinkyDirectives.includes('sso enable')) {
-        return 'sso';
-    }
-    return 'none';
-}
+import { resolveAgentAuthPolicy } from './manifestAuth.js';
 
 function manifestForAgentRef(agentRef) {
     try {
@@ -233,7 +198,10 @@ function resolveWorkspaceDependencyGraph({
                 agentPath: path.dirname(resolved.manifestPath),
                 manifest,
                 network,
-                authMode: resolveManifestAuthMode(manifest, registryRecord),
+                authMode: resolveAgentAuthPolicy(manifest,
+                    ['', 'none'].includes(String(registryRecord?.auth?.mode || '').trim().toLowerCase())
+                        ? undefined : registryRecord.auth,
+                ).mode,
                 dependencies: new Set(),
                 dependents: new Set(),
                 // dependencyEdges maps a direct child's node id to the edge-local

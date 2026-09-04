@@ -11,29 +11,12 @@ export function requiredCapabilityFromManifest(manifest) {
     return normalizeRequiredCapability(manifest?.routerAccess?.requiredCapability);
 }
 
-export function normalizeLocalAuthRoles(value) {
-    if (value === undefined) return [];
-    if (!Array.isArray(value) || value.length > 64
-        || value.some((role) => typeof role !== 'string' || !REQUIRED_CAPABILITY_PATTERN.test(role))) return null;
-    return [...new Set(value)];
-}
-
-export function evaluateRequiredCapability(manifest, user, { authMode } = {}) {
+export function evaluateRequiredCapability(manifest, user) {
     const requiredCapability = requiredCapabilityFromManifest(manifest);
     if (requiredCapability === null) {
         return { ok: false, error: 'required_capability_invalid' };
     }
     if (!requiredCapability) return { ok: true };
-    const localAuthRoles = normalizeLocalAuthRoles(manifest?.routerAccess?.localAuthRoles);
-    if (localAuthRoles === null) {
-        return { ok: false, error: 'local_auth_roles_invalid' };
-    }
-    // Only the router's verified authentication channel can select this
-    // explicit compatibility policy. User/provider claims never select it.
-    if (authMode === 'local'
-        && Array.isArray(user?.roles) && localAuthRoles.some((role) => user.roles.includes(role))) {
-        return { ok: true, requiredCapability };
-    }
     const capabilities = Array.isArray(user?.capabilities)
         ? user.capabilities.map(String)
         : [];

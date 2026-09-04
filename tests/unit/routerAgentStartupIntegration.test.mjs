@@ -86,7 +86,7 @@ function createFixture(t) {
             instanceId: 'alpha-instance',
             enableGeneration: 'alpha-enable-generation',
             profile: 'default',
-            auth: { mode: 'local' },
+            auth: { mode: 'sso' },
         },
         'beta-container': {
             type: 'agent',
@@ -95,7 +95,7 @@ function createFixture(t) {
             instanceId: 'beta-instance',
             enableGeneration: 'beta-enable-generation',
             profile: 'default',
-            auth: { mode: 'local' },
+            auth: { mode: 'sso' },
         },
     });
     writeJson(path.join(edgeDir, 'desired.json'), {

@@ -352,7 +352,7 @@ function agentPortPlan({
             allowedOrigins: [`${forwarding.protocol}://${forwarding.authority}`],
             allowMissingOrigin: true,
         },
-        allowRequestStreaming: true,
+        allowRequestStreaming: !authDefinition.issueInvocation,
     });
 }
 

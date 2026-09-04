@@ -93,8 +93,6 @@ let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
     alias: 'as',
     auth: '--auth',
-    user: '--user',
-    password: '--password',
 });
 const ENABLE_AGENT_CLI_TOKEN_SET = new Set(Object.values(ENABLE_AGENT_CLI_TOKENS));
 
@@ -120,11 +118,12 @@ function parseEnableAgentArgs(rawOptions = []) {
     if (!tokens.length) {
         return { agentName: undefined, mode: undefined, repoName: undefined, alias: undefined };
     }
+    if (tokens.some((token) => typeof token === 'string' && /^--(?:user|password)(?:=|$)/i.test(token))) {
+        throw new Error('Local password authentication options are no longer supported.');
+    }
 
     let alias;
     let authMode;
-    let username;
-    let password;
     let aliasIndex = -1;
     for (let i = 0; i < tokens.length; i += 1) {
         const token = tokens[i];
@@ -147,31 +146,15 @@ function parseEnableAgentArgs(rawOptions = []) {
         if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.auth) {
             const next = tokens[i + 1];
             if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
+                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|guest|sso] [as <alias>]");
             }
             authMode = next.trim().toLowerCase();
+            if (authMode === 'local' || authMode === 'pwd') {
+                throw new Error('Local password authentication is no longer supported; use --auth sso.');
+            }
             tokens.splice(i, 2);
             i -= 1;
             continue;
-        }
-        if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.user) {
-            const next = tokens[i + 1];
-            if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
-            }
-            username = next.trim();
-            tokens.splice(i, 2);
-            i -= 1;
-            continue;
-        }
-        if (typeof token === 'string' && token.toLowerCase() === ENABLE_AGENT_CLI_TOKENS.password) {
-            const next = tokens[i + 1];
-            if (!next || typeof next !== 'string') {
-                throw new Error("Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]");
-            }
-            password = next;
-            tokens.splice(i, 2);
-            i -= 1;
         }
     }
 
@@ -181,8 +164,6 @@ function parseEnableAgentArgs(rawOptions = []) {
         repoName: tokens[2],
         alias,
         authMode,
-        username,
-        password,
     };
 }
 
@@ -219,7 +200,8 @@ function parseUninstallRepoTarget(options = []) {
 function hasAgentEnableSyntax(options = []) {
     return options.slice(1).some((token) => {
         const normalized = String(token || '').trim().toLowerCase();
-        return agentsSvc.isEnableAgentMode(normalized) || ENABLE_AGENT_CLI_TOKEN_SET.has(normalized);
+        return agentsSvc.isEnableAgentMode(normalized) || ENABLE_AGENT_CLI_TOKEN_SET.has(normalized)
+            || /^--(?:user|password)(?:=|$)/.test(normalized);
     });
 }
 
@@ -312,7 +294,7 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
             }
             else if (options[0] === 'agent') {
                 const parsed = parseEnableAgentArgs(options.slice(1));
-                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
+                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode);
             }
             else if (['sandbox', 'host-sandbox', 'lite-sandbox'].includes(String(options[0] || '').toLowerCase())) {
                 enableHostSandbox();
@@ -323,7 +305,7 @@ async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
                     break;
                 }
                 const parsed = parseEnableAgentArgs(options);
-                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode, parsed.username, parsed.password);
+                await enableAgent(parsed.agentName, parsed.mode, parsed.repoName, parsed.alias, parsed.authMode);
             }
             break;
         case 'expose':

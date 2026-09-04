@@ -1,4 +1,4 @@
-import { authenticateLocalUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, resolveLocalAuthConfig, updateLocalCredentials, verifySessionJwt, revokeSession as revokeLocalSession } from '../auth/localService.js';
+import { getSession as getLocalSession, isAdminUser, verifySessionJwt, revokeSession as revokeLocalSession } from '../auth/localService.js';
 import { revokeSessionId } from '../auth/sessionRevocations.js';
 import { canonicalControlOrigin, mintAdminCsrfToken } from '../adminControlSecurity.js';
 import {
@@ -15,7 +15,6 @@ import {
     getCookieNameForMode,
     GUEST_AUTH_COOKIE_NAME,
     GUEST_SESSION_TTL_SECONDS,
-    LOCAL_AUTH_COOKIE_NAME,
     normalizeRelativePath,
     parseCookies,
     readJsonBody,
@@ -25,15 +24,10 @@ import {
     SSO_AUTH_COOKIE_NAME,
 } from './shared.js';
 import {
-    getLocalAuthPolicyFromSession,
-    getLocalRouteKey,
     resolveAuthContextForRoutePlan,
     waitForAgentRedirectReady,
 } from './authContext.js';
 import {
-    renderExternalAccountHtml,
-    renderLocalAccountHtml,
-    renderLocalLoginHtml,
     renderLoggedOutHtml,
     renderLogoutConfirmationHtml,
     renderSsoLoginHtml,
@@ -51,31 +45,6 @@ function buildLoginBindingCookie(name, value, baseUrl, maxAge) {
         maxAge,
         sameSite: 'Lax',
     });
-}
-
-function getLocalAccountErrorMessage(code = '') {
-    switch (String(code || '').trim()) {
-        case 'current_password_required':
-            return 'Enter the current password to apply changes.';
-        case 'username_required':
-            return 'Username cannot be empty.';
-        case 'password_too_short':
-            return 'New password must be at least 8 characters.';
-        case 'password_confirmation_required':
-            return 'Confirm the new password.';
-        case 'password_confirmation_mismatch':
-            return 'The new password and confirmation do not match.';
-        case 'invalid_credentials':
-            return 'Current password is incorrect.';
-        case 'local_auth_not_configured':
-            return 'Local auth is not configured for this account.';
-        case 'no_changes_requested':
-            return 'No changes were submitted.';
-        case 'session_stale':
-            return 'Your session is out of date. Sign in again and retry.';
-        default:
-            return code ? 'Unable to update credentials.' : '';
-    }
 }
 
 function isHostBoundAuthContext(authContext) {
@@ -102,13 +71,6 @@ function requireCurrentGeneration(res, routePlan) {
     return true;
 }
 
-function addUnboundAgent(params, authContext, routeKey = authContext?.routeKey) {
-    if (!isHostBoundAuthContext(authContext) && String(routeKey || '').trim()) {
-        params.set('agent', String(routeKey).trim());
-    }
-    return params;
-}
-
 function setAuthenticatedRequest(req, { session, sessionId, mode }) {
     req.user = session.user;
     req.session = session;
@@ -129,13 +91,6 @@ async function resolveBrowserTokenSession(cookies, authContext) {
     const candidates = authContext.mode === 'guest'
         ? [
             {
-                mode: 'local',
-                cookieName: LOCAL_AUTH_COOKIE_NAME,
-                getSession: (sessionId) => sessionTokenService.getUserSession(sessionId, {
-                    policy: authContext.policy,
-                }),
-            },
-            {
                 mode: 'sso',
                 cookieName: SSO_AUTH_COOKIE_NAME,
                 getSession: (sessionId) => authService.isConfigured()
@@ -153,9 +108,7 @@ async function resolveBrowserTokenSession(cookies, authContext) {
         : [{
             mode: authContext.mode,
             cookieName: getCookieNameForMode(authContext.mode),
-            getSession: (sessionId) => authContext.mode === 'local'
-                ? sessionTokenService.getUserSession(sessionId, { policy: authContext.policy })
-                : authService.getSession(sessionId),
+            getSession: (sessionId) => authService.getSession(sessionId),
         }];
 
     let invalidCookie = null;
@@ -221,77 +174,12 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 sendJson(res, 404, { ok: false, error: 'auth_disabled' });
                 return true;
             }
-            if (authContext.mode === 'local') {
-                if (method === 'GET') {
-                    const returnTo = parsedUrl.searchParams.get('returnTo') || '/';
-                    const localCfg = resolveLocalAuthConfig(authContext.policy);
-                    res.writeHead(200, {
-                        'Content-Type': 'text/html; charset=utf-8',
-                        'Cache-Control': 'no-store'
-                    });
-                    res.end(renderLocalLoginHtml({
-                        agentName: authContext.boundHostRouteKey || authContext.routeKey,
-                        returnTo,
-                        error: parsedUrl.searchParams.get('error') || '',
-                        notice: parsedUrl.searchParams.get('notice') || '',
-                        usersVar: localCfg.usersVar,
-                        includeAgentSelector: !isHostBoundAuthContext(authContext),
-                    }));
-                    return true;
-                }
-                if (method !== 'POST') {
-                    res.writeHead(405); res.end(); return true;
-                }
-                const body = await readLoginBody(req);
-                const username = String(body?.username || '').trim();
-                const password = String(body?.password || '');
-                const returnTo = normalizeRelativePath(body?.returnTo || '/', '/');
-                if (rejectMismatchedHostSelector(res, authContext, body?.agent)) return true;
-                const agent = isHostBoundAuthContext(authContext)
-                    ? String(authContext.routeKey || '').trim()
-                    : String(body?.agent || authContext.routeKey || '').trim();
-                if (!requireCurrentGeneration(res, routePlan)) return true;
-                try {
-                    const result = authenticateLocalUser({ username, password, policy: authContext.policy, routeKey: agent });
-                    await waitForAgentRedirectReady(agent, { routePlan });
-                    if (!requireCurrentGeneration(res, routePlan)) return true;
-                    const cookie = buildCookie(LOCAL_AUTH_COOKIE_NAME, result.sessionId, req, '/', {
-                        maxAge: getLocalSessionCookieMaxAge(),
-                        sameSite: 'Lax'
-                    });
-                    const csrfToken = issueBrowserMutationProof(req, res, {
-                        routePlan,
-                        authContext,
-                        sessionId: result.sessionId,
-                        maxAge: getLocalSessionCookieMaxAge(),
-                    });
-                    void csrfToken;
-                    appendSetCookie(res, cookie);
-                    res.writeHead(302, {
-                        Location: returnTo,
-                    });
-                    res.end('Login successful');
-                    appendLog('auth_local_login_success', { user: result.user?.username, agent });
-                    return true;
-                } catch (err) {
-                    appendLog('auth_local_login_failure', { error: err?.message || String(err), agent });
-                    const params = addUnboundAgent(new URLSearchParams({
-                        returnTo,
-                        error: err?.message === 'local_auth_not_configured'
-                            ? 'Local auth is not configured for this agent.'
-                            : 'Invalid username or password.'
-                    }), authContext, agent);
-                    res.writeHead(302, { Location: `/auth/login?${params.toString()}` });
-                    res.end('Login failed');
-                    return true;
-                }
+            if (method !== 'GET') {
+                res.writeHead(405); res.end(); return true;
             }
             if (!authService.isConfigured()) {
                 sendJson(res, 503, { ok: false, error: 'sso_disabled' });
                 return true;
-            }
-            if (method !== 'GET') {
-                res.writeHead(405); res.end(); return true;
             }
             const returnTo = normalizeRelativePath(parsedUrl.searchParams.get('returnTo') || '/', '/');
             const prompt = parsedUrl.searchParams.get('prompt') || undefined;
@@ -315,176 +203,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             return true;
         }
         if (pathname === '/auth/account') {
-            if (method !== 'GET' && method !== 'POST') {
-                res.writeHead(405); res.end(); return true;
-            }
-            const cookies = parseCookies(req);
-            const sessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME) || '';
-            const session = getLocalSession(sessionId, { policy: authContext.policy });
-            const routeKey = isHostBoundAuthContext(authContext)
-                ? String(authContext.routeKey || '').trim()
-                : getLocalRouteKey(parsedUrl, session, authContext.routeKey);
-            const returnToFromQuery = normalizeRelativePath(parsedUrl.searchParams.get('returnTo') || '/', '/');
-
-            if (!session) {
-                const params = addUnboundAgent(
-                    new URLSearchParams({ returnTo: returnToFromQuery }),
-                    authContext,
-                    routeKey,
-                );
-                res.writeHead(302, { Location: `/auth/login?${params.toString()}` });
-                res.end('Authentication required');
-                return true;
-            }
-
-            setAuthenticatedRequest(req, { session, sessionId, mode: 'local' });
-
-            let body = null;
-            if (method === 'POST') {
-                body = await readLoginBody(req);
-                if (rejectMismatchedHostSelector(res, authContext, body?.agent)) return true;
-                const mutationDecision = verifyBrowserMutationRequest(req, {
-                    routePlan,
-                    authContext,
-                    sessionId,
-                    token: body?.csrfToken,
-                });
-                if (!mutationDecision.ok) {
-                    denyBrowserMutation(res, mutationDecision);
-                    return true;
-                }
-                if (!requireCurrentGeneration(res, routePlan)) return true;
-            }
-
-            const policy = getLocalAuthPolicyFromSession(session, authContext.policy);
-            if (!policy) {
-                if (method === 'GET') {
-                    res.writeHead(200, {
-                        'Content-Type': 'text/html; charset=utf-8',
-                        'Cache-Control': 'no-store'
-                    });
-                    res.end(renderExternalAccountHtml({
-                        providerLabel: session?.externalAuth?.provider === 'github' ? 'GitHub' : 'External sign-in',
-                        returnTo: returnToFromQuery,
-                        username: req.user?.username || req.user?.name || '',
-                        agentName: routeKey,
-                        includeAgentSelector: !isHostBoundAuthContext(authContext),
-                    }));
-                    return true;
-                }
-                sendJson(res, 400, {
-                    ok: false,
-                    error: 'external_account_readonly',
-                    message: 'Account settings are not available for this sign-in method.'
-                });
-                return true;
-            }
-
-            if (method === 'GET') {
-                const localCfg = resolveLocalAuthConfig(policy);
-                const csrfToken = issueBrowserMutationProof(req, res, {
-                    routePlan,
-                    authContext,
-                    sessionId,
-                    maxAge: getLocalSessionCookieMaxAge(),
-                });
-                res.writeHead(200, {
-                    'Content-Type': 'text/html; charset=utf-8',
-                    'Cache-Control': 'no-store'
-                });
-                res.end(renderLocalAccountHtml({
-                    agentName: routeKey,
-                    returnTo: returnToFromQuery,
-                    error: getLocalAccountErrorMessage(parsedUrl.searchParams.get('error') || ''),
-                    notice: parsedUrl.searchParams.get('notice') || '',
-                    username: req.user?.username || '',
-                    usersVar: localCfg.usersVar,
-                    csrfToken,
-                    includeAgentSelector: !isHostBoundAuthContext(authContext),
-                }));
-                return true;
-            }
-
-            const returnTo = normalizeRelativePath(body?.returnTo || '/', '/');
-            const nextUsername = String(body?.newUsername || '').trim();
-            const currentPassword = String(body?.currentPassword || '');
-            const newPassword = String(body?.newPassword || '');
-            const confirmPassword = String(body?.confirmPassword || '');
-            const wantsJson = String(req.headers?.accept || '').toLowerCase().includes('application/json');
-            let errorCode = '';
-
-            if (!currentPassword) {
-                errorCode = 'current_password_required';
-            } else if (!nextUsername) {
-                errorCode = 'username_required';
-            } else if ((newPassword || confirmPassword) && !confirmPassword) {
-                errorCode = 'password_confirmation_required';
-            } else if ((newPassword || confirmPassword) && newPassword !== confirmPassword) {
-                errorCode = 'password_confirmation_mismatch';
-            } else if (newPassword && newPassword.length < 8) {
-                errorCode = 'password_too_short';
-            }
-
-            if (!errorCode) {
-                try {
-                    const result = updateLocalCredentials({
-                        currentPassword,
-                        nextUsername,
-                        nextPassword: newPassword,
-                        policy,
-                        sessionUser: req.user
-                    });
-                    const clearCookie = buildCookie(LOCAL_AUTH_COOKIE_NAME, '', req, '/', { maxAge: 0, sameSite: 'Lax' });
-                    const notice = result.passwordChanged
-                        ? 'Credentials updated. Sign in again with the new username and password.'
-                        : 'Username updated. Sign in again with the new username.';
-                    appendLog('auth_local_account_updated', {
-                        user: req.user?.username || null,
-                        agent: routeKey || null,
-                        usernameChanged: result.usernameChanged,
-                        passwordChanged: result.passwordChanged
-                    });
-                    if (wantsJson) {
-                        res.writeHead(200, {
-                            'Content-Type': 'application/json',
-                            'Set-Cookie': clearCookie
-                        });
-                        res.end(JSON.stringify({ ok: true, notice }));
-                        return true;
-                    }
-                    const params = addUnboundAgent(
-                        new URLSearchParams({ returnTo, notice }),
-                        authContext,
-                        routeKey,
-                    );
-                    res.writeHead(302, {
-                        Location: `/auth/login?${params.toString()}`,
-                        'Set-Cookie': clearCookie
-                    });
-                    res.end('Credentials updated');
-                    return true;
-                } catch (err) {
-                    errorCode = err?.message || 'local_account_update_failed';
-                    appendLog('auth_local_account_update_failure', {
-                        error: errorCode,
-                        agent: routeKey || null
-                    });
-                }
-            }
-
-            if (wantsJson) {
-                sendJson(res, 400, {
-                    ok: false,
-                    error: errorCode,
-                    message: getLocalAccountErrorMessage(errorCode)
-                });
-                return true;
-            }
-
-            const params = addUnboundAgent(new URLSearchParams({ returnTo }), authContext, routeKey);
-            if (errorCode) params.set('error', errorCode);
-            res.writeHead(302, { Location: `/auth/account?${params.toString()}` });
-            res.end('Unable to update credentials');
+            sendJson(res, 404, { ok: false, error: 'local_auth_disabled' });
             return true;
         }
 
@@ -506,12 +225,12 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 sendJson(res, 404, { ok: false, error: 'callback_not_supported' });
                 return true;
             }
+            if (method !== 'GET') {
+                res.writeHead(405); res.end(); return true;
+            }
             if (!authService.isConfigured()) {
                 sendJson(res, 503, { ok: false, error: 'sso_disabled' });
                 return true;
-            }
-            if (method !== 'GET') {
-                res.writeHead(405); res.end(); return true;
             }
             const code = parsedUrl.searchParams.get('code') || '';
             const state = parsedUrl.searchParams.get('state') || '';
@@ -526,7 +245,17 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 sendJson(res, 400, { ok: false, error: 'invalid_authorization_browser' });
                 return true;
             }
-            const result = await authService.handleCallback({ code, state, browserBinding, baseUrl });
+            let result;
+            try {
+                result = await authService.handleCallback({ code, state, browserBinding, baseUrl });
+            } catch (err) {
+                if (err?.statusCode === 400 || err?.statusCode === 401 || err?.statusCode === 403) {
+                    appendLog('auth_callback_rejected', { statusCode: err.statusCode });
+                    sendJson(res, 400, { ok: false, error: 'invalid_authorization_code' });
+                    return true;
+                }
+                throw err;
+            }
             appendSetCookie(res, buildLoginBindingCookie(bindingCookieName, '', baseUrl, 0));
             await waitForAgentRedirectReady(authContext.routeKey || '', { routePlan });
             if (!requireCurrentGeneration(res, routePlan)) return true;
@@ -556,7 +285,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             const cookieName = getCookieNameForMode(authContext.mode);
             const sessionId = cookies.get(cookieName) || '';
             const session = sessionId
-                ? ((authContext.mode === 'local' || authContext.mode === 'guest')
+                ? (authContext.mode === 'guest'
                     ? getLocalSession(sessionId, { policy: authContext.policy })
                     : authService.getSession(sessionId))
                 : null;
@@ -582,9 +311,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                     sessionId,
                     maxAge: authContext.mode === 'guest'
                         ? GUEST_SESSION_TTL_SECONDS
-                        : authContext.mode === 'sso'
-                            ? authService.getSessionCookieMaxAge()
-                            : getLocalSessionCookieMaxAge(),
+                        : authService.getSessionCookieMaxAge(),
                 });
                 res.writeHead(200, {
                     'Content-Type': 'text/html; charset=utf-8',
@@ -614,15 +341,15 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                 return true;
             }
             if (!requireCurrentGeneration(res, routePlan)) return true;
-            // For stateless JWT sessions (local + guest), add the session's sid to
+            // For guest JWT sessions, add the session's sid to
             // the persistent revocation list so the cookie cannot be replayed.
-            if (sessionId && (authContext.mode === 'local' || authContext.mode === 'guest')) {
+            if (sessionId && authContext.mode === 'guest') {
                 try {
                     const payload = verifySessionJwt(sessionId);
                     revokeSessionId({ sid: payload.sid, jti: payload.jti, reason: 'logout' });
                 } catch { /* already invalid/expired — nothing to revoke */ }
             }
-            const outcome = authContext.mode === 'local' || authContext.mode === 'guest'
+            const outcome = authContext.mode === 'guest'
                 ? (revokeLocalSession(sessionId), { redirect: requestedReturnTo || '/' })
                 : await authService.logout(sessionId, {
                     baseUrl,
@@ -720,11 +447,10 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
                     tokenType: session.tokens?.tokenType || null
                 };
             }
-            const cookieMaxAge = sessionMode === 'local'
-                ? getLocalSessionCookieMaxAge()
-                : sessionMode === 'guest'
-                    ? GUEST_SESSION_TTL_SECONDS
-                    : authService.getSessionCookieMaxAge();
+            if (!requireCurrentGeneration(res, routePlan)) return true;
+            const cookieMaxAge = sessionMode === 'guest'
+                ? GUEST_SESSION_TTL_SECONDS
+                : authService.getSessionCookieMaxAge();
             const cookie = buildCookie(cookieName, sessionId, req, '/', {
                 maxAge: cookieMaxAge,
                 sameSite: 'Lax'
@@ -737,7 +463,7 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             });
             if (method === 'POST') appendSetCookie(res, cookie);
             let adminControl;
-            if (isLocalAdminUser(session.user)) {
+            if (isAdminUser(session.user)) {
                 try {
                     adminControl = {
                         origin: canonicalControlOrigin(req),

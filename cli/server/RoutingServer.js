@@ -502,7 +502,7 @@ async function processRequest(req, res) {
     // Single administrative endpoint for router access-control policy (DS016).
     // Authenticated + never policy-routable; handles its own authorization.
     if (pathname === '/policy/command') {
-        const handled = await policy.commandInvoker.handle(req, res);
+        const handled = await policy.commandInvoker.handle(req, res, { routePlan });
         if (handled) return;
     }
 

@@ -399,6 +399,12 @@ function getMimeType(filePath) {
 
 function getCacheControl(filePath) {
     const ext = path.extname(filePath).toLowerCase();
+    // HTML documents are application entry points behind session and capability
+    // checks. A cached copy would let a browser reopen a shell the Router has
+    // since denied (logout, demotion, block), so documents are never stored.
+    if (ext === '.html' || ext === '.htm') {
+        return 'no-store';
+    }
     if (ext === '.woff2' || ext === '.woff' || ext === '.ttf' || ext === '.otf' || ext === '.eot') {
         return 'public, max-age=31536000, immutable';
     }

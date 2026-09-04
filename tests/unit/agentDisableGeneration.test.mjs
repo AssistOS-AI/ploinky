@@ -26,7 +26,7 @@ function agentRecord(agentName, overrides = {}) {
         agentName,
         instanceId: `${agentName}-instance`,
         enableGeneration: `${agentName}-generation`,
-        auth: { mode: 'local', usersVar: `PLOINKY_AUTH_${agentName.toUpperCase()}_USERS` },
+        auth: { mode: 'sso' },
         ...overrides,
     };
 }

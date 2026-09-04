@@ -34,7 +34,7 @@ function fixture(t, { routes = [protocolRoute(), { path: `${PREFIX}/public/*`, a
         'alpha-container': {
             type: 'agent', repoName: 'fixtures', agentName: 'alpha',
             instanceId: 'alpha-instance', enableGeneration: 'alpha-enabled',
-            runtime: 'podman', containerId: 'a'.repeat(64), auth: { mode: 'local' },
+            runtime: 'podman', containerId: 'a'.repeat(64), auth: { mode: 'sso' },
         },
     }));
     fs.writeFileSync(path.join(edgeDir, 'desired.json'), JSON.stringify({ hosts: {} }));

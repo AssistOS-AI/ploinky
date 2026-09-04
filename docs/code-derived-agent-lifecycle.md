@@ -251,9 +251,8 @@ Ploinky does not load a central manifest schema in the observed paths. Individua
 | `configProviders` | No | Top-level startup provider entries processed for the static agent after dependency graph discovery and before dependency env resolution. Profile entries replace the default profile list. |
 | `providesConfig` | No | Declares a startup provider command and output allowlist. Provider stdout must be schema version 1 JSON and is persisted by Ploinky only after allowlist, reserved-name, sensitive-flag, and generated-secret checks pass. |
 | `startup` | No | General workspace startup policy: `automatic` or `manual`. Absent defaults to `automatic`; invalid values fail validation. Static-agent and dependency graph membership override `manual`. |
-| `guest` | No | `guest: true` makes manifest-derived auth mode `guest`. |
-| `ploinky` | No | String/list directives. `pwd enable` maps to local auth; `sso enable` maps to SSO auth. |
-| `pwd.users` | No | Seeds local password users when local auth is active and CLI user/password were not provided. Each entry needs username/user and password. |
+| `guest` | No | `guest: true` makes manifest-derived auth mode `guest`; combining it with `sso enable` is rejected. |
+| `ploinky` | No | String/list directives. `sso enable` requires SSO; local password directives are rejected. |
 | `start` | No | Main runtime command when present. If both `start` and `agent`/`commands.run` exist, `start` runs as the container entry and the agent command is launched as a detached sidecar. |
 | `agent` | No | Agent command. Used before `commands.run`. |
 | `commands.run` | No | Agent command fallback after `agent`. |
@@ -286,20 +285,20 @@ Profile selection is generic and product-independent. Bare, slash-qualified, and
 
 ## Auth Mode Processing
 
-Auth mode can be supplied by the CLI or inferred from the manifest:
+`cli/utils/manifestAuth.js` resolves the manifest requirement and saved policy. The CLI can select an authentication mode only when it does not weaken an explicit `sso enable` requirement:
 
 | Source | Result |
 | --- | --- |
-| CLI `--auth none` | `none` |
-| CLI `--auth pwd` or `--auth local` | `local` |
+| CLI `--auth none` | `none`, unless the manifest requires SSO |
+| CLI `--auth pwd` or `--auth local` | Rejected |
 | CLI `--auth sso` | `sso` |
-| CLI `--auth guest` | `guest` |
-| `guest: true` | `guest` |
-| `ploinky` contains `pwd enable` | `local` |
-| `ploinky` contains `sso enable` | `sso` |
+| CLI `--auth guest` | `guest`, unless the manifest requires SSO |
+| `guest: true` | `guest`, unless combined with an SSO requirement |
+| `ploinky` contains a `pwd` directive, or manifest has a `pwd` field | Rejected |
+| `ploinky` contains `sso enable` | Mandatory `sso`, including when saved policy differs |
 | None of the above | `none` |
 
-For local auth, the record gets a generated users variable name such as `PLOINKY_AUTH_<ROUTE>_USERS`. If `--user` and `--password` are provided, Ploinky writes one admin local user into the encrypted password store. Otherwise, if `pwd.users` exists, those users are hashed and written. Local auth can therefore be enabled without users if neither source provides credentials; the code records local mode but does not seed a users payload.
+Ploinky does not store browser passwords or seed local users. Credential options `--user` and `--password`, local role mappings, and saved local authentication policies without an authoritative SSO manifest are rejected. Browser login and account administration use the configured provider. The separately signed CLI operator credential remains a runtime control channel and is not an application authentication setting. There is no local-account migration or fallback login.
 
 ## Start Flow
 
@@ -785,3 +784,7 @@ MCP tool and resource commands require router-minted invocation headers before c
 9. `client tool --agent` resolves ambiguity, but the observed call path invokes `client.callTool(toolName, payloadObj)` without passing target-agent metadata.
 10. Seatbelt links prepared dependencies into the real agent code path as `node_modules`; it errors if that path exists and is not a symlink.
 11. Manifest health scripts remain watchdog/container-monitor probes by default, but `health.readiness.script` also becomes blocking startup readiness for a start-only container when no explicit `readiness.protocol` overrides it. `health.readiness.continuous: false` keeps that readiness check activation-only and requires a separate recurring liveness probe for ongoing semantic health.
+
+## Rejected SSO callback exchanges
+
+`cli/server/authHandlers/authRoutes.js` normalizes an authentication provider callback rejection with integer `statusCode` 400, 401, or 403 to HTTP 400 `invalid_authorization_code`. This includes expired or invalid authorization codes and accounts blocked after code issuance while the browser transaction is still valid. No session cookie is issued and provider-specific rejection details are not returned. Browser-proof checks remain required, and unexpected provider/server errors retain their failure handling. This classification applies only to the callback exchange; errors after that exchange and errors on other authentication routes are not reclassified.

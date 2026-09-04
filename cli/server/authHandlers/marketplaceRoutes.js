@@ -17,13 +17,14 @@ import {
     observeNoWaitAgentRecord,
 } from '../noWaitAgentStartupState.js';
 import { collectAgentsSummary } from '../../utils/status.js';
-import { isLocalAdminUser } from '../auth/localService.js';
+import { isAdminUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
+import { localSessionAllowedForRoutePlan } from './authContext.js';
 
 export const MARKETPLACE_PATH = '/api/marketplace';
 export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
@@ -398,7 +399,7 @@ function buildMarketplaceState(user = null, options = {}) {
             roles: Array.isArray(user.roles) ? [...user.roles] : []
         } : null,
         permissions: {
-            canManage: isLocalAdminUser(user)
+            canManage: isAdminUser(user)
         },
         repositories,
         agents: agents.sort((left, right) => left.ref.localeCompare(right.ref)),
@@ -406,22 +407,22 @@ function buildMarketplaceState(user = null, options = {}) {
     };
 }
 
-async function ensureMarketplaceAdmin(req, res, parsedUrl) {
-    const authResult = await ensureMarketplaceUser(req, res);
+async function ensureMarketplaceAdmin(req, res, parsedUrl, { routePlan } = {}) {
+    const authResult = await ensureMarketplaceUser(req, res, routePlan);
     if (!authResult.ok) return false;
-    if (!isLocalAdminUser(req.user)) {
+    if (!isAdminUser(req.user)) {
         sendMarketplaceError(res, 403, 'admin_required', 'Administrator access is required.');
         return false;
     }
     return true;
 }
 
-async function ensureMarketplaceUser(req, res) {
+async function ensureMarketplaceUser(req, res, routePlan) {
     const cookies = parseCookies(req);
     const localSessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME);
     if (localSessionId) {
         const session = await sessionTokenService.getUserSession(localSessionId);
-        if (session?.user) {
+        if (session?.user && localSessionAllowedForRoutePlan(session, routePlan)) {
             req.user = session.user;
             req.session = session;
             req.sessionId = localSessionId;
@@ -463,7 +464,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 tool: MARKETPLACE_READ_TOOL,
             })) return true;
         } else {
-            const authResult = await ensureMarketplaceUser(req, res);
+            const authResult = await ensureMarketplaceUser(req, res, routePlan);
             if (!authResult.ok) return true;
         }
         sendJson(res, 200, {
@@ -476,7 +477,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     if (method === 'POST' && !route.resource) {
         const agentRequest = Boolean(readAuthorizationBearer(req));
         if (!agentRequest) {
-            if (!(await ensureAdmin(req, res, parsedUrl))) {
+            if (!(await ensureAdmin(req, res, parsedUrl, { routePlan }))) {
                 return true;
             }
             const mutationDecision = verifyAdminMutationRequest(req, req.sessionId);

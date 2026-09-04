@@ -530,18 +530,12 @@ function resolveUpdateProjectsRoot(folderPath) {
     return process.cwd();
 }
 
-async function enableAgent(agentName, mode, repoNameParam, alias, authMode, username, password) {
-    if (!agentName) throw new Error('Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]');
-    const { shortAgentName, repoName, alias: resolvedAlias, auth } = await agentsSvc.enableAgent(agentName, mode, repoNameParam, alias, authMode, { username, password });
+async function enableAgent(agentName, mode, repoNameParam, alias, authMode) {
+    if (!agentName) throw new Error('Usage: enable agent <name|repo/name> [isolated|global|devel [repoName]] [--auth none|guest|sso] [as <alias>]');
+    const { shortAgentName, repoName, alias: resolvedAlias, auth } = await agentsSvc.enableAgent(agentName, mode, repoNameParam, alias, authMode);
     const aliasNote = resolvedAlias ? ` as '${resolvedAlias}'` : '';
-    const authLabel = auth?.mode === 'local' ? 'pwd' : (auth?.mode || 'none');
+    const authLabel = auth?.mode || 'none';
     console.log(`✓ Agent '${shortAgentName}' from repo '${repoName}' enabled and started${aliasNote} with auth '${authLabel}'.`);
-    if (auth?.mode === 'local' && auth.usersVar) {
-        console.log(`  Local auth users var: ${auth.usersVar}`);
-        if (username) {
-            console.log(`  Local auth user set to '${username}'.`);
-        }
-    }
 }
 
 function findAgentManifest(agentName) {

@@ -8,6 +8,7 @@ import { isSsoProviderManifest } from '../agentRegistry.js';
 import { bindSsoProvider } from '../security/sso.js';
 import { PLOINKY_DIR } from '../config.js';
 import { getActiveProfile } from './profileService.js';
+import { resolveManifestAuthMode } from '../manifestAuth.js';
 
 export function parseEnableDirective(entry) {
     if (entry === null || entry === undefined) return null;
@@ -93,30 +94,6 @@ export function qualifyEnableSpecForRepo(spec, repoName) {
     return [`${repo}/${tokens[0]}`, ...tokens.slice(1)].join(' ');
 }
 
-function parsePloinkyDirectives(rawValue) {
-    if (Array.isArray(rawValue)) {
-        return rawValue.flatMap((item) => parsePloinkyDirectives(item)).filter(Boolean);
-    }
-    if (typeof rawValue !== 'string') {
-        return [];
-    }
-    return rawValue
-        .split(/[,\n;]+/)
-        .map((entry) => entry.trim().toLowerCase())
-        .filter(Boolean);
-}
-
-function resolveManifestAuthMode(manifest) {
-    const ploinkyDirectives = parsePloinkyDirectives(manifest?.ploinky);
-    if (ploinkyDirectives.includes('pwd enable')) {
-        return 'local';
-    }
-    if (ploinkyDirectives.includes('sso enable')) {
-        return 'sso';
-    }
-    return 'none';
-}
-
 export function resolveManifestSsoProvider(manifest, repoName = '') {
     if (resolveManifestAuthMode(manifest) !== 'sso') return '';
     const raw = manifest?.sso?.providerAgent;
@@ -127,9 +104,8 @@ export function resolveManifestSsoProvider(manifest, repoName = '') {
     return agentRefFromEnableSpec(qualifyEnableSpecForRepo(raw.trim(), repoName));
 }
 
-// Compute auth configuration from the admitted graph, without mutating the
-// workspace during repository discovery. Retained local-auth records keep
-// their identity store; changing a provider requires an explicit migration.
+// Compute the manifest-required provider from the admitted graph without
+// mutating the workspace during repository discovery.
 export function resolveWorkspaceGraphSsoConfig(graph, currentSso = {}) {
     const nodes = Array.from(graph?.nodes?.values?.() || []);
     const providers = new Set();
@@ -154,7 +130,7 @@ export function resolveWorkspaceGraphSsoConfig(graph, currentSso = {}) {
     if (previousRef) {
         const resolved = findAgent(previousRef);
         if (`${resolved.repo}/${resolved.shortAgentName}` !== providerAgent) {
-            throw new Error('workspace SSO provider change requires an explicit account migration and provider selection');
+            throw new Error('workspace SSO provider conflicts with the manifest-declared provider');
         }
     }
     return {

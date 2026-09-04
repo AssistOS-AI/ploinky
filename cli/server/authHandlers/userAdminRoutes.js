@@ -1,15 +1,12 @@
-import { createLocalAuthUser, deleteLocalAuthUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthRoles, listLocalAuthUsers, updateLocalAuthUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import {
     mintBrowserCsrfToken,
     verifyBrowserMutationRequest,
 } from '../browserMutationSecurity.js';
-import { readRouterSettings, updateRouterSettings } from '../auth/routerSettings.js';
 import {
     appendSetCookie,
     authService,
     buildCookie,
-    LOCAL_AUTH_COOKIE_NAME,
     parseCookies,
     readJsonBody,
     sendJson,
@@ -163,6 +160,10 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     const route = parseUserAdminPath(pathname);
     if (!route) return false;
 
+    if (route.resource === 'settings') {
+        sendUserAdminError(res, 'not_found');
+        return true;
+    }
     const method = (req.method || 'GET').toUpperCase();
     if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
         sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
@@ -171,27 +172,22 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     const authContext = resolveAuthContextForRouteKey(route.agent, {
         snapshot: routePlan?.snapshot || routePlan?.lease?.snapshot || null,
     });
-    const usesLocalAuth = authContext.mode === 'local' && Boolean(authContext.policy?.usersVar);
     const usesSsoAuth = authContext.mode === 'sso' && authService.isConfigured();
-    if (!usesLocalAuth && !usesSsoAuth) {
-        sendUserAdminError(res, authContext.mode === 'sso' ? 'sso_not_configured' : 'local_auth_disabled');
+    if (!usesSsoAuth) {
+        sendUserAdminError(res, authContext.mode === 'sso' ? 'sso_not_configured' : 'provider_user_admin_unsupported');
         return true;
     }
 
     const cookies = parseCookies(req);
-    const cookieName = usesLocalAuth ? LOCAL_AUTH_COOKIE_NAME : SSO_AUTH_COOKIE_NAME;
+    const cookieName = SSO_AUTH_COOKIE_NAME;
     const sessionId = cookies.get(cookieName) || '';
-    const session = usesLocalAuth
-        ? getLocalSession(sessionId, { policy: authContext.policy })
-        : await authService.validateSession(sessionId, { forceRemote: true });
+    const session = await authService.validateSession(sessionId, { forceRemote: true });
     if (!session) {
         sendUserAdminError(res, 'authentication_required');
         return true;
     }
-    const isAdmin = usesLocalAuth
-        ? isLocalAdminUser(session.user)
-        : Array.isArray(session.user?.capabilities)
-            && session.user.capabilities.includes('admin.users.manage');
+    const isAdmin = Array.isArray(session.user?.capabilities)
+        && session.user.capabilities.includes('admin.users.manage');
     if (!isAdmin) {
         sendUserAdminError(res, 'admin_required');
         return true;
@@ -225,9 +221,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     }
 
     try {
-        const cookieMaxAge = usesLocalAuth
-            ? getLocalSessionCookieMaxAge()
-            : authService.getSessionCookieMaxAge();
+        const cookieMaxAge = authService.getSessionCookieMaxAge();
         const cookie = buildCookie(cookieName, sessionId, req, '/', {
             maxAge: cookieMaxAge,
             sameSite: 'Lax'
@@ -252,40 +246,6 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
             ));
         }
 
-        if (route.resource === 'settings') {
-            if (route.userId) {
-                sendUserAdminError(res, 'not_found');
-                return true;
-            }
-            if (method === 'GET') {
-                sendJson(res, 200, {
-                    ok: true,
-                    agent: authContext.routeKey,
-                    settings: readRouterSettings()
-                });
-                return true;
-            }
-            if (method === 'PATCH') {
-                const body = await readUserAdminBody(req);
-                if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
-                    sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
-                    return true;
-                }
-                const settings = updateRouterSettings({
-                    loginBrandingName: body?.loginBrandingName
-                });
-                sendJson(res, 200, {
-                    ok: true,
-                    agent: authContext.routeKey,
-                    settings
-                });
-                return true;
-            }
-            res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET, PATCH' });
-            res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
-            return true;
-        }
-
         if (method === 'GET' && !route.userId) {
             const start = Number(parsedUrl.searchParams.get('start') ?? 0);
             const pageSize = Number(parsedUrl.searchParams.get('pageSize') ?? 100);
@@ -294,16 +254,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 400, { ok: false, error: 'invalid_pagination' });
                 return true;
             }
-            const localUsers = usesLocalAuth
-                ? listLocalAuthUsers(authContext.policy).sort((left, right) => String(left.username || left.email || '').localeCompare(String(right.username || right.email || '')))
-                : null;
-            const result = usesLocalAuth
-                ? {
-                    users: localUsers.slice(start, start + pageSize),
-                    totalCount: localUsers.length,
-                    availableRoles: listLocalAuthRoles(authContext.policy),
-                }
-                : await authService.listUsers({ actorUserId: session.user.id, start, pageSize });
+            const result = await authService.listUsers({ actorUserId: session.user.id, start, pageSize });
             const users = result.users || [];
             const totalCount = Number.isSafeInteger(result.totalCount) && result.totalCount >= 0
                 ? result.totalCount
@@ -335,9 +286,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 email: body?.email,
                 roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined,
             };
-            const user = usesLocalAuth
-                ? createLocalAuthUser({ policy: authContext.policy, ...input })
-                : await authService.createUser({ ...input, actorUserId: session.user.id });
+            const user = await authService.createUser({ ...input, actorUserId: session.user.id });
             sendJson(res, 201, {
                 ok: true,
                 agent: authContext.routeKey,
@@ -362,9 +311,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 email: Object.prototype.hasOwnProperty.call(body || {}, 'email') ? body.email : undefined,
                 roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined,
             };
-            const user = usesLocalAuth
-                ? updateLocalAuthUser({ policy: authContext.policy, id: route.userId, ...input })
-                : await authService.updateUser({ ...input, userId: route.userId, actorUserId: session.user.id });
+            const user = await authService.updateUser({ ...input, userId: route.userId, actorUserId: session.user.id });
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
@@ -378,9 +325,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
                 return true;
             }
-            const user = usesLocalAuth
-                ? deleteLocalAuthUser({ policy: authContext.policy, id: route.userId })
-                : await authService.deleteUser({ userId: route.userId, actorUserId: session.user.id });
+            const user = await authService.deleteUser({ userId: route.userId, actorUserId: session.user.id });
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,

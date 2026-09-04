@@ -11,7 +11,6 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MASTER_KEY = '3'.repeat(64);
 let mintAdminCsrfToken = null;
-let getLocalSession = null;
 
 class MockResponse {
     constructor() {
@@ -66,7 +65,6 @@ function makeRequest({
             part.startsWith('ploinky_jwt=') || part.startsWith('ploinky_sso=')
         ));
         const sessionId = authCookiePart ? authCookiePart.slice(authCookiePart.indexOf('=') + 1) : '';
-        req.session = getLocalSession?.(sessionId) || null;
         if (csrf !== 'browser') req.headers['x-ploinky-csrf-token'] = csrf === 'valid' && mintAdminCsrfToken
             ? mintAdminCsrfToken({ sessionId, req })
             : 'v1.invalid';
@@ -89,10 +87,6 @@ async function invoke(handler, options) {
     };
 }
 
-function authCookie(sessionId) {
-    return `ploinky_jwt=${sessionId}`;
-}
-
 function responseCookie(result, name) {
     const header = result.headers.get('set-cookie');
     const values = Array.isArray(header) ? header : [header];
@@ -103,24 +97,7 @@ function responseCookie(result, name) {
     return '';
 }
 
-function userRecord(passwords, {
-    username,
-    password,
-    roles = ['local'],
-    rev = 1,
-}) {
-    return {
-        id: `local:${username}`,
-        username,
-        name: username,
-        email: null,
-        passwordHash: passwords.hashPassword(password),
-        roles,
-        rev,
-    };
-}
-
-test('user admin routes enforce admin access, CRUD, rev invalidation, and agent isolation', async (t) => {
+test('provider user administration enforces capabilities, CRUD, pagination, and mutation proofs', async (t) => {
     const workspace = mkdtempSync(path.join(os.tmpdir(), 'ploinky-user-admin-'));
     const ploinkyDir = path.join(workspace, '.ploinky');
     mkdirSync(ploinkyDir, { recursive: true });
@@ -142,373 +119,7 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     const nonce = Date.now();
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
     ({ mintAdminCsrfToken } = await import(pathToFileURL(path.join(REPO_ROOT, 'cli/server/adminControlSecurity.js')).href));
-    const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
-    ({ getSession: getLocalSession } = await import(pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href));
-    const passwordStore = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/encryptedPasswordStore.js')).href}?test=${nonce}`);
-    const passwords = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/utils/security/localAuthPasswords.js')).href}?test=${nonce}`);
-
-    const explorerPolicy = { usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' };
-    const dpuPolicy = { usersVar: 'PLOINKY_AUTH_DPUAGENT_USERS' };
-    writeFileSync(path.join(ploinkyDir, 'agents.json'), JSON.stringify({
-        explorer: {
-            type: 'agent',
-            agentName: 'explorer',
-            repoName: 'AssistOSExplorer',
-            auth: { mode: 'local', ...explorerPolicy },
-        },
-        dpuAgent: {
-            type: 'agent',
-            agentName: 'dpuAgent',
-            repoName: 'AssistOSExplorer',
-            auth: { mode: 'local', ...dpuPolicy },
-        },
-    }, null, 2));
-
-    passwordStore.setUsersPayload(explorerPolicy.usersVar, {
-        version: 1,
-        users: [
-            userRecord(passwords, {
-                username: 'admin',
-                password: 'adminpass',
-                roles: ['local', 'admin'],
-            }),
-            userRecord(passwords, {
-                username: 'user',
-                password: 'userpass',
-                roles: ['local'],
-            }),
-        ],
-    });
-    passwordStore.setUsersPayload(dpuPolicy.usersVar, {
-        version: 1,
-        users: [
-            userRecord(passwords, {
-                username: 'admin',
-                password: 'dpupass',
-                roles: ['local', 'admin'],
-            }),
-        ],
-    });
-
-    const explorerAdmin = localService.authenticateLocalUser({
-        username: 'admin',
-        password: 'adminpass',
-        policy: explorerPolicy,
-        routeKey: 'explorer',
-    });
-    const explorerUser = localService.authenticateLocalUser({
-        username: 'user',
-        password: 'userpass',
-        policy: explorerPolicy,
-        routeKey: 'explorer',
-    });
-    const dpuAdmin = localService.authenticateLocalUser({
-        username: 'admin',
-        password: 'dpupass',
-        policy: dpuPolicy,
-        routeKey: 'dpuAgent',
-    });
-
-    let result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/explorer/users',
-        cookie: authCookie(explorerAdmin.sessionId),
-    });
-    assert.equal(result.handled, true);
-    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
-    assert.deepEqual(result.body.users.map((user) => user.username), ['admin', 'user']);
-    assert.match(String(result.headers.get('set-cookie') || ''), /ploinky_jwt=/);
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/explorer/users?start=1&pageSize=1',
-        cookie: authCookie(explorerAdmin.sessionId),
-    });
-    assert.deepEqual(result.body.users.map((user) => user.username), ['user']);
-    assert.equal(result.body.totalCount, 2);
-    assert.equal(result.body.start, 1);
-    assert.equal(result.body.hasMore, false);
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/explorer/settings',
-        cookie: authCookie(explorerAdmin.sessionId),
-    });
-    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
-    assert.equal(result.body.settings.loginBrandingName, 'Login');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'PATCH',
-        url: '/api/agents/explorer/settings',
-        cookie: authCookie(explorerAdmin.sessionId),
-        body: {
-            loginBrandingName: 'Acme Workspace',
-        },
-    });
-    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
-    assert.equal(result.body.settings.loginBrandingName, 'Acme Workspace');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/explorer/users',
-    });
-    assert.equal(result.statusCode, 401);
-    assert.equal(result.body.error, 'authentication_required');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'PATCH',
-        url: '/api/agents/explorer/settings',
-        cookie: authCookie(explorerAdmin.sessionId),
-        csrf: 'missing',
-        body: { loginBrandingName: 'Cross-site mutation' },
-    });
-    assert.equal(result.statusCode, 403);
-    assert.equal(result.body.error, 'control_origin_required');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'PATCH',
-        url: '/api/agents/explorer/settings',
-        cookie: authCookie(explorerAdmin.sessionId),
-        csrf: 'invalid',
-        body: { loginBrandingName: 'Invalid mutation proof' },
-    });
-    assert.equal(result.statusCode, 403);
-    assert.equal(result.body.error, 'csrf_invalid');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/explorer/users',
-        cookie: authCookie(explorerUser.sessionId),
-    });
-    assert.equal(result.statusCode, 403);
-    assert.equal(result.body.error, 'admin_required');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/dpuAgent/users',
-        cookie: authCookie(explorerAdmin.sessionId),
-    });
-    assert.equal(result.statusCode, 401);
-    assert.equal(result.body.error, 'authentication_required');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'POST',
-        url: '/api/agents/explorer/users',
-        cookie: authCookie(explorerAdmin.sessionId),
-        body: {
-            username: 'editor',
-            password: 'editorpass',
-            name: 'Editor',
-            email: 'editor@example.com',
-            roles: ['editor'],
-        },
-    });
-    assert.equal(result.statusCode, 201);
-    assert.equal(result.body.user.username, 'editor');
-    assert.deepEqual(result.body.user.roles, ['user', 'editor']);
-
-    const editorLogin = localService.authenticateLocalUser({
-        username: 'editor',
-        password: 'editorpass',
-        policy: explorerPolicy,
-        routeKey: 'explorer',
-    });
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'PATCH',
-        url: '/api/agents/explorer/users/local%3Aeditor',
-        cookie: authCookie(explorerAdmin.sessionId),
-        body: {
-            roles: ['admin'],
-            password: 'editorpass2',
-        },
-    });
-    assert.equal(result.statusCode, 200);
-    assert.deepEqual(result.body.user.roles, ['user', 'admin']);
-    assert.equal(localService.getSession(editorLogin.sessionId, { policy: explorerPolicy }), null);
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/dpuAgent/users',
-        cookie: authCookie(dpuAdmin.sessionId),
-    });
-    assert.equal(result.statusCode, 200);
-    assert.deepEqual(result.body.users.map((user) => user.username), ['admin']);
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'DELETE',
-        url: '/api/agents/explorer/users/local%3Aeditor',
-        cookie: authCookie(explorerAdmin.sessionId),
-    });
-    assert.equal(result.statusCode, 200);
-    assert.equal(result.body.deleted, true);
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'DELETE',
-        url: '/api/agents/explorer/users/local%3Aadmin',
-        cookie: authCookie(explorerAdmin.sessionId),
-    });
-    assert.equal(result.statusCode, 400);
-    assert.equal(result.body.error, 'last_admin_required');
-
-    const publicSnapshot = {
-        generation: 'public-generation-a',
-        routing: {
-            static: { agent: 'explorer' },
-            routes: {
-                explorer: { repo: 'AssistOSExplorer', agent: 'explorer' },
-                dpuAgent: { repo: 'AssistOSExplorer', agent: 'dpuAgent' },
-            },
-        },
-        agents: JSON.parse(readFileSync(path.join(ploinkyDir, 'agents.json'), 'utf8')),
-        manifests: {},
-    };
-    const publicRoutePlan = (generation = publicSnapshot.generation, commit = () => true) => ({
-        ok: true,
-        kind: 'router-surface',
-        surface: 'user-admin',
-        listener: 'public',
-        host: 'explorer.example.test',
-        hostSelection: {
-            kind: 'agent-root',
-            source: 'public-host',
-            host: 'explorer.example.test',
-            record: { routeKey: 'explorer' },
-        },
-        forwarding: {
-            protocol: 'https',
-            authority: 'explorer.example.test',
-        },
-        snapshot: { ...publicSnapshot, generation },
-        lease: {
-            id: generation,
-            snapshot: { ...publicSnapshot, generation },
-            commit,
-        },
-    });
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/explorer/users',
-        host: 'explorer.example.test',
-        origin: 'https://explorer.example.test',
-        cookie: authCookie(explorerAdmin.sessionId),
-        routePlan: publicRoutePlan(),
-    });
-    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
-    assert.deepEqual(result.body.users.map((user) => user.username), ['admin', 'user']);
-    const userAdminProof = responseCookie(result, 'ploinky_user_admin_csrf');
-    assert.match(userAdminProof, /^ploinky_user_admin_csrf=v2\./);
-    assert.match(
-        String(result.headers.get('set-cookie')),
-        /ploinky_user_admin_csrf=.*Path=\/api\/agents\/explorer; HttpOnly; SameSite=Strict/,
-    );
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/explorer/settings',
-        host: 'explorer.example.test',
-        origin: 'https://explorer.example.test',
-        cookie: authCookie(explorerAdmin.sessionId),
-        routePlan: publicRoutePlan(),
-    });
-    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
-    assert.equal(result.body.settings.loginBrandingName, 'Acme Workspace');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'POST',
-        url: '/api/agents/explorer/users',
-        host: 'explorer.example.test',
-        origin: 'https://explorer.example.test',
-        cookie: `${authCookie(explorerAdmin.sessionId)}; ${
-            userAdminProof.replace('ploinky_user_admin_csrf=', 'ploinky_browser_csrf=')
-        }`,
-        csrf: 'browser',
-        body: {
-            username: 'wrong-proof-cookie',
-            password: 'wrong-proof-cookie-pass',
-        },
-        routePlan: publicRoutePlan(),
-    });
-    assert.equal(result.statusCode, 403);
-    assert.equal(result.body.error, 'browser_csrf_invalid');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'POST',
-        url: '/api/agents/explorer/users',
-        host: 'explorer.example.test',
-        origin: 'https://explorer.example.test',
-        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
-        csrf: 'browser',
-        body: {
-            username: 'qa-editor',
-            password: 'qa-editor-pass',
-            roles: ['editor'],
-        },
-        routePlan: publicRoutePlan(),
-    });
-    assert.equal(result.statusCode, 201, JSON.stringify(result.body));
-    assert.equal(result.body.user.username, 'qa-editor');
-    const publicUserId = result.body.user.id;
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'PATCH',
-        url: `/api/agents/explorer/users/${encodeURIComponent(publicUserId)}`,
-        host: 'explorer.example.test',
-        origin: 'https://explorer.example.test',
-        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
-        csrf: 'browser',
-        body: { roles: ['admin'] },
-        routePlan: publicRoutePlan(),
-    });
-    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
-    assert.deepEqual(result.body.user.roles, ['user', 'admin']);
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'DELETE',
-        url: `/api/agents/explorer/users/${encodeURIComponent(publicUserId)}`,
-        host: 'explorer.example.test',
-        origin: 'https://explorer.example.test',
-        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
-        csrf: 'browser',
-        routePlan: publicRoutePlan(),
-    });
-    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
-    assert.equal(result.body.deleted, true);
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'POST',
-        url: '/api/agents/explorer/users',
-        host: 'explorer.example.test',
-        origin: 'https://cross-origin.invalid',
-        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
-        csrf: 'browser',
-        body: {
-            username: 'cross-origin',
-            password: 'cross-origin-pass',
-        },
-        routePlan: publicRoutePlan(),
-    });
-    assert.equal(result.statusCode, 403);
-    assert.equal(result.body.error, 'browser_origin_required');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        method: 'POST',
-        url: '/api/agents/explorer/users',
-        host: 'explorer.example.test',
-        origin: 'https://explorer.example.test',
-        cookie: `${authCookie(explorerAdmin.sessionId)}; ${userAdminProof}`,
-        csrf: 'browser',
-        body: {
-            username: 'stale-generation',
-            password: 'stale-generation-pass',
-        },
-        routePlan: publicRoutePlan('public-generation-b'),
-    });
-    assert.equal(result.statusCode, 403);
-    assert.equal(result.body.error, 'browser_csrf_invalid');
-
-    result = await invoke(authHandlers.handleUserAdminRoutes, {
-        url: '/api/agents/explorer/users',
-        host: 'explorer.example.test',
-        origin: 'https://explorer.example.test',
-        cookie: authCookie(explorerUser.sessionId),
-        routePlan: publicRoutePlan(),
-    });
-    assert.equal(result.statusCode, 403);
-    assert.equal(result.body.error, 'admin_required');
-    assert.equal(responseCookie(result, 'ploinky_user_admin_csrf'), '');
-
+    let result;
     const ssoSnapshot = {
         generation: 'sso-user-admin-generation',
         routing: {
@@ -535,6 +146,8 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
         validateSession: authService.validateSession,
         listUsers: authService.listUsers,
         createUser: authService.createUser,
+        updateUser: authService.updateUser,
+        deleteUser: authService.deleteUser,
     };
     const providerCalls = [];
     authService.isConfigured = () => true;
@@ -576,6 +189,14 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
     authService.createUser = async (payload) => {
         providerCalls.push({ operation: 'createUser', payload });
         return { id: 'persisto-new-user', email: payload.email, roles: payload.roles };
+    };
+    authService.updateUser = async (payload) => {
+        providerCalls.push({ operation: 'updateUser', payload });
+        return { id: payload.userId, email: payload.email, roles: payload.roles };
+    };
+    authService.deleteUser = async (payload) => {
+        providerCalls.push({ operation: 'deleteUser', payload });
+        return { id: payload.userId };
     };
     try {
         result = await invoke(authHandlers.handleUserAdminRoutes, {
@@ -637,6 +258,68 @@ test('user admin routes enforce admin access, CRUD, rev invalidation, and agent 
             assert.equal(result.body.error, 'invalid_pagination');
         }
         assert.equal(providerCalls.filter((call) => call.operation === 'listUsers').length, listCallsBefore);
+
+        for (const csrf of ['missing', 'invalid']) {
+            const before = providerCalls.filter(call => call.operation === 'createUser').length;
+            result = await invoke(authHandlers.handleUserAdminRoutes, {
+                method: 'POST', url: '/api/agents/explorer/users', cookie: 'ploinky_sso=sso-admin-session',
+                body: { email: 'blocked@example.test', password: 'long-password' }, csrf, routePlan: ssoRoutePlan,
+            });
+            assert.equal(result.statusCode, 403);
+            assert.equal(providerCalls.filter(call => call.operation === 'createUser').length, before);
+        }
+        const publicPlan = {
+            ...ssoRoutePlan, ok: true, kind: 'router-surface', surface: 'user-admin', listener: 'public',
+            hostSelection: { kind: 'agent-root', record: { routeKey: 'explorer' } },
+            forwarding: { protocol: 'https', authority: 'explorer.example.test' },
+        };
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            url: '/api/agents/explorer/users', cookie: 'ploinky_sso=sso-admin-session',
+            host: 'explorer.example.test', origin: 'https://explorer.example.test', routePlan: publicPlan,
+        });
+        assert.equal(result.statusCode, 200);
+        const proofCookie = responseCookie(result, 'ploinky_user_admin_csrf');
+        assert.ok(proofCookie);
+        const update = {
+            method: 'PATCH', url: '/api/agents/explorer/users/provider-member',
+            cookie: `ploinky_sso=sso-admin-session; ${proofCookie}`, csrf: 'browser',
+            host: 'explorer.example.test', origin: 'https://explorer.example.test', routePlan: publicPlan,
+            body: { email: 'changed@example.test', roles: ['user'] },
+        };
+        result = await invoke(authHandlers.handleUserAdminRoutes, update);
+        assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+        assert.equal(providerCalls.filter(call => call.operation === 'updateUser').at(-1).payload.actorUserId, 'persisto-admin');
+        assert.equal(providerCalls.filter(call => call.operation === 'updateUser').at(-1).payload.userId, 'provider-member');
+        const updateCount = providerCalls.filter(call => call.operation === 'updateUser').length;
+        for (const override of [
+            { origin: 'https://attacker.example.test' },
+            { cookie: 'ploinky_sso=sso-admin-session' },
+            { routePlan: { ...publicPlan, lease: { ...publicPlan.lease, id: 'different-generation' } } },
+        ]) {
+            result = await invoke(authHandlers.handleUserAdminRoutes, { ...update, ...override });
+            assert.equal(result.statusCode, 403);
+        }
+        assert.equal(providerCalls.filter(call => call.operation === 'updateUser').length, updateCount);
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            method: 'DELETE', url: '/api/agents/explorer/users/provider-member',
+            cookie: 'ploinky_sso=sso-admin-session', routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.statusCode, 200);
+        assert.deepEqual(providerCalls.filter(call => call.operation === 'deleteUser').at(-1).payload,
+            { userId: 'provider-member', actorUserId: 'persisto-admin' });
+        for (const method of ['GET', 'PATCH']) {
+            result = await invoke(authHandlers.handleUserAdminRoutes, {
+                method, url: '/api/agents/explorer/settings', cookie: 'ploinky_sso=sso-admin-session',
+                body: { loginBrandingName: 'retired' }, routePlan: ssoRoutePlan,
+            });
+            assert.equal(result.statusCode, 404);
+        }
+        authService.isConfigured = () => false;
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            url: '/api/agents/explorer/users', cookie: 'ploinky_sso=sso-admin-session', routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.statusCode, 503);
+        assert.equal(result.body.error, 'sso_not_configured');
     } finally {
         Object.assign(authService, originals);
     }

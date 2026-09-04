@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { WEBTTY_PROTOCOL_LIMITS } from '../../../core-services/webtty/worker-protocol.mjs';
-import { isLocalAdminUser } from '../auth/localService.js';
+import { isAdminUser } from '../auth/localService.js';
 import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
 import { commitRouteGeneration } from '../edgeRoutePlan.js';
 
@@ -69,7 +69,7 @@ async function readJsonBody(req, maxBytes) {
 }
 
 function requireAdministrator(req, res) {
-    if (isLocalAdminUser(req?.user)) return true;
+    if (isAdminUser(req?.user)) return true;
     sendError(res, req?.user ? 403 : 401, req?.user ? 'administrator_required' : 'authentication_required');
     return false;
 }

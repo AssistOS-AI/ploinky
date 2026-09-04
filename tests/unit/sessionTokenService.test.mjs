@@ -7,7 +7,8 @@ const { SessionTokenService } = await import(`../../cli/server/security/tokens/S
 function serviceWithSessions() {
     return new SessionTokenService({
         verifySessionJwt: (token) => {
-            if (token === 'user-token') return { typ: 'user-session', usr: { id: 'u1', username: 'u1', roles: ['user'] }, rev: 1 };
+            if (token === 'user-token') return { typ: 'user-session', chn: 'cli', sub: 'local:admin', usr: { id: 'local:admin', username: 'admin', roles: ['admin'] } };
+            if (token === 'browser-token') return { typ: 'user-session', usr: { id: 'local:admin', roles: ['admin'] } };
             if (token === 'guest-token') {
                 return {
                     typ: 'guest-session',
@@ -19,16 +20,16 @@ function serviceWithSessions() {
             }
             throw new Error('Not a session JWT');
         },
-        resolveUserRev: () => 1,
     });
 }
 
-test('getUserSession accepts only typ user-session', async () => {
+test('getUserSession accepts only the signed CLI operator identity', async () => {
     const service = serviceWithSessions();
     const userSession = await service.getUserSession('user-token');
-    assert.equal(userSession.kind, 'user');
-    assert.equal(userSession.user.id, 'u1');
+    assert.equal(userSession.kind, 'operator');
+    assert.equal(userSession.user.id, 'local:admin');
     assert.equal(await service.getUserSession('guest-token'), null);
+    assert.equal(await service.getUserSession('browser-token'), null);
     assert.equal(await service.getUserSession('garbage'), null);
 });
 

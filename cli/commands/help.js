@@ -254,20 +254,18 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                     notes: 'Equivalent to `sandbox enable`. Restart running agents to apply the change.'
                 },
                 'agent': {
-                    syntax: 'enable [agent] <name|repo/name> [isolated|global|devel [repoName]] [--auth none|pwd|sso] [--user <name> --password <value>] [as <alias>]',
+                    syntax: 'enable [agent] <name|repo/name> [isolated|global|devel [repoName]] [--auth none|guest|sso] [as <alias>]',
                     description: 'Register and start an agent without changing the configured primary/static agent. Modes: isolated (omitted) creates a subfolder <agentName>; global uses current project; devel uses a repo under .ploinky/repos. Use "as <alias>" to create an additional instance with its own container name.',
                     examples: [
                         'enable demo',
                         'enable agent repoName/demo global',
                         'enable agent demo',
-                        'enable agent demo --auth pwd',
-                        'enable agent demo --auth pwd --user admin --password admin',
                         'enable agent demo --auth sso',
                         'enable agent demo global',
                         'enable agent demo devel simulator',
                         'enable agent demo as demo2'
                     ],
-                    notes: 'If --auth is omitted, no auth is applied unless the agent manifest declares a default auth mode. Pwd auth stores policy in .ploinky/agents.json and can also seed credentials via --user/--password or manifest defaults under `pwd.user` and `pwd.password`. Enable starts the agent and updates its route, but does not replace the primary/static agent configured by start. Aliases must be unique; commands like reinstall/disable should target the alias when multiple containers exist.'
+                    notes: 'If --auth is omitted, the manifest selects the authentication mode, defaulting to none. A manifest that declares SSO requires its identity provider and cannot be overridden by --auth. Browser credentials and account management belong to the SSO provider. Enable starts the agent and updates its route, but does not replace the primary/static agent configured by start. Aliases must be unique; commands like reinstall/disable should target the alias when multiple containers exist.'
                 }
             }
         },

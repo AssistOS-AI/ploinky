@@ -1,4 +1,6 @@
-import { getSession, isLocalAdminUser } from '../auth/localService.js';
+import { getSession, isAdminUser } from '../auth/localService.js';
+import { authService } from '../authHandlers/shared.js';
+import { localSessionAllowedForRoutePlan } from '../authHandlers/authContext.js';
 
 import { PolicyStateRepository } from './PolicyStateRepository.js';
 import { FileSystemPolicyStateStore } from './FileSystemPolicyStateStore.js';
@@ -47,7 +49,13 @@ const registry = new PolicyCommandRegistry()
     .register(new McpPolicyGetCommand({ repository }))
     .register(new McpPolicyListCommand({ repository }));
 
-const commandInvoker = new PolicyCommandInvoker({ registry, auditLog, getSession, isAdminUser: isLocalAdminUser });
+const commandInvoker = new PolicyCommandInvoker({
+    registry, auditLog, getSession, isAdminUser,
+    allowLocalSession: localSessionAllowedForRoutePlan,
+    getProviderSession: (id) => authService.isConfigured()
+        ? authService.validateSession(id, { forceRemote: true })
+        : null,
+});
 
 export const policy = {
     repository,

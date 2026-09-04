@@ -1,7 +1,7 @@
 import { appendLog } from '../utils/logger.js';
 import { parseCookies, buildCookie, readJsonBody, appendSetCookie } from '../handlers/common.js';
 import { createAuthService } from '../auth/service.js';
-import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt, resolveUserRev, revokeSession as revokeLocalSession, verifySessionJwt } from '../auth/localService.js';
+import { GUEST_SESSION_TTL_SECONDS, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, mintGuestSessionJwt, mintSessionJwt, revokeSession as revokeLocalSession, verifySessionJwt } from '../auth/localService.js';
 import { isSessionRevoked } from '../auth/sessionRevocations.js';
 import { SessionTokenService } from '../security/tokens/SessionTokenService.js';
 
@@ -16,7 +16,6 @@ export const sessionTokenService = new SessionTokenService({
     mintUserSession: mintSessionJwt,
     mintGuestSession: mintGuestSessionJwt,
     verifySessionJwt,
-    resolveUserRev,
     revokeSession: revokeLocalSession,
     isSessionRevoked,
 });

@@ -10,7 +10,8 @@ import {
     ROUTING_FILE,
 } from '../utils/config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
-import { normalizeRequiredCapability, normalizeLocalAuthRoles } from '../server/authHandlers/requiredCapability.js';
+import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
+import { resolveAgentAuthPolicy } from '../utils/manifestAuth.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import {
@@ -573,7 +574,7 @@ function collectWorkspaceLogConsumers(routing, manifests, agents) {
     return consumers;
 }
 
-function routeDefaultDecision(routing, agents, routeKey, seen = new Set()) {
+function routeDefaultDecision(routing, agents, manifests, routeKey, seen = new Set()) {
     const key = String(routeKey || '');
     if (!key || seen.has(key)) return { access: 'guest', routeKey: key, source: 'routeDefault' };
     seen.add(key);
@@ -584,12 +585,12 @@ function routeDefaultDecision(routing, agents, routeKey, seen = new Set()) {
             && String(entry.agentName || '') === String(route?.agent || ''))
         || String(entry.agentName || '') === key
     ));
-    const mode = String(record?.auth?.mode || '').trim().toLowerCase();
+    const mode = String(resolveAgentAuthPolicy(manifests[key], record?.auth).mode || '').trim().toLowerCase();
     if (mode === 'guest') return { access: 'guest', routeKey: key, source: 'routeDefault' };
     if (mode && mode !== 'none') return { access: 'authenticated', routeKey: key, source: 'routeDefault' };
     const staticKey = String(routing.static?.agent || '').trim();
     if (staticKey && staticKey !== key) {
-        const staticDecision = routeDefaultDecision(routing, agents, staticKey, seen);
+        const staticDecision = routeDefaultDecision(routing, agents, manifests, staticKey, seen);
         return staticDecision.access === 'authenticated'
             ? { access: 'authenticated', routeKey: key, source: 'routeDefault' }
             : { access: 'guest', routeKey: key, source: 'routeDefault' };
@@ -771,8 +772,8 @@ function validateRoutingShape(routing, manifests) {
                 && normalizeRequiredCapability(manifest.routerAccess.requiredCapability) === null) {
                 throw edgeError(`manifest(${routeKey}).routerAccess.requiredCapability must be a non-empty capability identifier of at most 128 characters`);
             }
-            if (normalizeLocalAuthRoles(manifest?.routerAccess?.localAuthRoles) === null) {
-                throw edgeError(`manifest(${routeKey}).routerAccess.localAuthRoles must be an array of at most 64 role identifiers`);
+            if (Object.prototype.hasOwnProperty.call(manifest.routerAccess || {}, 'localAuthRoles')) {
+                throw edgeError(`manifest(${routeKey}).routerAccess.localAuthRoles is unsupported; authenticated identities must supply the required capability`);
             }
         }
     }
@@ -986,7 +987,7 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     const policyNamespaces = [];
     for (const [routeKey, route] of Object.entries(routing.routes || {})) {
         if (!route || route.disabled) continue;
-        routeDefaults[routeKey] = routeDefaultDecision(routing, agents, routeKey);
+        routeDefaults[routeKey] = routeDefaultDecision(routing, agents, manifests, routeKey);
         policyNamespaces.push({
             id: `agent-root:${routeKey}`,
             kind: 'agent-root',

@@ -941,7 +941,7 @@ test('retained graph records reconcile isolated, global, and devel execution bef
             },
         ])),
     };
-    registry.blocking_container.auth = { mode: 'local', usersVar: 'AUTH_USERS' };
+    registry.blocking_container.auth = { mode: 'sso' };
     registry.blocking_container.unrelated = { retained: true };
 
     const prepared = ensureGraphNodesEnabled({ nodes }, registry, {
@@ -1037,7 +1037,7 @@ test('retained graph records reconcile isolated, global, and devel execution bef
         { runMode: 'global', projectPath: tempDir, profile: 'embedded' },
     );
     assert.deepEqual(registry.blocking_container.config.binds, [{ source: '/old', target: '/root' }]);
-    assert.deepEqual(registry.blocking_container.auth, { mode: 'local', usersVar: 'AUTH_USERS' });
+    assert.deepEqual(registry.blocking_container.auth, { mode: 'sso' });
     assert.deepEqual(registry.blocking_container.unrelated, { retained: true });
     for (const containerName of prepared.changedContainers) {
         assert.match(registry[containerName].instanceId, /^fresh-id-/);

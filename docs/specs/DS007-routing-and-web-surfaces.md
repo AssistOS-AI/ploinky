@@ -47,24 +47,23 @@ The following table is the active Router-owned HTTP surface. Endpoint families w
 | `GET` or `HEAD /MCPBrowserClient.js` | Serves the Router's browser MCP client module used by browser applications to initialize and call MCP endpoints. |
 | `GET` or `HEAD /web-libs/<path>` | Serves traversal-safe shared browser libraries from Ploinky's `webLibs` directory. A directory root or path outside that directory is rejected. |
 | `GET /auth/logged-out` | Renders the signed-out page and a bounded return link. |
-| `GET` or `POST /auth/login` | Renders or submits local login, or starts the configured SSO login flow. The exact host-selected auth context determines which agent policy is used. |
-| `GET` or `POST /auth/account` | Renders account information and allows an authenticated local user to update their own username or password with a mutation proof. External-auth accounts are read-only here. |
+| `GET /auth/login` | Starts the configured SSO login flow for the exact host-selected authentication context. Credential verification belongs to the provider. `POST /auth/login` returns `405`; the Router has no password form. |
+| `/auth/account` | Removed local-account surface; returns `404 local_auth_disabled`. Account and credential management belong to the identity provider. |
 | `GET /auth/callback` | Completes the configured SSO callback, binds the new session to the current edge generation, and redirects to the validated return path. |
 | `GET` or `POST /auth/logout` | Renders logout confirmation or invalidates the session after mutation-proof validation and clears authentication state. |
-| `GET` or `POST /auth/token` | Returns the authenticated browser's token metadata, user, session/origin/host-bound browser-mutation proof, current generation metadata, and local admin-control proof when applicable. Route authorization remains separate. `POST` may request an SSO refresh and requires CSRF validation. |
+| `GET` or `POST /auth/token` | Returns the authenticated browser's token metadata, user, session/origin/host-bound browser-mutation proof, current generation metadata, and administrator-control proof when applicable. Route authorization remains separate. `POST` may request an SSO refresh and requires CSRF validation. |
 | `/auth/local-users`, `/auth/github/*`, and `POST /auth/agent-token` | Reserved removed surfaces. They return `410` or `404` and must not be reused; user administration and router-mediated agent assertions replace them. |
-| `GET /api/agents/<agentName>/settings` | Returns Router login presentation settings for a host-selected agent using local authentication. A local administrator session is required. |
-| `PATCH /api/agents/<agentName>/settings` | Updates supported Router login settings after administrator and mutation-proof checks. |
-| `GET /api/agents/<agentName>/users` | Lists local users and available roles for the selected agent. |
-| `POST /api/agents/<agentName>/users` | Creates a local user for the selected agent. |
-| `PATCH /api/agents/<agentName>/users/<userId>` | Updates one local user's identity fields, password, or roles. |
-| `DELETE /api/agents/<agentName>/users/<userId>` | Deletes one local user while preserving local-auth invariants such as retaining an administrator. |
+| `/api/agents/<agentName>/settings` | Removed local-login branding settings; returns `404`. Provider login presentation is owned by the provider. |
+| `GET /api/agents/<agentName>/users` | Lists provider users and roles after current SSO validation and the `admin.users.manage` capability check. |
+| `POST /api/agents/<agentName>/users` | Delegates user creation to the selected SSO provider after administrator and mutation-proof checks. |
+| `PATCH /api/agents/<agentName>/users/<userId>` | Delegates identity, password, and role changes to the SSO provider, which re-authorizes the persisted actor. |
+| `DELETE /api/agents/<agentName>/users/<userId>` | Delegates deactivation or deletion to the provider, which preserves its own account and last-administrator invariants. |
 | `GET /api/marketplace` | Returns the authenticated caller's repository, agent, enabled-instance, and runtime inventory. A running agent may use an assertion limited to `marketplace.read`. |
-| `POST /api/marketplace` | Performs `install_repo`, `uninstall_repo`, `enable_agent`, or `disable_agent` for a local administrator with mutation proof. An asserted agent is restricted to `enable_agent` for an already available agent. |
-| `POST /policy/command` | Invokes the administrator-only Router policy command registry. It supports HTTP-route inspection/mutation and MCP-policy inspection/mutation; mutating commands require exact control Origin and CSRF proof. |
+| `POST /api/marketplace` | Performs `install_repo`, `uninstall_repo`, `enable_agent`, or `disable_agent` for a provider administrator or signed CLI operator with mutation proof. An asserted agent is restricted to `enable_agent` for an already available agent. |
+| `POST /policy/command` | Invokes the Router policy command registry for a currently validated provider administrator or signed CLI operator. It supports HTTP-route inspection/mutation and MCP-policy inspection/mutation; mutating commands require exact control Origin and CSRF proof. |
 | `GET /api/router/openai-agent-discovery` | Returns Router paths and OpenAI-compatible metadata for enabled agents to an asserted agent caller. Browser session authentication is neither sufficient nor required. |
 | `POST /api/router/identity/user-api-key` | Mints a Router-signed identity key for the authenticated non-guest user. An administrator may request another valid user subject; ordinary users can mint only their own identity. |
-| `GET /status/data` | Returns workspace, server, static-agent, and runtime metrics to a local administrator. |
+| `GET /status/data` | Returns workspace, server, static-agent, and runtime metrics to an authenticated administrator on the admitted control surface. |
 | `GET /status/data?follow=1` | Streams the same metrics as newline-delimited JSON until the request closes or authorization becomes stale. |
 | `POST` or `PUT /upload?path=<workspacePath>` | Streams one bounded upload into a traversal-safe workspace path, replacing the target atomically under upload policy. |
 | `POST /blobs` | Stores a bounded shared blob and returns its id, `/shared` path, size, media type, and download URL. |
@@ -72,6 +71,8 @@ The following table is the active Router-owned HTTP surface. Endpoint families w
 | `POST /blobs/<agentName>` | Stores a bounded blob in the selected enabled agent's project blob directory. Repository-qualified `repo:agent` selectors resolve ambiguity. |
 | `GET` or `HEAD /blobs/<agentName>/<blobId>` | Reads or inspects an agent-owned blob and supports byte ranges. |
 | `GET` or `HEAD /workspace-files/<workspacePath>` | Serves a traversal-safe file below the workspace root for authenticated previews and downloads. A directory may resolve `index.html`, `index.htm`, or `default.html`; the bare route is rejected. |
+
+Browser authentication uses the declared SSO provider. Local password configuration, saved browser JWTs, and local role mappings cannot select or bypass that flow. Marketplace and policy controls accept the provider session or the exact signed CLI operator channel; a username such as `admin` does not confer administrator rights. Provider user management requires `admin.users.manage`, while runtime controls require an authenticated `admin` role and their existing Origin and mutation proofs. Query parameters cannot recover a retired local authentication path.
 
 Router-owned names are closed namespaces. `/auth`, `/policy`, `/admin`, `/__agent`, `/api/edge`, `/api/agents`, `/api/marketplace`, `/api/router`, `/status`, `/webchat`, `/web-libs`, `/workspace-files`, `/upload`, `/blobs`, `/health`, `/metrics`, `/agent-card`, `/mcp`, and `MCPBrowserClient.js` must not fall through to an agent when their Router surface is absent or disallowed. Any `__agent` path segment is internal control plane and returns a generic `404` on the public listener.
 
