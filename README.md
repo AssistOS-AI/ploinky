@@ -329,6 +329,9 @@ agent runtime reports that it is ready. Starting, failed, or disconnected
 sessions cannot accept new input. A message marked `Sending…` is still awaiting
 server admission; rejected input keeps its draft and selected attachments for
 correction or retry instead of appearing as successfully sent.
+Control requests such as cancellation consume the HTTP response before their
+promise completes, including empty responses, so the browser can finish the
+request before a caller navigates away. The response status is unchanged.
 
 - WebChat sends structured message envelopes over stdin. Agents that want a reliable chat experience should expose a real CLI process that reads stdin continuously and writes replies to stdout.
 - A manifest `cli` that points to a plain shell such as `"/bin/sh"` or `"/bin/bash"` does not become conversational by itself. In that setup WebChat mirrors raw input to the shell, and the shell may simply echo or mis-handle the incoming payload.

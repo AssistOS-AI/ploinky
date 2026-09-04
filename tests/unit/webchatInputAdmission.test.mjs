@@ -54,6 +54,7 @@ function fixture(t, { inputResponse, uploadResponse, proofResponse } = {}) {
     const bubbles = [];
     const attachmentBubbles = [];
     const errors = [];
+    const debug = [];
     const banners = [];
     const readiness = [];
     const timeline = [];
@@ -93,7 +94,7 @@ function fixture(t, { inputResponse, uploadResponse, proofResponse } = {}) {
     const composer = createComposer({ cmdInput, sendBtn, cancelBtn }, { purgeTriggerRe: /__never__/ });
     const network = createNetwork({
         TAB_ID: 'tab', PAGE_INSTANCE_ID: 'page', agentName: 'generic-agent',
-        toEndpoint: (route) => `/webchat/${route}`, dlog() {},
+        toEndpoint: (route) => `/webchat/${route}`, dlog: (...args) => debug.push(args),
         showBanner: (...args) => banners.push(args), hideBanner() {},
     }, {
         addClientMsg: (text, options) => {
@@ -134,7 +135,7 @@ function fixture(t, { inputResponse, uploadResponse, proofResponse } = {}) {
     network.start();
     return {
         network, composer, cmdInput, sendBtn, cancelBtn, sources, inputs, uploads,
-        bubbles, attachmentBubbles, errors, banners, readiness, timeline,
+        bubbles, attachmentBubbles, errors, debug, banners, readiness, timeline,
         ready() { sources.at(-1).emit('startup-state', { state: 'ready' }); },
     };
 }
@@ -158,6 +159,7 @@ test('delayed runtime readiness blocks every input path and retains the draft un
     assert.equal(await f.network.sendCommand('blocked'), false);
     assert.equal(await f.network.sendQuickCommand('/generic'), false);
     assert.equal(await f.network.sendQuickCommands(['/one', '/two']), false);
+    assert.equal(await f.network.sendControl('\x1b'), false);
     assert.equal(await f.network.sendAttachments([{ file: new File(['data'], 'note.txt') }], 'blocked'), false);
     assert.equal(f.inputs.length, 0);
     assert.equal(f.uploads.length, 0);
@@ -209,6 +211,7 @@ test('disconnect, reconnect and terminal failure revoke readiness; stale streams
     assert.equal(f.cmdInput.disabled, true);
     first.emit('startup-state', { state: 'ready' });
     assert.equal(await f.network.sendQuickCommand('/generic'), false);
+    assert.equal(await f.network.sendControl('\x1b'), false);
     t.mock.timers.tick(1000);
     const second = f.sources[1];
     second.onopen();
@@ -221,9 +224,66 @@ test('disconnect, reconnect and terminal failure revoke readiness; stale streams
     second.emit('startup-state', { state: 'ready' });
     assert.equal(await f.composer.submit(), false);
     assert.equal(await f.network.sendQuickCommands(['/one']), false);
+    assert.equal(await f.network.sendControl('\x1b'), false);
     assert.equal(f.inputs.length, 1);
     assert.equal(f.readiness.at(-1), false);
 });
+
+test('control completion waits for the response body and returns the unchanged response', async (t) => {
+    const body = deferred();
+    const response = { status: 204, text: t.mock.fn(() => body.promise) };
+    const f = fixture(t, { inputResponse: () => response });
+    f.ready();
+    let settled = false;
+    const submitted = f.network.sendControl('\x1b').then((result) => {
+        settled = true;
+        return result;
+    });
+    await flush();
+    assert.equal(response.text.mock.callCount(), 1);
+    assert.equal(settled, false);
+    assert.equal(f.inputs.length, 1);
+    assert.match(f.inputs[0].url, /\/control\?/);
+    assert.deepEqual(f.inputs[0].options, {
+        method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '\x1b',
+    });
+    body.resolve('');
+    assert.equal(await submitted, response);
+    assert.equal(response.status, 204);
+    assert.equal(f.inputs.length, 1);
+    assert.deepEqual(f.errors, []);
+});
+
+for (const status of [401, 500]) {
+    test(`control drains HTTP ${status} without changing its existing status or return semantics`, async (t) => {
+        const response = new Response('control error', { status });
+        const f = fixture(t, { inputResponse: () => response });
+        f.ready();
+        assert.equal(await f.network.sendControl('\x1b'), response);
+        assert.equal(response.status, status);
+        assert.equal(response.bodyUsed, true);
+        assert.equal(f.inputs.length, 1, 'control does not acquire new retries');
+        assert.deepEqual(f.errors, []);
+        assert.equal(f.debug.some(([message]) => message === 'control send error'), false);
+    });
+}
+
+for (const phase of ['fetch', 'body']) {
+    test(`control ${phase} failure keeps the existing caught-error result without retrying`, async (t) => {
+        const error = new Error(`fixture ${phase} failure`);
+        const f = fixture(t, {
+            inputResponse: () => {
+                if (phase === 'fetch') throw error;
+                return { status: 204, text: async () => { throw error; } };
+            },
+        });
+        f.ready();
+        assert.equal(await f.network.sendControl('\x1b'), undefined);
+        assert.equal(f.inputs.length, 1);
+        assert.deepEqual(f.debug.filter(([message]) => message === 'control send error'), [['control send error', error]]);
+        assert.deepEqual(f.errors, []);
+    });
+}
 
 test('interaction blocking composes with startup readiness and keeps processing cancellation available only online', async (t) => {
     const f = fixture(t);

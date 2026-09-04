@@ -984,6 +984,9 @@ export function createNetwork({
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
             body: controlSeq
+        }).then(async (response) => {
+            await response.text();
+            return response;
         }).catch((error) => {
             dlog('control send error', error);
         });
