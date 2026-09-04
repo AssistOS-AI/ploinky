@@ -140,6 +140,14 @@ bound to the administrator login and active route generation, single-use, and
 invalidates its sibling target choices when consumed. All mutations require the
 same-origin, session-bound browser CSRF proof.
 
+Rejected authentication-lease checks during agent-terminal startup emit a
+server-only `webtty_auth_lease_rejected` audit entry with the fixed
+`before_agent_prepare` or `after_agent_ready` phase and an allowlisted validation
+reason. Unknown reasons are recorded as `unknown`; no credentials, session
+fingerprints, or raw authentication data are included. These categories identify
+the rejecting check, not necessarily its underlying cause, and do not change
+authentication responses or startup cleanup.
+
 WebTTY records exact Box or agent process evidence in the transient
 `/run/ploinky/webtty` recovery directory using the v2 target-discriminated
 schema. Startup recovery runs before the surface becomes available. Ambiguity

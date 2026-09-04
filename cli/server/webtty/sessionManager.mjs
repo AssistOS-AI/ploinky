@@ -27,6 +27,17 @@ const DEFAULT_AUTH_ADAPTER = Object.freeze({
     validateLease: validateBrowserSessionLease,
 });
 
+const AUTH_LEASE_AUDIT_PHASES = new Set(['before_agent_prepare', 'after_agent_ready']);
+const AUTH_LEASE_AUDIT_REASONS = new Set([
+    'invalid_lease',
+    'validation_failed',
+    'missing_or_expired',
+    'expired',
+    'user_changed',
+    'session_changed',
+    'administrator_revoked',
+]);
+
 export const WEBTTY_SESSION_LIMITS = Object.freeze({
     global: 12,
     perUser: 6,
@@ -278,11 +289,21 @@ export class WebttySessionManager {
         return lease;
     }
 
-    async revalidateLease(lease) {
+    async revalidateLease(lease, auditPhase) {
         const currentAuth = await this.auth.validateLease(lease);
         if (!currentAuth.ok) {
+            const reason = currentAuth.reason;
+            if (AUTH_LEASE_AUDIT_PHASES.has(auditPhase)) {
+                try {
+                    // Diagnostics must not replace the rejection or delay startup cleanup.
+                    Promise.resolve(this.audit('webtty_auth_lease_rejected', {
+                        phase: auditPhase,
+                        reason: AUTH_LEASE_AUDIT_REASONS.has(reason) ? reason : 'unknown',
+                    })).catch(() => {});
+                } catch (_) { }
+            }
             throw errorWithCode(
-                currentAuth.reason === 'administrator_revoked'
+                reason === 'administrator_revoked'
                     ? 'WEBTTY_ADMIN_REQUIRED'
                 : 'WEBTTY_AUTH_INVALID',
             );
@@ -595,7 +616,7 @@ export class WebttySessionManager {
                 await this.withAgentStartLock(target, async () => {
                     try {
                         this.assertStartupActive(session);
-                        await this.revalidateLease(lease);
+                        await this.revalidateLease(lease, 'before_agent_prepare');
                         await this.revalidateTarget({
                             routePlan,
                             target,
@@ -635,7 +656,7 @@ export class WebttySessionManager {
                             });
                         });
                         this.assertStartupActive(session);
-                        await this.revalidateLease(lease);
+                        await this.revalidateLease(lease, 'after_agent_ready');
                         await this.revalidateTarget({
                             routePlan,
                             target,

@@ -270,6 +270,7 @@ async function createManager(t, options = {}) {
         launchStore: options.launchStore,
         targetResolver: options.targetResolver,
         agentProviderAvailable: options.agentProviderAvailable,
+        audit: options.audit,
     });
     await manager.initialize();
     installBoxLaunchTestHelper(manager);
@@ -284,6 +285,104 @@ test('production create rejects the removed Box compatibility path', async (t) =
         { code: 'WEBTTY_LAUNCH_NOT_FOUND' },
     );
     assert.equal(manager.activeCount(), 0);
+});
+
+test('lease rejection audits contain only fixed startup phases and allowlisted reasons', async (t) => {
+    const audits = [];
+    let validation = { ok: true };
+    const manager = await createManager(t, {
+        auth: authAdapter({ validate: async () => validation }),
+        audit: (event, fields) => audits.push({ event, ...fields }),
+    });
+    const unknownObject = { toString() { throw new Error('reason must not be coerced'); } };
+    const cases = [
+        ...['invalid_lease', 'validation_failed', 'missing_or_expired', 'expired',
+            'user_changed', 'session_changed', 'administrator_revoked'].map(reason => [reason, reason]),
+        ['Bearer synthetic-secret jwt-current sess-stable auth-fingerprint', 'unknown'],
+        [unknownObject, 'unknown'],
+        [undefined, 'unknown'],
+        [null, 'unknown'],
+        ['', 'unknown'],
+    ];
+    for (const phase of ['before_agent_prepare', 'after_agent_ready']) {
+        for (const [reason, expectedReason] of cases) {
+            audits.length = 0;
+            validation = { ok: false, reason };
+            const code = reason === 'administrator_revoked' ? 'WEBTTY_ADMIN_REQUIRED' : 'WEBTTY_AUTH_INVALID';
+            await assert.rejects(manager.revalidateLease(LEASE, phase), { code, message: code });
+            assert.deepEqual(audits, [{ event: 'webtty_auth_lease_rejected', phase, reason: expectedReason }]);
+        }
+    }
+    audits.length = 0;
+    validation = { ok: true, session: { credential: 'must-not-be-audited' } };
+    await manager.revalidateLease(LEASE, 'before_agent_prepare');
+    await manager.revalidateLease(LEASE, 'after_agent_ready');
+    validation = { ok: false, reason: 'expired' };
+    await assert.rejects(manager.revalidateLease(LEASE), { code: 'WEBTTY_AUTH_INVALID' });
+    await assert.rejects(manager.revalidateLease(LEASE, 'raw-private-phase'), { code: 'WEBTTY_AUTH_INVALID' });
+    assert.deepEqual(audits, []);
+});
+
+test('agent startup rejection auditing preserves exact failure, worker cleanup, and quota release', async (t) => {
+    for (const [failAt, phase] of [[3, 'before_agent_prepare'], [4, 'after_agent_ready']]) {
+        for (const auditFailure of ['none', 'throws', 'rejects']) {
+            await t.test(`${phase} with audit sink ${auditFailure}`, async (t2) => {
+                let validations = 0;
+                let preparations = 0;
+                let starts = 0;
+                const audits = [];
+                const store = recordStore();
+                const worker = new FakeWorker();
+                const originalPrepare = worker.prepare.bind(worker);
+                const originalStart = worker.start.bind(worker);
+                worker.prepare = async (...args) => { preparations += 1; return originalPrepare(...args); };
+                worker.start = async (...args) => { starts += 1; return originalStart(...args); };
+                const manager = await createManager(t2, {
+                    recordStore: store,
+                    agentProviderAvailable: true,
+                    agentWorkerFactory: () => worker,
+                    targetResolver: { async revalidate({ target }) { return target; } },
+                    auth: authAdapter({ validate: async () => (++validations === failAt
+                        ? { ok: false, reason: 'session_changed' }
+                        : { ok: true }) }),
+                    audit: (event, fields) => {
+                        audits.push({ event, ...fields });
+                        if (event !== 'webtty_auth_lease_rejected') return;
+                        if (auditFailure === 'throws') throw new Error('synthetic audit failure');
+                        if (auditFailure === 'rejects') return Promise.reject(new Error('synthetic audit rejection'));
+                    },
+                });
+                const plan = routePlan();
+                const discovery = manager.launchStore.createDiscovery({
+                    owner: { userId: LEASE.userId, sessionFingerprint: LEASE.sessionFingerprint },
+                    routeBinding: terminalTargetRouteBinding(plan),
+                    targets: terminalTargets(),
+                    agentTargetsAvailable: true,
+                });
+                await assert.rejects(manager.create({
+                    req: {}, routePlan: plan, launch: discovery.targets[1].launch,
+                }), { code: 'WEBTTY_AUTH_INVALID', message: 'WEBTTY_AUTH_INVALID' });
+                assert.deepEqual(audits.filter(row => row.event === 'webtty_auth_lease_rejected'), [{
+                    event: 'webtty_auth_lease_rejected', phase, reason: 'session_changed',
+                }]);
+                assert.deepEqual(audits.filter(row => row.event === 'webtty_session_closed').map(row => row.reason), ['create_failed']);
+                assert.equal(audits.some(row => row.event === 'webtty_session_created'), false);
+                assert.equal(validations, failAt);
+                assert.equal(preparations, failAt === 3 ? 0 : 1);
+                assert.equal(starts, failAt === 3 ? 0 : 1);
+                assert.equal(worker.closed, 1);
+                assert.equal(store.calls.created, 1);
+                assert.equal(store.calls.removed, 1);
+                assert.equal(store.calls.confirmed, failAt === 3 ? 1 : 0);
+                assert.equal(store.calls.recovered, failAt === 3 ? 0 : 1);
+                assert.equal(manager.activeCount(), 0);
+                assert.deepEqual([...manager.userCounts], []);
+                assert.deepEqual([...manager.authCounts], []);
+                assert.deepEqual([...manager.agentStartLocks], []);
+                assert.deepEqual(manager.availability(), { ok: true });
+            });
+        }
+    }
 });
 
 test('create-time authentication loss fails before quota reservation or worker allocation', async (t) => {
