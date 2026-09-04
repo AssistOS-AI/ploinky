@@ -113,6 +113,14 @@ recreate the Box. Ordinary destroy retains `.ploinky/box`;
 `--delete-cache` performs an explicit storage reset of exactly those two cache
 directories without deleting any other workspace file.
 
+Cross-repository release candidates must align the AgentLib commit in
+`ploinky-box/dependencies.lock.json` with the selected AgentLib source and the
+release manifest. Run the offline release-bundle verifier before recreating a
+test workspace. AgentLib is direct-mounted, not bundled into the Box image;
+an AgentLib-only policy-pin change does not change the bundled MCP SDK or its
+dependency-cache fingerprint. Changes to actual image inputs still require
+image-contract verification and a matching immutable image.
+
 State follows these stop/start and destroy boundaries:
 
 | State | Where it lives | Survives stop/start? | Survives destroy? |
