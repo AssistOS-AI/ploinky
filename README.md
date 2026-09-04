@@ -316,6 +316,12 @@ Node-based agents consume a prepared, runtime-keyed dependency cache. `ploinky s
 
 ## WebChat agent requirements
 
+The browser enables message and attachment submission only after the current
+agent runtime reports that it is ready. Starting, failed, or disconnected
+sessions cannot accept new input. A message marked `Sending…` is still awaiting
+server admission; rejected input keeps its draft and selected attachments for
+correction or retry instead of appearing as successfully sent.
+
 - WebChat sends structured message envelopes over stdin. Agents that want a reliable chat experience should expose a real CLI process that reads stdin continuously and writes replies to stdout.
 - A manifest `cli` that points to a plain shell such as `"/bin/sh"` or `"/bin/bash"` does not become conversational by itself. In that setup WebChat mirrors raw input to the shell, and the shell may simply echo or mis-handle the incoming payload.
 - The recommended pattern is a dedicated CLI entrypoint such as `node /code/main.mjs` that parses WebChat input and keeps running for the full session.
