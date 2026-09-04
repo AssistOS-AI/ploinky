@@ -103,7 +103,11 @@ function createWebchatFactoryConfig(webchatTTYModule, resolvedWebchatCommands) {
         const hostWorkdir = resolveHostWorkdir(config);
         if (createWebChatLocalFactory) {
             const command = config.hostCommand;
-            const factory = buildLocalFactory(createWebChatLocalFactory, { command, workdir: hostWorkdir });
+            const factory = buildLocalFactory(createWebChatLocalFactory, {
+                command,
+                workdir: hostWorkdir,
+                startupProtocol: Boolean(command),
+            });
             if (factory) {
                 logBootEvent('webchat_local_process_factory_ready', {
                     command: command || null,

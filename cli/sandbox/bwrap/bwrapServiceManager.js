@@ -1311,6 +1311,7 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
             routeKey: record.alias || agentName,
             containerName,
         });
+        options.onReady?.();
         const result = spawnBwrapInteractive(bwrapArgs, { usePty: process.stdin.isTTY });
         return result.status ?? 0;
     } finally {

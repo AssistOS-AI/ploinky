@@ -2,6 +2,8 @@ const PROCESS_PREFIX_RE = /^(?:\s*\.+\s*){3,}/;
 const ENVELOPE_FLAG = '__webchatMessage';
 const PROGRESS_FLAG = '__webchatProgress';
 const ENVELOPE_VERSION = 1;
+const MAX_STREAM_RECONNECT_ATTEMPTS = 6;
+const STABLE_STREAM_MS = 30000;
 const BROWSER_CSRF_HEADER = 'x-ploinky-browser-csrf-token';
 const BROWSER_MUTATION_RETRY_ERRORS = new Set([
     'browser_csrf_invalid',
@@ -366,6 +368,9 @@ export function createNetwork({
     let pendingVisibleCommand = '';
     let reconnectAttempts = 0;
     let reconnectTimer = null;
+    let stableTimer = null;
+    let bannerTimer = null;
+    let stopped = false;
     let pendingUploads = 0;
     let assistantMessageIndex = null;
     let pendingPageInteractionId = '';
@@ -458,8 +463,34 @@ export function createNetwork({
         }
     }
 
-    function start() {
+    function setConnectionStatus(status, online = false) {
+        if (statusEl) statusEl.textContent = status;
+        if (statusDot) {
+            statusDot.classList.remove(online ? 'offline' : 'online');
+            statusDot.classList.add(online ? 'online' : 'offline');
+        }
+    }
+
+    function clearConnectionTimers() {
+        for (const timer of [reconnectTimer, stableTimer, bannerTimer]) {
+            if (timer !== null) clearTimeout(timer);
+        }
+        reconnectTimer = stableTimer = bannerTimer = null;
+    }
+
+    function terminalConnection(message) {
+        stop();
+        hideTypingIndicator(true);
+        setConnectionStatus('offline');
+        showBanner(message, 'err');
+    }
+
+    function start({ reconnecting = false } = {}) {
+        clearConnectionTimers();
+        if (!reconnecting) reconnectAttempts = 0;
+        stopped = false;
         dlog('SSE connecting');
+        setConnectionStatus('connecting');
         showBanner('Connecting…');
         try {
             es?.close?.();
@@ -467,47 +498,32 @@ export function createNetwork({
             // Ignore close failures
         }
 
-        es = new EventSource(toEndpoint(runtimePath(`stream?tabId=${encodeURIComponent(TAB_ID)}`)));
+        const source = new EventSource(toEndpoint(runtimePath(`stream?tabId=${encodeURIComponent(TAB_ID)}`)));
+        es = source;
+        let runtimeReady = false;
+        const isCurrent = () => !stopped && es === source;
 
         es.onopen = () => {
-            // Reset reconnect attempts on successful connection
-            reconnectAttempts = 0;
-
-            hideTypingIndicator(true);
-            if (statusEl) {
-                statusEl.textContent = 'online';
-            }
-            if (statusDot) {
-                statusDot.classList.remove('offline');
-                statusDot.classList.add('online');
-            }
-            showBanner('Connected', 'ok');
-            setTimeout(() => hideBanner(), 800);
-            if (typeof onConnected === 'function') onConnected();
+            if (!isCurrent()) return;
+            setConnectionStatus('starting');
+            showBanner('Starting agent…');
         };
 
         es.onerror = () => {
+            if (!isCurrent()) return;
             hideTypingIndicator(true);
-            if (statusEl) {
-                statusEl.textContent = 'offline';
-            }
-            if (statusDot) {
-                statusDot.classList.remove('online');
-                statusDot.classList.add('offline');
-            }
+            setConnectionStatus('offline');
             try {
-                es.close();
+                source.close();
             } catch (_) {
                 // Ignore close failures
             }
-
-            // Clear any pending reconnect timer
-            if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-                reconnectTimer = null;
+            es = null;
+            clearConnectionTimers();
+            if (reconnectAttempts >= MAX_STREAM_RECONNECT_ATTEMPTS) {
+                terminalConnection('Unable to reconnect. Reload to retry.');
+                return;
             }
-
-            // CRITICAL FIX: Exponential backoff to prevent reconnection storms
             reconnectAttempts++;
             const baseDelay = 1000; // 1 second
             const maxDelay = 60000; // 60 seconds max
@@ -517,16 +533,14 @@ export function createNetwork({
             const jitter = Math.random() * 1000;
             const totalDelay = delay + jitter;
 
-            if (reconnectAttempts > 1) {
-                showBanner(`Reconnecting in ${Math.ceil(totalDelay / 1000)}s (attempt ${reconnectAttempts})...`);
-            }
+            showBanner(`Reconnecting in ${Math.ceil(totalDelay / 1000)}s (attempt ${reconnectAttempts}/${MAX_STREAM_RECONNECT_ATTEMPTS})…`);
 
             dlog(`SSE reconnect scheduled in ${Math.ceil(totalDelay)}ms (attempt ${reconnectAttempts})`);
 
             reconnectTimer = setTimeout(() => {
                 reconnectTimer = null;
                 try {
-                    start();
+                    start({ reconnecting: true });
                 } catch (error) {
                     dlog('SSE restart error', error);
                 }
@@ -534,6 +548,7 @@ export function createNetwork({
         };
 
         es.onmessage = (event) => {
+            if (!isCurrent()) return;
             try {
                 const payload = JSON.parse(event.data);
                 if (typeof payload === 'string') {
@@ -548,6 +563,41 @@ export function createNetwork({
                 dlog('term write error', error);
             }
         };
+
+        es.addEventListener('startup-state', (event) => {
+            if (!isCurrent()) return;
+            let state;
+            try { state = JSON.parse(event.data)?.state; } catch (_) { return; }
+            if (state === 'failed') {
+                terminalConnection('Agent startup failed. Reload to retry.');
+                return;
+            }
+            if (state !== 'ready' || runtimeReady) return;
+            runtimeReady = true;
+            hideTypingIndicator(true);
+            setConnectionStatus('online', true);
+            showBanner('Connected', 'ok');
+            bannerTimer = setTimeout(() => {
+                bannerTimer = null;
+                if (isCurrent()) hideBanner();
+            }, 800);
+            // Briefly opening a transport (or a crashing CLI) cannot replenish
+            // the retry budget. Only a sustained ready runtime does so.
+            stableTimer = setTimeout(() => {
+                stableTimer = null;
+                if (isCurrent()) reconnectAttempts = 0;
+            }, STABLE_STREAM_MS);
+            if (typeof onConnected === 'function') onConnected();
+        });
+
+        es.addEventListener('close', (event) => {
+            if (!isCurrent()) return;
+            let failed = !runtimeReady;
+            try { failed = failed || JSON.parse(event.data)?.state === 'failed'; } catch (_) { }
+            terminalConnection(failed
+                ? 'Agent startup failed. Reload to retry.'
+                : 'Agent session closed. Reload to reconnect.');
+        });
 
         es.addEventListener('user-message', (event) => {
             try {
@@ -637,11 +687,8 @@ export function createNetwork({
     }
 
     function stop() {
-        // Clear reconnect timer
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-            reconnectTimer = null;
-        }
+        stopped = true;
+        clearConnectionTimers();
         reconnectAttempts = 0;
 
         if (!es) {

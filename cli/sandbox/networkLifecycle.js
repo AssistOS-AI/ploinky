@@ -370,6 +370,43 @@ export function withNetworkLifecycleLock(callback, options = {}) {
     return result;
 }
 
+// CLI startup can wait behind another agent's asynchronous readiness work.
+// Yield between acquisition attempts so an owner in this process can finish;
+// synchronous lifecycle callers retain the existing fail-fast/wait contract.
+export async function withNetworkLifecycleLockAsync(callback, options = {}) {
+    if (typeof callback !== 'function') {
+        throw new Error('network lifecycle mutation requires a callback');
+    }
+    const waitMs = Number(options.waitMs ?? 0);
+    const pollMs = Math.max(10, Number(options.pollMs ?? 50));
+    if (!Number.isFinite(waitMs) || waitMs < 0 || !Number.isFinite(pollMs)) {
+        throw new RangeError('network lifecycle wait and poll budgets must be finite and non-negative');
+    }
+    const deadline = Date.now() + waitMs;
+    while (true) {
+        let attempt;
+        try {
+            // Keep callback failures asynchronous and outside this catch: a
+            // failed mutation must never be retried as acquisition contention.
+            attempt = withNetworkLifecycleLock(async (capability) => callback(capability), {
+                ...options,
+                waitMs: 0,
+            });
+        } catch (error) {
+            if (error?.code !== 'PLOINKY_NETWORK_LIFECYCLE_BUSY' || waitMs === 0) throw error;
+            const remainingMs = deadline - Date.now();
+            if (remainingMs <= 0) {
+                const timeout = new Error(`timed out waiting ${waitMs}ms for network lifecycle serialization: ${error.message}`);
+                timeout.code = 'PLOINKY_NETWORK_LIFECYCLE_BUSY';
+                throw timeout;
+            }
+            await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, remainingMs)));
+            continue;
+        }
+        return await attempt;
+    }
+}
+
 function defaultRun(runtime, args, options = {}) {
     const result = spawnSync(runtime, args, {
         encoding: 'utf8',

@@ -1050,6 +1050,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         routeKey: record.alias || agentName,
         containerName,
     });
+    options.onReady?.();
     const result = spawnSync('sandbox-exec', ['-f', profilePath, 'sh', '-lc', `cd '${wd}' && ${rewrittenCmd}`], {
         stdio: 'inherit',
         env: envMap,
