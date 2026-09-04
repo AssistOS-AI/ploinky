@@ -72,6 +72,7 @@ function projectInspectedContainer(data, fallbackName = '') {
     if (agentName === '-' && mountAgent && mountAgent !== '-') agentName = mountAgent;
     return {
         containerName,
+        containerId: String(data.Id || '').trim().toLowerCase(),
         agentName,
         repoName,
         containerImage: data.Config?.Image || '-',

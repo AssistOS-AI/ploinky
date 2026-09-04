@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { collectAgentRuntimeStates, collectAgentRuntimeStatesAsync } from '../../cli/sandbox/agentRuntimeState.js';
 import { __testables as marketplaceTestables } from '../../cli/server/authHandlers/marketplaceRoutes.js';
+import { applyCurrentNoWaitReadiness } from '../../cli/utils/noWaitReadiness.js';
 
 test('collectAgentRuntimeStates reports live and stopped host sandboxes from tracked PIDs', () => {
     const checked = [];
@@ -173,6 +174,87 @@ test('collectAgentRuntimeStates does not report disabled or mismatched routes as
         running: false,
         pid: 99,
     });
+});
+
+function serviceOnlyFixture() {
+    const record = {
+        type: 'agent', runtime: 'podman', repoName: 'Agents', agentName: 'service',
+        instanceId: 'instance-1', enableGeneration: 'enable-1', profile: 'default', containerId: 'a'.repeat(64),
+    };
+    const registry = { serviceKey: record };
+    const activeGeneration = {
+        routing: { routes: { service: { repo: 'Agents', agent: 'service', container: 'serviceKey' } } },
+        agents: structuredClone(registry),
+        manifests: { service: { start: './start.sh', health: { readiness: { script: './ready.sh' } } } },
+    };
+    return {
+        registry, activeGeneration,
+        liveContainers: [{ containerName: 'serviceKey', containerId: record.containerId, state: { status: 'running', running: true, pid: 99 } }],
+        observeNoWaitRecord: () => ({ state: 'running' }),
+    };
+}
+
+test('service-only OCI runtimes are running after exact active publication and semantic readiness without a main port', () => {
+    for (const observation of [null, { state: 'running' }]) {
+        const fixture = serviceOnlyFixture();
+        fixture.observeNoWaitRecord = (containerName, record, { readRegistrySnapshot }) => {
+            assert.equal(containerName, 'serviceKey');
+            assert.equal(record, fixture.registry.serviceKey);
+            assert.equal(readRegistrySnapshot(), fixture.registry);
+            return observation;
+        };
+        const [entry] = collectAgentRuntimeStates(fixture);
+        assert.deepEqual(entry.state, { status: 'running', running: true, pid: 99 });
+        assert.equal(marketplaceTestables.normalizeMarketplaceAgentStatus({ active: true, runtimeState: entry.state }).status, 'running');
+        const projected = applyCurrentNoWaitReadiness(entry, fixture.registry, {
+            readMarker: () => ({}), createBinding: () => ({}), observeRun: () => ({ state: 'running' }),
+        });
+        assert.equal(projected.state.status, 'running');
+        assert.equal(projected.state.ready, true);
+    }
+});
+
+test('service-only readiness rejects pending, failed, unreadable, and stale detached runs', () => {
+    for (const state of ['pending', 'starting', 'failed', 'unverified', 'superseded']) {
+        const fixture = serviceOnlyFixture();
+        fixture.observeNoWaitRecord = () => ({ state });
+        const [entry] = collectAgentRuntimeStates(fixture);
+        assert.equal(entry.state.status, 'starting', state);
+        assert.equal(entry.state.running, false, state);
+        assert.equal(entry.state.pid, 99);
+    }
+    const fixture = serviceOnlyFixture();
+    fixture.observeNoWaitRecord = () => { throw new Error('stale current marker'); };
+    assert.equal(collectAgentRuntimeStates(fixture)[0].state.running, false);
+});
+
+test('service-only readiness rejects missing publication, ordinary agents, and mismatched immutable runtime identities', () => {
+    const mutations = [
+        (fixture) => { fixture.activeGeneration = null; },
+        (fixture) => { fixture.activeGeneration.routing.routes.service.disabled = true; },
+        (fixture) => { fixture.activeGeneration.routing.routes.service.draining = true; },
+        (fixture) => { fixture.activeGeneration.routing.routes.service.container = 'otherKey'; },
+        (fixture) => { fixture.activeGeneration.routing.routes.service.repo = 'Other'; },
+        (fixture) => { delete fixture.activeGeneration.manifests.service; },
+        (fixture) => { fixture.activeGeneration.manifests.service = {}; },
+        (fixture) => { fixture.activeGeneration.manifests.service.agent = './agent.sh'; },
+        (fixture) => { fixture.activeGeneration.agents.serviceKey.instanceId = 'old-instance'; },
+        (fixture) => { fixture.activeGeneration.agents.serviceKey.enableGeneration = 'old-enable'; },
+        (fixture) => { fixture.activeGeneration.agents.serviceKey.containerId = 'b'.repeat(64); },
+        (fixture) => { fixture.activeGeneration.agents.serviceKey.profile = 'other'; },
+        (fixture) => { fixture.activeGeneration.agents.serviceKey.runtime = 'docker'; },
+        (fixture) => { fixture.liveContainers[0].containerId = 'b'.repeat(64); },
+        (fixture) => { delete fixture.liveContainers[0].containerId; },
+        (fixture) => { fixture.liveContainers[0].state.running = false; },
+    ];
+    for (const mutate of mutations) {
+        const fixture = serviceOnlyFixture();
+        mutate(fixture);
+        let observations = 0;
+        fixture.observeNoWaitRecord = () => { observations += 1; return { state: 'running' }; };
+        assert.equal(collectAgentRuntimeStates(fixture)[0].state.running, false, mutate.toString());
+        assert.equal(observations, 0, 'invalid runtime must not reach semantic readiness lookup');
+    }
 });
 
 test('Marketplace reports an enabled bwrap agent as running from generic runtime state', () => {

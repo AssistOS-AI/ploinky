@@ -923,7 +923,7 @@ case "$1" in
     printf '%s\\n' 'ploinky_repoA_agentA_project_12345678'
     ;;
   inspect)
-    printf '%s\\n' '[{"Mounts":[{"Destination":"/code","Source":"/tmp/ws/.ploinky/repos/repoA/agentA"}],"Config":{"Env":["AGENT_NAME=agentA"],"Image":"node:20-alpine"},"NetworkSettings":{"Ports":{"7000/tcp":[{"HostIp":"127.0.0.1","HostPort":"12345"}]}}}]'
+    printf '%s\\n' '[{"Id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Mounts":[{"Destination":"/code","Source":"/tmp/ws/.ploinky/repos/repoA/agentA"}],"Config":{"Env":["AGENT_NAME=agentA"],"Image":"node:20-alpine"},"NetworkSettings":{"Ports":{"7000/tcp":[{"HostIp":"127.0.0.1","HostPort":"12345"}]}}}]'
     ;;
   *)
     exit 1
@@ -946,6 +946,7 @@ process.stdout.write(JSON.stringify({ sync, asyncResult }));`,
         assert.deepEqual(asyncResult, containers);
         assert.equal(containers.length, 1);
         assert.equal(containers[0].containerName, 'ploinky_repoA_agentA_project_12345678');
+        assert.equal(containers[0].containerId, 'a'.repeat(64));
         assert.equal(containers[0].agentName, 'agentA');
         assert.equal(containers[0].repoName, 'repoA');
         assert.equal(containers[0].config.ports[0].hostPort, '12345');
