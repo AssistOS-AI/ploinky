@@ -207,7 +207,7 @@ function createTTYFactory({ runtime, containerName, workdir, entry }) {
 
 export { createTTYFactory, createLocalTTYFactory };
 
-function createLocalTTYFactory({ workdir, command }) {
+function createLocalTTYFactory({ workdir, command, startupProtocol = false }) {
     const DEBUG = process.env.WEBCHAT_TTY_DEBUG === '1';
     const log = (...args) => { if (DEBUG) console.log('[webchat][tty-local]', ...args); };
     const factory = (ssoUser) => {
@@ -218,6 +218,7 @@ function createLocalTTYFactory({ workdir, command }) {
             TERM: 'xterm-256color',
             PLOINKY_NO_TTY: '1'
         });
+        if (startupProtocol) env.PLOINKY_WEBCHAT_STARTUP_FD = '3';
 
         // Build SSO CLI arguments (no env vars)
         const ssoCliArgs = [];
@@ -245,10 +246,32 @@ function createLocalTTYFactory({ workdir, command }) {
 
         let ptyProc = null;
         let disposed = false;
+        let disposalStarted = false;
         const outputHandlers = new Set();
         const closeHandlers = new Set();
+        const startupHandlers = new Set();
+        let startupState = startupProtocol ? 'starting' : 'ready';
+        let startupOutput = '';
+        let startupControl = '';
         let closeEmitted = false;
+        const setStartupState = (state) => {
+            if (startupState !== 'starting') return;
+            startupState = state;
+            for (const handler of startupHandlers) {
+                try { handler({ state }); } catch (_) { }
+            }
+            const buffered = startupOutput;
+            startupOutput = '';
+            if (state === 'ready' && buffered) emitOutput(buffered);
+        };
         const emitOutput = (data) => {
+            if (startupState === 'starting') {
+                // Preserve a fast agent's greeting when stdout is delivered before
+                // the separate readiness pipe. Failed launcher output is never chat.
+                startupOutput = (startupOutput + data).slice(-64 * 1024);
+                return;
+            }
+            if (startupState === 'failed') return;
             for (const h of outputHandlers) {
                 try { h(data); } catch (_) { }
             }
@@ -256,6 +279,7 @@ function createLocalTTYFactory({ workdir, command }) {
         const emitClose = () => {
             if (closeEmitted) return;
             closeEmitted = true;
+            setStartupState('failed');
             for (const h of closeHandlers) {
                 try { h(); } catch (_) { }
             }
@@ -263,6 +287,22 @@ function createLocalTTYFactory({ workdir, command }) {
         const hasCustom = !!(command && String(command).trim());
         const parentShell = process.env.WEBCHAT_SHELL || process.env.SHELL || '/bin/sh';
         const fallbackEntry = 'command -v /bin/bash >/dev/null 2>&1 && exec /bin/bash || exec /bin/sh';
+
+        function disposeProcess() {
+            if (disposalStarted) return;
+            disposalStarted = true;
+            disposed = true;
+            const pid = ptyProc?.pid;
+            const killProcess = global.processKill || process.kill;
+            try { ptyProc?.kill?.(); } catch (_) { }
+            if (pid) {
+                try { killProcess(-pid, 'SIGTERM'); } catch (_) { }
+                setTimeout(() => {
+                    try { killProcess(-pid, 'SIGKILL'); } catch (_) { }
+                    try { killProcess(pid, 'SIGKILL'); } catch (_) { }
+                }, 500).unref?.();
+            }
+        }
 
         function startProc({ entry } = {}) {
             let useEntry = entry && String(entry).trim() ? String(entry) : fallbackEntry;
@@ -281,8 +321,39 @@ function createLocalTTYFactory({ workdir, command }) {
                     cwd: wd,
                     env,
                     detached: true,                 // own process group: global.processKill(-pid) reaps the tree
-                    stdio: ['pipe', 'pipe', 'pipe'],
+                    stdio: startupProtocol ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
                 });
+                if (startupProtocol) {
+                    const control = ptyProc.stdio[3];
+                    control.setEncoding('utf8');
+                    control.on('data', (data) => {
+                        if (startupState !== 'starting') return;
+                        startupControl += data;
+                        if (startupControl.length > 1024) {
+                            setStartupState('failed');
+                            disposeProcess();
+                            return;
+                        }
+                        const lineEnd = startupControl.indexOf('\n');
+                        if (lineEnd < 0) return;
+                        try {
+                            const state = JSON.parse(startupControl.slice(0, lineEnd));
+                            if (state.version === 1 && state.state === 'ready') {
+                                setStartupState('ready');
+                                return;
+                            }
+                        } catch (_) { }
+                        setStartupState('failed');
+                        disposeProcess();
+                    });
+                    const failStartupControl = () => {
+                        if (startupState !== 'starting') return;
+                        setStartupState('failed');
+                        disposeProcess();
+                    };
+                    control.on('error', failStartupControl);
+                    control.on('end', failStartupControl);
+                }
                 ptyProc.stdout.setEncoding('utf8');
                 ptyProc.stderr.setEncoding('utf8');
                 ptyProc.stdout.on('data', emitOutput);
@@ -311,6 +382,14 @@ function createLocalTTYFactory({ workdir, command }) {
             get pid() { return ptyProc?.pid; },
             onOutput(handler) { if (handler) outputHandlers.add(handler); return () => outputHandlers.delete(handler); },
             onClose(handler) { if (handler) closeHandlers.add(handler); return () => closeHandlers.delete(handler); },
+            onStartupState(handler) {
+                if (handler) {
+                    startupHandlers.add(handler);
+                    handler({ state: startupState });
+                }
+                return () => startupHandlers.delete(handler);
+            },
+            isReady() { return startupState === 'ready'; },
             isAlive() { return !disposed && isWritableChild(ptyProc); },
             write(data) {
                 if (disposed || !isWritableChild(ptyProc)) return false;
@@ -332,19 +411,7 @@ function createLocalTTYFactory({ workdir, command }) {
                 }
             },
             dispose() {
-                disposed = true;
-                const pid = ptyProc?.pid;
-                // First try graceful termination
-                try { ptyProc?.kill?.(); } catch (_) { }
-                // Kill process group
-                if (pid) {
-                    try { global.processKill(-pid, 'SIGTERM'); } catch (_) { }
-                    // Force kill after short delay
-                    setTimeout(() => {
-                        try { global.processKill(-pid, 'SIGKILL'); } catch (_) { }
-                        try { global.processKill(pid, 'SIGKILL'); } catch (_) { }
-                    }, 500);
-                }
+                disposeProcess();
             },
             close() { this.kill(); }
         };

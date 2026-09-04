@@ -152,7 +152,9 @@ test('a visible /tasks command clears Thinking and identifies its list response'
         });
 
         network.start();
-        network.sendCommand('/tasks');
+        eventSource.emit('startup-state', { state: 'ready' });
+        hidden.length = 0;
+        await network.sendCommand('/tasks');
         eventSource.emit('task-update', { event: 'list', tasks: [] });
         await new Promise((resolve) => setImmediate(resolve));
 

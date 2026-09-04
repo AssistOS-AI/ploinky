@@ -113,6 +113,14 @@ recreate the Box. Ordinary destroy retains `.ploinky/box`;
 `--delete-cache` performs an explicit storage reset of exactly those two cache
 directories without deleting any other workspace file.
 
+Cross-repository release candidates must align the AgentLib commit in
+`ploinky-box/dependencies.lock.json` with the selected AgentLib source and the
+release manifest. Run the offline release-bundle verifier before recreating a
+test workspace. AgentLib is direct-mounted, not bundled into the Box image;
+an AgentLib-only policy-pin change does not change the bundled MCP SDK or its
+dependency-cache fingerprint. Changes to actual image inputs still require
+image-contract verification and a matching immutable image.
+
 State follows these stop/start and destroy boundaries:
 
 | State | Where it lives | Survives stop/start? | Survives destroy? |
@@ -140,6 +148,23 @@ bound to the administrator login and active route generation, single-use, and
 invalidates its sibling target choices when consumed. All mutations require the
 same-origin, session-bound browser CSRF proof.
 
+Rejected authentication-lease checks during agent-terminal startup emit a
+server-only `webtty_auth_lease_rejected` audit entry with the fixed
+`before_agent_prepare` or `after_agent_ready` phase and an allowlisted validation
+reason. Unknown reasons are recorded as `unknown`; no credentials, session
+fingerprints, or raw authentication data are included. These categories identify
+the rejecting check, not necessarily its underlying cause, and do not change
+authentication responses or startup cleanup.
+
+An exception while confirming terminal reclamation emits a server-only
+`webtty_reclamation_check_failed` audit entry containing only the target kind
+(`box` or `agent`) and a fixed reason. Known reasons distinguish bounded proc
+scan/file limits, access or I/O failures, malformed process evidence, and
+identity changes; all other exceptions become `unknown`. Raw exceptions and
+process or session identifiers are never included. Audit failures cannot delay
+cleanup or change its result. This event identifies a failed check; it does not
+prove the underlying cause or relax fail-closed cleanup and record retention.
+
 WebTTY records exact Box or agent process evidence in the transient
 `/run/ploinky/webtty` recovery directory using the v2 target-discriminated
 schema. Startup recovery runs before the surface becomes available. Ambiguity
@@ -151,6 +176,15 @@ be reclaimed safely, recreate the exact managed Box with `ploinky destroy`
 followed by the normal `ploinky start` workflow; recreation discards both the
 ephemeral recovery records and nested runtime state while preserving the host
 workspace and retained caches.
+
+Box session enumeration overlaps at most four process-stat visits at a time.
+It retains the one-second scan deadline, 8,192-entry limit, 64 KiB per-file
+limit, and before/after process-start checks. A failed or expired scan cannot
+start another batch or another stat read; pending file and directory handles
+are still closed when their operations finish. Directory cleanup does not
+extend the scan deadline. Agent startup-client enumeration remains serial.
+This reduces serial I/O latency without treating incomplete process evidence
+as successful reclamation.
 
 Nested container records, writable layers, networks, and inner Podman named
 volumes are discarded with the outer Box, so persistent agent data must use
@@ -315,6 +349,15 @@ Node-based agents consume a prepared, runtime-keyed dependency cache. `ploinky s
 - If an agent manifest lacks an `agent` command, the container runs `/Agent/AgentServer.sh` which supervises the default AgentServer and restarts it if it exits.
 
 ## WebChat agent requirements
+
+The browser enables message and attachment submission only after the current
+agent runtime reports that it is ready. Starting, failed, or disconnected
+sessions cannot accept new input. A message marked `Sending…` is still awaiting
+server admission; rejected input keeps its draft and selected attachments for
+correction or retry instead of appearing as successfully sent.
+Control requests such as cancellation consume the HTTP response before their
+promise completes, including empty responses, so the browser can finish the
+request before a caller navigates away. The response status is unchanged.
 
 - WebChat sends structured message envelopes over stdin. Agents that want a reliable chat experience should expose a real CLI process that reads stdin continuously and writes replies to stdout.
 - A manifest `cli` that points to a plain shell such as `"/bin/sh"` or `"/bin/bash"` does not become conversational by itself. In that setup WebChat mirrors raw input to the shell, and the shell may simply echo or mis-handle the incoming payload.

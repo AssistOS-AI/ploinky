@@ -49,6 +49,10 @@ function writeRuntimeInput(tab, data) {
     }
 }
 
+function serializeStartupState(state = 'ready') {
+    return `event: startup-state\ndata: ${JSON.stringify({ state })}\n\n`;
+}
+
 function disposeUnavailableRuntime(tab, runtimeKey, runtimes) {
     if (!tab) return;
     tab.ttyClosed = true;
@@ -119,8 +123,15 @@ export function handleRuntimeRoute({
                 tty.onOutput((data) => {
                     routeWorkspaceRuntimeOutput(appState, tab, data);
                 });
+                tty.onStartupState?.(({ state }) => {
+                    if (!['starting', 'ready', 'failed'].includes(state)) return;
+                    tab.startupState = state;
+                    writeOrBufferSseEvent(tab, serializeStartupState(state));
+                });
                 tty.onClose(() => {
-                    writeOrBufferSseEvent(tab, 'event: close\ndata: {}\n\n');
+                    const state = tab.startupState === 'starting' || tab.startupState === 'failed'
+                        ? 'failed' : 'closed';
+                    writeOrBufferSseEvent(tab, `event: close\ndata: ${JSON.stringify({ state })}\n\n`);
                     tab.ttyClosed = true;
                     disposeTab(tab, runtimeKey, { runtimes });
                 });
@@ -175,6 +186,7 @@ export function handleRuntimeRoute({
         res.write(': connected\n\n');
         const connectionId = crypto.randomUUID();
         tab.subscribers.set(connectionId, { res, sid, tabId, pageInstanceId });
+        res.write(serializeStartupState(tab.startupState));
         const runtimeStateSnapshot = serializeRuntimeStateSseEvent(tab.webchatRuntimeState);
         if (runtimeStateSnapshot) res.write(runtimeStateSnapshot);
         const sessionStateSnapshot = serializeSessionStateSseEvent(tab.webchatSessionSnapshot);
@@ -220,6 +232,9 @@ export function handleRuntimeRoute({
         if (!tabId || !isRuntimeWritable(tab)) {
             disposeUnavailableRuntime(tab, runtimeKey, runtimes);
             res.writeHead(409); return res.end('Session runtime unavailable. Reconnect to create a new process.');
+        }
+        if (tab.startupState === 'starting') {
+            res.writeHead(409); return res.end('Agent startup is still in progress.');
         }
         if (tab.pendingInteraction) {
             res.writeHead(409); return res.end('Resolve the active interaction before sending another message.');

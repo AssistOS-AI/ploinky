@@ -71,10 +71,12 @@ export function createSessionController({
         label.className = 'wa-session-list-preview';
         label.textContent = 'New';
         button.appendChild(label);
-        button.addEventListener('click', () => {
+        button.addEventListener('click', async () => {
             closeDialog();
             showBanner('Creating session…');
-            network.sendQuickCommand('/session new');
+            if (!await network.sendQuickCommand('/session new')) {
+                showBanner('Unable to create session. Wait for the agent to be ready.', 'err');
+            }
         });
         sessionList.appendChild(button);
     }
@@ -95,16 +97,18 @@ export function createSessionController({
             relative.className = 'wa-session-list-time';
             relative.textContent = formatRelativeTime(session.updatedAt);
             button.append(preview, relative);
-            button.addEventListener('click', () => {
+            button.addEventListener('click', async () => {
                 closeDialog();
                 showBanner('Loading session…');
-                network.sendQuickCommand(`/session resume ${session.sessionId}`);
+                if (!await network.sendQuickCommand(`/session resume ${session.sessionId}`)) {
+                    showBanner('Unable to load session. Wait for the agent to be ready.', 'err');
+                }
             });
             sessionList.appendChild(button);
         }
     }
 
-    function openDialog() {
+    async function openDialog() {
         if (!sessionsAvailable || !sessionDialog || !sessionList) return;
         sessionDialog.hidden = false;
         sessionList.replaceChildren();
@@ -113,7 +117,10 @@ export function createSessionController({
         loading.className = 'wa-session-list-loading';
         loading.textContent = 'Loading sessions…';
         sessionList.appendChild(loading);
-        network.sendQuickCommand('/session');
+        if (!await network.sendQuickCommand('/session')) {
+            loading.textContent = 'Sessions unavailable until the agent is ready.';
+            showBanner('Unable to load sessions. Wait for the agent to be ready.', 'err');
+        }
     }
 
     function handleSessionState(payload) {

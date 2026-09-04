@@ -26,7 +26,29 @@ function shouldDeferUnindexedTask(payload) {
         && !Number.isInteger(payload?.messageIndex);
 }
 
-export const __testables = { findOrderedInsertionPoint, shouldDeferUnindexedTask };
+function createDeliveryState(wrapper, pending) {
+    const icon = wrapper.querySelector('.wa-seen-icon');
+    let label = null;
+    wrapper.dataset.deliveryState = pending ? 'pending' : 'sent';
+    if (pending) {
+        if (icon) icon.style.display = 'none';
+        label = document.createElement('span');
+        label.className = 'wa-message-delivery';
+        label.textContent = ' · Sending…';
+        label.setAttribute('role', 'status');
+        wrapper.querySelector('.wa-message-time')?.appendChild(label);
+    }
+    return {
+        markSent() {
+            wrapper.dataset.deliveryState = 'sent';
+            if (icon) icon.style.display = '';
+            label?.remove();
+        },
+        remove() { wrapper.remove(); },
+    };
+}
+
+export const __testables = { findOrderedInsertionPoint, shouldDeferUnindexedTask, createDeliveryState };
 
 function formatTime(timestamp = null) {
     const parsed = timestamp ? new Date(timestamp) : new Date();
@@ -709,14 +731,14 @@ export function createMessages({
             btn.type = 'button';
             btn.className = className;
             btn.textContent = label;
-            btn.addEventListener('click', () => {
+            btn.addEventListener('click', async () => {
                 if (btn.disabled) {
                     return;
                 }
                 btn.disabled = true;
                 btn.setAttribute('aria-busy', 'true');
                 try {
-                    const accepted = quickCommandHandler(command);
+                    const accepted = await quickCommandHandler(command);
                     if (accepted !== false) {
                         holder.remove();
                     } else {
@@ -789,14 +811,14 @@ export function createMessages({
             button.type = 'button';
             button.className = className;
             button.textContent = label;
-            button.addEventListener('click', () => {
+            button.addEventListener('click', async () => {
                 if (button.disabled) {
                     return;
                 }
                 setButtonsEnabled(false);
                 button.setAttribute('aria-busy', 'true');
                 try {
-                    const accepted = quickCommandHandler(command);
+                    const accepted = await quickCommandHandler(command);
                     if (accepted !== false) {
                         holder.remove();
                     } else {
@@ -854,14 +876,14 @@ export function createMessages({
         button.type = 'button';
         button.className = 'wa-abort-cancel-btn';
         button.textContent = 'Cancel';
-        button.addEventListener('click', () => {
+        button.addEventListener('click', async () => {
             if (button.disabled) {
                 return;
             }
             button.disabled = true;
             button.setAttribute('aria-busy', 'true');
             try {
-                const accepted = quickCommandHandler(abortState.cancelCommand);
+                const accepted = await quickCommandHandler(abortState.cancelCommand);
                 if (accepted !== false) {
                     holder.remove();
                 } else {
@@ -923,14 +945,14 @@ export function createMessages({
             button.className = 'wa-shortcut-btn';
             button.textContent = toShortcutLabel(command);
             button.title = command;
-            button.addEventListener('click', () => {
+            button.addEventListener('click', async () => {
                 if (button.disabled) {
                     return;
                 }
                 setButtonsEnabled(false);
                 button.setAttribute('aria-busy', 'true');
                 try {
-                    const accepted = quickCommandHandler(command);
+                    const accepted = await quickCommandHandler(command);
                     if (accepted !== false) {
                         holder.remove();
                     } else {
@@ -1157,6 +1179,7 @@ export function createMessages({
         appendMessageEl(wrapper, Number.isInteger(options.messageIndex) ? options.messageIndex : null);
         scrollToBottomIfLocked();
         lastServerMsg.bubble = null;
+        return createDeliveryState(wrapper, options.pending === true);
     }
 
     function addClientAttachment({
@@ -1165,7 +1188,8 @@ export function createMessages({
         mime,
         previewUrl,
         isImage,
-        caption
+        caption,
+        pending = false,
     }) {
         const displayName = fileName || 'Attachment';
         const wrapper = document.createElement('div');
@@ -1278,6 +1302,7 @@ export function createMessages({
         }
 
         return {
+            ...createDeliveryState(wrapper, pending),
             markUploaded({
                 downloadUrl,
                 size: uploadedSize,

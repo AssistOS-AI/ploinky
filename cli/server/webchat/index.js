@@ -229,6 +229,7 @@ network = createNetwork({
         sidePanelApi.postTaskInteractionResolved(resolution);
         interactionController?.resolve(resolution);
     },
+    onInputReadinessChange: (ready) => composer.setReadyState(ready),
     onConnected: () => taskController?.refresh().catch(() => {})
 });
 
@@ -252,7 +253,14 @@ const composer = createComposer({
     sendBtn,
     cancelBtn
 }, {
-    purgeTriggerRe: PURGE_TRIGGER_RE
+    purgeTriggerRe: PURGE_TRIGGER_RE,
+    onAvailabilityChange: (available) => {
+        attachmentBtn?.toggleAttribute?.('disabled', !available);
+        if (!available) {
+            attachmentMenu?.classList.remove('show');
+            composerAutocomplete?.hide?.();
+        }
+    },
 });
 
 interactionController = createInteractionPrompt({
@@ -270,7 +278,6 @@ interactionController = createInteractionPrompt({
     onCancel: (interactionId) => network.sendInteractionCancel(interactionId),
     onActiveChange: (active) => {
         composer.setInteractionState(active);
-        attachmentBtn?.toggleAttribute?.('disabled', active);
         if (active) composerAutocomplete?.hide?.();
     },
 });
@@ -679,28 +686,23 @@ if (logoutBtn) {
     logoutBtn.addEventListener('click', handleLogout);
 }
 
-composer.setSendHandler((cmdText) => {
+composer.setSendHandler(async (cmdText, { isCurrentDraft }) => {
     const cmd = cmdText.trim();
     const fileSelections = uploader.getSelectedFiles();
     autocompleteState.pruneByText(cmdText || '');
     const references = autocompleteState.snapshot();
 
-    if (fileSelections.length) {
-        network.sendAttachments(fileSelections, cmd, { references });
-        uploader.clearFiles();
+    if (!fileSelections.length && !cmd) return false;
+    const accepted = fileSelections.length
+        ? await network.sendAttachments(fileSelections, cmd, { references })
+        : await network.sendCommand(cmd, { references });
+    if (!accepted) return false;
+    if (fileSelections.length) uploader.clearFiles(fileSelections);
+    if (isCurrentDraft()) {
         autocompleteState.clear();
         mentionHighlighter.clear();
-        return true;
     }
-
-    if (cmd) {
-        network.sendCommand(cmd, { references });
-        autocompleteState.clear();
-        mentionHighlighter.clear();
-        return true;
-    }
-
-    return false;
+    return true;
 });
 
 composer.setCancelHandler(() => {
@@ -708,7 +710,7 @@ composer.setCancelHandler(() => {
 });
 
 messages.setQuickCommandHandler((command) => {
-    if (!command || typeof command !== 'string') {
+    if (!command || typeof command !== 'string' || !composer.canSubmit()) {
         return false;
     }
     // Route quick actions through the same path as user typing + Send.

@@ -163,7 +163,7 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
     }
 
     async function loadLog(taskId) {
-        if (!sendQuickCommand?.(`/task view ${taskId}`)) throw new Error('task_command_unavailable');
+        if (!await sendQuickCommand?.(`/task view ${taskId}`)) throw new Error('task_command_unavailable');
         return '';
     }
 
@@ -179,7 +179,7 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
     }
 
     async function refresh() {
-        if (!sendQuickCommand?.('/tasks')) throw new Error('task_command_unavailable');
+        if (!await sendQuickCommand?.('/tasks')) throw new Error('task_command_unavailable');
     }
 
     function open({ refresh: shouldRefresh = true } = {}) {

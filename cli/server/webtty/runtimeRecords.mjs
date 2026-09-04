@@ -28,6 +28,7 @@ const MAX_RECORD_BYTES = 16 * 1024;
 const MAX_LINUX_PROC_BYTES = 64 * 1024;
 const MAX_LINUX_PROC_SCAN_ENTRIES = 8_192;
 const LINUX_PROC_SCAN_TIMEOUT_MS = 1_000;
+const LINUX_SESSION_SCAN_CONCURRENCY = 4;
 const RECORD_NAME = /^[a-zA-Z0-9_-]{20,80}\.json$/;
 const TEMPORARY_RECORD_NAME = /^\.([a-zA-Z0-9_-]{20,80}\.json)\.([a-f0-9]{16})$/;
 const RECLAMATION_STABILITY_MS = 25;
@@ -277,11 +278,14 @@ function processEvidenceError(category) {
     return error;
 }
 
-async function readBoundedLinuxProcFile(filePath, encoding = null) {
+async function readBoundedLinuxProcFile(filePath, encoding = null, checkScan = () => {}) {
+    checkScan();
     const handle = await fs.open(filePath, 'r');
     try {
+        checkScan();
         const buffer = Buffer.alloc(MAX_LINUX_PROC_BYTES + 1);
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        checkScan();
         if (bytesRead > MAX_LINUX_PROC_BYTES) throw processEvidenceError('proc-file-limit');
         const value = buffer.subarray(0, bytesRead);
         return encoding ? value.toString(encoding) : value;
@@ -292,7 +296,10 @@ async function readBoundedLinuxProcFile(filePath, encoding = null) {
 
 async function withinProcScanDeadline(operation, deadlineAt) {
     const remaining = deadlineAt - Date.now();
-    if (remaining <= 0) throw processEvidenceError('proc-scan-timeout');
+    if (remaining <= 0) {
+        void Promise.resolve(operation).catch(() => {});
+        throw processEvidenceError('proc-scan-timeout');
+    }
     let timer;
     try {
         return await Promise.race([
@@ -312,11 +319,26 @@ async function withinProcScanDeadline(operation, deadlineAt) {
 async function scanLinuxProc(procRoot, visit, {
     maxEntries = MAX_LINUX_PROC_SCAN_ENTRIES,
     timeoutMs = LINUX_PROC_SCAN_TIMEOUT_MS,
+    concurrency = 1,
 } = {}) {
     const deadlineAt = Date.now() + timeoutMs;
-    const directory = await withinProcScanDeadline(fs.opendir(procRoot), deadlineAt);
+    const opening = fs.opendir(procRoot);
+    let directory;
+    try {
+        directory = await withinProcScanDeadline(opening, deadlineAt);
+    } catch (error) {
+        // A timed-out open still owns its eventual handle. Close it when it
+        // arrives without extending the deadline or starting enumeration.
+        void opening.then(value => value.close()).catch(() => {});
+        throw error;
+    }
     const iterator = directory[Symbol.asyncIterator]();
     let scannedEntries = 0;
+    let stopped = false;
+    const checkScan = () => {
+        if (stopped || Date.now() >= deadlineAt) throw processEvidenceError('proc-scan-timeout');
+    };
+    let batch = [];
     try {
         while (true) {
             const step = await withinProcScanDeadline(iterator.next(), deadlineAt);
@@ -326,12 +348,26 @@ async function scanLinuxProc(procRoot, visit, {
             const entry = step.value;
             if (!entry.isDirectory() || !/^[1-9][0-9]*$/.test(entry.name)) continue;
             if (!safeInteger(Number(entry.name))) continue;
-            await withinProcScanDeadline(visit(entry, deadlineAt), deadlineAt);
+            batch.push(entry);
+            if (batch.length === concurrency) {
+                // Fixed-size batches overlap proc I/O without retaining the
+                // complete directory or expanding the shared scan deadline.
+                await withinProcScanDeadline(Promise.all(batch.map(value => visit(value, checkScan))), deadlineAt);
+                batch = [];
+            }
         }
+        if (batch.length) {
+            await withinProcScanDeadline(Promise.all(batch.map(value => visit(value, checkScan))), deadlineAt);
+        }
+        checkScan();
     } finally {
-        try { await directory.close(); } catch (error) {
+        // In-flight opens/reads may still complete after a failure. Their
+        // handles must close, but they must not begin another read or visit.
+        stopped = true;
+        const closing = directory.close().catch(error => {
             if (error?.code !== 'ERR_DIR_CLOSED') throw error;
-        }
+        });
+        await withinProcScanDeadline(closing, deadlineAt);
     }
 }
 
@@ -445,14 +481,14 @@ export async function listLinuxSessionMembers(sessionId, {
 } = {}) {
     if (!safeInteger(sessionId)) throw new Error('invalid Linux session id');
     const members = [];
-    await scanLinuxProc(procRoot, async (entry) => {
+    await scanLinuxProc(procRoot, async (entry, checkScan) => {
         const pid = Number(entry.name);
         if (!safeInteger(pid)) return;
         const statPath = path.join(procRoot, entry.name, 'stat');
         try {
-            const before = parseLinuxProcStat(await readBoundedLinuxProcFile(statPath, 'utf8'), pid);
+            const before = parseLinuxProcStat(await readBoundedLinuxProcFile(statPath, 'utf8', checkScan), pid);
             if (before.session !== sessionId) return;
-            const after = parseLinuxProcStat(await readBoundedLinuxProcFile(statPath, 'utf8'), pid);
+            const after = parseLinuxProcStat(await readBoundedLinuxProcFile(statPath, 'utf8', checkScan), pid);
             if (before.rawStartToken !== after.rawStartToken) {
                 throw new Error('proc identity changed while enumerating session');
             }
@@ -468,7 +504,7 @@ export async function listLinuxSessionMembers(sessionId, {
         } catch (error) {
             if (error?.code !== 'ENOENT' && error?.code !== 'ESRCH') throw error;
         }
-    }, { maxEntries, timeoutMs: scanTimeoutMs });
+    }, { maxEntries, timeoutMs: scanTimeoutMs, concurrency: LINUX_SESSION_SCAN_CONCURRENCY });
     return Object.freeze(members);
 }
 

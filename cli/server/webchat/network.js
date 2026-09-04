@@ -2,6 +2,8 @@ const PROCESS_PREFIX_RE = /^(?:\s*\.+\s*){3,}/;
 const ENVELOPE_FLAG = '__webchatMessage';
 const PROGRESS_FLAG = '__webchatProgress';
 const ENVELOPE_VERSION = 1;
+const MAX_STREAM_RECONNECT_ATTEMPTS = 6;
+const STABLE_STREAM_MS = 30000;
 const BROWSER_CSRF_HEADER = 'x-ploinky-browser-csrf-token';
 const BROWSER_MUTATION_RETRY_ERRORS = new Set([
     'browser_csrf_invalid',
@@ -358,6 +360,7 @@ export function createNetwork({
     onWorkspaceFiles,
     onInteractionRequest,
     onInteractionResolved,
+    onInputReadinessChange,
     onConnected
 }) {
     let es = null;
@@ -366,9 +369,22 @@ export function createNetwork({
     let pendingVisibleCommand = '';
     let reconnectAttempts = 0;
     let reconnectTimer = null;
+    let stableTimer = null;
+    let bannerTimer = null;
+    let stopped = false;
     let pendingUploads = 0;
     let assistantMessageIndex = null;
     let pendingPageInteractionId = '';
+    let inputReady = false;
+    let activeInteractionId = '';
+    const uploadedSelections = new WeakMap();
+
+    function setInputReady(ready) {
+        inputReady = ready === true;
+        if (typeof onInputReadinessChange === 'function') onInputReadinessChange(inputReady);
+    }
+
+    const canSendInput = () => inputReady && !activeInteractionId;
 
     const runtimePath = (path) => `${path}${path.includes('?') ? '&' : '?'}pageInstanceId=${encodeURIComponent(PAGE_INSTANCE_ID || '')}`;
 
@@ -458,8 +474,35 @@ export function createNetwork({
         }
     }
 
-    function start() {
+    function setConnectionStatus(status, online = false) {
+        if (statusEl) statusEl.textContent = status;
+        if (statusDot) {
+            statusDot.classList.remove(online ? 'offline' : 'online');
+            statusDot.classList.add(online ? 'online' : 'offline');
+        }
+    }
+
+    function clearConnectionTimers() {
+        for (const timer of [reconnectTimer, stableTimer, bannerTimer]) {
+            if (timer !== null) clearTimeout(timer);
+        }
+        reconnectTimer = stableTimer = bannerTimer = null;
+    }
+
+    function terminalConnection(message) {
+        stop();
+        hideTypingIndicator(true);
+        setConnectionStatus('offline');
+        showBanner(message, 'err');
+    }
+
+    function start({ reconnecting = false } = {}) {
+        clearConnectionTimers();
+        if (!reconnecting) reconnectAttempts = 0;
+        stopped = false;
+        setInputReady(false);
         dlog('SSE connecting');
+        setConnectionStatus('connecting');
         showBanner('Connecting…');
         try {
             es?.close?.();
@@ -467,47 +510,35 @@ export function createNetwork({
             // Ignore close failures
         }
 
-        es = new EventSource(toEndpoint(runtimePath(`stream?tabId=${encodeURIComponent(TAB_ID)}`)));
+        const source = new EventSource(toEndpoint(runtimePath(`stream?tabId=${encodeURIComponent(TAB_ID)}`)));
+        es = source;
+        let runtimeReady = false;
+        const isCurrent = () => !stopped && es === source;
 
         es.onopen = () => {
-            // Reset reconnect attempts on successful connection
-            reconnectAttempts = 0;
-
-            hideTypingIndicator(true);
-            if (statusEl) {
-                statusEl.textContent = 'online';
-            }
-            if (statusDot) {
-                statusDot.classList.remove('offline');
-                statusDot.classList.add('online');
-            }
-            showBanner('Connected', 'ok');
-            setTimeout(() => hideBanner(), 800);
-            if (typeof onConnected === 'function') onConnected();
+            if (!isCurrent()) return;
+            runtimeReady = false;
+            setInputReady(false);
+            setConnectionStatus('starting');
+            showBanner('Starting agent…');
         };
 
         es.onerror = () => {
+            if (!isCurrent()) return;
+            setInputReady(false);
             hideTypingIndicator(true);
-            if (statusEl) {
-                statusEl.textContent = 'offline';
-            }
-            if (statusDot) {
-                statusDot.classList.remove('online');
-                statusDot.classList.add('offline');
-            }
+            setConnectionStatus('offline');
             try {
-                es.close();
+                source.close();
             } catch (_) {
                 // Ignore close failures
             }
-
-            // Clear any pending reconnect timer
-            if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-                reconnectTimer = null;
+            es = null;
+            clearConnectionTimers();
+            if (reconnectAttempts >= MAX_STREAM_RECONNECT_ATTEMPTS) {
+                terminalConnection('Unable to reconnect. Reload to retry.');
+                return;
             }
-
-            // CRITICAL FIX: Exponential backoff to prevent reconnection storms
             reconnectAttempts++;
             const baseDelay = 1000; // 1 second
             const maxDelay = 60000; // 60 seconds max
@@ -517,16 +548,14 @@ export function createNetwork({
             const jitter = Math.random() * 1000;
             const totalDelay = delay + jitter;
 
-            if (reconnectAttempts > 1) {
-                showBanner(`Reconnecting in ${Math.ceil(totalDelay / 1000)}s (attempt ${reconnectAttempts})...`);
-            }
+            showBanner(`Reconnecting in ${Math.ceil(totalDelay / 1000)}s (attempt ${reconnectAttempts}/${MAX_STREAM_RECONNECT_ATTEMPTS})…`);
 
             dlog(`SSE reconnect scheduled in ${Math.ceil(totalDelay)}ms (attempt ${reconnectAttempts})`);
 
             reconnectTimer = setTimeout(() => {
                 reconnectTimer = null;
                 try {
-                    start();
+                    start({ reconnecting: true });
                 } catch (error) {
                     dlog('SSE restart error', error);
                 }
@@ -534,6 +563,7 @@ export function createNetwork({
         };
 
         es.onmessage = (event) => {
+            if (!isCurrent()) return;
             try {
                 const payload = JSON.parse(event.data);
                 if (typeof payload === 'string') {
@@ -548,6 +578,50 @@ export function createNetwork({
                 dlog('term write error', error);
             }
         };
+
+        es.addEventListener('startup-state', (event) => {
+            if (!isCurrent()) return;
+            let state;
+            try { state = JSON.parse(event.data)?.state; } catch (_) { return; }
+            if (state === 'starting') {
+                runtimeReady = false;
+                setInputReady(false);
+                clearConnectionTimers();
+                setConnectionStatus('starting');
+                showBanner('Starting agent…');
+                return;
+            }
+            if (state === 'failed') {
+                terminalConnection('Agent startup failed. Reload to retry.');
+                return;
+            }
+            if (state !== 'ready' || runtimeReady) return;
+            runtimeReady = true;
+            setInputReady(true);
+            hideTypingIndicator(true);
+            setConnectionStatus('online', true);
+            showBanner('Connected', 'ok');
+            bannerTimer = setTimeout(() => {
+                bannerTimer = null;
+                if (isCurrent()) hideBanner();
+            }, 800);
+            // Briefly opening a transport (or a crashing CLI) cannot replenish
+            // the retry budget. Only a sustained ready runtime does so.
+            stableTimer = setTimeout(() => {
+                stableTimer = null;
+                if (isCurrent()) reconnectAttempts = 0;
+            }, STABLE_STREAM_MS);
+            if (typeof onConnected === 'function') onConnected();
+        });
+
+        es.addEventListener('close', (event) => {
+            if (!isCurrent()) return;
+            let failed = !runtimeReady;
+            try { failed = failed || JSON.parse(event.data)?.state === 'failed'; } catch (_) { }
+            terminalConnection(failed
+                ? 'Agent startup failed. Reload to retry.'
+                : 'Agent session closed. Reload to reconnect.');
+        });
 
         es.addEventListener('user-message', (event) => {
             try {
@@ -616,8 +690,10 @@ export function createNetwork({
         });
 
         es.addEventListener('interaction-request', (event) => {
+            if (!isCurrent()) return;
             const interaction = parseInteractionPayload(event.data);
             if (!interactionTargetsTab(interaction, TAB_ID, PAGE_INSTANCE_ID)) return;
+            if (interaction && !interaction.targetTaskId) activeInteractionId = interaction.id;
             if (interaction?.targetPageInstanceId === PAGE_INSTANCE_ID) {
                 pendingPageInteractionId = interaction.id;
             }
@@ -627,7 +703,9 @@ export function createNetwork({
         });
 
         es.addEventListener('interaction-resolved', (event) => {
+            if (!isCurrent()) return;
             const resolution = parseInteractionResolutionPayload(event.data);
+            if (resolution?.id === activeInteractionId) activeInteractionId = '';
             if (resolution?.id === pendingPageInteractionId) pendingPageInteractionId = '';
             if (resolution && typeof onInteractionResolved === 'function') {
                 onInteractionResolved(resolution);
@@ -637,11 +715,9 @@ export function createNetwork({
     }
 
     function stop() {
-        // Clear reconnect timer
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-            reconnectTimer = null;
-        }
+        stopped = true;
+        setInputReady(false);
+        clearConnectionTimers();
         reconnectAttempts = 0;
 
         if (!es) {
@@ -655,7 +731,8 @@ export function createNetwork({
         es = null;
     }
 
-    function postEnvelope(payload = {}, { silent = false } = {}) {
+    async function postEnvelope(payload = {}, { silent = false } = {}) {
+        if (!canSendInput()) return false;
         const text = typeof payload.text === 'string' ? payload.text : '';
         const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
         const references = Array.isArray(payload.references) ? payload.references : [];
@@ -673,6 +750,7 @@ export function createNetwork({
 
         if (!silent) markUserInputSent();
 
+        const inputSource = es;
         const send = () => fetchWithBrowserMutationProof(
             agentName,
             toEndpoint(runtimePath(`input?tabId=${encodeURIComponent(TAB_ID)}`)),
@@ -681,15 +759,24 @@ export function createNetwork({
                 headers: { 'Content-Type': 'application/json' },
                 body: `${serialized}\n`,
             },
+            {
+                fetchImpl: (url, options) => {
+                    if (options?.method === 'POST' && (!canSendInput() || es !== inputSource)) {
+                        throw new Error('input_not_ready');
+                    }
+                    return fetch(url, options);
+                },
+            },
         );
         return send().then((response) => {
-            if (response.status === 409) {
-                return new Promise((resolve) => setTimeout(resolve, 250)).then(send);
-            }
+            // Admission conflicts are authoritative, not a timer-based startup
+            // signal. Never retry an input blindly or treat a rejected retry
+            // as accepted; readiness arrives on the current runtime stream.
             if (!response.ok) throw new Error(`input_failed_${response.status}`);
             return response;
         }).catch((error) => {
             dlog('chat error', error);
+            pendingUserPrompt = '';
             if (!silent) pendingVisibleCommand = '';
             if (pendingUploads === 0) {
                 hideTypingIndicator(true);
@@ -700,24 +787,34 @@ export function createNetwork({
         });
     }
 
-    function sendCommand(cmd, options = {}) {
+    async function sendCommand(cmd, options = {}) {
+        if (!canSendInput()) return false;
         const message = typeof cmd === 'string' ? cmd : '';
         const references = Array.isArray(options?.references) ? options.references : [];
-        addClientMsg(message, { references });
-        postEnvelope({ text: message, references });
+        const pendingMessage = addClientMsg(message, { references, pending: true });
+        let accepted = false;
         if (pendingUploads === 0) {
             showTypingIndicator();
         }
-        return true;
+        try {
+            if (!await postEnvelope({ text: message, references })) return false;
+            accepted = true;
+            pendingMessage?.markSent?.();
+            return true;
+        } catch (_) {
+            return false;
+        } finally {
+            if (!accepted) pendingMessage?.remove?.();
+        }
     }
 
     function sendQuickCommand(cmd) {
         const message = typeof cmd === 'string' ? cmd : '';
-        if (!message.trim()) {
+        if (!message.trim() || !canSendInput()) {
             return false;
         }
-        postEnvelope({ text: message }, { silent: true });
-        return true;
+        return postEnvelope({ text: message }, { silent: true })
+            .then((response) => Boolean(response)).catch(() => false);
     }
 
     async function sendQuickCommands(commands) {
@@ -725,19 +822,19 @@ export function createNetwork({
             || commands.some((command) => typeof command !== 'string' || !command.trim())) {
             return false;
         }
-        for (const command of commands) {
-            await postEnvelope({ text: command }, { silent: true });
+        try {
+            for (const command of commands) {
+                if (!await postEnvelope({ text: command }, { silent: true })) return false;
+            }
+            return true;
+        } catch (_) {
+            return false;
         }
-        return true;
     }
 
-    function uploadAttachment(filePayload, caption) {
+    function uploadAttachment(filePayload) {
         const {
             file,
-            previewUrl,
-            revokePreview,
-            previewNeedsRevoke,
-            isImage,
             relativePath,
             destinationPath,
             overwrite,
@@ -745,12 +842,13 @@ export function createNetwork({
         const isFileObject = (typeof File !== 'undefined' && file instanceof File)
             || (file && typeof file.name === 'string' && typeof file.size !== 'undefined');
         if (!isFileObject) {
-            if (typeof caption === 'string' && caption.trim()) {
-                addClientMsg(caption);
-            } else {
-                addServerMsg('[upload error: no file selected]');
-            }
+            addServerMsg('[upload error: no file selected]');
             return Promise.reject(new Error('no file selected'));
+        }
+
+        const selectionKey = filePayload.selectionId || file;
+        if (uploadedSelections.has(selectionKey)) {
+            return Promise.resolve(uploadedSelections.get(selectionKey));
         }
 
         const effectiveRelativePath = typeof relativePath === 'string' && relativePath.trim()
@@ -759,23 +857,6 @@ export function createNetwork({
         const normalizedDestination = typeof destinationPath === 'string'
             ? destinationPath.trim().replace(/^\/+|\/+$/g, '')
             : '';
-        const targetLocalPath = [normalizedDestination, effectiveRelativePath]
-            .filter(Boolean)
-            .join('/');
-
-        let clientAttachment = null;
-        if (typeof addClientAttachment === 'function') {
-            clientAttachment = addClientAttachment({
-                fileName: targetLocalPath || file.name,
-                size: file.size,
-                mime: file.type,
-                previewUrl,
-                isImage,
-                caption,
-            });
-        } else {
-            addClientMsg(caption || effectiveRelativePath || file.name);
-        }
         trackUploadStart();
 
         const uploadUrl = toEndpoint('uploads');
@@ -809,7 +890,6 @@ export function createNetwork({
                 return res.json();
             })
             .then(data => {
-                trackUploadEnd();
                 const localPath = data.localPath || data.workspacePath || data.url || null;
                 if (!localPath) {
                     throw new Error(data.error || 'Invalid upload response');
@@ -819,26 +899,7 @@ export function createNetwork({
                     ? data.downloadUrl
                     : (localPath.startsWith('/') ? localPath : `/${localPath}`);
                 const absoluteUrl = new URL(downloadHref, window.location.origin).href;
-                if (clientAttachment && typeof clientAttachment.markUploaded === 'function') {
-                    clientAttachment.markUploaded({
-                        downloadUrl: absoluteUrl,
-                        size: data.size ?? (Number.isFinite(file.size) ? file.size : null),
-                        mime: data.mime ?? file.type ?? null,
-                        localPath,
-                        id: data.id ?? null,
-                    });
-                    if (isImage && typeof clientAttachment.replacePreview === 'function') {
-                        clientAttachment.replacePreview(absoluteUrl);
-                    }
-                } else {
-                    const linkLabel = displayName || absoluteUrl;
-                    const infoMessageFallback = `File uploaded: [${linkLabel}](${absoluteUrl})`;
-                    addServerMsg(infoMessageFallback);
-                }
-                if (previewNeedsRevoke && typeof revokePreview === 'function') {
-                    revokePreview();
-                }
-                return {
+                const attachment = {
                     id: data.id ?? null,
                     filename: displayName || null,
                     mime: data.mime ?? file.type ?? null,
@@ -848,62 +909,84 @@ export function createNetwork({
                     workspacePath: data.workspacePath ?? null,
                     relativePath: data.relativePath ?? null,
                 };
+                // A successful upload is not yet an accepted chat message.
+                // Retain it with the draft so a rejected input can be retried
+                // without overwriting or uploading the same file again.
+                uploadedSelections.set(selectionKey, attachment);
+                return attachment;
             })
             .catch(error => {
-                trackUploadEnd();
                 dlog('upload error', error);
-                if (clientAttachment && typeof clientAttachment.markFailed === 'function') {
-                    clientAttachment.markFailed(error.message || 'Upload failed');
-                } else {
-                    addServerMsg(`[upload error: ${error.message}]`);
-                }
+                addServerMsg(`[upload error: ${error.message}]`);
                 showBanner('Upload error', 'err');
                 throw error;
-            });
+            }).finally(trackUploadEnd);
     }
 
-    function sendAttachments(fileSelections, caption, options = {}) {
+    async function sendAttachments(fileSelections, caption, options = {}) {
         const selections = Array.isArray(fileSelections) ? fileSelections : [];
         const text = typeof caption === 'string' ? caption : '';
         const references = Array.isArray(options?.references) ? options.references : [];
 
         if (!selections.length) {
-            if (text.trim()) {
-                sendCommand(text, { references });
-            }
-            return;
+            return text.trim() ? sendCommand(text, { references }) : false;
         }
 
-        const uploads = selections.map((selection, index) => uploadAttachment(selection, index === 0 ? text : ''));
-
-        Promise.allSettled(uploads).then((results) => {
-            const attachments = [];
-            let hasSuccess = false;
-
-            results.forEach((result) => {
-                if (result.status === 'fulfilled' && result.value) {
-                    hasSuccess = true;
-                    attachments.push(result.value);
-                }
+        const inputSource = es;
+        const pendingMessages = [];
+        let accepted = false;
+        try {
+            if (!canSendInput()) return false;
+            const results = await Promise.allSettled(selections.map((selection) => uploadAttachment(selection)));
+            if (results.some((result) => result.status !== 'fulfilled')) return false;
+            if (!canSendInput() || es !== inputSource) return false;
+            const attachments = results.map((result) => result.value);
+            attachments.forEach((attachment, index) => {
+                const selection = selections[index];
+                const clientAttachment = addClientAttachment?.({
+                    fileName: attachment.localPath || attachment.filename,
+                    size: attachment.size,
+                    mime: attachment.mime,
+                    previewUrl: attachment.downloadUrl,
+                    isImage: selection.isImage,
+                    caption: index === 0 ? text : '',
+                    pending: true,
+                });
+                pendingMessages.push(clientAttachment || addClientMsg(
+                    index === 0 ? text || attachment.filename : attachment.filename,
+                    { references, pending: true },
+                ));
             });
-
-            const trimmedText = text.trim();
-
-            if (!hasSuccess && !trimmedText) {
-                return;
+            showTypingIndicator();
+            if (!await postEnvelope({ text, attachments, references })) return false;
+            accepted = true;
+            attachments.forEach((attachment, index) => {
+                pendingMessages[index]?.markUploaded?.(attachment);
+                pendingMessages[index]?.markSent?.();
+                const selection = selections[index];
+                uploadedSelections.delete(selection.selectionId || selection.file);
+            });
+            return true;
+        } catch (_) {
+            // Upload and input transports already report their exact error.
+            return false;
+        } finally {
+            if (!accepted) pendingMessages.forEach((message) => message?.remove?.());
+            for (const selection of selections) {
+                if (selection.previewNeedsRevoke) selection.revokePreview?.();
             }
-
-            postEnvelope({ text, attachments, references });
-        }).catch(() => {
-            // Individual upload rejections already handled with UI feedback.
-        });
+        }
     }
 
     function sendControl(controlSeq) {
+        if (!inputReady) return Promise.resolve(false);
         return fetch(toEndpoint(runtimePath(`control?tabId=${encodeURIComponent(TAB_ID)}`)), {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
             body: controlSeq
+        }).then(async (response) => {
+            await response.text();
+            return response;
         }).catch((error) => {
             dlog('control send error', error);
         });

@@ -745,9 +745,14 @@ export function createUploader({
         }
     }
 
-    function clearFiles() {
-        while (selections.length) {
-            const selection = selections.pop();
+    function clearFiles(acceptedSelections = null) {
+        const acceptedIds = Array.isArray(acceptedSelections)
+            ? new Set(acceptedSelections.map((selection) => selection.selectionId))
+            : null;
+        for (let index = selections.length - 1; index >= 0; index -= 1) {
+            const selection = selections[index];
+            if (acceptedIds && !acceptedIds.has(selection)) continue;
+            selections.splice(index, 1);
             if (selection?.domItem && selection.domItem.parentNode === filePreviewContainer) {
                 filePreviewContainer.removeChild(selection.domItem);
             }
@@ -756,8 +761,10 @@ export function createUploader({
         if (folderUploadInput) {
             folderUploadInput.value = '';
         }
-        filePreviewContainer.replaceChildren();
-        filePreviewContainer.classList.remove('show');
+        if (!selections.length) {
+            filePreviewContainer.replaceChildren();
+            filePreviewContainer.classList.remove('show');
+        }
         updatePreviewVisibility();
     }
 
@@ -799,6 +806,7 @@ export function createUploader({
                     }
                 }
                 return {
+                    selectionId: selection,
                     file: selection.file,
                     previewUrl,
                     previewNeedsRevoke: typeof revokePreview === 'function',

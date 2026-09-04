@@ -66,6 +66,8 @@ function agentCliHarness({ noTTY = false, endpointError = null } = {}) {
             },
             loadAgentsMap: () => ({
                 'nested-explorer': {
+                    type: 'agent',
+                    ...record.record,
                     runtime: 'container',
                     containerImage: 'docker.io/assistos/ploinky-node:24-bookworm-tools',
                 },

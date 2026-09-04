@@ -598,7 +598,7 @@ function resolveContainerWorkdir(containerName, workdir, agents) {
     return workdir;
 }
 
-function attachInteractive(containerName, workdir, entryCommand) {
+function attachInteractive(containerName, workdir, entryCommand, options = {}) {
     const runtime = getRuntime();
     // PLOINKY_NO_TTY=1 disables TTY allocation (used by webchat to ensure stdin EOF propagates)
     const allocateTty = process.env.PLOINKY_NO_TTY !== '1';
@@ -607,6 +607,7 @@ function attachInteractive(containerName, workdir, entryCommand) {
         env: process.env,
         historyName: containerName
     });
+    options.onReady?.();
     const result = spawnSync(runtime, execArgs, { stdio: 'inherit' });
     return result.status ?? 0;
 }

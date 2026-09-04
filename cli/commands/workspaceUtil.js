@@ -90,7 +90,9 @@ import {
 } from '../server/utils/agentReadiness.js';
 import {
   createNetworkLifecycleAdapter,
+  NETWORK_LOCK_WAIT_MS,
   withNetworkLifecycleLock,
+  withNetworkLifecycleLockAsync,
 } from '../sandbox/networkLifecycle.js';
 import { networkContractHash } from '../sandbox/networkContract.js';
 import {
@@ -2658,7 +2660,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     activateRuntimeAfterReadiness: activateRuntimeAfterReadinessImpl = activatePreparedRuntimeAfterReadiness,
     loadAgentsMap: loadAgentsMapImpl,
     withMaintenanceLock: withMaintenanceLockImpl = withMaintenanceLock,
-    withNetworkLifecycleLock: withNetworkLifecycleLockImpl = withNetworkLifecycleLock,
+    withNetworkLifecycleLock: withNetworkLifecycleLockImpl = withNetworkLifecycleLockAsync,
     attachInteractive,
     attachBwrapInteractive,
     attachSeatbeltInteractive,
@@ -2670,7 +2672,14 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     error = () => {},
     withSuspendedInput = callback => callback(),
     admitRuntimeManifest = admitDirectAgentRuntimeManifest,
+    notifyCliReady = () => {
+      if (startupControlFd === null) return;
+      // This private launcher pipe is not part of the agent's stdout protocol.
+      fs.writeSync(startupControlFd, JSON.stringify({ version: 1, state: 'ready' }) + '\n');
+    },
   } = dependencies;
+  const startupControlFd = env.PLOINKY_WEBCHAT_STARTUP_FD === '3' ? 3 : null;
+  delete env.PLOINKY_WEBCHAT_STARTUP_FD;
   const suppressLauncherLogs = env.PLOINKY_NO_TTY === '1';
   let registryRecord = null;
   let manifestLookup = agentName;
@@ -2769,27 +2778,31 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
       repo: repoName,
     },
   }, async () => {
-    const refreshedAgents = loadAgentsMapImpl() || {};
-    const initialRefreshedRecord = refreshedAgents[initialContainerName];
-    if (initialRefreshedRecord) {
-      if (initialRefreshedRecord.type === 'agent') {
-        registryRecord = { containerName: initialContainerName, record: initialRefreshedRecord };
-      }
-    } else {
-      const refreshedMatches = Object.entries(refreshedAgents).filter(([, record]) => (
+    const lifecycleResult = await withNetworkLifecycleLockImpl(async (networkLifecycleCapability) => {
+      // A different agent can hold this workspace-wide lock through readiness.
+      // Resolve the current exact target only after that wait, before mutation.
+      const refreshedAgents = loadAgentsMapImpl() || {};
+      const matchesIdentity = (record) => (
         record?.type === 'agent'
         && String(record.repoName || '') === repoName
         && String(record.agentName || '') === shortAgentName
         && String(record.alias || '') === expectedAlias
-      ));
-      if (refreshedMatches.length !== 1) {
-        throw new Error(
-          `CLI startup for '${expectedAlias || shortAgentName}' requires one exact refreshed runtime identity; found ${refreshedMatches.length}.`,
-        );
+      );
+      const initialRefreshedRecord = refreshedAgents[initialContainerName];
+      if (initialRefreshedRecord) {
+        if (!matchesIdentity(initialRefreshedRecord)) {
+          throw new Error(`CLI startup for '${expectedAlias || shortAgentName}' found a changed runtime identity.`);
+        }
+        registryRecord = { containerName: initialContainerName, record: initialRefreshedRecord };
+      } else {
+        const refreshedMatches = Object.entries(refreshedAgents).filter(([, record]) => matchesIdentity(record));
+        if (refreshedMatches.length !== 1) {
+          throw new Error(
+            `CLI startup for '${expectedAlias || shortAgentName}' requires one exact refreshed runtime identity; found ${refreshedMatches.length}.`,
+          );
+        }
+        registryRecord = { containerName: refreshedMatches[0][0], record: refreshedMatches[0][1] };
       }
-      registryRecord = { containerName: refreshedMatches[0][0], record: refreshedMatches[0][1] };
-    }
-    const lifecycleResult = await withNetworkLifecycleLockImpl(async (networkLifecycleCapability) => {
       let result = null;
       try {
         result = ensureAgentService(shortAgentName, manifest, agentDir, {
@@ -2856,6 +2869,10 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
         cleanupFailedPreparedRuntime(result, error);
         throw error;
       }
+    }, {
+      // Interactive starts share the ordinary network acquisition budget, not
+      // the longer background no-wait worker retry policy or readiness budget.
+      waitMs: NETWORK_LOCK_WAIT_MS,
     });
     containerInfo = lifecycleResult.containerInfo;
     containerName = lifecycleResult.containerName;
@@ -2883,17 +2900,17 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     const attach = attachBwrapInteractive
       || (await import('../sandbox/bwrap/bwrapServiceManager.js')).attachBwrapInteractive;
     exitCode = withSuspendedInput(() => {
-      return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
+      return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint, onReady: notifyCliReady });
     });
   } else if (actualRuntime === 'seatbelt') {
     const attach = attachSeatbeltInteractive
       || (await import('../sandbox/seatbelt/seatbeltServiceManager.js')).attachSeatbeltInteractive;
     exitCode = withSuspendedInput(() => {
-      return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint });
+      return attach(shortAgentName, manifest, agentDir, projectPath, cmd, { containerName, routerEndpoint, onReady: notifyCliReady });
     });
   } else {
     exitCode = withSuspendedInput(() => {
-      return attachInteractive(containerName, projectPath, cmd);
+      return attachInteractive(containerName, projectPath, cmd, { onReady: notifyCliReady });
     });
   }
   return Number.isInteger(exitCode) ? exitCode : 0;

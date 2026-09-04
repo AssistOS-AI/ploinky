@@ -188,6 +188,29 @@ test('default install copies the verified image bundle without Git or npm', (t) 
     assert.equal(fs.readFileSync(path.join(installed, 'index.mjs'), 'utf8'), 'export const bundled = true;\n');
 });
 
+test('an AgentLib-only policy update preserves the installed SDK bundle and marker', (t) => {
+    const state = fixture(t);
+    const first = installPinnedDependencies({ ...state, token: 'before-agentlib-update' });
+    assert.equal(first.changed, true);
+    const markerPath = path.join(state.targetRoot, DEPENDENCY_MARKER_NAME);
+    const beforeMarker = fs.readFileSync(markerPath, 'utf8');
+    const updated = structuredClone(state.lock);
+    updated.repositories.achillesAgentLib.commit = 'a'.repeat(40);
+    assert.notEqual(updated.repositories.achillesAgentLib.commit, state.lock.repositories.achillesAgentLib.commit);
+    const second = installPinnedDependencies({ ...state, lock: updated, token: 'after-agentlib-update' });
+    assert.equal(second.changed, false);
+    assert.deepEqual(second.marker, first.marker);
+    assert.equal(fs.readFileSync(markerPath, 'utf8'), beforeMarker);
+    assert.equal(fs.existsSync(path.join(state.targetRoot, 'achillesAgentLib')), false);
+
+    updated.repositories['mcp-sdk'].commit = 'b'.repeat(40);
+    assert.throws(
+        () => installPinnedDependencies({ ...state, lock: updated, token: 'wrong-sdk-bundle' }),
+        /no valid bundled MCP SDK/,
+    );
+    assert.equal(fs.readFileSync(markerPath, 'utf8'), beforeMarker);
+});
+
 test('missing or tampered image bundle fails before cache mutation', (t) => {
     const state = fixture(t);
     const missing = path.join(state.root, 'missing-bundle');

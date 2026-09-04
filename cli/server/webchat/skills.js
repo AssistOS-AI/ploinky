@@ -278,13 +278,13 @@ export function createSkillsController({
         }
     }
 
-    function open() {
+    async function open() {
         if (!skillsDialog) return;
         skillsDialog.hidden = false;
         loading = true;
         folderIntents.clear();
         render();
-        if (!sendQuickCommand?.('/skills')) {
+        if (!await sendQuickCommand?.('/skills')) {
             loading = false;
             showBanner('Unable to load workspace skills.', 'err');
             render();
