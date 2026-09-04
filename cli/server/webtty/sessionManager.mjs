@@ -37,6 +37,24 @@ const AUTH_LEASE_AUDIT_REASONS = new Set([
     'session_changed',
     'administrator_revoked',
 ]);
+const RECLAMATION_PROC_REASONS = new Set(['proc-scan-timeout', 'proc-scan-limit', 'proc-file-limit']);
+const RECLAMATION_IO_REASONS = new Set(['EACCES', 'EPERM', 'EIO', 'EMFILE', 'ENFILE']);
+const RECLAMATION_INTERNAL_REASONS = new Map([
+    ['invalid proc stat', 'invalid-proc-stat'],
+    ['incomplete proc stat', 'incomplete-proc-stat'],
+    ['incomplete proc identity', 'incomplete-proc-identity'],
+    ['proc identity changed while reading', 'process-changed'],
+    ['proc identity changed while enumerating session', 'session-member-changed'],
+    ['session membership evidence is invalid', 'invalid-session-membership'],
+]);
+
+function reclamationAuditReason(error) {
+    if (error?.code === 'WEBTTY_PROCESS_IDENTITY_UNPROVEN'
+        && RECLAMATION_PROC_REASONS.has(error.category)) return error.category;
+    if (RECLAMATION_IO_REASONS.has(error?.code)) return error.code;
+    // Match only fixed internal errors. Never serialize or coerce exception data.
+    return RECLAMATION_INTERNAL_REASONS.get(error?.message) || 'unknown';
+}
 
 export const WEBTTY_SESSION_LIMITS = Object.freeze({
     global: 12,
@@ -1102,6 +1120,12 @@ export class WebttySessionManager {
             } catch (error) {
                 cleanupProven = false;
                 cleanupFailureCategory = 'terminal_reclamation_check_failed';
+                try {
+                    Promise.resolve(this.audit('webtty_reclamation_check_failed', {
+                        targetKind: session.target.kind === 'agent' ? 'agent' : 'box',
+                        reason: reclamationAuditReason(error),
+                    })).catch(() => {});
+                } catch (_) { }
                 if (session.target.kind === 'agent') {
                     cleanupFailureScope = classifyAgentEvidenceFailure(error);
                     if (cleanupFailureScope === 'provider') {

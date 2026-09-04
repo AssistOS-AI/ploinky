@@ -995,6 +995,79 @@ test('abrupt worker exit preserves evidence and disables WebTTY when session cle
     assert.equal(store.calls.removed, 0);
 });
 
+test('reclamation exceptions retain a bounded reason without weakening failed cleanup', async (t) => {
+    const sensitive = 'private-token-and-workspace-path';
+    const cases = [
+        [{ code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN', category: 'proc-scan-timeout' }, 'proc-scan-timeout'],
+        [{ code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN', category: 'proc-scan-limit' }, 'proc-scan-limit'],
+        [{ code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN', category: 'proc-file-limit' }, 'proc-file-limit'],
+        [{ code: 'EACCES' }, 'EACCES'],
+        [{ code: 'EPERM' }, 'EPERM'],
+        [{ code: 'EIO' }, 'EIO'],
+        [{ code: 'EMFILE' }, 'EMFILE'],
+        [{ code: 'ENFILE' }, 'ENFILE'],
+        [{ message: 'invalid proc stat' }, 'invalid-proc-stat'],
+        [{ message: 'incomplete proc stat' }, 'incomplete-proc-stat'],
+        [{ message: 'incomplete proc identity' }, 'incomplete-proc-identity'],
+        [{ message: 'proc identity changed while reading' }, 'process-changed'],
+        [{ message: 'proc identity changed while enumerating session' }, 'session-member-changed'],
+        [{ message: 'session membership evidence is invalid' }, 'invalid-session-membership'],
+        [{ code: sensitive, category: sensitive, message: sensitive }, 'unknown'],
+        [{ code: 'WEBTTY_PROCESS_IDENTITY_UNPROVEN', category: sensitive }, 'unknown'],
+        [{ code: { toString() { throw new Error(sensitive); } }, message: Symbol(sensitive) }, 'unknown'],
+    ];
+    for (const [fields, reason] of cases) {
+        await t.test(reason, async (t2) => {
+            const store = recordStore();
+            store.confirmReclaimed = async () => { throw Object.assign(new Error(sensitive), fields); };
+            const events = [];
+            const manager = await createManager(t2, {
+                recordStore: store,
+                audit: (event, details) => events.push({ event, details }),
+            });
+            const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24 });
+            await manager.closeSession(created.id, 'requested');
+            await manager.closeSession(created.id, 'requested');
+            assert.deepEqual(events.filter(entry => entry.event === 'webtty_reclamation_check_failed'), [{
+                event: 'webtty_reclamation_check_failed',
+                details: { targetKind: 'box', reason },
+            }]);
+            assert.equal(JSON.stringify(events).includes(sensitive), false);
+            assert.equal(manager.activeCount(), 0);
+            assert.deepEqual(manager.availability(), { ok: false, category: 'terminal_reclamation_check_failed' });
+            assert.equal(store.calls.removed, 0);
+            await assert.rejects(manager.discoverTargets({ req: {}, routePlan: routePlan(), directory: '' }), {
+                code: 'WEBTTY_UNAVAILABLE',
+            });
+        });
+    }
+});
+
+test('reclamation auditing cannot throw, reject, or delay failed cleanup and quota release', async (t) => {
+    for (const mode of ['throw', 'reject', 'pending']) {
+        await t.test(mode, async (t2) => {
+            const store = recordStore();
+            store.confirmReclaimed = async () => { throw new Error('incomplete proc stat'); };
+            const manager = await createManager(t2, {
+                recordStore: store,
+                audit: (event) => {
+                    if (event !== 'webtty_reclamation_check_failed') return;
+                    if (mode === 'throw') throw new Error('audit unavailable');
+                    if (mode === 'reject') return Promise.reject(new Error('audit unavailable'));
+                    return new Promise(() => {});
+                },
+            });
+            const created = await manager.create({ req: {}, routePlan: routePlan(), cwdRelative: '', cols: 80, rows: 24 });
+            await manager.closeSession(created.id, 'requested');
+            assert.deepEqual(manager.availability(), { ok: false, category: 'terminal_reclamation_check_failed' });
+            assert.equal(manager.activeCount(), 0);
+            assert.equal(manager.userCounts.size, 0);
+            assert.equal(manager.authCounts.size, 0);
+            assert.equal(store.calls.removed, 0);
+        });
+    }
+});
+
 test('unconfirmed worker exit and recovery-record removal failures fail WebTTY closed', async (t) => {
     const cases = [
         {

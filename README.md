@@ -148,6 +148,15 @@ fingerprints, or raw authentication data are included. These categories identify
 the rejecting check, not necessarily its underlying cause, and do not change
 authentication responses or startup cleanup.
 
+An exception while confirming terminal reclamation emits a server-only
+`webtty_reclamation_check_failed` audit entry containing only the target kind
+(`box` or `agent`) and a fixed reason. Known reasons distinguish bounded proc
+scan/file limits, access or I/O failures, malformed process evidence, and
+identity changes; all other exceptions become `unknown`. Raw exceptions and
+process or session identifiers are never included. Audit failures cannot delay
+cleanup or change its result. This event identifies a failed check; it does not
+prove the underlying cause or relax fail-closed cleanup and record retention.
+
 WebTTY records exact Box or agent process evidence in the transient
 `/run/ploinky/webtty` recovery directory using the v2 target-discriminated
 schema. Startup recovery runs before the surface becomes available. Ambiguity
