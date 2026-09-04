@@ -147,13 +147,12 @@ workspace exists. Every create and recreate emits exactly:
 
 ```text
 127.0.0.1:<selected-host-port>:8080/tcp
-0.0.0.0:<selected-media-host-port>:<selected-media-host-port>/udp
+0.0.0.0:<selected-media-host-port>:7882/udp
 ```
 
-`--port` changes only `<selected-host-port>`; `--udp-port` selects the same media
-UDP port on the physical host and inside the Box. They default to `8080` and
-`7882`, respectively. The in-Box Router target remains fixed on `8080` while LiveKit
-binds the selected media port. Outer `--publish`, `--expose`, and
+`--port` changes only `<selected-host-port>` and `--udp-port` changes only
+`<selected-media-host-port>`; they default to `8080` and `7882`, respectively.
+The in-Box Router and LiveKit targets remain fixed. Outer `--publish`, `--expose`, and
 `--listen-lan` fail before engine discovery. No workspace, graph, profile,
 manifest, readiness result, environment value, label, CLI escape hatch, or
 persisted state can add a third physical-host mapping. A pre-existing owner of
