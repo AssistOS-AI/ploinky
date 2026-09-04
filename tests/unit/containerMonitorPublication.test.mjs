@@ -4,7 +4,33 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { performContainerRestart } from '../../cli/server/containerMonitor.js';
+// The monitor reads workspace locks and the edge selector even when runtime
+// launch/publication are mocked. Bind those real reads to an isolated workspace
+// before importing modules that capture workspace paths.
+const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-publication-'));
+const previousRoot = process.env.PLOINKY_WORKSPACE_ROOT;
+process.env.PLOINKY_WORKSPACE_ROOT = workspace;
+const { performContainerRestart } = await import('../../cli/server/containerMonitor.js');
+const {
+    inactivateEdgeRoutingGeneration,
+    readEdgeRoutingSelection,
+    resolveEdgeGenerationPaths,
+} = await import('../../cli/sandbox/edgeGeneration.js');
+
+test.beforeEach(() => {
+    // Same-name replacement fixtures start with authorization revoked. Use the
+    // real writer/reader contract, including the selector integrity digest.
+    inactivateEdgeRoutingGeneration('monitor-publication-fixture', { workspaceRoot: workspace });
+    const selection = readEdgeRoutingSelection();
+    assert.equal(selection.paths.root, workspace);
+    assert.equal(selection.selector.state, 'inactive');
+});
+
+test.after(() => {
+    if (previousRoot === undefined) delete process.env.PLOINKY_WORKSPACE_ROOT;
+    else process.env.PLOINKY_WORKSPACE_ROOT = previousRoot;
+    fs.rmSync(workspace, { recursive: true, force: true });
+});
 
 function restartTarget(manifestPath, overrides = {}) {
     return {
@@ -128,11 +154,69 @@ test('monitor resolves the router endpoint under the workspace mutation lease', 
     }
 });
 
-test('monitor rejects manifest bytes changed during ensure before readiness or activation', async () => {
+for (const corruption of ['missing', 'malformed', 'tampered']) {
+test(`monitor rejects a ${corruption} selector before runtime mutation and releases its workspace lease`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-selector-'));
+    try {
+        const manifestPath = path.join(root, 'manifest.json');
+        fs.writeFileSync(manifestPath, '{}');
+        const { activeSelectorFile } = resolveEdgeGenerationPaths({ workspaceRoot: workspace });
+        if (corruption === 'missing') fs.unlinkSync(activeSelectorFile);
+        else if (corruption === 'malformed') fs.writeFileSync(activeSelectorFile, '{');
+        else {
+            const selector = JSON.parse(fs.readFileSync(activeSelectorFile, 'utf8'));
+            selector.reason = 'changed-without-updating-the-digest';
+            fs.writeFileSync(activeSelectorFile, JSON.stringify(selector));
+        }
+        const selectorBytes = fs.existsSync(activeSelectorFile) ? fs.readFileSync(activeSelectorFile) : null;
+        const events = [];
+        const lease = Object.freeze({ token: 'workspace' });
+        const monitor = {
+            targets: new Map(),
+            isShuttingDown: () => false,
+            log(_level, event) { events.push(event); },
+            createWorkspaceMutationLease() { events.push('workspace-lease'); return lease; },
+            releaseWorkspaceMutationLease(received) {
+                assert.equal(received, lease);
+                events.push('workspace-release');
+            },
+            resolveRouterEndpoint: () => Object.freeze({
+                mode: 'default', host: 'host.containers.internal', port: 8080,
+                url: 'http://host.containers.internal:8080',
+            }),
+            ensureAgentService() { assert.fail('an invalid selector must prevent runtime ensure'); },
+            saveAgents() { assert.fail('an invalid selector must prevent registry publication'); },
+            mergeRoutingConfig() { assert.fail('an invalid selector must prevent route publication'); },
+            applyEdgeRoutingGeneration() { assert.fail('an invalid selector must prevent activation'); },
+            abortEdgeRoutingPreparation() { assert.fail('no preparation exists to abort'); },
+            cleanupExactAgentRuntimeCandidate() { assert.fail('no runtime candidate exists to clean'); },
+        };
+        const target = restartTarget(manifestPath);
+
+        await assert.rejects(performContainerRestart(monitor, target, 'not_running'), {
+            code: 'EDGE_GENERATION_CORRUPT',
+            message: 'edge routing selector is missing or corrupt',
+        });
+
+        assert.deepEqual(events, ['workspace-lease', 'container_restart_failed', 'workspace-release']);
+        assert.equal(target.isRestarting, false);
+        assert.equal(target.lastError, 'edge routing selector is missing or corrupt');
+        assert.deepEqual(fs.existsSync(activeSelectorFile) ? fs.readFileSync(activeSelectorFile) : null, selectorBytes);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+}
+
+for (const checkpoint of ['ensure', 'readiness']) {
+test(`monitor rejects manifest bytes changed during ${checkpoint} before ${checkpoint === 'ensure' ? 'readiness or activation' : 'activation'}`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-manifest-race-'));
     try {
         const manifestPath = path.join(root, 'manifest.json');
-        fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'none' }, profile: 'before' }));
+        fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'mcp' }, profile: 'before' }));
+        const changeManifest = () => fs.writeFileSync(manifestPath, JSON.stringify({
+            readiness: { protocol: 'mcp' }, profile: 'after',
+        }));
         const result = preparedRestartResult();
         const events = [];
         const monitor = {
@@ -150,10 +234,15 @@ test('monitor rejects manifest bytes changed during ensure before readiness or a
             }),
             ensureAgentService() {
                 events.push('ensure');
-                fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'none' }, profile: 'after' }));
+                if (checkpoint === 'ensure') changeManifest();
                 return result;
             },
-            waitForAgentReady() { assert.fail('changed launch input must fail before readiness'); },
+            waitForAgentReady() {
+                assert.equal(checkpoint, 'readiness', 'changed launch input must fail before readiness');
+                events.push('readiness');
+                changeManifest();
+                return true;
+            },
             mergeRoutingConfig() { assert.fail('changed launch input must not mutate routes'); },
             applyEdgeRoutingGeneration() { assert.fail('changed launch input must not activate'); },
             abortEdgeRoutingPreparation(lease) {
@@ -171,16 +260,20 @@ test('monitor rejects manifest bytes changed during ensure before readiness or a
             performContainerRestart(monitor, target, 'manifest-race'),
             { code: 'PLOINKY_RESTART_MANIFEST_CHANGED' },
         );
-        assert.deepEqual(events.slice(0, 3), [
+        assert.deepEqual(events, [
             'ensure',
+            ...(checkpoint === 'readiness' ? ['readiness'] : []),
             'preparation-abort',
             'candidate-cleanup:agent_container',
+            'container_restart_failed',
+            'workspace-release',
         ]);
         assert.equal(events.includes('container_restart_success'), false);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
+}
 
 for (const scenario of [
     { name: 'default budget', manifest: {}, config: {}, timeoutMs: 120000, intervalMs: 250, probeTimeoutMs: 1000 },
@@ -224,7 +317,11 @@ test(`monitor waits for exact semantic readiness before committing the returned 
                 port: 8080,
                 url: 'http://host.containers.internal:8080',
             }),
-            ensureAgentService() { events.push('ensure'); return result; },
+            ensureAgentService(_agent, _manifest, _dir, options) {
+                assert.equal(options.preserveActiveAuthorization, false);
+                events.push('ensure');
+                return result;
+            },
             async waitForAgentReady(route, options) {
                 events.push('readiness-start');
                 assert.deepEqual(route, { hostPort: 43123 });
@@ -255,6 +352,7 @@ test(`monitor waits for exact semantic readiness before committing the returned 
                 events.push('generation-apply');
                 assert.equal(options.preparationLease, result.preparationLease);
                 assert.equal(options.reason, 'watchdog-runtime-ready:demo');
+                options.testHooks.beforeSelectorCommit();
                 return { selector: { state: 'active' } };
             },
             abortEdgeRoutingPreparation() {
@@ -269,6 +367,7 @@ test(`monitor waits for exact semantic readiness before committing the returned 
 
         const pending = performContainerRestart(monitor, target, 'not_running');
         await nextTurn();
+        assert.equal(events.includes('readiness-start'), true);
         assert.equal(events.includes('registry-save'), false);
         assert.equal(events.includes('route-merge-start'), false);
         assert.equal(events.includes('generation-apply'), false);
@@ -296,7 +395,12 @@ test(`monitor waits for exact semantic readiness before committing the returned 
 });
 }
 
-test('monitor rejects staged registry metadata drift before committing the runtime candidate', async () => {
+for (const drift of [
+    { name: 'metadata', values: { projectPath: '/changed-after-launch' } },
+    { name: 'instance', values: { instanceId: 'external-instance' } },
+    { name: 'generation', values: { enableGeneration: 'external-generation' } },
+]) {
+test(`monitor rejects staged registry ${drift.name} drift before committing the runtime candidate`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-staged-drift-'));
     try {
         const manifestPath = path.join(root, 'manifest.json');
@@ -320,7 +424,7 @@ test('monitor rejects staged registry metadata drift before committing the runti
             loadAgents: () => ({
                 agent_container: {
                     ...structuredClone(result.stagedRegistryRecord),
-                    projectPath: '/changed-after-launch',
+                    ...drift.values,
                 },
             }),
             saveAgents() { assert.fail('drifted staged registry must not be overwritten'); },
@@ -355,6 +459,7 @@ test('monitor rejects staged registry metadata drift before committing the runti
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
+}
 
 test('monitor readiness failure aborts the exact preparation, applies no route, and propagates without success', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-ready-fail-'));
