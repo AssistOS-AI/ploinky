@@ -136,7 +136,7 @@ async function initializeSession(port) {
     return sessionId;
 }
 
-function mintRouterRequest({ secret, audience, tool, args = {}, method = 'POST', reqPath = '/mcp' }) {
+function mintRouterRequest({ secret, audience, tool, args = {}, method = 'POST', reqPath = '/mcp', actor = { kind: 'user', id: 'user:test', roles: ['user'] } }) {
     const now = Math.floor(Date.now() / 1000);
     const rch = computeRchTool({ method, path: reqPath, tool, arguments: args });
     return signHmacJwt({
@@ -145,8 +145,8 @@ function mintRouterRequest({ secret, audience, tool, args = {}, method = 'POST',
             typ: 'router-request',
             iss: 'ploinky-router',
             aud: audience,
-            sub: 'user:test',
-            actor: { kind: 'user', id: 'user:test', roles: ['user'] },
+            sub: actor.id,
+            actor,
             method,
             path: reqPath,
             tool,
@@ -157,6 +157,78 @@ function mintRouterRequest({ secret, audience, tool, args = {}, method = 'POST',
         }
     });
 }
+
+test('AgentServer shares only schemas across concurrent sessions and verifies every actor and replay independently', async t => {
+    const tmp = await createTempDir(t);
+    const configPath = path.join(tmp, 'mcp-config.json');
+    const toolScript = path.join(tmp, 'echo-actor.mjs');
+    const invocations = path.join(tmp, 'verified-invocations.jsonl');
+    await fs.writeFile(toolScript, [
+        "import fs from 'node:fs';",
+        "let text = ''; for await (const chunk of process.stdin) text += chunk;",
+        "const { input, metadata } = JSON.parse(text);",
+        "await new Promise(resolve => setTimeout(resolve, 20));",
+        "const result = { input, actor: metadata.invocation.actor };",
+        `fs.appendFileSync(${JSON.stringify(invocations)}, JSON.stringify(result) + '\\n');`,
+        "console.log(JSON.stringify(result));",
+    ].join('\n'));
+    const inputSchema = { label: { type: 'string' } };
+    await fs.writeFile(configPath, JSON.stringify({ tools: [{
+        name: 'actor', command: process.execPath, args: [toolScript], cwd: tmp, inputSchema,
+    }] }));
+    const secret = crypto.randomBytes(32);
+    const audience = 'agent:schema-actor-test';
+    const { port } = await startAgentServer(t, { tmp, configPath, env: {
+        PLOINKY_AGENT_SECRET: secret.toString('hex'), PLOINKY_AGENT_ID: audience,
+    } });
+    const sessions = await Promise.all(Array.from({ length: 3 }, () => initializeSession(port)));
+    assert.equal(new Set(sessions).size, 3, 'each initialization retains an independent session');
+    const actors = [
+        { kind: 'user', id: 'user:alice', roles: ['admin'] },
+        { kind: 'user', id: 'user:bob', roles: ['user'] },
+    ];
+    let id = 0;
+    const call = (sessionId, args, token) => mcpPost(port, {
+        jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name: 'actor', arguments: args },
+    }, { sessionId, ...(token ? { authorization: `Bearer ${token}` } : {}) });
+    let replayToken;
+    let replayArgs;
+    const expected = [];
+    for (let round = 0; round < 3; round += 1) {
+        const calls = actors.map(async (actor, index) => {
+            const args = { label: `round-${round}-${index}` };
+            const token = mintRouterRequest({ secret, audience, tool: 'actor', args, actor });
+            if (round === 0 && index === 0) { replayToken = token; replayArgs = args; }
+            const result = await call(sessions[(round + index) % sessions.length], args, token);
+            assert.equal(result.json?.result?.isError, undefined, result.text);
+            assert.equal(result.json?.error, undefined, result.text);
+            const verified = JSON.parse(result.json.result.content[0].text);
+            assert.deepEqual(verified, { input: args, actor });
+            expected.push(verified);
+        });
+        await Promise.all(calls);
+    }
+    const replayed = await call(sessions[2], replayArgs, replayToken);
+    assert.equal(replayed.json.result.isError, true, replayed.text);
+    assert.match(replayed.json.result.content[0].text, /Invocation rejected/);
+    const unsigned = await call(sessions[0], { label: 'unsigned' });
+    assert.equal(unsigned.json.result.isError, true, unsigned.text);
+    assert.match(unsigned.json.result.content[0].text, /missing secure wire headers/);
+    const signedArgs = { label: 'signed' };
+    const token = mintRouterRequest({ secret, audience, tool: 'actor', args: signedArgs, actor: actors[1] });
+    const tampered = await call(sessions[1], { label: 'tampered' }, token);
+    assert.equal(tampered.json.result.isError, true, tampered.text);
+    assert.match(tampered.json.result.content[0].text, /Invocation rejected/);
+    const invalidArgs = { label: 42 };
+    const invalid = await call(sessions[2], invalidArgs, mintRouterRequest({ secret, audience, tool: 'actor', args: invalidArgs, actor: actors[0] }));
+    assert.equal(invalid.json.error?.code, -32602, invalid.text);
+    const listed = await mcpPost(port, { jsonrpc: '2.0', id: ++id, method: 'tools/list' }, { sessionId: sessions[2] });
+    assert.equal(listed.json.result.tools[0].inputSchema.properties.label.type, 'string');
+    assert.deepEqual(listed.json.result.tools[0].inputSchema.required, ['label']);
+    const executed = (await fs.readFile(invocations, 'utf8')).trim().split('\n').map(JSON.parse);
+    const byLabel = (left, right) => left.input.label.localeCompare(right.input.label);
+    assert.deepEqual(executed.sort(byLabel), expected.sort(byLabel), 'rejected calls must never dispatch');
+});
 
 test('AgentServer routes DELETE /mcp to the active SDK transport', async (t) => {
     const tmp = await createTempDir(t);
