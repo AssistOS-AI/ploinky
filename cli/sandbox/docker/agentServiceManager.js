@@ -3061,6 +3061,21 @@ export function resolveReplacementRuntimeIdentity({
     return mintReplacementRuntimeIdentity({}, uuid);
 }
 
+export function assertAgentServiceNotDraining(containerName, {
+    targetedRestart = false,
+    loadRouting = readRoutingConfig,
+} = {}) {
+    if (targetedRestart) return;
+    const draining = Object.values(loadRouting()?.routes || {}).some((route) => (
+        route?.container === containerName && route.draining === true
+    ));
+    if (draining) {
+        const error = new Error(`agent '${containerName}' still requires an acknowledged targeted drain; automatic replacement is blocked`);
+        error.code = 'PLOINKY_AGENT_DRAINING';
+        throw error;
+    }
+}
+
 function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     if (!options || typeof options !== 'object'
         || !Object.prototype.hasOwnProperty.call(options, 'routerEndpoint')
@@ -3176,6 +3191,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
 
     const repoName = path.basename(path.dirname(agentPath));
     const containerName = containerOverride || getAgentContainerName(agentName, repoName);
+    assertAgentServiceNotDraining(containerName, { targetedRestart: Boolean(targetedRestart) });
     const snapshot = loadAgentsMap();
     const existingRecord = snapshot[containerName] || {};
     const preservePreparedRegistryRecord = assertPreparedRegistryRecordPreservation(
