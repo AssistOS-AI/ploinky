@@ -14,6 +14,7 @@ import { computeRchTool } from '../../Agent/lib/requestHash.mjs';
 
 const REPO_ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
 const AGENT_SERVER = path.join(REPO_ROOT, 'Agent/server/AgentServer.mjs');
+const fixtureServers = new Map();
 
 function isolatedAgentServerEnv() {
     const env = { ...process.env };
@@ -32,6 +33,25 @@ function isolatedAgentServerEnv() {
 async function createTempDir(t) {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-server-session-'));
     t.after(async () => {
+        for (const child of fixtureServers.get(tmp) || []) {
+            if (child.exitCode !== null || child.signalCode !== null) continue;
+            const exited = once(child, 'exit');
+            let timer;
+            child.kill('SIGTERM');
+            try {
+                await Promise.race([
+                    exited,
+                    new Promise((resolve) => { timer = setTimeout(resolve, 5000); }),
+                ]);
+                if (child.exitCode === null && child.signalCode === null) {
+                    child.kill('SIGKILL');
+                    await exited;
+                }
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+        fixtureServers.delete(tmp);
         await fs.rm(tmp, { recursive: true, force: true });
     });
     return tmp;
@@ -78,15 +98,8 @@ async function startAgentServer(t, { tmp, cwd = tmp, configPath, env = {} }) {
     child.stdout.on('data', chunk => { output += chunk.toString('utf8'); });
     child.stderr.on('data', chunk => { output += chunk.toString('utf8'); });
 
-    t.after(async () => {
-        if (child.exitCode === null && child.signalCode === null) {
-            child.kill('SIGTERM');
-            await Promise.race([
-                once(child, 'exit'),
-                new Promise((resolve) => setTimeout(resolve, 1000))
-            ]);
-        }
-    });
+    if (!fixtureServers.has(tmp)) fixtureServers.set(tmp, []);
+    fixtureServers.get(tmp).push(child);
 
     await waitForHealth(port, () => output);
     return { child, port, output: () => output };
@@ -606,6 +619,7 @@ test('AgentServer cancels an asynchronous task only with a matching Router Reque
         headers: { 'content-type': 'application/json' },
         body
     });
+    await unauthenticated.arrayBuffer();
     assert.equal(unauthenticated.status, 401);
 
     const token = mintRouterRequest({
