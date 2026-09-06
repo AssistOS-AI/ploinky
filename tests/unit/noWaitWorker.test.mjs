@@ -445,6 +445,51 @@ test('a transient malformed status recovers on the next valid read', async (t) =
     assert.deepEqual(status, { state: 'running' });
 });
 
+test('a published status temporarily missing after startup retains a bounded read window', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = 1_700_000_000_000;
+    let now = runStartedAtMs + 120_000;
+    const target = publishRunScoped(runningDir, 'republished', { runStartedAtMs, waveIndex: 0 });
+    let sleeps = 0;
+    const status = await waitForRunScopedStatus(
+        barrierEntry(runningDir, 'republished', { waveIndex: 0 }),
+        {
+            runningDir, expectedRunId: RUN_ID, runStartedAtMs, timeouts: FAST_TIMEOUTS,
+            nowFn: () => now,
+            pollIntervalMs: 10,
+            sleepFn: async (ms) => {
+                now += ms;
+                if (++sleeps === 1) fs.unlinkSync(target);
+                else publishRunScoped(runningDir, 'republished', { runStartedAtMs, waveIndex: 0, state: 'running' });
+            },
+        },
+    );
+    assert.deepEqual(status, { state: 'running' });
+    assert.equal(sleeps, 2);
+});
+
+test('a disappeared status cannot extend its read window by alternating missing and malformed reads', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = 1_700_000_000_000;
+    let now = runStartedAtMs + 120_000;
+    const target = publishRunScoped(runningDir, 'disappeared', { runStartedAtMs, waveIndex: 0 });
+    let sleeps = 0;
+    await assert.rejects(() => waitForRunScopedStatus(
+        barrierEntry(runningDir, 'disappeared', { waveIndex: 0 }),
+        {
+            runningDir, expectedRunId: RUN_ID, runStartedAtMs, timeouts: FAST_TIMEOUTS,
+            nowFn: () => now,
+            pollIntervalMs: 10,
+            sleepFn: async (ms) => {
+                now += ms;
+                if (++sleeps % 2) fs.unlinkSync(target);
+                else fs.writeFileSync(target, '{');
+            },
+        },
+    ), /remained unreadable after bounded retries/);
+    assert.equal(now, runStartedAtMs + 120_010 + FAST_TIMEOUTS.readRetryTimeoutMs);
+});
+
 test('a persistently malformed status fails closed after its bounded retry window', async (t) => {
     const { runningDir } = fixture(t);
     const runStartedAtMs = Date.now();

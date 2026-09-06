@@ -318,16 +318,20 @@ export async function waitForRunScopedStatus(entry, {
     let readFaultStartedAtMs = null;
     let lastReadFault = null;
     let workerExitObservedAtMs = null;
+    let hasObservedStatus = false;
 
     while (true) {
         const nowMs = nowFn();
         let deadline = publicationDeadline;
         const readResult = readSequenceStatus(target.path);
-        if (readResult.readFault) {
+        if (readResult.readFault
+            || (readResult.missing && (hasObservedStatus || readFaultStartedAtMs !== null))) {
             // Malformed JSON and transient filesystem faults share one bounded
-            // retry window. Persisting past it is a rejected barrier outcome.
+            // retry window. Once published, a briefly absent status is also a
+            // read fault, not a return to the original publication deadline.
+            // Alternating absent and malformed reads must not reset the window.
             if (readFaultStartedAtMs === null) readFaultStartedAtMs = nowMs;
-            lastReadFault = readResult.readFault;
+            lastReadFault = readResult.readFault || new Error('previously observed status is missing');
             deadline = readFaultStartedAtMs + timeouts.readRetryTimeoutMs;
         } else {
             readFaultStartedAtMs = null;
@@ -347,6 +351,7 @@ export async function waitForRunScopedStatus(entry, {
                         `no-wait barrier status '${statusLabel}' is invalid: ${error?.message || error}`,
                     );
                 }
+                hasObservedStatus = true;
                 if (observation.terminal) {
                     return Object.freeze({ state: observation.terminal });
                 }
