@@ -17,8 +17,10 @@ import {
     observeNoWaitAgentRecord,
 } from '../noWaitAgentStartupState.js';
 import { collectAgentsSummary } from '../../utils/status.js';
-import { isLocalAdminUser } from '../auth/localService.js';
-import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
+import { getSession as getLocalSession, isLocalAdminUser } from '../auth/localService.js';
+import { canonicalControlOrigin, verifyAdminMutationRequest } from '../adminControlSecurity.js';
+import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
+import { resolveAuthContextForRouteKey } from './authContext.js';
 import { computeRchHttp, sha256RawBodyHash } from '../../../Agent/lib/requestHash.mjs';
 import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
@@ -32,6 +34,7 @@ export const MARKETPLACE_ENABLE_TOOL = 'marketplace.enable_agent';
 const marketplaceAssertionReplayCache = createTokenReplayCache({ maxSize: 4096 });
 
 const SAFE_LIFECYCLE_ERRORS = new Map([
+    ['EDGE_GENERATION_CHANGED', { status: 503, message: 'The routing generation changed. Refresh Marketplace before retrying.' }],
     ['PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED', { status: 422, message: 'The requested runtime capability is unavailable in Ploinky Box.' }],
     ['PLOINKY_MANIFEST_SECURITY_INVALID', { status: 422, message: 'The agent manifest contains invalid runtime security settings.' }],
     ['PLOINKY_MANIFEST_SECURITY_PROFILE_UNSUPPORTED', { status: 422, message: 'Runtime security settings are only supported at the manifest root.' }],
@@ -201,13 +204,17 @@ function enqueueMarketplaceEnable(agentRef, mode, runEnableWorker) {
 export async function enableMarketplaceAgent(body, {
     enable,
     runEnableWorker = runMarketplaceEnableWorker,
+    beforeEnable = () => {},
 } = {}) {
     const ref = normalizeMarketplaceAgentRef(body?.agentRef);
     const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
     const repoName = ref.split('/')[0];
     const result = typeof enable === 'function'
         ? await enable(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined)
-        : await enqueueMarketplaceEnable(ref, mode, runEnableWorker);
+        : await enqueueMarketplaceEnable(ref, mode, async (options) => {
+            beforeEnable();
+            return runEnableWorker(options);
+        });
     return { ref, mode, result };
 }
 
@@ -406,8 +413,20 @@ function buildMarketplaceState(user = null, options = {}) {
     };
 }
 
-async function ensureMarketplaceAdmin(req, res, parsedUrl) {
-    const authResult = await ensureMarketplaceUser(req, res);
+function publicMarketplaceAuthContext(routePlan) {
+    const routeKey = String(routePlan?.hostSelection?.record?.routeKey || '').trim();
+    const snapshot = routePlan?.snapshot || routePlan?.lease?.snapshot;
+    if (routePlan?.ok !== true || routePlan.kind !== 'router-surface'
+        || routePlan.surface !== 'marketplace-ui' || routePlan.listener !== 'public'
+        || routePlan.hostSelection?.kind !== 'agent-root' || !routeKey
+        || !snapshot || typeof routePlan.lease?.commit !== 'function') return null;
+    const context = resolveAuthContextForRouteKey(routeKey, { snapshot });
+    if (context.mode !== 'local' || !context.policy?.usersVar) return null;
+    return { ...context, boundHostRouteKey: routeKey, mutationRouteKey: `marketplace:${routeKey}` };
+}
+
+async function ensureMarketplaceAdmin(req, res, parsedUrl, { routePlan = null } = {}) {
+    const authResult = await ensureMarketplaceUser(req, res, { routePlan });
     if (!authResult.ok) return false;
     if (!isLocalAdminUser(req.user)) {
         sendMarketplaceError(res, 403, 'admin_required', 'Administrator access is required.');
@@ -416,9 +435,23 @@ async function ensureMarketplaceAdmin(req, res, parsedUrl) {
     return true;
 }
 
-async function ensureMarketplaceUser(req, res) {
+async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
     const cookies = parseCookies(req);
     const localSessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME);
+    if (routePlan?.hostSelection?.kind === 'agent-root') {
+        const context = publicMarketplaceAuthContext(routePlan);
+        const session = context && localSessionId
+            ? getLocalSession(localSessionId, { policy: context.policy }) : null;
+        if (!session?.user) {
+            sendMarketplaceError(res, 401, 'not_authenticated', 'Authentication is required for this workspace.');
+            return { ok: false };
+        }
+        req.user = session.user;
+        req.session = session;
+        req.sessionId = localSessionId;
+        req.authMode = 'local';
+        return { ok: true, session };
+    }
     if (localSessionId) {
         const session = await sessionTokenService.getUserSession(localSessionId);
         if (session?.user) {
@@ -449,10 +482,23 @@ async function ensureMarketplaceUser(req, res) {
 export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     routePlan = null,
     ensureAdmin = ensureMarketplaceAdmin,
-    enableAgentAction = enableMarketplaceAgent,
+    enableAgentAction = (body) => enableMarketplaceAgent(body, {
+        beforeEnable: () => {
+            if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+                const error = new Error('The routing generation changed before agent activation.');
+                error.code = 'EDGE_GENERATION_CHANGED';
+                throw error;
+            }
+        },
+    }),
 } = {}) {
     const route = parseMarketplacePath(parsedUrl.pathname || '/');
     if (!route) return false;
+
+    if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
+        sendMarketplaceError(res, 503, 'edge_generation_changed');
+        return true;
+    }
 
     const method = (req.method || 'GET').toUpperCase();
     if (method === 'GET' && !route.resource) {
@@ -463,12 +509,18 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
                 tool: MARKETPLACE_READ_TOOL,
             })) return true;
         } else {
-            const authResult = await ensureMarketplaceUser(req, res);
+            const authResult = await ensureMarketplaceUser(req, res, { routePlan });
             if (!authResult.ok) return true;
         }
         sendJson(res, 200, {
             ok: true,
-            marketplace: buildMarketplaceState(req.user)
+            marketplace: {
+                ...buildMarketplaceState(req.user),
+                permissions: {
+                    canManage: isLocalAdminUser(req.user)
+                        && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
+                },
+            }
         });
         return true;
     }
@@ -476,10 +528,13 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     if (method === 'POST' && !route.resource) {
         const agentRequest = Boolean(readAuthorizationBearer(req));
         if (!agentRequest) {
-            if (!(await ensureAdmin(req, res, parsedUrl))) {
+            if (!(await ensureAdmin(req, res, parsedUrl, { routePlan }))) {
                 return true;
             }
-            const mutationDecision = verifyAdminMutationRequest(req, req.sessionId);
+            const publicContext = publicMarketplaceAuthContext(routePlan);
+            const mutationDecision = publicContext
+                ? verifyBrowserMutationRequest(req, { routePlan, authContext: publicContext, sessionId: req.sessionId })
+                : verifyAdminMutationRequest(req, req.sessionId);
             if (!mutationDecision.ok) {
                 sendMarketplaceError(res, 403, mutationDecision.code.toLowerCase(), 'Exact control Origin and CSRF proof are required.');
                 return true;
