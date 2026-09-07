@@ -20,7 +20,7 @@ Usage: ploinky [--debug] [--dry-run] [--port PORT] [--udp-port PORT] [--] COMMAN
 
 Commands:
   ploinky                         Prepare the Box and open the Ploinky REPL
-  ploinky start AGENT [PORT]      Start the graph; the Router host port defaults to 8080
+  ploinky start [AGENT [PORT]]    Start the graph; omit AGENT to reuse the saved workspace agent
   ploinky restart                 Reconcile sources and restart the whole workspace graph
   ploinky restart AGENT           Restart one agent in the existing Box generation
   ploinky --udp-port PORT start AGENT [PORT]

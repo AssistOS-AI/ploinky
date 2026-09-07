@@ -25,7 +25,7 @@ function consumeValue(tokens, index, flag) {
 function analyzeStart(tokens, commandToken, explicitPort, explicitMediaPort) {
     const tail = tokens.filter((token) => token.rawIndex > commandToken.rawIndex);
     const positional = [];
-    const policyWithValue = new Set(['--branch', '--repo-branch', '--branch-fallback']);
+    const policyWithValue = new Set(['--branch', '--repo-branch', '--branch-fallback', '--profile']);
     for (let index = 0; index < tail.length; index += 1) {
         const token = tail[index];
         if (token.text === '--port' || token.text.startsWith('--port=')) {
@@ -43,9 +43,6 @@ function analyzeStart(tokens, commandToken, explicitPort, explicitMediaPort) {
         if (token.text === '-d') continue;
         positional.push(token);
     }
-    if (positional.length === 0) {
-        throw argumentError('start requires a static agent');
-    }
     if (positional.length > 2) {
         throw argumentError('start accepts only STATIC_AGENT and one optional host port');
     }
@@ -58,7 +55,7 @@ function analyzeStart(tokens, commandToken, explicitPort, explicitMediaPort) {
     }
     const hostPort = explicitPort ?? positionalPort ?? null;
     const positionalPortIndex = positional.length === 2 ? positional[1].rawIndex : -1;
-    return { hostPort, mediaHostPort: explicitMediaPort, positionalPortIndex };
+    return { hostPort, mediaHostPort: explicitMediaPort, positionalPortIndex, hasAgent: positional.length > 0 };
 }
 
 export function parseOuterArguments(argv) {
@@ -153,7 +150,9 @@ export function parseOuterArguments(argv) {
             if (rawIndex === analyzed.positionalPortIndex) return [String(BOX_ROUTER_CONTAINER_PORT)];
             return [token];
         });
-        if (analyzed.positionalPortIndex < 0) {
+        // Without an explicit agent, core resolves the saved workspace selection
+        // and Router port. Appending 8080 would instead select an agent named 8080.
+        if (analyzed.hasAgent && analyzed.positionalPortIndex < 0) {
             normalized.push(String(BOX_ROUTER_CONTAINER_PORT));
         }
         start = Object.freeze({

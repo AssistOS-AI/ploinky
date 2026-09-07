@@ -3,6 +3,28 @@ import test from 'node:test';
 
 import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
 import { routeOuterCommand } from '../../ploinky-box/command/route.mjs';
+import { parseStartArgs } from '../../cli/utils/repos.js';
+
+test('bare start reaches core without inventing an agent from the Router port', () => {
+    for (const [argv, expected] of [
+        [['start'], ['start']],
+        [['--debug', 'start'], ['--debug', 'start']],
+        [['--port', '9090', '--udp-port', '17891', 'start'], ['start']],
+        [['start', '--branch', 'candidate'], ['start', '--branch', 'candidate']],
+        [['start', '--profile', 'local'], ['start', '--profile', 'local']],
+    ]) {
+        const parsed = parseOuterArguments(argv);
+        const route = routeOuterCommand(parsed);
+        assert.equal(route.kind, 'start');
+        assert.deepEqual(parsed.start.coreArgv, expected);
+        const core = parseStartArgs(parsed.start.coreArgv.slice(parsed.start.coreArgv.indexOf('start') + 1));
+        assert.equal(core.staticAgent, null);
+        assert.equal(core.port, null);
+    }
+    const selected = parseOuterArguments(['--port', '9090', '--udp-port', '17891', 'start']);
+    assert.equal(selected.start.hostPort, 9090);
+    assert.equal(selected.start.mediaHostPort, 17891);
+});
 
 test('first debug token is removed only from classification and preserved for core forwarding', () => {
     const stop = parseOuterArguments(['--debug', 'stop']);
