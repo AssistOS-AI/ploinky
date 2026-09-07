@@ -1028,6 +1028,7 @@ async function registerFromConfig(server, config, helpers) {
                         timeoutMs: asyncTimeout,
                         logRetention: taskLogRetention,
                         continuationTool,
+                        taskMessageTool: tool.taskMessageTool,
                     });
                     return {
                         content: [{ type: 'text', text: `Task '${name}' queued with id ${enqueued.id}` }],

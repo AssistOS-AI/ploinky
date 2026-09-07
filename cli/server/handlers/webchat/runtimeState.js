@@ -107,6 +107,8 @@ function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
             version: 1,
             targetAgent: continuationTarget,
             toolName: continuationTool,
+            ...(TASK_TOOL_NAME_RE.test(raw.continuation?.messageToolName || '')
+                ? { messageToolName: raw.continuation.messageToolName } : {}),
             ...(continuationHandle ? { handle: continuationHandle } : {}),
         }
         : null;

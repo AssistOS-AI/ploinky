@@ -1,3 +1,5 @@
+import { createTaskLogFollower } from './taskLogFollow.js';
+
 const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
 const ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
 const STREAM_PREFIX_RE = /^\[([^\]]+)\s+(stdout|stderr)\]\s?/i;
@@ -6,6 +8,7 @@ const TASK_LOG_INLINE_CODE_RE = /`[^`\r\n]+`/gu;
 const TASK_LOG_PATH_RE = /(?:[A-Za-z]:[\\/][^\s"'`<>|]+|(?:\/|~\/|\.{1,2}\/)[^\s"'`<>|]+|[\p{L}\p{N}_+.-]+(?:[\\/][\p{L}\p{N}_+.@-]+)+(?::\d+(?::\d+)?)?)/gu;
 const TASK_LOG_FILE_RE = /(?:^|[\s([{<"'`])([\p{L}\p{N}_+-]+\.(?:c|cc|cpp|cs|css|csv|go|h|hpp|htm|html|java|jpeg|jpg|js|json|jsx|log|md|mdx|mjs|pdf|php|png|py|rb|rs|scss|sh|sql|svg|toml|ts|tsx|txt|webp|xml|yaml|yml)(?::\d+(?::\d+)?)?)(?=$|[\s)\]}>.,'";!?`])/giu;
 const TASK_LOG_TRAILING_PATH_PUNCTUATION_RE = /[),.;!?}\]]+$/u;
+const TASK_LOG_MARKDOWN_LINK_RE = /\[([^\]\r\n]+)\]\(([^)\s]+)\)/gu;
 
 function addTaskLogHighlight(matches, start, end, kind) {
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end <= start) return;
@@ -178,6 +181,53 @@ export function parseTaskLogPresentation(text, task = null) {
     return parseTaskLogEntries(text, taskFinalOutputRanges(task));
 }
 
+function safeTaskLogUrl(rawUrl) {
+    try {
+        const origin = globalThis.window?.location?.origin || 'http://localhost';
+        const url = new URL(rawUrl, origin);
+        return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+    } catch {
+        return '';
+    }
+}
+
+function highlightedTaskLogFragments(text) {
+    return tokenizeTaskLogText(text).map((token) => {
+        const fragment = document.createElement('span');
+        fragment.className = token.kind
+            ? `wa-task-log-token is-${token.kind}`
+            : 'wa-task-log-fragment';
+        fragment.textContent = token.text;
+        return fragment;
+    });
+}
+
+function linkedTaskLogFragments(text) {
+    const fragments = [];
+    let cursor = 0;
+    let found = false;
+    TASK_LOG_MARKDOWN_LINK_RE.lastIndex = 0;
+    let match;
+    while ((match = TASK_LOG_MARKDOWN_LINK_RE.exec(text)) !== null) {
+        const href = safeTaskLogUrl(match[2]);
+        if (!href) continue;
+        fragments.push(...highlightedTaskLogFragments(text.slice(cursor, match.index)));
+        const link = document.createElement('a');
+        link.className = 'wa-task-log-inline-link';
+        link.href = href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.dataset.wcLink = 'true';
+        link.textContent = match[1];
+        fragments.push(link);
+        cursor = match.index + match[0].length;
+        found = true;
+    }
+    if (!found) return null;
+    fragments.push(...highlightedTaskLogFragments(text.slice(cursor)));
+    return fragments;
+}
+
 export function renderTaskLog(container, text, emptyText = 'No log output yet.', task = null) {
     if (!container) return;
     container.replaceChildren();
@@ -195,15 +245,9 @@ export function renderTaskLog(container, text, emptyText = 'No log output yet.',
         const text = entry.text || '\u00a0';
         line.textContent = text;
         const tokens = tokenizeTaskLogText(text);
-        if (tokens.some((token) => token.kind) && typeof line.replaceChildren === 'function') {
-            const fragments = tokens.map((token) => {
-                const fragment = document.createElement('span');
-                fragment.className = token.kind
-                    ? `wa-task-log-token is-${token.kind}`
-                    : 'wa-task-log-fragment';
-                fragment.textContent = token.text;
-                return fragment;
-            });
+        const linkedFragments = linkedTaskLogFragments(text);
+        if (typeof line.replaceChildren === 'function' && (linkedFragments || tokens.some((token) => token.kind))) {
+            const fragments = linkedFragments || highlightedTaskLogFragments(text);
             line.replaceChildren(...fragments);
         }
         container.appendChild(line);
@@ -226,10 +270,15 @@ export function mergeTaskLogUpdate(state, payload) {
 
 export function attachTaskSummary({ bubble, taskId, taskController }) {
     const panel = document.createElement('div');
-    panel.className = 'wa-task-summary';
+    panel.className = 'wa-task-summary is-expanded';
     panel.dataset.taskId = taskId;
-    const summary = document.createElement('div');
+    const summary = document.createElement('button');
+    summary.type = 'button';
     summary.className = 'wa-task-summary-row';
+    const bodyId = `task-summary-body-${taskId}`;
+    summary.setAttribute('aria-expanded', 'true');
+    summary.setAttribute('aria-controls', bodyId);
+    summary.setAttribute('aria-label', 'Collapse task log');
     const agent = document.createElement('strong');
     agent.className = 'wa-task-summary-agent';
     agent.textContent = 'Task';
@@ -240,7 +289,17 @@ export function attachTaskSummary({ bubble, taskId, taskController }) {
     status.textContent = 'LOADING';
     const duration = document.createElement('span');
     duration.className = 'wa-task-summary-duration';
-    summary.append(agent, description, status, duration);
+    const arrow = document.createElement('span');
+    arrow.className = 'wa-task-summary-arrow';
+    arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = '▾';
+    summary.append(agent, description, status, duration, arrow);
+    const body = document.createElement('div');
+    body.id = bodyId;
+    body.className = 'wa-task-summary-body';
+    const log = document.createElement('div');
+    log.className = 'wa-task-log wa-task-summary-log';
+    const logFollower = createTaskLogFollower(log);
     const link = document.createElement('a');
     link.className = 'wa-task-log-link';
     link.href = taskController.getTaskViewUrl(taskId);
@@ -248,14 +307,52 @@ export function attachTaskSummary({ bubble, taskId, taskController }) {
     link.rel = 'noopener noreferrer';
     link.dataset.wcLink = 'true';
     link.dataset.wcTaskId = taskId;
-    link.textContent = 'View task details';
-    panel.append(summary, link);
+    link.textContent = 'Open Task';
+    const actions = document.createElement('div');
+    actions.className = 'wa-task-summary-actions';
+    const actionButton = document.createElement('button');
+    actionButton.type = 'button';
+    actionButton.className = 'wa-task-inline-action';
+    actionButton.hidden = true;
+    actions.append(link, actionButton);
+    const actionError = document.createElement('div');
+    actionError.className = 'wa-task-summary-error';
+    actionError.hidden = true;
+    body.append(log, actions, actionError);
+    const composer = document.createElement('form');
+    composer.className = 'wa-task-composer';
+    composer.hidden = true;
+    const input = document.createElement('textarea');
+    input.placeholder = 'Send a message to this task…';
+    input.setAttribute('aria-label', 'Task message');
+    input.maxLength = 32768;
+    input.rows = 2;
+    const send = document.createElement('button');
+    send.type = 'submit';
+    send.textContent = 'Send';
+    composer.append(input, send);
+    body.appendChild(composer);
+    panel.append(summary, body);
     const timeNode = bubble.querySelector(':scope > .wa-message-time');
     if (timeNode) bubble.insertBefore(panel, timeNode);
     else bubble.appendChild(panel);
 
-    let latest = { task: null, ready: false };
+    let latest = { task: null, ready: false, log: '', logLoaded: false };
+    let renderedLog = null;
     let disposed = false;
+    let actionPending = '';
+    let messagePending = false;
+    let actionErrorText = '';
+    const resizeInput = () => {
+        if (disposed || composer.hidden || body.hidden) return;
+        input.style.height = 'auto';
+        // scrollHeight includes padding but excludes the two 1px borders.
+        const contentHeight = input.value ? Math.ceil(input.scrollHeight) + 2 : 64;
+        input.style.height = `${Math.min(180, Math.max(64, contentHeight))}px`;
+        input.style.overflowY = contentHeight > 180 ? 'auto' : 'hidden';
+        if (contentHeight <= 180) input.scrollTop = 0;
+    };
+    input.oninput = resizeInput;
     const renderSummary = () => {
         if (disposed) return;
         const task = latest.task;
@@ -265,9 +362,101 @@ export function attachTaskSummary({ bubble, taskId, taskController }) {
         status.className = `wa-task-status is-${presentation.className}`;
         status.textContent = latest.ready || task ? presentation.label : 'LOADING';
         duration.textContent = taskDurationLabel(task);
+        const stopping = task?.status === 'ongoing'
+            && String(task?.remoteStatus || '').trim().toLowerCase() === 'cancelling';
+        const canStop = task?.status === 'ongoing';
+        const canResume = task?.status === 'stopped' && Boolean(task?.continuation?.handle);
+        const composerWasHidden = composer.hidden;
+        composer.hidden = !task?.continuation?.handle
+            || (task.status === 'ongoing' && !task.continuation.messageToolName);
+        if (composerWasHidden && !composer.hidden) resizeInput();
+        send.disabled = messagePending;
+        send.textContent = messagePending ? 'Sending…' : 'Send';
+        if (actionPending === 'stop' && (!canStop || stopping || task?.error)) actionPending = '';
+        if (actionPending === 'resume' && (task?.status === 'ongoing' || task?.error)) actionPending = '';
+        actionButton.hidden = !canStop && !canResume;
+        actionButton.disabled = Boolean(actionPending) || stopping;
+        actionButton.className = `wa-task-inline-action ${canResume ? 'is-resume' : 'is-stop'}`;
+        actionButton.textContent = actionPending === 'resume'
+            ? 'Resuming…'
+            : (actionPending === 'stop' || stopping ? 'Stopping…' : (canResume ? 'Resume' : 'Stop'));
+        const nextLog = latest.logLoaded ? latest.log : '';
+        if (nextLog !== renderedLog) {
+            const previousScrollTop = log.scrollTop;
+            renderTaskLog(
+                log,
+                nextLog,
+                latest.logLoaded ? 'No log output yet.' : 'Loading log…',
+                task,
+            );
+            logFollower.restoreAfterRender(previousScrollTop);
+            renderedLog = nextLog;
+        }
+    };
+    summary.onclick = () => {
+        const expanded = body.hidden;
+        body.hidden = !expanded;
+        panel.classList.toggle('is-expanded', expanded);
+        summary.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        summary.setAttribute('aria-label', expanded ? 'Collapse task log' : 'Expand task log');
+        arrow.textContent = expanded ? '▾' : '▸';
+        if (expanded) resizeInput();
+        if (expanded && typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => logFollower.restoreAfterRender(log.scrollTop));
+        }
+    };
+    actionButton.onclick = (event) => {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        if (actionButton.disabled) return;
+        const operation = latest.task?.status === 'stopped' ? 'resume' : 'stop';
+        actionPending = operation;
+        renderSummary();
+        const accepted = operation === 'resume'
+            ? taskController.resumeTask?.(taskId)
+            : taskController.stopTask?.(taskId);
+        if (!accepted) {
+            actionPending = '';
+            renderSummary();
+        }
     };
     const unsubscribe = taskController.subscribe(taskId, (value) => {
+        if (value?.actionEvent && value.action === 'continue') {
+            messagePending = false;
+            if (value.actionOk !== false) {
+                input.value = '';
+                resizeInput();
+            }
+            else actionErrorText = value.actionError || 'Message was not accepted.';
+        }
+        if (value?.actionEvent && value.action === actionPending) {
+            actionPending = '';
+            actionErrorText = value.actionOk === false
+                ? (value.actionError || 'Task action failed.')
+                : '';
+        }
         latest = value;
+        actionError.hidden = !actionErrorText;
+        actionError.textContent = actionErrorText;
+        renderSummary();
+    });
+    composer.onsubmit = (event) => {
+        event.preventDefault();
+        const prompt = input.value.trim();
+        if (!prompt || messagePending) return;
+        messagePending = true;
+        actionErrorText = '';
+        if (!taskController.continueTask?.(taskId, prompt)) messagePending = false;
+        renderSummary();
+    };
+    input.onkeydown = (event) => {
+        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+            event.preventDefault(); composer.requestSubmit();
+        }
+    };
+    void taskController.loadLog?.(taskId).catch(() => {
+        if (disposed || latest.logLoaded) return;
+        latest = { ...latest, log: 'Unable to load task log.', logLoaded: true };
         renderSummary();
     });
     const timer = setInterval(renderSummary, 1000);

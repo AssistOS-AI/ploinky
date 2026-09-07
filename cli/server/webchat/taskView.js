@@ -239,7 +239,7 @@ function renderTask() {
     stopButton.disabled = stopSubmitting || taskStopping;
     stopButton.textContent = stopSubmitting || taskStopping ? 'Stopping…' : 'Stop';
     const canContinue = Boolean(task?.continuation?.handle)
-        && TERMINAL_STATUSES.has(task?.status);
+        && (TERMINAL_STATUSES.has(task?.status) || (taskOngoing && Boolean(task.continuation.messageToolName)));
     continuationForm.hidden = !canContinue;
     continuationInput.disabled = continuationSubmitting || !canContinue;
     continuationSend.disabled = continuationSubmitting || !canContinue;

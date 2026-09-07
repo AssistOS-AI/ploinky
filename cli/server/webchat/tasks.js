@@ -24,6 +24,7 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
     } = elements;
     const tasks = new Map();
     const logs = new Map();
+    const logSnapshots = new Map();
     const subscribers = new Map();
     let selectedId = '';
     let toastTimer = null;
@@ -44,10 +45,10 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
         };
     }
 
-    function notify(taskId) {
+    function notify(taskId, event = null) {
         const listeners = subscribers.get(taskId);
         if (!listeners) return;
-        const value = snapshot(taskId);
+        const value = event ? { ...snapshot(taskId), ...event } : snapshot(taskId);
         for (const listener of listeners) listener(value);
     }
 
@@ -210,7 +211,34 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
         if (!task?.id) return;
         const previous = tasks.get(task.id);
         tasks.set(task.id, { ...previous, ...task });
-        if (payload.event === 'view' && payload.log) {
+        const chunkPhase = payload?.logChunk?.phase;
+        if (payload.event === 'view' && chunkPhase === 'start') {
+            const count = Number(payload.logChunk.count);
+            logSnapshots.set(task.id, Number.isSafeInteger(count) && count > 0
+                ? { count, chunks: [], nextOffset: Number(payload.logChunk.nextOffset) || 0 }
+                : null);
+        } else if (payload.event === 'view-log-chunk' && chunkPhase === 'chunk') {
+            const snapshot = logSnapshots.get(task.id);
+            const index = Number(payload.logChunk.index);
+            const count = Number(payload.logChunk.count);
+            const text = typeof payload.logChunk.text === 'string' ? payload.logChunk.text : null;
+            if (!snapshot || count !== snapshot.count || index !== snapshot.chunks.length || text === null) {
+                logSnapshots.delete(task.id);
+                void loadLog(task.id).catch(() => {});
+            } else {
+                snapshot.chunks.push(text);
+                if (snapshot.chunks.length === snapshot.count) {
+                    const joined = snapshot.chunks.join('');
+                    logs.set(task.id, {
+                        text: joined,
+                        offset: Number(payload.logChunk.nextOffset) || snapshot.nextOffset || joined.length,
+                        loaded: true,
+                    });
+                    logSnapshots.delete(task.id);
+                }
+            }
+        } else if (payload.event === 'view' && payload.log) {
+            logSnapshots.delete(task.id);
             logs.set(task.id, {
                 text: typeof payload.log.text === 'string' ? payload.log.text : '',
                 offset: Number(payload.log.nextOffset) || 0,
@@ -236,7 +264,12 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
         }
         updateBadge();
         renderList();
-        notify(task.id);
+        notify(task.id, payload.event === 'action' ? {
+            actionEvent: true,
+            action: payload.action,
+            actionOk: payload.ok,
+            actionError: typeof payload.error === 'string' ? payload.error : '',
+        } : null);
         if (selectedId === task.id) {
             const currentLog = taskDetail?.querySelector('.wa-task-log');
             const stickToEnd = !currentLog
@@ -267,6 +300,11 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
         close,
         subscribe,
         loadLog,
+        stopTask: (taskId) => Boolean(sendQuickCommand?.(`/task stop ${taskId}`)),
+        continueTask: (taskId, prompt) => Boolean(sendQuickCommand?.(`/task continue ${taskId} ${prompt}`)),
+        resumeTask: (taskId) => Boolean(sendQuickCommand?.(
+            `/task continue ${taskId} Continue from the current state.`,
+        )),
         getTask: (taskId) => tasks.get(taskId) || null,
         getTaskViewUrl: (taskId) => toEndpoint(`tasks/${encodeURIComponent(taskId)}/view`),
     };
