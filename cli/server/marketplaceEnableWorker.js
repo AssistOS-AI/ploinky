@@ -1,7 +1,10 @@
 import { Worker } from 'node:worker_threads';
+import { resolveNoWaitBarrierTimeouts } from '../commands/noWaitProtocol.js';
 
 const MARKETPLACE_ENABLE_WORKER_URL = new URL('./marketplaceEnableWorkerThread.js', import.meta.url);
-export const MARKETPLACE_ENABLE_TIMEOUT_MS = 180_000;
+// Marketplace performs the same cold image installation as background startup.
+// Its outer watchdog must include the sanctioned image-operation budgets.
+export const MARKETPLACE_ENABLE_TIMEOUT_MS = resolveNoWaitBarrierTimeouts().activeTimeoutMs;
 
 function boundedMessage(value, fallback) {
     const message = String(value || '').trim();

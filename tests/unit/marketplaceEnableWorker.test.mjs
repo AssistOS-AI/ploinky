@@ -2,9 +2,39 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
+import { EventEmitter } from 'node:events';
 
 import { enableMarketplaceAgent } from '../../cli/server/authHandlers/marketplaceRoutes.js';
-import { runMarketplaceEnableWorker } from '../../cli/server/marketplaceEnableWorker.js';
+import { MARKETPLACE_ENABLE_TIMEOUT_MS, runMarketplaceEnableWorker } from '../../cli/server/marketplaceEnableWorker.js';
+
+test('Marketplace cold activation survives a four-minute image pull and still has a finite deadline', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let worker;
+    class ColdWorker extends EventEmitter {
+        constructor() {
+            super();
+            worker = this;
+            this.terminated = false;
+        }
+        terminate() { this.terminated = true; return Promise.resolve(1); }
+    }
+    const activation = runMarketplaceEnableWorker({ agentRef: 'repo/agent', mode: 'global' }, { WorkerClass: ColdWorker });
+    let settled = false;
+    activation.then(() => { settled = true; }, () => { settled = true; });
+    t.mock.timers.tick(4 * 60 * 1000);
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.equal(worker.terminated, false);
+    worker.emit('message', { ok: true, result: { ready: true } });
+    assert.deepEqual(await activation, { ready: true });
+
+    const stuck = runMarketplaceEnableWorker({ agentRef: 'repo/stuck', mode: 'global' }, { WorkerClass: ColdWorker });
+    const rejection = assert.rejects(stuck, { code: 'PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', status: 504 });
+    assert.ok(Number.isSafeInteger(MARKETPLACE_ENABLE_TIMEOUT_MS));
+    t.mock.timers.tick(MARKETPLACE_ENABLE_TIMEOUT_MS);
+    await rejection;
+    assert.equal(worker.terminated, true);
+});
 
 test('Marketplace enable offloads blocking activation so Router callbacks remain responsive', async (t) => {
     const server = http.createServer((_request, response) => response.end('router-responsive'));
