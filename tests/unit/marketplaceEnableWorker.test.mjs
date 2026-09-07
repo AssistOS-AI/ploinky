@@ -52,6 +52,34 @@ test('Marketplace enable offloads blocking activation so Router callbacks remain
     assert.deepEqual(result, { callback: 'router-responsive', mode: 'global' });
 });
 
+test('Marketplace probe progress cannot complete activation or consume its final result', async () => {
+    let worker;
+    class ProbeWorker extends EventEmitter {
+        constructor() { super(); worker = this; }
+    }
+    const activation = runMarketplaceEnableWorker({ agentRef: 'repo/probed', mode: 'global' }, { WorkerClass: ProbeWorker });
+    let settled = false;
+    activation.then(() => { settled = true; }, () => { settled = true; });
+    worker.emit('message', { type: 'log', level: 'info', message: 'readiness probe starting' });
+    worker.emit('message', { type: 'log', level: 'warn', message: 'probe still waiting' });
+    await Promise.resolve();
+    assert.equal(settled, false);
+    worker.emit('message', { ok: true, result: { containerName: 'ready-runtime' } });
+    assert.deepEqual(await activation, { containerName: 'ready-runtime' });
+});
+
+test('Marketplace malformed terminal messages still fail closed', async () => {
+    class InvalidWorker extends EventEmitter {
+        constructor() {
+            super();
+            queueMicrotask(() => this.emit('message', { unexpected: true }));
+        }
+    }
+    await assert.rejects(runMarketplaceEnableWorker({ agentRef: 'repo/agent', mode: 'global' }, { WorkerClass: InvalidWorker }), {
+        code: 'PLOINKY_MARKETPLACE_ENABLE_WORKER_FAILED',
+    });
+});
+
 test('Marketplace enable uses the worker path and preserves normalized arguments', async () => {
     const calls = [];
     const result = await enableMarketplaceAgent({
@@ -116,6 +144,10 @@ test('Marketplace enable worker preserves safe nested lifecycle codes', async ()
 
         once(event, listener) {
             this.addEventListener(event, (entry) => listener(event === 'message' ? entry.data : entry), { once: true });
+        }
+
+        on(event, listener) {
+            this.addEventListener(event, (entry) => listener(event === 'message' ? entry.data : entry));
         }
     }
 

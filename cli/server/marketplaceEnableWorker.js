@@ -50,7 +50,11 @@ export function runMarketplaceEnableWorker({ agentRef, mode }, {
             callback(value);
         };
 
-        worker.once('message', (message) => {
+        worker.on('message', (message) => {
+            if (settled) return;
+            // Health probes publish progress on the same parent port. Only the
+            // activation result may complete the Marketplace mutation.
+            if (message?.type === 'log') return;
             if (message?.ok === true) {
                 finish(resolve, message.result);
                 return;
