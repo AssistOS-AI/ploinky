@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { retireNoWaitRunMarker } from '../../cli/commands/noWaitMarkerLifecycle.js';
 
 import { signPrivateRouterAssertion } from '../../Agent/lib/agentAssertion.mjs';
 import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
@@ -495,4 +499,92 @@ test('coordinated replacement rejects a missing network capability before mutati
         saveRegistry: () => assert.fail('must reject before registry mutation'),
         prepare: () => assert.fail('must reject before generation preparation'),
     }), /network lifecycle capability required/);
+});
+
+function markerRotationFixture(t, markerOverrides = {}, request = {}) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-destroy-marker-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const runningDir = path.join(root, 'running');
+    const markerDirectory = path.join(runningDir, 'no-wait');
+    fs.mkdirSync(markerDirectory, { recursive: true, mode: 0o700 });
+    const markerPath = path.join(markerDirectory, `${containerName}.current.json`);
+    const runId = '11111111-2222-4333-8444-555555555555';
+    const marker = {
+        containerName,
+        instanceId: oldIdentity.instanceId,
+        enableGeneration: oldIdentity.enableGeneration,
+        repoName: 'fixtures',
+        shortAgent: 'caller',
+        alias: '',
+        routeKey: 'caller',
+        runId,
+        runStartedAtMs: 1_700_000_000_000,
+        waveIndex: 0,
+        statusFile: `${containerName}.${runId}.json`,
+        ...markerOverrides,
+    };
+    fs.writeFileSync(markerPath, JSON.stringify(marker), { mode: 0o600 });
+    let registry = { [containerName]: existingRecord() };
+    const events = [];
+    const values = ['instance-successor', 'enable-successor'];
+    const rotate = () => coordinateReplacementRuntimeIdentity({
+        containerName,
+        existingRecord: existingRecord(),
+        ...request,
+    }, {
+        assertNetworkCapability: () => {},
+        withApplyLock: (callback) => callback({}),
+        inactivate: () => events.push('inactivate'),
+        loadRegistry: () => structuredClone(registry),
+        loadRouting: () => ({ routes: { caller: { container: containerName } } }),
+        retireNoWaitMarker: (name, options) => {
+            events.push('retire');
+            return retireNoWaitRunMarker(name, { ...options, runningDir });
+        },
+        saveRegistry: (next) => {
+            events.push(fs.existsSync(markerPath) ? 'save-with-marker' : 'save-after-retirement');
+            registry = structuredClone(next);
+        },
+        prepareReplacement: () => ({
+            selector: { state: 'inactive' },
+            generation: { agents: structuredClone(registry) },
+        }),
+        prepare: ({ agents }) => ({
+            selector: { state: 'active' },
+            preparationLease: { mode: 'additive' },
+            generation: { agents },
+        }),
+        uuid: () => values.shift(),
+    });
+    return { rotate, events, markerPath, runningDir, registry: () => registry };
+}
+
+test('runtime rotation retires its no-wait marker before persistence so destroy/restart can stage again', (t) => {
+    const fixture = markerRotationFixture(t);
+    fixture.rotate();
+    // Destroy retains workspace files. The next start retires current markers
+    // against the retained registry before staging another generation.
+    assert.doesNotThrow(() => retireNoWaitRunMarker(containerName, {
+        runningDir: fixture.runningDir,
+        expectedRecord: fixture.registry()[containerName],
+    }));
+    assert.deepEqual(fixture.events, ['inactivate', 'retire', 'save-after-retirement']);
+});
+
+test('runtime rotation rejects foreign and malformed markers before writing the successor registry', (t) => {
+    for (const overrides of [{ instanceId: 'foreign-instance' }, { runId: 'malformed' }]) {
+        const fixture = markerRotationFixture(t, overrides);
+        assert.throws(fixture.rotate, /no-wait marker/);
+        assert.deepEqual(fixture.registry()[containerName], existingRecord());
+        assert.equal(fs.existsSync(fixture.markerPath), true);
+        assert.deepEqual(fixture.events, ['inactivate', 'retire']);
+    }
+});
+
+test('additive runtime preparation preserves the active predecessor no-wait marker', (t) => {
+    const fixture = markerRotationFixture(t, {}, { stageAlongsidePredecessor: true });
+    fixture.rotate();
+    assert.equal(fs.existsSync(fixture.markerPath), true);
+    assert.deepEqual(fixture.registry()[containerName], existingRecord());
+    assert.deepEqual(fixture.events, []);
 });

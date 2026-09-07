@@ -736,7 +736,7 @@ test('destroy --delete-cache runs without prompting and works without a containe
     }
 });
 
-test('destroy is an input-free no-op when the outer Box is already absent', async () => {
+test('destroy runs input-free marker recovery when the outer Box is already absent', async () => {
     const events = [];
     const output = bufferStream();
     const unreadableInput = new Proxy({}, {
@@ -747,9 +747,10 @@ test('destroy is an input-free no-op when the outer Box is already absent', asyn
         supervisor: fakeSupervisor(events, { statusState: 'absent' }),
     });
     assert.equal(code, 0);
-    assert.deepEqual(events, ['status']);
+    assert.deepEqual(events, ['status', ['destroy', null, { deleteCache: false }]]);
     assert.doesNotMatch(output.value(), /\[y\/N\]|cancelled/i);
-    assert.equal(events.some((event) => Array.isArray(event) && event[0] === 'destroy'), false);
+    assert.deepEqual(events.find((event) => Array.isArray(event) && event[0] === 'destroy'),
+        ['destroy', null, { deleteCache: false }]);
 });
 
 test('public help documents non-interactive destroy and explicit cache deletion', async () => {

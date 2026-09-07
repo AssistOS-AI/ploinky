@@ -38,6 +38,7 @@ import {
     isUsableHostIpv4,
 } from './hostNetwork.mjs';
 import { resolveWorkspaceIdentity } from './identity.mjs';
+import { retireDestroyedBoxNoWaitMarkers } from './noWaitCleanup.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
 import { updateWorkspacePloinkySource } from './command/hostUpdate.mjs';
@@ -213,6 +214,7 @@ export function createBoxSupervisor({
     updateWorkspacePloinky = updateWorkspacePloinkySource,
     commitAgentLibSelection = writeActiveDescriptor,
     revalidateAgentLibSource = defaultRevalidateAgentLibSource,
+    retireDestroyedMarkers = retireDestroyedBoxNoWaitMarkers,
     destroyBoxCache = removeWorkspaceDataPaths,
     destroyManagedAgentLib = removeManagedAgentLibState,
     inspectBoxData = inspectWorkspaceDataPaths,
@@ -685,6 +687,7 @@ export function createBoxSupervisor({
                 throw supervisorError('Box changed before destroy; nothing was removed');
             }
             if (!container && !deleteCache) {
+                retireDestroyedMarkers({ identity, lock });
                 return Object.freeze({ identity, action: 'absent' });
             }
             if (container && (!expectedContainerId || container.id !== expectedContainerId)) {
@@ -725,6 +728,7 @@ export function createBoxSupervisor({
                 }
                 removeContainerById(ownership.engine, container.id, runner);
             }
+            retireDestroyedMarkers({ identity, lock });
             // Cache deletion is explicit and runs only after the outer Box is
             // proven gone, so a failed stop or removal always retains the data.
             const deletedPaths = deleteCache

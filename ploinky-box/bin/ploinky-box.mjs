@@ -138,9 +138,9 @@ export async function runOuterCli(argv, {
     if (route.kind === 'destroy') {
         const status = selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
-        // Cache deletion is workspace-backed, so it stays available even when
-        // the outer container is already gone.
-        if (!container && !route.deleteCache) {
+        // An absent Box still needs locked cleanup of retained current markers.
+        // Keep unsupported/ambiguous observations read-only.
+        if (!container && !route.deleteCache && status.state !== 'absent') {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }
