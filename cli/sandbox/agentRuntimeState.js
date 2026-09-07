@@ -1,6 +1,8 @@
 import { getBwrapPid, isBwrapProcessRunning } from './bwrap/bwrapFleet.js';
 import { collectLiveAgentContainers, collectLiveAgentContainersAsync, getAgentsRegistry } from './docker/containerRegistry.js';
 import { loadActiveEdgeRoutingGeneration } from './edgeGeneration.js';
+import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
+import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 
 const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
 
@@ -9,17 +11,17 @@ function normalizeRuntime(record) {
     return recorded || 'container';
 }
 
-function loadActiveRoutes() {
+function loadActiveGeneration() {
     try {
-        return loadActiveEdgeRoutingGeneration().generation.routing?.routes || {};
+        return loadActiveEdgeRoutingGeneration().generation;
     } catch (_) {
-        return {};
+        return null;
     }
 }
 
 function hasActiveRoutePort(routes, containerName, record = {}) {
     const routeMatchesRuntime = (entry) => {
-        if (!entry || entry.disabled === true) return false;
+        if (!entry || entry.disabled === true || entry.draining === true) return false;
         const runtimeContainer = String(containerName || '');
         const routeContainer = String(entry.container || '');
         if (runtimeContainer && routeContainer && runtimeContainer !== routeContainer) return false;
@@ -41,9 +43,46 @@ function hasActiveRoutePort(routes, containerName, record = {}) {
     return Number.isSafeInteger(hostPort) && hostPort > 0 && hostPort <= 65535;
 }
 
-function usableRuntimeState(state, routes, containerName, record) {
+function exactIdentity(value) {
+    return typeof value === 'string' && value && value === value.trim() ? value : '';
+}
+
+function hasActivatedScriptRuntime(generation, containerName, record) {
+    const captured = generation?.agents?.[containerName];
+    if (record?.type !== 'agent' || captured?.type !== 'agent') return false;
+    for (const field of ['instanceId', 'enableGeneration', 'containerId', 'repoName', 'agentName', 'profile']) {
+        if (!exactIdentity(record[field]) || record[field] !== captured[field]) return false;
+    }
+    const alias = record.alias || '';
+    if ((alias && !exactIdentity(alias)) || alias !== (captured.alias || '')) return false;
+    const routeKey = alias || record.agentName;
+    const route = generation?.routing?.routes?.[routeKey];
+    if (!route || route.disabled === true || route.draining === true
+        || route.container !== containerName
+        || route.repo !== record.repoName || route.agent !== record.agentName
+        || (route.alias || '') !== alias) return false;
+    const manifest = generation?.manifests?.[routeKey];
+    // Activation captures the final runtime identity only after semantic
+    // readiness succeeds. A live process or a mutable manifest alone cannot
+    // prove that a service without a main MCP port has reached that boundary.
+    if (resolveAgentExecutionMode(manifest).type !== 'start_only'
+        || resolveAgentReadinessProtocol(manifest) !== 'script') return false;
+    try {
+        return resolveManifestRuntimeProfile(manifest, {
+            agentName: `${record.repoName}/${record.agentName}`,
+            persistedProfileName: record.profile,
+            fallbackProfileName: 'default',
+            path: `captured manifest(${routeKey})`,
+        }).resolvedProfileName === record.profile;
+    } catch (_) {
+        return false;
+    }
+}
+
+function usableRuntimeState(state, routes, containerName, record, generation) {
     const processRunning = state?.running === true;
-    const running = processRunning && hasActiveRoutePort(routes, containerName, record);
+    const running = processRunning && (hasActiveRoutePort(routes, containerName, record)
+        || hasActivatedScriptRuntime(generation, containerName, record));
     return {
         ...(state || {}),
         status: processRunning && !running ? 'starting' : String(state?.status || (running ? 'running' : 'stopped')).toLowerCase(),
@@ -83,7 +122,10 @@ function collectAgentRuntimeStates(options = {}) {
         : (options.collectContainers || collectLiveAgentContainers)() || [];
     const sandboxRunning = options.isSandboxRunning || isBwrapProcessRunning;
     const sandboxPid = options.getSandboxPid || getBwrapPid;
-    const routes = Object.hasOwn(options, 'routes') ? (options.routes || {}) : loadActiveRoutes();
+    const generation = Object.hasOwn(options, 'activeGeneration')
+        ? options.activeGeneration
+        : (Object.hasOwn(options, 'routes') ? null : loadActiveGeneration());
+    const routes = Object.hasOwn(options, 'routes') ? (options.routes || {}) : (generation?.routing?.routes || {});
     const containersByName = new Map(liveContainers.map((entry) => [String(entry?.containerName || ''), entry]));
     const matchedContainers = new Set();
     const states = [];
@@ -102,7 +144,7 @@ function collectAgentRuntimeStates(options = {}) {
                     status: processRunning ? 'running' : 'stopped',
                     running: processRunning,
                     pid,
-                }, routes, containerName, record),
+                }, routes, containerName, record, generation),
             });
             continue;
         }
@@ -121,7 +163,7 @@ function collectAgentRuntimeStates(options = {}) {
                     status: String(liveEntry.state?.status || 'running').toLowerCase(),
                     running: Boolean(liveEntry.state?.running),
                     pid: Number(liveEntry.state?.pid || 0),
-                }, routes, containerName, record),
+                }, routes, containerName, record, generation),
             });
             continue;
         }
