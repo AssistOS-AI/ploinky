@@ -2,9 +2,39 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
+import { EventEmitter } from 'node:events';
 
 import { enableMarketplaceAgent } from '../../cli/server/authHandlers/marketplaceRoutes.js';
-import { runMarketplaceEnableWorker } from '../../cli/server/marketplaceEnableWorker.js';
+import { MARKETPLACE_ENABLE_TIMEOUT_MS, runMarketplaceEnableWorker } from '../../cli/server/marketplaceEnableWorker.js';
+
+test('Marketplace cold activation survives a four-minute image pull and still has a finite deadline', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let worker;
+    class ColdWorker extends EventEmitter {
+        constructor() {
+            super();
+            worker = this;
+            this.terminated = false;
+        }
+        terminate() { this.terminated = true; return Promise.resolve(1); }
+    }
+    const activation = runMarketplaceEnableWorker({ agentRef: 'repo/agent', mode: 'global' }, { WorkerClass: ColdWorker });
+    let settled = false;
+    activation.then(() => { settled = true; }, () => { settled = true; });
+    t.mock.timers.tick(4 * 60 * 1000);
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.equal(worker.terminated, false);
+    worker.emit('message', { ok: true, result: { ready: true } });
+    assert.deepEqual(await activation, { ready: true });
+
+    const stuck = runMarketplaceEnableWorker({ agentRef: 'repo/stuck', mode: 'global' }, { WorkerClass: ColdWorker });
+    const rejection = assert.rejects(stuck, { code: 'PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', status: 504 });
+    assert.ok(Number.isSafeInteger(MARKETPLACE_ENABLE_TIMEOUT_MS));
+    t.mock.timers.tick(MARKETPLACE_ENABLE_TIMEOUT_MS);
+    await rejection;
+    assert.equal(worker.terminated, true);
+});
 
 test('Marketplace enable offloads blocking activation so Router callbacks remain responsive', async (t) => {
     const server = http.createServer((_request, response) => response.end('router-responsive'));
@@ -20,6 +50,34 @@ test('Marketplace enable offloads blocking activation so Router callbacks remain
     });
 
     assert.deepEqual(result, { callback: 'router-responsive', mode: 'global' });
+});
+
+test('Marketplace probe progress cannot complete activation or consume its final result', async () => {
+    let worker;
+    class ProbeWorker extends EventEmitter {
+        constructor() { super(); worker = this; }
+    }
+    const activation = runMarketplaceEnableWorker({ agentRef: 'repo/probed', mode: 'global' }, { WorkerClass: ProbeWorker });
+    let settled = false;
+    activation.then(() => { settled = true; }, () => { settled = true; });
+    worker.emit('message', { type: 'log', level: 'info', message: 'readiness probe starting' });
+    worker.emit('message', { type: 'log', level: 'warn', message: 'probe still waiting' });
+    await Promise.resolve();
+    assert.equal(settled, false);
+    worker.emit('message', { ok: true, result: { containerName: 'ready-runtime' } });
+    assert.deepEqual(await activation, { containerName: 'ready-runtime' });
+});
+
+test('Marketplace malformed terminal messages still fail closed', async () => {
+    class InvalidWorker extends EventEmitter {
+        constructor() {
+            super();
+            queueMicrotask(() => this.emit('message', { unexpected: true }));
+        }
+    }
+    await assert.rejects(runMarketplaceEnableWorker({ agentRef: 'repo/agent', mode: 'global' }, { WorkerClass: InvalidWorker }), {
+        code: 'PLOINKY_MARKETPLACE_ENABLE_WORKER_FAILED',
+    });
 });
 
 test('Marketplace enable uses the worker path and preserves normalized arguments', async () => {
@@ -86,6 +144,10 @@ test('Marketplace enable worker preserves safe nested lifecycle codes', async ()
 
         once(event, listener) {
             this.addEventListener(event, (entry) => listener(event === 'message' ? entry.data : entry), { once: true });
+        }
+
+        on(event, listener) {
+            this.addEventListener(event, (entry) => listener(event === 'message' ? entry.data : entry));
         }
     }
 

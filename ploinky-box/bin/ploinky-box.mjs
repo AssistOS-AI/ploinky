@@ -20,7 +20,7 @@ Usage: ploinky [--debug] [--dry-run] [--port PORT] [--udp-port PORT] [--] COMMAN
 
 Commands:
   ploinky                         Prepare the Box and open the Ploinky REPL
-  ploinky start AGENT [PORT]      Start the graph; the Router host port defaults to 8080
+  ploinky start [AGENT [PORT]]    Start the graph; omit AGENT to reuse the saved workspace agent
   ploinky restart                 Reconcile sources and restart the whole workspace graph
   ploinky restart AGENT           Restart one agent in the existing Box generation
   ploinky --udp-port PORT start AGENT [PORT]
@@ -138,9 +138,9 @@ export async function runOuterCli(argv, {
     if (route.kind === 'destroy') {
         const status = selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
-        // Cache deletion is workspace-backed, so it stays available even when
-        // the outer container is already gone.
-        if (!container && !route.deleteCache) {
+        // An absent Box still needs locked cleanup of retained current markers.
+        // Keep unsupported/ambiguous observations read-only.
+        if (!container && !route.deleteCache && status.state !== 'absent') {
             output.write(formatBoxStatus(status));
             return ['foreign', 'incompatible', 'unknown', 'unsupported'].includes(status.state) ? 1 : 0;
         }

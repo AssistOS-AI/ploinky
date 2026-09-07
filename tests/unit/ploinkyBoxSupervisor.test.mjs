@@ -1241,3 +1241,74 @@ test('public health bounds an inactive edge generation wait', async (t) => {
         retryDelayMs: 1,
     }), /did not become ready within 0ms/);
 });
+
+function seedRetainedNoWaitMarker(workspace, overrides = {}) {
+    const runningDir = path.join(workspace, '.ploinky', 'running', 'no-wait');
+    fs.mkdirSync(runningDir, { recursive: true, mode: 0o700 });
+    const containerName = 'ploinky_retained_worker';
+    const runId = '11111111-2222-4333-8444-555555555555';
+    const markerPath = path.join(runningDir, `${containerName}.current.json`);
+    const statusPath = path.join(runningDir, `${containerName}.${runId}.json`);
+    fs.writeFileSync(statusPath, 'retained run status');
+    fs.writeFileSync(markerPath, JSON.stringify({
+        containerName, instanceId: 'old-instance', enableGeneration: 'old-generation',
+        repoName: 'fixture', shortAgent: 'worker', alias: '', routeKey: 'worker',
+        runId, runStartedAtMs: 1_700_000_000_000, waveIndex: 0,
+        statusFile: path.basename(statusPath), ...overrides,
+    }), { mode: 0o600 });
+    return { markerPath, statusPath };
+}
+
+test('destroy retires retained no-wait current markers only after exact Box removal', async (t) => {
+    const state = fixture(t);
+    const files = seedRetainedNoWaitMarker(state.workspace);
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const ownership = owned(identity, { running: false });
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: { run(command, args) {
+            if (args[1] === 'rm') assert.equal(fs.existsSync(files.markerPath), true);
+        } },
+    });
+    await supervisor.runDestroyTransaction(ownership.handles.container.id);
+    assert.equal(fs.existsSync(files.markerPath), false);
+    assert.equal(fs.readFileSync(files.statusPath, 'utf8'), 'retained run status');
+});
+
+test('repeat destroy recovers markers when the Box is already absent without reading stale registry', async (t) => {
+    const state = fixture(t);
+    const files = seedRetainedNoWaitMarker(state.workspace);
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    fs.writeFileSync(path.join(identity.anchorPath, 'agents.json'), '{malformed retained registry');
+    const events = [];
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ({ state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: null }),
+        runner: { run() { assert.fail('absent Box needs no engine mutation'); } },
+    });
+    const result = await supervisor.runDestroyTransaction(null);
+    assert.equal(result.action, 'absent');
+    assert.equal(fs.existsSync(files.markerPath), false);
+    assert.equal(fs.existsSync(files.statusPath), true);
+    assert.equal((await supervisor.runDestroyTransaction(null)).action, 'absent');
+});
+
+test('failed Box removal preserves current no-wait markers', async (t) => {
+    const state = fixture(t);
+    const files = seedRetainedNoWaitMarker(state.workspace);
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const events = [];
+    const ownership = owned(identity, { running: false });
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: { run() { throw new Error('removal failed'); } },
+    });
+    await assert.rejects(() => supervisor.runDestroyTransaction(ownership.handles.container.id), /removal failed/);
+    assert.equal(fs.existsSync(files.markerPath), true);
+});

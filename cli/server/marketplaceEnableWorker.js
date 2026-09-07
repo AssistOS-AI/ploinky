@@ -1,7 +1,10 @@
 import { Worker } from 'node:worker_threads';
+import { resolveNoWaitBarrierTimeouts } from '../commands/noWaitProtocol.js';
 
 const MARKETPLACE_ENABLE_WORKER_URL = new URL('./marketplaceEnableWorkerThread.js', import.meta.url);
-export const MARKETPLACE_ENABLE_TIMEOUT_MS = 180_000;
+// Marketplace performs the same cold image installation as background startup.
+// Its outer watchdog must include the sanctioned image-operation budgets.
+export const MARKETPLACE_ENABLE_TIMEOUT_MS = resolveNoWaitBarrierTimeouts().activeTimeoutMs;
 
 function boundedMessage(value, fallback) {
     const message = String(value || '').trim();
@@ -47,7 +50,11 @@ export function runMarketplaceEnableWorker({ agentRef, mode }, {
             callback(value);
         };
 
-        worker.once('message', (message) => {
+        worker.on('message', (message) => {
+            if (settled) return;
+            // Health probes publish progress on the same parent port. Only the
+            // activation result may complete the Marketplace mutation.
+            if (message?.type === 'log') return;
             if (message?.ok === true) {
                 finish(resolve, message.result);
                 return;

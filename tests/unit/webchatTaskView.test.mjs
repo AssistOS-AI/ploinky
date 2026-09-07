@@ -4,6 +4,65 @@ import test from 'node:test';
 
 import { createSidePanel } from '../../cli/server/webchat/sidePanel.js';
 
+test('chat links open live robot sessions in the right side panel', (t) => {
+    const originalDocument = globalThis.document;
+    const originalWindow = globalThis.window;
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalLocalStorage = globalThis.localStorage;
+    let clickHandler = null;
+    const makeElement = (tagName = 'div') => ({
+        tagName: tagName.toUpperCase(),
+        children: [],
+        className: '',
+        dataset: {},
+        style: {},
+        appendChild(child) { this.children.push(child); return child; },
+        addEventListener(type, listener) {
+            if (type === 'click') clickHandler = listener;
+        },
+    });
+    const panelWrapper = makeElement();
+    panelWrapper.innerHTML = '';
+    const sidePanel = makeElement();
+    sidePanel.querySelector = () => panelWrapper;
+    const chatContainer = makeElement();
+    chatContainer.classList = { add() {}, remove() {} };
+    globalThis.document = { createElement: (tagName) => makeElement(tagName) };
+    globalThis.window = { location: { origin: 'http://localhost:8080' } };
+    globalThis.localStorage = { getItem: () => null };
+    globalThis.setTimeout = () => 0;
+    t.after(() => {
+        globalThis.document = originalDocument;
+        globalThis.window = originalWindow;
+        globalThis.localStorage = originalLocalStorage;
+        globalThis.setTimeout = originalSetTimeout;
+    });
+
+    const api = createSidePanel({
+        chatContainer,
+        chatArea: null,
+        sidePanel,
+        sidePanelContent: null,
+        sidePanelClose: null,
+        sidePanelTitle: null,
+        sidePanelResizer: null,
+    }, { markdown: null });
+    const link = {
+        href: 'http://localhost:8080/base-agent-additional-server/roboTeamAgent/3001/api/robots/analyst/session/',
+        dataset: { wcLink: 'true' },
+    };
+    api.bindLinkDelegation(chatContainer);
+    let prevented = false;
+    clickHandler({
+        target: { closest: () => link },
+        preventDefault() { prevented = true; },
+    });
+
+    assert.equal(prevented, true);
+    assert.equal(sidePanel.style.display, 'flex');
+    assert.equal(panelWrapper.children.at(-1).children[0].src, link.href);
+});
+
 test('side panel forwards only the active task update to its same-origin iframe', (t) => {
     const originalDocument = globalThis.document;
     const originalWindow = globalThis.window;

@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import { describeShellFailure } from '../lib/toolError.mjs';
+import { createTaskControlStream } from './taskControlStream.mjs';
 
 const DEFAULT_MAX_LOG_TAIL_BYTES = 128 * 1024;
 const DEFAULT_CANCEL_GRACE_MS = 2000;
@@ -23,7 +24,8 @@ function normalizeContinuation(raw) {
     if (raw.version !== 1 || !CONTINUATION_HANDLE_RE.test(handle) || !TOOL_NAME_RE.test(toolName)) {
         return null;
     }
-    return { version: 1, handle, toolName };
+    return { version: 1, handle, toolName,
+        ...(TOOL_NAME_RE.test(raw.messageToolName || '') ? { messageToolName: raw.messageToolName } : {}) };
 }
 
 function commandResult(stdout) {
@@ -137,6 +139,8 @@ export class TaskQueue {
                         continuationTool: TOOL_NAME_RE.test(String(entry.continuationTool || '').trim())
                             ? String(entry.continuationTool).trim()
                             : '',
+                        taskMessageTool: TOOL_NAME_RE.test(entry.taskMessageTool || '') ? entry.taskMessageTool : '',
+                        liveContinuation: normalizeContinuation(entry.liveContinuation),
                         createdAt: entry.createdAt || new Date().toISOString(),
                         updatedAt: entry.updatedAt || entry.createdAt || new Date().toISOString(),
                         error: entry.error ?? null,
@@ -172,6 +176,8 @@ export class TaskQueue {
                 error: task.error,
                 logRetention: task.logRetention,
                 continuationTool: task.continuationTool,
+                taskMessageTool: task.taskMessageTool,
+                liveContinuation: task.liveContinuation,
             }));
             fs.writeFileSync(this.storagePath, JSON.stringify(snapshot, null, 2));
         } catch (err) {
@@ -268,6 +274,7 @@ export class TaskQueue {
         timeoutMs,
         logRetention = 'bounded',
         continuationTool = '',
+        taskMessageTool = '',
     }) {
         this.initialize();
         if (this.shuttingDown) {
@@ -295,6 +302,7 @@ export class TaskQueue {
             continuationTool: TOOL_NAME_RE.test(String(continuationTool || '').trim())
                 ? String(continuationTool).trim()
                 : '',
+            taskMessageTool: TOOL_NAME_RE.test(taskMessageTool) ? taskMessageTool : '',
             status: 'pending',
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
@@ -519,6 +527,19 @@ export class TaskQueue {
                     // Ignore log forwarding failures.
                 }
             };
+            const controlStream = createTaskControlStream((chunk) => {
+                forwardToHostLog(process.stderr, chunk);
+                this.appendTaskLog(task.id, chunk);
+            }, (raw) => {
+                if (task.liveContinuation) return;
+                const continuation = normalizeContinuation(raw);
+                if (!continuation || continuation.toolName !== task.continuationTool) return;
+                if (continuation.messageToolName !== task.taskMessageTool) delete continuation.messageToolName;
+                task.liveContinuation = continuation;
+                task.updatedAt = new Date().toISOString();
+                task.logSeq += 1;
+                this.persistTasks();
+            });
             const result = await this.executor(task.commandSpec, task.payload, {
                 onSpawn: (child) => {
                     this.activeChildren.set(task.id, child);
@@ -544,11 +565,11 @@ export class TaskQueue {
                     // not leak into task presentation.
                 },
                 onStderrChunk: (chunk) => {
-                    forwardToHostLog(process.stderr, chunk);
-                    this.appendTaskLog(task.id, chunk);
+                    controlStream.push(chunk);
                 },
                 detached: true,
             });
+            controlStream.finish();
 
             if (task.cancelRequested || task.status === 'cancelling') {
                 const cleanup = this.cancelCleanups.get(task.id);
@@ -564,7 +585,8 @@ export class TaskQueue {
             const continuation = task.continuationTool
                 && parsedResult.continuation?.toolName === task.continuationTool
                 ? parsedResult.continuation
-                : null;
+                : task.liveContinuation || null;
+            if (continuation && continuation.messageToolName !== task.taskMessageTool) delete continuation.messageToolName;
             if (task.cancelRequested || task.status === 'cancelling') {
                 task.status = 'cancelled';
                 task.error = null;
@@ -648,6 +670,7 @@ export class TaskQueue {
             updatedAt: task.updatedAt,
             error: task.error,
             result: task.result,
+            ...(task.liveContinuation ? { liveContinuation: task.liveContinuation } : {}),
             logTail: logSnapshot.tail,
             logSeq: logSnapshot.seq,
             logTruncated: logSnapshot.truncated

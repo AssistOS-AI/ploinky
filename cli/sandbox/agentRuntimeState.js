@@ -1,8 +1,10 @@
 import { getBwrapPid, isBwrapProcessRunning } from './bwrap/bwrapFleet.js';
 import { collectLiveAgentContainers, collectLiveAgentContainersAsync, getAgentsRegistry } from './docker/containerRegistry.js';
 import { loadActiveEdgeRoutingGeneration } from './edgeGeneration.js';
-import { resolveAgentExecutionMode } from '../utils/runtime/startupReadiness.js';
+import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
 import { observeNoWaitAgentRecord } from '../server/noWaitAgentStartupState.js';
+
+import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 
 const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
 
@@ -48,8 +50,9 @@ function hasReadyServiceOnlyRuntime(selected, containerName, record, context) {
     const manifest = context.generation.manifests?.[routeKey];
     if (context.generation.routing?.routes?.[routeKey] !== route
         || route.container !== containerName || captured?.type !== 'agent'
-        || !manifest || resolveAgentExecutionMode(manifest).type !== 'start_only') return false;
-    for (const field of ['repoName', 'agentName', 'instanceId', 'enableGeneration', 'runtime']) {
+        || !manifest || resolveAgentExecutionMode(manifest).type !== 'start_only'
+        || resolveAgentReadinessProtocol(manifest) !== 'script') return false;
+    for (const field of ['repoName', 'agentName', 'instanceId', 'enableGeneration', 'runtime', 'profile']) {
         if (typeof record?.[field] !== 'string' || !record[field] || record[field] !== record[field].trim()
             || captured[field] !== record[field]) return false;
     }
@@ -63,6 +66,12 @@ function hasReadyServiceOnlyRuntime(selected, containerName, record, context) {
         || captured.containerId !== record.containerId
         || context.liveEntry?.containerId !== record.containerId) return false;
     try {
+        if (resolveManifestRuntimeProfile(manifest, {
+            agentName: `${record.repoName}/${record.agentName}`,
+            persistedProfileName: record.profile,
+            fallbackProfileName: 'default',
+            path: `captured manifest(${routeKey})`,
+        }).resolvedProfileName !== record.profile) return false;
         // Foreground startup publishes the final exact runtime only after its
         // readiness probe. Detached startup must also prove its current run.
         const observation = context.observeNoWaitRecord(containerName, record, {

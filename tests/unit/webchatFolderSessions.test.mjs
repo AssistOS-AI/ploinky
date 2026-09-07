@@ -66,9 +66,12 @@ test('WebChat exposes a task overlay backed by AchillesCLI commands', () => {
     assert.match(messages, /message\?\.type === 'task'/);
     assert.match(messages, /wa-task-item/);
     assert.doesNotMatch(messages, /taskAssociations/);
-    assert.match(presentation, /View task details/);
+    assert.match(presentation, /Open Task/);
     assert.match(presentation, /data.*wcTaskId|dataset\.wcTaskId/);
-    assert.doesNotMatch(presentation, /wa-inline-task-arrow|wa-inline-task-log/);
+    assert.match(presentation, /wa-task-summary-arrow/);
+    assert.match(presentation, /wa-task-summary-log/);
+    assert.match(presentation, /createTaskLogFollower/);
+    assert.match(presentation, /aria-expanded/);
     assert.match(presentation, /\(stdout\|stderr\)/);
     assert.match(presentation, /RUNNER_PREFIX_RE/);
     assert.match(presentation, /setInterval\(renderSummary, 1000\)/);

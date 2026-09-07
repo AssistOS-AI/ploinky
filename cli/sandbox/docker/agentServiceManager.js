@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { isDeepStrictEqual } from 'node:util';
+import { retireNoWaitRunMarker } from '../../commands/noWaitMarkerLifecycle.js';
 import {
     assertManifestEnvProfileCompleteness,
     buildEnvMap,
@@ -2858,6 +2859,7 @@ export function coordinateReplacementRuntimeIdentity({
     saveRegistry = saveAgentsMap,
     saveRouting = writeRoutingConfig,
     withApplyLock = withEdgeGenerationApplyLock,
+    retireNoWaitMarker = retireNoWaitRunMarker,
     uuid = randomUUID,
 } = {}) {
     const exactContainerName = String(containerName || '').trim();
@@ -2927,6 +2929,10 @@ export function coordinateReplacementRuntimeIdentity({
             });
             return;
         }
+        // The current marker authorizes observations of the predecessor tuple.
+        // Retire it before a non-additive write replaces or removes that tuple.
+        // Additive preparation above retains the active predecessor until commit.
+        retireNoWaitMarker(exactContainerName, { expectedRecord: current });
         // Capture before the write: persistence can succeed and then throw.
         // This receipt records only this coordinator's attempted rotation;
         // consumers must still match the exact live staged registry record.

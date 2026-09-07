@@ -18,6 +18,7 @@ request.on('error', (error) => {
 });
 `;
 
+parentPort?.postMessage({ type: 'log', level: 'info', message: 'readiness probe starting' });
 const callback = spawnSync(process.execPath, ['-e', script, String(workerData?.agentRef || '')], {
     encoding: 'utf8',
     timeout: 2_000,

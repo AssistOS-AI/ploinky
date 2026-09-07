@@ -439,3 +439,84 @@ test('Marketplace state exposes starting and disabled agents as distinct lifecyc
         },
     ]);
 });
+
+function activatedScriptRuntimeFixture() {
+    const record = {
+        type: 'agent', runtime: 'podman', repoName: 'Services', agentName: 'documentServer',
+        alias: 'documents', profile: 'default', instanceId: 'instance-current',
+        enableGeneration: 'enable-current', containerId: 'c'.repeat(64),
+    };
+    return {
+        registry: { documentKey: { ...record } },
+        liveContainers: [{
+            containerName: 'documentKey', containerId: record.containerId,
+            state: { status: 'running', running: true, pid: 123 },
+        }],
+        activeGeneration: {
+            agents: { documentKey: { ...record } },
+            routing: { routes: { documents: {
+                container: 'documentKey', repo: 'Services', agent: 'documentServer', alias: 'documents',
+            } } },
+            manifests: { documents: {
+                start: 'node /code/server.mjs',
+                health: { readiness: { script: 'ready.sh' } },
+                profiles: { default: {} },
+            } },
+        },
+    };
+}
+
+test('a running script-ready start-only runtime uses its exact activated generation without a main port', async () => {
+    const options = activatedScriptRuntimeFixture();
+    assert.deepEqual(collectAgentRuntimeStates(options)[0].state, {
+        status: 'running', running: true, pid: 123,
+    });
+    assert.equal((await collectAgentRuntimeStatesAsync(options))[0].state.running, true);
+    options.liveContainers[0].state = { status: 'stopped', running: false, pid: 0 };
+    assert.deepEqual(collectAgentRuntimeStates(options)[0].state, {
+        status: 'stopped', running: false, pid: 0,
+    });
+});
+
+const invalidScriptRuntimeEvidence = {
+    'missing generation': (o) => { o.activeGeneration = null; },
+    'missing captured manifest': (o) => { delete o.activeGeneration.manifests.documents; },
+    'missing captured registry': (o) => { delete o.activeGeneration.agents; },
+    'missing captured route': (o) => { delete o.activeGeneration.routing.routes.documents; },
+    'disabled route': (o) => { o.activeGeneration.routing.routes.documents.disabled = true; },
+    'draining route': (o) => { o.activeGeneration.routing.routes.documents.draining = true; },
+    'wrong container name': (o) => { o.activeGeneration.routing.routes.documents.container = 'replacementKey'; },
+    'wrong route repository': (o) => { o.activeGeneration.routing.routes.documents.repo = 'Other'; },
+    'wrong route agent': (o) => { o.activeGeneration.routing.routes.documents.agent = 'other'; },
+    'wrong route alias': (o) => { o.activeGeneration.routing.routes.documents.alias = 'other'; },
+    'wrong route key': (o) => { o.activeGeneration.routing.routes.other = o.activeGeneration.routing.routes.documents; delete o.activeGeneration.routing.routes.documents; },
+    'untracked live process': (o) => { o.registry = {}; },
+    'ordinary MCP with script': (o) => { o.activeGeneration.manifests.documents.agent = 'node agent.mjs'; },
+    'ordinary implicit MCP': (o) => { delete o.activeGeneration.manifests.documents.start; },
+    'TCP start-only readiness': (o) => { o.activeGeneration.manifests.documents.readiness = { protocol: 'tcp' }; },
+    'missing script readiness': (o) => { delete o.activeGeneration.manifests.documents.health; },
+    'undeclared profile': (o) => { o.registry.documentKey.profile = 'missing'; o.activeGeneration.agents.documentKey.profile = 'missing'; },
+    'noncanonical profile': (o) => { o.registry.documentKey.profile = 'DEFAULT'; o.activeGeneration.agents.documentKey.profile = 'DEFAULT'; },
+};
+for (const field of ['instanceId', 'enableGeneration', 'containerId', 'repoName', 'agentName', 'profile', 'alias']) {
+    invalidScriptRuntimeEvidence[`stale ${field}`] = (o) => { o.activeGeneration.agents.documentKey[field] = 'stale'; };
+    if (field !== 'alias') {
+        invalidScriptRuntimeEvidence[`missing ${field}`] = (o) => { delete o.activeGeneration.agents.documentKey[field]; delete o.registry.documentKey[field]; };
+    }
+}
+for (const [label, invalidate] of Object.entries(invalidScriptRuntimeEvidence)) {
+    test(`script-ready runtime remains starting for ${label}`, () => {
+        const options = activatedScriptRuntimeFixture();
+        invalidate(options);
+        assert.deepEqual(collectAgentRuntimeStates(options)[0].state, {
+            status: 'starting', running: false, pid: 123,
+        });
+    });
+}
+
+test('routes-only evidence cannot declare a portless script runtime ready', () => {
+    const options = activatedScriptRuntimeFixture();
+    options.routes = options.activeGeneration.routing.routes;
+    delete options.activeGeneration;
+    assert.equal(collectAgentRuntimeStates(options)[0].state.running, false);
+});

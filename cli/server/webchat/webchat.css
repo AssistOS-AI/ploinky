@@ -3851,6 +3851,17 @@ button.wa-upload-directory-entry.folder:hover {
     color: var(--wa-accent);
 }
 
+.wa-task-log-inline-link {
+    color: var(--wa-accent);
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.wa-task-log-inline-link:hover {
+    color: var(--wa-accent-hover);
+}
+
 .wa-task-log-line.is-user-prompt {
     margin: 5px 0;
     padding: 3px 7px;
@@ -3878,12 +3889,26 @@ button.wa-upload-directory-entry.folder:hover {
 .wa-task-view-header {
     width: 100%;
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
     align-items: center;
     gap: 7px;
     color: var(--wa-text-primary);
     font: inherit;
     text-align: left;
+}
+
+.wa-task-summary-row {
+    appearance: none;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+}
+
+.wa-task-summary-row:focus-visible {
+    border-radius: 4px;
+    outline: 2px solid var(--wa-accent);
+    outline-offset: 3px;
 }
 
 .wa-task-view-header {
@@ -3922,9 +3947,30 @@ button.wa-upload-directory-entry.folder:hover {
     font-variant-numeric: tabular-nums;
 }
 
+.wa-task-summary-arrow {
+    color: var(--wa-text-muted);
+    font-size: 13px;
+    line-height: 1;
+}
+
+.wa-task-summary-body {
+    min-width: 0;
+    margin-top: 9px;
+}
+
+.wa-task-summary-body[hidden] {
+    display: none;
+}
+
+.wa-task-summary-log {
+    width: 100%;
+    max-height: 280px;
+    flex: none;
+    overflow-y: auto;
+}
+
 .wa-task-log-link {
     display: inline-block;
-    margin-top: 7px;
     color: var(--wa-accent);
     font-size: 12px;
     font-weight: 600;
@@ -3934,6 +3980,49 @@ button.wa-upload-directory-entry.folder:hover {
 
 .wa-task-log-link:hover {
     color: var(--wa-accent-hover);
+}
+
+.wa-task-summary-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 7px;
+}
+
+.wa-task-inline-action {
+    padding: 5px 10px;
+    border: 1px solid currentColor;
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.wa-task-inline-action.is-stop {
+    color: #f15c6d;
+}
+
+.wa-task-inline-action.is-resume {
+    color: var(--wa-accent);
+}
+
+.wa-task-inline-action:hover:not(:disabled) {
+    background: var(--wa-bg-hover);
+}
+
+.wa-task-inline-action:disabled {
+    cursor: progress;
+    opacity: 0.6;
+}
+
+.wa-task-summary-error {
+    margin-top: 7px;
+    color: #f15c6d;
+    font-size: 12px;
+    line-height: 1.4;
 }
 
 .wa-task-view-page {
@@ -4116,5 +4205,97 @@ button.wa-upload-directory-entry.folder:hover {
     .wa-tasks-list {
         border-right: 0;
         border-bottom: 1px solid var(--wa-border);
+    }
+}
+.wa-task-composer {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    min-width: 0;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--wa-border);
+}
+
+.wa-task-composer[hidden] {
+    display: none;
+}
+
+.wa-task-composer textarea {
+    appearance: none;
+    box-sizing: border-box;
+    flex: 1 1 0;
+    width: 100%;
+    min-width: 0;
+    min-height: 64px;
+    max-height: 180px;
+    padding: 10px 12px;
+    border: 1px solid var(--wa-border-light);
+    border-radius: 10px;
+    background: var(--wa-bg-input);
+    color: var(--wa-text-primary);
+    caret-color: var(--wa-accent);
+    font: inherit;
+    font-size: 13px;
+    line-height: 1.5;
+    resize: none;
+    overflow-y: hidden;
+}
+
+.wa-task-composer textarea::placeholder {
+    color: var(--wa-text-muted);
+    opacity: 1;
+}
+
+.wa-task-composer textarea:focus {
+    border-color: var(--wa-accent);
+    outline: 2px solid var(--wa-accent-faded);
+    outline-offset: 1px;
+}
+
+.wa-task-composer button {
+    appearance: none;
+    flex: 0 0 auto;
+    min-height: 40px;
+    padding: 9px 14px;
+    border: 1px solid var(--wa-accent);
+    border-radius: 10px;
+    background: var(--wa-accent);
+    color: #fff;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.5;
+    cursor: pointer;
+}
+
+.wa-task-composer button:hover:not(:disabled) {
+    background: var(--wa-accent-hover);
+    border-color: var(--wa-accent-hover);
+}
+
+.wa-task-composer button:focus-visible {
+    outline: 2px solid var(--wa-accent);
+    outline-offset: 3px;
+}
+
+.wa-task-composer button:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+
+@media (max-width: 480px) {
+    .wa-task-composer {
+        flex-wrap: wrap;
+    }
+
+    .wa-task-composer textarea {
+        flex-basis: 100%;
+        font-size: 16px;
+    }
+
+    .wa-task-composer button {
+        min-height: 44px;
+        margin-left: auto;
     }
 }

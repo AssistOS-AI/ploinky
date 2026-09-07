@@ -166,6 +166,25 @@ test('TaskQueue exposes stderr as live logs without leaking stdout result payloa
     assert.doesNotMatch(completed.logTail, /step 1/);
 });
 
+test('TaskQueue exposes declared live controls before completion and retains them afterwards', async (t) => {
+    const storagePath = makeTempStorage(t);
+    let finish;
+    const queue = new TaskQueue({ storagePath, executor: (_spec, _payload, options) => new Promise((resolve) => {
+        finish = resolve;
+        options.onStderrChunk('@@PLOINKY_TASK_CONTROL@@' + JSON.stringify({
+            version: 1, toolName: 'resume-work', messageToolName: 'message-work', handle: 'private-session-handle',
+        }) + '\nvisible output\n');
+    }) });
+    const { id } = queue.enqueueTask({ ...dummyTaskConfig(), continuationTool: 'resume-work', taskMessageTool: 'message-work' });
+    const running = await waitFor(() => queue.getTask(id)?.liveContinuation && queue.getTask(id));
+    assert.equal(running.status, 'running');
+    assert.equal(running.liveContinuation.messageToolName, 'message-work');
+    assert.equal(running.logTail, 'visible output\n');
+    finish({ code: 0, stdout: 'done', stderr: '' });
+    await waitFor(() => queue.getTask(id)?.status === 'completed');
+    assert.equal(queue.getTask(id).result.metadata.continuation.handle, 'private-session-handle');
+});
+
 test('TaskQueue exposes only outputText from structured command results', async (t) => {
     const storagePath = makeTempStorage(t);
     const stdout = JSON.stringify({
