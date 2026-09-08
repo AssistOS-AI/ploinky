@@ -3045,13 +3045,16 @@ async function reinstallAgent(agentName) {
     const routerPort = resolvePersistedRouterPort();
     if (!agentName) { throw new Error('Usage: reinstall <name> | reinstall agent <name>'); }
 
-    const { getAgentContainerName, isContainerRunning, ensureAgentService } = dockerSvc;
+    const { getAgentContainerName, ensureAgentService } = dockerSvc;
     let registryRecord = null;
     try {
         registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
     } catch (err) {
         console.error(err?.message || err);
         return;
+    }
+    if (!registryRecord) {
+        throw new Error(`Agent '${agentName}' is not enabled. Run 'ploinky start ${agentName}' first.`);
     }
 
     let resolved;
@@ -3087,17 +3090,9 @@ async function reinstallAgent(agentName) {
     });
 
     const agentRuntime = getRuntimeForAgent(manifest);
-    const bwrapRunning = isSandboxRuntime(agentRuntime)
-        && Boolean(registryRecord?.record?.instanceId && registryRecord?.record?.enableGeneration)
-        && isBwrapProcessRunning(containerName, {
-            instanceId: registryRecord.record.instanceId,
-            enableGeneration: registryRecord.record.enableGeneration,
-        });
 
-    if (!isContainerRunning(containerName) && !bwrapRunning) {
-        console.error(`Agent '${agentName}' is not running.`);
-        return;
-    }
+    // Failed installations may have no runtime. The shared runtime manager
+    // validates ownership and recreates missing, stopped, or running agents.
 
     console.log(`Reinstalling (re-creating) agent '${agentName}'...`);
 

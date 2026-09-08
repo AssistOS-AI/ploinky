@@ -106,7 +106,6 @@ test('managed single-agent restart drains before replacement and publishes only 
 test('sandbox ownership checks use exact runtime keys rather than short agent names', () => {
     assert.match(cliSource, /isBwrapProcessRunning\(containerName, \{/);
     assert.match(workspaceSource, /isSandboxRunningImpl\(existing\.key, \{/);
-    assert.match(workspaceSource, /isBwrapProcessRunning\(containerName, \{/);
     for (const source of [cliSource, workspaceSource]) {
         assert.match(source, /instanceId:/);
         assert.match(source, /enableGeneration:/);
