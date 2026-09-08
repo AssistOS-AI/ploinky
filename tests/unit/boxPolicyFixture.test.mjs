@@ -65,7 +65,7 @@ test('clean explicit fixture repository rejects privilege in Box with zero admis
         encoding: 'utf8',
     }), '');
 
-    for (const repoName of ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents']) {
+    for (const repoName of ['AchillesIDE', 'AchillesCLI', 'copilot-agents']) {
         fs.mkdirSync(path.join(workspace, '.ploinky', 'repos', repoName), { recursive: true });
     }
 

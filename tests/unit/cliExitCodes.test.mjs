@@ -16,7 +16,7 @@ const lightweightBoundaryLoader = path.join(
     'fixtures',
     'lightweightCliBoundaryLoader.mjs',
 );
-const bootRepos = ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents'];
+const bootRepos = ['AchillesIDE', 'AchillesCLI', 'copilot-agents'];
 
 function createWorkspace(t) {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-exit-'));

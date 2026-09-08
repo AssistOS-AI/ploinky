@@ -41,7 +41,7 @@ function nestedResourceExists(harness, containerId, kind, name) {
     ], { timeoutMs: 120_000 }).ok;
 }
 
-test('pinned seven-repository graph starts through one immutable Box candidate', {
+test('pinned Explorer graph starts through one immutable Box candidate', {
     timeout: 25 * 60_000,
 }, async (t) => {
     const candidateReference = requirePodmanCandidate(t);
@@ -82,12 +82,36 @@ test('pinned seven-repository graph starts through one immutable Box candidate',
     assert.equal(harness.output.bytes.includes(keyValue), false);
 
     const publications = started.ownership.handles.container.runtime.publications;
+    assert.equal(publications.length, 2);
     assert.equal(publications.some((entry) => (
         entry.protocol === 'tcp'
         && entry.hostPort === String(route.hostPort)
         && entry.containerPort === '8080'
+        && entry.hostIp === '127.0.0.1'
+    )), true);
+    assert.equal(publications.some((entry) => (
+        entry.protocol === 'udp'
+        && entry.containerPort === '7882'
+        && entry.hostIp === '0.0.0.0'
     )), true);
     assert.equal(publications.some((entry) => entry.containerPort === '8081'), false);
+
+    const graphState = JSON.parse(execInBox(harness.runner, started.containerId, [
+        '/usr/local/bin/node', '-e', [
+            "const f=require('node:fs');",
+            "const a=JSON.parse(f.readFileSync('/workspace/.ploinky/agents.json'));",
+            "const agents=Object.values(a).map(({repoName,agentName})=>({repoName,agentName}));",
+            "const repositories=f.readdirSync('/workspace/.ploinky/repos');",
+            "process.stdout.write(JSON.stringify({agents,repositories}));",
+        ].join(''),
+    ]));
+    assert.deepEqual(graphState.agents.filter((entry) => entry.agentName === 'liveKitServerAgent'), [
+        { repoName: 'AchillesIDE', agentName: 'liveKitServerAgent' },
+    ]);
+    for (const retired of ['basic', 'webmeetInfra']) {
+        assert.equal(graphState.repositories.includes(retired), false);
+        assert.equal(graphState.agents.some((entry) => entry.repoName === retired), false);
+    }
 
     const transport = JSON.parse(execInBox(harness.runner, started.containerId, [
         'cat', '/run/ploinky/box-transport.json',

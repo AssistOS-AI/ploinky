@@ -17,7 +17,10 @@ import {
     writeCandidatePodmanProxy,
 } from '../e2e/ploinkyBox/candidatePodmanProxy.mjs';
 
-test('smoke graph requires exactly seven clean absolute real checkouts at exact SHAs', (t) => {
+test('smoke graph pins only the required Explorer repositories and stages their exact SHAs', (t) => {
+    assert.deepEqual(SMOKE_GRAPH_REPOSITORIES, [
+        'AssistOSExplorer', 'UmamiAgent', 'AchillesCLI', 'proxies', 'container-image-builds',
+    ]);
     const createdRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-smoke-inputs-'));
     const root = fs.realpathSync(createdRoot);
     t.after(() => fs.rmSync(createdRoot, { recursive: true, force: true }));
@@ -55,7 +58,7 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
         SMOKE_GRAPH_EDGE_DESIRED_FILE: desiredCandidate,
     };
     const graph = readSmokeGraphInputs(baseEnvironment, { runner });
-    assert.equal(Object.keys(graph.repositories).length, 7);
+    assert.equal(Object.keys(graph.repositories).length, 5);
     assert.deepEqual(graph.args, ['start', 'AchillesIDE/explorer', '19090']);
 
     const containerId = 'b'.repeat(64);
@@ -65,6 +68,10 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
         `${containerId}:/workspace/.ploinky/repos/AchillesIDE`
     )));
     assert.ok(copyCalls.every((call) => !call.at(-1).endsWith('/AssistOSExplorer')));
+    assert.deepEqual(copyCalls.filter((call) => call.at(-1).includes('/repos/'))
+        .map((call) => call.at(-1)), [
+        'AchillesIDE', 'UmamiAgent', 'AchillesCLI', 'proxies', 'container-image-builds',
+    ].map((name) => `${containerId}:/workspace/.ploinky/repos/${name}`));
     assert.ok(copyCalls.some((call) => call.at(-1).endsWith('/desired.json.smoke-candidate')));
     const initializeIndex = calls.findIndex((call) => (
         call.includes('/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs')
@@ -92,11 +99,23 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
     }), /desired state changed during graph staging/);
 
     const missing = { ...repositories };
-    delete missing.basic;
+    delete missing.AssistOSExplorer;
     assert.throws(() => readSmokeGraphInputs({
         ...baseEnvironment,
         SMOKE_GRAPH_REPOSITORIES_JSON: JSON.stringify(missing),
-    }, { runner }), /exactly the seven/);
+    }, { runner }), /exactly the 5 pinned graph repositories/);
+
+    for (const retired of ['basic', 'webmeetInfra']) {
+        for (const [key, value] of [
+            ['SMOKE_GRAPH_REPOSITORIES_JSON', { ...repositories, [retired]: root }],
+            ['SMOKE_GRAPH_REVISIONS_JSON', { ...revisions, [retired]: sha }],
+        ]) {
+            assert.throws(() => readSmokeGraphInputs({
+                ...baseEnvironment,
+                [key]: JSON.stringify(value),
+            }, { runner }), /exactly the 5 pinned graph repositories/);
+        }
+    }
 
     assert.throws(() => readSmokeGraphInputs({
         ...baseEnvironment,
@@ -121,6 +140,39 @@ test('smoke graph requires exactly seven clean absolute real checkouts at exact 
         ...baseEnvironment,
         SMOKE_GRAPH_EDGE_DESIRED_FILE: duplicateAuthorityCandidate,
     }, { runner }), /must not duplicate manifest or HTTP route policy authority/);
+});
+
+test('candidate workflow stages the same Explorer graph and rejects retired repository pins', () => {
+    const workflow = fs.readFileSync(new URL(
+        '../../.github/workflows/verify-ploinky-box-candidate.yml', import.meta.url,
+    ), 'utf8');
+    const repositoryMap = JSON.parse(workflow.match(
+        /SMOKE_GRAPH_REPOSITORIES_JSON: >-\n\s+(\{[^\n]+\})/,
+    )[1]);
+    const expected = [...SMOKE_GRAPH_REPOSITORIES].sort();
+    assert.deepEqual(Object.keys(repositoryMap).sort(), expected);
+    const checkouts = [...workflow.matchAll(/repository: AssistOS-AI\/([^\s]+)/g)]
+        .map((match) => match[1]).sort();
+    assert.deepEqual(checkouts, expected);
+
+    const validation = workflow.match(/node --input-type=module -e '\n([\s\S]*?)\n\s+'/)[1];
+    const revisions = Object.fromEntries(expected.map((name) => [name, 'a'.repeat(40)]));
+    const validate = (pins) => spawnSync(process.execPath, ['--input-type=module', '-e', validation], {
+        cwd: new URL('../..', import.meta.url),
+        encoding: 'utf8',
+        env: {
+            ...process.env,
+            PLOINKY_BOX_CANDIDATE_DIGEST: `sha256:${'b'.repeat(64)}`,
+            SMOKE_GRAPH_REVISIONS_JSON: JSON.stringify(pins),
+            SMOKE_GRAPH_ARGS_JSON: '["start","AchillesIDE/explorer","19090"]',
+        },
+    });
+    const accepted = validate(revisions);
+    assert.equal(accepted.status, 0, accepted.stderr);
+    for (const retired of ['basic', 'webmeetInfra']) {
+        const rejected = validate({ ...revisions, [retired]: 'a'.repeat(40) });
+        assert.equal(rejected.status, 3, rejected.stderr);
+    }
 });
 
 test('generated candidate proxy embeds one digest outside the repository and writes NUL-safe traces', (t) => {

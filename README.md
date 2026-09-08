@@ -73,6 +73,11 @@ On startup the Box verifies that immutable bundle and copies it into
 `/opt/ploinky/node_modules`; a fresh workspace therefore performs no MCP SDK
 Git or npm operation and needs no GitHub credentials.
 
+Automatic repository bootstrap installs `AchillesIDE`, `AchillesCLI`, and
+`copilot-agents`. Explorer's manifest declares its additional repositories and
+uses `AchillesIDE/liveKitServerAgent` for LiveKit. The `basic` repository is
+optional: install it explicitly with `ploinky install repo basic` when needed.
+
 | Invocation | Documented effect |
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |

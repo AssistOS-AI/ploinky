@@ -6,11 +6,9 @@ import { PloinkyBoxError } from '../errors.mjs';
 
 export const SMOKE_GRAPH_REPOSITORIES = Object.freeze([
     'AssistOSExplorer',
-    'webmeetInfra',
     'UmamiAgent',
     'AchillesCLI',
     'proxies',
-    'basic',
     'container-image-builds',
 ]);
 
@@ -38,7 +36,7 @@ function exactKeys(record, label) {
     const actual = Object.keys(record || {}).sort();
     const expected = [...SMOKE_GRAPH_REPOSITORIES].sort();
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-        throw smokeError(`${label} must contain exactly the seven pinned graph repositories`);
+        throw smokeError(`${label} must contain exactly the ${SMOKE_GRAPH_REPOSITORIES.length} pinned graph repositories`);
     }
 }
 

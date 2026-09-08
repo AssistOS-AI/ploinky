@@ -744,6 +744,11 @@ test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expe
     const profile = loadListenerProfile(FULL_PROFILE);
     assert.equal(profile.requiredContainers.length, 19);
     const livekitContainer = profile.requiredContainers.find(entry => entry.id === 'livekit');
+    const livekitName = 'ploinky_AchillesIDE_liveKitServerAgent_fixture';
+    const retiredName = 'ploinky_webmeetInfra_liveKitServerAgent_fixture';
+    assert.equal(livekitContainer.effectiveInstance, 'agent:AchillesIDE/liveKitServerAgent');
+    assert.equal(livekitContainer.namePattern.test(livekitName), true);
+    assert.equal(livekitContainer.namePattern.test(retiredName), false);
     assert.equal(livekitContainer.networkModePattern.test('host'), true);
     assert.equal(livekitContainer.networkModePattern.test('bridge'), false);
     const media = profile.rules.find(rule => rule.id === 'livekit-udp-mux');
@@ -753,6 +758,11 @@ test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expe
     assert.deepEqual(media.exactOwners, ['livekit-server']);
     assert.equal(media.exclusiveSocket, true);
     assert.ok(media.ownerContainerPattern);
+    for (const rule of profile.rules.filter(entry => entry.id.startsWith('livekit-'))) {
+        assert.equal(rule.effectiveInstance, 'agent:AchillesIDE/liveKitServerAgent');
+        assert.equal(rule.ownerContainerPattern.test(livekitName), true);
+        assert.equal(rule.ownerContainerPattern.test(retiredName), false);
+    }
     const privateRouter = profile.rules.find(rule => rule.id === 'router-private');
     assert.equal(privateRouter.dynamicBindSet, 'loopback-and-managed-gateways');
     assert.deepEqual(privateRouter.bindAddresses, []);
@@ -777,6 +787,57 @@ test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expe
         assert.deepEqual(support.bindClasses, ['loopback']);
         assert.equal(support.ownerPattern.test(owner), true);
         assert.equal(support.reviewedSensitive, true);
+    }
+});
+
+test('full Explorer LiveKit rules accept the migrated owner and reject media boundary violations', () => {
+    const fullProfile = loadListenerProfile(FULL_PROFILE);
+    const profile = {
+        ...fullProfile,
+        requiredContainers: fullProfile.requiredContainers.filter(entry => entry.id === 'livekit'),
+        rules: fullProfile.rules.filter(rule => rule.id.startsWith('livekit-')),
+    };
+    const livekit = container({
+        name: 'ploinky_AchillesIDE_liveKitServerAgent_fixture',
+        networkMode: 'host',
+        pids: [200, 201, 202, 203],
+    });
+    const sockets = [
+        'tcp LISTEN 0 511 127.0.0.1:7880 0.0.0.0:* users:(("livekit-server",pid=201,fd=7))',
+        'udp UNCONN 0 0 0.0.0.0:7882 0.0.0.0:* users:(("livekit-server",pid=201,fd=8))',
+        'tcp LISTEN 0 511 127.0.0.1:6379 0.0.0.0:* users:(("redis-server",pid=202,fd=7))',
+        'tcp LISTEN 0 511 127.0.0.1:7980 0.0.0.0:* users:(("egress",pid=203,fd=7))',
+        'tcp LISTEN 0 511 127.0.0.1:7981 0.0.0.0:* users:(("egress",pid=203,fd=8))',
+        'tcp LISTEN 0 511 127.0.0.1:17000 0.0.0.0:* users:(("node",pid=200,fd=7))',
+    ].join('\n');
+    const validate = (bytes = sockets, containers = [livekit]) => validateListenerInventory({
+        listeners: parseSsOutput(bytes, { namespace: 'outer' }),
+        containers,
+    }, profile);
+    const accepted = validate();
+    assert.equal(accepted.ok, true, accepted.errors.join('\n'));
+    assert.equal(accepted.listeners.length, 6);
+    assert.ok(accepted.listeners.every(entry => (
+        entry.effectiveInstance === 'agent:AchillesIDE/liveKitServerAgent'
+    )));
+
+    const retired = container({
+        name: 'ploinky_webmeetInfra_liveKitServerAgent_fixture',
+        networkMode: 'host',
+        pids: livekit.pids,
+    });
+    assert.equal(validate(sockets, [retired]).ok, false);
+    assert.equal(validate(sockets.replaceAll('pid=201', 'pid=999')).ok, false);
+    assert.equal(validate(`${sockets}\n${sockets.split('\n')[1]}`).ok, false);
+    for (const port of [7880, 6379, 7980, 7981, 17000]) {
+        assert.equal(validate(sockets.replace(`127.0.0.1:${port}`, `0.0.0.0:${port}`)).ok, false,
+            `LiveKit support port ${port} must stay on loopback`);
+    }
+    for (const [protocol, port] of [['tcp', 7881], ['udp', 7883], ['udp', 3478]]) {
+        const extra = `${protocol} ${protocol === 'tcp' ? 'LISTEN' : 'UNCONN'} 0 0 0.0.0.0:${port} 0.0.0.0:* users:(("livekit-server",pid=201,fd=9))`;
+        const rejected = validate(`${sockets}\n${extra}`);
+        assert.equal(rejected.ok, false);
+        assert.match(rejected.errors.join('\n'), /forbidden socket/);
     }
 });
 

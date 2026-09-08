@@ -125,7 +125,7 @@ export function getActiveRepos(REPOS_DIR) {
 }
 
 const PREDEFINED_REPOS = {
-    basic: { url: 'https://github.com/AssistOS-AI/Basic.git', description: 'Default base agents', kind: 'agents' },
+    basic: { url: 'https://github.com/AssistOS-AI/Basic.git', description: 'Optional base agents', kind: 'agents' },
     cloud: { url: 'https://github.com/AssistOS-AI/cloud.git', description: 'Cloud infrastructure agents', kind: 'agents' },
     vibe: { url: 'https://github.com/AssistOS-AI/vibe.git', description: 'Vibe coding agents', kind: 'agents' },
     security: { url: 'https://github.com/AssistOS-AI/security.git', description: 'Security and scanning tools', kind: 'agents' },
@@ -140,7 +140,7 @@ const PREDEFINED_REPOS = {
     PloinkySkills: { url: 'https://github.com/AssistOS-AI/PloinkySkills.git', description: 'Skills for developing the Ploinky application', kind: 'skills' }
 };
 
-const BOOT_REPO_NAMES = ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents'];
+const BOOT_REPO_NAMES = ['AchillesIDE', 'AchillesCLI', 'copilot-agents'];
 
 export function getDefaultBootRepos() {
     return BOOT_REPO_NAMES

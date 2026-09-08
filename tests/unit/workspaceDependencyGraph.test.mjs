@@ -2265,14 +2265,14 @@ test('AssistOSExplorer-shaped wiring routes the LiveKit AI worker as no-wait whi
     // LiveKit AI worker with `no-wait`, and the worker's own manifest still
     // lists webmeetAgent so it can be enabled standalone. Cycle truncation
     // drops the inverse edge cleanly so the worker stays in the no-wait set.
-    writeManifest('webmeetInfra', 'stack', { container: 'node:20' });
+    writeManifest('AchillesIDE', 'liveKitServerAgent', { container: 'node:20' });
     writeManifest('AchillesIDE', 'webmeetLivekitAiAgent', {
         container: 'node:20',
-        enable: ['webmeetInfra/stack', 'webmeetAgent global']
+        enable: ['AchillesIDE/liveKitServerAgent', 'webmeetAgent global']
     });
     writeManifest('AchillesIDE', 'webmeetAgent', {
         container: 'node:20',
-        enable: ['webmeetInfra/stack', 'webmeetLivekitAiAgent global no-wait']
+        enable: ['AchillesIDE/liveKitServerAgent', 'webmeetLivekitAiAgent global no-wait']
     });
     writeManifest('AchillesIDE', 'explorer', {
         container: 'node:20',
@@ -2292,7 +2292,7 @@ test('AssistOSExplorer-shaped wiring routes the LiveKit AI worker as no-wait whi
     const { blocking, noWait } = classifyDependencyGraphWaitMode(graph);
     assert.deepEqual(
         Array.from(blocking).sort(),
-        ['AchillesIDE/explorer', 'AchillesIDE/webmeetAgent', 'webmeetInfra/stack']
+        ['AchillesIDE/explorer', 'AchillesIDE/liveKitServerAgent', 'AchillesIDE/webmeetAgent']
     );
     assert.deepEqual(Array.from(noWait), ['AchillesIDE/webmeetLivekitAiAgent']);
     // The inverse edge from the LiveKit AI worker back to webmeetAgent must be
