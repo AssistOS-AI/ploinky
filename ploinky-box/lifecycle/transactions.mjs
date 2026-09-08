@@ -21,6 +21,7 @@ import {
 import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
+import { retireQuiescentBoxEdgePreparation } from '../edgePreparationCleanup.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { preflightPublications, resolveEffectiveHostPort } from '../ports.mjs';
 import {
@@ -127,6 +128,7 @@ async function createAndStart({
     discover,
     startAndWaitReady,
     retireStartLock,
+    retireEdgePreparation,
     beforeCreate = () => {},
     revalidateDataPaths,
     readCidfile,
@@ -140,9 +142,10 @@ async function createAndStart({
     const observed = discover(identity, { runner });
     if (observed?.state !== 'absent' || observed.handles?.container
         || (observed.engine && (observed.engine.name !== engine.name || observed.engine.identity !== engine.identity))) {
-        throw transactionError('Box must be absent before workspace start lock cleanup and creation');
+        throw transactionError('Box must be absent before workspace lifecycle cleanup and creation');
     }
     retireStartLock({ identity, lock });
+    retireEdgePreparation({ identity, lock });
     const cidfile = secureCidfilePath(lock, token);
     cleanCidfile(cidfile, fsApi);
     writeProgress(stderr, `Creating Box container ${identity.instance}...`);
@@ -225,6 +228,7 @@ async function restoreOldContainer({
         discover: dependencies.discover,
         startAndWaitReady: dependencies.startAndWaitReady,
         retireStartLock: dependencies.retireStartLock,
+        retireEdgePreparation: dependencies.retireEdgePreparation,
         revalidateDataPaths: dependencies.revalidateDataPaths,
         readCidfile: dependencies.readCidfile,
         fsApi: dependencies.fsApi,
@@ -269,6 +273,7 @@ export async function reconcileBoxContainer({
         startAndWaitReady: seams.startAndWaitReady || startContainerAndWaitReady,
         readCidfile: seams.readCidfile || readContainerIdFromCidfile,
         retireStartLock: seams.retireStartLock || retireQuiescentBoxWorkspaceStartLock,
+        retireEdgePreparation: seams.retireEdgePreparation || retireQuiescentBoxEdgePreparation,
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
@@ -319,10 +324,11 @@ export async function reconcileBoxContainer({
             const handle = observed?.state === 'owned' ? observed.handles?.container : null;
             if (!handle || handle.id !== currentContainer.id || handle.runtime?.running !== false
                 || (observed.engine && (observed.engine.name !== engine.name || observed.engine.identity !== engine.identity))) {
-                throw transactionError('Box identity or stopped state changed before workspace start lock cleanup');
+                throw transactionError('Box identity or stopped state changed before workspace lifecycle cleanup');
             }
             validateContainerConfiguration(handle, old);
             dependencies.retireStartLock({ identity, lock });
+            dependencies.retireEdgePreparation({ identity, lock });
             writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
             await dependencies.startAndWaitReady(
                 engine,
@@ -397,6 +403,7 @@ export async function reconcileBoxContainer({
             discover: dependencies.discover,
             startAndWaitReady: dependencies.startAndWaitReady,
             retireStartLock: dependencies.retireStartLock,
+            retireEdgePreparation: dependencies.retireEdgePreparation,
             beforeCreate: () => { candidateAttempted = true; },
             revalidateDataPaths: dependencies.revalidateDataPaths,
             readCidfile: dependencies.readCidfile,

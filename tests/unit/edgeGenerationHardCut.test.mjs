@@ -16,12 +16,15 @@ import {
     createRouterAttestationGenerationLease,
     currentEnabledAgentIdentity,
     initializeFreshEdgeRoutingSources,
+    inactivateEdgeRoutingGeneration,
     loadActiveEdgeRoutingGeneration,
     prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
     readCurrentEdgeTopology,
     withEdgeGenerationApplyLock,
 } from '../../cli/sandbox/edgeGeneration.js';
+import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { retireQuiescentBoxEdgePreparation } from '../../ploinky-box/edgePreparationCleanup.mjs';
 import {
     isActiveAgentRootPlan,
     isAgentRootPlan,
@@ -1707,3 +1710,40 @@ test('partial connector/API desired state remains in fail-closed error publicati
     assert.equal(applied.selector.publicationState, 'error');
     assert.equal(applied.topology.state, 'error');
 });
+
+for (const mode of ['replacement', 'additive']) {
+    test(`quiescent Box recovery retires abandoned ${mode} preparation and permits a fresh start`, (t) => {
+        const fixture = createFixture(t);
+        const options = { workspaceRoot: fixture.workspace };
+        applyEdgeRoutingGeneration({ ...options, reason: 'prior-deployment' });
+        const prepared = mode === 'additive'
+            ? withEdgeGenerationApplyLock(applyLockCapability => prepareAdditiveEdgeRoutingGeneration({
+                ...options, applyLockCapability, reason: 'interrupted-addition',
+            }), options)
+            : prepareEdgeRoutingGeneration({ ...options, reason: 'interrupted-replacement' });
+        // Stopping the old graph inactivates routing but leaves the durable
+        // preparation behind when its owning process disappears with the Box.
+        inactivateEdgeRoutingGeneration('cli-workspace-stop', options);
+        assert.throws(() => applyEdgeRoutingGeneration(options), error => (
+            error.code === 'EDGE_PREPARATION_BUSY'
+            && error.message.includes('edge lifecycle preparation is outstanding; unrelated apply is denied')
+        ));
+        const retainedPaths = [prepared.paths.activeSelectorFile, prepared.paths.routingFile,
+            prepared.paths.agentsFile, prepared.paths.desiredFile];
+        const retained = retainedPaths.map(file => fs.readFileSync(file));
+        const identity = buildWorkspaceIdentity(fixture.workspace, { markerFound: true });
+        const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
+        retireQuiescentBoxEdgePreparation({ identity, lock });
+        assert.equal(fs.existsSync(prepared.paths.preparationLeaseFile), false);
+        retainedPaths.forEach((file, index) => assert.deepEqual(fs.readFileSync(file), retained[index]));
+        // Cleanup grants no routing authority. Startup must prepare and commit
+        // a fresh lease; the old capability must remain unusable.
+        assert.throws(() => loadActiveEdgeRoutingGeneration(options), { code: 'EDGE_GENERATION_INACTIVE' });
+        const fresh = prepareEdgeRoutingGeneration({ ...options, reason: 'restored-start' });
+        assert.notEqual(fresh.preparationLease.transactionId, prepared.preparationLease.transactionId);
+        assert.throws(() => applyEdgeRoutingGeneration({ ...options,
+            preparationLease: prepared.preparationLease }), { code: 'EDGE_PREPARATION_BUSY' });
+        const committed = applyEdgeRoutingGeneration({ ...options, preparationLease: fresh.preparationLease });
+        assert.equal(committed.selector.state, 'active');
+    });
+}
