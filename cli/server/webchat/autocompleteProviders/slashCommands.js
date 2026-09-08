@@ -411,6 +411,14 @@ async function callMcpInitialize(agentName, mcpEndpoint) {
 async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, catalogArguments = {}) {
     const catalogTool = tools.find((tool) => tool?.name === ACHILLES_COMMAND_CATALOG_TOOL);
     if (!catalogTool) return [];
+    // Forward only declared string selectors, never arbitrary URL parameters.
+    const schema = catalogTool.inputSchema?.properties || catalogTool.inputSchema || {};
+    const query = new URLSearchParams(globalThis.document?.body?.dataset?.agentQuery || '');
+    for (const [key, definition] of Object.entries(schema)) {
+        if (key !== 'dir' && definition?.type === 'string' && query.has(key)) {
+            catalogArguments[key] = query.get(key);
+        }
+    }
 
     const callRes = await fetchAgentMcp(agentName, mcpEndpoint, {
         method: 'POST',

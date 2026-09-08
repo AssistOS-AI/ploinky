@@ -49,7 +49,7 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
     globalThis.document = {
         body: {
             dataset: {
-                agentQuery: '',
+                agentQuery: 'robot=analyst&unrelated=not-forwarded',
                 workdir: '/workspace/project',
             },
         },
@@ -89,7 +89,9 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
             return Response.json({
                 jsonrpc: '2.0',
                 id: payload.id,
-                result: { tools: [{ name: 'list_achilles_cli_commands' }] },
+                result: { tools: [{ name: 'list_achilles_cli_commands', inputSchema: {
+                    type: 'object', properties: { robot: { type: 'string' }, dir: { type: 'string' } },
+                } }] },
             });
         }
         if (payload.method === 'tools/call') {
@@ -130,6 +132,8 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         ));
         const catalogRequest = requests.find(({ payload }) => payload.method === 'tools/call');
         assert.equal(catalogRequest.payload.params.arguments.dir, '/workspace/project');
+        assert.equal(catalogRequest.payload.params.arguments.robot, 'analyst');
+        assert.equal(catalogRequest.payload.params.arguments.unrelated, undefined);
         assert.deepEqual(
             provider.getSuggestions('/model anthropic/claude', '/model anthropic/claude'.length)
                 .map((suggestion) => suggestion.insertText),
