@@ -1495,6 +1495,10 @@ body {
     display: block;
 }
 
+.wa-message-bubble[hidden] {
+    display: none;
+}
+
 .wa-message.out .wa-message-bubble {
     background: var(--wa-bg-message-out);
     color: var(--wa-text-message-out);

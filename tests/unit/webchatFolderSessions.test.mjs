@@ -179,6 +179,53 @@ test('a visible /tasks command clears Thinking and identifies its list response'
     }
 });
 
+test('session delivery is page-targeted while background tasks remain available across views', (t) => {
+    const previousEventSource = globalThis.EventSource;
+    let stream;
+    globalThis.EventSource = class {
+        listeners = new Map();
+        constructor() { stream = this; }
+        addEventListener(name, callback) { this.listeners.set(name, callback); }
+        emit(name, payload) { this.listeners.get(name)?.({ data: JSON.stringify(payload) }); }
+        close() {}
+    };
+    t.after(() => { globalThis.EventSource = previousEventSource; });
+    const sessions = [];
+    const users = [];
+    const tasks = [];
+    const models = [];
+    const network = createNetwork({
+        TAB_ID: 'tab-A', PAGE_INSTANCE_ID: 'page-A',
+        toEndpoint: (route) => `/webchat/${route}`,
+        dlog() {}, showBanner() {}, hideBanner() {},
+    }, {
+        onSessionState: (payload) => sessions.push(payload),
+        addRemoteUserMessage: (message) => users.push(message.text),
+        onTaskUpdate: (payload) => tasks.push(payload),
+        onRuntimeState: (payload) => models.push(payload),
+        showTypingIndicator() {}, hideTypingIndicator() {},
+    });
+    t.after(() => network.stop());
+    network.start();
+    const selected = {
+        event: 'selected', session: { sessionId: 'session-A' },
+        targetTabId: 'tab-A', targetPageInstanceId: 'page-A',
+    };
+    stream.emit('session-state', selected);
+    stream.emit('session-state', { ...selected, targetPageInstanceId: 'old-page' });
+    stream.emit('session-state', { ...selected, targetTabId: 'tab-B' });
+    stream.emit('user-message', { sourceTabId: 'tab-B', sessionId: 'session-B', message: { text: 'wrong conversation' } });
+    stream.emit('user-message', { sourceTabId: 'tab-B', sessionId: 'session-A', message: { text: 'same conversation' } });
+    stream.emit('task-update', { event: 'started', task: { id: 'task-B', sessionId: 'session-B', assistantMessageId: 'anchor-B' } });
+    stream.emit('runtime-state', { model: 'native-A', backend: 'backend-A', targetTabId: 'tab-A', targetPageInstanceId: 'page-A' });
+    stream.emit('runtime-state', { model: 'native-B', targetTabId: 'tab-B', targetPageInstanceId: 'page-B' });
+    stream.emit('runtime-state', { model: 'stale', targetTabId: 'tab-A', targetPageInstanceId: 'old-page' });
+    assert.deepEqual(models.map(({ model, backend }) => ({ model, backend })), [{ model: 'native-A', backend: 'backend-A' }]);
+    assert.deepEqual(sessions, [selected]);
+    assert.deepEqual(users, ['same conversation']);
+    assert.equal(tasks[0].task.sessionId, 'session-B'); // Task drawer/log state must not drop off-view events.
+});
+
 test('WebChat tab identity is restored from sessionStorage before UUID fallback', () => {
     const dom = read('cli/server/webchat/domSetup.js');
     const readIndex = dom.indexOf('sessionStorage.getItem(tabStorageKey)');

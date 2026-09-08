@@ -83,6 +83,9 @@ export function createMessages({
     let pendingProgressItems = [];
     const taskItems = new Map();
     const pendingUnindexedTaskIds = [];
+    const associatedTasks = new Map();
+    let currentSessionId = '';
+    let renderingHistory = false;
     const taskPanelCleanups = new Map();
     const tableScrollHintBindings = new WeakMap();
 
@@ -1031,7 +1034,7 @@ export function createMessages({
         updateShortcutActions(bubble, safeText);
     }
 
-    function attachProgressPanel(bubble, progressItems) {
+    function attachProgressPanel(bubble, progressItems, { expanded = false } = {}) {
         if (!bubble || !Array.isArray(progressItems) || !progressItems.length) {
             return;
         }
@@ -1048,20 +1051,21 @@ export function createMessages({
         }
 
         panel.replaceChildren();
-        panel.classList.add('is-collapsed');
+        panel.classList.toggle('is-collapsed', !expanded);
+        panel.classList.toggle('is-expanded', expanded);
 
         const toggle = document.createElement('button');
         toggle.type = 'button';
         toggle.className = 'wa-progress-toggle';
-        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-expanded', String(expanded));
 
         const arrow = document.createElement('span');
         arrow.className = 'wa-progress-arrow';
-        arrow.textContent = '▸';
+        arrow.textContent = expanded ? '▾' : '▸';
 
         const title = document.createElement('span');
         title.className = 'wa-progress-title';
-        title.textContent = `${progressItems.length} step${progressItems.length === 1 ? '' : 's'}`;
+        title.textContent = 'Activity';
 
         toggle.appendChild(arrow);
         toggle.appendChild(title);
@@ -1101,17 +1105,53 @@ export function createMessages({
     }
 
     function associateTask(payload) {
+        if (Array.isArray(payload?.tasks)) {
+            for (const task of payload.tasks) associateTask({ task });
+            return;
+        }
         const taskId = payload?.task?.id;
-        const messageIndex = Number.isInteger(payload?.messageIndex) ? payload.messageIndex : null;
         if (!taskId) return;
+        const sessionId = payload.task.sessionId || payload.sessionId;
+        const assistantMessageId = payload.task.assistantMessageId || payload.assistantMessageId;
+        const turnId = payload.task.turnId || payload.turnId;
+        const messageIndex = Number.isInteger(payload.messageIndex) ? payload.messageIndex : null;
+        if (sessionId || assistantMessageId) {
+            // Never fall back to the current conversation for an explicitly owned task.
+            associatedTasks.set(taskId, { sessionId, assistantMessageId, turnId, messageIndex });
+            reconcileAssociatedTasks();
+            return;
+        }
         if (shouldDeferUnindexedTask(payload)) {
             if (!taskItems.has(taskId) && !pendingUnindexedTaskIds.includes(taskId)) {
                 pendingUnindexedTaskIds.push(taskId);
             }
             return;
         }
-        if (!Number.isInteger(messageIndex)) return;
-        addTaskItem(taskId, { messageIndex });
+        if (Number.isInteger(messageIndex)) addTaskItem(taskId, { messageIndex });
+    }
+
+    function reconcileAssociatedTasks() {
+        if (renderingHistory) return;
+        for (const [taskId, association] of associatedTasks) {
+            if (!association.sessionId || association.sessionId !== currentSessionId) continue;
+            if (association.assistantMessageId) {
+                const anchor = Array.from(chatList.children).find(
+                    (node) => node.dataset?.messageId === association.assistantMessageId,
+                );
+                if (!anchor) continue;
+                addTaskItem(taskId, { ...association, anchor });
+                const existing = taskItems.get(taskId);
+                if (existing) existing.dataset.assistantMessageId = association.assistantMessageId;
+            } else if (Number.isInteger(association.messageIndex)) {
+                addTaskItem(taskId, association);
+            }
+        }
+    }
+
+    function setSessionId(sessionId) {
+        const next = typeof sessionId === 'string' ? sessionId : '';
+        if (next !== currentSessionId) pendingUnindexedTaskIds.length = 0;
+        currentSessionId = next;
     }
 
     function flushPendingUnindexedTasks() {
@@ -1131,7 +1171,16 @@ export function createMessages({
         wrapper.appendChild(bubble);
         attachTaskPanel(bubble, normalizedTaskId);
         taskItems.set(normalizedTaskId, wrapper);
-        appendMessageEl(wrapper, Number.isInteger(options.messageIndex) ? options.messageIndex : null);
+        if (options.anchor) {
+            wrapper.dataset.assistantMessageId = options.assistantMessageId;
+            if (options.turnId) wrapper.dataset.turnId = options.turnId;
+            const children = Array.from(chatList.children);
+            let next = children.indexOf(options.anchor) + 1;
+            while (children[next]?.dataset?.assistantMessageId === options.assistantMessageId) next += 1;
+            chatList.insertBefore(wrapper, children[next] || null);
+        } else {
+            appendMessageEl(wrapper, Number.isInteger(options.messageIndex) ? options.messageIndex : null);
+        }
         scrollToBottomIfLocked();
         return true;
     }
@@ -1176,6 +1225,7 @@ export function createMessages({
         if (bubble) {
             bubble.dataset.fullText = text;
         }
+        if (options.messageId) wrapper.dataset.messageId = options.messageId;
         appendMessageEl(wrapper, Number.isInteger(options.messageIndex) ? options.messageIndex : null);
         scrollToBottomIfLocked();
         lastServerMsg.bubble = null;
@@ -1384,7 +1434,7 @@ export function createMessages({
         }
 
         const messageIndex = Number.isInteger(options.messageIndex) ? options.messageIndex : null;
-        if (!normalized.trim() && progressItems.length === 0) {
+        if (!normalized.trim() && progressItems.length === 0 && !options.messageId) {
             lastServerMsg.bubble = null;
             lastServerMsg.fullText = '';
             userInputSent = false;
@@ -1392,14 +1442,16 @@ export function createMessages({
         }
 
         const previousFullText = typeof lastServerMsg.fullText === 'string' ? lastServerMsg.fullText : '';
-        const appendToExisting = !options.forceNew && !userInputSent && lastServerMsg.bubble;
+        const appendToExisting = !options.forceNew && !userInputSent && lastServerMsg.bubble
+            && (!options.messageId || lastServerMsg.bubble.parentElement?.dataset.messageId === options.messageId);
 
         if (appendToExisting) {
             const combined = previousFullText ? `${previousFullText}\n${normalized}` : normalized;
             lastServerMsg.fullText = combined;
+            lastServerMsg.bubble.hidden = options.pending === true && !combined.trim() && !progressItems.length;
             updateBubbleContent(lastServerMsg.bubble, combined);
             if (progressItems.length) {
-                attachProgressPanel(lastServerMsg.bubble, progressItems);
+                attachProgressPanel(lastServerMsg.bubble, progressItems, { expanded: options.pending === true });
             }
             if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
@@ -1409,6 +1461,8 @@ export function createMessages({
             wrapper.className = 'wa-message in';
             const bubble = document.createElement('div');
             bubble.className = 'wa-message-bubble';
+            // Keep the stable assistant anchor for tasks, without an empty visible bubble.
+            bubble.hidden = options.pending === true && !normalized.trim() && !progressItems.length;
             bubble.innerHTML = '<div class="wa-message-text"></div><span class="wa-message-time"></span>';
             wrapper.appendChild(bubble);
 
@@ -1418,7 +1472,7 @@ export function createMessages({
 
             updateBubbleContent(bubble, normalized);
             if (progressItems.length) {
-                attachProgressPanel(bubble, progressItems);
+                attachProgressPanel(bubble, progressItems, { expanded: options.pending === true });
             }
             if (explicitProgressItems === null && pendingProgressItems.length) {
                 resetProgressEvents();
@@ -1427,10 +1481,12 @@ export function createMessages({
             if (timeNode) {
                 timeNode.textContent = formatTime(options.timestamp);
             }
+            if (options.messageId) wrapper.dataset.messageId = options.messageId;
             appendMessageEl(wrapper, messageIndex);
         }
 
         flushPendingUnindexedTasks();
+        reconcileAssociatedTasks();
         scrollToBottomIfLocked();
         return true;
     }
@@ -1468,6 +1524,7 @@ export function createMessages({
 
     function renderHistory(historyMessages = []) {
         clearMessages();
+        renderingHistory = true;
         const messages = Array.isArray(historyMessages) ? historyMessages : [];
         for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
             const message = messages[messageIndex];
@@ -1481,6 +1538,7 @@ export function createMessages({
                     historical: true,
                     timestamp: message.timestamp,
                     messageIndex,
+                    messageId: message.id,
                     references: message.references
                 });
             } else if (message?.role === 'assistant') {
@@ -1489,10 +1547,17 @@ export function createMessages({
                     timestamp: message.timestamp,
                     progressItems: Array.isArray(message.progress) ? message.progress : [],
                     messageIndex,
+                    messageId: message.id,
+                    pending: message.status === 'pending',
                 });
             }
         }
+        renderingHistory = false;
+        reconcileAssociatedTasks();
         userInputSent = false;
+        if (messages.some((message) => message?.role === 'assistant' && message.status === 'pending')) {
+            showTypingIndicator();
+        }
     }
 
     function refreshWorkspaceFileLinks() {
@@ -1515,6 +1580,7 @@ export function createMessages({
         renderHistory,
         refreshWorkspaceFileLinks,
         associateTask,
+        setSessionId,
         addProgressEvent,
         showTypingIndicator,
         hideTypingIndicator,

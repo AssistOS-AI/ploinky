@@ -81,7 +81,7 @@ test('skill envelopes expose only validated workspace-relative catalog state', (
     }), undefined);
     assert.equal(parseWebchatSkillsState({
         ...envelope,
-        skills: [{ ...envelope.skills[0], type: 'anthropic' }],
+        skills: [{ ...envelope.skills[0], type: 'unknown-format' }],
     }), undefined);
     assert.equal(parseWebchatSkillsState({
         ...envelope,
@@ -91,6 +91,14 @@ test('skill envelopes expose only validated workspace-relative catalog state', (
         ...envelope,
         operation: { scope: 'skill', action: 'enable', target: 'not a canonical name' },
     }), undefined);
+});
+
+test('Anthropic skill descriptors survive the generic catalog relay', () => {
+    const parsed = parseWebchatSkillsState({
+        __webchatSkills: 1, version: 1, event: 'list',
+        skills: [{ name: 'bash', displayName: 'bash', relativePath: 'skills/bash', type: 'anthropic', enabled: true }],
+    });
+    assert.equal(parsed.skills[0].type, 'anthropic');
 });
 
 test('skill state is intercepted, cached, and omitted from ordinary output', () => {
@@ -147,6 +155,69 @@ test('session list envelopes are validated but do not replace the current snapsh
     assert.deepEqual(list.sessions, [sessionEnvelope().summary]);
     assert.equal(parseWebchatSessionState({ ...sessionEnvelope(), version: 2 }), undefined);
     assert.match(serializeSessionStateSseEvent(current), /event: session-state/);
+});
+
+test('targeted session updates retain stable task anchors without replacing another tab selection', () => {
+    const writes = [];
+    const tab = {
+        workspaceDirectory: '/workspace',
+        subscribers: new Map([['client', { res: { write: (value) => writes.push(value) } }]]),
+        taskProtocolBuffer: '',
+    };
+    const appState = { runtimes: new Map([['runtime', tab]]) };
+    const send = (payload) => routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify(payload)}\n`);
+    send(sessionEnvelope());
+    const selected = sessionEnvelope('selected');
+    selected.targetTabId = 'tab-B';
+    selected.targetPageInstanceId = 'page-B';
+    selected.session.sessionId = selected.summary.sessionId = '223e4567-e89b-42d3-a456-426614174000';
+    selected.session.messages[1].id = 'assistant-B';
+    send(selected);
+    const stale = { ...sessionEnvelope('updated'), targetTabId: 'tab-B', targetPageInstanceId: 'page-B' };
+    send(stale);
+    assert.equal(tab.webchatSessionSnapshot.session.sessionId, SESSION_ID);
+    assert.equal(tab.webchatSessionSnapshots.get('tab-B').session.sessionId, selected.session.sessionId);
+    send({
+        __webchatTask: 1, version: 1, event: 'started',
+        task: {
+            id: 'task_1234567890abcdef12345678', status: 'ongoing',
+            sessionId: selected.session.sessionId, assistantMessageId: 'assistant-B', turnId: 'turn-B',
+        },
+    });
+    const frames = writes.map((value) => JSON.parse(value.split('\ndata: ')[1]));
+    assert.equal(frames.find((frame) => frame.event === 'selected').session.messages[1].id, 'assistant-B');
+    assert.equal(frames.at(-1).task.assistantMessageId, 'assistant-B');
+    const replay = JSON.parse(serializeTaskListSseEvent(tab.webchatTasks).split('\ndata: ')[1]);
+    assert.equal(replay.tasks[0].sessionId, selected.session.sessionId);
+    assert.equal(replay.tasks[0].turnId, 'turn-B');
+});
+
+test('Stop carries the requesting surface only for envelope-capable runtimes', () => {
+    for (const forwardEnvelope of [true, false]) {
+        const writes = [];
+        const effectiveConfig = { agentName: 'demo-agent', forwardEnvelope };
+        const runtimeKey = buildRuntimeKey('/workspace', effectiveConfig, '');
+        const tab = { tty: { write: (value) => writes.push(value) } };
+        const req = new EventEmitter();
+        req.method = 'POST';
+        handleRuntimeRoute({
+            pathname: '/control', req,
+            res: { writeHead: (status) => assert.equal(status, 204), end() {} },
+            parsedUrl: new URL('http://localhost/control?tabId=tab-B&pageInstanceId=page-B'),
+            appState: { runtimes: new Map([[runtimeKey, tab]]) },
+            workspaceDirectory: '/workspace', effectiveConfig, agentQuery: '',
+        });
+        req.emit('data', '\x1b');
+        req.emit('end');
+        assert.equal(writes.length, 1);
+        if (forwardEnvelope) {
+            assert.deepEqual(JSON.parse(writes[0]), {
+                __webchatControl: 1, type: 'stop', sourceTabId: 'tab-B', sourcePageInstanceId: 'page-B',
+            });
+        } else {
+            assert.equal(writes[0], '\x1b');
+        }
+    }
 });
 
 test('workspace file envelopes become hidden in-memory snapshots and deltas', () => {
@@ -245,9 +316,23 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
         end() {},
     };
 
+    const selected = sessionEnvelope('selected');
+    selected.targetTabId = 'tab-1';
+    selected.targetPageInstanceId = 'old-page';
+    selected.session.sessionId = selected.summary.sessionId = '223e4567-e89b-42d3-a456-426614174000';
+    selected.session.messages[1].id = 'restored-assistant';
+    tab.webchatSessionSnapshots = new Map([['tab-1', parseWebchatSessionState(selected)]]);
+    routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
+        __webchatRuntimeState: 1, version: 1, model: 'model-A', backend: 'backend-A',
+        targetTabId: 'tab-1', targetPageInstanceId: 'old-page',
+    })}\n`);
+    routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify({
+        __webchatRuntimeState: 1, version: 1, model: 'model-B', backend: 'backend-B',
+        targetTabId: 'tab-2', targetPageInstanceId: 'another-page',
+    })}\n`);
     handleRuntimeRoute({
         pathname: '/stream', req, res,
-        parsedUrl: new URL('http://localhost/stream?tabId=tab-1'),
+        parsedUrl: new URL('http://localhost/stream?tabId=tab-1&pageInstanceId=new-page'),
         appState, workspaceDirectory, effectiveConfig, agentQuery: '',
     });
 
@@ -257,7 +342,17 @@ test('an EventSource reconnect receives the in-memory session snapshot', (t) => 
     assert.match(writes.join(''), /event: workspace-files/);
     assert.match(writes.join(''), /event: skills-state/);
     assert.match(writes.join(''), /reports\/final\.md/);
-    assert.match(writes.join(''), new RegExp(SESSION_ID));
+    const sessionFrame = writes.find((value) => value.startsWith('event: session-state'));
+    const restored = JSON.parse(sessionFrame.split('\ndata: ')[1]);
+    assert.equal(restored.session.sessionId, selected.session.sessionId);
+    assert.equal(restored.session.messages[1].id, 'restored-assistant');
+    assert.equal(restored.targetPageInstanceId, 'new-page');
+    assert.equal(restored.event, 'current');
+    const runtimeFrame = writes.find((value) => value.startsWith('event: runtime-state'));
+    const restoredRuntime = JSON.parse(runtimeFrame.split('\ndata: ')[1]);
+    assert.equal(restoredRuntime.model, 'model-A');
+    assert.equal(restoredRuntime.backend, 'backend-A');
+    assert.equal(restoredRuntime.targetPageInstanceId, 'new-page');
     req.emit('close');
     if (tab.cleanupTimer) clearTimeout(tab.cleanupTimer);
 });

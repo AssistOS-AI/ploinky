@@ -24,7 +24,7 @@ const MAX_WORKSPACE_FILE_PATHS = 100000;
 const MAX_WORKSPACE_FILE_DELTA_PATHS = 20000;
 const MAX_WORKSPACE_FILE_PATH_LENGTH = 4096;
 const MAX_WEBCHAT_SKILLS = 10000;
-const SKILL_TYPES = new Set(['cskill', 'dcgskill', 'oskill', 'tskill']);
+const SKILL_TYPES = new Set(['cskill', 'dcgskill', 'oskill', 'tskill', 'anthropic']);
 const SKILL_EVENTS = new Set(['list', 'changed', 'error']);
 
 function normalizeFinalOutputRanges(raw) {
@@ -123,6 +123,7 @@ function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
     return {
         version: 1,
         id: String(raw.id),
+        ...normalizeTaskAssociation(raw),
         targetAgent: String(raw.targetAgent || '').slice(0, 160),
         remoteTaskId: String(raw.remoteTaskId || '').slice(0, 200),
         toolName: String(raw.toolName || '').slice(0, 160),
@@ -325,13 +326,20 @@ export function parseWebchatRuntimeState(envelope) {
     }
     const model = normalizeRuntimeModel(envelope.model);
     if (model === undefined) return undefined;
-    return { model };
+    const backend = Object.prototype.hasOwnProperty.call(envelope, 'backend')
+        ? normalizeRuntimeModel(envelope.backend)
+        : undefined;
+    if (Object.prototype.hasOwnProperty.call(envelope, 'backend') && backend === undefined) return undefined;
+    return {
+        model,
+        ...(backend !== undefined ? { backend } : {}),
+        ...normalizeSessionTarget(envelope),
+    };
 }
 
 export function serializeRuntimeStateSseEvent(state) {
-    const model = normalizeRuntimeModel(state?.model);
-    if (model === undefined) return '';
-    return `event: runtime-state\ndata: ${JSON.stringify({ model })}\n\n`;
+    const normalized = parseWebchatRuntimeState({ [WEBCHAT_RUNTIME_STATE_FLAG]: 1, version: 1, ...state });
+    return normalized ? `event: runtime-state\ndata: ${JSON.stringify(normalized)}\n\n` : '';
 }
 
 function normalizeWorkspaceFilePath(value) {
@@ -443,6 +451,30 @@ export function serializeSkillsStateSseEvent(state) {
     return normalized ? `event: skills-state\ndata: ${JSON.stringify(normalized)}\n\n` : '';
 }
 
+function normalizeStableId(value) {
+    return typeof value === 'string' && /^[A-Za-z0-9:_-]{1,200}$/.test(value) ? value : '';
+}
+
+function normalizeTaskAssociation(raw) {
+    const sessionId = normalizeSessionId(raw?.sessionId);
+    const assistantMessageId = normalizeStableId(raw?.assistantMessageId);
+    const turnId = normalizeStableId(raw?.turnId);
+    return {
+        ...(sessionId ? { sessionId } : {}),
+        ...(assistantMessageId ? { assistantMessageId } : {}),
+        ...(turnId ? { turnId } : {}),
+    };
+}
+
+function normalizeSessionTarget(raw) {
+    const targetTabId = normalizeStableId(raw?.targetTabId);
+    const targetPageInstanceId = normalizeStableId(raw?.targetPageInstanceId);
+    return {
+        ...(targetTabId ? { targetTabId } : {}),
+        ...(targetPageInstanceId ? { targetPageInstanceId } : {}),
+    };
+}
+
 function normalizeSessionId(value) {
     const sessionId = typeof value === 'string' ? value.trim().toLowerCase() : '';
     return SESSION_ID_RE.test(sessionId) ? sessionId : '';
@@ -477,6 +509,7 @@ function normalizeSessionMessage(raw) {
     const timestamp = normalizeTimestamp(raw.timestamp);
     const message = {
         role,
+        ...(normalizeStableId(raw.id) ? { id: raw.id } : {}),
         text: typeof raw.text === 'string' ? raw.text : '',
         ...(timestamp ? { timestamp } : {}),
         attachments: Array.isArray(raw.attachments) ? raw.attachments.slice(0, 64) : [],
@@ -488,6 +521,9 @@ function normalizeSessionMessage(raw) {
             .map((entry) => entry.trim().slice(0, 2000))
             .filter(Boolean)
             .slice(0, 500);
+    }
+    if (role === 'assistant' && ['pending', 'completed', 'failed', 'interrupted'].includes(raw.status)) {
+        message.status = raw.status;
     }
     if (raw.context === false) message.context = false;
     return message;
@@ -510,20 +546,29 @@ export function parseWebchatSessionState(envelope) {
     if (!envelope || typeof envelope !== 'object' || !envelope[WEBCHAT_SESSION_FLAG] || envelope.version !== 1) {
         return undefined;
     }
+    const target = normalizeSessionTarget(envelope);
+    if (envelope.event === 'error') {
+        const sessionId = normalizeSessionId(envelope.sessionId);
+        const error = typeof envelope.error === 'string' ? envelope.error.slice(0, 1000) : '';
+        return error ? { event: 'error', ...target, ...(sessionId ? { sessionId } : {}), error } : undefined;
+    }
     if (envelope.event === 'list') {
         const currentSessionId = normalizeSessionId(envelope.currentSessionId);
         if (!currentSessionId || !Array.isArray(envelope.sessions)) return undefined;
         return {
             event: 'list',
+            ...target,
             currentSessionId,
             sessions: envelope.sessions.map(normalizeSessionSummary).filter(Boolean).slice(0, 1000),
         };
     }
-    if (envelope.event !== 'current' && envelope.event !== 'selected') return undefined;
+    if (!['current', 'selected', 'updated'].includes(envelope.event)) {
+        return undefined;
+    }
     const session = normalizeSession(envelope.session);
     const summary = normalizeSessionSummary(envelope.summary);
     if (!session || !summary || session.sessionId !== summary.sessionId) return undefined;
-    return { event: envelope.event, session, summary };
+    return { event: envelope.event, ...target, session, summary };
 }
 
 export function serializeSessionStateSseEvent(state) {
@@ -637,6 +682,7 @@ export function parseWebchatInteraction(envelope) {
         && /^[A-Za-z0-9_-]{1,128}$/.test(envelope.targetPageInstanceId)
         ? envelope.targetPageInstanceId
         : '';
+    if ((envelope.targetTabId && !targetTabId) || (envelope.targetPageInstanceId && !targetPageInstanceId)) return undefined;
     return {
         id,
         kind,
@@ -662,7 +708,14 @@ export function parseWebchatInteractionResolved(envelope) {
     const status = normalizeInteractionText(envelope.status, 64, { required: true });
     if (!id || !INTERACTION_ID_RE.test(id) || !status || !INTERACTION_TOKEN_RE.test(status)) return undefined;
     if (optionId !== null && (!optionId || !INTERACTION_TOKEN_RE.test(optionId))) return undefined;
-    return { id, optionId, status };
+    const target = normalizeSessionTarget(envelope);
+    if ((envelope.targetTabId && target.targetTabId !== envelope.targetTabId)
+        || (envelope.targetPageInstanceId && target.targetPageInstanceId !== envelope.targetPageInstanceId)) return undefined;
+    return {
+        id, optionId, status,
+        ...target,
+        ...(TASK_ID_RE.test(envelope.targetTaskId || '') ? { targetTaskId: envelope.targetTaskId } : {}),
+    };
 }
 
 export function serializeInteractionRequestSseEvent(interaction) {
@@ -679,6 +732,11 @@ export function serializeInteractionResolvedSseEvent(resolution) {
     return normalized ? `event: interaction-resolved\ndata: ${JSON.stringify(normalized)}\n\n` : '';
 }
 
+export function interactionTargetsClient(interaction, tabId, pageInstanceId) {
+    return (!interaction.targetTabId || interaction.targetTabId === tabId)
+        && (!interaction.targetPageInstanceId || interaction.targetPageInstanceId === pageInstanceId);
+}
+
 export function getRuntimeMap(appState) {
     if (!(appState.runtimes instanceof Map)) appState.runtimes = new Map();
     return appState.runtimes;
@@ -690,9 +748,9 @@ export function buildRuntimeKey(workspaceDirectory, effectiveConfig, agentQuery 
     return `${workspaceDirectory}\0${agent}\0${launchSignature}`;
 }
 
-export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payload) {
+export function broadcastWorkspaceTaskEvent(appState, workspaceDirectory, payload, sourceRuntimeKey = null) {
     for (const runtime of getRuntimeMap(appState).values()) {
-        if (runtime.workspaceDirectory === workspaceDirectory) {
+        if (runtime.workspaceDirectory === workspaceDirectory && (!sourceRuntimeKey || runtime.runtimeKey === sourceRuntimeKey)) {
             writeOrBufferSseEvent(runtime, payload);
         }
     }
@@ -705,9 +763,17 @@ function routeCompleteOutputLine(appState, tab, line) {
         try {
             const sessionState = parseWebchatSessionState(JSON.parse(normalized));
             if (sessionState !== undefined) {
-                if (sessionState.event !== 'list') {
-                    tab.webchatSessionSnapshot = sessionState;
-                    tab.liveMessageCount = sessionState.session.messages.length;
+                if (sessionState.session) {
+                    if (sessionState.targetTabId) {
+                        if (!(tab.webchatSessionSnapshots instanceof Map)) tab.webchatSessionSnapshots = new Map();
+                        const previous = tab.webchatSessionSnapshots.get(sessionState.targetTabId) || tab.webchatSessionSnapshot;
+                        if (sessionState.event !== 'updated' || previous?.session.sessionId === sessionState.session.sessionId) {
+                            tab.webchatSessionSnapshots.set(sessionState.targetTabId, sessionState);
+                        }
+                    } else if (sessionState.event !== 'updated') {
+                        tab.webchatSessionSnapshot = sessionState;
+                        tab.liveMessageCount = sessionState.session.messages.length;
+                    }
                 }
                 writeOrBufferSseEvent(tab, serializeSessionStateSseEvent(sessionState));
                 return;
@@ -720,7 +786,14 @@ function routeCompleteOutputLine(appState, tab, line) {
         try {
             const interaction = parseWebchatInteraction(JSON.parse(normalized));
             if (interaction) {
-                tab.pendingInteraction = interaction;
+                if (!(tab.pendingInteractions instanceof Map)) tab.pendingInteractions = new Map();
+                if (!(tab.interactionIds instanceof Set)) tab.interactionIds = new Set();
+                if (tab.interactionIds.has(interaction.id)) {
+                    console.warn('[webchat] Ignoring duplicate interaction request.');
+                    return;
+                }
+                tab.interactionIds.add(interaction.id);
+                tab.pendingInteractions.set(interaction.id, interaction);
                 writeOrBufferSseEvent(tab, serializeInteractionRequestSseEvent(interaction));
                 return;
             }
@@ -732,8 +805,14 @@ function routeCompleteOutputLine(appState, tab, line) {
         try {
             const resolution = parseWebchatInteractionResolved(JSON.parse(normalized));
             if (resolution) {
-                if (tab.pendingInteraction?.id === resolution.id) tab.pendingInteraction = null;
-                writeOrBufferSseEvent(tab, serializeInteractionResolvedSseEvent(resolution));
+                const pending = tab.pendingInteractions?.get(resolution.id);
+                if (!pending || !interactionTargetsClient(resolution, pending.targetTabId, pending.targetPageInstanceId)) return;
+                tab.pendingInteractions.delete(resolution.id);
+                writeOrBufferSseEvent(tab, serializeInteractionResolvedSseEvent({
+                    ...resolution,
+                    ...normalizeSessionTarget(pending),
+                    ...(pending.targetTaskId ? { targetTaskId: pending.targetTaskId } : {}),
+                }));
                 return;
             }
         } catch (_) {
@@ -746,7 +825,12 @@ function routeCompleteOutputLine(appState, tab, line) {
             if (envelope?.[WEBCHAT_RUNTIME_STATE_FLAG]) {
                 const runtimeState = parseWebchatRuntimeState(envelope);
                 if (runtimeState !== undefined) {
-                    tab.webchatRuntimeState = runtimeState;
+                    if (runtimeState.targetTabId) {
+                        if (!(tab.webchatRuntimeStates instanceof Map)) tab.webchatRuntimeStates = new Map();
+                        tab.webchatRuntimeStates.set(runtimeState.targetTabId, runtimeState);
+                    } else {
+                        tab.webchatRuntimeState = runtimeState;
+                    }
                     writeOrBufferSseEvent(tab, serializeRuntimeStateSseEvent(runtimeState));
                 }
                 return;
@@ -804,16 +888,16 @@ function routeCompleteOutputLine(appState, tab, line) {
                         ...update.task,
                     });
                 }
-                const sessionId = normalizeSessionId(envelope.sessionId);
                 const messageIndex = Number.isInteger(envelope.messageIndex) && envelope.messageIndex >= 0
                     ? envelope.messageIndex
                     : null;
                 const outgoing = {
                     ...update,
-                    ...(sessionId && messageIndex !== null ? { sessionId, messageIndex } : {}),
+                    ...normalizeTaskAssociation(envelope),
+                    ...(messageIndex !== null ? { messageIndex } : {}),
                 };
                 for (const payload of serializeTaskUpdateSseEvents(outgoing)) {
-                    broadcastWorkspaceTaskEvent(appState, tab.workspaceDirectory, payload);
+                    broadcastWorkspaceTaskEvent(appState, tab.workspaceDirectory, payload, tab.runtimeKey);
                 }
                 return;
             }

@@ -227,6 +227,9 @@ function parseProgressEnvelope(text) {
             return null;
         }
         return {
+            ...(typeof payload.sessionId === 'string' ? { sessionId: payload.sessionId } : {}),
+            ...(typeof payload.targetTabId === 'string' ? { targetTabId: payload.targetTabId } : {}),
+            ...(typeof payload.targetPageInstanceId === 'string' ? { targetPageInstanceId: payload.targetPageInstanceId } : {}),
             type: typeof payload.type === 'string' ? payload.type : '',
             tool: typeof payload.tool === 'string' ? payload.tool : '',
             reason: typeof payload.reason === 'string' ? payload.reason : '',
@@ -243,10 +246,13 @@ function parseRuntimeStatePayload(text) {
         if (!payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, 'model')) {
             return undefined;
         }
-        if (payload.model === null) return { model: null };
-        if (typeof payload.model !== 'string') return undefined;
-        const model = payload.model.trim();
-        return model ? { model } : { model: null };
+        if (payload.model !== null && typeof payload.model !== 'string') return undefined;
+        return {
+            model: payload.model?.trim() || null,
+            ...(payload.backend === null || typeof payload.backend === 'string' ? { backend: payload.backend } : {}),
+            ...(typeof payload.targetTabId === 'string' ? { targetTabId: payload.targetTabId } : {}),
+            ...(typeof payload.targetPageInstanceId === 'string' ? { targetPageInstanceId: payload.targetPageInstanceId } : {}),
+        };
     } catch (_) {
         return undefined;
     }
@@ -374,6 +380,7 @@ export function createNetwork({
     let stopped = false;
     let pendingUploads = 0;
     let assistantMessageIndex = null;
+    let currentSessionId = '';
     let pendingPageInteractionId = '';
     let inputReady = false;
     let activeInteractionId = '';
@@ -425,6 +432,8 @@ export function createNetwork({
         }
 
         const progress = parseProgressEnvelope(normalized);
+        if (progress && (!interactionTargetsTab(progress, TAB_ID, PAGE_INSTANCE_ID)
+            || (progress.sessionId && progress.sessionId !== currentSessionId))) return;
         if (progress) {
             if (typeof addProgressEvent === 'function') {
                 addProgressEvent(progress);
@@ -572,6 +581,8 @@ export function createNetwork({
                     return;
                 }
                 if (payload && typeof payload === 'object' && typeof payload.text === 'string') {
+                    if (!interactionTargetsTab(payload, TAB_ID, PAGE_INSTANCE_ID)
+                        || (payload.sessionId && payload.sessionId !== currentSessionId)) return;
                     handleServerChunk(stripCtrlAndAnsi(payload.text));
                 }
             } catch (error) {
@@ -626,9 +637,13 @@ export function createNetwork({
         es.addEventListener('user-message', (event) => {
             try {
                 const payload = JSON.parse(event.data);
-                const userMessageIndex = Number(payload?.messageIndex);
+                if (!interactionTargetsTab(payload, TAB_ID, PAGE_INSTANCE_ID)
+                    || (payload.sessionId && payload.sessionId !== currentSessionId)) return;
+                const userMessageIndex = payload?.messageIndex;
                 assistantMessageIndex = Number.isInteger(userMessageIndex) ? userMessageIndex + 1 : null;
-                if (payload?.sourceTabId !== TAB_ID && typeof addRemoteUserMessage === 'function') {
+                const fromThisPage = payload?.sourceTabId === TAB_ID
+                    && (!payload.sourcePageInstanceId || payload.sourcePageInstanceId === PAGE_INSTANCE_ID);
+                if (!fromThisPage && typeof addRemoteUserMessage === 'function') {
                     addRemoteUserMessage(payload.message, payload);
                 }
             } catch (error) {
@@ -639,8 +654,10 @@ export function createNetwork({
         es.addEventListener('session-state', (event) => {
             try {
                 const payload = JSON.parse(event.data);
+                if (!interactionTargetsTab(payload, TAB_ID, PAGE_INSTANCE_ID)) return;
                 if ((payload?.event === 'current' || payload?.event === 'selected')) {
                     assistantMessageIndex = null;
+                    currentSessionId = payload.session?.sessionId || payload.summary?.sessionId || '';
                 }
                 if (typeof onSessionState === 'function') onSessionState(payload);
             } catch (error) {
@@ -651,6 +668,7 @@ export function createNetwork({
         es.addEventListener('task-update', (event) => {
             try {
                 const payload = JSON.parse(event.data);
+                if (!interactionTargetsTab(payload, TAB_ID, PAGE_INSTANCE_ID)) return;
                 const visibleCommand = resolvesVisibleTaskCommand(payload, pendingVisibleCommand)
                     ? pendingVisibleCommand
                     : '';
@@ -677,6 +695,7 @@ export function createNetwork({
 
         es.addEventListener('runtime-state', (event) => {
             const runtimeState = parseRuntimeStatePayload(event.data);
+            if (!interactionTargetsTab(runtimeState, TAB_ID, PAGE_INSTANCE_ID)) return;
             if (runtimeState !== undefined && typeof onRuntimeState === 'function') {
                 onRuntimeState(runtimeState);
             }
@@ -705,6 +724,7 @@ export function createNetwork({
         es.addEventListener('interaction-resolved', (event) => {
             if (!isCurrent()) return;
             const resolution = parseInteractionResolutionPayload(event.data);
+            if (!interactionTargetsTab(resolution, TAB_ID, PAGE_INSTANCE_ID)) return;
             if (resolution?.id === activeInteractionId) activeInteractionId = '';
             if (resolution?.id === pendingPageInteractionId) pendingPageInteractionId = '';
             if (resolution && typeof onInteractionResolved === 'function') {

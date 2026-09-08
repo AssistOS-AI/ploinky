@@ -32,6 +32,13 @@ function approvalEnvelope(id = 'approval_12345678') {
     };
 }
 
+function pendingInteractions(...envelopes) {
+    return new Map(envelopes.map((envelope) => {
+        const interaction = parseWebchatInteraction(envelope);
+        return [interaction.id, interaction];
+    }));
+}
+
 test('interaction envelopes become SSE state without entering conversation history', (t) => {
     const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'webchat-interaction-'));
     t.after(() => fs.rmSync(workspaceDirectory, { recursive: true, force: true }));
@@ -47,10 +54,10 @@ test('interaction envelopes become SSE state without entering conversation histo
     routeWorkspaceRuntimeOutput(appState, tab, serialized.slice(0, 30));
     routeWorkspaceRuntimeOutput(appState, tab, `${serialized.slice(30)}\n`);
 
-    assert.equal(tab.pendingInteraction.id, 'approval_12345678');
     assert.match(writes.join(''), /event: interaction-request/);
     assert.equal(fs.existsSync(path.join(workspaceDirectory, '.achilles-cli')), false);
-    assert.equal(networkTestables.parseInteractionPayload(JSON.stringify(tab.pendingInteraction)).defaultOptionId, 'always-allow');
+    const delivered = JSON.parse(writes.join('').split('\ndata: ')[1]);
+    assert.equal(networkTestables.parseInteractionPayload(JSON.stringify(delivered)).defaultOptionId, 'always-allow');
 });
 
 test('interaction validation rejects malformed options and preserves the requested default', () => {
@@ -133,12 +140,16 @@ test('a refreshed page cancels its previous page-owned interaction before replay
     const ttyWrites = [];
     const tab = {
         tty: { write: (value) => ttyWrites.push(value) },
-        subscribers: new Map(),
+        subscribers: new Map([['other', { sid, tabId: 'tab-2', pageInstanceId: 'other-page', res: { write() {} } }]]),
         workspaceDirectory,
-        pendingInteraction: parseWebchatInteraction({
+        pendingInteractions: pendingInteractions({
             ...approvalEnvelope('task_control_12345678'),
             targetTabId: 'tab-1',
             targetPageInstanceId: 'page-before-refresh',
+        }, {
+            ...approvalEnvelope('native_request_other'),
+            targetTabId: 'tab-2',
+            targetPageInstanceId: 'other-page',
         }),
     };
     const appState = {
@@ -166,8 +177,12 @@ test('a refreshed page cancels its previous page-owned interaction before replay
     });
 
     assert.match(ttyWrites[0], /"cancelled":true/);
-    assert.equal(tab.pendingInteraction, null);
     assert.doesNotMatch(writes.join(''), /event: interaction-request/);
+    assert.equal(JSON.parse(ttyWrites[0]).sourcePageInstanceId, 'page-before-refresh');
+    assert.equal(postInteraction({
+        appState, workspaceDirectory, effectiveConfig, sid,
+        tabId: 'tab-2', pageInstanceId: 'other-page', interactionId: 'native_request_other',
+    }).status, 204);
     req.emit('close');
     if (tab.cleanupTimer) clearTimeout(tab.cleanupTimer);
 });
@@ -182,7 +197,7 @@ test('an EventSource reconnect receives the pending interaction snapshot', (t) =
         tty: {},
         subscribers: new Map(),
         workspaceDirectory,
-        pendingInteraction: parseWebchatInteraction(approvalEnvelope()),
+        pendingInteractions: pendingInteractions(approvalEnvelope()),
     };
     const appState = {
         runtimes: new Map([[runtimeKey, tab]]),
@@ -226,7 +241,7 @@ test('authenticated interaction responses use the control channel and reject rep
     const tab = {
         tty: { write: (value) => ttyWrites.push(value) },
         workspaceDirectory,
-        pendingInteraction: parseWebchatInteraction(approvalEnvelope()),
+        pendingInteractions: pendingInteractions(approvalEnvelope()),
         subscribers: new Map([['client', { sid, tabId, res: { write: (value) => sseWrites.push(value) } }]]),
     };
     const appState = {
@@ -263,7 +278,6 @@ test('authenticated interaction responses use the control channel and reject rep
     assert.equal(first.status, 204);
     assert.match(ttyWrites[0], /"__webchatInteractionResponse":1/);
     assert.match(ttyWrites[0], /"optionId":"always-allow"/);
-    assert.equal(tab.pendingInteraction, null);
     assert.match(sseWrites.join(''), /event: interaction-resolved/);
 
     const replay = postInteraction({ appState, workspaceDirectory, effectiveConfig, sid, tabId });
@@ -290,7 +304,7 @@ test('generic input responses use the authenticated interaction control channel'
     const tab = {
         tty: { write: (value) => ttyWrites.push(value) },
         workspaceDirectory,
-        pendingInteraction: interaction,
+        pendingInteractions: new Map([[interaction.id, interaction]]),
         subscribers: new Map([['client', { sid, tabId, res: { write() {} } }]]),
     };
     const appState = {
@@ -329,7 +343,7 @@ test('authenticated interaction cancellation reaches the runtime and clears the 
     const tab = {
         tty: { write: (value) => ttyWrites.push(value) },
         workspaceDirectory,
-        pendingInteraction: interaction,
+        pendingInteractions: new Map([[interaction.id, interaction]]),
         subscribers: new Map([['client', {
             sid,
             tabId,
@@ -355,7 +369,57 @@ test('authenticated interaction cancellation reaches the runtime and clears the 
     });
     assert.equal(result.status, 204);
     assert.match(ttyWrites[0], /"cancelled":true/);
-    assert.equal(tab.pendingInteraction, null);
+    const replay = postInteraction({
+        appState, workspaceDirectory, effectiveConfig, sid, tabId, pageInstanceId,
+        interactionId: interaction.id, optionId: null, cancelled: true,
+    });
+    assert.equal(replay.status, 409);
+});
+
+test('simultaneous native choices stay source-bound and leave other surfaces usable', () => {
+    const workspaceDirectory = '/workspace';
+    const effectiveConfig = { agentName: 'demo-agent' };
+    const runtimeKey = buildRuntimeKey(workspaceDirectory, effectiveConfig, '');
+    const sid = 'browser-session';
+    const ttyWrites = [];
+    const sseWrites = [];
+    const tab = {
+        tty: { write: (value) => ttyWrites.push(value) },
+        workspaceDirectory,
+        subscribers: new Map(['tab-A', 'tab-B', 'tab-C'].map((tabId) => [
+            tabId, { sid, tabId, pageInstanceId: 'page', res: { write: (value) => sseWrites.push(value) } },
+        ])),
+        taskProtocolBuffer: '',
+    };
+    const appState = {
+        runtimes: new Map([[runtimeKey, tab]]),
+        sessions: new Map([[sid, { tabs: new Map() }]]),
+    };
+    const shared = { appState, workspaceDirectory, effectiveConfig, sid, pageInstanceId: 'page' };
+    const send = (envelope) => routeWorkspaceRuntimeOutput(appState, tab, `${JSON.stringify(envelope)}\n`);
+    const requestA = { ...approvalEnvelope('native_request_A'), targetTabId: 'tab-A', targetPageInstanceId: 'page' };
+    const requestB = { ...approvalEnvelope('native_request_B'), targetTabId: 'tab-B', targetPageInstanceId: 'page' };
+    send(requestA);
+    send(requestB);
+    assert.equal(postInput({ ...shared, tabId: 'tab-C' }).status, 204);
+    ttyWrites.length = 0;
+    assert.equal(postInput({ ...shared, tabId: 'tab-A' }).status, 409);
+    assert.equal(postInteraction({ ...shared, tabId: 'tab-A', interactionId: requestB.id }).status, 409);
+    assert.equal(ttyWrites.length, 0);
+    assert.equal(postInteraction({ ...shared, tabId: 'tab-B', interactionId: requestB.id }).status, 204);
+    assert.deepEqual(JSON.parse(ttyWrites[0]), {
+        __webchatInteractionResponse: 1, version: 1, id: requestB.id,
+        sourceTabId: 'tab-B', sourcePageInstanceId: 'page', optionId: 'always-allow',
+    });
+    send({ __webchatInteractionResolved: 1, version: 1, id: requestA.id, optionId: null,
+        status: 'cancelled', targetTabId: 'tab-B', targetPageInstanceId: 'page' });
+    assert.equal(postInput({ ...shared, tabId: 'tab-A' }).status, 409);
+    assert.equal(postInteraction({ ...shared, tabId: 'tab-A', interactionId: requestA.id }).status, 204);
+    assert.equal(postInteraction({ ...shared, tabId: 'tab-B', interactionId: requestB.id }).status, 409);
+    const beforeDuplicate = sseWrites.length;
+    send(requestB);
+    assert.equal(sseWrites.length, beforeDuplicate);
+    assert.equal(postInteraction({ ...shared, tabId: 'tab-B', interactionId: requestB.id }).status, 409);
 });
 
 test('approval selector starts on Always approve and supports arrow plus Enter', async () => {
@@ -483,7 +547,7 @@ function postInteraction({
     return result;
 }
 
-function postInput({ appState, workspaceDirectory, effectiveConfig, tabId }) {
+function postInput({ appState, workspaceDirectory, effectiveConfig, tabId, pageInstanceId = '' }) {
     const req = new EventEmitter();
     req.method = 'POST';
     req.headers = {};
@@ -496,12 +560,14 @@ function postInput({ appState, workspaceDirectory, effectiveConfig, tabId }) {
         pathname: '/input',
         req,
         res,
-        parsedUrl: new URL(`http://localhost/input?tabId=${tabId}`),
+        parsedUrl: new URL(`http://localhost/input?tabId=${tabId}&pageInstanceId=${pageInstanceId}`),
         appState,
         workspaceDirectory,
         effectiveConfig,
         agentQuery: '',
     });
+    req.emit('data', 'new user input');
+    req.emit('end');
     return result;
 }
 
