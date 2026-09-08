@@ -1256,10 +1256,15 @@ function seedRetainedNoWaitMarker(workspace, overrides = {}) {
         runId, runStartedAtMs: 1_700_000_000_000, waveIndex: 0,
         statusFile: path.basename(statusPath), ...overrides,
     }), { mode: 0o600 });
-    return { markerPath, statusPath };
+    const lockPath = path.join(path.dirname(runningDir), 'workspace-start.json');
+    fs.writeFileSync(lockPath, JSON.stringify({
+        operation: `no-wait-activate:${containerName}`, ownerPid: process.pid,
+        token: 'retained-box-lease', expiresAt: '2020-01-01T00:00:00Z',
+    }), { mode: 0o600 });
+    return { markerPath, statusPath, lockPath };
 }
 
-test('destroy retires retained no-wait current markers only after exact Box removal', async (t) => {
+test('destroy retires retained markers and workspace lease only after exact Box removal', async (t) => {
     const state = fixture(t);
     const files = seedRetainedNoWaitMarker(state.workspace);
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
@@ -1270,11 +1275,15 @@ test('destroy retires retained no-wait current markers only after exact Box remo
         lockManager: fakeLockManager(state.root, events),
         discover: () => ownership,
         runner: { run(command, args) {
-            if (args[1] === 'rm') assert.equal(fs.existsSync(files.markerPath), true);
+            if (args[1] === 'rm') {
+                assert.equal(fs.existsSync(files.markerPath), true);
+                assert.equal(fs.existsSync(files.lockPath), true);
+            }
         } },
     });
     await supervisor.runDestroyTransaction(ownership.handles.container.id);
     assert.equal(fs.existsSync(files.markerPath), false);
+    assert.equal(fs.existsSync(files.lockPath), false);
     assert.equal(fs.readFileSync(files.statusPath, 'utf8'), 'retained run status');
 });
 
@@ -1293,11 +1302,12 @@ test('repeat destroy recovers markers when the Box is already absent without rea
     const result = await supervisor.runDestroyTransaction(null);
     assert.equal(result.action, 'absent');
     assert.equal(fs.existsSync(files.markerPath), false);
+    assert.equal(fs.existsSync(files.lockPath), false);
     assert.equal(fs.existsSync(files.statusPath), true);
     assert.equal((await supervisor.runDestroyTransaction(null)).action, 'absent');
 });
 
-test('failed Box removal preserves current no-wait markers', async (t) => {
+test('failed Box removal preserves current no-wait markers and workspace lease', async (t) => {
     const state = fixture(t);
     const files = seedRetainedNoWaitMarker(state.workspace);
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
@@ -1311,4 +1321,5 @@ test('failed Box removal preserves current no-wait markers', async (t) => {
     });
     await assert.rejects(() => supervisor.runDestroyTransaction(ownership.handles.container.id), /removal failed/);
     assert.equal(fs.existsSync(files.markerPath), true);
+    assert.equal(fs.existsSync(files.lockPath), true);
 });

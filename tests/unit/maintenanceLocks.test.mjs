@@ -290,3 +290,158 @@ test('token comparison preserves a replacement maintenance lock', async () => {
     assert.equal(JSON.parse(fs.readFileSync(filePath, 'utf8')).token, replacement.token);
     assert.equal(locks.removeMaintenanceLock(containerName, replacement.token), true);
 });
+
+
+function mockLinuxOwnerIdentity(t) {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+    t.after(() => Object.defineProperty(process, 'platform', platform));
+    const identity = { bootId: 'test-boot', namespace: 'pid:[1234]', startTicks: '100' };
+    const readFileSync = fs.readFileSync;
+    t.mock.method(fs, 'readFileSync', function (filePath, ...args) {
+        if (filePath === '/proc/sys/kernel/random/boot_id') {
+            if (!identity.bootId) throw new Error('boot identity unavailable');
+            return identity.bootId;
+        }
+        if (filePath === `/proc/${process.pid}/stat`) {
+            if (!identity.startTicks) throw new Error('process identity unavailable');
+            return `${process.pid} (test (worker)) S ${Array(18).fill('0').join(' ')} ${identity.startTicks}`;
+        }
+        return readFileSync.call(this, filePath, ...args);
+    });
+    const readlinkSync = fs.readlinkSync;
+    t.mock.method(fs, 'readlinkSync', function (filePath, ...args) {
+        if (filePath === '/proc/self/ns/pid') {
+            if (!identity.namespace) throw new Error('namespace unavailable');
+            return identity.namespace;
+        }
+        return readlinkSync.call(this, filePath, ...args);
+    });
+    t.after(() => fs.rmSync(locks.WORKSPACE_START_LOCK_PATH, { force: true }));
+    return identity;
+}
+
+test('workspace lease reclaims a reused PID only when its birth differs in the same scope', (t) => {
+    const identity = mockLinuxOwnerIdentity(t);
+    const old = locks.createWorkspaceMutationLease({ operation: 'no-wait-activate:old', ttlMs: -1 });
+    assert.equal(old.ownerIdentity.startIdentity, 'linux-proc:100');
+    assert.deepEqual(JSON.parse(old.ownerIdentity.scope), ['linux', 'test-boot', 'pid:[1234]']);
+    identity.startTicks = '200';
+    const recovered = locks.inspectWorkspaceStartLock();
+    assert.equal(recovered.active, false);
+    assert.equal(recovered.stale, true);
+    const replacement = locks.createWorkspaceStartLock();
+    assert.equal(replacement.ownerIdentity.startIdentity, 'linux-proc:200');
+    assert.equal(locks.releaseWorkspaceMutationLease(old), false);
+    assert.equal(locks.inspectWorkspaceStartLock().lock.token, replacement.token);
+    assert.equal(locks.releaseWorkspaceStartLock(replacement), true);
+});
+
+test('matching workspace owner birth remains protected after expiry', (t) => {
+    mockLinuxOwnerIdentity(t);
+    const owner = locks.createWorkspaceStartLock({ ttlMs: -1 });
+    const state = locks.inspectWorkspaceStartLock();
+    assert.equal(state.active, true);
+    assert.equal(state.renewalOverdue, true);
+    assert.equal(state.lock.token, owner.token);
+});
+
+test('unavailable or different workspace owner scope and birth fail closed', (t) => {
+    const identity = mockLinuxOwnerIdentity(t);
+    const owner = locks.createWorkspaceStartLock({ ttlMs: -1 });
+    for (const unavailableField of ['startTicks', 'bootId', 'namespace']) {
+        const saved = identity[unavailableField];
+        identity[unavailableField] = '';
+        assert.equal(locks.inspectWorkspaceStartLock().active, true, unavailableField);
+        identity[unavailableField] = saved;
+    }
+    identity.startTicks = '200';
+    identity.namespace = 'pid:[another-box]';
+    assert.equal(locks.inspectWorkspaceStartLock().active, true);
+    identity.namespace = 'pid:[1234]';
+    identity.bootId = 'another-boot';
+    assert.equal(locks.inspectWorkspaceStartLock().active, true);
+    assert.equal(JSON.parse(fs.readFileSync(locks.WORKSPACE_START_LOCK_PATH, 'utf8')).token, owner.token);
+});
+
+test('a lease created without a birth identity never reaps a live PID', (t) => {
+    const identity = mockLinuxOwnerIdentity(t);
+    identity.startTicks = '';
+    const owner = locks.createWorkspaceStartLock({ ttlMs: -1 });
+    identity.startTicks = '200';
+    assert.equal(locks.inspectWorkspaceStartLock().active, true);
+    assert.equal(locks.releaseWorkspaceStartLock(owner), true);
+});
+
+test('legacy live PID leases remain protected and dead PID leases recover', (t) => {
+    mockLinuxOwnerIdentity(t);
+    const owner = locks.createWorkspaceStartLock({ ttlMs: -1 });
+    delete owner.ownerIdentity;
+    fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, JSON.stringify(owner));
+    assert.equal(locks.inspectWorkspaceStartLock().active, true);
+    owner.ownerPid = 2_147_483_647;
+    fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, JSON.stringify(owner));
+    assert.equal(locks.inspectWorkspaceStartLock().active, false);
+});
+
+test('workspace start waits for no-wait activation before acquiring its own lease', async () => {
+    const activation = locks.createWorkspaceMutationLease({ operation: 'no-wait-activate:worker' });
+    let acquired = false;
+    const waiting = locks.acquireWorkspaceMutationLease({
+        operation: 'workspace-start', waitTimeoutMs: 1_000, retryIntervalMs: 5,
+    }).then((lease) => { acquired = true; return lease; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(acquired, false);
+    assert.equal(locks.inspectWorkspaceStartLock().lock.token, activation.token);
+    assert.equal(locks.releaseWorkspaceMutationLease(activation), true);
+    const start = await waiting;
+    assert.equal(start.operation, 'workspace-start');
+    assert.notEqual(start.token, activation.token);
+    assert.equal(locks.releaseWorkspaceMutationLease(start), true);
+});
+
+test('workspace start timeout preserves an ongoing no-wait activation', async () => {
+    const activation = locks.createWorkspaceMutationLease({ operation: 'no-wait-activate:worker' });
+    await assert.rejects(
+        () => locks.acquireWorkspaceMutationLease({ operation: 'workspace-start', waitTimeoutMs: 0 }),
+        (error) => error.code === 'workspace_mutation_lock_timeout',
+    );
+    assert.equal(locks.inspectWorkspaceStartLock().lock.token, activation.token);
+    assert.equal(locks.releaseWorkspaceMutationLease(activation), true);
+});
+
+
+test('stale owner recovery preserves a concurrent replacement lease', (t) => {
+    const identity = mockLinuxOwnerIdentity(t);
+    const stale = locks.createWorkspaceMutationLease({ operation: 'no-wait-activate:old' });
+    identity.startTicks = '200';
+    const replacement = {
+        ...stale,
+        token: 'concurrent-owner-token',
+        ownerIdentity: { ...stale.ownerIdentity, startIdentity: 'linux-proc:200' },
+    };
+    const readFileSync = fs.readFileSync;
+    let replaced = false;
+    t.mock.method(fs, 'readFileSync', function (filePath, ...args) {
+        if (!replaced && filePath === `/proc/${process.pid}/stat`) {
+            replaced = true;
+            fs.writeFileSync(locks.WORKSPACE_START_LOCK_PATH, JSON.stringify(replacement));
+        }
+        return readFileSync.call(this, filePath, ...args);
+    });
+    const state = locks.inspectWorkspaceStartLock();
+    assert.equal(replaced, true);
+    assert.equal(state.active, true);
+    assert.equal(state.lock.token, replacement.token);
+    assert.equal(locks.releaseWorkspaceMutationLease(stale), false);
+});
+
+test('scoped workspace lease recovers a dead owner but preserves inconclusive liveness', (t) => {
+    mockLinuxOwnerIdentity(t);
+    const owner = locks.createWorkspaceStartLock();
+    t.mock.method(process, 'kill', () => { throw Object.assign(new Error('probe unavailable'), { code: 'EIO' }); });
+    assert.equal(locks.inspectWorkspaceStartLock().active, true);
+    t.mock.method(process, 'kill', () => { throw Object.assign(new Error('dead'), { code: 'ESRCH' }); });
+    assert.equal(locks.inspectWorkspaceStartLock().active, false);
+    assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false);
+});

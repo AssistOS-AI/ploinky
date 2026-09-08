@@ -52,7 +52,7 @@ import {
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
-import { createWorkspaceStartLock, releaseWorkspaceStartLock, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
 import {
   AGENTS_DATA_DIR,
   LOGS_DIR,
@@ -1949,7 +1949,10 @@ async function startWorkspace(staticAgentArg, portArg, {
   // writes, both inactive prelaunch preparations, and every subsequent start.
   // Only the final post-provider lease may authorize runtime targets.
   resetPreinstallRunInProcess();
-  const workspaceStartLock = createWorkspaceStartLock();
+  // A previous start may have returned while its no-wait workers are still
+  // activating routes. Serialize with them using the same bounded wait they
+  // use for startup, then revalidate the admitted graph under the lease.
+  const workspaceStartLock = await acquireWorkspaceMutationLease({ operation: 'workspace-start' });
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
   try {

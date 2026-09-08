@@ -57,7 +57,7 @@ test('start admits prepared repositories before persisting the fixed Router port
         'prepareDefaultBootRepositories',
         'prepareManifestRepositories',
         'const admittedStart = preflightWorkspaceStartRuntimeCapabilities',
-        'createWorkspaceStartLock()',
+        "await acquireWorkspaceMutationLease({ operation: 'workspace-start' })",
         'assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions)',
         "inactivateEdgeRoutingGeneration('workspace-start-prepare'",
         'resolveAndPersistStartRouterPort(staticAgentArg, portArg, {',

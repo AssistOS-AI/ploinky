@@ -20,6 +20,7 @@ import {
 } from '../contract/image.mjs';
 import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { preflightPublications, resolveEffectiveHostPort } from '../ports.mjs';
 import {
@@ -125,6 +126,8 @@ async function createAndStart({
     lock,
     discover,
     startAndWaitReady,
+    retireStartLock,
+    beforeCreate = () => {},
     revalidateDataPaths,
     readCidfile,
     fsApi,
@@ -134,9 +137,16 @@ async function createAndStart({
 }) {
     lock.assertHeld(identity.instance);
     const dataState = revalidateDataPaths({ identity, lock, fsApi });
+    const observed = discover(identity, { runner });
+    if (observed?.state !== 'absent' || observed.handles?.container
+        || (observed.engine && (observed.engine.name !== engine.name || observed.engine.identity !== engine.identity))) {
+        throw transactionError('Box must be absent before workspace start lock cleanup and creation');
+    }
+    retireStartLock({ identity, lock });
     const cidfile = secureCidfilePath(lock, token);
     cleanCidfile(cidfile, fsApi);
     writeProgress(stderr, `Creating Box container ${identity.instance}...`);
+    beforeCreate();
     runner.run(engine.name, containerCreateArgs({
         identity,
         dataFingerprints: dataState.fingerprints,
@@ -214,6 +224,7 @@ async function restoreOldContainer({
         lock,
         discover: dependencies.discover,
         startAndWaitReady: dependencies.startAndWaitReady,
+        retireStartLock: dependencies.retireStartLock,
         revalidateDataPaths: dependencies.revalidateDataPaths,
         readCidfile: dependencies.readCidfile,
         fsApi: dependencies.fsApi,
@@ -257,6 +268,7 @@ export async function reconcileBoxContainer({
         stopPloinkyLocal: seams.stopPloinkyLocal || stopPloinkyLocalByContainerId,
         startAndWaitReady: seams.startAndWaitReady || startContainerAndWaitReady,
         readCidfile: seams.readCidfile || readContainerIdFromCidfile,
+        retireStartLock: seams.retireStartLock || retireQuiescentBoxWorkspaceStartLock,
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
@@ -303,6 +315,14 @@ export async function reconcileBoxContainer({
         // rejects any later parent or directory substitution.
         dependencies.revalidateDataPaths({ identity, lock, fsApi: dependencies.fsApi });
         if (!currentContainer.runtime.running) {
+            const observed = dependencies.discover(identity, { runner });
+            const handle = observed?.state === 'owned' ? observed.handles?.container : null;
+            if (!handle || handle.id !== currentContainer.id || handle.runtime?.running !== false
+                || (observed.engine && (observed.engine.name !== engine.name || observed.engine.identity !== engine.identity))) {
+                throw transactionError('Box identity or stopped state changed before workspace start lock cleanup');
+            }
+            validateContainerConfiguration(handle, old);
+            dependencies.retireStartLock({ identity, lock });
             writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
             await dependencies.startAndWaitReady(
                 engine,
@@ -352,6 +372,7 @@ export async function reconcileBoxContainer({
     }
 
     let candidateId = '';
+    let candidateAttempted = false;
     let oldRemoved = false;
     try {
         if (old) {
@@ -375,6 +396,8 @@ export async function reconcileBoxContainer({
             lock,
             discover: dependencies.discover,
             startAndWaitReady: dependencies.startAndWaitReady,
+            retireStartLock: dependencies.retireStartLock,
+            beforeCreate: () => { candidateAttempted = true; },
             revalidateDataPaths: dependencies.revalidateDataPaths,
             readCidfile: dependencies.readCidfile,
             fsApi: dependencies.fsApi,
@@ -445,7 +468,7 @@ export async function reconcileBoxContainer({
         });
     } catch (error) {
         const rollbackFailures = [];
-        if (!candidateId && (!old || oldRemoved)) {
+        if (!candidateId && candidateAttempted && (!old || oldRemoved)) {
             const recovered = dependencies.discover(identity, { runner });
             const candidate = recovered?.state === 'owned'
                 ? recovered.handles?.container

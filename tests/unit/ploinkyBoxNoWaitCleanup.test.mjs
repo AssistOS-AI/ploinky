@@ -105,3 +105,75 @@ test('destroy cleanup bounds subprocess execution and fails closed on timeout', 
     } }), /cleanup failed/);
     assert.equal(fs.existsSync(f.markerPath), true);
 });
+
+test('destroy retires legacy and expired inner mutation locks regardless of host PID liveness', (t) => {
+    for (const noWaitState of ['markers', 'empty', 'absent']) {
+        for (const content of [String(process.pid), JSON.stringify({ pid: process.pid, expiresAt: 1, command: 'no-wait-activate:worker' })]) {
+            const f = fixture(t);
+            if (noWaitState !== 'markers') fs.unlinkSync(f.markerPath);
+            if (noWaitState === 'absent') fs.rmdirSync(f.markerDirectory);
+            const running = path.dirname(f.markerDirectory);
+            const lockPath = path.join(running, 'workspace-start.json');
+            fs.writeFileSync(lockPath, content, { mode: 0o600 });
+            fs.writeFileSync(path.join(running, 'unrelated.json'), 'keep');
+            f.cleanup();
+            assert.equal(fs.existsSync(lockPath), false);
+            assert.equal(fs.readFileSync(path.join(running, 'unrelated.json'), 'utf8'), 'keep');
+            f.cleanup();
+        }
+    }
+});
+
+test('destroy refuses unsafe inner locks without touching their target or retiring markers', (t) => {
+    for (const kind of ['symlink', 'hardlink', 'directory', 'writable']) {
+        const f = fixture(t);
+        const lockPath = path.join(path.dirname(f.markerDirectory), 'workspace-start.json');
+        const outside = path.join(f.root, 'outside-lock');
+        fs.writeFileSync(outside, String(process.pid), { mode: 0o600 });
+        if (kind === 'symlink') fs.symlinkSync(outside, lockPath);
+        if (kind === 'hardlink') fs.linkSync(outside, lockPath);
+        if (kind === 'directory') fs.mkdirSync(lockPath, { mode: 0o700 });
+        if (kind === 'writable') fs.writeFileSync(lockPath, String(process.pid), { mode: 0o666 });
+        if (kind === 'writable') fs.chmodSync(lockPath, 0o666);
+        assert.throws(f.cleanup, /secure owned regular file/);
+        assert.equal(fs.existsSync(f.markerPath), true);
+        assert.equal(fs.readFileSync(outside, 'utf8'), String(process.pid));
+        assert.equal(fs.existsSync(lockPath), true);
+    }
+});
+
+test('destroy rejects replacement, new, or modified inner locks during marker cleanup', (t) => {
+    for (const kind of ['replacement', 'new', 'modified', 'symlink']) {
+        const f = fixture(t);
+        const lockPath = path.join(path.dirname(f.markerDirectory), 'workspace-start.json');
+        if (kind !== 'new') fs.writeFileSync(lockPath, 'original', { mode: 0o600 });
+        assert.throws(() => f.cleanup({ spawn: () => {
+            if (kind === 'replacement') {
+                fs.renameSync(lockPath, `${lockPath}.old`);
+                fs.writeFileSync(lockPath, 'replacement', { mode: 0o600 });
+            } else if (kind === 'symlink') {
+                fs.renameSync(lockPath, `${lockPath}.old`);
+                fs.symlinkSync(`${lockPath}.old`, lockPath);
+            } else {
+                fs.writeFileSync(lockPath, 'changed content', { mode: 0o600 });
+            }
+            return { status: 0 };
+        } }), /mutation lock (changed|is not a secure)/);
+        assert.equal(fs.existsSync(lockPath), true);
+    }
+});
+
+test('destroy does not retire an inner lock after state ancestor replacement', (t) => {
+    const f = fixture(t);
+    const running = path.dirname(f.markerDirectory);
+    const lockPath = path.join(running, 'workspace-start.json');
+    fs.writeFileSync(lockPath, 'original', { mode: 0o600 });
+    assert.throws(() => f.cleanup({ spawn: () => {
+        fs.renameSync(running, `${running}.old`);
+        fs.mkdirSync(running, { mode: 0o700 });
+        fs.writeFileSync(lockPath, 'replacement', { mode: 0o600 });
+        return { status: 0 };
+    } }), /directories changed/);
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), 'replacement');
+    assert.equal(fs.readFileSync(path.join(`${running}.old`, 'workspace-start.json'), 'utf8'), 'original');
+});

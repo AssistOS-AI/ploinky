@@ -590,7 +590,7 @@ test('workspace router TCP listener and both inactive graph preparations precede
     const generationIndex = source.indexOf('ensureGraphNodesEnabled(dependencyGraph, reg, {');
     const finalPreparationIndex = source.indexOf('reprepareGraphAfterStartupProviders(');
     const launchIndex = source.indexOf('ensureAgentService(shortAgentName');
-    const lockIndex = source.indexOf('createWorkspaceStartLock()');
+    const lockIndex = source.indexOf("await acquireWorkspaceMutationLease({ operation: 'workspace-start' })");
 
     assert.ok(lockIndex >= 0 && lockIndex < routerIndex, 'workspace start must suppress watchdog container reconciliation before router startup');
     assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');

@@ -440,7 +440,7 @@ function harness(state, {
         },
         discover() {
             calls.push(['seam', 'discover']);
-            return { state: 'owned', handles: { container: current } };
+            return current ? { state: 'owned', handles: { container: current } } : { state: 'absent', handles: null };
         },
         token(kind) { return kind === 'candidate' ? '1'.repeat(24) : '2'.repeat(24); },
     };
@@ -741,7 +741,7 @@ test('initial transaction preflights before pull, workspace data, and container 
     assert.ok(flat.findIndex((value) => value.includes('container create')) < flat.findIndex((value) => value.includes('capture-logs')));
     assert.ok(flat.findIndex((value) => value.includes('capture-logs')) < flat.findIndex((value) => value.includes('container start')));
     assert.ok(flat.findIndex((value) => value.includes('container start')) < flat.findIndex((value) => value.includes('wait-ready')));
-    assert.ok(flat.findIndex((value) => value.includes('wait-ready')) < flat.findIndex((value) => value.includes('discover')));
+    assert.ok(flat.findIndex((value) => value.includes('wait-ready')) < flat.findLastIndex((value) => value.includes('discover')));
     assertNoEngineVolumeCommand(h.calls);
 });
 
@@ -826,7 +826,7 @@ test('stopped reuse captures logs before start and validates the same running ID
     const capture = events.findIndex((value) => value.includes('capture-logs'));
     const start = events.findIndex((value) => value.includes('container start'));
     const wait = events.findIndex((value) => value.includes('wait-ready'));
-    const discover = events.findIndex((value) => value.includes('discover'));
+    const discover = events.findLastIndex((value) => value.includes('discover'));
     assert.ok(revalidate >= 0 && revalidate < capture);
     assert.ok(capture < start && start < wait && wait < discover);
     assert.equal(events.some((value) => value.includes('pull')), false);
@@ -1435,4 +1435,152 @@ test('a corrupt cidfile can recover only through rediscovered immutable image id
     }, h.seams);
     assert.equal(result.action, 'created');
     assert.equal(result.ownership.handles.container.id, 'a'.repeat(64));
+});
+
+function retainedStartLock(state) {
+    const running = path.join(state.identity.workspaceRoot, '.ploinky', 'running');
+    fs.mkdirSync(running, { recursive: true, mode: 0o700 });
+    const lockPath = path.join(running, 'workspace-start.json');
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, expiresAt: 1 }), { mode: 0o600 });
+    const marker = path.join(running, 'no-wait', 'worker.current.json');
+    fs.mkdirSync(path.dirname(marker), { mode: 0o700 });
+    fs.writeFileSync(marker, 'preserve marker', { mode: 0o600 });
+    return { lockPath, marker };
+}
+
+function reconciliationArguments(state, h, initial, replacement = false) {
+    return {
+        identity: state.identity, agentLib: state.agentLib,
+        ownership: initial ? { state: 'owned', handles: { container: initial } } : { state: 'absent', handles: null },
+        engine: { name: 'podman', identity: 'engine' }, runner: h.runner, lock: state.lock,
+        repositoryRoot: state.root, ...(replacement ? { explicitPort: 19090 } : {}),
+        stderr: { write() {} },
+    };
+}
+
+function lifecycleContainer(state, running = true) {
+    return containerHandle({
+        identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root,
+        imageId: 'd'.repeat(64), imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
+        id: 'e'.repeat(64), running,
+    });
+}
+
+test('fresh creation, stopped reuse and replacement retire only the quiescent inner lease before start', async (t) => {
+    for (const scenario of ['fresh', 'stopped', 'replacement', 'running']) {
+        const state = fixture(t);
+        const initial = scenario === 'fresh' ? null : lifecycleContainer(state, scenario !== 'stopped');
+        const h = harness(state, { initial });
+        const { lockPath, marker } = retainedStartLock(state);
+        const start = h.seams.startAndWaitReady;
+        h.seams.startAndWaitReady = async (...args) => {
+            assert.equal(fs.existsSync(lockPath), false, scenario);
+            return start(...args);
+        };
+        await reconcileBoxContainer(reconciliationArguments(state, h, initial, scenario === 'replacement'), h.seams);
+        assert.equal(fs.existsSync(lockPath), scenario === 'running', scenario);
+        assert.equal(fs.readFileSync(marker, 'utf8'), 'preserve marker');
+    }
+});
+
+test('failed candidate readiness and explicit rollback retire candidate leases before restoring the old Box', async (t) => {
+    for (const failCandidateReady of [true, false]) {
+        const state = fixture(t);
+        const initial = lifecycleContainer(state);
+        const h = harness(state, { initial, failCandidateReady });
+        const { lockPath, marker } = retainedStartLock(state);
+        const start = h.seams.startAndWaitReady;
+        let starts = 0;
+        h.seams.startAndWaitReady = async (...args) => {
+            assert.equal(fs.existsSync(lockPath), false);
+            starts += 1;
+            if (starts === 1) fs.writeFileSync(lockPath, 'candidate lease', { mode: 0o600 });
+            return start(...args);
+        };
+        const run = () => reconcileBoxContainer(reconciliationArguments(state, h, initial, true), h.seams);
+        if (failCandidateReady) await assert.rejects(run, /ready timeout/);
+        else await (await run()).rollback();
+        assert.equal(starts, 2);
+        assert.equal(fs.existsSync(lockPath), false);
+        assert.equal(fs.readFileSync(marker, 'utf8'), 'preserve marker');
+    }
+});
+
+test('stopped reuse refuses cleanup when exact Box identity or stopped state changed', async (t) => {
+    for (const change of ['running', 'different-id', 'foreign', 'absent', 'engine']) {
+        const state = fixture(t);
+        const initial = lifecycleContainer(state, false);
+        const h = harness(state, { initial });
+        const { lockPath } = retainedStartLock(state);
+        h.seams.discover = () => {
+            const observed = structuredClone(initial);
+            if (change === 'running') observed.runtime.running = true;
+            if (change === 'different-id') observed.id = 'f'.repeat(64);
+            return ['foreign', 'absent'].includes(change)
+                ? { state: change } : { state: 'owned', handles: { container: observed },
+                    ...(change === 'engine' ? { engine: { name: 'podman', identity: 'other' } } : {}) };
+        };
+        await assert.rejects(() => reconcileBoxContainer(reconciliationArguments(state, h, initial), h.seams), /stopped state changed/);
+        assert.equal(fs.existsSync(lockPath), true);
+        assert.equal(h.calls.some((call) => call.includes('start')), false);
+    }
+});
+
+test('fresh creation fails closed if a Box appears before cleanup without removing it', async (t) => {
+    const state = fixture(t);
+    const h = harness(state);
+    const { lockPath } = retainedStartLock(state);
+    const unexpected = lifecycleContainer(state);
+    unexpected.runtime.imageId = 'c'.repeat(64);
+    h.seams.discover = () => ({ state: 'owned', handles: { container: unexpected } });
+    await assert.rejects(() => reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams), /must be absent/);
+    assert.equal(fs.existsSync(lockPath), true);
+    assert.equal(h.calls.some((call) => call.includes('rm') || call.includes('create')), false);
+});
+
+test('failed old Box stop or removal preserves its lease and performs no new create', async (t) => {
+    for (const failure of ['stop', 'remove']) {
+        const state = fixture(t);
+        const initial = lifecycleContainer(state);
+        const h = harness(state, { initial, failLocalStop: failure === 'stop' });
+        if (failure === 'remove') h.seams.removeContainer = () => { throw new Error('remove failed'); };
+        const { lockPath } = retainedStartLock(state);
+        await assert.rejects(() => reconcileBoxContainer(reconciliationArguments(state, h, initial, true), h.seams));
+        assert.equal(fs.existsSync(lockPath), true);
+        assert.equal(h.calls.some((call) => call.includes('create')), false);
+    }
+});
+
+test('failed candidate removal prevents lease cleanup and old Box restoration', async (t) => {
+    const state = fixture(t);
+    const initial = lifecycleContainer(state);
+    const h = harness(state, { initial });
+    const { lockPath } = retainedStartLock(state);
+    const result = await reconcileBoxContainer(reconciliationArguments(state, h, initial, true), h.seams);
+    fs.writeFileSync(lockPath, 'live candidate lease', { mode: 0o600 });
+    // Dependencies are captured at reconcile time; fail the underlying removal.
+    const run = h.runner.run;
+    h.runner.run = (command, args) => {
+        if (args[1] === 'rm') throw new Error('remove failed');
+        return run(command, args);
+    };
+    await assert.rejects(() => result.rollback(), /candidate removal/);
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), 'live candidate lease');
+    assert.equal(h.calls.filter((call) => call.includes('create')).length, 1);
+});
+
+test('absence from another engine or with a retained handle cannot authorize lease cleanup', async (t) => {
+    for (const mismatch of ['engine', 'handle']) {
+        const state = fixture(t);
+        const h = harness(state);
+        const { lockPath } = retainedStartLock(state);
+        h.seams.discover = () => ({
+            state: 'absent',
+            ...(mismatch === 'engine' ? { engine: { name: 'podman', identity: 'other' } }
+                : { handles: { container: lifecycleContainer(state) } }),
+        });
+        await assert.rejects(() => reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams), /must be absent/);
+        assert.equal(fs.existsSync(lockPath), true);
+        assert.equal(h.calls.some((call) => call.includes('rm') || call.includes('create')), false);
+    }
 });
