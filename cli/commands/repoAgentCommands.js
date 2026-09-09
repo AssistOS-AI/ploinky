@@ -17,6 +17,7 @@ import { collectAgentsSummary } from '../utils/status.js';
 import { findAgent } from '../utils/utils.js';
 import { updateWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
 import { isInsideBoxRuntime } from '../../agentlib/bootstrap.mjs';
+import { agentLibRoot } from '../../agentlib/runtime.mjs';
 import { PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV } from './ploinkyUpdateScope.js';
 import { sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 
@@ -388,10 +389,11 @@ async function updatePloinkyRepos(options = {}) {
 async function updateAllRepos(folderPath, options = {}) {
     const projectsRoot = resolveUpdateProjectsRoot(folderPath);
     const ploinkyRoot = resolvePloinkyRoot();
+    const runtimeAgentLibSource = agentLibRoot();
     const hostUpdatedWorkspaceCheckout = String(
         process.env[PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV] || '',
     ).trim();
-    const workspaceRepos = reposSvc.findWorkspaceGitRepos(projectsRoot)
+    const discoveredWorkspaceRepos = reposSvc.findWorkspaceGitRepos(projectsRoot)
         .filter(repo => !pathsReferToSameLocation(repo.path, ploinkyRoot))
         .filter(repo => !hostUpdatedWorkspaceCheckout
             || !pathsReferToSameLocation(repo.path, hostUpdatedWorkspaceCheckout));
@@ -436,6 +438,13 @@ async function updateAllRepos(folderPath, options = {}) {
         branchPolicy: options.agentLibBranchPolicy || null,
         interactiveSession: options.interactiveSession === true,
     });
+
+    // AgentLib has one source owner. The runtime source may also be visible at
+    // a workspace bind mount, and a host refresh may have selected a new source.
+    // Neither belongs in the generic Git update loop.
+    const agentLibSources = [runtimeAgentLibSource, agentLib?.selection?.sourceDir].filter(Boolean);
+    const workspaceRepos = discoveredWorkspaceRepos.filter(repo =>
+        !agentLibSources.some(source => pathsReferToSameLocation(repo.path, source)));
 
     if (ploinkyRepos.length) {
         console.log('Updating ploinky repositories...');
@@ -523,11 +532,16 @@ async function updateAllRepos(folderPath, options = {}) {
 }
 
 function pathsReferToSameLocation(first, second) {
+    if (path.resolve(first) === path.resolve(second)) return true;
     try {
-        return fs.realpathSync(first) === fs.realpathSync(second);
-    } catch (_) {
-        return path.resolve(first) === path.resolve(second);
-    }
+        if (fs.realpathSync(first) === fs.realpathSync(second)) return true;
+    } catch (_) {}
+    try {
+        // Separate bind mounts have different realpaths but share file identity.
+        const firstStat = fs.statSync(first, { bigint: true });
+        const secondStat = fs.statSync(second, { bigint: true });
+        return firstStat.dev === secondStat.dev && firstStat.ino === secondStat.ino;
+    } catch (_) { return false; }
 }
 
 function resolveUpdateProjectsRoot(folderPath) {

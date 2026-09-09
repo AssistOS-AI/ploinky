@@ -55,6 +55,9 @@ function runAggregateUpdateChild(workspaceRoot, body) {
     const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
     const configUrl = projectFileUrl('cli/utils/config.js');
     const commandsUrl = projectFileUrl('cli/commands/repoAgentCommands.js');
+    const agentLibFixtureUrl = projectFileUrl('tests/helpers/agentlibFixture.mjs');
+    const agentLibContractUrl = projectFileUrl('agentlib/contract.mjs');
+    const boxConstantsUrl = projectFileUrl('ploinky-box/constants.mjs');
     const runtimeRoot = path.join(workspaceRoot, '.fixtures', 'runtime-root');
 
     execFileSync(process.execPath, ['--input-type=module', '-e', `
@@ -145,6 +148,9 @@ function runAggregateUpdateChild(workspaceRoot, body) {
             const wrapperPath = path.join(binDir, 'git');
             fs.writeFileSync(wrapperPath, [
                 '#!/bin/sh',
+                'if [ -n "$PLOINKY_TEST_GIT_TRACE" ]; then',
+                '  printf "%s\\\\n" "$*" >> "$PLOINKY_TEST_GIT_TRACE"',
+                'fi',
                 'is_ls_remote=0',
                 'for arg in "$@"; do',
                 '  if [ "$arg" = "ls-remote" ]; then',
@@ -251,6 +257,9 @@ function runAggregateUpdateChild(workspaceRoot, body) {
 
         const { REPOS_DIR } = await import(${JSON.stringify(configUrl)});
         const { updatePloinkyRepos, updateAllRepos } = await import(${JSON.stringify(commandsUrl)});
+        const { writeAgentLibCheckout } = await import(${JSON.stringify(agentLibFixtureUrl)});
+        const { AGENTLIB_ENV, AGENTLIB_LOCAL_DIR_NAME } = await import(${JSON.stringify(agentLibContractUrl)});
+        const { BOX_MARKER_PATH } = await import(${JSON.stringify(boxConstantsUrl)});
 
         ${body}
     `], {
@@ -899,6 +908,113 @@ test('updateAllRepos still rejects an invalid selected search root', () => {
         fs.rmSync(workspaceRoot, { recursive: true, force: true });
     }
 });
+
+for (const runtimeAlreadySelected of [true, false]) {
+    test('updateAllRepos preserves the host local AgentLib source '
+        + (runtimeAlreadySelected ? 'already selected by the runtime' : 'newly selected during refresh'), () => {
+        const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-agentlib-host-'));
+
+        try {
+            runAggregateUpdateChild(workspaceRoot, String.raw`
+                setupAggregateRepoFixture();
+                const sourcePath = path.join(workspaceRoot, '.fixtures', 'agentlib-upstream');
+                initGitRepo(sourcePath);
+                writeAgentLibCheckout(sourcePath);
+                execFileSync('git', ['add', '.'], { cwd: sourcePath, stdio: 'ignore' });
+                execFileSync('git', ['commit', '-m', 'add runtime entrypoints'], { cwd: sourcePath, stdio: 'ignore' });
+                const selectedPath = path.join(workspaceRoot, AGENTLIB_LOCAL_DIR_NAME);
+                const unrelatedPath = path.join(workspaceRoot, 'project', AGENTLIB_LOCAL_DIR_NAME);
+                cloneRepo(sourcePath, selectedPath);
+                cloneRepo(sourcePath, unrelatedPath);
+                const originalHead = readHead(selectedPath);
+                const upstreamHead = commitFile(sourcePath, 'upstream.txt', 'new upstream content');
+                if (${runtimeAlreadySelected}) process.env[AGENTLIB_ENV.dir] = selectedPath;
+                const tracePath = path.join(workspaceRoot, '.fixtures', 'git-activity.log');
+                process.env.PLOINKY_TEST_GIT_TRACE = tracePath;
+
+                const { result } = await captureUpdate(() => updateAllRepos(workspaceRoot));
+
+                const activity = fs.readFileSync(tracePath, 'utf8').split('\n');
+                assert.equal(result.failed.length, 0);
+                assert.equal(result.agentLib.mode, 'local');
+                assert.equal(result.agentLib.selection.sourceDir, fs.realpathSync(selectedPath));
+                assert.equal(readHead(selectedPath), originalHead, 'developer-owned checkout must not advance');
+                assert.equal(fs.existsSync(path.join(selectedPath, 'upstream.txt')), false);
+                assert.equal(readHead(unrelatedPath), upstreamHead, 'a distinct repository with the same name still updates');
+                const selectedActivity = activity.filter(line => [selectedPath, fs.realpathSync(selectedPath)]
+                    .some(location => line.startsWith('-C ' + location + ' ')));
+                assert.ok(selectedActivity.every(line => !/ (?:pull|fetch|ls-remote|reset|checkout)(?: |$)/.test(line)),
+                    'selected source permits read-only revision reporting, never a generic Git update: ' + selectedActivity.join('\n'));
+            `);
+        } finally {
+            fs.rmSync(workspaceRoot, { recursive: true, force: true });
+        }
+    });
+}
+
+for (const runtimeAlias of ['direct path', 'symlink alias', 'bind alias']) {
+    test('updateAllRepos excludes the in-Box selected AgentLib source through a ' + runtimeAlias, () => {
+        const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-agentlib-box-'));
+
+        try {
+            runAggregateUpdateChild(workspaceRoot, String.raw`
+                const fixture = setupAggregateRepoFixture();
+                const selectedPath = path.join(workspaceRoot, AGENTLIB_LOCAL_DIR_NAME);
+                const unrelatedPath = path.join(workspaceRoot, 'project', AGENTLIB_LOCAL_DIR_NAME);
+                cloneRepo(fixture.sourceRepoPath, selectedPath);
+                cloneRepo(fixture.sourceRepoPath, unrelatedPath);
+                const originalHead = readHead(selectedPath);
+                const upstreamHead = commitFile(fixture.sourceRepoPath, 'upstream.txt', 'new upstream content');
+                const aliasKind = ${JSON.stringify(runtimeAlias)};
+                let runtimePath = selectedPath;
+                if (aliasKind !== 'direct path') {
+                    runtimePath = path.join(workspaceRoot, '.fixtures', 'mounted-runtime');
+                    if (aliasKind === 'symlink alias') fs.symlinkSync(selectedPath, runtimePath, 'dir');
+                    else mkdir(runtimePath);
+                }
+                process.env[AGENTLIB_ENV.dir] = runtimePath;
+                const canonicalRuntimePath = fs.realpathSync(runtimePath);
+                const originalStat = fs.statSync;
+                fs.statSync = (target, options) => {
+                    if (target === BOX_MARKER_PATH) return { isFile: () => true };
+                    // Distinct bind mounts preserve physical directory identity even when realpath differs.
+                    if (aliasKind === 'bind alias' && path.resolve(target) === canonicalRuntimePath) {
+                        return originalStat(selectedPath, options);
+                    }
+                    const result = originalStat(target, options);
+                    if (aliasKind === 'bind alias' && path.resolve(target) === path.resolve(unrelatedPath)) {
+                        const selectedStat = originalStat(selectedPath, options);
+                        return Object.assign(Object.create(result), {
+                            ino: selectedStat.ino,
+                            dev: selectedStat.dev + (typeof selectedStat.dev === 'bigint' ? 1n : 1),
+                        });
+                    }
+                    return result;
+                };
+                const tracePath = path.join(workspaceRoot, '.fixtures', 'git-activity.log');
+                process.env.PLOINKY_TEST_GIT_TRACE = tracePath;
+                let result;
+                try {
+                    ({ result } = await captureUpdate(() => updateAllRepos(workspaceRoot, { interactiveSession: true })));
+                } finally {
+                    fs.statSync = originalStat;
+                }
+
+                const activity = fs.readFileSync(tracePath, 'utf8').split('\n');
+                assert.equal(result.failed.length, 0);
+                assert.equal(result.agentLib, null, 'the in-Box updater leaves source ownership to the host');
+                assert.equal(readHead(selectedPath), originalHead, 'the mounted checkout must not be pulled through its workspace path');
+                assert.equal(fs.existsSync(path.join(selectedPath, 'upstream.txt')), false);
+                assert.equal(readHead(unrelatedPath), upstreamHead, 'same name or inode on another device does not identify the selected source');
+                assert.equal(activity.some(line => [selectedPath, fs.realpathSync(selectedPath)]
+                    .some(location => line.startsWith('-C ' + location + ' '))), false,
+                    'the in-Box selected source must not even receive a remote probe');
+            `);
+        } finally {
+            fs.rmSync(workspaceRoot, { recursive: true, force: true });
+        }
+    });
+}
 
 test('installDefaultSkills migrates legacy .claude skills without deleting other .claude content', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-claude-'));
