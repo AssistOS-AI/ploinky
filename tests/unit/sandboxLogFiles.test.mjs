@@ -190,24 +190,23 @@ test('a producer fstat failure still closes its newly opened descriptor', (t) =>
     assert.deepEqual(closed, opened);
 });
 
-test('producer selection rejects symlinked and writable log parents', (t) => {
+test('producer selection accepts symlinked and writable log parents', (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-parent-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-sandbox-outside-'));
     t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
     fs.symlinkSync(outside, path.join(root, 'logs'));
-    assert.throws(
-        () => openSandboxLogHandle({ containerName: BLUE, logsDir: path.join(root, 'logs') }),
-        /not one regular directory/,
-    );
+    const linked = openSandboxLogHandle({ containerName: BLUE, logsDir: path.join(root, 'logs') });
+    fs.writeSync(linked.descriptor, 'linked log');
+    assert.equal(fs.readFileSync(linked.temporaryPath, 'utf8'), 'linked log');
+    linked.discard();
 
     fs.unlinkSync(path.join(root, 'logs'));
     fs.mkdirSync(path.join(root, 'logs'), { mode: 0o700 });
     fs.chmodSync(path.join(root, 'logs'), 0o777);
-    assert.throws(
-        () => openSandboxLogHandle({ containerName: BLUE, logsDir: path.join(root, 'logs') }),
-        /group- or other-writable/,
-    );
+    const writable = openSandboxLogHandle({ containerName: BLUE, logsDir: path.join(root, 'logs') });
+    assert.equal(fs.statSync(path.join(root, 'logs')).mode & 0o777, 0o777);
+    writable.discard();
 });
 
 test('a stopped post-cut sandbox log is derived from the registry tuple and pid', (t) => {

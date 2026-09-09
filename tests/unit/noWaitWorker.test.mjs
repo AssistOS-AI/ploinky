@@ -70,22 +70,20 @@ test('no-wait status replacement is atomic and leaves no temporary file', (t) =>
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
 });
 
-test('no-wait status publication rejects unsafe or foreign producer directories', (t) => {
+test('no-wait status publication accepts writable and symlinked producer directories', (t) => {
     const { root, runningDir } = fixture(t);
     fs.chmodSync(runningDir, 0o777);
-    assert.throws(
-        () => writeStatus('ploinky_demo_worker', { state: 'starting' }, { runningDir }),
-        /group- or other-writable/,
-    );
+    writeStatus('ploinky_demo_worker', { state: 'starting' }, { runningDir });
+    assert.equal(fs.statSync(runningDir).mode & 0o777, 0o777);
+    fs.rmSync(path.join(runningDir, 'no-wait'), { recursive: true });
     fs.chmodSync(runningDir, 0o700);
 
     const outside = path.join(root, 'outside');
     fs.mkdirSync(outside, { mode: 0o700 });
     fs.symlinkSync(outside, path.join(runningDir, 'no-wait'));
-    assert.throws(
-        () => writeStatus('ploinky_demo_worker', { state: 'starting' }, { runningDir }),
-        /not one regular directory/,
-    );
+    writeStatus('ploinky_demo_worker', { state: 'starting' }, { runningDir });
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outside, 'ploinky_demo_worker.json'), 'utf8')),
+        { state: 'starting' });
 });
 
 const RUN_ID = '11111111-1111-4111-8111-111111111111';

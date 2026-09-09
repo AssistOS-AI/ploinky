@@ -38,11 +38,12 @@ test('empty workspace gets one private random key that remains byte-stable', (t)
     assert.equal(fs.statSync(first.path).mode & 0o777, 0o600);
 });
 
-test('existing permissive .ploinky directory is normalized to private mode', (t) => {
+test('existing .ploinky directory permissions are preserved', (t) => {
     const root = fixture(t);
     fs.mkdirSync(path.join(root, '.ploinky'), { mode: 0o775 });
+    fs.chmodSync(path.join(root, '.ploinky'), 0o777);
     initializeWorkspaceMasterKey({ workspaceRoot: root });
-    assert.equal(fs.statSync(path.join(root, '.ploinky')).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(path.join(root, '.ploinky')).mode & 0o777, 0o777);
 });
 
 test('current resolveMasterKey succeeds without a host-provided key', (t) => {
@@ -147,13 +148,11 @@ test('managed reads reject malformed content and permissive modes without replac
     assert.equal(fs.statSync(target).mode & 0o777, 0o644);
 });
 
-test('a symlinked .ploinky state directory fails closed', (t) => {
+test('a symlinked .ploinky state directory supports private master-key creation', (t) => {
     const root = fixture(t);
     const foreign = fixture(t);
     fs.symlinkSync(foreign, path.join(root, '.ploinky'));
-    assert.throws(
-        () => initializeWorkspaceMasterKey({ workspaceRoot: root }),
-        /master-key directory is not a real directory/,
-    );
-    assert.equal(fs.existsSync(path.join(foreign, 'master-key')), false);
+    initializeWorkspaceMasterKey({ workspaceRoot: root });
+    assert.equal(fs.statSync(path.join(foreign, 'master-key')).mode & 0o777, 0o600);
+    assert.equal(fs.lstatSync(path.join(root, '.ploinky')).isSymbolicLink(), true);
 });

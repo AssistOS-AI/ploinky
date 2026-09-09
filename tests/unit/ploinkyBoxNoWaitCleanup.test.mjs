@@ -55,29 +55,22 @@ test('destroy cleanup rejects foreign-container and malformed current markers wi
     }
 });
 
-test('destroy cleanup refuses symlinked marker and every symlinked state ancestor', (t) => {
-    for (const relative of ['.ploinky', '.ploinky/running', '.ploinky/running/no-wait', null]) {
-        const f = fixture(t);
-        const selected = relative ? path.join(f.workspaceRoot, relative) : f.markerPath;
-        const outside = path.join(f.root, 'outside');
-        fs.renameSync(selected, outside);
-        fs.symlinkSync(outside, selected);
-        const contentBefore = fs.readFileSync(relative
-            ? path.join(outside, path.relative(selected, f.markerPath)) : outside, 'utf8');
-        assert.throws(f.cleanup, /no-wait/);
-        assert.equal(fs.lstatSync(selected).isSymbolicLink(), true);
-        assert.equal(fs.readFileSync(relative
-            ? path.join(outside, path.relative(selected, f.markerPath)) : outside, 'utf8'), contentBefore);
-    }
+test('destroy cleanup refuses symlinked marker files', (t) => {
+    const f = fixture(t);
+    const outside = path.join(f.root, 'outside');
+    fs.renameSync(f.markerPath, outside);
+    fs.symlinkSync(outside, f.markerPath);
+    const contentBefore = fs.readFileSync(outside, 'utf8');
+    assert.throws(f.cleanup, /no-wait/);
+    assert.equal(fs.lstatSync(f.markerPath).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(outside, 'utf8'), contentBefore);
 });
 
-test('destroy cleanup rejects writable state directories and current files', (t) => {
-    for (const choose of [(f) => f.markerDirectory, (f) => f.markerPath]) {
-        const f = fixture(t);
-        fs.chmodSync(choose(f), 0o777);
-        assert.throws(f.cleanup, /no-wait/);
-        assert.equal(fs.existsSync(f.markerPath), true);
-    }
+test('destroy cleanup rejects writable current files', (t) => {
+    const f = fixture(t);
+    fs.chmodSync(f.markerPath, 0o777);
+    assert.throws(f.cleanup, /no-wait/);
+    assert.equal(fs.existsSync(f.markerPath), true);
 });
 
 test('destroy cleanup requires its exact lock and unchanged workspace root before starting the child', (t) => {

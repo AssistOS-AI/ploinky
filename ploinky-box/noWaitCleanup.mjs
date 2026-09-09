@@ -19,17 +19,18 @@ function inspectDirectories(workspaceRoot, rootFingerprint, includeNoWait = true
     const snapshots = [];
     for (const directory of directories) {
         let stat;
-        try { stat = fs.lstatSync(directory); } catch (error) {
+        let identityStat;
+        try {
+            identityStat = fs.lstatSync(directory);
+            stat = fs.statSync(directory);
+        } catch (error) {
             if (error.code === 'ENOENT' && directory !== workspaceRoot) return null;
             throw cleanupError('Cannot inspect the selected workspace no-wait directory');
         }
-        if (stat.isSymbolicLink() || !stat.isDirectory()
-            || (typeof process.getuid === 'function' && stat.uid !== process.getuid())
-            || (directory !== workspaceRoot && (stat.mode & 0o022) !== 0)) {
-            throw cleanupError('The selected workspace no-wait path is not a secure owned directory');
-        }
-        if (directory === workspaceRoot && (String(stat.dev) !== rootFingerprint?.device
-            || String(stat.ino) !== rootFingerprint?.inode || stat.mode !== rootFingerprint?.mode)) {
+        // Follow directory links for replacement detection; root identity uses
+        // the same link inode captured when the workspace was selected.
+        if (directory === workspaceRoot && (String(identityStat.dev) !== rootFingerprint?.device
+            || String(identityStat.ino) !== rootFingerprint?.inode || identityStat.mode !== rootFingerprint?.mode)) {
             throw cleanupError('Workspace identity changed before no-wait marker cleanup');
         }
         snapshots.push({ directory, device: stat.dev, inode: stat.ino, mode: stat.mode });

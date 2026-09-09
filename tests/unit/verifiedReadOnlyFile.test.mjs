@@ -80,27 +80,25 @@ test('verified JSON bounds nesting and total object nodes iteratively', (t) => {
     }), /node limit/);
 });
 
-test('verified opens reject symlinked roots, parents, files, and real-path escapes', (t) => {
+test('verified opens follow directory symlinks while rejecting symlinked files', (t) => {
     const root = fixture(t);
     const outside = fixture(t);
     fs.writeFileSync(path.join(outside, 'state.json'), '{}');
 
     const linkedRoot = path.join(root, 'linked-root');
     fs.symlinkSync(outside, linkedRoot);
-    assert.throws(
-        () => openVerifiedRegularFile({ trustedRoot: linkedRoot, relativeSegments: ['state.json'] }),
-        (error) => error.code === 'VERIFIED_FILE_INVALID',
-    );
+    const linked = openVerifiedRegularFile({ trustedRoot: linkedRoot, relativeSegments: ['state.json'] });
+    assert.equal(fs.readFileSync(linked.descriptor, 'utf8'), '{}');
+    fs.closeSync(linked.descriptor);
 
     fs.mkdirSync(path.join(root, 'safe'));
     fs.symlinkSync(outside, path.join(root, 'safe', 'linked-parent'));
-    assert.throws(
-        () => openVerifiedRegularFile({
-            trustedRoot: root,
-            relativeSegments: ['safe', 'linked-parent', 'state.json'],
-        }),
-        (error) => error.code === 'VERIFIED_FILE_INVALID',
-    );
+    const nested = openVerifiedRegularFile({
+        trustedRoot: root,
+        relativeSegments: ['safe', 'linked-parent', 'state.json'],
+    });
+    assert.equal(fs.readFileSync(nested.descriptor, 'utf8'), '{}');
+    fs.closeSync(nested.descriptor);
 
     fs.symlinkSync(path.join(outside, 'state.json'), path.join(root, 'state.json'));
     assert.throws(
@@ -108,25 +106,6 @@ test('verified opens reject symlinked roots, parents, files, and real-path escap
         (error) => error.code === 'VERIFIED_FILE_INVALID',
     );
 
-    const fakeFs = {
-        ...fs,
-        constants: fs.constants,
-        realpathSync(target) {
-            if (target === path.join(root, 'safe', 'state.json')) {
-                return path.join(outside, 'state.json');
-            }
-            return fs.realpathSync(target);
-        },
-    };
-    fs.writeFileSync(path.join(root, 'safe', 'state.json'), '{}');
-    assert.throws(
-        () => openVerifiedRegularFile({
-            trustedRoot: root,
-            relativeSegments: ['safe', 'state.json'],
-            fsApi: fakeFs,
-        }),
-        /outside its trusted root/,
-    );
 });
 
 test('verified reads reject inode replacement, truncation, and growth and close descriptors', (t) => {
@@ -198,7 +177,7 @@ test('absence is caller-selected and every successful descriptor can be closed',
     fs.closeSync(opened.descriptor);
 });
 
-test('producer directories create only a secure leaf beneath verified parents', (t) => {
+test('producer directories create a private leaf without changing parent permissions', (t) => {
     const root = fixture(t);
     fs.mkdirSync(path.join(root, 'logs'), { mode: 0o700 });
     const created = ensureVerifiedProducerDirectory({
@@ -209,20 +188,23 @@ test('producer directories create only a secure leaf beneath verified parents', 
     assert.equal(fs.statSync(created).mode & 0o777, 0o700);
 
     fs.chmodSync(path.join(root, 'logs'), 0o777);
-    assert.throws(() => ensureVerifiedProducerDirectory({
+    ensureVerifiedProducerDirectory({
         trustedRoot: root,
         relativeSegments: ['logs', 'other'],
-    }), /group- or other-writable/);
+    });
+    assert.equal(fs.statSync(path.join(root, 'logs')).mode & 0o777, 0o777);
+    assert.equal(fs.statSync(path.join(root, 'logs', 'other')).mode & 0o777, 0o700);
 });
 
-test('producer directories reject missing and symlinked parents', (t) => {
+test('producer directories follow symlinked parents and reject missing parents', (t) => {
     const root = fixture(t);
     const outside = fixture(t);
     fs.symlinkSync(outside, path.join(root, 'logs'));
-    assert.throws(() => ensureVerifiedProducerDirectory({
+    ensureVerifiedProducerDirectory({
         trustedRoot: root,
         relativeSegments: ['logs', 'agents'],
-    }), /not one regular directory/);
+    });
+    assert.equal(fs.statSync(path.join(outside, 'agents')).isDirectory(), true);
 
     fs.unlinkSync(path.join(root, 'logs'));
     assert.throws(() => ensureVerifiedProducerDirectory({

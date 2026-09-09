@@ -124,7 +124,7 @@ test('missing cwd reproduces the current diagnostic without mutating', () => {
     );
 });
 
-test('anchor materialization requires the matching lock and rejects unsafe targets', (t) => {
+test('anchor materialization requires the matching lock and a directory target', (t) => {
     const root = fixture(t);
     const workspace = path.join(root, 'workspace');
     fs.mkdirSync(workspace);
@@ -148,7 +148,31 @@ test('anchor materialization requires the matching lock and rejects unsafe targe
     assert.throws(() => materializeIdentityAnchor(identity, lock), /not a directory/);
     fs.unlinkSync(path.join(workspace, '.ploinky'));
     fs.symlinkSync(root, path.join(workspace, '.ploinky'), 'dir');
-    assert.throws(() => materializeIdentityAnchor(identity, lock), /not a directory/);
+    assert.deepEqual(materializeIdentityAnchor(identity, lock), {
+        created: false,
+        path: identity.anchorPath,
+    });
+    assert.equal(fs.lstatSync(identity.anchorPath).isSymbolicLink(), true);
+});
+
+test('anchor materialization accepts a symlinked workspace and detects root replacement', (t) => {
+    const root = fixture(t);
+    const workspace = path.join(root, 'workspace');
+    const target = path.join(root, 'target');
+    const replacement = path.join(root, 'replacement');
+    fs.mkdirSync(target);
+    fs.mkdirSync(replacement);
+    fs.chmodSync(target, 0o777);
+    fs.symlinkSync(target, workspace, 'dir');
+    const identity = resolveWorkspaceIdentity({ env: {}, cwd: () => workspace });
+    const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); } };
+
+    assert.equal(materializeIdentityAnchor(identity, lock).created, true);
+    assert.equal(fs.statSync(path.join(target, '.ploinky')).isDirectory(), true);
+    fs.unlinkSync(workspace);
+    fs.symlinkSync(replacement, workspace, 'dir');
+    assert.throws(() => materializeIdentityAnchor(identity, lock), /Workspace root changed/);
+    assert.equal(fs.existsSync(path.join(replacement, '.ploinky')), false);
 });
 
 test('anchor materialization fails closed on a concurrent EEXIST', (t) => {

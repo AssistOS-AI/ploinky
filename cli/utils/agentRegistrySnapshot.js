@@ -4,7 +4,7 @@
 // it cannot serve a command that must never touch workspace state. This module
 // reads the same registry through verified descriptors and never creates,
 // repairs, or rewrites anything: `ENOENT` is an empty registry and every other
-// containment, type, or JSON problem fails closed.
+// file validation or JSON problem fails closed. Directory symlinks are followed.
 
 import fsDefault from 'node:fs';
 import pathDefault from 'node:path';

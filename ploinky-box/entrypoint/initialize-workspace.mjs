@@ -39,13 +39,10 @@ function sameDirectoryFingerprint(left, right) {
         && left.mode === right.mode;
 }
 
-function assertOwnedDirectory(target, fsApi) {
-    const stat = fsApi.lstatSync(target);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+function inspectDirectory(target, fsApi) {
+    const stat = fsApi.statSync(target);
+    if (!stat.isDirectory()) {
         throw initializerError(`Workspace master-key directory is not a real directory: ${target}`);
-    }
-    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-        throw initializerError(`Workspace master-key directory is not owned by the current user: ${target}`);
     }
     return fingerprint(stat);
 }
@@ -95,12 +92,7 @@ function readExisting(target, fsApi, { normalizeMode = false } = {}) {
 function ensurePloinkyDirectory(root, fsApi) {
     const target = path.join(root, PLOINKY_DIRECTORY);
     try {
-        assertOwnedDirectory(target, fsApi);
-        // The Box mounts this directory into multiple confined producers. A
-        // pre-existing host directory may have inherited 0775 from umask;
-        // normalize it before any producer validates or writes beneath it.
-        fsApi.chmodSync(target, 0o700);
-        return { path: target, fingerprint: assertOwnedDirectory(target, fsApi) };
+        return { path: target, fingerprint: inspectDirectory(target, fsApi) };
     } catch (error) {
         if (error.code !== 'ENOENT') throw error;
     }
@@ -111,13 +103,12 @@ function ensurePloinkyDirectory(root, fsApi) {
             throw initializerError(`Unable to create workspace state directory: ${target}`, error);
         }
     }
-    fsApi.chmodSync(target, 0o700);
-    return { path: target, fingerprint: assertOwnedDirectory(target, fsApi) };
+    return { path: target, fingerprint: inspectDirectory(target, fsApi) };
 }
 
 function assertStableDirectories(root, rootBefore, ploinkyDirectory, ploinkyBefore, fsApi) {
-    const rootAfter = assertOwnedDirectory(root, fsApi);
-    const ploinkyAfter = assertOwnedDirectory(ploinkyDirectory, fsApi);
+    const rootAfter = inspectDirectory(root, fsApi);
+    const ploinkyAfter = inspectDirectory(ploinkyDirectory, fsApi);
     if (!sameDirectoryFingerprint(rootBefore, rootAfter)) {
         throw initializerError('Workspace root changed while initializing its master key');
     }
@@ -151,8 +142,8 @@ export function readWorkspaceMasterKey({
     const ploinkyDirectory = path.join(root, PLOINKY_DIRECTORY);
     const target = path.join(ploinkyDirectory, MASTER_KEY_FILE);
     try {
-        const rootBefore = assertOwnedDirectory(root, fsApi);
-        const ploinkyBefore = assertOwnedDirectory(ploinkyDirectory, fsApi);
+        const rootBefore = inspectDirectory(root, fsApi);
+        const ploinkyBefore = inspectDirectory(ploinkyDirectory, fsApi);
         const existing = readExisting(target, fsApi);
         assertStableDirectories(root, rootBefore, ploinkyDirectory, ploinkyBefore, fsApi);
         return Object.freeze({ path: target, key: existing.key });
@@ -168,7 +159,7 @@ export function initializeWorkspaceMasterKey({
     randomBytes = crypto.randomBytes,
 } = {}) {
     const root = path.resolve(workspaceRoot);
-    const rootBefore = assertOwnedDirectory(root, fsApi);
+    const rootBefore = inspectDirectory(root, fsApi);
     const stateDirectory = ensurePloinkyDirectory(root, fsApi);
     const target = path.join(stateDirectory.path, MASTER_KEY_FILE);
     try {

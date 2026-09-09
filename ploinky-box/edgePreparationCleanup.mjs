@@ -18,19 +18,20 @@ function inspectDirectories(identity) {
     const snapshots = [];
     for (const directory of directories) {
         let stat;
-        try { stat = fs.lstatSync(directory); } catch (error) {
+        let identityStat;
+        try {
+            identityStat = fs.lstatSync(directory);
+            stat = fs.statSync(directory);
+        } catch (error) {
             if (error.code === 'ENOENT' && directory !== identity.workspaceRoot) return null;
             throw cleanupError('Cannot inspect the selected workspace edge preparation directory');
         }
-        if (!stat.isDirectory() || stat.isSymbolicLink()
-            || (typeof process.getuid === 'function' && stat.uid !== process.getuid())
-            || (directory !== identity.workspaceRoot && (stat.mode & 0o022) !== 0)) {
-            throw cleanupError('The selected workspace edge preparation path is not a secure owned directory');
-        }
+        // Follow directory links for replacement detection; root identity uses
+        // the same link inode captured when the workspace was selected.
         if (directory === identity.workspaceRoot
-            && (String(stat.dev) !== identity.rootFingerprint?.device
-                || String(stat.ino) !== identity.rootFingerprint?.inode
-                || stat.mode !== identity.rootFingerprint?.mode)) {
+            && (String(identityStat.dev) !== identity.rootFingerprint?.device
+                || String(identityStat.ino) !== identity.rootFingerprint?.inode
+                || identityStat.mode !== identity.rootFingerprint?.mode)) {
             throw cleanupError('Workspace identity changed before edge preparation cleanup');
         }
         snapshots.push(stat);

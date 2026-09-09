@@ -21,15 +21,14 @@ function assertLock(lock, identity) {
 
 function inspectPath(target, fsApi) {
     try {
-        const stat = fsApi.lstatSync(target);
+        const stat = fsApi.statSync(target);
         return {
             exists: true,
             directory: stat.isDirectory(),
-            symlink: stat.isSymbolicLink(),
         };
     } catch (error) {
         if (error.code === 'ENOENT') {
-            return { exists: false, directory: false, symlink: false };
+            return { exists: false, directory: false };
         }
         throw workspaceDataError(`Unable to inspect Box data path: ${target}`, undefined, error);
     }
@@ -45,19 +44,19 @@ function fingerprint(stat) {
 
 function inspectDirectory(target, fsApi, {
     missing = 'Box data directory is missing',
-    invalid = 'Box data path is not a real directory',
+    invalid = 'Box data path is not a directory',
     code = 'PLOINKY_BOX_WORKSPACE_DATA_FAILED',
 } = {}) {
     let stat;
     try {
-        stat = fsApi.lstatSync(target);
+        stat = fsApi.statSync(target);
     } catch (error) {
         if (error.code === 'ENOENT') {
             throw workspaceDataError(`${missing}: ${target}`, code, error);
         }
         throw workspaceDataError(`Unable to inspect Box data path: ${target}`, code, error);
     }
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    if (!stat.isDirectory()) {
         throw workspaceDataError(`${invalid}: ${target}`, code);
     }
     return Object.freeze({
@@ -109,13 +108,13 @@ function assertWritableDirectory(target, fsApi) {
     }
 }
 
-// Reuses an existing real directory and never follows a symlink into one.
+// Reuses an existing directory, including a symlink to one.
 // Returns true only when this call created the directory.
 function ensureDirectory(target, fsApi) {
     const before = inspectPath(target, fsApi);
     if (before.exists) {
-        if (before.symlink || !before.directory) {
-            throw workspaceDataError(`Box data path is not a real directory: ${target}`);
+        if (!before.directory) {
+            throw workspaceDataError(`Box data path is not a directory: ${target}`);
         }
         assertWritableDirectory(target, fsApi);
         return false;
@@ -128,7 +127,7 @@ function ensureDirectory(target, fsApi) {
         }
     }
     const after = inspectPath(target, fsApi);
-    if (!after.exists || after.symlink || !after.directory) {
+    if (!after.exists || !after.directory) {
         throw workspaceDataError(`Box data path was replaced during creation: ${target}`);
     }
     assertWritableDirectory(target, fsApi);
@@ -142,7 +141,7 @@ function inspectParentChain(identity, fsApi, {
     assertWorkspaceRoot(identity, fsApi, code);
     const anchor = inspectDirectory(identity.anchorPath, fsApi, {
         missing: 'Workspace identity anchor is missing',
-        invalid: 'Workspace identity anchor is not a real directory',
+        invalid: 'Workspace identity anchor is not a directory',
         code,
     });
     const rootObserved = inspectPath(identity.boxDataRoot, fsApi);
@@ -154,7 +153,7 @@ function inspectParentChain(identity, fsApi, {
         );
     }
     const boxRoot = inspectDirectory(identity.boxDataRoot, fsApi, {
-        invalid: 'Box data root is not a real directory',
+        invalid: 'Box data root is not a directory',
         code,
     });
     return Object.freeze({ anchor, boxRoot });
@@ -166,6 +165,27 @@ function assertSameDirectory(expected, fsApi, message, code) {
         throw workspaceDataError(`${message}: ${expected.path}`, code);
     }
     return current;
+}
+
+function inspectEntry(target, fsApi) {
+    try {
+        return fsApi.lstatSync(target);
+    } catch (error) {
+        if (error.code === 'ENOENT') return null;
+        throw workspaceDataError(`Unable to inspect Box data path: ${target}`, undefined, error);
+    }
+}
+
+function assertSameEntry(expected, fsApi) {
+    const current = inspectEntry(expected.path, fsApi);
+    if (!current
+        || fingerprint(current) !== expected.entryFingerprint
+        || current.isSymbolicLink() !== expected.symlink) {
+        throw workspaceDataError(
+            `Box data entry changed before cache deletion: ${expected.path}`,
+            'PLOINKY_BOX_WORKSPACE_DATA_CHANGED',
+        );
+    }
 }
 
 function dataState(identity, fsApi, {
@@ -220,7 +240,7 @@ export function ensureWorkspaceDataPaths({ identity, lock, fsApi = fs }) {
         created.push(identity.boxDataRoot);
     }
     const boxRoot = inspectDirectory(identity.boxDataRoot, fsApi, {
-        invalid: 'Box data root is not a real directory',
+        invalid: 'Box data root is not a directory',
     });
     assertSameDirectory(
         initialParents.anchor,
@@ -249,13 +269,13 @@ export function ensureWorkspaceDataPaths({ identity, lock, fsApi = fs }) {
 }
 
 // Read-only host inspection used by status and lifecycle planning. It proves
-// that both intermediate parents and both final directories are unchanged real
+// that both intermediate parents and both final directories are unchanged
 // directories, then returns stable device/inode fingerprints for bind identity.
 export function inspectWorkspaceDataPaths({ identity, fsApi = fs, writable = true }) {
     return dataState(identity, fsApi, { writable });
 }
 
-// Proves the exact data directories still exist, are real, and stay writable
+// Proves the exact data directories still exist and stay writable
 // immediately before a container is created.
 export function revalidateWorkspaceDataPaths({ identity, lock, fsApi = fs }) {
     assertLock(lock, identity);
@@ -281,12 +301,17 @@ export function removeWorkspaceDataPaths({ identity, lock, fsApi = fs }) {
         if (path.dirname(target) !== identity.boxDataRoot) {
             throw workspaceDataError(`Refusing to delete a Box data path outside ${identity.boxDataRoot}`);
         }
-        const observed = inspectPath(target, fsApi);
-        if (!observed.exists) continue;
+        const entry = inspectEntry(target, fsApi);
+        if (!entry) continue;
         const record = inspectDirectory(target, fsApi, {
-            invalid: 'Refusing to delete a Box data path that is not a real directory',
+            invalid: 'Refusing to delete a Box data path that is not a directory',
         });
-        candidates.push(Object.freeze({ key, ...record }));
+        candidates.push(Object.freeze({
+            key,
+            ...record,
+            symlink: entry.isSymbolicLink(),
+            entryFingerprint: fingerprint(entry),
+        }));
     }
 
     // Revalidate every preflighted directory as one set immediately before the
@@ -305,6 +330,7 @@ export function removeWorkspaceDataPaths({ identity, lock, fsApi = fs }) {
         'PLOINKY_BOX_WORKSPACE_DATA_CHANGED',
     );
     for (const candidate of candidates) {
+        assertSameEntry(candidate, fsApi);
         assertSameDirectory(
             candidate,
             fsApi,
@@ -313,8 +339,12 @@ export function removeWorkspaceDataPaths({ identity, lock, fsApi = fs }) {
         );
     }
 
-    const removed = [];
-    for (const candidate of candidates) {
+    // Remove links before directories so a sibling cache alias never becomes
+    // dangling before it is handled. A link may itself refer through another
+    // link: after the full preflight, revalidate its entry and unlink it without
+    // following its target again.
+    const removalOrder = [...candidates].sort((left, right) => Number(right.symlink) - Number(left.symlink));
+    for (const candidate of removalOrder) {
         assertSameDirectory(
             parents.anchor,
             fsApi,
@@ -327,23 +357,27 @@ export function removeWorkspaceDataPaths({ identity, lock, fsApi = fs }) {
             'Box data root changed during cache deletion',
             'PLOINKY_BOX_WORKSPACE_DATA_CHANGED',
         );
-        assertSameDirectory(
-            candidate,
-            fsApi,
-            'Box data directory changed during cache deletion',
-            'PLOINKY_BOX_WORKSPACE_DATA_CHANGED',
-        );
-        fsApi.rmSync(candidate.path, { recursive: true, force: true });
+        assertSameEntry(candidate, fsApi);
+        if (candidate.symlink) {
+            fsApi.unlinkSync(candidate.path);
+        } else {
+            assertSameDirectory(
+                candidate,
+                fsApi,
+                'Box data directory changed during cache deletion',
+                'PLOINKY_BOX_WORKSPACE_DATA_CHANGED',
+            );
+            fsApi.rmSync(candidate.path, { recursive: true, force: true });
+        }
         assertSameDirectory(
             parents.boxRoot,
             fsApi,
             'Box data root changed after cache deletion',
             'PLOINKY_BOX_WORKSPACE_DATA_CHANGED',
         );
-        if (inspectPath(candidate.path, fsApi).exists) {
+        if (inspectEntry(candidate.path, fsApi)) {
             throw workspaceDataError(`Box data directory still exists after deletion: ${candidate.path}`);
         }
-        removed.push(candidate.path);
     }
     assertSameDirectory(
         parents.anchor,
@@ -358,7 +392,11 @@ export function removeWorkspaceDataPaths({ identity, lock, fsApi = fs }) {
         'PLOINKY_BOX_WORKSPACE_DATA_CHANGED',
     );
     if (fsApi.readdirSync(identity.boxDataRoot).length === 0) {
-        fsApi.rmdirSync(identity.boxDataRoot);
+        if (fsApi.lstatSync(identity.boxDataRoot).isSymbolicLink()) {
+            fsApi.unlinkSync(identity.boxDataRoot);
+        } else {
+            fsApi.rmdirSync(identity.boxDataRoot);
+        }
     }
-    return Object.freeze(removed);
+    return Object.freeze(candidates.map((candidate) => candidate.path));
 }

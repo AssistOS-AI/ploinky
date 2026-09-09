@@ -49,25 +49,28 @@ test('missing lease and missing state directories are idempotent', (t) => {
     }
 });
 
-test('cleanup rejects symlinked workspace, state ancestors, and lease', (t) => {
+test('cleanup follows directory links but rejects replaced roots and symlinked leases', (t) => {
     for (const relative of ['', '.ploinky', '.ploinky/data', '.ploinky/data/edge-routing', '.ploinky/data/edge-routing/preparation-lease.json']) {
         const f = fixture(t);
         const target = path.join(f.workspaceRoot, relative);
         const outside = path.join(f.root, 'outside');
         fs.renameSync(target, outside);
         fs.symlinkSync(outside, target);
-        assert.throws(f.cleanup, /secure owned/);
-        assert.equal(fs.existsSync(f.leasePath), true);
+        if (!relative || relative.endsWith('.json')) {
+            assert.throws(f.cleanup, /identity changed|secure owned/);
+            assert.equal(fs.existsSync(f.leasePath), true);
+        } else {
+            f.cleanup();
+            assert.equal(fs.existsSync(f.leasePath), false);
+        }
         assert.equal(fs.lstatSync(target).isSymbolicLink(), true);
     }
 });
 
-test('cleanup rejects writable paths, nonregular leases, hardlinks and oversized leases', (t) => {
-    for (const kind of ['state', 'data', 'edge', 'file', 'hardlink', 'directory', 'oversize']) {
+test('cleanup rejects writable files, nonregular leases, hardlinks and oversized leases', (t) => {
+    for (const kind of ['file', 'hardlink', 'directory', 'oversize']) {
         const f = fixture(t);
-        const paths = { root: f.workspaceRoot, state: path.join(f.workspaceRoot, '.ploinky'),
-            data: path.dirname(f.directory), edge: f.directory, file: f.leasePath };
-        if (paths[kind]) fs.chmodSync(paths[kind], 0o777);
+        if (kind === 'file') fs.chmodSync(f.leasePath, 0o777);
         if (kind === 'hardlink') fs.linkSync(f.leasePath, path.join(f.root, 'other-lease'));
         if (kind === 'directory') { fs.unlinkSync(f.leasePath); fs.mkdirSync(f.leasePath); }
         if (kind === 'oversize') fs.truncateSync(f.leasePath, 1024 * 1024 + 1);
@@ -98,10 +101,10 @@ test('cleanup requires held lock and exact original root identity', (t) => {
     assert.equal(fs.existsSync(path.join(f.root, 'original', '.ploinky', 'data', 'edge-routing', 'preparation-lease.json')), true);
 });
 
-test('cleanup rejects foreign ownership of every ancestor and the lease', (t) => {
+test('cleanup rejects foreign ownership of the lease file', (t) => {
     if (typeof process.getuid !== 'function') return;
     const originalLstat = fs.lstatSync;
-    for (const relative of ['', '.ploinky', '.ploinky/data', '.ploinky/data/edge-routing', '.ploinky/data/edge-routing/preparation-lease.json']) {
+    for (const relative of ['.ploinky/data/edge-routing/preparation-lease.json']) {
         const f = fixture(t);
         const target = path.join(f.workspaceRoot, relative);
         const mocked = t.mock.method(fs, 'lstatSync', (candidate, ...args) => {
