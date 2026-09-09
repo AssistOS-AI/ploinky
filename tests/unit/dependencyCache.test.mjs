@@ -100,6 +100,17 @@ test('container dependency install runs as root for non-root runtime images', ()
     assert.equal(args.some((arg) => String(arg).includes('slirp4netns')), false);
 });
 
+test('npm installer mounts the selected AgentLib read-only and preserves local package links', () => {
+    const args = buildContainerInstallRunArgs({
+        cwd: '/tmp/cache', image: 'example/image:tag', runtime: 'podman', shellPath: '/bin/sh',
+        agentLibSourceDir: '/selected/source',
+        installScript: buildContainerInstallScript({ linkAgentLib: true }),
+    });
+    assert.ok(args.includes('/selected/source:/opt/ploinky-agentlib:ro'));
+    assert.equal(args.filter(arg => String(arg).includes(':/opt/ploinky-agentlib:')).length, 1);
+    assert.match(args.at(-1), /--install-links=false/);
+});
+
 test('Box dependency caches use portable copies instead of hard links', () => {
     assert.equal(shouldSeedAgentCacheWithHardlinks({ insideBox: true }), false);
     assert.equal(shouldSeedAgentCacheWithSystemCopy({ insideBox: true }), true);
@@ -146,6 +157,17 @@ test('writeStamp + readStamp round-trip', () => {
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
+});
+
+test('old caches rebuild before adopting the transitive AgentLib installation contract', () => {
+    const dir = tempDir();
+    try {
+        seedCoreMarker(dir);
+        writeStamp(dir, { version: 2, runtimeKey: 'container-linux-x64-node24', globalPackageHash: 'same' });
+        assert.deepEqual(isGlobalCacheValid(dir, {
+            runtimeKey: 'container-linux-x64-node24', globalPackageHash: 'same', mcpSdk: null,
+        }), { valid: false, reason: `stamp version 2 != ${STAMP_VERSION}` });
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('readStamp returns null for missing stamp', () => {
