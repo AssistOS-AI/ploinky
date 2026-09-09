@@ -18,7 +18,12 @@ import {
     withNetworkLifecycleLock,
     workspaceNetworkIdentity,
 } from '../networkLifecycle.js';
-import { assertExactContainerOwnership } from './containerOwnership.js';
+import { assertExactContainerOwnership, IMMUTABLE_CONTAINER_ID } from './containerOwnership.js';
+import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
+import {
+    buildGeneratedRouterDescriptorEnv,
+    readVerifiedGeneratedRouterDescriptorFile,
+} from '../../utils/security/generatedRouterDescriptor.js';
 
 const GENERATED_ROUTER_DESCRIPTOR_TARGET = '/run/ploinky/router-descriptor.json';
 const GENERATED_ROUTER_DESCRIPTOR_ROOT = path.join(PLOINKY_DIR, 'run', 'router-descriptors');
@@ -36,17 +41,30 @@ function runContainerControl(runtime, args) {
 function inspectExactContainer(runtime, identifier) {
     const result = runContainerControl(runtime, ['container', 'inspect', identifier]);
     if (result.error) throw result.error;
-    if (result.status !== 0) return null;
-    let parsed;
-    try { parsed = JSON.parse(String(result.stdout || '')); } catch (error) {
-        throw new Error(`container inspection returned malformed JSON: ${error.message}`);
+    if (result.status !== 0) {
+        if (/no such (?:container|object)|no container with .* (?:found|exists)/i.test(String(result.stderr || ''))) {
+            return null;
+        }
+        throw new Error('container inspection failed; check that the recorded container engine is available');
     }
-    const record = Array.isArray(parsed) ? parsed[0] : parsed;
-    return record && typeof record === 'object' ? record : null;
+    let parsed;
+    try { parsed = JSON.parse(String(result.stdout || '')); } catch (_) {
+        // Engine inspection contains credentials. Do not expose parser excerpts.
+        throw new Error('container inspection returned malformed JSON');
+    }
+    const record = Array.isArray(parsed) && parsed.length === 1 ? parsed[0] : parsed;
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+        throw new Error('container inspection did not return one exact container record');
+    }
+    return record;
 }
 
 function captureRecordedGeneratedRouterDescriptor(record) {
-    const binds = (record?.config?.binds || []).filter((bind) => (
+    const configuredBinds = record?.config?.binds ?? [];
+    if (!Array.isArray(configuredBinds)) {
+        throw new Error('generated Router descriptor registry binds are malformed');
+    }
+    const binds = configuredBinds.filter((bind) => (
         bind?.generatedRouterDescriptor === true
         || String(bind?.target || '') === GENERATED_ROUTER_DESCRIPTOR_TARGET
     ));
@@ -73,7 +91,89 @@ function captureRecordedGeneratedRouterDescriptor(record) {
     if (realSource !== path.join(realRoot, relative)) {
         throw new Error('generated Router descriptor registry source failed real-path confinement');
     }
-    return Object.freeze({ source, dev: stat.dev, ino: stat.ino });
+    return Object.freeze({ source, dev: stat.dev, ino: stat.ino,
+        size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs });
+}
+
+function assertDescriptorUnchanged(name, artifact) {
+    if (!artifact) return;
+    const stat = fs.lstatSync(artifact.source);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o600
+        || stat.dev !== artifact.dev || stat.ino !== artifact.ino || stat.size !== artifact.size
+        || stat.mtimeMs !== artifact.mtimeMs || stat.ctimeMs !== artifact.ctimeMs) {
+        throw new Error(`descriptor cleanup for '${name}' detected artifact identity drift`);
+    }
+}
+
+function inspectedEnvironment(inspected) {
+    const values = new Map();
+    for (const rawEntry of inspected?.Config?.Env || []) {
+        const entry = String(rawEntry);
+        const separator = entry.indexOf('=');
+        if (separator < 1) continue;
+        const key = entry.slice(0, separator);
+        if (values.has(key)) values.set(key, null);
+        else values.set(key, entry.slice(separator + 1));
+    }
+    return values;
+}
+
+function assertRecoveryAgentIdentity(name, record, inspected) {
+    let principal;
+    try { principal = deriveAgentPrincipalId(record?.repoName, record?.agentName); } catch (_) {
+        throw new Error(`reinstall recovery for '${name}' requires its registered repository and agent identity`);
+    }
+    const environment = inspectedEnvironment(inspected);
+    for (const [key, value] of Object.entries({
+        PLOINKY_AGENT_PRINCIPAL: principal,
+        PLOINKY_AGENT_INSTANCE_ID: record.instanceId,
+        PLOINKY_AGENT_ENABLE_GENERATION: record.enableGeneration,
+    })) {
+        if (environment.get(key) !== value) {
+            throw new Error(`reinstall recovery for '${name}' found conflicting or missing agent launch identity (${key})`);
+        }
+    }
+    return principal;
+}
+
+function recoverGeneratedRouterDescriptor(name, record, inspected) {
+    const mounts = (inspected?.Mounts || []).filter((mount) => (
+        String(mount?.Destination || '') === GENERATED_ROUTER_DESCRIPTOR_TARGET
+    ));
+    if (!mounts.length) return { record, artifact: null };
+    if (mounts.length !== 1 || mounts[0]?.RW !== false) {
+        throw new Error(`reinstall recovery for '${name}' found ambiguous generated Router descriptor mounts`);
+    }
+    const recoveredRecord = {
+        ...record,
+        config: {
+            ...record.config,
+            binds: [...(record.config?.binds || []), {
+                source: mounts[0].Source,
+                target: GENERATED_ROUTER_DESCRIPTOR_TARGET,
+                ro: true,
+                generatedRouterDescriptor: true,
+            }],
+        },
+    };
+    const artifact = captureRecordedGeneratedRouterDescriptor(recoveredRecord);
+    const verified = readVerifiedGeneratedRouterDescriptorFile(artifact.source);
+    const principal = assertRecoveryAgentIdentity(name, record, inspected);
+    if (verified.identity.dev !== artifact.dev || verified.identity.ino !== artifact.ino
+        || verified.payload.agentPrincipal !== principal
+        || verified.payload.instanceId !== record.instanceId
+        || verified.payload.generationId !== record.enableGeneration
+        || path.basename(artifact.source) !== `${verified.payload.launchId}.json`) {
+        throw new Error(`reinstall recovery for '${name}' could not match the signed Router descriptor to its exact launch`);
+    }
+    const environment = inspectedEnvironment(inspected);
+    for (const [key, value] of Object.entries(buildGeneratedRouterDescriptorEnv(verified.payload))) {
+        if (environment.get(key) !== value) {
+            throw new Error(`reinstall recovery for '${name}' found a Router descriptor that differs from the container launch (${key})`);
+        }
+    }
+    assertDescriptorUnchanged(name, artifact);
+    return { record: recoveredRecord, artifact };
 }
 
 function defaultPause(milliseconds) {
@@ -112,89 +212,155 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     now = Date.now,
     workspaceIdentity = workspaceNetworkIdentity,
     retireRelay = retireRuntimeRelaySocket,
+    recoverIncompleteIdentity = false,
+    onRecoveredIdentity = null,
 } = {}) {
-    const expectedId = String(record?.containerId || '').trim();
-    if (!/^[a-f0-9]{64}$/.test(expectedId)) {
+    let expectedId = String(record?.containerId || '').trim();
+    const incompleteId = !IMMUTABLE_CONTAINER_ID.test(expectedId);
+    if (incompleteId && !recoverIncompleteIdentity) {
         throw new Error(`fleet lifecycle for '${name}' requires its immutable registry container ID`);
     }
-    if (record?.type !== 'agent'
-        || !String(record?.instanceId || '').trim()
-        || !String(record?.enableGeneration || '').trim()) {
+    if (recoverIncompleteIdentity && !remove) {
+        throw new Error(`reinstall recovery for '${name}' requires an explicit removal operation`);
+    }
+    if (incompleteId && expectedId && expectedId !== name && !/^[a-f0-9]{12,63}$/.test(expectedId)) {
+        throw new Error(`reinstall recovery for '${name}' found a malformed registry container ID; restore the exact launch record`);
+    }
+    const completeRegistryIdentity = !(record?.type !== 'agent'
+        || typeof record?.instanceId !== 'string' || !record.instanceId
+        || record.instanceId !== record.instanceId.trim()
+        || typeof record?.enableGeneration !== 'string' || !record.enableGeneration
+        || record.enableGeneration !== record.enableGeneration.trim());
+    if (!completeRegistryIdentity && !recoverIncompleteIdentity) {
         throw new Error(`fleet lifecycle for '${name}' requires a complete managed-agent registry identity`);
     }
+    if (recoverIncompleteIdentity && record?.runtime && record.runtime !== runtime) {
+        throw new Error(`reinstall recovery for '${name}' requires the recorded '${record.runtime}' container engine`);
+    }
     return withLock(() => {
-        const artifact = captureRecordedGeneratedRouterDescriptor(record);
         const workspaceHash = String(workspaceIdentity()?.hash || '');
         if (!workspaceHash) {
             throw new Error(`fleet lifecycle for '${name}' could not resolve the workspace identity`);
         }
-        let inspected = inspect(runtime, expectedId);
+        // A name is only a discovery key for an incomplete legacy record. It
+        // never authorizes control, and cannot replace a recorded immutable ID.
+        let inspected = inspect(runtime, incompleteId ? name : expectedId);
         if (!inspected) {
+            if (recoverIncompleteIdentity) {
+                if (!incompleteId && inspect(runtime, name)) {
+                    throw new Error(`reinstall recovery for '${name}' found a different named container while its recorded immutable ID is absent`);
+                }
+                return Object.freeze({ found: false, stopped: false, removed: false, state: 'absent' });
+            }
             // Without a live immutable-ID inspection there is no container
             // ownership evidence that permits deleting even a recorded
             // descriptor artifact. Preserve both registry state and artifact.
             return Object.freeze({ found: false, stopped: false, removed: false });
         }
 
+        if (!completeRegistryIdentity) {
+            throw new Error(`fleet lifecycle for '${name}' requires a complete managed-agent registry identity`);
+        }
+        if (incompleteId) {
+            const actualId = String(inspected?.Id || inspected?.ID || '');
+            if (!IMMUTABLE_CONTAINER_ID.test(actualId)
+                || (expectedId && expectedId !== name && !actualId.startsWith(expectedId))) {
+                throw new Error(`reinstall recovery for '${name}' could not resolve its recorded container ID prefix to one exact immutable ID`);
+            }
+            expectedId = actualId;
+        }
+        let exactRecord = record;
+        assertExactContainerOwnership(name, record, inspected, expectedId, workspaceHash);
+        if (incompleteId) assertRecoveryAgentIdentity(name, record, inspected);
+        let artifact = captureRecordedGeneratedRouterDescriptor(record);
+        let recoveredDescriptor = false;
+        if (!artifact && recoverIncompleteIdentity) {
+            const recovered = recoverGeneratedRouterDescriptor(name, record, inspected);
+            artifact = recovered.artifact;
+            exactRecord = recovered.record;
+            recoveredDescriptor = Boolean(artifact);
+        }
+        exactRecord = { ...exactRecord, containerId: expectedId, runtime };
+        assertExactDescriptorMount(name, inspected, artifact);
+        const recoveredIdentity = incompleteId || recoveredDescriptor;
+
         const revalidate = () => {
             const current = inspect(runtime, expectedId);
             if (!current) return null;
-            assertExactContainerOwnership(name, record, current, expectedId, workspaceHash);
+            assertExactContainerOwnership(name, exactRecord, current, expectedId, workspaceHash);
+            if (recoveredIdentity) assertRecoveryAgentIdentity(name, exactRecord, current);
             assertExactDescriptorMount(name, current, artifact);
+            assertDescriptorUnchanged(name, artifact);
             return current;
         };
-        inspected = assertExactContainerOwnership(name, record, inspected, expectedId, workspaceHash);
-        assertExactDescriptorMount(name, inspected, artifact);
-
-        if (inspected?.State?.Running === true) {
-            // Retire the projected pathname while the producer is still alive.
-            // On macOS nested Podman, metadata and unlink can both become
-            // permanently unsupported after the owning container exits.
-            retireRelay(name);
-            const signaled = control(runtime, ['kill', '--signal', 'SIGTERM', expectedId]);
-            if (!controlSucceeded(signaled)) {
-                const raced = revalidate();
-                if (raced) throw new Error(`fleet lifecycle for '${name}' could not send SIGTERM by immutable ID`);
-            }
-        }
-
-        const deadline = now() + (fast ? 100 : 5_000);
+        // Pin/reinspect after discovery and before any signal. A replacement
+        // observed between name lookup and ID lookup is never adopted.
         inspected = revalidate();
-        while (inspected?.State?.Running === true && now() < deadline) {
-            pause(Math.min(fast ? 10 : 100, Math.max(1, deadline - now())));
-            inspected = revalidate();
-        }
-        if (inspected?.State?.Running === true) {
-            const killed = control(runtime, ['kill', expectedId]);
-            if (!controlSucceeded(killed)) {
-                const raced = revalidate();
-                if (raced) throw new Error(`fleet lifecycle for '${name}' could not force-stop by immutable ID`);
+        if (!inspected) {
+            if (recoverIncompleteIdentity && !inspect(runtime, name)) {
+                return Object.freeze({ found: false, stopped: false, removed: false, state: 'absent' });
             }
+            throw new Error(`fleet lifecycle for '${name}' lost its exact container before removal; retry after checking the runtime identity`);
+        }
+        if (recoveredIdentity && onRecoveredIdentity) {
+            onRecoveredIdentity({ containerId: expectedId, record: exactRecord });
             inspected = revalidate();
+            if (!inspected) {
+                throw new Error(`fleet lifecycle for '${name}' changed while recording its recovered immutable ID`);
+            }
+        }
+
+        try {
             if (inspected?.State?.Running === true) {
-                throw new Error(`fleet lifecycle for '${name}' remained running after immutable-ID kill`);
+                // Retire the projected pathname while the producer is still alive.
+                // On macOS nested Podman, metadata and unlink can both become
+                // permanently unsupported after the owning container exits.
+                retireRelay(name);
+                const signaled = control(runtime, ['kill', '--signal', 'SIGTERM', expectedId]);
+                if (!controlSucceeded(signaled)) {
+                    const raced = revalidate();
+                    if (raced) throw new Error(`fleet lifecycle for '${name}' could not send SIGTERM by immutable ID`);
+                }
             }
-        }
 
-        if (!remove) {
-            return Object.freeze({ found: true, stopped: true, removed: false });
-        }
-        inspected = revalidate();
-        if (inspected) {
-            const removed = control(runtime, ['rm', '-f', expectedId]);
-            if (!controlSucceeded(removed) || inspect(runtime, expectedId)) {
-                throw new Error(`descriptor cleanup for '${name}' could not prove exact container removal`);
+            const deadline = now() + (fast ? 100 : 5_000);
+            inspected = revalidate();
+            while (inspected?.State?.Running === true && now() < deadline) {
+                pause(Math.min(fast ? 10 : 100, Math.max(1, deadline - now())));
+                inspected = revalidate();
             }
-        }
-        if (artifact) {
-            const current = fs.lstatSync(artifact.source);
-            if (!current.isFile() || current.isSymbolicLink()
-                || current.dev !== artifact.dev || current.ino !== artifact.ino) {
-                throw new Error(`descriptor cleanup for '${name}' detected artifact identity drift`);
+            if (inspected?.State?.Running === true) {
+                const killed = control(runtime, ['kill', expectedId]);
+                if (!controlSucceeded(killed)) {
+                    const raced = revalidate();
+                    if (raced) throw new Error(`fleet lifecycle for '${name}' could not force-stop by immutable ID`);
+                }
+                inspected = revalidate();
+                if (inspected?.State?.Running === true) {
+                    throw new Error(`fleet lifecycle for '${name}' remained running after immutable-ID kill`);
+                }
             }
-            fs.unlinkSync(artifact.source);
+
+            if (!remove) {
+                return Object.freeze({ found: true, stopped: true, removed: false });
+            }
+            inspected = revalidate();
+            if (inspected) {
+                const removed = control(runtime, ['rm', '-f', expectedId]);
+                if (!controlSucceeded(removed) || inspect(runtime, expectedId)) {
+                    throw new Error(`descriptor cleanup for '${name}' could not prove exact container removal`);
+                }
+            }
+            if (artifact) {
+                assertDescriptorUnchanged(name, artifact);
+                fs.unlinkSync(artifact.source);
+            }
+            return Object.freeze({ found: true, stopped: true, removed: true,
+                ...(recoveredIdentity ? { containerId: expectedId, recoveredIdentity: true } : {}) });
+        } catch (error) {
+            if (recoveredIdentity) error.recoveredContainerId = expectedId;
+            throw error;
         }
-        return Object.freeze({ found: true, stopped: true, removed: true });
     });
 }
 

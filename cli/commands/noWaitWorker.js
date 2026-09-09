@@ -1,3 +1,4 @@
+import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 // Detached helper that boots a single `no-wait` dependency in the background
 // after `startWorkspace` has finished gating on its blocking dependencies.
 //
@@ -1920,6 +1921,11 @@ async function main() {
                     });
                 }
                 onCommitted();
+                if (result?.durableCandidate) {
+                    try { retireRuntimeCandidate(result.durableCandidate); } catch (error) {
+                        console.warn(`[no-wait] ${shortAgent}: runtime committed; candidate receipt retained: ${error.message}`);
+                    }
+                }
                 const finishedAtMs = Date.now();
                 publishStatus({
                     ...baseStatus,

@@ -115,9 +115,9 @@ test('descriptor cleanup is confined to an immutable container ID and exact reco
     );
     assert.match(fleet, /withLock = withNetworkLifecycleLock/);
     assert.match(fleet, /return withLock\(\(\) => \{/);
-    assert.match(fleet, /import \{ assertExactContainerOwnership \} from '\.\/containerOwnership\.js'/);
+    assert.match(fleet, /import \{ assertExactContainerOwnership, IMMUTABLE_CONTAINER_ID \} from '\.\/containerOwnership\.js'/);
     assert.match(fleet,
-        /assertExactContainerOwnership\(name, record, current, expectedId, workspaceHash\)/);
+        /assertExactContainerOwnership\(name, exactRecord, current, expectedId, workspaceHash\)/);
     assert.match(fleet,
         /assertExactContainerOwnership\(name, record, inspected, expectedId, workspaceHash\)/);
     assert.match(ownership, /actualId !== expectedId \|\| actualName !== name/);
@@ -125,7 +125,7 @@ test('descriptor cleanup is confined to an immutable container ID and exact reco
     assert.match(fleet, /inspect\(runtime, expectedId\)/);
     assert.match(ownership, /NETWORK_LABELS\.instanceId/);
     assert.match(ownership, /NETWORK_LABELS\.enableGeneration/);
-    assert.match(fleet, /current\.dev !== artifact\.dev \|\| current\.ino !== artifact\.ino/);
+    assert.match(fleet, /stat\.dev !== artifact\.dev \|\| stat\.ino !== artifact\.ino/);
     assert.match(fleet, /fs\.unlinkSync\(artifact\.source\)/);
 
     const lifecycle = fs.readFileSync(

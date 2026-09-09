@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { randomUUID } from 'node:crypto';
+import { readRuntimeCandidate, retireRuntimeCandidate, writeRuntimeCandidate } from '../../cli/sandbox/runtimeCandidateStore.js';
 
 import {
     NETWORK_LABELS,
@@ -1272,6 +1274,129 @@ test('old contract hashes remain foreign and block replacement before mutation',
     }), /network-contract/);
     assert.equal(harness.calls.some((args) => ['stop', 'rename'].includes(args[0])
         || (args[0] === 'network' && args[1] === 'create')), false);
+});
+
+test('failed installation retains a durable immutable candidate and can retry exact cleanup then reinstall', t => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const candidateId = 'a'.repeat(64);
+    const registryRecord = {
+        type: 'agent', agentName: 'demo', repoName: 'repo', runtime: 'podman', containerId: candidateId,
+        ...TEST_RUNTIME_IDENTITY,
+    };
+    let refuseRemoval = true;
+    let installationFails = true;
+    let durableCandidate;
+    const adapter = createNetworkLifecycleAdapter({
+        runtime: 'podman', workspaceRoot: harness.identity.canonical,
+        lockPath: path.join(harness.dir, 'failed-install.lock'),
+        run(runtime, args) {
+            if (args[0] === 'start') {
+                // Installation can exit as soon as the container starts. Its
+                // full ID must already survive a separate reader at this point.
+                const stored = readRuntimeCandidate('demo-container', registryRecord, { workspaceRoot: harness.identity.canonical });
+                assert.equal(stored?.containerId, args[1]);
+                if (installationFails) {
+                    harness.calls.push([...args]);
+                    const container = harness.containers.get(args[1]);
+                    container.State = { Running: false, Status: 'exited', ExitCode: 1 };
+                    return ok();
+                }
+            }
+            if (args[0] === 'rm' && refuseRemoval) {
+                harness.calls.push([...args]);
+                return { ok: false, status: 1, stderr: 'injected runtime removal failure', stdout: '' };
+            }
+            return harness.run(runtime, args);
+        },
+    });
+    const start = () => adapter.runManagedContainerTransaction({
+        network, canonicalAgentId: 'demo', containerName: 'demo-container', runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer(plan) {
+            const primary = plan.attachments[0];
+            const candidate = managedAgentRecord({
+                id: candidateId, name: 'demo-container', labels: managedAgentLabels(harness.identity, network),
+                networks: { [primary.name]: { Aliases: [plan.alias, candidateId.slice(0, 12)] } },
+            });
+            harness.containers.set(candidateId, candidate);
+            harness.networks.get(primary.name).Containers[candidateId] = { Name: candidate.Name };
+            return candidateId;
+        },
+        onContainerCreated({ containerId }) {
+            durableCandidate = writeRuntimeCandidate({
+                operationId: randomUUID(), containerName: 'demo-container', containerId, runtime: 'podman',
+                registryRecord, runtimeNetwork: network,
+            }, { workspaceRoot: harness.identity.canonical });
+        },
+    });
+    assert.throws(start, error => {
+        assert.match(error.message, /did not reach running state.*injected runtime removal failure/);
+        assert.equal(error.ploinkyContainerTransaction.containerId, candidateId);
+        assert.equal(error.ploinkyContainerTransaction.exactCleanupPerformed, false);
+        return true;
+    });
+    assert.equal(harness.containers.has(candidateId), true);
+    const recovered = readRuntimeCandidate('demo-container', registryRecord, { workspaceRoot: harness.identity.canonical });
+    assert.equal(recovered.containerId, candidateId);
+    refuseRemoval = false;
+    const removed = adapter.removeExactContainer('demo-container', network, 'demo', {
+        expectedContainerId: recovered.containerId, contractHash: networkContractHash(network), ...TEST_RUNTIME_IDENTITY,
+    });
+    assert.equal(removed.removed, true);
+    retireRuntimeCandidate(recovered, { workspaceRoot: harness.identity.canonical });
+    installationFails = false;
+    assert.equal(start().containerId, candidateId);
+    assert.equal(harness.containers.get(candidateId).State.Running, true);
+    assert.ok(harness.calls.filter(args => args[0] === 'rm').every(args => args.at(-1) === candidateId));
+});
+
+test('created identity persistence failure prevents startup and reports exact removal', t => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const id = 'a'.repeat(64);
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network, canonicalAgentId: 'demo', containerName: 'demo-container', runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer(plan, launch, { recordCreatedId }) {
+            harness.containers.set(id, managedAgentRecord({
+                id, name: 'demo-container', labels: managedAgentLabels(harness.identity, network),
+                networks: { [plan.attachments[0].name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+            }));
+            recordCreatedId(id);
+            throw new Error('disk full while saving identity');
+        },
+    }), error => {
+        assert.match(error.message, /disk full while saving identity/);
+        assert.deepEqual(error.ploinkyContainerTransaction, { containerId: id, creationAttempted: true, exactCleanupPerformed: true });
+        return true;
+    });
+    assert.equal(harness.calls.some(args => args[0] === 'start'), false);
+    assert.equal(harness.containers.size, 0);
+});
+
+test('a name replacement after identity persistence is preserved while only the created immutable ID is cleaned', t => {
+    const harness = networkHarness(t);
+    const network = canonicalizeNetwork({ mode: 'default' });
+    const id = 'a'.repeat(64);
+    const replacementId = 'b'.repeat(64);
+    assert.throws(() => harness.adapter.runManagedContainerTransaction({
+        network, canonicalAgentId: 'demo', containerName: 'demo-container', runtimeIdentity: TEST_RUNTIME_IDENTITY,
+        createContainer(plan) {
+            harness.containers.set(id, managedAgentRecord({
+                id, name: 'demo-container', labels: managedAgentLabels(harness.identity, network),
+                networks: { [plan.attachments[0].name]: { Aliases: [plan.alias, id.slice(0, 12)] } },
+            }));
+            return id;
+        },
+        onContainerCreated() {
+            const created = harness.containers.get(id);
+            created.Name = 'original-renamed';
+            harness.containers.set(replacementId, { ...structuredClone(created), Id: replacementId, Name: 'demo-container' });
+        },
+    }), /changed identity after creation/);
+    assert.equal(harness.containers.has(replacementId), true);
+    assert.equal(harness.containers.has(id), false);
+    assert.equal(harness.calls.some(args => args[0] === 'start'), false);
+    assert.equal(harness.calls.some(args => args[0] === 'rm' && args.at(-1) === replacementId), false);
 });
 
 test('network lifecycle source contains no removed gateway, socket, managed-hosts, or namespace machinery', () => {

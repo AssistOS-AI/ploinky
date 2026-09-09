@@ -53,7 +53,7 @@ import {
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
-import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, withMaintenanceLock, withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import {
   AGENTS_DATA_DIR,
   LOGS_DIR,
@@ -77,9 +77,11 @@ import {
   inactivateEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
   readEdgeRoutingSelection,
+  retireAbandonedAgentPreparation,
   withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
+import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 import {
   finalizeStartupRoutes,
   partitionAdditionalStartupAgents,
@@ -1721,6 +1723,7 @@ async function activatePreparedRuntimeAfterReadiness({
     `[edge] active replacement committed, but exact predecessor '${predecessor?.containerName || '<unknown>'}' retirement failed: ${error?.message || error}`,
   ),
   cleanupFailure = cleanupFailedPreparedRuntime,
+  retireCandidate = retireRuntimeCandidate,
 } = {}) {
   if (!result?.requiresEdgeActivation) return false;
   if (!result?.containerName || !result?.registryRecord) {
@@ -1729,6 +1732,12 @@ async function activatePreparedRuntimeAfterReadiness({
   if (!result?.preparationLease) {
     throw new Error('runtime replacement activation requires its exact preparation lease');
   }
+  const retirePublishedCandidate = () => {
+    if (!result.durableCandidate) return;
+    try { retireCandidate(result.durableCandidate); } catch (error) {
+      console.warn(`[edge] active runtime recovery receipt could not be retired: ${error?.message || error}`);
+    }
+  };
   try {
     if (result.preparationLease.mode === 'additive') {
       await withApplyLock((applyLockCapability) => {
@@ -1765,6 +1774,7 @@ async function activatePreparedRuntimeAfterReadiness({
           try { reportRetirementFailure(result.replacementPredecessor, retirementError); } catch (_) {}
         }
       }
+      retirePublishedCandidate();
       return true;
     }
     await mergeRouting((cfg) => {
@@ -1787,6 +1797,7 @@ async function activatePreparedRuntimeAfterReadiness({
       reason: 'runtime-replacement-ready',
       preparationLease: result.preparationLease,
     });
+    retirePublishedCandidate();
     return true;
   } catch (error) {
     cleanupFailure(
@@ -1835,11 +1846,15 @@ export function cleanupFailedPreparedRuntime(
   if (failedResult.preparationLease.mode !== 'additive') {
     try {
       inactivate(reason, { preserveSelectedGeneration: true });
-    } catch (_) {}
+    } catch (cleanupError) {
+      error.message += `; routing inactivation: ${cleanupError?.message || cleanupError}`;
+    }
   }
   try {
     abortPreparation(failedResult.preparationLease, { reason });
-  } catch (_) {}
+  } catch (cleanupError) {
+    error.message += `; routing preparation cleanup: ${cleanupError?.message || cleanupError}`;
+  }
 }
 
 async function resolveAndPersistStartRouterPort(staticAgentArg, portArg, {
@@ -2488,6 +2503,12 @@ async function startWorkspace(staticAgentArg, portArg, {
       preparationLease: workspacePreparationLease,
     });
     workspacePreparationLease = null;
+    for (const candidate of workspaceRuntimeCandidates) {
+      if (!candidate.durableCandidate) continue;
+      try { retireRuntimeCandidate(candidate.durableCandidate); } catch (error) {
+        console.warn(`[start] active runtime recovery receipt could not be retired: ${error?.message || error}`);
+      }
+    }
     workspaceRuntimeCandidates.length = 0;
 
     const noWaitRunId = randomUUID();
@@ -3100,6 +3121,7 @@ async function reinstallAgent(agentName) {
     console.log(`Reinstalling (re-creating) agent '${agentName}'...`);
 
     try {
+        await withWorkspaceMutationLease({ operation: 'reinstall' }, async (workspaceMutationLease) => {
         await withMaintenanceLock(containerName, {
             operation: 'reinstall',
             metadata: {
@@ -3110,10 +3132,20 @@ async function reinstallAgent(agentName) {
           return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
             let reinstallResult = null;
             try {
+            const currentRegistration = agentsSvc.resolveEnabledAgentRecord(agentName);
+            if (currentRegistration?.containerName !== containerName
+                || ['repoName', 'agentName', 'instanceId', 'enableGeneration', 'profile', 'alias'].some(
+                    field => currentRegistration?.record?.[field] !== registryRecord.record[field],
+                )) {
+              throw new Error(`Agent '${agentName}' changed while waiting for reinstall; retry with its current registration.`);
+            }
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
             const edgeSelection = readEdgeRoutingSelection();
             const stageAlongsidePredecessor = edgeSelection.selector.state === 'active';
+            if (!stageAlongsidePredecessor) {
+              retireAbandonedAgentPreparation(containerName, { workspaceMutationLease, networkLifecycleCapability });
+            }
             if (!stageAlongsidePredecessor && !isSandboxRuntime(agentRuntime)) {
               dockerSvc.removeAgentContainerForRecreate(
                 containerName,
@@ -3192,6 +3224,7 @@ async function reinstallAgent(agentName) {
               throw error;
             }
           });
+        });
         });
     } catch (e) {
         console.error(`[reinstall] ${agentName}: ${e?.message||e}`);

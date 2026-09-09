@@ -207,6 +207,8 @@ import {
     RUNTIME_CLEANUP_RECEIPT_VERSION,
 } from '../runtimeCleanupReceipt.js';
 
+import { readRuntimeCandidate, writeRuntimeCandidate, retireRuntimeCandidate } from '../runtimeCandidateStore.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
@@ -863,18 +865,29 @@ function appendEnvFlagsFromMap(envFlags, envMap) {
 }
 
 function removeContainerForRecreate(runtime, containerName, label, record = null) {
-    if (!containerExists(containerName)) return { removed: false, state: 'absent' };
-    const exactRecord = record || loadAgentsMap()[containerName];
+    let exactRecord = record || loadAgentsMap()[containerName];
     try {
-        const result = removeExactRegisteredContainer(containerName, exactRecord, { runtime });
-        if (result?.removed !== true) {
+        const pending = exactRecord?.instanceId && exactRecord?.enableGeneration
+            ? readRuntimeCandidate(containerName, exactRecord)
+            : null;
+        if (pending) {
+            if (/^[a-f0-9]{64}$/.test(String(exactRecord.containerId || ''))
+                && exactRecord.containerId !== pending.containerId
+                && exactRecord.containerId !== pending.predecessorContainerId) {
+                throw new Error('registered container ID conflicts with the persisted failed launch');
+            }
+            exactRecord = { ...exactRecord, ...pending.registryRecord };
+        }
+        const result = removeExactRegisteredContainer(containerName, exactRecord, { runtime, recoverIncompleteIdentity: true });
+        if (result?.removed !== true && result?.state !== 'absent') {
             throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
         }
+        if (pending) retireRuntimeCandidate(pending);
         clearLivenessState(containerName);
         return result;
     } catch (cause) {
         const error = new Error(
-            `[${label}] preserved container '${containerName}' because exact immutable ownership/removal was not proven`,
+            `[${label}] preserved container '${containerName}' because exact immutable ownership/removal was not proven: ${cause?.message || cause}`,
             { cause },
         );
         error.code = 'PLOINKY_RUNTIME_OWNERSHIP_AMBIGUOUS';
@@ -2247,7 +2260,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     if (!adoptManagedRuntimeOnly) {
         console.log(`[start] ${agentName}: ${runtime} create (cwd='${cwd}') -> ${entrySummary}`);
     }
-    const createContainer = (plan, launch) => {
+    const createContainer = (plan, launch, { recordCreatedId = () => {} } = {}) => {
         const createArgs = [...args];
         if (plan?.args?.length) createArgs.splice(1, 0, ...plan.args);
         if (launch) {
@@ -2284,13 +2297,23 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         const res = withNetworkLifecycleLock(() => {
             const cleanupLegacyMountpoints = prepareLegacyGuardMountpointCleanup();
             try {
-                const res = spawnSync(runtime, createArgs, { stdio: 'inherit' });
+                const res = spawnSync(runtime, createArgs, { stdio: ['inherit', 'pipe', 'inherit'], encoding: 'utf8' });
+                if (res.status === 0) {
+                    const createdId = String(res.stdout || '').trim();
+                    if (!/^[a-f0-9]{64}$/.test(createdId)) {
+                        throw new Error(`${runtime} create did not return one full immutable container ID`);
+                    }
+                    launchedContainerId = createdId;
+                    recordCreatedId(createdId);
+                    recordCreatedIdentity({ containerId: createdId, launch });
+                }
                 return res;
             } finally {
                 cleanupLegacyMountpoints();
             }
         }, { waitMs: 15 * 60 * 1000 });
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
+        return launchedContainerId;
     };
     let cleanupReceipt = beginCandidateLifecycle({
         runtimeKind: 'container',
@@ -2313,6 +2336,62 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     let launchedContainerId = '';
     let generatedLaunch = null;
     let adoptedExistingRuntime = false;
+    let durableCandidate = null;
+    let createdRegistryRecord = null;
+    let createdIdentityPersisted = false;
+    const recordCreatedIdentity = ({ containerId, launch = null, record = null }) => {
+        if (launchedContainerId && launchedContainerId !== containerId) {
+            throw new Error(`created candidate '${containerName}' changed its immutable ID before persistence`);
+        }
+        launchedContainerId = containerId;
+        generatedLaunch = launch;
+        if (record && cleanupReceipt.phase === 'create-attempted') cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+            phase: 'candidate-observed',
+            creationAttempted: true,
+            state: 'retryable-exact-id',
+            candidateId: containerId,
+            inspectionComplete: true,
+            ownershipProof: {
+                immutableId: true,
+                instanceId: runtimeIdentity.instanceId,
+                enableGeneration: runtimeIdentity.enableGeneration,
+            },
+        });
+        if (createdIdentityPersisted) return;
+        createdRegistryRecord = {
+            ...launchRecord,
+            type: 'agent', agentName, repoName, runtime, containerId,
+            ...(options.alias ? { alias: options.alias } : {}),
+            instanceId: runtimeIdentity.instanceId,
+            enableGeneration: runtimeIdentity.enableGeneration,
+            config: {
+                ...launchRecord.config,
+                binds: launch?.descriptorHostFile ? [{
+                    source: launch.descriptorHostFile,
+                    target: GENERATED_ROUTER_DESCRIPTOR_CONTAINER_FILE,
+                    ro: true,
+                    generatedRouterDescriptor: true,
+                }] : [],
+            },
+        };
+        // Persist before start/install can fail. Prepared launches retain their
+        // signed registry source and use this separate immutable recovery record.
+        durableCandidate = {
+            operationId: cleanupReceipt.operationId,
+            predecessorContainerId: String(cleanupReceipt.predecessorId || ''),
+            containerName, containerId, runtime,
+            runtimeNetwork: manifestNetwork,
+            registryRecord: createdRegistryRecord,
+            preparationLease: runtimeIdentity.preparationLease || options.preparationLease || null,
+        };
+        durableCandidate = writeRuntimeCandidate(durableCandidate);
+        if (options.preserveRegistryRecord !== true) {
+            const agents = loadAgentsMap();
+            agents[containerName] = createdRegistryRecord;
+            saveAgentsMap(agents);
+        }
+        createdIdentityPersisted = true;
+    };
     // A non-Node target image needs the fixed Node helper to attest its exact
     // read-only volume topology. Pull it before any lifecycle/network lock; the
     // later probe uses only the already-present immutable image ID.
@@ -2351,6 +2430,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 preStartLaunch: preStartGeneratedRouterLaunch,
                 postStartLaunch: cleanupLegacyGuardMountpointCleanupAfterStart,
                 finalizeLaunch: finalizeGeneratedRouterLaunch,
+                onContainerCreated: recordCreatedIdentity,
             });
         if (adoptManagedRuntimeOnly && launched?.adopted !== true) {
             const mismatch = new Error(
@@ -2383,10 +2463,12 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             ownershipProof: { predecessorRegistryIdentity: true, predecessorRemoved: predecessorRemoval.state },
         });
         launchedContainerId = withNetworkLifecycleLock(() => {
-            createContainer(unmanagedNetworkLifecyclePlan);
+            const createdId = createContainer(unmanagedNetworkLifecyclePlan);
             return String(networkLifecycle.finalizeContainer(containerName, unmanagedNetworkLifecyclePlan, {
                 network: manifestNetwork,
                 runtimeIdentity,
+                expectedContainerId: createdId,
+                onCreated: recordCreatedIdentity,
                 beforeStart: prepareLegacyGuardMountpointCleanupBeforeStart,
                 afterStart: cleanupLegacyGuardMountpointCleanupAfterStart,
             }) || '');
@@ -2396,19 +2478,43 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         throw new Error(`startAgentContainer(${agentName}) did not capture an immutable container ID`);
     }
     } catch (error) {
+        let exactCleanupPerformed = error?.ploinkyContainerTransaction?.exactCleanupPerformed === true;
+        launchedContainerId ||= String(error?.ploinkyContainerTransaction?.containerId || '');
+        if (!runtimeNetworkPlan.requiresManagedNetwork && launchedContainerId) {
+            try {
+                const cleanup = removeExactGenerationCandidate({
+                    containerName, containerId: launchedContainerId,
+                    network: manifestNetwork,
+                    record: createdRegistryRecord || { agentName, repoName, ...runtimeIdentity },
+                });
+                exactCleanupPerformed = cleanup.removed === true || cleanup.state === 'absent';
+            } catch (cleanupError) { appendExactCleanupFailure(error, cleanupError.message); }
+        }
+        if (exactCleanupPerformed && durableCandidate) {
+            try { retireRuntimeCandidate(durableCandidate); } catch (cleanupError) {
+                appendExactCleanupFailure(error, cleanupError.message);
+            }
+        }
+        if (exactCleanupPerformed && ['create-attempted', 'candidate-observed'].includes(cleanupReceipt.phase)) {
+            cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
+                phase: 'readiness', state: 'removed-proven', inspectionComplete: true,
+                ownershipProof: { ...cleanupReceipt.ownershipProof, exactAbsenceProven: true },
+            });
+        }
         throw attachRestartCandidate(error, {
             containerName,
+            ...(launchedContainerId ? { containerId: launchedContainerId } : {}),
             runtimeNetwork: structuredClone(manifestNetwork),
-            registryRecord: {
-                type: 'agent',
-                agentName,
-                repoName,
+            registryRecord: createdRegistryRecord || {
+                type: 'agent', agentName, repoName, runtime,
+                ...(launchedContainerId ? { containerId: launchedContainerId } : {}),
                 ...(options.alias ? { alias: options.alias } : {}),
                 instanceId: runtimeIdentity.instanceId,
                 enableGeneration: runtimeIdentity.enableGeneration,
             },
             cleanupReceipt,
-            exactCleanupPerformed: false,
+            durableCandidate,
+            exactCleanupPerformed,
         });
     }
     if (adoptManagedRuntimeOnly && adoptedExistingRuntime) {
@@ -2424,7 +2530,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             }),
         };
     }
-    cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, adoptedExistingRuntime
+    if (cleanupReceipt.phase !== 'candidate-observed') cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, adoptedExistingRuntime
         ? {
             phase: 'candidate-observed',
             state: 'not-created-proven',
@@ -2448,7 +2554,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         containerId: launchedContainerId,
         runtimeNetwork: structuredClone(manifestNetwork),
         cleanupReceipt,
+        durableCandidate,
         registryRecord: Object.freeze({
+            ...(createdRegistryRecord || {}),
+            runtime,
+            containerId: launchedContainerId,
             type: 'agent',
             agentName,
             repoName,
@@ -2496,6 +2606,11 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         } catch (receiptError) {
             appendExactCleanupFailure(error, `receipt transition: ${receiptError?.message || receiptError}`);
         }
+        if (exactCleanupPerformed && durableCandidate) {
+            try { retireRuntimeCandidate(durableCandidate); } catch (cleanupError) {
+                appendExactCleanupFailure(error, cleanupError.message);
+            }
+        }
         if (exactCleanupPerformed && generatedLaunch?.cleanup) {
             try { generatedLaunch.cleanup(); } catch (cleanupError) {
                 appendExactCleanupFailure(error, `descriptor cleanup: ${cleanupError?.message || cleanupError}`);
@@ -2542,6 +2657,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         develRepo: persistedRecord.develRepo,
         profile: activeProfile,
         type: 'agent',
+        runtime,
+        containerId: launchedContainerId,
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         agentLib: agentLibRuntimeRecord(containerAgentLibGrant),
@@ -2628,6 +2745,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         runtimeNetwork: structuredClone(manifestNetwork),
         registryRecord,
         cleanupReceipt,
+        durableCandidate,
     };
 }
 
@@ -3950,6 +4068,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     if (!preserveRuntimeRegistryRecord) saveAgentsMap(agents);
 
     syncAgentMcpConfig(containerName, agentPath, finalInstanceName, { workDir: finalAgentWorkDir });
+    if (!preserveRuntimeRegistryRecord && started?.durableCandidate) {
+        retireRuntimeCandidate(started.durableCandidate);
+    }
     const returnPort = runtimeNetworkPlan.mode === 'host'
         ? (allPortMappings.find((p) => p.containerPort === agentServerPort)?.containerPort
             || allPortMappings[0]?.containerPort
@@ -3965,6 +4086,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             createdByThisLaunch: started?.createdByThisLaunch !== false,
             registryRecord: structuredClone(agents[containerName]),
             cleanupReceipt: started?.cleanupReceipt,
+            durableCandidate: started?.durableCandidate,
             requiresEdgeActivation,
             ...(runtimeIdentity.preparationLease ? { preparationLease: runtimeIdentity.preparationLease } : {}),
             ...(stagedRegistryRecord
@@ -4041,8 +4163,15 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 appendExactCleanupFailure(error, cleanupError?.message || cleanupError);
             }
         }
+        const durableCandidate = started?.durableCandidate || error?.ploinkyRestartCandidate?.durableCandidate;
+        if (exactCleanupPerformed && durableCandidate) {
+            try { retireRuntimeCandidate(durableCandidate); } catch (cleanupError) {
+                appendExactCleanupFailure(error, cleanupError.message);
+            }
+        }
         throw attachRestartCandidate(error, {
             containerName,
+            durableCandidate,
             ...(candidateId ? { containerId: candidateId } : {}),
             runtimeNetwork: structuredClone(manifestNetwork),
             registryRecord: structuredClone(candidateRecord),
@@ -4128,6 +4257,7 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
     });
     if (cleanupReceipt.state === 'absent-proven' || cleanupReceipt.state === 'removed-proven'
         || cleanupReceipt.state === 'not-created-proven') {
+        if (candidate?.durableCandidate) retireRuntimeCandidate(candidate.durableCandidate);
         return { removed: false, state: cleanupReceipt.state };
     }
     if (cleanupReceipt.state !== 'retryable-exact-id' || cleanupReceipt.inspectionComplete !== true) {
@@ -4154,12 +4284,14 @@ export function cleanupExactAgentRuntimeCandidate(candidate) {
     if (!containerId || !candidate?.runtimeNetwork) {
         throw new Error('exact container candidate cleanup requires its immutable ID and runtime network');
     }
-    return removeExactGenerationCandidate({
+    const cleanup = removeExactGenerationCandidate({
         containerName,
         containerId,
         network: candidate.runtimeNetwork,
         record,
     });
+    if (candidate?.durableCandidate) retireRuntimeCandidate(candidate.durableCandidate);
+    return cleanup;
 }
 
 function appendExactCleanupFailure(error, detail) {

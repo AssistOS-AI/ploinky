@@ -226,3 +226,36 @@ test('an additive launch failure cleans and aborts exactly once without inactiva
     assert.deepEqual(calls, ['cleanup', 'abort:cli-start-failed']);
     assert.equal(failure.message, 'candidate readiness failed');
 });
+
+for (const retirementFails of [false, true]) {
+    test(`a published runtime retires its recovery receipt without rolling back activation; retirementFails=${retirementFails}`, async t => {
+        const result = preparedRuntime();
+        result.durableCandidate = { operationId: 'receipt' };
+        const calls = [];
+        const warnings = [];
+        t.mock.method(console, 'warn', message => warnings.push(message));
+        const activated = await activatePreparedRuntimeAfterReadiness({ result }, {
+            mergeRouting: async () => { calls.push('commit'); },
+            retireCandidate(candidate) {
+                assert.equal(candidate, result.durableCandidate);
+                calls.push('retire');
+                if (retirementFails) throw new Error('receipt filesystem unavailable');
+            },
+            cleanupFailure: () => assert.fail('published runtime must stay active'),
+        });
+        assert.equal(activated, true);
+        assert.deepEqual(calls, ['commit', 'retire']);
+        assert.equal(warnings.length, retirementFails ? 1 : 0);
+        if (retirementFails) assert.match(warnings[0], /receipt filesystem unavailable/);
+    });
+}
+
+test('failed routing cleanup reports its blocker alongside the installation error', () => {
+    const failure = new Error('install.sh exited 1');
+    cleanupFailedPreparedRuntime(preparedRuntime(), failure, 'install-failed', {
+        cleanupCandidate() {},
+        inactivate() { throw new Error('selector unavailable'); },
+        abortPreparation() { throw new Error('preparation lease changed'); },
+    });
+    assert.match(failure.message, /install.sh exited 1; routing inactivation: selector unavailable; routing preparation cleanup: preparation lease changed/);
+});

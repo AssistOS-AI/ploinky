@@ -71,6 +71,7 @@ import {
     resolveEnabledAgentRecordFromMap,
 } from './agentRegistryResolver.js';
 import { retireNoWaitRunMarkers } from '../commands/noWaitMarkerLifecycle.js';
+import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -941,6 +942,12 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
                     networkLifecycleCapability,
                 });
             }, { preparationLease: finalLease });
+
+            if (started?.durableCandidate) {
+                try { retireRuntimeCandidate(started.durableCandidate); } catch (error) {
+                    console.warn(`[enable] ${shortAgentName}: runtime committed; candidate receipt retained: ${error.message}`);
+                }
+            }
 
             return { containerName: started?.containerName || containerName, repoName, shortAgentName, alias: alias || undefined, auth: record.auth, runMode, hostPort };
         });

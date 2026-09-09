@@ -17,6 +17,7 @@ const MAINTENANCE_DIR = path.join(RUNNING_DIR, 'maintenance');
 const WORKSPACE_START_LOCK_PATH = path.join(RUNNING_DIR, 'workspace-start.json');
 const WORKSPACE_START_TTL_MS = 24 * 60 * 60 * 1000;
 const LOCK_STALE_GRACE_MS = 5_000;
+const OWNED_WORKSPACE_LEASES = new WeakSet();
 
 function lockPathFor(containerName) {
     // Direct replacement candidates use an immutable physical name so the
@@ -177,7 +178,20 @@ function createWorkspaceMutationLease({
         }
         throw error;
     }
+    OWNED_WORKSPACE_LEASES.add(lock);
     return lock;
+}
+
+export function assertWorkspaceMutationLease(lease, { runningDir = RUNNING_DIR } = {}) {
+    const current = lockSnapshot(WORKSPACE_START_LOCK_PATH)?.lock;
+    if (!OWNED_WORKSPACE_LEASES.has(lease)
+        || path.resolve(runningDir) !== path.resolve(RUNNING_DIR)
+        || current?.token !== lease.token || current?.ownerPid !== process.pid) {
+        const error = new Error('workspace mutation requires its exact live workspace lease');
+        error.code = 'PLOINKY_WORKSPACE_MUTATION_CAPABILITY_REQUIRED';
+        throw error;
+    }
+    return lease;
 }
 
 async function acquireWorkspaceMutationLease({
@@ -222,7 +236,7 @@ async function withWorkspaceMutationLease(options, fn) {
     const lease = await acquireWorkspaceMutationLease(options);
     let callbackError = null;
     try {
-        return await fn();
+        return await fn(lease);
     } catch (error) {
         callbackError = error;
         throw error;
@@ -275,7 +289,9 @@ function renewWorkspaceMutationLease(lock, { ttlMs = WORKSPACE_START_TTL_MS } = 
 
 function releaseWorkspaceStartLock(lock) {
     if (!lock?.token) return false;
-    return removeSnapshot(lockSnapshot(WORKSPACE_START_LOCK_PATH), lock.token);
+    const removed = removeSnapshot(lockSnapshot(WORKSPACE_START_LOCK_PATH), lock.token);
+    if (removed) OWNED_WORKSPACE_LEASES.delete(lock);
+    return removed;
 }
 
 const releaseWorkspaceMutationLease = releaseWorkspaceStartLock;

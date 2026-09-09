@@ -932,6 +932,7 @@ export function createNetworkLifecycleAdapter({
         runtimeIdentity = null,
         beforeStart = null,
         afterStart = null,
+        onCreated = null,
     } = {}) {
         const exactLabels = expectedLabels || (network && runtimeIdentity
             ? expectedAgentLabels(identity.hash, networkContractHash(network), runtimeIdentity)
@@ -944,11 +945,13 @@ export function createNetworkLifecycleAdapter({
         try {
             const initial = inspectContainer(containerName);
             if (!initial) throw new Error(`container '${containerName}' disappeared after creation`);
-            ownedContainerId = containerRecordId(initial, containerName);
-            if (expectedContainerId && ownedContainerId !== expectedContainerId) {
+            const inspectedId = containerRecordId(initial, containerName);
+            if (expectedContainerId && inspectedId !== expectedContainerId) {
                 throw new Error(`container '${containerName}' changed identity after creation`);
             }
+            ownedContainerId = inspectedId;
             assertRequiredLabels(containerName, labelsOf(initial), exactLabels);
+            if (onCreated) onCreated({ plan, containerId: ownedContainerId, record: initial });
             const managedMode = plan?.mode === 'default' || plan?.mode === 'bridge';
             if (managedMode && !managedHostsPolicyIsExact(initial)) {
                 throw new Error(`container '${containerName}' has unsupported managed hosts policy`);
@@ -1012,6 +1015,7 @@ export function createNetworkLifecycleAdapter({
         preStartLaunch = null,
         postStartLaunch = null,
         finalizeLaunch = null,
+        onContainerCreated = null,
         networkLockWaitMs = NETWORK_LOCK_WAIT_MS,
         networkLifecycleCapability,
     }) {
@@ -1031,6 +1035,9 @@ export function createNetworkLifecycleAdapter({
         if (finalizeLaunch !== null && typeof finalizeLaunch !== 'function') {
             throw new Error('managed container transaction finalizeLaunch must be a function');
         }
+        if (onContainerCreated !== null && typeof onContainerCreated !== 'function') {
+            throw new Error('managed container transaction onContainerCreated must be a function');
+        }
         return withNetworkLifecycleLock(() => {
             const checked = preflight(network, canonicalAgentId, { instanceKey });
             if (!['default', 'bridge'].includes(checked.mode)) {
@@ -1045,6 +1052,7 @@ export function createNetworkLifecycleAdapter({
                 previousId = containerRecordId(previous, containerName);
             }
             let candidateCreationAttempted = false;
+            let candidateId = '';
             let plan = null;
             let launch = null;
             try {
@@ -1122,11 +1130,29 @@ export function createNetworkLifecycleAdapter({
                 // attestation and only then construct key-capable launch state.
                 launch = prepareLaunch ? prepareLaunch(plan) : null;
                 candidateCreationAttempted = true;
-                createContainer(plan, launch);
-                const candidate = inspectContainer(containerName);
+                const created = createContainer(plan, launch, {
+                    recordCreatedId(containerId) {
+                        const exactId = String(containerId || '');
+                        if (!exactId || candidateId && candidateId !== exactId) {
+                            throw new Error(`managed candidate '${containerName}' reported conflicting creation identity`);
+                        }
+                        candidateId = exactId;
+                    },
+                });
+                const returnedId = String(created?.containerId || (typeof created === 'string' ? created : ''));
+                if (candidateId && returnedId && candidateId !== returnedId) {
+                    throw new Error(`managed candidate '${containerName}' returned conflicting creation identity`);
+                }
+                candidateId ||= returnedId;
+                const candidate = inspectContainer(candidateId || containerName);
                 if (!candidate) throw new Error(`managed candidate '${containerName}' disappeared after creation`);
                 assertRequiredLabels(containerName, labelsOf(candidate), agentLabels);
-                const candidateId = containerRecordId(candidate, containerName);
+                const inspectedId = containerRecordId(candidate, containerName);
+                if (candidateId && inspectedId !== candidateId) {
+                    throw new Error(`managed candidate '${containerName}' changed identity after creation`);
+                }
+                candidateId = inspectedId;
+                if (onContainerCreated) onContainerCreated({ plan, launch, containerId: candidateId, record: candidate });
                 const containerId = finalizeContainer(containerName, plan, {
                     expectedContainerId: candidateId,
                     expectedLabels: agentLabels,
@@ -1148,7 +1174,7 @@ export function createNetworkLifecycleAdapter({
                 let candidateInspectionComplete = false;
                 let launchArtifactCleanupSafe = false;
                 try {
-                    candidate = inspectContainer(containerName);
+                    candidate = inspectContainer(candidateId || containerName);
                     candidateInspectionComplete = true;
                 } catch (inspectError) {
                     error.message += `; failure cleanup could not inspect candidate '${containerName}': ${inspectError.message}`;
@@ -1158,10 +1184,13 @@ export function createNetworkLifecycleAdapter({
                 } else if (candidateCreationAttempted
                     && candidate
                     && hasRequiredLabels(labelsOf(candidate), agentLabels)) {
-                    const candidateId = String(candidate?.Id || candidate?.ID || '');
-                    if (!candidateId) {
+                    const inspectedId = String(candidate?.Id || candidate?.ID || '');
+                    if (candidateId && inspectedId !== candidateId) {
+                        error.message += `; failure cleanup preserved candidate '${containerName}' because its immutable ID changed`;
+                    } else if (!inspectedId) {
                         error.message += `; failure cleanup preserved candidate '${containerName}' because its immutable ID was unavailable`;
                     } else {
+                        candidateId = inspectedId;
                         const removed = execute(['rm', '-f', candidateId]);
                         if (!removed.ok && !missing(removed)) {
                             error.message += `; failure cleanup could not remove candidate '${containerName}': ${failure(removed)}`;
@@ -1188,6 +1217,14 @@ export function createNetworkLifecycleAdapter({
                     }
                 }
                 if (plan) rollbackResources(plan, error);
+                Object.defineProperty(error, 'ploinkyContainerTransaction', {
+                    configurable: true,
+                    value: Object.freeze({
+                        containerId: candidateId,
+                        creationAttempted: candidateCreationAttempted,
+                        exactCleanupPerformed: launchArtifactCleanupSafe,
+                    }),
+                });
                 throw error;
             }
         }, {

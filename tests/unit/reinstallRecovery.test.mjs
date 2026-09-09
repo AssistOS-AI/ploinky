@@ -6,7 +6,8 @@ import { reinstallAgent } from '../../cli/commands/workspaceUtil.js';
 
 // Execute the command body with runtime boundaries replaced, so recovery can
 // be tested without installing agents or mutating a real workspace.
-function fixture({ runtime = 'docker', running = false, active = true, failure, enabled = true } = {}) {
+function fixture({ runtime = 'docker', running = false, active = true, failure, enabled = true, changedRegistration = false } = {}) {
+    let resolutions = 0;
     const calls = [];
     const errors = [];
     const record = {
@@ -22,7 +23,13 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
         path,
         console: { log() {}, error(message) { errors.push(message); } },
         resolvePersistedRouterPort: () => 8080,
-        agentsSvc: { resolveEnabledAgentRecord: () => enabled ? record : null },
+        agentsSvc: { resolveEnabledAgentRecord: () => {
+            resolutions += 1;
+            if (!enabled) return null;
+            return changedRegistration && resolutions > 1
+                ? { ...record, record: { ...record.record, enableGeneration: 'concurrent-generation' } }
+                : record;
+        } },
         utils: { findAgent(name) {
             assert.equal(enabled, true, 'unregistered targets must not reach runtime lookup');
             assert.equal(name, 'repo/example');
@@ -50,6 +57,15 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
                 if (failure === 'install') throw new Error('install failed');
                 return result;
             },
+        },
+        withWorkspaceMutationLease: async (options, callback) => {
+            assert.equal(options.operation, 'reinstall');
+            return callback('workspace-lease');
+        },
+        retireAbandonedAgentPreparation(name, options) {
+            assert.equal(name, record.containerName);
+            assert.equal(options.workspaceMutationLease, 'workspace-lease');
+            assert.equal(options.networkLifecycleCapability, capability);
         },
         withMaintenanceLock: async (name, options, callback) => {
             assert.equal(name, record.containerName);
@@ -114,4 +130,11 @@ test('reinstall rejects an unregistered target instead of creating a new install
     const { run, calls } = fixture({ enabled: false });
     await assert.rejects(run('chosen-name'), /is not enabled/);
     assert.deepEqual(calls, []);
+});
+
+
+test('reinstall revalidates the enabled identity after waiting for the workspace lease', async () => {
+    const { run, calls } = fixture({ changedRegistration: true });
+    await assert.rejects(run('chosen-name'), /changed while waiting for reinstall/);
+    assert.deepEqual(calls.map(([step]) => step), ['cleanup']);
 });
