@@ -88,14 +88,14 @@ test('partial pre-existence creates only the missing directory', (t) => {
     assert.deepEqual(result.created, [path.join(workspace, '.ploinky', 'box', 'images')]);
 });
 
-test('files and symlinks where directories are required fail closed', (t) => {
+test('directory requirements reject files and accept directory symlinks', (t) => {
     const { workspace, identity, lock } = setup(t);
     fs.mkdirSync(path.join(workspace, '.ploinky', 'box'));
     fs.writeFileSync(path.join(workspace, '.ploinky', 'box', 'dependencies'), 'not a directory');
 
     assert.throws(
         () => ensureWorkspaceDataPaths({ identity, lock }),
-        /Box data path is not a real directory/,
+        /Box data path is not a directory/,
     );
     assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'box', 'images')), false);
 
@@ -103,10 +103,19 @@ test('files and symlinks where directories are required fail closed', (t) => {
     const elsewhere = path.join(workspace, 'elsewhere');
     fs.mkdirSync(elsewhere);
     fs.symlinkSync(elsewhere, path.join(workspace, '.ploinky', 'box', 'dependencies'), 'dir');
-    assert.throws(
-        () => ensureWorkspaceDataPaths({ identity, lock }),
-        /Box data path is not a real directory/,
+    fs.writeFileSync(path.join(elsewhere, 'canary'), 'kept');
+    const prepared = ensureWorkspaceDataPaths({ identity, lock });
+    assert.deepEqual(prepared.created, [identity.dataPaths.images]);
+    assert.equal(fs.lstatSync(identity.dataPaths.dependencies).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(path.join(elsewhere, 'canary'), 'utf8'), 'kept');
+    assert.deepEqual(
+        revalidateWorkspaceDataPaths({ identity, lock }).fingerprints,
+        prepared.fingerprints,
     );
+
+    removeWorkspaceDataPaths({ identity, lock });
+    assert.equal(fs.existsSync(identity.dataPaths.dependencies), false);
+    assert.equal(fs.readFileSync(path.join(elsewhere, 'canary'), 'utf8'), 'kept');
 });
 
 test('a missing workspace anchor fails closed before any directory is created', (t) => {
@@ -216,7 +225,7 @@ test('cache deletion removes exactly the two Box directories and nothing else', 
     assert.equal(fs.readFileSync(path.join(workspace, 'workspace-file.txt'), 'utf8'), 'user data');
 });
 
-test('parent symlink substitution is rejected by inspection, revalidation, and deletion', (t) => {
+test('symlinked Box data roots support inspection, revalidation, and deletion', (t) => {
     const { workspace, identity, lock } = setup(t);
     ensureWorkspaceDataPaths({ identity, lock });
     const originalRoot = path.join(workspace, 'displaced-box-root');
@@ -225,18 +234,38 @@ test('parent symlink substitution is rejected by inspection, revalidation, and d
     fs.writeFileSync(path.join(originalRoot, 'images', 'sentinel'), 'keep');
     fs.symlinkSync(originalRoot, identity.boxDataRoot, 'dir');
 
-    for (const operation of [
-        () => inspectWorkspaceDataPaths({ identity }),
-        () => revalidateWorkspaceDataPaths({ identity, lock }),
-        () => removeWorkspaceDataPaths({ identity, lock }),
-    ]) {
-        assert.throws(operation, /Box data root is not a real directory/);
-    }
+    const inspected = inspectWorkspaceDataPaths({ identity });
+    const revalidated = revalidateWorkspaceDataPaths({ identity, lock });
+    assert.deepEqual(inspected.fingerprints, revalidated.fingerprints);
     assert.equal(
         fs.readFileSync(path.join(originalRoot, 'dependencies', 'sentinel'), 'utf8'),
         'keep',
     );
     assert.equal(fs.readFileSync(path.join(originalRoot, 'images', 'sentinel'), 'utf8'), 'keep');
+
+    assert.deepEqual(removeWorkspaceDataPaths({ identity, lock }), [
+        identity.dataPaths.dependencies,
+        identity.dataPaths.images,
+    ]);
+    assert.equal(fs.existsSync(identity.boxDataRoot), false);
+    assert.deepEqual(fs.readdirSync(originalRoot), []);
+});
+
+test('a shared symlinked workspace anchor supports all Box data operations', (t) => {
+    const { workspace, identity, lock } = setup(t, { anchor: false });
+    const target = path.join(workspace, 'shared-state');
+    fs.mkdirSync(target);
+    fs.chmodSync(target, 0o777);
+    fs.symlinkSync(target, identity.anchorPath, 'dir');
+    fs.writeFileSync(path.join(target, 'other-state'), 'kept');
+
+    const prepared = ensureWorkspaceDataPaths({ identity, lock });
+    assert.deepEqual(inspectWorkspaceDataPaths({ identity }).fingerprints, prepared.fingerprints);
+    assert.deepEqual(revalidateWorkspaceDataPaths({ identity, lock }).fingerprints, prepared.fingerprints);
+    assert.equal(removeWorkspaceDataPaths({ identity, lock }).length, 2);
+    assert.equal(fs.lstatSync(identity.anchorPath).isSymbolicLink(), true);
+    assert.equal(fs.statSync(target).mode & 0o777, 0o777);
+    assert.deepEqual(fs.readdirSync(target), ['other-state']);
 });
 
 test('cache deletion preflights every target before removing the first one', (t) => {
@@ -249,10 +278,87 @@ test('cache deletion preflights every target before removing the first one', (t)
 
     assert.throws(
         () => removeWorkspaceDataPaths({ identity, lock }),
-        /not a real directory/,
+        /not a directory/,
     );
     assert.equal(fs.readFileSync(dependencyCanary, 'utf8'), 'keep');
     assert.equal(fs.readFileSync(identity.dataPaths.images, 'utf8'), 'invalid');
+});
+
+test('cache reset removes a sibling symlink before its target and remains idempotent', (t) => {
+    const { identity, lock } = setup(t);
+    ensureWorkspaceDataPaths({ identity, lock });
+    fs.rmdirSync(identity.dataPaths.images);
+    fs.symlinkSync('dependencies', identity.dataPaths.images, 'dir');
+    fs.writeFileSync(path.join(identity.dataPaths.dependencies, 'cache-canary'), 'cached');
+    ensureWorkspaceDataPaths({ identity, lock });
+    const removals = [];
+    const fsApi = {
+        ...fs,
+        unlinkSync(target) {
+            removals.push(target);
+            assert.equal(fs.readFileSync(path.join(identity.dataPaths.dependencies, 'cache-canary'), 'utf8'), 'cached');
+            fs.unlinkSync(target);
+        },
+        rmSync(target, options) {
+            removals.push(target);
+            fs.rmSync(target, options);
+        },
+    };
+
+    assert.deepEqual(removeWorkspaceDataPaths({ identity, lock, fsApi }), [
+        identity.dataPaths.dependencies,
+        identity.dataPaths.images,
+    ]);
+    assert.deepEqual(removals, [identity.dataPaths.images, identity.dataPaths.dependencies]);
+    assert.equal(fs.existsSync(identity.boxDataRoot), false);
+    assert.deepEqual(removeWorkspaceDataPaths({ identity, lock }), []);
+});
+
+test('cache reset handles a chain of final symlinks without removing their external target', (t) => {
+    const { workspace, identity, lock } = setup(t);
+    ensureWorkspaceDataPaths({ identity, lock });
+    const external = path.join(workspace, 'external-cache');
+    fs.mkdirSync(external);
+    fs.writeFileSync(path.join(external, 'canary'), 'kept');
+    fs.rmdirSync(identity.dataPaths.dependencies);
+    fs.rmdirSync(identity.dataPaths.images);
+    fs.symlinkSync(external, identity.dataPaths.dependencies, 'dir');
+    fs.symlinkSync('dependencies', identity.dataPaths.images, 'dir');
+    ensureWorkspaceDataPaths({ identity, lock });
+
+    assert.equal(removeWorkspaceDataPaths({ identity, lock }).length, 2);
+    assert.equal(fs.existsSync(identity.boxDataRoot), false);
+    assert.equal(fs.readFileSync(path.join(external, 'canary'), 'utf8'), 'kept');
+    assert.deepEqual(removeWorkspaceDataPaths({ identity, lock }), []);
+});
+
+test('cache reset detects a symlink replaced after preflight even when its target is unchanged', (t) => {
+    const { workspace, identity, lock } = setup(t);
+    ensureWorkspaceDataPaths({ identity, lock });
+    const external = path.join(workspace, 'external-cache');
+    fs.mkdirSync(external);
+    fs.writeFileSync(path.join(external, 'canary'), 'kept');
+    fs.rmdirSync(identity.dataPaths.images);
+    fs.symlinkSync(external, identity.dataPaths.images, 'dir');
+    let imageReads = 0;
+    const fsApi = {
+        ...fs,
+        lstatSync(target, ...args) {
+            if (target === identity.dataPaths.images && ++imageReads === 3) {
+                fs.renameSync(target, path.join(workspace, 'displaced-images-link'));
+                fs.symlinkSync(external, target, 'dir');
+            }
+            return fs.lstatSync(target, ...args);
+        },
+    };
+
+    assert.throws(
+        () => removeWorkspaceDataPaths({ identity, lock, fsApi }),
+        /Box data entry changed before cache deletion/,
+    );
+    assert.equal(fs.statSync(identity.dataPaths.dependencies).isDirectory(), true);
+    assert.equal(fs.lstatSync(identity.dataPaths.images).isSymbolicLink(), true);
+    assert.equal(fs.readFileSync(path.join(external, 'canary'), 'utf8'), 'kept');
 });
 
 test('directory fingerprints change when a canonical bind source is replaced', (t) => {

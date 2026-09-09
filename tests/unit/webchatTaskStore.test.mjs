@@ -37,6 +37,23 @@ test('WebChat validates AchillesCLI task lists without owning task storage', () 
     assert.equal('finalOutputRanges' in parsed.tasks[0], false);
 });
 
+test('structured live sessions survive updates and snapshots but reject unsafe URLs', () => {
+    for (const mode of ['desktop', 'browser']) {
+        const liveSession = { mode, url: '/example/session/' };
+        const parsed = parseWebchatTaskState({ __webchatTask: 1, version: 1,
+            event: 'update', task: { ...task, liveSession: { ...liveSession, label: 'Untrusted label' } } });
+        assert.deepEqual(parsed.task.liveSession, liveSession);
+        const snapshot = parseWebchatTaskState({ __webchatTask: 1, version: 1,
+            event: 'list', tasks: [parsed.task] });
+        assert.deepEqual(snapshot.tasks[0].liveSession, liveSession);
+    }
+    for (const url of ['javascript:alert(1)', '//evil.test/', '/\\evil.test/', '/%2f%2fevil.test/', 'https://evil.test/']) {
+        const parsed = parseWebchatTaskState({ __webchatTask: 1, version: 1, event: 'update',
+            task: { ...task, liveSession: { mode: 'browser', url } } });
+        assert.equal(parsed.task.liveSession, undefined);
+    }
+});
+
 test('WebChat validates task view snapshots and live log deltas', () => {
     const view = parseWebchatTaskState({
         __webchatTask: 1,

@@ -115,11 +115,14 @@ test('malformed and symlinked Cloudflare status fail to local unstarted with a w
     assert.equal(result.warnings.some((entry) => entry.includes('cloudflare-publication-status')), true);
 });
 
-test('symlinked Cloudflare status parent cannot spoof publication readiness', (t) => {
+test('status follows symlinked workspace state and Cloudflare status directories', (t) => {
     const root = fixture(t);
     const ploinky = path.join(root, '.ploinky');
+    const state = path.join(root, 'shared-state');
     const outside = path.join(root, 'outside-run');
-    fs.mkdirSync(ploinky);
+    fs.mkdirSync(state);
+    fs.chmodSync(state, 0o777);
+    fs.symlinkSync(state, ploinky, 'dir');
     fs.mkdirSync(outside);
     fs.writeFileSync(path.join(ploinky, 'agents.json'), '{}');
     fs.writeFileSync(path.join(outside, 'cloudflare-publication-status.json'), JSON.stringify({
@@ -129,16 +132,20 @@ test('symlinked Cloudflare status parent cannot spoof publication readiness', (t
         connectorState: 'running',
         configurationGeneration: `sha256:${'a'.repeat(64)}`,
         desiredDigest: `sha256:${'b'.repeat(64)}`,
-        hostnames: ['spoofed.example.test'],
+        hostnames: ['office.example.test'],
     }));
     fs.symlinkSync(outside, path.join(ploinky, 'run'));
     const result = readInboxStatus({
         workspaceRoot: root,
         runner: { query() { throw new Error('must not query'); } },
     });
-    assert.equal(result.cloudflarePublication.state, 'unstarted');
-    assert.deepEqual(result.cloudflarePublication.hostnames, []);
-    assert.equal(result.warnings.some((entry) => entry.includes('cloudflare-publication-status')), true);
+    assert.equal(result.state, 'initialized');
+    assert.equal(result.cloudflarePublication.state, 'ready');
+    assert.deepEqual(result.cloudflarePublication.hostnames, ['office.example.test']);
+    assert.deepEqual(result.warnings, []);
+    assert.equal(fs.lstatSync(ploinky).isSymbolicLink(), true);
+    assert.equal(fs.lstatSync(path.join(ploinky, 'run')).isSymbolicLink(), true);
+    assert.equal(fs.statSync(state).mode & 0o777, 0o777);
 });
 
 test('status exposes allowlisted counts and treats disappearing containers as transient', (t) => {

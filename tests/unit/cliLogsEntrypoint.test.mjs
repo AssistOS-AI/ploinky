@@ -320,10 +320,7 @@ test('registry snapshot treats an absent registry as empty and fails closed othe
     fs.mkdirSync(realDir, { recursive: true });
     fs.writeFileSync(path.join(realDir, 'agents.json'), '{}');
     fs.symlinkSync(realDir, path.join(symlinkedDir, '.ploinky'));
-    assert.throws(
-        () => readAgentRegistrySnapshot({ workspaceRoot: symlinkedDir }),
-        /not one regular directory/,
-    );
+    assert.deepEqual(readAgentRegistrySnapshot({ workspaceRoot: symlinkedDir }), {});
 });
 
 test('a corrupt registry fails the logs command without repairing it', (t) => {

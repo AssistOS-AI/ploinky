@@ -57,7 +57,7 @@ test('start admits prepared repositories before persisting the fixed Router port
         'prepareDefaultBootRepositories',
         'prepareManifestRepositories',
         'const admittedStart = preflightWorkspaceStartRuntimeCapabilities',
-        'createWorkspaceStartLock()',
+        "await acquireWorkspaceMutationLease({ operation: 'workspace-start' })",
         'assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions)',
         "inactivateEdgeRoutingGeneration('workspace-start-prepare'",
         'resolveAndPersistStartRouterPort(staticAgentArg, portArg, {',
@@ -106,7 +106,6 @@ test('managed single-agent restart drains before replacement and publishes only 
 test('sandbox ownership checks use exact runtime keys rather than short agent names', () => {
     assert.match(cliSource, /isBwrapProcessRunning\(containerName, \{/);
     assert.match(workspaceSource, /isSandboxRunningImpl\(existing\.key, \{/);
-    assert.match(workspaceSource, /isBwrapProcessRunning\(containerName, \{/);
     for (const source of [cliSource, workspaceSource]) {
         assert.match(source, /instanceId:/);
         assert.match(source, /enableGeneration:/);

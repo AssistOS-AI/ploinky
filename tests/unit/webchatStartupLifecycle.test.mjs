@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { createLocalTTYFactory } from '../../cli/server/webchat/tty.js';
 import { handleRuntimeRoute } from '../../cli/server/handlers/webchat/runtimeRoutes.js';
 import { createNetwork } from '../../cli/server/webchat/network.js';
+import { CLI_OUTPUT_BOUNDARY } from '../../cli/server/webchat/startupOutput.js';
 
 const quote = (value) => `'${value.replace(/'/g, `'\\''`)}'`;
 
@@ -24,6 +25,10 @@ async function runChild(script) {
 test('WebChat buffers early output until the private CLI readiness signal', async () => {
     const result = await runChild(`
         const fs = require('fs');
+        fs.writeSync(1, 'installer stdout\\n');
+        fs.writeSync(2, 'npm warn installer stderr\\n');
+        fs.writeSync(1, ${JSON.stringify(CLI_OUTPUT_BOUNDARY)});
+        fs.writeSync(2, ${JSON.stringify(CLI_OUTPUT_BOUNDARY)});
         fs.writeSync(1, 'early greeting\\n');
         setTimeout(() => {
             fs.writeSync(3, '{"version":1,"state":"ready"}\\n');

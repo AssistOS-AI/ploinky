@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { domainToASCII } from 'node:url';
+import { assertWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import { assertNetworkLifecycleCapability } from './networkLifecycle.js';
 
 import {
     AGENTS_FILE,
@@ -1841,6 +1843,61 @@ function removePreparationLease(paths, expected) {
     }
     fs.unlinkSync(paths.preparationLeaseFile);
     fsyncDirectory(paths.edgeDir);
+}
+
+/** Retire a failed inactive preparation while a serialized reinstall owns the workspace. */
+export function retireAbandonedAgentPreparation(containerName, options = {}) {
+    const paths = resolveEdgeGenerationPaths(options);
+    assertWorkspaceMutationLease(options.workspaceMutationLease, {
+        runningDir: path.join(paths.root, '.ploinky', 'running'),
+    });
+    assertNetworkLifecycleCapability(options.networkLifecycleCapability, {
+        lockPath: path.join(paths.root, '.ploinky', 'run', 'network.lock'),
+    });
+    const { release } = acquireApplyLockCapability(paths, options);
+    try {
+        const lease = readPreparationLease(paths);
+        if (!lease) return { retired: false };
+        if (lease.mode !== 'replacement') {
+            throw edgeError('reinstall cannot retire an additive routing preparation', 'EDGE_PREPARATION_BUSY');
+        }
+        assertPreparedSelectorStillSelected(paths, lease);
+        if (lease.pid !== process.pid) {
+            let dead = false;
+            try { process.kill(lease.pid, 0); } catch (error) { dead = error?.code === 'ESRCH'; }
+            if (!dead) {
+                throw edgeError(`routing preparation is still owned by pid ${lease.pid}`, 'EDGE_PREPARATION_BUSY');
+            }
+        }
+        const prepared = loadCapturedGeneration(paths, lease.preparedGeneration).generation;
+        if (lifecycleBindingDigest(prepared) !== lease.lifecycleBindingDigest) {
+            throw edgeError('routing preparation lifecycle binding changed', 'EDGE_PREPARATION_CORRUPT');
+        }
+        const agents = JSON.parse(fs.readFileSync(paths.agentsFile, 'utf8'));
+        const expected = prepared.agents?.[containerName];
+        const current = agents?.[containerName];
+        const identityFields = ['type', 'repoName', 'agentName', 'instanceId', 'enableGeneration'];
+        if (expected?.type !== 'agent' || !expected.instanceId || !expected.enableGeneration
+            || identityFields.some(field => current?.[field] !== expected[field])) {
+            throw edgeError('routing preparation does not match the enabled reinstall target', 'EDGE_PREPARATION_SOURCE_CHANGED');
+        }
+        const targetRotation = lease.reason.startsWith('runtime-identity-rotation:')
+            && lease.reason.endsWith(`:${containerName}`);
+        // A workspace-start preparation covers the whole graph. Only retire it
+        // when every enabled identity still matches its captured graph; corrected
+        // installation files and runtime-only fields may legitimately differ.
+        const graphStart = lease.reason === 'workspace-graph-enable-prelaunch'
+            && stableStringify(lifecycleAgentProjection(agents)) === stableStringify(lifecycleAgentProjection(prepared.agents));
+        if (!targetRotation && !graphStart) {
+            throw edgeError('routing preparation belongs to another lifecycle operation', 'EDGE_PREPARATION_BUSY');
+        }
+        assertPreparationLeaseForApply(paths, lease);
+        assertPreparedSelectorStillSelected(paths, lease);
+        removePreparationLease(paths, lease);
+        return { retired: true, transactionId: lease.transactionId };
+    } finally {
+        release();
+    }
 }
 
 function buildGenerationDocument(captured) {

@@ -542,6 +542,8 @@ test('global enabled agents keep workspace projectPath and declare persistent /r
         const podmanPath = path.join(binDir, 'podman');
         fs.writeFileSync(inspectHelper, `
 import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import path from 'node:path';
 const [argsPath, statePath, runningPath, mode = 'full'] = process.argv.slice(2);
 const args = fs.readFileSync(argsPath, 'utf8').split(/\\r?\\n/).filter(Boolean);
 const labels = {};
@@ -552,13 +554,27 @@ for (let index = 0; index < args.length; index += 1) {
   const [key, ...value] = String(args[index + 1] || '').split('=');
   labels[key] = value.join('=');
 }
+if (mode === 'durable') {
+  const registry = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(workspaceDir, '.ploinky/agents.json'))}, 'utf8'));
+  const name = fs.readFileSync(statePath, 'utf8').trim();
+  // Additive enable must preserve the signed active registry until commit.
+  assert.deepEqual(registry, {});
+  const receiptRoot = ${JSON.stringify(path.join(workspaceDir, '.ploinky/run/runtime-candidates'))};
+  const receipts = fs.readdirSync(receiptRoot).filter(name => name.endsWith('.json'));
+  assert.equal(receipts.length, 1);
+  const candidate = JSON.parse(fs.readFileSync(path.join(receiptRoot, receipts[0]), 'utf8'));
+  assert.equal(candidate.containerName, name);
+  assert.equal(candidate.containerId, '${'c'.repeat(64)}');
+  assert.equal(candidate.runtime, 'podman');
+  process.exit(0);
+}
 if (mode === 'env') {
   process.stdout.write(JSON.stringify(env));
   process.exit(0);
 }
 const running = fs.existsSync(runningPath);
 process.stdout.write(JSON.stringify([{
-  Id: 'candidate1234567890',
+  Id: '${'c'.repeat(64)}',
   Name: fs.readFileSync(statePath, 'utf8').trim(),
   Config: { Labels: labels },
   HostConfig: { Init: args.includes('--init'), NetworkMode: 'none' },
@@ -570,7 +586,10 @@ process.stdout.write(JSON.stringify([{
             podmanPath,
             `#!/bin/sh
 emit_inspect() {
-  [ -f ${JSON.stringify(stateFile)} ] || exit 1
+  if [ ! -f ${JSON.stringify(stateFile)} ]; then
+    printf '%s\\n' 'Error: no such container' >&2
+    exit 125
+  fi
   ${JSON.stringify(process.execPath)} ${JSON.stringify(inspectHelper)} ${JSON.stringify(argsFile)} ${JSON.stringify(stateFile)} ${JSON.stringify(runningFile)}
 }
 case "$1" in
@@ -610,9 +629,11 @@ case "$1" in
       prev="$arg"
     done
     printf '%s\\n' "$name" > ${JSON.stringify(stateFile)}
+    printf '%s\\n' '${'c'.repeat(64)}'
     exit 0
     ;;
   start)
+    ${JSON.stringify(process.execPath)} ${JSON.stringify(inspectHelper)} ${JSON.stringify(argsFile)} ${JSON.stringify(stateFile)} ${JSON.stringify(runningFile)} durable || exit 1
     : > ${JSON.stringify(runningFile)}
     exit 0
     ;;
@@ -678,6 +699,9 @@ console.log(JSON.stringify({ record, mcpTools: policyState.mcpTools }));`,
 
         assert.equal(result.status, 0, result.stderr);
         const { record, mcpTools } = JSON.parse(result.stdout.trim().split('\n').at(-1));
+        assert.equal(record.containerId, 'c'.repeat(64));
+        assert.equal(record.runtime, 'podman');
+        assert.deepEqual(fs.readdirSync(path.join(workspaceDir, '.ploinky/run/runtime-candidates')), []);
         assert.equal(record.runMode, 'global');
         assert.equal(record.projectPath, workspaceDir);
         assert.deepEqual(record.config.ports, []);

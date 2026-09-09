@@ -38,24 +38,12 @@ function exactContainerName(value) {
   return value;
 }
 
-function lstatOrAbsent(fsApi, target) {
+function statOrAbsent(fsApi, target, { directory = false } = {}) {
   try {
-    return fsApi.lstatSync(target);
+    return directory ? fsApi.statSync(target) : fsApi.lstatSync(target);
   } catch (error) {
     if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null;
     throw retirementError(`no-wait marker path '${target}' could not be inspected`, error);
-  }
-}
-
-function assertOwnedDirectory(target, stat, uid) {
-  if (!stat?.isDirectory() || stat.isSymbolicLink?.()) {
-    throw retirementError(`no-wait marker directory '${target}' is not one regular directory`);
-  }
-  if (Number.isInteger(uid) && stat.uid !== uid) {
-    throw retirementError(`no-wait marker directory '${target}' is not owned by the current user`);
-  }
-  if ((stat.mode & 0o022) !== 0) {
-    throw retirementError(`no-wait marker directory '${target}' is group- or other-writable`);
   }
 }
 
@@ -130,11 +118,10 @@ export function retireNoWaitRunMarker(containerName, {
     throw retirementError('no-wait marker retirement requires one exact container name', error);
   }
   const markerDirectory = pathApi.dirname(markerPath);
-  const directoryStat = lstatOrAbsent(fsApi, markerDirectory);
+  const directoryStat = statOrAbsent(fsApi, markerDirectory, { directory: true });
   if (!directoryStat) return Object.freeze({ retired: false, containerName: exactContainer, markerPath });
-  assertOwnedDirectory(markerDirectory, directoryStat, uid);
 
-  const before = lstatOrAbsent(fsApi, markerPath);
+  const before = statOrAbsent(fsApi, markerPath);
   if (!before) return Object.freeze({ retired: false, containerName: exactContainer, markerPath });
   assertOwnedMarker(markerPath, before, uid);
   const expectedRegistryIdentity = expectedRecord === undefined
@@ -182,12 +169,11 @@ export function retireNoWaitRunMarker(containerName, {
     }
   }
 
-  const currentDirectory = lstatOrAbsent(fsApi, markerDirectory);
-  assertOwnedDirectory(markerDirectory, currentDirectory, uid);
+  const currentDirectory = statOrAbsent(fsApi, markerDirectory, { directory: true });
   if (!sameInode(directoryStat, currentDirectory)) {
     throw retirementError(`no-wait marker directory '${markerDirectory}' changed during retirement`);
   }
-  const current = lstatOrAbsent(fsApi, markerPath);
+  const current = statOrAbsent(fsApi, markerPath);
   assertOwnedMarker(markerPath, current, uid);
   if (!sameInode(before, current)) {
     throw retirementError(`no-wait marker '${markerPath}' changed during retirement`);
@@ -201,7 +187,7 @@ export function retireNoWaitRunMarker(containerName, {
     markerDirectory,
     `${exactContainer}.current.${retirementId.toLowerCase()}.retired.json`,
   );
-  if (lstatOrAbsent(fsApi, retiredPath)) {
+  if (statOrAbsent(fsApi, retiredPath)) {
     throw retirementError(`no-wait retired marker destination '${retiredPath}' already exists`);
   }
   try {
@@ -210,13 +196,12 @@ export function retireNoWaitRunMarker(containerName, {
     throw retirementError(`no-wait marker '${markerPath}' could not be retired atomically`, error);
   }
 
-  const retired = lstatOrAbsent(fsApi, retiredPath);
-  const retiredDirectory = lstatOrAbsent(fsApi, markerDirectory);
-  assertOwnedDirectory(markerDirectory, retiredDirectory, uid);
+  const retired = statOrAbsent(fsApi, retiredPath);
+  const retiredDirectory = statOrAbsent(fsApi, markerDirectory, { directory: true });
   assertOwnedMarker(retiredPath, retired, uid);
   if (!sameInode(directoryStat, retiredDirectory)
       || !sameInode(before, retired)
-      || lstatOrAbsent(fsApi, markerPath)) {
+      || statOrAbsent(fsApi, markerPath)) {
     throw retirementError(`no-wait marker '${markerPath}' lost exact ownership during retirement`);
   }
   try {

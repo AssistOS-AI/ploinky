@@ -199,10 +199,10 @@ test('parseBranchPolicy: --branch=value', () => {
 test('parseBranchPolicy: repeated --repo-branch', () => {
     const policy = parseBranchPolicy([
         '--repo-branch', 'proxies=embedded',
-        '--repo-branch', 'webmeetInfra=main',
+        '--repo-branch', 'mediaRepo=main',
     ]);
     assert.equal(policy.repoBranches.proxies, 'embedded');
-    assert.equal(policy.repoBranches.webmeetInfra, 'main');
+    assert.equal(policy.repoBranches.mediaRepo, 'main');
 });
 
 test('parseBranchPolicy: --repo-branch=repo=branch', () => {
@@ -286,14 +286,14 @@ test('parseStartArgs: full example with --repo-branch and --reset-repos', () => 
     const result = parseStartArgs([
         'AchillesIDE/explorer', '8097',
         '--branch', 'embedded-soul-gateway',
-        '--repo-branch', 'webmeetInfra=main',
+        '--repo-branch', 'mediaRepo=main',
         '--branch-fallback', 'fail',
         '--reset-repos',
     ]);
     assert.equal(result.staticAgent, 'AchillesIDE/explorer');
     assert.equal(result.port, '8097');
     assert.equal(result.branchPolicy.branch, 'embedded-soul-gateway');
-    assert.equal(result.branchPolicy.repoBranches.webmeetInfra, 'main');
+    assert.equal(result.branchPolicy.repoBranches.mediaRepo, 'main');
     assert.equal(result.branchPolicy.fallback, 'fail');
     assert.equal(result.branchPolicy.resetRepos, true);
 });
@@ -582,7 +582,6 @@ test('ensureRepoOnBranch: missing branch with fallback=default keeps current', (
 // ---------------------------------------------------------------------------
 
 test('bootstrap: global branch policy only applies to the static repo among default boot repos', () => {
-    const basicPath = initManagedRepo('basic');
     const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
     const cliPath = initManagedRepo('AchillesCLI');
     initManagedRepo('copilot-agents');
@@ -597,24 +596,21 @@ test('bootstrap: global branch policy only applies to the static repo among defa
         },
     }));
 
-    const basicBranch = String(execFileSync('git', ['-C', basicPath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
     const ideBranch = String(execFileSync('git', ['-C', idePath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
     const cliBranch = String(execFileSync('git', ['-C', cliPath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
-    assert.equal(basicBranch, 'main');
     assert.equal(ideBranch, 'feature-start');
     assert.equal(cliBranch, 'main');
 });
 
 test('bootstrap: a bare static agent name resolves its own repo for the global branch', () => {
     // Isolate from the prior bootstrap test which reuses these default-repo names.
-    for (const r of ['basic', 'AchillesIDE', 'AchillesCLI', 'copilot-agents']) {
+    for (const r of ['AchillesIDE', 'AchillesCLI', 'copilot-agents']) {
         fs.rmSync(path.join(tempDir, '.ploinky', 'repos', r), { recursive: true, force: true });
     }
     fs.rmSync(path.join(tempDir, '.ploinky', 'enabled_repos.json'), { force: true });
 
     const idePath = initManagedRepo('AchillesIDE', { branches: ['feature-start'] });
-    const basicPath = initManagedRepo('basic');
-    initManagedRepo('AchillesCLI');
+    const cliPath = initManagedRepo('AchillesCLI');
     initManagedRepo('copilot-agents');
 
     // findAgent('explorer') must resolve to AchillesIDE; commit the manifest so
@@ -632,10 +628,10 @@ test('bootstrap: a bare static agent name resolves its own repo for the global b
     });
 
     const ideBranch = String(execFileSync('git', ['-C', idePath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
-    const basicBranch = String(execFileSync('git', ['-C', basicPath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
     assert.equal(ideBranch, 'feature-start');
     // The static repo's branch must NOT bleed onto unrelated boot repos.
-    assert.equal(basicBranch, 'main');
+    const cliBranch = String(execFileSync('git', ['-C', cliPath, 'rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+    assert.equal(cliBranch, 'main');
 });
 
 test('applyManifestDirectives: strict branch policy aborts manifest repo fallback', async () => {

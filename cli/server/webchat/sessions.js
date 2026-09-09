@@ -125,6 +125,13 @@ export function createSessionController({
 
     function handleSessionState(payload) {
         if (!payload || typeof payload !== 'object') return;
+        if (payload.event === 'error') {
+            if (!payload.sessionId || payload.sessionId === currentSession?.sessionId) {
+                messages.hideTypingIndicator?.(true);
+                showBanner(payload.error || 'Session operation failed.', 'err');
+            }
+            return;
+        }
         sessionsAvailable = true;
         if (sessionsBtn) sessionsBtn.disabled = false;
 
@@ -132,17 +139,19 @@ export function createSessionController({
             renderSessionList(payload);
             return;
         }
-        if ((payload.event !== 'current' && payload.event !== 'selected') || !payload.session || !payload.summary) {
+        if (!['current', 'selected', 'updated'].includes(payload.event) || !payload.session || !payload.summary) {
             return;
         }
 
         const hadSession = Boolean(currentSession?.sessionId);
         const changed = payload.summary.sessionId !== currentSession?.sessionId;
+        // Updates describe an execution, not a request to select its conversation.
+        if (payload.event === 'updated' && changed) return;
         currentSession = payload.summary;
         currentSnapshot = payload.session;
+        messages.setSessionId?.(currentSession.sessionId);
 
-        if (payload.event === 'selected' || (hadSession && changed)) {
-            messages.clearMessages();
+        if (payload.event === 'selected' || payload.event === 'updated' || (hadSession && changed)) {
             messages.renderHistory(payload.session.messages || []);
             historyLoaded = true;
             showHistoryGate(false);
@@ -156,11 +165,14 @@ export function createSessionController({
         }
     }
 
-    function addRemoteUserMessage(message) {
+    function addRemoteUserMessage(message, payload = {}) {
+        if (payload.sessionId && payload.sessionId !== currentSession?.sessionId) return;
         messages.addClientMsg(message?.text || '', {
             historical: true,
             timestamp: message?.timestamp,
-            references: message?.references
+            references: message?.references,
+            messageId: message?.id,
+            messageIndex: payload.messageIndex,
         });
     }
 

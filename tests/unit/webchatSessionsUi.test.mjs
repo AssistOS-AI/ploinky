@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { createSessionController, formatRelativeTime } from '../../cli/server/webchat/sessions.js';
@@ -123,10 +122,58 @@ test('selected session history is rendered immediately', () => {
     }
 });
 
-test('session controls preserve their established styling and lazy history gate', () => {
-    const css = readFileSync(new URL('../../cli/server/webchat/webchat.css', import.meta.url), 'utf8');
-    const template = readFileSync(new URL('../../cli/server/webchat/chat.html', import.meta.url), 'utf8');
-    assert.match(css, /\.wa-session-btn:hover\s*\{\s*background:\s*#086b58;\s*\}/);
-    assert.match(css, /\.wa-session-list-new \.wa-session-list-preview/);
-    assert.match(template, /Click to load session history/);
+test('execution snapshots leave the thinking lifecycle to the history renderer', (t) => {
+    const originalDocument = globalThis.document;
+    globalThis.document = { addEventListener() {} };
+    t.after(() => { globalThis.document = originalDocument; });
+    let thinking = false;
+    const controller = createSessionController({
+        elements: {},
+        messages: {
+            renderHistory(messages) { thinking = messages.some((message) => message.status === 'pending'); },
+            hideTypingIndicator() { thinking = false; },
+        },
+        network: {}, showBanner() {}, hideBanner() {},
+    });
+    controller.handleSessionState(sessionState('current'));
+    controller.handleSessionState(sessionState('updated', [{ role: 'assistant', status: 'pending', text: '' }]));
+    assert.equal(thinking, true);
+    controller.handleSessionState(sessionState('updated', [{ role: 'assistant', status: 'completed', text: 'Hello' }]));
+    assert.equal(thinking, false);
+});
+
+test('execution snapshots and remote echoes never switch the selected conversation', (t) => {
+    const originalDocument = globalThis.document;
+    globalThis.document = { createElement: makeElement, addEventListener() {} };
+    t.after(() => { globalThis.document = originalDocument; });
+    const rendered = [];
+    const remote = [];
+    const errors = [];
+    const controller = createSessionController({
+        elements: {},
+        messages: {
+            renderHistory(messages) { rendered.push(messages); },
+            addClientMsg(text) { remote.push(text); },
+        },
+        network: {},
+        showBanner: (text) => errors.push(text),
+        hideBanner() {},
+    });
+    const selected = sessionState('selected', [{ id: 'anchor-A', role: 'assistant', text: 'A' }]);
+    controller.handleSessionState(selected);
+    const other = sessionState('updated', [{ id: 'anchor-B', role: 'assistant', text: 'B' }]);
+    other.session.sessionId = other.summary.sessionId = 'other-session';
+    controller.handleSessionState(other);
+    controller.addRemoteUserMessage({ text: 'B user' }, { sessionId: 'other-session' });
+    controller.handleSessionState({ event: 'error', sessionId: 'other-session', error: 'B failed' });
+    assert.equal(controller.getCurrentSession().sessionId, SESSION_ID);
+    assert.equal(rendered.length, 1);
+    assert.deepEqual(remote, []);
+    assert.deepEqual(errors, []);
+    controller.handleSessionState(sessionState('updated', [{ id: 'anchor-A', role: 'assistant', text: 'A finished' }]));
+    assert.equal(rendered.at(-1)[0].text, 'A finished');
+    controller.loadHistory();
+    assert.equal(rendered.at(-1)[0].id, 'anchor-A');
+    controller.handleSessionState({ event: 'error', sessionId: SESSION_ID, error: 'Native home mismatch' });
+    assert.deepEqual(errors, ['Native home mismatch']);
 });

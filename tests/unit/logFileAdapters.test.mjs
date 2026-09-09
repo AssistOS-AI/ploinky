@@ -71,7 +71,7 @@ test('an absent root, directory, or file reports absence instead of failing', (t
     }), null);
 });
 
-test('a symlinked root, parent, or file is rejected', (t) => {
+test('symlinked directories can supply logs while symlinked log files are rejected', (t) => {
     const root = workspace(t);
     const outside = path.join(root, 'outside');
     fs.mkdirSync(outside, { recursive: true });
@@ -79,18 +79,16 @@ test('a symlinked root, parent, or file is rejected', (t) => {
 
     const linkedRoot = path.join(root, 'linked-root');
     fs.symlinkSync(outside, linkedRoot);
-    assert.throws(
-        () => openVerifiedLogFile({ trustedRoot: linkedRoot, relativeSegments: ['fixture.log'] }),
-        (error) => error.code === 'LOG_PATH_UNSAFE' && /not one regular directory/.test(error.message),
-    );
+    const linked = openVerifiedLogFile({ trustedRoot: linkedRoot, relativeSegments: ['fixture.log'] });
+    assert.equal(fs.readFileSync(linked.descriptor, 'utf8'), 'foreign\n');
+    closeAll(linked);
 
     const logs = path.join(root, 'logs');
     fs.mkdirSync(logs, { recursive: true });
     fs.symlinkSync(outside, path.join(logs, 'no-wait'));
-    assert.throws(
-        () => openVerifiedLogFile({ trustedRoot: logs, relativeSegments: ['no-wait', 'fixture.log'] }),
-        (error) => error.code === 'LOG_PATH_UNSAFE' && /not one regular directory/.test(error.message),
-    );
+    const nested = openVerifiedLogFile({ trustedRoot: logs, relativeSegments: ['no-wait', 'fixture.log'] });
+    assert.equal(fs.readFileSync(nested.descriptor, 'utf8'), 'foreign\n');
+    closeAll(nested);
 
     fs.symlinkSync(path.join(outside, 'fixture.log'), path.join(logs, 'fixture.log'));
     assert.throws(

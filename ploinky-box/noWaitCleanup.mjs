@@ -12,24 +12,25 @@ function cleanupError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_NO_WAIT_CLEANUP_FAILED' });
 }
 
-function inspectDirectories(workspaceRoot, rootFingerprint) {
-    const directories = [workspaceRoot, ...['.ploinky', 'running', 'no-wait'].map((_, index, parts) => (
+function inspectDirectories(workspaceRoot, rootFingerprint, includeNoWait = true) {
+    const directories = [workspaceRoot, ...['.ploinky', 'running', ...(includeNoWait ? ['no-wait'] : [])].map((_, index, parts) => (
         path.join(workspaceRoot, ...parts.slice(0, index + 1))
     ))];
     const snapshots = [];
     for (const directory of directories) {
         let stat;
-        try { stat = fs.lstatSync(directory); } catch (error) {
+        let identityStat;
+        try {
+            identityStat = fs.lstatSync(directory);
+            stat = fs.statSync(directory);
+        } catch (error) {
             if (error.code === 'ENOENT' && directory !== workspaceRoot) return null;
             throw cleanupError('Cannot inspect the selected workspace no-wait directory');
         }
-        if (stat.isSymbolicLink() || !stat.isDirectory()
-            || (typeof process.getuid === 'function' && stat.uid !== process.getuid())
-            || (directory !== workspaceRoot && (stat.mode & 0o022) !== 0)) {
-            throw cleanupError('The selected workspace no-wait path is not a secure owned directory');
-        }
-        if (directory === workspaceRoot && (String(stat.dev) !== rootFingerprint?.device
-            || String(stat.ino) !== rootFingerprint?.inode || stat.mode !== rootFingerprint?.mode)) {
+        // Follow directory links for replacement detection; root identity uses
+        // the same link inode captured when the workspace was selected.
+        if (directory === workspaceRoot && (String(identityStat.dev) !== rootFingerprint?.device
+            || String(identityStat.ino) !== rootFingerprint?.inode || identityStat.mode !== rootFingerprint?.mode)) {
             throw cleanupError('Workspace identity changed before no-wait marker cleanup');
         }
         snapshots.push({ directory, device: stat.dev, inode: stat.ino, mode: stat.mode });
@@ -38,11 +39,52 @@ function inspectDirectories(workspaceRoot, rootFingerprint) {
 }
 
 function assertDirectoriesUnchanged(workspaceRoot, rootFingerprint, before) {
-    const after = inspectDirectories(workspaceRoot, rootFingerprint);
+    const after = inspectDirectories(workspaceRoot, rootFingerprint, before.length === 4);
     if (!after || after.some((entry, index) => entry.device !== before[index].device
         || entry.inode !== before[index].inode || entry.mode !== before[index].mode)) {
         throw cleanupError('Workspace no-wait directories changed during marker cleanup');
     }
+}
+
+function inspectStartLock(workspaceRoot) {
+    const lockPath = path.join(workspaceRoot, '.ploinky', 'running', 'workspace-start.json');
+    let stat;
+    try { stat = fs.lstatSync(lockPath); } catch (error) {
+        if (error.code === 'ENOENT') return null;
+        throw cleanupError('Cannot inspect the destroyed Box workspace mutation lock');
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
+        || (typeof process.getuid === 'function' && stat.uid !== process.getuid())
+        || (stat.mode & 0o022) !== 0) {
+        throw cleanupError('The destroyed Box workspace mutation lock is not a secure owned regular file');
+    }
+    return stat;
+}
+
+function retireStartLock(workspaceRoot, before) {
+    const after = inspectStartLock(workspaceRoot);
+    if (Boolean(before) !== Boolean(after) || (before && ['dev', 'ino', 'mode', 'uid', 'nlink', 'size', 'mtimeMs', 'ctimeMs']
+        .some((key) => before[key] !== after[key]))) {
+        throw cleanupError('The destroyed Box workspace mutation lock changed during cleanup');
+    }
+    // The exact Box is stopped or absent: its workers are gone. Never probe or signal
+    // a recorded PID in the host namespace, including legacy bare-PID locks.
+    if (after) fs.unlinkSync(path.join(workspaceRoot, '.ploinky', 'running', 'workspace-start.json'));
+}
+
+// The caller must prove the exact Box is stopped or absent while holding the
+// host workspace lock. A live Box's inner mutation lease must never be retired.
+export function retireQuiescentBoxWorkspaceStartLock({ identity, lock }) {
+    if (!lock || typeof lock.assertHeld !== 'function') {
+        throw cleanupError('Workspace start lock cleanup requires the workspace mutation lock');
+    }
+    lock.assertHeld(identity.instance);
+    const snapshots = inspectDirectories(identity.workspaceRoot, identity.rootFingerprint, false);
+    if (!snapshots) return;
+    const startLock = inspectStartLock(identity.workspaceRoot);
+    lock.assertHeld(identity.instance);
+    assertDirectoriesUnchanged(identity.workspaceRoot, identity.rootFingerprint, snapshots);
+    retireStartLock(identity.workspaceRoot, startLock);
 }
 
 // Run only after the host has removed the exact Box or proved it already absent.
@@ -53,8 +95,10 @@ export function retireDestroyedBoxNoWaitMarkers({ identity, lock, spawn = spawnS
         throw cleanupError('No-wait marker cleanup requires the workspace mutation lock');
     }
     lock.assertHeld(identity.instance);
-    const snapshots = inspectDirectories(identity.workspaceRoot, identity.rootFingerprint);
+    const snapshots = inspectDirectories(identity.workspaceRoot, identity.rootFingerprint, false);
     if (!snapshots) return;
+    const markerSnapshots = inspectDirectories(identity.workspaceRoot, identity.rootFingerprint);
+    const startLock = inspectStartLock(identity.workspaceRoot);
     const result = spawn(process.execPath, [
         HELPER_PATH, identity.workspaceRoot, JSON.stringify(identity.rootFingerprint),
     ], {
@@ -77,6 +121,8 @@ export function retireDestroyedBoxNoWaitMarkers({ identity, lock, spawn = spawnS
         throw cleanupError('Box is absent, but secure no-wait marker cleanup failed; retained markers were not fully retired');
     }
     assertDirectoriesUnchanged(identity.workspaceRoot, identity.rootFingerprint, snapshots);
+    if (markerSnapshots) assertDirectoriesUnchanged(identity.workspaceRoot, identity.rootFingerprint, markerSnapshots);
+    retireStartLock(identity.workspaceRoot, startLock);
 }
 
 async function retireMarkersInChild(workspaceRoot, rootFingerprint) {

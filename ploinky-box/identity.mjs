@@ -147,23 +147,23 @@ export function resolveWorkspaceIdentity({
     });
 }
 
-function inspectAnchor(anchorPath, lstatSync) {
+function inspectAnchor(anchorPath, statSync) {
     try {
-        const stat = lstatSync(anchorPath);
+        const stat = statSync(anchorPath);
         return {
             exists: true,
             directory: stat.isDirectory(),
-            symlink: stat.isSymbolicLink(),
         };
     } catch (error) {
         if (error.code === 'ENOENT') {
-            return { exists: false, directory: false, symlink: false };
+            return { exists: false, directory: false };
         }
         throw error;
     }
 }
 
 export function materializeIdentityAnchor(identity, lock, {
+    statSync = fs.statSync,
     lstatSync = fs.lstatSync,
     readlinkSync = fs.readlinkSync,
     mkdirSync = fs.mkdirSync,
@@ -184,9 +184,9 @@ export function materializeIdentityAnchor(identity, lock, {
         throw new WorkspaceResolutionError('Workspace root changed before identity anchor creation');
     }
 
-    const before = inspectAnchor(identity.anchorPath, lstatSync);
+    const before = inspectAnchor(identity.anchorPath, statSync);
     if (before.exists) {
-        if (!before.directory || before.symlink) {
+        if (!before.directory) {
             throw new WorkspaceResolutionError(
                 `Workspace identity anchor is not a directory: ${identity.anchorPath}`,
             );
@@ -206,8 +206,8 @@ export function materializeIdentityAnchor(identity, lock, {
         throw error;
     }
 
-    const after = inspectAnchor(identity.anchorPath, lstatSync);
-    if (!after.exists || !after.directory || after.symlink) {
+    const after = inspectAnchor(identity.anchorPath, statSync);
+    if (!after.exists || !after.directory) {
         throw new WorkspaceResolutionError(
             `Workspace identity anchor was replaced during creation: ${identity.anchorPath}`,
         );

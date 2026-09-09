@@ -167,7 +167,7 @@ test('runtime creation cleans fixed control artifacts only after predecessor han
         new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url),
         'utf8',
     );
-    const createStart = source.indexOf('const createContainer = (plan, launch) => {');
+    const createStart = source.indexOf('const createContainer = (plan, launch,');
     const cleanup = source.indexOf('prepareHealthProbeHostDirForLaunch(containerName);', createStart);
     const runtimeCreate = source.indexOf('const res = spawnSync(runtime, createArgs', createStart);
     assert.ok(createStart >= 0);

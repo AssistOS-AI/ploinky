@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { connectRelayWorker } from './lib/runtimeRelayConnection.mjs';
 
 import { createRelayReplayCache } from '../lib/relayTokenVerify.mjs';
 import { verifyRelayRequestToken, verifyRelaySessionToken } from '../lib/relayRequestAuth.mjs';
@@ -142,18 +143,10 @@ async function serveSocketBroker(socketPath, readyPath) {
             stdio: ['pipe', 'pipe', 'pipe'],
         });
         workers.add(worker);
-        socket.pipe(worker.stdin);
-        worker.stdout.pipe(socket);
-        worker.stderr.pipe(process.stderr, { end: false });
-
-        socket.once('close', () => {
-            sockets.delete(socket);
-            if (worker.exitCode === null && worker.signalCode === null) worker.kill('SIGTERM');
-        });
-        worker.once('error', error => socket.destroy(error));
-        worker.once('exit', () => {
-            workers.delete(worker);
-            if (!socket.destroyed) socket.end();
+        connectRelayWorker(socket, worker, {
+            stderr: process.stderr,
+            onClose: () => sockets.delete(socket),
+            onExit: () => workers.delete(worker),
         });
     });
 

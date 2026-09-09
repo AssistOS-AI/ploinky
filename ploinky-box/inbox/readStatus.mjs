@@ -34,9 +34,9 @@ function readCloudflarePublicationStatus(ploinkyRoot, fsApi, warnings) {
     const runRoot = path.join(ploinkyRoot, 'run');
     const statusPath = path.join(runRoot, 'cloudflare-publication-status.json');
     try {
-        const runStats = fsApi.lstatSync(runRoot);
-        if (!runStats.isDirectory() || runStats.isSymbolicLink()) {
-            throw new Error('run is not a real directory');
+        const runStats = fsApi.statSync(runRoot);
+        if (!runStats.isDirectory()) {
+            throw new Error('run is not a directory');
         }
         const value = JSON.parse(readRegular(statusPath, fsApi));
         if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
@@ -58,7 +58,7 @@ export function readInboxStatus({
     const ploinkyRoot = path.join(root, '.ploinky');
     const warnings = [];
     let marker;
-    try { marker = fsApi.lstatSync(ploinkyRoot); } catch (error) {
+    try { marker = fsApi.statSync(ploinkyRoot); } catch (error) {
         if (error.code === 'ENOENT') {
             return Object.freeze({
                 state: 'not-initialized',
@@ -72,12 +72,12 @@ export function readInboxStatus({
         }
         throw error;
     }
-    if (marker.isSymbolicLink() || !marker.isDirectory()) {
+    if (!marker.isDirectory()) {
         return Object.freeze({
             state: 'invalid-initialization', initialized: false,
             routingConfigured: false, trackedAgents: 0, runningAgents: 0,
             cloudflarePublication: LOCAL_CLOUDFLARE_STATUS,
-            warnings: Object.freeze(['.ploinky is not a real directory']),
+            warnings: Object.freeze(['.ploinky is not a directory']),
         });
     }
     const routing = readJson(path.join(ploinkyRoot, 'routing.json'), fsApi, warnings);

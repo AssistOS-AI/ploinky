@@ -411,6 +411,15 @@ async function callMcpInitialize(agentName, mcpEndpoint) {
 async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, catalogArguments = {}) {
     const catalogTool = tools.find((tool) => tool?.name === ACHILLES_COMMAND_CATALOG_TOOL);
     if (!catalogTool) return [];
+    // Forward only declared string selectors, never arbitrary URL parameters.
+    const schema = catalogTool.inputSchema?.properties || catalogTool.inputSchema || {};
+    if (!schema.sessionId) delete catalogArguments.sessionId;
+    const query = new URLSearchParams(globalThis.document?.body?.dataset?.agentQuery || '');
+    for (const [key, definition] of Object.entries(schema)) {
+        if (key !== 'dir' && !Object.hasOwn(catalogArguments, key) && definition?.type === 'string' && query.has(key)) {
+            catalogArguments[key] = query.get(key);
+        }
+    }
 
     const callRes = await fetchAgentMcp(agentName, mcpEndpoint, {
         method: 'POST',
@@ -463,6 +472,7 @@ async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, 
             const argCompletions = normalizeArgCompletions(command.argCompletions);
             return {
                 name: normalizedName,
+                catalogWarning: normalizedName === '/model' && parsed.modelError ? String(parsed.modelError) : '',
                 description: typeof command.description === 'string' ? command.description : '',
                 argMatchMode: command.argMatchMode === 'fragment' ? 'fragment' : 'prefix',
                 argSuggestionLimit: Number.isInteger(Number(command.argSuggestionLimit))
@@ -476,7 +486,7 @@ async function fetchStructuredCatalog(agentName, mcpEndpoint, sessionId, tools, 
         .filter(Boolean);
 }
 
-async function fetchCommandsFromAgent(agentName, dlog) {
+async function fetchCommandsFromAgent(agentName, dlog, extraArguments = {}) {
     if (!agentName) return [];
     const mcpEndpoint = `/${agentName}/mcp`;
     const sessionId = await callMcpInitialize(agentName, mcpEndpoint);
@@ -501,7 +511,7 @@ async function fetchCommandsFromAgent(agentName, dlog) {
             mcpEndpoint,
             sessionId,
             tools,
-            buildCatalogArguments(),
+            { ...buildCatalogArguments(), ...extraArguments },
         );
         if (structured.length > 0) {
             return structured.sort((a, b) => a.name.localeCompare(b.name));
@@ -557,9 +567,11 @@ export function createSlashCommandsProvider({
     dlog,
     retryDelays = INITIAL_CATALOG_RETRY_DELAYS_MS,
     wait = waitForRetry,
+    getCatalogArguments = () => ({}),
 } = {}) {
     let commands = [];
     let refreshPromise = null;
+    let refreshKey = '';
 
     function detectTrigger(value, caretIndex) {
         const inputValue = typeof value === 'string' ? value : '';
@@ -583,6 +595,11 @@ export function createSlashCommandsProvider({
         const currentToken = spaceIdx === -1 ? afterSlash : afterSlash.slice(0, spaceIdx);
         const hasSubToken = spaceIdx !== -1;
         const subToken = hasSubToken ? afterSlash.slice(spaceIdx + 1) : '';
+        if (refreshPromise && hasSubToken) return [{ trigger: '/', group: 'Commands',
+            loading: true, label: 'Loading options…', loadingLabel: 'Loading options…' }];
+        const warning = commands.find((entry) => entry.name === `/${currentToken}`)?.catalogWarning;
+        if (warning && hasSubToken) return [{ trigger: '/', group: 'Commands', loading: true,
+            label: `Unable to load models: ${warning}`, loadingLabel: `Unable to load models: ${warning}` }];
 
         return buildSuggestions(commands, { currentToken, hasSubToken, subToken })
             .map((suggestion) => ({
@@ -604,17 +621,23 @@ export function createSlashCommandsProvider({
     }
 
     function refresh() {
-        if (refreshPromise) return refreshPromise;
-        refreshPromise = loadSlashCommandsWithRetry(
-            () => fetchCommandsFromAgent(agentName, dlog),
+        const args = getCatalogArguments();
+        const key = JSON.stringify(args);
+        if (refreshPromise && refreshKey === key) return refreshPromise;
+        refreshKey = key;
+        commands = [];
+        const pending = loadSlashCommandsWithRetry(
+            () => fetchCommandsFromAgent(agentName, dlog, args),
             { retryDelays, wait, dlog },
         ).then((loadedCommands) => {
+            if (refreshPromise !== pending) return commands;
             commands = loadedCommands;
             dlog?.('SlashCommandsProvider: loaded', commands.length, 'commands');
             return commands;
         }).finally(() => {
-            refreshPromise = null;
+            if (refreshPromise === pending) refreshPromise = null;
         });
+        refreshPromise = pending;
         return refreshPromise;
     }
 

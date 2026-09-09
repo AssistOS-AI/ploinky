@@ -29,32 +29,14 @@ function lstatOrAbsent(fsApi, target) {
     }
 }
 
-function beneathRoot(pathApi, realRoot, realFile) {
-    const relative = pathApi.relative(realRoot, realFile);
-    return Boolean(relative) && !relative.startsWith('..') && !pathApi.isAbsolute(relative);
-}
-
-function assertOwnedSecureDirectory(target, stat, { uid }) {
-    if (!stat.isDirectory() || stat.isSymbolicLink?.()) {
-        throw verifiedFileError(`producer path '${target}' is not one regular directory`);
-    }
-    if (Number.isInteger(uid) && stat.uid !== uid) {
-        throw verifiedFileError(`producer directory '${target}' is not owned by the current user`);
-    }
-    if ((stat.mode & 0o022) !== 0) {
-        throw verifiedFileError(`producer directory '${target}' is group- or other-writable`);
-    }
-}
-
-// Validates a producer-owned path from its workspace root and creates only the
-// final expected directory. Missing or unsafe parents are never repaired.
+// Creates only the final expected directory. Directory permissions, ownership,
+// and symlinks follow normal filesystem behavior; missing parents are not created.
 export function ensureVerifiedProducerDirectory({
     trustedRoot,
     relativeSegments = [],
     mode = 0o700,
     fsApi = fsDefault,
     pathApi = pathDefault,
-    uid = typeof process.getuid === 'function' ? process.getuid() : undefined,
 } = {}) {
     const rootInput = String(trustedRoot || '').trim();
     if (!rootInput || !Array.isArray(relativeSegments) || relativeSegments.length === 0) {
@@ -67,17 +49,11 @@ export function ensureVerifiedProducerDirectory({
     const root = pathApi.resolve(rootInput);
     const rootStat = lstatOrAbsent(fsApi, root);
     if (!rootStat) throw verifiedFileError(`producer root '${root}' does not exist`);
-    assertOwnedSecureDirectory(root, rootStat, { uid });
-
-    let realRoot;
-    try { realRoot = fsApi.realpathSync(root); } catch (_) {
-        throw verifiedFileError(`producer root '${root}' is unresolvable`);
-    }
 
     let current = root;
     for (let index = 0; index < segments.length; index += 1) {
         current = pathApi.join(current, segments[index]);
-        let stat = lstatOrAbsent(fsApi, current);
+        const stat = lstatOrAbsent(fsApi, current);
         if (!stat) {
             if (index !== segments.length - 1) {
                 throw verifiedFileError(`producer parent '${current}' does not exist`);
@@ -87,23 +63,14 @@ export function ensureVerifiedProducerDirectory({
             } catch (error) {
                 throw verifiedFileError(`producer directory '${current}' could not be created safely: ${error?.message || error}`);
             }
-            stat = lstatOrAbsent(fsApi, current);
         }
-        assertOwnedSecureDirectory(current, stat, { uid });
     }
 
-    let realDirectory;
-    try { realDirectory = fsApi.realpathSync(current); } catch (_) {
-        throw verifiedFileError(`producer directory '${current}' is unresolvable`);
-    }
-    if (!beneathRoot(pathApi, realRoot, realDirectory)) {
-        throw verifiedFileError(`producer directory '${current}' resolves outside its trusted root`);
-    }
     return current;
 }
 
-// Pins one already-validated regular inode. Missing components return null;
-// every ambiguous or unsafe filesystem state fails closed.
+// Follows normal directory paths and pins the final regular inode. Missing
+// components return null; symlinked files and file replacement are rejected.
 export function openVerifiedRegularFile({
     trustedRoot,
     relativeSegments = [],
@@ -120,18 +87,12 @@ export function openVerifiedRegularFile({
 
     const rootStat = lstatOrAbsent(fsApi, root);
     if (!rootStat) return null;
-    if (!rootStat.isDirectory() || rootStat.isSymbolicLink?.()) {
-        throw verifiedFileError(`verified root '${root}' is not one regular directory`);
-    }
 
     let current = root;
     for (const segment of segments.slice(0, -1)) {
         current = pathApi.join(current, segment);
         const stat = lstatOrAbsent(fsApi, current);
         if (!stat) return null;
-        if (!stat.isDirectory() || stat.isSymbolicLink?.()) {
-            throw verifiedFileError(`verified path component '${segment}' is not one regular directory`);
-        }
     }
 
     const filePath = pathApi.join(current, segments.at(-1));
@@ -139,18 +100,6 @@ export function openVerifiedRegularFile({
     if (!fileStat) return null;
     if (!fileStat.isFile() || fileStat.isSymbolicLink?.()) {
         throw verifiedFileError(`verified file '${filePath}' is not one regular file`);
-    }
-
-    let realRoot;
-    let realFile;
-    try {
-        realRoot = fsApi.realpathSync(root);
-        realFile = fsApi.realpathSync(filePath);
-    } catch (_) {
-        throw verifiedFileError(`verified file '${filePath}' is unresolvable`);
-    }
-    if (!beneathRoot(pathApi, realRoot, realFile)) {
-        throw verifiedFileError(`verified file '${filePath}' resolves outside its trusted root`);
     }
 
     const flags = (fsApi.constants?.O_RDONLY ?? 0) | (fsApi.constants?.O_NOFOLLOW ?? 0);

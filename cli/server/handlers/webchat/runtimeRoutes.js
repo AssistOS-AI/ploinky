@@ -10,6 +10,7 @@ import {
     buildRuntimeKey,
     disposeTab,
     getRuntimeMap,
+    interactionTargetsClient,
     scheduleDisconnectedTabCleanup,
     routeWorkspaceRuntimeOutput,
     serializeInteractionRequestSseEvent,
@@ -155,24 +156,28 @@ export function handleRuntimeRoute({
             return res.end('Too many clients connected to this folder session.');
         }
 
-        const pending = tab.pendingInteraction;
-        if (pageInstanceId && pending?.targetTabId === tabId
-            && pending.targetPageInstanceId
-            && pending.targetPageInstanceId !== pageInstanceId) {
+        for (const pending of tab.pendingInteractions?.values() || []) {
+            if (!pageInstanceId || pending.targetTabId !== tabId
+                || !pending.targetPageInstanceId || pending.targetPageInstanceId === pageInstanceId) continue;
             if (!writeRuntimeInput(tab, `${JSON.stringify({
                 __webchatInteractionResponse: 1,
                 version: 1,
                 id: pending.id,
                 cancelled: true,
+                sourceTabId: tabId,
+                sourcePageInstanceId: pending.targetPageInstanceId,
             })}\n`)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
                 res.writeHead(409); return res.end('Session runtime unavailable.');
             }
-            tab.pendingInteraction = null;
+            tab.pendingInteractions.delete(pending.id);
             writeOrBufferSseEvent(tab, serializeInteractionResolvedSseEvent({
                 id: pending.id,
                 optionId: null,
                 status: 'cancelled',
+                targetTabId: pending.targetTabId,
+                targetPageInstanceId: pending.targetPageInstanceId,
+                ...(pending.targetTaskId ? { targetTaskId: pending.targetTaskId } : {}),
             }));
         }
 
@@ -187,9 +192,18 @@ export function handleRuntimeRoute({
         const connectionId = crypto.randomUUID();
         tab.subscribers.set(connectionId, { res, sid, tabId, pageInstanceId });
         res.write(serializeStartupState(tab.startupState));
-        const runtimeStateSnapshot = serializeRuntimeStateSseEvent(tab.webchatRuntimeState);
+        const selectedRuntimeState = tab.webchatRuntimeStates?.get(tabId) || tab.webchatRuntimeState;
+        const runtimeStateSnapshot = serializeRuntimeStateSseEvent(selectedRuntimeState && {
+            ...selectedRuntimeState,
+            ...(selectedRuntimeState.targetTabId ? { targetTabId: tabId, targetPageInstanceId: pageInstanceId } : {}),
+        });
         if (runtimeStateSnapshot) res.write(runtimeStateSnapshot);
-        const sessionStateSnapshot = serializeSessionStateSseEvent(tab.webchatSessionSnapshot);
+        const selectedSession = tab.webchatSessionSnapshots?.get(tabId) || tab.webchatSessionSnapshot;
+        const sessionStateSnapshot = serializeSessionStateSseEvent(selectedSession && {
+            ...selectedSession,
+            event: 'current',
+            ...(selectedSession.targetTabId ? { targetTabId: tabId, targetPageInstanceId: pageInstanceId } : {}),
+        });
         if (sessionStateSnapshot) res.write(sessionStateSnapshot);
         const taskListSnapshot = serializeTaskListSseEvent(tab.webchatTasks);
         if (taskListSnapshot) res.write(taskListSnapshot);
@@ -203,8 +217,11 @@ export function handleRuntimeRoute({
         if (workspaceFilesSnapshot) res.write(workspaceFilesSnapshot);
         const skillsStateSnapshot = serializeSkillsStateSseEvent(tab.webchatSkillsSnapshot);
         if (skillsStateSnapshot) res.write(skillsStateSnapshot);
-        const interactionSnapshot = serializeInteractionRequestSseEvent(tab.pendingInteraction);
-        if (interactionSnapshot) res.write(interactionSnapshot);
+        for (const interaction of tab.pendingInteractions?.values() || []) {
+            if (!interactionTargetsClient(interaction, tabId, pageInstanceId)) continue;
+            const interactionSnapshot = serializeInteractionRequestSseEvent(interaction);
+            if (interactionSnapshot) res.write(interactionSnapshot);
+        }
 
         let keepaliveTimer = setInterval(() => {
             try { res.write(': keepalive\n\n'); } catch (_) { }
@@ -236,8 +253,10 @@ export function handleRuntimeRoute({
         if (tab.startupState === 'starting') {
             res.writeHead(409); return res.end('Agent startup is still in progress.');
         }
-        if (tab.pendingInteraction) {
-            res.writeHead(409); return res.end('Resolve the active interaction before sending another message.');
+        for (const interaction of tab.pendingInteractions?.values() || []) {
+            if (interactionTargetsClient(interaction, tabId, pageInstanceId)) {
+                res.writeHead(409); return res.end('Resolve the active interaction before sending another message.');
+            }
         }
 
         let body = '';
@@ -276,6 +295,11 @@ export function handleRuntimeRoute({
                 tab.liveMessageCount = (messageIndex ?? 0) + 2;
                 writeOrBufferSseEvent(tab, `event: user-message\ndata: ${JSON.stringify({
                     sourceTabId: tabId,
+                    sourcePageInstanceId: pageInstanceId,
+                    ...(tab.webchatSessionSnapshots?.get(tabId)?.session?.sessionId
+                        || tab.webchatSessionSnapshot?.session?.sessionId
+                        ? { sessionId: (tab.webchatSessionSnapshots?.get(tabId) || tab.webchatSessionSnapshot).session.sessionId }
+                        : {}),
                     ...(messageIndex !== null ? { messageIndex } : {}),
                     message: {
                         role: 'user',
@@ -303,7 +327,15 @@ export function handleRuntimeRoute({
         let body = '';
         req.on('data', chunk => body += chunk.toString());
         req.on('end', () => {
-            if (!writeRuntimeInput(tab, body)) {
+            const control = body === '\x1b' && shouldForwardWebchatEnvelope(parsedUrl, effectiveConfig)
+                ? `${JSON.stringify({
+                    __webchatControl: 1,
+                    type: 'stop',
+                    sourceTabId: String(parsedUrl.searchParams.get('tabId') || '').trim(),
+                    sourcePageInstanceId: pageInstanceIdFrom(parsedUrl),
+                })}\n`
+                : body;
+            if (!writeRuntimeInput(tab, control)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
                 res.writeHead(409); res.end();
                 return;
@@ -356,7 +388,7 @@ export function handleRuntimeRoute({
             const optionId = typeof payload?.optionId === 'string' ? payload.optionId.trim() : '';
             const response = typeof payload?.response === 'string' ? payload.response : null;
             const cancelled = payload?.cancelled === true;
-            const pending = tab.pendingInteraction;
+            const pending = tab.pendingInteractions?.get(interactionId);
             const optionResponse = !cancelled && Boolean(optionId) && response === null;
             const inputResponse = !cancelled && !optionId && response !== null;
             const cancelResponse = cancelled && !optionId && response === null;
@@ -370,9 +402,8 @@ export function handleRuntimeRoute({
                 res.writeHead(409); res.end('Interaction is no longer pending.');
                 return;
             }
-            if (pending.targetPageInstanceId
-                && pending.targetPageInstanceId !== pageInstanceId) {
-                res.writeHead(409); res.end('Interaction belongs to another page instance.');
+            if (!interactionTargetsClient(pending, tabId, pageInstanceId)) {
+                res.writeHead(409); res.end('Interaction belongs to another page or tab.');
                 return;
             }
             if (optionResponse && !pending.options.some((option) => option.id === optionId)) {
@@ -387,17 +418,22 @@ export function handleRuntimeRoute({
                     __webchatInteractionResponse: 1,
                     version: 1,
                     id: interactionId,
+                    sourceTabId: tabId,
+                    sourcePageInstanceId: pageInstanceId,
                     ...(cancelResponse ? { cancelled: true } : (optionResponse ? { optionId } : { response })),
                 })}\n`)) {
                 disposeUnavailableRuntime(tab, runtimeKey, runtimes);
                 res.writeHead(409); res.end('Session runtime unavailable.');
                 return;
             }
-            tab.pendingInteraction = null;
+            tab.pendingInteractions.delete(interactionId);
             const resolution = {
                 id: interactionId,
                 optionId: optionResponse ? optionId : null,
                 status: cancelResponse ? 'cancelled' : 'submitted',
+                ...(pending.targetTabId ? { targetTabId: pending.targetTabId } : {}),
+                ...(pending.targetPageInstanceId ? { targetPageInstanceId: pending.targetPageInstanceId } : {}),
+                ...(pending.targetTaskId ? { targetTaskId: pending.targetTaskId } : {}),
             };
             writeOrBufferSseEvent(tab, serializeInteractionResolvedSseEvent(resolution));
             res.writeHead(204); res.end();

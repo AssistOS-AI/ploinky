@@ -1,6 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import os from 'os';
+import { execFileSync } from 'child_process';
+
+import { readProcessStartIdentity } from '../../sandbox/processIdentity.js';
 
 import { RUNNING_DIR } from '../config.js';
 
@@ -13,6 +17,7 @@ const MAINTENANCE_DIR = path.join(RUNNING_DIR, 'maintenance');
 const WORKSPACE_START_LOCK_PATH = path.join(RUNNING_DIR, 'workspace-start.json');
 const WORKSPACE_START_TTL_MS = 24 * 60 * 60 * 1000;
 const LOCK_STALE_GRACE_MS = 5_000;
+const OWNED_WORKSPACE_LEASES = new WeakSet();
 
 function lockPathFor(containerName) {
     // Direct replacement candidates use an immutable physical name so the
@@ -33,8 +38,43 @@ function isProcessAlive(pid) {
         process.kill(numericPid, 0);
         return true;
     } catch (error) {
-        return error?.code === 'EPERM';
+        return error?.code !== 'ESRCH';
     }
+}
+
+// A PID is meaningful only within the same boot and PID namespace. In
+// particular, a persisted workspace may outlive the Box that wrote its lease.
+function readWorkspaceOwnerIdentity(pid) {
+    let scope = '';
+    try {
+        if (process.platform === 'linux') {
+            const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+            const pidNamespace = fs.readlinkSync('/proc/self/ns/pid');
+            if (bootId && pidNamespace) scope = JSON.stringify(['linux', bootId, pidNamespace]);
+        } else if (process.platform === 'darwin') {
+            const bootTime = execFileSync('/usr/sbin/sysctl', ['-n', 'kern.boottime'], {
+                encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1_000,
+            }).trim();
+            if (bootTime) scope = JSON.stringify(['darwin', os.hostname(), bootTime]);
+        }
+    } catch (_) {}
+    return { scope, startIdentity: readProcessStartIdentity(Number(pid)) };
+}
+
+function workspaceOwnerIsActive(lock) {
+    // Old leases have no birth identity. A live legacy PID remains protected;
+    // only exact Box destruction can safely retire it across Box generations.
+    if (!lock?.ownerIdentity) return isProcessAlive(lock?.ownerPid);
+    const expected = lock.ownerIdentity;
+    const current = readWorkspaceOwnerIdentity(lock.ownerPid);
+    if (!expected.scope || !current.scope || expected.scope !== current.scope) {
+        // The owner may still be running in another namespace or on another
+        // host. Neither local PID absence nor expiry proves that lease stale.
+        return true;
+    }
+    if (!isProcessAlive(lock.ownerPid)) return false;
+    if (!expected.startIdentity || !current.startIdentity) return true;
+    return expected.startIdentity === current.startIdentity;
 }
 
 function lockSnapshot(filePath) {
@@ -95,7 +135,7 @@ function inspectWorkspaceStartLock(attempt = 0) {
     }
     const expiresAtMs = Date.parse(lock?.expiresAt || '');
     const expired = Number.isFinite(expiresAtMs) ? expiresAtMs <= Date.now() : true;
-    const ownerAlive = isProcessAlive(lock?.ownerPid);
+    const ownerAlive = workspaceOwnerIsActive(lock);
     if (ownerAlive) {
         return { active: true, stale: false, renewalOverdue: expired, lock };
     }
@@ -123,6 +163,7 @@ function createWorkspaceMutationLease({
     const lock = {
         operation,
         ownerPid: process.pid,
+        ownerIdentity: readWorkspaceOwnerIdentity(process.pid),
         token: randomUUID(),
         startedAt: new Date(now).toISOString(),
         expiresAt: new Date(now + ttlMs).toISOString(),
@@ -137,7 +178,20 @@ function createWorkspaceMutationLease({
         }
         throw error;
     }
+    OWNED_WORKSPACE_LEASES.add(lock);
     return lock;
+}
+
+export function assertWorkspaceMutationLease(lease, { runningDir = RUNNING_DIR } = {}) {
+    const current = lockSnapshot(WORKSPACE_START_LOCK_PATH)?.lock;
+    if (!OWNED_WORKSPACE_LEASES.has(lease)
+        || path.resolve(runningDir) !== path.resolve(RUNNING_DIR)
+        || current?.token !== lease.token || current?.ownerPid !== process.pid) {
+        const error = new Error('workspace mutation requires its exact live workspace lease');
+        error.code = 'PLOINKY_WORKSPACE_MUTATION_CAPABILITY_REQUIRED';
+        throw error;
+    }
+    return lease;
 }
 
 async function acquireWorkspaceMutationLease({
@@ -182,7 +236,7 @@ async function withWorkspaceMutationLease(options, fn) {
     const lease = await acquireWorkspaceMutationLease(options);
     let callbackError = null;
     try {
-        return await fn();
+        return await fn(lease);
     } catch (error) {
         callbackError = error;
         throw error;
@@ -235,7 +289,9 @@ function renewWorkspaceMutationLease(lock, { ttlMs = WORKSPACE_START_TTL_MS } = 
 
 function releaseWorkspaceStartLock(lock) {
     if (!lock?.token) return false;
-    return removeSnapshot(lockSnapshot(WORKSPACE_START_LOCK_PATH), lock.token);
+    const removed = removeSnapshot(lockSnapshot(WORKSPACE_START_LOCK_PATH), lock.token);
+    if (removed) OWNED_WORKSPACE_LEASES.delete(lock);
+    return removed;
 }
 
 const releaseWorkspaceMutationLease = releaseWorkspaceStartLock;

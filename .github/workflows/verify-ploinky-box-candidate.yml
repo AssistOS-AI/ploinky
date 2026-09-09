@@ -8,12 +8,12 @@ on:
         required: true
         type: string
       smoke_graph_revisions_json:
-        description: Exact seven-repository revision map as JSON
+        description: Exact five-repository revision map as JSON
         required: true
         type: string
     secrets:
       PLOINKY_CANDIDATE_REPOSITORY_TOKEN:
-        description: Read-only token for the seven smoke-graph repositories
+        description: Read-only token for the five smoke-graph repositories
         required: true
   workflow_dispatch:
     inputs:
@@ -22,7 +22,7 @@ on:
         required: true
         type: string
       smoke_graph_revisions_json:
-        description: Exact seven-repository revision map as JSON
+        description: Exact five-repository revision map as JSON
         required: true
         type: string
 
@@ -50,7 +50,7 @@ jobs:
       SMOKE_GRAPH_ARGS_JSON: '["start","AchillesIDE/explorer","19090"]'
       SMOKE_GRAPH_REVISIONS_JSON: ${{ inputs.smoke_graph_revisions_json }}
       SMOKE_GRAPH_REPOSITORIES_JSON: >-
-        {"AssistOSExplorer":"${{ github.workspace }}/candidate-repositories/AssistOSExplorer","webmeetInfra":"${{ github.workspace }}/candidate-repositories/webmeetInfra","UmamiAgent":"${{ github.workspace }}/candidate-repositories/UmamiAgent","AchillesCLI":"${{ github.workspace }}/candidate-repositories/AchillesCLI","proxies":"${{ github.workspace }}/candidate-repositories/proxies","basic":"${{ github.workspace }}/candidate-repositories/basic","container-image-builds":"${{ github.workspace }}/candidate-repositories/container-image-builds"}
+        {"AssistOSExplorer":"${{ github.workspace }}/candidate-repositories/AssistOSExplorer","UmamiAgent":"${{ github.workspace }}/candidate-repositories/UmamiAgent","AchillesCLI":"${{ github.workspace }}/candidate-repositories/AchillesCLI","proxies":"${{ github.workspace }}/candidate-repositories/proxies","container-image-builds":"${{ github.workspace }}/candidate-repositories/container-image-builds"}
       SMOKE_GRAPH_EDGE_DESIRED_FILE: ${{ runner.temp }}/ploinky-box-smoke-desired-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.host }}.json
     steps:
       - name: Check out Ploinky candidate
@@ -64,15 +64,6 @@ jobs:
           repository: AssistOS-AI/AssistOSExplorer
           ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).AssistOSExplorer }}
           path: candidate-repositories/AssistOSExplorer
-          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
-          persist-credentials: false
-
-      - name: Check out webmeetInfra
-        uses: actions/checkout@v4
-        with:
-          repository: AssistOS-AI/webmeetInfra
-          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).webmeetInfra }}
-          path: candidate-repositories/webmeetInfra
           token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
           persist-credentials: false
 
@@ -103,15 +94,6 @@ jobs:
           token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
           persist-credentials: false
 
-      - name: Check out basic
-        uses: actions/checkout@v4
-        with:
-          repository: AssistOS-AI/basic
-          ref: ${{ fromJSON(inputs.smoke_graph_revisions_json).basic }}
-          path: candidate-repositories/basic
-          token: ${{ secrets.PLOINKY_CANDIDATE_REPOSITORY_TOKEN }}
-          persist-credentials: false
-
       - name: Check out container-image-builds
         uses: actions/checkout@v4
         with:
@@ -131,10 +113,11 @@ jobs:
         run: |
           set -euo pipefail
           node --input-type=module -e '
+            import { SMOKE_GRAPH_REPOSITORIES } from "./ploinky-box/smoke/graph.mjs";
             const digest = process.env.PLOINKY_BOX_CANDIDATE_DIGEST;
             if (!/^sha256:[a-f0-9]{64}$/.test(digest || "")) process.exit(2);
             const revisions = JSON.parse(process.env.SMOKE_GRAPH_REVISIONS_JSON || "null");
-            const expected = ["AchillesCLI","AssistOSExplorer","UmamiAgent","basic","container-image-builds","proxies","webmeetInfra"].sort();
+            const expected = [...SMOKE_GRAPH_REPOSITORIES].sort();
             if (JSON.stringify(Object.keys(revisions || {}).sort()) !== JSON.stringify(expected)) process.exit(3);
             if (Object.values(revisions).some((value) => !/^[a-f0-9]{40}$/.test(value))) process.exit(4);
             const args = JSON.parse(process.env.SMOKE_GRAPH_ARGS_JSON || "null");
