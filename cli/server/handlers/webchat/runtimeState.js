@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { normalizeTaskLiveSession } from '../../webchat/taskLiveSession.js';
 
 const STREAM_RECONNECT_GRACE_MS = 120000;
 const MAX_PENDING_SSE_EVENTS = 200;
@@ -130,6 +131,7 @@ function normalizeTask(raw, { includeFinalOutputRanges = true } = {}) {
         description: String(raw.description || '').replace(/\s+/g, ' ').trim().slice(0, 240),
         status: TASK_STATUSES.has(raw.status) ? raw.status : 'ongoing',
         remoteStatus: String(raw.remoteStatus || '').slice(0, 80),
+        ...(normalizeTaskLiveSession(raw.liveSession) ? { liveSession: normalizeTaskLiveSession(raw.liveSession) } : {}),
         createdAt: normalizeTimestamp(raw.createdAt),
         updatedAt: normalizeTimestamp(raw.updatedAt),
         executionStartedAt: normalizeTimestamp(raw.executionStartedAt),

@@ -203,6 +203,9 @@ function highlightedTaskLogFragments(text) {
 }
 
 function linkedTaskLogFragments(text) {
+    // Service paths in runtime logs resolve against the browser's actual Router origin.
+    text = text.replace(/(^|\s)(\/base-agent-additional-server\/[A-Za-z0-9/_-]+)(?=\s|$)/gu,
+        (_match, prefix, path) => `${prefix}[${path}](${path})`);
     const fragments = [];
     let cursor = 0;
     let found = false;
@@ -218,7 +221,7 @@ function linkedTaskLogFragments(text) {
         link.target = '_blank';
         link.rel = 'noopener noreferrer';
         link.dataset.wcLink = 'true';
-        link.textContent = match[1];
+        link.textContent = match[1] === match[2] ? href : match[1];
         fragments.push(link);
         cursor = match.index + match[0].length;
         found = true;

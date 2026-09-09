@@ -49,7 +49,7 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
     globalThis.document = {
         body: {
             dataset: {
-                agentQuery: 'robot=analyst&unrelated=not-forwarded',
+                agentQuery: 'robot=analyst&sessionId=stale-url-session&unrelated=not-forwarded',
                 workdir: '/workspace/project',
             },
         },
@@ -90,7 +90,7 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
                 jsonrpc: '2.0',
                 id: payload.id,
                 result: { tools: [{ name: 'list_achilles_cli_commands', inputSchema: {
-                    type: 'object', properties: { robot: { type: 'string' }, dir: { type: 'string' } },
+                    type: 'object', properties: { robot: { type: 'string' }, dir: { type: 'string' }, sessionId: { type: 'string' } },
                 } }] },
             });
         }
@@ -122,6 +122,7 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         const logs = [];
         const provider = createSlashCommandsProvider({
             agentName: 'achilles-cli',
+            getCatalogArguments: () => ({ sessionId: 'active-conversation' }),
             dlog: (...args) => logs.push(args),
         });
         await provider.refresh();
@@ -133,6 +134,7 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
         const catalogRequest = requests.find(({ payload }) => payload.method === 'tools/call');
         assert.equal(catalogRequest.payload.params.arguments.dir, '/workspace/project');
         assert.equal(catalogRequest.payload.params.arguments.robot, 'analyst');
+        assert.equal(catalogRequest.payload.params.arguments.sessionId, 'active-conversation');
         assert.equal(catalogRequest.payload.params.arguments.unrelated, undefined);
         assert.deepEqual(
             provider.getSuggestions('/model anthropic/claude', '/model anthropic/claude'.length)

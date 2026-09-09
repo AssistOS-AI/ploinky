@@ -540,6 +540,7 @@ export function createComposerAutocomplete({ cmdInput }, {
             });
         });
         await Promise.all(refreshes);
+        if (active) onInputChange();
     }
 
     function destroy() {

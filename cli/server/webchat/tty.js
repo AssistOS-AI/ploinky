@@ -1,5 +1,6 @@
 import { buildExecArgs } from '../../sandbox/docker/index.js';
 import { spawn } from 'child_process';
+import { createStartupOutputFilter } from './startupOutput.js';
 
 import fs from 'fs';
 import os from 'os';
@@ -356,8 +357,8 @@ function createLocalTTYFactory({ workdir, command, startupProtocol = false }) {
                 }
                 ptyProc.stdout.setEncoding('utf8');
                 ptyProc.stderr.setEncoding('utf8');
-                ptyProc.stdout.on('data', emitOutput);
-                ptyProc.stderr.on('data', emitOutput);
+                ptyProc.stdout.on('data', startupProtocol ? createStartupOutputFilter(emitOutput) : emitOutput);
+                ptyProc.stderr.on('data', startupProtocol ? createStartupOutputFilter(emitOutput) : emitOutput);
                 ptyProc.stdin.on('error', (e) => {
                     log('local child stdin error', e?.message || e);
                 });

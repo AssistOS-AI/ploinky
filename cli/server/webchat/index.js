@@ -122,6 +122,7 @@ const sidePanelApi = createSidePanel({
 });
 
 let sessionController = null;
+let modelCatalogSessionKey = '';
 let taskController = null;
 let skillsController = null;
 let interactionController = null;
@@ -202,7 +203,17 @@ network = createNetwork({
     hideTypingIndicator: messages.hideTypingIndicator,
     markUserInputSent: messages.markUserInputSent,
     addRemoteUserMessage: (message, payload) => sessionController?.addRemoteUserMessage(message, payload),
-    onSessionState: (payload) => sessionController?.handleSessionState(payload),
+    onSessionState: (payload) => {
+        sessionController?.handleSessionState(payload);
+        const selected = sessionController?.getCurrentSession()?.sessionId;
+        if (selected && selected === payload.summary?.sessionId) {
+            const key = `${selected}:${payload.session?.engine?.backend || ''}`;
+            if (key !== modelCatalogSessionKey) {
+                modelCatalogSessionKey = key;
+                void composerAutocomplete?.refresh().catch((error) => dlog(error));
+            }
+        }
+    },
     onTaskUpdate: (payload, { visibleCommand = '' } = {}) => {
         taskController?.handleUpdate(payload);
         sidePanelApi.postTaskUpdate(payload);
@@ -287,6 +298,10 @@ const mentionHighlighter = createComposerMentionHighlighter({ cmdInput });
 
 const slashProvider = createSlashCommandsProvider({
     agentName: dom.agentName,
+    getCatalogArguments: () => {
+        const sessionId = sessionController?.getCurrentSession()?.sessionId;
+        return sessionId ? { sessionId } : {};
+    },
     dlog
 });
 const workspacePathsProvider = createWorkspacePathsProvider({

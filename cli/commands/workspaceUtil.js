@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { CLI_OUTPUT_BOUNDARY } from '../server/webchat/startupOutput.js';
 import path from 'path';
 import net from 'net';
 import { randomUUID } from 'node:crypto';
@@ -2672,6 +2673,8 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
     admitRuntimeManifest = admitDirectAgentRuntimeManifest,
     notifyCliReady = () => {
       if (startupControlFd === null) return;
+      fs.writeSync(1, CLI_OUTPUT_BOUNDARY);
+      fs.writeSync(2, CLI_OUTPUT_BOUNDARY);
       // This private launcher pipe is not part of the agent's stdout protocol.
       fs.writeSync(startupControlFd, JSON.stringify({ version: 1, state: 'ready' }) + '\n');
     },

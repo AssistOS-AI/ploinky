@@ -3986,6 +3986,10 @@ button.wa-upload-directory-entry.folder:hover {
     color: var(--wa-accent-hover);
 }
 
+.wa-task-log-link[hidden] {
+    display: none;
+}
+
 .wa-task-summary-actions {
     display: flex;
     align-items: center;

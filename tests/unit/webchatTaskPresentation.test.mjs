@@ -288,6 +288,15 @@ test('task log renderer turns a safe live-session Markdown link into a side-pane
     assert.equal(link.textContent, 'Open live desktop');
     assert.equal(link.href, 'http://localhost:8080/robot/session/');
     assert.equal(link.dataset.wcLink, 'true');
+    const sessionPath = '/base-agent-additional-server/example/3001/api/robots/analyst/session/';
+    for (const origin of ['http://localhost:8080', 'https://workspace.example']) {
+        globalThis.window.location.origin = origin;
+        renderTaskLog(container, `RoboTeam live session: ${sessionPath}`);
+        const live = container.children[0].children.find((child) => child.tagName === 'A');
+        assert.equal(live.textContent, origin + sessionPath);
+        assert.equal(live.href, origin + sessionPath);
+        assert.equal(live.dataset.wcLink, 'true');
+    }
 });
 
 test('task log renderer leaves unsafe Markdown URLs inert', (t) => {
@@ -339,6 +348,7 @@ test('chat task summary streams inline logs and collapses to its metadata header
             replaceChildren(...children) { this.children = children; },
             querySelector() { return null; },
             setAttribute(name, value) { attributes.set(name, String(value)); },
+            removeAttribute(name) { attributes.delete(name); delete this[name]; },
             getAttribute(name) { return attributes.get(name); },
             addEventListener(type, listener) { listeners.set(type, listener); },
         };
@@ -404,6 +414,11 @@ test('chat task summary streams inline logs and collapses to its metadata header
     assert.equal(actionButton.hidden, false);
     assert.equal(actionButton.textContent, 'Stop');
     assert.equal(loadRequests, 1);
+
+    assert.equal(bubble.children[0].children[1].children[1].children.length, 2);
+    subscriber({ task: { ...task, liveSession: { mode: 'browser', url: '/example/session/', label: 'Translated' } },
+        ready: true, log: 'first message', logLoaded: true });
+    assert.equal(bubble.children[0].children[1].children[1].children.length, 2);
 
     actionButton.onclick({ preventDefault() {}, stopPropagation() {} });
     assert.deepEqual(actions, [['stop', task.id]]);
