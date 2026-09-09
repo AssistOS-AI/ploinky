@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { REPOS_DIR } from '../utils/config.js';
 import * as reposSvc from '../utils/repos.js';
+import { runGitCommand, sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 
 export const AGENT_SKILL_TARGETS = Object.freeze({
     'claude-code': '.claude/skills',
@@ -75,7 +77,7 @@ function parseSkillsManifest(rawPath) {
     try {
         parsed = JSON.parse(rawManifest || '');
     } catch (err) {
-        throw new Error(`Invalid JSON in skills manifest '${rawPath}': ${err?.message || String(err)}`);
+        throw new Error(sanitizeGitDiagnostic(`Invalid JSON in skills manifest '${rawPath}': ${err?.message || String(err)}`));
     }
 
     if (!Array.isArray(parsed)) {
@@ -85,13 +87,109 @@ function parseSkillsManifest(rawPath) {
     return parsed.map((entry, index) => normalizeManifestEntry(entry, index, rawPath));
 }
 
+function normalizeRepoIdentity(rawUrl, basePath) {
+    const value = String(rawUrl).trim();
+    const stripGitSuffix = text => text.replace(/\/+$/, '').replace(/\.git$/, '');
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value)) {
+        const url = new URL(value);
+        if (url.protocol !== 'file:') {
+            // Credentials do not change HTTP repository identity. Keep SSH users,
+            // ports, protocol and path case because they can identify another repo.
+            const user = url.protocol === 'ssh:' ? `${url.username}@` : '';
+            return `${url.protocol}//${user}${url.host}${stripGitSuffix(url.pathname)}${url.search}`;
+        }
+        return normalizeRepoIdentity(fileURLToPath(url), basePath);
+    }
+    const scp = value.match(/^([^/@:]+@)?([^/:]+):(.+)$/);
+    if (scp) return `${scp[1] || ''}${scp[2].toLowerCase()}:${stripGitSuffix(scp[3])}`;
+
+    const resolvedPath = path.resolve(basePath, value);
+    try {
+        const stat = fs.statSync(resolvedPath);
+        return `local:${stat.dev}:${stat.ino}`;
+    } catch (_) {
+        // Local repo.git and repo may be distinct directories: do not strip a
+        // local suffix or lowercase paths when checking whether a cache is safe.
+        return resolvedPath;
+    }
+}
+
+function readCachedRepoSource(repoPath) {
+    const urls = String(runGitCommand(['-C', repoPath, 'config', '--get-all', 'remote.origin.url'], { stdio: 'pipe' })).trim().split('\n');
+    if (urls.length !== 1 || !urls[0]) {
+        throw new Error(`Cached origin at '${repoPath}' must have exactly one fetch URL. Inspect its remote.origin.url configuration before retrying.`);
+    }
+    return urls[0];
+}
+
+function skillSourceError(manifestPath, entry, error) {
+    const repoPath = path.join(REPOS_DIR, entry.name);
+    return new Error(sanitizeGitDiagnostic(
+        `Skills manifest '${manifestPath}', source repo '${entry.name}' ` +
+        `(URL '${entry.url}', requested branch '${entry.branch || '(unspecified; cached branch or remote default)'}', ` +
+        `cache '${repoPath}'): ${error?.message || String(error)}`
+    ));
+}
+
+function registerManifestCacheBranch(entry, cacheBranches) {
+    const repoPath = path.resolve(REPOS_DIR, entry.name);
+    let cacheIdentity;
+    try {
+        const stat = fs.statSync(repoPath);
+        // Filesystem identity also catches symlink aliases and case variants on
+        // case-insensitive filesystems, where distinct names share one checkout.
+        cacheIdentity = `existing:${stat.dev}:${stat.ino}`;
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        cacheIdentity = `missing:${repoPath}`;
+    }
+    const previous = cacheBranches.get(cacheIdentity);
+    if (previous && previous.branch !== entry.branch) {
+        throw new Error(
+            `Manifest entries '${previous.name}' and '${entry.name}' share cache '${repoPath}' with different branches. ` +
+            'Use a distinct name for each branch that resolves to a separate cache directory.'
+        );
+    }
+    cacheBranches.set(cacheIdentity, entry);
+}
+
 function ensureManifestRepoCached(entry) {
     const repoPath = path.join(REPOS_DIR, entry.name);
-    if (fs.existsSync(repoPath)) {
-        reposSvc.updateRepo(entry.name, { stdio: 'inherit' });
-        return repoPath;
+    if (entry.branch) {
+        runGitCommand(['check-ref-format', '--branch', entry.branch], { stdio: 'pipe' });
     }
-    return reposSvc.installRepo(entry.url, entry.name, entry.branch, { stdio: 'inherit' }).path;
+    if (fs.existsSync(repoPath)) {
+        if (!reposSvc.isGitRepository(repoPath)) {
+            throw new Error(`Cached source is not a Git repository. Inspect '${repoPath}' and move it aside before retrying.`);
+        }
+        const actualUrl = readCachedRepoSource(repoPath);
+        if (normalizeRepoIdentity(actualUrl, repoPath) !== normalizeRepoIdentity(entry.url, process.cwd())) {
+            throw new Error(
+                `Cached origin URL '${actualUrl}' does not match requested URL '${entry.url}'. ` +
+                `Use a different manifest name for the requested source, or inspect and move aside cache '${repoPath}' before retrying.`
+            );
+        }
+        if (entry.branch) {
+            const result = reposSvc.ensureRepoOnBranch(entry.name, {
+                branch: entry.branch,
+                resetRepos: false,
+                fallback: 'fail',
+                fetchRequestedBranch: true,
+                stdio: 'inherit',
+            });
+            if (result.branch !== entry.branch) {
+                throw new Error(`Could not select requested branch '${entry.branch}' (actual '${result.branch || 'unknown'}').`);
+            }
+        }
+        reposSvc.updateRepo(entry.name, { branch: entry.branch, stdio: 'inherit' });
+    } else {
+        reposSvc.installRepo(entry.url, entry.name, entry.branch, { stdio: 'inherit' });
+    }
+    const actualBranch = String(runGitCommand(['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], { stdio: 'pipe' })).trim();
+    if (entry.branch && actualBranch !== entry.branch) {
+        throw new Error(`Expected branch '${entry.branch}', but cached source is on '${actualBranch}'.`);
+    }
+    return { repoPath, branch: actualBranch, source: sanitizeGitDiagnostic(readCachedRepoSource(repoPath)) };
 }
 
 function copySkillTree(sourcePath, destinationPath) {
@@ -198,41 +296,61 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
     const sourceRepos = [];
     const skillConflicts = [];
     const skillSource = new Map();
+    const cacheBranches = new Map();
 
     for (const entry of entries) {
-        const repoPath = ensureManifestRepoCached(entry);
-        const skillsRoot = path.join(repoPath, 'skills');
-        if (!fs.existsSync(skillsRoot) || !fs.statSync(skillsRoot).isDirectory()) {
-            throw new Error(`No skills/ folder in source repo '${entry.name}' (expected ${skillsRoot}).`);
+        try {
+            registerManifestCacheBranch(entry, cacheBranches);
+        } catch (error) {
+            throw skillSourceError(manifestPath, entry, error);
         }
-        const availableSkills = listSkillDirectories(skillsRoot);
-        const available = new Set(availableSkills);
-        for (const skill of entry.skills) {
-            if (!available.has(skill)) {
-                throw new Error(`Skill '${skill}' is listed for repo '${entry.name}' but was not found under ${skillsRoot}.`);
+    }
+
+    for (const entry of entries) {
+        try {
+            // Recheck after earlier sources have been cloned: a previously absent
+            // name can now resolve to the same checkout through a filesystem alias.
+            registerManifestCacheBranch(entry, cacheBranches);
+            const { repoPath, branch, source } = ensureManifestRepoCached(entry);
+            registerManifestCacheBranch(entry, cacheBranches);
+            const skillsRoot = path.join(repoPath, 'skills');
+            if (!fs.existsSync(skillsRoot) || !fs.statSync(skillsRoot).isDirectory()) {
+                throw new Error(`No skills/ folder in source repo '${entry.name}' (expected ${skillsRoot}).`);
             }
-            const previousSource = skillSource.get(skill);
-            if (previousSource) {
-                skillConflicts.push({
+            const availableSkills = listSkillDirectories(skillsRoot);
+            const available = new Set(availableSkills);
+            for (const skill of entry.skills) {
+                if (!available.has(skill)) {
+                    const choices = availableSkills.slice(0, 20).join(', ') || '(none)';
+                    const remainder = availableSkills.length > 20 ? ` (and ${availableSkills.length - 20} more)` : '';
+                    throw new Error(`Skill '${skill}' was not found under '${skillsRoot}'. Available skills: ${choices}${remainder}. Update the manifest to request an available skill, or restore it in the source repository.`);
+                }
+                const previousSource = skillSource.get(skill);
+                if (previousSource) {
+                    skillConflicts.push({
+                        skill,
+                        previousSource: previousSource.source,
+                        chosenSource: entry.name,
+                    });
+                }
+                skillSource.set(skill, {
+                    source: entry.name,
+                    repoPath,
                     skill,
-                    previousSource: previousSource.source,
-                    chosenSource: entry.name,
+                    entry,
                 });
             }
-            skillSource.set(skill, {
-                source: entry.name,
+            sourceRepos.push({
+                source,
+                name: entry.name,
+                branch,
                 repoPath,
-                skill,
+                skills: entry.skills,
+                availableSkills,
             });
+        } catch (error) {
+            throw skillSourceError(manifestPath, entry, error);
         }
-        sourceRepos.push({
-            source: entry.url,
-            name: entry.name,
-            branch: entry.branch,
-            repoPath,
-            skills: entry.skills,
-            availableSkills,
-        });
     }
 
     const incomingSkills = Array.from(skillSource.keys());
@@ -242,7 +360,11 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
     fs.mkdirSync(agentsSkillsDir, { recursive: true });
 
     for (const [skill, source] of skillSource.entries()) {
-        copySkill(path.join(source.repoPath, 'skills', skill), path.join(agentsSkillsDir, skill));
+        try {
+            copySkill(path.join(source.repoPath, 'skills', skill), path.join(agentsSkillsDir, skill));
+        } catch (error) {
+            throw skillSourceError(manifestPath, source.entry, error);
+        }
     }
 
     const claudeLink = ensureClaudeSymlink(destRoot);

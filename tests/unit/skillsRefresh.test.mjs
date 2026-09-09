@@ -89,6 +89,51 @@ function runAggregateUpdateChild(workspaceRoot, body) {
             execFileSync('git', ['commit', '-m', 'initial'], { cwd: repoPath, stdio: 'ignore' });
         }
 
+        function cloneRepo(sourcePath, destinationPath) {
+            mkdir(path.dirname(destinationPath));
+            execFileSync('git', ['clone', '--quiet', sourcePath, destinationPath], { stdio: 'ignore' });
+        }
+
+        function commitFile(repoPath, relativePath, content) {
+            writeFile(path.join(repoPath, relativePath), content);
+            execFileSync('git', ['add', relativePath], { cwd: repoPath, stdio: 'ignore' });
+            execFileSync('git', ['commit', '-m', 'advance fixture'], { cwd: repoPath, stdio: 'ignore' });
+            return String(execFileSync('git', ['rev-parse', 'HEAD'], {
+                cwd: repoPath, encoding: 'utf8',
+            })).trim();
+        }
+
+        function readHead(repoPath) {
+            return String(execFileSync('git', ['rev-parse', 'HEAD'], {
+                cwd: repoPath, encoding: 'utf8',
+            })).trim();
+        }
+
+        async function captureUpdate(operation) {
+            const stdout = [];
+            const stderr = [];
+            const original = { log: console.log, error: console.error, warn: console.warn };
+            console.log = (...values) => stdout.push(values.map(String).join(' '));
+            console.error = console.warn = (...values) => stderr.push(values.map(String).join(' '));
+            try {
+                return { result: await operation(), stdout, stderr };
+            } finally {
+                Object.assign(console, original);
+            }
+        }
+
+        function assertFinalFailureDetails(stderr, failures) {
+            const summaryIndex = stderr.lastIndexOf(
+                'Update completed with ' + failures.length + ' error(s):',
+            );
+            assert.notEqual(summaryIndex, -1, 'a nonfatal final error summary is logged');
+            const summary = stderr.slice(summaryIndex + 1).join('\\n');
+            for (const failure of failures) {
+                assert.ok(summary.includes(failure.repoName), 'summary identifies ' + failure.repoName);
+                assert.ok(summary.includes(failure.message), 'summary retains the underlying error');
+            }
+        }
+
         function shellQuotePath(filePath) {
             return '"' + filePath.replace(/["\\\\$]/g, '\\\\$&') + '"';
         }
@@ -181,7 +226,7 @@ function runAggregateUpdateChild(workspaceRoot, body) {
                 });
             }
 
-            return { repoName, installedRepoPath, defaultSkillsRepoPath };
+            return { repoName, installedRepoPath, sourceRepoPath, defaultSkillsRepoPath };
         }
 
         function assertDefaultSkillsSummary(summary, repoName) {
@@ -616,7 +661,7 @@ test('aggregate update commands return default skill summaries after refreshing 
                 'SKILL.md',
             );
 
-            const ploinkyResult = await updatePloinkyRepos();
+            const ploinkyResult = await updatePloinkyRepos({ interactiveSession: true });
 
             assert.equal(ploinkyResult.failed.length, 0);
             assertDefaultSkillsSummary(ploinkyResult.defaultSkills, fixture.repoName);
@@ -640,28 +685,215 @@ test('aggregate update commands return default skill summaries after refreshing 
     }
 });
 
-test('updatePloinkyRepos surfaces default skill failures in aggregate errors', () => {
-    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-aggregate-default-skills-failure-'));
+for (const command of ['updatePloinkyRepos', 'updateAllRepos']) {
+    const invocation = command === 'updatePloinkyRepos'
+        ? 'updatePloinkyRepos({ interactiveSession: true })'
+        : 'updateAllRepos(workspaceRoot, { interactiveSession: true })';
+
+    test(command + ' logs default skill failures and continues refreshing other sources', () => {
+        const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-aggregate-default-skills-failure-'));
+
+        try {
+            runAggregateUpdateChild(workspaceRoot, String.raw`
+                const fixture = setupAggregateRepoFixture({ defaultSkillsHasSkills: false });
+                const { result, stderr } = await captureUpdate(() => ${invocation});
+
+                assert.equal(result.failed.length, 1);
+                assert.equal(result.failed[0].repoName, 'default skills ' + fixture.repoName);
+                assert.match(result.failed[0].message, /No skills\/ folder in repo 'AchillesCopilotBasicSkills'/);
+                assert.equal(result.defaultSkills.failed.length, 1);
+                assert.equal(result.defaultSkills.refreshed.filter(entry => entry.repoName === fixture.repoName).length, 2);
+                assertFinalFailureDetails(stderr, result.failed);
+                assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'README.md')), true);
+                assert.equal(
+                    fs.existsSync(path.join(fixture.installedRepoPath, '.agents', 'skills', 'defaultSkill', 'SKILL.md')),
+                    false,
+                );
+                for (const skillName of ['documentationSkill', 'ploinkySkill']) {
+                    assert.equal(fs.existsSync(path.join(
+                        fixture.installedRepoPath, '.agents', 'skills', skillName, 'SKILL.md',
+                    )), true, 'later default source installed ' + skillName);
+                }
+            `);
+        } finally {
+            fs.rmSync(workspaceRoot, { recursive: true, force: true });
+        }
+    });
+
+    test(command + ' continues after a managed repository pull fails', () => {
+        const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-managed-update-continue-'));
+
+        try {
+            runAggregateUpdateChild(workspaceRoot, String.raw`
+                const fixture = setupAggregateRepoFixture();
+                const failedRepoName = 'AAFailedManaged';
+                const laterRepoName = 'ZZLaterManaged';
+                const failedRepoPath = path.join(REPOS_DIR, failedRepoName);
+                const laterRepoPath = path.join(REPOS_DIR, laterRepoName);
+                cloneRepo(fixture.sourceRepoPath, failedRepoPath);
+                cloneRepo(fixture.sourceRepoPath, laterRepoPath);
+                execFileSync('git', ['checkout', '--detach', '--quiet'], {
+                    cwd: failedRepoPath, stdio: 'ignore',
+                });
+                const oldHead = readHead(laterRepoPath);
+                const newHead = commitFile(fixture.sourceRepoPath, 'upstream.txt', 'updated upstream');
+                assert.notEqual(newHead, oldHead);
+
+                const { result, stdout, stderr } = await captureUpdate(() => ${invocation});
+
+                assert.equal(result.failed.length, 1);
+                assert.equal(result.failed[0].repoName, failedRepoName);
+                assert.match(result.failed[0].message, /git .*pull .*exited with status [1-9]/);
+                assert.match(result.failed[0].message, /not currently on a branch/);
+                assert.equal(readHead(failedRepoPath), oldHead);
+                assert.equal(readHead(laterRepoPath), newHead, 'a later managed checkout advances');
+                assert.ok(stdout.includes('  ✓ ' + laterRepoName));
+                assertFinalFailureDetails(stderr, result.failed);
+            `);
+        } finally {
+            fs.rmSync(workspaceRoot, { recursive: true, force: true });
+        }
+    });
+}
+
+test('updateAllRepos continues after a workspace pull fails and retains its error details', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-workspace-update-continue-'));
 
     try {
-        runAggregateUpdateChild(workspaceRoot, `
-            const fixture = setupAggregateRepoFixture({ defaultSkillsHasSkills: false });
+        runAggregateUpdateChild(workspaceRoot, String.raw`
+            const fixture = setupAggregateRepoFixture();
+            const failedRepoName = 'aa-workspace-failure';
+            const failedRepoPath = path.join(workspaceRoot, failedRepoName);
+            const laterRepoPath = path.join(workspaceRoot, 'zz-workspace-success');
+            cloneRepo(fixture.sourceRepoPath, failedRepoPath);
+            cloneRepo(fixture.sourceRepoPath, laterRepoPath);
+            execFileSync('git', ['checkout', '--detach', '--quiet'], {
+                cwd: failedRepoPath, stdio: 'ignore',
+            });
+            const oldHead = readHead(laterRepoPath);
+            const newHead = commitFile(fixture.sourceRepoPath, 'upstream.txt', 'updated upstream');
 
-            await assert.rejects(
-                () => updatePloinkyRepos(),
-                (err) => {
-                    assert.match(
-                        err.message,
-                        new RegExp('Failed to update 1 repository\\\\(s\\\\): default skills ' + fixture.repoName),
-                    );
-                    return true;
-                },
-            );
-            assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'README.md')), true);
-            assert.equal(
-                fs.existsSync(path.join(fixture.installedRepoPath, '.agents', 'skills', 'defaultSkill', 'SKILL.md')),
-                false,
-            );
+            const { result, stdout, stderr } = await captureUpdate(() => (
+                updateAllRepos(workspaceRoot, { interactiveSession: true })
+            ));
+
+            assert.equal(result.failed.length, 1);
+            assert.equal(result.failed[0].repoName, failedRepoName);
+            assert.match(result.failed[0].message, /git .*pull .*exited with status [1-9]/);
+            assert.match(result.failed[0].message, /not currently on a branch/);
+            assert.equal(result.skipped.length, 0, 'the failing remote is reachable and the pull was attempted');
+            assert.equal(readHead(failedRepoPath), oldHead);
+            assert.equal(readHead(laterRepoPath), newHead, 'a later workspace checkout advances');
+            assert.ok(stdout.includes('  ✓ zz-workspace-success'));
+            assertFinalFailureDetails(stderr, result.failed);
+        `);
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('updateAllRepos installs later skills manifests after an earlier manifest fails', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-manifest-update-continue-'));
+
+    try {
+        runAggregateUpdateChild(workspaceRoot, String.raw`
+            setupAggregateRepoFixture();
+            const badManifestPath = path.join(workspaceRoot, 'aa-invalid', 'ploinky-skills-manifest.json');
+            const validFolder = path.join(workspaceRoot, 'zz-valid');
+            writeFile(badManifestPath, JSON.stringify([{
+                name: 'DocumentationSkills',
+                url: path.join(workspaceRoot, '.fixtures', 'documentation-skills-source'),
+                skills: ['removedSkill'],
+            }]));
+            writeFile(path.join(validFolder, 'ploinky-skills-manifest.json'), JSON.stringify([{
+                name: 'DocumentationSkills',
+                url: path.join(workspaceRoot, '.fixtures', 'documentation-skills-source'),
+                skills: ['documentationSkill'],
+            }]));
+
+            const { result, stdout, stderr } = await captureUpdate(() => (
+                updateAllRepos(workspaceRoot, { interactiveSession: true })
+            ));
+
+            assert.equal(result.failed.length, 1);
+            assert.equal(result.failed[0].repoName, 'aa-invalid skills');
+            assert.match(result.failed[0].message, /Skill 'removedSkill' was not found/);
+            assert.match(result.failed[0].message, /source repo 'DocumentationSkills'/);
+            assert.match(result.failed[0].message, /Available skills: documentationSkill/);
+            assert.equal(fs.readFileSync(path.join(
+                validFolder, '.agents', 'skills', 'documentationSkill', 'SKILL.md',
+            ), 'utf8'), '# Documentation skill\n');
+            assert.ok(stdout.some(message => message.includes('✓ zz-valid: 1 skill(s)')));
+            assertFinalFailureDetails(stderr, result.failed);
+            const finalSummary = stderr.slice(stderr.lastIndexOf('Update completed with 1 error(s):')).join('\n');
+            assert.ok(finalSummary.includes(badManifestPath), 'the final error identifies the failing manifest');
+        `);
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+for (const wrongUpstream of ['origin/main', 'secondary/feature']) {
+    test('updateAllRepos prevents skill cache contamination from ' + wrongUpstream, () => {
+        const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-upstream-continue-'));
+        try {
+            runAggregateUpdateChild(workspaceRoot, String.raw`
+                setupAggregateRepoFixture();
+                const source = path.join(workspaceRoot, '.fixtures', 'branch-source');
+                initGitRepo(source, { 'skills/shared/SKILL.md': '# main\n' });
+                const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+                git(source, 'branch', '-M', 'main');
+                git(source, 'checkout', '-b', 'feature');
+                commitFile(source, 'skills/shared/SKILL.md', '# feature\n');
+                const cache = path.join(REPOS_DIR, 'SelectedSkills');
+                cloneRepo(source, cache);
+                const selectedHead = readHead(cache);
+                const wrongUpstream = ${JSON.stringify(wrongUpstream)};
+                if (wrongUpstream === 'secondary/feature') {
+                    const secondary = path.join(workspaceRoot, '.fixtures', 'secondary');
+                    cloneRepo(source, secondary);
+                    git(secondary, 'config', 'user.name', 'Test User');
+                    git(secondary, 'config', 'user.email', 'test@example.invalid');
+                    commitFile(secondary, 'skills/foreign/SKILL.md', '# wrong source\n');
+                    git(cache, 'remote', 'add', 'secondary', secondary);
+                    git(cache, 'fetch', 'secondary');
+                } else {
+                    git(source, 'checkout', 'main');
+                    commitFile(source, 'skills/foreign/SKILL.md', '# wrong branch\n');
+                }
+                git(cache, 'branch', '--set-upstream-to=' + wrongUpstream, 'feature');
+                const folder = path.join(workspaceRoot, 'valid-selected-skills');
+                writeFile(path.join(folder, 'ploinky-skills-manifest.json'), JSON.stringify([{
+                    name: 'SelectedSkills', url: source, branch: 'feature', skills: ['shared'],
+                }]));
+                const { result, stderr } = await captureUpdate(() => updateAllRepos(workspaceRoot, { interactiveSession: true }));
+                assert.equal(result.failed.length, 1);
+                assert.equal(result.failed[0].repoName, 'SelectedSkills');
+                assert.match(result.failed[0].message, /Refusing to pull a different source or branch/);
+                assert.equal(readHead(cache), selectedHead);
+                assert.equal(fs.existsSync(path.join(cache, 'skills', 'foreign')), false);
+                assert.equal(fs.readFileSync(path.join(folder, '.agents', 'skills', 'shared', 'SKILL.md'), 'utf8'), '# feature\n');
+                assertFinalFailureDetails(stderr, result.failed);
+            `);
+        } finally {
+            fs.rmSync(workspaceRoot, { recursive: true, force: true });
+        }
+    });
+}
+
+test('updateAllRepos still rejects an invalid selected search root', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-invalid-root-'));
+
+    try {
+        runAggregateUpdateChild(workspaceRoot, String.raw`
+            const nonDirectory = path.join(workspaceRoot, 'a-file');
+            writeFile(nonDirectory, 'not a directory');
+            for (const invalidRoot of [path.join(workspaceRoot, 'missing'), nonDirectory]) {
+                await assert.rejects(
+                    () => updateAllRepos(invalidRoot, { interactiveSession: true }),
+                    /Search root .* is not a directory/,
+                );
+            }
         `);
     } finally {
         fs.rmSync(workspaceRoot, { recursive: true, force: true });
