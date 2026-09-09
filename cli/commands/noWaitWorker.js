@@ -318,64 +318,75 @@ export async function waitForRunScopedStatus(entry, {
     let readFaultStartedAtMs = null;
     let lastReadFault = null;
     let workerExitObservedAtMs = null;
+    let lastObservation = null;
 
     while (true) {
         const nowMs = nowFn();
-        let deadline = publicationDeadline;
+        let deadline = lastObservation?.deadline ?? publicationDeadline;
         const readResult = readSequenceStatus(target.path);
-        if (readResult.readFault) {
-            // Malformed JSON and transient filesystem faults share one bounded
-            // retry window. Persisting past it is a rejected barrier outcome.
+        if (readResult.readFault || (readResult.missing && lastObservation)) {
+            // Once a valid status was observed, a disappearing file is a read
+            // fault, not a new publication attempt. Consecutive missing and
+            // malformed reads share one retry window and retain the last known
+            // phase deadline. Only a fresh, validated status can settle a barrier.
             if (readFaultStartedAtMs === null) readFaultStartedAtMs = nowMs;
-            lastReadFault = readResult.readFault;
-            deadline = readFaultStartedAtMs + timeouts.readRetryTimeoutMs;
-        } else {
+            lastReadFault = readResult.readFault || new Error('status file is missing after publication');
+            const retryDeadline = readFaultStartedAtMs + timeouts.readRetryTimeoutMs;
+            deadline = lastObservation ? Math.min(deadline, retryDeadline) : retryDeadline;
+        } else if (!readResult.missing) {
             readFaultStartedAtMs = null;
             lastReadFault = null;
-            if (!readResult.missing) {
-                let observation;
-                try {
-                    observation = resolveRunScopedObservation(readResult.status, {
-                        expectedRunId: target.runId,
-                        runStartedAtMs: exactRunStartedAtMs,
-                        targetWaveIndex: target.waveIndex,
-                        timeouts,
-                        nowMs,
-                    });
-                } catch (error) {
-                    throw new Error(
-                        `no-wait barrier status '${statusLabel}' is invalid: ${error?.message || error}`,
-                    );
-                }
-                if (observation.terminal) {
-                    return Object.freeze({ state: observation.terminal });
-                }
-                deadline = observation.queued ? queuedDeadline : observation.deadline;
-                if (!Number.isSafeInteger(observation.workerPid) || observation.workerPid <= 0) {
-                    throw new Error(
-                        `no-wait barrier status '${statusLabel}' is invalid: non-terminal status has no exact worker pid`,
-                    );
-                }
-                if (isWorkerAlive(observation.workerPid)) {
-                    workerExitObservedAtMs = null;
-                } else {
-                    if (workerExitObservedAtMs === null) workerExitObservedAtMs = nowMs;
-                    deadline = Math.min(
-                        deadline,
-                        workerExitObservedAtMs + timeouts.terminalPublicationGraceMs,
-                    );
-                }
+            let observation;
+            try {
+                observation = resolveRunScopedObservation(readResult.status, {
+                    expectedRunId: target.runId,
+                    runStartedAtMs: exactRunStartedAtMs,
+                    targetWaveIndex: target.waveIndex,
+                    timeouts,
+                    nowMs,
+                });
+            } catch (error) {
+                throw new Error(
+                    `no-wait barrier status '${statusLabel}' is invalid: ${error?.message || error}`,
+                );
+            }
+            if (observation.terminal) {
+                return Object.freeze({ state: observation.terminal });
+            }
+            deadline = observation.queued ? queuedDeadline : observation.deadline;
+            if (!Number.isSafeInteger(observation.workerPid) || observation.workerPid <= 0) {
+                throw new Error(
+                    `no-wait barrier status '${statusLabel}' is invalid: non-terminal status has no exact worker pid`,
+                );
+            }
+            lastObservation = { deadline, workerPid: observation.workerPid };
+        } else if (readFaultStartedAtMs !== null) {
+            // A missing file cannot restart an earlier unreadable-file window
+            // or extend the initial grace before the first valid publication.
+            deadline = Math.min(deadline, readFaultStartedAtMs + timeouts.readRetryTimeoutMs);
+        }
+        if (lastObservation) {
+            if (!isWorkerAlive(lastObservation.workerPid)) {
+                if (workerExitObservedAtMs === null) workerExitObservedAtMs = nowMs;
+            } else if (!readResult.missing && !readResult.readFault) {
+                // An occupied PID during a read gap may be a reused PID. Only
+                // a fresh valid status can clear an observed worker exit.
+                workerExitObservedAtMs = null;
+            }
+            if (workerExitObservedAtMs !== null) {
+                deadline = Math.min(deadline, workerExitObservedAtMs + timeouts.terminalPublicationGraceMs);
             }
         }
         if (nowMs >= deadline) {
-            if (lastReadFault) {
-                throw new Error(
-                    `no-wait barrier status '${statusLabel}' remained unreadable after bounded retries: ${lastReadFault?.message || lastReadFault}`,
-                );
-            }
-            if (workerExitObservedAtMs !== null) {
+            if (workerExitObservedAtMs !== null
+                && nowMs >= workerExitObservedAtMs + timeouts.terminalPublicationGraceMs) {
                 throw new Error(
                     `no-wait worker for barrier status '${statusLabel}' exited before publishing a terminal status`,
+                );
+            }
+            if (lastReadFault && nowMs >= readFaultStartedAtMs + timeouts.readRetryTimeoutMs) {
+                throw new Error(
+                    `no-wait barrier status '${statusLabel}' remained unreadable after bounded retries: ${lastReadFault?.message || lastReadFault}`,
                 );
             }
             throw new Error(`timed out waiting for no-wait barrier status '${statusLabel}'`);

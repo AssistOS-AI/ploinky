@@ -402,10 +402,11 @@ test('run-scoped status binding rejects a foreign run, wave, or run start', asyn
     await assert.rejects(() => waitFor('running-while-waiting'), /outside its active phase/);
 });
 
-test('a missing status expires at its bounded cumulative queued deadline', async (t) => {
+test('a never-published status expires at its initial publication deadline', async (t) => {
     const { runningDir } = fixture(t);
     const runStartedAtMs = 1_700_000_000_000;
     const clock = virtualClock(runStartedAtMs);
+    const timeouts = { ...FAST_TIMEOUTS, startupGraceMs: 200 };
     await assert.rejects(
         () => waitForRunScopedStatus(
             barrierEntry(runningDir, 'never-published', { waveIndex: 0 }),
@@ -413,12 +414,163 @@ test('a missing status expires at its bounded cumulative queued deadline', async
                 runningDir,
                 expectedRunId: RUN_ID,
                 runStartedAtMs,
-                timeouts: FAST_TIMEOUTS,
+                timeouts,
                 ...clock,
             },
         ),
         /timed out waiting for no-wait barrier status/,
     );
+    assert.equal(clock.nowFn(), runStartedAtMs + timeouts.startupGraceMs);
+});
+
+for (const sequencePhase of ['active', 'waiting-barrier']) {
+    test(`an observed ${sequencePhase} status can disappear briefly after publication grace`, async (t) => {
+        const { runningDir } = fixture(t);
+        const runStartedAtMs = 1_700_000_000_000;
+        const target = publishRunScoped(runningDir, 'transient-missing', {
+            runStartedAtMs, waveIndex: 0, sequencePhase,
+        });
+        const timeouts = resolveNoWaitBarrierTimeouts({
+            activeTimeoutMs: 120_000,
+            imagePullBudgetMs: 0,
+            imageBuildBudgetMs: 0,
+            startupGraceMs: 60_000,
+            readRetryTimeoutMs: 5_000,
+        });
+        const clock = virtualClock(runStartedAtMs + 59_950);
+        let sleeps = 0;
+        const status = await waitForRunScopedStatus(
+            barrierEntry(runningDir, 'transient-missing', { waveIndex: 0 }),
+            {
+                runningDir, expectedRunId: RUN_ID, runStartedAtMs, timeouts,
+                isWorkerAlive: () => true,
+                nowFn: clock.nowFn,
+                sleepFn: async (ms) => {
+                    await clock.sleepFn(ms);
+                    sleeps += 1;
+                    if (sleeps === 1) fs.unlinkSync(target);
+                    else publishRunScoped(runningDir, 'transient-missing', {
+                        runStartedAtMs, waveIndex: 0, state: 'running',
+                    });
+                },
+            },
+        );
+        assert.deepEqual(status, { state: 'running' });
+        assert.equal(sleeps, 2, 'missing status must be retried and never treated as terminal');
+        assert.equal(clock.nowFn(), runStartedAtMs + 60_150);
+    });
+}
+
+for (const alternateMalformed of [false, true]) {
+    test(`an observed status has one bounded retry window for ${alternateMalformed ? 'alternating malformed and missing reads' : 'persistent disappearance'}`, async (t) => {
+        const { runningDir } = fixture(t);
+        const runStartedAtMs = 1_700_000_000_000;
+        const target = publishRunScoped(runningDir, 'persistent-missing', {
+            runStartedAtMs, waveIndex: 0,
+        });
+        const timeouts = { ...FAST_TIMEOUTS, readRetryTimeoutMs: 1_000 };
+        const clock = virtualClock(runStartedAtMs + 60_000);
+        let sleeps = 0;
+        await assert.rejects(
+            () => waitForRunScopedStatus(
+                barrierEntry(runningDir, 'persistent-missing', { waveIndex: 0 }),
+                {
+                    runningDir, expectedRunId: RUN_ID, runStartedAtMs, timeouts,
+                    isWorkerAlive: () => true,
+                    nowFn: clock.nowFn,
+                    sleepFn: async (ms) => {
+                        await clock.sleepFn(ms);
+                        sleeps += 1;
+                        if (alternateMalformed && sleeps % 2 === 0) fs.writeFileSync(target, '{"state":');
+                        else if (fs.existsSync(target)) fs.unlinkSync(target);
+                    },
+                },
+            ),
+            /remained unreadable after bounded retries/,
+        );
+        assert.equal(clock.nowFn(), runStartedAtMs + 60_100 + timeouts.readRetryTimeoutMs);
+    });
+}
+
+for (const limit of ['active', 'queued', 'dead worker', 'worker dies while missing', 'worker pid reused while missing']) {
+    for (const readKind of ['missing', 'malformed']) {
+        test(`a ${readKind} observed status cannot extend the ${limit} deadline`, async (t) => {
+            const { runningDir } = fixture(t);
+            const runStartedAtMs = 1_700_000_000_000;
+            const timeouts = resolveNoWaitBarrierTimeouts({
+                activeTimeoutMs: limit.includes('worker') ? 10_000 : 1_000,
+                imagePullBudgetMs: 0,
+                imageBuildBudgetMs: 0,
+                terminalPublicationGraceMs: 100,
+                startupGraceMs: 100,
+                readRetryTimeoutMs: 5_000,
+            });
+            const queued = limit === 'queued';
+            const target = publishRunScoped(runningDir, 'deadline-missing', {
+                runStartedAtMs, waveIndex: 0, sequencePhase: queued ? 'waiting-barrier' : 'active',
+            });
+            const observationStartedAtMs = runStartedAtMs + (queued ? 1_100 : 1_000);
+            const clock = virtualClock(observationStartedAtMs);
+            const expectedDeadline = limit === 'worker dies while missing'
+                ? observationStartedAtMs + 25 + timeouts.terminalPublicationGraceMs
+                : observationStartedAtMs + 100;
+            await assert.rejects(
+                () => waitForRunScopedStatus(
+                    barrierEntry(runningDir, 'deadline-missing', { waveIndex: 0 }),
+                    {
+                        runningDir, expectedRunId: RUN_ID, runStartedAtMs, timeouts,
+                        pollIntervalMs: 25,
+                        isWorkerAlive: () => {
+                            if (limit === 'dead worker') return false;
+                            if (limit === 'worker dies while missing') return clock.nowFn() === observationStartedAtMs;
+                            if (limit === 'worker pid reused while missing') return clock.nowFn() > observationStartedAtMs;
+                            return true;
+                        },
+                        nowFn: clock.nowFn,
+                        sleepFn: async (ms) => {
+                            await clock.sleepFn(ms);
+                            if (readKind === 'malformed') fs.writeFileSync(target, '{"state":');
+                            else if (fs.existsSync(target)) fs.unlinkSync(target);
+                        },
+                    },
+                ),
+                limit.includes('worker') ? /exited before publishing a terminal status/ : /timed out waiting/,
+            );
+            assert.equal(clock.nowFn(), expectedDeadline);
+        });
+    }
+}
+
+test('a missing observed status must recover with the exact original run identity', async (t) => {
+    const { runningDir } = fixture(t);
+    const runStartedAtMs = 1_700_000_000_000;
+    const target = publishRunScoped(runningDir, 'replaced-missing', { runStartedAtMs, waveIndex: 0 });
+    const clock = virtualClock(runStartedAtMs + 60_000);
+    let sleeps = 0;
+    await assert.rejects(
+        () => waitForRunScopedStatus(
+            barrierEntry(runningDir, 'replaced-missing', { waveIndex: 0 }),
+            {
+                runningDir, expectedRunId: RUN_ID, runStartedAtMs, timeouts: FAST_TIMEOUTS,
+                pollIntervalMs: 25,
+                isWorkerAlive: () => true,
+                nowFn: clock.nowFn,
+                sleepFn: async (ms) => {
+                    await clock.sleepFn(ms);
+                    sleeps += 1;
+                    if (sleeps === 1) fs.unlinkSync(target);
+                    else {
+                        const foreign = publishRunScoped(runningDir, 'replaced-missing', {
+                            runStartedAtMs, waveIndex: 0, state: 'running', runId: FOREIGN_RUN_ID,
+                        });
+                        fs.renameSync(foreign, target);
+                    }
+                },
+            },
+        ),
+        /different run/,
+    );
+    assert.equal(sleeps, 2, 'a readable foreign terminal status must fail immediately');
 });
 
 test('a transient malformed status recovers on the next valid read', async (t) => {
