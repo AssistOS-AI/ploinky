@@ -3,6 +3,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { PLOINKY_DIR } from './config.js';
 import { parseBranchPolicy } from '../../agentlib/branchPolicy.mjs';
+import { runGitCommand, sanitizeGitDiagnostic } from './gitCommand.js';
 
 export const REPO_SOURCES_FILE = path.join(PLOINKY_DIR, 'repo_sources.json');
 export const ENABLED_REPOS_FILE = path.join(PLOINKY_DIR, 'enabled_repos.json');
@@ -309,7 +310,7 @@ export function addRepo(name, url, branch = null, { stdio = 'inherit' } = {}) {
     const args = ['clone'];
     if (actualBranch) args.push('--branch', actualBranch);
     args.push(actualUrl, repoPath);
-    execFileSync('git', args, { stdio });
+    runGitCommand(args, { stdio });
     recordRepoSource(name, actualUrl, actualBranch);
     return { status: 'cloned', path: repoPath, branch: actualBranch || 'default' };
 }
@@ -453,7 +454,7 @@ function recloneNonGitRepo(name, repoPath, url, { branch = null, stdio = 'inheri
     if (branch) args.push('--branch', branch);
     args.push(url, tempPath);
 
-    execFileSync('git', args, { stdio });
+    runGitCommand(args, { stdio });
 
     let installed = false;
     try {
@@ -480,11 +481,11 @@ function recloneNonGitRepo(name, repoPath, url, { branch = null, stdio = 'inheri
 
 function gitCommandErrorMessage(err) {
     const stderr = err?.stderr ? String(err.stderr).trim() : '';
-    if (stderr) return stderr;
-    return err?.message || String(err);
+    if (stderr) return sanitizeGitDiagnostic(stderr);
+    return sanitizeGitDiagnostic(err?.message || String(err));
 }
 
-export function updateRepo(name, { rebase = true, autostash = true, stdio = 'inherit' } = {}) {
+export function updateRepo(name, { rebase = true, autostash = true, stdio = 'inherit', branch = null } = {}) {
     if (!name) throw new Error('Missing repository name.');
     const REPOS_DIR = ensureReposDir();
     const repoPath = path.join(REPOS_DIR, name);
@@ -499,9 +500,29 @@ export function updateRepo(name, { rebase = true, autostash = true, stdio = 'inh
         return recloneNonGitRepo(name, repoPath, source.url, { branch: source.branch, stdio });
     }
     const args = ['-C', repoPath, 'pull'];
+    if (!branch) {
+        const current = currentBranch(repoPath);
+        let upstreamRef = '';
+        let upstreamRemote = '';
+        try {
+            upstreamRef = execFileSync('git', ['-C', repoPath, 'config', '--get', `branch.${current}.merge`], {
+                stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8',
+            }).trim();
+            upstreamRemote = execFileSync('git', ['-C', repoPath, 'config', '--get', `branch.${current}.remote`], {
+                stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8',
+            }).trim();
+        } catch (_) {}
+        if (upstreamRef && (upstreamRef !== `refs/heads/${current}` || upstreamRemote !== 'origin')) {
+            throw new Error(
+                sanitizeGitDiagnostic(`Repository '${name}' at '${repoPath}' is on branch '${current}' but its upstream is '${upstreamRemote}:${upstreamRef}'. `) +
+                'Refusing to pull a different source or branch into this cache; correct the upstream to the same branch on origin or specify the intended branch in the skills manifest.'
+            );
+        }
+    }
     if (rebase) args.push('--rebase');
     if (autostash) args.push('--autostash');
-    execFileSync('git', args, { stdio });
+    if (branch) args.push('--', 'origin', branch);
+    runGitCommand(args, { stdio });
     return { pulled: true };
 }
 
@@ -597,7 +618,7 @@ export function pullGitRepo(repoPath, { rebase = true, autostash = true, stdio =
     const args = ['-C', repoPath, 'pull'];
     if (rebase) args.push('--rebase');
     if (autostash) args.push('--autostash');
-    execFileSync('git', args, { stdio });
+    runGitCommand(args, { stdio });
     return true;
 }
 
@@ -760,12 +781,12 @@ export function ensureRepoInstalled(name, url, { branchPolicy, branch, stdio = '
     const args = ['clone'];
     if (cloneBranch) args.push('--branch', cloneBranch);
     args.push(actualUrl, repoPath);
-    execFileSync('git', args, { stdio });
+    runGitCommand(args, { stdio });
     recordRepoSource(name, actualUrl, cloneBranch);
     return { status: 'cloned', path: repoPath, branch: cloneBranch || 'default' };
 }
 
-export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback = 'default', stdio = 'inherit' } = {}) {
+export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback = 'default', stdio = 'inherit', fetchRequestedBranch = false } = {}) {
     if (!branch) return { status: 'noop', branch: null };
     const repoPath = path.join(PLOINKY_DIR, 'repos', name);
     if (!fs.existsSync(repoPath) || !isGitRepository(repoPath)) return { status: 'missing', branch: null };
@@ -786,11 +807,13 @@ export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback 
     }
 
     try {
-        execFileSync('git', ['-C', repoPath, 'fetch', '--prune'], { stdio });
-    } catch (_) {
+        const fetchArgs = ['-C', repoPath, 'fetch', '--prune'];
+        if (fetchRequestedBranch) fetchArgs.push('origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`);
+        runGitCommand(fetchArgs, { stdio });
+    } catch (error) {
         if (fallback === 'fail') {
             throw new Error(
-                `Unable to fetch branch '${branch}' for repo '${name}'. Aborting (--branch-fallback fail).`
+                `Unable to fetch branch '${branch}' for repo '${name}': ${error.message}`
             );
         }
     }
@@ -832,9 +855,9 @@ export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback 
         execFileSync('git', ['-C', repoPath, 'clean', '-fd'], { stdio });
     } else {
         if (localBranchExists) {
-            execFileSync('git', ['-C', repoPath, 'checkout', branch], { stdio });
+            runGitCommand(['-C', repoPath, 'checkout', branch], { stdio });
         } else {
-            execFileSync('git', ['-C', repoPath, 'checkout', '-b', branch, `origin/${branch}`], { stdio });
+            runGitCommand(['-C', repoPath, 'checkout', '-b', branch, `origin/${branch}`], { stdio });
         }
     }
 

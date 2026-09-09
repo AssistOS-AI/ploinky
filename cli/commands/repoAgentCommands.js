@@ -17,7 +17,9 @@ import { collectAgentsSummary } from '../utils/status.js';
 import { findAgent } from '../utils/utils.js';
 import { updateWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
 import { isInsideBoxRuntime } from '../../agentlib/bootstrap.mjs';
+import { agentLibRoot } from '../../agentlib/runtime.mjs';
 import { PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV } from './ploinkyUpdateScope.js';
+import { sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const DEFAULT_SKILLS_REPO_NAMES = [
@@ -143,7 +145,7 @@ function logRepoUpdateSuccess(repoName, result, indent = '') {
 }
 
 function formatWorkspaceRepoSkip(repo, remoteCheck) {
-    const location = remoteCheck?.remoteUrl ? ` (${remoteCheck.remoteUrl})` : '';
+    const location = remoteCheck?.remoteUrl ? ` (${sanitizeGitDiagnostic(remoteCheck.remoteUrl)})` : '';
     const reason = remoteCheck?.reason || 'remote unavailable';
     return `  - ${repo.name}: skipped update, ${reason}${location}`;
 }
@@ -211,6 +213,7 @@ function appendDefaultSkillFailures(failed, summary) {
     for (const entry of summary.failed) {
         failed.push({
             repoName: `default skills ${entry.repoName}`,
+            defaultSkillsRepoName: entry.defaultSkillsRepoName,
             message: entry.message,
         });
     }
@@ -228,6 +231,16 @@ function logDefaultSkillSummary(summary, indent = '') {
     }
     if (failedCount) {
         console.log(`${indent}Default skills failed: ${failedCount} repo(s).`);
+    }
+}
+
+function logUpdateFailures(failed) {
+    if (!failed.length) return;
+    console.error(`Update completed with ${failed.length} error(s):`);
+    for (const entry of failed) {
+        const source = entry.defaultSkillsRepoName ? ` (source: ${entry.defaultSkillsRepoName})` : '';
+        console.error(sanitizeGitDiagnostic(`  ✗ ${entry.repoName}${source}: ${entry.message}`));
+        if (entry.manifestPath) console.error(`    Manifest: ${entry.manifestPath}`);
     }
 }
 
@@ -368,10 +381,7 @@ async function updatePloinkyRepos(options = {}) {
 
     console.log(`Ploinky repository update summary: ${updated}/${ploinkyRepos.length} repositories updated.`);
 
-    if (failed.length) {
-        const failedNames = failed.map(entry => entry.repoName).join(', ');
-        throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
-    }
+    logUpdateFailures(failed);
 
     return { total: ploinkyRepos.length, updated, failed, agentLib, defaultSkills };
 }
@@ -379,10 +389,11 @@ async function updatePloinkyRepos(options = {}) {
 async function updateAllRepos(folderPath, options = {}) {
     const projectsRoot = resolveUpdateProjectsRoot(folderPath);
     const ploinkyRoot = resolvePloinkyRoot();
+    const runtimeAgentLibSource = agentLibRoot();
     const hostUpdatedWorkspaceCheckout = String(
         process.env[PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV] || '',
     ).trim();
-    const workspaceRepos = reposSvc.findWorkspaceGitRepos(projectsRoot)
+    const discoveredWorkspaceRepos = reposSvc.findWorkspaceGitRepos(projectsRoot)
         .filter(repo => !pathsReferToSameLocation(repo.path, ploinkyRoot))
         .filter(repo => !hostUpdatedWorkspaceCheckout
             || !pathsReferToSameLocation(repo.path, hostUpdatedWorkspaceCheckout));
@@ -427,6 +438,13 @@ async function updateAllRepos(folderPath, options = {}) {
         branchPolicy: options.agentLibBranchPolicy || null,
         interactiveSession: options.interactiveSession === true,
     });
+
+    // AgentLib has one source owner. The runtime source may also be visible at
+    // a workspace bind mount, and a host refresh may have selected a new source.
+    // Neither belongs in the generic Git update loop.
+    const agentLibSources = [runtimeAgentLibSource, agentLib?.selection?.sourceDir].filter(Boolean);
+    const workspaceRepos = discoveredWorkspaceRepos.filter(repo =>
+        !agentLibSources.some(source => pathsReferToSameLocation(repo.path, source)));
 
     if (ploinkyRepos.length) {
         console.log('Updating ploinky repositories...');
@@ -494,7 +512,7 @@ async function updateAllRepos(folderPath, options = {}) {
             } catch (err) {
                 const message = err?.message || String(err);
                 const folderLabel = path.relative(projectsRoot, manifestFolder) || path.basename(manifestFolder);
-                failed.push({ repoName: `${folderLabel} skills`, message });
+                failed.push({ repoName: `${folderLabel} skills`, manifestPath, message });
                 console.error(`  ✗ ${folderLabel} skills: ${message}`);
             }
         }
@@ -503,25 +521,27 @@ async function updateAllRepos(folderPath, options = {}) {
     }
 
     const totalRepos = 1 + ploinkyRepos.length + workspaceRepos.length + workspaceManifestFolders.length;
-    console.log(`Update summary: ${updated}/${totalRepos} repositories updated.`);
+    console.log(`Update summary: ${updated}/${totalRepos} update operations succeeded.`);
     if (skipped.length) {
         const skippedNames = skipped.map(entry => entry.repoName).join(', ');
         console.log(`Workspace repository update skipped: ${skippedNames}`);
     }
-    if (failed.length) {
-        const failedNames = failed.map(entry => entry.repoName).join(', ');
-        throw new Error(`Failed to update ${failed.length} repository(s): ${failedNames}`);
-    }
+    logUpdateFailures(failed);
 
     return { total: totalRepos, updated, failed, skipped, selfUpdate, agentLib, defaultSkills };
 }
 
 function pathsReferToSameLocation(first, second) {
+    if (path.resolve(first) === path.resolve(second)) return true;
     try {
-        return fs.realpathSync(first) === fs.realpathSync(second);
-    } catch (_) {
-        return path.resolve(first) === path.resolve(second);
-    }
+        if (fs.realpathSync(first) === fs.realpathSync(second)) return true;
+    } catch (_) {}
+    try {
+        // Separate bind mounts have different realpaths but share file identity.
+        const firstStat = fs.statSync(first, { bigint: true });
+        const secondStat = fs.statSync(second, { bigint: true });
+        return firstStat.dev === secondStat.dev && firstStat.ino === secondStat.ino;
+    } catch (_) { return false; }
 }
 
 function resolveUpdateProjectsRoot(folderPath) {
