@@ -139,7 +139,7 @@ export async function assertMarketplacePrerequisite({ env = process.env, inspect
     assert.ok(path.isAbsolute(requested), 'SMOKE_OPTIONAL_GATE_RECEIPT must be an absolute run.json path.');
     const receipt = await jsonFile(requested, 'Marketplace receipt', 64 * 1024);
     assert.ok(receipt.gate === 'optional' && receipt.result === 'passed' && receipt.exitCode === 0,
-        'Marketplace prerequisite is incomplete or failed. Complete it before any deployed browser gate.');
+        'Marketplace prerequisite is incomplete or failed. Complete it before this dependent browser check.');
     assert.ok(same(receipt.command, optionalCommand), 'Marketplace receipt must identify the canonical optional command.');
     const receiptDirectory = await directory(receipt.directory, 'Marketplace receipt directory');
     assert.ok(receipt.directory === receiptDirectory && receipt.runId === path.basename(receiptDirectory)
