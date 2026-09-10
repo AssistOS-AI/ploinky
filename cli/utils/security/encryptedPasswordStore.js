@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { PLOINKY_DIR } from '../config.js';
+import { withPasswordStoreLock } from './passwordStoreLock.mjs';
 import {
     MASTER_KEY_VAR,
     deriveSubkey,
@@ -99,16 +100,24 @@ function readPasswordStore() {
     return normalizeStore(JSON.parse(plaintext.toString('utf8')));
 }
 
-function writePasswordStore(store) {
+function writePasswordStoreUnlocked(store) {
     const passwordStoreFile = resolvePasswordStoreFile();
     const packed = encryptStoreToPacked(store);
     fs.mkdirSync(path.dirname(passwordStoreFile), { recursive: true });
-    const tempPath = `${passwordStoreFile}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tempPath, `${packed}\n`, { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(tempPath, passwordStoreFile);
+    const tempPath = `${passwordStoreFile}.${crypto.randomUUID()}.tmp`;
+    try {
+        fs.writeFileSync(tempPath, `${packed}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+        fs.renameSync(tempPath, passwordStoreFile);
+    } finally {
+        try { fs.unlinkSync(tempPath); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    }
     try {
         fs.chmodSync(passwordStoreFile, 0o600);
     } catch (_) { }
+}
+
+function writePasswordStore(store) {
+    return withPasswordStoreLock(resolvePasswordStoreFile(), () => writePasswordStoreUnlocked(store));
 }
 
 function getUsersPayload(usersVar) {
@@ -123,18 +132,35 @@ function getUsersPayload(usersVar) {
     };
 }
 
-function setUsersPayload(usersVar, payload = {}) {
-    const key = String(usersVar || '').trim();
-    if (!key) {
-        throw new Error('setUsersPayload requires usersVar.');
-    }
-    const store = readPasswordStore();
+function applyUsersUpdate(store, key, payload, ifAbsent) {
+    // Presence, rather than a nonempty users list, records the operator's choice.
+    if (ifAbsent === true && Object.prototype.hasOwnProperty.call(store.usersByVar, key)) return false;
     store.usersByVar[key] = {
         version: Number(payload?.version) || 1,
         users: Array.isArray(payload?.users) ? payload.users : [],
     };
-    writePasswordStore(store);
-    return store.usersByVar[key];
+    return true;
+}
+
+function setUsersPayload(usersVar, payload = {}, { ifAbsent = false } = {}) {
+    const key = String(usersVar || '').trim();
+    if (!key) {
+        throw new Error('setUsersPayload requires usersVar.');
+    }
+    return withPasswordStoreLock(resolvePasswordStoreFile(), () => {
+        const store = readPasswordStore();
+        if (applyUsersUpdate(store, key, payload, ifAbsent)) writePasswordStoreUnlocked(store);
+        return store.usersByVar[key];
+    });
+}
+
+function onceRollback(callback = () => {}) {
+    let available = true;
+    return () => {
+        if (!available) throw new Error('password store transaction rollback was already consumed.');
+        available = false;
+        return callback();
+    };
 }
 
 /**
@@ -142,75 +168,64 @@ function setUsersPayload(usersVar, payload = {}) {
  * rollback callback for transactions whose authorization selector has not yet
  * committed. The rollback is intentionally file-scoped: encrypted envelopes
  * use random IVs, so rebuilding the same logical store would not restore the
- * exact predecessor bytes.
+ * exact predecessor bytes. Conditional seeds are decided under the mutation
+ * lock, and rollback refuses to discard a subsequent writer's publication.
  */
 function setUsersPayloadBatchTransactional(updates = []) {
     if (!Array.isArray(updates)) {
         throw new Error('setUsersPayloadBatchTransactional requires an array.');
     }
-    if (updates.length === 0) {
-        let rollbackAvailable = true;
-        return () => {
-            if (!rollbackAvailable) {
-                throw new Error('password store transaction rollback was already consumed.');
-            }
-            rollbackAvailable = false;
-        };
-    }
-    const passwordStoreFile = resolvePasswordStoreFile();
-    const existed = fs.existsSync(passwordStoreFile);
-    const predecessorBytes = existed ? fs.readFileSync(passwordStoreFile) : null;
-    const store = readPasswordStore();
-    for (const update of updates) {
+    if (updates.length === 0) return onceRollback();
+    const normalizedUpdates = updates.map((update) => {
         const key = String(update?.usersVar || '').trim();
         if (!key) {
             throw new Error('setUsersPayloadBatchTransactional requires usersVar.');
         }
-        const payload = update?.payload || {};
-        store.usersByVar[key] = {
-            version: Number(payload?.version) || 1,
-            users: Array.isArray(payload?.users) ? payload.users : [],
-        };
-    }
-    writePasswordStore(store);
+        return { key, payload: update?.payload || {}, ifAbsent: update?.ifAbsent };
+    });
+    const passwordStoreFile = resolvePasswordStoreFile();
+    return withPasswordStoreLock(passwordStoreFile, () => {
+        const existed = fs.existsSync(passwordStoreFile);
+        const predecessorBytes = existed ? fs.readFileSync(passwordStoreFile) : null;
+        const store = readPasswordStore();
+        let changed = false;
+        for (const { key, payload, ifAbsent } of normalizedUpdates) {
+            if (applyUsersUpdate(store, key, payload, ifAbsent)) changed = true;
+        }
+        if (!changed) return onceRollback();
+        writePasswordStoreUnlocked(store);
+        const committedBytes = fs.readFileSync(passwordStoreFile);
 
-    let rollbackAvailable = true;
-    return () => {
-        if (!rollbackAvailable) {
-            throw new Error('password store transaction rollback was already consumed.');
-        }
-        rollbackAvailable = false;
-        if (!existed) {
-            try {
-                fs.unlinkSync(passwordStoreFile);
-            } catch (error) {
-                if (error?.code !== 'ENOENT') throw error;
+        return onceRollback(() => withPasswordStoreLock(passwordStoreFile, () => {
+            if (!fs.existsSync(passwordStoreFile) || !fs.readFileSync(passwordStoreFile).equals(committedBytes)) {
+                throw new Error('Encrypted password store changed after transaction; refusing stale rollback.');
             }
-            return;
-        }
-        fs.mkdirSync(path.dirname(passwordStoreFile), { recursive: true });
-        const tempPath = `${passwordStoreFile}.${process.pid}.${Date.now()}.rollback.tmp`;
-        try {
-            fs.writeFileSync(tempPath, predecessorBytes, { mode: 0o600 });
-            fs.renameSync(tempPath, passwordStoreFile);
-            try { fs.chmodSync(passwordStoreFile, 0o600); } catch (_) {}
-        } catch (error) {
-            try { fs.unlinkSync(tempPath); } catch (_) {}
-            throw error;
-        }
-    };
+            if (!existed) {
+                fs.unlinkSync(passwordStoreFile);
+                return;
+            }
+            const tempPath = `${passwordStoreFile}.${crypto.randomUUID()}.rollback.tmp`;
+            try {
+                fs.writeFileSync(tempPath, predecessorBytes, { mode: 0o600, flag: 'wx' });
+                fs.renameSync(tempPath, passwordStoreFile);
+                try { fs.chmodSync(passwordStoreFile, 0o600); } catch (_) {}
+            } finally {
+                try { fs.unlinkSync(tempPath); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+            }
+        }));
+    });
 }
 
 function deleteUsersPayload(usersVar) {
     const key = String(usersVar || '').trim();
     if (!key) return false;
-    const store = readPasswordStore();
-    if (!Object.prototype.hasOwnProperty.call(store.usersByVar, key)) {
-        return false;
-    }
-    delete store.usersByVar[key];
-    writePasswordStore(store);
-    return true;
+    return withPasswordStoreLock(resolvePasswordStoreFile(), () => {
+        const store = readPasswordStore();
+        if (!Object.prototype.hasOwnProperty.call(store.usersByVar, key)) return false;
+        delete store.usersByVar[key];
+        writePasswordStoreUnlocked(store);
+        return true;
+    });
 }
 
 export {

@@ -585,6 +585,7 @@ function planAgentEnable({
         } else if (manifestPwdUsers.length) {
             credentialUpdate = {
                 usersVar: record.auth.usersVar,
+                ifAbsent: true,
                 payload: {
                     version: 1,
                     users: manifestPwdUsers
@@ -764,7 +765,9 @@ export function prepareAgentEnableBatch(requests, {
                 retireNoWaitMarkers(supersededNoWaitRecords);
                 for (const plan of plans) {
                     if (!plan.credentialUpdate) continue;
-                    setUsersPayload(plan.credentialUpdate.usersVar, plan.credentialUpdate.payload);
+                    setUsersPayload(plan.credentialUpdate.usersVar, plan.credentialUpdate.payload, {
+                        ifAbsent: plan.credentialUpdate.ifAbsent,
+                    });
                 }
                 saveAgents(map, { coordinate: false, applyLockCapability });
                 writeRoutingConfig(routing, { coordinate: false });
