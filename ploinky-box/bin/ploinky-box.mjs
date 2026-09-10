@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { buildHostSkillScope } from '../skillScope.mjs';
 import { parseOuterArguments } from '../command/parse.mjs';
 import { routeOuterCommand } from '../command/route.mjs';
 import { buildContainerExecArgs, executeProcess, executeProcessStreaming } from '../command/execute.mjs';
@@ -64,12 +65,14 @@ function executePrepared(prepared, coreArgv, {
     logStream = false,
     colorOutput = false,
     engineEnv,
+    launchCwd,
 }) {
     return execute(prepared.engine.name, buildContainerExecArgs(
         prepared.containerId,
         coreArgv,
         {
             hostPort: prepared.hostPort,
+            skillScopeEnv: prepared.identity && launchCwd ? buildHostSkillScope(prepared.identity.workspaceRoot, launchCwd) : {},
             mediaHostPort: prepared.mediaHostPort,
             shell,
             interactive,
@@ -98,7 +101,8 @@ export async function runOuterCli(argv, {
     if (detectInsideBox()) {
         return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
     }
-    const selectedSupervisor = supervisor || createBoxSupervisor({ env });
+    const launchDirectory = cwd();
+    const selectedSupervisor = supervisor || createBoxSupervisor({ env, launchCwd: launchDirectory });
     const parsed = parseOuterArguments(argv);
     const route = routeOuterCommand(parsed);
     const engineEnv = buildEngineProcessEnvironment(env);
@@ -274,6 +278,7 @@ export async function runOuterCli(argv, {
             shell: true,
             interactive: true,
             engineEnv,
+            launchCwd: launchDirectory,
         });
     }
     return executePrepared(prepared, route.coreArgv, {
@@ -281,6 +286,7 @@ export async function runOuterCli(argv, {
         input,
         output,
         interactive: ['repl', 'agent-cli'].includes(route.kind),
+        launchCwd: launchDirectory,
         engineEnv,
     });
 }

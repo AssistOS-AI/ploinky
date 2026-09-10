@@ -273,7 +273,7 @@ function runAggregateUpdateChild(workspaceRoot, body) {
     });
 }
 
-test('copySkill replaces destination so removed source files do not linger', () => {
+test('copySkill creates fresh output and refuses unverified replacement', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-'));
     try {
         const src = path.join(root, 'src-skill');
@@ -290,6 +290,9 @@ test('copySkill replaces destination so removed source files do not linger', () 
         fs.mkdirSync(dest, { recursive: true });
         fs.writeFileSync(path.join(dest, 'stale.js'), 'stale file\n');
 
+        assert.throws(() => copySkill(src, dest), /unverified/);
+        assert.equal(fs.readFileSync(path.join(dest, 'stale.js'), 'utf8'), 'stale file\n');
+        fs.rmSync(dest, { recursive: true });
         copySkill(src, dest);
 
         // Files from source are copied / overwritten
@@ -306,7 +309,7 @@ test('copySkill replaces destination so removed source files do not linger', () 
     }
 });
 
-test('installDefaultSkills refreshes incoming skills and preserves other .agents skills', () => {
+test('installDefaultSkills preserves unrecorded same-name and unrelated local skills', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-install-'));
     const repoName = `UnitSkills-${process.pid}-${Date.now()}-agents`;
     const repoRoot = createRepo(repoName, {
@@ -334,8 +337,8 @@ test('installDefaultSkills refreshes incoming skills and preserves other .agents
 
         installDefaultSkills(repoName, { targetRoot: root });
 
-        assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'owned', 'tool.js')), true);
-        assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'owned', 'stale.js')), false);
+        assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'owned', 'tool.js')), false);
+        assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'owned', 'stale.js')), true);
         assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'local-only', 'SKILL.md')), true);
         assert.equal(fs.lstatSync(path.join(root, '.claude')).isSymbolicLink(), true);
         assert.equal(fs.readlinkSync(path.join(root, '.claude')), '.agents');
@@ -345,6 +348,28 @@ test('installDefaultSkills refreshes incoming skills and preserves other .agents
         assert.match(gitignore, /^\.agents\/skills\/owned\/$/m);
         assert.doesNotMatch(gitignore, /^\.agents\/skills\/$/m);
         assert.doesNotMatch(gitignore, /local-only/);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+});
+
+test('default installer updates only proven owned output and preserves subsequent local edits', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-owned-defaults-'));
+    const repoName = `OwnedDefaults-${process.pid}-${Date.now()}`;
+    const repoRoot = createRepo(repoName, { demo: { 'SKILL.md': '# one\n', 'helper': 'one' } });
+    const output = path.join(root, '.agents', 'skills', 'demo');
+    try {
+        installDefaultSkills(repoName, { targetRoot: root });
+        fs.writeFileSync(path.join(repoRoot, 'skills', 'demo', 'helper'), 'two');
+        const refreshed = installDefaultSkills(repoName, { targetRoot: root });
+        assert.deepEqual(refreshed.managedExport.installed, ['demo']);
+        assert.equal(fs.readFileSync(path.join(output, 'helper'), 'utf8'), 'two');
+        fs.writeFileSync(path.join(output, 'helper'), 'user edit');
+        fs.writeFileSync(path.join(repoRoot, 'skills', 'demo', 'helper'), 'three');
+        const preserved = installDefaultSkills(repoName, { targetRoot: root });
+        assert.equal(preserved.managedExport.diagnostics[0].reason, 'edited-output-preserved');
+        assert.equal(fs.readFileSync(path.join(output, 'helper'), 'utf8'), 'user edit');
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(repoRoot, { recursive: true, force: true });
@@ -1016,7 +1041,7 @@ for (const runtimeAlias of ['direct path', 'symlink alias', 'bind alias']) {
     });
 }
 
-test('installDefaultSkills migrates legacy .claude skills without deleting other .claude content', () => {
+test('installDefaultSkills preserves independent legacy .claude skills and content', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-claude-'));
     const repoName = `UnitSkills-${process.pid}-${Date.now()}-claude`;
     const repoRoot = createRepo(repoName, {
@@ -1041,14 +1066,13 @@ test('installDefaultSkills migrates legacy .claude skills without deleting other
 
         assert.equal(fs.existsSync(path.join(root, '.claude', 'worktrees', 'keep.txt')), true);
         assert.equal(fs.lstatSync(path.join(root, '.claude')).isDirectory(), true);
-        assert.equal(fs.lstatSync(path.join(root, '.claude', 'skills')).isSymbolicLink(), true);
-        assert.equal(fs.readlinkSync(path.join(root, '.claude', 'skills')), '../.agents/skills');
+        assert.equal(fs.lstatSync(path.join(root, '.claude', 'skills')).isDirectory(), true);
 
         assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'owned', 'fresh.js')), true);
         assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'owned', 'stale.js')), false);
-        assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'legacy-only', 'SKILL.md')), true);
+        assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'legacy-only', 'SKILL.md')), false);
         assert.equal(fs.existsSync(path.join(root, '.claude', 'skills', 'legacy-only', 'SKILL.md')), true);
-        assert.equal(fs.existsSync(path.join(root, '.claude', 'skills', 'owned', 'fresh.js')), true);
+        assert.equal(fs.existsSync(path.join(root, '.claude', 'skills', 'owned', 'fresh.js')), false);
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(repoRoot, { recursive: true, force: true });

@@ -36,7 +36,8 @@ import {
     ROUTING_FILE,
     SECRETS_FILE,
     SERVERS_CONFIG_FILE,
-    PLOINKY_WORKSPACE_ROOT
+    PLOINKY_WORKSPACE_ROOT,
+    PLOINKY_SKILL_SCOPE_ENV
 } from '../../utils/config.js';
 import { openSandboxLogHandle, readSandboxCrashLog } from '../sandboxLogFiles.js';
 import { sanitizeDiagnosticText } from '../../utils/diagnosticText.js';
@@ -688,6 +689,7 @@ function buildFullEnvMap(agentName, manifest, profileConfig, workspacePath, repo
     // no descriptor, Router mirror, request secret, API key, or trust anchor is
     // constructed. Generated-local use therefore fails before key/socket work.
     stripReservedAgentEnv(env);
+    Object.assign(env, PLOINKY_SKILL_SCOPE_ENV);
     const exactRuntimeIdentity = runtimeIdentity === undefined
         ? undefined
         : normalizeSandboxRuntimeIdentity(runtimeIdentity);

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { REPOS_DIR } from '../utils/config.js';
 import * as reposSvc from '../utils/repos.js';
 import { runGitCommand, sanitizeGitDiagnostic } from '../utils/gitCommand.js';
+import { syncManagedSkillExports, copyFreshSkillTree } from '../utils/skills/managedExports.js';
 
 export const AGENT_SKILL_TARGETS = Object.freeze({
     'claude-code': '.claude/skills',
@@ -192,42 +193,11 @@ function ensureManifestRepoCached(entry) {
     return { repoPath, branch: actualBranch, source: sanitizeGitDiagnostic(readCachedRepoSource(repoPath)) };
 }
 
-function copySkillTree(sourcePath, destinationPath) {
-    const stat = fs.lstatSync(sourcePath);
-    const finalMode = stat.mode & 0o777;
-
-    if (stat.isDirectory()) {
-        // Keep the directory owner-writable until its children are complete.
-        // Node's native recursive cp can leave transient mode-0200 files on a
-        // macOS virtiofs mount, after which the in-Box process cannot even stat
-        // them. Explicit creation avoids exposing those intermediate modes.
-        fs.mkdirSync(destinationPath, { mode: 0o700 });
-        for (const entry of fs.readdirSync(sourcePath).sort()) {
-            copySkillTree(path.join(sourcePath, entry), path.join(destinationPath, entry));
-        }
-        fs.chmodSync(destinationPath, finalMode);
-        return;
-    }
-
-    if (stat.isFile()) {
-        const descriptor = fs.openSync(destinationPath, 'wx', 0o600);
-        fs.closeSync(descriptor);
-        fs.copyFileSync(sourcePath, destinationPath);
-        fs.chmodSync(destinationPath, finalMode);
-        return;
-    }
-
-    if (stat.isSymbolicLink()) {
-        fs.symlinkSync(fs.readlinkSync(sourcePath), destinationPath);
-        return;
-    }
-
-    throw new Error(`Unsupported skill entry type: ${sourcePath}`);
-}
-
+// Low-level copies may only create a fresh destination; managed replacement
+// requires the recorded content/mode proof in syncManagedSkillExports.
 export function copySkill(srcDir, destDir) {
-    fs.rmSync(destDir, { recursive: true, force: true });
-    copySkillTree(srcDir, destDir);
+    if (pathExists(destDir)) throw new Error(`Refusing to replace unverified skill output: ${destDir}`);
+    copyFreshSkillTree(srcDir, destDir);
 }
 
 function pathExists(targetPath) {
@@ -327,11 +297,7 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
                 }
                 const previousSource = skillSource.get(skill);
                 if (previousSource) {
-                    skillConflicts.push({
-                        skill,
-                        previousSource: previousSource.source,
-                        chosenSource: entry.name,
-                    });
+                    throw new Error(`Duplicate skill '${skill}' from '${previousSource.source}' and '${entry.name}'; choose one source explicitly.`);
                 }
                 skillSource.set(skill, {
                     source: entry.name,
@@ -356,16 +322,15 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
     const incomingSkills = Array.from(skillSource.keys());
     const isGitRepoTarget = reposSvc.isGitRepository(destRoot);
     const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
-    fs.rmSync(agentsSkillsDir, { recursive: true, force: true });
-    fs.mkdirSync(agentsSkillsDir, { recursive: true });
-
-    for (const [skill, source] of skillSource.entries()) {
-        try {
-            copySkill(path.join(source.repoPath, 'skills', skill), path.join(agentsSkillsDir, skill));
-        } catch (error) {
-            throw skillSourceError(manifestPath, source.entry, error);
-        }
-    }
+    const managedExport = syncManagedSkillExports({
+        folder: destRoot,
+        owner: 'manifest',
+        sources: [...skillSource.entries()].map(([name, source]) => ({
+            name, path: path.join(source.repoPath, 'skills', name),
+            source: { name: source.source, url: sanitizeGitDiagnostic(source.entry.url), branch: source.entry.branch },
+        })),
+    });
+    reportExportDiagnostics(managedExport);
 
     const claudeLink = ensureClaudeSymlink(destRoot);
     let gitignoreUpdated = false;
@@ -395,6 +360,7 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
         symlinkCreated: claudeLink.changed,
         claudeLink,
         duplicateSkills: skillConflicts,
+        managedExport,
         legacyMigration: { migratedSkills: [], skippedExistingSkills: [] },
     };
 }
@@ -443,84 +409,29 @@ export function findWorkspaceFoldersWithSkillsManifest(searchRoot) {
     return folders;
 }
 
-function migrateLegacyClaudeSkills(destRoot, incomingSkills, agentsSkillsDir) {
-    const claudePath = path.join(destRoot, CLAUDE_SYMLINK);
-    const claudeSkillsDir = path.join(claudePath, 'skills');
-    const incoming = new Set(incomingSkills);
-    const migratedSkills = [];
-    const skippedExistingSkills = [];
-
-    let claudeStat;
-    try { claudeStat = fs.lstatSync(claudePath); } catch (_) { claudeStat = null; }
-    if (!claudeStat) {
-        return { migratedSkills, skippedExistingSkills };
-    }
-
-    if (claudeStat.isSymbolicLink()) {
-        try {
-            const canonicalReal = fs.realpathSync(path.join(destRoot, CANONICAL_AGENT_DIR));
-            const claudeReal = fs.realpathSync(claudePath);
-            if (canonicalReal === claudeReal) {
-                return { migratedSkills, skippedExistingSkills };
-            }
-        } catch (_) { }
-    }
-
-    for (const skill of listExistingSkillDirectories(claudeSkillsDir)) {
-        if (incoming.has(skill)) continue;
-
-        const srcDir = path.join(claudeSkillsDir, skill);
-        const destDir = path.join(agentsSkillsDir, skill);
-        if (pathExists(destDir)) {
-            skippedExistingSkills.push(skill);
-            continue;
-        }
-        fs.cpSync(srcDir, destDir, { recursive: true, force: true });
-        migratedSkills.push(skill);
-    }
-
-    if (!claudeStat.isSymbolicLink() && pathExists(claudeSkillsDir)) {
-        fs.rmSync(claudeSkillsDir, { recursive: true, force: true });
-    }
-
-    return { migratedSkills, skippedExistingSkills };
+function reportExportDiagnostics(result) {
+    for (const entry of result.diagnostics) console.warn(`[skills] '${entry.name}': ${entry.reason}; existing output preserved.`);
 }
 
 function ensureClaudeSymlink(destRoot) {
-    const symlinkPath = path.join(destRoot, CLAUDE_SYMLINK);
-    const target = CANONICAL_AGENT_DIR;
-
-    let stat;
-    try { stat = fs.lstatSync(symlinkPath); } catch (_) { stat = null; }
-
-    if (stat) {
-        if (stat.isSymbolicLink()) {
-            const existing = fs.readlinkSync(symlinkPath);
-            if (existing === target) return { changed: false, mode: 'root' };
-            fs.unlinkSync(symlinkPath);
-        } else if (stat.isDirectory()) {
-            const entries = fs.readdirSync(symlinkPath).filter(name => name !== '.DS_Store');
-            if (entries.length) {
-                const skillsSymlinkPath = path.join(symlinkPath, 'skills');
-                if (pathExists(skillsSymlinkPath)) {
-                    const skillsStat = fs.lstatSync(skillsSymlinkPath);
-                    if (skillsStat.isSymbolicLink()
-                        && fs.readlinkSync(skillsSymlinkPath) === `../${CANONICAL_SKILLS_DIR}`) {
-                        return { changed: false, mode: 'skills' };
-                    }
-                    fs.rmSync(skillsSymlinkPath, { recursive: true, force: true });
-                }
-                fs.symlinkSync(`../${CANONICAL_SKILLS_DIR}`, skillsSymlinkPath, 'dir');
-                return { changed: true, mode: 'skills' };
-            }
-            fs.rmSync(symlinkPath, { recursive: true, force: true });
-        } else {
-            fs.unlinkSync(symlinkPath);
-        }
+    const claude = path.join(destRoot, CLAUDE_SYMLINK);
+    if (!pathExists(claude)) {
+        fs.symlinkSync(CANONICAL_AGENT_DIR, claude, 'dir');
+        return { changed: true, mode: 'root' };
     }
-
-    fs.symlinkSync(target, symlinkPath, 'dir');
-    return { changed: true, mode: 'root' };
+    if (fs.lstatSync(claude).isSymbolicLink()) {
+        return { changed: false, mode: fs.readlinkSync(claude) === CANONICAL_AGENT_DIR ? 'root' : 'preserved' };
+    }
+    if (fs.lstatSync(claude).isDirectory()) {
+        const skills = path.join(claude, 'skills');
+        if (!pathExists(skills)) {
+            fs.symlinkSync(`../${CANONICAL_SKILLS_DIR}`, skills, 'dir');
+            return { changed: true, mode: 'skills' };
+        }
+        if (fs.lstatSync(skills).isSymbolicLink() && fs.readlinkSync(skills) === `../${CANONICAL_SKILLS_DIR}`) return { changed: false, mode: 'skills' };
+    }
+    console.warn(`[skills] Independent .claude content preserved at '${claude}'.`);
+    return { changed: false, mode: 'preserved' };
 }
 
 export function installDefaultSkills(repoName, { only, skip, targetRoot } = {}) {
@@ -561,16 +472,15 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot } = {}) 
     }
 
     const skills = listSkillDirectories(skillsRoot);
-    if (!skills.length) {
-        throw new Error(`No skill subdirectories found under ${skillsRoot}.`);
-    }
 
     const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
-    fs.mkdirSync(agentsSkillsDir, { recursive: true });
-    const legacyMigration = migrateLegacyClaudeSkills(destRoot, skills, agentsSkillsDir);
-    for (const skill of skills) {
-        copySkill(path.join(skillsRoot, skill), path.join(agentsSkillsDir, skill));
-    }
+    const managedExport = syncManagedSkillExports({
+        folder: destRoot,
+        owner: `defaults:${repoName}`,
+        sources: skills.map(name => ({ name, path: path.join(skillsRoot, name), source: { name: repoName } })),
+    });
+    reportExportDiagnostics(managedExport);
+    const legacyMigration = { migratedSkills: [], skippedExistingSkills: [] };
 
     const claudeLink = ensureClaudeSymlink(destRoot);
 
@@ -592,5 +502,6 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot } = {}) 
         symlinkCreated: claudeLink.changed,
         claudeLink,
         legacyMigration,
+        managedExport,
     };
 }

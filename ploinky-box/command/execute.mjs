@@ -11,6 +11,7 @@ function signalExitCode(signal) {
 
 export function buildContainerExecArgs(containerId, commandArgv, {
     hostPort,
+    skillScopeEnv = {},
     mediaHostPort,
     interactive = false,
     inputIsTty = false,
@@ -34,6 +35,7 @@ export function buildContainerExecArgs(containerId, commandArgv, {
         })}`,
         ...(logStream ? ['--env', 'PLOINKY_BOX_LOG_STREAM=1'] : []),
         ...(colorOutput === true ? ['--env', 'PLOINKY_COLOR=1'] : []),
+        ...Object.entries(skillScopeEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         '--user', 'podman',
         '--workdir', '/workspace',
         containerId,

@@ -1,3 +1,4 @@
+import { PLOINKY_SKILL_SCOPE_ENV } from '../../utils/config.js';
 import fs from 'fs';
 import { execSync, spawnSync } from 'child_process';
 import path from 'path';
@@ -579,6 +580,7 @@ function buildExecArgs(containerName, workdir, entryCommand, interactive = true,
         args.push('-i');   // Interactive stdin only, no TTY (for webchat - ensures stdin EOF propagates)
     }
     args.push(...buildWebchatEnvArgs(options.env || process.env));
+    for (const [key, value] of Object.entries(PLOINKY_SKILL_SCOPE_ENV)) args.push('-e', `${key}=${value}`);
     args.push(containerName, ...buildAgentShellArgs(`cd ${shellQuote(wd)} && ${cmd}`));
     return args;
 }

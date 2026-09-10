@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { normalizeTaskLiveSession } from '../../webchat/taskLiveSession.js';
+import { normalizeSessionSettingsAction } from '../../webchat/sessionSettings.js';
 
 const STREAM_RECONNECT_GRACE_MS = 120000;
 const MAX_PENDING_SSE_EVENTS = 200;
@@ -570,7 +571,8 @@ export function parseWebchatSessionState(envelope) {
     const session = normalizeSession(envelope.session);
     const summary = normalizeSessionSummary(envelope.summary);
     if (!session || !summary || session.sessionId !== summary.sessionId) return undefined;
-    return { event: envelope.event, ...target, session, summary };
+    const settingsAction = normalizeSessionSettingsAction(envelope.settingsAction, 'https://webchat.invalid');
+    return { event: envelope.event, ...target, session, summary, ...(settingsAction ? { settingsAction } : {}) };
 }
 
 export function serializeSessionStateSseEvent(state) {

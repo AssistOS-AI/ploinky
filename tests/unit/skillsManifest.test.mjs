@@ -154,7 +154,7 @@ test('readSkillsManifest rejects invalid content', () => {
     }
 });
 
-test('installSkillsFromManifest replaces all skills from listed repos', () => {
+test('installSkillsFromManifest installs requested skills and preserves unrelated local skills', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skill-manifest-install-'));
     const reposRoot = path.join(workspace, 'repo-sources');
     const repoA = path.join(reposRoot, 'repoA');
@@ -179,7 +179,7 @@ test('installSkillsFromManifest replaces all skills from listed repos', () => {
         });
 
         const manifestPath = createManifest(workspace, [
-            manifestEntry(repoA, 'ManifestRepoAInstall', ['owned']),
+            manifestEntry(repoA, 'ManifestRepoAInstall', []),
             manifestEntry(repoB, 'ManifestRepoBInstall', ['owned', 'fresh']),
         ]);
 
@@ -194,7 +194,7 @@ test('installSkillsFromManifest replaces all skills from listed repos', () => {
         assert.equal(fs.existsSync(path.join(target, '.agents', 'skills', 'owned', 'SKILL.md')), true);
         assert.equal(fs.existsSync(path.join(target, '.agents', 'skills', 'owned', 'stale')), false);
         assert.equal(fs.existsSync(path.join(target, '.agents', 'skills', 'fresh', 'SKILL.md')), true);
-        assert.equal(fs.existsSync(path.join(target, '.agents', 'skills', 'localOnly', 'SKILL.md')), false);
+        assert.equal(fs.existsSync(path.join(target, '.agents', 'skills', 'localOnly', 'SKILL.md')), true);
         assert.equal(fs.lstatSync(path.join(target, '.claude')).isSymbolicLink(), true);
         assert.equal(fs.readlinkSync(path.join(target, '.claude')), '.agents');
     } finally {
@@ -266,7 +266,7 @@ test('installSkillsFromManifest does not create or update .gitignore for non-git
     }
 });
 
-test('installSkillsFromManifest resolves duplicate skill names using manifest order (last wins)', () => {
+test('installSkillsFromManifest rejects ambiguous duplicate names before exporting', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skill-manifest-dup-'));
     const reposRoot = path.join(workspace, 'repo-sources');
     const first = path.join(reposRoot, 'first');
@@ -298,16 +298,8 @@ test('installSkillsFromManifest resolves duplicate skill names using manifest or
         ]);
 
         const target = path.join(workspace, 'target');
-        const result = installSkillsFromManifest(manifestPath, { targetRoot: target });
-
-        assert.equal(result.duplicateSkills.length, 1);
-        assert.equal(result.duplicateSkills[0].skill, 'shared');
-        assert.equal(result.duplicateSkills[0].previousSource, 'ManifestRepoFirstDup');
-        assert.equal(result.duplicateSkills[0].chosenSource, 'ManifestRepoSecondDup');
-        assert.equal(fs.readFileSync(path.join(target, '.agents', 'skills', 'shared', 'SKILL.md'), 'utf8'), '# second\n');
-        assert.equal(result.skills.includes('shared'), true);
-        assert.equal(result.skills.includes('firstOnly'), true);
-        assert.equal(result.skills.includes('secondOnly'), true);
+        assert.throws(() => installSkillsFromManifest(manifestPath, { targetRoot: target }), /Duplicate skill 'shared'/);
+        assert.equal(fs.existsSync(path.join(target, '.agents')), false);
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
         removeCachedRepo('ManifestRepoFirstDup');

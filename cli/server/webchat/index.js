@@ -15,6 +15,7 @@ import { createSkillsController } from './skills.js';
 import { createInteractionPrompt } from './interactionPrompt.js';
 import { createWorkspaceFileIndex } from './workspaceFileIndex.js';
 import { createHeaderMenu, createResponsiveHeaderActions } from './headerMenu.js';
+import { createSessionSettingsController } from './sessionSettings.js';
 
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
@@ -99,6 +100,7 @@ const {
 } = elements;
 
 const workspaceFileIndex = createWorkspaceFileIndex();
+const sessionSettingsController = createSessionSettingsController({ link: elements.sessionSettingsLink });
 
 let network = null;
 
@@ -206,6 +208,7 @@ network = createNetwork({
     onSessionState: (payload) => {
         sessionController?.handleSessionState(payload);
         const selected = sessionController?.getCurrentSession()?.sessionId;
+        sessionSettingsController.handleSessionState(payload, selected);
         if (selected && selected === payload.summary?.sessionId) {
             const key = `${selected}:${payload.session?.engine?.backend || ''}`;
             if (key !== modelCatalogSessionKey) {

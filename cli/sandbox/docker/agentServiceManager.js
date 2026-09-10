@@ -81,7 +81,7 @@ import {
 import { DEFAULT_AGENT_ENTRY, launchAgentSidecar, readManifestAgentCommand, readManifestStartCommand, splitCommandArgs } from './agentCommands.js';
 import { hasExactAgentHomeLayout, resolveAgentHomeLayout } from './agentHomeLayout.js';
 import { buildAgentShellArgs } from './agentShell.js';
-import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, SHARED_DIR } from '../../utils/config.js';
+import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, PLOINKY_SKILL_SCOPE_ENV, SHARED_DIR } from '../../utils/config.js';
 import {
     planRuntimeResources,
     applyRuntimeResourceEnv,
@@ -1889,6 +1889,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // config can redirect the runtime, inject a master key, or override the
     // agent's derived secret.
     stripReservedAndRestoreRuntimeRouterEnvFlags(envStrings, {});
+    for (const [key, value] of Object.entries(PLOINKY_SKILL_SCOPE_ENV)) envStrings.push(formatEnvFlag(key, value));
     // Only non-secret principal fields exist before topology attestation.
     for (const [key, value] of Object.entries(buildAgentPrincipalEnv(
         deriveAgentPrincipalId(path.basename(path.dirname(agentPath)), agentName),
