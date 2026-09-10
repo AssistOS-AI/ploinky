@@ -285,19 +285,74 @@ test('legacy guard ancestors remain pinned without making the project read-only'
     } finally { cleanup(); }
 });
 
-test('legacy guard admission rejects mutable symlink parents and indirect writable aliases', () => {
-    const { root, cleanup } = fixture();
-    try {
-        const framework = path.join(root, 'framework');
-        fs.mkdirSync(path.join(framework, 'data'), { recursive: true });
-        fs.symlinkSync('framework', path.join(root, '.ploinky'));
-        const bindings = [{ hostPath: root, runtimePath: '/workspace' }];
-        policyFailure(() => legacyAgentGuardTargets(bindings, { workspaceRoot: root }));
-        fs.unlinkSync(path.join(root, '.ploinky'));
-        fs.mkdirSync(path.join(root, '.ploinky'));
-        fs.symlinkSync('framework', path.join(root, 'alias'));
-        fs.symlinkSync('../alias/data', path.join(root, '.ploinky', 'data'));
-        policyFailure(() => legacyAgentGuardTargets(bindings, { workspaceRoot: root }));
-        assert.deepEqual(fs.readdirSync(path.join(framework, 'data')), []);
-    } finally { cleanup(); }
-});
+for (const workspaceAlias of [false, true]) {
+    for (const existingChildren of [false, true]) {
+        test(`legacy guards accept controller aliases with workspace alias=${workspaceAlias}, existing children=${existingChildren}`, () => {
+            const { root, cleanup } = fixture();
+            try {
+                const physicalWorkspace = path.join(root, 'project');
+                const framework = path.join(physicalWorkspace, '.state');
+                const running = path.join(framework, '.running-state');
+                fs.mkdirSync(running, { recursive: true });
+                fs.symlinkSync('.state', path.join(physicalWorkspace, '.ploinky'));
+                fs.symlinkSync('.running-state', path.join(framework, 'running'));
+                const workspaceRoot = workspaceAlias ? path.join(root, 'workspace') : physicalWorkspace;
+                if (workspaceAlias) fs.symlinkSync('project', workspaceRoot);
+                for (const directory of [physicalWorkspace, framework, running]) fs.chmodSync(directory, 0o770);
+                if (existingChildren) {
+                    for (const key of ['data', 'shared']) fs.mkdirSync(path.join(framework, key));
+                }
+                const preservedPaths = [workspaceRoot, physicalWorkspace, framework, running,
+                    path.join(physicalWorkspace, '.ploinky'), path.join(framework, 'running')];
+                const identities = () => preservedPaths.map(file => {
+                    const stat = fs.lstatSync(file);
+                    return { file, mode: stat.mode, uid: stat.uid, gid: stat.gid, dev: stat.dev,
+                        ino: stat.ino, link: stat.isSymbolicLink() ? fs.readlinkSync(file) : null };
+                });
+                const before = identities();
+                const bindings = [
+                    { hostPath: root, runtimePath: '/home' },
+                    { hostPath: workspaceRoot, runtimePath: '/workspace' },
+                ];
+                const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
+                assert.deepEqual(targets.map(guard => guard.target), [
+                    '/home/project/.state/data', '/home/project/.state/shared',
+                    '/workspace/.state/data', '/workspace/.state/shared',
+                ]);
+                const mounts = legacyAgentGuardMounts(targets, { workspaceRoot, bindings });
+                assert.deepEqual(mounts.filter(mount => mount.parent).map(mount => [mount.target, mount.readOnly]), [
+                    ['/home/project', false], ['/workspace/.state', true], ['/home/project/.state', true],
+                ]);
+                assert.deepEqual(mounts.filter(mount => !mount.parent).map(mount => [mount.target, mount.readOnly]),
+                    existingChildren ? targets.map(guard => [guard.target, true]) : []);
+                for (const key of ['data', 'shared']) {
+                    assert.equal(fs.existsSync(path.join(framework, key)), existingChildren);
+                    policyFailure(() => legacyAgentGuardTargets([
+                        { hostPath: path.join(workspaceRoot, '.ploinky', key, 'child'), runtimePath: '/leak' },
+                    ], { workspaceRoot }));
+                }
+                assert.deepEqual(identities(), before);
+            } finally { cleanup(); }
+        });
+    }
+}
+
+for (const frameworkAlias of [false, true]) {
+    test(`legacy guard admission rejects indirect writable aliases with controller alias=${frameworkAlias}`, () => {
+        const { root, cleanup } = fixture();
+        try {
+            const framework = path.join(root, 'framework');
+            fs.mkdirSync(path.join(framework, 'data'), { recursive: true });
+            if (frameworkAlias) {
+                fs.mkdirSync(path.join(root, '.state'));
+                fs.symlinkSync('.state', path.join(root, '.ploinky'));
+            } else fs.mkdirSync(path.join(root, '.ploinky'));
+            fs.symlinkSync('framework', path.join(root, 'alias'));
+            fs.symlinkSync('../alias/data', path.join(root, '.ploinky', 'data'));
+            policyFailure(() => legacyAgentGuardTargets([
+                { hostPath: root, runtimePath: '/workspace' },
+            ], { workspaceRoot: root }));
+            assert.deepEqual(fs.readdirSync(path.join(framework, 'data')), []);
+        } finally { cleanup(); }
+    });
+}

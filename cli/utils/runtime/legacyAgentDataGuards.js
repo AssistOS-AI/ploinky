@@ -139,7 +139,9 @@ export function legacyAgentGuardTargets(bindings, {
         const canonicalSource = projectedCanonicalPath(source);
         for (const protectedRoot of protectedLegacyAgentRoots(workspaceRoot)) {
             const canonicalProtectedRoot = projectedCanonicalPath(protectedRoot.hostPath);
-            for (const symlink of legacyRootSymlinks(protectedRoot.hostPath)) {
+            // Workspace and controller aliases are allowed. Inspect indirection
+            // introduced below the canonical controller root instead.
+            for (const symlink of legacyRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
                 const parent = projectedCanonicalPath(path.dirname(symlink));
                 if (binding.readOnly !== true && !isPathWithin(parent, frameworkRoot)
                     && isPathWithin(parent, canonicalSource)) {
