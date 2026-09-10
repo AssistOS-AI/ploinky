@@ -143,7 +143,7 @@ test('local edits propagate through a queued existing conversation and both expo
     const resumed = await manager.resumeTask(f.robot, firstTask.taskId, 'Report the current empty selection.');
     const empty = await completed(resumed);
     assert.deepEqual(empty.before.envelope.entries, []);
-    assert.match(empty.before.conveyed, /none; no task skills are selected/);
+    assert.match(empty.before.conveyed, /no task skills are selected for this execution/);
     assert.deepEqual(empty.session, first.session);
     assert.equal(empty.resumed, true);
     await writeSkill(path.join(f.scopeRoot, '.agents/skills/later'), 'later');

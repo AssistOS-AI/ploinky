@@ -29,7 +29,7 @@ async function consume() {
     // Match the public CLI's explicit-catalog empty handling before validation.
     const skills = await discoverTaskSkills((await discoverAnthropicSkills(catalogPath)).length ? [catalogPath] : []);
     const envelope = await readCatalogEnvelope(catalogPath, skills);
-    const conveyed = catalogSelectionPrompt(skills, prompt, envelope);
+    const conveyed = catalogSelectionPrompt(skills, prompt);
     const output = {};
     for (const entry of envelope.entries) {
         const dir = path.join(catalogPath, entry.name);
