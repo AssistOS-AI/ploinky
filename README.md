@@ -128,6 +128,16 @@ an AgentLib-only policy-pin change does not change the bundled MCP SDK or its
 dependency-cache fingerprint. Changes to actual image inputs still require
 image-contract verification and a matching immutable image.
 
+Prepared dependency caches bind both `achillesAgentLib` and `ploinky-agent-lib`
+to that same admitted source. After npm completes, Ploinky replaces hoisted,
+scoped, and nested copies of either package with source links and verifies them
+before admitting the cache. This also covers dependencies that use the package
+name `ploinky-agent-lib`, such as ALA. Older cache adapters are repaired under
+the cache lock without reinstalling unrelated packages. Linked local packages
+are inspected without changing their source. If they contain or resolve a
+different AgentLib, install those dependencies as package copies so Ploinky can
+adapt the owned cache. Runtime caches and the selected library remain read-only.
+
 State follows these stop/start and destroy boundaries:
 
 | State | Where it lives | Survives stop/start? | Survives destroy? |

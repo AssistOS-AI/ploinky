@@ -1,8 +1,8 @@
-// The achillesAgentLib adapter inside a prepared dependency cache.
+// The AgentLib package adapters inside a prepared dependency cache.
 //
 // Agent-owned code keeps writing bare `import 'achillesAgentLib/...'`. Instead
-// of installing a copy per cache, each cache carries one symlink into the
-// selected source, so every agent resolves the same bytes the core does.
+// of retaining a copy per cache, both package names and every nested npm copy
+// link into the selected source, so all consumers resolve the core's bytes.
 //
 // This is deliberately not an install-tree fallback: the link is created after
 // every npm operation (npm prunes entries it does not know about) and verified
@@ -19,6 +19,7 @@ import {
     agentLibError,
 } from '../../../agentlib/contract.mjs';
 import { parseRuntimeKey, SUPPORTED_FAMILIES } from './dependencyRuntimeKey.js';
+import { AGENTLIB_ADAPTER_SCHEMA, agentLibPackagePaths } from './agentLibPackages.mjs';
 
 /** Runtime families that get their own mount namespace. */
 const MOUNT_NAMESPACE_FAMILIES = new Set(['container', 'bwrap']);
@@ -96,13 +97,21 @@ export function agentLibLinkPath(cachePath) {
  * @returns {{ created: boolean, target: string }}
  */
 export function ensureAgentLibCacheLink(cachePath, target, { fsApi = fs } = {}) {
-    const linkPath = agentLibLinkPath(cachePath);
-    fsApi.mkdirSync(path.dirname(linkPath), { recursive: true });
+    fsApi.mkdirSync(path.join(cachePath, 'node_modules'), { recursive: true });
+    const aliases = agentLibPackagePaths(cachePath, target, { fsApi });
+    let created = false;
+    for (const linkPath of aliases) {
+        created = ensureCacheLink(linkPath, target, fsApi) || created;
+    }
+    return { created, target };
+}
+
+function ensureCacheLink(linkPath, target, fsApi) {
     let current = null;
     try {
         const stat = fsApi.lstatSync(linkPath);
         current = stat.isSymbolicLink() ? fsApi.readlinkSync(linkPath) : null;
-        if (current === target) return { created: false, target };
+        if (current === target) return false;
         fsApi.rmSync(linkPath, { recursive: true, force: true });
     } catch (error) {
         if (error?.code !== 'ENOENT') throw error;
@@ -113,7 +122,7 @@ export function ensureAgentLibCacheLink(cachePath, target, { fsApi = fs } = {}) 
     try { fsApi.rmSync(staging, { recursive: true, force: true }); } catch (_) { /* nothing staged */ }
     fsApi.symlinkSync(target, staging);
     fsApi.renameSync(staging, linkPath);
-    return { created: true, target };
+    return true;
 }
 
 /**
@@ -122,7 +131,17 @@ export function ensureAgentLibCacheLink(cachePath, target, { fsApi = fs } = {}) 
  * @returns {string}
  */
 export function agentLibCacheLinkProblem(cachePath, target, { fsApi = fs } = {}) {
-    const linkPath = agentLibLinkPath(cachePath);
+    let aliases;
+    try { aliases = agentLibPackagePaths(cachePath, target, { fsApi }); }
+    catch (error) { return `AgentLib package tree is unreadable at ${cachePath}: ${error.message}`; }
+    for (const linkPath of aliases) {
+        const problem = cacheLinkProblem(linkPath, target, fsApi);
+        if (problem) return problem;
+    }
+    return '';
+}
+
+function cacheLinkProblem(linkPath, target, fsApi) {
     let stat;
     try {
         stat = fsApi.lstatSync(linkPath);
@@ -166,6 +185,7 @@ export function assertNoReservedAgentLibDependency(pkg, source = 'agent package.
 /** The AgentLib section recorded in a cache stamp. */
 export function agentLibStampSection(runtimeKey, selection) {
     return {
+        adapterSchema: AGENTLIB_ADAPTER_SCHEMA,
         mode: selection.mode,
         fingerprint: selection.fingerprint,
         commit: selection.commit || '',
@@ -183,6 +203,9 @@ export function agentLibStampSection(runtimeKey, selection) {
 export function agentLibStampProblem(stamp, expected) {
     const actual = stamp?.agentLib;
     if (!actual) return 'agentLib stamp section missing';
+    if (actual.adapterSchema !== expected.adapterSchema) {
+        return `agentLib adapterSchema changed (${actual.adapterSchema ?? 'null'} != ${expected.adapterSchema})`;
+    }
     for (const key of ['mode', 'fingerprint', 'sourceIdHash', 'linkTarget']) {
         if (String(actual[key] ?? '') !== String(expected[key] ?? '')) {
             return `agentLib ${key} changed (${actual[key] ?? 'null'} != ${expected[key] ?? 'null'})`;
