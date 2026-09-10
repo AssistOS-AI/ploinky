@@ -1286,6 +1286,10 @@ function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
     return matches.values().next().value || null;
 }
 
+// This private handoff is created only by ensureAgentService and is usable
+// under its still-live lock. Independent service calls get a fresh adapter.
+const SERVICE_NETWORK_LIFECYCLE = Symbol('serviceNetworkLifecycle');
+
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const repoName = path.basename(path.dirname(agentPath));
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
@@ -1756,7 +1760,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    const networkLifecycle = createNetworkLifecycleAdapter({ runtime });
+    const serviceNetworkLifecycle = options[SERVICE_NETWORK_LIFECYCLE];
+    if (serviceNetworkLifecycle) {
+        assertNetworkLifecycleCapability(options.networkLifecycleCapability);
+        if (serviceNetworkLifecycle.capability !== options.networkLifecycleCapability
+            || serviceNetworkLifecycle.runtime !== runtime) {
+            throw new Error('service network lifecycle handoff does not match the locked runtime');
+        }
+    }
+    const networkLifecycle = serviceNetworkLifecycle?.adapter || createNetworkLifecycleAdapter({ runtime });
     const unmanagedNetworkLifecyclePlan = runtimeNetworkPlan.requiresManagedNetwork
         ? null
         : {
@@ -3572,6 +3584,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     const runtime = getRuntime();
+    // Reuse this observation only for preliminary decisions under the lock.
+    // Contract inspection and the launch transaction re-read exact identity,
+    // running state, network membership and generated descriptor authority.
     const existingRuntimeAtEntry = containerExists(containerName);
     assertManifestEnvProfileCompleteness(manifest, profileConfig, { agentName, repoName, profileName: activeProfile });
     // LLM-runtime agents get their real image from the hardware-aware catalog in
@@ -3622,17 +3637,17 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     let recreateReason = targetedRestart ? 'targetedRestart' : (forceRecreate ? 'forceRecreate' : null);
     const requestedEnableGeneration = String(options.enableGeneration || existingRecord.enableGeneration || randomUUID());
     const requestedInstanceId = String(options.instanceId || existingRecord.instanceId || '');
-    if (containerExists(containerName) && (!existingRecord.instanceId || !existingRecord.enableGeneration)) {
+    if (existingRuntimeAtEntry && (!existingRecord.instanceId || !existingRecord.enableGeneration)) {
         recreateReason ||= 'missingRuntimeIdentity';
     }
-    if (containerExists(containerName) && (
+    if (existingRuntimeAtEntry && (
         (options.instanceId && options.instanceId !== existingRecord.instanceId)
         || (options.enableGeneration && options.enableGeneration !== existingRecord.enableGeneration)
     )) {
         recreateReason ||= 'runtimeIdentityChanged';
     }
 
-    if (containerExists(containerName) && !runtimeNetworkPlan.requiresManagedNetwork) {
+    if (existingRuntimeAtEntry && !runtimeNetworkPlan.requiresManagedNetwork) {
         const desired = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
         const current = getContainerLabel(containerName, 'ploinky.envhash');
         if (desired && desired !== current) {
@@ -3644,7 +3659,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     // The AgentLib selection lives outside the manifest and profile, so the env
     // hash cannot see a changed source. Compare it directly: a fingerprint
     // change must replace this container, not reuse it against old bytes.
-    if (containerExists(containerName)) {
+    if (existingRuntimeAtEntry) {
         const agentLibProblem = agentLibReuseProblem(existingRecord, agentLibGrant('container'));
         if (agentLibProblem) {
             debugLog(`[ensureAgentService] ${agentName}: ${agentLibProblem}, recreating container`);
@@ -3653,7 +3668,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
 
     // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
-    if (containerExists(containerName) && isLlmRuntimeManifest(manifest, profileConfig)) {
+    if (existingRuntimeAtEntry && isLlmRuntimeManifest(manifest, profileConfig)) {
         try {
             const desiredEnvHash = computeEnvHash(manifest, profileConfig, envHashExtra, { agentName, repoName });
             const effectiveNetworkForLlm = profileConfig?.network ?? manifest?.network ?? null;
@@ -3694,7 +3709,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     let inspectedContainerId = null;
     let managedReconciliationPreparationLease = options.preparationLease;
     let adoptManagedRuntimeOnly = false;
-    if (containerExists(containerName)) {
+    if (existingRuntimeAtEntry) {
         const contractInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
             instanceKey: effectiveInstanceKey(repoName, agentName, aliasOverride || ''),
             contractHash: networkContractHash(manifestNetwork),
@@ -3712,7 +3727,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 : 'networkContractDrift';
             debugLog(`[ensureAgentService] ${agentName}: managed runtime contract drifted (${driftReason}); recreating container`);
             recreateReason ||= driftReason;
-        } else if (!isContainerRunning(containerName)) {
+        } else if (!contractInspection.running) {
             // A stopped runtime is an instance replacement, not a process-resume
             // optimization. Its old identity is inactivated and rotated before
             // any host/none/managed process can start again.
@@ -3720,7 +3735,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
-    if (containerExists(containerName) && !recreateReason) {
+    if (existingRuntimeAtEntry && !recreateReason) {
         debugLog(`[ensureAgentService] ${agentName}: container exists, checking if running...`);
         let canReuseExisting = true;
         const reuseInspection = networkLifecycle.inspectContainerContract(containerName, manifestNetwork, agentName, {
@@ -3736,7 +3751,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         if (reuseInspection.state !== 'exact' || !inspectedContainerId || reuseInspection.id !== inspectedContainerId) {
             canReuseExisting = false;
             recreateReason ||= 'runtimeChangedDuringInspection';
-        } else if (!isContainerRunning(containerName)) {
+        } else if (!reuseInspection.running) {
             // Never resume a stopped container under its predecessor identity.
             // Re-enter the coordinated inactive-generation replacement path.
             canReuseExisting = false;
@@ -3966,6 +3981,11 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
             adoptManagedRuntimeOnly,
+            [SERVICE_NETWORK_LIFECYCLE]: {
+                runtime,
+                capability: options.networkLifecycleCapability,
+                adapter: networkLifecycle,
+            },
         });
     if (adoptManagedRuntimeOnly) {
         if (started?.createdByThisLaunch !== false) {
