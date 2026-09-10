@@ -42,13 +42,14 @@ function controlledNodeFixture(root) {
     };
 }
 
-test('package metadata changes only the exact bin map and immutable postinstall', () => {
+test('package metadata preserves the exact bin map, immutable postinstall and local skill test entry point', () => {
     const current = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'package.json'), 'utf8'));
     const baseline = JSON.parse(run('git', ['show', `${BASE_SHA}:package.json`]).stdout);
     const { bin: currentBin, ...currentRest } = current;
     const { bin: baselineBin, ...baselineRest } = baseline;
     const expectedRest = structuredClone(baselineRest);
     expectedRest.scripts.postinstall = 'node ./ploinky-box/entrypoint/install-dependencies.mjs';
+    expectedRest.scripts['test:local-skills'] = 'node tests/integration/local-skills/run.mjs';
     assert.deepEqual(currentRest, expectedRest);
     assert.notDeepEqual(currentBin, baselineBin);
     assert.deepEqual(currentBin, {

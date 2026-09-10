@@ -92,7 +92,7 @@ test('Phase 0 CLI admission imports the production exact argv builder', () => {
         '--env', 'PLOINKY_WEBTTY_MARKER=phase0-regression-marker',
         'a'.repeat(64),
         '/bin/bash', '--noprofile', '--norc', '-p', '-c',
-        'PS1=\'$PWD $ \'; export PS1; /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac',
+        'if [ -f /etc/ploinky/webtty-env.sh ]; then . /etc/ploinky/webtty-env.sh || exit 124; fi; PS1=\'$PWD $ \'; export PS1; /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac',
         'ploinky-webtty-marker:phase0-regression-marker',
     ]);
     assert.deepEqual(fixedAgentShellWrapperArgv(
@@ -100,7 +100,7 @@ test('Phase 0 CLI admission imports the production exact argv builder', () => {
         '/bin/sh',
     ), [
         '/bin/sh', '-p', '-c',
-        'PS1=\'$PWD $ \'; export PS1; /bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"',
+        'if [ -f /etc/ploinky/webtty-env.sh ]; then . /etc/ploinky/webtty-env.sh || exit 124; fi; PS1=\'$PWD $ \'; export PS1; /bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"',
         'ploinky-webtty-marker:phase0-regression-marker',
     ]);
 });

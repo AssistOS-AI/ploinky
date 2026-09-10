@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
+import { CLI_OUTPUT_BOUNDARY, createStartupOutputFilter } from '../../cli/server/webchat/startupOutput.js';
 
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-network-startup-'));
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
@@ -235,8 +236,17 @@ test('CLI reports readiness on private fd3 only and never forwards its control e
         const success = ready && !attachFails;
         assert.deepEqual(await once(child, 'close'), [success ? 0 : 1, null]);
         assert.equal(control, success && fd === '3' ? '{"version":1,"state":"ready"}\n' : '');
-        assert.equal(stdout, success ? 'agent output' : '');
-        if (success) assert.equal(stderr, '');
+        const boundary = success && fd === '3' ? CLI_OUTPUT_BOUNDARY : '';
+        assert.equal(stdout, success ? `${boundary}agent output` : '');
+        if (success) {
+            assert.equal(stderr, boundary);
+            if (fd === '3') {
+                let visible = '';
+                createStartupOutputFilter(chunk => { visible += chunk; })(stdout);
+                assert.equal(visible, 'agent output');
+                createStartupOutputFilter(() => assert.fail('the stderr boundary is not user output'))(stderr);
+            }
+        }
         else if (attachFails) assert.match(stderr, /attach preflight failed/);
         else assert.match(stderr, /did not become ready before CLI attach/);
     }
