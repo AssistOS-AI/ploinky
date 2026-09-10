@@ -10,11 +10,16 @@ import { GRAPH_SKILL_SCOPE_FILE, readGraphSkillScope, validateGraphSkillScope, w
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
 
-function fixture(t) {
+function fixture(t, { symlinkedState = false } = {}) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-scope-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
     for (const name of ['.ploinky', 'prior', 'candidate']) fs.mkdirSync(path.join(workspace, name), { recursive: true });
+    if (symlinkedState) {
+        const stateDirectory = path.join(root, 'linked-state');
+        fs.renameSync(path.join(workspace, '.ploinky'), stateDirectory);
+        fs.symlinkSync(stateDirectory, path.join(workspace, '.ploinky'), 'dir');
+    }
     const identity = buildWorkspaceIdentity(workspace, { markerFound: true });
     const priorScope = buildHostSkillScope(workspace, path.join(workspace, 'prior'));
     const candidateScope = buildHostSkillScope(workspace, path.join(workspace, 'candidate'));
@@ -65,6 +70,50 @@ const activate = (supervisor, operation) => operation === 'start'
     ? supervisor.runStartTransaction(['start', 'fixture'])
     : operation === 'restart' ? supervisor.runRestartTransaction(['restart'])
         : supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true });
+
+for (const operation of ['start', 'restart', 'update']) {
+    test(`${operation} accepts linked workspace state and preserves exact saved graph scope`, async t => {
+        const f = fixture(t, { symlinkedState: true });
+        assert.equal(readGraphSkillScope(f.identity), null);
+        await f.create(f.priorScope.PLOINKY_HOST_LAUNCH_CWD).runStartTransaction(['start', 'fixture']);
+        assert.deepEqual(readGraphSkillScope(f.identity), f.priorScope);
+        await activate(f.create(f.candidateScope.PLOINKY_HOST_LAUNCH_CWD), operation);
+        assert.deepEqual(f.state.calls.at(-1).scope, f.candidateScope);
+        assert.deepEqual(readGraphSkillScope(f.identity), f.candidateScope);
+        assert.equal(fs.lstatSync(f.identity.anchorPath).isSymbolicLink(), true);
+        const record = JSON.parse(fs.readFileSync(path.join(f.root, 'linked-state', GRAPH_SKILL_SCOPE_FILE)));
+        assert.deepEqual(record, { version: 1, instance: f.identity.instance, launchRelativePath: 'candidate' });
+        assert.equal(fs.statSync(f.target).mode & 0o777, 0o600);
+        assert.equal(f.state.held, false);
+        assert.equal(f.state.acquisitions, 2);
+    });
+}
+
+for (const operation of ['publication', 'removal']) {
+test(`linked state retargeted before atomic ${operation} preserves both directories`, t => {
+    const f = fixture(t, { symlinkedState: true });
+    f.state.held = true;
+    writeGraphSkillScope(f.identity, f.priorScope, f.lock);
+    const original = fs.readFileSync(f.target, 'utf8');
+    const replacement = path.join(f.root, 'replacement-state');
+    fs.mkdirSync(replacement);
+    const replacementTarget = path.join(replacement, GRAPH_SKILL_SCOPE_FILE);
+    fs.writeFileSync(replacementTarget, 'untouched replacement', { mode: 0o600 });
+    let assertions = 0;
+    const lock = { assertHeld(instance) {
+        f.lock.assertHeld(instance);
+        if (++assertions === 2) {
+            fs.unlinkSync(f.identity.anchorPath);
+            fs.symlinkSync(replacement, f.identity.anchorPath, 'dir');
+        }
+    } };
+    assert.throws(() => writeGraphSkillScope(f.identity, operation === 'removal' ? null : f.candidateScope, lock), /state directory changed/);
+    assert.equal(fs.readFileSync(path.join(f.root, 'linked-state', GRAPH_SKILL_SCOPE_FILE), 'utf8'), original);
+    assert.equal(fs.readFileSync(replacementTarget, 'utf8'), 'untouched replacement');
+    assert.equal(fs.readdirSync(path.join(f.root, 'linked-state')).some(name => name.endsWith('.tmp')), false);
+    assert.equal(fs.readdirSync(replacement).some(name => name.endsWith('.tmp')), false);
+});
+}
 
 for (const operation of ['start', 'restart', 'update']) {
     for (const launch of ['prior', 'candidate']) {

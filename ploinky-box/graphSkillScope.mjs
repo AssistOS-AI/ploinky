@@ -23,11 +23,26 @@ function statePath(identity) {
         || (rootStat.isSymbolicLink() ? fs.readlinkSync(root) : null) !== fingerprint.symlinkTarget) {
         throw scopeError('Workspace identity changed before accessing its graph skill scope');
     }
-    const stat = fs.lstatSync(identity.anchorPath);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        throw scopeError('Graph skill scope requires a real workspace state directory');
+    const anchor = fs.lstatSync(identity.anchorPath);
+    const stat = fs.statSync(identity.anchorPath);
+    if (!stat.isDirectory()) {
+        throw scopeError('Graph skill scope requires a workspace state directory');
     }
-    return path.join(identity.anchorPath, GRAPH_SKILL_SCOPE_FILE);
+    // Workspace state directories may be symlinks. Pin the resolved directory
+    // for this operation, while continuing to reject links at the record itself.
+    return Object.freeze({
+        target: path.join(fs.realpathSync(identity.anchorPath), GRAPH_SKILL_SCOPE_FILE),
+        device: String(stat.dev), inode: String(stat.ino), mode: stat.mode,
+        anchorDevice: String(anchor.dev), anchorInode: String(anchor.ino), anchorMode: anchor.mode,
+        symlinkTarget: anchor.isSymbolicLink() ? fs.readlinkSync(identity.anchorPath) : null,
+    });
+}
+
+function assertStatePathCurrent(identity, before) {
+    const after = statePath(identity);
+    if (Object.keys(before).some(key => before[key] !== after[key])) {
+        throw scopeError('Workspace state directory changed while accessing its graph skill scope');
+    }
 }
 
 function normalizeRecord(identity, record) {
@@ -50,12 +65,16 @@ function normalizeRecord(identity, record) {
 // Missing metadata identifies a pre-migration graph, never a workspace-wide
 // scope. Successful activation can replace it; automatic rollback cannot infer it.
 export function readGraphSkillScope(identity) {
-    const target = statePath(identity);
+    const state = statePath(identity);
+    const { target } = state;
     let descriptor;
     try {
         descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     } catch (error) {
-        if (error.code === 'ENOENT') return null;
+        if (error.code === 'ENOENT') {
+            assertStatePathCurrent(identity, state);
+            return null;
+        }
         throw scopeError('Could not open the saved graph skill scope', error);
     }
     try {
@@ -71,7 +90,9 @@ export function readGraphSkillScope(identity) {
             || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
             throw scopeError('Saved graph skill scope changed while being read');
         }
-        return normalizeRecord(identity, JSON.parse(bytes.toString('utf8')));
+        const record = normalizeRecord(identity, JSON.parse(bytes.toString('utf8')));
+        assertStatePathCurrent(identity, state);
+        return record;
     } catch (error) {
         if (error instanceof PloinkyBoxError) throw error;
         throw scopeError('Could not read the saved graph skill scope', error);
@@ -102,9 +123,13 @@ export function validateGraphSkillScope(identity, scopeEnv) {
 export function writeGraphSkillScope(identity, scopeEnv, lock) {
     if (typeof lock?.assertHeld !== 'function') throw scopeError('Saving graph skill scope requires the workspace mutation lock');
     lock.assertHeld(identity.instance);
-    const target = statePath(identity);
+    const state = statePath(identity);
+    const { target } = state;
     if (!scopeEnv) {
+        lock.assertHeld(identity.instance);
+        assertStatePathCurrent(identity, state);
         try { fs.unlinkSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        assertStatePathCurrent(identity, state);
         return;
     }
     const current = validateGraphSkillScope(identity, scopeEnv);
@@ -117,7 +142,7 @@ export function writeGraphSkillScope(identity, scopeEnv, lock) {
     try {
         fs.writeFileSync(temporary, `${JSON.stringify(record)}\n`, { flag: 'wx', mode: 0o600 });
         lock.assertHeld(identity.instance);
-        statePath(identity);
+        assertStatePathCurrent(identity, state);
         fs.renameSync(temporary, target);
     } finally {
         try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
