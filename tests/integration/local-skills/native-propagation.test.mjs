@@ -37,8 +37,8 @@ test('real native conversation uses live source edits, additions, explicit empty
     f.cleanup.push(() => engine.close());
     const history = `conversation-${randomUUID()}`;
     const states = [];
-    const turn = async (label, prompt, expected, entries) => {
-        for (const value of expected.filter((item) => item !== history)) assert.ok(!prompt.includes(value), 'Expected skill answers must only exist in source files.');
+    const turn = async (label, prompt, expected, entries, sourceAnswers = expected) => {
+        for (const value of sourceAnswers) assert.ok(!prompt.includes(value), 'Expected skill answers must only exist in source files.');
         const registrations = [];
         const result = await engine.executeTurn({ sessionId: f.id, prompt, signal: AbortSignal.timeout(150000), onEvent(event) {
             if (event.type === 'coding-agent-skill-registration') registrations.push({ state: event.state,
@@ -92,12 +92,12 @@ test('real native conversation uses live source edits, additions, explicit empty
         [added.descriptor, added.helper, added.asset], ['acceptance-probe', 'new-probe']);
     await f.catalog.command(f.id, 'use none');
     const emptyPrompt = 'If no task skills are selected, respond exactly NO_SKILLS followed by the conversation token I asked you to remember. Otherwise respond HAS_SKILLS.';
-    const empty = await turn('explicit-empty', emptyPrompt, ['NO_SKILLS', history], []);
+    const empty = await turn('explicit-empty', emptyPrompt, ['NO_SKILLS', history], [], []);
     assert.ok(!empty.includes('HAS_SKILLS'));
     await f.catalog.command(f.id, 'use workspace');
     await fs.rm(directory, { recursive: true });
     await fs.rm(addedDirectory, { recursive: true });
-    const deleted = await turn('final-deletion', emptyPrompt, ['NO_SKILLS', history], []);
+    const deleted = await turn('final-deletion', emptyPrompt, ['NO_SKILLS', history], [], []);
     assert.ok(!deleted.includes('HAS_SKILLS'));
     for (const marker of [first.descriptor, changed.descriptor, added.descriptor]) assert.ok(!deleted.includes(marker));
     assert.equal(await fs.readFile(path.join(unselectedHomeSkill, 'SKILL.md'), 'utf8'), homeDescriptor,
