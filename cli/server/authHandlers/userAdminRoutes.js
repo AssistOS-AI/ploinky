@@ -254,7 +254,25 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 400, { ok: false, error: 'invalid_pagination' });
                 return true;
             }
-            const result = await authService.listUsers({ actorUserId: session.user.id, start, pageSize });
+            const filters = {};
+            for (const [key, maxLength] of [['search', 200], ['excludeOnlyRole', 128]]) {
+                if (!parsedUrl.searchParams.has(key)) continue;
+                const value = parsedUrl.searchParams.get(key).trim();
+                if (value.length > maxLength) {
+                    sendJson(res, 400, { ok: false, error: 'invalid_user_filter' });
+                    return true;
+                }
+                filters[key] = value;
+            }
+            if (parsedUrl.searchParams.has('includeRoleCounts')) {
+                const value = parsedUrl.searchParams.get('includeRoleCounts');
+                if (!['true', 'false'].includes(value)) {
+                    sendJson(res, 400, { ok: false, error: 'invalid_user_filter' });
+                    return true;
+                }
+                filters.includeRoleCounts = value === 'true';
+            }
+            const result = await authService.listUsers({ actorUserId: session.user.id, start, pageSize, ...filters });
             const users = result.users || [];
             const totalCount = Number.isSafeInteger(result.totalCount) && result.totalCount >= 0
                 ? result.totalCount
@@ -267,6 +285,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 start,
                 pageSize,
                 totalCount,
+                ...(result.singleRoleCounts ? { singleRoleCounts: result.singleRoleCounts } : {}),
                 hasMore: totalCount === null ? users.length === pageSize : start + users.length < totalCount,
             });
             return true;

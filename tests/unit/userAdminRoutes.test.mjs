@@ -184,6 +184,7 @@ test('provider user administration enforces capabilities, CRUD, pagination, and 
             users: users.slice(payload.start, payload.start + payload.pageSize),
             totalCount: users.length,
             availableRoles: ['admin', 'user'],
+            ...(payload.includeRoleCounts ? { singleRoleCounts: { visitor: 42, user: 601 } } : {}),
         };
     };
     authService.createUser = async (payload) => {
@@ -258,6 +259,32 @@ test('provider user administration enforces capabilities, CRUD, pagination, and 
             assert.equal(result.body.error, 'invalid_pagination');
         }
         assert.equal(providerCalls.filter((call) => call.operation === 'listUsers').length, listCallsBefore);
+
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            url: '/api/agents/explorer/users?search=Reader&excludeOnlyRole=visitor&includeRoleCounts=true',
+            cookie: 'ploinky_sso=sso-admin-session', routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.statusCode, 200);
+        assert.deepEqual(result.body.singleRoleCounts, { visitor: 42, user: 601 });
+        assert.deepEqual(providerCalls.filter(call => call.operation === 'listUsers').at(-1).payload, {
+            actorUserId: 'persisto-admin', start: 0, pageSize: 100,
+            search: 'Reader', excludeOnlyRole: 'visitor', includeRoleCounts: true,
+        });
+        const filteredCallsBefore = providerCalls.filter(call => call.operation === 'listUsers').length;
+        for (const query of [`search=${'x'.repeat(201)}`, `excludeOnlyRole=${'x'.repeat(129)}`, 'includeRoleCounts=1']) {
+            result = await invoke(authHandlers.handleUserAdminRoutes, {
+                url: `/api/agents/explorer/users?${query}`,
+                cookie: 'ploinky_sso=sso-admin-session', routePlan: ssoRoutePlan,
+            });
+            assert.equal(result.statusCode, 400);
+            assert.equal(result.body.error, 'invalid_user_filter');
+        }
+        result = await invoke(authHandlers.handleUserAdminRoutes, {
+            url: '/api/agents/explorer/users?search=Reader&includeRoleCounts=true',
+            cookie: 'ploinky_sso=sso-role-only-session', routePlan: ssoRoutePlan,
+        });
+        assert.equal(result.statusCode, 403);
+        assert.equal(providerCalls.filter(call => call.operation === 'listUsers').length, filteredCallsBefore);
 
         for (const csrf of ['missing', 'invalid']) {
             const before = providerCalls.filter(call => call.operation === 'createUser').length;
