@@ -75,6 +75,53 @@ The native test has a 20-minute outer timeout and a 150-second timeout per turn.
 
 A failed native prerequisite is a failed invocation, not a propagation result. Retain the capability diagnostic and run the native test in a supported environment.
 
+## Deployed Conversation skills check
+
+`deployed-settings.mjs` exercises the production Explorer folder action, WebChat Menu → Conversation skills link, and Settings modal on an explicitly requested fresh local deployment. It uses that deployed Explorer checkout's existing smoke helpers and Playwright installation. It submits no model prompt. This check is separate from the eleven deterministic tests, six native turns, and three official browser gates; none of those runners is changed or replaced.
+
+Serialize the deployed browser workflow. First finish Marketplace optional-agent activation. Then run the official OnlyOffice, Copilot, and WebMeet gates and this Conversation skills check one at a time, awaiting each command's completed result. The Settings check may run before or after those three separate gates, but always after Marketplace has finished. Do not run another Marketplace activation or workspace-changing setup concurrently. Cold activation and WebChat CLI startup share Ploinky's workspace lifecycle lock; overlapping them can exhaust the unchanged 60-second composer deadline. This ordering belongs to the requested deployment verification workflow. Optional agents are not a product prerequisite for ordinary Copilot use.
+
+The preflight fails before Playwright loads, a browser launches, or the test creates any files when the prerequisite is missing, running, failed, skipped, retried, stale, or belongs to another Box. It reads the completed `run.json` and its authoritative `test-results/results.json`, checks the exact Marketplace test and command, and requires one passing Chromium result, one worker, and zero skips, failures, retries, or repeats. The current Box must still be running with the recorded ID and start time, mount the selected canonical workspace at `/workspace`, and publish its Router `8080/tcp` on the requested loopback origin. Both live and configured port bindings must match. A Box restart invalidates the proof. Publication here means the Router's network binding; ordinary subsequent agent activation changes are not treated as a Box restart.
+
+| Required environment | Value |
+| --- | --- |
+| `SMOKE_EXPLORER_REPO` | Absolute fresh Explorer repository path. Its canonical `tests/smoke` directory must be the one that ran Marketplace. |
+| `SMOKE_WORKSPACE_ROOT` | Absolute deployed workspace, matching the live Box bind mount. |
+| `SMOKE_BASE_URL` | Exact credential-free `http://127.0.0.1:<port>` origin. |
+| `SMOKE_PLOINKY_BOX_CONTAINER` | Exact live Box name or full ID, inspected through existing Podman. |
+| `SMOKE_OPTIONAL_GATE_RECEIPT` | Absolute path to the completed optional gate's `run.json`. |
+| `SMOKE_ARTIFACT_DIR` | Explicit existing output root outside source trees and the deployed workspace, including through symlinks. Each invocation creates its own unique subdirectory. |
+| `SMOKE_USERNAME`, `SMOKE_PASSWORD` | Existing provisioned Explorer credentials, supplied through the environment. Do not put them in command arguments, receipts, or logs. |
+
+With those variables already set by the deployment operator, run:
+
+```sh
+node /absolute/path/to/ploinky/tests/integration/local-skills/deployed-settings.mjs
+```
+
+The check opens a conversation for a uniquely owned folder, then adds an uncommitted skill inside that folder. It requires the live inventory to discover that skill, follows the production session action to Settings, verifies the persisted conversation scope despite Explorer opening at root, and toggles the actual skill button. The persisted policy must contain the exclusion and a newer version; refreshing must retain it. Ordinary Settings must keep its original default policy and version. The composer and idle deadlines remain 60 seconds. There is no assertion retry, timeout widening, browser transport substitution, or deployed source modification.
+
+Successful runs save redacted evidence and screenshots before deleting the uniquely owned folder through Explorer's existing cleanup helper. Failed runs keep the folder for diagnosis and exit nonzero. Preflight failures exit without creating a run directory; the operator should retain their stderr in the deployment evidence. Follow the repository's fresh-deployment failure procedure instead of rerunning around a failed assertion.
+
+### Receipt producer and reusable preflight
+
+The operator wrapper imports `inspectDeploymentTarget` and `assertMarketplacePrerequisite` from `deployed-prerequisites.mjs`. Before starting Marketplace, call `await inspectDeploymentTarget({ env })` and spread its safe return fields into the optional receipt. Save `result: "running"` before spawning the command. After it exits, record `finishedAt`, `exitCode`, and the authoritative report's `stats`, and mark passed only after validating the report. Before each later deployed browser command, call `await assertMarketplacePrerequisite({ env })`. Both helpers use bounded read-only Podman inspection and return no raw container inspection or credentials. Do not fill missing fields into an earlier receipt after the fact.
+
+| Receipt field | Required meaning |
+| --- | --- |
+| `gate`, `result`, `exitCode` | `"optional"`, `"passed"`, `0`. |
+| `runId`, `directory`, `cwd` | Run directory basename, its absolute canonical directory, and the canonical fresh Explorer `tests/smoke` directory. `run.json` must belong to that run directory. |
+| `command` | `["npm", "run", "test:optional-agents", "--", "--workers=1", "--retries=0"]`. |
+| `boxId`, `boxStartedAt`, `workspaceRoot`, `baseURL`, `publication` | Unmodified safe fields returned by `inspectDeploymentTarget`; the start timestamp is canonical UTC. `publication` contains `containerPort`, `hostIp`, and `hostPort`. |
+| `startedAt`, `finishedAt` | Valid timestamps enclosing the authoritative report and following the Box start. Completion must not be in the future. |
+| `stats` | The exact authoritative report statistics, including `expected: 1`, `skipped: 0`, `unexpected: 0`, `flaky: 0`, start time, and finite duration. The report's actual test/results and retry configuration are also checked. |
+
+The independent guard tests run on any supported Node host and make no browser, container, or network mutations:
+
+```sh
+node --test /absolute/path/to/ploinky/tests/integration/local-skills/deployed-prerequisites.test.mjs
+```
+
 ## Coverage boundary
 
 This suite targets uppercase portable `SKILL.md` catalogs. Typed AchillesAgentLib skills, OpenCode/Pi native behavior, native registration races after the final inventory check, and full deployed-system acceptance remain outside this harness's claims. Existing repository suites still need to run alongside it.
