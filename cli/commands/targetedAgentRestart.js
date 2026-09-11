@@ -3,6 +3,7 @@ import {
   cleanupExactAgentRuntimeCandidate,
 } from '../sandbox/docker/index.js';
 import { loadActiveEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 import {
   mergeRoutingConfig,
   mergeRuntimeRoute,
@@ -179,6 +180,8 @@ export async function commitTargetedAgentRestart({
   loadActive = loadActiveEdgeRoutingGeneration,
   loadAgents = workspaceSvc.loadAgents,
   saveAgents = workspaceSvc.saveAgents,
+  retireCandidate = retireRuntimeCandidate,
+  reportRetirementFailure = (error) => console.warn(`[edge] published targeted restart candidate receipt could not be retired: ${error?.message || error}`),
 } = {}) {
   if (!transition || !result?.containerName || !result?.registryRecord) {
     throw new Error('targeted agent restart commit requires its transition and exact ready runtime');
@@ -228,6 +231,14 @@ export async function commitTargetedAgentRestart({
     || text(active.generation?.agents?.[transition.containerName]?.containerId)
       !== text(result.registryRecord.containerId)) {
     throw new Error('targeted agent restart successor was not published exactly');
+  }
+  if (result.durableCandidate) {
+    try {
+      retireCandidate(result.durableCandidate);
+    } catch (error) {
+      // Publication already succeeded; reporting must not trigger successor cleanup.
+      try { reportRetirementFailure(error); } catch (_) {}
+    }
   }
   return active;
 }

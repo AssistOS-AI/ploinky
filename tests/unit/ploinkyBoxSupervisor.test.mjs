@@ -9,6 +9,7 @@ import { IMAGE_CONTRACT } from '../../ploinky-box/contract/image.mjs';
 import { writeGraphSkillScope } from '../../ploinky-box/graphSkillScope.mjs';
 import { buildHostSkillScope } from '../../ploinky-box/skillScope.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { readInboxStatus } from '../../ploinky-box/inbox/readStatus.mjs';
 import {
     captureConfiguredCoreStartArgv,
     checkBoxHealth,
@@ -340,8 +341,8 @@ test('targeted restart preserves the exact running Box and mounted AgentLib gene
             assert.equal(options.hostReachableIpv4, '192.168.1.12');
             assert.equal(options.agentLib.fingerprint, agentLibFixture(identity.workspaceRoot).fingerprint);
         },
-        healthCheck: async (hostPort) => {
-            events.push(`health:${hostPort}`);
+        healthCheck: async (hostPort, options) => {
+            events.push(`health:${hostPort}:${options?.readinessTimeoutMs === 0 ? 'before' : 'after'}`);
         },
         commitAgentLibSelection: () => assert.fail('targeted restart must not advance source state'),
     });
@@ -352,8 +353,57 @@ test('targeted restart preserves the exact running Box and mounted AgentLib gene
     assert.equal(result.containerId, container.id);
     assert.equal(result.agentLib.sourceDir, agentLibFixture(identity.workspaceRoot).sourceDir);
     assert.equal(events.some((event) => event.startsWith('core:restart onlyOffice')), true);
-    assert.ok(events.indexOf('health:19090') > events.indexOf('core:restart onlyOffice'));
+    assert.ok(events.indexOf('health:19090:before') < events.indexOf('core:restart onlyOffice'));
+    assert.ok(events.indexOf('health:19090:before') >= 0);
+    assert.ok(events.indexOf('health:19090:after') > events.indexOf('core:restart onlyOffice'));
     assert.equal(events.at(-1), 'release');
+});
+
+test('targeted restart refuses retained initialization metadata before Core can drain a recreated graph', async (t) => {
+    const state = fixture(t);
+    const ploinkyRoot = path.join(state.workspace, '.ploinky');
+    fs.mkdirSync(ploinkyRoot);
+    fs.writeFileSync(path.join(ploinkyRoot, 'routing.json'), '{"routes":{"target":{"draining":false}}}');
+    fs.writeFileSync(path.join(ploinkyRoot, 'agents.json'), JSON.stringify({
+        target: { type: 'agent', runtime: 'podman', containerId: 'f'.repeat(64) },
+    }));
+    const sourceBytes = fs.readFileSync(path.join(ploinkyRoot, 'routing.json'));
+    const inbox = readInboxStatus({
+        workspaceRoot: state.workspace,
+        runner: { query: () => ({ ok: false, status: 1, stdout: '', stderr: '' }) },
+    });
+    assert.equal(inbox.initialized, true);
+    assert.equal(inbox.runningAgents, 0);
+    const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
+    const ownership = owned(identity);
+    ownership.handles.container.labels[BOX_LABELS.routerHostPort] = '18080';
+    ownership.handles.container.labels[BOX_LABELS.mediaHostPort] = '17882';
+    const events = [];
+    const supervisor = createBoxSupervisor({
+        resolveIdentity: () => identity,
+        launchCwd: state.workspace,
+        lockManager: fakeLockManager(state.root, events),
+        discover: () => ownership,
+        runner: { query: () => ({ ok: true, status: 0, stdout: JSON.stringify(inbox) }) },
+        validateExistingImage: () => ({ immutableId: `sha256:${'b'.repeat(64)}` }),
+        validateContainer: () => {},
+        selectAgentLib: async () => assert.fail('must not select source'),
+        reconcile: async () => assert.fail('must not recreate the Box'),
+        resolveHostReachableIpv4: async () => assert.fail('must stop before Core preparation'),
+        runCoreCommand: async () => assert.fail('must not drain or mutate retained graph'),
+        healthCheck: async (port, options) => {
+            assert.equal(port, 18080);
+            assert.equal(options.readinessTimeoutMs, 0);
+            events.push('health-unavailable');
+            throw new Error('current Box Router is unavailable');
+        },
+    });
+    await assert.rejects(() => supervisor.runTargetedRestartTransaction(['restart', 'target']), {
+        code: 'PLOINKY_BOX_TARGETED_RESTART_UNAVAILABLE',
+        message: /ready Router/,
+    });
+    assert.deepEqual(events, ['lock', 'health-unavailable', 'release']);
+    assert.deepEqual(fs.readFileSync(path.join(ploinkyRoot, 'routing.json')), sourceBytes);
 });
 
 test('targeted restart refuses stopped and uninitialized Boxes without mutation', async (t) => {
