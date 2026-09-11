@@ -18,6 +18,7 @@ import {
     inspectExactAgentTarget,
     inspectExactAgentTargetAsync,
     selectExactNewExecId,
+    waitForExactAgentPodmanClient,
 } from '../../cli/server/webtty/agentTerminalWorker.mjs';
 import { agentWorkerMessage } from '../../cli/server/webtty/agentWorkerProtocol.mjs';
 
@@ -64,6 +65,151 @@ test('Podman client capture independently binds UID and exact fixed argv', () =>
         fsApi: { readFileSync: (name) => files.get(name) },
         capturePty: () => identity,
     }));
+});
+
+function clientStartupFixture(stages, options = {}) {
+    const args = fixedAgentPodmanArgv(init());
+    const parentArgv = ['/usr/bin/node', '/opt/ploinky/agentTerminalWorker.mjs', '--ploinky-webtty-agent-worker=v1'];
+    const parent = {
+        pid: process.pid, startToken: 'linux-proc:41000', uid: 1000, state: 'S',
+        processGroupId: 4100, sessionId: 4100, ttyNumber: 0,
+        foregroundProcessGroupId: -1, argv: parentArgv,
+    };
+    const inherited = { ...parent, pid: CLIENT.pid, startToken: CLIENT.startToken };
+    const final = { ...CLIENT, state: 'S', argv: ['/usr/bin/podman', ...args] };
+    let index = 0;
+    let now = 0;
+    const sleeps = [];
+    const reads = [];
+    const fsApi = {
+        readFileSync(file, encoding) {
+            reads.push(file);
+            options.onRead?.(file, { advance: () => { index += 1; }, setNow: (value) => { now = value; } });
+            const [, pid, leaf] = file.match(/^\/proc\/(\d+)\/(stat|status|cmdline)$/) || [];
+            const current = Number(pid) === process.pid
+                ? parent
+                : { ...final, ...stages[Math.min(index, stages.length - 1)] };
+            assert.equal(Number(pid), current.pid);
+            let value;
+            if (leaf === 'stat') {
+                const fields = [current.state, 1, current.processGroupId, current.sessionId,
+                    current.ttyNumber, current.foregroundProcessGroupId];
+                while (fields.length < 19) fields.push(0);
+                fields.push(current.startToken.split(':')[1]);
+                value = `${current.pid} (client) ${fields.join(' ')}\n`;
+            } else if (leaf === 'status') {
+                value = `Uid:\t${current.uid}\t${current.uid}\t${current.uid}\t${current.uid}\n`;
+            } else {
+                value = current.argv.length ? `${current.argv.join('\0')}\0` : '';
+            }
+            return encoding ? value : Buffer.from(value);
+        },
+    };
+    return {
+        inherited, final, parentArgv, args, fsApi, reads, sleeps,
+        wait: (overrides = {}) => waitForExactAgentPodmanClient(CLIENT.pid, args, {
+            deadlineAt: 100, fsApi, nowImpl: () => now,
+            delayImpl: async (milliseconds) => {
+                sleeps.push(milliseconds);
+                now += milliseconds;
+                index += 1;
+                options.onDelay?.();
+            },
+            ...overrides,
+        }),
+    };
+}
+
+test('client startup waits for inherited forkpty, setsid and empty exec argv before exact capture', async () => {
+    const stages = [];
+    const fixture = clientStartupFixture(stages);
+    stages.push(fixture.inherited,
+        { ...fixture.inherited, processGroupId: CLIENT.pid, sessionId: CLIENT.pid },
+        { argv: [] }, fixture.final);
+    assert.deepEqual(await fixture.wait(), CLIENT);
+    assert.deepEqual(fixture.sleeps, [10, 10, 10]);
+});
+
+test('an immediately exact Podman client returns without a polling delay', async () => {
+    const fixture = clientStartupFixture([{}]);
+    assert.deepEqual(await fixture.wait(), CLIENT);
+    assert.deepEqual(fixture.sleeps, []);
+});
+
+test('startup rejects replaced PID birth and changed UID after an unresolved exec', async () => {
+    for (const changed of [{ startToken: 'linux-proc:99999' }, { uid: 1001 }]) {
+        const fixture = clientStartupFixture([{ argv: [] }, changed]);
+        await assert.rejects(fixture.wait(), { category: 'podman-client-startup-identity-changed' });
+        assert.deepEqual(fixture.sleeps, [10]);
+    }
+});
+
+test('unknown argv, foreign topology and wrong UID fail without retrying', async () => {
+    for (const [stage, category] of [
+        [{ argv: ['/usr/bin/podman', 'container', 'exec', '--privileged'] }, 'podman-client-argv'],
+        [{ argv: ['/usr/bin/other'] }, 'podman-client-argv'],
+        [{ processGroupId: 9999 }, 'pty-group-topology'],
+        [{ foregroundProcessGroupId: 9999 }, 'pty-group-topology'],
+        [{ uid: 0 }, 'podman-client-startup-identity-changed'],
+        [{ state: 'Z' }, 'podman-client-changed-during-capture'],
+    ]) {
+        const fixture = clientStartupFixture([stage]);
+        await assert.rejects(fixture.wait(), { category });
+        assert.deepEqual(fixture.sleeps, []);
+    }
+});
+
+test('a process change inside initial birth capture fails before polling', async () => {
+    let statReads = 0;
+    const fixture = clientStartupFixture([{ argv: [] }, { startToken: 'linux-proc:99999' }], {
+        onRead(file, { advance }) {
+            if (file === `/proc/${CLIENT.pid}/stat` && ++statReads === 2) advance();
+        },
+    });
+    await assert.rejects(fixture.wait(), { category: 'podman-client-changed-during-capture' });
+    assert.deepEqual(fixture.sleeps, []);
+});
+
+test('unknown proc read errors never enter the startup retry loop', async () => {
+    for (const code of ['EACCES', 'EIO', 'ENOENT']) {
+        const fixture = clientStartupFixture([{ argv: [] }], {
+            onRead(file) {
+                if (file === `/proc/${CLIENT.pid}/status`) throw Object.assign(new Error('unreadable'), { code });
+            },
+        });
+        await assert.rejects(fixture.wait(), { code });
+        assert.deepEqual(fixture.sleeps, []);
+    }
+});
+
+test('client startup deadline caps polling and rejects exact evidence arriving at the deadline', async () => {
+    const pending = clientStartupFixture([{ argv: [] }]);
+    await assert.rejects(pending.wait({ deadlineAt: 25 }), { category: 'podman-client-startup-timeout' });
+    assert.deepEqual(pending.sleeps, [10, 10, 5]);
+
+    const late = clientStartupFixture([{}]);
+    let expired = false;
+    await assert.rejects(late.wait({
+        deadlineAt: 10,
+        captureClient(pid, args, options) {
+            const value = captureExactAgentPodmanClient(pid, args, options);
+            expired = true;
+            options.fsApi.readFileSync = () => { throw new Error('must not inspect after deadline'); };
+            return value;
+        },
+        nowImpl: () => expired ? 10 : 0,
+    }), { category: 'podman-client-startup-timeout' });
+});
+
+test('startup cancellation is checked before proc reads and after each async wait', async () => {
+    let cancelled = true;
+    const before = clientStartupFixture([{}]);
+    await assert.rejects(before.wait({ isCancelled: () => cancelled }), { category: 'podman-client-startup-cancelled' });
+    assert.deepEqual(before.reads, []);
+    cancelled = false;
+    const during = clientStartupFixture([{ argv: [] }, {}], { onDelay: () => { cancelled = true; } });
+    await assert.rejects(during.wait({ isCancelled: () => cancelled }), { category: 'podman-client-startup-cancelled' });
+    assert.deepEqual(during.sleeps, [10]);
 });
 const INNER = Object.freeze({
     boxPid: 4300,
@@ -221,10 +367,133 @@ function harness(overrides = {}) {
                 assert.equal(spawnCalls.length > 0, true, 'challenge must be generated post-spawn');
                 return READINESS_CHALLENGE;
             }),
-        startupTimeoutMs: 100,
+        startupTimeoutMs: overrides.startupTimeoutMs ?? 100,
     });
     return { worker, processApi, ptyState, spawnCalls };
 }
+
+test('worker sends its first byte only after async exact client capture completes', async () => {
+    let release;
+    let captureOptions;
+    let challengeCalls = 0;
+    const h = harness({
+        captureClient: (_pid, _args, options) => {
+            captureOptions = options;
+            return new Promise((resolve) => { release = resolve; });
+        },
+        createReadinessChallenge: () => { challengeCalls += 1; return READINESS_CHALLENGE; },
+    });
+    await h.worker.initialize(init());
+    const launching = h.worker.launch();
+    assert.equal(Number.isFinite(captureOptions.deadlineAt), true);
+    assert.equal(captureOptions.isCancelled(), false);
+    assert.deepEqual(h.ptyState.writes, []);
+    assert.equal(challengeCalls, 0);
+    release(CLIENT);
+    await launching;
+    assert.equal(h.ptyState.writes.length, 1);
+    assert.equal(challengeCalls, 1);
+    assert.equal(h.processApi.sent.some((message) => message.type === 'ready'), true);
+});
+
+test('invalid readiness challenge fails without input or an unhandled pending readiness rejection', async () => {
+    const unhandled = [];
+    const observe = (error) => unhandled.push(error);
+    process.on('unhandledRejection', observe);
+    try {
+        for (const createReadinessChallenge of [() => 'invalid', () => { throw new Error('entropy unavailable'); }]) {
+            const h = harness({ createReadinessChallenge });
+            await h.worker.initialize(init());
+            await h.worker.launch();
+            assert.deepEqual(h.ptyState.writes, []);
+            assert.equal(h.worker.readinessReject, null);
+            assert.equal(h.processApi.sent.some((message) => message.type === 'ready'), false);
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.deepEqual(unhandled, []);
+    } finally {
+        process.off('unhandledRejection', observe);
+    }
+});
+
+test('close or PTY exit during async client capture prevents late input and ready', async () => {
+    for (const reason of ['close', 'pty-exit']) {
+        let release;
+        let captureOptions;
+        const signals = [];
+        const h = harness({
+            captureClient: (_pid, _args, options) => {
+                captureOptions = options;
+                return new Promise((resolve) => { release = resolve; });
+            },
+            signalClient: (...args) => signals.push(args),
+        });
+        await h.worker.initialize(init());
+        const launching = h.worker.launch();
+        if (reason === 'close') void h.worker.cleanup('requested');
+        else h.ptyState.onExit({ exitCode: 0, signal: null });
+        assert.equal(captureOptions.isCancelled(), true);
+        release(CLIENT);
+        await launching;
+        assert.deepEqual(h.ptyState.writes, []);
+        assert.deepEqual(signals, []);
+        assert.equal(h.worker.clientProcess, null);
+        assert.equal(h.processApi.sent.some((message) => message.type === 'ready'), false);
+        assert.equal(h.processApi.sent.find((message) => message.type === 'exit')?.cleanupProven, false);
+    }
+});
+
+test('client capture and shell readiness consume one startup deadline', async (context) => {
+    context.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+    let captureDeadline;
+    const h = harness({
+        autoReady: false,
+        captureClient: (_pid, _args, options) => {
+            captureDeadline = options.deadlineAt;
+            context.mock.timers.tick(60);
+            return CLIENT;
+        },
+    });
+    await h.worker.initialize(init());
+    let failure;
+    const starting = h.worker.spawnAttempt('/bin/bash').catch((error) => { failure = error; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(captureDeadline, 100);
+    assert.equal(h.ptyState.writes.length, 1);
+    context.mock.timers.tick(39);
+    await Promise.resolve();
+    assert.equal(failure, undefined);
+    context.mock.timers.tick(1);
+    await starting;
+    assert.match(failure.message, /readiness timed out/);
+    assert.equal(Date.now(), 100);
+    assert.equal(h.worker.innerProcess, null);
+});
+
+test('a capture result at the startup deadline cannot send a readiness probe', async (context) => {
+    context.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+    const h = harness({
+        captureClient: () => { context.mock.timers.tick(100); return CLIENT; },
+    });
+    await h.worker.initialize(init());
+    await assert.rejects(h.worker.spawnAttempt('/bin/bash'), /readiness timed out/);
+    assert.deepEqual(h.ptyState.writes, []);
+    assert.equal(h.worker.clientProcess, null);
+});
+
+test('close during async inner capture cannot publish a late ready message', async () => {
+    let release;
+    const h = harness({ captureInner: () => new Promise((resolve) => { release = resolve; }) });
+    await h.worker.initialize(init());
+    const launching = h.worker.launch();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(typeof release, 'function');
+    void h.worker.cleanup('requested');
+    release(INNER);
+    await launching;
+    assert.equal(h.worker.innerProcess, null);
+    assert.equal(h.processApi.sent.some((message) => message.type === 'ready'), false);
+});
 
 test('fixed backend argv contains no browser-controlled shell, flags, env, or no-session mode', () => {
     const argv = fixedAgentPodmanArgv(init());
@@ -559,6 +828,7 @@ test('true Bash absence falls back through the same persistent identity-captured
     const processApi = new FakeProcess();
     const spawnCalls = [];
     const disposals = [];
+    const captureDeadlines = [];
     let spawnIndex = 0;
     const makePty = (index) => {
         const state = { onData: null, onExit: null };
@@ -596,7 +866,10 @@ test('true Bash absence falls back through the same persistent identity-captured
         }),
         inspectTarget,
         inspectTargetCleanup: async () => inspectTarget(),
-        captureClient: (pid) => ({ ...CLIENT, pid, processGroupId: pid, sessionId: pid }),
+        captureClient: (pid, _args, options) => {
+            captureDeadlines.push(options.deadlineAt);
+            return { ...CLIENT, pid, processGroupId: pid, sessionId: pid };
+        },
         captureInner: async () => INNER,
         captureSession: async () => [],
         listSession: async () => [],
@@ -627,6 +900,9 @@ test('true Bash absence falls back through the same persistent identity-captured
     assert.deepEqual(spawnCalls[1].args, fixedAgentPodmanArgv(init(), '/bin/sh'));
     assert.equal(spawnCalls.flatMap((call) => call.args).includes('--no-session'), false);
     assert.deepEqual(disposals, [0]);
+    assert.equal(captureDeadlines.length, 2);
+    assert.equal(Number.isFinite(captureDeadlines[0]), true);
+    assert.equal(captureDeadlines[1], captureDeadlines[0]);
     assert.equal(processApi.sent.some((message) => message.type === 'ready'), true);
 });
 
