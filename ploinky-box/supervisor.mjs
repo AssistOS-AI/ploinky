@@ -1114,6 +1114,14 @@ export function checkBoxHealth(hostPort, {
                                 resolve({ ready: true });
                                 return;
                             }
+                            // The active Router protects /health even when workspace auth is disabled.
+                            if (response.statusCode === 401 && health.ok === false
+                                && health.error?.code === 'AUTH_REQUIRED'
+                                && Object.keys(health).length === 2
+                                && Object.keys(health.error).length === 1) {
+                                resolve({ ready: true });
+                                return;
+                            }
                             const transitionCode = String(health.error || '');
                             if (response.statusCode === 503
                                 && [

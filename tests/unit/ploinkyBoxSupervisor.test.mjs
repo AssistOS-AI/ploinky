@@ -1165,6 +1165,62 @@ test('public health accepts the exact active admin-auth challenge', async (t) =>
     await checkBoxHealth(port);
 });
 
+test('public health accepts the protected control challenge in an auth-none workspace', async (t) => {
+    const http = await import('node:http');
+    const { requireAdminControlRequest } = await import('../../cli/server/adminControlSecurity.js');
+    let requests = 0;
+    let protectedHandlerCalls = 0;
+    const server = http.createServer((request, response) => {
+        requests += 1;
+        if (requests === 1) {
+            response.writeHead(503).end('{"error":"EDGE_GENERATION_INACTIVE"}');
+            return;
+        }
+        if (!requireAdminControlRequest(request, response)) return;
+        protectedHandlerCalls += 1;
+        response.writeHead(200).end('{"status":"healthy"}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+
+    await checkBoxHealth(server.address().port, { readinessTimeoutMs: 1_000, retryDelayMs: 1 });
+
+    assert.equal(requests, 2);
+    assert.equal(protectedHandlerCalls, 0);
+});
+
+test('public health rejects responses that are not the protected anonymous challenge', async (t) => {
+    const http = await import('node:http');
+    const cases = [
+        [401, { error: 'unauthorized' }],
+        [401, { ok: false, error: { code: 'ADMIN_REQUIRED' } }],
+        [401, { ok: true, error: { code: 'AUTH_REQUIRED' } }],
+        [401, { error: { code: 'AUTH_REQUIRED' } }],
+        [401, { ok: false, error: 'AUTH_REQUIRED' }],
+        [401, { ok: false, error: { code: 'AUTH_REQUIRED', cause: 'unhealthy' } }],
+        [401, { ok: false, error: { code: 'AUTH_REQUIRED' }, status: 'unhealthy' }],
+        [403, { ok: false, error: { code: 'AUTH_REQUIRED' } }],
+        [503, { ok: false, error: { code: 'AUTH_REQUIRED' } }],
+        [200, { ok: false, error: { code: 'AUTH_REQUIRED' } }],
+        [401, null],
+        [401, []],
+    ];
+    for (const [status, body] of cases) {
+        await t.test(`${status} ${JSON.stringify(body)}`, async (t) => {
+            let requests = 0;
+            const server = http.createServer((_request, response) => {
+                requests += 1;
+                response.writeHead(status).end(JSON.stringify(body));
+            });
+            await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+            t.after(() => new Promise((resolve) => server.close(resolve)));
+
+            await assert.rejects(() => checkBoxHealth(server.address().port), /unhealthy|malformed/);
+            assert.equal(requests, 1);
+        });
+    }
+});
+
 test('public health waits for an inactive edge generation to become ready', async (t) => {
     const http = await import('node:http');
     let requests = 0;
