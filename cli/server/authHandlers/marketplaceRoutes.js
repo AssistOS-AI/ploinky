@@ -2,6 +2,7 @@ import path from 'path';
 
 import { PLOINKY_DIR } from '../../utils/config.js';
 import * as reposSvc from '../../utils/repos.js';
+import { resolveSkillRepositorySource } from '../../utils/skillRepositorySource.js';
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
 import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
@@ -330,11 +331,14 @@ function buildMarketplaceState(user = null, options = {}) {
     const repositories = [...repoNames].sort((left, right) => left.localeCompare(right)).map((name) => {
         const predefinedEntry = predefined[name] || {};
         const sourceEntry = sources[name] || {};
+        const kind = predefinedEntry.kind || sourceEntry.kind || reposSvc.classifyRepoKind(name);
+        const url = predefinedEntry.url || sourceEntry.url || '';
         return {
             name,
-            url: predefinedEntry.url || sourceEntry.url || '',
+            url,
             description: predefinedEntry.description || '',
-            kind: predefinedEntry.kind || sourceEntry.kind || reposSvc.classifyRepoKind(name),
+            kind,
+            ...(kind === 'skills' ? { skillSource: resolveSkillRepositorySource(name, url) } : {}),
             installed: installed.has(name),
             default: bootRepos.has(name),
             branch: sourceEntry.branch || '',

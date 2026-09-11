@@ -110,3 +110,14 @@ test('queued activations revalidate immediately before starting the worker', asy
     await rejected;
     assert.equal(checks, 1);
 });
+
+
+test('Marketplace skill recommendations prefer the workspace checkout over installed copies', async () => {
+    fs.mkdirSync(path.join(workspace, '.ploinky/repos/DocumentationSkills/.git'), { recursive: true });
+    fs.mkdirSync(path.join(workspace, 'DocumentationSkills/.git'), { recursive: true });
+    const res = await request({ method: 'GET' });
+    assert.equal(res.status, 200);
+    const repo = res.body.marketplace.repositories.find(item => item.name === 'DocumentationSkills');
+    assert.equal(repo.kind, 'skills');
+    assert.deepEqual(repo.skillSource, { source: path.join(workspace, 'DocumentationSkills'), origin: 'workspace' });
+});
