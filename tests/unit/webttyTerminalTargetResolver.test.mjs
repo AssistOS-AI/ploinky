@@ -478,7 +478,15 @@ test('exact inspection concurrency is capped at four', async (t) => {
     assert.deepEqual(result.targets.map((target) => target.kind), ['box']);
 });
 
+function synchronousPromiseFs() {
+    return { ...fs, promises: { ...fs.promises,
+        realpath: async (...args) => fs.realpathSync(...args),
+        stat: async (...args) => fs.statSync(...args),
+    } };
+}
+
 test('concurrent discoveries share one exact-inspection cap and retain independent partial results', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const { root } = fixture(t);
     const metadata = new Map();
     function record(index, agentName) {
@@ -520,12 +528,14 @@ test('concurrent discoveries share one exact-inspection cap and retain independe
         } finally {
             active -= 1;
         }
-    }, { limits: { concurrency: 2, overallTimeoutMs: 100, inspectTimeoutMs: 100 } });
+    }, { fsApi: synchronousPromiseFs(), limits: { concurrency: 2, overallTimeoutMs: 100, inspectTimeoutMs: 100 } });
 
-    const [first, second] = await Promise.all([
-        targetResolver.discover({ routePlan: routePlan(recordsA), requestedDirectory: '' }),
-        targetResolver.discover({ routePlan: routePlan(recordsB), requestedDirectory: '' }),
-    ]);
+    const firstPending = targetResolver.discover({ routePlan: routePlan(recordsA), requestedDirectory: '' });
+    const secondPending = targetResolver.discover({ routePlan: routePlan(recordsB), requestedDirectory: '' });
+    const second = await secondPending;
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(100);
+    const first = await firstPending;
 
     assert.equal(maximum, 2);
     assert.equal(first.agentTargetsAvailable, true);
@@ -582,6 +592,7 @@ test('discoveries and concurrent exact-target revalidations share the same four 
 });
 
 test('discovery budget retains completed agents while aborting a slow exact inspection', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
     const { root } = fixture(t);
     const slowId = 'c'.repeat(64);
     const records = {
@@ -598,12 +609,17 @@ test('discovery budget retains completed agents while aborting a slow exact insp
         return new Promise((resolve, reject) => {
             signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
         });
-    }, { limits: { overallTimeoutMs: 20, inspectTimeoutMs: 20 } });
+    }, { fsApi: synchronousPromiseFs(), limits: { overallTimeoutMs: 20, inspectTimeoutMs: 20 } });
     const started = Date.now();
-    const result = await targetResolver.discover({
-        routePlan: routePlan(records),
-        requestedDirectory: '',
-    });
+    let settled = false;
+    const pending = targetResolver.discover({ routePlan: routePlan(records), requestedDirectory: '' }).then((value) => { settled = true; return value; });
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(19);
+    await Promise.resolve();
+    assert.equal(settled, false);
+    t.mock.timers.tick(1);
+    const result = await pending;
+    assert.equal(Date.now() - started, 20);
     assert.ok(Date.now() - started < 250);
     assert.equal(result.agentTargetsAvailable, true);
     assert.deepEqual(result.targets.map((target) => target.kind), ['box', 'agent']);

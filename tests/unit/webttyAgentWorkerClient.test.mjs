@@ -268,12 +268,16 @@ test('default cleanup grace does not preempt a worker that proves cleanup after 
     assert.deepEqual(h.signals, []);
 });
 
-test('identity-capture failure reclaims the exact fork before rejecting startup', async () => {
+test('identity-capture failure reclaims the exact fork before rejecting startup', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
     const h = harness({
         closeGraceMs: 1,
         readProcessIdentity: async () => { throw new Error('proc unavailable'); },
     });
-    await assert.rejects(h.client.spawn(), { code: 'WEBTTY_AGENT_WORKER_IDENTITY_UNPROVEN' });
+    const rejected = assert.rejects(h.client.spawn(), { code: 'WEBTTY_AGENT_WORKER_IDENTITY_UNPROVEN' });
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(1);
+    await rejected;
     assert.deepEqual(h.child.messages.map((message) => message.type), ['close']);
     assert.deepEqual(h.child.kills, ['SIGKILL']);
     assert.equal(await h.client.waitForExit(), true);
