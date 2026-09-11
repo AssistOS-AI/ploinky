@@ -6,8 +6,10 @@ import { reinstallAgent } from '../../cli/commands/workspaceUtil.js';
 
 // Execute the command body with runtime boundaries replaced, so recovery can
 // be tested without installing agents or mutating a real workspace.
-function fixture({ runtime = 'docker', running = false, active = true, failure, enabled = true, changedRegistration = false } = {}) {
+function fixture({ runtime = 'docker', running = false, active = true, failure, enabled = true, changedRegistration = false,
+    routerRunning = true, routerFailure = null } = {}) {
     let resolutions = 0;
+    let routerReady = routerRunning;
     const calls = [];
     const errors = [];
     const record = {
@@ -19,8 +21,11 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
     const result = { containerName: 'replacement-example', hostPort: 0 };
     const endpoint = { mode: 'bridge' };
     const capability = {};
+    const routerChild = { pid: 123, unref() { calls.push(['router-unref']); } };
     const context = {
         path,
+        __dirname: '/ploinky/cli/commands',
+        RUNNING_DIR: '/workspace/.ploinky/running',
         console: { log() {}, error(message) { errors.push(message); } },
         resolvePersistedRouterPort: () => 8080,
         agentsSvc: { resolveEnabledAgentRecord: () => {
@@ -35,7 +40,32 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
             assert.equal(name, 'repo/example');
             return { repo: 'repo', shortAgentName: 'example', manifestPath: '/repos/repo/example/manifest.json' };
         } },
-        fs: { readFileSync: () => JSON.stringify(manifest) },
+        fs: {
+            readFileSync: () => JSON.stringify(manifest),
+            mkdirSync(directory, options) {
+                assert.equal(directory, '/workspace/.ploinky/running');
+                assert.equal(options.recursive, true);
+            },
+            writeFileSync(file, content) {
+                assert.equal(file, '/workspace/.ploinky/running/router.pid');
+                assert.equal(content, '123');
+            },
+        },
+        spawnWatchdog(script, port, pidFile) {
+            calls.push(['router-spawn']);
+            assert.equal(script, '/ploinky/cli/server/Watchdog.js');
+            assert.equal(port, 8080);
+            assert.equal(pidFile, '/workspace/.ploinky/running/router.pid');
+            if (routerFailure === 'spawn') throw new Error('Router spawn failed');
+            return routerChild;
+        },
+        async waitForRouterReady(port, child) {
+            calls.push(['router-readiness']);
+            assert.equal(port, 8080);
+            assert.equal(child, routerChild);
+            if (routerFailure === 'readiness') throw new Error('Router readiness failed');
+            routerReady = true;
+        },
         resolveManifestRouterEndpoint: () => endpoint,
         admitDirectAgentRuntimeManifest: () => ({ runtimeAdmission: 'admitted' }),
         getRuntimeForAgent: () => runtime,
@@ -47,6 +77,7 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
             removeAgentContainerForRecreate(name) { calls.push(['remove', name]); },
             async ensureAgentService(name, suppliedManifest, agentPath, options) {
                 calls.push(['prepare', name]);
+                assert.equal(routerReady, true, 'Router attestation must be available before runtime preparation');
                 assert.equal(options.containerName, record.containerName);
                 assert.equal(options.alias, 'chosen-name');
                 assert.equal(options.forceRecreate, true);
@@ -85,7 +116,10 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
             calls.push(['activate', options.result.containerName]);
         },
         cleanupFailedPreparedRuntime: (value, error) => calls.push(['cleanup', value, error.message]),
-        execSync: () => Buffer.from('123'),
+        execSync: () => {
+            if (!routerRunning) throw new Error('Router is stopped');
+            return Buffer.from('123');
+        },
     };
     return { run: vm.runInNewContext(`(${reinstallAgent.toString()})`, context), calls, errors, result };
 }
@@ -110,6 +144,29 @@ test('reinstall still recreates an already running agent', async () => {
     await run('chosen-name');
     assert.deepEqual(calls.map(([step]) => step), ['prepare', 'readiness', 'activate']);
 });
+
+for (const runtime of ['podman', 'docker', 'bwrap', 'seatbelt']) {
+    for (const active of [false, true]) {
+        test(`reinstall starts a stopped Router before replacing a ${runtime} runtime; routing active=${active}`, async () => {
+            const { run, calls } = fixture({ runtime, active, routerRunning: false });
+            await run('chosen-name');
+            assert.deepEqual(calls.filter(([step]) => step !== 'remove').map(([step]) => step), [
+                'router-spawn', 'router-unref', 'router-readiness', 'prepare', 'readiness', 'activate',
+            ]);
+            const removal = calls.findIndex(([step]) => step === 'remove');
+            if (removal !== -1) assert.ok(removal > calls.findIndex(([step]) => step === 'router-readiness'));
+        });
+    }
+}
+
+for (const routerFailure of ['spawn', 'readiness']) {
+    test(`Router ${routerFailure} failure preserves the old runtime and prevents replacement`, async () => {
+        const { run, calls } = fixture({ active: false, routerRunning: false, routerFailure });
+        await assert.rejects(run('chosen-name'), { message: `Router ${routerFailure} failed` });
+        assert.equal(calls.some(([step]) => ['remove', 'prepare', 'readiness', 'activate'].includes(step)), false);
+        assert.deepEqual(calls.at(-1), ['cleanup', null, `Router ${routerFailure} failed`]);
+    });
+}
 
 for (const failure of ['install', 'readiness']) {
     test(`failed recovery propagates ${failure} failure and never activates`, async () => {
