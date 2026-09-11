@@ -134,14 +134,16 @@ function ensureRealDirectoryChain(anchor, directory) {
         fail('Cloudflare managed tunnel registry escapes its workspace');
     }
     let current = root;
-    const rootStats = fs.lstatSync(current);
+    const rootStats = fs.statSync(current);
     if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
         fail('Cloudflare managed tunnel registry workspace is not a real directory');
     }
     for (const component of relative.split(path.sep).filter(Boolean)) {
         current = path.join(current, component);
         try {
-            const stats = fs.lstatSync(current);
+            // Workspace and .ploinky aliases are user-selected directory paths.
+            const stats = current === path.join(root, '.ploinky')
+                ? fs.statSync(current) : fs.lstatSync(current);
             if (!stats.isDirectory() || stats.isSymbolicLink()) {
                 fail('Cloudflare managed tunnel registry parent is not a real directory');
             }
