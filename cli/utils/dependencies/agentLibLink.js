@@ -1,7 +1,8 @@
-// The achillesAgentLib adapter inside a prepared dependency cache.
+// The AgentLib package adapters inside a prepared dependency cache.
 //
-// Both the historical import alias and the package's declared name resolve to
-// the selected source. No agent cache installs its own copy of the framework.
+// Agent-owned code keeps writing bare `import 'achillesAgentLib/...'`. Instead
+// of retaining a copy per cache, both package names and every nested npm copy
+// link into the selected source, so all consumers resolve the core's bytes.
 //
 // This is deliberately not an install-tree fallback: the link is created after
 // every npm operation (npm prunes entries it does not know about) and verified
@@ -20,6 +21,7 @@ import {
     canonicalAgentLibRemote,
 } from '../../../agentlib/contract.mjs';
 import { parseRuntimeKey, SUPPORTED_FAMILIES } from './dependencyRuntimeKey.js';
+import { AGENTLIB_ADAPTER_SCHEMA, agentLibPackagePaths } from './agentLibPackages.mjs';
 
 /** Runtime families that get their own mount namespace. */
 const MOUNT_NAMESPACE_FAMILIES = new Set(['container', 'bwrap']);
@@ -98,9 +100,11 @@ export function agentLibLinkPath(cachePath, name = AGENTLIB_CACHE_LINK_NAME) {
  * @returns {{ created: boolean, target: string }}
  */
 export function ensureAgentLibCacheLink(cachePath, target, { fsApi = fs } = {}) {
+    fsApi.mkdirSync(path.join(cachePath, 'node_modules'), { recursive: true });
+    const aliases = agentLibPackagePaths(cachePath, target, { fsApi });
     let created = false;
-    for (const name of AGENTLIB_CACHE_LINK_NAMES) {
-        created = ensureCacheLink(agentLibLinkPath(cachePath, name), target, fsApi) || created;
+    for (const linkPath of aliases) {
+        created = ensureCacheLink(linkPath, target, fsApi) || created;
     }
     return { created, target };
 }
@@ -131,15 +135,14 @@ function ensureCacheLink(linkPath, target, fsApi) {
  * @returns {string}
  */
 export function agentLibCacheLinkProblem(cachePath, target, { fsApi = fs } = {}) {
-    for (const name of AGENTLIB_CACHE_LINK_NAMES) {
-        const problem = cacheLinkProblem(agentLibLinkPath(cachePath, name), target, fsApi);
+    let aliases;
+    try { aliases = agentLibPackagePaths(cachePath, target, { fsApi }); }
+    catch (error) { return `AgentLib package tree is unreadable at ${cachePath}: ${error.message}`; }
+    for (const linkPath of aliases) {
+        const problem = cacheLinkProblem(linkPath, target, fsApi);
         if (problem) return problem;
     }
-    try {
-        return competingAgentLibProblem(path.join(cachePath, 'node_modules'), target, fsApi);
-    } catch (error) {
-        return `AgentLib dependency tree is unreadable: ${error.message}`;
-    }
+    return '';
 }
 
 function cacheLinkProblem(linkPath, target, fsApi) {
@@ -156,49 +159,6 @@ function cacheLinkProblem(linkPath, target, fsApi) {
     const actual = fsApi.readlinkSync(linkPath);
     if (actual !== target) {
         return `achillesAgentLib cache link points at ${actual}, expected ${target}`;
-    }
-    return '';
-}
-
-// Inspect only npm package roots and their node_modules, including linked file:
-// dependencies. Real paths bound cycles; the selected source remains a separate
-// read-only grant and is not traversed.
-function competingAgentLibProblem(directory, target, fsApi, visited = new Set()) {
-    let entries;
-    try {
-        const realDirectory = fsApi.realpathSync(directory);
-        if (visited.has(realDirectory)) return '';
-        visited.add(realDirectory);
-        entries = fsApi.readdirSync(directory, { withFileTypes: true });
-    } catch (error) {
-        if (['ENOENT', 'ENOTDIR'].includes(error.code)) return '';
-        throw error;
-    }
-    for (const entry of entries) {
-        if (entry.name.startsWith('.')) continue;
-        const packagePath = path.join(directory, entry.name);
-        if (entry.name.startsWith('@') && (entry.isDirectory() || entry.isSymbolicLink())) {
-            const problem = competingAgentLibProblem(packagePath, target, fsApi, visited);
-            if (problem) return problem;
-            continue;
-        }
-        const reservedName = AGENTLIB_CACHE_LINK_NAMES.includes(entry.name);
-        if (entry.isSymbolicLink()) {
-            const destination = path.resolve(directory, fsApi.readlinkSync(packagePath));
-            if (destination === target) continue;
-            if (reservedName) return `competing AgentLib link at ${packagePath}`;
-        }
-        let pkg;
-        try { pkg = JSON.parse(fsApi.readFileSync(path.join(packagePath, 'package.json'), 'utf8')); } catch (error) {
-            if (!['ENOENT', 'ENOTDIR'].includes(error.code)) throw error;
-        }
-        if (reservedName || AGENTLIB_CACHE_LINK_NAMES.includes(pkg?.name)) {
-            return `competing AgentLib package at ${packagePath}; only links to ${target} are accepted`;
-        }
-        if (entry.isDirectory() || entry.isSymbolicLink()) {
-            const problem = competingAgentLibProblem(path.join(packagePath, 'node_modules'), target, fsApi, visited);
-            if (problem) return problem;
-        }
     }
     return '';
 }
@@ -287,6 +247,7 @@ export function installWithAgentLib(cachePath, pkg, { sourceDir, installTarget }
 /** The AgentLib section recorded in a cache stamp. */
 export function agentLibStampSection(runtimeKey, selection) {
     return {
+        adapterSchema: AGENTLIB_ADAPTER_SCHEMA,
         mode: selection.mode,
         fingerprint: selection.fingerprint,
         commit: selection.commit || '',
@@ -304,6 +265,9 @@ export function agentLibStampSection(runtimeKey, selection) {
 export function agentLibStampProblem(stamp, expected) {
     const actual = stamp?.agentLib;
     if (!actual) return 'agentLib stamp section missing';
+    if (actual.adapterSchema !== expected.adapterSchema) {
+        return `agentLib adapterSchema changed (${actual.adapterSchema ?? 'null'} != ${expected.adapterSchema})`;
+    }
     for (const key of ['mode', 'fingerprint', 'sourceIdHash', 'linkTarget']) {
         if (String(actual[key] ?? '') !== String(expected[key] ?? '')) {
             return `agentLib ${key} changed (${actual[key] ?? 'null'} != ${expected[key] ?? 'null'})`;

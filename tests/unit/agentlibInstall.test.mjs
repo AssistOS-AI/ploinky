@@ -49,7 +49,7 @@ test('both AgentLib dependency names, aliases and overrides are reserved before 
     }));
 });
 
-test('both cache names resolve to the same source and reject nested renamed copies', (t) => {
+test('both cache names resolve to the same source and repair owned nested renamed copies', (t) => {
     const { source, cache } = fixture(t);
     ensureAgentLibCacheLink(cache, source);
     for (const name of AGENTLIB_CACHE_LINK_NAMES) {
@@ -61,10 +61,12 @@ test('both cache names resolve to the same source and reject nested renamed copi
         const copied = path.join(cache, 'node_modules', 'consumer', 'node_modules', name);
         fs.mkdirSync(copied, { recursive: true });
         fs.writeFileSync(path.join(copied, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib' }));
-        assert.match(agentLibCacheLinkProblem(cache, source), /competing AgentLib package/);
+        assert.match(agentLibCacheLinkProblem(cache, source), /copied package/);
         ensureAgentLibCacheLink(cache, source);
-        assert.match(agentLibCacheLinkProblem(cache, source), /competing AgentLib package/,
-            'repairing root links must not hide a nested duplicate');
+        assert.equal(agentLibCacheLinkProblem(cache, source), '');
+        assert.equal(fs.lstatSync(copied).isSymbolicLink(), true);
+        assert.equal(fs.realpathSync(copied), source, 'nested aliases must use the selected source');
+        assert.equal(ensureAgentLibCacheLink(cache, source).created, false);
         fs.rmSync(copied, { recursive: true, force: true });
     }
     assert.equal(agentLibCacheLinkProblem(cache, source), '');
@@ -105,7 +107,9 @@ test('linked dependency trees are cycle-safe and cannot hide private AgentLib co
     const privateLibrary = path.join(dependencies, 'ploinky-agent-lib');
     fs.mkdirSync(privateLibrary);
     fs.writeFileSync(path.join(privateLibrary, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib' }));
-    assert.match(agentLibCacheLinkProblem(cache, source), /competing AgentLib package/);
+    assert.match(agentLibCacheLinkProblem(cache, source), /AgentLib outside the owned cache/);
+    assert.throws(() => ensureAgentLibCacheLink(cache, source), /AgentLib outside the owned cache/);
+    assert.equal(fs.lstatSync(privateLibrary).isDirectory(), true);
 });
 
 test('a linked npm scope cannot hide a renamed AgentLib package', (t) => {
@@ -116,7 +120,9 @@ test('a linked npm scope cannot hide a renamed AgentLib package', (t) => {
     fs.writeFileSync(path.join(renamed, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib' }));
     ensureAgentLibCacheLink(cache, source);
     fs.symlinkSync(scope, path.join(cache, 'node_modules', '@private'));
-    assert.match(agentLibCacheLinkProblem(cache, source), /competing AgentLib package/);
+    assert.match(agentLibCacheLinkProblem(cache, source), /AgentLib outside the owned cache/);
+    assert.throws(() => ensureAgentLibCacheLink(cache, source), /AgentLib outside the owned cache/);
+    assert.equal(fs.lstatSync(renamed).isDirectory(), true);
 });
 
 test('offline npm overrides transitive Git requests and lifecycle imports use the selected source', (t) => {

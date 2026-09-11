@@ -112,6 +112,7 @@ function boxEnvironment(t, { globalPackage = null, insideBox = true, onInstall =
             // restore the validated image bundle after this operation.
             fs.rmSync(path.join(installPath, 'node_modules', 'mcp-sdk'), { recursive: true, force: true });
             fs.rmSync(path.join(installPath, 'node_modules', 'achillesAgentLib'), { recursive: true, force: true });
+            fs.rmSync(path.join(installPath, 'node_modules', 'ploinky-agent-lib'), { recursive: true, force: true });
             if (onInstall) onInstall(installPath, pkg);
             return { status: 0, stdout: '', stderr: '' };
         }
@@ -225,7 +226,7 @@ test('other dependencies still install and the image SDK is restored after npm p
     assert.equal(validateMcpSdkBundle({ sourceRoot: f.sourceRoot }).contentSha256, f.bundle.contentSha256);
 });
 
-test('a competing nested AgentLib produced during npm cannot receive a cache stamp', (t) => {
+test('a nested AgentLib produced during npm uses the selected source before receiving a cache stamp', (t) => {
     const f = boxEnvironment(t, {
         onInstall(installPath) {
             const duplicate = path.join(installPath, 'node_modules', 'consumer', 'node_modules', 'ploinky-agent-lib');
@@ -237,11 +238,15 @@ test('a competing nested AgentLib produced during npm cannot receive a cache sta
         ...prepareOptions, repoName: 'duplicate-agentlib', agentName: 'agent', force: true,
         agentPackagePath: agentPackage(f.root, { dependencies: { consumer: '1.0.0' } }),
     };
-    assert.throws(() => cache.prepareAgentCache(options), /competing AgentLib package/);
-    assert.equal(cache.readStamp(cache.getAgentCachePath(options.repoName, options.agentName, runtimeKey)), null);
+    const prepared = cache.prepareAgentCache(options);
+    const duplicate = path.join(prepared.cachePath, 'node_modules', 'consumer', 'node_modules', 'ploinky-agent-lib');
+    assert.equal(fs.lstatSync(duplicate).isSymbolicLink(), true);
+    assert.equal(fs.readlinkSync(duplicate), '/opt/ploinky-agentlib');
+    assert.equal(cache.inspectAgentCache(options).valid, true);
+    assert.ok(cache.readStamp(prepared.cachePath));
 });
 
-test('cache admission and link refresh reject a nested AgentLib inserted after preparation', (t) => {
+test('cache admission rejects an inserted nested AgentLib until link refresh repairs it', (t) => {
     const f = boxEnvironment(t);
     const options = { ...prepareOptions, repoName: 'tampered-agentlib', agentName: 'agent' };
     const prepared = cache.prepareAgentCache(options);
@@ -250,8 +255,12 @@ test('cache admission and link refresh reject a nested AgentLib inserted after p
     fs.mkdirSync(duplicate, { recursive: true });
     fs.writeFileSync(path.join(duplicate, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib' }));
     assert.equal(cache.inspectAgentCache(options).valid, false);
-    assert.throws(() => cache.prepareAgentCache(options), /competing AgentLib package/);
+    assert.throws(() => cache.verifyAgentCache(options), /copied package/);
+    assert.equal(fs.lstatSync(duplicate).isDirectory(), true);
     assert.deepEqual(fs.readFileSync(cache.stampPath(prepared.cachePath)), originalStamp);
+    assert.equal(cache.prepareAgentCache(options).reused, true);
+    assert.equal(fs.readlinkSync(duplicate), '/opt/ploinky-agentlib');
+    assert.equal(cache.inspectAgentCache(options).valid, true);
     assert.equal(f.installs.length, 0);
 });
 
@@ -426,4 +435,77 @@ test('finalization rejects a different self-consistent package pretending to be 
     finalizeBoxMcpSdkCache(cachePath, bundle);
     assert.equal(boxMcpSdkCacheProblem(cachePath, { mcpSdk: boxMcpSdkStampSection(bundle) }, bundle), '');
     assert.equal(validateMcpSdkBundle({ sourceRoot }).contentSha256, bundle.contentSha256);
+});
+
+test('managed npm caches replace hoisted and nested AgentLib copies before admission', (t) => {
+    const relativeCopies = ['ploinky-agent-lib', '@vendor/consumer/node_modules/ploinky-agent-lib'];
+    const f = boxEnvironment(t, {
+        onInstall(installPath) {
+            for (const relative of relativeCopies) {
+                const directory = path.join(installPath, 'node_modules', relative);
+                fs.mkdirSync(directory, { recursive: true });
+                fs.writeFileSync(path.join(directory, 'package.json'), '{"name":"ploinky-agent-lib"}');
+                fs.writeFileSync(path.join(directory, 'private-copy'), 'must be removed');
+            }
+        },
+    });
+    const options = { ...prepareOptions, repoName: 'agentlib-aliases', agentName: 'agent',
+        agentPackagePath: agentPackage(f.root, { dependencies: { consumer: '1.0.0' } }) };
+    const prepared = cache.prepareAgentCache({ ...options, force: true });
+    assert.equal(f.installs.length, 1);
+    for (const relative of relativeCopies) {
+        const directory = path.join(prepared.cachePath, 'node_modules', relative);
+        assert.equal(fs.lstatSync(directory).isSymbolicLink(), true);
+        assert.equal(fs.readlinkSync(directory), '/opt/ploinky-agentlib');
+    }
+    assert.equal(cache.inspectAgentCache(options).valid, true);
+
+    const nested = path.join(prepared.cachePath, 'node_modules', relativeCopies[1]);
+    fs.unlinkSync(nested);
+    fs.mkdirSync(nested);
+    const stampBefore = fs.readFileSync(cache.stampPath(prepared.cachePath), 'utf8');
+    assert.equal(cache.inspectAgentCache(options).valid, false);
+    assert.throws(() => cache.verifyAgentCache(options), /copied package/);
+    assert.equal(fs.lstatSync(nested).isDirectory(), true, 'admission does not repair');
+    assert.equal(fs.readFileSync(cache.stampPath(prepared.cachePath), 'utf8'), stampBefore);
+    const repaired = cache.prepareAgentCache(options);
+    assert.equal(repaired.reused, true);
+    assert.equal(f.installs.length, 1, 'link repair does not rerun npm');
+    assert.equal(fs.readlinkSync(nested), '/opt/ploinky-agentlib');
+    assert.equal(cache.inspectAgentCache(options).valid, true);
+});
+
+test('legacy AgentLib adapters refresh both cache stamps without reinstalling npm', (t) => {
+    const f = boxEnvironment(t);
+    const options = { ...prepareOptions, repoName: 'legacy-agentlib', agentName: 'agent' };
+    const prepared = cache.prepareAgentCache({ ...options, force: true });
+    for (const directory of [cache.getGlobalCachePath(runtimeKey), prepared.cachePath]) {
+        const stamp = cache.readStamp(directory);
+        delete stamp.agentLib.adapterSchema;
+        cache.writeStamp(directory, stamp);
+        fs.unlinkSync(path.join(directory, 'node_modules', 'ploinky-agent-lib'));
+    }
+    assert.match(cache.inspectAgentCache(options).reason, /adapterSchema changed/);
+    const repaired = cache.prepareAgentCache(options);
+    assert.equal(repaired.reused, true);
+    assert.equal(f.installs.length, 0);
+    for (const directory of [cache.getGlobalCachePath(runtimeKey), prepared.cachePath]) {
+        assert.equal(cache.readStamp(directory).agentLib.adapterSchema, 1);
+        assert.equal(fs.readlinkSync(path.join(directory, 'node_modules', 'ploinky-agent-lib')), '/opt/ploinky-agentlib');
+    }
+    assert.equal(cache.inspectAgentCache(options).valid, true);
+});
+
+test('an unsafe nested dependency link cannot retain a valid cache stamp after failed repair', (t) => {
+    const f = boxEnvironment(t);
+    const options = { ...prepareOptions, repoName: 'unsafe-agentlib', agentName: 'agent' };
+    const prepared = cache.prepareAgentCache({ ...options, force: true });
+    const outside = path.join(f.root, 'external-package');
+    const privateLibrary = path.join(outside, 'node_modules', 'ploinky-agent-lib');
+    fs.mkdirSync(privateLibrary, { recursive: true });
+    fs.symlinkSync(outside, path.join(prepared.cachePath, 'node_modules', 'external-package'));
+    assert.equal(cache.inspectAgentCache(options).valid, false);
+    assert.throws(() => cache.prepareAgentCache(options), /AgentLib outside the owned cache/);
+    assert.equal(cache.readStamp(prepared.cachePath), null);
+    assert.equal(fs.lstatSync(privateLibrary).isDirectory(), true);
 });

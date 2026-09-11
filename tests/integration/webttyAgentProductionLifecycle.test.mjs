@@ -130,7 +130,7 @@ test('production AgentTerminalWorker and default recovery reclaim exact non-root
         assert.equal(evidence.cases.clean.markerProof.innerUid, 1000);
         assert.deepEqual(evidence.cases.clean.markerProof.argv, [
             '/bin/bash', '--noprofile', '--norc', '-p', '-c',
-            'PS1=\'$PWD $ \'; export PS1; /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac',
+            'if [ -f /etc/ploinky/webtty-env.sh ]; then . /etc/ploinky/webtty-env.sh || exit 124; fi; PS1=\'$PWD $ \'; export PS1; /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac',
             `ploinky-webtty-marker:production_marker_${evidence.runId}_clean`,
         ]);
         assert.deepEqual(evidence.cases.clean.io,

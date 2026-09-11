@@ -322,6 +322,7 @@ export function initDom() {
             interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,
+            sessionSettingsLink: document.getElementById('sessionSettingsLink'),
             skillsBtn,
             skillsDialog,
             skillsDialogClose,

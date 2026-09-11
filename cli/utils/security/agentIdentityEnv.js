@@ -1,3 +1,4 @@
+import { SKILL_SCOPE_ENV_NAMES } from '../../../ploinky-box/skillScope.mjs';
 import { AGENTLIB_RESERVED_ENV_NAMES } from '../../../agentlib/contract.mjs';
 import { deriveAgentRequestSecret, derivePrivateAgentRequestSecret } from './masterKey.js';
 import { buildSubjectIdentityKey, getSubjectIdentityPublicKey } from './subjectIdentityKey.js';
@@ -142,6 +143,7 @@ export const RESERVED_AGENT_ENV_NAMES = Object.freeze([
     // layer must not be able to point an agent at a different source than the
     // one the workspace selected.
     ...AGENTLIB_RESERVED_ENV_NAMES,
+    ...SKILL_SCOPE_ENV_NAMES,
 ]);
 
 const RESERVED = new Set(RESERVED_AGENT_ENV_NAMES);

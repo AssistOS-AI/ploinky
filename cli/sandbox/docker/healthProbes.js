@@ -3,11 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parentPort } from 'worker_threads';
 import {
-    isContainerRunning,
     waitForContainerRunning,
     sleepMs
 } from './common.js';
 import { HEALTH_PROBE_CONTROL_HOST_ROOT } from '../../utils/runtime/healthProbeControlPath.js';
+import { inspectContainerState } from './containerState.mjs';
 
 const DEFAULT_INTERVAL_SECONDS = 1;
 const DEFAULT_TIMEOUT_SECONDS = 5;
@@ -25,6 +25,7 @@ const PROBE_RESULT_GRACE_MS = 60_000;
 // preserved and still fail closed when this deadline expires.
 const PROBE_CANCELLATION_GRACE_MS = 180_000;
 const PROBE_RESULT_POLL_MS = 50;
+const PROBE_CONTAINER_RECHECK_MS = 10_000;
 const PROBE_OUTPUT_MAX_BYTES = 1024 * 1024;
 const DEFAULT_PROBE_CONTROL_PLANE_FAILURE_THRESHOLD = 3;
 const DEFAULT_PROBE_CONTROL_PLANE_RETRY_MS = 10_000;
@@ -284,7 +285,7 @@ function readProbeResult(control) {
     };
 }
 
-function waitForProbeResult(control, timeoutMs, options = {}) {
+function waitForProbeResult(control, timeoutMs, options = {}, onPending) {
     const sleepMsImpl = options.sleepMsImpl || sleepMs;
     const nowImpl = options.nowImpl || Date.now;
     const deadline = nowImpl() + Math.max(0, timeoutMs);
@@ -293,7 +294,15 @@ function waitForProbeResult(control, timeoutMs, options = {}) {
         if (result) return result;
         const remaining = deadline - nowImpl();
         if (remaining <= 0) return null;
-        sleepMsImpl(Math.min(PROBE_RESULT_POLL_MS, remaining));
+        if (onPending) {
+            onPending(remaining);
+            // An inspection can consume its budget or race a broker result.
+            const completed = readProbeResult(control);
+            if (completed) return completed;
+        }
+        const remainingAfterInspection = deadline - nowImpl();
+        if (remainingAfterInspection <= 0) return null;
+        sleepMsImpl(Math.min(PROBE_RESULT_POLL_MS, remainingAfterInspection));
     }
 }
 
@@ -331,7 +340,7 @@ function removeCompletedProbeControl(control) {
     fs.rmSync(retiredParent, { recursive: true, force: true });
 }
 
-function cancelAndAwaitProbe(control, options = {}) {
+function cancelAndAwaitProbe(control, options = {}, onPending) {
     try {
         requestProbeCancellation(control);
     } catch (error) {
@@ -341,7 +350,33 @@ function cancelAndAwaitProbe(control, options = {}) {
         control,
         options.probeCancellationGraceMs || PROBE_CANCELLATION_GRACE_MS,
         options,
+        onPending,
     );
+}
+
+function watchCancelledProbeContainer(agentName, control, options) {
+    if (!options.probeContainerIdentity) return undefined;
+    const identity = options.probeContainerIdentity;
+    const now = options.nowImpl || Date.now;
+    let nextInspection = 0;
+    return remainingMs => {
+        if (now() < nextInspection) return;
+        let state;
+        try {
+            state = (options.inspectContainerStateImpl || inspectContainerState)(identity.id, {
+                runtime: identity.runtime, spawnSyncImpl: options.spawnSyncImpl,
+                timeoutMs: Math.min(options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS, remainingMs),
+            });
+        } catch (_) {
+            // Runtime uncertainty must not substitute for exact cancellation.
+        }
+        nextInspection = now() + PROBE_CONTAINER_RECHECK_MS;
+        if (readProbeResult(control)) return;
+        if (state?.id !== identity.id || !['exited', 'dead', 'stopped'].includes(state.status)) return;
+        const error = new Error(`[probe] ${agentName}: the selected container exited while its broker was unresponsive`);
+        error.code = 'PLOINKY_PROBE_CONTAINER_EXITED';
+        throw error;
+    };
 }
 
 function runProbeWithControlPlaneRetry(agentName, operation, callback, options = {}) {
@@ -421,7 +456,7 @@ function runProbeOnce(agentName, containerName, probe, options = {}) {
         execRes = waitForProbeResult(control, completionTimeoutMs, options);
     }
     if (!execRes) {
-        execRes = cancelAndAwaitProbe(control, options);
+        execRes = cancelAndAwaitProbe(control, options, watchCancelledProbeContainer(agentName, control, options));
         if (!execRes) {
             const claimed = probeWasClaimed(control);
             // Never erase an unterminated request. A broker can atomically
@@ -479,22 +514,27 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
     postProbeLog('info', `[probe] ${agentName}: ${type} probe -> script='${probe.script}', interval=${probe.interval}s, timeout=${probe.timeout}s, successThreshold=${probe.successThreshold}, failureThreshold=${probe.failureThreshold}, continuous=${probe.continuous}`);
     let consecutiveSuccesses = 0;
     let consecutiveFailures = 0;
-    // Prove the immutable runtime once before entering the semantic loop. A
-    // mounted broker result is itself evidence that the same main process tree
-    // executed each subsequent probe, so repeating runtime inventory here adds
-    // no identity proof and can overload nested Podman during cold fan-out.
-    const isContainerRunningImpl = options.isContainerRunningImpl || isContainerRunning;
+    // Responsive brokers need one runtime inspection. Retain its immutable ID
+    // so a silent broker can be checked during cancellation without amplifying
+    // normal cold-start inventory or observing a same-name replacement.
+    let probeContainerIdentity;
     const containerRunning = runProbeWithControlPlaneRetry(
         agentName,
         'container running-state inspection',
         () => {
             try {
-                return isContainerRunningImpl(containerName, {
+                const inspectionOptions = {
                     timeoutMs: options.controlPlaneTimeoutMs || PROBE_CONTROL_PLANE_TIMEOUT_MS,
                     runtime: options.runtime,
                     spawnSyncImpl: options.spawnSyncImpl,
                     throwOnError: true,
-                });
+                };
+                if (options.isContainerRunningImpl && !options.inspectContainerStateImpl) {
+                    // Boolean-only injected runtimes cannot prove an immutable exit.
+                    return options.isContainerRunningImpl(containerName, inspectionOptions);
+                }
+                probeContainerIdentity = (options.inspectContainerStateImpl || inspectContainerState)(containerName, inspectionOptions);
+                return probeContainerIdentity.status === 'running';
             } catch (error) {
                 throw probeControlPlaneFailure(agentName, 'inspect container running state', error);
             }
@@ -510,12 +550,18 @@ function runProbeLoop(agentName, containerName, type, probe, options = {}) {
     }
 
     while (true) {
-        const result = runProbeWithControlPlaneRetry(
-            agentName,
-            `${type} probe`,
-            () => runProbeOnce(agentName, containerName, probe, options),
-            options,
-        );
+        let result;
+        try {
+            result = runProbeWithControlPlaneRetry(
+                agentName,
+                `${type} probe`,
+                () => runProbeOnce(agentName, containerName, probe, { ...options, probeContainerIdentity }),
+                options,
+            );
+        } catch (error) {
+            if (error?.code !== 'PLOINKY_PROBE_CONTAINER_EXITED') throw error;
+            return { status: 'failed', reason: 'container exited', detail: '' };
+        }
 
         const detail = (result.stdout || result.stderr || '').trim();
         if (result.success) {

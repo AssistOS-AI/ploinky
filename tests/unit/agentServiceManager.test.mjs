@@ -510,9 +510,10 @@ test('reserved env filtering restores only the runtime-owned Router authority', 
 test('existing-container ownership inspection is unconditional across network modes', () => {
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.doesNotMatch(source, /\bresolveRouterEndpoint\s*\(/, 'service manager must not reread persisted routing state');
-    assert.match(source, /const networkLifecycle = createNetworkLifecycleAdapter\(\{ runtime \}\);[\s\S]*?if \(containerExists\(containerName\)\) \{\s+const contractInspection = networkLifecycle\.inspectContainerContract/);
+    assert.match(source, /const networkLifecycle = createNetworkLifecycleAdapter\(\{ runtime \}\);[\s\S]*?if \(existingRuntimeAtEntry\) \{\s+const contractInspection = networkLifecycle\.inspectContainerContract/);
     assert.doesNotMatch(source, /if \(containerExists\(containerName\) && managedNetworkLifecycle\)/);
-    assert.match(source, /else if \(!isContainerRunning\(containerName\)\)/);
+    assert.match(source, /else if \(!contractInspection\.running\)/);
+    assert.match(source, /else if \(!reuseInspection\.running\)/);
     assert.match(source, /recreateReason \|\|= 'runtimeStopped'/);
     assert.match(source, /reuseInspection\.id !== inspectedContainerId/);
     assert.match(source, /recreateReason \|\|= 'runtimeStoppedAfterInspection'/);
@@ -525,6 +526,21 @@ test('existing-container ownership inspection is unconditional across network mo
     assert.match(homeVerificationSource, /spawnSync\(runtime, \['inspect', reuseInspection\.id\]/);
     assert.match(homeVerificationSource, /!hasExactAgentHomeLayout\(inspectedRecords\[0\], desiredHomeLayout\)/);
     assert.match(homeVerificationSource, /canReuseExisting = false;\s*recreateReason \|\|= 'agentHomeLayoutChanged'/);
+});
+
+test('service startup passes its platform adapter through a private lock-bound handoff', () => {
+    const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
+    assert.match(source, /const SERVICE_NETWORK_LIFECYCLE = Symbol\('serviceNetworkLifecycle'\)/);
+    assert.match(source, /const serviceNetworkLifecycle = options\[SERVICE_NETWORK_LIFECYCLE\]/);
+    assert.match(source, /if \(serviceNetworkLifecycle\) \{\s*assertNetworkLifecycleCapability\(options\.networkLifecycleCapability\)/);
+    assert.match(source, /serviceNetworkLifecycle\.capability !== options\.networkLifecycleCapability/);
+    assert.match(source, /serviceNetworkLifecycle\.runtime !== runtime/);
+    assert.match(source, /const networkLifecycle = serviceNetworkLifecycle\?\.adapter \|\| createNetworkLifecycleAdapter\(\{ runtime \}\)/);
+    assert.match(source, /\[SERVICE_NETWORK_LIFECYCLE\]: \{\s*runtime,\s*capability: options\.networkLifecycleCapability,\s*adapter: networkLifecycle,/);
+    const service = source.slice(source.indexOf('function ensureAgentService('), source.indexOf('function ', source.indexOf('function ensureAgentService(') + 10));
+    assert.equal((service.match(/containerExists\(containerName\)/g) || []).length, 2,
+        'keep the entry observation and final disappearance check, without repeated preliminary existence probes');
+    assert.equal((service.match(/createNetworkLifecycleAdapter\(\{ runtime \}\)/g) || []).length, 1);
 });
 
 test('managed adoption derives one exact dependency runtime key from registered cache mounts', () => {

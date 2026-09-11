@@ -4,6 +4,8 @@ Ploinky is a lightweight runtime for AI agents. It is technology‑agnostic: an 
 
 Beyond a single agent, Ploinky supports a multi‑agent workspace. Each agent runs in its own container. A local web router serves a simple web app and proxies API calls to the containers, so you can build applications that orchestrate multiple agents. A companion cloud component (in progress) will host multiple such custom apps, each with its own agents and routes.
 
+See [local instruction skills](docs/local-instruction-skills.md) for launch scope metadata, RoboTeam's catalog boundary, and compatibility installation that preserves local edits.
+
 ## Prerequisites
 - Node.js 20+
 - Docker or Podman
@@ -125,6 +127,16 @@ test workspace. AgentLib is direct-mounted, not bundled into the Box image;
 an AgentLib-only policy-pin change does not change the bundled MCP SDK or its
 dependency-cache fingerprint. Changes to actual image inputs still require
 image-contract verification and a matching immutable image.
+
+Prepared dependency caches bind both `achillesAgentLib` and `ploinky-agent-lib`
+to that same admitted source. After npm completes, Ploinky replaces hoisted,
+scoped, and nested copies of either package with source links and verifies them
+before admitting the cache. This also covers dependencies that use the package
+name `ploinky-agent-lib`, such as ALA. Older cache adapters are repaired under
+the cache lock without reinstalling unrelated packages. Linked local packages
+are inspected without changing their source. If they contain or resolve a
+different AgentLib, install those dependencies as package copies so Ploinky can
+adapt the owned cache. Runtime caches and the selected library remain read-only.
 
 State follows these stop/start and destroy boundaries:
 

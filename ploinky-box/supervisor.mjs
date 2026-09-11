@@ -1,3 +1,5 @@
+import { buildHostSkillScope } from './skillScope.mjs';
+import { readGraphSkillScope, validateGraphSkillScope, writeGraphSkillScope } from './graphSkillScope.mjs';
 import path from 'node:path';
 import http from 'node:http';
 
@@ -199,6 +201,7 @@ export function createBoxSupervisor({
     discover = defaultDiscovery,
     platform = process.platform,
     env = process.env,
+    launchCwd = process.cwd(),
     repositoryRoot = path.resolve(import.meta.dirname, '..'),
     reconcile = reconcileBoxContainer,
     validateExistingImage = inspectAndValidateExistingImage,
@@ -284,6 +287,7 @@ export function createBoxSupervisor({
     }
 
     async function rollbackPreparedGraph({
+        identity,
         prepared,
         ownership,
         containerId,
@@ -291,6 +295,7 @@ export function createBoxSupervisor({
         stopGraph,
         restoreGraph,
         restoreCoreArgv = null,
+        restoreSkillScopeEnv = null,
     }) {
         const failures = [];
         if (stopGraph) {
@@ -311,6 +316,7 @@ export function createBoxSupervisor({
                 if (!Array.isArray(restoreCoreArgv) || restoreCoreArgv[0] !== 'start') {
                     throw new Error('the prior graph start configuration was not captured');
                 }
+                const skillScopeEnv = validateGraphSkillScope(identity, restoreSkillScopeEnv);
                 const prior = outerRollback.agentLib;
                 const observed = fingerprintSource(prior.sourceDir);
                 if (observed.fingerprint !== prior.fingerprint
@@ -330,6 +336,7 @@ export function createBoxSupervisor({
                         stderr,
                         hostReachableIpv4,
                         agentLib: prior,
+                        skillScopeEnv,
                     },
                 );
                 await healthCheck(outerRollback.hostPort);
@@ -348,19 +355,30 @@ export function createBoxSupervisor({
 
     async function completeGraphAdmission({
         identity,
+        lock,
         prepared,
         selection,
         requireHealth = true,
+        skillScopeEnv = null,
+        priorSkillScopeEnv = null,
     }) {
         if (requireHealth) await healthCheck(prepared.hostPort);
         revalidateAgentLibSource(selection);
         commitAgentLibSelection(identity.workspaceRoot, selection);
-        prepared.finalize?.();
+        if (skillScopeEnv) writeGraphSkillScope(identity, skillScopeEnv, lock);
+        try {
+            prepared.finalize?.();
+        } catch (error) {
+            if (skillScopeEnv) writeGraphSkillScope(identity, priorSkillScopeEnv, lock);
+            throw error;
+        }
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
+            const priorSkillScopeEnv = readGraphSkillScope(identity);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -408,16 +426,18 @@ export function createBoxSupervisor({
                         stderr,
                         hostReachableIpv4,
                         agentLib: selection,
+                        skillScopeEnv,
                     },
                 );
                 await completeGraphAdmission({
-                    identity, ownership, prepared, selection, containerId,
+                    identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
                 });
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
+                    identity,
                     prepared,
                     ownership,
                     containerId,
@@ -427,6 +447,7 @@ export function createBoxSupervisor({
                         && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
                     restoreCoreArgv: priorCoreStartArgv,
+                    restoreSkillScopeEnv: priorSkillScopeEnv,
                 });
             }
         });
@@ -434,7 +455,9 @@ export function createBoxSupervisor({
 
     async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
+            const priorSkillScopeEnv = readGraphSkillScope(identity);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -469,16 +492,17 @@ export function createBoxSupervisor({
                     prepared.hostPort,
                     prepared.mediaHostPort,
                     runner,
-                    { stdout, stderr, hostReachableIpv4, agentLib: selection },
+                    { stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
                 );
                 await completeGraphAdmission({
-                    identity, ownership, prepared, selection, containerId,
+                    identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
                 });
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
+                    identity,
                     prepared,
                     ownership,
                     containerId,
@@ -488,6 +512,7 @@ export function createBoxSupervisor({
                         && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
                     restoreCoreArgv: priorCoreStartArgv,
+                    restoreSkillScopeEnv: priorSkillScopeEnv,
                 });
             }
         });
@@ -502,6 +527,7 @@ export function createBoxSupervisor({
             );
         }
         return lockedMutation(async (identity, lock, ownership) => {
+            const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const status = inspectBoxStatus();
             const container = status.ownership?.handles?.container;
             const engine = status.ownership?.engine;
@@ -534,7 +560,7 @@ export function createBoxSupervisor({
                 hostPort,
                 mediaHostPort,
                 runner,
-                { stdout, stderr, hostReachableIpv4, agentLib: selection },
+                { stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
             );
 
             // Manual engine operations are outside the workspace lock. Refuse
@@ -567,7 +593,9 @@ export function createBoxSupervisor({
 
     async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
+            const priorSkillScopeEnv = readGraphSkillScope(identity);
             const workspacePloinky = await updateWorkspacePloinky({
                 identity,
                 lock,
@@ -608,6 +636,7 @@ export function createBoxSupervisor({
                         stdout,
                         stderr,
                         agentLib: selection,
+                        skillScopeEnv,
                         updateExcludedRepoPath: workspacePloinky?.boxRepoPath || '',
                     },
                 );
@@ -621,16 +650,19 @@ export function createBoxSupervisor({
                         prepared.hostPort,
                         prepared.mediaHostPort,
                         runner,
-                        { stdout, stderr, hostReachableIpv4, agentLib: selection },
+                        { stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
                     );
                 }
                 await completeGraphAdmission({
                     identity,
+                    lock,
                     ownership,
                     prepared,
                     selection,
                     containerId,
                     requireHealth: options.restartAfterUpdate === true,
+                    skillScopeEnv: options.restartAfterUpdate === true ? skillScopeEnv : null,
+                    priorSkillScopeEnv,
                 });
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
@@ -638,6 +670,7 @@ export function createBoxSupervisor({
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
+                    identity,
                     prepared,
                     ownership,
                     containerId,
@@ -648,6 +681,7 @@ export function createBoxSupervisor({
                         && Boolean(priorCoreStartArgv)
                         && (graphMutated || prepared.action === 'replaced'),
                     restoreCoreArgv: priorCoreStartArgv,
+                    restoreSkillScopeEnv: priorSkillScopeEnv,
                 });
             }
         });
@@ -917,6 +951,7 @@ function boundedCoreEnvironment(
     agentLib,
     hostReachableIpv4 = '',
     updateExcludedRepoPath = '',
+    skillScopeEnv = {},
 ) {
     if (!agentLib) {
         throw supervisorError('Bounded core command requires the selected achillesAgentLib contract');
@@ -924,6 +959,7 @@ function boundedCoreEnvironment(
     const agentLibEnvironment = agentLibBoxEnv(normalizeBoxAgentLib(agentLib));
     return [
         'container', 'exec',
+        ...Object.entries(skillScopeEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         '--env', `PLOINKY_ROUTER_HOST_PORT=${hostPort}`,
         '--env', `PLOINKY_MEDIA_HOST_PORT=${mediaHostPort}`,
         ...(hostReachableIpv4
@@ -950,6 +986,7 @@ export async function runBoundedCoreCommand(
         hostReachableIpv4 = '',
         agentLib = null,
         updateExcludedRepoPath = '',
+        skillScopeEnv = {},
     } = {},
 ) {
     const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
@@ -966,6 +1003,7 @@ export async function runBoundedCoreCommand(
             agentLib,
             normalizedHostReachableIpv4,
             updateExcludedRepoPath,
+            skillScopeEnv,
         ),
         '--user', 'podman',
         '--workdir', '/workspace',
@@ -992,6 +1030,7 @@ export async function runBoundedCoreStart(
         timeoutMs = 1_800_000,
         hostReachableIpv4 = '',
         agentLib = null,
+        skillScopeEnv = {},
     } = {},
 ) {
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
@@ -1004,7 +1043,7 @@ export async function runBoundedCoreStart(
         hostPort,
         mediaHostPort,
         runner,
-        { stdout, stderr, timeoutMs, hostReachableIpv4, agentLib },
+        { stdout, stderr, timeoutMs, hostReachableIpv4, agentLib, skillScopeEnv },
     );
     const externalRouter = `http://127.0.0.1:${hostPort}`;
     const outputLines = String(result.stdout || '').split(/\r?\n/);
@@ -1072,6 +1111,14 @@ export function checkBoxHealth(hostPort, {
                     try {
                         const health = JSON.parse(body);
                             if (response.statusCode === 200 && health.status === 'healthy') {
+                                resolve({ ready: true });
+                                return;
+                            }
+                            // The active Router protects /health even when workspace auth is disabled.
+                            if (response.statusCode === 401 && health.ok === false
+                                && health.error?.code === 'AUTH_REQUIRED'
+                                && Object.keys(health).length === 2
+                                && Object.keys(health.error).length === 1) {
                                 resolve({ ready: true });
                                 return;
                             }

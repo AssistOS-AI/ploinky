@@ -10,6 +10,7 @@ import { loadImmutableNodePty } from '../../../core-services/webtty/native-runti
 import {
     capturePtyProcessIdentity,
     processIdentityError,
+    readLinuxProcessIdentity,
     signalVerifiedPtyProcessGroup,
     waitForPtyProcessExit,
 } from '../../../core-services/webtty/process-identity.mjs';
@@ -51,6 +52,16 @@ const MAX_QUEUED_IPC_BYTES = 256 * 1024;
 const MAX_PODMAN_OUTPUT_BYTES = 1024 * 1024;
 const READINESS_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
 
+function podmanClientUid(status) {
+    const values = String(status).match(/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m);
+    const uid = Number(values?.[1]);
+    if (!values || !Number.isSafeInteger(uid) || uid < 0
+        || values.slice(1).some((value) => Number(value) !== uid)) {
+        throw processIdentityError('podman-client-uid');
+    }
+    return uid;
+}
+
 export function captureExactAgentPodmanClient(pid, expectedArgs, {
     fsApi = fs,
     capturePty = capturePtyProcessIdentity,
@@ -65,18 +76,110 @@ export function captureExactAgentPodmanClient(pid, expectedArgs, {
     if (before.startToken !== after.startToken) {
         throw processIdentityError('podman-client-changed-during-capture');
     }
-    const uidValues = String(status).match(/^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$/m);
-    const uid = Number(uidValues?.[1]);
-    if (!uidValues || !Number.isSafeInteger(uid) || uid < 0
-        || uidValues.slice(1).some((value) => Number(value) !== uid)) {
-        throw processIdentityError('podman-client-uid');
-    }
+    const uid = podmanClientUid(status);
     const argv = Buffer.from(command).toString('utf8').split('\0').filter(Boolean);
     const expected = [PODMAN, ...expectedArgs];
     if (argv.length !== expected.length || argv.some((value, index) => value !== expected[index])) {
         throw processIdentityError('podman-client-argv');
     }
     return Object.freeze({ ...after, uid });
+}
+
+function readClientStartupIdentity(pid, fsApi) {
+    const before = readLinuxProcessIdentity(pid, { fsApi });
+    const uid = podmanClientUid(fsApi.readFileSync(`/proc/${pid}/status`, 'utf8'));
+    const command = Buffer.from(fsApi.readFileSync(`/proc/${pid}/cmdline`));
+    const after = readLinuxProcessIdentity(pid, { fsApi });
+    if (before.startToken !== after.startToken || before.state === 'Z' || after.state === 'Z') {
+        throw processIdentityError('podman-client-changed-during-capture', { stale: true });
+    }
+    if (command.length > 64 * 1024 || (command.length && command.at(-1) !== 0)) {
+        throw processIdentityError('podman-client-argv');
+    }
+    const argv = command.length ? command.subarray(0, -1).toString('utf8').split('\0') : [];
+    if (command.length && !Buffer.from(`${argv.join('\0')}\0`).equals(command)) {
+        throw processIdentityError('podman-client-argv');
+    }
+    return { ...after, uid, argv };
+}
+
+export async function waitForExactAgentPodmanClient(pid, expectedArgs, {
+    deadlineAt,
+    fsApi = fs,
+    captureClient = captureExactAgentPodmanClient,
+    nowImpl = Date.now,
+    delayImpl = delay,
+    isCancelled = () => false,
+} = {}) {
+    const active = () => {
+        if (isCancelled()) throw processIdentityError('podman-client-startup-cancelled');
+        if (!Number.isFinite(deadlineAt) || nowImpl() >= deadlineAt) {
+            throw processIdentityError('podman-client-startup-timeout');
+        }
+    };
+    active();
+    if (!Array.isArray(expectedArgs) || expectedArgs.some((value) => typeof value !== 'string')) {
+        throw processIdentityError('podman-client-expected-argv');
+    }
+    // forkpty returns before setsid, controlling-terminal setup and exec have
+    // necessarily finished. Bind the child birth before yielding, independent
+    // of that still-incomplete PTY topology or inherited/empty command line.
+    const anchor = readClientStartupIdentity(pid, fsApi);
+    const parent = readClientStartupIdentity(process.pid, fsApi);
+    const expected = [PODMAN, ...expectedArgs];
+    const check = (identity) => {
+        active();
+        if (identity.pid !== pid || identity.startToken !== anchor.startToken
+            || identity.uid !== anchor.uid || identity.uid !== parent.uid) {
+            throw processIdentityError('podman-client-startup-identity-changed');
+        }
+        if (identity.argv.length && !exactArgv(identity.argv, parent.argv)
+            && !exactArgv(identity.argv, expected)) {
+            throw processIdentityError('podman-client-argv');
+        }
+        const inherited = identity.processGroupId === parent.processGroupId
+            && identity.sessionId === parent.sessionId
+            && identity.ttyNumber === parent.ttyNumber
+            && identity.foregroundProcessGroupId === parent.foregroundProcessGroupId;
+        const ownSession = identity.processGroupId === pid && identity.sessionId === pid
+            && ((identity.ttyNumber === 0 && identity.foregroundProcessGroupId === -1)
+                || (identity.ttyNumber > 0 && identity.foregroundProcessGroupId === pid));
+        if (!inherited && !ownSession) throw processIdentityError('pty-group-topology');
+    };
+    check(anchor);
+    while (true) {
+        const before = readClientStartupIdentity(pid, fsApi);
+        check(before);
+        try {
+            const captured = captureClient(pid, expectedArgs, {
+                fsApi,
+                capturePty: (target) => capturePtyProcessIdentity(target, {
+                    readIdentityImpl: (current) => readLinuxProcessIdentity(current, { fsApi }),
+                }),
+            });
+            active();
+            const after = readClientStartupIdentity(pid, fsApi);
+            check(after);
+            if (captured.pid !== pid || captured.startToken !== anchor.startToken
+                || captured.uid !== anchor.uid || !exactArgv(after.argv, expected)
+                || ['processGroupId', 'sessionId', 'foregroundProcessGroupId', 'ttyNumber'].some(
+                    (field) => captured[field] !== after[field],
+                )) {
+                throw processIdentityError('podman-client-startup-identity-changed');
+            }
+            return captured;
+        } catch (error) {
+            if (error?.code !== 'WEBTTY_PROCESS_IDENTITY_UNPROVEN'
+                || !['pty-tty', 'pty-group-topology', 'podman-client-argv'].includes(error.category)) {
+                throw error;
+            }
+            // Unknown argv, changed UID/birth and unreadable proc data are
+            // never treated as startup transitions, including on retry.
+            check(readClientStartupIdentity(pid, fsApi));
+        }
+        await delayImpl(Math.min(10, deadlineAt - nowImpl()));
+        active();
+    }
 }
 
 function delay(milliseconds) {
@@ -379,7 +482,7 @@ export class AgentTerminalWorker {
             execId,
             { environment: workerEnvironment, ...options },
         ),
-        captureClient = captureExactAgentPodmanClient,
+        captureClient = waitForExactAgentPodmanClient,
         captureInner = captureAgentInnerProcessIdentity,
         captureSession = captureAgentSessionSnapshot,
         listSession = listAgentSessionMembers,
@@ -571,7 +674,15 @@ export class AgentTerminalWorker {
         this.readinessReject = null;
     }
 
-    async spawnAttempt(shellPath, fallback = false) {
+    assertStartupActive(deadlineAt, generation = this.attemptGeneration) {
+        if (this.closing || this.ptyExited || generation !== this.attemptGeneration) {
+            throw new Error('agent shell startup was cancelled');
+        }
+        if (Date.now() >= deadlineAt) throw new Error('agent shell readiness timed out');
+    }
+
+    async spawnAttempt(shellPath, fallback = false, deadlineAt = Date.now() + this.startupTimeoutMs) {
+        if (this.closing || Date.now() >= deadlineAt) throw new Error('agent shell startup was cancelled');
         this.resetAttemptState();
         const generation = this.attemptGeneration;
         const nodePty = this.loadNodePty();
@@ -593,11 +704,12 @@ export class AgentTerminalWorker {
         // node-pty PID, until that PID has been bound to the exact immutable
         // Podman client identity.  A failed capture leaves durable
         // pty-starting evidence for the normal recovery scanner.
-        this.clientProcess = this.captureClient(this.pty.pid, podmanArgs);
-        const ready = new Promise((resolve, reject) => {
-            this.readinessResolve = resolve;
-            this.readinessReject = reject;
+        const clientProcess = await this.captureClient(this.pty.pid, podmanArgs, {
+            deadlineAt,
+            isCancelled: () => this.closing || this.ptyExited || generation !== this.attemptGeneration,
         });
+        this.assertStartupActive(deadlineAt, generation);
+        this.clientProcess = clientProcess;
         let challenge;
         try {
             challenge = String(this.createReadinessChallenge() || '');
@@ -615,11 +727,23 @@ export class AgentTerminalWorker {
         const readinessCommand = fallback
             ? agentFallbackReadinessCommand(challenge)
             : agentReadinessCommand(challenge);
-        this.pty.write(readinessCommand);
-        const timeout = delay(this.startupTimeoutMs).then(() => {
-            throw new Error('agent shell readiness timed out');
-        });
-        const match = await Promise.race([ready, timeout]);
+        this.assertStartupActive(deadlineAt, generation);
+        let readinessTimer;
+        let match;
+        try {
+            match = await new Promise((resolve, reject) => {
+                this.readinessResolve = resolve;
+                this.readinessReject = reject;
+                readinessTimer = setTimeout(() => reject(new Error('agent shell readiness timed out')),
+                    Math.max(0, deadlineAt - Date.now()));
+                this.pty.write(readinessCommand);
+            });
+        } finally {
+            clearTimeout(readinessTimer);
+            this.readinessResolve = null;
+            this.readinessReject = null;
+        }
+        this.assertStartupActive(deadlineAt, generation);
         const inner = {
             pid: Number(match[1]),
             processGroupId: Number(match[2]),
@@ -627,13 +751,16 @@ export class AgentTerminalWorker {
             uid: Number(match[4]),
             startToken: `linux-proc:${match[5]}`,
         };
-        this.innerProcess = await this.captureInner({
+        const innerProcess = await this.captureInner({
             containerInitBoxPid: this.startupEvidence.containerInitProcess.pid,
             inner,
             marker: this.spec.marker,
             shellPath,
         });
+        this.assertStartupActive(deadlineAt, generation);
+        this.innerProcess = innerProcess;
         const after = this.inspectTarget(this.spec.containerId);
+        this.assertStartupActive(deadlineAt, generation);
         if (after.absent || !after.running
             || after.initPid !== this.startupEvidence.containerInitProcess.pid) {
             throw podmanRuntimeError('target-stale');
@@ -757,11 +884,13 @@ export class AgentTerminalWorker {
             return;
         }
         this.startRequested = true;
+        const deadlineAt = Date.now() + this.startupTimeoutMs;
         let match;
         try {
             try {
-                match = await this.spawnAttempt('/bin/bash');
+                match = await this.spawnAttempt('/bin/bash', false, deadlineAt);
             } catch (bashError) {
+                if (this.closing) throw bashError;
                 const fallbackAllowed = bashExecutableLookupFailed(
                     this.pendingOutput,
                     this.ptyExitEvent,
@@ -773,12 +902,13 @@ export class AgentTerminalWorker {
                     throw error;
                 }
                 try {
-                    match = await this.spawnAttempt('/bin/sh', true);
+                    match = await this.spawnAttempt('/bin/sh', true, deadlineAt);
                 } catch (fallbackError) {
                     if (this.ptyExitEvent?.exitCode === 125) throw shellSelectionError();
                     throw fallbackError;
                 }
             }
+            this.assertStartupActive(deadlineAt);
             const recoveryEvidence = {
                 backend: WEBTTY_AGENT_BACKEND,
                 runtime: 'podman',
@@ -794,6 +924,10 @@ export class AgentTerminalWorker {
             this.readySent = true;
             this.flushStartupOutput(match);
         } catch (error) {
+            if (this.closing) {
+                await this.cleanupPromise;
+                return;
+            }
             const category = startupFailureCategory(error, this.pendingOutput, Boolean(this.pty));
             this.sendError(category);
             await this.cleanup(category);
@@ -850,6 +984,7 @@ export class AgentTerminalWorker {
     cleanup(category) {
         if (this.cleanupPromise) return this.cleanupPromise;
         this.closing = true;
+        this.readinessReject?.(new Error('agent shell startup was cancelled'));
         const controller = new AbortController();
         const cleanupContext = Object.freeze({
             deadlineAt: Date.now() + this.cleanupDeadlineMs,

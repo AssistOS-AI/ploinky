@@ -1,3 +1,4 @@
+import { PLOINKY_SKILL_SCOPE_ENV } from '../../cli/utils/config.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -794,6 +795,7 @@ test('buildExecArgs prefers interactive bash for direct shell TTY sessions', () 
         '-e', 'HISTFILE=/shared/.ploinky-repo_agent-shell-history',
         '-e', 'HISTSIZE=5000',
         '-e', 'HISTFILESIZE=10000',
+        ...Object.entries(PLOINKY_SKILL_SCOPE_ENV).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
         'agent-container',
         'sh',
         '-c',
@@ -810,6 +812,7 @@ test('buildExecArgs preserves non-tty shell sessions for webchat stdin EOF handl
         [
             'exec',
             '-i',
+            ...Object.entries(PLOINKY_SKILL_SCOPE_ENV).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
             'agent-container',
             'sh',
             '-c',
@@ -830,6 +833,7 @@ test('buildExecArgs forwards only validated WebChat history metadata to non-tty 
             'exec',
             '-i',
             '-e', 'PLOINKY_WEBCHAT_HAS_HISTORY=1',
+            ...Object.entries(PLOINKY_SKILL_SCOPE_ENV).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
             'agent-container',
             'sh',
             '-c',
@@ -846,6 +850,7 @@ test('buildExecArgs forwards only validated WebChat history metadata to non-tty 
         [
             'exec',
             '-i',
+            ...Object.entries(PLOINKY_SKILL_SCOPE_ENV).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
             'agent-container',
             'sh',
             '-c',
@@ -863,6 +868,7 @@ test('buildExecArgs does not rewrite non-shell commands and quotes workdir', () 
         [
             'exec',
             '-it',
+            ...Object.entries(PLOINKY_SKILL_SCOPE_ENV).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
             'agent-container',
             'sh',
             '-c',

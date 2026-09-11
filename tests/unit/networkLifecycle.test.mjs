@@ -30,20 +30,21 @@ function absent(resource = 'resource') {
 
 function platformResult(args, overrides = {}) {
     if (args[0] === 'version') return ok(`${overrides.version || '5.4.0'}\n`);
-    if (args[0] === 'info' && args[2]?.includes('Rootless')) {
-        return ok(`${overrides.rootless ?? 'true'}\n`);
-    }
-    if (args[0] === 'info' && args[2]?.includes('NetworkBackend')) {
-        return ok(JSON.stringify(overrides.backend || 'netavark'));
-    }
-    if (args[0] === 'info' && args[2]?.includes('Pasta')) {
-        return overrides.pastaMetadata === false
-            ? ok('null')
-            : ok(JSON.stringify({ executable: '/usr/bin/pasta', version: '0^20250620' }));
-    }
-    if (args[0] === 'info' && args[2]?.includes('ServiceIsRemote')) {
-        if (overrides.serviceIsRemoteProbe === false) return absent('remote service metadata');
-        return ok(JSON.stringify(overrides.serviceIsRemote === true));
+    if (args[0] === 'info') {
+        assert.deepEqual(args.slice(0, 2), ['info', '--format']);
+        for (const field of ['Host.Security.Rootless', 'Host.NetworkBackend', 'Host.Pasta', 'Host.ServiceIsRemote']) {
+            assert.ok(args[2].includes(field), `one info snapshot must include ${field}`);
+        }
+        return ok(JSON.stringify({
+            rootless: overrides.rootless !== 'false',
+            networkBackend: overrides.backend || 'netavark',
+            pasta: overrides.pastaMetadata === false
+                ? null
+                : { executable: '/usr/bin/pasta', version: '0^20250620' },
+            serviceIsRemote: overrides.serviceIsRemoteProbe === false
+                ? null
+                : overrides.serviceIsRemote === true,
+        }));
     }
     if (args[0] === 'unshare' && args[1] === '/usr/bin/pasta' && args[2] === '--version') {
         if (overrides.serviceIsRemote === true) {
@@ -287,6 +288,79 @@ test('managed preflight requires Podman 5.4+, rootless Netavark, operational pas
         containersConfigPaths: [gatewayDisabledPath, gatewayEnabledPath],
     });
     assert.doesNotThrow(() => overriddenGateway.adapter.preflight({ mode: 'default' }, 'demo'));
+});
+
+test('managed preflight rejects missing and mistyped snapshot fields before network mutation', (t) => {
+    const valid = {
+        rootless: true,
+        networkBackend: 'netavark',
+        pasta: { executable: '/usr/bin/pasta', version: '0^20250620' },
+        serviceIsRemote: false,
+    };
+    const invalid = [undefined, null, [], true, {}, '{malformed'];
+    for (const key of Object.keys(valid)) {
+        const missing = { ...valid };
+        delete missing[key];
+        invalid.push(missing);
+    }
+    for (const value of ['true', 1, null, {}]) invalid.push({ ...valid, rootless: value });
+    for (const value of [true, ['netavark'], {}, 'cni']) invalid.push({ ...valid, networkBackend: value });
+    for (const value of ['false', 0, null, {}]) invalid.push({ ...valid, serviceIsRemote: value });
+    for (const value of [null, [], '', { executable: {}, version: '1' },
+        { executable: '/usr/bin/pasta', version: 1 }, { executable: ' ', version: '1' }]) {
+        invalid.push({ ...valid, pasta: value });
+    }
+    for (const snapshot of invalid) {
+        const harness = networkHarness(t);
+        const adapter = createNetworkLifecycleAdapter({
+            runtime: 'podman',
+            workspaceRoot: path.join(harness.dir, 'workspace'),
+            lockPath: path.join(harness.dir, 'malformed.lock'),
+            containersConfigPaths: [],
+            run(runtime, args) {
+                if (args[0] === 'info') {
+                    harness.calls.push([...args]);
+                    return ok(snapshot === '{malformed' ? snapshot : JSON.stringify(snapshot));
+                }
+                return harness.run(runtime, args);
+            },
+            waitForRuntimeProofRetry: () => assert.fail('a successful malformed proof must not be retried'),
+        });
+        assert.throws(() => adapter.prepare({ mode: 'default' }, 'demo'),
+            /rootless Podman|Netavark|pasta backend metadata|local or remote/);
+        assert.equal(harness.calls.filter((args) => args[0] === 'info').length, 1);
+        assert.equal(harness.calls.some((args) => args[0] === 'network'), false);
+    }
+});
+
+test('platform snapshot is stable within an adapter and never shared with another adapter', (t) => {
+    const harness = networkHarness(t);
+    const network = { mode: 'default' };
+    const first = harness.adapter.preflight(network, 'demo').runtimeProof;
+    const second = harness.adapter.preflight(network, 'demo').runtimeProof;
+    assert.equal(first, second);
+    assert.ok(Object.isFrozen(first));
+    assert.equal(harness.calls.filter((args) => args[0] === 'info').length, 1);
+    assert.deepEqual(first, {
+        engine: 'podman', rootless: true, version: '5.4.0', backend: 'netavark',
+        remote: false, pastaExecutable: '/usr/bin/pasta', pastaVersion: '0^20250620',
+        platform: process.platform,
+    });
+
+    const freshAdapter = createNetworkLifecycleAdapter({
+        runtime: 'podman',
+        workspaceRoot: path.join(harness.dir, 'workspace'),
+        containersConfigPaths: [],
+        run(runtime, args) {
+            if (args[0] === 'info') {
+                harness.calls.push([...args]);
+                return platformResult(args, { rootless: 'false' });
+            }
+            return harness.run(runtime, args);
+        },
+    });
+    assert.throws(() => freshAdapter.preflight(network, 'demo'), /observed 'false'/);
+    assert.equal(harness.calls.filter((args) => args[0] === 'info').length, 2);
 });
 
 test('managed preflight retries transient Podman ownership proof failures before mutating', (t) => {
@@ -1014,6 +1088,11 @@ test('validation-only managed adoption reuses one exact immutable runtime withou
         running: true,
     }));
     const callsBefore = harness.calls.length;
+    assert.equal(harness.adapter.inspectContainerContract('demo-container', network, 'demo', {
+        contractHash: networkContractHash(network),
+        ...TEST_RUNTIME_IDENTITY,
+        requireRuntimeIdentity: true,
+    }).state, 'exact');
     let finalized = false;
     const result = harness.adapter.adoptManagedContainerTransaction({
         network,
@@ -1037,6 +1116,11 @@ test('validation-only managed adoption reuses one exact immutable runtime withou
     assert.equal(result.containerId, id);
     assert.match(result.adoption.launch.semanticTopologyDigest, /^sha256:[a-f0-9]{64}$/);
     assert.equal(finalized, true);
+    assert.equal(harness.calls.filter((args) => args[0] === 'info').length, 1,
+        'preflight, contract inspection and adoption share only one platform probe');
+    assert.ok(harness.calls.slice(callsBefore).some((args) => (
+        args[0] === 'container' && args[1] === 'inspect' && args[2] === id
+    )), 'final adoption must re-inspect the immutable container ID');
     assert.equal(harness.calls.slice(callsBefore).some((args) => ['stop', 'rm', 'create'].includes(args[0])), false);
 });
 

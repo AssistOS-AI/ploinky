@@ -3151,6 +3151,31 @@ async function reinstallAgent(agentName) {
             if (!stageAlongsidePredecessor) {
               retireAbandonedAgentPreparation(containerName, { workspaceMutationLease, networkLifecycleCapability });
             }
+
+            // Failed workspace startup stops the Router. Runtime creation needs
+            // its private attestation service before replacement can begin.
+            const isRouterUp = (p) => {
+                try {
+                    const out = execSync(`lsof -t -i :${p} -sTCP:LISTEN`, { stdio: 'pipe' }).toString().trim();
+                    if (out) return true;
+                } catch(_) {}
+                try {
+                    const out = execSync('ss -ltnp', { stdio: 'pipe' }).toString();
+                    return out.includes(`:${p}`) && out.includes('LISTEN');
+                } catch(_) { return false; }
+            };
+            if (!isRouterUp(routerPort)) {
+                const runningDir = RUNNING_DIR;
+                fs.mkdirSync(runningDir, { recursive: true });
+                const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
+                const routerPidFile = path.join(runningDir, 'router.pid');
+                const child = spawnWatchdog(routerPath, routerPort, routerPidFile);
+                try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch(_) {}
+                child.unref();
+                await waitForRouterReady(routerPort, child);
+                console.log(`[reinstall] Watchdog launched (pid ${child.pid}) on port ${routerPort}.`);
+                console.log(`[reinstall] Watchdog will automatically restart the server if needed.`);
+            }
             if (!stageAlongsidePredecessor && !isSandboxRuntime(agentRuntime)) {
               dockerSvc.removeAgentContainerForRecreate(
                 containerName,
@@ -3202,27 +3227,6 @@ async function reinstallAgent(agentName) {
                 networkLifecycleCapability,
             });
 
-            const isRouterUp = (p) => {
-                try {
-                    const out = execSync(`lsof -t -i :${p} -sTCP:LISTEN`, { stdio: 'pipe' }).toString().trim();
-                    if (out) return true;
-                } catch(_) {}
-                try {
-                    const out = execSync('ss -ltnp', { stdio: 'pipe' }).toString();
-                    return out.includes(`:${p}`) && out.includes('LISTEN');
-                } catch(_) { return false; }
-            };
-            if (!isRouterUp(routerPort)) {
-                const runningDir = RUNNING_DIR;
-                fs.mkdirSync(runningDir, { recursive: true });
-                const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
-                const routerPidFile = path.join(runningDir, 'router.pid');
-                const child = spawnWatchdog(routerPath, routerPort, routerPidFile);
-                try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch(_) {}
-                child.unref();
-                console.log(`[reinstall] Watchdog launched (pid ${child.pid}) on port ${routerPort}.`);
-                console.log(`[reinstall] Watchdog will automatically restart the server if needed.`);
-            }
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
             } catch (error) {
               cleanupFailedPreparedRuntime(reinstallResult, error, 'runtime-reinstall-readiness-failed');

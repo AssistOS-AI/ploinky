@@ -85,6 +85,7 @@ function matrixSupervisor(identity, events) {
     };
     const supervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
         discover: () => ownership,
         lockManager,
         runner,
@@ -137,6 +138,7 @@ test('every public verb has the required single-lock depth and release boundary'
         const execute = () => { events.push('execute'); return 0; };
         const code = await runOuterCli(scenario.argv, {
             env: {},
+            cwd: () => identity.workspaceRoot,
             input: { isTTY: false },
             output: bufferStream(),
             errorOutput: bufferStream(),
@@ -182,6 +184,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
     };
     const stagedSupervisor = createBoxSupervisor({
         resolveIdentity: () => identity,
+        launchCwd: identity.workspaceRoot,
         discover: () => ownership,
         lockManager: {
             async acquire(instance) {

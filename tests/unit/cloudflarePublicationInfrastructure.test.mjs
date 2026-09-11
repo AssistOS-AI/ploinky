@@ -626,25 +626,55 @@ test('publication status refuses a symlinked parent directory', (t) => {
     assert.deepEqual(fs.readdirSync(outside), []);
 });
 
-test('publication status refuses a symlinked intermediate workspace directory', (t) => {
-    const root = temporaryDirectory(t);
-    const workspace = path.join(root, 'workspace');
-    const outside = path.join(root, 'outside');
-    fs.mkdirSync(workspace);
-    fs.mkdirSync(outside);
-    fs.symlinkSync(outside, path.join(workspace, '.ploinky'));
-    assert.throws(
-        () => writeCloudflarePublicationStatus(
-            path.join(workspace, '.ploinky', 'run', 'cloudflare-publication-status.json'),
-            {
-                mode: 'cloudflare',
-                management: 'connector-only',
-                state: 'ready',
-                connectorState: 'running',
-            },
-            { trustedRoot: workspace },
-        ),
-        (error) => error.code === 'CLOUDFLARE_STATUS_DIRECTORY_INVALID',
-    );
-    assert.deepEqual(fs.readdirSync(outside), []);
-});
+for (const writer of ['status', 'journal', 'registry']) {
+    for (const aliases of ['workspace', 'controller', 'both']) {
+        test(`publication ${writer} accepts ${aliases} aliases without changing directory identity`, (t) => {
+            const root = temporaryDirectory(t);
+            const physicalWorkspace = path.join(root, 'project');
+            fs.mkdirSync(physicalWorkspace, { mode: 0o770 });
+            const workspace = aliases === 'controller' ? physicalWorkspace : path.join(root, 'workspace');
+            if (workspace !== physicalWorkspace) fs.symlinkSync('project', workspace);
+            const controller = path.join(physicalWorkspace, '.ploinky');
+            const state = aliases === 'workspace' ? controller : path.join(root, 'state');
+            fs.mkdirSync(state, { mode: 0o770 });
+            if (state !== controller) fs.symlinkSync('../state', controller);
+            fs.chmodSync(physicalWorkspace, 0o770);
+            fs.chmodSync(state, 0o770);
+            const paths = [physicalWorkspace, workspace, controller, state];
+            const identities = () => paths.map(file => {
+                const stat = fs.lstatSync(file);
+                return { file, mode: stat.mode, uid: stat.uid, gid: stat.gid, dev: stat.dev,
+                    ino: stat.ino, link: stat.isSymbolicLink() ? fs.readlinkSync(file) : null };
+            });
+            const before = identities();
+            let file;
+            if (writer === 'status') {
+                file = path.join(workspace, '.ploinky', 'run', 'cloudflare-publication-status.json');
+                const written = writeCloudflarePublicationStatus(file, {
+                    mode: 'cloudflare', management: 'connector-only', state: 'ready', connectorState: 'running',
+                }, { trustedRoot: workspace });
+                assert.deepEqual(JSON.parse(fs.readFileSync(file)), written);
+                assert.equal(fs.realpathSync(file), path.join(fs.realpathSync(state), 'run', path.basename(file)));
+            } else if (writer === 'journal') {
+                const journal = createCloudflarePublicationJournal({ workspaceRoot: workspace });
+                file = journal.path;
+                const written = journal.write({
+                    mode: 'local-only', configurationGeneration: `sha256:${'a'.repeat(64)}`,
+                    desiredDigest: `sha256:${'b'.repeat(64)}`, phase: 'local-only', scope: null,
+                    ingressDigest: '', managedDnsRecords: [], lastError: null,
+                });
+                assert.deepEqual(createCloudflarePublicationJournal({ workspaceRoot: workspace }).read(), written);
+                assert.equal(fs.realpathSync(file), path.join(fs.realpathSync(state), 'data', 'edge-publication', path.basename(file)));
+            } else {
+                const registry = createCloudflareManagedTunnelRegistry({ workspaceRoot: workspace });
+                file = registry.path;
+                const intent = registry.begin({ accountId: 'account', zoneId: 'zone', tunnelName: 'test', deleteOnTeardown: false });
+                assert.deepEqual(createCloudflareManagedTunnelRegistry({ workspaceRoot: workspace }).list(), [intent]);
+                assert.equal(fs.realpathSync(file), path.join(fs.realpathSync(state), 'data', 'edge-publication', path.basename(file)));
+            }
+            assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+            assert.deepEqual(fs.readdirSync(path.dirname(file)), [path.basename(file)]);
+            assert.deepEqual(identities(), before);
+        });
+    }
+}

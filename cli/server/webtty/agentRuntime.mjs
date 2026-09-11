@@ -63,7 +63,7 @@ function shellSingleQuote(value) {
 // Podman injects PS1 into the non-interactive wrapper shell. Bash and sh remove
 // that special variable before launching the nested interactive shell, so the
 // wrapper must restore and export the fixed prompt immediately before launch.
-const SHELL_PROMPT_BOOTSTRAP = `PS1=${shellSingleQuote(WEBTTY_SHELL_PROMPT)}; export PS1;`;
+const SHELL_PROMPT_BOOTSTRAP = `if [ -f /etc/ploinky/webtty-env.sh ]; then . /etc/ploinky/webtty-env.sh || exit 124; fi; PS1=${shellSingleQuote(WEBTTY_SHELL_PROMPT)}; export PS1;`;
 const BASH_WRAPPER = `${SHELL_PROMPT_BOOTSTRAP} /bin/bash --noprofile --norc; ploinky_webtty_status=$?; case "$ploinky_webtty_status" in 126|127) exit 124 ;; *) exit "$ploinky_webtty_status" ;; esac`;
 const SH_WRAPPER = `${SHELL_PROMPT_BOOTSTRAP} /bin/sh -i; ploinky_webtty_status=$?; exit "$ploinky_webtty_status"`;
 const SHELLS = Object.freeze({

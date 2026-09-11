@@ -198,3 +198,13 @@ test('the bwrap full env map matches the non-secret principal phase exactly', ()
     assert.equal(env.SOUL_GATEWAY_API_KEY, undefined);
     assert.equal(env.PLOINKY_SOUL_GATEWAY_API_PUBLIC_KEY, undefined);
 });
+
+test('launch scope is runtime-owned and cannot be overridden by manifest or profile', () => {
+    const env = buildFullEnvMap('sample', { env: { PLOINKY_SKILL_SCOPE: '/' } }, {
+        env: { PLOINKY_SKILL_SCOPE: '/other', PLOINKY_HOST_LAUNCH_CWD: '/forged' },
+    }, path.join(tempDir, 'saved-execution-cwd'), 'Repo', 'dev', 'bwrap', null, routerEndpoint);
+    assert.equal(env.PLOINKY_SKILL_SCOPE, fs.realpathSync(tempDir));
+    assert.equal(env.PLOINKY_SKILL_SCOPE_VERSION, '1');
+    assert.equal(env.PLOINKY_HOST_LAUNCH_CWD, fs.realpathSync(tempDir));
+    assert.equal(env.WORKSPACE_PATH, path.join(tempDir, 'saved-execution-cwd'));
+});

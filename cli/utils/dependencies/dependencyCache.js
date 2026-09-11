@@ -755,6 +755,7 @@ export function prepareGlobalCache(runtimeKey, {
             const lock = acquireLock(cachePath);
             try {
                 finalizeBoxMcpSdkCache(cachePath, mcpSdk);
+                fs.rmSync(stampPath(cachePath), { force: true });
                 finalizeAgentLibCacheLink(cachePath, agentLibSection);
                 const stamp = writeStamp(cachePath, {
                     runtimeKey,
@@ -775,7 +776,7 @@ export function prepareGlobalCache(runtimeKey, {
     const lock = acquireLock(cachePath);
     try {
         ensureCacheDir(cachePath);
-        if (mcpSdk) fs.rmSync(stampPath(cachePath), { force: true });
+        fs.rmSync(stampPath(cachePath), { force: true });
         fs.writeFileSync(
             path.join(cachePath, 'package.json'),
             JSON.stringify(globalPkg, null, 2),
@@ -891,6 +892,7 @@ export function prepareAgentCache({
             const lock = acquireLock(cachePath);
             try {
                 finalizeBoxMcpSdkCache(cachePath, mcpSdk);
+                fs.rmSync(stampPath(cachePath), { force: true });
                 finalizeAgentLibCacheLink(cachePath, agentLibSection);
                 const stamp = writeStamp(cachePath, {
                     runtimeKey,
@@ -915,7 +917,7 @@ export function prepareAgentCache({
     const lock = acquireLock(cachePath);
     try {
         ensureCacheDir(cachePath);
-        if (mcpSdk) fs.rmSync(stampPath(cachePath), { force: true });
+        fs.rmSync(stampPath(cachePath), { force: true });
         seedFromGlobalCache(globalCachePath, cachePath, {
             log,
             allowHardlinks: shouldSeedAgentCacheWithHardlinks({

@@ -572,6 +572,7 @@ export function createNetworkLifecycleAdapter({
     const identity = workspaceNetworkIdentity(workspaceRoot);
     const execute = (args, options) => run(runtime, args, options);
     let rootlessPodmanVerified = false;
+    let podmanInfo = null;
     let managedPodmanVerified = false;
     let managedPodmanProof = null;
 
@@ -622,14 +623,25 @@ export function createNetworkLifecycleAdapter({
         if (runtime !== 'podman') {
             throw new Error(`runtime '${runtime}' cannot prove the managed rootless bridge contract; rootless Podman is required`);
         }
-        const probe = executeRuntimeProof(['info', '--format', '{{json .Host.Security.Rootless}}']);
-        const observed = jsonScalar(probe.result.stdout);
+        // Read the platform fields together so one transaction cannot combine
+        // values from separate service snapshots. No container or Router
+        // authority evidence is cached here.
+        const probe = executeRuntimeProof(['info', '--format',
+            '{"rootless":{{json .Host.Security.Rootless}},"networkBackend":{{json .Host.NetworkBackend}},"pasta":{{json .Host.Pasta}},"serviceIsRemote":{{json .Host.ServiceIsRemote}}}',
+        ]);
         if (!probe.result.ok) {
             throw new Error(`runtime '${runtime}' cannot prove rootless Podman ownership; refusing managed network mutation: ${runtimeProofFailure(probe)}`);
         }
-        if (observed !== 'true') {
-            throw new Error(`runtime '${runtime}' cannot prove rootless Podman ownership; refusing managed network mutation: observed '${observed || '<empty>'}'`);
+        let snapshot;
+        try { snapshot = JSON.parse(String(probe.result.stdout || '')); } catch (_) {}
+        if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)
+            || typeof snapshot.rootless !== 'boolean') {
+            throw new Error(`runtime '${runtime}' cannot prove rootless Podman ownership; invalid platform info snapshot`);
         }
+        if (snapshot.rootless !== true) {
+            throw new Error(`runtime '${runtime}' cannot prove rootless Podman ownership; refusing managed network mutation: observed 'false'`);
+        }
+        podmanInfo = snapshot;
         rootlessPodmanVerified = true;
     }
 
@@ -642,33 +654,27 @@ export function createNetworkLifecycleAdapter({
         if (!version.ok || !versionAtLeast(versionValue, 5, 4)) {
             throw new Error(`managed networking requires Podman server 5.4 or newer; observed '${version.ok ? versionValue || '<empty>' : runtimeProofFailure(versionProbe)}'`);
         }
-        const backendProbe = executeRuntimeProof(['info', '--format', '{{json .Host.NetworkBackend}}']);
-        const backend = backendProbe.result;
-        const backendValue = jsonScalar(backend.stdout);
-        if (!backend.ok || backendValue.toLowerCase() !== 'netavark') {
-            throw new Error(`managed networking requires Netavark; observed '${backend.ok ? backendValue || '<empty>' : runtimeProofFailure(backendProbe)}'`);
+        const backendValue = podmanInfo.networkBackend;
+        if (typeof backendValue !== 'string' || backendValue.toLowerCase() !== 'netavark') {
+            throw new Error('managed networking requires Netavark platform metadata');
         }
-        const pastaProbe = executeRuntimeProof(['info', '--format', '{{json .Host.Pasta}}']);
-        const pasta = pastaProbe.result;
-        let pastaRecord = null;
-        try { pastaRecord = JSON.parse(String(pasta.stdout || 'null')); } catch (_) {}
-        const pastaExecutable = String(pastaRecord?.executable || pastaRecord?.Executable || '').trim();
-        const pastaVersion = String(pastaRecord?.version || pastaRecord?.Version || '').trim();
-        if (!pasta.ok
-            || !pastaRecord
+        const pastaRecord = podmanInfo.pasta;
+        const pastaExecutableValue = pastaRecord?.executable ?? pastaRecord?.Executable;
+        const pastaVersionValue = pastaRecord?.version ?? pastaRecord?.Version;
+        if (!pastaRecord
             || typeof pastaRecord !== 'object'
             || Array.isArray(pastaRecord)
-            || !pastaExecutable
-            || !pastaVersion) {
-            throw new Error(`managed networking requires operational pasta backend metadata: ${pasta.ok ? failure(pasta) : runtimeProofFailure(pastaProbe)}`);
+            || typeof pastaExecutableValue !== 'string' || !pastaExecutableValue.trim()
+            || typeof pastaVersionValue !== 'string' || !pastaVersionValue.trim()) {
+            throw new Error('managed networking requires operational pasta backend metadata');
         }
-        const remoteServiceProbe = executeRuntimeProof(['info', '--format', '{{json .Host.ServiceIsRemote}}']);
-        const remoteService = remoteServiceProbe.result;
-        const remoteServiceValue = jsonScalar(remoteService.stdout).toLowerCase();
-        if (!remoteService.ok || !['true', 'false'].includes(remoteServiceValue)) {
-            throw new Error(`managed networking cannot determine whether Podman is local or remote: ${remoteService.ok ? failure(remoteService) : runtimeProofFailure(remoteServiceProbe)}`);
+        const pastaExecutable = pastaExecutableValue.trim();
+        const pastaVersion = pastaVersionValue.trim();
+        const remoteServiceValue = podmanInfo.serviceIsRemote;
+        if (typeof remoteServiceValue !== 'boolean') {
+            throw new Error('managed networking cannot determine whether Podman is local or remote: invalid platform metadata');
         }
-        if (remoteServiceValue === 'false') {
+        if (remoteServiceValue === false) {
             const pastaOperationalProbe = executeRuntimeProof(['unshare', pastaExecutable, '--version']);
             const pastaOperational = pastaOperationalProbe.result;
             if (!pastaOperational.ok || !String(pastaOperational.stdout || '').trim()) {
@@ -691,7 +697,7 @@ export function createNetworkLifecycleAdapter({
             rootless: true,
             version: jsonScalar(version.stdout),
             backend: 'netavark',
-            remote: remoteServiceValue === 'true',
+            remote: remoteServiceValue,
             pastaExecutable,
             pastaVersion,
             platform: process.platform,

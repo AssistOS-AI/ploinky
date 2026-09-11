@@ -724,6 +724,24 @@ body {
     display: flex;
 }
 
+.wa-session-settings-link {
+    display: block;
+    padding: 9px 11px;
+    border: 1px solid var(--wa-border);
+    border-radius: 8px;
+    color: var(--wa-text-primary);
+    text-decoration: none;
+}
+
+.wa-session-settings-link:hover,
+.wa-session-settings-link:focus-visible {
+    background: var(--wa-bg-hover);
+}
+
+.wa-session-settings-link[hidden] {
+    display: none;
+}
+
 .wa-settings-header {
     font-size: 14px;
     font-weight: 600;

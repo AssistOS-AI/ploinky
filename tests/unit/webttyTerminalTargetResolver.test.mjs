@@ -213,12 +213,30 @@ test('mount translation chooses the longest source and exposes effective read-on
     });
 });
 
-test('ambiguous equal sources and destination shadows fail closed', async (t) => {
+test('equivalent bind aliases select the same cwd regardless of mount ordering', async (t) => {
+    const { root, selected } = fixture(t);
+    for (const writable of [true, false]) {
+        const aliases = [bind(root, '/root', writable), bind(root, '/data', writable)];
+        for (const rawMounts of [aliases, [...aliases].reverse()]) {
+            const mounts = projectTerminalContainerInspect(inspected(rawMounts)).mounts;
+            assert.deepEqual(await translateWorkspaceDirectoryToMount(fs.realpathSync(selected), mounts), {
+                translatedCwd: '/data/projects/demo', access: writable ? 'rw' : 'ro', sourceRealPath: fs.realpathSync(root),
+            });
+        }
+    }
+});
+
+test('conflicting alias access and destination shadows fail closed', async (t) => {
     const { root, selected } = fixture(t);
     const cases = [
         [
             bind(root, '/workspace-a', true),
-            bind(root, '/workspace-b', true),
+            bind(root, '/workspace-b', false),
+        ],
+        [
+            bind(root, '/data', true),
+            bind(root, '/root', true),
+            { Type: 'volume', Source: 'named', Destination: '/root/projects', RW: true, Name: 'named' },
         ],
         [
             bind(root, '/workspace', true),

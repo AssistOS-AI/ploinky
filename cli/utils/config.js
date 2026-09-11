@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { buildLocalSkillScope } from '../../ploinky-box/skillScope.mjs';
 import { ensureAgentDataDirectory } from './runtime/agentDataPathPolicy.js';
 
 function resolveWorkspaceRoot() {
@@ -60,6 +61,7 @@ try {
     launchCwd = PLOINKY_WORKSPACE_ROOT;
 }
 export const PLOINKY_CWD = launchCwd;
+export const PLOINKY_SKILL_SCOPE_ENV = buildLocalSkillScope(PLOINKY_WORKSPACE_ROOT, launchCwd);
 if (!process.env.PLOINKY_CWD) {
     process.env.PLOINKY_CWD = PLOINKY_CWD;
 }

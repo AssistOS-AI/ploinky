@@ -222,27 +222,28 @@ export async function translateWorkspaceDirectoryToMount(selectedDirectory, moun
     if (!sourceCandidates.length) return null;
     const longestSource = Math.max(...sourceCandidates.map((candidate) => candidate.sourceReal.length));
     const strongest = sourceCandidates.filter((candidate) => candidate.sourceReal.length === longestSource);
-    const destinations = new Set(strongest.map((candidate) => candidate.translatedCwd));
-    if (destinations.size !== 1) return null;
-    const translatedCwd = strongest[0].translatedCwd;
-
-    const effectiveMounts = mostSpecificMounts(mounts, translatedCwd);
-    if (!effectiveMounts.length || effectiveMounts.some((mount) => mount.type !== 'bind')) return null;
-    const effectiveMappings = [];
-    for (const mount of effectiveMounts) {
-        if (typeof mount.rw !== 'boolean') return null;
-        const sourceReal = await realDirectory(mount.source, fsApi);
-        if (!sourceReal) return null;
-        const mapped = mappedDestination(sourceReal, mount.destination, selectedDirectory);
-        if (mapped !== translatedCwd) return null;
-        effectiveMappings.push({ mount, sourceReal });
+    const destinations = [...new Set(strongest.map((candidate) => candidate.translatedCwd))].sort();
+    const aliases = [];
+    for (const translatedCwd of destinations) {
+        const effectiveMounts = mostSpecificMounts(mounts, translatedCwd);
+        if (!effectiveMounts.length || effectiveMounts.some((mount) => mount.type !== 'bind')) return null;
+        for (const mount of effectiveMounts) {
+            if (typeof mount.rw !== 'boolean') return null;
+            const sourceReal = await realDirectory(mount.source, fsApi);
+            if (!sourceReal) return null;
+            const mapped = mappedDestination(sourceReal, mount.destination, selectedDirectory);
+            if (mapped !== translatedCwd) return null;
+            aliases.push({ mount, sourceReal });
+        }
     }
-    const accessValues = new Set(effectiveMappings.map(({ mount }) => mount.rw ? 'rw' : 'ro'));
+    // Equivalent bind aliases are common for persistent data also mounted as HOME.
+    // Validate every alias before selecting one; never prefer a writable alias over a read-only one.
+    const accessValues = new Set(aliases.map(({ mount }) => mount.rw ? 'rw' : 'ro'));
     if (accessValues.size !== 1) return null;
     return Object.freeze({
-        translatedCwd,
+        translatedCwd: destinations[0],
         access: [...accessValues][0],
-        sourceRealPath: effectiveMappings[0].sourceReal,
+        sourceRealPath: aliases[0].sourceReal,
     });
 }
 
