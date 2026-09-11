@@ -49,6 +49,9 @@ function getUserAdminErrorStatus(code = '') {
         case 'password_required':
         case 'user_id_required':
         case 'no_changes_requested':
+        case 'user_creation_unsupported':
+        case 'password_unsupported':
+        case 'email_change_unsupported':
             return 400;
         default:
             return 500;
@@ -94,6 +97,13 @@ function getUserAdminErrorMessage(code = '') {
             return 'User id is required.';
         case 'no_changes_requested':
             return 'No changes were submitted.';
+        // Providers whose accounts come only from sign-in may refuse these.
+        case 'user_creation_unsupported':
+            return 'This sign-in provider creates accounts when people sign in.';
+        case 'password_unsupported':
+            return 'This sign-in provider does not use account passwords.';
+        case 'email_change_unsupported':
+            return 'This sign-in provider does not allow changing a sign-in email here.';
         default:
             return code ? 'User management request failed.' : '';
     }

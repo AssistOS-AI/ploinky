@@ -39,9 +39,9 @@ export function resolveProviderConfig({ providerConfig = {} } = {}) {
 export function createProvider({ getConfig }) {
     return {
         name: 'fake/fakeProvider',
-        async sso_begin_login({ redirectUri, prompt }) {
+        async sso_begin_login({ redirectUri, prompt, returnTo }) {
             const cfg = await getConfig();
-            recordCall('sso_begin_login', { redirectUri, prompt, config: cfg });
+            recordCall('sso_begin_login', { redirectUri, prompt, returnTo, config: cfg });
             return {
                 authorizationUrl: 'https://fake.test/auth?state=PROVIDER_STATE',
                 providerState: 'PROVIDER_STATE',
@@ -180,6 +180,8 @@ test('generic bridge orchestrates begin/callback/refresh/logout through provider
     // Verify provider received each operation
     const ops = readCalls().map((c) => c.op);
     assert.ok(ops.includes('sso_begin_login'));
+    // The provider sees the validated return path only as information.
+    assert.equal(readCalls().find((c) => c.op === 'sso_begin_login').payload.returnTo, '/webchat/');
     assert.ok(ops.includes('sso_handle_callback'));
     assert.ok(ops.includes('sso_refresh_session'));
     assert.ok(ops.includes('sso_logout'));

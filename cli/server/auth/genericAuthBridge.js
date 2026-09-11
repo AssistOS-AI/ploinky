@@ -193,7 +193,9 @@ export function createGenericAuthBridge(options = {}) {
         const epoch = validationEpoch;
         const { provider, config, providerAgent } = await ensureProvider();
         const redirectUri = resolveRedirectUri(baseUrl, config);
-        const { authorizationUrl, providerState, expiresAt } = await provider.sso_begin_login({ redirectUri, prompt });
+        // `returnTo` is informational for the provider (for example a Start again
+        // link back to /auth/login); the Router alone decides the final redirect.
+        const { authorizationUrl, providerState, expiresAt } = await provider.sso_begin_login({ redirectUri, prompt, returnTo: returnTo || '/' });
         if (epoch !== validationEpoch) throw new Error('Authorization configuration changed');
         const coreState = randomId(16);
         const browserBinding = randomId(32);

@@ -230,6 +230,25 @@ test('provider user administration enforces capabilities, CRUD, pagination, and 
             .filter((call) => call.operation === 'validateSession')
             .every((call) => call.options?.forceRemote === true));
         assert.equal(providerCalls.find((call) => call.operation === 'createUser').payload.actorUserId, 'persisto-admin');
+        // Providers whose accounts come only from sign-in refuse these as client errors.
+        for (const [operation, code] of [
+            ['createUser', 'user_creation_unsupported'],
+            ['updateUser', 'password_unsupported'],
+            ['updateUser', 'email_change_unsupported'],
+        ]) {
+            const original = authService[operation];
+            authService[operation] = async () => { throw new Error(code); };
+            try {
+                result = await invoke(authHandlers.handleUserAdminRoutes, operation === 'createUser'
+                    ? { method: 'POST', url: '/api/agents/explorer/users', cookie: 'ploinky_sso=sso-admin-session', body: { email: 'new@example.test', roles: ['user'] }, routePlan: ssoRoutePlan }
+                    : { method: 'PATCH', url: '/api/agents/explorer/users/persisto-user-1', cookie: 'ploinky_sso=sso-admin-session', body: { email: 'changed@example.test' }, routePlan: ssoRoutePlan });
+                assert.equal(result.statusCode, 400, code);
+                assert.equal(result.body.error, code);
+                assert.doesNotMatch(result.body.message, /request failed/i, code);
+            } finally {
+                authService[operation] = original;
+            }
+        }
         result = await invoke(authHandlers.handleUserAdminRoutes, {
             url: '/api/agents/explorer/users?start=500&pageSize=100',
             cookie: 'ploinky_sso=sso-admin-session',
