@@ -370,3 +370,127 @@ test('cleanup identity mismatch never stops or removes an ambiguous container', 
     assert.equal(runtime.events.includes('rm'), false);
     assert.equal(runtime.containers.size, 1);
 });
+
+test('Podman start failures identify the operation and include the runtime diagnostic', () => {
+    const runtime = new FakeAuthorityRuntime();
+    const run = runtime.run.bind(runtime);
+    runtime.run = (command, args) => args[0] === 'start'
+        ? { status: 125, stderr: 'Error: crun: creating cgroup: permission denied\n' }
+        : run(command, args);
+    assert.throws(runProbe(runtime).invoke, (error) => {
+        assert.match(error.message, /start authority helper/);
+        assert.match(error.message, /"status":125/);
+        assert.match(error.message, /crun: creating cgroup: permission denied/);
+        assert.match(error.message, /stderrSha256/);
+        return true;
+    });
+    assert.equal(runtime.containers.size, 0);
+});
+
+test('helper failures redact credentials and nonce without dumping argv or stdout', () => {
+    const runtime = new FakeAuthorityRuntime();
+    const run = runtime.run.bind(runtime);
+    runtime.run = (command, args) => args[0] === 'exec' ? {
+        status: 125,
+        stdout: 'private-response-body-canary',
+        stderr: [
+            'Error: permission denied',
+            'Authorization: Bearer authorization-canary',
+            'https://user:url-password-canary@example.invalid/path?token=query-canary',
+            '{"refresh_token":"json-token-canary","PLOINKY_API_KEY":"json-key-canary"}',
+            'PLOINKY_CHANNEL_SECRET=channel-secret-canary',
+            '-----BEGIN PRIVATE KEY-----\nprivate-key-canary\n-----END PRIVATE KEY-----',
+            `nonce=${NONCE}`,
+        ].join('\n'),
+    } : run(command, args);
+    assert.throws(runProbe(runtime).invoke, (error) => {
+        assert.match(error.message, /probe router authority/);
+        assert.match(error.message, /permission denied/);
+        assert.doesNotMatch(error.message, /canary|setTimeout|X-Ploinky-Authority-Probe/);
+        assert.ok(!error.message.includes(NONCE));
+        assert.doesNotMatch(error.message, /[\r\n\u001b]/);
+        return true;
+    });
+    assert.equal(runtime.containers.size, 0);
+});
+
+test('create timeouts report the deadline and process error without dumping spawn arguments', () => {
+    const runtime = new FakeAuthorityRuntime({ createTimeout: true });
+    const run = runtime.run.bind(runtime);
+    runtime.run = (command, args) => {
+        const result = run(command, args);
+        if (args[0] === 'create') {
+            result.error = Object.assign(new Error('spawn command-arguments-canary'), { code: 'ETIMEDOUT' });
+            result.signal = 'SIGKILL';
+        }
+        return result;
+    };
+    assert.throws(runProbe(runtime).invoke, (error) => {
+        assert.match(error.message, /create authority helper/);
+        assert.match(error.message, /ETIMEDOUT/);
+        assert.match(error.message, /"timeoutMs":15000/);
+        assert.match(error.message, /"timedOut":true/);
+        assert.match(error.message, /SIGKILL/);
+        assert.doesNotMatch(error.message, /canary/);
+        return true;
+    });
+    assert.equal(runtime.containers.size, 0);
+});
+
+test('a cleanup failure preserves the primary error and still prevents success', () => {
+    const runtime = new FakeAuthorityRuntime({ execFailure: 'connect ECONNREFUSED 10.0.0.1:8080' });
+    const run = runtime.run.bind(runtime);
+    runtime.run = (command, args) => args[0] === 'rm'
+        ? { status: 125, stderr: 'Error: removing container: storage is busy' }
+        : run(command, args);
+    assert.throws(runProbe(runtime).invoke, (error) => {
+        assert.match(error.message, /probe router authority.*ECONNREFUSED/);
+        assert.match(error.message, /cleanup also failed.*remove authority helper.*storage is busy/);
+        assert.match(error.cause.message, /ECONNREFUSED/);
+        return true;
+    });
+    assert.equal(runtime.containers.size, 1);
+});
+
+test('an expired observation with failed cleanup is not reported as retryable', () => {
+    const runtime = new FakeAuthorityRuntime();
+    const run = runtime.run.bind(runtime);
+    runtime.run = (command, args) => args[0] === 'rm'
+        ? { status: 125, stderr: 'Error: storage is busy' }
+        : run(command, args);
+    assert.throws(runProbe(runtime, {
+        consumeObservation() {
+            throw Object.assign(new Error('observation expired'), {
+                code: 'PLOINKY_ROUTER_ATTESTATION_OBSERVATION_EXPIRED',
+            });
+        },
+    }).invoke, (error) => {
+        assert.notEqual(error.code, 'PLOINKY_ROUTER_ATTESTATION_OBSERVATION_EXPIRED');
+        assert.match(error.message, /observation expired.*cleanup also failed.*storage is busy/);
+        return true;
+    });
+});
+
+test('missing Podman reports the failed operation and ENOENT without leaking thrown spawn arguments', () => {
+    const runtime = new FakeAuthorityRuntime();
+    runtime.run = () => { throw Object.assign(new Error('argv-secret-canary'), { code: 'ENOENT' }); };
+    assert.throws(runProbe(runtime).invoke, (error) => {
+        assert.match(error.message, /inspect agent image \(podman image inspect\)/);
+        assert.match(error.message, /ENOENT/);
+        assert.doesNotMatch(error.message, /canary/);
+        assert.equal(error.cause, undefined);
+        return true;
+    });
+});
+
+test('failed cleanup existence checks include Podman diagnostics', () => {
+    const runtime = new FakeAuthorityRuntime();
+    const run = runtime.run.bind(runtime);
+    runtime.run = (command, args) => args[0] === 'container' && args[1] === 'exists'
+        ? { status: 125, stderr: 'Error: database is locked' }
+        : run(command, args);
+    assert.throws(runProbe(runtime).invoke, (error) => {
+        assert.match(error.message, /verify authority helper removal.*database is locked/);
+        return true;
+    });
+});

@@ -94,7 +94,7 @@ test('authority helper uses a pinned image, fixed non-root user, and mandatory i
     assert.match(source, /actualBodySha256/);
     assert.doesNotMatch(source, /actualBody: String\(record\?\.body \|\| ''\)/);
     const confinement = source.indexOf('proveAuthorityHelperIdentity(inspected');
-    const start = source.indexOf("runBounded(commandRunner, runtime, ['start', helperId])", confinement);
+    const start = source.indexOf("runBounded(commandRunner, runtime, ['start', helperId],", confinement);
     const running = source.indexOf('running.running !== true || running.status !== \'running\'', start);
     const registration = source.indexOf('registerObservation();', running);
     const probe = source.indexOf("'exec', '--user', AUTHORITY_HELPER_USER", registration);
