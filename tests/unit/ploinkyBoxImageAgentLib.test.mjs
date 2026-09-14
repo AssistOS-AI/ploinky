@@ -37,6 +37,9 @@ test('image source has no host binds and survives reconstruction with the exact 
     assert.deepEqual(expectedAgentLibMounts(contract), {});
     const container = { labels: agentLibLabels(contract), runtime: { imageId, mounts: [] } };
     assert.deepEqual(agentLibContractFromContainer(container), contract);
+    assert.deepEqual(agentLibContractFromContainer({
+        ...container, runtime: { ...container.runtime, imageId: imageId.slice(7) },
+    }), contract);
     assert.equal(agentLibSelectionChanged(contract, normalizeBoxAgentLib(contract)), false);
     assert.equal(agentLibSelectionChanged(contract, { ...contract, mode: 'local' }), true);
     assert.throws(() => agentLibContractFromContainer({
@@ -63,31 +66,46 @@ test('immutable image probe runs offline and checks the required pin', () => {
         imageId, IMAGE_AGENTLIB_PROBE_PATH, 'verify', '--expected-commit', commit,
     ]);
     assert.equal(calls[0].options.timeoutMs, 60_000);
+    assert.deepEqual(probeImageAgentLib('podman', imageId.slice(7), runner), { ...metadata, imageId });
+    assert.equal(calls[1].args[5], imageId.slice(7));
     for (const result of [
         { ok: false, status: 1 }, { ok: true, stdout: '{}' },
         { ok: true, stdout: JSON.stringify({ ...metadata, commit: '0'.repeat(40) }) },
         { ok: true, stdout: JSON.stringify({ ...metadata, fingerprint: '' }) },
     ]) assert.throws(() => probeImageAgentLib('podman', imageId, { query: () => result }),
         { code: 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE' });
-    assert.throws(() => probeImageAgentLib('podman', 'latest', runner), /immutable image ID/);
 });
 
-test('bundle loader uses a cached image without pulling and never runs host Git', async () => {
-    const calls = [];
-    const runner = { query(command, args) {
-        calls.push([command, ...args]);
-        if (args[0] === 'image') return { ok: true, stdout: JSON.stringify([{
-            Id: imageId, Os: 'linux', Architecture: 'arm64', Config: {
-                User: IMAGE_CONTRACT.user, WorkingDir: IMAGE_CONTRACT.workdir,
-                Env: Object.entries(IMAGE_CONTRACT.environment).map(([key, value]) => `${key}=${value}`),
-                Entrypoint: [IMAGE_CONTRACT.entrypoint], Cmd: [], Labels: {}, Volumes: {},
+test('image probe delegates the inspected ID to the engine without a format gate', () => {
+    for (const inspectedId of ['engine-image-id', 'a'.repeat(12), imageId.slice(7)]) {
+        const engineFailure = new Error('engine rejected the image');
+        assert.throws(() => probeImageAgentLib('podman', inspectedId, {
+            query(_engine, args) {
+                assert.equal(args[5], inspectedId);
+                throw engineFailure;
             },
-        }]) };
-        return { ok: true, stdout: JSON.stringify(metadata) };
-    }, run() { assert.fail('cached bundle must not pull or run a host command'); } };
-    assert.deepEqual(await loadBoxAgentLibImage({ engine, runner, imageRef: 'pinned-image' }), { ...metadata, imageId });
-    assert.deepEqual(calls.map(call => call.slice(0, 2)), [['podman', 'image'], ['podman', 'run']]);
+        }), error => error === engineFailure);
+    }
 });
+
+for (const inspectedId of [imageId, imageId.slice(7)]) {
+    test(`bundle loader accepts ${inspectedId.startsWith('sha256:') ? 'prefixed' : 'bare'} IDs without pulling or host Git`, async () => {
+        const calls = [];
+        const runner = { query(command, args) {
+            calls.push([command, ...args]);
+            if (args[0] === 'image') return { ok: true, stdout: JSON.stringify([{
+                Id: inspectedId, Os: 'linux', Architecture: 'arm64', Config: {
+                    User: IMAGE_CONTRACT.user, WorkingDir: IMAGE_CONTRACT.workdir,
+                    Env: Object.entries(IMAGE_CONTRACT.environment).map(([key, value]) => `${key}=${value}`),
+                    Entrypoint: [IMAGE_CONTRACT.entrypoint], Cmd: [], Labels: {}, Volumes: {},
+                },
+            }]) };
+            return { ok: true, stdout: JSON.stringify(metadata) };
+        }, run() { assert.fail('cached bundle must not pull or run a host command'); } };
+        assert.deepEqual(await loadBoxAgentLibImage({ engine, runner, imageRef: 'pinned-image' }), { ...metadata, imageId });
+        assert.deepEqual(calls.map(call => call.slice(0, 2)), [['podman', 'image'], ['podman', 'run']]);
+    });
+}
 
 test('running bundle verification rejects fingerprint drift and uses the admitted revision', () => {
     const contract = normalizeBoxAgentLib(selection);

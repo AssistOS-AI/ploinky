@@ -481,32 +481,35 @@ function imageAgentLibFixture() {
     });
 }
 
-test('image bundle creates and reuses a Box without host AgentLib mounts', async t => {
-    const state = fixture(t);
-    fs.rmSync(state.agentLib.sourceDir, { recursive: true });
-    state.agentLib = imageAgentLibFixture();
-    const h = harness(state, { candidateImage: state.agentLib.imageId });
-    h.seams.probeAgentLib = (_engine, id, _runner, options) => {
-        assert.equal(id, state.agentLib.imageId);
-        assert.equal(options.expectedCommit, state.agentLib.commit);
-        return { fingerprint: state.agentLib.fingerprint };
-    };
-    const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
-    assert.equal(result.action, 'created');
-    const created = h.current();
-    assert.equal(created.runtime.mounts.length, 4);
-    assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_MODE, 'image');
-    const callsBefore = h.calls.length;
-    const reused = await reconcileBoxContainer(reconciliationArguments(state, h, created), h.seams);
-    assert.equal(reused.action, 'reused');
-    assert.equal(h.calls.slice(callsBefore).some(call => call.includes('pull') || call.includes('create')), false);
-    const desired = {
-        identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root,
-        imageId: state.agentLib.imageId, imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
-    };
-    created.runtime.mounts.push({ type: 'bind', source: '/tmp/fake', destination: '/opt/ploinky-agentlib', rw: false });
-    assert.throws(() => validateContainerConfiguration(created, desired), /mount set is incompatible/);
-});
+for (const imageIdPrefix of ['', 'sha256:']) {
+    test(`image bundle creates and reuses a Box with ${imageIdPrefix || 'bare'} engine IDs without host AgentLib mounts`, async t => {
+        const state = fixture(t);
+        fs.rmSync(state.agentLib.sourceDir, { recursive: true });
+        state.agentLib = imageAgentLibFixture();
+        const candidateImage = state.agentLib.imageId.replace(/^sha256:/, imageIdPrefix);
+        const h = harness(state, { candidateImage });
+        h.seams.probeAgentLib = (_engine, id, _runner, options) => {
+            assert.equal(id, candidateImage);
+            assert.equal(options.expectedCommit, state.agentLib.commit);
+            return { fingerprint: state.agentLib.fingerprint };
+        };
+        const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
+        assert.equal(result.action, 'created');
+        const created = h.current();
+        assert.equal(created.runtime.mounts.length, 4);
+        assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_MODE, 'image');
+        const callsBefore = h.calls.length;
+        const reused = await reconcileBoxContainer(reconciliationArguments(state, h, created), h.seams);
+        assert.equal(reused.action, 'reused');
+        assert.equal(h.calls.slice(callsBefore).some(call => call.includes('pull') || call.includes('create')), false);
+        const desired = {
+            identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root,
+            imageId: candidateImage, imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
+        };
+        created.runtime.mounts.push({ type: 'bind', source: '/tmp/fake', destination: '/opt/ploinky-agentlib', rw: false });
+        assert.throws(() => validateContainerConfiguration(created, desired), /mount set is incompatible/);
+    });
+}
 
 test('an image change after source selection preserves the old Box', async t => {
     const state = fixture(t);

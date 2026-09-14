@@ -18,6 +18,7 @@ import {
     normalizeBoxAgentLib,
 } from './agentlib.mjs';
 import { IMAGE_CONTRACT } from './image.mjs';
+import { normalizeImageId } from './image-id.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
 const INCOMPATIBLE_BOX_GUIDANCE = "; back up any Box-only data, then run 'ploinky stop'"
@@ -265,7 +266,7 @@ export function validateContainerConfiguration(containerHandle, {
         );
     }
     const agentLibContract = normalizeBoxAgentLib(agentLib);
-    if (agentLibContract.mode === 'image' && agentLibContract.imageId !== imageId) {
+    if (agentLibContract.mode === 'image' && agentLibContract.imageId !== normalizeImageId(imageId)) {
         throw publicationError('Owned Box does not match the selected AgentLib bundle image');
     }
     expectedLabels[BOX_AGENTLIB_LABELS.mode] = agentLibContract.mode;

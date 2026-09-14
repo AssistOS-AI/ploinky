@@ -4,6 +4,7 @@ import {
 } from '../agentlib/contract.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import { normalizeImageInspect, validateImageContract } from './contract/image.mjs';
+import { normalizeImageId } from './contract/image-id.mjs';
 
 export const IMAGE_AGENTLIB_PROBE_PATH = '/usr/local/share/ploinky/agentlib/image-bundle.mjs';
 const RUNTIME_AGENTLIB_PROBE_PATH = '/opt/ploinky/agentlib/image-bundle.mjs';
@@ -30,15 +31,12 @@ function readProbe(result, expectedCommit) {
 export function probeImageAgentLib(engine, imageId, runner, {
     expectedCommit = canonicalAgentLibRemote().commit,
 } = {}) {
-    if (!/^sha256:[a-f0-9]{64}$/.test(String(imageId))) {
-        throw bundleError('AchillesAgentLib probing requires an immutable image ID');
-    }
     const result = runner.query(engine, [
         'run', '--rm', '--network=none', '--pull=never',
         '--entrypoint=/usr/local/bin/node', imageId,
         IMAGE_AGENTLIB_PROBE_PATH, 'verify', '--expected-commit', expectedCommit,
     ], { timeoutMs: 60_000 });
-    return Object.freeze({ ...readProbe(result, expectedCommit), imageId });
+    return Object.freeze({ ...readProbe(result, expectedCommit), imageId: normalizeImageId(imageId) });
 }
 
 /** Called lazily, only when the workspace has no local library. */

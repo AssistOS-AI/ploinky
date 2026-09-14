@@ -17,6 +17,7 @@ import {
 import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { BOX_AGENTLIB_LABELS, BOX_WORKSPACE_MOUNT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { normalizeImageId } from './image-id.mjs';
 
 function agentLibContractError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE' });
@@ -52,7 +53,7 @@ export function normalizeBoxAgentLib(selection) {
     if (!selection?.sourceId && !/^[a-f0-9]{64}$/.test(String(selection?.sourceIdHash || ''))) {
         throw agentLibContractError('Box AgentLib contract requires a source identity');
     }
-    const imageId = mode === 'image' ? String(selection?.imageId || '') : null;
+    const imageId = mode === 'image' ? normalizeImageId(selection?.imageId) : null;
     const identityHash = selection?.sourceId
         ? sourceIdHash(selection.sourceId)
         : String(selection?.sourceIdHash || '');

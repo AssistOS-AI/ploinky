@@ -21,6 +21,7 @@ import {
 import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { probeImageAgentLib } from '../image-agentlib.mjs';
+import { normalizeImageId } from '../contract/image-id.mjs';
 import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
 import { retireQuiescentBoxEdgePreparation } from '../edgePreparationCleanup.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
@@ -397,7 +398,7 @@ export async function reconcileBoxContainer({
     await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
     const image = dependencies.validateImage(engine.name, imageRef, runner);
     if (desiredAgentLib.mode === 'image') {
-        if (desiredAgentLib.imageId !== image.immutableId) {
+        if (desiredAgentLib.imageId !== normalizeImageId(image.immutableId)) {
             throw transactionError('Box image changed after AchillesAgentLib selection; run the command again');
         }
         const bundle = dependencies.probeAgentLib(engine.name, image.immutableId, runner, { expectedCommit: desiredAgentLib.commit });
