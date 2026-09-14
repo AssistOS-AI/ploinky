@@ -4,6 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { REPOS_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../utils/config.js';
+import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 import { getAgentWorkDir } from '../../utils/workspaceStructure.js';
 import {
     AGENT_DATA_POLICY_CODE,
@@ -218,8 +219,10 @@ function resolveLocalImageBuildSource(image, options = {}) {
     const img = String(image || '').trim();
     const definition = LOCAL_IMAGE_BUILD_DEFINITIONS[img];
     if (!definition) return null;
-    const reposDir = options.reposDir || REPOS_DIR;
-    const contextPath = path.join(reposDir, definition.repoName, definition.context);
+    const repositoryPath = options.reposDir && options.reposDir !== REPOS_DIR
+        ? path.join(options.reposDir, definition.repoName)
+        : resolveAgentRepositoryPath(definition.repoName);
+    const contextPath = path.join(repositoryPath, definition.context);
     const dockerfilePath = path.join(contextPath, definition.dockerfile || 'Dockerfile');
     if (!fs.existsSync(dockerfilePath)) return null;
     return {

@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import crypto from 'node:crypto';
 import path from 'path';
 import { Worker } from 'worker_threads';
@@ -770,7 +771,7 @@ export function syncManagedContainers(monitor) {
         const alias = record.alias || null;
         if (!agentName || !repoName) continue;
 
-        const manifestPath = path.join(REPOS_DIR, repoName, agentName, 'manifest.json');
+        const manifestPath = path.join(resolveAgentRepositoryPath(repoName), agentName, 'manifest.json');
         if (!fs.existsSync(manifestPath)) {
             logEvent(monitorRef, 'warn', 'container_manifest_missing', {
                 container: containerName,

@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { PLOINKY_DIR } from './config.js';
+import { listAgentRepositoryNames, resolveAgentRepositoryPath, workspaceAgentRepositoryPath } from './agentRepositorySource.mjs';
+import { isAgentRepositoryUnregistered, setAgentRepositoryRegistered } from './agentRepositoryRegistration.mjs';
 import { parseBranchPolicy } from '../../agentlib/branchPolicy.mjs';
 import { runGitCommand, sanitizeGitDiagnostic } from './gitCommand.js';
 
@@ -100,29 +102,24 @@ function recordRepoSource(name, url, branch = null, kind = null) {
     saveRepoSources(sources);
 }
 
-export function getInstalledRepos(REPOS_DIR) {
-    try {
-        return fs
-            .readdirSync(REPOS_DIR)
-            .filter(name => {
-                try {
-                    return fs.statSync(path.join(REPOS_DIR, name)).isDirectory();
-                } catch (_) {
-                    return false;
-                }
-            });
-    } catch (_) {
-        return [];
-    }
+export function getInstalledRepos() {
+    return listAgentRepositoryNames().filter(name => {
+        const repoPath = resolveAgentRepositoryPath(name);
+        try {
+            return fs.statSync(repoPath).isDirectory();
+        } catch (error) {
+            if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
+            throw error;
+        }
+    });
 }
 
-export function getActiveRepos(REPOS_DIR) {
+export function getActiveRepos() {
+    const installed = getInstalledRepos();
     const enabled = loadEnabledRepos();
-    if (!enabled.length) {
-        return getInstalledRepos(REPOS_DIR);
-    }
-    const installed = new Set(getInstalledRepos(REPOS_DIR));
-    return enabled.filter(repoName => installed.has(repoName));
+    if (!enabled.length) return installed;
+    const installedNames = new Set(installed);
+    return enabled.filter(repoName => installedNames.has(repoName));
 }
 
 const PREDEFINED_REPOS = {
@@ -161,7 +158,7 @@ export function classifyRepoKind(repoName) {
     const declared = PREDEFINED_REPOS[repoName]?.kind;
     if (declared) return declared;
 
-    const repoPath = path.join(PLOINKY_DIR, 'repos', repoName);
+    const repoPath = resolveAgentRepositoryPath(repoName);
     if (!fs.existsSync(repoPath)) return 'unknown';
 
     let hasSkills = false;
@@ -263,13 +260,11 @@ function findManifestRepoSource(repoName) {
         return null;
     }
 
-    try {
-        if (!fs.existsSync(REPOS_DIR) || !fs.statSync(REPOS_DIR).isDirectory()) return null;
-    } catch (_) {
-        return null;
+    for (const name of listAgentRepositoryNames()) {
+        const source = visit(resolveAgentRepositoryPath(name));
+        if (source) return source;
     }
-
-    return visit(REPOS_DIR);
+    return null;
 }
 
 export function resolveRepoSource(name, url = null, branch = null) {
@@ -297,6 +292,12 @@ export function resolveRepoSourceUrl(name, url = null) {
 
 export function addRepo(name, url, branch = null, { stdio = 'inherit' } = {}) {
     if (!name) throw new Error('Missing repository name.');
+    const localPath = workspaceAgentRepositoryPath(name, { url });
+    if (localPath) {
+        recordRepoSource(name, url, branch);
+        setAgentRepositoryRegistered(name, true);
+        return { status: 'exists', path: localPath, branch: currentBranch(localPath) };
+    }
     const REPOS_DIR = ensureReposDir();
     const repoPath = path.join(REPOS_DIR, name);
     const source = resolveRepoSource(name, url, branch);
@@ -402,6 +403,7 @@ export function installRepo(url, name = null, branch = null, { stdio = 'inherit'
     }
 
     const result = addRepo(repoName, repoUrl, resolvedBranch, { stdio });
+    setAgentRepositoryRegistered(repoName, true);
     const kind = classifyRepoKind(repoName);
     recordRepoSource(repoName, repoUrl, result.branch, kind);
     return {
@@ -417,7 +419,7 @@ export function resolveInstalledRepoTarget(target) {
     const rawTarget = String(target || '').trim();
     if (!rawTarget) throw new Error('Missing repository target.');
     const reposDir = ensureReposDir();
-    const installed = getInstalledRepos(reposDir);
+    const installed = listAgentRepositoryNames();
     if (installed.includes(rawTarget)) return rawTarget;
 
     const sources = loadRepoSources();
@@ -438,7 +440,13 @@ export function resolveInstalledRepoTarget(target) {
 
 export function uninstallRepo(target, { stdio = 'inherit' } = {}) {
     const repoName = resolveInstalledRepoTarget(target);
-    const repoPath = path.join(ensureReposDir(), repoName);
+    const localPath = workspaceAgentRepositoryPath(repoName);
+    const repoPath = resolveAgentRepositoryPath(repoName);
+    disableRepo(repoName);
+    if (localPath) {
+        setAgentRepositoryRegistered(repoName, false);
+        return { status: 'unregistered', name: repoName, path: repoPath, preserved: true };
+    }
     if (!fs.existsSync(repoPath)) {
         return { status: 'missing', name: repoName, path: repoPath };
     }
@@ -487,12 +495,14 @@ function gitCommandErrorMessage(err) {
 
 export function updateRepo(name, { rebase = true, autostash = true, stdio = 'inherit', branch = null } = {}) {
     if (!name) throw new Error('Missing repository name.');
-    const REPOS_DIR = ensureReposDir();
-    const repoPath = path.join(REPOS_DIR, name);
+    if (isAgentRepositoryUnregistered(name)) throw new Error(`Repository '${name}' is not installed.`);
+    const localPath = workspaceAgentRepositoryPath(name);
+    const repoPath = resolveAgentRepositoryPath(name);
     if (!fs.existsSync(repoPath)) {
         throw new Error(`Repository '${name}' is not installed.`);
     }
     if (!isGitRepository(repoPath)) {
+        if (localPath) throw new Error(`Workspace repository '${name}' is not a git repository; refusing to replace it.`);
         const source = resolveRepoSource(name, null);
         if (!source?.url) {
             throw new Error(`Repository '${name}' is not a git repository and no source URL is known.`);
@@ -746,6 +756,13 @@ function currentBranch(repoPath) {
 }
 
 export function ensureRepoInstalled(name, url, { branchPolicy, branch, stdio = 'inherit' } = {}) {
+    // Workspace checkouts belong to the developer; never clone, reset or
+    // switch their branch as a side effect of starting an agent.
+    const localPath = workspaceAgentRepositoryPath(name, { url });
+    if (localPath) {
+        recordRepoSource(name, url, branch);
+        return { status: 'exists', path: localPath, branch: currentBranch(localPath) };
+    }
     const reposDir = ensureReposDir();
     const repoPath = path.join(reposDir, name);
     const source = resolveRepoSource(name, url, branch);
@@ -787,6 +804,8 @@ export function ensureRepoInstalled(name, url, { branchPolicy, branch, stdio = '
 }
 
 export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback = 'default', stdio = 'inherit', fetchRequestedBranch = false } = {}) {
+    const localPath = workspaceAgentRepositoryPath(name);
+    if (localPath) return { status: 'local', path: localPath, branch: currentBranch(localPath) };
     if (!branch) return { status: 'noop', branch: null };
     const repoPath = path.join(PLOINKY_DIR, 'repos', name);
     if (!fs.existsSync(repoPath) || !isGitRepository(repoPath)) return { status: 'missing', branch: null };

@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { listAgentRepositoryNames, resolveAgentRepositoryPath } from '../agentRepositorySource.mjs';
 import path from 'path';
 import { PROFILE_FILE, PLOINKY_CWD, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, REPOS_DIR } from '../config.js';
 import { validateSecrets } from '../security/secretInjector.js';
@@ -12,9 +13,8 @@ import { effectiveManifestNetwork, validateManifestNetworks } from '../../sandbo
 function discoverManifestProfiles() {
     const discovered = new Set(['default']);
     try {
-        if (!fs.existsSync(REPOS_DIR)) return discovered;
-        for (const repo of fs.readdirSync(REPOS_DIR)) {
-            const repoDir = path.join(REPOS_DIR, repo);
+        for (const repo of listAgentRepositoryNames()) {
+            const repoDir = resolveAgentRepositoryPath(repo);
             if (!fs.statSync(repoDir).isDirectory()) continue;
             for (const agent of fs.readdirSync(repoDir)) {
                 const manifestPath = path.join(repoDir, agent, 'manifest.json');

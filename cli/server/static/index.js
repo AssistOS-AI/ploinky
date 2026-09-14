@@ -9,6 +9,7 @@ import {
     toRealPathSafe
 } from '../utils/workspacePaths.js';
 import { ROUTING_FILE } from '../../utils/config.js';
+import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -468,10 +469,29 @@ function resolveWorkspaceFile(requestPath) {
         return { status: 'denied', filePath: null };
     }
 
-    const candidate = path.join(workspaceRoot, rel);
-    const allowedRoots = [workspaceRoot];
-
     try {
+        let candidate = path.join(workspaceRoot, rel);
+        let allowedRoots = [workspaceRoot];
+        const segments = rel.split('/');
+        if (segments[0] === '.ploinky' && segments[1] === 'repos' && segments.length >= 4) {
+            const [, , repo, agent, ...asset] = segments;
+            const routes = Object.values(readRouting().routes || {}).filter(route =>
+                route?.repo === repo && route?.agent === agent && route?.hostPath);
+            const selectedRoots = [...new Set(routes.map(route => path.resolve(route.hostPath)))];
+            if (selectedRoots.length > 1) return { status: 'denied', filePath: null };
+            const sourceRoot = selectedRoots[0] || path.join(resolveAgentRepositoryPath(repo), agent);
+            const managedRoot = path.join(workspaceRoot, '.ploinky', 'repos', repo, agent);
+            if (selectedRoots.length || fs.existsSync(path.join(sourceRoot, 'manifest.json'))
+                || fs.existsSync(path.join(managedRoot, 'manifest.json'))) {
+                // Legacy agent asset URLs follow the admitted source, never a
+                // second copy. Ordinary workspace file paths remain literal.
+                if (!isPathWithinAllowedRoots([workspaceRoot], sourceRoot, { allowMissing: true })) {
+                    return { status: 'denied', filePath: null };
+                }
+                candidate = path.join(sourceRoot, ...asset);
+                allowedRoots = [sourceRoot];
+            }
+        }
         if (!isPathWithinAllowedRoots(allowedRoots, candidate, { allowMissing: true })) {
             return { status: 'denied', filePath: null };
         }

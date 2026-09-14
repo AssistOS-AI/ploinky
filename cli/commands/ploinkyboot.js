@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import path from 'path';
 import { PLOINKY_DIR } from '../utils/config.js';
 import * as repos from '../utils/repos.js';
@@ -35,7 +36,7 @@ export function prepareDefaultBootRepositories({
 } = {}) {
     const prepared = [];
     for (const { name, url } of bootRepos) {
-        const repoPath = path.join(PLOINKY_DIR, 'repos', name);
+        const repoPath = resolveAgentRepositoryPath(name);
         const repoBranchPolicy = policyForBootRepo(name, branchPolicy, staticAgent);
         if (!fs.existsSync(repoPath)) {
             log(`Default '${name}' repository not found. Cloning...`);
@@ -76,7 +77,7 @@ export function prepareDefaultBootRepositories({
     if (branchPolicy?.branch && staticAgent && !repoNameFromAgentRef(staticAgent)) {
         try {
             const staticRepo = findAgent(String(staticAgent).trim())?.repo;
-            if (staticRepo && fs.existsSync(path.join(PLOINKY_DIR, 'repos', staticRepo))) {
+            if (staticRepo && fs.existsSync(resolveAgentRepositoryPath(staticRepo))) {
                 const result = repos.ensureRepoOnBranch(staticRepo, {
                     branch: branchPolicy.branch,
                     resetRepos: branchPolicy.resetRepos || false,

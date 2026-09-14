@@ -73,3 +73,17 @@ Ploinky is a workspace-local runtime for repository-backed agents.
 - The LLM helper uses this file as context, so this overview must stay in sync with the current CLI behavior.
 
 WebChat message bubbles can occupy up to 80% of the chat width. Task cards show the executing robot when supplied by the CLI, status and duration. Cards always show **View Task Details** in the right pane or an available **Open live browser/desktop** link. Logs and the continuation composer live on the task details page. The chat header uses the selected robot launch parameter and optional runtime `robotName` metadata.
+
+## Agent repository source selection
+
+Agent repositories can live directly inside the workspace. Every operation selecting their source prefers a matching workspace checkout over `.ploinky/repos/<repository>`: first by repository alias as the folder name, otherwise by registered Git origin. Candidates must contain agent directories with `manifest.json`; multiple matching Git origins cause an error. The managed directory is the fallback when no local checkout matches. Explicitly unregistered repositories remain excluded until installed again.
+
+For example, `work/AssistOSExplorer` can supply `AchillesIDE` while Ploinky runs in `work`, even with a cached `.ploinky/repos/AchillesIDE` present. An explicit update can pull into the selected local Git checkout. Uninstalling a local repository unregisters it and preserves its files. See [workspace repository operations](operations.html#workspace-agent-repositories).
+
+Workspace agent checkouts may have a different folder name from their registered repository alias. Discovery matches the Git origin to the registered source and keeps the alias for runtime principals, container identity, dependency caches and Router attestation. The checkout path selects source files; it does not rename the agent.
+
+Repository dependencies declared in agent manifests are discovered from each repository's selected source, including workspace-only checkouts. Installing a new alias can match its explicit Git URL to a differently named local checkout; it records the association without cloning or switching that checkout's branch. Container diagnostics prefer the runtime principal over staged code directory names. Existing runtime generations retain their admitted source paths until a lifecycle transition selects a new source.
+
+When a new runtime starts, Bubblewrap and Seatbelt refresh managed source symlinks before resolving code and skill paths for dependency preparation and execution. If the selected source has no `skills/` directory, lifecycle preparation removes the previous managed skills symlink, including dangling links, while preserving real user directories and the old source files.
+
+Installed and active repository lists use the same source resolver. They include workspace-only agent repositories under their registered aliases, exclude unregistered or missing sources, and retain managed repositories. If no enabled repository list is configured, the active list contains all installed repositories; otherwise it contains only installed entries from that list.

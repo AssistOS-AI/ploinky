@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { REPOS_DIR } from '../../utils/config.js';
+import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 
 /**
  * McpToolPolicy — MCP tool access decisions (DS016). Maps mcp-config `tags` to
@@ -57,7 +58,7 @@ export class McpToolPolicy {
         }
         const repo = String(route?.repo || '').trim();
         const agent = String(route?.agent || '').trim();
-        return repo && agent ? path.join(REPOS_DIR, repo, agent) : '';
+        return repo && agent ? path.join(resolveAgentRepositoryPath(repo), agent) : '';
     }
 
     // Build `[{ agent, tool, access }]` defaults from each route's mcp-config

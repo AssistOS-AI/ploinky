@@ -1,3 +1,4 @@
+import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { execSync, spawnSync } from 'child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'fs';
@@ -1291,7 +1292,7 @@ function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
 const SERVICE_NETWORK_LIFECYCLE = Symbol('serviceNetworkLifecycle');
 
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const useHealthProbeBroker = manifestUsesHealthProbeBroker(manifest);
     const managedControlEnv = Object.freeze({
@@ -1385,7 +1386,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
     const cwd = (preservePreparedRegistryRecord || adoptManagedRuntimeOnly) && launchRecord.projectPath
         ? launchRecord.projectPath
-        : getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), options.alias);
+        : getConfiguredProjectPath(agentName, repoName, options.alias);
     const isolatedHome = (launchRecord.runMode || 'isolated') === 'isolated';
     const agentHomeDir = getAgentWorkDir(instanceName);
     const containerCwd = isolatedHome ? '/root' : cwd;
@@ -1904,7 +1905,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     for (const [key, value] of Object.entries(PLOINKY_SKILL_SCOPE_ENV)) envStrings.push(formatEnvFlag(key, value));
     // Only non-secret principal fields exist before topology attestation.
     for (const [key, value] of Object.entries(buildAgentPrincipalEnv(
-        deriveAgentPrincipalId(path.basename(path.dirname(agentPath)), agentName),
+        deriveAgentPrincipalId(repoName, agentName),
         runtimeIdentity,
     ))) {
         envStrings.push(formatEnvFlag(key, value));
@@ -3206,7 +3207,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
         throw error;
     }
-    const preflightRepoName = path.basename(path.dirname(agentPath));
+    const preflightRepoName = resolveAgentRepositoryName(agentPath);
     const preflightManifestPath = path.join(agentPath, 'manifest.json');
     const preflightManifestBytes = fs.existsSync(preflightManifestPath)
         ? fs.readFileSync(preflightManifestPath)
@@ -3311,7 +3312,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
     networkLockWaitMs = options.networkLockWaitMs;
 
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = containerOverride || getAgentContainerName(agentName, repoName);
     const snapshot = loadAgentsMap();
     const existingRecord = snapshot[containerName] || {};
@@ -4021,7 +4022,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     ];
     let projPath = preservePreparedRegistryRecord && launchRecord.projectPath
         ? launchRecord.projectPath
-        : getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), aliasOverride);
+        : getConfiguredProjectPath(agentName, repoName, aliasOverride);
     if (!projPath) {
         projPath = launchRecord.projectPath;
     }

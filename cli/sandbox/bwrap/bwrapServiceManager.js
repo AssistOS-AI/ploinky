@@ -1,3 +1,4 @@
+import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { execSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -126,7 +127,7 @@ const BWRAP_NODE_RUNTIME_PATH = '/opt/ploinky-node';
 const BWRAP_PATH = '/usr/bin/bwrap';
 
 function admitBwrapBoundary(agentName, manifest, agentPath, options, profileResolution) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const optionBag = options && typeof options === 'object' ? options : {};
     const manifestPath = path.join(agentPath, 'manifest.json');
     const manifestBytes = optionBag.manifestBytes !== undefined
@@ -158,7 +159,7 @@ function admitBwrapBoundary(agentName, manifest, agentPath, options, profileReso
 }
 
 function resolveBwrapRuntimeProfile(agentName, manifest, agentPath, options = {}, existingRecord = {}) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const manifestPath = `manifest(${repoName}/${agentName})`;
     const resolution = options.profileResolution || resolveManifestRuntimeProfile(manifest, {
         agentName: `${repoName}/${agentName}`,
@@ -784,7 +785,7 @@ function spawnBwrapInteractive(bwrapArgs, options = {}) {
  * Start a bwrap-sandboxed agent process.
  */
 function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agentSnapshot = loadAgentsMap();
     const existingRecord = agentSnapshot[containerName] || {};
@@ -818,9 +819,6 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
     const sharedDir = ensureSharedHostDir();
 
-    // Resolve paths
-    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
-    const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
     const runtimeResourcePlan = planRuntimeResources(manifest, { agentName, repoName });
     const nodeRuntime = resolveBwrapNodeRuntime();
 
@@ -829,6 +827,10 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     if (!preLifecycle.success) {
         throw new Error(`[profile] ${agentName}: pre-container lifecycle failed: ${preLifecycle.errors.join('; ')}`);
     }
+
+    // Resolve source links after the lifecycle refreshes them.
+    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
+    const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
 
     // Ensure work directory and MCP config
     ensureAgentDataDirectory(agentHomeDir);
@@ -1084,7 +1086,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
         profileNameOverride = options.profileName;
     }
 
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = containerOverride || getAgentContainerName(agentName, repoName);
     const snapshot = loadAgentsMap();
     const existingRecord = snapshot[containerName] || {};
@@ -1197,7 +1199,7 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
  * Uses --die-with-parent so the session is cleaned up when the parent exits.
  */
 function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCommand, options = {}) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agents = loadAgentsMap();
     const record = agents[containerName];

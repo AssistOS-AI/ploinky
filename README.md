@@ -75,10 +75,15 @@ On startup the Box verifies that immutable bundle and copies it into
 `/opt/ploinky/node_modules`; a fresh workspace therefore performs no MCP SDK
 Git or npm operation and needs no GitHub credentials.
 
-Automatic repository bootstrap installs `AchillesIDE`, `AchillesCLI`, and
-`copilot-agents`. Explorer's manifest declares its additional repositories and
-uses `AchillesIDE/liveKitServerAgent` for LiveKit. The `basic` repository is
-optional: install it explicitly with `ploinky install repo basic` when needed.
+Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `AchillesIDE/liveKitServerAgent` for LiveKit. The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
+
+### Agent repositories in the workspace
+
+You can keep agent repositories directly inside your [workspace](docs/wiki.html#definition-workspace). Every operation that selects an agent repository's source prefers the matching workspace checkout over `.ploinky/repos/<repository>`. This includes discovery, installed/active lists, Marketplace inventory, manifest and dependency preparation, and source selection for new runtimes.
+
+For example, when Ploinky runs in `work`, it can use `work/AssistOSExplorer` for the registered repository `AchillesIDE` because its Git origin matches the registered URL. The cached `work/.ploinky/repos/AchillesIDE` is then unused for source selection. The agent still has the identity `AchillesIDE/explorer`.
+
+A matching folder named after the registered repository takes priority; otherwise Ploinky matches Git origins among direct workspace children containing agent manifests. With no local match, it uses `.ploinky/repos`. Automatic preparation reuses the local checkout without switching its branch. An explicit repository update can pull into that checkout; uninstalling it unregisters it while preserving its files. Already running instances retain their selected source until a lifecycle transition creates a new runtime. See [repository selection and lifecycle details](docs/operations.html#workspace-agent-repositories).
 
 | Invocation | Documented effect |
 | --- | --- |

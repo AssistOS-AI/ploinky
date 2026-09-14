@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { listAgentRepositoryNames, resolveAgentRepositoryPath } from '../agentRepositorySource.mjs';
 import path from 'path';
 import * as repos from '../repos.js';
 import { enableAgent } from '../agents.js';
@@ -74,7 +75,7 @@ function hasSameRepoBareAgent(repoName, agentName) {
     const repo = String(repoName || '').trim();
     const agent = String(agentName || '').trim();
     if (!repo || !agent) return false;
-    return fs.existsSync(path.join(PLOINKY_DIR, 'repos', repo, agent, 'manifest.json'));
+    return fs.existsSync(path.join(resolveAgentRepositoryPath(repo), agent, 'manifest.json'));
 }
 
 export function qualifyEnableSpecForRepo(spec, repoName) {
@@ -191,7 +192,7 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy, {
     if (sepIdx < 1) return;
 
     const repoName = spec.slice(0, sepIdx);
-    const repoPath = path.join(PLOINKY_DIR, 'repos', repoName);
+    const repoPath = resolveAgentRepositoryPath(repoName);
     const source = repos.resolveRepoSource(repoName);
     if (fs.existsSync(repoPath)) {
         if (activate) {
@@ -234,6 +235,9 @@ function ensurePrefixedRepoInstalled(spec, branchPolicy, {
 function repoNameFromManifestPath(manifestPath) {
     const reposRoot = path.join(PLOINKY_DIR, 'repos');
     const repoPath = path.dirname(path.dirname(path.resolve(manifestPath)));
+    for (const name of listAgentRepositoryNames()) {
+        if (path.resolve(resolveAgentRepositoryPath(name)) === repoPath) return name;
+    }
     const relative = path.relative(reposRoot, repoPath);
     if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
         return '';
