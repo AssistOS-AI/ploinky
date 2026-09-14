@@ -395,117 +395,26 @@ test('chat task summary streams inline logs and collapses to its metadata header
         },
     });
 
-    const panel = bubble.children[0];
-    const [summary, body] = panel.children;
-    const [log, actionRow, actionError, composer] = body.children;
-    const [link, actionButton] = actionRow.children;
-    assert.equal(panel.className, 'wa-task-summary is-expanded');
-    assert.equal(summary.tagName, 'BUTTON');
-    assert.deepEqual(summary.children.map((child) => child.textContent).slice(0, 3), [
-        'opencodeAgent',
-        'Build project',
-        'RUNNING',
-    ]);
-    assert.equal(log.children[0].textContent, 'first message');
-    assert.equal(link.textContent, 'Open Task');
-    assert.equal(link.dataset.wcLink, 'true');
-    assert.equal(link.dataset.wcTaskId, task.id);
-    assert.equal(link.href, `/webchat/tasks/${task.id}/view`);
-    assert.equal(actionButton.hidden, false);
-    assert.equal(actionButton.textContent, 'Stop');
-    assert.equal(loadRequests, 1);
-
-    assert.equal(bubble.children[0].children[1].children[1].children.length, 2);
-    subscriber({ task: { ...task, liveSession: { mode: 'browser', url: '/example/session/', label: 'Translated' } },
-        ready: true, log: 'first message', logLoaded: true });
-    assert.equal(bubble.children[0].children[1].children[1].children.length, 2);
-
-    actionButton.onclick({ preventDefault() {}, stopPropagation() {} });
-    assert.deepEqual(actions, [['stop', task.id]]);
-    assert.equal(actionButton.textContent, 'Stopping…');
-
-    subscriber({
-        task: {
-            ...task,
-            remoteStatus: 'cancelled',
-            status: 'stopped',
-            continuation: { handle: 'continuation_handle_1' },
-        },
-        ready: true,
-        log: 'first message\n',
-        logLoaded: true,
-    });
-    assert.equal(actionButton.textContent, 'Resume');
-    actionButton.onclick({ preventDefault() {}, stopPropagation() {} });
-    assert.deepEqual(actions, [['stop', task.id], ['resume', task.id]]);
-    assert.equal(actionButton.textContent, 'Resuming…');
-
-    subscriber({
-        task: {
-            ...task,
-            remoteStatus: 'cancelled',
-            status: 'stopped',
-            continuation: { handle: 'continuation_handle_1' },
-        },
-        ready: true,
-        log: 'first message\n',
-        logLoaded: true,
-        actionEvent: true,
-        action: 'resume',
-        actionOk: false,
-        actionError: 'Resume was denied.',
-    });
-    assert.equal(actionButton.textContent, 'Resume');
-    assert.equal(actionButton.disabled, false);
-    assert.equal(actionError.hidden, false);
-    assert.equal(actionError.textContent, 'Resume was denied.');
-
-    actionButton.onclick({ preventDefault() {}, stopPropagation() {} });
-    assert.deepEqual(actions.at(-1), ['resume', task.id]);
-
-    subscriber({ task: { ...task, turn: 2 }, ready: true, log: 'first message\n', logLoaded: true });
-    assert.equal(actionButton.textContent, 'Stop');
-    assert.equal(composer.hidden, true);
-    const liveTask = { ...task, continuation: { handle: 'continuation_handle_2', messageToolName: 'send-input' } };
-    subscriber({ task: liveTask, ready: true, log: 'first message\n', logLoaded: true });
-    assert.equal(composer.hidden, false);
-    const [input, send] = composer.children;
-    assert.equal(input.style.height, '64px');
-    input.value = 'check the screen';
-    input.scrollHeight = 110;
-    input.oninput();
-    assert.equal(input.style.height, '112px');
-    assert.equal(input.style.overflowY, 'hidden');
-    input.scrollHeight = 240;
-    input.oninput();
-    assert.equal(input.style.height, '180px');
-    assert.equal(input.style.overflowY, 'auto');
-    input.scrollHeight = 80;
-    input.scrollTop = 50;
-    input.oninput();
-    assert.equal(input.style.height, '82px');
-    assert.equal(input.style.overflowY, 'hidden');
-    assert.equal(input.scrollTop, 0);
-    composer.onsubmit({ preventDefault() {} });
-    assert.deepEqual(actions.at(-1), ['message', task.id, 'check the screen']);
-    assert.equal(send.textContent, 'Sending…');
-    subscriber({ task: liveTask, ready: true, log: 'first message\n', logLoaded: true,
-        actionEvent: true, action: 'continue', actionOk: true });
-    assert.equal(input.value, '');
-    assert.equal(input.style.height, '64px');
-    assert.equal(send.disabled, false);
-
-    summary.onclick();
-    assert.equal(body.hidden, true);
-    assert.equal(summary.getAttribute('aria-expanded'), 'false');
-    assert.equal(summary.children.at(-1).textContent, '▸');
-
-    subscriber({ task: { ...task, remoteStatus: 'completed', status: 'finished' }, ready: true, log: 'first message\nsecond message\n', logLoaded: true });
-    assert.equal(log.children[1].textContent, 'second message');
-    summary.onclick();
+    t.after(dispose);
+    const [summary, body] = bubble.children[0].children;
+    const [link, live] = body.children[0].children;
     assert.equal(body.hidden, false);
-    assert.equal(summary.getAttribute('aria-expanded'), 'true');
-    dispose();
+    assert.equal(link.textContent, 'View Task Details');
+    assert.equal(link.dataset.wcTaskId, task.id);
+    assert.equal(loadRequests, 0, 'inline cards must not request task logs');
+    assert.equal(body.children.length, 1, 'no inline log or composer');
+    assert.equal(summary.onclick, undefined);
+    assert.equal(summary.children.length, 4);
+    assert.equal(body.hidden, false);
+    subscriber({ task: { ...task, robotName: 'analyst', liveSession: { mode: 'browser', url: '/example/session/' } }, ready: true });
+    assert.equal(summary.children[0].textContent, 'Robot: analyst');
+    assert.equal(live.hidden, false);
+    assert.equal(live.textContent, 'Open live browser');
+    assert.equal(live.href, '/example/session/');
+    subscriber({ task: { ...task, liveSession: { mode: 'browser', url: 'javascript:alert(1)' } }, ready: true });
+    assert.equal(live.hidden, true);
+    assert.deepEqual(actions, []);
+
 });
 
 test('inline task composer uses theme colors and visible interaction states', () => {

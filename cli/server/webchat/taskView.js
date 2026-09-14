@@ -223,7 +223,7 @@ function renderTask() {
     const fallbackDescription = !taskId
         ? 'Invalid task'
         : (initialLoadComplete ? 'Task data unavailable' : 'Loading task…');
-    agent.textContent = task?.targetAgent || 'Task';
+    agent.textContent = task?.robotName || task?.targetAgent || 'Task';
     const taskModel = task?.execution?.model;
     model.textContent = taskModel?.label || taskModel?.key || taskModel?.model || 'default';
     description.textContent = task?.description || task?.toolName || fallbackDescription;

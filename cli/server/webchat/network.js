@@ -249,6 +249,7 @@ function parseRuntimeStatePayload(text) {
         if (payload.model !== null && typeof payload.model !== 'string') return undefined;
         return {
             model: payload.model?.trim() || null,
+            ...(typeof payload.robotName === 'string' && payload.robotName.trim() ? { robotName: payload.robotName.trim().slice(0, 160) } : {}),
             ...(payload.backend === null || typeof payload.backend === 'string' ? { backend: payload.backend } : {}),
             ...(typeof payload.targetTabId === 'string' ? { targetTabId: payload.targetTabId } : {}),
             ...(typeof payload.targetPageInstanceId === 'string' ? { targetPageInstanceId: payload.targetPageInstanceId } : {}),

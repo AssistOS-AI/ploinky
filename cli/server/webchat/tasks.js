@@ -110,7 +110,7 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
         title.textContent = task.description || task.toolName || task.id;
         const meta = document.createElement('div');
         meta.className = 'wa-task-meta';
-        meta.textContent = `${task.targetAgent} · ${task.toolName} · ${formatTime(task.updatedAt)} · ${taskDurationLabel(task)}`;
+        meta.textContent = `${task.robotName || task.targetAgent} · ${task.toolName} · ${formatTime(task.updatedAt)} · ${taskDurationLabel(task)}`;
         const presentation = taskStatusPresentation(task);
         const status = document.createElement('span');
         status.className = `wa-task-status is-${presentation.className}`;
@@ -151,7 +151,7 @@ export function createTaskController({ toEndpoint, sendQuickCommand, elements, s
             const footer = document.createElement('span');
             footer.className = 'wa-task-list-footer';
             const agent = document.createElement('span');
-            agent.textContent = `${task.targetAgent || ''} · ${taskDurationLabel(task)}`;
+            agent.textContent = `${task.robotName || task.targetAgent || ''} · ${taskDurationLabel(task)}`;
             const presentation = taskStatusPresentation(task);
             const status = document.createElement('span');
             status.className = `wa-task-status is-${presentation.className}`;

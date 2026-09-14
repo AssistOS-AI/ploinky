@@ -14,7 +14,7 @@ const readWebchatHandlers = () => fs.readdirSync(path.join(ROOT, 'cli/server/han
 
 test('WebChat exposes folder-session controls and lazy history loading', () => {
     const template = read('cli/server/webchat/chat.html');
-    for (const id of ['sessionsBtn', 'historyGate', 'loadHistoryBtn', 'sessionDialog', 'sessionList']) {
+    for (const id of ['sessionsBtn', 'historyGate', 'sessionDialog', 'sessionList']) {
         assert.match(template, new RegExp(`id="${id}"`));
     }
     assert.match(template, /id="sessionsBtn"[^>]*>Sessions<\/button>/);
@@ -24,10 +24,10 @@ test('WebChat exposes folder-session controls and lazy history loading', () => {
     const typingIndicator = template.indexOf('id="typingIndicator"');
     assert.ok(chatListStart >= 0 && historyGate > chatListStart && typingIndicator > historyGate);
     assert.match(template, /class="wa-history-gate" id="historyGate" hidden/);
-    assert.match(template, /class="wa-history-load-button"[^>]*id="loadHistoryBtn"/);
+    assert.doesNotMatch(template, /id="loadHistoryBtn"/);
     assert.doesNotMatch(template, /class="wa-message in wa-history-gate"/);
     assert.doesNotMatch(template, /class="wa-message-bubble wa-history-load-button"/);
-    assert.match(template, /Click to load session history/);
+    assert.match(template, /Loading conversation history/);
 });
 
 test('WebChat keeps desktop actions in the header and moves them into the mobile overflow menu', () => {
@@ -66,15 +66,15 @@ test('WebChat exposes a task overlay backed by AchillesCLI commands', () => {
     assert.match(messages, /message\?\.type === 'task'/);
     assert.match(messages, /wa-task-item/);
     assert.doesNotMatch(messages, /taskAssociations/);
-    assert.match(presentation, /Open Task/);
+    assert.match(presentation, /View Task Details/);
     assert.match(presentation, /data.*wcTaskId|dataset\.wcTaskId/);
-    assert.match(presentation, /wa-task-summary-arrow/);
-    assert.match(presentation, /wa-task-summary-log/);
-    assert.match(presentation, /createTaskLogFollower/);
-    assert.match(presentation, /aria-expanded/);
+    assert.doesNotMatch(presentation, /wa-task-summary-arrow/);
+    assert.doesNotMatch(presentation, /wa-task-summary-log/);
+    assert.doesNotMatch(presentation, /createTaskLogFollower/);
+    assert.doesNotMatch(presentation, /aria-expanded/);
     assert.match(presentation, /\(stdout\|stderr\)/);
     assert.match(presentation, /RUNNER_PREFIX_RE/);
-    assert.match(presentation, /setInterval\(renderSummary, 1000\)/);
+    assert.match(presentation, /setInterval\(render, 1000\)/);
     assert.match(taskRoutes, /\/view\$/);
     assert.match(taskView, /webchat-task-update/);
     assert.match(taskViewTransport, /webchat-task-command/);

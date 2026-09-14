@@ -32,7 +32,7 @@ export function createSessionController({
     const {
         sessionsBtn,
         historyGate,
-        loadHistoryBtn,
+        chatList,
         sessionDialog,
         sessionDialogClose,
         sessionList
@@ -41,6 +41,12 @@ export function createSessionController({
     let currentSnapshot = null;
     let historyLoaded = false;
     let sessionsAvailable = false;
+    let firstVisibleIndex = 0;
+    let loadingOlder = false;
+    let generation = 0;
+    const INITIAL_MESSAGES = 100;
+    const PAGE_MESSAGES = 50;
+
 
     if (sessionsBtn) sessionsBtn.disabled = true;
 
@@ -54,9 +60,39 @@ export function createSessionController({
 
     function loadHistory() {
         if (!currentSnapshot) return;
-        messages.renderHistory(currentSnapshot.messages || []);
+        generation += 1;
+        loadingOlder = false;
+        chatList?.classList.remove('is-loading-history');
+        const all = currentSnapshot.messages || [];
+        firstVisibleIndex = Math.max(0, all.length - INITIAL_MESSAGES);
+        messages.renderHistory(all.slice(firstVisibleIndex), { startIndex: firstVisibleIndex });
         historyLoaded = true;
         showHistoryGate(false);
+        if (chatList) chatList.scrollTop = chatList.scrollHeight;
+    }
+
+    async function loadOlder() {
+        if (loadingOlder || !firstVisibleIndex || !chatList) return;
+        loadingOlder = true;
+        const requestGeneration = generation;
+        const previousHeight = chatList.scrollHeight;
+        const previousTop = chatList.scrollTop;
+        chatList.classList.add('is-loading-history');
+        showHistoryGate(true);
+        // Let the loading overlay paint before inserting a bounded page.
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        if (requestGeneration !== generation) return;
+        try {
+            const nextIndex = Math.max(0, firstVisibleIndex - PAGE_MESSAGES);
+            messages.renderHistory(currentSnapshot.messages.slice(nextIndex, firstVisibleIndex), { prepend: true, startIndex: nextIndex });
+            firstVisibleIndex = nextIndex;
+
+        } finally {
+            loadingOlder = false;
+            showHistoryGate(false);
+            chatList.classList.remove('is-loading-history');
+            chatList.scrollTop = previousTop + chatList.scrollHeight - previousHeight;
+        }
     }
 
     function closeDialog() {
@@ -143,25 +179,32 @@ export function createSessionController({
             return;
         }
 
-        const hadSession = Boolean(currentSession?.sessionId);
         const changed = payload.summary.sessionId !== currentSession?.sessionId;
         // Updates describe an execution, not a request to select its conversation.
         if (payload.event === 'updated' && changed) return;
         currentSession = payload.summary;
+        if (loadingOlder) {
+            generation += 1;
+            loadingOlder = false;
+            showHistoryGate(false);
+            chatList?.classList.remove('is-loading-history');
+        }
         currentSnapshot = payload.session;
         messages.setSessionId?.(currentSession.sessionId);
 
-        if (payload.event === 'selected' || payload.event === 'updated' || (hadSession && changed)) {
-            messages.renderHistory(payload.session.messages || []);
-            historyLoaded = true;
-            showHistoryGate(false);
+        if (!historyLoaded || changed || payload.event === 'selected') {
+            loadHistory();
             closeDialog();
             hideBanner();
-            return;
-        }
-
-        if (!historyLoaded) {
-            showHistoryGate(Boolean(payload.summary.hasHistory));
+        } else if (payload.event === 'updated' || payload.event === 'current') {
+            const previousHeight = chatList?.scrollHeight || 0;
+            const previousTop = chatList?.scrollTop || 0;
+            const atBottom = !chatList || previousHeight - previousTop - chatList.clientHeight < 80;
+            const all = currentSnapshot.messages || [];
+            firstVisibleIndex = Math.min(firstVisibleIndex, all.length);
+            messages.renderHistory(all.slice(firstVisibleIndex), { startIndex: firstVisibleIndex });
+            if (chatList) chatList.scrollTop = atBottom ? chatList.scrollHeight : previousTop;
+            hideBanner();
         }
     }
 
@@ -177,7 +220,8 @@ export function createSessionController({
     }
 
     sessionsBtn?.addEventListener('click', openDialog);
-    loadHistoryBtn?.addEventListener('click', loadHistory);
+    chatList?.addEventListener('scroll', () => { if (chatList.scrollTop < 120) void loadOlder(); }, { passive: true });
+    for (const event of ['wheel', 'touchmove']) chatList?.addEventListener(event, e => { if (loadingOlder) e.preventDefault(); }, { passive: false });
     sessionDialogClose?.addEventListener('click', closeDialog);
     sessionDialog?.addEventListener('click', (event) => {
         if (event.target === sessionDialog) closeDialog();
@@ -189,6 +233,7 @@ export function createSessionController({
     return {
         bootstrap,
         loadHistory,
+        loadOlder,
         handleSessionState,
         addRemoteUserMessage,
         getCurrentSession: () => currentSession,

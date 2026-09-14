@@ -48,11 +48,12 @@ function sessionEnvelope(event = 'current') {
     };
 }
 
-test('runtime state contains only the selected model', () => {
+test('runtime state carries model and optional robot presentation', () => {
     assert.deepEqual(parseWebchatRuntimeState({ __webchatRuntimeState: 1, version: 1, model: 'deep' }), { model: 'deep' });
     assert.equal(parseWebchatRuntimeState({ __webchatRuntimeState: 1, version: 1, model: 42 }), undefined);
     assert.equal(serializeRuntimeStateSseEvent({ model: 'deep' }), 'event: runtime-state\ndata: {"model":"deep"}\n\n');
     assert.deepEqual(networkTestables.parseRuntimeStatePayload('{"model":"deep"}'), { model: 'deep' });
+    assert.deepEqual(networkTestables.parseRuntimeStatePayload({ model: null, robotName: ' default ' }), { model: null, robotName: 'default' });
 });
 
 test('skill envelopes expose only validated workspace-relative catalog state', () => {
@@ -636,6 +637,7 @@ test('WebChat renders generic runtime model state beside the agent title', () =>
     const index = read('../../cli/server/webchat/index.js');
     assert.match(template, /id="titleBar"[\s\S]*id="runtimeModel" hidden/);
     assert.match(network, /addEventListener\('runtime-state'/);
-    assert.match(index, /onRuntimeState: \(state\) => dom\.setRuntimeModel\(state\?\.model\)/);
+    assert.match(index, /dom\.setRuntimeModel\(state\?\.model\)/);
+    assert.match(index, /dom\.setRuntimeRobot\(state\?\.robotName\)/);
     assert.doesNotMatch(`${network}\n${dom}\n${index}`, /runtimeInstanceId/);
 });
