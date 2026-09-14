@@ -7,9 +7,47 @@ Beyond a single agent, Ploinky supports a multi‑agent workspace. Each agent ru
 See [local instruction skills](docs/local-instruction-skills.md) for launch scope metadata, RoboTeam's catalog boundary, and compatibility installation that preserves local edits.
 
 ## Prerequisites
-- Node.js 20+
-- Docker or Podman
-- Git
+
+The public `ploinky` command requires Node.js 22 or newer and rootless Podman.
+Native Linux hosts use a supported baseline of Podman 5.4.0 or newer; macOS
+uses Podman Machine. Docker and arbitrary remote engines are unsupported for
+the outer Box. Git is needed to clone and update the host checkout.
+
+Before preparing, starting, or restarting a Box on Linux, Ploinky checks:
+
+| Requirement | What must be available |
+| --- | --- |
+| Rootless runtime | A regular login account, `newuidmap` and `newgidmap`, working user namespaces, and at least 65,536 contiguous mapped container UIDs and GIDs starting at zero |
+| Nested devices | Read/write access to the `/dev/fuse` and `/dev/net/tun` character devices |
+| Resource controls | Cgroup v2 with `cpu`, `memory`, and `pids` delegated to the login session; seccomp support |
+| Runtime helpers | The executable conmon and OCI runtime paths selected by `podman info` |
+| Networking | The configured `pasta` (provided by `passt`) or `slirp4netns` executable, and the selected Netavark executable when applicable |
+| Storage | The configured overlay mount helper, if one is selected; native overlay does not require host `fuse-overlayfs` |
+
+Missing prerequisites produce a nonzero exit with the failed checks, bounded
+redacted diagnostics, distribution-specific installation guidance, and the next
+configuration step. This happens before the workspace lock, source selection,
+image pull, or Box creation. Ploinky does not install packages or change host
+configuration automatically. Status, logs, help, dry-run, stop, and destroy do
+not run the Linux startup gate, so inspection and cleanup remain available.
+
+For a Debian/Ubuntu installation, start with
+`sudo apt-get update && sudo apt-get install podman uidmap passt conmon crun catatonit`.
+Verify `podman --version` meets the minimum: an older distribution may need an
+OS upgrade or a supported newer package source. Install other helpers only when
+the preflight reports they are missing from the selected configuration.
+Catatonit supplies the usual `--init` helper; a custom configured init path is
+resolved by Podman rather than rejected because catatonit is absent from PATH.
+Subordinate UID/GID ranges must be allocated by an administrator without
+overlapping other users' ranges. After changing existing mappings, stop your
+containers and run `podman system migrate` as your normal user before retrying.
+
+Use the official [Node.js downloads](https://nodejs.org/en/download),
+[Podman installation guide](https://podman.io/docs/installation), and
+[rootless setup guide](https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md)
+for your distribution. The packages inside the Box are checked separately by
+its immutable image contract and entrypoint; they need not all be installed on
+the physical host.
 
 ## Getting started
 

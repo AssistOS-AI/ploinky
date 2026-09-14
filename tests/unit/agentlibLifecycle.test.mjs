@@ -214,6 +214,7 @@ test('destroy --delete-cache removes managed AgentLib state but never a local ch
     const identity = { workspaceRoot: workspace, instance: 'ploinky-box-test' };
     let removed = null;
     const supervisor = supervisorMod.createBoxSupervisor({
+        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         discover: () => ({ state: 'absent', engine: { name: 'podman' }, handles: {} }),
         lockManager: {

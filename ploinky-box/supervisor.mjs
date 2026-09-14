@@ -34,6 +34,7 @@ import {
     stageWorkspaceEdgeDesired,
 } from './edgeDesired.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import { assertLinuxHostPrerequisites } from './hostPrerequisites.mjs';
 import { loadBoxAgentLibImage, revalidateContainerAgentLib } from './image-agentlib.mjs';
 import {
     HOST_REACHABLE_IPV4_ENV,
@@ -210,6 +211,7 @@ export function createBoxSupervisor({
     discover = defaultDiscovery,
     platform = process.platform,
     env = process.env,
+    checkHostPrerequisites = assertLinuxHostPrerequisites,
     launchCwd = process.cwd(),
     repositoryRoot = path.resolve(import.meta.dirname, '..'),
     reconcile = reconcileBoxContainer,
@@ -254,13 +256,18 @@ export function createBoxSupervisor({
         });
     }
 
+    async function startupMutation(execute) {
+        await checkHostPrerequisites({ runner, platform, env });
+        return lockedMutation(execute);
+    }
+
     async function prepareBoxForCommand({
         explicitPort,
         explicitMediaPort,
         branchPolicy = null,
         imageRef = resolveBoxImageReference(env),
     } = {}) {
-        return lockedMutation(async (identity, lock, ownership) => {
+        return startupMutation(async (identity, lock, ownership) => {
             // The source is selected before Box reconciliation so the mount
             // contract can be part of the Box's immutable identity.
             const { selection } = await selectAgentLib({
@@ -392,7 +399,7 @@ export function createBoxSupervisor({
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
-        return lockedMutation(async (identity, lock, ownership) => {
+        return startupMutation(async (identity, lock, ownership) => {
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
@@ -472,7 +479,7 @@ export function createBoxSupervisor({
     }
 
     async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
-        return lockedMutation(async (identity, lock, ownership) => {
+        return startupMutation(async (identity, lock, ownership) => {
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
@@ -545,7 +552,7 @@ export function createBoxSupervisor({
                 'PLOINKY_BOX_ARGUMENT_INVALID',
             );
         }
-        return lockedMutation(async (identity, lock, ownership) => {
+        return startupMutation(async (identity, lock, ownership) => {
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const status = inspectBoxStatus();
             const container = status.ownership?.handles?.container;
@@ -611,7 +618,7 @@ export function createBoxSupervisor({
     }
 
     async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
-        return lockedMutation(async (identity, lock, ownership) => {
+        return startupMutation(async (identity, lock, ownership) => {
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);

@@ -22,6 +22,20 @@ and `node:util`) and the existing diagnostic sanitizer. They add no third-party
 dependencies or installation requirements. Their regression tests use the
 existing fake Podman runner and Node.js test runner.
 
+The native Linux host preflight adds no third-party code or packages. It uses
+Node.js filesystem/path APIs, the existing bounded process runner, and the
+existing diagnostic sanitizer. The public launcher requires Node.js 22+ before
+loading modules. The supported native host baseline is Podman 5.4.0+; its
+selected runtime, networking, and configured storage helpers remain external
+system prerequisites, with the effective paths read from `podman info`.
+Rootless UID/GID helpers, namespace mappings, cgroup delegation, seccomp, and
+FUSE/TUN device access are checked before Box preparation. Installation and
+configuration guidance is in [README.md](README.md#prerequisites) and in each
+failure message. These checks neither install packages nor alter host settings.
+The host's configured packages retain their distribution/upstream licensing;
+none is newly vendored or redistributed by this change. Regression tests use
+fake filesystems and process runners and need no container engine.
+
 The focused tests substitute container operations and require no container engine or model backend. The broader acceptance harness can optionally use an existing Podman installation to provide Linux; its environment requirements are documented with that harness. No external code, licenses, or notices were added by this component.
 
 The cross-repository propagation tests are available through `npm run test:local-skills`. Their explicit source and optional native-runtime prerequisites are recorded in [tests/integration/local-skills/dependencies.md](tests/integration/local-skills/dependencies.md). They add no third-party packages.

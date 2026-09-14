@@ -36,6 +36,7 @@ function fixture(t, { symlinkedState = false } = {}) {
         if (!state.initial && containerId === candidate.handles.container.id && state.failAt === 'core') throw new Error('candidate core failed');
     };
     const create = launchCwd => createBoxSupervisor({
+        checkHostPrerequisites: () => {},
         env: {}, launchCwd, resolveIdentity: () => identity, discover: () => prior,
         lockManager: { async acquire() {
             state.acquisitions += 1; state.held = true;

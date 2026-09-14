@@ -84,6 +84,7 @@ function matrixSupervisor(identity, events) {
         },
     };
     const supervisor = createBoxSupervisor({
+        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -183,6 +184,7 @@ test('start stages host-owned edge desired state under the Box lock before core 
         size: 123,
     };
     const stagedSupervisor = createBoxSupervisor({
+        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -247,6 +249,7 @@ test('foreign ownership blocks every lifecycle path with zero engine mutation', 
     for (const argv of [['status'], ['stop'], ['destroy'], ['start', 'Agent'], ['logs'], ['list']]) {
         const mutations = [];
         const supervisor = createBoxSupervisor({
+            checkHostPrerequisites: () => {},
             resolveIdentity: () => identity,
             discover: () => ({ state: 'foreign', message: 'foreign exact-name resource' }),
             runner: {
