@@ -387,6 +387,58 @@ test('browser auth host binding rejects selector switches and ignores raw candid
     assert.equal(JSON.parse(staleRes.body).error, 'edge_generation_changed');
 });
 
+test('canonical login restart sanitizes return paths and rejects invalid agents before redirecting', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t);
+    t.mock.method(authService, 'beginLogin', async () => ({ restartLogin: true, canonicalLoginOrigin: 'http://127.0.0.1' }));
+    for (const returnTo of ['https://evil.example', '//evil.example', '/%252f%252fevil.example', '/safe\r\nLocation:evil']) {
+        const req = makeRequest({ url: `/auth/login?agent=webAssist&returnTo=${encodeURIComponent(returnTo)}` });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(res.statusCode, 303, res.body);
+        const target = new URL(res.getHeader('location'));
+        assert.equal(target.origin, 'http://127.0.0.1');
+        assert.deepEqual(Object.fromEntries(target.searchParams), { returnTo: '/', agent: 'webAssist' });
+        assert.equal(res.getHeader('set-cookie'), undefined);
+        assert.equal(res.getHeader('cache-control'), 'no-store');
+    }
+    const callsBefore = authService.beginLogin.mock.callCount();
+    for (const agent of ['missing-agent', 'https://evil.example', 'webAssist\r\nLocation:evil']) {
+        const req = makeRequest({ url: `/auth/login?agent=${encodeURIComponent(agent)}` });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(res.statusCode, 404, res.body);
+        assert.equal(res.getHeader('location'), undefined);
+        assert.equal(res.getHeader('set-cookie'), undefined);
+    }
+    assert.equal(authService.beginLogin.mock.callCount(), callsBefore);
+});
+
+test('canonical login restart requires GET and a current generation before emitting a redirect', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t);
+    let activePlan;
+    t.mock.method(authService, 'beginLogin', async () => {
+        activePlan.lease.commit = () => false;
+        return { restartLogin: true, canonicalLoginOrigin: 'http://127.0.0.1' };
+    });
+    for (const method of ['POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS']) {
+        const req = makeRequest({ method, url: '/auth/login' });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(res.statusCode, 405, res.body);
+        assert.equal(res.getHeader('location'), undefined);
+        assert.equal(res.getHeader('set-cookie'), undefined);
+    }
+    assert.equal(authService.beginLogin.mock.callCount(), 0);
+    activePlan = createRoutePlan();
+    const req = makeRequest({ url: '/auth/login' });
+    const res = new MockResponse();
+    await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: activePlan });
+    assert.equal(res.statusCode, 503, res.body);
+    assert.equal(JSON.parse(res.body).error, 'edge_generation_changed');
+    assert.equal(res.getHeader('location'), undefined);
+    assert.equal(res.getHeader('set-cookie'), undefined);
+});
+
 test('host-bound browser token mints only an admitted service mutation proof', async (t) => {
     const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
         staticAuthMode: 'sso',

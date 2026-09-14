@@ -33,15 +33,27 @@ function recordCall(op, payload) {
 export function resolveProviderConfig({ providerConfig = {} } = {}) {
     return {
         issuerBaseUrl: providerConfig.issuerBaseUrl || 'https://fake.test',
-        clientId: providerConfig.clientId || 'fake-client'
+        clientId: providerConfig.clientId || 'fake-client',
+        ...(providerConfig.redirectUri ? { redirectUri: providerConfig.redirectUri } : {}),
+        ...(providerConfig.canonicalLoginOrigin ? { canonicalLoginOrigin: providerConfig.canonicalLoginOrigin } : {}),
     };
 }
 export function createProvider({ getConfig }) {
     return {
         name: 'fake/fakeProvider',
-        async sso_begin_login({ redirectUri, prompt, returnTo }) {
+        async sso_begin_login({ redirectUri, prompt, returnTo, supportsCanonicalLoginOrigin }) {
             const cfg = await getConfig();
-            recordCall('sso_begin_login', { redirectUri, prompt, returnTo, config: cfg });
+            recordCall('sso_begin_login', { redirectUri, prompt, returnTo, supportsCanonicalLoginOrigin, config: cfg });
+            if (process.env.__FAKE_PROVIDER_BEGIN_DELAY === '1') {
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            if (process.env.__FAKE_PROVIDER_BEGIN_RESPONSE) {
+                return JSON.parse(process.env.__FAKE_PROVIDER_BEGIN_RESPONSE);
+            }
+            if (supportsCanonicalLoginOrigin === true && cfg.canonicalLoginOrigin
+                && new URL(redirectUri).origin !== cfg.canonicalLoginOrigin) {
+                return { canonicalLoginOrigin: cfg.canonicalLoginOrigin };
+            }
             return {
                 authorizationUrl: 'https://fake.test/auth?state=PROVIDER_STATE',
                 providerState: 'PROVIDER_STATE',
@@ -201,6 +213,72 @@ test('bridge rejects unknown state on callback', async () => {
         bridge.handleCallback({ code: 'x', state: 'bogus', baseUrl: 'http://127.0.0.1:8080' }),
         /Invalid or expired/
     );
+});
+
+test('canonical login hints restart only between exact loopback origins without browser state', async (t) => {
+    t.after(() => { delete process.env.__FAKE_PROVIDER_BEGIN_RESPONSE; });
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    for (const [baseUrl, canonicalLoginOrigin] of [
+        ['http://localhost:8080', 'http://127.0.0.1:8080'],
+        ['http://[::1]:8080', 'http://127.0.0.1:8080'],
+        ['http://127.0.0.1', 'http://localhost'],
+        ['https://localhost', 'https://[::1]'],
+    ]) {
+        process.env.__FAKE_PROVIDER_BEGIN_RESPONSE = JSON.stringify({ canonicalLoginOrigin });
+        const bridge = createGenericAuthBridge();
+        const result = await bridge.beginLogin({ baseUrl });
+        assert.deepEqual(result, { restartLogin: true, canonicalLoginOrigin });
+        assert.equal(readCalls().at(-1).payload.supportsCanonicalLoginOrigin, true);
+        await assert.rejects(bridge.handleCallback({
+            state: result.state, browserBinding: result.browserBinding, code: 'copied-code', baseUrl,
+        }), /Invalid or expired authorization state/);
+    }
+});
+
+test('malformed or unsafe canonical hints fail closed even when a fallback authorization URL exists', async (t) => {
+    t.after(() => { delete process.env.__FAKE_PROVIDER_BEGIN_RESPONSE; });
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    const baseUrl = 'http://localhost:8080';
+    for (const canonicalLoginOrigin of [
+        null, {}, [], 123, '',
+        'http://127.0.0.1:8080/', 'http://127.0.0.1:8080/auth/login',
+        'http://127.0.0.1:8080?next=evil', 'http://127.0.0.1:8080#fragment',
+        'http://127.0.0.1:8080\r\n', 'http://127.0.0.1:\t8080', ' http://127.0.0.1:8080',
+        'http://attacker:password@127.0.0.1:8080', 'http://127.0.0.1.evil.test:8080',
+        'http://evil.test:8080', 'http://127.0.0.2:8080', 'http://app.localhost:8080',
+        'http://127.1:8080', 'http://2130706433:8080', 'HTTP://127.0.0.1:8080',
+        'http://127.0.0.1:8081', 'https://127.0.0.1:8080', 'ftp://127.0.0.1:8080',
+        'http://localhost:8080', '//127.0.0.1:8080',
+    ]) {
+        process.env.__FAKE_PROVIDER_BEGIN_RESPONSE = JSON.stringify({ canonicalLoginOrigin });
+        await assert.rejects(createGenericAuthBridge().beginLogin({ baseUrl }), /Invalid canonical login origin/);
+    }
+    for (const extra of [{ authorizationUrl: 'https://fake.test/auth' }, { providerState: 'unwanted-state' }]) {
+        process.env.__FAKE_PROVIDER_BEGIN_RESPONSE = JSON.stringify({ canonicalLoginOrigin: 'http://127.0.0.1:8080', ...extra });
+        await assert.rejects(createGenericAuthBridge().beginLogin({ baseUrl }), /Invalid canonical login origin/);
+    }
+    process.env.__FAKE_PROVIDER_BEGIN_RESPONSE = JSON.stringify({ canonicalLoginOrigin: 'http://127.0.0.1:8080' });
+    await assert.rejects(createGenericAuthBridge().beginLogin({ baseUrl: 'http://public.example:8080' }), /Invalid canonical login origin/);
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {
+        redirectUri: 'http://127.0.0.1:8080/auth/callback',
+    } });
+    await assert.rejects(createGenericAuthBridge().beginLogin({ baseUrl }), /Invalid canonical login origin/);
+});
+
+test('canonical hints cannot survive a provider configuration reload in flight', async (t) => {
+    t.after(() => {
+        delete process.env.__FAKE_PROVIDER_BEGIN_DELAY;
+        delete process.env.__FAKE_PROVIDER_BEGIN_RESPONSE;
+    });
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {} });
+    process.env.__FAKE_PROVIDER_BEGIN_RESPONSE = JSON.stringify({ canonicalLoginOrigin: 'http://127.0.0.1:8080' });
+    process.env.__FAKE_PROVIDER_BEGIN_DELAY = '1';
+    const bridge = createGenericAuthBridge();
+    const callCount = readCalls().length;
+    const login = bridge.beginLogin({ baseUrl: 'http://localhost:8080' });
+    while (readCalls().length === callCount) await new Promise((resolve) => setTimeout(resolve, 1));
+    bridge.reloadConfig();
+    await assert.rejects(login, /Authorization configuration changed/);
 });
 
 test('callbacks require the initiating browser proof and remain single-use across concurrent tabs', async () => {
@@ -397,4 +475,74 @@ test('real bridge and browser routes reject copied callbacks and issue a session
     assert.match(secureCookie, /^__Host-ploinky_sso_login_/);
     assert.match(secureCookie, /; Secure;/);
     assert.match(secureCookie, /; Path=\//);
+});
+
+test('Router login restarts on the canonical origin before creating a fresh cookie and callback state', async () => {
+    const canonicalOrigin = 'http://127.0.0.1:8080';
+    writeWorkspaceSsoConfig({ enabled: true, providerAgent: 'fake/fakeProvider', providerConfig: {
+        canonicalLoginOrigin: canonicalOrigin,
+    } });
+    const { handleAuthRoutes } = await import('../../cli/server/authHandlers/authRoutes.js');
+    const { authService } = await import('../../cli/server/authHandlers/shared.js');
+    authService.reloadConfig();
+    const snapshot = {
+        generation: 'canonical-origin-generation',
+        agents: { explorer: { type: 'agent', agentName: 'explorer', repoName: 'fixture', auth: { mode: 'sso' } } },
+        routing: { static: { agent: 'explorer' }, routes: { explorer: { agent: 'explorer', repo: 'fixture', hostPort: 0 } } },
+        manifests: {},
+    };
+    const request = async (url, cookie = '') => {
+        const parsedUrl = new URL(url);
+        const routePlan = {
+            ok: false,
+            hostSelection: { kind: 'control', host: parsedUrl.hostname },
+            snapshot,
+            lease: { id: snapshot.generation, snapshot, commit: () => true },
+        };
+        const req = { method: 'GET', url, headers: { host: parsedUrl.host, cookie, accept: 'application/json' }, socket: {} };
+        const res = {
+            statusCode: 200, headers: new Map(), body: '',
+            setHeader(name, value) { this.headers.set(name.toLowerCase(), value); },
+            getHeader(name) { return this.headers.get(name.toLowerCase()); },
+            writeHead(status, headers = {}) { this.statusCode = status; for (const [name, value] of Object.entries(headers)) this.setHeader(name, value); },
+            end(chunk = '') { this.body += chunk; },
+        };
+        await handleAuthRoutes(req, res, parsedUrl, { routePlan });
+        return res;
+    };
+    const returnTo = '/explorer/index.html?view=list#file-exp/Confidential/My%20Space';
+    const aliasUrl = new URL('/auth/login', 'http://localhost:8080');
+    aliasUrl.search = new URLSearchParams({
+        returnTo, prompt: 'select_account', agent: 'explorer', state: 'old-state', requestId: 'old-request',
+    }).toString();
+    const oldCookie = `ploinky_sso_login_${'o'.repeat(22)}=old-browser-proof`;
+    const alias = await request(aliasUrl.href, oldCookie);
+    assert.equal(alias.statusCode, 303, alias.body);
+    assert.equal(alias.getHeader('cache-control'), 'no-store');
+    assert.equal(alias.getHeader('set-cookie'), undefined);
+    assert.equal(alias.body, '');
+    const canonicalUrl = new URL(alias.getHeader('location'));
+    assert.equal(canonicalUrl.origin, canonicalOrigin);
+    assert.equal(canonicalUrl.pathname, '/auth/login');
+    assert.deepEqual(Object.fromEntries(canonicalUrl.searchParams), { returnTo, prompt: 'select_account', agent: 'explorer' });
+
+    const login = await request(canonicalUrl.href);
+    assert.equal(login.statusCode, 200, login.body);
+    assert.equal(login.getHeader('location'), undefined);
+    const cookie = String(login.getHeader('set-cookie'));
+    assert.match(cookie, /^ploinky_sso_login_[A-Za-z0-9_-]{22}=/);
+    assert.match(cookie, /Path=\/; HttpOnly; SameSite=Lax; Max-Age=60/);
+    assert.doesNotMatch(cookie, /Domain=|old-browser-proof/);
+    const browserCookie = cookie.split(';')[0];
+    const [cookieName, browserProof] = browserCookie.split('=');
+    assert.equal(login.body.includes(browserProof), false);
+    const state = cookieName.slice('ploinky_sso_login_'.length);
+    const callbackUrl = `${canonicalOrigin}/auth/callback?code=fixture-code&state=${state}`;
+    const rejected = await request(callbackUrl, oldCookie);
+    assert.equal(rejected.statusCode, 400);
+    assert.equal(rejected.getHeader('set-cookie'), undefined);
+    const callback = await request(callbackUrl, browserCookie);
+    assert.equal(callback.statusCode, 302, callback.body);
+    assert.equal(callback.getHeader('location'), returnTo);
+    assert.ok(callback.getHeader('set-cookie').some((value) => value.startsWith('ploinky_sso=')));
 });

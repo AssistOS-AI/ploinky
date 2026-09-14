@@ -184,8 +184,25 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             const returnTo = normalizeRelativePath(parsedUrl.searchParams.get('returnTo') || '/', '/');
             const prompt = parsedUrl.searchParams.get('prompt') || undefined;
             if (!requireCurrentGeneration(res, routePlan)) return true;
-            const { redirectUrl, state, browserBinding, expiresAt } = await authService.beginLogin({ baseUrl, returnTo, prompt });
+            const login = await authService.beginLogin({ baseUrl, returnTo, prompt });
             if (!requireCurrentGeneration(res, routePlan)) return true;
+            if (login.restartLogin === true) {
+                const restartUrl = new URL('/auth/login', login.canonicalLoginOrigin);
+                restartUrl.searchParams.set('returnTo', returnTo);
+                if (prompt) restartUrl.searchParams.set('prompt', prompt);
+                const explicitAgent = String(parsedUrl.searchParams.get('agent') || '').trim();
+                if (explicitAgent) {
+                    if (!authContext.record
+                        || explicitAgent !== (authContext.boundHostRouteKey || authContext.routeKey)) {
+                        throw new Error('Invalid canonical login agent');
+                    }
+                    restartUrl.searchParams.set('agent', explicitAgent);
+                }
+                res.writeHead(303, { Location: restartUrl.toString(), 'Cache-Control': 'no-store' });
+                res.end();
+                return true;
+            }
+            const { redirectUrl, state, browserBinding, expiresAt } = login;
             const bindingCookieName = loginBindingCookieName(state, baseUrl);
             if (!bindingCookieName || !browserBinding) throw new Error('Invalid authorization browser binding');
             appendSetCookie(res, buildLoginBindingCookie(bindingCookieName, browserBinding, baseUrl,

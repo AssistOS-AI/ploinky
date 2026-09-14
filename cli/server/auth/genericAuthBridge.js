@@ -11,6 +11,7 @@ import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
 import { findAgent } from '../../utils/utils.js';
 import { emitAuthenticationSessionInvalidated } from './sessionEvents.js';
 import { createProviderConfigReader } from './providerConfigValues.js';
+import { validateCanonicalLoginOrigin } from './canonicalLoginOrigin.mjs';
 
 /**
  * genericAuthBridge.js
@@ -195,8 +196,20 @@ export function createGenericAuthBridge(options = {}) {
         const redirectUri = resolveRedirectUri(baseUrl, config);
         // `returnTo` is informational for the provider (for example a Start again
         // link back to /auth/login); the Router alone decides the final redirect.
-        const { authorizationUrl, providerState, expiresAt } = await provider.sso_begin_login({ redirectUri, prompt, returnTo: returnTo || '/' });
+        const result = await provider.sso_begin_login({
+            redirectUri, prompt, returnTo: returnTo || '/', supportsCanonicalLoginOrigin: true,
+        });
         if (epoch !== validationEpoch) throw new Error('Authorization configuration changed');
+        if (Object.hasOwn(result, 'canonicalLoginOrigin')) {
+            if (Object.hasOwn(result, 'authorizationUrl') || Object.hasOwn(result, 'providerState')) {
+                throw new Error('Invalid canonical login origin');
+            }
+            const canonicalLoginOrigin = validateCanonicalLoginOrigin({
+                canonicalLoginOrigin: result.canonicalLoginOrigin, baseUrl, redirectUri,
+            });
+            return { restartLogin: true, canonicalLoginOrigin };
+        }
+        const { authorizationUrl, providerState, expiresAt } = result;
         const coreState = randomId(16);
         const browserBinding = randomId(32);
         const providerExpiresAt = typeof expiresAt === 'string' ? Date.parse(expiresAt) : expiresAt;
