@@ -28,7 +28,7 @@ npm run test:authorization
 
 `AUTHZ_TARGET` is optional and, if set, must equal the exact loopback origin above. Alternative hostnames, ports and origins are refused. The selected baseline is Ploinky `706d9b65dbbf39c33a403cdfecf075bf2b529855`, Explorer `f3590932f3fce75fcb8c290590b114397a9181ae`, and Box `209c0ce14c3f9ff7ef7ecddde77006408dc08c7119a2a45161adcb2f84366871`. The preflight carries all other dependency and immutable image pins. Suite-only commits can run against these unchanged application revisions.
 
-Credential input consists of private, operator-owned `accounts.json` (`adminPassword`) and `admin-storage-state.json` in `AUTHZ_CREDENTIAL_DIR`. An expired administrator session triggers the real configured-password sign-in. Do not paste passwords, codes, cookies or tokens into commands. A fresh private log capture is attached to the exact current UserPersisto container to read only development email codes for newly generated `example.test` addresses. Browser requests are restricted to the selected origin; Google sign-in is never attempted.
+Credential input is a private, operator-owned `admin-storage-state.json` in `AUTHZ_CREDENTIAL_DIR`, captured after a normal Google or verified-email administrator sign-in. An absent or expired administrator session stops the suite; refresh that private storage state before retrying. Do not paste codes, cookies or tokens into commands. A fresh private log capture is attached to the exact current UserPersisto container to read only development email codes for newly generated `example.test` addresses. Browser requests are restricted to the selected origin; Google sign-in is never attempted.
 
 | Principal | Creation and independent verification | Expected access |
 | --- | --- | --- |
@@ -36,7 +36,7 @@ Credential input consists of private, operator-owned `accounts.json` (`adminPass
 | selfRegistered | New public email registration; verified code; Router token and persisted UserPersisto listing/profile agree | Own account; no workspace/admin access |
 | userA | Separate public registration, administrator grants `user`, fresh sign-in | Ordinary workspace access and own private resources |
 | userB | Separate public registration and grant; distinct persisted ID from userA | Same ordinary role, used for horizontal probes |
-| admin | Existing configured administrator session or recovery sign-in; current Router role verified | Administrative positive controls |
+| admin | Existing administrator session from normal passwordless sign-in; current Router role verified | Administrative positive controls |
 
 The historical member/selfRegistered storage state is never used: that account was promoted. No guest is accepted as a selfRegistered substitute. The first-account bootstrap rule is intended behavior; pre-setup, unverified, concurrent-claim, restart and later-account regressions live in Explorer's isolated UserPersisto tests, not in a reset of this deployed fixture.
 

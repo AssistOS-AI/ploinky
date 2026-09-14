@@ -45,8 +45,6 @@ async function eventually(read, predicate, label) {
 
 export async function setupPrincipals(ctx, config) {
     const { chromium } = await import(pathToFileURL(config.playwrightModule).href);
-    const secret = await privateJson(path.join(config.credentials, 'accounts.json'));
-    ctx.secrets.add(secret.adminPassword);
     const pin = await ctx.guard();
     const agentName = 'ploinky_AchillesIDE_userPersistoAgent_workspace_c52ddf65';
     const inner = JSON.parse(command('podman', ['exec', pin.boxId, 'podman', 'inspect', agentName]))[0];
@@ -75,7 +73,7 @@ export async function setupPrincipals(ctx, config) {
         contexts.push(context);
         return context;
     }
-    async function login(context, { email, administrator = false, fresh = false } = {}) {
+    async function login(context, { email, fresh = false } = {}) {
         await ctx.guard();
         const page = await context.newPage();
         page.setDefaultTimeout(45000);
@@ -83,35 +81,29 @@ export async function setupPrincipals(ctx, config) {
         const root = page.locator('#auth_content');
         await root.locator('input[name="email"]').waitFor();
         assert.equal(await root.getByText('The first completed sign-in becomes its administrator', { exact: false }).count(), 0, 'Bootstrap must remain claimed');
-        if (administrator) {
-            await root.getByRole('button', { name: 'Administrator sign-in', exact: true }).click();
-            await root.locator('input[name="password"]').fill(secret.adminPassword);
-            await root.getByRole('button', { name: 'Sign in', exact: true }).click();
-        } else {
-            const offset = (await fs.stat(logPath)).size;
-            await root.locator('input[name="email"]').fill(email);
-            await root.getByRole('button', { name: 'Next', exact: true }).click();
-            const create = root.getByRole('button', { name: 'Create account', exact: true });
-            const choose = root.getByRole('button', { name: 'Email me a code', exact: true });
-            const input = root.locator('input[name="code"]');
-            await create.or(choose).or(input).first().waitFor();
-            if (fresh) assert.equal(await create.isVisible(), true, 'Fresh principal must use real public registration');
-            if (await create.isVisible()) await create.click();
-            await choose.or(input).first().waitFor();
-            if (await choose.isVisible()) await choose.click();
-            await input.waitFor();
-            const code = await eventually(async () => {
-                const content = await fs.readFile(logPath, 'utf8');
-                const marker = `[userPersisto] DEVELOPMENT email code for ${email}: `;
-                return content.slice(offset).split('\n').reverse().map(line => {
-                    const index = line.indexOf(marker);
-                    return index < 0 ? '' : line.slice(index + marker.length).match(/^(\d{6})(?:\s|$)/)?.[1] || '';
-                }).find(Boolean);
-            }, Boolean, 'development email delivery for exact disposable account');
-            ctx.secrets.add(code);
-            await input.fill(code);
-            await root.getByRole('button', { name: 'Verify', exact: true }).click();
-        }
+        const offset = (await fs.stat(logPath)).size;
+        await root.locator('input[name="email"]').fill(email);
+        await root.getByRole('button', { name: 'Next', exact: true }).click();
+        const create = root.getByRole('button', { name: 'Create account', exact: true });
+        const choose = root.getByRole('button', { name: 'Email me a code', exact: true });
+        const input = root.locator('input[name="code"]');
+        await create.or(choose).or(input).first().waitFor();
+        if (fresh) assert.equal(await create.isVisible(), true, 'Fresh principal must use real public registration');
+        if (await create.isVisible()) await create.click();
+        await choose.or(input).first().waitFor();
+        if (await choose.isVisible()) await choose.click();
+        await input.waitFor();
+        const code = await eventually(async () => {
+            const content = await fs.readFile(logPath, 'utf8');
+            const marker = `[userPersisto] DEVELOPMENT email code for ${email}: `;
+            return content.slice(offset).split('\n').reverse().map(line => {
+                const index = line.indexOf(marker);
+                return index < 0 ? '' : line.slice(index + marker.length).match(/^(\d{6})(?:\s|$)/)?.[1] || '';
+            }).find(Boolean);
+        }, Boolean, 'development email delivery for exact disposable account');
+        ctx.secrets.add(code);
+        await input.fill(code);
+        await root.getByRole('button', { name: 'Verify', exact: true }).click();
         await page.waitForURL(url => url.origin === TARGET && (url.pathname.startsWith('/explorer/') || url.pathname === `${DASHBOARD}/` || url.pathname === '/'));
         const client = newClient(await context.cookies());
         const token = await client.request({ path: '/auth/token?agent=explorer' });
@@ -122,13 +114,10 @@ export async function setupPrincipals(ctx, config) {
 
     const initial = await privateJson(path.join(config.credentials, 'admin-storage-state.json'));
     const admin = newClient(initial.cookies);
-    let adminToken = await admin.request({ path: '/auth/token?agent=explorer' });
+    const adminToken = await admin.request({ path: '/auth/token?agent=explorer' });
     ctx.clients.admin = admin;
-    if (adminToken.status !== 200) {
-        const signed = await login(await browserContext(), { administrator: true });
-        ctx.clients.admin = signed.client;
-        adminToken = signed.token;
-    }
+    assert.equal(adminToken.status, 200,
+        'Administrator session is unavailable or expired. Sign in normally with Google or a verified email code and refresh the private admin-storage-state.json before running the suite.');
     ctx.principals.admin = assertPrincipal(adminToken.json, 'admin');
     const adminProfile = await ctx.request('admin', { path: `${DASHBOARD}/api/profile` });
     assert.equal(adminProfile.status, 200);
