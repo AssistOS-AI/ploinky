@@ -1,5 +1,18 @@
 # Dependencies for graph skill scope persistence
 
+AchillesAgentLib source selection and Box bundle verification use Node.js built-ins
+and add no third-party packages. The existing library is pinned in
+`ploinky-box/dependencies.lock.json` and bundled by the `container-image-builds`
+Box workflow, including its declared runtime dependencies and license files.
+The bundle contains the existing `ploinky-agent-lib` package (MIT, with its
+upstream LICENSE retained); its source URL and immutable revision are recorded
+in that lock. To update it, update the pin and rebuild the Box image. A valid
+workspace checkout remains the development override. Host Git and network
+access are no longer needed to acquire a fallback library; other repository
+operations retain their own Git requirements. Startup rejects absent, changed,
+or incompatible bundles before admitting the graph. Focused verification uses
+the existing Node test runner and fake container engine, without installations.
+
 The graph scope state implementation and its regression tests add no third-party dependencies. They use Node.js built-ins (`node:crypto`, `node:fs`, `node:path`, `node:os`, `node:test`, and `node:assert/strict`) and repository-owned modules. Node.js is a runtime prerequisite, not a bundled library; the focused tests were verified with Node.js 25.8.0 and the portable acceptance runner targets Node.js 22 or newer.
 
 Existing application dependencies and installation behavior remain declared in `package.json`. This change does not install packages, download tools, or alter those dependencies. Scope-state reads and writes run in the existing host supervisor and require its workspace mutation lock. A missing saved scope is handled as legacy state; malformed state produces an explicit error before graph mutation.

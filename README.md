@@ -323,10 +323,26 @@ entry directly from your checkout:
 node cli/index.js <args>
 ```
 
+Ploinky uses `<workspace>/achillesAgentLib` when that directory is present and
+valid. It mounts the source read-only for the Box and all consumers, and never
+pulls or rewrites the local checkout. An invalid local directory is an error.
+When the directory is absent, the Box uses its bundled AchillesAgentLib copy at
+`/opt/ploinky-agentlib`; the host does not clone a fallback repository. The bundle
+must match `ploinky-box/dependencies.lock.json` and pass content verification.
+An older image without a compatible bundle must be rebuilt or replaced, or a
+valid local checkout supplied. Direct host `ploinky-local` development requires
+a local checkout because the image bundle is available only inside the Box.
+
+Start, full restart, and update select the source again. Adding or removing a
+local checkout replaces the Box when the source changes. A targeted agent
+restart keeps the admitted source. Bundled library updates require a new Box
+image matching the required pin; general repository branch options do not
+change the bundled revision.
+
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
-- `update [folderPath]`: use the current directory as the update folder, or `folderPath` when supplied. A Ploinky checkout is pulled only when it is inside that folder or contains the launch folder. Ploinky being out of scope does not stop `node_modules/achillesAgentLib`, managed repositories, discovered project repositories, dependencies, or default skills from being refreshed.
+- `update [folderPath]`: use the current directory as the update folder, or `folderPath` when supplied. A Ploinky checkout is pulled only when it is inside that folder or contains the launch folder. Ploinky being out of scope does not stop managed repositories, discovered project repositories, dependencies, or default skills from being refreshed. AchillesAgentLib is revalidated from the local checkout or the pinned Box bundle; update never pulls a local library checkout or clones a host fallback.
 - `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the loopback physical-host selection and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.

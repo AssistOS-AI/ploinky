@@ -21,8 +21,11 @@ export const AGENTLIB_LOCAL_DIR_NAME = 'achillesAgentLib';
 /** Managed-source state root, relative to the workspace root. */
 export const AGENTLIB_MANAGED_RELATIVE_DIR = path.join('.ploinky', 'agentlib');
 
-/** Stable path the selected source is bind-mounted at in every mount namespace. */
+/** Stable path for the selected local mount or image-bundled source. */
 export const AGENTLIB_STABLE_MOUNT_PATH = '/opt/ploinky-agentlib';
+
+/** Immutable metadata outside both the source tree and the Ploinky bind mount. */
+export const AGENTLIB_IMAGE_METADATA_PATH = '/usr/local/share/ploinky/agentlib/runtime-contract.json';
 
 /**
  * The package-resolution adapter inside a prepared dependency cache. This is a
@@ -61,7 +64,8 @@ export const AGENTLIB_REQUIRED_ENTRYPOINTS = Object.freeze([
 /** Directory names excluded from the deterministic content fingerprint. */
 export const AGENTLIB_FINGERPRINT_EXCLUDED_DIRS = Object.freeze(['.git']);
 
-export const AGENTLIB_MODES = Object.freeze(['local', 'managed']);
+// Managed descriptors remain readable to identify and replace existing Boxes.
+export const AGENTLIB_MODES = Object.freeze(['local', 'image', 'managed']);
 
 export const AGENTLIB_ERROR_CODES = Object.freeze({
     sourceInvalid: 'PLOINKY_AGENTLIB_SOURCE_INVALID',
@@ -75,6 +79,9 @@ export const AGENTLIB_ERROR_CODES = Object.freeze({
     lockFailed: 'PLOINKY_AGENTLIB_LOCK_FAILED',
     unsupportedSetting: 'PLOINKY_AGENTLIB_UNSUPPORTED_SETTING',
     reservedDependency: 'PLOINKY_AGENTLIB_RESERVED_DEPENDENCY',
+    imageRequired: 'PLOINKY_AGENTLIB_IMAGE_REQUIRED',
+    imageInvalid: 'PLOINKY_AGENTLIB_IMAGE_INVALID',
+    imagePinMismatch: 'PLOINKY_AGENTLIB_IMAGE_PIN_MISMATCH',
 });
 
 export class AgentLibError extends Error {
@@ -153,6 +160,30 @@ function assertOptionalString(value, field) {
     return value;
 }
 
+/** Validate immutable build evidence before selecting or executing image bytes. */
+export function validateImageBundleMetadata(value, { expectedCommit = null } = {}) {
+    if (!value || value.schemaVersion !== 1 || !/^[0-9a-f]{40}$/.test(value.commit || '')
+        || !/^[0-9a-f]{64}$/.test(value.fingerprint || '')) {
+        throw agentLibError(AGENTLIB_ERROR_CODES.imageInvalid,
+            'The Box image has missing or invalid achillesAgentLib bundle metadata; rebuild the Box image.');
+    }
+    if (expectedCommit && value.commit !== expectedCommit) {
+        throw agentLibError(AGENTLIB_ERROR_CODES.imagePinMismatch,
+            `The Box image bundles achillesAgentLib ${value.commit}, but Ploinky requires ${expectedCommit}. `
+            + 'Rebuild or select a Box image with the required pinned revision.');
+    }
+    return { schemaVersion: 1, commit: value.commit, fingerprint: value.fingerprint };
+}
+
+/** Image identity survives container recreation and never depends on overlay inodes. */
+export function imageSourceId(imageId, fingerprint) {
+    if (!/^sha256:[0-9a-f]{64}$/.test(String(imageId || '')) || !/^[0-9a-f]{64}$/.test(String(fingerprint || ''))) {
+        throw agentLibError(AGENTLIB_ERROR_CODES.imageInvalid,
+            'An image AgentLib source requires an immutable sha256 image ID and content fingerprint.');
+    }
+    return { device: `image:${imageId}`, inode: fingerprint };
+}
+
 /**
  * Validate an `AgentLibSelection` / persisted `active.json` shape.
  *
@@ -211,6 +242,15 @@ export function validateSelectionDescriptor(value) {
             'A managed AgentLib selection requires remoteUrl.',
         );
     }
+    if (value.mode === 'image') {
+        const expectedId = imageSourceId(value.imageId, fingerprint);
+        if (sourceRelativePath !== 'image' || !resolvedCommit || value.dirty === true
+            || value.remoteUrl || value.requestedRef
+            || String(sourceId.device) !== expectedId.device || String(sourceId.inode) !== expectedId.inode) {
+            throw agentLibError(AGENTLIB_ERROR_CODES.descriptorInvalid,
+                'An image AgentLib selection must identify the immutable bundled source and its pinned commit.');
+        }
+    }
     return {
         schemaVersion: AGENTLIB_SELECTION_SCHEMA_VERSION,
         workspacePathHash: assertString(value.workspacePathHash, 'workspacePathHash'),
@@ -223,6 +263,7 @@ export function validateSelectionDescriptor(value) {
         dirty: value.dirty === true,
         contentFingerprint: fingerprint,
         selectedAt: assertString(value.selectedAt, 'selectedAt'),
+        ...(value.mode === 'image' ? { imageId: value.imageId } : {}),
     };
 }
 
@@ -275,8 +316,8 @@ export function assertNoRemovedAgentLibSettings(env = process.env) {
             throw agentLibError(
                 AGENTLIB_ERROR_CODES.unsupportedSetting,
                 `${name} is no longer supported. achillesAgentLib is selected from `
-                + `<workspace>/${AGENTLIB_LOCAL_DIR_NAME} or a managed workspace generation; `
-                + `unset ${name} and use --branch to select a managed branch.`,
+                + `<workspace>/${AGENTLIB_LOCAL_DIR_NAME} or the pinned Box image bundle; `
+                + `unset ${name} and use a local checkout for a different AgentLib revision.`,
             );
         }
     }

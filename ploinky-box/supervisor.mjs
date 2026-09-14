@@ -19,7 +19,7 @@ import {
     sourceIdEquals,
     sourceIdHash,
 } from '../agentlib/fingerprint.mjs';
-import { canonicalWorkspaceRoot, managedRootPath, writeActiveDescriptor } from '../agentlib/source.mjs';
+import { canonicalWorkspaceRoot, localCandidateExists, localCandidatePath, managedRootPath, writeActiveDescriptor } from '../agentlib/source.mjs';
 import fsPromisesFree from 'node:fs';
 import {
     agentLibBoxEnv,
@@ -34,6 +34,7 @@ import {
     stageWorkspaceEdgeDesired,
 } from './edgeDesired.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import { loadBoxAgentLibImage, revalidateContainerAgentLib } from './image-agentlib.mjs';
 import {
     HOST_REACHABLE_IPV4_ENV,
     detectHostReachableIpv4,
@@ -149,7 +150,14 @@ function removeManagedAgentLibState(workspaceRoot, fsApi = fsPromisesFree) {
  * startup is detectable only here. It is a hard failure: declaring readiness
  * would claim one fingerprint for a graph that loaded another.
  */
-function defaultRevalidateAgentLibSource(selection) {
+function defaultRevalidateAgentLibSource(selection, context) {
+    if (selection.mode === 'image') {
+        if (localCandidateExists(localCandidatePath(selection.workspaceRoot))) {
+            throw agentLibError(AGENTLIB_ERROR_CODES.sourceChanged,
+                'A local AchillesAgentLib source appeared during startup; run the command again.');
+        }
+        return revalidateContainerAgentLib(selection, context);
+    }
     const { fingerprint, sourceId } = fingerprintSource(selection.sourceDir);
     if (!sourceIdEquals(sourceId, selection.sourceId)) {
         throw agentLibError(
@@ -174,7 +182,8 @@ function defaultRevalidateAgentLibSource(selection) {
  * was admitted with. Targeted restarts deliberately do not select or advance
  * source: the replacement agent must load the same mounted bytes as its peers.
  */
-function revalidateMountedAgentLibSource(selection) {
+function revalidateMountedAgentLibSource(selection, context) {
+    if (selection.mode === 'image') return revalidateContainerAgentLib(selection, context);
     const { fingerprint, sourceId } = fingerprintSource(selection.sourceDir);
     if (sourceIdHash(sourceId) !== selection.sourceIdHash) {
         throw agentLibError(
@@ -213,6 +222,7 @@ export function createBoxSupervisor({
     stageEdgeDesired = stageWorkspaceEdgeDesired,
     healthCheck = checkBoxHealth,
     selectAgentLib = selectWorkspaceAgentLibSource,
+    loadAgentLibImage = loadBoxAgentLibImage,
     updateAgentLib = updateWorkspaceAgentLibSource,
     updateWorkspacePloinky = updateWorkspacePloinkySource,
     commitAgentLibSelection = writeActiveDescriptor,
@@ -227,6 +237,10 @@ export function createBoxSupervisor({
 } = {}) {
     function inspect(identity) {
         return discover(identity, runner, platform, env);
+    }
+
+    function imageBundleLoader(ownership, imageRef = resolveBoxImageReference(env)) {
+        return () => loadAgentLibImage({ engine: ownership.engine, imageRef, runner, stdout, stderr });
     }
 
     async function lockedMutation(execute, authorize = assertMutableOwnership) {
@@ -252,6 +266,7 @@ export function createBoxSupervisor({
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy,
+                loadImageBundle: imageBundleLoader(ownership, imageRef),
             });
             const prepared = await reconcile({
                 identity,
@@ -318,11 +333,9 @@ export function createBoxSupervisor({
                 }
                 const skillScopeEnv = validateGraphSkillScope(identity, restoreSkillScopeEnv);
                 const prior = outerRollback.agentLib;
-                const observed = fingerprintSource(prior.sourceDir);
-                if (observed.fingerprint !== prior.fingerprint
-                    || sourceIdHash(observed.sourceId) !== prior.sourceIdHash) {
-                    throw new Error('the prior achillesAgentLib source changed during rollback');
-                }
+                revalidateMountedAgentLibSource(prior, {
+                    engine: ownership.engine, containerId: outerRollback.containerId, runner,
+                });
                 const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
                 await runCoreCommand(
                     ownership.engine,
@@ -363,7 +376,11 @@ export function createBoxSupervisor({
         priorSkillScopeEnv = null,
     }) {
         if (requireHealth) await healthCheck(prepared.hostPort);
-        revalidateAgentLibSource(selection);
+        revalidateAgentLibSource(selection, {
+            engine: prepared.ownership.engine,
+            containerId: prepared.ownership.handles.container.id,
+            runner,
+        });
         commitAgentLibSelection(identity.workspaceRoot, selection);
         if (skillScopeEnv) writeGraphSkillScope(identity, skillScopeEnv, lock);
         try {
@@ -382,6 +399,7 @@ export function createBoxSupervisor({
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
+                loadImageBundle: imageBundleLoader(ownership, options.imageRef || resolveBoxImageReference(env)),
             });
             const prepared = await reconcile({
                 identity,
@@ -461,6 +479,7 @@ export function createBoxSupervisor({
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
+                loadImageBundle: imageBundleLoader(ownership, options.imageRef || resolveBoxImageReference(env)),
             });
             const prepared = await reconcile({
                 identity,
@@ -549,7 +568,7 @@ export function createBoxSupervisor({
             // Reconstruct the generation from those observed mounts and labels
             // so this path can neither pull nor replace the outer Box.
             const selection = agentLibContractFromContainer(container);
-            revalidateMountedAgentLibSource(selection);
+            revalidateMountedAgentLibSource(selection, { engine, containerId: container.id, runner });
             const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
             const mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
             const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
@@ -577,7 +596,7 @@ export function createBoxSupervisor({
                 );
             }
             await healthCheck(hostPort);
-            revalidateMountedAgentLibSource(selection);
+            revalidateMountedAgentLibSource(selection, { engine, containerId: container.id, runner });
             return Object.freeze({
                 identity,
                 action: 'targeted-restart',
@@ -606,6 +625,7 @@ export function createBoxSupervisor({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
                 insideBox: false,
+                loadImageBundle: imageBundleLoader(ownership, options.imageRef || resolveBoxImageReference(env)),
             });
             const prepared = await reconcile({
                 identity,

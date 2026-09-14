@@ -265,6 +265,9 @@ export function validateContainerConfiguration(containerHandle, {
         );
     }
     const agentLibContract = normalizeBoxAgentLib(agentLib);
+    if (agentLibContract.mode === 'image' && agentLibContract.imageId !== imageId) {
+        throw publicationError('Owned Box does not match the selected AgentLib bundle image');
+    }
     expectedLabels[BOX_AGENTLIB_LABELS.mode] = agentLibContract.mode;
     expectedLabels[BOX_AGENTLIB_LABELS.sourceIdHash] = agentLibContract.sourceIdHash;
     expectedLabels[BOX_AGENTLIB_LABELS.fingerprint] = agentLibContract.fingerprint;
@@ -355,9 +358,9 @@ export function validateContainerConfiguration(containerHandle, {
             `Owned Box tmpfs set is incompatible${INCOMPATIBLE_BOX_GUIDANCE}`,
         );
     }
-    // Durable state is exactly six host binds: the four workspace binds plus the
-    // stable read-only achillesAgentLib source and the read-only shadow over its
-    // writable /workspace alias. Podman currently reports the /tmp tmpfs through
+    // Local AgentLib sources add two read-only binds to the four workspace
+    // binds. Image bundles require neither source nor alias binds.
+    // Podman currently reports the /tmp tmpfs through
     // HostConfig.Tmpfs and may additionally expose the same mount in Mounts; no
     // named, anonymous, or unrelated mount is accepted.
     const expectedMounts = {

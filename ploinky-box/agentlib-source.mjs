@@ -9,17 +9,15 @@
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
-import { AGENTLIB_ERROR_CODES, AGENTLIB_LOCAL_DIR_NAME, agentLibError } from '../agentlib/contract.mjs';
+import { AGENTLIB_ERROR_CODES, AGENTLIB_LOCAL_DIR_NAME, agentLibError, canonicalAgentLibRemote } from '../agentlib/contract.mjs';
 import { isInsideBoxRuntime } from '../agentlib/bootstrap.mjs';
 import { fingerprintSource } from '../agentlib/fingerprint.mjs';
-import { createGitRunner, selectManagedSource } from '../agentlib/materialize.mjs';
 import {
+    buildImageSelection,
     planSourceSelection,
     readActiveDescriptor,
-    resolveDescriptorSource,
     selectAgentLibSource,
     validateAgentLibSource,
-    withAgentLibSourceLock,
 } from '../agentlib/source.mjs';
 
 /**
@@ -47,68 +45,52 @@ export function readLocalGitState(sourceDir, { spawn = spawnSync } = {}) {
 }
 
 /**
- * Select the one achillesAgentLib source for a workspace.
- *
- * A present local checkout always wins and is never mutated. Only its absence
- * reaches the managed path, and a present-but-invalid checkout is a hard error
- * rather than a silent GitHub fallback.
- *
- * @param {object} params
- * @param {string} params.workspaceRoot
- * @param {{branch: string|null, fallback: 'default'|'fail'}|null} [params.branchPolicy]
- * @param {boolean} [params.readOnly] - reuse only; never clone, fetch, or create state
- * @returns {Promise<{ selection: object, mode: 'local'|'managed' }>}
+ * Prefer the exact local checkout, otherwise use the verified image bundle.
+ * Neither path clones, fetches, creates source state, or changes a checkout.
+ * Global branch policy applies to local sources; image bytes always follow the
+ * canonical pinned commit. A local validation failure never probes the image.
  */
 export async function selectWorkspaceAgentLibSource({
     workspaceRoot,
     branchPolicy = null,
-    readOnly = false,
+    imageBundle = null,
+    loadImageBundle = null,
     remote = null,
+    expectedCommit = null,
     fsApi = fs,
-    runner = createGitRunner(),
     gitState = readLocalGitState,
     now,
 }) {
-    const local = selectAgentLibSource({
+    const selectLocal = () => selectAgentLibSource({
         workspaceRoot,
         fsApi,
         branchPolicy,
         readGitState: gitState,
         ...(now ? { now } : {}),
     });
-    if (!local.requiresMaterialization) {
-        return { selection: local.selection, mode: 'local' };
+    const local = selectLocal();
+    if (local.selection) return { selection: local.selection, mode: 'local' };
+    const bundle = imageBundle || (loadImageBundle ? await loadImageBundle() : null);
+    // An image inspection may take time. Recheck developer intent before
+    // accepting its result if a local checkout appeared during the probe.
+    if (loadImageBundle && !imageBundle) {
+        const current = selectLocal();
+        if (current.selection) return { selection: current.selection, mode: 'local' };
     }
-    if (readOnly) {
-        // Read-only commands may reuse an already-materialized generation but
-        // must never create one, so an unmaterialized workspace is reported
-        // rather than silently populated.
-        const activeDescriptor = readActiveDescriptor(workspaceRoot, fsApi);
-        if (!activeDescriptor) {
-            throw agentLibError(
-                AGENTLIB_ERROR_CODES.sourceMissing,
-                'No achillesAgentLib source is available for this workspace yet. '
-                + 'Add <workspace>/achillesAgentLib, or run `ploinky start` to materialize a managed source.',
-            );
-        }
-        const { sourceDir } = resolveDescriptorSource(activeDescriptor, workspaceRoot, { fsApi });
-        return { selection: { ...activeDescriptor, sourceDir }, mode: activeDescriptor.mode };
+    if (!bundle) {
+        throw agentLibError(AGENTLIB_ERROR_CODES.imageRequired,
+            'No local achillesAgentLib checkout exists. Start this workspace with \u0060ploinky start\u0060 '
+            + 'to use the pinned Box image bundle, or add <workspace>/achillesAgentLib for ploinky-local. '
+            + 'Host-managed Git fallback is no longer supported.');
     }
-    // Only a managed source needs the writer lock; a local checkout is selected
-    // without creating any workspace state at all.
-    return withAgentLibSourceLock(workspaceRoot, () => {
-        const activeDescriptor = readActiveDescriptor(workspaceRoot, fsApi);
-        const { selection } = selectManagedSource({
-            workspaceRoot,
-            activeDescriptor,
-            branchPolicy,
-            remote,
-            runner,
-            fsApi,
-            ...(now ? { now } : {}),
-        });
-        return { selection, mode: 'managed' };
-    }, { fsApi });
+    const selection = buildImageSelection({
+        workspaceRoot,
+        imageBundle: bundle,
+        expectedCommit: expectedCommit || remote?.commit || canonicalAgentLibRemote({ fsApi }).commit,
+        fsApi,
+        ...(now ? { now } : {}),
+    });
+    return { selection, mode: 'image' };
 }
 
 /**
@@ -127,80 +109,33 @@ export function assertNotInBoxSourceOwner(insideBox) {
     }
 }
 
-/**
- * The one `ploinky update` behavior for the achillesAgentLib source.
- *
- * A local checkout is never pulled, reset, or checked out — it belongs to the
- * developer. It is revalidated and reported; if its bytes changed, the new
- * fingerprint becomes the selection and consumers must restart coherently.
- *
- * A managed source advances only through a new immutable generation: an explicit
- * branch is fetched and resolved to one exact commit, and an unpinned managed
- * source follows the canonical lock commit, which moves only when Ploinky itself
- * is updated.
- *
- * @param {object} params
- * @param {string} params.workspaceRoot
- * @param {{branch: string|null, fallback: 'default'|'fail'}|null} [params.branchPolicy]
- * @returns {Promise<{mode: 'local'|'managed', selection: object, changed: boolean, previous: object|null}>}
- */
+/** Revalidate local bytes or select the current pinned image without host Git. */
 export async function updateWorkspaceAgentLibSource({
     workspaceRoot,
     branchPolicy = null,
+    imageBundle = null,
+    loadImageBundle = null,
     remote = null,
+    expectedCommit = null,
     fsApi = fs,
-    runner = createGitRunner(),
     gitState = readLocalGitState,
     insideBox = isInsideBoxRuntime({ fsApi }),
     now,
 }) {
-    // Defense in depth: callers are expected to check first, but a future
-    // unguarded caller must not be able to reopen in-Box source mutation.
     assertNotInBoxSourceOwner(insideBox);
     const previous = readActiveDescriptor(workspaceRoot, fsApi);
-    const local = selectAgentLibSource({
-        workspaceRoot,
-        fsApi,
-        branchPolicy,
-        readGitState: gitState,
-        ...(now ? { now } : {}),
+    const { selection, mode } = await selectWorkspaceAgentLibSource({
+        workspaceRoot, branchPolicy, imageBundle, loadImageBundle, remote, expectedCommit, fsApi, gitState, now,
     });
-    if (!local.requiresMaterialization) {
-        const selection = local.selection;
-        return {
-            mode: 'local',
-            selection,
-            changed: previous?.contentFingerprint !== selection.contentFingerprint,
-            previous,
-        };
-    }
-    return withAgentLibSourceLock(workspaceRoot, () => {
-        // An update is allowed to resolve a moving branch, so the previous
-        // descriptor is not used to pin the commit here; a new generation is
-        // staged and the old one is retained for rollback.
-        const effectiveBranchPolicy = branchPolicy?.branch
-            ? branchPolicy
-            : previous?.requestedRef
-                ? { branch: previous.requestedRef, fallback: 'fail' }
-                : null;
-        const { selection } = selectManagedSource({
-            workspaceRoot,
-            // Update is the operation that advances a moving source. Never
-            // feed the active descriptor back into ordinary-start pinning.
-            activeDescriptor: null,
-            branchPolicy: effectiveBranchPolicy,
-            remote,
-            runner,
-            fsApi,
-            ...(now ? { now } : {}),
-        });
-        return {
-            mode: 'managed',
-            selection,
-            changed: previous?.contentFingerprint !== selection.contentFingerprint,
-            previous,
-        };
-    }, { fsApi });
+    return {
+        mode,
+        selection,
+        changed: previous?.contentFingerprint !== selection.contentFingerprint
+            || previous?.mode !== selection.mode || previous?.imageId !== selection.imageId
+            || previous?.sourceId.device !== selection.sourceId.device
+            || previous?.sourceId.inode !== selection.sourceId.inode,
+        previous,
+    };
 }
 
 /**
@@ -225,13 +160,16 @@ export function inspectWorkspaceAgentLibSource({
         detail = error.message;
     }
     if (!plan.present) {
+        const missingLocal = active?.mode === 'local';
         return {
-            mode: active?.mode || 'managed',
-            sourceRelativePath: active?.sourceRelativePath || null,
+            mode: missingLocal ? 'image' : active?.mode || 'image',
+            sourceRelativePath: missingLocal ? null : active?.sourceRelativePath || null,
             active,
-            drifted: false,
-            present: Boolean(active),
-            detail: detail || (active ? '' : 'no achillesAgentLib source has been selected yet'),
+            drifted: missingLocal,
+            present: Boolean(active) && !missingLocal,
+            detail: detail || (missingLocal
+                ? 'The selected local achillesAgentLib checkout is missing; the next lifecycle command requires the pinned Box image bundle.'
+                : active ? '' : 'no achillesAgentLib source has been selected yet'),
         };
     }
     try {

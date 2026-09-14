@@ -86,11 +86,12 @@ test('local candidate wins without invoking any Git or network seam', () => {
     assert.deepEqual(gitCalls, ['git']);
 });
 
-test('absent local candidate reports that materialization is required', () => {
+test('absent local candidate requires the image bundle without host materialization', () => {
     const workspace = makeWorkspace();
     const result = source.selectAgentLibSource({ workspaceRoot: workspace });
-    assert.equal(result.requiresMaterialization, true);
-    assert.equal(result.mode, 'managed');
+    assert.equal(result.requiresMaterialization, false);
+    assert.equal(result.requiresImageBundle, true);
+    assert.equal(result.mode, 'image');
     assert.equal(result.selection, null);
 });
 
@@ -104,7 +105,7 @@ test('only the exact workspace-root spelling is a candidate', () => {
     const plan = source.planSourceSelection(workspace);
     assert.equal(plan.candidate, path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME));
     assert.equal(plan.present, false);
-    assert.equal(plan.mode, 'managed');
+    assert.equal(plan.mode, 'image');
 });
 
 test('workspace root resolution stops at the nearest .ploinky ancestor', () => {

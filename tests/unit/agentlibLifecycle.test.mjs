@@ -40,52 +40,8 @@ test.after(() => {
 });
 
 const LOCK_COMMIT = 'a'.repeat(40);
-const BRANCH_COMMIT = 'b'.repeat(40);
-const ADVANCED_BRANCH_COMMIT = 'c'.repeat(40);
 const REMOTE = { url: 'https://example.invalid/AchillesAgentLib.git', commit: LOCK_COMMIT };
-
-function stubGit(calls, { refs = { 'feature-x': BRANCH_COMMIT } } = {}) {
-    const known = new Set();
-    return {
-        run(args, { cwd } = {}) {
-            calls.push(args.join(' '));
-            const [command] = args;
-            if (command === 'ls-remote') {
-                const commit = refs[args[2]];
-                return { status: 0, stdout: commit ? `${commit}\trefs/heads/${args[2]}\n` : '', stderr: '' };
-            }
-            if (command === 'clone' && args.includes('--mirror')) {
-                fs.mkdirSync(args.at(-1), { recursive: true });
-                fs.writeFileSync(path.join(args.at(-1), 'HEAD'), 'ref: refs/heads/main\n');
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            if (command === 'config') return { status: 0, stdout: `${REMOTE.url}\n`, stderr: '' };
-            if (command === 'cat-file') {
-                return { status: known.has(String(args[2]).replace('^{commit}', '')) ? 0 : 1, stdout: '', stderr: '' };
-            }
-            if (command === 'fetch') {
-                known.add(LOCK_COMMIT);
-                known.add(BRANCH_COMMIT);
-                for (const commit of Object.values(refs)) known.add(commit);
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            if (command === 'clone') {
-                fs.mkdirSync(args.at(-1), { recursive: true });
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            if (command === 'checkout') {
-                writeAgentLibCheckout(cwd);
-                fs.writeFileSync(path.join(cwd, 'GENERATION'), args.at(-1));
-                return { status: 0, stdout: '', stderr: '' };
-            }
-            if (command === 'rev-parse') {
-                return { status: 0, stdout: `${path.basename(cwd).slice(0, 40)}\n`, stderr: '' };
-            }
-            if (command === 'status') return { status: 0, stdout: '', stderr: '' };
-            return { status: 0, stdout: '', stderr: '' };
-        },
-    };
-}
+const IMAGE_BUNDLE = { commit: LOCK_COMMIT, fingerprint: 'b'.repeat(64), imageId: 'sha256:' + 'c'.repeat(64) };
 
 // --- update ----------------------------------------------------------------
 
@@ -117,70 +73,44 @@ test('update never pulls, resets, or checks out a local checkout', async () => {
     assert.equal(second.selection.dirty, true);
 });
 
-test('a managed update stages a new generation and keeps the old one for rollback', async () => {
+test('an image update changes provenance without committing active state before readiness', async () => {
     const workspace = makeWorkspace({ withCheckout: false });
     const base = await boxSource.updateWorkspaceAgentLibSource({
-        workspaceRoot: workspace,
-        insideBox: false,
-        runner: stubGit([]),
-        remote: REMOTE,
+        workspaceRoot: workspace, insideBox: false, imageBundle: IMAGE_BUNDLE, remote: REMOTE,
     });
     source.writeActiveDescriptor(workspace, base.selection);
-
     const updated = await boxSource.updateWorkspaceAgentLibSource({
-        workspaceRoot: workspace,
-        insideBox: false,
-        branchPolicy: { branch: 'feature-x', fallback: 'fail' },
-        runner: stubGit([]),
-        remote: REMOTE,
+        workspaceRoot: workspace, insideBox: false,
+        imageBundle: { ...IMAGE_BUNDLE, imageId: 'sha256:' + 'd'.repeat(64) }, remote: REMOTE,
     });
     assert.equal(updated.changed, true);
-    assert.equal(updated.selection.resolvedCommit, BRANCH_COMMIT);
-    // The previously active generation is still on disk and still valid.
-    const previousDir = path.join(workspace, base.selection.sourceRelativePath);
-    assert.doesNotThrow(() => source.validateAgentLibSource(previousDir));
-    // `active.json` still names the old generation: only a ready graph commits.
-    assert.equal(source.readActiveDescriptor(workspace).contentFingerprint, base.selection.contentFingerprint);
+    assert.equal(updated.selection.resolvedCommit, LOCK_COMMIT);
+    assert.equal(source.readActiveDescriptor(workspace).imageId, base.selection.imageId);
+    assert.equal(fs.existsSync(source.managedGenerationsDir(workspace)), false);
+    assert.equal(fs.existsSync(source.managedMirrorPath(workspace)), false);
 });
 
-test('an ordinary managed update follows the lock commit without a branch lookup', async () => {
+test('an image update follows the lock commit and ignores the global branch without Git', async () => {
     const workspace = makeWorkspace({ withCheckout: false });
-    const calls = [];
     const result = await boxSource.updateWorkspaceAgentLibSource({
-        workspaceRoot: workspace,
-        insideBox: false,
-        runner: stubGit(calls),
-        remote: REMOTE,
+        workspaceRoot: workspace, insideBox: false,
+        branchPolicy: { branch: 'feature-x', fallback: 'fail' },
+        runner: { run() { throw new Error('must not invoke host Git'); } },
+        imageBundle: IMAGE_BUNDLE, remote: REMOTE,
     });
     assert.equal(result.selection.resolvedCommit, LOCK_COMMIT);
-    assert.equal(calls.some((call) => call.startsWith('ls-remote')), false);
+    assert.equal(result.selection.requestedRef, null);
+    assert.equal(fs.existsSync(source.managedRootPath(workspace)), false);
 });
 
-test('a managed update without a new flag advances the previously requested branch', async () => {
+test('an unchanged image update keeps its source identity across selection timestamps', async () => {
     const workspace = makeWorkspace({ withCheckout: false });
-    const refs = { 'feature-x': BRANCH_COMMIT };
-    const calls = [];
-    const runner = stubGit(calls, { refs });
-    const first = await boxSource.updateWorkspaceAgentLibSource({
-        workspaceRoot: workspace,
-        insideBox: false,
-        branchPolicy: { branch: 'feature-x', fallback: 'fail' },
-        runner,
-        remote: REMOTE,
-    });
+    const params = { workspaceRoot: workspace, insideBox: false, imageBundle: IMAGE_BUNDLE, remote: REMOTE };
+    const first = await boxSource.updateWorkspaceAgentLibSource({ ...params, now: () => 'first' });
     source.writeActiveDescriptor(workspace, first.selection);
-    refs['feature-x'] = ADVANCED_BRANCH_COMMIT;
-
-    const updated = await boxSource.updateWorkspaceAgentLibSource({
-        workspaceRoot: workspace,
-        insideBox: false,
-        runner,
-        remote: REMOTE,
-    });
-    assert.equal(updated.selection.requestedRef, 'feature-x');
-    assert.equal(updated.selection.resolvedCommit, ADVANCED_BRANCH_COMMIT);
-    assert.equal(updated.changed, true);
-    assert.ok(calls.includes(`ls-remote ${REMOTE.url} feature-x`));
+    const updated = await boxSource.updateWorkspaceAgentLibSource({ ...params, now: () => 'second' });
+    assert.equal(updated.changed, false);
+    assert.deepEqual(updated.selection.sourceId, first.selection.sourceId);
 });
 
 // --- status ----------------------------------------------------------------
@@ -222,16 +152,22 @@ test('a local source that disappears switches provenance on the next lifecycle c
     const workspace = makeWorkspace();
     const local = source.selectAgentLibSource({ workspaceRoot: workspace });
     assert.equal(local.mode, 'local');
+    source.writeActiveDescriptor(workspace, local.selection);
 
     fs.rmSync(path.join(workspace, contract.AGENTLIB_LOCAL_DIR_NAME), { recursive: true, force: true });
-    const managed = await boxSource.updateWorkspaceAgentLibSource({
+    const missing = boxSource.inspectWorkspaceAgentLibSource({ workspaceRoot: workspace });
+    assert.equal(missing.drifted, true);
+    assert.equal(missing.present, false);
+    assert.equal(missing.mode, 'image');
+    assert.match(missing.detail, /selected local achillesAgentLib checkout is missing/);
+    const bundled = await boxSource.updateWorkspaceAgentLibSource({
         workspaceRoot: workspace,
         insideBox: false,
-        runner: stubGit([]),
+        imageBundle: IMAGE_BUNDLE,
         remote: REMOTE,
     });
-    assert.equal(managed.mode, 'managed');
-    assert.equal(managed.selection.resolvedCommit, LOCK_COMMIT);
+    assert.equal(bundled.mode, 'image');
+    assert.equal(bundled.selection.resolvedCommit, LOCK_COMMIT);
 });
 
 // --- retired paths ---------------------------------------------------------

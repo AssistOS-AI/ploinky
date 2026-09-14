@@ -1,8 +1,7 @@
 // Pure achillesAgentLib source selection and validation.
 //
 // Importing this module never clones, fetches, or creates workspace state.
-// Materialization of a managed source is an explicit, separate call in
-// `materialize.mjs`.
+// An absent local checkout requires the pinned Box image bundle.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -15,7 +14,10 @@ import {
     AGENTLIB_PACKAGE_NAME,
     AGENTLIB_REQUIRED_ENTRYPOINTS,
     AGENTLIB_SELECTION_SCHEMA_VERSION,
+    AGENTLIB_STABLE_MOUNT_PATH,
     agentLibError,
+    imageSourceId,
+    validateImageBundleMetadata,
     validateSelectionDescriptor,
 } from './contract.mjs';
 import { fingerprintSource, sha256Hex, sourceIdEquals, sourceIdOf } from './fingerprint.mjs';
@@ -119,8 +121,7 @@ export function generationDirName(commit, fingerprint) {
 }
 
 /**
- * True when `candidate` exists at all. Distinguishes "absent, so materialize a
- * managed source" from "present but broken, so fail closed".
+ * True when `candidate` exists at all. A present but broken source fails closed.
  */
 export function localCandidateExists(candidate, fsApi = fs) {
     try {
@@ -315,6 +316,28 @@ export function buildSelection({
     return { ...descriptor, sourceDir: canonicalSource, workspaceRoot: root };
 }
 
+/** Select verified immutable image bytes without resolving a host filesystem path. */
+export function buildImageSelection({ workspaceRoot, imageBundle, expectedCommit = null, fsApi = fs,
+    now = () => new Date().toISOString() }) {
+    const bundle = validateImageBundleMetadata({ schemaVersion: 1, ...imageBundle }, { expectedCommit });
+    const root = canonicalWorkspaceRoot(workspaceRoot, fsApi);
+    const descriptor = validateSelectionDescriptor({
+        schemaVersion: AGENTLIB_SELECTION_SCHEMA_VERSION,
+        workspacePathHash: workspacePathHash(root, fsApi),
+        mode: 'image',
+        sourceRelativePath: 'image',
+        sourceId: imageSourceId(imageBundle.imageId, bundle.fingerprint),
+        imageId: imageBundle.imageId,
+        remoteUrl: null,
+        requestedRef: null,
+        resolvedCommit: bundle.commit,
+        dirty: false,
+        contentFingerprint: bundle.fingerprint,
+        selectedAt: now(),
+    });
+    return { ...descriptor, sourceDir: AGENTLIB_STABLE_MOUNT_PATH, workspaceRoot: root };
+}
+
 /**
  * Re-derive and revalidate the absolute source directory for a descriptor.
  *
@@ -334,6 +357,11 @@ export function resolveDescriptorSource(descriptor, workspaceRoot, { fsApi = fs,
             AGENTLIB_ERROR_CODES.descriptorInvalid,
             'AgentLib selection belongs to a different workspace; refusing to adopt it.',
         );
+    }
+    if (normalized.mode === 'image') {
+        // The supervisor verifies this source inside the exact immutable image
+        // before use; the runtime path must never be inspected on the host.
+        return { sourceDir: AGENTLIB_STABLE_MOUNT_PATH, sourceId: normalized.sourceId, descriptor: normalized };
     }
     const candidate = path.join(root, ...normalized.sourceRelativePath.split('/'));
     const { sourceDir, sourceId } = validateAgentLibSource(candidate, { fsApi, deepSymlinkScan: false });
@@ -415,12 +443,12 @@ export function readTransactionDescriptor(workspaceRoot, fsApi = fs) {
 /**
  * Inspect the workspace without any network or mutation.
  *
- * @returns {{ mode: 'local'|'managed', candidate: string, present: boolean }}
+ * @returns {{ mode: 'local'|'image', candidate: string, present: boolean }}
  */
 export function planSourceSelection(workspaceRoot, { fsApi = fs } = {}) {
     const candidate = localCandidatePath(workspaceRoot, fsApi);
     const present = localCandidateExists(candidate, fsApi);
-    return { mode: present ? 'local' : 'managed', candidate, present };
+    return { mode: present ? 'local' : 'image', candidate, present };
 }
 
 /**
@@ -447,18 +475,17 @@ export function assertLocalBranchPolicy(sourceDir, gitState, branchPolicy) {
             `The local achillesAgentLib checkout at ${sourceDir} is on `
             + `${actual ? `branch '${actual}'` : 'a detached or unknown revision'}, not the requested `
             + `branch '${requested}'. Ploinky never modifies a local checkout; check it out yourself `
-            + 'or remove it to use a managed source (--branch-fallback fail).',
+            + 'before retrying (--branch-fallback fail).',
         );
     }
     return { matched: false, requested, actual };
 }
 
 /**
- * Select a local source, or report that materialization is required.
+ * Select a local source, or report that an image bundle is required.
  *
  * This call is pure with respect to the network and to workspace state. When it
- * returns `{ requiresMaterialization: true }` the caller must invoke
- * `materialize.mjs` explicitly under the source lock.
+ * returns `{ requiresImageBundle: true }` the host must verify the Box image.
  *
  * @param {object} params
  * @param {string} params.workspaceRoot
@@ -477,7 +504,8 @@ export function selectAgentLibSource({
     const root = canonicalWorkspaceRoot(workspaceRoot, fsApi);
     const plan = planSourceSelection(root, { fsApi });
     if (!plan.present) {
-        return { requiresMaterialization: true, mode: 'managed', candidate: plan.candidate, selection: null };
+        return { requiresMaterialization: false, requiresImageBundle: true,
+            mode: 'image', candidate: plan.candidate, selection: null };
     }
     const { sourceDir } = validateAgentLibSource(plan.candidate, { fsApi });
     const git = readGitState ? readGitState(sourceDir) : { commit: null, dirty: false, branch: null };
@@ -493,7 +521,7 @@ export function selectAgentLibSource({
         fsApi,
         ...(now ? { now } : {}),
     });
-    return { requiresMaterialization: false, mode: 'local', candidate: plan.candidate, selection };
+    return { requiresMaterialization: false, requiresImageBundle: false, mode: 'local', candidate: plan.candidate, selection };
 }
 
 // ---------------------------------------------------------------------------
