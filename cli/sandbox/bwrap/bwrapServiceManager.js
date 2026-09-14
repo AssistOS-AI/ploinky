@@ -275,9 +275,9 @@ function normalizeMountMode(mode, fallback) {
 
 function getProfileMountModes(profile, profileConfig = {}) {
     const defaultMounts = getDefaultMountModes(profile);
-    const mounts = profileConfig?.mounts || {};
-    const codeMode = normalizeMountMode(mounts.code, defaultMounts.code);
-    const skillsMode = normalizeMountMode(mounts.skills, defaultMounts.skills);
+    // Profile overrides must not make installed source writable.
+    const codeMode = defaultMounts.code;
+    const skillsMode = defaultMounts.skills;
     return {
         codeReadOnly: codeMode === 'ro',
         skillsReadOnly: skillsMode === 'ro'
@@ -499,7 +499,7 @@ function buildBwrapArgs(options) {
     // namespace agrees on. The agent cache symlink resolves into it.
     args.push('--ro-bind', grant.sourceDir, grant.runtimePath);
 
-    // Agent code (rw in dev, ro in qa/prod)
+    // Agent code is read-only in every profile.
     if (codeReadOnly) {
         args.push('--ro-bind', agentCodePath, '/code');
     } else {

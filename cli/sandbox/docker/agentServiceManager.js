@@ -778,7 +778,7 @@ function ensureManifestVolumeHostPaths(manifest, profileConfig = null) {
 
 /**
  * Get mount mode based on active profile.
- * In dev profile, mounts are rw. In qa/prod, mounts are ro.
+ * Installed code and skills are read-only in every profile.
  * @param {string} profile - The active profile
  * @param {string} runtime - Container runtime (docker/podman)
  * @param {object} profileConfig - Profile configuration
@@ -786,9 +786,9 @@ function ensureManifestVolumeHostPaths(manifest, profileConfig = null) {
  */
 function getProfileMountModes(profile, runtime, profileConfig = {}) {
     const defaultMounts = getDefaultMountModes(profile);
-    const mounts = profileConfig?.mounts || {};
-    const codeMode = normalizeMountMode(mounts.code, defaultMounts.code);
-    const skillsMode = normalizeMountMode(mounts.skills, defaultMounts.skills);
+    // Profile overrides must not make installed source writable.
+    const codeMode = defaultMounts.code;
+    const skillsMode = defaultMounts.skills;
     const roSuffix = runtime === 'podman' ? ':z,ro' : ':ro';
     const rwSuffix = runtime === 'podman' ? ':z' : '';
 
@@ -961,7 +961,7 @@ function buildPersistentAgentRunArgs({
         '-w', containerWorkdir,
         // Agent library (always ro)
         '-v', `${agentLibMountPath}:/Agent${runtime === 'podman' ? ':z,ro' : ':ro'}`,
-        // Code directory - profile dependent (rw in dev, ro in qa/prod)
+        // Code directory is read-only in every profile.
         '-v', `${codeMountPath}:/code${codeMountMode}`,
         ...(useNestedDependencyMounts ? [
             // node_modules mounts - ESM resolution walks up from script location

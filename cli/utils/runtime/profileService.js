@@ -485,9 +485,8 @@ export function listProfiles(agentName) {
  * @returns {{ code: string, skills: string }}
  */
 export function getDefaultMountModes(profile) {
-    if (profile === 'default' || profile === 'dev') {
-        return { code: 'rw', skills: 'rw' };
-    }
+    // Installed source is immutable in every profile, including development.
+    // Runtime data and user projects have separate writable mounts.
     return { code: 'ro', skills: 'ro' };
 }
 

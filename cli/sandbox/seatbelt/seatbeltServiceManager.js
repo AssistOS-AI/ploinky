@@ -318,9 +318,9 @@ function normalizeMountMode(mode, fallback) {
 
 function getProfileMountModes(profile, profileConfig = {}) {
     const defaultMounts = getDefaultMountModes(profile);
-    const mounts = profileConfig?.mounts || {};
-    const codeMode = normalizeMountMode(mounts.code, defaultMounts.code);
-    const skillsMode = normalizeMountMode(mounts.skills, defaultMounts.skills);
+    // Profile overrides must not make installed source writable.
+    const codeMode = defaultMounts.code;
+    const skillsMode = defaultMounts.skills;
     return {
         codeReadOnly: codeMode === 'ro',
         skillsReadOnly: skillsMode === 'ro'
