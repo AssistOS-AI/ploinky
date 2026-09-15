@@ -92,6 +92,7 @@ export function initDom() {
     const sessionDialog = document.getElementById('sessionDialog');
     const sessionDialogClose = document.getElementById('sessionDialogClose');
     const sessionList = document.getElementById('sessionList');
+    const sessionListLoading = document.getElementById('sessionListLoading');
     const tasksBtn = document.getElementById('tasksBtn');
     const tasksBadge = document.getElementById('tasksBadge');
     const tasksDialog = document.getElementById('tasksDialog');
@@ -342,6 +343,7 @@ export function initDom() {
             sessionDialog,
             sessionDialogClose,
             sessionList,
+            sessionListLoading,
             tasksBtn,
             tasksBadge,
             tasksDialog,

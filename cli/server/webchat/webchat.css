@@ -277,17 +277,16 @@ body {
     display: none;
 }
 
-.wa-history-gate[hidden] {
+.wa-history-gate[hidden],
+.wa-session-list-loading[hidden] {
     display: none;
 }
 
-.wa-history-gate {
-    width: 100%;
-    padding: 10px 0 6px;
+.wa-session-list-loading {
     display: flex;
-    flex: 0 0 auto;
     align-items: center;
     justify-content: center;
+    padding: 16px;
 }
 
 
@@ -4265,37 +4264,36 @@ button.wa-upload-directory-entry.folder:hover {
     }
 }
 
-/* Earlier messages are inserted above the reader without moving the viewport. */
+/* Keep the history indicator above the scrolling conversation. */
 .wa-history-gate {
-    width: min(100%, 360px);
-    position: sticky;
-    top: 0;
+    position: absolute;
+    top: 18px;
+    left: 50%;
+    transform: translateX(-50%);
     z-index: 20;
-    height: 0;
-    overflow: visible;
-    align-self: center;
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 10px;
+    pointer-events: none;
 }
 
-.wa-history-gate:not([hidden]) {
-    padding: 20px;
-    min-height: 54px;
-    margin-bottom: -54px;
-    background: var(--wa-bg-panel);
-    border-radius: 12px;
-    box-shadow: var(--wa-shadow-md);
-}
-
-.wa-history-spinner {
-    width: 18px;
-    height: 18px;
-    border: 2px solid currentColor;
+.wa-loading-spinner {
+    display: inline-block;
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    box-sizing: border-box;
+    color: var(--wa-text-muted);
+    border: 3px solid currentColor;
     border-right-color: transparent;
     border-radius: 50%;
     animation: history-spin .7s linear infinite;
+}
+
+.wa-loading-spinner--small {
+    width: 18px;
+    height: 18px;
+    border-width: 2px;
 }
 
 @keyframes history-spin {

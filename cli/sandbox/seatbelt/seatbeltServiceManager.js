@@ -73,6 +73,12 @@ import {
     pruneStaleRuntimeEntries,
     runtimeSegment,
 } from '../../utils/runtime/runtimeStaging.js';
+
+function isPathWithin(childPath, parentPath) {
+    const relativePath = path.relative(parentPath, childPath);
+    return relativePath === ''
+        || (relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
 // Reuse bwrap PID management (platform-agnostic)
 import {
     assertBwrapPidSlotAvailable,
@@ -577,6 +583,8 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     ensureSeatbeltManifestVolumePaths(manifest, profileConfig);
     assertCanonicalAgentDataPath(agentWorkDir);
     assertCanonicalAgentDataPath(sharedDir);
+    const projectSourceWritable = (profileRecord.runMode || 'isolated') !== 'isolated'
+        && isPathWithin(agentCodePath, cwd);
     const profileContent = buildSeatbeltProfile({
         agentCodePath,
         agentLibGrant: grant,
@@ -586,7 +594,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
         sharedDir,
         cwd,
         skillsPath: agentSkillsPath,
-        codeReadOnly,
+        codeReadOnly: codeReadOnly && !projectSourceWritable,
         skillsReadOnly,
         volumes: {
             ...(manifest.volumes || {}),
@@ -1003,6 +1011,8 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     ensureSeatbeltManifestVolumePaths(manifest, profileConfig);
     assertCanonicalAgentDataPath(agentWorkDir);
     assertCanonicalAgentDataPath(sharedDir);
+    const projectSourceWritable = (record.runMode || 'isolated') !== 'isolated'
+        && isPathWithin(agentCodePath, cwd);
     const profileContent = buildSeatbeltProfile({
         agentCodePath,
         agentLibGrant: grant,
@@ -1012,7 +1022,7 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         sharedDir,
         cwd,
         skillsPath: agentSkillsPath,
-        codeReadOnly,
+        codeReadOnly: codeReadOnly && !projectSourceWritable,
         skillsReadOnly,
         volumes: {
             ...(manifest.volumes || {}),

@@ -78,6 +78,7 @@ const {
     sessionDialog,
     sessionDialogClose,
     sessionList,
+    sessionListLoading,
     tasksBtn,
     tasksBadge,
     tasksDialog,
@@ -256,7 +257,8 @@ sessionController = createSessionController({
         chatList,
         sessionDialog,
         sessionDialogClose,
-        sessionList
+        sessionList,
+        sessionListLoading
     },
     messages,
     network,

@@ -123,10 +123,10 @@
     <div class="wa-chat-container" id="chatContainer">
         <div class="wa-chat-area" id="chatArea">
             <div class="wa-chat-bg"></div>
+            <div class="wa-history-gate" id="historyGate" role="status" aria-label="Loading conversation history" hidden>
+                <span class="wa-loading-spinner" aria-hidden="true"></span>
+            </div>
             <div class="wa-messages" id="chatList">
-                <div class="wa-history-gate" id="historyGate" hidden>
-                    <span class="wa-history-spinner" aria-hidden="true"></span><span role="status">Loading conversation history…</span>
-                </div>
                 <div class="wa-message in wa-typing" id="typingIndicator" aria-hidden="true">
                     <div class="wa-message-bubble">
                         <div class="wa-typing-status" role="status" aria-live="polite" aria-label="Processing">
@@ -168,6 +168,9 @@
             <button type="button" id="sessionDialogClose" aria-label="Close">×</button>
         </div>
         <div class="wa-session-list" id="sessionList"></div>
+        <div class="wa-session-list-loading" id="sessionListLoading" role="status" aria-label="Loading sessions" hidden>
+            <span class="wa-loading-spinner wa-loading-spinner--small" aria-hidden="true"></span>
+        </div>
     </section>
 </div>
 

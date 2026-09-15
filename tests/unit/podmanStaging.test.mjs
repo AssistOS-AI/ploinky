@@ -193,6 +193,30 @@ test('buildPodmanStagedTargetMounts protects source and dependency targets while
     }
 });
 
+test('buildPodmanStagedTargetMounts keeps /code read-only while allowing a global project alias to write', () => {
+    const root = tempDir();
+    try {
+        const agentCodePath = path.join(root, 'workspace', 'repo', 'agent');
+        const cacheNodeModules = path.join(root, 'workspace', '.ploinky', 'deps', 'node_modules');
+        fs.mkdirSync(agentCodePath, { recursive: true });
+        fs.mkdirSync(cacheNodeModules, { recursive: true });
+
+        const mounts = buildPodmanStagedTargetMounts({
+            agentCodePath,
+            nodeModulesDir: cacheNodeModules,
+            codeReadOnly: true,
+            writableProjectSource: true,
+        });
+
+        assert.deepEqual(mounts, [
+            { source: agentCodePath, target: agentCodePath, ro: false },
+            { source: cacheNodeModules, target: cacheNodeModules, ro: true },
+        ]);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
 test('assertPodmanCodeMountAllowed reports reserved dependency cache mounts', () => {
     assert.doesNotThrow(() => assertPodmanCodeMountAllowed('config/runtime.json', '/code/config/runtime.json'));
     assert.throws(

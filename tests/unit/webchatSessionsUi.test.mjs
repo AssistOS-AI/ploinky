@@ -45,19 +45,20 @@ test('formats WebChat session activity as compact relative English time', () => 
     assert.equal(formatRelativeTime('2026-07-12T12:00:00.000Z', now), '1 day ago');
 });
 
-test('session UI sends AchillesCLI slash commands and renders protocol responses', () => {
+test('session UI sends AchillesCLI slash commands and renders protocol responses', async () => {
     const originalDocument = globalThis.document;
     const sessionsBtn = makeElement();
     const historyGate = makeElement();
     const loadHistoryBtn = makeElement();
     const sessionDialog = makeElement();
     const sessionList = makeElement();
+    const sessionListLoading = makeElement();
     const commands = [];
     const rendered = [];
     globalThis.document = { createElement: makeElement, addEventListener() {} };
     try {
         const controller = createSessionController({
-            elements: { sessionsBtn, historyGate, loadHistoryBtn, sessionDialog, sessionList },
+            elements: { sessionsBtn, historyGate, loadHistoryBtn, sessionDialog, sessionList, sessionListLoading },
             messages: {
                 clearMessages() {},
                 renderHistory(messages) { rendered.push(messages); },
@@ -68,19 +69,23 @@ test('session UI sends AchillesCLI slash commands and renders protocol responses
             hideBanner() {},
         });
 
+        await controller.bootstrap();
+        assert.equal(historyGate.hidden, false);
         assert.equal(sessionsBtn.disabled, true);
         controller.handleSessionState(sessionState('current', [{ role: 'user', text: 'Earlier question' }]));
         assert.equal(sessionsBtn.disabled, false);
         assert.equal(historyGate.hidden, true);
         assert.equal(rendered.length, 1);
 
-        sessionsBtn.listeners.get('click')();
+        await sessionsBtn.listeners.get('click')();
+        assert.equal(sessionListLoading.hidden, false);
         assert.equal(commands.at(-1), '/session');
         controller.handleSessionState({
             event: 'list',
             currentSessionId: SESSION_ID,
             sessions: [sessionState().summary],
         });
+        assert.equal(sessionListLoading.hidden, true);
         assert.equal(sessionList.children[0].children[0].textContent, 'New');
         sessionList.children[0].listeners.get('click')();
         assert.equal(commands.at(-1), '/session new');
@@ -92,6 +97,9 @@ test('session UI sends AchillesCLI slash commands and renders protocol responses
         });
         sessionList.children[1].listeners.get('click')();
         assert.equal(commands.at(-1), `/session resume ${SESSION_ID}`);
+        assert.equal(historyGate.hidden, false);
+        controller.handleSessionState(sessionState('selected'));
+        assert.equal(historyGate.hidden, true);
     } finally {
         globalThis.document = originalDocument;
     }
@@ -218,4 +226,32 @@ test('history automatically shows a bounded tail and prepends pages without jump
     await pending;
     assert.deepEqual(rendered.at(-1).page, []);
     assert.equal(rendered.length, 3, 'old pending page cannot enter the new session');
+});
+
+test('failed session requests clear their loading indicators', async (t) => {
+    const originalDocument = globalThis.document;
+    globalThis.document = { createElement: makeElement, addEventListener() {} };
+    t.after(() => { globalThis.document = originalDocument; });
+    const elements = Object.fromEntries(
+        ['sessionsBtn', 'historyGate', 'sessionDialog', 'sessionList', 'sessionListLoading']
+            .map(name => [name, makeElement()])
+    );
+    let accepted = false;
+    const controller = createSessionController({
+        elements,
+        messages: { renderHistory() {} },
+        network: { sendQuickCommand: async () => accepted },
+        showBanner() {}, hideBanner() {},
+    });
+    controller.handleSessionState(sessionState());
+    await elements.sessionsBtn.listeners.get('click')();
+    assert.equal(elements.sessionListLoading.hidden, true);
+    controller.handleSessionState({ event: 'list', sessions: [sessionState().summary] });
+    await elements.sessionList.children[1].listeners.get('click')();
+    assert.equal(elements.historyGate.hidden, true);
+    accepted = true;
+    await elements.sessionsBtn.listeners.get('click')();
+    assert.equal(elements.sessionListLoading.hidden, false);
+    controller.handleSessionState({ event: 'error', error: 'Unavailable' });
+    assert.equal(elements.sessionListLoading.hidden, true);
 });

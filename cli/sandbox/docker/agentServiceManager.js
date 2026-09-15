@@ -452,11 +452,15 @@ function buildPodmanStagedTargetMounts(options = {}) {
         agentCodePath,
         nodeModulesDir,
         codeLinks = new Map(),
-        codeReadOnly = false
+        codeReadOnly = false,
+        writableProjectSource = false,
     } = options;
     const mounts = new Map();
 
-    setPodmanTargetMount(mounts, agentCodePath, codeReadOnly);
+    // /code remains read-only. For global/devel agents the same host source is
+    // also deliberately exposed through the writable project/workspace path;
+    // protect only the isolated source path when no writable project exists.
+    setPodmanTargetMount(mounts, agentCodePath, codeReadOnly && !writableProjectSource);
     for (const [relPath, rawSpec] of codeLinks.entries()) {
         const normalizedRelPath = normalizeStagedRelPath(relPath);
         if (!normalizedRelPath) continue;
@@ -1674,7 +1678,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             agentCodePath,
             nodeModulesDir: preparedNodeModulesDir,
             codeLinks: podmanCodeLinks,
-            codeReadOnly
+            codeReadOnly,
+            writableProjectSource: !isolatedHome && isPathWithin(agentCodePath, cwd),
         });
     }
 

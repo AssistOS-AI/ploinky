@@ -306,7 +306,7 @@ function addProtectedWorkspaceOverlays(args, options) {
         agentCodePath,
         nodeModulesDir,
         cwd,
-        codeReadOnly,
+        protectAgentCodePath,
     } = options;
     const seen = new Set();
     const nodeModulesParent = nodeModulesDir ? path.dirname(nodeModulesDir) : '';
@@ -321,7 +321,7 @@ function addProtectedWorkspaceOverlays(args, options) {
     addReadOnlyOverlay(args, ROUTING_FILE, cwd, seen);
     addReadOnlyOverlay(args, SERVERS_CONFIG_FILE, cwd, seen);
 
-    if (codeReadOnly) {
+    if (protectAgentCodePath) {
         addReadOnlyOverlay(args, agentCodePath, cwd, seen);
     }
 }
@@ -561,11 +561,13 @@ function buildBwrapArgs(options) {
         args.push('--bind', ps.hostPath, ps.containerPath);
     }
 
+    const projectSourceWritable = cwdMountTarget !== '/root'
+        && isPathWithin(agentCodePath, cwd);
     addProtectedWorkspaceOverlays(args, {
         agentCodePath,
         nodeModulesDir,
         cwd,
-        codeReadOnly,
+        protectAgentCodePath: codeReadOnly && !projectSourceWritable,
     });
 
     // Applied after every writable bind: a workspace or project mount that also

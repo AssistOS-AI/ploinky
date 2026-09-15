@@ -35,7 +35,8 @@ export function createSessionController({
         chatList,
         sessionDialog,
         sessionDialogClose,
-        sessionList
+        sessionList,
+        sessionListLoading
     } = elements;
     let currentSession = null;
     let currentSnapshot = null;
@@ -55,6 +56,7 @@ export function createSessionController({
     }
 
     function bootstrap() {
+        showHistoryGate(!historyLoaded);
         return Promise.resolve(null);
     }
 
@@ -119,6 +121,7 @@ export function createSessionController({
 
     function renderSessionList(payload) {
         if (!sessionList) return;
+        if (sessionListLoading) sessionListLoading.hidden = true;
         sessionList.replaceChildren();
         appendNewButton();
         for (const session of payload.sessions || []) {
@@ -135,8 +138,9 @@ export function createSessionController({
             button.append(preview, relative);
             button.addEventListener('click', async () => {
                 closeDialog();
-                showBanner('Loading session…');
+                showHistoryGate(true);
                 if (!await network.sendQuickCommand(`/session resume ${session.sessionId}`)) {
+                    showHistoryGate(false);
                     showBanner('Unable to load session. Wait for the agent to be ready.', 'err');
                 }
             });
@@ -149,12 +153,9 @@ export function createSessionController({
         sessionDialog.hidden = false;
         sessionList.replaceChildren();
         appendNewButton();
-        const loading = document.createElement('div');
-        loading.className = 'wa-session-list-loading';
-        loading.textContent = 'Loading sessions…';
-        sessionList.appendChild(loading);
+        if (sessionListLoading) sessionListLoading.hidden = false;
         if (!await network.sendQuickCommand('/session')) {
-            loading.textContent = 'Sessions unavailable until the agent is ready.';
+            if (sessionListLoading) sessionListLoading.hidden = true;
             showBanner('Unable to load sessions. Wait for the agent to be ready.', 'err');
         }
     }
@@ -162,6 +163,8 @@ export function createSessionController({
     function handleSessionState(payload) {
         if (!payload || typeof payload !== 'object') return;
         if (payload.event === 'error') {
+            showHistoryGate(false);
+            if (sessionListLoading) sessionListLoading.hidden = true;
             if (!payload.sessionId || payload.sessionId === currentSession?.sessionId) {
                 messages.hideTypingIndicator?.(true);
                 showBanner(payload.error || 'Session operation failed.', 'err');
