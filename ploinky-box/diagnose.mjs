@@ -8,7 +8,7 @@ import { sanitizeAuthorityDiagnostic } from '../cli/sandbox/authorityCommandDiag
 import { BOX_LABELS, BOX_MEDIA_PORT, resolveBoxImageReference } from './constants.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from './identity.mjs';
-import { inspectAndValidateImage, normalizeImageInspect, validateImageContract } from './contract/image.mjs';
+import { IMAGE_OBSERVATION_UNAVAILABLE, inspectAndValidateImage, normalizeImageInspect, validateImageContract } from './contract/image.mjs';
 import { observeContainerRouterBinding, validateContainerConfiguration } from './contract/container.mjs';
 import { agentLibContractFromContainer } from './contract/agentlib.mjs';
 import { probeImageAgentLib } from './image-agentlib.mjs';
@@ -23,11 +23,22 @@ import { inspectWorkspaceDataPaths } from './workspace-data.mjs';
 
 const LIMIT = 4000;
 const clean = (value) => sanitizeAuthorityDiagnostic(String(value ?? ''), { limit: LIMIT });
+// These wrappers deliberately summarize failed queries without retaining their
+// stderr. A failed final query in the same stage supplies that missing evidence.
+const QUERY_WRAPPER_FAILURE_CODES = new Set([
+    IMAGE_OBSERVATION_UNAVAILABLE,
+    'PLOINKY_BOX_IMAGE_CONTRACT_INVALID',
+    'PLOINKY_BOX_WEBTTY_NATIVE_CONTRACT_INVALID',
+    'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE',
+]);
 
 export function diagnosticAdvice(value) {
     const message = String(value || '');
     if (/TCP.*already in use|UDP.*already in use/i.test(message)) {
         return 'Use ss -ltnu (or lsof -i on macOS) to identify the listener. Select an available --port/--udp-port or stop only the known conflicting service, then rerun diagnose with the same port options.';
+    }
+    if (/\b(?:crun|runc|OCI runtime)\b[\s\S]*\b(?:unknown|unsupported) version(?: specified)?\b/i.test(message)) {
+        return 'Run podman info --format json to identify host.ociRuntime.path, run that selected executable with --version, and compare with podman --version. Upgrade the selected OCI runtime to a release compatible with the installed Podman using supported distribution packages or the runtime’s official release, then rerun ploinky diagnose.';
     }
     if (/network namespace.*Permission denied|apparmor|DENIED.*pasta/is.test(message)) {
         return 'Inspect journalctl -k for the matching AppArmor denial. Ask an administrator to review the pasta profile namespace-file and directory access; keep profiles enforced. Rerun this exact probe after the policy is reloaded.';
@@ -57,6 +68,21 @@ function failureDetail(error) {
         if (current.message) parts.push(current.message);
     }
     return clean(parts.join('\n'));
+}
+
+function failureCommand(error, commands, detail) {
+    let wrappedQueryFailure = false;
+    for (let cause = error, depth = 0; cause && depth < 5; cause = cause.cause, depth += 1) {
+        if (commands.includes(cause.diagnosticCommand)) return cause.diagnosticCommand;
+        wrappedQueryFailure ||= QUERY_WRAPPER_FAILURE_CODES.has(cause.code);
+    }
+    const matched = commands.findLast((entry) => entry.exitCode !== 0 && entry.detail && detail.includes(entry.detail));
+    if (matched) return matched;
+    // Do not infer a cause from incidental missing-image/container inspections,
+    // or from an earlier failure after a later query succeeded. In particular,
+    // filesystem errors must not inherit an unrelated command's exit status.
+    const last = commands.at(-1);
+    return wrappedQueryFailure && last && last.exitCode !== 0 ? last : undefined;
 }
 
 export function formatDiagnosticCommand(command) {
@@ -370,12 +396,10 @@ export async function diagnoseWorkspace({
                 ...(commands.length > start ? { command: { file: commands.at(-1).file, args: commands.at(-1).args }, exitCode: commands.at(-1).exitCode } : {}) });
             return value || true;
         } catch (error) {
-            let command;
-            for (let cause = error, depth = 0; cause && depth < 5; cause = cause.cause, depth += 1) {
-                command ||= cause.diagnosticCommand;
-            }
-            const detail = failureDetail(error);
-            command ||= commands.slice(start).findLast((entry) => entry.exitCode !== 0 && entry.detail && detail.includes(entry.detail));
+            const wrapperDetail = failureDetail(error);
+            const command = failureCommand(error, commands.slice(start), wrapperDetail);
+            const detail = clean(command?.detail && !wrapperDetail.includes(command.detail)
+                ? `${wrapperDetail}\n${command.detail}` : wrapperDetail);
             checks.push({ id, label, status: 'fail', detail, next: diagnosticAdvice(detail),
                 ...(command && commands.length > start ? { command: { file: command.file, args: command.args }, exitCode: command.exitCode } : {}) });
             return null;

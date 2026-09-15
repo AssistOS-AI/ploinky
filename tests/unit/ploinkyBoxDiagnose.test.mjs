@@ -8,6 +8,8 @@ import {
     createDiagnosticRunner, createVerifierScope, diagnoseWorkspace,
     diagnosticAdvice, formatDiagnosticReport, validateInsideReport,
 } from '../../ploinky-box/diagnose.mjs';
+import { probeImageBinaries, IMAGE_OBSERVATION_UNAVAILABLE } from '../../ploinky-box/contract/image.mjs';
+import { probeImageAgentLib } from '../../ploinky-box/image-agentlib.mjs';
 
 const IMAGE = 'a'.repeat(64);
 const ID = 'b'.repeat(64);
@@ -55,6 +57,145 @@ test('remediation distinguishes namespace, filesystem and port failures', () => 
     assert.match(diagnosticAdvice('crun mkdir /code Operation not permitted'), /overlay/);
     assert.match(diagnosticAdvice('Physical-host TCP 127.0.0.1:8080 is already in use'), /ss -ltnu/);
     assert.match(diagnosticAdvice('newuidmap failed'), /subuid/);
+    const advice = diagnosticAdvice('Error: OCI runtime error: crun: unknown version specified');
+    assert.match(advice, /host\.ociRuntime\.path/);
+    assert.match(advice, /--version/);
+    assert.match(advice, /Upgrade the selected OCI runtime.*compatible with the installed Podman/);
+    assert.doesNotMatch(advice, /AppArmor/);
+});
+
+test('a wrapped image verifier failure retains the actual crun command, stderr and recovery action', async (t) => {
+    const root = workspace(t);
+    const stderr = 'Error: OCI runtime error: crun: unknown version specified\n';
+    let failedArgs;
+    const report = await diagnoseWorkspace({ cwd: root, env: {},
+        hostChecks: () => ({ checks: [], engineUsable: true }), discover: () => ({ state: 'absent' }),
+        bindingStore: { read: () => null }, checkPublications: async () => {},
+        runner: { query(file, args) {
+            assert.equal(file, 'podman');
+            if (args[0] === 'run') {
+                failedArgs = args;
+                return { ok: false, status: 126, stdout: '', stderr, error: null };
+            }
+            assert.deepEqual(args.slice(0, 2), ['container', 'inspect']);
+            return absent;
+        } },
+        runtimeChecks: async ({ stage, runner }) => {
+            const verifier = createVerifierScope(runner, OWNER);
+            await stage('image.contract', 'Validate the exact Box image and bundled tools', async () => {
+                try { probeImageBinaries('podman', IMAGE, verifier.runner); }
+                catch (error) { throw new Error('Image validation failed', { cause: error }); }
+            });
+            await stage('cleanup.verifiers', 'Remove test verifiers', async () => verifier.cleanup());
+        },
+    });
+    const check = report.checks.find((entry) => entry.id === 'image.contract');
+    assert.equal(report.exitCode, 1);
+    assert.equal(check.status, 'fail');
+    assert.equal(check.exitCode, 126);
+    assert.deepEqual(check.command, { file: 'podman', args: failedArgs });
+    assert.match(check.detail, /runtime capability probe unavailable \(command-failed\)/);
+    assert.match(check.detail, /crun: unknown version specified/);
+    assert.match(check.next, /Upgrade the selected OCI runtime/);
+    const rendered = formatDiagnosticReport(report);
+    assert.match(rendered, /Command: podman run --name ploinky-diagnose-verify-/);
+    assert.match(rendered, /Exit: 126/);
+    assert.match(rendered, /crun: unknown version specified/);
+    const cleanup = report.checks.find((entry) => entry.id === 'cleanup.verifiers');
+    assert.equal(cleanup.status, 'pass');
+    assert.equal(cleanup.exitCode, 125);
+    assert.doesNotMatch(cleanup.detail, /crun/);
+});
+
+test('AgentLib query wrappers retain sanitized failed command evidence', async (t) => {
+    const root = workspace(t);
+    const report = await diagnoseWorkspace({ cwd: root, env: {},
+        hostChecks: () => ({ checks: [], engineUsable: true }), discover: () => ({ state: 'absent' }),
+        bindingStore: { read: () => null }, checkPublications: async () => {},
+        runner: { query: () => ({ ok: false, status: 126, stdout: '',
+            stderr: 'crun: unknown version specified\nAuthorization: Bearer secret-verifier-token\n', error: null }) },
+        runtimeChecks: async ({ stage, runner }) => {
+            await stage('image.agentlib', 'Verify the bundled AgentLib', async () => probeImageAgentLib('podman', IMAGE, runner));
+        },
+    });
+    const check = report.checks.find((entry) => entry.id === 'image.agentlib');
+    assert.equal(check.exitCode, 126);
+    assert.equal(check.command.file, 'podman');
+    assert.equal(check.command.args[0], 'run');
+    assert.match(check.detail, /crun: unknown version specified/);
+    assert.doesNotMatch(JSON.stringify(report), /secret-verifier-token/);
+});
+
+test('incidental absent resources and cleanup commands do not explain unrelated filesystem failures', async (t) => {
+    const root = workspace(t);
+    const cases = [
+        ['image', 'inspect', 'missing-image'],
+        ['container', 'inspect', ID],
+        ['container', 'rm', ID],
+    ];
+    const report = await diagnoseWorkspace({ cwd: root, env: {},
+        hostChecks: () => ({ checks: [], engineUsable: true }), discover: () => ({ state: 'absent' }),
+        bindingStore: { read: () => null }, checkPublications: async () => {},
+        runner: { query: () => absent },
+        runtimeChecks: async ({ stage, runner }) => {
+            for (const [index, args] of cases.entries()) {
+                await stage(`filesystem.${index}`, 'Create diagnostic scratch', async () => {
+                    runner.query('podman', args);
+                    fs.mkdirSync(path.join(root, 'missing-parent', 'child'));
+                });
+            }
+        },
+    });
+    for (const check of report.checks.filter((entry) => entry.id.startsWith('filesystem.'))) {
+        assert.equal(check.status, 'fail');
+        assert.match(check.detail, /ENOENT/);
+        assert.doesNotMatch(check.detail, /no such container/);
+        assert.equal(check.command, undefined);
+        assert.equal(check.exitCode, undefined);
+    }
+});
+
+test('a later successful command prevents borrowing an older failure for a summarized error', async (t) => {
+    const root = workspace(t);
+    const report = await diagnoseWorkspace({ cwd: root, env: {},
+        hostChecks: () => ({ checks: [], engineUsable: true }), discover: () => ({ state: 'absent' }),
+        bindingStore: { read: () => null }, checkPublications: async () => {},
+        runner: { query: (_file, args) => args[0] === 'image' ? absent : { ok: true, status: 0, stdout: '{}', stderr: '' } },
+        runtimeChecks: async ({ stage, runner }) => {
+            await stage('image.validation', 'Inspect image result', async () => {
+                runner.query('podman', ['image', 'inspect', 'missing-image']);
+                runner.query('podman', ['info', '--format', 'json']);
+                throw Object.assign(new Error('Image result is unavailable'), { code: IMAGE_OBSERVATION_UNAVAILABLE });
+            });
+        },
+    });
+    const check = report.checks.find((entry) => entry.id === 'image.validation');
+    assert.equal(check.command, undefined);
+    assert.equal(check.exitCode, undefined);
+    assert.doesNotMatch(check.detail, /no such container/);
+});
+
+test('explicit command cause survives later expected-absence cleanup', async (t) => {
+    const root = workspace(t);
+    const report = await diagnoseWorkspace({ cwd: root, env: {},
+        hostChecks: () => ({ checks: [], engineUsable: true }), discover: () => ({ state: 'absent' }),
+        bindingStore: { read: () => null }, checkPublications: async () => {},
+        runner: { query: (_file, args) => args[0] === 'start'
+            ? { ok: false, status: 126, stdout: '', stderr: 'crun: unknown version specified', error: null }
+            : absent },
+        runtimeChecks: async ({ stage, runner }) => {
+            await stage('container.start', 'Start test container', async () => {
+                try { runner.run('podman', ['start', ID]); }
+                catch (error) { throw new Error('Startup failed', { cause: error }); }
+                finally { runner.query('podman', ['container', 'inspect', ID]); }
+            });
+        },
+    });
+    const check = report.checks.find((entry) => entry.id === 'container.start');
+    assert.deepEqual(check.command, { file: 'podman', args: ['start', ID] });
+    assert.equal(check.exitCode, 126);
+    assert.match(check.detail, /crun: unknown version specified/);
+    assert.doesNotMatch(check.detail, /no such container/);
 });
 
 test('empty, malformed and incomplete successful inner reports fail closed', () => {
