@@ -40,15 +40,12 @@ test('conversation navigation rejects external origins, credentials, script sche
     assert.equal(normalizeSessionSettingsAction({ ...action, label: '' }, origin), null);
 });
 
-test('production WebChat menu and session event handler expose the generic action', async () => {
+test('production WebChat does not expose session settings navigation', async () => {
     const client = new URL('../../cli/server/webchat/', import.meta.url);
-    const [html, index, dom, css] = await Promise.all(['chat.html', 'index.js', 'domSetup.js', 'webchat.css'].map((name) => fs.readFile(new URL(name, client), 'utf8')));
-    assert.match(html, /id="sessionSettingsLink" data-menu-action hidden/);
-    assert.match(dom, /sessionSettingsLink: document\.getElementById\('sessionSettingsLink'\)/);
-    assert.match(index, /sessionSettingsController\.handleSessionState\(payload, selected\)/);
-    assert.match(css, /\.wa-session-settings-link\[hidden\]\s*\{\s*display: none/);
-    const controller = await fs.readFile(new URL('sessionSettings.js', client), 'utf8');
-    assert.doesNotMatch(controller, /roboTeamAgent|copilot-session|list_achilles_skills/);
+    for (const name of ['chat.html', 'index.js', 'domSetup.js', 'webchat.css']) {
+        const source = await fs.readFile(new URL(name, client), 'utf8');
+        assert.doesNotMatch(source, /sessionSettingsLink|sessionSettingsController|wa-session-settings-link/);
+    }
 });
 
 test('session settings survive the production protocol parser and SSE serializer without extra metadata', () => {

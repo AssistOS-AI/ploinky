@@ -14,7 +14,6 @@ import { createTaskController } from './tasks.js';
 import { createInteractionPrompt } from './interactionPrompt.js';
 import { createWorkspaceFileIndex } from './workspaceFileIndex.js';
 import { createHeaderMenu, createResponsiveHeaderActions } from './headerMenu.js';
-import { createSessionSettingsController } from './sessionSettings.js';
 
 const PURGE_TRIGGER_RE = /\bpurge\b/i;
 const EDITABLE_TAGS = ['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'];
@@ -30,8 +29,6 @@ const {
     toEndpoint,
     showBanner,
     hideBanner,
-    getViewMoreLineLimit,
-    setViewMoreChangeHandler,
     elements
 } = dom;
 
@@ -92,7 +89,6 @@ const {
 } = elements;
 
 const workspaceFileIndex = createWorkspaceFileIndex();
-const sessionSettingsController = createSessionSettingsController({ link: elements.sessionSettingsLink });
 
 let network = null;
 
@@ -146,17 +142,13 @@ const messages = createMessages({
     workspaceBase,
     webchatBasePath: basePath,
     workspaceFileIndex,
-    initialViewMoreLineLimit: getViewMoreLineLimit(),
+    initialViewMoreLineLimit: 1000,
     sidePanel: sidePanelApi,
     taskController,
     onQuickCommand: null,
     onTypingStateChange: (typing) => {
         composer.setProcessingState(Boolean(typing));
     }
-});
-
-dom.setViewMoreChangeHandler((limit) => {
-    messages.setViewMoreLineLimit(limit);
 });
 
 sidePanelApi.bindLinkDelegation(chatList);
@@ -184,7 +176,6 @@ network = createNetwork({
     onSessionState: (payload) => {
         sessionController?.handleSessionState(payload);
         const selected = sessionController?.getCurrentSession()?.sessionId;
-        sessionSettingsController.handleSessionState(payload, selected);
         if (selected && selected === payload.summary?.sessionId) {
             const key = `${selected}:${payload.session?.engine?.backend || ''}`;
             if (key !== modelCatalogSessionKey) {

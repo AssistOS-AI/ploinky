@@ -1,35 +1,3 @@
-const VIEW_MORE_LINES_KEY = 'wa_view_more_lines';
-const LEGACY_VIEW_MORE_KEY = 'wa_view_more_enabled';
-
-function readInitialViewMoreLimit() {
-    let limit = 1000;
-    try {
-        const storedLimit = localStorage.getItem(VIEW_MORE_LINES_KEY);
-        if (storedLimit !== null) {
-            const parsed = parseInt(storedLimit, 10);
-            if (!Number.isNaN(parsed) && parsed >= 1) {
-                limit = parsed;
-            }
-        } else {
-            const legacy = localStorage.getItem(LEGACY_VIEW_MORE_KEY);
-            if (legacy === 'true') {
-                limit = 6;
-            } else if (legacy === 'false') {
-                limit = 1000;
-            }
-        }
-    } catch (_) {
-        limit = 1000;
-    }
-    try {
-        localStorage.removeItem(LEGACY_VIEW_MORE_KEY);
-        localStorage.setItem(VIEW_MORE_LINES_KEY, String(limit));
-    } catch (_) {
-        // Ignore storage issues
-    }
-    return limit;
-}
-
 export function initDom() {
     const dlog = () => {};
 
@@ -62,7 +30,6 @@ export function initDom() {
     const settingsPanel = document.getElementById('settingsPanel');
     const settingsMobileActions = document.getElementById('settingsMobileActions');
     const settingsActionSlot = document.getElementById('settingsActionSlot');
-    const viewMoreLinesInput = document.getElementById('viewMoreLines');
     const attachmentBtn = document.getElementById('attachmentBtn');
     const attachmentMenu = document.getElementById('attachmentMenu');
     const uploadFileBtn = document.getElementById('uploadFileBtn');
@@ -220,37 +187,6 @@ export function initDom() {
         });
     }
 
-    let viewMoreLineLimit = readInitialViewMoreLimit();
-    let viewMoreChangeHandler = null;
-
-    function emitViewMoreChange() {
-        if (typeof viewMoreChangeHandler === 'function') {
-            viewMoreChangeHandler(viewMoreLineLimit);
-        }
-    }
-
-    if (viewMoreLinesInput) {
-        const normalizeLineLimit = () => {
-            const parsed = parseInt(viewMoreLinesInput.value, 10);
-            viewMoreLineLimit = Number.isNaN(parsed) ? 1 : Math.max(1, parsed);
-            viewMoreLinesInput.value = String(viewMoreLineLimit);
-            try {
-                localStorage.setItem(VIEW_MORE_LINES_KEY, String(viewMoreLineLimit));
-            } catch (_) {
-                // Ignore storage failures
-            }
-            emitViewMoreChange();
-        };
-        viewMoreLinesInput.value = String(viewMoreLineLimit);
-        viewMoreLinesInput.addEventListener('change', normalizeLineLimit);
-        viewMoreLinesInput.addEventListener('blur', normalizeLineLimit);
-    }
-
-    function setViewMoreChangeHandler(handler) {
-        viewMoreChangeHandler = typeof handler === 'function' ? handler : null;
-        emitViewMoreChange();
-    }
-
     const toEndpoint = (path) => {
         const suffix = String(path || '').replace(/^\/+/, '');
         let url = basePath ? `${basePath}/${suffix}` : `/${suffix}`;
@@ -276,8 +212,6 @@ export function initDom() {
         hideBanner,
         setRuntimeModel,
         setRuntimeRobot,
-        getViewMoreLineLimit: () => viewMoreLineLimit,
-        setViewMoreChangeHandler,
         elements: {
             body,
             titleBar,
@@ -306,7 +240,6 @@ export function initDom() {
             settingsPanel,
             settingsMobileActions,
             settingsActionSlot,
-            viewMoreLinesInput,
             attachmentBtn,
             attachmentMenu,
             uploadFileBtn,
@@ -326,7 +259,6 @@ export function initDom() {
             interactionPromptOptions,
             attachmentContainer,
             sessionsBtn,
-            sessionSettingsLink: document.getElementById('sessionSettingsLink'),
             historyGate,
             sessionDialog,
             sessionDialogClose,
