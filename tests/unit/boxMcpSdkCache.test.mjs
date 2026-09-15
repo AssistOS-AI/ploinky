@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
+import { withDependencyRefresh } from '../../cli/utils/dependencies/dependencyRefresh.mjs';
 import { BOX_MARKER_CONTENT, BOX_MARKER_PATH } from '../../ploinky-box/constants.mjs';
 import {
     MCP_SDK_BUNDLE_PATH,
@@ -107,7 +108,7 @@ function boxEnvironment(t, { globalPackage = null, insideBox = true, onInstall =
                     assert.equal(Object.hasOwn(pkg[field] || {}, 'mcp-sdk'), false, `npm input still contains SDK in ${field}`);
                 }
             }
-            installs.push({ installPath, pkg });
+            installs.push({ installPath, pkg, operation: args.at(-1).includes("npm 'update'") ? 'update' : 'install' });
             // npm prunes extraneous entries; the production finalizer must
             // restore the validated image bundle after this operation.
             fs.rmSync(path.join(installPath, 'node_modules', 'mcp-sdk'), { recursive: true, force: true });
@@ -133,6 +134,37 @@ function agentPackage(root, pkg) {
     fs.writeFileSync(filename, JSON.stringify(pkg));
     return filename;
 }
+
+test('lifecycle refresh installs once, updates unchanged manifests, and retries failed installs', (t) => {
+    let fail = false;
+    const f = boxEnvironment(t, { onInstall() { if (fail) throw new Error('fixture npm failed'); } });
+    const options = { ...prepareOptions, repoName: 'refresh', agentName: 'agent',
+        agentPackagePath: agentPackage(f.root, { dependencies: { example: '^1.0.0' } }) };
+    withDependencyRefresh('start', () => {
+        assert.equal(cache.prepareAgentCache(options).operation, 'install');
+        assert.equal(cache.prepareAgentCache(options).operation, 'install');
+        assert.equal(f.installs.length, 1, 'first install must not be followed by update');
+    });
+    const installed = cache.getAgentCachePath('refresh', 'agent', runtimeKey);
+    const sentinel = path.join(installed, 'node_modules', 'retained.txt');
+    fs.writeFileSync(sentinel, 'existing installed tree');
+    for (const command of ['enable', 'update', 'reinstall', 'start']) {
+        withDependencyRefresh(command, () => {
+            assert.equal(cache.prepareAgentCache(options).operation, 'update');
+            assert.equal(fs.readFileSync(sentinel, 'utf8'), 'existing installed tree');
+        });
+    }
+    assert.deepEqual(f.installs.map(entry => entry.operation), ['install', 'update', 'update', 'update', 'update']);
+    assert.equal(cache.inspectAgentCache(options).valid, true);
+    fail = true;
+    withDependencyRefresh('update', () => {
+        assert.throws(() => cache.prepareAgentCache(options), /fixture npm failed/);
+        assert.equal(cache.readStamp(installed), null);
+        fail = false;
+        assert.equal(cache.prepareAgentCache(options).operation, 'install');
+    });
+    assert.equal(cache.inspectAgentCache(options).valid, true);
+});
 
 test('canonical legacy and immutable SDK declarations are excluded from every npm dependency field', (t) => {
     const { bundle } = fixture(t);

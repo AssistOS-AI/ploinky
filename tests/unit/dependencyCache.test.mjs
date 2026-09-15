@@ -30,7 +30,60 @@ import {
     shouldSeedAgentCacheWithHardlinks,
     shouldSeedAgentCacheWithSystemCopy,
     seedFromGlobalCache,
+    agentDependencyNpmOperation,
 } from '../../cli/utils/dependencies/dependencyCache.js';
+import { withDependencyRefresh, dependencyRefreshOperation, hasAgentPackageJson } from '../../cli/utils/dependencies/dependencyRefresh.mjs';
+
+test('dependency refresh recognizes root and legacy code package manifests', (t) => {
+    const root = tempDir();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    assert.equal(hasAgentPackageJson(root), false);
+    fs.writeFileSync(path.join(root, 'package.json'), '{}');
+    assert.equal(hasAgentPackageJson(root), true);
+    fs.mkdirSync(path.join(root, 'code'));
+    assert.equal(hasAgentPackageJson(root), false);
+    fs.writeFileSync(path.join(root, 'code/package.json'), '{}');
+    assert.equal(hasAgentPackageJson(root), true);
+});
+
+test('agent npm selection requires a successful compatible install, not an unchanged manifest', (t) => {
+    const dir = tempDir();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const runtimeKey = 'container-linux-x64-glibc-node24';
+    const installer = { image: 'node:24', runtimeFamily: 'container' };
+    const options = { runtimeKey, installer };
+    assert.equal(agentDependencyNpmOperation(dir, options), 'install');
+    ensureCacheDir(dir);
+    assert.equal(agentDependencyNpmOperation(dir, options), 'install');
+    writeStamp(dir, { runtimeKey, installer, agentPackageHash: 'previous-manifest' });
+    assert.equal(agentDependencyNpmOperation(dir, options), 'update');
+    assert.equal(agentDependencyNpmOperation(dir, { runtimeKey, installer: { ...installer, image: 'node:26' } }), 'install');
+    fs.rmSync(stampPath(dir));
+    assert.equal(agentDependencyNpmOperation(dir, options), 'install');
+});
+
+test('dependency refresh state is isolated per command and shared across nested graph visits', async () => {
+    for (const command of ['start', 'enable', 'update', 'reinstall']) {
+        await withDependencyRefresh(command, async () => {
+            const state = dependencyRefreshOperation();
+            assert.equal(state.size, 0);
+            state.set('repo/agent', 'installed');
+            await withDependencyRefresh('enable', async () => {
+                assert.equal(dependencyRefreshOperation().get('repo/agent'), 'installed');
+            });
+        });
+        assert.equal(dependencyRefreshOperation(), undefined);
+    }
+    withDependencyRefresh('status', () => assert.equal(dependencyRefreshOperation(), undefined));
+});
+
+test('container update uses npm update with the same isolation flags', () => {
+    const script = buildContainerInstallScript({ operation: 'update', linkBoxMcpSdk: true });
+    assert.match(script, /npm 'update'/);
+    assert.match(script, /--no-package-lock/);
+    assert.match(script, /--install-links=false/);
+    assert.doesNotMatch(script, /npm 'install'/);
+});
 
 function tempDir(prefix = 'deps-cache-test-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));

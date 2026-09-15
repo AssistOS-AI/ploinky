@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { refreshRepositoryDependencies } from './depsCommands.js';
 import path from 'path';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import { showHelp } from './help.js';
@@ -334,6 +335,7 @@ async function updateRepo(repoName) {
     if (!repoName) throw new Error('Usage: update repo <name>');
     try {
         const result = reposSvc.updateRepo(repoName);
+        await refreshRepositoryDependencies([repoName]);
         if (result?.recloned) {
             console.log(`✓ Repo '${repoName}' repaired by recloning.`);
         } else {
@@ -378,6 +380,7 @@ async function updatePloinkyRepos(options = {}) {
         console.log('No ploinky repositories installed.');
     }
 
+    await refreshRepositoryDependencies(getRepoNames());
     const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos);
     logDefaultSkillSummary(defaultSkills);
     appendDefaultSkillFailures(failed, defaultSkills);
@@ -485,6 +488,7 @@ async function updateAllRepos(folderPath, options = {}) {
         }
     }
 
+    await refreshRepositoryDependencies(getRepoNames());
     const defaultSkills = refreshDefaultSkillsInPloinkyRepos(ploinkyRepos);
     logDefaultSkillSummary(defaultSkills);
     appendDefaultSkillFailures(failed, defaultSkills);

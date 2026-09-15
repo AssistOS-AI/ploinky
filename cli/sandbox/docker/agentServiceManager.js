@@ -2,6 +2,7 @@ import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mj
 import { execSync, spawnSync } from 'child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'fs';
+import { dependencyRefreshOperation, hasAgentPackageJson } from '../../utils/dependencies/dependencyRefresh.mjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { isDeepStrictEqual } from 'node:util';
@@ -3309,7 +3310,8 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     preferredHostPort = options.preferredHostPort;
     containerOverride = options.containerName;
     aliasOverride = options.alias;
-    forceRecreate = options.forceRecreate === true;
+    forceRecreate = options.forceRecreate === true
+        || (Boolean(dependencyRefreshOperation()) && hasAgentPackageJson(agentPath));
     profileNameOverride = options.profileName;
     routerEndpointOverride = options.routerEndpoint;
     if (Object.prototype.hasOwnProperty.call(options, 'routerHost')) {

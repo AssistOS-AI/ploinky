@@ -67,6 +67,8 @@ function mainHelpText(surface) {
 ${lifecycleHelpLines(surface).join('\n')}
   restart                        Restart enabled agents + Router
   reinstall <agentName>          Re-create a running agent container (destructive)
+  Agent dependencies: update/start/enable/reinstall run npm install on first
+  preparation, then npm update for agents with package.json, even if unchanged.
   logs tail [router|agent] [--startup]
                                  Follow Router or one agent's logs
   logs last [<N>] [router|agent] [--startup]

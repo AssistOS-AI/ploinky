@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { dependencyRefreshOperation } from './dependencyRefresh.mjs';
 import path from 'path';
 import crypto from 'crypto';
 import { spawnSync } from 'child_process';
@@ -584,33 +585,35 @@ function withGithubHttpsGitConfig(env = process.env, { cwd = '' } = {}) {
     };
 }
 
-function runNpmInstall(cwd, { log = debugLog, linkBoxMcpSdk = false } = {}) {
-    log(`[deps-cache] npm install in ${cwd}`);
-    const result = spawnSync('npm', npmInstallArgs({ linkBoxMcpSdk }), {
+function runNpmInstall(cwd, { log = debugLog, linkBoxMcpSdk = false, operation = 'install' } = {}) {
+    log(`[deps-cache] npm ${operation} in ${cwd}`);
+    const result = spawnSync('npm', npmInstallArgs({ linkBoxMcpSdk, operation }), {
         cwd,
         env: withGithubHttpsGitConfig(process.env, { cwd }),
         stdio: 'inherit',
         timeout: INSTALL_TIMEOUT_MS,
     });
     if (result.error) {
-        throw new Error(`npm install failed: ${result.error.message}`);
+        throw new Error(`npm ${operation} failed: ${result.error.message}`);
     }
     if (result.status !== 0) {
-        throw new Error(`npm install exited with code ${result.status}`);
+        throw new Error(`npm ${operation} exited with code ${result.status}`);
     }
 }
 
-function npmInstallArgs({ linkBoxMcpSdk = false } = {}) {
-    return linkBoxMcpSdk ? [...NPM_INSTALL_ARGS, '--install-links=false'] : NPM_INSTALL_ARGS;
+function npmInstallArgs({ linkBoxMcpSdk = false, operation = 'install' } = {}) {
+    if (!['install', 'update'].includes(operation)) throw new Error(`Invalid npm operation: ${operation}`);
+    const args = [operation, ...NPM_INSTALL_ARGS.slice(1)];
+    return linkBoxMcpSdk ? [...args, '--install-links=false'] : args;
 }
 
 function shellQuote(value) {
     return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-export function buildContainerInstallScript({ installDir = '/install', heartbeatSeconds = 30, linkBoxMcpSdk = false } = {}) {
+export function buildContainerInstallScript({ installDir = '/install', heartbeatSeconds = 30, linkBoxMcpSdk = false, operation = 'install' } = {}) {
     const installLabel = shellQuote(installDir);
-    const npmArgs = npmInstallArgs({ linkBoxMcpSdk }).map(shellQuote).join(' ');
+    const npmArgs = npmInstallArgs({ linkBoxMcpSdk, operation }).map(shellQuote).join(' ');
     const interval = Number.isFinite(Number(heartbeatSeconds)) && Number(heartbeatSeconds) > 0
         ? String(Number(heartbeatSeconds))
         : '30';
@@ -624,8 +627,8 @@ export function buildContainerInstallScript({ installDir = '/install', heartbeat
         '&& git config --global url.https://github.com/.insteadOf ssh://git@github.com/',
         '&& git config --global --add url.https://github.com/.insteadOf git@github.com:',
         '&& (',
-        `  printf '[deps-cache] npm install started in %s; cold native dependency caches can take several minutes.\\n' ${installLabel};`,
-        `  (while true; do sleep ${interval}; printf '[deps-cache] npm install still running in %s at %s\\n' ${installLabel} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; done) &`,
+        `  printf '[deps-cache] npm ${operation} started in %s; native dependencies can take several minutes.\\n' ${installLabel};`,
+        `  (while true; do sleep ${interval}; printf '[deps-cache] npm ${operation} still running in %s at %s\\n' ${installLabel} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; done) &`,
         '  heartbeat_pid=$!;',
         '  trap \'kill "$heartbeat_pid" 2>/dev/null || true\' EXIT INT TERM;',
         `  GIT_CEILING_DIRECTORIES=${installLabel} npm ${npmArgs};`,
@@ -689,7 +692,7 @@ export function buildContainerInstallRunArgs({
     ];
 }
 
-function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog, linkBoxMcpSdk = false } = {}) {
+function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog, linkBoxMcpSdk = false, operation = 'install' } = {}) {
     if (!image) {
         throw new Error('Container dependency install requires an image.');
     }
@@ -703,15 +706,15 @@ function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog, 
         image,
         runtime: resolvedRuntime,
         shellPath,
-        installScript: buildContainerInstallScript({ linkBoxMcpSdk }),
+        installScript: buildContainerInstallScript({ linkBoxMcpSdk, operation }),
     });
-    log(`[deps-cache] npm install in container ${image} at ${cwd}`);
+    log(`[deps-cache] npm ${operation} in container ${image} at ${cwd}`);
     const result = spawnSync(resolvedRuntime, args, { stdio: 'inherit', timeout: INSTALL_TIMEOUT_MS });
     if (result.error) {
-        throw new Error(`container npm install failed: ${result.error.message}`);
+        throw new Error(`container npm ${operation} failed: ${result.error.message}`);
     }
     if (result.status !== 0) {
-        throw new Error(`container npm install exited with code ${result.status}`);
+        throw new Error(`container npm ${operation} exited with code ${result.status}`);
     }
 }
 
@@ -840,6 +843,7 @@ export function prepareAgentCache({
     image = '',
     runtime = null,
     agentLib = null,
+    refresh = Boolean(dependencyRefreshOperation()),
 } = {}) {
     const mcpSdk = activeBoxMcpSdkBundle();
     const sdkStamp = mcpSdk ? { mcpSdk: boxMcpSdkStampSection(mcpSdk) } : {};
@@ -865,8 +869,11 @@ export function prepareAgentCache({
     const agentPackageHash = agentPackagePath ? hashFile(agentPackagePath) : null;
     const globalPackageHash = hashMergedPackage(globalPkg);
     const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
+    const completed = dependencyRefreshOperation();
+    const refreshKey = `${cachePath}:${mergedPackageHash}`;
+    if (!force && completed?.has(refreshKey)) return completed.get(refreshKey);
 
-    if (!force) {
+    if (!force && !(refresh && agentPkg)) {
         const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer: expectedInstaller, mcpSdk });
         const linkCheck = check.valid
             ? isAgentLibLinkValid(cachePath, { runtimeKey, agentLib: selection })
@@ -903,9 +910,11 @@ export function prepareAgentCache({
 
     const lock = acquireLock(cachePath);
     try {
+        const operation = !force && agentPkg
+            ? agentDependencyNpmOperation(cachePath, { runtimeKey, installer: expectedInstaller }) : 'install';
         ensureCacheDir(cachePath);
         fs.rmSync(stampPath(cachePath), { force: true });
-        seedFromGlobalCache(globalCachePath, cachePath, {
+        if (operation === 'install') seedFromGlobalCache(globalCachePath, cachePath, {
             log,
             allowHardlinks: shouldSeedAgentCacheWithHardlinks({
                 agentPackagePresent: Boolean(agentPkg),
@@ -916,8 +925,9 @@ export function prepareAgentCache({
             path.join(cachePath, 'package.json'),
             JSON.stringify(mergedPkg, null, 2),
         );
-        if (agentPkg && (!mcpSdk || needsNpmInstall(mergedPkg))) {
-            installWithBoxMcpSdk(cachePath, mergedPkg, mcpSdk, backend.install);
+        if (agentPkg && (refresh || !mcpSdk || needsNpmInstall(mergedPkg))) {
+            installWithBoxMcpSdk(cachePath, mergedPkg, mcpSdk,
+                (cwd, options) => backend.install(cwd, { ...options, operation }));
         }
         finalizeBoxMcpSdkCache(cachePath, mcpSdk);
         finalizeAgentLibCacheLink(cachePath, agentLibSection);
@@ -931,10 +941,21 @@ export function prepareAgentCache({
             ...sdkStamp,
         });
         log(`[deps-cache] agent cache prepared at ${cachePath}`);
-        return { cachePath, reused: false, stamp, mergedPackageHash };
+        const result = { cachePath, reused: false, stamp, mergedPackageHash, operation: agentPkg ? operation : null };
+        completed?.set(refreshKey, result);
+        return result;
     } finally {
         lock.release();
     }
+}
+
+export function agentDependencyNpmOperation(cachePath, { runtimeKey, installer = null }) {
+    const stamp = readStamp(cachePath);
+    // A seeded directory alone is not a completed agent installation. Ignore
+    // the manifest hash here: npm update also reconciles changed dependencies.
+    return stamp?.version === STAMP_VERSION && stamp.runtimeKey === runtimeKey
+        && stamp.agentPackageHash && !installerMismatchReason(stamp, installer)
+        && fs.existsSync(nodeModulesDir(cachePath)) ? 'update' : 'install';
 }
 
 /**

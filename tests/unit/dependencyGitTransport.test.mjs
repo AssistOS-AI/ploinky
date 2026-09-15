@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
     buildContainerInstallScript,
     NPM_INSTALL_ARGS,
@@ -56,6 +57,38 @@ function assertObserved(f, transport) {
         args: NPM_INSTALL_ARGS,
     });
 }
+
+test('npm update advances a Git branch dependency without a package.json edit', (t) => {
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'dependency-moving-git-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const source = path.join(root, 'source');
+    const consumer = path.join(root, 'consumer');
+    fs.mkdirSync(source);
+    fs.mkdirSync(consumer);
+    const env = { ...process.env, npm_config_cache: path.join(root, 'npm-cache') };
+    const run = (cmd, args, cwd) => {
+        const result = spawnSync(cmd, args, { cwd, env, encoding: 'utf8', timeout: 30000 });
+        assert.equal(result.status, 0, `${result.error || ''}\n${result.stdout}\n${result.stderr}`);
+    };
+    run('git', ['init', '-b', 'main'], source);
+    fs.writeFileSync(path.join(source, 'package.json'), JSON.stringify({ name: 'moving-example', version: '1.0.0' }));
+    const commit = (value) => {
+        fs.writeFileSync(path.join(source, 'feature.txt'), value);
+        run('git', ['add', '.'], source);
+        run('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', value], source);
+    };
+    commit('before');
+    const manifest = JSON.stringify({ name: 'consumer', version: '1.0.0',
+        dependencies: { 'moving-example': `git+${pathToFileURL(source).href}#main` } });
+    fs.writeFileSync(path.join(consumer, 'package.json'), manifest);
+    run('npm', NPM_INSTALL_ARGS, consumer);
+    const installed = path.join(consumer, 'node_modules/moving-example/feature.txt');
+    assert.equal(fs.readFileSync(installed, 'utf8'), 'before');
+    commit('effort-support');
+    run('npm', ['update', ...NPM_INSTALL_ARGS.slice(1)], consumer);
+    assert.equal(fs.readFileSync(installed, 'utf8'), 'effort-support');
+    assert.equal(fs.readFileSync(path.join(consumer, 'package.json'), 'utf8'), manifest);
+});
 
 for (const transport of [null, 'HTTP/2']) {
     const label = transport || 'default negotiation';

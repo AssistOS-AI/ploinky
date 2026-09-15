@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { withDependencyRefresh } from '../utils/dependencies/dependencyRefresh.mjs';
 import path from 'path';
 import { spawn } from 'child_process';
 import { debugLog, findAgent } from '../utils/utils.js';
@@ -232,6 +233,10 @@ export async function handleCliCommand(options = [], {
 }
 
 async function handleCommand(args, { agentLibBranchPolicy = null } = {}) {
+    return withDependencyRefresh(args[0], () => dispatchCommand(args, { agentLibBranchPolicy }));
+}
+
+async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
     const [command, ...options] = args;
     if (command === 'start') {
         const parsed = parseStartArgs(options);

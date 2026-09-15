@@ -20,6 +20,7 @@ import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 // recorded durably so an operator can see what went wrong without losing the
 // already-running blocking stack.
 import fs from 'fs';
+import { withDependencyRefresh, hasAgentPackageJson } from '../utils/dependencies/dependencyRefresh.mjs';
 import path from 'path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -1806,6 +1807,7 @@ async function main() {
                     explicitPort: lifecycle.routerPort || undefined,
                 });
                 const adopted = lifecycle.targetState === 'ready'
+                    && !hasAgentPackageJson(agentPath)
                     && !['default', 'bridge'].includes(profileResolution.network.mode);
                 return {
                     manifest,
@@ -1989,7 +1991,7 @@ async function main() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-    main().catch((err) => {
+    withDependencyRefresh('start', () => main()).catch((err) => {
         console.error(sanitizeDiagnosticText(
             `[no-wait] worker crashed: ${sanitizeDiagnosticText(err)}`,
             { singleLine: true },

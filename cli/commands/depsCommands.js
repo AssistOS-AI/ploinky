@@ -24,6 +24,10 @@ import {
 import { getRepoAgentCodePath } from '../utils/workspaceStructure.js';
 import { getRuntimeForAgent } from '../sandbox/docker/common.js';
 import { readManifestStartCommand } from '../sandbox/docker/agentCommands.js';
+import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
+import { withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import { withDependencyRefresh, hasAgentPackageJson } from '../utils/dependencies/dependencyRefresh.mjs';
+import { resolveManifestImage } from '../utils/security/secretVars.js';
 
 const USAGE = [
     'Usage:',
@@ -126,9 +130,9 @@ function depsPrepare(args) {
             runtimeKey,
             log,
             runtime: manifest ? getRuntimeForAgent(manifest) : 'bwrap',
-            image: manifest?.container || manifest?.image || '',
+            image: resolveManifestImage(manifest, null, { repoName, agentName }),
         });
-        log(result.reused ? '[deps] reused existing cache' : '[deps] prepared fresh cache');
+        log(result.reused ? '[deps] reused existing cache' : `[deps] ${result.operation || 'prepare'} completed`);
         return;
     }
 
@@ -333,6 +337,21 @@ export async function handleDepsCommand(options = []) {
             console.log(`Unknown deps subcommand: ${sub}`);
             console.log(USAGE);
     }
+}
+
+export async function refreshRepositoryDependencies(repoNames) {
+    return withDependencyRefresh('update', () => withWorkspaceMutationLease({ operation: 'update-dependencies' }, async () => {
+        for (const repoName of new Set(repoNames)) {
+            const root = resolveAgentRepositoryPath(repoName);
+            for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+                if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+                const agentPath = path.join(root, entry.name);
+                if (!fs.existsSync(path.join(agentPath, 'manifest.json'))
+                    || !hasAgentPackageJson(agentPath)) continue;
+                depsPrepare([`${repoName}/${entry.name}`]);
+            }
+        }
+    }));
 }
 
 export { depsPrepare, depsStatus, depsClean };

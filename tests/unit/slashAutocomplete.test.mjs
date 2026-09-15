@@ -101,10 +101,10 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
                     name: '/model',
                     description: 'Select a model',
                     argMatchMode: 'fragment',
-                    argCompletions: [{
-                        value: 'anthropic/claude-sonnet-4-6',
-                        label: 'anthropic/claude-sonnet-4-6',
+                    subCommands: [{
+                        name: 'anthropic/claude-sonnet-4-6',
                         description: 'Anthropic Sonnet',
+                        argCompletions: ['default', 'low', 'high'],
                     }],
                 }],
             };
@@ -142,6 +142,19 @@ test('slash provider loads MCP catalog with streamable HTTP headers and preserve
             ['/model anthropic/claude-sonnet-4-6 ']
         );
         assert.deepEqual(provider.getSuggestions('text /model anthropic', 21), []);
+        const modelInput = '/model anthropic/claude';
+        const model = provider.getSuggestions(modelInput, modelInput.length)[0];
+        assert.equal(model.keepMenuOpen, true);
+        const efforts = provider.getSuggestions(model.insertText, model.insertText.length);
+        assert.deepEqual(efforts.map((suggestion) => suggestion.insertText), [
+            '/model anthropic/claude-sonnet-4-6 default ',
+            '/model anthropic/claude-sonnet-4-6 low ',
+            '/model anthropic/claude-sonnet-4-6 high ',
+        ]);
+        assert.ok(efforts.every((suggestion) => suggestion.keepMenuOpen === false));
+        const effortInput = '/model anthropic/claude-sonnet-4-6 hi';
+        assert.deepEqual(provider.getSuggestions(effortInput, effortInput.length)
+            .map((suggestion) => suggestion.insertText), ['/model anthropic/claude-sonnet-4-6 high ']);
     } finally {
         globalThis.fetch = originalFetch;
         if (originalLocation === undefined) delete globalThis.location;
@@ -513,6 +526,27 @@ test('buildSuggestions supports subcommand argument completions', () => {
         insertText: '/remove skill admin-flow ',
         description: 'Admin flow'
     }]);
+});
+
+test('model subcommands offer only the selected model efforts and keep default terminal', () => {
+    const commands = [{ name: '/model', subCommands: [
+        { name: 'default', argCompletions: [] },
+        { name: 'provider/first', argCompletions: ['default', 'low', 'high'] },
+        { name: 'provider/second', argCompletions: ['default', 'medium'] },
+        { name: 'legacy', argCompletions: [] },
+    ] }];
+    const suggest = (subToken) => buildSuggestions(commands, {
+        currentToken: 'model', hasSubToken: true, subToken,
+    });
+    assert.deepEqual(suggest('').map((entry) => entry.insertText), [
+        '/model default ', '/model provider/first ', '/model provider/second ', '/model legacy ',
+    ]);
+    assert.deepEqual(suggest('').map((entry) => entry.keepMenuOpen), [false, true, true, false]);
+    assert.deepEqual(suggest('provider/second ').map((entry) => entry.insertText), [
+        '/model provider/second default ', '/model provider/second medium ',
+    ]);
+    assert.deepEqual(suggest('default '), []);
+    assert.deepEqual(suggest('legacy '), []);
 });
 
 test('buildSuggestions displays session names while inserting resume session ids', () => {
