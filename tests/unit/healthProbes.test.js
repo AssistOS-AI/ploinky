@@ -10,6 +10,14 @@ import {
     isUnsupportedRelaySocketIdentity,
     readRelaySocketIdentityWithRetry,
 } from '../../Agent/server/lib/runtimeRelaySocket.mjs';
+import {
+    BOX_HEALTH_PROBE_CONTROL_HOST_ROOT,
+    HEALTH_PROBE_CONTROL_HOST_ROOT,
+    resolveHealthProbeControlHostRoot,
+} from '../../cli/utils/runtime/healthProbeControlPath.js';
+import {
+    RUNTIME_RELAY_CONTROL_HOST_ROOT,
+} from '../../cli/server/runtimeRelay/RuntimeRelayManager.js';
 
 const module = await import('../../cli/sandbox/docker/healthProbes.js');
 const {
@@ -43,6 +51,29 @@ const {
 } = __testConstants;
 
 const containerName = 'test_container_health';
+
+test('Box health and relay control state uses the fresh outer-boot tmpfs', () => {
+    assert.equal(
+        resolveHealthProbeControlHostRoot({
+            insideBox: true,
+            ploinkyDir: '/workspace/.ploinky',
+        }),
+        BOX_HEALTH_PROBE_CONTROL_HOST_ROOT,
+    );
+    assert.equal(BOX_HEALTH_PROBE_CONTROL_HOST_ROOT, '/tmp/ploinky-health-probes');
+    assert.equal(
+        resolveHealthProbeControlHostRoot({
+            insideBox: false,
+            ploinkyDir: '/workspace/.ploinky',
+        }),
+        '/workspace/.ploinky/run/health-probes',
+    );
+    assert.equal(RUNTIME_RELAY_CONTROL_HOST_ROOT, HEALTH_PROBE_CONTROL_HOST_ROOT);
+    assert.throws(
+        () => resolveHealthProbeControlHostRoot({ insideBox: 'yes' }),
+        /exact Box-runtime decision/,
+    );
+});
 
 function resetContainerState() {
     clearLivenessState(containerName);

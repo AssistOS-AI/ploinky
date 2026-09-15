@@ -2,6 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getConfiguredToolInputSchema } from '../../Agent/server/toolInputSchemaCache.mjs';
 
+const standardSpec = {
+    type: 'object',
+    properties: {
+        name: { type: 'string', enum: ['alice', 'bob'], minLength: 3 },
+        count: { type: 'integer', minimum: 0, maximum: 2 },
+        nested: { type: 'object', properties: { flag: { type: 'boolean' } }, required: ['flag'], additionalProperties: false },
+        labels: { type: 'array', items: { type: 'string' }, uniqueItems: true, maxItems: 2 },
+        metadata: { type: 'object', additionalProperties: true },
+    },
+    required: ['name', 'nested'],
+    additionalProperties: false,
+};
+
 const legacySpec = {
     name: { type: 'string', enum: ['alice', 'bob'] },
     count: { type: 'number', min: 0, max: 2, optional: true },
@@ -17,9 +30,9 @@ function result(schema, input) {
     return parsed.success ? { data: parsed.data } : { issues: JSON.parse(JSON.stringify(parsed.error.issues)) };
 }
 
-test('declared tool schemas compile only once for a configuration, including absent and empty schemas', () => {
+test('each declared tool compiles only once for a configuration, including absent and empty schemas', () => {
     let reads = 0;
-    const tool = { name: 'cached', get inputSchema() { reads += 1; return legacySpec; } };
+    const tool = { name: 'cached', get inputSchema() { reads += 1; return standardSpec; } };
     const config = { tools: [tool, { name: 'absent' }, { name: 'empty', inputSchema: {} }] };
     const entries = config.tools.map(entry => getConfiguredToolInputSchema(config, entry));
     const coldReads = reads;
@@ -56,74 +69,61 @@ test('tool and configuration identities cannot collide or grow from undeclared t
     assert.throws(() => getConfiguredToolInputSchema(config, appended), /not declared/);
 });
 
-test('warm schemas preserve legacy validation and parsing behavior', async () => {
-    const tool = { name: 'legacy', inputSchema: legacySpec };
-    const config = { tools: [tool] };
-    const compiled = getConfiguredToolInputSchema(config, tool);
-    const coldConfig = structuredClone(config);
-    const cold = getConfiguredToolInputSchema(coldConfig, coldConfig.tools[0]);
-    const valid = { name: 'alice', nested: { flag: true }, labels: ['a', 'b'], metadata: { untyped: [1] } };
-    for (const value of [
-        valid, { name: 'bob', nested: { flag: false } },
-        { ...valid, count: 0 }, { ...valid, count: 2 }, { ...valid, count: -1 },
-        { ...valid, count: 3 }, { ...valid, name: '' }, { ...valid, name: 'unknown' },
-        { ...valid, nested: {} }, { ...valid, labels: ['a', 'b', 'c'] },
-        { ...valid, extra: true }, { ...valid, nested: { flag: true, extra: true } },
-        {}, null, [], '',
-    ]) assert.deepEqual(result(compiled.schema, value), result(cold.schema, value));
-    assert.deepEqual(compiled.schema.parse(valid), valid);
-    assert.deepEqual(compiled.schema.parse({ ...valid, extra: true, nested: { flag: true, extra: true } }), valid);
-    assert.equal(compiled.schema.safeParse({ ...valid, name: 'unknown' }).success, false);
-    assert.equal(compiled.schema.safeParse({ ...valid, nested: {} }).success, false);
-    const parsed = await Promise.all(Array.from({ length: 20 }, (_, index) =>
-        compiled.schema.parseAsync({ name: index % 2 ? 'alice' : 'bob', nested: { flag: true } })));
-    parsed[0].nested.flag = false;
-    assert.ok(parsed.slice(1).every(entry => entry.nested.flag));
-    assert.equal(parsed[0].optionalDefault, undefined, 'legacy default metadata is not applied');
-    assert.deepEqual(compiled.schema.parse(valid), valid);
-});
-
-test('schema snapshots are detached and frozen without freezing Zod memoization', () => {
-    const literal = { allowed: true };
-    const tool = { name: 'snapshot', inputSchema: { value: { type: 'object', enum: [literal] } } };
-    const config = { tools: [tool] };
-    const compiled = getConfiguredToolInputSchema(config, tool);
-    const retainedLiteral = compiled.schema.shape.value._def.value;
-    assert.ok(Object.isFrozen(compiled));
-    assert.ok(Object.isFrozen(retainedLiteral));
-    assert.notStrictEqual(retainedLiteral, literal);
-    assert.throws(() => { retainedLiteral.allowed = false; }, TypeError);
-    literal.allowed = false;
-    assert.deepEqual(retainedLiteral, { allowed: true });
-    assert.equal(compiled.schema.safeParse({ value: retainedLiteral }).success, true);
-});
-
-test('absent, non-object, array and failed schemas retain the master fallback behavior', () => {
-    for (const inputSchema of [undefined, null, false, 42, 'string']) {
-        const tool = { name: 'fallback', inputSchema };
+for (const [format, inputSchema] of [['standard', standardSpec], ['legacy', legacySpec]]) {
+    test(`${format} warm schemas preserve cold validation, nested values and independent parse results`, async () => {
+        const tool = { name: format, inputSchema };
         const config = { tools: [tool] };
         const compiled = getConfiguredToolInputSchema(config, tool);
-        assert.equal(compiled.configured, false);
-        assert.equal(compiled.errorMessage, null);
-        assert.deepEqual(compiled.schema.parse({ ignored: true }), {});
-        assert.strictEqual(getConfiguredToolInputSchema(config, tool), compiled);
-    }
-    const broken = { name: 'broken', inputSchema: { value: { type: 'string', enum: ['only'], minLength: 2 } } };
-    const config = { tools: [broken] };
-    const compiled = getConfiguredToolInputSchema(config, broken);
-    assert.equal(compiled.configured, false);
-    assert.match(compiled.errorMessage, /Failed to build inputSchema for tool 'broken'/);
-    assert.deepEqual(compiled.schema.parse({ ignored: true }), {});
-    assert.strictEqual(getConfiguredToolInputSchema(config, broken), compiled);
-    const arrayTool = { name: 'array', inputSchema: ['string'] };
-    const arrayConfig = { tools: [arrayTool] };
-    assert.deepEqual(getConfiguredToolInputSchema(arrayConfig, arrayTool).schema.parse({ 0: 'value' }), { 0: 'value' });
+        const coldConfig = structuredClone(config);
+        const cold = getConfiguredToolInputSchema(coldConfig, coldConfig.tools[0]);
+        const valid = { name: 'alice', nested: { flag: true }, labels: ['a', 'b'], metadata: { untyped: [1] } };
+        for (const value of [
+            valid, { name: 'bob', nested: { flag: false } },
+            { ...valid, count: 0 }, { ...valid, count: 2 }, { ...valid, count: -1 },
+            { ...valid, count: 3 }, { ...valid, name: '' }, { ...valid, name: 'unknown' },
+            { ...valid, nested: {} }, { ...valid, labels: ['a', 'b', 'c'] },
+            { ...valid, extra: true }, { ...valid, nested: { flag: true, extra: true } },
+            {}, null, [], '',
+        ]) assert.deepEqual(result(compiled.schema, value), result(cold.schema, value));
+        assert.deepEqual(compiled.schema.parse(valid), valid);
+        assert.equal(compiled.schema.safeParse({ ...valid, name: 'unknown' }).success, false);
+        assert.equal(compiled.schema.safeParse({ ...valid, nested: {} }).success, false);
+        const parsed = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+            compiled.schema.parseAsync({ name: index % 2 ? 'alice' : 'bob', nested: { flag: true } })));
+        parsed[0].nested.flag = false;
+        assert.ok(parsed.slice(1).every(entry => entry.nested.flag));
+        assert.equal(parsed[0].optionalDefault, undefined);
+        assert.deepEqual(compiled.schema.parse(valid), valid);
+    });
+}
+
+test('cached standard listings and retained refinement inputs are isolated immutable snapshots', () => {
+    const spec = { type: 'object', properties: { value: { type: 'object', enum: [{ allowed: true }] } }, required: ['value'] };
+    const tool = { name: 'snapshot', inputSchema: spec };
+    const config = { tools: [tool] };
+    const compiled = getConfiguredToolInputSchema(config, tool);
+    assert.ok(Object.isFrozen(compiled));
+    assert.ok(Object.isFrozen(compiled.jsonSchema.properties.value.enum[0]));
+    assert.notStrictEqual(compiled.jsonSchema, spec);
+    assert.throws(() => { compiled.jsonSchema.properties.value.enum[0].allowed = false; }, TypeError);
+    spec.properties.value.enum[0].allowed = false;
+    assert.equal(compiled.schema.safeParse({ value: { allowed: true } }).success, true);
+    assert.equal(compiled.schema.safeParse({ value: { allowed: false } }).success, false);
+    assert.deepEqual(compiled.jsonSchema.properties.value.enum, [{ allowed: true }]);
 });
 
-test('JSON Schema-looking objects are still legacy field maps rather than a new schema dialect', () => {
-    const tool = { name: 'legacy-only', inputSchema: { type: 'object', properties: { value: { type: 'string' } } } };
-    const config = { tools: [tool] };
-    const { schema } = getConfiguredToolInputSchema(config, tool);
-    assert.equal(schema.safeParse({ value: 'new dialect must not be introduced' }).success, false);
-    assert.deepEqual(schema.parse({ type: {}, properties: 'legacy property' }), { type: {}, properties: 'legacy property' });
+test('invalid schemas fail closed on every lookup without falling back to an empty schema', () => {
+    for (const inputSchema of [
+        null, [], 'string', 42,
+        { type: 'object', properties: null },
+        { type: 'object', properties: {}, default: {} },
+        { type: 'object', properties: { value: { type: 'string', default: 'unsupported' } } },
+        { type: 'object', properties: {}, oneOf: [] },
+    ]) {
+        const tool = { name: 'invalid', inputSchema };
+        const config = { tools: [tool] };
+        for (let i = 0; i < 3; i += 1) {
+            assert.throws(() => getConfiguredToolInputSchema(config, tool), /Failed to build inputSchema for tool 'invalid'/);
+        }
+    }
 });

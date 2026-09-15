@@ -5,35 +5,34 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 
-const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'marketplace-public-'));
+const workspace = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'marketplace-public-'));
 const previousCwd = process.cwd();
 const previousKey = process.env.PLOINKY_MASTER_KEY;
 process.chdir(workspace);
 process.env.PLOINKY_MASTER_KEY = '4'.repeat(64);
 fs.mkdirSync('.ploinky');
 const { handleMarketplaceRoutes } = await import('../../cli/server/authHandlers/marketplaceRoutes.js');
-const { authenticateLocalUser, getSession } = await import('../../cli/server/auth/localService.js');
-const { hashPassword } = await import('../../cli/utils/security/localAuthPasswords.js');
-const { setUsersPayload } = await import('../../cli/utils/security/encryptedPasswordStore.js');
+const { mintSessionJwt, getSession } = await import('../../cli/server/auth/localService.js');
+const { authService, SSO_AUTH_COOKIE_NAME } = await import('../../cli/server/authHandlers/shared.js');
 const { mintBrowserCsrfToken } = await import('../../cli/server/browserMutationSecurity.js');
 const { mintAdminCsrfToken } = await import('../../cli/server/adminControlSecurity.js');
-const policy = { mode: 'local', usersVar: 'MARKETPLACE_TEST_USERS' };
-const otherPolicy = { mode: 'local', usersVar: 'OTHER_TEST_USERS' };
-for (const p of [policy, otherPolicy]) setUsersPayload(p.usersVar, { version: 1, users: ['admin', 'user'].map(username => ({
-    id: `local:${username}`, username, passwordHash: hashPassword('fixture-password'), roles: username === 'admin' ? ['local', 'admin'] : ['local'], rev: 1,
-})) });
-const session = (username = 'admin', p = policy) => authenticateLocalUser({ username, password: 'fixture-password', policy: p, routeKey: 'shell' });
-const admin = session();
-const user = session('user');
-const foreign = session('admin', otherPolicy);
+const policy = { mode: 'sso' };
+const admin = { sessionId: 'admin-provider-session', user: { id: 'admin', roles: ['admin'] } };
+const user = { sessionId: 'user-provider-session', user: { id: 'user', roles: ['user'] } };
+const foreign = { sessionId: 'foreign-provider-session' };
+const cli = { sessionId: mintSessionJwt({ id: 'local:admin', roles: ['admin'] }, 1, { channel: 'cli' }) };
+const originalConfigured = authService.isConfigured;
+const originalValidate = authService.validateSession;
+authService.isConfigured = () => true;
+authService.validateSession = async id => [admin, user].find(session => session.sessionId === id) || null;
 const snapshot = { generation: 'generation-a', agents: { shell: { type: 'agent', agentName: 'shell', repoName: 'repo', auth: policy } }, routing: { static: { agent: 'shell' }, routes: { shell: { agent: 'shell', repo: 'repo' } } }, manifests: {} };
 const plan = () => ({ ok: true, kind: 'router-surface', surface: 'marketplace-ui', listener: 'public', hostSelection: { kind: 'agent-root', record: { routeKey: 'shell' } }, forwarding: { protocol: 'https', authority: 'explorer.example.test' }, snapshot, lease: { id: snapshot.generation, snapshot, commit: () => true } });
 let enabled = 0;
 async function request({ who = admin, routePlan = plan(), origin = 'https://explorer.example.test', csrf = 'valid', method = 'POST', body = { action: 'enable_agent', agentRef: 'repo/worker', mode: 'global' }, mutate } = {}) {
     const req = Readable.from(method === 'GET' ? [] : [Buffer.from(JSON.stringify(body))]);
     req.method = method;
-    req.headers = { host: 'explorer.example.test', origin, cookie: `ploinky_jwt=${who.sessionId}` };
-    req.session = getSession(who.sessionId);
+    req.headers = { host: 'explorer.example.test', origin, cookie: `${who === cli ? 'ploinky_jwt' : SSO_AUTH_COOKIE_NAME}=${who.sessionId}` };
+    req.session = who === cli ? getSession(who.sessionId) : who;
     if (csrf === 'valid') req.headers['x-ploinky-browser-csrf-token'] = mintBrowserCsrfToken({ req, routePlan: plan(), authContext: { boundHostRouteKey: 'shell' }, sessionId: who.sessionId });
     if (csrf === 'local') {
         req.headers.host = 'localhost'; req.headers.origin = 'http://localhost';
@@ -44,7 +43,7 @@ async function request({ who = admin, routePlan = plan(), origin = 'https://expl
     await handleMarketplaceRoutes(req, res, new URL('https://explorer.example.test/api/marketplace'), { routePlan, enableAgentAction: async () => { enabled++; return { result: { status: 'enabled' } }; } });
     return res;
 }
-test.after(() => { process.chdir(previousCwd); if (previousKey === undefined) delete process.env.PLOINKY_MASTER_KEY; else process.env.PLOINKY_MASTER_KEY = previousKey; fs.rmSync(workspace, { recursive: true, force: true }); });
+test.after(() => { authService.isConfigured = originalConfigured; authService.validateSession = originalValidate; process.chdir(previousCwd); if (previousKey === undefined) delete process.env.PLOINKY_MASTER_KEY; else process.env.PLOINKY_MASTER_KEY = previousKey; fs.rmSync(workspace, { recursive: true, force: true }); });
 
 test('public Marketplace admits a selected-root admin using routed browser CSRF', async () => {
     const before = enabled;
@@ -53,11 +52,33 @@ test('public Marketplace admits a selected-root admin using routed browser CSRF'
     assert.equal(enabled, before + 1);
     assert.equal(res.body.action, 'enable_agent');
 });
-test('public Marketplace rejects non-admin and foreign user-store sessions', async () => {
+test('public Marketplace rejects non-admin and foreign provider sessions', async () => {
     const before = enabled;
     assert.equal((await request({ who: user })).status, 403);
     assert.equal((await request({ who: foreign })).status, 401);
     assert.equal(enabled, before);
+});
+test('public Marketplace rejects expired, guest-admin, unconfigured, and CLI sessions', async () => {
+    const before = enabled;
+    const validate = authService.validateSession;
+    try {
+        authService.validateSession = async () => ({ ...admin, expiresAt: Date.now() - 1 });
+        assert.equal((await request()).status, 401);
+        authService.validateSession = async () => ({ ...admin, user: { ...admin.user, roles: ['admin', 'guest'] } });
+        assert.equal((await request()).status, 403);
+        authService.validateSession = validate;
+        authService.isConfigured = () => false;
+        assert.equal((await request()).status, 401);
+        authService.isConfigured = () => true;
+        assert.equal((await request({ who: cli })).status, 401);
+        const noAuthSnapshot = structuredClone(snapshot);
+        noAuthSnapshot.agents.shell.auth = { mode: 'none' };
+        assert.equal((await request({ routePlan: { ...plan(), snapshot: noAuthSnapshot } })).status, 401);
+        assert.equal(enabled, before);
+    } finally {
+        authService.validateSession = validate;
+        authService.isConfigured = () => true;
+    }
 });
 test('public Marketplace rejects missing proof, cross-origin, host and generation replay', async () => {
     const before = enabled;
@@ -77,7 +98,7 @@ test('public Marketplace revalidates the lease before mutation', async () => {
     assert.equal(enabled, before);
 });
 test('local Marketplace still requires local control proof', async () => {
-    assert.equal((await request({ routePlan: null, csrf: 'local' })).status, 200);
+    assert.equal((await request({ who: cli, routePlan: null, csrf: 'local' })).status, 200);
     assert.equal((await request({ routePlan: null })).status, 403);
 });
 

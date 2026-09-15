@@ -6,6 +6,8 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { signBrowserSessionFixture } from '../helpers/routerSessionFixture.mjs';
+
 import { dispatchAgentStartupRequest } from '../../cli/server/agentStartupDispatch.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -64,7 +66,7 @@ function makeRequest({
     return req;
 }
 
-function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
+function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'sso' } = {}) {
     writeFileSync(path.join(ploinkyDir, '.secrets'), '# test secrets\n');
     const webAdminManifestDir = path.join(ploinkyDir, 'repos', 'webassist', 'webAdmin');
     const serviceManifestDir = path.join(ploinkyDir, 'repos', 'services', 'guestAgent');
@@ -113,9 +115,7 @@ function writeWorkspaceConfig(ploinkyDir, { staticAuthMode = 'local' } = {}) {
             type: 'agent',
             agentName: 'explorer',
             repoName: 'AchillesIDE',
-            auth: staticAuthMode === 'local'
-                ? { mode: 'local', usersVar: 'PLOINKY_AUTH_EXPLORER_USERS' }
-                : { mode: staticAuthMode },
+            auth: { mode: staticAuthMode },
         },
         webAssist: {
             type: 'agent',
@@ -192,6 +192,7 @@ async function withAuthModules(t, options = {}) {
     const nonce = `${Date.now()}-${Math.random()}`;
     const authHandlers = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/authHandlers/index.js')).href}?test=${nonce}`);
     const localService = await import(`${pathToFileURL(path.join(REPO_ROOT, 'cli/server/auth/localService.js')).href}?test=${nonce}`);
+    t.mock.method(authHandlers.authService, 'isConfigured', () => true);
     const createRoutePlan = (overrides = {}) => {
         const snapshot = {
             generation: 'guest-auth-test-generation',
@@ -324,6 +325,7 @@ test('guest routes use the guest agent policy instead of the static Explorer pol
 
 test('browser auth host binding rejects selector switches and ignores raw candidate edits', async (t) => {
     const { authHandlers, createRoutePlan } = await withAuthModules(t);
+    t.mock.method(authHandlers.authService, 'beginLogin', async () => ({ redirectUrl: '/identity/login', state: 's'.repeat(22), browserBinding: 'test-proof', expiresAt: Date.now() + 60000 }));
     const routePlan = createRoutePlan({
         ok: true,
         kind: 'router-surface',
@@ -370,7 +372,7 @@ test('browser auth host binding rejects selector switches and ignores raw candid
         { routePlan },
     );
     assert.equal(fixedRes.statusCode, 200);
-    assert.match(fixedRes.body, /data-auth-login-form/);
+    assert.match(fixedRes.body, /Single Sign-On/);
     assert.doesNotMatch(fixedRes.body, /name="agent"/);
 
     routePlan.lease.commit = () => false;
@@ -383,6 +385,58 @@ test('browser auth host binding rejects selector switches and ignores raw candid
     );
     assert.equal(staleRes.statusCode, 503);
     assert.equal(JSON.parse(staleRes.body).error, 'edge_generation_changed');
+});
+
+test('canonical login restart sanitizes return paths and rejects invalid agents before redirecting', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t);
+    t.mock.method(authService, 'beginLogin', async () => ({ restartLogin: true, canonicalLoginOrigin: 'http://127.0.0.1' }));
+    for (const returnTo of ['https://evil.example', '//evil.example', '/%252f%252fevil.example', '/safe\r\nLocation:evil']) {
+        const req = makeRequest({ url: `/auth/login?agent=webAssist&returnTo=${encodeURIComponent(returnTo)}` });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(res.statusCode, 303, res.body);
+        const target = new URL(res.getHeader('location'));
+        assert.equal(target.origin, 'http://127.0.0.1');
+        assert.deepEqual(Object.fromEntries(target.searchParams), { returnTo: '/', agent: 'webAssist' });
+        assert.equal(res.getHeader('set-cookie'), undefined);
+        assert.equal(res.getHeader('cache-control'), 'no-store');
+    }
+    const callsBefore = authService.beginLogin.mock.callCount();
+    for (const agent of ['missing-agent', 'https://evil.example', 'webAssist\r\nLocation:evil']) {
+        const req = makeRequest({ url: `/auth/login?agent=${encodeURIComponent(agent)}` });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(res.statusCode, 404, res.body);
+        assert.equal(res.getHeader('location'), undefined);
+        assert.equal(res.getHeader('set-cookie'), undefined);
+    }
+    assert.equal(authService.beginLogin.mock.callCount(), callsBefore);
+});
+
+test('canonical login restart requires GET and a current generation before emitting a redirect', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t);
+    let activePlan;
+    t.mock.method(authService, 'beginLogin', async () => {
+        activePlan.lease.commit = () => false;
+        return { restartLogin: true, canonicalLoginOrigin: 'http://127.0.0.1' };
+    });
+    for (const method of ['POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS']) {
+        const req = makeRequest({ method, url: '/auth/login' });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(res.statusCode, 405, res.body);
+        assert.equal(res.getHeader('location'), undefined);
+        assert.equal(res.getHeader('set-cookie'), undefined);
+    }
+    assert.equal(authService.beginLogin.mock.callCount(), 0);
+    activePlan = createRoutePlan();
+    const req = makeRequest({ url: '/auth/login' });
+    const res = new MockResponse();
+    await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: activePlan });
+    assert.equal(res.statusCode, 503, res.body);
+    assert.equal(JSON.parse(res.body).error, 'edge_generation_changed');
+    assert.equal(res.getHeader('location'), undefined);
+    assert.equal(res.getHeader('set-cookie'), undefined);
 });
 
 test('host-bound browser token mints only an admitted service mutation proof', async (t) => {
@@ -488,6 +542,35 @@ test('host-bound browser token mints only an admitted service mutation proof', a
     assert.equal(JSON.parse(switchedRes.body).error, 'auth_route_context_mismatch');
 });
 
+test('browser token GET denies a generation change during session resolution before issuing proofs or cookies', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    let resolveSession;
+    let sessionLookupStarted;
+    const started = new Promise((resolve) => { sessionLookupStarted = resolve; });
+    t.mock.method(authService, 'getSession', async () => {
+        sessionLookupStarted();
+        return new Promise((resolve) => { resolveSession = resolve; });
+    });
+    let current = true;
+    const routePlan = createRoutePlan();
+    routePlan.lease.commit = () => current;
+    const req = makeRequest({ method: 'GET', url: '/auth/token', cookie: 'ploinky_sso=slow-session' });
+    const res = new MockResponse();
+    const handled = authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan });
+    await started;
+    current = false;
+    resolveSession({
+        user: { id: 'member-1', username: '', email: 'member@example.test', roles: ['user'] },
+        tokens: null, expiresAt: Date.now() + 60_000,
+    });
+    assert.equal(await handled, true);
+    assert.equal(res.statusCode, 503);
+    assert.equal(JSON.parse(res.body).error, 'edge_generation_changed');
+    assert.equal(res.getHeader('set-cookie'), undefined);
+    assert.equal(Object.hasOwn(JSON.parse(res.body), 'browserMutation'), false);
+    assert.equal(Object.hasOwn(JSON.parse(res.body), 'adminControl'), false);
+});
+
 test('SSO login and callback keep every return target inside the normalized same-origin boundary', async (t) => {
     const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, {
         staticAuthMode: 'sso',
@@ -508,6 +591,9 @@ test('SSO login and callback keep every return target inside the normalized same
         observedReturnTargets.push(returnTo);
         return {
             redirectUrl: 'https://identity.example.test/authorize',
+            state: 'test-state-12345678901',
+            browserBinding: 'test-browser-proof',
+            expiresAt: Date.now() + 60_000,
         };
     };
 
@@ -566,7 +652,8 @@ test('SSO login and callback keep every return target inside the normalized same
     callbackPlan.snapshot.routing.routes.explorer.hostPort = 0;
     const callbackReq = makeRequest({
         method: 'GET',
-        url: '/auth/callback?code=test-code&state=test-state',
+        url: '/auth/callback?code=test-code&state=test-state-12345678901',
+        cookie: 'ploinky_sso_login_test-state-12345678901=test-browser-proof',
         accept: 'text/html',
     });
     const callbackRes = new MockResponse();
@@ -697,15 +784,15 @@ test('static-auth webchat input preserves the target mutation route binding', as
     assert.match(String(req.browserCsrfToken || ''), /^v2\./);
 });
 
-test('browser token for a guest target preserves an authenticated local session', async (t) => {
+test('browser token for a guest target rejects retired local browser credentials', async (t) => {
     const { authHandlers, localService, createRoutePlan } = await withAuthModules(t);
-    const token = localService.mintSessionJwt({
+    const token = signBrowserSessionFixture({
         id: 'local:admin',
         username: 'admin',
         name: 'Local Admin',
         email: 'admin@example.test',
         roles: ['user', 'admin'],
-    }, 1);
+    });
     const req = makeRequest({
         method: 'GET',
         url: '/auth/token?mutationRoute=webAssist',
@@ -722,14 +809,9 @@ test('browser token for a guest target preserves an authenticated local session'
     const body = JSON.parse(res.body || '{}');
 
     assert.equal(handled, true);
-    assert.equal(res.statusCode, 200);
-    assert.equal(req.authMode, 'local');
-    assert.equal(body.ok, true);
-    assert.equal(body.user.username, 'admin');
-    assert.deepEqual(body.user.roles, ['user', 'admin']);
-    assert.equal(body.browserMutation.routeKey, 'webAssist');
-    assert.equal(body.browserMutation.generation, 'guest-auth-test-generation');
-    assert.match(String(res.getHeader('set-cookie') || ''), /^ploinky_browser_csrf=/);
+    assert.equal(res.statusCode, 401);
+    assert.equal(req.user, undefined);
+    assert.equal(body.ok, false);
 });
 
 test('browser token accepts an exact manifest guest path without widening dependency access', async (t) => {
@@ -956,7 +1038,7 @@ test('route default falls back to guest when no user-authenticated static agent 
     assert.deepEqual(decision, { access: 'guest', routeKey: 'webAdmin', source: 'routeDefault' });
 });
 
-test('auth mode none preserves valid local sessions for router policy', async (t) => {
+test('auth mode none admits the signed CLI operator for router policy', async (t) => {
     const { authHandlers, localService } = await withAuthModules(t, { staticAuthMode: 'none' });
     const token = localService.mintSessionJwt({
         id: 'local:admin',
@@ -964,7 +1046,7 @@ test('auth mode none preserves valid local sessions for router policy', async (t
         name: 'Local CLI',
         email: '',
         roles: ['user', 'admin'],
-    }, 1);
+    }, 1, { channel: 'cli' });
     const req = makeRequest({
         method: 'POST',
         url: '/mcp',
@@ -984,7 +1066,7 @@ test('auth mode none preserves valid local sessions for router policy', async (t
 });
 
 test('local CLI channel crosses configured surface auth without weakening browser sessions', async (t) => {
-    const { authHandlers, localService } = await withAuthModules(t);
+    const { authHandlers, localService, createRoutePlan } = await withAuthModules(t);
     const user = {
         id: 'local:admin',
         username: 'admin',
@@ -999,10 +1081,15 @@ test('local CLI channel crosses configured surface auth without weakening browse
         cookie: `ploinky_jwt=${cliToken}`,
     });
     const cliRes = new MockResponse();
+    const snapshot = createRoutePlan().snapshot;
+    snapshot.manifests.explorer = {
+        routerAccess: { requiredCapability: 'explorer.access' },
+    };
     const cliResult = await authHandlers.ensureAuthenticated(
         cliReq,
         cliRes,
         new URL(cliReq.url, 'http://localhost'),
+        { snapshot },
     );
 
     assert.equal(cliResult.ok, true);
@@ -1010,7 +1097,7 @@ test('local CLI channel crosses configured surface auth without weakening browse
     assert.equal(cliReq.authChannel, 'cli');
     assert.equal(cliReq.user?.id, 'local:admin');
 
-    const browserToken = localService.mintSessionJwt(user, 1);
+    const browserToken = signBrowserSessionFixture(user);
     const browserReq = makeRequest({
         method: 'POST',
         url: '/mcp',
@@ -1096,7 +1183,7 @@ test('parameterized guest routes mint an exact scope and reject unbound guest en
         username: 'admin',
         roles: ['user', 'admin'],
     };
-    const adminToken = localService.mintSessionJwt(admin, 1);
+    const adminToken = localService.mintSessionJwt(admin, 1, { channel: 'cli' });
     const adminReq = makeRequest({
         method: 'GET',
         url: '/webAssist/roomLoader.html',
@@ -1140,13 +1227,17 @@ test('an SSO user session takes precedence over guest minting on guest routes', 
     const { authHandlers, authService } = await withAuthModules(t);
     const originalIsConfigured = authService.isConfigured;
     const originalGetSession = authService.getSession;
+    const originalValidateSession = authService.validateSession;
     authService.isConfigured = () => true;
-    authService.getSession = (id) => id === 'sso-cookie-1'
+    const sessionFor = (id) => id === 'sso-cookie-1'
         ? { user: { id: 'sso:alice', username: 'alice', roles: ['user'] }, expiresAt: Date.now() + 60_000 }
         : null;
+    authService.getSession = sessionFor;
+    authService.validateSession = async (id) => sessionFor(id);
     t.after(() => {
         authService.isConfigured = originalIsConfigured;
         authService.getSession = originalGetSession;
+        authService.validateSession = originalValidateSession;
     });
 
     const req = makeRequest({ method: 'GET', url: '/webAssist/page', cookie: 'ploinky_sso=sso-cookie-1' });
@@ -1161,6 +1252,64 @@ test('an SSO user session takes precedence over guest minting on guest routes', 
     assert.equal(req.authMode, 'sso');
     assert.equal(req.user.username, 'alice');
     assert.doesNotMatch(String(res.getHeader('set-cookie') || ''), /^ploinky_guest=/);
+});
+
+test('an authenticated route enforces its manifest capability against the live SSO identity', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    const originalIsConfigured = authService.isConfigured;
+    const originalValidateSession = authService.validateSession;
+    authService.isConfigured = () => true;
+    let capabilities = [];
+    authService.validateSession = async (sessionId) => sessionId === 'sso-capability-session'
+        ? {
+            user: { id: 'sso:member', username: 'member', roles: ['user'], capabilities },
+            expiresAt: Date.now() + 60_000,
+        }
+        : null;
+    t.after(() => {
+        authService.isConfigured = originalIsConfigured;
+        authService.validateSession = originalValidateSession;
+    });
+
+    const routePlan = createRoutePlan();
+    routePlan.snapshot.manifests.explorer = {
+        routerAccess: { requiredCapability: 'explorer.access' },
+    };
+    const decision = { access: 'authenticated', routeKey: 'explorer', source: 'policy' };
+
+    const deniedReq = makeRequest({
+        method: 'GET',
+        url: '/explorer/index.html',
+        cookie: 'ploinky_sso=sso-capability-session',
+    });
+    const deniedRes = new MockResponse();
+    const denied = await authHandlers.ensureHttpRouteAccess(
+        deniedReq,
+        deniedRes,
+        new URL(deniedReq.url, 'http://localhost'),
+        decision,
+        { routePlan },
+    );
+    assert.equal(denied.ok, false);
+    assert.equal(deniedRes.statusCode, 403);
+    assert.equal(JSON.parse(deniedRes.body).error, 'required_capability_missing');
+
+    capabilities = ['explorer.access'];
+    const allowedReq = makeRequest({
+        method: 'GET',
+        url: '/explorer/index.html',
+        cookie: 'ploinky_sso=sso-capability-session',
+    });
+    const allowedRes = new MockResponse();
+    const allowed = await authHandlers.ensureHttpRouteAccess(
+        allowedReq,
+        allowedRes,
+        new URL(allowedReq.url, 'http://localhost'),
+        decision,
+        { routePlan },
+    );
+    assert.equal(allowed.ok, true);
+    assert.deepEqual(allowedReq.user.capabilities, ['explorer.access']);
 });
 
 test('authenticated route key with guest auth falls back to static route auth instead of minting guest', async (t) => {
@@ -1543,5 +1692,33 @@ test('startup dispatch preserves the real access and host matrix before lifecycl
         assert.equal(afterExpiry.lifecycleReads, 0);
         assert.equal(afterExpiry.res.statusCode, 401);
         assert.equal(JSON.parse(afterExpiry.res.body).error, 'not_authenticated');
+    }
+});
+
+
+test('SSO callback maps provider client rejection without exposing provider detail or issuing a session', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    const originals = { isConfigured: authService.isConfigured, handleCallback: authService.handleCallback };
+    t.after(() => Object.assign(authService, originals));
+    authService.isConfigured = () => true;
+    for (const [providerStatus, expectedStatus] of [[400, 400], [401, 400], ['400', 500], [403, 400], [500, 500], [503, 500], [undefined, 500]]) {
+        await t.test(`provider status ${String(providerStatus)}`, async () => {
+            authService.handleCallback = async () => {
+                throw Object.assign(new Error('private provider rejection detail'), { statusCode: providerStatus, code: 'provider_specific_rejection' });
+            };
+            const req = makeRequest({
+                url: '/auth/callback?code=test-code&state=test-state-12345678901',
+                cookie: 'ploinky_sso_login_test-state-12345678901=test-browser-proof',
+                accept: 'text/html',
+            });
+            const res = new MockResponse();
+            await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+            assert.equal(res.statusCode, expectedStatus);
+            const body = JSON.parse(res.body);
+            assert.equal(body.ok, false);
+            assert.equal(body.error, expectedStatus === 400 ? 'invalid_authorization_code' : 'auth_failure');
+            if (expectedStatus === 400) assert.deepEqual(body, { ok: false, error: 'invalid_authorization_code' });
+            assert.equal(res.getHeader('set-cookie'), undefined, 'a rejected exchange must not issue cookies');
+        });
     }
 });

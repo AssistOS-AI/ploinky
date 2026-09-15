@@ -18,10 +18,12 @@ that configuration when first used; a client-provided tool name, actor or argume
 cannot add cache entries. Distinct configurations and tool objects never share a
 cache entry, even when their names match.
 
-Only configuration-derived schema data is shared. The input specification is
-copied and deeply frozen before compilation. The descriptor is frozen, while
-the private Zod graph remains writable for the SDK's internal shape memoization.
-Validation results and errors are local to each parse, not retained in the cache.
+Only configuration-derived schema data is shared. The JSON input specification
+is copied and deeply frozen before compilation. Standard JSON Schema listings
+use that same immutable snapshot so refinements and listings cannot diverge.
+The descriptor is frozen, while the private Zod graph remains writable for the
+SDK's internal shape memoization. Validation results and errors are local to
+each parse, not retained in the cache.
 
 There is no configuration hot reload: change the configuration through the
 normal agent lifecycle. A new configuration identity has a separate cache.
@@ -30,27 +32,24 @@ session/token reuse.
 
 ## Preserved schema behavior
 
-The existing legacy field-map compiler is moved without semantic changes.
+Legacy field-map schemas use the existing compiler without semantic changes.
 Optional/nullable fields, nested objects, enums and array constraints retain
-their prior behavior. Unknown object properties are stripped unless a nested
-object explicitly permits them. Legacy `default` metadata does not insert a
-value. Input remains a field map, not standard JSON Schema; no new schema dialect
-or authentication feature is introduced.
+their prior behavior. Unknown legacy object properties are stripped unless a
+nested object explicitly permits them. Legacy `default` metadata does not
+insert a value.
 
-Absent, null and other non-object specifications keep the existing empty-object
-validation fallback. Object specifications, including the previously accepted
-array form, use the same compiler as before. If compilation throws, the prior
-diagnostic and empty-object fallback are retained; the cache stores that result
-and registration still emits the diagnostic. This compatibility behavior is
-not a new fail-closed schema-validation guarantee. Invocation authentication,
-argument-hash binding and replay checks remain mandatory on every dispatched call.
+Standard JSON Schema uses the existing strict supported-keyword compiler.
+Required fields, enum refinements, integer and string constraints, nested
+properties and boolean `additionalProperties` retain their prior behavior.
+Unsupported standard keywords, including `default`, still fail initialization
+closed. An invalid schema is never replaced with an empty or permissive schema.
+Missing input schemas keep the previous empty-object validation behavior.
 
 ## Verification and measurement
 
 `tests/unit/toolInputSchemaCache.test.mjs` checks object reuse, bounded declared
 keys, distinct configuration/tool identities, cold/warm validation equivalence,
-immutable snapshots, concurrent independent parses, legacy fallback behavior
-and the absence of a new standard JSON Schema interpretation.
+immutable snapshots, concurrent independent parses and repeated invalid input.
 `tests/unit/agentServerSessionLifecycle.test.mjs` exercises fresh real MCP
 sessions, overlapping calls from different actors, actor changes within a
 session, signed validation failures, missing authorization, tampering and
@@ -59,7 +58,7 @@ cross-session replay rejection.
 Run the relevant tests with the repository's explicit AgentLib preload:
 
 ```sh
-node --import ./tests/helpers/agentlibTestContract.mjs --test tests/unit/toolInputSchemaCache.test.mjs tests/unit/agentServerSessionLifecycle.test.mjs tests/unit/invocationAuth.test.mjs tests/unit/invocationAuthInfo.test.mjs tests/unit/mcpToolArguments.test.mjs tests/unit/mcpToolPolicy.test.mjs
+node --import ./tests/helpers/agentlibTestContract.mjs --test tests/unit/toolInputSchemaCache.test.mjs tests/unit/agentInputSchema.test.mjs tests/unit/agentServerSessionLifecycle.test.mjs tests/unit/invocationAuth.test.mjs tests/unit/invocationAuthInfo.test.mjs tests/unit/mcpToolArguments.test.mjs tests/unit/mcpToolPolicy.test.mjs
 ```
 
 The bounded synthetic benchmark compares cold compilation with warm lookup
@@ -69,7 +68,7 @@ through the same production helper:
 node --expose-gc tests/benchmarks/toolInputSchemaCache.mjs 200
 ```
 
-It uses 40 legacy field-map tools, reports elapsed time and sampled total
+It uses 40 mixed standard/legacy tools, reports elapsed time and sampled total
 allocation bytes (including collected allocations), and asserts 8,000 distinct
 schemas for cold configurations versus 40 for one reused configuration.
 Timings and allocation samples are observations, not test thresholds. Cold

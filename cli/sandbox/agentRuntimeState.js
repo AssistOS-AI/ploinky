@@ -2,6 +2,8 @@ import { getBwrapPid, isBwrapProcessRunning } from './bwrap/bwrapFleet.js';
 import { collectLiveAgentContainers, collectLiveAgentContainersAsync, getAgentsRegistry } from './docker/containerRegistry.js';
 import { loadActiveEdgeRoutingGeneration } from './edgeGeneration.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol } from '../utils/runtime/startupReadiness.js';
+import { observeNoWaitAgentRecord } from '../server/noWaitAgentStartupState.js';
+
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 
 const HOST_SANDBOX_RUNTIMES = new Set(['bwrap', 'seatbelt']);
@@ -19,7 +21,7 @@ function loadActiveGeneration() {
     }
 }
 
-function hasActiveRoutePort(routes, containerName, record = {}) {
+function findActiveRuntimeRoute(routes, containerName, record = {}) {
     const routeMatchesRuntime = (entry) => {
         if (!entry || entry.disabled === true || entry.draining === true) return false;
         const runtimeContainer = String(containerName || '');
@@ -35,54 +37,58 @@ function hasActiveRoutePort(routes, containerName, record = {}) {
         return Boolean(runtimeContainer && routeContainer && runtimeContainer === routeContainer);
     };
     const preferredKeys = [...new Set([record.alias, record.agentName].map((value) => String(value || '')).filter(Boolean))];
-    const route = preferredKeys
-        .map((key) => routes?.[key])
-        .find(routeMatchesRuntime)
-        || Object.values(routes || {}).find(routeMatchesRuntime);
-    const hostPort = Number(route?.hostPort || 0);
-    return Number.isSafeInteger(hostPort) && hostPort > 0 && hostPort <= 65535;
+    return preferredKeys
+        .map((key) => [key, routes?.[key]])
+        .find(([, route]) => routeMatchesRuntime(route))
+        || Object.entries(routes || {}).find(([, route]) => routeMatchesRuntime(route));
 }
 
-function exactIdentity(value) {
-    return typeof value === 'string' && value && value === value.trim() ? value : '';
-}
-
-function hasActivatedScriptRuntime(generation, containerName, record) {
-    const captured = generation?.agents?.[containerName];
-    if (record?.type !== 'agent' || captured?.type !== 'agent') return false;
-    for (const field of ['instanceId', 'enableGeneration', 'containerId', 'repoName', 'agentName', 'profile']) {
-        if (!exactIdentity(record[field]) || record[field] !== captured[field]) return false;
-    }
-    const alias = record.alias || '';
-    if ((alias && !exactIdentity(alias)) || alias !== (captured.alias || '')) return false;
-    const routeKey = alias || record.agentName;
-    const route = generation?.routing?.routes?.[routeKey];
-    if (!route || route.disabled === true || route.draining === true
-        || route.container !== containerName
-        || route.repo !== record.repoName || route.agent !== record.agentName
-        || (route.alias || '') !== alias) return false;
-    const manifest = generation?.manifests?.[routeKey];
-    // Activation captures the final runtime identity only after semantic
-    // readiness succeeds. A live process or a mutable manifest alone cannot
-    // prove that a service without a main MCP port has reached that boundary.
-    if (resolveAgentExecutionMode(manifest).type !== 'start_only'
+function hasReadyServiceOnlyRuntime(selected, containerName, record, context) {
+    if (!selected || !context.generation) return false;
+    const [routeKey, route] = selected;
+    const captured = context.generation.agents?.[containerName];
+    const manifest = context.generation.manifests?.[routeKey];
+    if (context.generation.routing?.routes?.[routeKey] !== route
+        || route.container !== containerName || captured?.type !== 'agent'
+        || !manifest || resolveAgentExecutionMode(manifest).type !== 'start_only'
         || resolveAgentReadinessProtocol(manifest) !== 'script') return false;
+    for (const field of ['repoName', 'agentName', 'instanceId', 'enableGeneration', 'runtime', 'profile']) {
+        if (typeof record?.[field] !== 'string' || !record[field] || record[field] !== record[field].trim()
+            || captured[field] !== record[field]) return false;
+    }
+    for (const field of ['alias', 'profile']) {
+        if (String(captured[field] || '') !== String(record[field] || '')) return false;
+    }
+    if (routeKey !== (record.alias || record.agentName)
+        || String(route.alias || '') !== String(record.alias || '')) return false;
+    if (!['docker', 'podman'].includes(record.runtime)
+        || !/^[a-f0-9]{64}$/.test(record.containerId || '')
+        || captured.containerId !== record.containerId
+        || context.liveEntry?.containerId !== record.containerId) return false;
     try {
-        return resolveManifestRuntimeProfile(manifest, {
+        if (resolveManifestRuntimeProfile(manifest, {
             agentName: `${record.repoName}/${record.agentName}`,
             persistedProfileName: record.profile,
             fallbackProfileName: 'default',
             path: `captured manifest(${routeKey})`,
-        }).resolvedProfileName === record.profile;
+        }).resolvedProfileName !== record.profile) return false;
+        // Foreground startup publishes the final exact runtime only after its
+        // readiness probe. Detached startup must also prove its current run.
+        const observation = context.observeNoWaitRecord(containerName, record, {
+            readRegistrySnapshot: () => context.registry,
+        });
+        return !observation || observation.state === 'running';
     } catch (_) {
         return false;
     }
 }
 
-function usableRuntimeState(state, routes, containerName, record, generation) {
+function usableRuntimeState(state, routes, containerName, record, context) {
     const processRunning = state?.running === true;
-    const running = processRunning && (hasActiveRoutePort(routes, containerName, record)
-        || hasActivatedScriptRuntime(generation, containerName, record));
+    const selected = findActiveRuntimeRoute(routes, containerName, record);
+    const hostPort = Number(selected?.[1]?.hostPort || 0);
+    const hasPort = Number.isSafeInteger(hostPort) && hostPort > 0 && hostPort <= 65535;
+    const running = processRunning && (hasPort || hasReadyServiceOnlyRuntime(selected, containerName, record, context));
     return {
         ...(state || {}),
         status: processRunning && !running ? 'starting' : String(state?.status || (running ? 'running' : 'stopped')).toLowerCase(),
@@ -122,10 +128,13 @@ function collectAgentRuntimeStates(options = {}) {
         : (options.collectContainers || collectLiveAgentContainers)() || [];
     const sandboxRunning = options.isSandboxRunning || isBwrapProcessRunning;
     const sandboxPid = options.getSandboxPid || getBwrapPid;
-    const generation = Object.hasOwn(options, 'activeGeneration')
-        ? options.activeGeneration
-        : (Object.hasOwn(options, 'routes') ? null : loadActiveGeneration());
-    const routes = Object.hasOwn(options, 'routes') ? (options.routes || {}) : (generation?.routing?.routes || {});
+    const generation = Object.hasOwn(options, 'activeGeneration') ? options.activeGeneration
+        : Object.hasOwn(options, 'routes') ? null : loadActiveGeneration();
+    const routes = Object.hasOwn(options, 'routes') ? (options.routes || {}) : generation?.routing?.routes || {};
+    const runtimeContext = {
+        generation, registry,
+        observeNoWaitRecord: options.observeNoWaitRecord || observeNoWaitAgentRecord,
+    };
     const containersByName = new Map(liveContainers.map((entry) => [String(entry?.containerName || ''), entry]));
     const matchedContainers = new Set();
     const states = [];
@@ -144,7 +153,7 @@ function collectAgentRuntimeStates(options = {}) {
                     status: processRunning ? 'running' : 'stopped',
                     running: processRunning,
                     pid,
-                }, routes, containerName, record, generation),
+                }, routes, containerName, record, runtimeContext),
             });
             continue;
         }
@@ -163,7 +172,7 @@ function collectAgentRuntimeStates(options = {}) {
                     status: String(liveEntry.state?.status || 'running').toLowerCase(),
                     running: Boolean(liveEntry.state?.running),
                     pid: Number(liveEntry.state?.pid || 0),
-                }, routes, containerName, record, generation),
+                }, routes, containerName, record, { ...runtimeContext, liveEntry }),
             });
             continue;
         }
@@ -178,7 +187,7 @@ function collectAgentRuntimeStates(options = {}) {
             ...liveEntry,
             runtime: 'container',
             enabled: false,
-            state: usableRuntimeState(liveEntry.state, routes, containerName, liveEntry),
+            state: usableRuntimeState(liveEntry.state, routes, containerName, liveEntry, { ...runtimeContext, liveEntry }),
         });
     }
 

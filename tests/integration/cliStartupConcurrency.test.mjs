@@ -71,7 +71,7 @@ function createGenerationFixture(t) {
         containerId: 'a'.repeat(64),
         instanceId: 'achilles-predecessor-instance',
         enableGeneration: 'achilles-predecessor-enable',
-        auth: { mode: 'local' },
+        auth: { mode: 'sso' },
         config: { ports: [{ containerPort: 7000, hostPort: 43101, protocol: 'tcp' }] },
     };
     writeJson(manifestPath, manifest);

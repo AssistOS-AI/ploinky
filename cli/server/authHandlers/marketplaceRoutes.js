@@ -19,7 +19,7 @@ import {
     observeNoWaitAgentRecord,
 } from '../noWaitAgentStartupState.js';
 import { collectAgentsSummary } from '../../utils/status.js';
-import { getSession as getLocalSession, isLocalAdminUser } from '../auth/localService.js';
+import { isAdminUser } from '../auth/localService.js';
 import { canonicalControlOrigin, verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import { verifyBrowserMutationRequest } from '../browserMutationSecurity.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
@@ -28,6 +28,7 @@ import { verifyAgentAssertion } from '../mcp-proxy/invocationMinter.js';
 import { createTokenReplayCache } from '../security/tokens/JwsCodec.js';
 import { runMarketplaceEnableWorker } from '../marketplaceEnableWorker.js';
 import { authService, LOCAL_AUTH_COOKIE_NAME, parseCookies, sendJson, sessionTokenService, SSO_AUTH_COOKIE_NAME } from './shared.js';
+import { localSessionAllowedForRoutePlan } from './authContext.js';
 
 export const MARKETPLACE_PATH = '/api/marketplace';
 export const MARKETPLACE_AGENT_TARGET = 'ploinky-router';
@@ -415,7 +416,7 @@ function buildMarketplaceState(user = null, options = {}) {
             roles: Array.isArray(user.roles) ? [...user.roles] : []
         } : null,
         permissions: {
-            canManage: isLocalAdminUser(user)
+            canManage: isAdminUser(user)
         },
         repositories,
         agents: agents.sort((left, right) => left.ref.localeCompare(right.ref)),
@@ -431,14 +432,14 @@ function publicMarketplaceAuthContext(routePlan) {
         || routePlan.hostSelection?.kind !== 'agent-root' || !routeKey
         || !snapshot || typeof routePlan.lease?.commit !== 'function') return null;
     const context = resolveAuthContextForRouteKey(routeKey, { snapshot });
-    if (context.mode !== 'local' || !context.policy?.usersVar) return null;
+    if (context.mode !== 'sso') return null;
     return { ...context, boundHostRouteKey: routeKey, mutationRouteKey: `marketplace:${routeKey}` };
 }
 
 async function ensureMarketplaceAdmin(req, res, parsedUrl, { routePlan = null } = {}) {
     const authResult = await ensureMarketplaceUser(req, res, { routePlan });
     if (!authResult.ok) return false;
-    if (!isLocalAdminUser(req.user)) {
+    if (!isAdminUser(req.user)) {
         sendMarketplaceError(res, 403, 'admin_required', 'Administrator access is required.');
         return false;
     }
@@ -450,21 +451,22 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
     const localSessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME);
     if (routePlan?.hostSelection?.kind === 'agent-root') {
         const context = publicMarketplaceAuthContext(routePlan);
-        const session = context && localSessionId
-            ? getLocalSession(localSessionId, { policy: context.policy }) : null;
-        if (!session?.user) {
+        const ssoSessionId = cookies.get(SSO_AUTH_COOKIE_NAME);
+        const session = context && ssoSessionId && authService.isConfigured()
+            ? await authService.validateSession(ssoSessionId) : null;
+        if (!session?.user || (session.expiresAt && Date.now() > session.expiresAt)) {
             sendMarketplaceError(res, 401, 'not_authenticated', 'Authentication is required for this workspace.');
             return { ok: false };
         }
         req.user = session.user;
         req.session = session;
-        req.sessionId = localSessionId;
-        req.authMode = 'local';
+        req.sessionId = ssoSessionId;
+        req.authMode = 'sso';
         return { ok: true, session };
     }
     if (localSessionId) {
         const session = await sessionTokenService.getUserSession(localSessionId);
-        if (session?.user) {
+        if (session?.user && localSessionAllowedForRoutePlan(session, routePlan)) {
             req.user = session.user;
             req.session = session;
             req.sessionId = localSessionId;
@@ -475,7 +477,7 @@ async function ensureMarketplaceUser(req, res, { routePlan = null } = {}) {
 
     const ssoSessionId = cookies.get(SSO_AUTH_COOKIE_NAME);
     if (ssoSessionId && authService.isConfigured()) {
-        const session = authService.getSession(ssoSessionId);
+        const session = await authService.validateSession(ssoSessionId);
         if (session?.user && (!session.expiresAt || Date.now() <= session.expiresAt)) {
             req.user = session.user;
             req.session = session;
@@ -527,7 +529,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             marketplace: {
                 ...buildMarketplaceState(req.user),
                 permissions: {
-                    canManage: isLocalAdminUser(req.user)
+                    canManage: isAdminUser(req.user)
                         && Boolean(publicMarketplaceAuthContext(routePlan) || canonicalControlOrigin(req)),
                 },
             }

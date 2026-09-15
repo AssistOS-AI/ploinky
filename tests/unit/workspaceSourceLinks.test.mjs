@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-source-links-'));
+const workspace = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'ploinky-source-links-'));
 process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 const { createAgentSymlinks, getAgentCodePath, getAgentSkillsPath } = await import('../../cli/utils/workspaceStructure.js');
 after(() => fs.rmSync(workspace, { recursive: true, force: true }));

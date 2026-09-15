@@ -1,4 +1,5 @@
 import { HttpRouteAccessPath } from './HttpRouteAccessPath.js';
+import { normalizePublicProtocol, isPublicMethodAllowed } from './PublicProtocolPolicy.js';
 import {
     noHttpRouteAccess,
     normalizeHttpRouteAccess,
@@ -61,12 +62,21 @@ export function normalizeHttpRoutePolicyEntry(entry, source, {
     if (guestScopeParam && (access !== 'guest' || !guestScope)) {
         return invalidEntry(strict, label, 'guestScopeParam requires guest access and an explicit guestScope');
     }
+    let publicProtocol;
+    try {
+        publicProtocol = normalizePublicProtocol(entry.publicProtocol, {
+            access, source, path: normalized.path, routeKey,
+        });
+    } catch (error) {
+        return invalidEntry(strict, label, error.message);
+    }
     if (entry?.enabled === false) return null;
     return {
         path: normalized.path,
         access,
         routeKey,
         source: String(entry.source || source),
+        ...(publicProtocol ? { publicProtocol } : {}),
         // The guest executor needs the route-declared scope when it creates
         // a guest identity for this route.
         ...(guestScope ? { guestScope } : {}),
@@ -75,7 +85,7 @@ export function normalizeHttpRoutePolicyEntry(entry, source, {
 }
 
 function applyPublicWriteGuard(decision, method) {
-    if (decision.access === 'public' && !HttpRouteAccessPath.isReadOnlyMethod(method)) {
+    if (decision.access === 'public' && !isPublicMethodAllowed(decision, method)) {
         return {
             access: 'deny',
             status: 403,

@@ -15,8 +15,7 @@ import { deriveSubkey, resolveMasterKey as resolveConfiguredMasterKey } from './
 // function returns it to callers. The matching public key is what consumers
 // verify against.
 //
-// Storage mirrors the repo's existing encrypted-store idiom
-// (cli/utils/security/encryptedPasswordStore.js): an AES-256-GCM envelope keyed by a
+// Storage uses an AES-256-GCM envelope keyed by a
 // HKDF subkey derived from the workspace master key via deriveSubkey(), written
 // atomically with 0o600 permissions under .ploinky/. The private key is
 // therefore encrypted at rest and never persisted in plaintext.

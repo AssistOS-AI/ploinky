@@ -12,6 +12,7 @@ const moduleSuffix = `?t=${Date.now()}`;
 const { PolicyStateRepository } = await import(`../../cli/server/policy/PolicyStateRepository.js${moduleSuffix}`);
 const { McpToolPolicy } = await import(`../../cli/server/policy/McpToolPolicy.js${moduleSuffix}`);
 const { Caller } = await import(`../../cli/server/policy/Caller.js${moduleSuffix}`);
+const { isAdminUser } = await import(`../../cli/server/auth/localService.js${moduleSuffix}`);
 
 const policyFile = path.join(tempDir, '.ploinky', 'data', 'router-security', 'policy-state.json');
 const repo = new PolicyStateRepository();
@@ -170,6 +171,22 @@ test('filterTools hides tools the caller cannot invoke', () => {
     assert.deepEqual(policy.filterTools('a', tools, USER).map((t) => t.name), ['pub']);
     assert.deepEqual(policy.filterTools('a', tools, ADMIN).map((t) => t.name), ['pub', 'adm']);
     assert.deepEqual(policy.filterTools('a', tools, AGENT).map((t) => t.name), ['int']);
+});
+
+test('provider usernames and local-looking ids cannot grant MCP administrator access', () => {
+    writePolicy([mcpEntry('app', 'adminTool', 'admin')]);
+    for (const user of [
+        { id: 'provider-member', username: 'admin', roles: ['selfRegistered'] },
+        { id: 'local:admin', username: 'member', roles: ['user'] },
+        { id: 'guest', username: 'admin', roles: ['guest', 'admin'] },
+    ]) {
+        const caller = Caller.fromRequest({ user });
+        assert.equal(caller.isAdmin, false);
+        assert.equal(isAdminUser(user), false);
+        assert.equal(policy.evaluate({ agent: 'app', tool: 'adminTool', caller }).code, 'ADMIN_REQUIRED');
+    }
+    const administrator = Caller.fromRequest({ user: { id: 'provider-owner', roles: ['admin'] } });
+    assert.equal(policy.evaluate({ agent: 'app', tool: 'adminTool', caller: administrator }).allow, true);
 });
 
 test('evaluateResource gates resources as an authenticated-class capability', () => {

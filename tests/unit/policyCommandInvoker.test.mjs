@@ -17,6 +17,7 @@ const { FileSystemPolicyStateStore } = await import(`../../cli/server/policy/Fil
 const { PolicyAuditLog } = await import(`../../cli/server/policy/PolicyAuditLog.js${moduleSuffix}`);
 const { PolicyCommandRegistry } = await import(`../../cli/server/policy/PolicyCommandRegistry.js${moduleSuffix}`);
 const { PolicyCommandInvoker } = await import(`../../cli/server/policy/PolicyCommandInvoker.js${moduleSuffix}`);
+const { localSessionAllowedForRoutePlan } = await import('../../cli/server/authHandlers/authContext.js');
 const { mintAdminCsrfToken } = await import(`../../cli/server/adminControlSecurity.js${moduleSuffix}`);
 const { HttpRouteAccessPolicy } = await import(`../../cli/server/policy/HttpRouteAccessPolicy.js${moduleSuffix}`);
 const {
@@ -60,11 +61,17 @@ function makeInvoker(authorizer = shareAllow) {
         registry,
         auditLog: new PolicyAuditLog(),
         getSession: (cookie) => (
-            cookie === 'admin' ? { user: { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] } }
+            cookie === 'admin' ? { user: { id: 'local:admin', username: 'admin', roles: ['user', 'admin'] }, _jwtPayload: { chn: 'cli' } }
+                : cookie === 'old-browser' ? { user: { id: 'local:admin', roles: ['admin'] } }
+                : cookie === 'cli' ? { user: { id: 'local:admin', roles: ['admin'] }, _jwtPayload: { chn: 'cli' } }
                 : cookie === 'user' ? { user: { id: 'local:bob', username: 'bob', roles: ['user'] } }
                     : null
         ),
+        getProviderSession: async (cookie) => cookie === 'provider-admin'
+            ? { user: { id: 'provider-owner', roles: ['admin'] } }
+            : cookie === 'provider-user' ? { user: { id: 'provider-member', username: 'admin', roles: ['selfRegistered'] } } : null,
         isAdminUser: (u) => Array.isArray(u?.roles) && u.roles.includes('admin'),
+        allowLocalSession: localSessionAllowedForRoutePlan,
     });
 }
 
@@ -101,7 +108,7 @@ function makeRequest({ method = 'POST', cookie = '', body, proof = 'valid', orig
     req.url = '/policy/command';
     req.headers = {
         host,
-        ...(cookie ? { cookie: `ploinky_jwt=${cookie}` } : {}),
+        ...(cookie ? { cookie: `${cookie.startsWith('provider-') ? 'ploinky_sso' : 'ploinky_jwt'}=${cookie}` } : {}),
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
         ...(proof === 'missing' ? {} : { origin }),
     };
@@ -117,11 +124,39 @@ function makeRequest({ method = 'POST', cookie = '', body, proof = 'valid', orig
 
 async function call(opts, subject = invoker) {
     const res = new MockResponse();
-    await subject.handle(makeRequest(opts), res);
+    const routePlan = opts.routePlan || { snapshot: {
+        routing: { static: { agent: 'app' }, routes: { app: { container: 'app' } } },
+        agents: { app: { type: 'agent', agentName: 'app', auth: { mode: 'local' } } },
+        manifests: { app: {} },
+    } };
+    const req = makeRequest(opts);
+    if (opts.url) req.url = opts.url;
+    await subject.handle(req, res, { routePlan });
     let json = {};
     try { json = JSON.parse(res.body || '{}'); } catch { /* leave */ }
     return { status: res.statusCode, json };
 }
+
+test('SSO application rejects local browser policy commands before mutation but retains the signed CLI operator', async () => {
+    resetPolicy();
+    const routePlan = { snapshot: {
+        routing: { static: { agent: 'app' }, routes: { app: { container: 'app' }, localApp: { container: 'localApp' } } },
+        agents: {
+            app: { type: 'agent', agentName: 'app', auth: { mode: 'local' } },
+            localApp: { type: 'agent', agentName: 'localApp', auth: { mode: 'local' } },
+        },
+        manifests: { app: { ploinky: 'sso enable' }, localApp: {} },
+    } };
+    const before = fs.readFileSync(policyFile, 'utf8');
+    const denied = await call({ routePlan, cookie: 'old-browser', url: '/policy/command?agent=localApp',
+        body: { command: 'mcp.policy.set', agent: 'app', tool: 'secret', access: 'public' } });
+    assert.equal(denied.status, 401);
+    assert.equal(denied.json.error.code, 'AUTH_REQUIRED');
+    assert.equal(fs.readFileSync(policyFile, 'utf8'), before);
+    const cli = await call({ routePlan, cookie: 'cli', body: { command: 'mcp.policy.list' } });
+    assert.equal(cli.status, 200);
+    assert.equal(cli.json.ok, true);
+});
 
 test('non-POST is rejected', async () => {
     const r = await call({ method: 'GET', cookie: 'admin' });
@@ -140,8 +175,8 @@ test('unknown command -> 400 UNKNOWN_COMMAND', async () => {
     assert.equal(r.json.error.code, 'UNKNOWN_COMMAND');
 });
 
-test('non-admin mcp.policy.set -> 403 ADMIN_REQUIRED', async () => {
-    const r = await call({ cookie: 'user', body: { command: 'mcp.policy.set', agent: 'dpu', tool: 'x', access: 'admin' } });
+test('provider non-admin mcp.policy.set -> 403 ADMIN_REQUIRED', async () => {
+    const r = await call({ cookie: 'provider-user', body: { command: 'mcp.policy.set', agent: 'dpu', tool: 'x', access: 'admin' } });
     assert.equal(r.status, 403);
     assert.equal(r.json.error.code, 'ADMIN_REQUIRED');
 });
@@ -181,15 +216,15 @@ test('the invoker dispatches and authorizes all seven commands for an admin', as
 
 test('every policy control command requires a real admin session', async () => {
     resetPolicy();
-    const listAsUser = await call({ cookie: 'user', body: { command: 'http.route.list' } });
+    const listAsUser = await call({ cookie: 'provider-user', body: { command: 'http.route.list' } });
     assert.equal(listAsUser.status, 403);
     assert.equal(listAsUser.json.error.code, 'ADMIN_REQUIRED');
 
-    const mcpGetAsUser = await call({ cookie: 'user', body: { command: 'mcp.policy.get', agent: 'dpu', tool: 'y' } });
+    const mcpGetAsUser = await call({ cookie: 'provider-user', body: { command: 'mcp.policy.get', agent: 'dpu', tool: 'y' } });
     assert.equal(mcpGetAsUser.status, 403);
     assert.equal(mcpGetAsUser.json.error.code, 'ADMIN_REQUIRED');
 
-    const mcpListAsUser = await call({ cookie: 'user', body: { command: 'mcp.policy.list' } });
+    const mcpListAsUser = await call({ cookie: 'provider-user', body: { command: 'mcp.policy.list' } });
     assert.equal(mcpListAsUser.status, 403);
     assert.equal(mcpListAsUser.json.error.code, 'ADMIN_REQUIRED');
 });
@@ -207,7 +242,7 @@ test('non-admin http.route.set is blocked before the owning share authorizer run
     resetPolicy();
     let calls = 0;
     const denyingInvoker = makeInvoker({ authorize: async () => { calls += 1; return { allowed: false, reason: 'nope' }; } });
-    const r = await call({ cookie: 'user', body: { command: 'http.route.set', path: '/explorer/pub/*', access: 'public' } }, denyingInvoker);
+    const r = await call({ cookie: 'provider-user', body: { command: 'http.route.set', path: '/explorer/pub/*', access: 'public' } }, denyingInvoker);
     assert.equal(r.status, 403);
     assert.equal(r.json.error.code, 'ADMIN_REQUIRED');
     assert.equal(calls, 0);
@@ -251,4 +286,12 @@ test('corrupt policy file fails closed for http.route commands', async () => {
     const list = await call({ cookie: 'admin', body: { command: 'http.route.list' } });
     assert.equal(list.status, 500);
     assert.equal(list.json.error.code, 'POLICY_PERSISTENCE_ERROR');
+});
+
+test('provider administrator can manage policy with session-bound proof', async () => {
+    resetPolicy();
+    const allowed = await call({ cookie: 'provider-admin', body: { command: 'mcp.policy.set', agent: 'app', tool: 'demo', access: 'authenticated' } });
+    assert.equal(allowed.status, 200);
+    const denied = await call({ cookie: 'provider-admin', proof: 'missing', body: { command: 'mcp.policy.set', agent: 'app', tool: 'demo', access: 'public' } });
+    assert.equal(denied.status, 403);
 });

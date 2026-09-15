@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { TaskQueue } from './TaskQueue.mjs';
+import { preserveJsonSchemaToolListings } from './inputSchema.mjs';
 import { getConfiguredToolInputSchema } from './toolInputSchemaCache.mjs';
 import {
     createMemoryReplayCache
@@ -971,6 +972,8 @@ async function registerFromConfig(server, config, helpers) {
     if (!config || typeof config !== 'object') return;
     const { ResourceTemplate, McpError, ErrorCode } = helpers;
     const defaultCwd = process.env.PLOINKY_CODE_DIR || '/code';
+    const jsonSchemas = new Map();
+    preserveJsonSchemaToolListings(server, jsonSchemas);
 
     if (Array.isArray(config.tools)) {
         for (const tool of config.tools) {
@@ -1062,10 +1065,10 @@ async function registerFromConfig(server, config, helpers) {
                 return { content, metadata: { agent: process.env.AGENT_NAME || name } };
             };
 
+            const compiled = getConfiguredToolInputSchema(config, tool);
+            if (compiled.jsonSchema) jsonSchemas.set(name, compiled.jsonSchema);
             const registeredTool = server.registerTool(name, definition, invocation);
 
-            const compiled = getConfiguredToolInputSchema(config, tool);
-            if (compiled.errorMessage) console.error(compiled.errorMessage);
             if (compiled.configured) {
                 registeredTool.inputSchema = compiled.schema;
                 if (typeof server.sendToolListChanged === 'function') {

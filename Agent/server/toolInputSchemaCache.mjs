@@ -1,4 +1,5 @@
 import { zod } from 'mcp-sdk';
+import { buildJsonSchema, isJsonSchema } from './inputSchema.mjs';
 
 const { z } = zod;
 // Only loaded configuration and its declared tool objects can populate this
@@ -25,22 +26,27 @@ export function getConfiguredToolInputSchema(config, tool) {
     const existing = entries.get(tool);
     if (existing) return existing;
 
+    const configured = tool.inputSchema !== undefined;
     let schema = null;
-    let errorMessage = null;
-    // Preserve the established field-map compiler and its empty-object fallback
-    // for absent/non-object input or a failed build. Validation semantics do not
-    // change as part of schema reuse.
-    if (tool.inputSchema && typeof tool.inputSchema === 'object') {
+    let jsonSchema = null;
+    if (configured) {
         try {
+            if (!tool.inputSchema || typeof tool.inputSchema !== 'object' || Array.isArray(tool.inputSchema)) {
+                throw new Error('inputSchema must be an object');
+            }
+            // Refinements can retain references to enum values. Snapshot only
+            // the configuration-derived spec so later callers cannot alter it.
             const spec = freezeSchemaSpec(structuredClone(tool.inputSchema));
-            schema = buildZodObjectSchema(spec);
+            const standard = isJsonSchema(spec);
+            schema = standard ? buildJsonSchema(spec) : buildZodObjectSchema(spec);
+            if (standard) jsonSchema = spec;
         } catch (err) {
-            errorMessage = `[AgentServer/MCP] Failed to build inputSchema for tool '${tool.name}': ${err.message}`;
+            throw new Error(`[AgentServer/MCP] Failed to build inputSchema for tool '${tool.name}': ${err.message}`);
         }
     }
     // Zod internally memoizes object shapes: keep its graph private and do not
     // deep-freeze it. Parsing creates request-local results and errors.
-    const compiled = Object.freeze({ schema: schema || z.object({}), configured: Boolean(schema), errorMessage });
+    const compiled = Object.freeze({ schema: schema || z.object({}), jsonSchema, configured });
     entries.set(tool, compiled);
     return compiled;
 }

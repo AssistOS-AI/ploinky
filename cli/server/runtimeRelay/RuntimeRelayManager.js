@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { normalizeCanonicalPortSet } from '../../../Agent/lib/requestHash.mjs';
-import { PLOINKY_DIR } from '../../utils/config.js';
+import { HEALTH_PROBE_CONTROL_HOST_ROOT } from '../../utils/runtime/healthProbeControlPath.js';
 import { RelayFrameDecoder, encodeRelayFrame } from './protocol.js';
 import { normalizeRelayDescriptor, verifyInspectedContainer } from './confinement.js';
 
@@ -15,7 +15,7 @@ const DEFAULT_CHANNEL_IDLE_TIMEOUT_MS = 30_000;
 const MAX_RELAY_STDERR_BYTES = 4096;
 export const RUNTIME_RELAY_CONTROL_DESTINATION = '/run/ploinky-health-probes';
 export const RUNTIME_RELAY_SOCKET_NAME = 'runtime-relay.sock';
-export const RUNTIME_RELAY_CONTROL_HOST_ROOT = path.join(PLOINKY_DIR, 'run', 'health-probes');
+export const RUNTIME_RELAY_CONTROL_HOST_ROOT = HEALTH_PROBE_CONTROL_HOST_ROOT;
 
 function isPrivateRelaySocketMode(mode) {
     const permissions = mode & 0o777;

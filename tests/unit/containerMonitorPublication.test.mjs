@@ -81,6 +81,10 @@ function nextTurn() {
     return new Promise((resolve) => setImmediate(resolve));
 }
 
+function inactiveEdgeSelection() {
+    return { selector: { state: 'inactive' } };
+}
+
 test('monitor acquires the common workspace lease and defers without mutation on contention', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-monitor-lease-'));
     try {
@@ -91,6 +95,7 @@ test('monitor acquires the common workspace lease and defers without mutation on
         const busy = new Error('workspace start active');
         busy.code = 'PLOINKY_WORKSPACE_MUTATION_BUSY';
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             targets: new Map(),
             isShuttingDown: () => false,
             log(level, event, data) { events.push({ level, event, data }); },
@@ -125,6 +130,7 @@ test('monitor resolves the router endpoint under the workspace mutation lease', 
         let ensureCalls = 0;
         const invalidPort = new Error('routing.json.port: expected an unsigned decimal port in the range 1..65535');
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             targets: new Map(),
             isShuttingDown: () => false,
             log() {},
@@ -220,6 +226,7 @@ test(`monitor rejects manifest bytes changed during ${checkpoint} before ${check
         const result = preparedRestartResult();
         const events = [];
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             config: {},
             targets: new Map(),
             isShuttingDown: () => false,
@@ -302,6 +309,7 @@ test(`monitor waits for exact semantic readiness before committing the returned 
         let releaseReadiness;
         const readinessGate = new Promise((resolve) => { releaseReadiness = resolve; });
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             config: scenario.config,
             targets: new Map(),
             isShuttingDown: () => false,
@@ -408,6 +416,7 @@ test(`monitor rejects staged registry ${drift.name} drift before committing the 
         const result = preparedRestartResult({ hostPort: null });
         const events = [];
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             config: {},
             targets: new Map(),
             isShuttingDown: () => false,
@@ -472,6 +481,7 @@ test('monitor readiness failure aborts the exact preparation, applies no route, 
         const result = preparedRestartResult();
         const events = [];
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             config: {},
             targets: new Map(),
             isShuttingDown: () => false,
@@ -536,6 +546,7 @@ test('monitor preserves the exact failed candidate and propagates recovery failu
         const logged = [];
         let cleanupCalls = 0;
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             config: {},
             targets: new Map(),
             isShuttingDown: () => false,
@@ -609,6 +620,7 @@ test('monitor apply failure aborts the exact preparation, cleans only the failed
         const events = [];
         const applyError = new Error('selector commit failed');
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             config: {},
             targets: new Map(),
             isShuttingDown: () => false,
@@ -673,6 +685,7 @@ test('monitor accepts a healthy exact reuse race without readiness, mutation, or
         fs.writeFileSync(manifestPath, JSON.stringify({ readiness: { protocol: 'mcp' } }));
         const events = [];
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             config: {},
             targets: new Map(),
             isShuttingDown: () => false,
@@ -722,6 +735,7 @@ test('monitor rejects a malformed ensure result instead of reporting healthy reu
         fs.writeFileSync(manifestPath, '{}');
         const events = [];
         const monitor = {
+            readEdgeRoutingSelection: inactiveEdgeSelection,
             config: {},
             targets: new Map(),
             isShuttingDown: () => false,

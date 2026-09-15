@@ -52,6 +52,7 @@ function createActiveExplorerGeneration(t) {
         },
     });
     writeJson(path.join(ploinkyDir, 'agents.json'), {
+        _config: { sso: { enabled: true, providerAgent: 'fixtures/identity' } },
         'explorer-container': {
             type: 'agent',
             repoName: 'AchillesIDE',
@@ -60,7 +61,7 @@ function createActiveExplorerGeneration(t) {
             containerId: 'a'.repeat(64),
             instanceId: 'explorer-instance',
             enableGeneration: 'explorer-enable-generation',
-            auth: { mode: 'local' },
+            auth: { mode: 'sso' },
         },
     });
     writeJson(path.join(ploinkyDir, 'data', 'edge-routing', 'desired.json'), { hosts: {} });

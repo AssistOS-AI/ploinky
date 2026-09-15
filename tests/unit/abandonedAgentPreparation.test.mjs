@@ -23,7 +23,7 @@ function fixture(t, { reason = 'runtime-identity-rotation:forceRecreate:alpha-co
     fs.mkdirSync(paths.edgeDir, { recursive: true });
     fs.writeFileSync(path.join(agentPath, 'manifest.json'), '{}');
     const record = { type: 'agent', repoName: 'fixtures', agentName: 'alpha',
-        instanceId: 'instance', enableGeneration: 'generation', auth: { mode: 'local' } };
+        instanceId: 'instance', enableGeneration: 'generation', auth: { mode: 'sso' } };
     fs.writeFileSync(paths.agentsFile, JSON.stringify({ 'alpha-container': record }));
     fs.writeFileSync(paths.routingFile, JSON.stringify({ routes: { alpha: {
         repo: 'fixtures', agent: 'alpha', container: 'alpha-container', hostPath: agentPath, hostPort: 43101,

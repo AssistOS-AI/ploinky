@@ -23,7 +23,9 @@ const tools = Array.from({ length: 40 }, (_, index) => {
     };
     return {
         name: `tool-${index}`,
-        inputSchema: fields,
+        inputSchema: index % 2
+            ? { type: 'object', properties: fields, required: ['name'], additionalProperties: false }
+            : fields,
     };
 });
 

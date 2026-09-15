@@ -1,17 +1,16 @@
-import { createLocalAuthUser, deleteLocalAuthUser, getSession as getLocalSession, getSessionCookieMaxAge as getLocalSessionCookieMaxAge, isLocalAdminUser, listLocalAuthRoles, listLocalAuthUsers, updateLocalAuthUser } from '../auth/localService.js';
 import { verifyAdminMutationRequest } from '../adminControlSecurity.js';
 import {
     mintBrowserCsrfToken,
     verifyBrowserMutationRequest,
 } from '../browserMutationSecurity.js';
-import { readRouterSettings, updateRouterSettings } from '../auth/routerSettings.js';
 import {
     appendSetCookie,
+    authService,
     buildCookie,
-    LOCAL_AUTH_COOKIE_NAME,
     parseCookies,
     readJsonBody,
     sendJson,
+    SSO_AUTH_COOKIE_NAME,
 } from './shared.js';
 import { resolveAuthContextForRouteKey } from './authContext.js';
 
@@ -24,17 +23,35 @@ function getUserAdminErrorStatus(code = '') {
             return 401;
         case 'admin_required':
             return 403;
+        case 'sso_not_configured':
+            return 503;
         case 'local_auth_disabled':
+        case 'provider_user_admin_unsupported':
         case 'user_not_found':
         case 'not_found':
             return 404;
+        case 'email_taken':
         case 'username_taken':
         case 'last_admin_required':
         case 'roles_must_be_array':
+        case 'roles_required':
+        case 'unknown_role':
+        case 'invalid_email':
+        case 'invalid_username':
+        case 'invalid_status':
+        case 'invalid_password':
+        case 'invalid_auth_method':
+        case 'auth_method_required':
+        case 'invalid_redirect_origin':
+        case 'registration_role_required':
+        case 'registration_role_must_be_non_admin':
         case 'username_required':
         case 'password_required':
         case 'user_id_required':
         case 'no_changes_requested':
+        case 'user_creation_unsupported':
+        case 'password_unsupported':
+        case 'email_change_unsupported':
             return 400;
         default:
             return 500;
@@ -48,14 +65,26 @@ function getUserAdminErrorMessage(code = '') {
             return 'Authentication required.';
         case 'admin_required':
             return 'Admin access is required.';
+        case 'sso_not_configured':
+            return 'The configured SSO provider is not available.';
         case 'local_auth_disabled':
             return 'Local auth is not enabled for this agent.';
+        case 'provider_user_admin_unsupported':
+            return 'The configured SSO provider does not support user administration.';
         case 'user_not_found':
             return 'User not found.';
         case 'not_found':
             return 'Not found.';
         case 'username_taken':
             return 'Username is already in use.';
+        case 'email_taken':
+            return 'Email is already in use.';
+        case 'invalid_status':
+            return 'User status is invalid.';
+        case 'invalid_password':
+            return 'Password does not meet the configured requirements.';
+        case 'registration_role_must_be_non_admin':
+            return 'The registration role must not grant administrative capabilities.';
         case 'last_admin_required':
             return 'At least one admin user is required.';
         case 'roles_must_be_array':
@@ -68,6 +97,13 @@ function getUserAdminErrorMessage(code = '') {
             return 'User id is required.';
         case 'no_changes_requested':
             return 'No changes were submitted.';
+        // Providers whose accounts come only from sign-in may refuse these.
+        case 'user_creation_unsupported':
+            return 'This sign-in provider creates accounts when people sign in.';
+        case 'password_unsupported':
+            return 'This sign-in provider does not use account passwords.';
+        case 'email_change_unsupported':
+            return 'This sign-in provider does not allow changing a sign-in email here.';
         default:
             return code ? 'User management request failed.' : '';
     }
@@ -134,6 +170,10 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     const route = parseUserAdminPath(pathname);
     if (!route) return false;
 
+    if (route.resource === 'settings') {
+        sendUserAdminError(res, 'not_found');
+        return true;
+    }
     const method = (req.method || 'GET').toUpperCase();
     if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
         sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
@@ -142,19 +182,23 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     const authContext = resolveAuthContextForRouteKey(route.agent, {
         snapshot: routePlan?.snapshot || routePlan?.lease?.snapshot || null,
     });
-    if (authContext.mode !== 'local' || !authContext.policy?.usersVar) {
-        sendUserAdminError(res, 'local_auth_disabled');
+    const usesSsoAuth = authContext.mode === 'sso' && authService.isConfigured();
+    if (!usesSsoAuth) {
+        sendUserAdminError(res, authContext.mode === 'sso' ? 'sso_not_configured' : 'provider_user_admin_unsupported');
         return true;
     }
 
     const cookies = parseCookies(req);
-    const sessionId = cookies.get(LOCAL_AUTH_COOKIE_NAME) || '';
-    const session = getLocalSession(sessionId, { policy: authContext.policy });
+    const cookieName = SSO_AUTH_COOKIE_NAME;
+    const sessionId = cookies.get(cookieName) || '';
+    const session = await authService.validateSession(sessionId, { forceRemote: true });
     if (!session) {
         sendUserAdminError(res, 'authentication_required');
         return true;
     }
-    if (!isLocalAdminUser(session.user)) {
+    const isAdmin = Array.isArray(session.user?.capabilities)
+        && session.user.capabilities.includes('admin.users.manage');
+    if (!isAdmin) {
         sendUserAdminError(res, 'admin_required');
         return true;
     }
@@ -187,8 +231,9 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
     }
 
     try {
-        const cookie = buildCookie(LOCAL_AUTH_COOKIE_NAME, sessionId, req, '/', {
-            maxAge: getLocalSessionCookieMaxAge(),
+        const cookieMaxAge = authService.getSessionCookieMaxAge();
+        const cookie = buildCookie(cookieName, sessionId, req, '/', {
+            maxAge: cookieMaxAge,
             sameSite: 'Lax'
         });
         res.setHeader('Set-Cookie', cookie);
@@ -205,54 +250,53 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 req,
                 `/api/agents/${encodeURIComponent(route.agent)}`,
                 {
-                    maxAge: getLocalSessionCookieMaxAge(),
+                    maxAge: cookieMaxAge,
                     sameSite: 'Strict',
                 },
             ));
         }
 
-        if (route.resource === 'settings') {
-            if (route.userId) {
-                sendUserAdminError(res, 'not_found');
+        if (method === 'GET' && !route.userId) {
+            const start = Number(parsedUrl.searchParams.get('start') ?? 0);
+            const pageSize = Number(parsedUrl.searchParams.get('pageSize') ?? 100);
+            if (!Number.isSafeInteger(start) || start < 0
+                || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 500) {
+                sendJson(res, 400, { ok: false, error: 'invalid_pagination' });
                 return true;
             }
-            if (method === 'GET') {
-                sendJson(res, 200, {
-                    ok: true,
-                    agent: authContext.routeKey,
-                    settings: readRouterSettings()
-                });
-                return true;
-            }
-            if (method === 'PATCH') {
-                const body = await readUserAdminBody(req);
-                if (routePlan?.lease?.commit && routePlan.lease.commit() !== true) {
-                    sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
+            const filters = {};
+            for (const [key, maxLength] of [['search', 200], ['excludeOnlyRole', 128]]) {
+                if (!parsedUrl.searchParams.has(key)) continue;
+                const value = parsedUrl.searchParams.get(key).trim();
+                if (value.length > maxLength) {
+                    sendJson(res, 400, { ok: false, error: 'invalid_user_filter' });
                     return true;
                 }
-                const settings = updateRouterSettings({
-                    loginBrandingName: body?.loginBrandingName
-                });
-                sendJson(res, 200, {
-                    ok: true,
-                    agent: authContext.routeKey,
-                    settings
-                });
-                return true;
+                filters[key] = value;
             }
-            res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET, PATCH' });
-            res.end(JSON.stringify({ ok: false, error: 'method_not_allowed' }));
-            return true;
-        }
-
-        if (method === 'GET' && !route.userId) {
-            const users = listLocalAuthUsers(authContext.policy)
-                .sort((left, right) => String(left.username || '').localeCompare(String(right.username || '')));
+            if (parsedUrl.searchParams.has('includeRoleCounts')) {
+                const value = parsedUrl.searchParams.get('includeRoleCounts');
+                if (!['true', 'false'].includes(value)) {
+                    sendJson(res, 400, { ok: false, error: 'invalid_user_filter' });
+                    return true;
+                }
+                filters.includeRoleCounts = value === 'true';
+            }
+            const result = await authService.listUsers({ actorUserId: session.user.id, start, pageSize, ...filters });
+            const users = result.users || [];
+            const totalCount = Number.isSafeInteger(result.totalCount) && result.totalCount >= 0
+                ? result.totalCount
+                : null;
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
-                availableRoles: listLocalAuthRoles(authContext.policy),
-                users
+                availableRoles: result.availableRoles || [],
+                users,
+                start,
+                pageSize,
+                totalCount,
+                ...(result.singleRoleCounts ? { singleRoleCounts: result.singleRoleCounts } : {}),
+                hasMore: totalCount === null ? users.length === pageSize : start + users.length < totalCount,
             });
             return true;
         }
@@ -263,14 +307,15 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
                 return true;
             }
-            const user = createLocalAuthUser({
-                policy: authContext.policy,
+            const input = {
                 username: body?.username,
                 password: body?.password,
                 name: body?.name,
+                displayName: body?.displayName ?? body?.name,
                 email: body?.email,
-                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined
-            });
+                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined,
+            };
+            const user = await authService.createUser({ ...input, actorUserId: session.user.id });
             sendJson(res, 201, {
                 ok: true,
                 agent: authContext.routeKey,
@@ -285,15 +330,17 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
                 return true;
             }
-            const user = updateLocalAuthUser({
-                policy: authContext.policy,
-                id: route.userId,
+            const input = {
                 username: Object.prototype.hasOwnProperty.call(body || {}, 'username') ? body.username : undefined,
                 password: Object.prototype.hasOwnProperty.call(body || {}, 'password') ? body.password : undefined,
                 name: Object.prototype.hasOwnProperty.call(body || {}, 'name') ? body.name : undefined,
+                displayName: Object.prototype.hasOwnProperty.call(body || {}, 'displayName')
+                    ? body.displayName
+                    : (Object.prototype.hasOwnProperty.call(body || {}, 'name') ? body.name : undefined),
                 email: Object.prototype.hasOwnProperty.call(body || {}, 'email') ? body.email : undefined,
-                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined
-            });
+                roles: Object.prototype.hasOwnProperty.call(body || {}, 'roles') ? body.roles : undefined,
+            };
+            const user = await authService.updateUser({ ...input, userId: route.userId, actorUserId: session.user.id });
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
@@ -307,10 +354,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
                 sendJson(res, 503, { ok: false, error: 'edge_generation_changed' });
                 return true;
             }
-            const user = deleteLocalAuthUser({
-                policy: authContext.policy,
-                id: route.userId
-            });
+            const user = await authService.deleteUser({ userId: route.userId, actorUserId: session.user.id });
             sendJson(res, 200, {
                 ok: true,
                 agent: authContext.routeKey,
@@ -329,7 +373,7 @@ export async function handleUserAdminRoutes(req, res, parsedUrl, { routePlan = n
             sendJson(res, 400, { ok: false, error: code, message: 'Request body must be valid JSON.' });
             return true;
         }
-        sendUserAdminError(res, code, error?.message || String(error));
+        sendUserAdminError(res, code);
         return true;
     }
 }

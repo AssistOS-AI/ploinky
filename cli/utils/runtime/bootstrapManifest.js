@@ -6,8 +6,10 @@ import { enableAgent } from '../agents.js';
 import { findAgent } from '../utils.js';
 import { loadAgents, saveAgents } from '../workspace.js';
 import { isSsoProviderManifest } from '../agentRegistry.js';
+import { bindSsoProvider } from '../security/sso.js';
 import { PLOINKY_DIR } from '../config.js';
 import { getActiveProfile } from './profileService.js';
+import { resolveManifestAuthMode } from '../manifestAuth.js';
 
 export function parseEnableDirective(entry) {
     if (entry === null || entry === undefined) return null;
@@ -93,28 +95,52 @@ export function qualifyEnableSpecForRepo(spec, repoName) {
     return [`${repo}/${tokens[0]}`, ...tokens.slice(1)].join(' ');
 }
 
-function parsePloinkyDirectives(rawValue) {
-    if (Array.isArray(rawValue)) {
-        return rawValue.flatMap((item) => parsePloinkyDirectives(item)).filter(Boolean);
+export function resolveManifestSsoProvider(manifest, repoName = '') {
+    if (resolveManifestAuthMode(manifest) !== 'sso') return '';
+    const raw = manifest?.sso?.providerAgent;
+    if (raw === undefined || raw === null) return '';
+    if (typeof raw !== 'string' || !raw.trim()) {
+        throw new Error('manifest sso.providerAgent must be a non-empty agent reference');
     }
-    if (typeof rawValue !== 'string') {
-        return [];
-    }
-    return rawValue
-        .split(/[,\n;]+/)
-        .map((entry) => entry.trim().toLowerCase())
-        .filter(Boolean);
+    return agentRefFromEnableSpec(qualifyEnableSpecForRepo(raw.trim(), repoName));
 }
 
-function resolveManifestAuthMode(manifest) {
-    const ploinkyDirectives = parsePloinkyDirectives(manifest?.ploinky);
-    if (ploinkyDirectives.includes('pwd enable')) {
-        return 'local';
+// Compute the manifest-required provider from the admitted graph without
+// mutating the workspace during repository discovery.
+export function resolveWorkspaceGraphSsoConfig(graph, currentSso = {}) {
+    const nodes = Array.from(graph?.nodes?.values?.() || []);
+    const providers = new Set();
+    for (const node of nodes) {
+        if (node.authMode !== 'sso') continue;
+        const providerRef = resolveManifestSsoProvider(node.manifest, node.repoName);
+        if (!providerRef) continue;
+        const resolved = findAgent(providerRef);
+        const canonicalRef = `${resolved.repo}/${resolved.shortAgentName}`;
+        const providerNode = nodes.find((candidate) => candidate.agentRef === canonicalRef && !candidate.alias);
+        if (!providerNode || !isSsoProviderManifest(providerNode.manifest)) {
+            throw new Error(`manifest SSO provider '${canonicalRef}' must be an enabled ssoProvider dependency in the workspace graph`);
+        }
+        providers.add(canonicalRef);
     }
-    if (ploinkyDirectives.includes('sso enable')) {
-        return 'sso';
+    if (!providers.size) return null;
+    if (providers.size !== 1) {
+        throw new Error(`workspace graph declares conflicting SSO providers: ${[...providers].sort().join(', ')}`);
     }
-    return 'none';
+    const [providerAgent] = providers;
+    const previousRef = String(currentSso?.providerAgent || '').trim();
+    if (previousRef) {
+        const resolved = findAgent(previousRef);
+        if (`${resolved.repo}/${resolved.shortAgentName}` !== providerAgent) {
+            throw new Error('workspace SSO provider conflicts with the manifest-declared provider');
+        }
+    }
+    return {
+        ...currentSso,
+        enabled: true,
+        providerAgent,
+        providerAgentShort: providerAgent.split('/').at(-1),
+        providerConfig: currentSso?.providerConfig || {},
+    };
 }
 
 function agentRefFromEnableSpec(spec) {
@@ -410,6 +436,11 @@ async function applyManifestDirectivesInternal(agentNameOrPath, {
                 logError(`[manifest enable] Failed to ${enableAgents ? 'enable' : 'prepare'} agent '${rawEntry}': ${message}`);
             }
         }
+    }
+
+    if (enableAgents) {
+        const providerAgent = resolveManifestSsoProvider(manifest, repoName);
+        if (providerAgent) bindSsoProvider(providerAgent);
     }
 }
 

@@ -14,6 +14,7 @@ import { computeRchTool } from '../../Agent/lib/requestHash.mjs';
 
 const REPO_ROOT = path.resolve(new URL('../..', import.meta.url).pathname);
 const AGENT_SERVER = path.join(REPO_ROOT, 'Agent/server/AgentServer.mjs');
+const fixtureServers = new Map();
 
 function isolatedAgentServerEnv() {
     const env = { ...process.env };
@@ -32,6 +33,25 @@ function isolatedAgentServerEnv() {
 async function createTempDir(t) {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-server-session-'));
     t.after(async () => {
+        for (const child of fixtureServers.get(tmp) || []) {
+            if (child.exitCode !== null || child.signalCode !== null) continue;
+            const exited = once(child, 'exit');
+            let timer;
+            child.kill('SIGTERM');
+            try {
+                await Promise.race([
+                    exited,
+                    new Promise((resolve) => { timer = setTimeout(resolve, 5000); }),
+                ]);
+                if (child.exitCode === null && child.signalCode === null) {
+                    child.kill('SIGKILL');
+                    await exited;
+                }
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+        fixtureServers.delete(tmp);
         await fs.rm(tmp, { recursive: true, force: true });
     });
     return tmp;
@@ -78,15 +98,8 @@ async function startAgentServer(t, { tmp, cwd = tmp, configPath, env = {} }) {
     child.stdout.on('data', chunk => { output += chunk.toString('utf8'); });
     child.stderr.on('data', chunk => { output += chunk.toString('utf8'); });
 
-    t.after(async () => {
-        if (child.exitCode === null && child.signalCode === null) {
-            child.kill('SIGTERM');
-            await Promise.race([
-                once(child, 'exit'),
-                new Promise((resolve) => setTimeout(resolve, 1000))
-            ]);
-        }
-    });
+    if (!fixtureServers.has(tmp)) fixtureServers.set(tmp, []);
+    fixtureServers.get(tmp).push(child);
 
     await waitForHealth(port, () => output);
     return { child, port, output: () => output };
@@ -158,6 +171,72 @@ function mintRouterRequest({ secret, audience, tool, args = {}, method = 'POST',
     });
 }
 
+test('AgentServer advertises full standard schemas and rejects signed invalid arguments before dispatch', async t => {
+    const tmp = await createTempDir(t);
+    const configPath = path.join(tmp, 'mcp-config.json');
+    const toolScript = path.join(tmp, 'echo-input.mjs');
+    const invocations = path.join(tmp, 'invocations.jsonl');
+    await fs.writeFile(toolScript, [
+        "import fs from 'node:fs';",
+        "let text = ''; for await (const chunk of process.stdin) text += chunk;",
+        "const { input } = JSON.parse(text);",
+        `fs.appendFileSync(${JSON.stringify(invocations)}, JSON.stringify(input) + '\\n');`,
+        "console.log(JSON.stringify(input));",
+    ].join('\n'));
+    const inputSchema = { type: 'object', properties: {
+        amount: { type: 'integer', minimum: 1, maximum: 10 },
+        code: { type: 'string', minLength: 3, maxLength: 4, pattern: '^a', enum: ['abc', 'abcd', 'bad'] },
+        roles: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'admin'] } },
+        details: { type: 'object', properties: { enabled: { type: 'boolean' } }, required: ['enabled'], additionalProperties: false },
+        variables: { type: 'object', additionalProperties: true },
+        redirectUri: { type: 'string', format: 'uri' },
+    }, required: ['amount', 'code', 'roles', 'details'], additionalProperties: false, minProperties: 4 };
+    const patchSchema = { type: 'object', properties: { displayName: { type: 'string', maxLength: 20 } }, minProperties: 1, additionalProperties: false };
+    const legacySchema = { name: { type: 'string' }, type: 'string', optionalFlag: { type: 'boolean', optional: true } };
+    await fs.writeFile(configPath, JSON.stringify({ tools: [
+        { name: 'standard', inputSchema }, { name: 'patch', inputSchema: patchSchema }, { name: 'legacy', inputSchema: legacySchema },
+    ].map(tool => ({ ...tool, command: process.execPath, args: [toolScript], cwd: tmp })) }));
+    const secret = crypto.randomBytes(32);
+    const audience = 'agent:schema-test';
+    const { port } = await startAgentServer(t, { tmp, configPath, env: {
+        PLOINKY_AGENT_SECRET: secret.toString('hex'), PLOINKY_AGENT_ID: audience,
+    } });
+    const sessionId = await initializeSession(port);
+    const listed = await mcpPost(port, { jsonrpc: '2.0', id: 'list', method: 'tools/list', params: {} }, { sessionId });
+    assert.deepEqual(listed.json.result.tools.find(tool => tool.name === 'standard').inputSchema, inputSchema);
+    assert.deepEqual(listed.json.result.tools.find(tool => tool.name === 'patch').inputSchema, patchSchema);
+    const legacyListed = listed.json.result.tools.find(tool => tool.name === 'legacy').inputSchema;
+    assert.equal(legacyListed.properties.name.type, 'string');
+    assert.deepEqual(legacyListed.required, ['name', 'type']);
+    let id = 0;
+    const call = (tool, args) => mcpPost(port, { jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name: tool, arguments: args } }, {
+        sessionId, authorization: `Bearer ${mintRouterRequest({ secret, audience, tool, args })}`,
+    });
+    const valid = { amount: 1, code: 'abc', roles: ['user', 'admin'], details: { enabled: true }, variables: { arbitrary: { value: 1 } }, redirectUri: 'https://example.test/callback' };
+    for (const [tool, args] of [['standard', valid], ['patch', { displayName: 'Owner' }], ['legacy', { name: 'owner', type: 'legacy' }]]) {
+        const result = await call(tool, args);
+        assert.equal(result.json.error, undefined, result.text);
+        assert.equal(result.json.result.isError, undefined, result.text);
+        assert.deepEqual(JSON.parse(result.json.result.content[0].text), args);
+    }
+    for (const args of [
+        { ...valid, amount: -1 }, { ...valid, amount: 1.5 }, { ...valid, amount: 11 },
+        { ...valid, extra: true }, { ...valid, amount: undefined },
+        { ...valid, code: 'ab' }, { ...valid, code: 'bad' }, { ...valid, code: 'abcde' },
+        { ...valid, roles: [] }, { ...valid, roles: ['user', 'user'] }, { ...valid, roles: ['invalid'] },
+        { ...valid, details: {} }, { ...valid, details: { enabled: true, extra: true } },
+        { ...valid, redirectUri: '/relative' },
+    ]) {
+        // Sign the exact JSON payload, including omission of undefined fields.
+        const result = await call('standard', JSON.parse(JSON.stringify(args)));
+        assert.equal(result.json.error?.code, -32602, result.text);
+    }
+    const emptyPatch = await call('patch', {});
+    assert.equal(emptyPatch.json.error?.code, -32602, emptyPatch.text);
+    const executed = (await fs.readFile(invocations, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(executed, [valid, { displayName: 'Owner' }, { name: 'owner', type: 'legacy' }]);
+});
+
 test('AgentServer shares only schemas across concurrent sessions and verifies every actor and replay independently', async t => {
     const tmp = await createTempDir(t);
     const configPath = path.join(tmp, 'mcp-config.json');
@@ -172,7 +251,7 @@ test('AgentServer shares only schemas across concurrent sessions and verifies ev
         `fs.appendFileSync(${JSON.stringify(invocations)}, JSON.stringify(result) + '\\n');`,
         "console.log(JSON.stringify(result));",
     ].join('\n'));
-    const inputSchema = { label: { type: 'string' } };
+    const inputSchema = { type: 'object', properties: { label: { type: 'string' } }, required: ['label'], additionalProperties: false };
     await fs.writeFile(configPath, JSON.stringify({ tools: [{
         name: 'actor', command: process.execPath, args: [toolScript], cwd: tmp, inputSchema,
     }] }));
@@ -223,11 +302,30 @@ test('AgentServer shares only schemas across concurrent sessions and verifies ev
     const invalid = await call(sessions[2], invalidArgs, mintRouterRequest({ secret, audience, tool: 'actor', args: invalidArgs, actor: actors[0] }));
     assert.equal(invalid.json.error?.code, -32602, invalid.text);
     const listed = await mcpPost(port, { jsonrpc: '2.0', id: ++id, method: 'tools/list' }, { sessionId: sessions[2] });
-    assert.equal(listed.json.result.tools[0].inputSchema.properties.label.type, 'string');
-    assert.deepEqual(listed.json.result.tools[0].inputSchema.required, ['label']);
+    assert.deepEqual(listed.json.result.tools[0].inputSchema, inputSchema);
     const executed = (await fs.readFile(invocations, 'utf8')).trim().split('\n').map(JSON.parse);
     const byLabel = (left, right) => left.input.label.localeCompare(right.input.label);
     assert.deepEqual(executed.sort(byLabel), expected.sort(byLabel), 'rejected calls must never dispatch');
+});
+
+test('AgentServer cannot initialize tools with unsupported or malformed input schemas', async t => {
+    const tmp = await createTempDir(t);
+    for (const [index, inputSchema] of [
+        { type: 'object', anyOf: [{ required: ['id'] }] },
+        { type: 'object', properties: { value: { type: 'string', format: 'unsupported' } } },
+        { type: 'object', properties: null },
+    ].entries()) {
+        const configPath = path.join(tmp, `invalid-${index}.json`);
+        await fs.writeFile(configPath, JSON.stringify({ tools: [{ name: 'invalid', command: process.execPath, args: ['-e', 'process.exit(99)'], inputSchema }] }));
+        const { port, output } = await startAgentServer(t, { tmp, configPath });
+        const result = await mcpPost(port, { jsonrpc: '2.0', id: 'init', method: 'initialize', params: {
+            protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'schema-test', version: '1' },
+        } });
+        assert.equal(result.status, 500, result.text);
+        assert.equal(result.headers.get('mcp-session-id'), null);
+        assert.equal(result.json.error?.code, -32603);
+        assert.match(output(), /Failed to build inputSchema/);
+    }
 });
 
 test('AgentServer routes DELETE /mcp to the active SDK transport', async (t) => {
@@ -521,6 +619,7 @@ test('AgentServer cancels an asynchronous task only with a matching Router Reque
         headers: { 'content-type': 'application/json' },
         body
     });
+    await unauthenticated.arrayBuffer();
     assert.equal(unauthenticated.status, 401);
 
     const token = mintRouterRequest({

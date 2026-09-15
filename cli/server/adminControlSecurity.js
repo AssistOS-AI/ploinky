@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 
 import { isTrustedPublicRouterHost } from '../utils/publicRouterHosts.mjs';
 import { deriveSubkey } from '../utils/security/masterKey.js';
-import { isLocalAdminUser } from './auth/localService.js';
+import { isAdminUser } from './auth/localService.js';
 import { resolveSessionBindingId } from './sessionBinding.js';
 
 export const ADMIN_CSRF_HEADER = 'x-ploinky-csrf-token';
@@ -98,7 +98,7 @@ function sendDenied(res, status, code) {
 }
 
 export function requireAdminControlRequest(req, res, { mutation = false, sessionId = req?.sessionId } = {}) {
-    if (!isLocalAdminUser(req?.user)) {
+    if (!isAdminUser(req?.user)) {
         sendDenied(res, req?.user ? 403 : 401, req?.user ? 'ADMIN_REQUIRED' : 'AUTH_REQUIRED');
         return false;
     }

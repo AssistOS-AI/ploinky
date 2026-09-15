@@ -196,7 +196,7 @@ test('request observation is inert for malformed and unregistered headers and co
     }, { req }), false);
 });
 
-test('private endpoint strictly registers, preserves incomplete records, consumes complete records, and bounds bodies', async () => {
+test('private endpoint strictly registers, preserves incomplete records, consumes complete records, and bounds bodies', async (t) => {
     assert.equal(AUTHORITY_ATTESTATION_BODY_TIMEOUT_MS, 1_000);
     const registry = createRouterAuthorityAttestationRegistry({ now: () => 0 });
     const registeredNonce = nonce(9);
@@ -245,10 +245,10 @@ test('private endpoint strictly registers, preserves incomplete records, consume
     req.url = '/authority-attestations';
     req.headers = {};
     res = response();
-    await handleRouterAuthorityAttestationRequest(req, res, {
-        registry,
-        bodyTimeoutMs: 5,
-    });
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const timedOut = handleRouterAuthorityAttestationRequest(req, res, { registry, bodyTimeoutMs: 5 });
+    t.mock.timers.tick(5);
+    await timedOut;
     assert.equal(res.statusCode, 408);
     assert.deepEqual(res.json(), { ok: false, error: 'AUTHORITY_ATTESTATION_BODY_TIMEOUT' });
     req.destroy();

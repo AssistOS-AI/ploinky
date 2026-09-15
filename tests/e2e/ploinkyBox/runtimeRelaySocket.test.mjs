@@ -41,6 +41,34 @@ const TARGET_SERVER_SCRIPT = [
     "process.on('SIGTERM',()=>s.close(()=>process.exit(0)));",
 ].join('');
 
+function countBoxReadyLines(output) {
+    return (String(output || '').match(/^PLOINKY_BOX_READY$/gm) || []).length;
+}
+
+async function abruptlyRestartBox(harness, containerId) {
+    const before = harness.runner.query('podman', ['container', 'logs', containerId]);
+    assert.equal(before.ok, true, before.stderr);
+    const priorReadyCount = countBoxReadyLines(`${before.stdout}\n${before.stderr}`);
+    assert.ok(priorReadyCount >= 1, 'initial Box boot did not publish readiness');
+
+    const restarted = harness.runner.query('podman', [
+        'container', 'restart', '--time', '0', containerId,
+    ], { timeoutMs: 120_000 });
+    assert.equal(restarted.ok, true, restarted.stderr);
+
+    const deadline = Date.now() + 120_000;
+    let latest = '';
+    while (Date.now() < deadline) {
+        const logs = harness.runner.query('podman', ['container', 'logs', containerId]);
+        if (logs.ok) {
+            latest = `${logs.stdout}\n${logs.stderr}`;
+            if (countBoxReadyLines(latest) > priorReadyCount) return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.fail(`restarted Box did not publish a new readiness line: ${latest.slice(-2000)}`);
+}
+
 const EXERCISE_RELAY_SCRIPT = String.raw`
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -144,12 +172,6 @@ test('native mounted relay serves through the exact control socket with zero OCI
     const effectiveInstanceId = 'native-instance';
     const enableGeneration = 'native-enable-generation';
     const targetPort = 19123;
-    const controlDir = path.join(
-        harness.workspace, '.ploinky', 'run', 'health-probes', containerName,
-    );
-    fs.mkdirSync(controlDir, { recursive: true, mode: 0o700 });
-    fs.chmodSync(controlDir, 0o700);
-
     const prepared = await harness.supervisor.prepareBoxForCommand({
         imageRef: candidateReference,
         explicitPort: 19097,
@@ -168,16 +190,26 @@ test('native mounted relay serves through the exact control socket with zero OCI
         } catch {}
     });
 
-    const controlSocketPath = `/workspace/.ploinky/run/health-probes/${containerName}/runtime-relay.sock`;
+    const controlRoot = '/tmp/ploinky-health-probes';
+    const controlDir = `${controlRoot}/${containerName}`;
+    const controlSocketPath = `${controlDir}/runtime-relay.sock`;
+    const ensureControlDir = () => {
+        execInBox(harness.runner, prepared.containerId, [
+            'mkdir', '-p', '--mode=0700', controlDir,
+        ]);
+        execInBox(harness.runner, prepared.containerId, ['chmod', '0700', controlDir]);
+    };
     const startTarget = (priorSocketIdentity = '') => {
+        ensureControlDir();
         execInBox(harness.runner, prepared.containerId, [
             'podman', 'run', '-d', '--init', '--name', containerName,
+            '--userns=keep-id:uid=1000,gid=1000',
             '--label', 'io.assistos.ploinky.managed=1',
             '--label', 'io.assistos.ploinky.resource=agent',
             '--label', `io.assistos.ploinky.instance-id=${effectiveInstanceId}`,
             '--label', `io.assistos.ploinky.enable-generation=${enableGeneration}`,
             '-v', '/workspace/runtime-relay-native/Agent:/Agent:ro',
-            '-v', `/workspace/.ploinky/run/health-probes/${containerName}:/run/ploinky-health-probes`,
+            '-v', `${controlDir}:/run/ploinky-health-probes`,
             '-e', 'PLOINKY_HEALTH_PROBE_BROKER=0',
             '-e', 'PLOINKY_AGENT_ID=agent:native/runtime-relay',
             '--entrypoint', '/Agent/server/AgentEntrypoint.sh',
@@ -185,10 +217,31 @@ test('native mounted relay serves through the exact control socket with zero OCI
             'node', '-e', TARGET_SERVER_SCRIPT, String(targetPort),
         ]);
         targetExists = true;
-        execInBox(harness.runner, prepared.containerId, [
-            '/usr/local/bin/node', '-e', WAIT_FOR_SOCKET_SCRIPT,
-            controlSocketPath, priorSocketIdentity,
-        ]);
+        try {
+            execInBox(harness.runner, prepared.containerId, [
+                '/usr/local/bin/node', '-e', WAIT_FOR_SOCKET_SCRIPT,
+                controlSocketPath, priorSocketIdentity,
+            ]);
+        } catch (error) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);
+            const runtimeInspection = execInBox(harness.runner, prepared.containerId, [
+                'podman', 'container', 'inspect', containerName,
+            ]);
+            const runtimeLogTail = execInBox(harness.runner, prepared.containerId, [
+                'podman', 'container', 'logs', '--tail', '40', containerName,
+            ]);
+            const outerControlIdentity = execInBox(harness.runner, prepared.containerId, [
+                '/usr/local/bin/node', '-e',
+                "const f=require('node:fs');for(const p of process.argv.slice(1)){try{const s=f.lstatSync(p);console.log(p,JSON.stringify({directory:s.isDirectory(),socket:s.isSocket(),mode:(s.mode&511).toString(8),uid:s.uid}))}catch(e){console.log(p,e.code,e.message)}}",
+                controlDir, controlSocketPath,
+            ]);
+            throw new Error(
+                `runtime relay socket did not become ready; nested inspection:\n${runtimeInspection}`
+                + `\nouter control identity:\n${outerControlIdentity}`
+                + `\nnested log tail:\n${runtimeLogTail}`,
+                { cause: error },
+            );
+        }
     };
     const readSocketIdentity = () => execInBox(harness.runner, prepared.containerId, [
         '/usr/local/bin/node', '-e', READ_SOCKET_IDENTITY_SCRIPT, controlSocketPath,
@@ -231,7 +284,7 @@ test('native mounted relay serves through the exact control socket with zero OCI
     assertExecFree('after relayed traffic');
     removeTarget();
 
-    // Abrupt removal may leave the socket inode in the persistent control bind.
+    // Abrupt removal may leave the socket inode in the private control bind.
     // A replacement with the exact same name must safely retire it and start a
     // new broker without manufacturing an OCI exec session.
     startTarget(firstSocketIdentity);
@@ -239,5 +292,26 @@ test('native mounted relay serves through the exact control socket with zero OCI
     const replacementContainerId = exerciseRelay();
     assert.notEqual(replacementContainerId, firstContainerId);
     assertExecFree('after replacement relayed traffic');
+    removeTarget();
+
+    // This is the production failure boundary: an abrupt outer restart changes
+    // the Linux kernel that owned every nested Unix socket. The control root is
+    // on the Box's boot-scoped tmpfs, so the stale socket must disappear with
+    // that boot instead of being projected back from the durable macOS
+    // workspace bind as an ENOTSUP object.
+    await abruptlyRestartBox(harness, prepared.containerId);
+    assert.equal(execInBox(harness.runner, prepared.containerId, [
+        '/usr/local/bin/node', '-e',
+        `process.stdout.write(String(require('node:fs').existsSync(${JSON.stringify(controlRoot)})))`,
+    ]), 'false');
+    execInBox(harness.runner, prepared.containerId, [
+        'podman', 'image', 'exists', runtimeImage,
+    ]);
+
+    startTarget();
+    assertExecFree('after outer Box restart');
+    const postRestartContainerId = exerciseRelay();
+    assert.notEqual(postRestartContainerId, replacementContainerId);
+    assertExecFree('after post-restart relayed traffic');
     removeTarget();
 });

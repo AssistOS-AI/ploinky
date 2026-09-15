@@ -65,6 +65,7 @@ function routedWorkspace(t) {
     fs.mkdirSync(policyDir, { recursive: true });
     fs.mkdirSync(alphaDir, { recursive: true });
     fs.writeFileSync(path.join(alphaDir, 'manifest.json'), JSON.stringify({
+        ploinky: 'sso enable',
         routerAccess: {
             httpRoutes: [{ path: '/base-agent-additional-server/alpha/7000/*', access: 'authenticated' }],
         },
@@ -90,7 +91,7 @@ function routedWorkspace(t) {
             enableGeneration: 'alpha-enable-generation',
             runtime: 'podman',
             containerId: 'a'.repeat(64),
-            auth: { mode: 'local' },
+            auth: { mode: 'sso' },
         },
     }));
     fs.writeFileSync(path.join(edgeDir, 'desired.json'), JSON.stringify({ hosts: {} }));
@@ -190,6 +191,7 @@ test('an exact trusted LAN Host reaches the public control surface with its own 
     const lan = plan({ host: '192.168.1.63:18080' });
     assert.equal(lan.ok, true);
     assert.equal(lan.kind, 'agent-root');
+    assert.equal(lan.decision.access, 'authenticated');
     assert.deepEqual(lan.hostSelection, { kind: 'control', host: '192.168.1.63', source: 'public-router-alias' });
     assert.deepEqual(lan.forwarding, { authority: '192.168.1.63:18080', protocol: 'http' });
 

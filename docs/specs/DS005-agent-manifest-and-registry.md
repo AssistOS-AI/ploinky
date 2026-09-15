@@ -118,14 +118,10 @@ An agent is discoverable only when its agent directory contains a readable, vali
 | `llmRuntime.runtimePolicy.ipc` | `"default"` or `"host"`. Selects the IPC namespace policy. |
 | `llmRuntime.runtimePolicy.gpus` | `"all"` or `"device=<list>"`. Requests Docker GPU selection; Podman must use CDI device entries instead. |
 | `guest` | Boolean; `true` selects it. Makes guest authentication the manifest default. |
-| `ploinky` | String or array of strings. Declares Ploinky directives separated by commas, semicolons, or newlines. Recognized authentication directives are `pwd enable` and `sso enable`. |
-| `pwd.users` | Array of user objects. Seeds local-password identities when local authentication is selected. |
-| `pwd.users[].username` / `.user` | Non-empty string; one required. Supplies the local login name. |
-| `pwd.users[].password` | Non-empty string; required. Supplies the password that Ploinky hashes before storing policy state. |
-| `pwd.users[].name` | String. Supplies the display name; defaults to the username. |
-| `pwd.users[].email` | String. Supplies optional identity metadata. |
-| `pwd.users[].roles` | String array. Adds roles; the `local` role is always retained. |
+| `ploinky` | String or array of strings. Declares Ploinky directives separated by commas, semicolons, or newlines. The supported authentication directive is `sso enable`; it requires provider authentication for this application. |
 | `ssoProvider` | Boolean; `true` marks it. Marks an agent as an SSO provider so dependency activation can depend on the selected auth mode. |
+| `sso.providerAgent` | Agent reference. Selects the generic SSO provider used by an application declaring `sso enable`. Startup rejects missing or conflicting provider bindings. |
+| `routerAccess.requiredCapability` | Capability name. The authenticated provider identity must possess it before protected application requests are forwarded. |
 | `routerAccess.httpRoutes` | Array or object keyed by route path. Declares Router access policy for HTTP paths served by this agent. |
 | `routerAccess.httpRoutes[].path` | Route path; required in array form. Identifies the protected HTTP path. |
 | `routerAccess.httpRoutes[].access` | `"public"`, `"guest"`, or `"authenticated"`; default authenticated. Selects the route access class. |
@@ -158,6 +154,8 @@ An agent is discoverable only when its agent directory contains a readable, vali
 | `webchat.forwardEnvelope` | Boolean-like `true` (`true`, `"true"`, `1`, or `"1"`). Sends the structured WebChat message envelope to the CLI instead of flattening the user message. |
 
 The supported profile fields are intentionally narrower than arbitrary root fields. In particular, `containerSecurity` is root-only, `openPorts` is profile-only, and direct capability fields such as `devices`, `gpus`, `ipc`, raw runtime arguments, and host mounts are rejected outside `llmRuntime.runtimePolicy` or `volumes`. The historical `ports` and `httpServices` fields are rejected; HTTP exposure is represented by the agent's private service plus `routerAccess.httpRoutes`, never by an outer Box publication.
+
+Authentication policies support `none`, `guest`, and `sso`. A manifest declaring `sso enable` is authoritative: saved settings and `--auth` must not weaken it, and combining it with `guest: true` is invalid. Local password authentication is removed. `--auth pwd`, `--auth local`, credential-seeding options `--user` and `--password`, manifest `pwd` declarations, and `routerAccess.localAuthRoles` are rejected. Ploinky does not maintain a browser password store or migrate old accounts. A saved local policy without an authoritative SSO manifest is invalid. The separately signed local CLI operator channel is not an application authentication mode.
 
 Agent lookup must support repository-qualified references and may accept an unqualified name only when it resolves uniquely. Enabling an agent must persist its repository, manifest agent name, optional alias, runtime mode, authentication selection, instance identity, and enable generation. Aliases create independent runtime identities and persistent homes; they must not collapse into the base agent record.
 

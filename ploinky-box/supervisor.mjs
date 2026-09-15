@@ -778,6 +778,17 @@ export function createBoxSupervisor({
             const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
             const mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
             const routerBinding = Object.freeze({ ...observeContainerRouterBinding(container), hostPort });
+            // Retained .ploinky metadata also marks a newly recreated Box as
+            // initialized. Prove its Router is ready before Core can drain routes.
+            try {
+                await healthCheck(hostPort, { routerBinding, readinessTimeoutMs: 0 });
+            } catch (_) {
+                throw supervisorError(
+                    'Targeted restart requires the exact owned Box to have a ready Router. '
+                    + 'Run `ploinky start AGENT` first.',
+                    'PLOINKY_BOX_TARGETED_RESTART_UNAVAILABLE',
+                );
+            }
             const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
             await runCoreCommand(
                 engine,

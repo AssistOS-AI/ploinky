@@ -2,12 +2,21 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Duplex, Readable, Writable } from 'node:stream';
 
 import { executeHttpPlan } from '../../cli/server/proxy/executeHttpPlan.js';
 import { executeWebSocketPlan } from '../../cli/server/proxy/executeWebSocketPlan.js';
 import { compileProxyLimits } from '../../cli/server/proxy/limits.js';
 import { createRoutePlan } from '../../cli/server/proxy/RoutePlan.js';
+import { applyEdgeRoutingGeneration, initializeFreshEdgeRoutingSources } from '../../cli/sandbox/edgeGeneration.js';
+import { resolveEdgeRoutePlan } from '../../cli/server/edgeRoutePlan.js';
+import { buildHttpRouteAuthInfoHeader } from '../../cli/server/routerHandlers.js';
+import { deriveAgentRequestSecret } from '../../cli/utils/security/masterKey.js';
+import { verifyHttpRouteAuthInfoFromHeaders } from '../../Agent/lib/invocationAuth.mjs';
+import { createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 
 class ApplicationRelayStream extends EventEmitter {
     constructor() {
@@ -223,6 +232,81 @@ test('HTTP relay uses the admitted convention suffix, port, query, and exact bod
     assert.equal(opened.headers.host, '127.0.0.1:7001');
     assert.equal(opened.headers['x-forwarded-prefix'], '/base-agent-additional-server/alpha/7001');
     assert.equal(released, true);
+});
+
+test('signed agent-port requests bind the exact body through edge planning, relay, and agent verification', async (t) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-signed-port-body-'));
+    const previous = Object.fromEntries(['PLOINKY_WORKSPACE_ROOT', 'PLOINKY_MASTER_KEY'].map((key) => [key, process.env[key]]));
+    process.env.PLOINKY_WORKSPACE_ROOT = workspace;
+    process.env.PLOINKY_MASTER_KEY = '7'.repeat(64);
+    t.after(() => {
+        for (const [key, value] of Object.entries(previous)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+        fs.rmSync(workspace, { recursive: true, force: true });
+    });
+    initializeFreshEdgeRoutingSources({ workspaceRoot: workspace });
+    const agentPath = path.join(workspace, '.ploinky/repos/fixtures/alpha');
+    fs.mkdirSync(agentPath, { recursive: true });
+    fs.writeFileSync(path.join(agentPath, 'manifest.json'), JSON.stringify({
+        routerAccess: { httpRoutes: [
+            { path: '/base-agent-additional-server/alpha/7001/service/account/*', access: 'authenticated' },
+            { path: '/base-agent-additional-server/alpha/7001/public/*', access: 'public' },
+        ] },
+    }));
+    fs.writeFileSync(path.join(workspace, '.ploinky/routing.json'), JSON.stringify({ routes: {
+        alpha: { repo: 'fixtures', agent: 'alpha', container: 'alpha-container', hostPath: agentPath },
+    } }));
+    fs.writeFileSync(path.join(workspace, '.ploinky/agents.json'), JSON.stringify({ 'alpha-container': {
+        type: 'agent', repoName: 'fixtures', agentName: 'alpha', runtime: 'podman',
+        containerId: 'a'.repeat(64), instanceId: 'alpha-instance', enableGeneration: 'alpha-enable-generation',
+        auth: { mode: 'sso' },
+    } }));
+    applyEdgeRoutingGeneration({ workspaceRoot: workspace, reason: 'signed-body-test' });
+    const body = Buffer.from('{ "displayName": "Updated profile" }\n');
+    const req = Readable.from([body.subarray(0, 9), body.subarray(9)]);
+    Object.assign(req, {
+        method: 'POST', url: '/base-agent-additional-server/alpha/7001/service/account/profile?view=1',
+        headers: { host: '127.0.0.1:8080', 'content-type': 'application/json' },
+        user: { id: 'member-1', username: '', email: 'member@example.test', roles: ['user'] },
+    });
+    const plan = resolveEdgeRoutePlan({ req });
+    assert.equal(plan.ok, true, plan.code);
+    assert.equal(plan.authDefinition.issueInvocation, true);
+    assert.equal(plan.allowRequestStreaming, false);
+    const publicPlan = resolveEdgeRoutePlan({ req: { ...req, method: 'GET', url: '/base-agent-additional-server/alpha/7001/public/status' } });
+    assert.equal(publicPlan.ok, true, publicPlan.code);
+    assert.equal(publicPlan.allowRequestStreaming, true);
+    publicPlan.lease.release?.();
+    let opened;
+    let stream;
+    const response = new Response();
+    await executeHttpPlan({
+        req, res: response, plan, lease: plan.lease, authorized: true,
+        trustedHeadersFactory: ({ bodyHash }) => ({
+            authInfo: buildHttpRouteAuthInfoHeader(req, plan.parsedUrl, plan.authDefinition, {
+                bodyHash, routePath: plan.unmatchedSuffix,
+            })['x-ploinky-auth-info'],
+        }),
+        relayManager: { checkout: async () => ({
+            openRequest: async (options) => { opened = options; stream = new ApplicationRelayStream(); return stream; },
+            close() {},
+        }) },
+    });
+    assert.equal(response.statusCode, 200, response.body.toString());
+    assert.equal(opened.bodyMode, 'buffered');
+    const forwardedBody = stream.request.subarray(stream.request.indexOf(Buffer.from('\r\n\r\n')) + 4);
+    assert.deepEqual(forwardedBody, body);
+    const verify = (requestBody) => verifyHttpRouteAuthInfoFromHeaders(opened.headers, {
+        env: { PLOINKY_AGENT_ID: 'agent:fixtures/alpha', PLOINKY_AGENT_SECRET: deriveAgentRequestSecret('agent:fixtures/alpha') },
+        replayCache: createMemoryReplayCache(), method: 'POST', path: '/service/account/profile', query: '?view=1', body: requestBody,
+    });
+    const verified = verify(forwardedBody);
+    assert.equal(verified.ok, true, verified.reason);
+    const changed = verify(Buffer.concat([forwardedBody, Buffer.from(' ')]));
+    assert.equal(changed.ok, false);
+    assert.match(changed.reason, /body hash mismatch/);
 });
 
 test('prebuffered private request bodies take precedence over route streaming', async () => {

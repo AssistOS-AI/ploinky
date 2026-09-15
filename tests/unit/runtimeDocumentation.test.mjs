@@ -36,9 +36,15 @@ test('active runtime documentation describes the semantic Box configuration', ()
         const content = read(relativePath);
         assert.match(content, /assistos\/ploinky-box/, relativePath);
         assert.match(content, /127\.0\.0\.1:[^`\n]*:8080\/tcp/, relativePath);
+        // The selected physical media UDP port always targets the fixed in-Box listener.
         assert.match(
             content,
             /0\.0\.0\.0:<(?:selectedMediaHostPort|selected-media-host-port)>:7882\/udp/,
+            relativePath,
+        );
+        assert.doesNotMatch(
+            content,
+            /0\.0\.0\.0:<(?:selectedMediaHostPort|selected-media-host-port)>:<(?:selectedMediaHostPort|selected-media-host-port)>\/udp/,
             relativePath,
         );
         assert.doesNotMatch(content, /io\.assistos\.ploinky\.runtime-contract/, relativePath);

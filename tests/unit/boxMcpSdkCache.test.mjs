@@ -248,12 +248,52 @@ test('other dependencies still install and the image SDK is restored after npm p
     assert.equal(f.installs.length, 1);
     assert.deepEqual(f.installs[0].pkg.dependencies, {
         example: '1.0.0', 'mcp-sdk': 'file:.ploinky-provided/node_modules/mcp-sdk',
+        achillesAgentLib: 'file:/opt/ploinky-agentlib',
+        'ploinky-agent-lib': 'file:/opt/ploinky-agentlib',
     });
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(prepared.cachePath, 'package.json'), 'utf8')).dependencies, { example: '1.0.0' });
     assert.equal(f.installs[0].pkg.scripts.postinstall, 'node setup.js');
     assert.equal(cache.inspectAgentCache(options).valid, true);
     assert.equal(boxMcpSdkCacheProblem(prepared.cachePath, prepared.stamp, f.bundle), '');
     assert.equal(validateMcpSdkBundle({ sourceRoot: f.sourceRoot }).contentSha256, f.bundle.contentSha256);
+});
+
+test('a nested AgentLib produced during npm uses the selected source before receiving a cache stamp', (t) => {
+    const f = boxEnvironment(t, {
+        onInstall(installPath) {
+            const duplicate = path.join(installPath, 'node_modules', 'consumer', 'node_modules', 'ploinky-agent-lib');
+            fs.mkdirSync(duplicate, { recursive: true });
+            fs.writeFileSync(path.join(duplicate, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib' }));
+        },
+    });
+    const options = {
+        ...prepareOptions, repoName: 'duplicate-agentlib', agentName: 'agent', force: true,
+        agentPackagePath: agentPackage(f.root, { dependencies: { consumer: '1.0.0' } }),
+    };
+    const prepared = cache.prepareAgentCache(options);
+    const duplicate = path.join(prepared.cachePath, 'node_modules', 'consumer', 'node_modules', 'ploinky-agent-lib');
+    assert.equal(fs.lstatSync(duplicate).isSymbolicLink(), true);
+    assert.equal(fs.readlinkSync(duplicate), '/opt/ploinky-agentlib');
+    assert.equal(cache.inspectAgentCache(options).valid, true);
+    assert.ok(cache.readStamp(prepared.cachePath));
+});
+
+test('cache admission rejects an inserted nested AgentLib until link refresh repairs it', (t) => {
+    const f = boxEnvironment(t);
+    const options = { ...prepareOptions, repoName: 'tampered-agentlib', agentName: 'agent' };
+    const prepared = cache.prepareAgentCache(options);
+    const originalStamp = fs.readFileSync(cache.stampPath(prepared.cachePath));
+    const duplicate = path.join(prepared.cachePath, 'node_modules', 'consumer', 'node_modules', 'private-alias');
+    fs.mkdirSync(duplicate, { recursive: true });
+    fs.writeFileSync(path.join(duplicate, 'package.json'), JSON.stringify({ name: 'ploinky-agent-lib' }));
+    assert.equal(cache.inspectAgentCache(options).valid, false);
+    assert.throws(() => cache.verifyAgentCache(options), /copied package/);
+    assert.equal(fs.lstatSync(duplicate).isDirectory(), true);
+    assert.deepEqual(fs.readFileSync(cache.stampPath(prepared.cachePath)), originalStamp);
+    assert.equal(cache.prepareAgentCache(options).reused, true);
+    assert.equal(fs.readlinkSync(duplicate), '/opt/ploinky-agentlib');
+    assert.equal(cache.inspectAgentCache(options).valid, true);
+    assert.equal(f.installs.length, 0);
 });
 
 test('npm lifecycle scripts run even when no npm dependencies remain', (t) => {

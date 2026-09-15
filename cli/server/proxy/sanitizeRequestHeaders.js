@@ -56,8 +56,13 @@ function sanitizeCookie(value) {
         .split(';')
         .map(part => part.trim())
         .filter(Boolean)
-        .filter(part => !ROUTER_COOKIES.has(part.split('=', 1)[0].trim()));
+        .filter(part => !isRouterCookie(part.split('=', 1)[0].trim()));
     return retained.join('; ');
+}
+
+export function isRouterCookie(name) {
+    const unprefixed = String(name || '').replace(/^__Host-/, '');
+    return ROUTER_COOKIES.has(unprefixed) || unprefixed.startsWith('ploinky_sso_login_');
 }
 
 export function sanitizeRequestHeaders(headers, plan, trusted = {}) {
@@ -82,8 +87,9 @@ export function sanitizeRequestHeaders(headers, plan, trusted = {}) {
     result['x-forwarded-host'] = plan.authority;
     result['x-forwarded-prefix'] = plan.forwardedPrefix
         || `/${plan.convention}/${encodeURIComponent(plan.routeKey)}/${plan.port}`;
-    if (trusted.authInfo) result['x-ploinky-auth-info'] = String(trusted.authInfo);
-    if (trusted.userId) result['x-ploinky-user-id'] = String(trusted.userId);
+    const publicProtocol = plan?.access?.access === 'public' && plan?.access?.publicProtocol;
+    if (!publicProtocol && trusted.authInfo) result['x-ploinky-auth-info'] = String(trusted.authInfo);
+    if (!publicProtocol && trusted.userId) result['x-ploinky-user-id'] = String(trusted.userId);
     for (const [rawName, value] of Object.entries(trusted.applicationHeaders || {})) {
         const name = String(rawName).toLowerCase();
         if (!name || HOP_BY_HOP.has(name) || ROUTER_HEADERS.has(name) || name.startsWith('x-forwarded-')) continue;

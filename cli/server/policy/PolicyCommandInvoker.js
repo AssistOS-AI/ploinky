@@ -12,8 +12,8 @@ function sendJson(res, statusCode, body) {
 
 /**
  * PolicyCommandInvoker — the Command-pattern invoker and HTTP adapter for
- * `POST /policy/command` (DS016). Authenticated via the local User Session
- * cookie; agents (which cannot present a session cookie) are rejected. It builds
+ * `POST /policy/command` (DS016). Authenticated through the SSO provider or
+ * the signed CLI operator channel; agent assertions are rejected. It builds
  * the CommandContext, looks the command up in the registry, runs authorize then
  * execute, maps the CommandResult to the HTTP response, and writes one audit line.
  *
@@ -25,23 +25,29 @@ const LOCAL_AUTH_COOKIE_NAME = 'ploinky_jwt';
 const MUTATING_COMMANDS = new Set(['http.route.set', 'http.route.remove', 'mcp.policy.set']);
 
 export class PolicyCommandInvoker {
-    constructor({ registry, auditLog, getSession, isAdminUser, verifyMutationRequest = verifyAdminMutationRequest }) {
+    constructor({ registry, auditLog, getSession, isAdminUser, allowLocalSession = () => false, getProviderSession = async () => null, verifyMutationRequest = verifyAdminMutationRequest }) {
         this._registry = registry;
         this._audit = auditLog;
         this._getSession = getSession;
         this._isAdminUser = isAdminUser;
+        this._allowLocalSession = allowLocalSession;
+        this._getProviderSession = getProviderSession;
         this._verifyMutationRequest = verifyMutationRequest;
     }
 
-    async handle(req, res) {
+    async handle(req, res, { routePlan } = {}) {
         if (String(req.method || '').toUpperCase() !== 'POST') {
             sendJson(res, 405, { ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'POST is required.' } });
             return true;
         }
         const cookies = parseCookies(req);
-        const cookie = cookies.get(LOCAL_AUTH_COOKIE_NAME) || '';
-        const session = cookie ? this._getSession(cookie) : null;
-        if (!session || !session.user) {
+        let cookie = cookies.get(LOCAL_AUTH_COOKIE_NAME) || '';
+        let session = cookie ? this._getSession(cookie) : null;
+        if (!session?.user || !this._allowLocalSession(session, routePlan)) {
+            cookie = cookies.get('ploinky_sso') || '';
+            session = cookie ? await this._getProviderSession(cookie) : null;
+        }
+        if (!session?.user) {
             sendJson(res, 401, { ok: false, error: { code: 'AUTH_REQUIRED', message: 'Authentication is required.' } });
             return true;
         }

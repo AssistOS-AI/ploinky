@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 import { createSessionStore } from './sessionStore.js';
@@ -9,6 +10,8 @@ import { getConfig as getWorkspaceConfig } from '../../utils/workspace.js';
 import { resolveAgentDescriptor } from '../../utils/agentRegistry.js';
 import { findAgent } from '../../utils/utils.js';
 import { emitAuthenticationSessionInvalidated } from './sessionEvents.js';
+import { createProviderConfigReader } from './providerConfigValues.js';
+import { validateCanonicalLoginOrigin } from './canonicalLoginOrigin.mjs';
 
 /**
  * genericAuthBridge.js
@@ -102,7 +105,7 @@ async function resolveProviderConfig(mod) {
         return await mod.resolveProviderConfig({
             workspaceConfig,
             providerConfig,
-            readValue: readConfigValue
+            readValue: createProviderConfigReader(sso.providerAgent, readConfigValue)
         });
     }
 
@@ -158,9 +161,9 @@ export function createGenericAuthBridge(options = {}) {
     }
 
     function cleanupPending() {
-        const now = Date.now();
+        const now = clock();
         for (const [state, entry] of pendingAuth.entries()) {
-            if (now - entry.createdAt > PENDING_TTL_MS) {
+            if (now >= entry.expiresAt) {
                 pendingAuth.delete(state);
             }
         }
@@ -188,17 +191,41 @@ export function createGenericAuthBridge(options = {}) {
 
     async function beginLogin({ baseUrl, returnTo = '/', prompt } = {}) {
         cleanupPending();
+        const epoch = validationEpoch;
         const { provider, config, providerAgent } = await ensureProvider();
         const redirectUri = resolveRedirectUri(baseUrl, config);
-        const { authorizationUrl, providerState, expiresAt } = await provider.sso_begin_login({ redirectUri, prompt });
+        // `returnTo` is informational for the provider (for example a Start again
+        // link back to /auth/login); the Router alone decides the final redirect.
+        const result = await provider.sso_begin_login({
+            redirectUri, prompt, returnTo: returnTo || '/', supportsCanonicalLoginOrigin: true,
+        });
+        if (epoch !== validationEpoch) throw new Error('Authorization configuration changed');
+        if (Object.hasOwn(result, 'canonicalLoginOrigin')) {
+            if (Object.hasOwn(result, 'authorizationUrl') || Object.hasOwn(result, 'providerState')) {
+                throw new Error('Invalid canonical login origin');
+            }
+            const canonicalLoginOrigin = validateCanonicalLoginOrigin({
+                canonicalLoginOrigin: result.canonicalLoginOrigin, baseUrl, redirectUri,
+            });
+            return { restartLogin: true, canonicalLoginOrigin };
+        }
+        const { authorizationUrl, providerState, expiresAt } = result;
         const coreState = randomId(16);
+        const browserBinding = randomId(32);
+        const providerExpiresAt = typeof expiresAt === 'string' ? Date.parse(expiresAt) : expiresAt;
+        const pendingExpiresAt = Math.min(
+            clock() + PENDING_TTL_MS,
+            Number.isFinite(providerExpiresAt) ? providerExpiresAt : Infinity,
+        );
         pendingAuth.set(coreState, {
             providerAgent,
+            configFingerprint: fingerprintFor(config, providerAgent),
+            epoch,
+            browserBinding,
             providerState,
             redirectUri,
             returnTo: returnTo || '/',
-            createdAt: Date.now(),
-            expiresAt: expiresAt || (Date.now() + PENDING_TTL_MS)
+            expiresAt: pendingExpiresAt,
         });
         // Replace the `state` query param in the authorization URL with our
         // core-owned `coreState`. That way, the browser always presents the
@@ -208,16 +235,29 @@ export function createGenericAuthBridge(options = {}) {
         url.searchParams.set('state', coreState);
         return {
             redirectUrl: url.toString(),
-            state: coreState
+            state: coreState,
+            browserBinding,
+            expiresAt: pendingExpiresAt,
         };
     }
 
-    async function handleCallback({ code, state, baseUrl, rawQuery }) {
+    async function handleCallback({ code, state, browserBinding, baseUrl, rawQuery }) {
         cleanupPending();
         const pending = pendingAuth.get(state);
         if (!pending) throw new Error('Invalid or expired authorization state');
+        // The proof travels only in a host-only HttpOnly cookie, never in the
+        // provider URL. A copied callback must not consume another browser's login.
+        if (typeof browserBinding !== 'string'
+            || Buffer.byteLength(browserBinding) !== Buffer.byteLength(pending.browserBinding)
+            || !timingSafeEqual(Buffer.from(browserBinding), Buffer.from(pending.browserBinding))) {
+            throw new Error('Invalid authorization browser binding');
+        }
         pendingAuth.delete(state);
-        const { provider, config } = await ensureProvider();
+        const { provider, config, providerAgent } = await ensureProvider();
+        if (pending.epoch !== validationEpoch
+            || pending.configFingerprint !== fingerprintFor(config, providerAgent)) {
+            throw new Error('Authorization configuration changed');
+        }
         const query = { code };
         if (rawQuery && typeof rawQuery === 'object') {
             for (const [k, v] of Object.entries(rawQuery)) {
@@ -230,6 +270,7 @@ export function createGenericAuthBridge(options = {}) {
             query,
             providerState: pending.providerState
         });
+        if (pending.epoch !== validationEpoch) throw new Error('Authorization configuration changed');
         const now = Date.now();
         const expiresAt = providerSession?.expiresAt || (now + sessionStore.sessionTtlMs);
         const refreshExpiresAt = providerSession?.refreshExpiresAt || null;
@@ -385,12 +426,40 @@ export function createGenericAuthBridge(options = {}) {
         providerFingerprint = null;
         configFingerprint = null;
         validationEpoch += 1;
+        pendingAuth.clear();
         remotelyValidatedAt.clear();
         validationInFlight.clear();
     }
 
     async function authenticateAgent(clientId, clientSecret) {
         throw new Error('authenticateAgent via client_credentials is not supported by the generic bridge. Use caller-assertion signed requests instead.');
+    }
+
+    async function runProviderAdminOperation(operationName, payload = {}) {
+        const { provider } = await ensureProvider();
+        const operation = provider?.[operationName];
+        if (typeof operation !== 'function') {
+            const error = new Error('provider_user_admin_unsupported');
+            error.code = 'provider_user_admin_unsupported';
+            throw error;
+        }
+        return operation.call(provider, payload);
+    }
+
+    async function listUsers(payload = {}) {
+        return runProviderAdminOperation('sso_admin_list_users', payload);
+    }
+
+    async function createUser(payload = {}) {
+        return runProviderAdminOperation('sso_admin_create_user', payload);
+    }
+
+    async function updateUser(payload = {}) {
+        return runProviderAdminOperation('sso_admin_update_user', payload);
+    }
+
+    async function deleteUser(payload = {}) {
+        return runProviderAdminOperation('sso_admin_delete_user', payload);
     }
 
     return {
@@ -404,6 +473,10 @@ export function createGenericAuthBridge(options = {}) {
         logout,
         revokeSession,
         getSessionCookieMaxAge,
-        authenticateAgent
+        authenticateAgent,
+        listUsers,
+        createUser,
+        updateUser,
+        deleteUser
     };
 }

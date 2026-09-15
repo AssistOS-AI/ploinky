@@ -13,16 +13,19 @@ import path from 'path';
 
 import {
     AGENTLIB_CACHE_LINK_NAME,
+    AGENTLIB_PACKAGE_NAME,
     AGENTLIB_ENV,
     AGENTLIB_ERROR_CODES,
     AGENTLIB_STABLE_MOUNT_PATH,
     agentLibError,
+    canonicalAgentLibRemote,
 } from '../../../agentlib/contract.mjs';
 import { parseRuntimeKey, SUPPORTED_FAMILIES } from './dependencyRuntimeKey.js';
 import { AGENTLIB_ADAPTER_SCHEMA, agentLibPackagePaths } from './agentLibPackages.mjs';
 
 /** Runtime families that get their own mount namespace. */
 const MOUNT_NAMESPACE_FAMILIES = new Set(['container', 'bwrap']);
+export const AGENTLIB_CACHE_LINK_NAMES = Object.freeze([AGENTLIB_CACHE_LINK_NAME, AGENTLIB_PACKAGE_NAME]);
 
 /**
  * The AgentLib selection this process is running under.
@@ -84,8 +87,8 @@ export function agentLibLinkTarget(runtimeKeyOrFamily, selection) {
         : path.resolve(selection.sourceDir);
 }
 
-export function agentLibLinkPath(cachePath) {
-    return path.join(cachePath, 'node_modules', AGENTLIB_CACHE_LINK_NAME);
+export function agentLibLinkPath(cachePath, name = AGENTLIB_CACHE_LINK_NAME) {
+    return path.join(cachePath, 'node_modules', name);
 }
 
 /**
@@ -107,6 +110,7 @@ export function ensureAgentLibCacheLink(cachePath, target, { fsApi = fs } = {}) 
 }
 
 function ensureCacheLink(linkPath, target, fsApi) {
+    fsApi.mkdirSync(path.dirname(linkPath), { recursive: true });
     let current = null;
     try {
         const stat = fsApi.lstatSync(linkPath);
@@ -160,7 +164,7 @@ function cacheLinkProblem(linkPath, target, fsApi) {
 }
 
 /**
- * Reject an agent that declares achillesAgentLib itself.
+ * Reject an agent that declares either AgentLib name or a competing alias.
  *
  * The framework source is not an agent-overridable dependency: an agent that
  * shadowed it would resolve different bytes than the core and the other agents.
@@ -170,16 +174,74 @@ function cacheLinkProblem(linkPath, target, fsApi) {
  */
 export function assertNoReservedAgentLibDependency(pkg, source = 'agent package.json') {
     for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
-        if (pkg?.[field] && Object.hasOwn(pkg[field], AGENTLIB_CACHE_LINK_NAME)) {
+        for (const [name, spec] of Object.entries(pkg?.[field] || {})) {
+            if (!AGENTLIB_CACHE_LINK_NAMES.includes(name) && !isAgentLibReference(spec)) continue;
             throw agentLibError(
                 AGENTLIB_ERROR_CODES.reservedDependency,
-                `${source} declares '${AGENTLIB_CACHE_LINK_NAME}' in ${field}. achillesAgentLib is `
+                `${source} declares '${name}' in ${field}. achillesAgentLib is `
                 + 'provided by Ploinky from the one selected workspace source and cannot be overridden; '
                 + 'remove the entry.',
             );
         }
     }
+    assertNoAgentLibOverrides(pkg?.overrides, source);
+    for (const field of ['bundledDependencies', 'bundleDependencies']) {
+        if (pkg?.[field] === true || (Array.isArray(pkg?.[field])
+            && pkg[field].some(name => AGENTLIB_CACHE_LINK_NAMES.includes(name)))) {
+            throw agentLibError(AGENTLIB_ERROR_CODES.reservedDependency,
+                `${source} must not bundle the Ploinky-provided AgentLib`);
+        }
+    }
     return pkg;
+}
+
+function githubRepository(spec) {
+    let value = String(spec || '').replace(/^git\+/, '').replace(/^github:/, 'https://github.com/');
+    value = value.replace(/^(?:ssh:\/\/git@github\.com\/|git@github\.com:)/, 'https://github.com/');
+    if (/^[\w.-]+\/[\w.-]+(?:#|$)/.test(value)) value = `https://github.com/${value}`;
+    try {
+        const url = new URL(value);
+        return url.hostname === 'github.com' ? url.pathname.replace(/\.git$/, '').toLowerCase() : null;
+    } catch { return null; }
+}
+
+function isAgentLibReference(spec) {
+    if (/^npm:(?:achillesAgentLib|ploinky-agent-lib)(?:@|$)/.test(String(spec))) return true;
+    const repository = githubRepository(spec);
+    return repository !== null && repository === githubRepository(canonicalAgentLibRemote().url);
+}
+
+function assertNoAgentLibOverrides(overrides, source) {
+    if (!overrides || typeof overrides !== 'object') return;
+    for (const [name, value] of Object.entries(overrides)) {
+        if (AGENTLIB_CACHE_LINK_NAMES.some(alias => name === alias || name.startsWith(`${alias}@`) || value === `$${alias}`)
+            || isAgentLibReference(value)) {
+            throw agentLibError(AGENTLIB_ERROR_CODES.reservedDependency,
+                `${source} overrides the Ploinky-provided AgentLib; remove the override`);
+        }
+        assertNoAgentLibOverrides(value, source);
+    }
+}
+
+/** npm must resolve the selected source before any dependency lifecycle runs. */
+export function installWithAgentLib(cachePath, pkg, { sourceDir, installTarget }, install) {
+    assertNoReservedAgentLibDependency(pkg);
+    const packagePath = path.join(cachePath, 'package.json');
+    const localPackage = {
+        ...pkg,
+        dependencies: { ...pkg.dependencies },
+        overrides: { ...pkg.overrides },
+    };
+    for (const name of AGENTLIB_CACHE_LINK_NAMES) {
+        localPackage.dependencies[name] = `file:${installTarget}`;
+        localPackage.overrides[name] = `$${name}`;
+    }
+    try {
+        fs.writeFileSync(packagePath, JSON.stringify(localPackage, null, 2));
+        return install(cachePath, localPackage, { linkAgentLib: true, agentLibSourceDir: sourceDir });
+    } finally {
+        fs.writeFileSync(packagePath, JSON.stringify(pkg, null, 2));
+    }
 }
 
 /** The AgentLib section recorded in a cache stamp. */

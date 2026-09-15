@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { readRuntimeCandidate, retireRuntimeCandidate, writeRuntimeCandidate } from '../../cli/sandbox/runtimeCandidateStore.js';
 
 import {
     cleanupFailedTargetedAgentRestart,
@@ -174,4 +179,75 @@ test('failed successor cleanup is exact and idempotent', () => {
     assert.equal(cleanupFailedTargetedAgentRestart(result, new Error('readiness failed'), dependencies), true);
     assert.equal(cleanupFailedTargetedAgentRestart(result, new Error('readiness failed'), dependencies), false);
     assert.deepEqual(removals, [result.containerId]);
+});
+
+function durableRestartFixture(t) {
+    const fixture = restartFixture();
+    const workspaceRoot = mkdtempSync(join(tmpdir(), 'ploinky-targeted-receipt-'));
+    t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
+    const receiptOptions = { workspaceRoot };
+    const dependencies = {
+        ...fixture.dependencies,
+        retireCandidate: candidate => retireRuntimeCandidate(candidate, receiptOptions),
+    };
+    async function launch(containerId) {
+        const predecessor = fixture.registry[fixture.containerName];
+        const transition = await prepareTargetedAgentRestart({
+            containerName: fixture.containerName,
+            routeKey: 'onlyOffice',
+            repoName: predecessor.repoName,
+            shortAgentName: predecessor.agentName,
+            record: predecessor,
+        }, dependencies);
+        const registryRecord = { ...predecessor, containerId };
+        const durableCandidate = writeRuntimeCandidate({
+            operationId: randomUUID(),
+            containerName: fixture.containerName,
+            containerId,
+            predecessorContainerId: predecessor.containerId,
+            runtime: 'podman',
+            runtimeNetwork: { mode: 'default' },
+            registryRecord,
+        }, receiptOptions);
+        return { transition, result: { containerName: fixture.containerName, containerId, registryRecord, durableCandidate, hostPort: 53201 } };
+    }
+    return { fixture, dependencies, launch, readReceipt: () => readRuntimeCandidate(fixture.containerName, fixture.registry[fixture.containerName], receiptOptions) };
+}
+
+test('two successive targeted restarts retire each published receipt before reusing the runtime tuple', async t => {
+    const state = durableRestartFixture(t);
+    for (const containerId of ['b'.repeat(64), 'c'.repeat(64)]) {
+        const launch = await state.launch(containerId);
+        assert.equal(state.readReceipt().containerId, containerId);
+        await commitTargetedAgentRestart({ ...launch, agentPath: '/workspace/agent' }, state.dependencies);
+        assert.equal(state.fixture.registry[state.fixture.containerName].containerId, containerId);
+        assert.equal(state.fixture.routing.routes.onlyOffice.draining, undefined);
+        assert.equal(state.readReceipt(), null);
+    }
+});
+
+test('failed targeted publication retains its receipt for exact candidate recovery', async t => {
+    const state = durableRestartFixture(t);
+    const launch = await state.launch('b'.repeat(64));
+    await assert.rejects(commitTargetedAgentRestart({ ...launch, agentPath: '/workspace/agent' }, {
+        ...state.dependencies,
+        mergeRouting: async () => { throw new Error('publication failed'); },
+    }), /publication failed/);
+    assert.equal(state.fixture.registry[state.fixture.containerName].containerId, 'a'.repeat(64));
+    assert.equal(state.readReceipt().operationId, launch.result.durableCandidate.operationId);
+});
+
+test('receipt retirement failure cannot fail an already-published targeted successor', async t => {
+    const state = durableRestartFixture(t);
+    const launch = await state.launch('b'.repeat(64));
+    const failures = [];
+    await commitTargetedAgentRestart({ ...launch, agentPath: '/workspace/agent' }, {
+        ...state.dependencies,
+        retireCandidate: () => { throw new Error('receipt unavailable'); },
+        reportRetirementFailure: error => { failures.push(error.message); throw new Error('report failed'); },
+    });
+    assert.equal(state.fixture.registry[state.fixture.containerName].containerId, launch.result.containerId);
+    assert.equal(state.fixture.routing.routes.onlyOffice.draining, undefined);
+    assert.deepEqual(failures, ['receipt unavailable']);
+    assert.equal(state.readReceipt().containerId, launch.result.containerId);
 });

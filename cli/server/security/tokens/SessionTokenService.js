@@ -3,14 +3,12 @@ export class SessionTokenService {
         mintUserSession,
         mintGuestSession,
         verifySessionJwt,
-        resolveUserRev,
         revokeSession,
         isSessionRevoked,
     } = {}) {
         this.mintUserSession = mintUserSession;
         this.mintGuestSession = mintGuestSession;
         this._verifySessionJwt = verifySessionJwt;
-        this._resolveUserRev = resolveUserRev;
         this.revokeSession = revokeSession;
         this._isSessionRevoked = isSessionRevoked;
     }
@@ -29,7 +27,7 @@ export class SessionTokenService {
             : false;
     }
 
-    _sessionFromPayload(token, payload, { usersVar = '', kind = 'user' } = {}) {
+    _sessionFromPayload(token, payload, { kind = 'user' } = {}) {
         return {
             kind,
             id: token,
@@ -40,10 +38,6 @@ export class SessionTokenService {
                 email: payload.usr.email || null,
                 roles: Array.isArray(payload.usr.roles) ? payload.usr.roles : ['user'],
             } : null,
-            localAuth: {
-                usersVar,
-                username: payload.usr?.username || '',
-            },
             createdAt: payload.iat * 1000,
             expiresAt: payload.exp * 1000,
             _jwtPayload: payload,
@@ -55,16 +49,8 @@ export class SessionTokenService {
         if (!payload || payload.typ !== 'user-session' || !payload.usr || this._isRevoked(payload)) {
             return null;
         }
-        const usersVar = String(options?.usersVar || options?.policy?.usersVar || payload.uvar || '').trim();
-        const payloadUsersVar = String(payload.uvar || '').trim();
-        if (usersVar && payloadUsersVar !== usersVar) {
-            return null;
-        }
-        if (this._resolveUserRev && usersVar) {
-            const currentRev = this._resolveUserRev(usersVar, payload.usr.username || '');
-            if (currentRev !== (payload.rev || 1)) return null;
-        }
-        return this._sessionFromPayload(token, payload, { usersVar, kind: 'user' });
+        if (payload.chn !== 'cli' || payload.usr.id !== 'local:admin' || payload.sub !== 'local:admin') return null;
+        return this._sessionFromPayload(token, payload, { kind: 'operator' });
     }
 
     async getGuestSession(token, options = {}) {

@@ -45,14 +45,23 @@ jobs:
     env:
       PLOINKY_BOX_REQUIRE_PODMAN: '1'
       PLOINKY_BOX_CANDIDATE_DIGEST: ${{ inputs.box_digest }}
-      PLOINKY_BOX_EVIDENCE_DIR: ${{ runner.temp }}/ploinky-box-candidate-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.host }}
-      PLOINKY_BOX_CANDIDATE_LOG_DIR: ${{ runner.temp }}/ploinky-box-candidate-logs/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.host }}
       SMOKE_GRAPH_ARGS_JSON: '["start","AchillesIDE/explorer","19090"]'
       SMOKE_GRAPH_REVISIONS_JSON: ${{ inputs.smoke_graph_revisions_json }}
       SMOKE_GRAPH_REPOSITORIES_JSON: >-
         {"AssistOSExplorer":"${{ github.workspace }}/candidate-repositories/AssistOSExplorer","UmamiAgent":"${{ github.workspace }}/candidate-repositories/UmamiAgent","AchillesCLI":"${{ github.workspace }}/candidate-repositories/AchillesCLI","proxies":"${{ github.workspace }}/candidate-repositories/proxies","container-image-builds":"${{ github.workspace }}/candidate-repositories/container-image-builds"}
-      SMOKE_GRAPH_EDGE_DESIRED_FILE: ${{ runner.temp }}/ploinky-box-smoke-desired-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.host }}.json
     steps:
+      - name: Set candidate artifact paths
+        shell: bash
+        env:
+          CANDIDATE_HOST: ${{ matrix.host }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "PLOINKY_BOX_EVIDENCE_DIR=$RUNNER_TEMP/ploinky-box-candidate-evidence/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/$CANDIDATE_HOST" \
+            "PLOINKY_BOX_CANDIDATE_LOG_DIR=$RUNNER_TEMP/ploinky-box-candidate-logs/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/$CANDIDATE_HOST" \
+            "SMOKE_GRAPH_EDGE_DESIRED_FILE=$RUNNER_TEMP/ploinky-box-smoke-desired-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CANDIDATE_HOST.json" \
+            >> "$GITHUB_ENV"
+
       - name: Check out Ploinky candidate
         uses: actions/checkout@v4
         with:

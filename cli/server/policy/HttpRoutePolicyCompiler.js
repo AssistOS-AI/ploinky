@@ -1,5 +1,6 @@
 import { normalizeHttpRoutePolicyEntry } from './HttpRouteAccessPolicy.js';
 import { HttpRouteAccessPath } from './HttpRouteAccessPath.js';
+import { isPublicMethodAllowed } from './PublicProtocolPolicy.js';
 
 const ACCESS_RANK = new Map([
     ['public', 1],
@@ -89,7 +90,10 @@ function representativePaths(root, entries) {
 }
 
 function executionMetadata(decision) {
-    if (decision.access === 'public') return { access: 'public' };
+    if (decision.access === 'public') return {
+        access: 'public',
+        ...(decision.publicProtocol ? { publicProtocol: decision.publicProtocol } : {}),
+    };
     if (decision.access === 'guest') {
         return {
             access: 'guest',
@@ -105,7 +109,7 @@ function metadataKey(decision) {
 }
 
 function methodDecision(winner, method) {
-    if (winner.access === 'public' && !HttpRouteAccessPath.isReadOnlyMethod(method)) {
+    if (winner.access === 'public' && !isPublicMethodAllowed(winner, method)) {
         return {
             access: 'deny',
             status: 403,
@@ -151,7 +155,7 @@ function evaluateRepresentative({ representative, entries, routeDefault }) {
             ...winner,
             ...executionMetadata(winner),
         },
-        methods: Object.fromEntries(['GET', 'HEAD', 'POST'].map((method) => [
+        methods: Object.fromEntries(['GET', 'HEAD', 'POST', 'OPTIONS', 'PUT', 'PATCH', 'DELETE', 'TRACE', 'CONNECT'].map((method) => [
             method,
             methodDecision(winner, method),
         ])),

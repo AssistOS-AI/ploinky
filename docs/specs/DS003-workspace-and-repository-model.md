@@ -67,7 +67,6 @@ Entries created only by an enabled feature or runtime may be absent. Their absen
 | `router-settings.json` | Stores Router authentication and related settings when configured. |
 | `.secrets` | Stores workspace secret variables through the encrypted secret-file contract. Secrets must not be copied into documentation, logs, or repository manifests. |
 | `master-key` | Stores the workspace master key used by managed Boxes for encrypted workspace material and derived agent secrets. It must remain confined to the workspace security boundary. |
-| `passwords.enc` | Stores encrypted local-password authentication material when password authentication is used. |
 | `profile` | Selects the active manifest profile, such as `default`, `dev`, `qa`, or `prod`. Every runnable manifest must provide the required `default` profile contract. |
 | `cloud.json` | Stores configured cloud connection information when the cloud commands are used. |
 | `ploinky_history` | Stores interactive Ploinky CLI history. It is initialized as an empty file for a new workspace. |

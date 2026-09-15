@@ -54,6 +54,9 @@ const {
     applyManifestDirectives,
     manifestEnableEntries,
     prepareExplicitRepositoryBranches,
+    prepareManifestRepositories,
+    resolveManifestSsoProvider,
+    resolveWorkspaceGraphSsoConfig,
 } = bootstrapManifestMod;
 const { bootstrap } = ploinkybootMod;
 
@@ -704,6 +707,128 @@ test('manifestEnableEntries: default profile enable is used when active profile 
     });
 
     assert.deepEqual(entries, ['base-agent', 'default-profile-agent']);
+});
+
+test('resolveManifestSsoProvider: qualifies a same-repository provider without hard-coding its identity', () => {
+    writeAgentManifest('manifestSsoRepo', 'provider', {
+        container: 'node:20',
+        ssoProvider: true,
+    });
+
+    assert.equal(resolveManifestSsoProvider({
+        ploinky: 'sso enable',
+        sso: { providerAgent: 'provider' },
+    }, 'manifestSsoRepo'), 'manifestSsoRepo/provider');
+    assert.throws(() => resolveManifestSsoProvider({
+        ploinky: 'pwd enable',
+        sso: { providerAgent: 'provider' },
+    }, 'manifestSsoRepo'), /Local password authentication is no longer supported/);
+    assert.throws(
+        () => resolveManifestSsoProvider({ ploinky: 'sso enable', sso: { providerAgent: ' ' } }, 'manifestSsoRepo'),
+        /non-empty agent reference/i,
+    );
+});
+
+test('applyManifestDirectives: declarative SSO provider is enabled and bound after dependencies', async () => {
+    writeAgentManifest('manifestSsoBind', 'provider', {
+        container: 'node:20',
+        ssoProvider: true,
+    });
+    writeAgentManifest('manifestSsoBind', 'app', {
+        container: 'node:20',
+        ploinky: 'sso enable',
+        sso: { providerAgent: 'provider' },
+        enable: ['provider'],
+    });
+
+    await applyManifestDirectives('manifestSsoBind/app', {
+        enableAgentImpl: recordEnabledAgentWithoutRuntime,
+    });
+
+    const agents = JSON.parse(fs.readFileSync(path.join(tempDir, '.ploinky', 'agents.json'), 'utf8'));
+    assert.equal(agents._config?.sso?.enabled, true);
+    assert.equal(agents._config?.sso?.providerAgent, 'manifestSsoBind/provider');
+    assert.ok(Object.values(agents).some((record) => (
+        record?.type === 'agent'
+        && record.repoName === 'manifestSsoBind'
+        && record.agentName === 'provider'
+    )));
+});
+
+test('canonical startup preparation binds manifest SSO despite a saved local auth mode', async () => {
+    const { resolveWorkspaceDependencyGraph } = await import('../../cli/utils/workspaceDependencyGraph.js');
+    const { evaluateRequiredCapability } = await import('../../cli/server/authHandlers/requiredCapability.js');
+    const { setConfig, getConfig } = await import('../../cli/utils/workspace.js');
+    writeAgentManifest('startupSso', 'provider', { container: 'node:20', ssoProvider: true });
+    writeAgentManifest('startupSso', 'otherProvider', { container: 'node:20', ssoProvider: true });
+    const appManifest = {
+        container: 'node:20', ploinky: 'sso enable', sso: { providerAgent: 'provider' }, enable: ['provider'],
+        routerAccess: { requiredCapability: 'app.access' },
+    };
+    writeAgentManifest('startupSso', 'app', appManifest);
+    setConfig({ static: { agent: 'startupSso/app', port: 8080 } });
+    await prepareManifestRepositories('startupSso/app');
+    assert.equal(getConfig().sso, undefined, 'repository discovery must not mutate workspace auth');
+    const freshGraph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'startupSso/app' });
+    const sso = resolveWorkspaceGraphSsoConfig(freshGraph, getConfig().sso);
+    setConfig({ ...getConfig(), sso });
+    assert.equal(getConfig().sso.providerAgent, 'startupSso/provider');
+    assert.equal(getConfig().sso.enabled, true);
+    assert.equal(getConfig().static.agent, 'startupSso/app');
+    assert.deepEqual(resolveWorkspaceGraphSsoConfig(freshGraph, { ...sso, providerConfig: { retained: 'value' } }).providerConfig,
+        { retained: 'value' });
+    assert.throws(() => resolveWorkspaceGraphSsoConfig(freshGraph, { providerAgent: 'startupSso/otherProvider' }),
+        /conflicts with the manifest-declared provider/);
+
+    const localRecord = { type: 'agent', repoName: 'startupSso', agentName: 'app', auth: { mode: 'local' } };
+    const upgradedGraph = resolveWorkspaceDependencyGraph({
+        staticAgentRef: 'startupSso/app', registry: { retained: localRecord },
+    });
+    assert.equal(upgradedGraph.nodes.get('startupSso/app').authMode, 'sso');
+    assert.equal(upgradedGraph.nodes.has('startupSso/provider'), true);
+    assert.equal(resolveWorkspaceGraphSsoConfig(upgradedGraph).providerAgent, 'startupSso/provider');
+    assert.deepEqual(localRecord.auth, { mode: 'local' });
+    assert.equal(evaluateRequiredCapability(appManifest, { id: 'existing-id', roles: ['user'] }, { authMode: 'local' }).ok, false);
+});
+
+test('workspace graph rejects missing and conflicting provider dependencies', async () => {
+    const { resolveWorkspaceDependencyGraph } = await import('../../cli/utils/workspaceDependencyGraph.js');
+    writeAgentManifest('conflictSso', 'one', { container: 'node:20', ssoProvider: true });
+    writeAgentManifest('conflictSso', 'two', { container: 'node:20', ssoProvider: true });
+    writeAgentManifest('conflictSso', 'child', {
+        container: 'node:20', ploinky: 'sso enable', sso: { providerAgent: 'two' }, enable: ['two'],
+    });
+    writeAgentManifest('conflictSso', 'app', {
+        container: 'node:20', ploinky: 'sso enable', sso: { providerAgent: 'one' }, enable: ['one', 'child'],
+    });
+    assert.throws(() => resolveWorkspaceGraphSsoConfig(resolveWorkspaceDependencyGraph({ staticAgentRef: 'conflictSso/app' })),
+        /conflicting SSO providers/);
+    writeAgentManifest('conflictSso', 'missing', {
+        container: 'node:20', ploinky: 'sso enable', sso: { providerAgent: 'one' },
+    });
+    assert.throws(() => resolveWorkspaceGraphSsoConfig(resolveWorkspaceDependencyGraph({ staticAgentRef: 'conflictSso/missing' })),
+        /enabled ssoProvider dependency/);
+});
+
+test('workspace graph rejects saved local policies and retired manifest declarations', async () => {
+    const { resolveWorkspaceDependencyGraph } = await import('../../cli/utils/workspaceDependencyGraph.js');
+    writeAgentManifest('retiredAuth', 'app', { container: 'node:20' });
+    for (const mode of ['local', 'pwd']) {
+        assert.throws(() => resolveWorkspaceDependencyGraph({
+            staticAgentRef: 'retiredAuth/app',
+            registry: { app: { type: 'agent', repoName: 'retiredAuth', agentName: 'app', auth: { mode } } },
+        }), /Local password authentication is no longer supported/);
+    }
+    for (const retiredDeclaration of [{ ploinky: 'pwd enable' }, { pwd: { users: [] } }]) {
+        writeAgentManifest('retiredAuth', 'app', { container: 'node:20', ...retiredDeclaration });
+        assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'retiredAuth/app' }),
+            /Local password authentication is no longer supported/);
+    }
+    writeAgentManifest('retiredAuth', 'app', {
+        container: 'node:20', routerAccess: { localAuthRoles: ['user'] },
+    });
+    assert.throws(() => resolveWorkspaceDependencyGraph({ staticAgentRef: 'retiredAuth/app' }),
+        /localAuthRoles is unsupported/);
 });
 
 test('applyManifestDirectives: child manifest repos are applied before recursive enables resolve', async () => {
