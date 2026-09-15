@@ -637,7 +637,19 @@ test('WebChat renders generic runtime model state beside the agent title', () =>
     const index = read('../../cli/server/webchat/index.js');
     assert.match(template, /id="titleBar"[\s\S]*id="runtimeModel" hidden/);
     assert.match(network, /addEventListener\('runtime-state'/);
-    assert.match(index, /dom\.setRuntimeModel\(state\?\.model\)/);
+    assert.match(index, /dom\.setRuntimeModel\(state\?\.model, state\?\.effort\)/);
     assert.match(index, /dom\.setRuntimeRobot\(state\?\.robotName\)/);
     assert.doesNotMatch(`${network}\n${dom}\n${index}`, /runtimeInstanceId/);
+});
+
+test('runtime effort survives server serialization and browser parsing, including reset', () => {
+    for (const effort of ['high', null]) {
+        const state = { model: 'native-model', effort };
+        const parsed = parseWebchatRuntimeState({ __webchatRuntimeState: 1, version: 1, ...state });
+        assert.deepEqual(parsed, state);
+        const sse = serializeRuntimeStateSseEvent(parsed);
+        assert.deepEqual(networkTestables.parseRuntimeStatePayload(sse.split('data: ')[1].trim()), state);
+    }
+    assert.equal(parseWebchatRuntimeState({ __webchatRuntimeState: 1, version: 1, model: 'native-model', effort: 42 }), undefined);
+    assert.equal(networkTestables.parseRuntimeStatePayload({ model: 'native-model', effort: 42 }), undefined);
 });

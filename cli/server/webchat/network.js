@@ -247,8 +247,11 @@ function parseRuntimeStatePayload(text) {
             return undefined;
         }
         if (payload.model !== null && typeof payload.model !== 'string') return undefined;
+        if (Object.prototype.hasOwnProperty.call(payload, 'effort')
+            && payload.effort !== null && typeof payload.effort !== 'string') return undefined;
         return {
             model: payload.model?.trim() || null,
+            ...(Object.prototype.hasOwnProperty.call(payload, 'effort') ? { effort: payload.effort?.trim() || null } : {}),
             ...(typeof payload.robotName === 'string' && payload.robotName.trim() ? { robotName: payload.robotName.trim().slice(0, 160) } : {}),
             ...(payload.backend === null || typeof payload.backend === 'string' ? { backend: payload.backend } : {}),
             ...(typeof payload.targetTabId === 'string' ? { targetTabId: payload.targetTabId } : {}),

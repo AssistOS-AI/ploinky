@@ -330,12 +330,16 @@ export function parseWebchatRuntimeState(envelope) {
     }
     const model = normalizeRuntimeModel(envelope.model);
     if (model === undefined) return undefined;
+    const effort = Object.prototype.hasOwnProperty.call(envelope, 'effort')
+        ? normalizeRuntimeModel(envelope.effort) : undefined;
+    if (Object.prototype.hasOwnProperty.call(envelope, 'effort') && effort === undefined) return undefined;
     const backend = Object.prototype.hasOwnProperty.call(envelope, 'backend')
         ? normalizeRuntimeModel(envelope.backend)
         : undefined;
     if (Object.prototype.hasOwnProperty.call(envelope, 'backend') && backend === undefined) return undefined;
     return {
         model,
+        ...(effort !== undefined ? { effort } : {}),
         ...(typeof envelope.robotName === 'string' && envelope.robotName.trim() ? { robotName: envelope.robotName.trim().slice(0, 160) } : {}),
         ...(backend !== undefined ? { backend } : {}),
         ...normalizeSessionTarget(envelope),

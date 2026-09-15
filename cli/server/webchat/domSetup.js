@@ -81,13 +81,6 @@ export function initDom() {
     const interactionPromptSubmit = document.getElementById('interactionPromptSubmit');
     const interactionPromptOptions = document.getElementById('interactionPromptOptions');
     const sessionsBtn = document.getElementById('sessionsBtn');
-    const skillsBtn = document.getElementById('skillsBtn');
-    const skillsDialog = document.getElementById('skillsDialog');
-    const skillsDialogClose = document.getElementById('skillsDialogClose');
-    const skillsTree = document.getElementById('skillsTree');
-    const skillsSaveBtn = document.getElementById('skillsSaveBtn');
-    const skillsSaveStatus = document.getElementById('skillsSaveStatus');
-    const skillsSummary = document.getElementById('skillsSummary');
     const historyGate = document.getElementById('historyGate');
     const sessionDialog = document.getElementById('sessionDialog');
     const sessionDialogClose = document.getElementById('sessionDialogClose');
@@ -157,11 +150,13 @@ export function initDom() {
         document.title = `${title} · WebChat`;
     }
 
-    function setRuntimeModel(value) {
+    function setRuntimeModel(value, effortValue) {
         if (!runtimeModel) return;
         const model = typeof value === 'string' ? value.trim() : '';
-        runtimeModel.textContent = model;
-        runtimeModel.title = model ? `Selected model: ${model}` : '';
+        const effort = typeof effortValue === 'string' ? effortValue.trim() : '';
+        const label = model ? `${model}${effort ? ` · ${effort}` : ''}` : '';
+        runtimeModel.textContent = label;
+        runtimeModel.title = model ? `Selected model: ${label}` : '';
         runtimeModel.hidden = !model;
     }
 
@@ -332,13 +327,6 @@ export function initDom() {
             attachmentContainer,
             sessionsBtn,
             sessionSettingsLink: document.getElementById('sessionSettingsLink'),
-            skillsBtn,
-            skillsDialog,
-            skillsDialogClose,
-            skillsTree,
-            skillsSaveBtn,
-            skillsSaveStatus,
-            skillsSummary,
             historyGate,
             sessionDialog,
             sessionDialogClose,
