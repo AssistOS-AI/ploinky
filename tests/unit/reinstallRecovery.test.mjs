@@ -40,6 +40,10 @@ function fixture({ runtime = 'docker', running = false, active = true, failure, 
             assert.equal(name, 'repo/example');
             return { repo: 'repo', shortAgentName: 'example', manifestPath: '/repos/repo/example/manifest.json' };
         } },
+        resolveAgentRepositoryName(agentPath) {
+            assert.equal(agentPath, '/repos/repo/example');
+            return 'repo';
+        },
         fs: {
             readFileSync: () => JSON.stringify(manifest),
             mkdirSync(directory, options) {

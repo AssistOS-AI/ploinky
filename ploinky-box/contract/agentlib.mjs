@@ -12,10 +12,12 @@ import {
     AGENTLIB_ENV,
     AGENTLIB_STABLE_MOUNT_PATH,
     agentLibRuntimeEnv,
+    imageSourceId,
 } from '../../agentlib/contract.mjs';
 import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { BOX_AGENTLIB_LABELS, BOX_WORKSPACE_MOUNT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { normalizeImageId } from './image-id.mjs';
 
 function agentLibContractError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE' });
@@ -45,11 +47,23 @@ export function normalizeBoxAgentLib(selection) {
     if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
         throw agentLibContractError('Box AgentLib contract requires a 64-hex content fingerprint');
     }
-    if (!['local', 'managed'].includes(mode)) {
+    if (!['local', 'managed', 'image'].includes(mode)) {
         throw agentLibContractError(`Box AgentLib contract has an unknown source mode '${mode}'`);
     }
     if (!selection?.sourceId && !/^[a-f0-9]{64}$/.test(String(selection?.sourceIdHash || ''))) {
         throw agentLibContractError('Box AgentLib contract requires a source identity');
+    }
+    const imageId = mode === 'image' ? normalizeImageId(selection?.imageId) : null;
+    const identityHash = selection?.sourceId
+        ? sourceIdHash(selection.sourceId)
+        : String(selection?.sourceIdHash || '');
+    if (mode === 'image') {
+        if (sourceDir !== AGENTLIB_STABLE_MOUNT_PATH || sourceRelativePath !== 'image'
+            || !/^sha256:[a-f0-9]{64}$/.test(imageId)
+            || !/^[a-f0-9]{40}$/.test(String(selection?.resolvedCommit ?? selection?.commit ?? ''))
+            || identityHash !== sourceIdHash(imageSourceId(imageId, fingerprint))) {
+            throw agentLibContractError('Box AgentLib image selection has an incompatible path, revision, or immutable identity');
+        }
     }
     return Object.freeze({
         sourceDir: path.resolve(sourceDir),
@@ -57,16 +71,16 @@ export function normalizeBoxAgentLib(selection) {
         mode,
         fingerprint,
         commit: String(selection?.resolvedCommit ?? selection?.commit ?? ''),
-        sourceIdHash: selection?.sourceId
-            ? sourceIdHash(selection.sourceId)
-            : String(selection?.sourceIdHash || ''),
+        sourceIdHash: identityHash,
+        ...(imageId ? { imageId } : {}),
         stablePath: AGENTLIB_STABLE_MOUNT_PATH,
-        aliasPath: path.posix.join(BOX_WORKSPACE_MOUNT, sourceRelativePath),
+        aliasPath: mode === 'image' ? null : path.posix.join(BOX_WORKSPACE_MOUNT, sourceRelativePath),
     });
 }
 
 /** The two exact read-only binds, keyed by container destination. */
 export function expectedAgentLibMounts(contract) {
+    if (contract.mode === 'image') return {};
     return {
         [contract.stablePath]: { source: contract.sourceDir, rw: false },
         [contract.aliasPath]: { source: contract.sourceDir, rw: false },
@@ -80,6 +94,7 @@ export function expectedAgentLibMounts(contract) {
  * read-only mount lands on top of it.
  */
 export function agentLibMountArgs(contract) {
+    if (contract.mode === 'image') return [];
     return [
         '--volume', `${contract.sourceDir}:${contract.stablePath}:ro`,
         '--volume', `${contract.sourceDir}:${contract.aliasPath}:ro`,
@@ -135,6 +150,18 @@ export function agentLibContractFromContainer(container) {
     }
     const mounts = Array.isArray(container?.runtime?.mounts) ? container.runtime.mounts : [];
     const stable = mounts.find((mount) => mount.destination === AGENTLIB_STABLE_MOUNT_PATH);
+    if (mode === 'image') {
+        if (stable) throw agentLibContractError('An image AgentLib selection must not have a source bind mount');
+        return normalizeBoxAgentLib({
+            sourceDir: AGENTLIB_STABLE_MOUNT_PATH,
+            sourceRelativePath,
+            mode,
+            fingerprint,
+            commit,
+            sourceIdHash: sourceIdHashValue,
+            imageId: container?.runtime?.imageId,
+        });
+    }
     if (!stable) {
         throw agentLibContractError(
             `Owned Box declares an AgentLib selection but has no ${AGENTLIB_STABLE_MOUNT_PATH} mount`,
@@ -162,6 +189,7 @@ export function agentLibContractFromContainer(container) {
 export function agentLibSelectionChanged(current, desired) {
     if (!current) return true;
     return current.sourceDir !== desired.sourceDir
+        || current.imageId !== desired.imageId
         || current.sourceRelativePath !== desired.sourceRelativePath
         || current.mode !== desired.mode
         || current.commit !== desired.commit

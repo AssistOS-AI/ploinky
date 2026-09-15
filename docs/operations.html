@@ -31,14 +31,32 @@
                 </div>
                 <div class="doc-section" id="manage">
                     <h2>Manage agents and repositories</h2>
-                    <p>Repository commands install, update, inspect, or remove managed source. Agent commands enable, disable, start, restart, reinstall, stop, and open a selected agent's shell or CLI. Each action resolves the intended enabled record before it changes the runtime.</p>
+                    <p>Repository commands install, update, inspect, or unregister source selected from the workspace or managed storage. Agent commands enable, disable, start, restart, reinstall, stop, and open a selected agent's shell or CLI. Each action resolves the intended enabled record before it changes the runtime.</p>
                     <table class="command-table"><thead><tr><th>Operator action</th><th>Result</th></tr></thead><tbody>
                         <tr><td><code>enable</code> / <code>disable</code></td><td>Adds or removes an enabled-agent record and coordinates the matching runtime lifecycle.</td></tr>
                         <tr><td><code>restart</code> / <code>reinstall</code></td><td>Replaces or refreshes the selected runtime through its recorded manifest and backend.</td></tr>
                         <tr><td><code>shell</code> / <code>cli</code></td><td>Opens an interactive session in the selected agent runtime without exposing it as a host service.</td></tr>
-                        <tr><td><code>update</code></td><td>Refreshes managed repositories and invalidates prepared dependency caches when their resolved inputs change.</td></tr>
+                        <tr><td><code>update</code></td><td>Refreshes repositories at their selected source paths and invalidates prepared dependency caches when their resolved inputs change.</td></tr>
                     </tbody></table>
                     <p>Disabling an agent removes its registry record before runtime teardown. This preserves the precise selected identity for cleanup and prevents the Watchdog from treating the intentional stop as a failed runtime to recreate.</p>
+                </div>
+                <div class="doc-section" id="workspace-agent-repositories">
+                    <h2>Use agent repositories from the workspace</h2>
+                    <p>Keep an agent repository directly inside the <a href="wiki.html#definition-workspace">workspace</a> to run and develop its agents from that checkout. All operations that select repository source use the same priority: a matching local checkout first, then the <a href="wiki.html#definition-managed-repository">managed repository</a> under <code>.ploinky/repos/&lt;repository&gt;</code>. Source files from the two copies are not merged.</p>
+                    <ol>
+                        <li>Look for a direct workspace child named after the repository alias, containing at least one <a href="wiki.html#definition-agent-directory">agent directory</a> with <code>manifest.json</code>.</li>
+                        <li>Otherwise, match the registered Git URL, or the explicit installation URL, against Git origins of direct workspace children containing agents. Hidden directories and <code>node_modules</code> are excluded. Multiple origin matches produce an error requiring the duplicate checkouts to be resolved.</li>
+                        <li>If neither local lookup finds a source, use <code>.ploinky/repos/&lt;repository&gt;</code>; installation or startup preparation clones it there when needed.</li>
+                    </ol>
+                    <p>For example, <code>work/AssistOSExplorer</code> with origin <code>https://github.com/AssistOS-AI/AssistOSExplorer.git</code> supplies the registered repository <code>AchillesIDE</code> when Ploinky runs in <code>work</code>, even if <code>work/.ploinky/repos/AchillesIDE</code> also exists. The <a href="wiki.html#definition-agent-principal">agent principal</a> remains <code>agent:AchillesIDE/explorer</code>. Folder names select source locations; registered aliases continue to identify agents, dependency caches, and runtime ownership.</p>
+                    <table class="command-table"><thead><tr><th>Operation</th><th>Workspace checkout behavior</th></tr></thead><tbody>
+                        <tr><td>Discovery and inventory</td><td>Installed and active repository lists and Marketplace include local repositories even without a managed copy. Missing and explicitly unregistered sources are excluded. An empty enabled-repository list means all installed repositories are active; otherwise only installed entries in that list are active.</td></tr>
+                        <tr><td>Install and automatic preparation</td><td>Reuse the matching checkout and record its repository association without cloning another copy or switching its branch. Manifest-declared repository dependencies are read from the selected source.</td></tr>
+                        <tr><td>Prepare and launch a new runtime</td><td>Read manifests, configuration, hooks, code, skills, and dependency inputs from the selected repository. Managed source links are refreshed during lifecycle preparation.</td></tr>
+                        <tr><td>Explicit repository update</td><td>Update the selected checkout, including a workspace Git checkout. A local directory without Git metadata is not replaced by a clone.</td></tr>
+                        <tr><td>Uninstall repository</td><td>Disable and unregister the local repository while preserving its files. Explicit installation registers it again. Uninstalling a managed-only repository removes its managed directory.</td></tr>
+                    </tbody></table>
+                    <p>An existing runtime retains the source paths admitted for its generation. Adding or removing a local checkout does not redirect an already running instance. Use a lifecycle action such as restart or reinstall to select the source for a new runtime; teardown and routing still refer to the exact existing runtime identity.</p>
                 </div>
                 <div class="doc-section" id="webtty">
                     <h2>Recover WebTTY terminals</h2>

@@ -6,7 +6,7 @@ import test from 'node:test';
 import { resolveSkillRepositorySource } from '../../cli/utils/skillRepositorySource.js';
 
 test('skill recommendations prefer workspace repositories, then installed repos, then the URL', t => {
-    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'recommended-skills-'));
+    const workspaceRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'recommended-skills-'));
     t.after(() => fs.rmSync(workspaceRoot, { recursive: true, force: true }));
     const url = 'https://example.com/DocumentationSkills.git';
     const resolve = () => resolveSkillRepositorySource('DocumentationSkills', url, { workspaceRoot });

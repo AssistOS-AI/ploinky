@@ -290,58 +290,7 @@ body {
     justify-content: center;
 }
 
-.wa-history-load-button {
-    width: min(100%, 320px);
-    min-height: 36px;
-    padding: 6px 12px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 7px;
-    border: 1px solid color-mix(in srgb, var(--wa-accent) 34%, var(--wa-border));
-    border-radius: 9px;
-    background: linear-gradient(135deg,
-        color-mix(in srgb, var(--wa-accent) 7%, var(--wa-bg-message-in)),
-        var(--wa-bg-message-in));
-    box-shadow: none;
-    color: var(--wa-accent);
-    font: inherit;
-    font-size: 12px;
-    font-weight: 600;
-    text-align: center;
-    cursor: pointer;
-    transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
-}
 
-.wa-history-load-button::before {
-    content: '↻';
-    width: 18px;
-    height: 18px;
-    display: inline-grid;
-    place-items: center;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--wa-accent) 10%, transparent);
-    font-size: 13px;
-    line-height: 1;
-}
-
-.wa-history-load-button:hover {
-    border-color: var(--wa-accent);
-    background: linear-gradient(135deg,
-        color-mix(in srgb, var(--wa-accent) 12%, var(--wa-bg-message-in)),
-        var(--wa-bg-message-in));
-    box-shadow: var(--wa-shadow-sm);
-    transform: translateY(-1px);
-}
-
-.wa-history-load-button:active {
-    transform: translateY(0);
-}
-
-.wa-history-load-button:focus-visible {
-    outline: 2px solid var(--wa-accent);
-    outline-offset: 3px;
-}
 
 .wa-session-dialog-backdrop {
     position: fixed;
@@ -1478,7 +1427,7 @@ body {
 /* --- Message Bubbles --- */
 .wa-message {
     width: auto;
-    max-width: min(80%, 900px);
+    max-width: 80%;
     min-width: 0;
     position: relative;
     margin-bottom: 0;
@@ -1497,7 +1446,7 @@ body {
 
 .wa-message.in {
     align-self: flex-start;
-    max-width: min(82%, 900px);
+    max-width: 80%;
 }
 
 .wa-message-bubble {
@@ -1806,7 +1755,7 @@ body {
 
 @media (max-width: 640px) {
     .wa-message:has(.wa-md-table-wrap) {
-        max-width: calc(100% - 3px);
+        max-width: 80%;
     }
 
     .wa-message-text .wa-md-table-shell {
@@ -2889,7 +2838,7 @@ body {
     }
 
     .wa-message {
-        max-width: calc(100% - 2px);
+        max-width: 80%;
     }
 
     .wa-message-time {
@@ -3911,7 +3860,7 @@ button.wa-upload-directory-entry.folder:hover {
 .wa-task-view-header {
     width: 100%;
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
     align-items: center;
     gap: 7px;
     color: var(--wa-text-primary);
@@ -3920,17 +3869,7 @@ button.wa-upload-directory-entry.folder:hover {
 }
 
 .wa-task-summary-row {
-    appearance: none;
     padding: 0;
-    border: 0;
-    background: transparent;
-    cursor: pointer;
-}
-
-.wa-task-summary-row:focus-visible {
-    border-radius: 4px;
-    outline: 2px solid var(--wa-accent);
-    outline-offset: 3px;
 }
 
 .wa-task-view-header {
@@ -3938,7 +3877,7 @@ button.wa-upload-directory-entry.folder:hover {
 }
 
 .wa-task-summary-agent {
-    font-size: 12px;
+    font-size: 14px;
 }
 
 .wa-task-summary-model {
@@ -4324,4 +4263,50 @@ button.wa-upload-directory-entry.folder:hover {
         min-height: 44px;
         margin-left: auto;
     }
+}
+
+/* Earlier messages are inserted above the reader without moving the viewport. */
+.wa-history-gate {
+    width: min(100%, 360px);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    height: 0;
+    overflow: visible;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+}
+
+.wa-history-gate:not([hidden]) {
+    padding: 20px;
+    min-height: 54px;
+    margin-bottom: -54px;
+    background: var(--wa-bg-panel);
+    border-radius: 12px;
+    box-shadow: var(--wa-shadow-md);
+}
+
+.wa-history-spinner {
+    width: 18px;
+    height: 18px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: history-spin .7s linear infinite;
+}
+
+@keyframes history-spin {
+    to { transform: rotate(360deg); }
+}
+
+.wa-messages.is-loading-history {
+    overflow-y: hidden;
+    overflow-anchor: none;
+}
+
+.wa-message[data-historical="true"] {
+    animation: none;
 }

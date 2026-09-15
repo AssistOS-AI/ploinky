@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import path from 'path';
 import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR, AGENTS_DATA_DIR, CODE_DIR, SKILLS_DIR, REPOS_DIR } from './config.js';
 import { ensureAgentDataDirectory, resolveAgentDataPath } from './runtime/agentDataPathPolicy.js';
@@ -80,6 +81,16 @@ export function createAgentSymlinks(agentName, repoName, agentPath) {
     // Create symlink for skills: $PLOINKY_WORKSPACE_ROOT/.ploinky/skills/<agentName> -> agent skills
     const skillsSymlinkPath = path.join(skillsDir, agentName);
     const skillsTargetPath = path.join(agentPath, 'skills');
+
+    // A source without skills must not retain links into the previous source.
+    if (!fs.existsSync(skillsTargetPath)) {
+        try {
+            if (fs.lstatSync(skillsSymlinkPath).isSymbolicLink()) fs.unlinkSync(skillsSymlinkPath);
+        } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+        }
+        return;
+    }
 
     // Only create skills symlink if skills folder exists
     if (fs.existsSync(skillsTargetPath)) {
@@ -165,7 +176,7 @@ export function getAgentCodePath(agentName) {
  * @returns {string} The path to $PLOINKY_WORKSPACE_ROOT/.ploinky/repos/<repo>/<agent>/
  */
 export function getRepoAgentRootPath(repoName, agentName) {
-    return path.join(REPOS_DIR, repoName, agentName);
+    return path.join(resolveAgentRepositoryPath(repoName), agentName);
 }
 
 /**

@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { listAgentRepositoryNames, resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import path from 'path';
 import net from 'net';
 import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT, ROUTING_FILE } from './config.js';
@@ -11,7 +12,6 @@ import { gatherSsoStatus, listAuthProviders } from './security/sso.js';
 import { inspectWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
 import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
 
-const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const PREDEFINED_REPOS = reposSvc.getPredefinedRepos();
 
 const ANSI = {
@@ -70,7 +70,7 @@ export function findAgentManifest(agentName) {
 }
 
 export function listRepos() {
-    const installed = new Set(reposSvc.getInstalledRepos(REPOS_DIR));
+    const installed = new Set(listAgentRepositoryNames());
     const allRepos = { ...PREDEFINED_REPOS };
 
     for (const repo of installed) {
@@ -141,15 +141,17 @@ export function listCurrentAgents({ verbose = false } = {}) {
 export { applyCurrentNoWaitReadiness } from './noWaitReadiness.js';
 
 export function collectAgentsSummary({ includeInactive = true } = {}) {
-    const repoList = includeInactive
-        ? reposSvc.getInstalledRepos(REPOS_DIR)
-        : reposSvc.getActiveRepos(REPOS_DIR);
+    const availableRepos = listAgentRepositoryNames();
+    const enabledRepos = reposSvc.loadEnabledRepos();
+    const repoList = includeInactive || !enabledRepos.length
+        ? availableRepos
+        : availableRepos.filter(name => enabledRepos.includes(name));
 
     const summary = [];
     if (!repoList || repoList.length === 0) return summary;
 
     for (const repo of repoList) {
-        const repoPath = path.join(REPOS_DIR, repo);
+        const repoPath = resolveAgentRepositoryPath(repo);
         const installed = fs.existsSync(repoPath);
 
         if (installed && reposSvc.classifyRepoKind(repo) === 'skills') {
@@ -201,7 +203,7 @@ export function collectAgentsSummary({ includeInactive = true } = {}) {
 export function listAgents() {
     const summary = collectAgentsSummary();
     if (!summary.length) {
-        const installedSkills = reposSvc.getInstalledRepos(REPOS_DIR)
+        const installedSkills = reposSvc.getInstalledRepos()
             .filter(r => reposSvc.classifyRepoKind(r) === 'skills');
         if (installedSkills.length) {
             console.log(`No agent repos installed. Skills-only repos installed: ${installedSkills.join(', ')}.`);
@@ -293,7 +295,7 @@ function isPortListening(port, host = '127.0.0.1', timeoutMs = 500) {
 }
 
 function collectRepoStatusRows() {
-    const installedList = reposSvc.getInstalledRepos(REPOS_DIR);
+    const installedList = listAgentRepositoryNames();
     const installed = new Set(installedList);
     const allNames = new Set(installedList);
     return Array.from(allNames)

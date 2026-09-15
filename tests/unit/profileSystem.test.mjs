@@ -326,9 +326,9 @@ test('validateProfile accepts secrets from .env', () => {
     assert.strictEqual(result.valid, true);
 });
 
-test('getDefaultMountModes returns rw for default and ro for others', () => {
-    assert.deepStrictEqual(getDefaultMountModes('default'), { code: 'rw', skills: 'rw' });
-    assert.deepStrictEqual(getDefaultMountModes('dev'), { code: 'rw', skills: 'rw' });
+test('getDefaultMountModes keeps source read-only in every profile', () => {
+    assert.deepStrictEqual(getDefaultMountModes('default'), { code: 'ro', skills: 'ro' });
+    assert.deepStrictEqual(getDefaultMountModes('dev'), { code: 'ro', skills: 'ro' });
     assert.deepStrictEqual(getDefaultMountModes('prod'), { code: 'ro', skills: 'ro' });
     assert.deepStrictEqual(getDefaultMountModes('embedded'), { code: 'ro', skills: 'ro' });
 });

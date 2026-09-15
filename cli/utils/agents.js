@@ -20,6 +20,7 @@ import { getRuntimeForAgent, isSandboxRuntime } from '../sandbox/docker/common.j
 import { resolveLlmRuntimeAdmissionContext } from '../sandbox/docker/llmRuntimeIntegration.js';
 import { isBwrapProcessRunning, stopBwrapProcess } from '../sandbox/bwrap/bwrapFleet.js';
 import { REPOS_DIR, PLOINKY_WORKSPACE_ROOT } from './config.js';
+import { resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { resolveManifestRuntimeProfile } from './runtime/profileService.js';
 import { resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from './runtime/startupReadiness.js';
@@ -432,7 +433,7 @@ function planAgentEnable({
         if (!repoCandidate) {
             throw new Error("enable agent devel: missing repoName. Usage: enable agent <name> devel <repoName>");
         }
-        const repoPath = path.join(REPOS_DIR, repoCandidate);
+        const repoPath = resolveAgentRepositoryPath(repoCandidate);
         if (!fs.existsSync(repoPath) || !fs.statSync(repoPath).isDirectory()) {
             throw new Error(`Repository '${repoCandidate}' not found in ${path.join(REPOS_DIR)}`);
         }

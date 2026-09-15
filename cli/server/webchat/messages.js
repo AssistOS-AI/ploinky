@@ -102,7 +102,7 @@ export function createMessages({
     }
 
     function scrollToBottomIfLocked() {
-        if (!chatList || !autoScrollLocked) {
+        if (!chatList || !autoScrollLocked || renderingHistory) {
             return;
         }
         try {
@@ -131,6 +131,7 @@ export function createMessages({
         if (!node || !chatList) {
             return;
         }
+        if (renderingHistory) node.dataset.historical = 'true';
         if (Number.isInteger(messageIndex)) {
             node.dataset.messageIndex = String(messageIndex);
         }
@@ -1522,12 +1523,15 @@ export function createMessages({
         hideTypingIndicator(true);
     }
 
-    function renderHistory(historyMessages = []) {
-        clearMessages();
+    function renderHistory(historyMessages = [], { prepend = false, startIndex = 0 } = {}) {
+        const previousServer = { ...lastServerMsg };
+        const previousUserInput = userInputSent;
+        if (!prepend) clearMessages();
         renderingHistory = true;
         const messages = Array.isArray(historyMessages) ? historyMessages : [];
-        for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
-            const message = messages[messageIndex];
+        for (let index = 0; index < messages.length; index += 1) {
+            const messageIndex = startIndex + index;
+            const message = messages[index];
             if (message?.type === 'task') {
                 addTaskItem(message.taskId, { messageIndex });
                 continue;
@@ -1554,8 +1558,9 @@ export function createMessages({
         }
         renderingHistory = false;
         reconcileAssociatedTasks();
-        userInputSent = false;
-        if (messages.some((message) => message?.role === 'assistant' && message.status === 'pending')) {
+        userInputSent = prepend ? previousUserInput : false;
+        if (prepend) Object.assign(lastServerMsg, previousServer);
+        if (!prepend && messages.some((message) => message?.role === 'assistant' && message.status === 'pending')) {
             showTypingIndicator();
         }
     }

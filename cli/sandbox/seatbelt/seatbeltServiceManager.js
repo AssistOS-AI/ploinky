@@ -1,3 +1,4 @@
+import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -100,7 +101,7 @@ const __dirname = path.dirname(__filename);
 const AGENT_LIB_PATH = path.resolve(__dirname, '../../../Agent');
 
 function resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, options = {}, existingRecord = {}) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const manifestPath = `manifest(${repoName}/${agentName})`;
     const resolution = options.profileResolution || resolveManifestRuntimeProfile(manifest, {
         agentName: `${repoName}/${agentName}`,
@@ -119,7 +120,7 @@ function resolveSeatbeltRuntimeProfile(agentName, manifest, agentPath, options =
 }
 
 function admitSeatbeltBoundary(agentName, manifest, agentPath, options, profileResolution) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const optionBag = options && typeof options === 'object' ? options : {};
     const manifestPath = path.join(agentPath, 'manifest.json');
     const manifestBytes = optionBag.manifestBytes !== undefined
@@ -318,9 +319,9 @@ function normalizeMountMode(mode, fallback) {
 
 function getProfileMountModes(profile, profileConfig = {}) {
     const defaultMounts = getDefaultMountModes(profile);
-    const mounts = profileConfig?.mounts || {};
-    const codeMode = normalizeMountMode(mounts.code, defaultMounts.code);
-    const skillsMode = normalizeMountMode(mounts.skills, defaultMounts.skills);
+    // Profile overrides must not make installed source writable.
+    const codeMode = defaultMounts.code;
+    const skillsMode = defaultMounts.skills;
     return {
         codeReadOnly: codeMode === 'ro',
         skillsReadOnly: skillsMode === 'ro'
@@ -470,7 +471,7 @@ function buildSeatbeltRuntimeBinds(layout) {
  * Start a seatbelt-sandboxed agent process.
  */
 function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const profileRecord = loadAgentsMap()[containerName] || {};
     const alias = options.alias || profileRecord.alias;
@@ -502,14 +503,15 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const { codeReadOnly, skillsReadOnly } = getProfileMountModes(activeProfile, profileConfig || {});
     const sharedDir = ensureSharedHostDir();
 
-    // Resolve paths (real host paths — no mount namespaces)
-    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
-    const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
     // Pre-container lifecycle
     const preLifecycle = runPreContainerLifecycle(agentName, repoName, agentPath, activeProfile);
     if (!preLifecycle.success) {
         throw new Error(`[profile] ${agentName}: pre-container lifecycle failed: ${preLifecycle.errors.join('; ')}`);
     }
+
+    // Resolve source links after the lifecycle refreshes them.
+    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
+    const agentSkillsPath = resolveSymlinkPath(getAgentSkillsPath(agentName));
 
     // Ensure work directory and MCP config
     ensureAgentDataDirectory(agentWorkDir);
@@ -789,7 +791,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
         profileNameOverride = options.profileName;
     }
 
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = containerOverride || getAgentContainerName(agentName, repoName);
     const snapshot = loadAgentsMap();
     const existingRecord = snapshot[containerName] || {};
@@ -910,7 +912,7 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
  * Spawn an interactive seatbelt session (for `ploinky cli` / `ploinky shell`).
  */
 function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entryCommand, options = {}) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const agents = loadAgentsMap();
     const record = agents[containerName];

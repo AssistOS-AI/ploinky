@@ -1,9 +1,7 @@
 // Establish the achillesAgentLib runtime contract before any framework import.
 //
-// Outside the Box this resolves (and, for a managed source, materializes) the
-// one workspace source and exports the reserved environment. Inside the Box it
-// only validates what the host supervisor already mounted: a missing contract
-// there is an error, not permission to clone from inside the Box.
+// Outside the Box this resolves the local workspace source. Inside the Box it
+// validates the selected local mount or pinned image bundle before imports.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -18,6 +16,7 @@ import {
     assertNoRemovedAgentLibSettings,
 } from './contract.mjs';
 import { resolveWorkspaceRoot } from './source.mjs';
+import { verifyImageBundle } from './image-bundle.mjs';
 
 let bootstrapped = null;
 
@@ -89,9 +88,25 @@ function validateProvidedContract({ env, fsApi, expectedDir }) {
             `${AGENTLIB_ENV.sourceId} must carry the selected physical source identity.`,
         );
     }
+    const mode = String(env[AGENTLIB_ENV.mode] || '');
+    if (!['local', 'image', 'managed'].includes(mode)) {
+        throw agentLibError(AGENTLIB_ERROR_CODES.contractMissing, 'The Box AgentLib source mode is missing or invalid.');
+    }
+    if (mode === 'image') {
+        const expectedCommit = String(env[AGENTLIB_ENV.commit] || '');
+        if (!/^[0-9a-f]{40}$/.test(expectedCommit)) {
+            throw agentLibError(AGENTLIB_ERROR_CODES.contractMissing,
+                'The image AgentLib runtime contract requires the selected pinned commit.');
+        }
+        const bundle = verifyImageBundle({ sourceDir: declared, expectedCommit, fsApi });
+        if (bundle.fingerprint !== env[AGENTLIB_ENV.fingerprint]) {
+            throw agentLibError(AGENTLIB_ERROR_CODES.imageInvalid,
+                'The image AgentLib fingerprint does not match the host-selected runtime contract.');
+        }
+    }
     return {
         sourceDir: root,
-        mode: String(env[AGENTLIB_ENV.mode] || ''),
+        mode,
         fingerprint: String(env[AGENTLIB_ENV.fingerprint] || ''),
         commit: String(env[AGENTLIB_ENV.commit] || ''),
         sourceIdHash: String(env[AGENTLIB_ENV.sourceId] || ''),

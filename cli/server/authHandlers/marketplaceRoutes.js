@@ -3,6 +3,7 @@ import path from 'path';
 import { PLOINKY_DIR } from '../../utils/config.js';
 import * as reposSvc from '../../utils/repos.js';
 import { resolveSkillRepositorySource } from '../../utils/skillRepositorySource.js';
+import { listAgentRepositoryNames, workspaceAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 import * as agentsSvc from '../../utils/agents.js';
 import * as workspaceSvc from '../../utils/workspace.js';
 import { collectAgentRuntimeStates } from '../../sandbox/agentRuntimeState.js';
@@ -309,7 +310,7 @@ function buildMarketplaceState(user = null, options = {}) {
     const reposDir = path.join(PLOINKY_DIR, 'repos');
     const predefined = reposSvc.getPredefinedRepos();
     const sources = reposSvc.getRepoSources();
-    const installed = new Set(reposSvc.getInstalledRepos(reposDir));
+    const installed = new Set(listAgentRepositoryNames());
     const agentsRegistry = options.registry || workspaceSvc.loadAgents();
     const enabledAgents = Object.entries(agentsRegistry)
         .filter(([, record]) => record && record.type === 'agent')
@@ -328,14 +329,19 @@ function buildMarketplaceState(user = null, options = {}) {
         activeAgentsByRepo.set(repoName, (activeAgentsByRepo.get(repoName) || 0) + 1);
     }
     const bootRepos = new Set(reposSvc.getDefaultBootRepos().map(repo => repo.name));
-    const repoNames = new Set([...Object.keys(predefined), ...Object.keys(sources), ...installed]);
+    const repoNames = new Set([...Object.keys(predefined), ...Object.keys(sources), ...installed, ...listAgentRepositoryNames()]);
     const repositories = [...repoNames].sort((left, right) => left.localeCompare(right)).map((name) => {
         const predefinedEntry = predefined[name] || {};
         const sourceEntry = sources[name] || {};
         const kind = predefinedEntry.kind || sourceEntry.kind || reposSvc.classifyRepoKind(name);
         const url = predefinedEntry.url || sourceEntry.url || '';
+        const localPath = workspaceAgentRepositoryPath(name);
+        // Expose a portable workspace label, not the physical host path.
+        const workspacePath = localPath ? path.posix.join('/workspace', path.basename(localPath)) : '';
         return {
             name,
+            displayName: workspacePath || name,
+            workspacePath,
             url,
             description: predefinedEntry.description || '',
             kind,

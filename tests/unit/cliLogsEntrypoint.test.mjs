@@ -11,6 +11,7 @@ import { launchCli } from '../../cli/index.js';
 import { readAgentRegistrySnapshot } from '../../cli/utils/agentRegistrySnapshot.js';
 import { parseLogCommandArgs } from '../../cli/commands/logCommands.js';
 import { createForegroundCommandCoordinator } from '../../cli/commands/foregroundCommand.js';
+import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
 const CLI_ENTRY = path.resolve(import.meta.dirname, '../../cli/index.js');
 const LOG_COMMAND_ENTRY = path.resolve(import.meta.dirname, '../../cli/commands/logCommands.js');
@@ -268,9 +269,12 @@ test('logs runs without the unrelated core runtime dependencies', (t) => {
     const logs = runLogsCli(['logs', 'last', '5', 'missingAgent'], { cwd: root, env: { PLOINKY_ROOT: emptyRoot } });
     assert.equal(logs.status, 1, logs.stderr);
     assert.doesNotMatch(logs.stderr, /dependencies missing/);
+    assert.doesNotMatch(logs.stderr, /No local achillesAgentLib checkout/);
+    assert.match(logs.stderr, /is not one enabled agent/);
 
     // The same absent dependency root still blocks a mutating core command, so
-    // the assertion above proves the logs path skipped that gate.
+    // provide its required local AgentLib source before checking the next gate.
+    writeAgentLibCheckout(path.join(root, 'achillesAgentLib'));
     const enable = runLogsCli(['enable', 'agent', 'exampleAgent'], {
         cwd: root,
         env: { PLOINKY_ROOT: emptyRoot },

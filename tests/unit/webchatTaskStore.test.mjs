@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
     hasRuntimeBackgroundTasks,
     parseWebchatTaskState,
+    parseWebchatRuntimeState,
 } from '../../cli/server/handlers/webchat/runtimeState.js';
 
 const task = {
@@ -26,10 +27,12 @@ test('WebChat validates AchillesCLI task lists without owning task storage', () 
         tasks: [{
             ...task,
             finalOutputRanges: [{ turn: 1, offset: 10, length: 5 }],
+            robotName: 'analyst',
             credential: 'must-not-reach-browser',
             arguments: { prompt: 'secret' },
         }],
     });
+    assert.equal(parsed.tasks[0].robotName, 'analyst');
     assert.equal(parsed.tasks[0].status, 'ongoing');
     assert.equal(parsed.tasks[0].remoteStatus, 'queued');
     assert.equal('credential' in parsed.tasks[0], false);
@@ -106,4 +109,10 @@ test('runtime cleanup uses only volatile AchillesCLI task state', () => {
     assert.equal(hasRuntimeBackgroundTasks(tab), true);
     tab.webchatTasks.set(task.id, { ...task, status: 'finished', remoteStatus: 'completed' });
     assert.equal(hasRuntimeBackgroundTasks(tab), false);
+});
+
+test('runtime state preserves the current robot name without requiring a launch query', () => {
+    const state = parseWebchatRuntimeState({ __webchatRuntimeState: 1, version: 1, model: null, robotName: ' default ' });
+    assert.equal(state.robotName, 'default');
+    assert.equal(Object.hasOwn(parseWebchatRuntimeState({ __webchatRuntimeState: 1, version: 1, model: null }), 'robotName'), false);
 });

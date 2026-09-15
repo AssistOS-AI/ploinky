@@ -71,8 +71,7 @@ test('session UI sends AchillesCLI slash commands and renders protocol responses
         assert.equal(sessionsBtn.disabled, true);
         controller.handleSessionState(sessionState('current', [{ role: 'user', text: 'Earlier question' }]));
         assert.equal(sessionsBtn.disabled, false);
-        assert.equal(historyGate.hidden, false);
-        loadHistoryBtn.listeners.get('click')();
+        assert.equal(historyGate.hidden, true);
         assert.equal(rendered.length, 1);
 
         sessionsBtn.listeners.get('click')();
@@ -176,4 +175,47 @@ test('execution snapshots and remote echoes never switch the selected conversati
     assert.equal(rendered.at(-1)[0].id, 'anchor-A');
     controller.handleSessionState({ event: 'error', sessionId: SESSION_ID, error: 'Native home mismatch' });
     assert.deepEqual(errors, ['Native home mismatch']);
+});
+
+
+test('history automatically shows a bounded tail and prepends pages without jumping or mixing sessions', async (t) => {
+    const previousDocument = globalThis.document;
+    const previousFrame = globalThis.requestAnimationFrame;
+    globalThis.document = { createElement: makeElement, addEventListener() {} };
+    globalThis.requestAnimationFrame = callback => setTimeout(callback, 0);
+    t.after(() => { globalThis.document = previousDocument; globalThis.requestAnimationFrame = previousFrame; });
+    const chatList = makeElement();
+    chatList.classList = { add() {}, remove() {} };
+    chatList.scrollHeight = 0;
+    chatList.scrollTop = 0;
+    chatList.clientHeight = 500;
+    const historyGate = makeElement();
+    const rendered = [];
+    const controller = createSessionController({ elements: { chatList, historyGate }, network: {}, showBanner() {}, hideBanner() {},
+        messages: { renderHistory(page, options) {
+            rendered.push({ page, options });
+            chatList.scrollHeight = (options.prepend ? chatList.scrollHeight : 0) + page.length * 20;
+        } } });
+    const all = Array.from({ length: 230 }, (_, index) => ({ role: 'user', id: String(index), text: String(index) }));
+    controller.handleSessionState(sessionState('current', all));
+    assert.equal(rendered[0].page.length, 100);
+    assert.equal(rendered[0].options.startIndex, 130);
+    chatList.scrollTop = 40;
+    const loading = controller.loadOlder();
+    assert.equal(historyGate.hidden, false);
+    await controller.loadOlder();
+    await loading;
+    assert.equal(rendered.length, 2, 'concurrent scrolls share one page');
+    assert.equal(rendered[1].page.length, 50);
+    assert.equal(rendered[1].options.startIndex, 80);
+    assert.equal(rendered[1].options.prepend, true);
+    assert.equal(chatList.scrollTop, 1040);
+    assert.equal(historyGate.hidden, true);
+    const pending = controller.loadOlder();
+    const replacement = sessionState('selected', []);
+    replacement.summary.sessionId = 'new-session';
+    controller.handleSessionState(replacement);
+    await pending;
+    assert.deepEqual(rendered.at(-1).page, []);
+    assert.equal(rendered.length, 3, 'old pending page cannot enter the new session');
 });

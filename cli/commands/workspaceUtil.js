@@ -1,3 +1,4 @@
+import { resolveAgentRepositoryName, resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import fs from 'fs';
 import { CLI_OUTPUT_BOUNDARY } from '../server/webchat/startupOutput.js';
 import path from 'path';
@@ -819,7 +820,9 @@ function resolveGraphNodeExecutionRecord(node, {
     if (!develRepo) {
       throw new Error(`Graph node '${node.id}' requests devel mode without a repository name.`);
     }
-    const projectPath = path.join(reposDir, develRepo);
+    const projectPath = reposDir === REPOS_DIR
+      ? resolveAgentRepositoryPath(develRepo)
+      : path.join(reposDir, develRepo);
     if (!fs.existsSync(projectPath) || !fs.statSync(projectPath).isDirectory()) {
       throw new Error(`Repository '${develRepo}' required by graph node '${node.id}' was not found in ${reposDir}.`);
     }
@@ -2268,7 +2271,7 @@ async function startWorkspace(staticAgentArg, portArg, {
           const manifestPath0 = findAgentManifest(manifestRef);
           const manifest = JSON.parse(fs.readFileSync(manifestPath0, 'utf8'));
           const agentPath = path.dirname(manifestPath0);
-          const repoName = rec.repoName || path.basename(path.dirname(agentPath));
+          const repoName = rec.repoName || resolveAgentRepositoryName(agentPath);
           const routeKey = rec.alias || shortAgentName;
           const routerEndpoint = resolveManifestRouterEndpoint(manifest, {
             explicitPort: staticPort,
@@ -2791,7 +2794,7 @@ export async function runCliWithDependencies(agentName, args, dependencies) {
   const rawCmd = ssoPrefix + cliBase + (regularArgs.length ? (' ' + regularArgs.join(' ')) : '');
   const cmd = wrapCliWithWebchat(rawCmd, env);
   const agentDir = path.dirname(manifestPath);
-  const repoName = path.basename(path.dirname(agentDir));
+  const repoName = resolveAgentRepositoryName(agentDir);
   const initialContainerName = registryRecord?.containerName || getAgentContainerNameImpl(shortAgentName, repoName);
   const expectedAlias = String(registryRecord?.record?.alias || '');
   const maintenanceContainerName = initialContainerName;
@@ -2992,7 +2995,7 @@ async function runShell(agentName) {
   });
   const { ensureAgentService, attachInteractive, getConfiguredProjectPath, getAgentContainerName } = dockerSvc;
   const agentDir = path.dirname(manifestPath);
-  const repoName = path.basename(path.dirname(agentDir));
+  const repoName = resolveAgentRepositoryName(agentDir);
   const registeredContainerName = registryRecord?.containerName || getAgentContainerName(shortAgentName, repoName);
   const { containerInfo, containerName } = await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
     let result = null;
@@ -3196,7 +3199,7 @@ async function reinstallAgent(agentName) {
             });
             const { containerName: newContainerName, hostPort } = reinstallResult;
 
-            const repoName = path.basename(path.dirname(agentPath));
+            const repoName = resolveAgentRepositoryName(agentPath);
             const routeKey = registryRecord?.record.alias || short;
             const reinstallReadinessRoute = buildRelayReadinessRoute({
                 route: {

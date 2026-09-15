@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { REPOS_DIR } from '../utils/config.js';
+import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import * as reposSvc from '../utils/repos.js';
 import { runGitCommand, sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 import { syncManagedSkillExports, copyFreshSkillTree } from '../utils/skills/managedExports.js';
@@ -21,7 +21,7 @@ const GITIGNORE_MARKER_START = '# >>> ploinky default-skills >>>';
 const GITIGNORE_MARKER_END = '# <<< ploinky default-skills <<<';
 
 function ensureRepoCloned(repoName) {
-    const repoPath = path.join(REPOS_DIR, repoName);
+    const repoPath = resolveAgentRepositoryPath(repoName);
     if (fs.existsSync(repoPath)) return repoPath;
     const result = reposSvc.addRepo(repoName, null);
     return result.path;
@@ -124,7 +124,7 @@ function readCachedRepoSource(repoPath) {
 }
 
 function skillSourceError(manifestPath, entry, error) {
-    const repoPath = path.join(REPOS_DIR, entry.name);
+    const repoPath = resolveAgentRepositoryPath(entry.name);
     return new Error(sanitizeGitDiagnostic(
         `Skills manifest '${manifestPath}', source repo '${entry.name}' ` +
         `(URL '${entry.url}', requested branch '${entry.branch || '(unspecified; cached branch or remote default)'}', ` +
@@ -133,7 +133,7 @@ function skillSourceError(manifestPath, entry, error) {
 }
 
 function registerManifestCacheBranch(entry, cacheBranches) {
-    const repoPath = path.resolve(REPOS_DIR, entry.name);
+    const repoPath = path.resolve(resolveAgentRepositoryPath(entry.name));
     let cacheIdentity;
     try {
         const stat = fs.statSync(repoPath);
@@ -155,7 +155,7 @@ function registerManifestCacheBranch(entry, cacheBranches) {
 }
 
 function ensureManifestRepoCached(entry) {
-    const repoPath = path.join(REPOS_DIR, entry.name);
+    const repoPath = resolveAgentRepositoryPath(entry.name);
     if (entry.branch) {
         runGitCommand(['check-ref-format', '--branch', entry.branch], { stdio: 'pipe' });
     }

@@ -1,4 +1,4 @@
-import { createTaskLogFollower } from './taskLogFollow.js';
+import { normalizeTaskLiveSession } from './taskLiveSession.js';
 
 const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
 const ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
@@ -273,36 +273,24 @@ export function mergeTaskLogUpdate(state, payload) {
 
 export function attachTaskSummary({ bubble, taskId, taskController }) {
     const panel = document.createElement('div');
-    panel.className = 'wa-task-summary is-expanded';
+    panel.className = 'wa-task-summary';
     panel.dataset.taskId = taskId;
-    const summary = document.createElement('button');
-    summary.type = 'button';
+    const summary = document.createElement('div');
     summary.className = 'wa-task-summary-row';
-    const bodyId = `task-summary-body-${taskId}`;
-    summary.setAttribute('aria-expanded', 'true');
-    summary.setAttribute('aria-controls', bodyId);
-    summary.setAttribute('aria-label', 'Collapse task log');
     const agent = document.createElement('strong');
     agent.className = 'wa-task-summary-agent';
-    agent.textContent = 'Task';
     const description = document.createElement('span');
     description.className = 'wa-task-summary-description';
     const status = document.createElement('span');
-    status.className = 'wa-task-status is-unavailable';
-    status.textContent = 'LOADING';
     const duration = document.createElement('span');
     duration.className = 'wa-task-summary-duration';
-    const arrow = document.createElement('span');
-    arrow.className = 'wa-task-summary-arrow';
-    arrow.setAttribute('aria-hidden', 'true');
-    arrow.textContent = '▾';
-    summary.append(agent, description, status, duration, arrow);
+    summary.append(agent, description, status, duration);
     const body = document.createElement('div');
-    body.id = bodyId;
     body.className = 'wa-task-summary-body';
-    const log = document.createElement('div');
-    log.className = 'wa-task-log wa-task-summary-log';
-    const logFollower = createTaskLogFollower(log);
+    body.id = `task-summary-body-${taskId}`;
+    body.hidden = false;
+    const actions = document.createElement('div');
+    actions.className = 'wa-task-summary-actions';
     const link = document.createElement('a');
     link.className = 'wa-task-log-link';
     link.href = taskController.getTaskViewUrl(taskId);
@@ -310,163 +298,37 @@ export function attachTaskSummary({ bubble, taskId, taskController }) {
     link.rel = 'noopener noreferrer';
     link.dataset.wcLink = 'true';
     link.dataset.wcTaskId = taskId;
-    link.textContent = 'Open Task';
-    const actions = document.createElement('div');
-    actions.className = 'wa-task-summary-actions';
-    const actionButton = document.createElement('button');
-    actionButton.type = 'button';
-    actionButton.className = 'wa-task-inline-action';
-    actionButton.hidden = true;
-    actions.append(link, actionButton);
-    const actionError = document.createElement('div');
-    actionError.className = 'wa-task-summary-error';
-    actionError.hidden = true;
-    body.append(log, actions, actionError);
-    const composer = document.createElement('form');
-    composer.className = 'wa-task-composer';
-    composer.hidden = true;
-    const input = document.createElement('textarea');
-    input.placeholder = 'Send a message to this task…';
-    input.setAttribute('aria-label', 'Task message');
-    input.maxLength = 32768;
-    input.rows = 2;
-    const send = document.createElement('button');
-    send.type = 'submit';
-    send.textContent = 'Send';
-    composer.append(input, send);
-    body.appendChild(composer);
+    link.textContent = 'View Task Details';
+    const live = document.createElement('a');
+    live.className = 'wa-task-log-link';
+    live.target = '_blank';
+    live.rel = 'noopener noreferrer';
+    live.dataset.wcLink = 'true';
+    live.hidden = true;
+    actions.append(link, live);
+    body.append(actions);
     panel.append(summary, body);
     const timeNode = bubble.querySelector(':scope > .wa-message-time');
     if (timeNode) bubble.insertBefore(panel, timeNode);
     else bubble.appendChild(panel);
-
-    let latest = { task: null, ready: false, log: '', logLoaded: false };
-    let renderedLog = null;
-    let disposed = false;
-    let actionPending = '';
-    let messagePending = false;
-    let actionErrorText = '';
-    const resizeInput = () => {
-        if (disposed || composer.hidden || body.hidden) return;
-        input.style.height = 'auto';
-        // scrollHeight includes padding but excludes the two 1px borders.
-        const contentHeight = input.value ? Math.ceil(input.scrollHeight) + 2 : 64;
-        input.style.height = `${Math.min(180, Math.max(64, contentHeight))}px`;
-        input.style.overflowY = contentHeight > 180 ? 'auto' : 'hidden';
-        if (contentHeight <= 180) input.scrollTop = 0;
-    };
-    input.oninput = resizeInput;
-    const renderSummary = () => {
-        if (disposed) return;
+    let latest = { task: null, ready: false };
+    const render = () => {
         const task = latest.task;
         const presentation = taskStatusPresentation(task);
-        agent.textContent = task?.targetAgent || 'Task';
-        description.textContent = task?.description || task?.toolName || (latest.ready ? 'Task data unavailable' : 'Loading task…');
+        agent.textContent = task?.robotName ? `Robot: ${task.robotName}` : task?.targetAgent ? `Agent: ${task.targetAgent}` : 'Loading robot…';
+        description.textContent = task?.description || task?.toolName || 'Loading task…';
         status.className = `wa-task-status is-${presentation.className}`;
         status.textContent = latest.ready || task ? presentation.label : 'LOADING';
         duration.textContent = taskDurationLabel(task);
-        const stopping = task?.status === 'ongoing'
-            && String(task?.remoteStatus || '').trim().toLowerCase() === 'cancelling';
-        const canStop = task?.status === 'ongoing';
-        const canResume = task?.status === 'stopped' && Boolean(task?.continuation?.handle);
-        const composerWasHidden = composer.hidden;
-        composer.hidden = !task?.continuation?.handle
-            || (task.status === 'ongoing' && !task.continuation.messageToolName);
-        if (composerWasHidden && !composer.hidden) resizeInput();
-        send.disabled = messagePending;
-        send.textContent = messagePending ? 'Sending…' : 'Send';
-        if (actionPending === 'stop' && (!canStop || stopping || task?.error)) actionPending = '';
-        if (actionPending === 'resume' && (task?.status === 'ongoing' || task?.error)) actionPending = '';
-        actionButton.hidden = !canStop && !canResume;
-        actionButton.disabled = Boolean(actionPending) || stopping;
-        actionButton.className = `wa-task-inline-action ${canResume ? 'is-resume' : 'is-stop'}`;
-        actionButton.textContent = actionPending === 'resume'
-            ? 'Resuming…'
-            : (actionPending === 'stop' || stopping ? 'Stopping…' : (canResume ? 'Resume' : 'Stop'));
-        const nextLog = latest.logLoaded ? latest.log : '';
-        if (nextLog !== renderedLog) {
-            const previousScrollTop = log.scrollTop;
-            renderTaskLog(
-                log,
-                nextLog,
-                latest.logLoaded ? 'No log output yet.' : 'Loading log…',
-                task,
-            );
-            logFollower.restoreAfterRender(previousScrollTop);
-            renderedLog = nextLog;
+        const session = normalizeTaskLiveSession(task?.liveSession);
+        live.hidden = !session;
+        if (session) {
+            live.href = session.url;
+            live.textContent = session.mode === 'browser' ? 'Open live browser' : 'Open live desktop';
         }
     };
-    summary.onclick = () => {
-        const expanded = body.hidden;
-        body.hidden = !expanded;
-        panel.classList.toggle('is-expanded', expanded);
-        summary.setAttribute('aria-expanded', expanded ? 'true' : 'false');
-        summary.setAttribute('aria-label', expanded ? 'Collapse task log' : 'Expand task log');
-        arrow.textContent = expanded ? '▾' : '▸';
-        if (expanded) resizeInput();
-        if (expanded && typeof requestAnimationFrame === 'function') {
-            requestAnimationFrame(() => logFollower.restoreAfterRender(log.scrollTop));
-        }
-    };
-    actionButton.onclick = (event) => {
-        event.preventDefault?.();
-        event.stopPropagation?.();
-        if (actionButton.disabled) return;
-        const operation = latest.task?.status === 'stopped' ? 'resume' : 'stop';
-        actionPending = operation;
-        renderSummary();
-        const accepted = operation === 'resume'
-            ? taskController.resumeTask?.(taskId)
-            : taskController.stopTask?.(taskId);
-        if (!accepted) {
-            actionPending = '';
-            renderSummary();
-        }
-    };
-    const unsubscribe = taskController.subscribe(taskId, (value) => {
-        if (value?.actionEvent && value.action === 'continue') {
-            messagePending = false;
-            if (value.actionOk !== false) {
-                input.value = '';
-                resizeInput();
-            }
-            else actionErrorText = value.actionError || 'Message was not accepted.';
-        }
-        if (value?.actionEvent && value.action === actionPending) {
-            actionPending = '';
-            actionErrorText = value.actionOk === false
-                ? (value.actionError || 'Task action failed.')
-                : '';
-        }
-        latest = value;
-        actionError.hidden = !actionErrorText;
-        actionError.textContent = actionErrorText;
-        renderSummary();
-    });
-    composer.onsubmit = (event) => {
-        event.preventDefault();
-        const prompt = input.value.trim();
-        if (!prompt || messagePending) return;
-        messagePending = true;
-        actionErrorText = '';
-        if (!taskController.continueTask?.(taskId, prompt)) messagePending = false;
-        renderSummary();
-    };
-    input.onkeydown = (event) => {
-        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-            event.preventDefault(); composer.requestSubmit();
-        }
-    };
-    void taskController.loadLog?.(taskId).catch(() => {
-        if (disposed || latest.logLoaded) return;
-        latest = { ...latest, log: 'Unable to load task log.', logLoaded: true };
-        renderSummary();
-    });
-    const timer = setInterval(renderSummary, 1000);
-    renderSummary();
-    return () => {
-        disposed = true;
-        clearInterval(timer);
-        unsubscribe();
-    };
+    const unsubscribe = taskController.subscribe(taskId, value => { latest = value; render(); });
+    const timer = setInterval(render, 1000);
+    render();
+    return () => { clearInterval(timer); unsubscribe(); };
 }

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { REPOS_DIR, isDebugMode } from './config.js';
 import * as reposSvc from './repos.js';
+import { listAgentRepositoryNames, resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 
 // Simple ANSI color helpers
 const ANSI = {
@@ -31,7 +32,7 @@ function findAgent(agentName) {
     debugLog(`Searching for agent '${agentName}'...`);
     if (agentName.includes(':') || agentName.includes('/')) {
         const [repoName, shortAgentName] = agentName.split(/[:/]/);
-        const manifestPath = path.join(REPOS_DIR, repoName, shortAgentName, 'manifest.json');
+        const manifestPath = path.join(resolveAgentRepositoryPath(repoName), shortAgentName, 'manifest.json');
         if (fs.existsSync(manifestPath)) {
             debugLog(`Found agent directly with prefixed name: ${manifestPath}`);
             return { manifestPath, repo: repoName, shortAgentName };
@@ -41,10 +42,10 @@ function findAgent(agentName) {
     }
 
     const foundAgents = [];
-    if (!fs.existsSync(REPOS_DIR)) {
+    const installedRepos = listAgentRepositoryNames();
+    if (!installedRepos.length) {
         throw new Error("Ploinky environment not initialized. No repos found.");
     }
-    const installedRepos = fs.readdirSync(REPOS_DIR);
     const enabledRepos = reposSvc.loadEnabledRepos();
     const primaryRepos = enabledRepos.length
         ? enabledRepos.filter(repo => installedRepos.includes(repo))
@@ -52,7 +53,7 @@ function findAgent(agentName) {
     const searchRepos = (repos, label) => {
         debugLog(`Searching ${label} repos: ${repos.join(', ')}`);
         for (const repo of repos) {
-            const repoPath = path.join(REPOS_DIR, repo);
+            const repoPath = resolveAgentRepositoryPath(repo);
             let isDirectory = false;
             try {
                 isDirectory = fs.statSync(repoPath).isDirectory();
@@ -97,9 +98,8 @@ function findAgent(agentName) {
  */
 function listAgentsDetailed() {
   const out = [];
-  if (!fs.existsSync(REPOS_DIR)) return out;
-  for (const repo of fs.readdirSync(REPOS_DIR)) {
-    const repoPath = path.join(REPOS_DIR, repo);
+  for (const repo of listAgentRepositoryNames()) {
+    const repoPath = resolveAgentRepositoryPath(repo);
     try {
       if (!fs.statSync(repoPath).isDirectory()) continue;
       for (const name of fs.readdirSync(repoPath)) {

@@ -1,5 +1,6 @@
 import { PLOINKY_SKILL_SCOPE_ENV } from '../../utils/config.js';
 import fs from 'fs';
+import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 import { execSync, spawnSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -389,7 +390,7 @@ function ensureAgentContainer(agentName, repoName, manifest) {
         cwd: projectDir, cwdMountTarget: projectDir, agentHomeDir: homeDir,
     });
     const agentLibPath = path.resolve(__dirname, '../../../Agent');
-    const agentPath = path.join(REPOS_DIR, repoName, agentName);
+    const agentPath = path.join(resolveAgentRepositoryPath(repoName), agentName);
     const absAgentPath = path.resolve(agentPath);
     const sharedDir = ensureSharedHostDir();
     ensureAgentDataDirectory(homeDir);

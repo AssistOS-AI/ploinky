@@ -21,6 +21,7 @@ import { agentLibRoot } from '../../agentlib/runtime.mjs';
 import { PLOINKY_UPDATED_WORKSPACE_CHECKOUT_ENV } from './ploinkyUpdateScope.js';
 import { sanitizeGitDiagnostic } from '../utils/gitCommand.js';
 
+import { listAgentRepositoryNames, resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 const REPOS_DIR = path.join(PLOINKY_DIR, 'repos');
 const DEFAULT_SKILLS_REPO_NAMES = [
     'AchillesCopilotBasicSkills',
@@ -28,15 +29,14 @@ const DEFAULT_SKILLS_REPO_NAMES = [
     'PloinkySkills',
 ];
 function getRepoNames() {
-    if (!fs.existsSync(REPOS_DIR)) return [];
-    return fs.readdirSync(REPOS_DIR).filter(file => fs.statSync(path.join(REPOS_DIR, file)).isDirectory());
+    return listAgentRepositoryNames();
 }
 
 function getGitRepoNames() {
     const repoNames = getRepoNames();
     const gitRepoNames = [];
     for (const repoName of repoNames) {
-        const repoPath = path.join(REPOS_DIR, repoName);
+        const repoPath = resolveAgentRepositoryPath(repoName);
         if (reposSvc.isGitRepository(repoPath) || reposSvc.resolveRepoSourceUrl(repoName)) {
             gitRepoNames.push(repoName);
         } else {
@@ -57,7 +57,10 @@ function normalizeManagedRepoName(repoName) {
         || path.isAbsolute(relativeRepoPath)) {
         throw new Error('Invalid repository name.');
     }
-    return { repoName: normalizedRepoName, repoPath };
+    return {
+        repoName: normalizedRepoName,
+        repoPath: resolveAgentRepositoryPath(normalizedRepoName),
+    };
 }
 
 function refreshDefaultSkillsInPloinkyRepo(repoName, {

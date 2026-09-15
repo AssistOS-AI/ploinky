@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { listAgentRepositoryNames, resolveAgentRepositoryPath } from './agentRepositorySource.mjs';
 import path from 'path';
 import crypto from 'crypto';
 
@@ -101,12 +102,12 @@ function collectInstalledAgents() {
     const out = [];
     let repoNames = [];
     try {
-        repoNames = reposSvc.getInstalledRepos(REPOS_DIR);
+        repoNames = listAgentRepositoryNames();
     } catch (_) {
         repoNames = [];
     }
     for (const repo of repoNames) {
-        const repoPath = path.join(REPOS_DIR, repo);
+        const repoPath = resolveAgentRepositoryPath(repo);
         let entries;
         try {
             entries = fs.readdirSync(repoPath);

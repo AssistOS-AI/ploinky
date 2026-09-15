@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { execFile, execFileSync } from 'child_process';
 import { promisify } from 'node:util';
 import path from 'path';
@@ -14,6 +16,13 @@ function parseAgentInfoFromMounts(mounts = []) {
     let agentName = '-';
     for (const mount of mounts) {
         if (mount.Destination === '/code' && mount.Source) {
+            const source = path.resolve(mount.Source);
+            const agentRoot = path.basename(source) === 'code' ? path.dirname(source) : source;
+            if (fs.existsSync(path.join(agentRoot, 'manifest.json'))) {
+                repoName = resolveAgentRepositoryName(agentRoot);
+                agentName = path.basename(agentRoot);
+                break;
+            }
             const parts = mount.Source.split(path.sep).filter(Boolean);
             const reposIdx = parts.lastIndexOf('repos');
             if (reposIdx !== -1 && reposIdx + 2 < parts.length) {
@@ -68,7 +77,13 @@ function projectInspectedContainer(data, fallbackName = '') {
         return { name: key, value: idx === -1 ? '' : value.slice(idx + 1) };
     });
     let agentName = env.find((entry) => entry.name === 'AGENT_NAME')?.value || '-';
-    const { repoName, agentName: mountAgent } = parseAgentInfoFromMounts(mounts);
+    const principal = env.find(entry => entry.name === 'PLOINKY_AGENT_ID')?.value
+        || env.find(entry => entry.name === 'PLOINKY_AGENT_PRINCIPAL')?.value || '';
+    const match = /^agent:([^/]+)\/([^/]+)$/.exec(principal);
+    const { repoName, agentName: mountAgent } = match
+        ? { repoName: match[1], agentName: match[2] }
+        : parseAgentInfoFromMounts(mounts);
+    if (match) agentName = match[2];
     if (agentName === '-' && mountAgent && mountAgent !== '-') agentName = mountAgent;
     return {
         containerName,

@@ -20,9 +20,12 @@ import {
 } from '../contract/image.mjs';
 import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { probeImageAgentLib } from '../image-agentlib.mjs';
+import { normalizeImageId } from '../contract/image-id.mjs';
 import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
 import { retireQuiescentBoxEdgePreparation } from '../edgePreparationCleanup.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
+import { localCandidateExists, localCandidatePath } from '../../agentlib/source.mjs';
 import { preflightPublications, resolveEffectiveHostPort } from '../ports.mjs';
 import {
     ensureWorkspaceDataPaths,
@@ -130,6 +133,7 @@ async function createAndStart({
     retireStartLock,
     retireEdgePreparation,
     beforeCreate = () => {},
+    restoring = false,
     revalidateDataPaths,
     readCidfile,
     fsApi,
@@ -149,6 +153,9 @@ async function createAndStart({
     const cidfile = secureCidfilePath(lock, token);
     cleanCidfile(cidfile, fsApi);
     writeProgress(stderr, `Creating Box container ${identity.instance}...`);
+    if (!restoring && agentLib.mode === 'image' && localCandidateExists(localCandidatePath(identity.workspaceRoot), fsApi)) {
+        throw transactionError('A local AchillesAgentLib source appeared after image selection; run the command again');
+    }
     beforeCreate();
     runner.run(engine.name, containerCreateArgs({
         identity,
@@ -207,12 +214,19 @@ async function restoreOldContainer({
     stdout,
     stderr,
 }) {
-    const observedSource = fingerprintSource(old.agentLib.sourceDir, { fsApi: dependencies.fsApi });
-    if (observedSource.fingerprint !== old.agentLib.fingerprint
-        || sourceIdHash(observedSource.sourceId) !== old.agentLib.sourceIdHash) {
-        throw transactionError(
-            `Refusing to restore the old Box because its achillesAgentLib source at ${old.agentLib.sourceDir} changed`,
-        );
+    if (old.agentLib.mode === 'image') {
+        const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner, { expectedCommit: old.agentLib.commit });
+        if (bundle.fingerprint !== old.agentLib.fingerprint) {
+            throw transactionError('Refusing to restore the old Box because its AchillesAgentLib image bundle changed');
+        }
+    } else {
+        const observedSource = fingerprintSource(old.agentLib.sourceDir, { fsApi: dependencies.fsApi });
+        if (observedSource.fingerprint !== old.agentLib.fingerprint
+            || sourceIdHash(observedSource.sourceId) !== old.agentLib.sourceIdHash) {
+            throw transactionError(
+                `Refusing to restore the old Box because its achillesAgentLib source at ${old.agentLib.sourceDir} changed`,
+            );
+        }
     }
     return createAndStart({
         engine,
@@ -223,6 +237,7 @@ async function restoreOldContainer({
         mediaHostPort: old.mediaHostPort,
         repositoryRoot: old.repositoryRoot,
         agentLib: old.agentLib,
+        restoring: true,
         runner,
         lock,
         discover: dependencies.discover,
@@ -265,6 +280,7 @@ export async function reconcileBoxContainer({
         preflight: seams.preflight || preflightPublications,
         validateImage: seams.validateImage || inspectAndValidateImage,
         validateExistingImage: seams.validateExistingImage || inspectAndValidateExistingImage,
+        probeAgentLib: seams.probeAgentLib || probeImageAgentLib,
         ensureDataPaths: seams.ensureDataPaths || ensureWorkspaceDataPaths,
         inspectDataPaths: seams.inspectDataPaths || inspectWorkspaceDataPaths,
         revalidateDataPaths: seams.revalidateDataPaths || revalidateBoxDataPaths,
@@ -281,11 +297,21 @@ export async function reconcileBoxContainer({
         throw transactionError('Box reconciliation requires a selected achillesAgentLib source');
     }
     const desiredAgentLib = normalizeBoxAgentLib(agentLib);
+    if (desiredAgentLib.mode === 'image'
+        && localCandidateExists(localCandidatePath(identity.workspaceRoot), dependencies.fsApi)) {
+        throw transactionError('A local AchillesAgentLib source appeared after image selection; run the command again');
+    }
     const portPlan = resolveEffectiveHostPort({ explicitPort, explicitMediaPort, ownership });
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
     if (old) {
         dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
+        if (old.agentLib.mode === 'image') {
+            const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner, { expectedCommit: old.agentLib.commit });
+            if (bundle.fingerprint !== old.agentLib.fingerprint) {
+                throw transactionError('Owned Box AchillesAgentLib bundle does not match its admitted fingerprint');
+            }
+        }
     }
     let currentDataState = null;
     if (old) {
@@ -371,6 +397,15 @@ export async function reconcileBoxContainer({
     });
     await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
     const image = dependencies.validateImage(engine.name, imageRef, runner);
+    if (desiredAgentLib.mode === 'image') {
+        if (desiredAgentLib.imageId !== normalizeImageId(image.immutableId)) {
+            throw transactionError('Box image changed after AchillesAgentLib selection; run the command again');
+        }
+        const bundle = dependencies.probeAgentLib(engine.name, image.immutableId, runner, { expectedCommit: desiredAgentLib.commit });
+        if (bundle.fingerprint !== desiredAgentLib.fingerprint) {
+            throw transactionError('Selected AchillesAgentLib image bundle fingerprint changed before Box creation');
+        }
+    }
     try {
         dependencies.ensureDataPaths({ identity, lock, fsApi: dependencies.fsApi });
     } catch (error) {
@@ -381,6 +416,10 @@ export async function reconcileBoxContainer({
     let candidateAttempted = false;
     let oldRemoved = false;
     try {
+        if (desiredAgentLib.mode === 'image'
+            && localCandidateExists(localCandidatePath(identity.workspaceRoot), dependencies.fsApi)) {
+            throw transactionError('A local AchillesAgentLib source appeared after image selection; run the command again');
+        }
         if (old) {
             if (currentContainer.runtime.running) {
                 dependencies.stopPloinkyLocal(engine, currentContainer.id, runner);

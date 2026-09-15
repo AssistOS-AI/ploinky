@@ -89,7 +89,6 @@ export function initDom() {
     const skillsSaveStatus = document.getElementById('skillsSaveStatus');
     const skillsSummary = document.getElementById('skillsSummary');
     const historyGate = document.getElementById('historyGate');
-    const loadHistoryBtn = document.getElementById('loadHistoryBtn');
     const sessionDialog = document.getElementById('sessionDialog');
     const sessionDialogClose = document.getElementById('sessionDialogClose');
     const sessionList = document.getElementById('sessionList');
@@ -135,7 +134,8 @@ export function initDom() {
         // Ignore URL parsing issues; providers fall back to empty config.
     }
 
-    const appTitle = displayName || agentName || 'WebChat';
+    const robotName = new URLSearchParams(agentQuery).get('robot') || launchConfig.robot || '';
+    const appTitle = robotName ? `${displayName || agentName || 'WebChat'} · ${robotName}` : displayName || agentName || 'WebChat';
     if (titleBar) {
         titleBar.textContent = appTitle;
     }
@@ -147,6 +147,13 @@ export function initDom() {
     if (avatarInitial) {
         const initial = appTitle.trim().charAt(0) || 'P';
         avatarInitial.textContent = initial.toUpperCase();
+    }
+
+    function setRuntimeRobot(value) {
+        if (typeof value !== 'string' || !value.trim()) return;
+        const title = `${displayName || agentName || 'WebChat'} · ${value.trim()}`;
+        if (titleBar) titleBar.textContent = title;
+        document.title = `${title} · WebChat`;
     }
 
     function setRuntimeModel(value) {
@@ -272,6 +279,7 @@ export function initDom() {
         showBanner,
         hideBanner,
         setRuntimeModel,
+        setRuntimeRobot,
         getViewMoreLineLimit: () => viewMoreLineLimit,
         setViewMoreChangeHandler,
         elements: {
@@ -331,7 +339,6 @@ export function initDom() {
             skillsSaveStatus,
             skillsSummary,
             historyGate,
-            loadHistoryBtn,
             sessionDialog,
             sessionDialogClose,
             sessionList,

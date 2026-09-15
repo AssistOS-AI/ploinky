@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isKnownCommand } from '../../cli/commands/commandRegistry.js';
+import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
@@ -20,6 +21,7 @@ const bootRepos = ['AchillesIDE', 'AchillesCLI', 'copilot-agents'];
 
 function createWorkspace(t) {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-exit-'));
+    writeAgentLibCheckout(path.join(workspace, 'achillesAgentLib'));
     const ploinky = path.join(workspace, '.ploinky');
     for (const repoName of bootRepos) {
         fs.mkdirSync(path.join(ploinky, 'repos', repoName), { recursive: true });
@@ -90,6 +92,7 @@ test('one-shot start without initial configuration exits nonzero', (t) => {
 
 test('read-only core commands do not initialize authoritative edge sources', (t) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-fresh-sources-'));
+    writeAgentLibCheckout(path.join(workspace, 'achillesAgentLib'));
     for (const repoName of bootRepos) {
         fs.mkdirSync(path.join(workspace, '.ploinky', 'repos', repoName), { recursive: true });
     }

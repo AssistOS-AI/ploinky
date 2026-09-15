@@ -985,6 +985,49 @@ process.stdout.write(JSON.stringify({ sync, asyncResult }));`,
     }
 });
 
+test('live-container diagnostics retain the principal when code is staged', () => {
+    const binDir = tempDir();
+    try {
+        const podmanPath = path.join(binDir, 'podman');
+        fs.writeFileSync(
+            podmanPath,
+            `#!/bin/sh
+case "$1" in
+  ps)
+    printf '%s\\n' 'ploinky_repoA_agentA_project_12345678'
+    ;;
+  inspect)
+    printf '%s\\n' '[{"Mounts":[{"Destination":"/code","Source":"/tmp/runtime/code-123"}],"Config":{"Env":["AGENT_NAME=wrong-folder-name","PLOINKY_AGENT_ID=agent:repoA/agentA"],"Image":"node:20-alpine"},"NetworkSettings":{"Ports":{"7000/tcp":[{"HostIp":"127.0.0.1","HostPort":"12345"}]}}}]'
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`,
+        );
+        fs.chmodSync(podmanPath, 0o755);
+
+        const result = runModuleSnippet(
+            `import { collectLiveAgentContainers, collectLiveAgentContainersAsync } from './cli/sandbox/docker/containerRegistry.js';
+const sync = collectLiveAgentContainers();
+const asyncResult = await collectLiveAgentContainersAsync();
+process.stdout.write(JSON.stringify({ sync, asyncResult }));`,
+            { PATH: binDir },
+        );
+
+        assert.equal(result.status, 0, result.stderr);
+        const { sync: containers, asyncResult } = JSON.parse(result.stdout);
+        assert.deepEqual(asyncResult, containers);
+        assert.equal(containers.length, 1);
+        assert.equal(containers[0].containerName, 'ploinky_repoA_agentA_project_12345678');
+        assert.equal(containers[0].agentName, 'agentA');
+        assert.equal(containers[0].repoName, 'repoA');
+        assert.equal(containers[0].config.ports[0].hostPort, '12345');
+    } finally {
+        fs.rmSync(binDir, { recursive: true, force: true });
+    }
+});
+
 test('collectLiveAgentContainers is non-fatal when no container runtime is installed', () => {
     const emptyBin = tempDir();
     try {

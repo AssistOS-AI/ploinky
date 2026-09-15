@@ -45,6 +45,7 @@ for (const differentLaunch of [false, true]) {
         let acquisitions = 0;
         let held = false;
         const options = {
+            checkHostPrerequisites: () => {},
             env: {}, resolveIdentity: () => identity, discover: () => oldOwnership,
             lockManager: {
                 async acquire(instance) {

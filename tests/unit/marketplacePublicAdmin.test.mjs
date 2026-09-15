@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 
-const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'marketplace-public-'));
+const workspace = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'marketplace-public-'));
 const previousCwd = process.cwd();
 const previousKey = process.env.PLOINKY_MASTER_KEY;
 process.chdir(workspace);

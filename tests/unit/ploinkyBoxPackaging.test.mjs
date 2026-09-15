@@ -50,6 +50,10 @@ test('package metadata preserves the exact bin map, immutable postinstall and lo
     const expectedRest = structuredClone(baselineRest);
     expectedRest.scripts.postinstall = 'node ./ploinky-box/entrypoint/install-dependencies.mjs';
     expectedRest.scripts['test:local-skills'] = 'node tests/integration/local-skills/run.mjs';
+    expectedRest.scripts['test:authorization'] = 'node tests/security/authorization/run.mjs';
+    expectedRest.scripts['test:authorization:harness'] = 'node --test tests/security/authorization/*.test.mjs';
+    expectedRest.scripts['authorization:inventory'] = 'node tests/security/authorization/coverage.mjs';
+    expectedRest.engines.node = '>=22.0.0';
     assert.deepEqual(currentRest, expectedRest);
     assert.notDeepEqual(currentBin, baselineBin);
     assert.deepEqual(currentBin, {

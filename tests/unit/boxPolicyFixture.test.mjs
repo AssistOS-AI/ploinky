@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
 import { admitManifestRuntimeCapabilities } from '../../cli/sandbox/runtimeCapabilities.js';
+import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
@@ -49,6 +50,7 @@ test('clean explicit fixture repository rejects privilege in Box with zero admis
     const fakeBin = path.join(workspace, 'fake-bin');
     const podmanCalled = path.join(workspace, 'podman-called');
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+    writeAgentLibCheckout(path.join(workspace, 'achillesAgentLib'));
 
     fs.cpSync(fixtureRoot, sourceRepo, { recursive: true, verbatimSymlinks: true });
     execFileSync('git', ['init', '-q'], { cwd: sourceRepo });

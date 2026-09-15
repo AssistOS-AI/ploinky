@@ -1,3 +1,4 @@
+import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { execSync, spawnSync } from 'child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'fs';
@@ -778,7 +779,7 @@ function ensureManifestVolumeHostPaths(manifest, profileConfig = null) {
 
 /**
  * Get mount mode based on active profile.
- * In dev profile, mounts are rw. In qa/prod, mounts are ro.
+ * Installed code and skills are read-only in every profile.
  * @param {string} profile - The active profile
  * @param {string} runtime - Container runtime (docker/podman)
  * @param {object} profileConfig - Profile configuration
@@ -786,9 +787,9 @@ function ensureManifestVolumeHostPaths(manifest, profileConfig = null) {
  */
 function getProfileMountModes(profile, runtime, profileConfig = {}) {
     const defaultMounts = getDefaultMountModes(profile);
-    const mounts = profileConfig?.mounts || {};
-    const codeMode = normalizeMountMode(mounts.code, defaultMounts.code);
-    const skillsMode = normalizeMountMode(mounts.skills, defaultMounts.skills);
+    // Profile overrides must not make installed source writable.
+    const codeMode = defaultMounts.code;
+    const skillsMode = defaultMounts.skills;
     const roSuffix = runtime === 'podman' ? ':z,ro' : ':ro';
     const rwSuffix = runtime === 'podman' ? ':z' : '';
 
@@ -961,7 +962,7 @@ function buildPersistentAgentRunArgs({
         '-w', containerWorkdir,
         // Agent library (always ro)
         '-v', `${agentLibMountPath}:/Agent${runtime === 'podman' ? ':z,ro' : ':ro'}`,
-        // Code directory - profile dependent (rw in dev, ro in qa/prod)
+        // Code directory is read-only in every profile.
         '-v', `${codeMountPath}:/code${codeMountMode}`,
         ...(useNestedDependencyMounts ? [
             // node_modules mounts - ESM resolution walks up from script location
@@ -1291,7 +1292,7 @@ function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
 const SERVICE_NETWORK_LIFECYCLE = Symbol('serviceNetworkLifecycle');
 
 function startAgentContainer(agentName, manifest, agentPath, options = {}) {
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = options.containerName || getAgentContainerName(agentName, repoName);
     const useHealthProbeBroker = manifestUsesHealthProbeBroker(manifest);
     const managedControlEnv = Object.freeze({
@@ -1385,7 +1386,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     }
     const cwd = (preservePreparedRegistryRecord || adoptManagedRuntimeOnly) && launchRecord.projectPath
         ? launchRecord.projectPath
-        : getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), options.alias);
+        : getConfiguredProjectPath(agentName, repoName, options.alias);
     const isolatedHome = (launchRecord.runMode || 'isolated') === 'isolated';
     const agentHomeDir = getAgentWorkDir(instanceName);
     const containerCwd = isolatedHome ? '/root' : cwd;
@@ -1904,7 +1905,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     for (const [key, value] of Object.entries(PLOINKY_SKILL_SCOPE_ENV)) envStrings.push(formatEnvFlag(key, value));
     // Only non-secret principal fields exist before topology attestation.
     for (const [key, value] of Object.entries(buildAgentPrincipalEnv(
-        deriveAgentPrincipalId(path.basename(path.dirname(agentPath)), agentName),
+        deriveAgentPrincipalId(repoName, agentName),
         runtimeIdentity,
     ))) {
         envStrings.push(formatEnvFlag(key, value));
@@ -3221,7 +3222,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         error.code = 'PLOINKY_ROUTER_ENDPOINT_REQUIRED';
         throw error;
     }
-    const preflightRepoName = path.basename(path.dirname(agentPath));
+    const preflightRepoName = resolveAgentRepositoryName(agentPath);
     const preflightManifestPath = path.join(agentPath, 'manifest.json');
     const preflightManifestBytes = fs.existsSync(preflightManifestPath)
         ? fs.readFileSync(preflightManifestPath)
@@ -3326,7 +3327,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     }
     networkLockWaitMs = options.networkLockWaitMs;
 
-    const repoName = path.basename(path.dirname(agentPath));
+    const repoName = resolveAgentRepositoryName(agentPath);
     const containerName = containerOverride || getAgentContainerName(agentName, repoName);
     assertAgentServiceNotDraining(containerName, { targetedRestart: Boolean(targetedRestart) });
     const snapshot = loadAgentsMap();
@@ -4037,7 +4038,7 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     ];
     let projPath = preservePreparedRegistryRecord && launchRecord.projectPath
         ? launchRecord.projectPath
-        : getConfiguredProjectPath(agentName, path.basename(path.dirname(agentPath)), aliasOverride);
+        : getConfiguredProjectPath(agentName, repoName, aliasOverride);
     if (!projPath) {
         projPath = launchRecord.projectPath;
     }

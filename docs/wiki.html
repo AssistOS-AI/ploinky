@@ -92,11 +92,12 @@
                         <article id="definition-managed-repository">
                             <h3>Managed repository</h3>
                             <p>A managed repository is a Git checkout stored under <code>.ploinky/repos/&lt;repository&gt;/</code> and recorded with enough source and branch information for later update or repair. Ploinky uses repositories as the distribution and development unit for agents, and one repository may contain several independent agent directories. Installing a repository makes its agents discoverable; it does not enable every discovered agent.</p>
+                            <p>A matching checkout directly inside the <a href="#definition-workspace">workspace</a> takes precedence over this managed copy whenever Ploinky selects repository source. Matching uses the repository alias as the folder name first, then the registered Git origin. The alias remains the source identity even when the local folder has another name. Existing runtime generations retain their admitted paths; see <a href="operations.html#workspace-agent-repositories">source selection and lifecycle behavior</a>.</p>
                         </article>
 
                         <article id="definition-agent-directory">
                             <h3>Agent directory</h3>
-                            <p>An agent directory is an immediate child of a managed repository that contains a file named exactly <code>manifest.json</code>. Its directory name becomes the manifest agent name, and an optional <code>code/</code> child becomes the source mount when present; otherwise the agent directory is the source. A directory without the required manifest is ordinary repository content and is not discoverable as an agent.</p>
+                            <p>An agent directory is an immediate child of the selected repository, either in the <a href="#definition-workspace">workspace</a> or in a <a href="#definition-managed-repository">managed repository</a>, that contains a file named exactly <code>manifest.json</code>. Its directory name becomes the manifest agent name, and an optional <code>code/</code> child becomes the source mount when present; otherwise the agent directory is the source. A directory without the required manifest is ordinary repository content and is not discoverable as an agent.</p>
                         </article>
 
                         <article id="definition-agent-manifest">

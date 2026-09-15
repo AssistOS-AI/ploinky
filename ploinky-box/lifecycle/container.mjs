@@ -20,6 +20,7 @@ import {
     normalizeBoxAgentLib,
 } from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
+import { normalizeImageId } from '../contract/image-id.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
@@ -85,6 +86,9 @@ export function containerCreateArgs({
         throw lifecycleError('Container creation requires a selected achillesAgentLib source');
     }
     const agentLibContract = normalizeBoxAgentLib(agentLib);
+    if (agentLibContract.mode === 'image' && agentLibContract.imageId !== normalizeImageId(imageId)) {
+        throw lifecycleError('Container image does not match the selected AchillesAgentLib bundle');
+    }
     const labels = {
         [BOX_LABELS.pathHash]: identity.pathHash,
         [BOX_LABELS.role]: BOX_ROLES.container,

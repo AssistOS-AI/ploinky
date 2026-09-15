@@ -10,6 +10,7 @@ import {
     AGENTLIB_STABLE_MOUNT_PATH,
     FORBIDDEN_BOX_AGENTLIB_PATH,
 } from '../../agentlib/contract.mjs';
+import { verifyImageBundle } from '../../agentlib/image-bundle.mjs';
 import { BOX_MARKER_CONTENT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
@@ -22,7 +23,7 @@ const LOCK_PATH = path.resolve(import.meta.dirname, '../dependencies.lock.json')
 export const DEPENDENCY_MARKER_NAME = '.ploinky-box-dependencies.json';
 const PIN_PATTERN = /^[a-f0-9]{40}$/;
 
-// achillesAgentLib is direct-mounted from the selected workspace source. The
+// AchillesAgentLib comes from a selected local mount or the immutable Box bundle. The
 // only dependency materialized into the workspace-backed Box cache is mcp-sdk,
 // copied from the immutable image bundle rather than fetched during startup.
 export const BOX_INSTALLED_DEPENDENCIES = Object.freeze(['mcp-sdk']);
@@ -234,6 +235,12 @@ export function validateMountedAgentLib({
     const fingerprint = String(env?.[AGENTLIB_ENV.fingerprint] || '');
     if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
         throw dependencyError(`${AGENTLIB_ENV.fingerprint} must carry the selected content fingerprint`);
+    }
+    if (env?.[AGENTLIB_ENV.mode] === 'image') {
+        const commit = String(env[AGENTLIB_ENV.commit] || '');
+        if (!PIN_PATTERN.test(commit)) throw dependencyError('Image AgentLib requires its pinned commit');
+        const bundle = verifyImageBundle({ sourceDir: sourcePath, expectedCommit: commit, fsApi });
+        if (bundle.fingerprint !== fingerprint) throw dependencyError('Image AgentLib fingerprint differs from its selected contract');
     }
     return Object.freeze({ sourcePath, fingerprint, mode: String(env?.[AGENTLIB_ENV.mode] || '') });
 }

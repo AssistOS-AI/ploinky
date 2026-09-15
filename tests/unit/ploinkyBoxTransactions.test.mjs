@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { canonicalAgentLibRemote, imageSourceId } from '../../agentlib/contract.mjs';
+import { normalizeBoxAgentLib } from '../../ploinky-box/contract/agentlib.mjs';
 
 import {
     BOX_IMAGE_REFERENCE,
@@ -468,6 +470,77 @@ function harness(state, {
 function assertNoEngineVolumeCommand(calls) {
     assert.equal(calls.some((call) => call.includes('volume')), false);
 }
+
+function imageAgentLibFixture() {
+    const imageId = `sha256:${'f'.repeat(64)}`;
+    const fingerprint = 'e'.repeat(64);
+    return normalizeBoxAgentLib({
+        sourceDir: '/opt/ploinky-agentlib', sourceRelativePath: 'image', mode: 'image', imageId,
+        fingerprint, commit: canonicalAgentLibRemote().commit,
+        sourceId: imageSourceId(imageId, fingerprint),
+    });
+}
+
+for (const imageIdPrefix of ['', 'sha256:']) {
+    test(`image bundle creates and reuses a Box with ${imageIdPrefix || 'bare'} engine IDs without host AgentLib mounts`, async t => {
+        const state = fixture(t);
+        fs.rmSync(state.agentLib.sourceDir, { recursive: true });
+        state.agentLib = imageAgentLibFixture();
+        const candidateImage = state.agentLib.imageId.replace(/^sha256:/, imageIdPrefix);
+        const h = harness(state, { candidateImage });
+        h.seams.probeAgentLib = (_engine, id, _runner, options) => {
+            assert.equal(id, candidateImage);
+            assert.equal(options.expectedCommit, state.agentLib.commit);
+            return { fingerprint: state.agentLib.fingerprint };
+        };
+        const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
+        assert.equal(result.action, 'created');
+        const created = h.current();
+        assert.equal(created.runtime.mounts.length, 4);
+        assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_MODE, 'image');
+        const callsBefore = h.calls.length;
+        const reused = await reconcileBoxContainer(reconciliationArguments(state, h, created), h.seams);
+        assert.equal(reused.action, 'reused');
+        assert.equal(h.calls.slice(callsBefore).some(call => call.includes('pull') || call.includes('create')), false);
+        const desired = {
+            identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root,
+            imageId: candidateImage, imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
+        };
+        created.runtime.mounts.push({ type: 'bind', source: '/tmp/fake', destination: '/opt/ploinky-agentlib', rw: false });
+        assert.throws(() => validateContainerConfiguration(created, desired), /mount set is incompatible/);
+    });
+}
+
+test('an image change after source selection preserves the old Box', async t => {
+    const state = fixture(t);
+    const initial = lifecycleContainer(state);
+    fs.rmSync(state.agentLib.sourceDir, { recursive: true });
+    state.agentLib = imageAgentLibFixture();
+    const h = harness(state, { initial, candidateImage: `sha256:${'1'.repeat(64)}` });
+    await assert.rejects(reconcileBoxContainer(reconciliationArguments(state, h, initial), h.seams),
+        /image changed after AchillesAgentLib selection/);
+    assert.equal(h.current(), initial);
+    assert.equal(h.calls.some(call => call.includes('stop') || call.includes('rm') || call.includes('create')), false);
+});
+
+test('failed image-bundle replacement restores the old image without host source access', async t => {
+    const state = fixture(t);
+    fs.rmSync(state.agentLib.sourceDir, { recursive: true });
+    state.agentLib = imageAgentLibFixture();
+    const initial = containerHandle({
+        identity: state.identity, agentLib: state.agentLib, repositoryRoot: state.root,
+        imageId: state.agentLib.imageId, imageRef: BOX_IMAGE_REFERENCE, hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    const h = harness(state, { initial, candidateImage: state.agentLib.imageId, failCandidateReady: true });
+    let probes = 0;
+    h.seams.probeAgentLib = () => { probes += 1; return { fingerprint: state.agentLib.fingerprint }; };
+    await assert.rejects(reconcileBoxContainer(reconciliationArguments(state, h, initial, true), h.seams), /ready timeout/);
+    assert.equal(h.current().runtime.imageId, initial.runtime.imageId);
+    assert.equal(h.current().labels[BOX_LABELS.routerHostPort], '8080');
+    assert.equal(h.current().runtime.mounts.length, 4);
+    assert.equal(probes, 3);
+});
 
 test('container argv is exact, unprivileged, and ends with immutable image ID', (t) => {
     const state = fixture(t);

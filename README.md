@@ -7,9 +7,47 @@ Beyond a single agent, Ploinky supports a multi‑agent workspace. Each agent ru
 See [local instruction skills](docs/local-instruction-skills.md) for launch scope metadata, RoboTeam's catalog boundary, and compatibility installation that preserves local edits.
 
 ## Prerequisites
-- Node.js 20+
-- Docker or Podman
-- Git
+
+The public `ploinky` command requires Node.js 22 or newer and rootless Podman.
+Native Linux hosts use a supported baseline of Podman 5.4.0 or newer; macOS
+uses Podman Machine. Docker and arbitrary remote engines are unsupported for
+the outer Box. Git is needed to clone and update the host checkout.
+
+Before preparing, starting, or restarting a Box on Linux, Ploinky checks:
+
+| Requirement | What must be available |
+| --- | --- |
+| Rootless runtime | A regular login account, `newuidmap` and `newgidmap`, working user namespaces, and at least 65,536 contiguous mapped container UIDs and GIDs starting at zero |
+| Nested devices | Read/write access to the `/dev/fuse` and `/dev/net/tun` character devices |
+| Resource controls | Cgroup v2 with `cpu`, `memory`, and `pids` delegated to the login session; seccomp support |
+| Runtime helpers | The executable conmon and OCI runtime paths selected by `podman info` |
+| Networking | The configured `pasta` (provided by `passt`) or `slirp4netns` executable, and the selected Netavark executable when applicable |
+| Storage | The configured overlay mount helper, if one is selected; native overlay does not require host `fuse-overlayfs` |
+
+Missing prerequisites produce a nonzero exit with the failed checks, bounded
+redacted diagnostics, distribution-specific installation guidance, and the next
+configuration step. This happens before the workspace lock, source selection,
+image pull, or Box creation. Ploinky does not install packages or change host
+configuration automatically. Status, logs, help, dry-run, stop, and destroy do
+not run the Linux startup gate, so inspection and cleanup remain available.
+
+For a Debian/Ubuntu installation, start with
+`sudo apt-get update && sudo apt-get install podman uidmap passt conmon crun catatonit`.
+Verify `podman --version` meets the minimum: an older distribution may need an
+OS upgrade or a supported newer package source. Install other helpers only when
+the preflight reports they are missing from the selected configuration.
+Catatonit supplies the usual `--init` helper; a custom configured init path is
+resolved by Podman rather than rejected because catatonit is absent from PATH.
+Subordinate UID/GID ranges must be allocated by an administrator without
+overlapping other users' ranges. After changing existing mappings, stop your
+containers and run `podman system migrate` as your normal user before retrying.
+
+Use the official [Node.js downloads](https://nodejs.org/en/download),
+[Podman installation guide](https://podman.io/docs/installation), and
+[rootless setup guide](https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md)
+for your distribution. The packages inside the Box are checked separately by
+its immutable image contract and entrypoint; they need not all be installed on
+the physical host.
 
 ## Getting started
 
@@ -75,10 +113,15 @@ On startup the Box verifies that immutable bundle and copies it into
 `/opt/ploinky/node_modules`; a fresh workspace therefore performs no MCP SDK
 Git or npm operation and needs no GitHub credentials.
 
-Automatic repository bootstrap installs `AchillesIDE`, `AchillesCLI`, and
-`copilot-agents`. Explorer's manifest declares its additional repositories and
-uses `AchillesIDE/liveKitServerAgent` for LiveKit. The `basic` repository is
-optional: install it explicitly with `ploinky install repo basic` when needed.
+Automatic repository bootstrap prepares `AchillesIDE`, `AchillesCLI`, and `copilot-agents`, reusing matching workspace checkouts before cloning missing repositories into `.ploinky/repos`. Explorer's manifest declares its additional repositories and uses `AchillesIDE/liveKitServerAgent` for LiveKit. The `basic` repository is optional: install it explicitly with `ploinky install repo basic` when needed.
+
+### Agent repositories in the workspace
+
+You can keep agent repositories directly inside your [workspace](docs/wiki.html#definition-workspace). Every operation that selects an agent repository's source prefers the matching workspace checkout over `.ploinky/repos/<repository>`. This includes discovery, installed/active lists, Marketplace inventory, manifest and dependency preparation, and source selection for new runtimes.
+
+For example, when Ploinky runs in `work`, it can use `work/AssistOSExplorer` for the registered repository `AchillesIDE` because its Git origin matches the registered URL. The cached `work/.ploinky/repos/AchillesIDE` is then unused for source selection. The agent still has the identity `AchillesIDE/explorer`.
+
+A matching folder named after the registered repository takes priority; otherwise Ploinky matches Git origins among direct workspace children containing agent manifests. With no local match, it uses `.ploinky/repos`. Automatic preparation reuses the local checkout without switching its branch. An explicit repository update can pull into that checkout; uninstalling it unregisters it while preserving its files. Already running instances retain their selected source until a lifecycle transition creates a new runtime. See [repository selection and lifecycle details](docs/operations.html#workspace-agent-repositories).
 
 | Invocation | Documented effect |
 | --- | --- |
@@ -318,10 +361,26 @@ entry directly from your checkout:
 node cli/index.js <args>
 ```
 
+Ploinky uses `<workspace>/achillesAgentLib` when that directory is present and
+valid. It mounts the source read-only for the Box and all consumers, and never
+pulls or rewrites the local checkout. An invalid local directory is an error.
+When the directory is absent, the Box uses its bundled AchillesAgentLib copy at
+`/opt/ploinky-agentlib`; the host does not clone a fallback repository. The bundle
+must match `ploinky-box/dependencies.lock.json` and pass content verification.
+An older image without a compatible bundle must be rebuilt or replaced, or a
+valid local checkout supplied. Direct host `ploinky-local` development requires
+a local checkout because the image bundle is available only inside the Box.
+
+Start, full restart, and update select the source again. Adding or removing a
+local checkout replaces the Box when the source changes. A targeted agent
+restart keeps the admitted source. Bundled library updates require a new Box
+image matching the required pin; general repository branch options do not
+change the bundled revision.
+
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
-- `update [folderPath]`: use the current directory as the update folder, or `folderPath` when supplied. A Ploinky checkout is pulled only when it is inside that folder or contains the launch folder. Ploinky being out of scope does not stop `node_modules/achillesAgentLib`, managed repositories, discovered project repositories, dependencies, or default skills from being refreshed.
+- `update [folderPath]`: use the current directory as the update folder, or `folderPath` when supplied. A Ploinky checkout is pulled only when it is inside that folder or contains the launch folder. Ploinky being out of scope does not stop managed repositories, discovered project repositories, dependencies, or default skills from being refreshed. AchillesAgentLib is revalidated from the local checkout or the pinned Box bundle; update never pulls a local library checkout or clones a host fallback.
 - `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the loopback physical-host selection and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.

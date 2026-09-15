@@ -154,9 +154,63 @@ test('the in-Box source owner guard is explicit', async () => {
     );
 });
 
+test('in-Box image bootstrap verifies bundle bytes and fails on contract or image drift', async () => {
+    const workspace = makeWorkspace();
+    const checkout = path.join(workspace, 'achillesAgentLib');
+    const metadataPath = path.join(workspace, 'bundle.json');
+    const { prepareImageBundle } = await import('../../agentlib/image-bundle.mjs');
+    const commit = 'a'.repeat(40);
+    const metadata = prepareImageBundle({
+        sourceDir: checkout, metadataPath, commit,
+        spawn: (_command, args) => ({ status: 0, stdout: args.includes('rev-parse') ? commit : '' }),
+    });
+    const stable = contract.AGENTLIB_STABLE_MOUNT_PATH;
+    const immutableMetadata = contract.AGENTLIB_IMAGE_METADATA_PATH;
+    const map = (value) => {
+        if (value === immutableMetadata) return metadataPath;
+        if (value === stable || value.startsWith(`${stable}/`)) return checkout + value.slice(stable.length);
+        if (stable.startsWith(`${value}/`) || immutableMetadata.startsWith(`${value}/`) || value === '/') return workspace;
+        return value;
+    };
+    const fsApi = {
+        ...fs,
+        realpathSync(value) {
+            const result = fs.realpathSync(map(value));
+            return result === checkout || result.startsWith(`${checkout}/`) ? stable + result.slice(checkout.length) : result;
+        },
+        statSync: (value, ...rest) => fs.statSync(map(value), ...rest),
+        lstatSync(value, ...rest) {
+            const stat = fs.lstatSync(map(value), ...rest);
+            stat.uid = 0;
+            stat.mode &= ~0o022;
+            return stat;
+        },
+        readFileSync: (value, ...rest) => fs.readFileSync(map(value), ...rest),
+        readdirSync: (value, ...rest) => fs.readdirSync(map(value), ...rest),
+        readlinkSync: (value, ...rest) => fs.readlinkSync(map(value), ...rest),
+    };
+    const env = {
+        [contract.AGENTLIB_ENV.dir]: stable,
+        [contract.AGENTLIB_ENV.mode]: 'image',
+        [contract.AGENTLIB_ENV.commit]: commit,
+        [contract.AGENTLIB_ENV.fingerprint]: metadata.fingerprint,
+        [contract.AGENTLIB_ENV.sourceId]: 'b'.repeat(64),
+    };
+    const result = await freshBootstrap()({ env, fsApi, insideBox: true });
+    assert.equal(result.mode, 'image');
+    assert.equal(result.owned, false);
+    await assert.rejects(freshBootstrap()({ env: { ...env, [contract.AGENTLIB_ENV.commit]: 'c'.repeat(40) }, fsApi, insideBox: true }),
+        { code: contract.AGENTLIB_ERROR_CODES.imagePinMismatch });
+    await assert.rejects(freshBootstrap()({ env: { ...env, [contract.AGENTLIB_ENV.fingerprint]: 'c'.repeat(64) }, fsApi, insideBox: true }),
+        { code: contract.AGENTLIB_ERROR_CODES.imageInvalid });
+    fs.appendFileSync(path.join(checkout, 'index.mjs'), '// drift\n');
+    await assert.rejects(freshBootstrap()({ env, fsApi, insideBox: true }),
+        { code: contract.AGENTLIB_ERROR_CODES.imageInvalid });
+});
+
 // --- read-only commands ----------------------------------------------------
 
-test('read-only bootstrap reuses without creating workspace state', async () => {
+test('host bootstrap without a local source reports the required Box image', async () => {
     const workspace = makeWorkspace({ withCheckout: false });
     const { selectWorkspaceAgentLibSource } = await import(path.join(repoRoot, 'ploinky-box/agentlib-source.mjs'));
     await assert.rejects(
@@ -165,7 +219,7 @@ test('read-only bootstrap reuses without creating workspace state', async () => 
             readOnly: true,
             runner: { run: () => { throw new Error('read-only must not invoke Git'); } },
         }),
-        (error) => error.code === contract.AGENTLIB_ERROR_CODES.sourceMissing,
+        (error) => error.code === contract.AGENTLIB_ERROR_CODES.imageRequired,
     );
     assert.equal(
         fs.existsSync(path.join(workspace, '.ploinky', 'agentlib')),

@@ -75,7 +75,6 @@ const {
     skillsSaveStatus,
     skillsSummary,
     historyGate,
-    loadHistoryBtn,
     sessionDialog,
     sessionDialogClose,
     sessionList,
@@ -226,7 +225,10 @@ network = createNetwork({
         }
     },
     onSkillsState: (payload) => skillsController?.handleState(payload),
-    onRuntimeState: (state) => dom.setRuntimeModel(state?.model),
+    onRuntimeState: (state) => {
+        dom.setRuntimeModel(state?.model);
+        dom.setRuntimeRobot(state?.robotName);
+    },
     onWorkspaceFiles: (update) => {
         if (!workspaceFileIndex.applyUpdate(update)) return;
         messages.refreshWorkspaceFileLinks();
@@ -251,7 +253,7 @@ sessionController = createSessionController({
     elements: {
         sessionsBtn,
         historyGate,
-        loadHistoryBtn,
+        chatList,
         sessionDialog,
         sessionDialogClose,
         sessionList

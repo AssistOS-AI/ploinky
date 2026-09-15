@@ -6,6 +6,7 @@ import { mintUserDelegationGrant, resolveMaxTtlSeconds } from './userDelegationG
 import { deriveSubkey } from '../../utils/security/masterKey.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { REPOS_DIR } from '../../utils/config.js';
+import { resolveAgentRepositoryPath } from '../../utils/agentRepositorySource.mjs';
 
 function readMcpConfigTools(agentDir) {
     if (!agentDir) return [];
@@ -23,7 +24,7 @@ function resolveAgentDir(route) {
     }
     const repo = String(route?.repo || '').trim();
     const agent = String(route?.agent || '').trim();
-    return repo && agent ? path.join(REPOS_DIR, repo, agent) : '';
+    return repo && agent ? path.join(resolveAgentRepositoryPath(repo), agent) : '';
 }
 
 function uniqueTrimmedStrings(values) {

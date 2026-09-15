@@ -10,6 +10,7 @@ process.env.PLOINKY_WORKSPACE_ROOT = workspace;
 test.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
 
 const { reinstallAgent } = await import('../../cli/commands/workspaceUtil.js');
+const { resolveAgentRepositoryName } = await import('../../cli/utils/agentRepositorySource.mjs');
 const manager = await import('../../cli/sandbox/docker/agentServiceManager.js');
 const { removeExactRegisteredContainer } = await import('../../cli/sandbox/docker/containerFleet.js');
 const { loadAgentsMap } = await import('../../cli/sandbox/docker/common.js');
@@ -99,7 +100,7 @@ function fixture({ strictLegacyRemoval = false, foreign = false, removeFails = f
     const result = { containerName: NAME, containerId: NEW_ID, hostPort: 0 };
     const endpoint = { mode: 'bridge' };
     const context = {
-        path, fs,
+        path, fs, resolveAgentRepositoryName,
         console: { log() {}, error(message) { errors.push(message); } },
         resolvePersistedRouterPort: () => 8080,
         agentsSvc: { resolveEnabledAgentRecord: () => ({ containerName: NAME, record: loadAgentsMap()[NAME] }) },
