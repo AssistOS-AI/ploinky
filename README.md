@@ -19,10 +19,14 @@ Before preparing, starting, or restarting a Box on Linux, Ploinky checks:
 | --- | --- |
 | Rootless runtime | A regular login account, `newuidmap` and `newgidmap`, working user namespaces, and at least 65,536 contiguous mapped container UIDs and GIDs starting at zero |
 | Nested devices | Read/write access to the `/dev/fuse` and `/dev/net/tun` character devices |
-| Resource controls | Cgroup v2 with `cpu`, `memory`, and `pids` delegated to the login session; seccomp support |
+| Confinement | Seccomp support |
 | Runtime helpers | The executable conmon and OCI runtime paths selected by `podman info` |
 | Networking | The configured `pasta` (provided by `passt`) or `slirp4netns` executable, and the selected Netavark executable when applicable |
 | Storage | The configured overlay mount helper, if one is selected; native overlay does not require host `fuse-overlayfs` |
+
+The current Box runs nested Podman with cgroups disabled and sets no outer CPU
+quota. Startup therefore does not require a particular host cgroup version or
+delegated `cpu`, `memory`, or `pids` controllers.
 
 Missing prerequisites produce a nonzero exit with the failed checks, bounded
 redacted diagnostics, distribution-specific installation guidance, and the next

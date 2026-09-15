@@ -162,13 +162,8 @@ export function assertLinuxHostPrerequisites({
     if (host.security?.rootless !== true) add('Rootless Podman', 'The selected engine is not rootless.', 'Use a regular login account and run podman info without sudo.');
     if (host.serviceIsRemote !== false || host.os !== 'linux') add('Native Podman', 'The selected engine is not a verified local Linux engine.', 'Select a native Linux Podman installation; remote connections are unsupported for this workspace.');
     if (host.security?.seccompEnabled !== true) add('Seccomp', 'Podman does not report seccomp support.', 'Install the distribution Podman and OCI runtime packages with seccomp support enabled.');
-    if (host.cgroupVersion !== 'v2') add('Cgroups', 'Cgroup v2 is required for nested agent resource limits.', 'Ask an administrator to enable the unified cgroup v2 hierarchy, reboot, and verify podman info reports cgroupVersion: v2.');
-    else {
-        const controllers = Array.isArray(host.cgroupControllers) ? host.cgroupControllers : [];
-        const missing = ['cpu', 'memory', 'pids'].filter((name) => !controllers.includes(name));
-        if (missing.length) add('Cgroup delegation', `Missing controllers: ${missing.join(', ')}.`,
-            'Use a login session with cpu, memory and pids delegated. On systemd, ask an administrator to set Delegate=cpu memory pids in a [Service] drop-in for user@.service, run sudo systemctl daemon-reload, and reconnect after the user manager restarts. Verify with podman info.');
-    }
+    // The Box runs nested Podman with cgroups disabled and sets no outer CPU
+    // quota. Host cgroup versions and controller delegation are not prerequisites.
 
     const requireSelectedBinary = (label, selected, packages) => {
         if (typeof selected !== 'string' || !path.isAbsolute(selected) || !executable(fsApi, selected)) {

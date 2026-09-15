@@ -28,8 +28,10 @@ existing diagnostic sanitizer. The public launcher requires Node.js 22+ before
 loading modules. The supported native host baseline is Podman 5.4.0+; its
 selected runtime, networking, and configured storage helpers remain external
 system prerequisites, with the effective paths read from `podman info`.
-Rootless UID/GID helpers, namespace mappings, cgroup delegation, seccomp, and
-FUSE/TUN device access are checked before Box preparation. Installation and
+Rootless UID/GID helpers, namespace mappings, seccomp, and FUSE/TUN device access
+are checked before Box preparation. Host cgroup versions and controller
+delegation are not prerequisites for the current Box runtime, which disables
+nested cgroups and sets no outer CPU quota. Installation and
 configuration guidance is in [README.md](README.md#prerequisites) and in each
 failure message. These checks neither install packages nor alter host settings.
 The host's configured packages retain their distribution/upstream licensing;

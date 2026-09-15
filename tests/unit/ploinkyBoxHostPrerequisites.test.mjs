@@ -134,13 +134,29 @@ test('host Git is not required for a Box using its bundled AgentLib', () => {
     state.run();
 });
 
-test('rootless resource limits require cgroup v2 and delegated cpu memory pids controllers', () => {
+test('Box startup does not require host cgroup versions or delegated controllers', () => {
+    for (const cgroups of [
+        { cgroupVersion: 'v2', cgroupControllers: ['memory', 'pids'] },
+        { cgroupVersion: 'v2', cgroupControllers: [] },
+        { cgroupVersion: 'v1', cgroupControllers: [] },
+        {},
+    ]) {
+        const state = fixture();
+        delete state.info.host.cgroupVersion;
+        delete state.info.host.cgroupControllers;
+        Object.assign(state.info.host, cgroups);
+        assert.doesNotThrow(state.run, JSON.stringify(cgroups));
+    }
+});
+
+test('hosts without delegated controllers still require rootless Podman and seccomp', () => {
     const state = fixture();
-    state.info.host.cgroupVersion = 'v1';
-    assert.throws(state.run, /Cgroup v2.*\n.*unified cgroup v2 hierarchy/);
-    state.info.host.cgroupVersion = 'v2';
-    state.info.host.cgroupControllers = ['memory', 'pids'];
-    assert.throws(state.run, /Missing controllers: cpu.*\n.*Delegate=cpu memory pids/);
+    state.info.host.cgroupControllers = [];
+    state.info.host.security.rootless = false;
+    assert.throws(state.run, /Rootless Podman/);
+    state.info.host.security.rootless = true;
+    state.info.host.security.seccompEnabled = false;
+    assert.throws(state.run, /Seccomp/);
 });
 
 test('insufficient and noncontiguous mappings give subordinate-ID recovery instructions', () => {
