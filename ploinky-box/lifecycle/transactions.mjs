@@ -13,7 +13,10 @@ import {
     agentLibSelectionChanged,
     normalizeBoxAgentLib,
 } from '../contract/agentlib.mjs';
-import { validateContainerConfiguration } from '../contract/container.mjs';
+import {
+    observeContainerRouterBinding,
+    validateContainerConfiguration,
+} from '../contract/container.mjs';
 import {
     inspectAndValidateExistingImage,
     inspectAndValidateImage,
@@ -26,7 +29,11 @@ import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
 import { retireQuiescentBoxEdgePreparation } from '../edgePreparationCleanup.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
 import { localCandidateExists, localCandidatePath } from '../../agentlib/source.mjs';
-import { preflightPublications, resolveEffectiveHostPort } from '../ports.mjs';
+import {
+    preflightPublications,
+    recheckReleasedPublications,
+    resolveEffectiveHostPort,
+} from '../ports.mjs';
 import {
     ensureWorkspaceDataPaths,
     inspectWorkspaceDataPaths,
@@ -42,6 +49,10 @@ import {
     validateCreatedContainer,
 } from './container.mjs';
 
+// `pull` refreshes the selected reference before a replacement. `preserve`
+// changes only the outer publication and keeps the exact current software.
+const IMAGE_POLICIES = new Set(['pull', 'preserve']);
+
 function transactionError(message, cause, rollbackFailures = []) {
     const causeSuffix = cause?.message ? `: ${cause.message}` : '';
     const suffix = rollbackFailures.length > 0
@@ -53,6 +64,15 @@ function transactionError(message, cause, rollbackFailures = []) {
             : 'PLOINKY_BOX_TRANSACTION_FAILED',
         cause,
     });
+}
+
+function routerBindingResult(publication, hostPort) {
+    return Object.freeze({ address: publication.address, hostPort, hosts: publication.hosts });
+}
+
+function samePublication(left, right) {
+    return left.address === right.address
+        && JSON.stringify(left.hosts) === JSON.stringify(right.hosts);
 }
 
 function oldDesired(identity, ownership, repositoryRoot, engine) {
@@ -69,16 +89,20 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         String(container.labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
     ])));
     const agentLib = agentLibContractFromContainer(container);
+    // Legacy Boxes without bind metadata reconstruct as loopback publications.
+    const routerBinding = observeContainerRouterBinding(container);
     const desired = {
         identity,
         hostPort,
         mediaHostPort,
+        routerBinding,
         imageRef,
         imageId,
         repositoryRoot,
         hostKind: engine.hostKind,
         dataFingerprints,
         agentLib,
+        running: container.runtime.running === true,
     };
     validateContainerConfiguration(container, desired);
     return Object.freeze(desired);
@@ -124,6 +148,7 @@ async function createAndStart({
     imageRef,
     hostPort,
     mediaHostPort,
+    routerBinding,
     repositoryRoot,
     agentLib,
     runner,
@@ -165,6 +190,7 @@ async function createAndStart({
         imageRef,
         hostPort,
         mediaHostPort,
+        routerBinding,
         repositoryRoot,
         cidfile,
         hostKind: engine.hostKind,
@@ -191,6 +217,7 @@ async function createAndStart({
         identity,
         hostPort,
         mediaHostPort,
+        routerBinding,
         imageId: image.immutableId,
         imageRef,
         repositoryRoot,
@@ -235,6 +262,7 @@ async function restoreOldContainer({
         imageRef: old.imageRef,
         hostPort: old.hostPort,
         mediaHostPort: old.mediaHostPort,
+        routerBinding: old.routerBinding,
         repositoryRoot: old.repositoryRoot,
         agentLib: old.agentLib,
         restoring: true,
@@ -263,7 +291,9 @@ export async function reconcileBoxContainer({
     agentLib,
     explicitPort,
     explicitMediaPort,
+    routerBinding = null,
     imageRef = BOX_IMAGE_REFERENCE,
+    imagePolicy = 'pull',
     platform = process.platform,
     env = process.env,
     stdout = process.stdout,
@@ -273,11 +303,15 @@ export async function reconcileBoxContainer({
     if (!['absent', 'owned'].includes(ownership?.state)) {
         throw transactionError(`Cannot mutate Box ownership state ${ownership?.state || 'unknown'}`);
     }
+    if (!IMAGE_POLICIES.has(imagePolicy)) {
+        throw transactionError(`Unsupported Box image policy ${String(imagePolicy)}`);
+    }
     const dependencies = {
         discover: seams.discover || ((selectedIdentity) => discoverBoxOwnership(selectedIdentity, {
             platform, env, runner,
         })),
         preflight: seams.preflight || preflightPublications,
+        recheckReleased: seams.recheckReleased || recheckReleasedPublications,
         validateImage: seams.validateImage || inspectAndValidateImage,
         validateExistingImage: seams.validateExistingImage || inspectAndValidateExistingImage,
         probeAgentLib: seams.probeAgentLib || probeImageAgentLib,
@@ -293,6 +327,17 @@ export async function reconcileBoxContainer({
         fsApi: seams.fsApi || fs,
         token: seams.token || (() => crypto.randomBytes(12).toString('hex')),
     };
+    function validateFinalOwnership(containerId, desired) {
+        lock.assertHeld(identity.instance);
+        const observed = dependencies.discover(identity, { runner });
+        if (observed?.engine && (observed.engine.name !== engine.name || observed.engine.identity !== engine.identity)) {
+            throw transactionError('Box engine changed before transaction finalization');
+        }
+        const handle = validateCreatedContainer(observed, desired);
+        if (handle.id !== containerId) {
+            throw transactionError('Box immutable ID changed before transaction finalization');
+        }
+    }
     if (!agentLib) {
         throw transactionError('Box reconciliation requires a selected achillesAgentLib source');
     }
@@ -301,11 +346,18 @@ export async function reconcileBoxContainer({
         && localCandidateExists(localCandidatePath(identity.workspaceRoot), dependencies.fsApi)) {
         throw transactionError('A local AchillesAgentLib source appeared after image selection; run the command again');
     }
-    const portPlan = resolveEffectiveHostPort({ explicitPort, explicitMediaPort, ownership });
+    const portPlan = resolveEffectiveHostPort({
+        explicitPort,
+        explicitMediaPort,
+        ownership,
+        routerBinding,
+    });
+    const desiredBinding = routerBindingResult(portPlan, portPlan.hostPort);
     const currentContainer = ownership.handles?.container || null;
     const old = currentContainer ? oldDesired(identity, ownership, repositoryRoot, engine) : null;
+    let oldImage = null;
     if (old) {
-        dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
+        oldImage = dependencies.validateExistingImage(engine.name, old.imageId, old.imageRef, runner);
         if (old.agentLib.mode === 'image') {
             const bundle = dependencies.probeAgentLib(engine.name, old.imageId, runner, { expectedCommit: old.agentLib.commit });
             if (bundle.fingerprint !== old.agentLib.fingerprint) {
@@ -334,6 +386,9 @@ export async function reconcileBoxContainer({
     const requiresReplacement = Boolean(old) && (
         old.hostPort !== portPlan.hostPort
         || old.mediaHostPort !== portPlan.mediaHostPort
+        // Podman cannot change the published address or the Box environment in
+        // place, so an address-only or trusted-host change is a replacement.
+        || !samePublication(old.routerBinding, portPlan)
         || old.imageRef !== imageRef
         || dataPathsChanged
         // A changed source directory, mode, identity, or fingerprint must never
@@ -345,36 +400,58 @@ export async function reconcileBoxContainer({
         // sources captured at creation. Revalidation immediately before start
         // rejects any later parent or directory substitution.
         dependencies.revalidateDataPaths({ identity, lock, fsApi: dependencies.fsApi });
-        if (!currentContainer.runtime.running) {
-            const observed = dependencies.discover(identity, { runner });
-            const handle = observed?.state === 'owned' ? observed.handles?.container : null;
-            if (!handle || handle.id !== currentContainer.id || handle.runtime?.running !== false
-                || (observed.engine && (observed.engine.name !== engine.name || observed.engine.identity !== engine.identity))) {
-                throw transactionError('Box identity or stopped state changed before workspace lifecycle cleanup');
+        let oldStartAttempted = false;
+        let finalOwnership;
+        try {
+            if (!currentContainer.runtime.running) {
+                const observed = dependencies.discover(identity, { runner });
+                const handle = observed?.state === 'owned' ? observed.handles?.container : null;
+                if (!handle || handle.id !== currentContainer.id || handle.runtime?.running !== false
+                    || (observed.engine && (observed.engine.name !== engine.name || observed.engine.identity !== engine.identity))) {
+                    throw transactionError('Box identity or stopped state changed before workspace lifecycle cleanup');
+                }
+                validateContainerConfiguration(handle, old);
+                dependencies.retireStartLock({ identity, lock });
+                dependencies.retireEdgePreparation({ identity, lock });
+                writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
+                oldStartAttempted = true;
+                await dependencies.startAndWaitReady(
+                    engine,
+                    currentContainer.id,
+                    runner,
+                    { stdout, stderr },
+                );
             }
-            validateContainerConfiguration(handle, old);
-            dependencies.retireStartLock({ identity, lock });
-            dependencies.retireEdgePreparation({ identity, lock });
-            writeProgress(stderr, `Starting existing Box container ${identity.instance}; streaming startup logs...`);
-            await dependencies.startAndWaitReady(
-                engine,
-                currentContainer.id,
-                runner,
-                { stdout, stderr },
-            );
+            finalOwnership = dependencies.discover(identity, { runner });
+            const finalHandle = validateCreatedContainer(finalOwnership, old);
+            if (finalHandle.id !== currentContainer.id) {
+                throw transactionError('Reused Box immutable ID changed during final validation');
+            }
+        } catch (error) {
+            const failure = transactionError('Box reuse transaction failed', error);
+            failure.boxRollback = Object.freeze({
+                action: 'preserved',
+                containerId: currentContainer.id,
+                oldStopAttempted: false,
+                oldStartAttempted,
+                previouslyRunning: old.running,
+                hostPort: old.hostPort,
+                mediaHostPort: old.mediaHostPort,
+                routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
+                agentLib: old.agentLib,
+            });
+            throw failure;
         }
-        const finalOwnership = dependencies.discover(identity, { runner });
-        const finalHandle = validateCreatedContainer(finalOwnership, old);
-        if (finalHandle.id !== currentContainer.id) {
-            throw transactionError('Reused Box immutable ID changed during final validation');
-        }
+        const reusedBinding = routerBindingResult(old.routerBinding, old.hostPort);
         return Object.freeze({
             action: 'reused',
             ownership: finalOwnership,
             hostPort: old.hostPort,
             mediaHostPort: old.mediaHostPort,
+            routerBinding: reusedBinding,
             previousAgentLib: old.agentLib,
-            finalize() {},
+            previousRouterBinding: reusedBinding,
+            finalize() { validateFinalOwnership(currentContainer.id, old); },
             async rollback() {
                 // Reuse did not replace an outer resource. The supervisor owns
                 // stopping any partially restarted inner graph.
@@ -384,19 +461,40 @@ export async function reconcileBoxContainer({
                     containerId: currentContainer.id,
                     hostPort: old.hostPort,
                     mediaHostPort: old.mediaHostPort,
+                    routerBinding: reusedBinding,
                     agentLib: old.agentLib,
                 });
             },
         });
     }
 
-    await dependencies.preflight({
+    const preflight = await dependencies.preflight({
         hostPort: portPlan.hostPort,
         mediaHostPort: portPlan.mediaHostPort,
+        address: portPlan.address,
         existingPublication: portPlan.existingPublication,
     });
-    await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
-    const image = dependencies.validateImage(engine.name, imageRef, runner);
+    let image;
+    if (imagePolicy === 'preserve') {
+        // A publication-only change must not upgrade software. Keep the exact
+        // old image; without a Box, admit only the locally present reference.
+        if (old) {
+            image = oldImage;
+        } else {
+            try {
+                image = dependencies.validateImage(engine.name, imageRef, runner);
+            } catch (error) {
+                throw transactionError(
+                    `The Box image ${imageRef} could not be validated locally; this command never pulls `
+                    + 'images, so run `ploinky start` to create the Box first',
+                    error,
+                );
+            }
+        }
+    } else {
+        await pullBoxImage(engine, imageRef, runner, { stdout, stderr });
+        image = dependencies.validateImage(engine.name, imageRef, runner);
+    }
     if (desiredAgentLib.mode === 'image') {
         if (desiredAgentLib.imageId !== normalizeImageId(image.immutableId)) {
             throw transactionError('Box image changed after AchillesAgentLib selection; run the command again');
@@ -414,6 +512,7 @@ export async function reconcileBoxContainer({
 
     let candidateId = '';
     let candidateAttempted = false;
+    let oldStopAttempted = false;
     let oldRemoved = false;
     try {
         if (desiredAgentLib.mode === 'image'
@@ -422,11 +521,15 @@ export async function reconcileBoxContainer({
         }
         if (old) {
             if (currentContainer.runtime.running) {
+                oldStopAttempted = true;
                 dependencies.stopPloinkyLocal(engine, currentContainer.id, runner);
                 runner.run(engine.name, ['container', 'stop', '--time', '30', currentContainer.id]);
             }
             dependencies.removeContainer(engine, currentContainer.id, runner);
             oldRemoved = true;
+            // A probe excused by the old listener is proven only after that
+            // listener is gone. Anything still holding the port is foreign.
+            await dependencies.recheckReleased(preflight);
         }
         const created = await createAndStart({
             engine,
@@ -435,6 +538,7 @@ export async function reconcileBoxContainer({
             imageRef,
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
+            routerBinding: desiredBinding,
             repositoryRoot,
             agentLib: desiredAgentLib,
             runner,
@@ -452,8 +556,13 @@ export async function reconcileBoxContainer({
             stderr,
         });
         candidateId = created.containerId;
+        const candidateDesired = oldDesired(identity, created.ownership, repositoryRoot, engine);
         let settled = false;
-        const finalize = () => { settled = true; };
+        const finalize = () => {
+            if (settled) return;
+            validateFinalOwnership(candidateId, candidateDesired);
+            settled = true;
+        };
         const rollback = async () => {
             lock.assertHeld(identity.instance);
             if (settled) return Object.freeze({ action: 'already-settled' });
@@ -499,6 +608,7 @@ export async function reconcileBoxContainer({
                 containerId: restored.containerId,
                 hostPort: old.hostPort,
                 mediaHostPort: old.mediaHostPort,
+                routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
                 agentLib: old.agentLib,
             } : { action: 'candidate-removed' });
         };
@@ -507,8 +617,10 @@ export async function reconcileBoxContainer({
             ownership: created.ownership,
             hostPort: portPlan.hostPort,
             mediaHostPort: portPlan.mediaHostPort,
+            routerBinding: desiredBinding,
             imageId: image.immutableId,
             previousAgentLib: old?.agentLib || null,
+            previousRouterBinding: old ? routerBindingResult(old.routerBinding, old.hostPort) : null,
             finalize,
             rollback,
         });
@@ -528,9 +640,10 @@ export async function reconcileBoxContainer({
                 rollbackFailures.push(`candidate removal: ${removeError.message}`);
             }
         }
+        let recovery = null;
         if (oldRemoved) {
             try {
-                await restoreOldContainer({
+                const restored = await restoreOldContainer({
                     engine,
                     identity,
                     old,
@@ -540,12 +653,35 @@ export async function reconcileBoxContainer({
                     stdout,
                     stderr,
                 });
+                recovery = { action: 'restored', containerId: restored.containerId };
             } catch (restoreError) {
                 rollbackFailures.push(`old Box restoration: ${restoreError.message}`);
             }
+        } else if (old) {
+            // The old Box was not removed, so it is left exactly as the failed
+            // stop or removal found it. A caller that owns the inner graph uses
+            // `oldStopAttempted` to bring that Box and graph back.
+            recovery = { action: 'preserved', containerId: currentContainer.id };
+        } else if (rollbackFailures.length === 0) {
+            recovery = { action: candidateId ? 'candidate-removed' : 'untouched', containerId: null };
         }
         // The workspace-backed cache directories are durable state, not
         // transaction-owned resources: a failed create never rolls them back.
-        throw transactionError('Box container transaction failed', error, rollbackFailures);
+        const failure = transactionError('Box container transaction failed', error, rollbackFailures);
+        // Callers that also own the inner graph use this exact outcome to put
+        // the previous graph and running state back.
+        failure.boxRollback = Object.freeze({
+            action: recovery?.action || 'failed',
+            containerId: recovery?.containerId || null,
+            oldStopAttempted,
+            ...(old ? {
+                previouslyRunning: old.running,
+                hostPort: old.hostPort,
+                mediaHostPort: old.mediaHostPort,
+                routerBinding: routerBindingResult(old.routerBinding, old.hostPort),
+                agentLib: old.agentLib,
+            } : {}),
+        });
+        throw failure;
     }
 }

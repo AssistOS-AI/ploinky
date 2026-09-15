@@ -1,6 +1,7 @@
 import { BOX_ROUTER_CONTAINER_PORT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { parseHostPort } from '../ports.mjs';
+import { parseRouterBindingMapping } from '../routerBinding.mjs';
 
 function argumentError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
@@ -56,6 +57,28 @@ function analyzeStart(tokens, commandToken, explicitPort, explicitMediaPort) {
     const hostPort = explicitPort ?? positionalPort ?? null;
     const positionalPortIndex = positional.length === 2 ? positional[1].rawIndex : -1;
     return { hostPort, mediaHostPort: explicitMediaPort, positionalPortIndex, hasAgent: positional.length > 0 };
+}
+
+// Bind is a host-owned publication change, so it accepts exactly one mapping
+// or none (all IPv4 interfaces at the workspace's current host port).
+function analyzeBind(tokens, commandToken) {
+    const tail = tokens.filter((token) => token.rawIndex > commandToken.rawIndex);
+    if (tail.length === 0) return Object.freeze({ mapping: null });
+    const [value, extra] = tail;
+    if (value.text.startsWith('-')) {
+        throw argumentError(
+            `bind does not accept option ${value.text}; use: ploinky [--dry-run] bind `
+            + '[BIND_ADDRESS:HOST_TCP_PORT:IN_BOX_ROUTER_PORT]',
+        );
+    }
+    if (extra) {
+        throw argumentError(`bind accepts one mapping; unexpected trailing argument '${extra.text}'`);
+    }
+    try {
+        return Object.freeze({ mapping: parseRouterBindingMapping(value.text) });
+    } catch (error) {
+        throw argumentError(error.message);
+    }
 }
 
 export function parseOuterArguments(argv) {
@@ -161,6 +184,7 @@ export function parseOuterArguments(argv) {
             coreArgv: Object.freeze(normalized),
         });
     }
+    const bind = command === 'bind' && !help ? analyzeBind(tokens, commandToken) : null;
     return Object.freeze({
         rawArgv: Object.freeze(raw),
         classificationArgv: Object.freeze(classificationArgv),
@@ -178,5 +202,6 @@ export function parseOuterArguments(argv) {
         explicitPort,
         explicitMediaPort,
         start,
+        bind,
     });
 }

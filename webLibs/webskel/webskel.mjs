@@ -1,29 +1,29 @@
-class L {
+class k {
   constructor() {
     this.loadedStyleSheets = /* @__PURE__ */ new Map(), this.components = {};
   }
   async loadStyleSheets(e, t) {
     const n = [];
-    return n.push(...e.map((o) => this.loadStyleSheet({
-      cssText: o,
+    return n.push(...e.map((s) => this.loadStyleSheet({
+      cssText: s,
       identifier: t
     }))), (await Promise.all(n)).join("");
   }
   async loadStyleSheet({ url: e = null, cssText: t = null, identifier: n = null }) {
     if (!e && !t)
       return;
-    const o = n || e;
-    let i = this.loadedStyleSheets.get(o) || 0;
+    const s = n || e;
+    let i = this.loadedStyleSheets.get(s) || 0;
     if (i === 0)
-      return new Promise((s, a) => {
+      return new Promise((o, a) => {
         try {
           const l = document.createElement("style");
-          l.textContent = t, n && (l.className = n), document.head.appendChild(l), this.loadedStyleSheets.set(o, i + 1), s(l.outerHTML);
+          l.textContent = t, n && (l.className = n), document.head.appendChild(l), this.loadedStyleSheets.set(s, i + 1), o(l.outerHTML);
         } catch (l) {
           a(new Error(`Failed to inject the CSS text: ${l.message}`));
         }
       });
-    this.loadedStyleSheets.set(o, i + 1);
+    this.loadedStyleSheets.set(s, i + 1);
   }
   async unloadStyleSheets(e) {
     let t = this.loadedStyleSheets.get(e);
@@ -50,25 +50,25 @@ class L {
       loadingPromise: null,
       isPromiseFulfilled: !1
     }, this.components[e.name].loadingPromise = (async () => {
-      function t(n, o) {
-        const { rootDir: i, webComponentsRootDir: s } = h.instance.configs;
-        let a = i || s || "";
-        return n.directory && (a = `${a}/${n.directory}`), a || (a = s ? `./${s}${n.directory ? `/${n.directory}` : ""}` : `${n.directory ? `/${n.directory}` : ""}`), `${a}/${n.type}/${n.name}/${n.name}.${o}`;
+      function t(n, s) {
+        const { rootDir: i, webComponentsRootDir: o } = h.instance.configs;
+        let a = i || o || "";
+        return n.directory && (a = `${a}/${n.directory}`), a || (a = o ? `./${o}${n.directory ? `/${n.directory}` : ""}` : `${n.directory ? `/${n.directory}` : ""}`), `${a}/${n.type}/${n.name}/${n.name}.${s}`;
       }
       try {
-        let n, o;
-        n = t(e, "html"), o = t(e, "css");
+        let n, s;
+        n = t(e, "html"), s = t(e, "css");
         const i = e.loadedTemplate || await (await fetch(n)).text();
         this.components[e.name].html = i;
-        const s = e.loadedCSSs || [await (await fetch(o)).text()];
-        if (this.components[e.name].css = s, await this.loadStyleSheets(s, e.name), e.presenterClassName)
+        const o = e.loadedCSSs || [await (await fetch(s)).text()];
+        if (this.components[e.name].css = o, await this.loadStyleSheets(o, e.name), e.presenterClassName)
           if (e.presenterModule)
             this.registerPresenter(e.name, e.presenterModule[e.presenterClassName]);
           else {
             const l = await import(t(e, "js"));
             this.registerPresenter(e.name, l[e.presenterClassName]);
           }
-        return this.components[e.name].isPromiseFulfilled = !0, { html: i, css: s };
+        return this.components[e.name].isPromiseFulfilled = !0, { html: i, css: o };
       } catch (n) {
         throw n;
       }
@@ -77,24 +77,23 @@ class L {
   registerPresenter(e, t) {
     this.components[e].presenter = t;
   }
-  initialisePresenter(e, t, n, o = {}) {
+  initialisePresenter(e, t, n, s = {}) {
     let i;
     try {
-      i = new this.components[t.componentName].presenter(t, n, o), t.isPresenterReady = !0, t.onPresenterReady();
-    } catch (s) {
-      showApplicationError("Error creating a presenter instance", `Encountered an error during the initialization of ${e} for component: ${t.componentName}`, s + ":" + s.stack.split(`
+      i = new this.components[t.componentName].presenter(t, n, s), t.isPresenterReady = !0, t.onPresenterReady();
+    } catch (o) {
+      showApplicationError("Error creating a presenter instance", `Encountered an error during the initialization of ${e} for component: ${t.componentName}`, o + ":" + o.stack.split(`
 `)[1]);
     }
     return i;
   }
   async waitForDescendantRenders(e) {
     await Promise.resolve();
-    const t = [...e.querySelectorAll("[data-presenter]")].filter((n) => n !== e);
-    const o = t.map((n) => n.renderCompletePromise).filter((n) => n && typeof n.then == "function");
-    o.length && await Promise.allSettled(o);
+    const n = [...e.querySelectorAll("[data-presenter]")].filter((s) => s !== e).map((s) => s.renderCompletePromise).filter((s) => s && typeof s.then == "function");
+    n.length && await Promise.allSettled(n);
   }
 }
-function $(r) {
+function x(r) {
   if (!r) {
     console.error("moveCursorToEnd: No element provided");
     return;
@@ -122,34 +121,34 @@ function g(r, e, t) {
   return n;
 }
 function w(r, e, t = "", n = !1) {
-  const o = /* @__PURE__ */ new Set();
+  const s = /* @__PURE__ */ new Set();
   if (!(r instanceof Element))
     throw new TypeError("The first argument must be a DOM Element.");
   if (typeof e != "string" || e.trim() === "")
     throw new TypeError("The second argument must be a non-empty string.");
   if (r.matches(e) && !n)
     return r;
-  o.add(r);
+  s.add(r);
   let i = r;
   for (; i; ) {
-    const s = i.parentElement;
-    if (s) {
-      let a = s.firstElementChild;
+    const o = i.parentElement;
+    if (o) {
+      let a = o.firstElementChild;
       for (; a; ) {
-        if (!o.has(a)) {
-          if (o.add(a), a !== i && a.matches(e))
+        if (!s.has(a)) {
+          if (s.add(a), a !== i && a.matches(e))
             return a;
           if (a.children.length > 0) {
             const l = [a.firstElementChild];
             for (; l.length > 0; ) {
-              const d = l.shift();
-              if (!o.has(d)) {
-                if (o.add(d), d.matches(e))
-                  return d;
-                let c = d.nextElementSibling;
-                for (; c; )
-                  l.push(c), c = c.nextElementSibling;
-                d.firstElementChild && l.push(d.firstElementChild);
+              const c = l.shift();
+              if (!s.has(c)) {
+                if (s.add(c), c.matches(e))
+                  return c;
+                let d = c.nextElementSibling;
+                for (; d; )
+                  l.push(d), d = d.nextElementSibling;
+                c.firstElementChild && l.push(c.firstElementChild);
               }
             }
           }
@@ -157,8 +156,8 @@ function w(r, e, t = "", n = !1) {
         a = a.nextElementSibling;
       }
     }
-    if (i = s, i && !o.has(i)) {
-      if (o.add(i), i.matches(e))
+    if (i = o, i && !s.has(i)) {
+      if (s.add(i), i.matches(e))
         return i;
       if (t && i.matches(t))
         break;
@@ -170,7 +169,7 @@ function A(r) {
   const e = (r.match(/\//g) || []).length;
   return !(e > 1 || e === 1 && r.charAt(r.length - 1) !== "/");
 }
-function R(r) {
+function $(r) {
   return r != null && typeof r == "string" ? r.replace(/&nbsp;/g, " ").replace(/&#13;/g, `
 `).replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">") : "";
 }
@@ -192,7 +191,7 @@ function b(r, e) {
   const t = e ? `[data-presenter="${e}"]` : "[data-presenter]";
   return w(r, t, "", !0);
 }
-function j(r) {
+function I(r) {
   if (!r || !(r instanceof HTMLElement))
     return console.error("invalidateParentElement: Invalid or no element provided"), null;
   E(b(r));
@@ -208,30 +207,30 @@ function E(r) {
   }
   r.webSkelPresenter.invalidate();
 }
-const N = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+const _ = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
   __proto__: null,
   customTrim: T,
   getClosestParentElement: g,
   getClosestParentWithPresenter: b,
   getMainAppContainer: O,
-  invalidateParentElement: j,
-  moveCursorToEnd: $,
+  invalidateParentElement: I,
+  moveCursorToEnd: x,
   normalizeSpaces: M,
   notBasePage: A,
   refreshElement: E,
   reverseQuerySelector: w,
   sanitize: y,
-  unsanitize: R
+  unsanitize: $
 }, Symbol.toStringTag, { value: "Module" }));
-async function _(r, e) {
+async function U(r, e) {
   const t = g(r, "form"), n = {
     data: {},
     elements: {},
     isValid: !1
   };
   typeof t.checkValidity == "function" && (n.isValid = t.checkValidity());
-  const o = [...t.querySelectorAll("[name]:not([type=hidden])")];
-  for (const i of o) {
+  const s = [...t.querySelectorAll("[name]:not([type=hidden])")];
+  for (const i of s) {
     if (i.disabled)
       continue;
     if (i.multiple && i.tagName === "SELECT" ? n.data[i.name] = Array.from(i.selectedOptions).map((l) => l.value) : n.data[i.name] = i.tagName === "CHECKBOX" || i.tagName === "INPUT" && i.type === "checkbox" ? i.checked : i.value, i.getAttribute("type") === "file")
@@ -243,17 +242,17 @@ async function _(r, e) {
         } catch (l) {
           console.log(l);
         }
-    let s = !0;
-    if (i.setCustomValidity(""), typeof i.checkValidity == "function" ? s = i.checkValidity() : typeof i.getInputElement == "function" && (s = (await i.getInputElement()).checkValidity()), s === !0 && e) {
+    let o = !0;
+    if (i.setCustomValidity(""), typeof i.checkValidity == "function" ? o = i.checkValidity() : typeof i.getInputElement == "function" && (o = (await i.getInputElement()).checkValidity()), o === !0 && e) {
       let l = i.getAttribute("data-condition");
-      l && (s = e[l].fn(i, n), s ? i.setCustomValidity("") : (i.setCustomValidity(e[l].errorMessage), n.isValid = !1));
+      l && (o = e[l].fn(i, n), o ? i.setCustomValidity("") : (i.setCustomValidity(e[l].errorMessage), n.isValid = !1));
     }
     n.elements[i.name] = {
-      isValid: s,
+      isValid: o,
       element: i
     };
     let a = document.querySelector(`[data-id = '${i.getAttribute("id")}' ]`);
-    a && (s ? a.classList.remove("input-invalid") : a.classList.add("input-invalid"));
+    a && (o ? a.classList.remove("input-invalid") : a.classList.add("input-invalid"));
   }
   t.checkValidity() || t.reportValidity();
   for (let i of Object.keys(n.data))
@@ -262,51 +261,51 @@ async function _(r, e) {
 }
 async function P(r) {
   let e = "", t = new FileReader();
-  return await new Promise((n, o) => {
+  return await new Promise((n, s) => {
     t.onload = function() {
       e = t.result, n(e);
-    }, r ? t.readAsDataURL(r) : o("No file given as input at imageUpload");
+    }, r ? t.readAsDataURL(r) : s("No file given as input at imageUpload");
   });
 }
-async function U(r) {
+async function j(r) {
   let e = "", t = new FileReader();
-  return await new Promise((n, o) => {
+  return await new Promise((n, s) => {
     t.onload = function() {
       e = t.result, n(e);
-    }, r ? t.readAsText(r) : o("No file given as input");
+    }, r ? t.readAsText(r) : s("No file given as input");
   });
 }
-const V = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+const F = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
   __proto__: null,
-  extractFormInformation: _,
+  extractFormInformation: U,
   imageUpload: P,
-  uploadFileAsText: U
+  uploadFileAsText: j
 }, Symbol.toStringTag, { value: "Module" }));
-async function S(r, e, t) {
+async function C(r, e, t) {
   typeof e == "boolean" && (t = e, e = void 0);
-  const n = document.querySelector("body"), o = g(n, "dialog");
-  o && (o.close(), o.remove());
-  const i = Object.assign(F(r, e), {
+  const n = document.querySelector("body"), s = g(n, "dialog");
+  s && (s.close(), s.remove());
+  const i = Object.assign(N(r, e), {
     component: r,
     cssClass: r,
     componentProps: e
   });
-  return n.appendChild(i), await i.showModal(), i.addEventListener("keydown", v), t ? new Promise((s) => {
+  return n.appendChild(i), await i.showModal(), i.addEventListener("keydown", S), t ? new Promise((o) => {
     i.addEventListener("close", (a) => {
-      s(a.data);
+      o(a.data);
     });
   }) : i;
 }
-function v(r) {
+function S(r) {
   r.key === "Escape" && r.preventDefault();
 }
-function F(r, e) {
+function N(r, e) {
   let t = document.createElement("dialog"), n = "";
   return e !== void 0 && Object.keys(e).forEach((i) => {
     n += ` data-${i}="${e[i]}"`;
   }), h.instance.configs.components.find((i) => i.name === r).presenterClassName && (n += ` data-presenter="${r}"`), n === "" ? t.innerHTML = `<${r}/>` : t.innerHTML = `<${r}${n}/>`, t.classList.add("modal", `${r}-dialog`), t;
 }
-function H(r, e) {
+function D(r, e) {
   const t = g(r, "dialog");
   if (e !== void 0) {
     let n = new Event("close", {
@@ -317,62 +316,62 @@ function H(r, e) {
   }
   t && (t.close(), t.remove());
 }
-function C(r, e) {
+function v(r, e) {
   document.removeEventListener("click", r.clickHandler), r.remove(), e !== void 0 && delete e.actionBox;
 }
-async function I(r, e, t, n, o = {}) {
+async function V(r, e, t, n, s = {}) {
   if (r.parentNode.querySelector(t))
     return null;
-  const s = document.createElement(`${t}`);
-  for (const [d, c] of Object.entries(o))
-    s.setAttribute(`data-${d}`, c);
+  const o = document.createElement(`${t}`);
+  for (const [c, d] of Object.entries(s))
+    o.setAttribute(`data-${c}`, d);
   let a;
   switch (n) {
     case "prepend":
-      r.parentNode.insertBefore(s, r);
+      r.parentNode.insertBefore(o, r);
       break;
     case "append":
-      r.parentNode.appendChild(s);
+      r.parentNode.appendChild(o);
       break;
     case "replace":
       a = r;
-      const d = a.parentNode;
-      d.removeChild(a), d.appendChild(s);
+      const c = a.parentNode;
+      c.removeChild(a), c.appendChild(o);
       break;
     case "replace-all":
       a = r.parentNode;
-      const c = a;
-      a = c.innerHTML, c.innerHTML = "", c.appendChild(s);
+      const d = a;
+      a = d.innerHTML, d.innerHTML = "", d.appendChild(o);
       break;
     default:
       console.error(`Invalid Insertion Mode: ${n}. No changes to the DOM have been made`);
       return;
   }
-  let l = (d) => {
-    if (s && !s.contains(d.target)) {
+  let l = (c) => {
+    if (o && !o.contains(c.target)) {
       if (n === "replace" && a) {
-        const c = s.parentNode;
-        c.removeChild(s), c.appendChild(a);
+        const d = o.parentNode;
+        d.removeChild(o), d.appendChild(a);
       } else if (n === "replace-all" && a) {
-        const c = s.parentNode;
-        c.innerHTML = a;
+        const d = o.parentNode;
+        d.innerHTML = a;
       }
-      C(s);
+      v(o);
     }
   };
-  return s.clickHandler = l, document.addEventListener("click", l), s;
+  return o.clickHandler = l, document.addEventListener("click", l), o;
 }
-async function D(r, e, t = !1) {
+async function q(r, e, t = !1) {
   typeof e == "boolean" && (t = e, e = void 0);
-  const n = document.querySelector("body"), o = g(n, "dialog");
-  o && (o.close(), o.remove());
+  const n = document.querySelector("body"), s = g(n, "dialog");
+  s && (s.close(), s.remove());
   let i = document.createElement("dialog");
   i.classList.add("modal", `${r}-dialog`);
-  const s = window.WebSkel || assistOS.UI;
-  if (!s)
+  const o = window.WebSkel || assistOS.UI;
+  if (!o)
     throw new Error("WebSkel instance not found for reactive modal");
-  let a = s.configs.components.find((c) => c.name === r);
-  const l = s.createElement(
+  let a = o.configs.components.find((d) => d.name === r);
+  const l = o.createElement(
     r,
     i,
     e || {},
@@ -385,49 +384,49 @@ async function D(r, e, t = !1) {
     componentProps: e,
     _componentProxy: l
   });
-  const d = new Proxy(i, {
-    get(c, f) {
-      return f === "props" ? l : Reflect.get(c, f);
+  const c = new Proxy(i, {
+    get(d, f) {
+      return f === "props" ? l : Reflect.get(d, f);
     }
   });
-  return n.appendChild(i), await i.showModal(), i.addEventListener("keydown", v), t ? new Promise((c) => {
+  return n.appendChild(i), await i.showModal(), i.addEventListener("keydown", S), t ? new Promise((d) => {
     i.addEventListener("close", (f) => {
-      c(f.data);
+      d(f.data);
     });
-  }) : d;
+  }) : c;
 }
 const B = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
   __proto__: null,
-  closeModal: H,
-  createReactiveModal: D,
-  removeActionBox: C,
-  showActionBox: I,
-  showModal: S
+  closeModal: D,
+  createReactiveModal: q,
+  removeActionBox: v,
+  showActionBox: V,
+  showModal: C
 }, Symbol.toStringTag, { value: "Module" }));
-function k(r) {
+function R(r) {
   let e = /\$\$[\w\-_]+/g;
   return r.match(e) || [];
 }
-function x(r) {
+function L(r) {
   let e = 0;
   const t = 0, n = 1;
-  function o(l) {
+  function s(l) {
     return !/^[a-zA-Z0-9_\-$]$/.test(l);
   }
   function i(l) {
     return r[l] !== "$" || r[l + 1] !== "$" ? t : n;
   }
-  let s = [], a = 0;
+  let o = [], a = 0;
   for (; a < r.length; ) {
     for (; !i(a) && a < r.length; )
       a++;
-    for (s.push(r.slice(e, a)), e = a; !o(r[a]) && a < r.length; )
+    for (o.push(r.slice(e, a)), e = a; !s(r[a]) && a < r.length; )
       a++;
-    s.push(r.slice(e, a)), e = a;
+    o.push(r.slice(e, a)), e = a;
   }
-  return s;
+  return o;
 }
-function q(r, e) {
+function H(r, e) {
   if (typeof r != "string" || r.trim() === "")
     throw new Error("Input data must be a non-empty string.");
   if (typeof e != "string" || e.trim() === "")
@@ -452,10 +451,10 @@ function z(r) {
 }
 const K = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
   __proto__: null,
-  createTemplateArray: x,
+  createTemplateArray: L,
   decodeBase64: z,
-  encodeToBase64: q,
-  findDoubleDollarWords: k
+  encodeToBase64: H,
+  findDoubleDollarWords: R
 }, Symbol.toStringTag, { value: "Module" }));
 function Q() {
   let r = navigator.userAgent, e, t = r.match(/(opera|chrome|safari|firefox|msie|trident(?=\/))\/?\s*(\d+)/i) || [];
@@ -471,26 +470,38 @@ function X() {
     t[n] = e.get(n);
   return t;
 }
-function Z() {
+function Y() {
   const r = window.location.hash.split("?");
   let e = {};
   if (r[1]) {
     const t = new URLSearchParams(r[1]);
-    for (const [n, o] of t)
-      e[n] = o;
+    for (const [n, s] of t)
+      e[n] = s;
     return e;
   }
   return e;
 }
-const G = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+const Z = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
   __proto__: null,
   getBrowser: Q,
-  getHashParams: Z,
+  getHashParams: Y,
   getURLParams: X
 }, Symbol.toStringTag, { value: "Module" }));
+function G(r = globalThis.crypto) {
+  if (typeof r?.randomUUID == "function")
+    return r.randomUUID();
+  if (typeof r?.getRandomValues != "function") {
+    const n = new Error("Secure UUID generation requires crypto.randomUUID() or crypto.getRandomValues().");
+    throw n.code = "WEB_CRYPTO_UNAVAILABLE", n;
+  }
+  const e = new Uint8Array(16);
+  r.getRandomValues(e), e[6] = e[6] & 15 | 64, e[8] = e[8] & 63 | 128;
+  const t = Array.from(e, (n) => n.toString(16).padStart(2, "0")).join("");
+  return `${t.slice(0, 8)}-${t.slice(8, 12)}-${t.slice(12, 16)}-${t.slice(16, 20)}-${t.slice(20)}`;
+}
 class h {
   constructor() {
-    this._appContent = {}, this.appServices = {}, this._documentElement = document, this.actionRegistry = {}, this.registerListeners(), this.ResourceManager = new L(), this.defaultLoader = document.createElement("dialog"), this.loaderCount = 0, this.activeLoaderId = null, this.defaultLoader.classList.add("spinner"), this.defaultLoader.classList.add("spinner-default-style"), window.showApplicationError = async (e, t, n) => await S("show-error-modal", {
+    this._appContent = {}, this.appServices = {}, this._documentElement = document, this.actionRegistry = {}, this.registerListeners(), this.ResourceManager = new k(), this.defaultLoader = document.createElement("dialog"), this.loaderCount = 0, this.activeLoaderId = null, this.defaultLoader.classList.add("spinner"), this.defaultLoader.classList.add("spinner-default-style"), window.showApplicationError = async (e, t, n) => await C("show-error-modal", {
       title: e,
       message: t,
       technical: n
@@ -505,47 +516,39 @@ class h {
     let t = new h();
     window.webSkel = t;
     const n = [
-      N,
-      V,
+      _,
+      F,
       B,
       K,
-      G
+      Z
     ];
-    for (const o of n)
-      for (const [i, s] of Object.entries(o))
-        t[i] = s;
+    for (const s of n)
+      for (const [i, o] of Object.entries(s))
+        t[i] = o;
     return await t.loadConfigs(e), h.instance = t, h.instance;
   }
   async loadConfigs(e) {
     try {
       const n = await (await fetch(e)).json();
       this.configs = n;
-      for (const o of n.components)
-        await this.defineComponent(o);
+      for (const s of n.components)
+        await this.defineComponent(s);
     } catch (t) {
       console.error(t), await window.showApplicationError("Error loading configs", "Error loading configs", `Encountered ${t} while trying loading webSkel configs`);
     }
   }
   showLoading() {
-    const t = this.activeLoaderId || crypto.randomUUID();
+    const e = this.activeLoaderId || G();
     if (this.loaderCount === 0) {
-      let e = this.defaultLoader.cloneNode(!0);
-      e.setAttribute("data-id", t);
-      document.body.appendChild(e);
-      e.showModal();
-      this.activeLoaderId = t;
-      this.loaderCount = 1;
-      return t;
+      let t = this.defaultLoader.cloneNode(!0);
+      return t.setAttribute("data-id", e), document.body.appendChild(t), t.showModal(), this.activeLoaderId = e, this.loaderCount = 1, e;
     }
-    this.loaderCount++;
-    return this.activeLoaderId;
+    return this.loaderCount++, this.activeLoaderId;
   }
   clearLoading() {
     document.querySelectorAll(".spinner").forEach((e) => {
       e.close(), e.remove();
-    });
-    this.loaderCount = 0;
-    this.activeLoaderId = null;
+    }), this.loaderCount = 0, this.activeLoaderId = null;
   }
   hideLoading(e) {
     if (this.loaderCount <= 0) {
@@ -559,16 +562,15 @@ class h {
     const t = this.activeLoaderId || e;
     if (t) {
       let n = document.querySelector(`[data-id = '${t}' ]`);
-      if (n) {
+      if (n)
         n.close(), n.remove();
-      } else {
+      else {
         this.clearLoading();
         return;
       }
     } else
       this.clearLoading();
-    this.loaderCount = 0;
-    this.activeLoaderId = null;
+    this.loaderCount = 0, this.activeLoaderId = null;
   }
   setLoading(e) {
     this.defaultLoader.innerHTML = e, this.defaultLoader.classList.remove("spinner-default-style");
@@ -576,7 +578,7 @@ class h {
   resetLoading() {
     this.defaultLoader = document.createElement("dialog"), this.defaultLoader.classList.add("spinner"), this.defaultLoader.classList.add("spinner-default-style");
   }
-  async changeToDynamicPage(e, t, n, o) {
+  async changeToDynamicPage(e, t, n, s) {
     try {
       this.validateTagName(e);
     } catch (a) {
@@ -584,22 +586,19 @@ class h {
       return;
     }
     const i = this.showLoading();
-    let s = "";
-    n && (s = Object.entries(n).map(([a, l]) => `data-${a}="${l}"`).join(" "));
+    let o = "";
+    n && (o = Object.entries(n).map(([a, l]) => `data-${a}="${l}"`).join(" "));
     try {
-      const a = `<${e} data-presenter="${e}" ${s}></${e}>`;
-      if (!o) {
-        const l = ["#", t].join("");
-        window.history.pushState({ pageHtmlTagName: e, relativeUrlContent: a }, l.toString(), l);
+      const a = `<${e} data-presenter="${e}" ${o}></${e}>`;
+      if (!s) {
+        const c = ["#", t].join("");
+        window.history.pushState({ pageHtmlTagName: e, relativeUrlContent: a }, c.toString(), c);
       }
       await this.updateAppContent(a);
-      const child = this._appContent.querySelector(e);
-      if (child && child.renderCompletePromise) {
-        await child.renderCompletePromise;
-      }
+      const l = this._appContent.querySelector(e);
+      l && l.renderCompletePromise && await l.renderCompletePromise;
     } catch (a) {
-      console.error("Failed to change page", a);
-      await window.showApplicationError("Failed to change page", a.message || "Failed to change page.", a.stack || String(a));
+      console.error("Failed to change page", a), await window.showApplicationError("Failed to change page", a.message || "Failed to change page.", a.stack || String(a));
     } finally {
       this.hideLoading(i);
     }
@@ -607,22 +606,18 @@ class h {
   validateTagName(e) {
     if (!/^(?![0-9])[a-z0-9]+(?:-*[a-z0-9]+)*-*?$/.test(e))
       throw new Error(`Invalid tag name: ${e}`);
-    if (!this.configs.components.find((o) => o.name === e))
+    if (!this.configs.components.find((s) => s.name === e))
       throw new Error(`Element not found in configs: ${e}`);
   }
   async changeToStaticPage(e, t) {
     const n = this.showLoading();
     try {
-      const o = await this.fetchTextResult(e, t);
-      await this.updateAppContent(o);
-      const children = this._appContent.querySelectorAll('[data-presenter]');
-      const promises = Array.from(children).map(c => c.renderCompletePromise).filter(Boolean);
-      if (promises.length) {
-        await Promise.all(promises);
-      }
-    } catch (o) {
-      console.error("Failed to change page", o);
-      await window.showApplicationError("Failed to change page", o.message || "Failed to change page.", o.stack || String(o));
+      const s = await this.fetchTextResult(e, t);
+      await this.updateAppContent(s);
+      const i = this._appContent.querySelectorAll("[data-presenter]"), o = Array.from(i).map((a) => a.renderCompletePromise).filter(Boolean);
+      o.length && await Promise.all(o);
+    } catch (s) {
+      console.error("Failed to change page", s), await window.showApplicationError("Failed to change page", s.message || "Failed to change page.", s.stack || String(s));
     } finally {
       this.hideLoading(n);
     }
@@ -653,69 +648,65 @@ class h {
   preventExternalResources(e) {
     let t = /(src|href|action|onclick)\s*=\s*"[^"]*"/g, n = e.match(t);
     if (n)
-      for (let o of n) {
-        let i = o.split('"')[1], s = new URL(i).host;
-        if (window.location.host !== s)
+      for (let s of n) {
+        let i = s.split('"')[1], o = new URL(i).host;
+        if (window.location.host !== o)
           throw new Error(`External resource detected: ${i}`);
       }
   }
   registerListeners() {
     this._documentElement.addEventListener("click", this.interceptAppContentLinks.bind(this)), window.onpopstate = async (e) => {
-      const hash = window.location.hash;
-      if (hash) {
-        const hashContent = hash.substring(1);
-        const pageName = hashContent.split("/")[0].split("?")[0];
-        const knownPage = this.configs.components.find((c) => c.name === pageName);
-        if (knownPage) {
-          const existing = this._appContent.querySelector(pageName);
-          if (existing && existing.webSkelPresenter) {
+      if (typeof this._appContent?.querySelector != "function")
+        return;
+      const t = window.location.hash;
+      if (t) {
+        const n = t.substring(1), s = n.split("/")[0].split("?")[0];
+        if (this.configs.components.find((o) => o.name === s)) {
+          const o = this._appContent.querySelector(s);
+          if (o && o.webSkelPresenter)
             return;
-          }
-          await this.changeToDynamicPage(pageName, hashContent, null, true);
+          await this.changeToDynamicPage(s, n, null, !0);
           return;
         }
       }
       if (e.state && e.state.relativeUrlContent) {
         await this.updateAppContent(e.state.relativeUrlContent);
-        const children = this._appContent.querySelectorAll('[data-presenter]');
-        const promises = Array.from(children).map(c => c.renderCompletePromise).filter(Boolean);
-        if (promises.length) {
-          await Promise.all(promises);
-        }
+        const n = this._appContent.querySelectorAll("[data-presenter]"), s = Array.from(n).map((i) => i.renderCompletePromise).filter(Boolean);
+        s.length && await Promise.all(s);
       }
     }, this._documentElement.addEventListener("click", async (e) => {
       let t = e.target, n = !1;
       for (; t && t !== this._documentElement && !n; ) {
         if (t.hasAttribute("data-local-action")) {
           e.preventDefault(), e.stopPropagation(), n = !0;
-          let o = t, i = !1;
-          const s = t.getAttribute("data-local-action"), [a, ...l] = s.split(" ");
+          let s = t, i = !1;
+          const o = t.getAttribute("data-local-action"), [a, ...l] = o.split(" ");
           for (; i === !1; ) {
-            let d = !1, c;
-            for (; d === !1; ) {
-              if (o.webSkelPresenter) {
-                d = !0, c = o.webSkelPresenter;
+            let c = !1, d;
+            for (; c === !1; ) {
+              if (s.webSkelPresenter) {
+                c = !0, d = s.webSkelPresenter;
                 break;
               }
-              if (o = o.parentElement, o === document) {
+              if (s = s.parentElement, s === document) {
                 await window.showApplicationError("Error executing action", "Action not found in any Presenter", "Action not found in any Presenter");
                 return;
               }
             }
-            if (c[a] !== void 0)
+            if (d[a] !== void 0)
               try {
-                o.webSkelPresenter[a](t, ...l), i = !0;
+                s.webSkelPresenter[a](t, ...l), i = !0;
               } catch (f) {
                 console.error(f), await window.showApplicationError("Error executing action", "There is no action for the button to execute", `Encountered ${f}`);
                 return;
               }
             else
-              d = !1, o = o.parentElement;
+              c = !1, s = s.parentElement;
           }
         } else if (t.hasAttribute("data-action")) {
           e.preventDefault(), e.stopPropagation(), n = !0;
-          const o = t.getAttribute("data-action"), [i, ...s] = o.split(" ");
-          i ? this.callAction(i, t, ...s) : console.error(`${t} : data action attribute value should not be empty!`);
+          const s = t.getAttribute("data-action"), [i, ...o] = s.split(" ");
+          i ? this.callAction(i, t, ...o) : console.error(`${t} : data action attribute value should not be empty!`);
           break;
         }
         t = t.parentElement;
@@ -729,19 +720,19 @@ class h {
     const n = this.actionRegistry[e];
     if (!n)
       throw new Error(`No action handler registered for "${e}"`);
-    let o = t && t[0] instanceof HTMLElement ? t[0] : null;
-    n.call(o, ...t);
+    let s = t && t[0] instanceof HTMLElement ? t[0] : null;
+    n.call(s, ...t);
   }
   async fetchTextResult(e, t) {
     const n = new URL(`${window.location.protocol}//${window.location.host}`);
     e.startsWith("#") && (e = e.slice(1)), console.log("Fetching Data from URL: ", n + e);
-    const o = await fetch(n + e);
-    if (!o.ok)
+    const s = await fetch(n + e);
+    if (!s.ok)
       throw new Error("Failed to execute request");
-    const i = await o.text();
+    const i = await s.text();
     if (!t) {
-      const s = n + "#" + e;
-      window.history.pushState({ relativeUrlPath: e, relativeUrlContent: i }, s.toString(), s);
+      const o = n + "#" + e;
+      window.history.pushState({ relativeUrlPath: e, relativeUrlContent: i }, o.toString(), o);
     }
     return i;
   }
@@ -754,48 +745,48 @@ class h {
    * @param {boolean} [observeProps=false] - If true, nested objects in props will be observed.
    * @returns {Proxy} A reactive proxy for the element's properties.
    */
-  createElement(e, t = null, n = {}, o = {}, i = !1) {
-    const s = document.createElement(e), { proxy: a, revoke: l } = this.createReactiveProxy(n, i, s);
-    s.setAttribute("data-presenter", e);
-    const d = {
+  createElement(e, t = null, n = {}, s = {}, i = !1) {
+    const o = document.createElement(e), { proxy: a, revoke: l } = this.createReactiveProxy(n, i, o);
+    o.setAttribute("data-presenter", e);
+    const c = {
       get(f, u, p) {
         if (u === "element")
-          return new WeakRef(s);
+          return new WeakRef(o);
         if (u in a)
           return Reflect.get(a, u, p);
-        if (u in s) {
-          const m = s[u];
-          return typeof m == "function" ? m.bind(s) : m;
+        if (u in o) {
+          const m = o[u];
+          return typeof m == "function" ? m.bind(o) : m;
         }
         return Reflect.get(f, u, p);
       },
       set(f, u, p, m) {
-        return u === "element" ? !1 : u in a ? Reflect.set(a, u, p, m) : u in s ? (s[u] = p, !0) : Reflect.set(a, u, p, m);
+        return u === "element" ? !1 : u in a ? Reflect.set(a, u, p, m) : u in o ? (o[u] = p, !0) : Reflect.set(a, u, p, m);
       },
       has(f, u) {
-        return u === "element" || u in a || u in s;
+        return u === "element" || u in a || u in o;
       },
       ownKeys(f) {
-        const u = Reflect.ownKeys(a), p = Reflect.ownKeys(s);
+        const u = Reflect.ownKeys(a), p = Reflect.ownKeys(o);
         return [.../* @__PURE__ */ new Set([...u, ...p, "element"])];
       },
       getOwnPropertyDescriptor(f, u) {
         return u === "element" ? {
-          value: new WeakRef(s),
+          value: new WeakRef(o),
           writable: !1,
           enumerable: !0,
           configurable: !1
-        } : u in a ? Reflect.getOwnPropertyDescriptor(a, u) : u in s ? Reflect.getOwnPropertyDescriptor(s, u) : Reflect.getOwnPropertyDescriptor(f, u);
+        } : u in a ? Reflect.getOwnPropertyDescriptor(a, u) : u in o ? Reflect.getOwnPropertyDescriptor(o, u) : Reflect.getOwnPropertyDescriptor(f, u);
       }
-    }, c = new Proxy({}, d);
-    return s._webSkelProps = {
+    }, d = new Proxy({}, c);
+    return o._webSkelProps = {
       raw: n,
       proxy: a,
       revoke: l,
       observeProps: i
-    }, Object.entries(o).forEach(([f, u]) => {
-      s.setAttribute(f, u);
-    }), t instanceof HTMLElement ? t?.appendChild(s) : typeof t == "string" && document.querySelector(t)?.appendChild(s), c;
+    }, Object.entries(s).forEach(([f, u]) => {
+      o.setAttribute(f, u);
+    }), t instanceof HTMLElement ? t?.appendChild(o) : typeof t == "string" && document.querySelector(t)?.appendChild(o), d;
   }
   /**
    * Creates a reactive proxy for an object that triggers an element invalidation on property changes.
@@ -805,20 +796,20 @@ class h {
    * @returns {{proxy: Proxy, revoke: Function}} An object containing the reactive proxy and a revoke function.
    */
   createReactiveProxy(e, t, n) {
-    const o = {
-      set(a, l, d) {
-        t && typeof d == "object" && d !== null && (d = this.createReactiveProxy(d, t, n).proxy);
-        const c = a[l];
-        return a[l] = d, Object.is(c, d) || n.invalidateProxy?.(), !0;
+    const s = {
+      set(a, l, c) {
+        t && typeof c == "object" && c !== null && (c = this.createReactiveProxy(c, t, n).proxy);
+        const d = a[l];
+        return a[l] = c, Object.is(d, c) || n.invalidateProxy?.(), !0;
       },
       deleteProperty(a, l) {
         return delete a[l], n.invalidateProxy?.(), !0;
       }
-    }, { proxy: i, revoke: s } = Proxy.revocable(e, o);
+    }, { proxy: i, revoke: o } = Proxy.revocable(e, s);
     if (t)
       for (const a in e)
         typeof e[a] == "object" && e[a] !== null && (e[a] = this.createReactiveProxy(e[a], t, n).proxy);
-    return { proxy: i, revoke: s };
+    return { proxy: i, revoke: o };
   }
   defineComponent = async (e) => {
     customElements.get(e.name) || customElements.define(
@@ -830,8 +821,7 @@ class h {
           }), this.isPresenterReady = !1, this.renderCompletePromise = null, this.onRenderComplete = null, this.resetRenderCompletePromise();
         }
         resetRenderCompletePromise() {
-          typeof this.onRenderComplete == "function" && (this.onRenderComplete(), this.onRenderComplete = null);
-          this.renderCompletePromise = new Promise((t) => {
+          typeof this.onRenderComplete == "function" && (this.onRenderComplete(), this.onRenderComplete = null), this.renderCompletePromise = new Promise((t) => {
             this.onRenderComplete = t;
           });
         }
@@ -842,46 +832,42 @@ class h {
           this.invalidateFn && this.invalidateFn();
         }
         async connectedCallback() {
-          this._webSkelProps && (this.props = this._webSkelProps.proxy), this.resources = await h.instance.ResourceManager.loadComponent(e), k(this.resources.html).forEach((i) => {
+          this._webSkelProps && (this.props = this._webSkelProps.proxy), this.resources = await h.instance.ResourceManager.loadComponent(e), R(this.resources.html).forEach((i) => {
             i = i.slice(2), this.variables[i] = "";
-          }), this.templateArray = x(this.resources.html);
-          let n = this, o = null;
+          }), this.templateArray = L(this.resources.html);
+          let n = this, s = null;
           for (const i of n.attributes)
-            n.variables[i.nodeName] = y(i.nodeValue), i.name === "data-presenter" && (o = i.nodeValue);
-          if (o) {
+            n.variables[i.nodeName] = y(i.nodeValue), i.name === "data-presenter" && (s = i.nodeValue);
+          if (s) {
             const i = async (a) => {
-              const l = (c) => {
-                const f = c?.stack ? c.stack.split(`
-`)[1] || "" : "";
+              const l = (f) => {
+                const u = f?.stack && f.stack.split(`
+`)[1] || "";
                 n.innerHTML = `Error rendering component: ${n.componentName}
-: ` + c + f, console.error(c), n.resolveRenderComplete();
-              }, d = async () => {
+: ` + f + u, console.error(f), n.resolveRenderComplete();
+              }, c = async () => {
                 try {
-                  n.resetRenderCompletePromise();
-                  await n.webSkelPresenter.beforeRender();
-                  for (let c in n.variables)
-                    typeof n.webSkelPresenter[c] < "u" && (n.variables[c] = n.webSkelPresenter[c]);
+                  n.resetRenderCompletePromise(), await n.webSkelPresenter.beforeRender();
+                  for (let f in n.variables)
+                    typeof n.webSkelPresenter[f] < "u" && (n.variables[f] = n.webSkelPresenter[f]);
                   n.refresh(), await h.instance.ResourceManager.waitForDescendantRenders(n), await n.webSkelPresenter.afterRender?.(), n.resolveRenderComplete();
-                } catch (c) {
-                  l(c);
+                } catch (f) {
+                  l(f);
                 }
-              };
-              const c = h.instance.showLoading();
+              }, d = h.instance.showLoading();
               try {
-                if (a)
-                  await a();
-                await d();
+                a && await a(), await c();
               } catch (f) {
                 l(f);
               } finally {
-                h.instance.hideLoading(c);
+                h.instance.hideLoading(d);
               }
-            }, s = new Proxy(i, {
-              apply: async function(a, l, d) {
-                return n.isPresenterReady || await n.presenterReadyPromise, Reflect.apply(a, l, d);
+            }, o = new Proxy(i, {
+              apply: async function(a, l, c) {
+                return n.isPresenterReady || await n.presenterReadyPromise, Reflect.apply(a, l, c);
               }
             });
-            n.invalidateFn = s, n.webSkelPresenter = h.instance.ResourceManager.initialisePresenter(o, n, s, this.props);
+            n.invalidateFn = o, n.webSkelPresenter = h.instance.ResourceManager.initialisePresenter(s, n, o, this.props);
           } else
             n.refresh(), n.resolveRenderComplete();
         }
@@ -899,30 +885,31 @@ class h {
   };
 }
 export {
-  L as ResourceManager,
+  k as ResourceManager,
   h as WebSkel,
-  H as closeModal,
-  x as createTemplateArray,
+  D as closeModal,
+  G as createSecureUuid,
+  L as createTemplateArray,
   T as customTrim,
   h as default,
-  _ as extractFormInformation,
-  k as findDoubleDollarWords,
+  U as extractFormInformation,
+  R as findDoubleDollarWords,
   Q as getBrowser,
   g as getClosestParentElement,
   b as getClosestParentWithPresenter,
-  Z as getHashParams,
+  Y as getHashParams,
   O as getMainAppContainer,
   X as getURLParams,
   P as imageUpload,
-  j as invalidateParentElement,
-  $ as moveCursorToEnd,
+  I as invalidateParentElement,
+  x as moveCursorToEnd,
   M as normalizeSpaces,
   A as notBasePage,
   E as refreshElement,
-  C as removeActionBox,
+  v as removeActionBox,
   w as reverseQuerySelector,
   y as sanitize,
-  I as showActionBox,
-  S as showModal,
-  R as unsanitize
+  V as showActionBox,
+  C as showModal,
+  $ as unsanitize
 };

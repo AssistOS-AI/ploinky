@@ -1,5 +1,6 @@
 import { SKILL_SCOPE_ENV_NAMES } from '../../../ploinky-box/skillScope.mjs';
 import { AGENTLIB_RESERVED_ENV_NAMES } from '../../../agentlib/contract.mjs';
+import { PUBLIC_ROUTER_HOSTS_ENV } from '../publicRouterHosts.mjs';
 import { deriveAgentRequestSecret, derivePrivateAgentRequestSecret } from './masterKey.js';
 import { buildSubjectIdentityKey, getSubjectIdentityPublicKey } from './subjectIdentityKey.js';
 
@@ -131,6 +132,9 @@ export const RESERVED_AGENT_ENV_NAMES = Object.freeze([
     'PLOINKY_TURN_SHARED_SECRET',
     'PLOINKY_CLOUDFLARE_TUNNEL_TOKEN',
     'PLOINKY_CLOUDFLARE_API_TOKEN',
+    // Trusted outer Host aliases for the public Router. Only the host-created
+    // Box environment may supply them; configuration must not widen the list.
+    PUBLIC_ROUTER_HOSTS_ENV,
     ...GENERATED_RUNTIME_ENV_NAMES,
     ...GENERATED_RUNTIME_SOURCE_NAMES,
     'PLOINKY_AGENT_LIB_DIR',

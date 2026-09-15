@@ -134,6 +134,8 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
+| `ploinky bind [ADDRESS:PORT:8080]` | Publish the public Router on this machine's IPv4 `ADDRESS` (`0` for all interfaces) and TCP `PORT`; recreate the Box and restart the configured graph when the mapping changes; save the binding for later lifecycle commands |
+| `ploinky bind 127.0.0.1:PORT:8080` | Restore local-only Router access |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
 | `ploinky update` / `ploinky update all [PATH]` | Pull Ploinky with `--rebase --autostash` only when its checkout is inside the selected folder (or the command is run from inside that checkout); still refresh AgentLib, agents, repositories, dependencies, and skills, then restart an already configured running workspace |
@@ -294,8 +296,11 @@ agents, routing state, or secrets.
 
 Every managed box has exactly two engine publications, independent of graph or
 workspace state: `127.0.0.1:<selectedRouterHostPort>:8080/tcp` and
-`0.0.0.0:<selectedMediaHostPort>:7882/udp`. `--port` changes only the physical
-Router port. `--udp-port` changes only the physical media UDP port and defaults
+`0.0.0.0:<selectedMediaHostPort>:7882/udp`. Only an explicit `ploinky bind`
+replaces the Router's loopback address with `0.0.0.0` or one IPv4 address of this
+host, as described in
+[Publishing the Router on a host network interface](#publishing-the-router-on-a-host-network-interface).
+`--port` changes only the physical Router port. `--udp-port` changes only the physical media UDP port and defaults
 to `7882`; the in-Box LiveKit listener remains fixed on wildcard UDP `7882`.
 For example, `ploinky --port 9090 --udp-port 12345 start explorer` publishes
 host TCP `9090` to in-Box TCP `8080` and host UDP `12345` to in-Box UDP `7882`.
@@ -381,12 +386,85 @@ restart keeps the admitted source. Bundled library updates require a new Box
 image matching the required pin; general repository branch options do not
 change the bundled revision.
 
+## Publishing the Router on a host network interface
+
+By default the public Router is reachable only through loopback on the machine
+that runs Ploinky. To reach it from another computer without an SSH tunnel,
+publish it on an interface of that machine:
+
+```sh
+ploinky bind                          # all IPv4 interfaces, current host port
+ploinky bind 0:8083:8080              # all IPv4 interfaces, host TCP 8083
+ploinky bind 192.168.1.50:8083:8080   # one IPv4 address assigned to this host
+ploinky bind 127.0.0.1:8083:8080      # restore local-only access
+ploinky --dry-run bind 0:8083:8080    # print the plan without changing anything
+```
+
+The mapping is `BIND_ADDRESS:HOST_TCP_PORT:IN_BOX_ROUTER_PORT`, and `0` means
+`0.0.0.0`. A specific address must be a canonical IPv4 address assigned to the
+machine running Ploinky, never the browser machine's address (the example
+address above is illustrative). Host names are not resolved and IPv6 is not
+supported. The last field must be `8080`, the public Router inside the Box; the
+private Router port `8081` and agent ports are rejected. `8081` remains a valid
+physical-host port, for example `0:8081:8080`.
+
+Bind requires a configured workspace graph, so run `ploinky start AGENT` once
+first. It keeps the graph's static agent and launch scope, the current Box
+image, the mounted AchillesAgentLib generation, and the UDP media port. A
+changed mapping recreates the Box through the normal replacement lifecycle,
+because Podman cannot change the publications of an existing container. The
+graph then restarts, briefly interrupting traffic, and bind waits until
+`/health` answers through the bound address before it saves the binding. A
+stopped graph or Box is started. Repeating an effective binding only verifies
+health. Bind never pulls images; without an existing Box it uses the locally
+present image. When a step fails, the previous publication, Box running state,
+graph, and saved binding are restored. Before the old Box is replaced, other
+listeners on the requested port are rejected, including listeners on other
+interfaces when widening from loopback to `0.0.0.0` on the same port.
+
+The binding is saved for this exact workspace as
+`~/.ploinky-box/router-bindings/<box-instance>.json` with mode `0600`. It lives
+outside the workspace because agents can write the workspace bind. `ploinky
+start`, `restart`, `update`, commands that create a missing Box, and recreation
+after `destroy` reuse it. A later `ploinky --port PORT start` keeps the saved
+address and saves the new port. Without a saved binding a workspace stays
+loopback-only; an unsafe or malformed saved binding fails closed. Ploinky refuses
+workspace or writable cache paths that overlap its host control-state directory,
+including symlinks and filesystem aliases, before admitting or creating a Box.
+
+Publishing the port alone is not enough, because the Router rejects unknown
+`Host` headers with `421 UNKNOWN_HOST`. For a non-loopback binding the host
+supervisor records the exact outer host names the Router may accept in the Box
+environment as `PLOINKY_PUBLIC_ROUTER_HOSTS`: the bound address, or for
+`0.0.0.0` every non-loopback IPv4 address outside container bridges, plus this
+machine's host name, its short name, and `<short>.local`. Those names reach the
+same control surface as loopback. Other hosts are still rejected, and request
+headers, the Box's own addresses, workspace `.env` or secret files, and agent
+configuration cannot extend the list. Sessions, per-origin CSRF proofs,
+agent-port WebSocket origins, and preserved application redirects bind to the
+exact browser origin, for example `http://192.168.1.50:8083`. Because the
+trusted names are part of the Box configuration, a later `start`, `restart`, or
+`update` recreates the Box when this machine's addresses or name change. A
+specific address that is no longer assigned must be bound again.
+
+WebChat creates its tab and page identities with cryptographic browser randomness
+on both loopback and plain-HTTP LAN origins; it does not require the
+secure-context-only `crypto.randomUUID()` method.
+
+Successful bind, `start`, `restart`, and `update` commands and `ploinky status`
+print the effective binding and browser URLs; `0.0.0.0` is shown as the listen
+address but never offered as a URL. The bind address is not a client access
+rule: Router traffic is plain HTTP without TLS, so restrict who can reach the
+port with the host firewall or a trusted network. Bind does not change firewall
+rules, DNS, tunnels, or authentication settings, and it does not rewrite callback
+URLs registered with an SSO provider.
+
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
 - `update [folderPath]`: use the current directory as the update folder, or `folderPath` when supplied. A Ploinky checkout is pulled only when it is inside that folder or contains the launch folder. Ploinky being out of scope does not stop managed repositories, discovered project repositories, dependencies, or default skills from being refreshed. AchillesAgentLib is revalidated from the local checkout or the pinned Box bundle; update never pulls a local library checkout or clones a host fallback.
 - `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
-  - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the loopback physical-host selection and still forwards inner `8080` to core.
+  - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the physical-host port selection (loopback unless `ploinky bind` saved another address) and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.
 - `cli`: from the managed runtime, open `/bin/bash` as `podman` in `/workspace`.
 - `cli <name> [args...]`: run the agent’s manifest CLI command interactively.

@@ -1,10 +1,12 @@
 import { buildHostSkillScope } from './skillScope.mjs';
 import { readGraphSkillScope, validateGraphSkillScope, writeGraphSkillScope } from './graphSkillScope.mjs';
+import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 
 import {
     BOX_LABELS,
+    BOX_MEDIA_PORT,
     BOX_ROUTER_CONTAINER_PORT,
     resolveBoxImageReference,
 } from './constants.mjs';
@@ -26,7 +28,11 @@ import {
     agentLibContractFromContainer,
     normalizeBoxAgentLib,
 } from './contract/agentlib.mjs';
-import { validateContainerConfiguration } from './contract/container.mjs';
+import {
+    observeContainerRouterBinding,
+    validateContainerConfiguration,
+    validateContainerPublications,
+} from './contract/container.mjs';
 import { IMAGE_OBSERVATION_UNAVAILABLE, inspectAndValidateExistingImage } from './contract/image.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import {
@@ -44,6 +50,7 @@ import {
 import { resolveWorkspaceIdentity } from './identity.mjs';
 import { retireDestroyedBoxNoWaitMarkers } from './noWaitCleanup.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
+import { parseHostPort } from './ports.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
 import { updateWorkspacePloinkySource } from './command/hostUpdate.mjs';
 import {
@@ -51,6 +58,19 @@ import {
     stopPloinkyLocalByContainerId,
 } from './lifecycle/container.mjs';
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
+import {
+    ROUTER_BIND_WILDCARD,
+    assertRouterBindingAssignable,
+    createRouterBindingStore,
+    deriveRouterBindingHosts,
+    describeRouterBinding,
+    isLoopbackRouterBinding,
+    isWildcardRouterBinding,
+    routerBindingBrowserUrls,
+    routerBindingProbeTargets,
+    routerBindingPublicAuthority,
+    sameRouterBinding,
+} from './routerBinding.mjs';
 import { serializeCloudflarePublicationStatus } from './cloudflared/status.mjs';
 import {
     inspectWorkspaceDataPaths,
@@ -234,6 +254,9 @@ export function createBoxSupervisor({
     destroyManagedAgentLib = removeManagedAgentLibState,
     inspectBoxData = inspectWorkspaceDataPaths,
     captureCoreStartArgv = captureConfiguredCoreStartArgv,
+    routerBindingStore = createRouterBindingStore(),
+    readNetworkInterfaces = () => os.networkInterfaces(),
+    readHostname = () => os.hostname(),
     stdout = process.stdout,
     stderr = process.stderr,
 } = {}) {
@@ -243,6 +266,87 @@ export function createBoxSupervisor({
 
     function imageBundleLoader(ownership, imageRef = resolveBoxImageReference(env)) {
         return () => loadAgentLibImage({ engine: ownership.engine, imageRef, runner, stdout, stderr });
+    }
+
+    // Bind never pulls: an image bundle may come only from a local image.
+    function localImageBundleLoader(ownership, imageRef) {
+        return () => {
+            const inspected = runner.query(ownership.engine.name, ['image', 'inspect', imageRef]);
+            if (!inspected?.ok) {
+                throw supervisorError(
+                    `The Box image ${imageRef} is not available locally and bind never pulls images; `
+                    + 'run `ploinky start` first',
+                    'PLOINKY_BOX_BIND_IMAGE_UNAVAILABLE',
+                );
+            }
+            return loadAgentLibImage({ engine: ownership.engine, imageRef, runner, stdout, stderr, allowPull: false });
+        };
+    }
+
+    /**
+     * Resolve a requested binding against this physical host: the address must
+     * be assigned here, and the trusted outer Host names come only from this
+     * host's interfaces and name.
+     */
+    function hostRouterBinding(binding) {
+        const interfaces = readNetworkInterfaces();
+        const normalized = assertRouterBindingAssignable(binding, { interfaces });
+        const hosts = deriveRouterBindingHosts(normalized, { interfaces, hostname: readHostname() });
+        return Object.freeze({ address: normalized.address, hostPort: normalized.hostPort, hosts });
+    }
+
+    // A saved binding is authoritative for graph lifecycle commands. A later
+    // explicit --port keeps the saved address and replaces only the port.
+    function selectSavedRouterBinding(identity, explicitPort) {
+        const saved = routerBindingStore.read(identity);
+        if (!saved) return Object.freeze({ saved: null, desired: null });
+        const hasExplicitPort = explicitPort !== undefined && explicitPort !== null && explicitPort !== '';
+        const hostPort = hasExplicitPort ? parseHostPort(explicitPort) : saved.hostPort;
+        return Object.freeze({ saved, desired: hostRouterBinding({ address: saved.address, hostPort }) });
+    }
+
+    function savedRouterBindingUpdate(saved, prepared) {
+        if (!saved || !prepared?.routerBinding) return null;
+        const next = Object.freeze({ address: prepared.routerBinding.address, hostPort: prepared.hostPort });
+        return next.address === saved.address && next.hostPort === saved.hostPort
+            ? null
+            : Object.freeze({ next, previous: saved });
+    }
+
+    function reportRouterBinding(binding) {
+        if (!binding?.address || isLoopbackRouterBinding(binding)) return;
+        for (const line of formatRouterBindingLines(binding)) stdout?.write?.(`[ploinky] ${line}\n`);
+    }
+
+    function readInboxStatus(engine, containerId) {
+        const inbox = runner.query(engine.name, [
+            'container', 'exec',
+            '--user', 'podman',
+            '--workdir', '/workspace',
+            containerId,
+            '/usr/local/bin/node',
+            '/opt/ploinky/ploinky-box/inbox/readStatus.mjs',
+        ]);
+        if (!inbox?.ok) return null;
+        try {
+            return JSON.parse(String(inbox.stdout || '').trim());
+        } catch {
+            return null;
+        }
+    }
+
+    function currentRouterPublication(container) {
+        const publication = validateContainerPublications(
+            container,
+            parseHostPort(container.labels?.[BOX_LABELS.routerHostPort], { source: 'owned Box host-port label' }),
+            parseHostPort(container.labels?.[BOX_LABELS.mediaHostPort], { source: 'owned Box media host-port label' }),
+        );
+        return Object.freeze({
+            address: publication.address,
+            hostPort: publication.hostPort,
+            hosts: publication.hosts,
+            mediaHostPort: publication.mediaHostPort,
+        });
     }
 
     async function lockedMutation(execute, authorize = assertMutableOwnership) {
@@ -268,6 +372,11 @@ export function createBoxSupervisor({
         imageRef = resolveBoxImageReference(env),
     } = {}) {
         return startupMutation(async (identity, lock, ownership) => {
+            // An existing Box keeps its publication for ad hoc commands; only a
+            // Box created here needs the saved binding.
+            const routerBinding = ownership.handles?.container
+                ? null
+                : selectSavedRouterBinding(identity, explicitPort).desired;
             // The source is selected before Box reconciliation so the mount
             // contract can be part of the Box's immutable identity.
             const { selection } = await selectAgentLib({
@@ -285,6 +394,7 @@ export function createBoxSupervisor({
                 agentLib: selection,
                 explicitPort,
                 explicitMediaPort,
+                routerBinding,
                 imageRef,
                 platform,
                 env,
@@ -308,6 +418,50 @@ export function createBoxSupervisor({
         });
     }
 
+    async function restorePriorGraph({
+        identity,
+        engine,
+        containerId,
+        hostPort,
+        mediaHostPort,
+        agentLib,
+        routerBinding,
+        coreArgv,
+        skillScopeEnv,
+    }) {
+        if (!Array.isArray(coreArgv) || coreArgv[0] !== 'start') {
+            throw new Error('the prior graph start configuration was not captured');
+        }
+        const validatedSkillScope = validateGraphSkillScope(identity, skillScopeEnv);
+        revalidateMountedAgentLibSource(agentLib, { engine, containerId, runner });
+        const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+        await runCoreCommand(
+            engine,
+            containerId,
+            coreArgv,
+            hostPort,
+            mediaHostPort,
+            runner,
+            {
+                stdout,
+                stderr,
+                hostReachableIpv4,
+                agentLib,
+                skillScopeEnv: validatedSkillScope,
+            },
+        );
+        await healthCheck(hostPort, { routerBinding });
+    }
+
+    // Return a restored Box to the stopped state it had before a failed bind.
+    function stopRestoredBox(engine, containerId) {
+        try {
+            stopPloinkyLocalByContainerId(engine, containerId, runner);
+        } finally {
+            runner.run(engine.name, ['container', 'stop', '--time', '30', containerId]);
+        }
+    }
+
     async function rollbackPreparedGraph({
         identity,
         prepared,
@@ -318,13 +472,16 @@ export function createBoxSupervisor({
         restoreGraph,
         restoreCoreArgv = null,
         restoreSkillScopeEnv = null,
+        restoreStopped = false,
+        afterRollback = null,
     }) {
         const failures = [];
+        let candidateStopError = null;
         if (stopGraph) {
             try {
                 stopPloinkyLocalByContainerId(ownership.engine, containerId, runner);
             } catch (stopError) {
-                failures.push(`candidate graph stop: ${stopError.message}`);
+                candidateStopError = stopError;
             }
         }
         let outerRollback = null;
@@ -333,35 +490,39 @@ export function createBoxSupervisor({
         } catch (rollbackError) {
             failures.push(`outer Box rollback: ${rollbackError.message}`);
         }
+        // Successful removal proves the candidate is quiescent even when its
+        // inner stop failed (for example, because the Box already exited).
+        if (candidateStopError && !['restored', 'candidate-removed'].includes(outerRollback?.action)) {
+            failures.push(`candidate graph stop: ${candidateStopError.message}`);
+        }
         if (restoreGraph && outerRollback?.agentLib && failures.length === 0) {
             try {
-                if (!Array.isArray(restoreCoreArgv) || restoreCoreArgv[0] !== 'start') {
-                    throw new Error('the prior graph start configuration was not captured');
-                }
-                const skillScopeEnv = validateGraphSkillScope(identity, restoreSkillScopeEnv);
-                const prior = outerRollback.agentLib;
-                revalidateMountedAgentLibSource(prior, {
-                    engine: ownership.engine, containerId: outerRollback.containerId, runner,
+                await restorePriorGraph({
+                    identity,
+                    engine: ownership.engine,
+                    containerId: outerRollback.containerId,
+                    hostPort: outerRollback.hostPort,
+                    mediaHostPort: outerRollback.mediaHostPort,
+                    agentLib: outerRollback.agentLib,
+                    routerBinding: outerRollback.routerBinding,
+                    coreArgv: restoreCoreArgv,
+                    skillScopeEnv: restoreSkillScopeEnv,
                 });
-                const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
-                await runCoreCommand(
-                    ownership.engine,
-                    outerRollback.containerId,
-                    restoreCoreArgv,
-                    outerRollback.hostPort,
-                    outerRollback.mediaHostPort,
-                    runner,
-                    {
-                        stdout,
-                        stderr,
-                        hostReachableIpv4,
-                        agentLib: prior,
-                        skillScopeEnv,
-                    },
-                );
-                await healthCheck(outerRollback.hostPort);
             } catch (restoreError) {
                 failures.push(`prior graph restoration: ${restoreError.message}`);
+            }
+        } else if (restoreStopped && outerRollback?.containerId && failures.length === 0) {
+            try {
+                stopRestoredBox(ownership.engine, outerRollback.containerId);
+            } catch (stopError) {
+                failures.push(`prior stopped Box restoration: ${stopError.message}`);
+            }
+        }
+        if (afterRollback) {
+            try {
+                await afterRollback();
+            } catch (stateError) {
+                failures.push(stateError.message);
             }
         }
         if (failures.length) {
@@ -381,8 +542,9 @@ export function createBoxSupervisor({
         requireHealth = true,
         skillScopeEnv = null,
         priorSkillScopeEnv = null,
+        routerBindingUpdate = null,
     }) {
-        if (requireHealth) await healthCheck(prepared.hostPort);
+        if (requireHealth) await healthCheck(prepared.hostPort, { routerBinding: prepared.routerBinding });
         revalidateAgentLibSource(selection, {
             engine: prepared.ownership.engine,
             containerId: prepared.ownership.handles.container.id,
@@ -391,10 +553,36 @@ export function createBoxSupervisor({
         commitAgentLibSelection(identity.workspaceRoot, selection);
         if (skillScopeEnv) writeGraphSkillScope(identity, skillScopeEnv, lock);
         try {
+            if (routerBindingUpdate) routerBindingStore.write(identity, routerBindingUpdate.next, lock);
             prepared.finalize?.();
         } catch (error) {
             if (skillScopeEnv) writeGraphSkillScope(identity, priorSkillScopeEnv, lock);
+            if (routerBindingUpdate) {
+                try {
+                    routerBindingStore.restore(identity, routerBindingUpdate.previous, lock);
+                } catch (restoreError) {
+                    error.message = `${error.message}; saved Router binding restoration: ${restoreError.message}`;
+                }
+            }
             throw error;
+        }
+    }
+
+    async function reconcileConfiguredGraph(options, { priorCoreStartArgv, priorSkillScopeEnv }) {
+        const priorRunning = options.ownership.handles?.container?.runtime?.running === true;
+        try {
+            return await reconcile(options);
+        } catch (error) {
+            await recoverFailedGraphReconcile({
+                identity: options.identity,
+                lock: options.lock,
+                ownership: options.ownership,
+                error,
+                priorRunning,
+                priorGraphRunning: priorRunning && Boolean(priorCoreStartArgv),
+                priorCoreStartArgv,
+                priorSkillScopeEnv,
+            });
         }
     }
 
@@ -403,12 +591,16 @@ export function createBoxSupervisor({
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
+            const { saved: savedBinding, desired: routerBinding } = selectSavedRouterBinding(
+                identity,
+                options.explicitPort,
+            );
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
                 loadImageBundle: imageBundleLoader(ownership, options.imageRef || resolveBoxImageReference(env)),
             });
-            const prepared = await reconcile({
+            const prepared = await reconcileConfiguredGraph({
                 identity,
                 ownership,
                 engine: ownership.engine,
@@ -418,12 +610,13 @@ export function createBoxSupervisor({
                 agentLib: selection,
                 explicitPort: options.explicitPort,
                 explicitMediaPort: options.explicitMediaPort,
+                routerBinding,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
                 stdout,
                 stderr,
-            });
+            }, { priorCoreStartArgv, priorSkillScopeEnv });
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
             try {
@@ -452,11 +645,14 @@ export function createBoxSupervisor({
                         hostReachableIpv4,
                         agentLib: selection,
                         skillScopeEnv,
+                        routerBinding: prepared.routerBinding,
                     },
                 );
                 await completeGraphAdmission({
                     identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
+                    routerBindingUpdate: savedRouterBindingUpdate(savedBinding, prepared),
                 });
+                reportRouterBinding(prepared.routerBinding);
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
                 });
@@ -483,12 +679,13 @@ export function createBoxSupervisor({
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
+            const { desired: routerBinding } = selectSavedRouterBinding(identity);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
                 loadImageBundle: imageBundleLoader(ownership, options.imageRef || resolveBoxImageReference(env)),
             });
-            const prepared = await reconcile({
+            const prepared = await reconcileConfiguredGraph({
                 identity,
                 ownership,
                 engine: ownership.engine,
@@ -496,12 +693,13 @@ export function createBoxSupervisor({
                 lock,
                 repositoryRoot,
                 agentLib: selection,
+                routerBinding,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
                 stdout,
                 stderr,
-            });
+            }, { priorCoreStartArgv, priorSkillScopeEnv });
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
             try {
@@ -523,6 +721,7 @@ export function createBoxSupervisor({
                 await completeGraphAdmission({
                     identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
                 });
+                reportRouterBinding(prepared.routerBinding);
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
                 });
@@ -578,6 +777,7 @@ export function createBoxSupervisor({
             revalidateMountedAgentLibSource(selection, { engine, containerId: container.id, runner });
             const hostPort = Number(container.labels?.[BOX_LABELS.routerHostPort]);
             const mediaHostPort = Number(container.labels?.[BOX_LABELS.mediaHostPort]);
+            const routerBinding = Object.freeze({ ...observeContainerRouterBinding(container), hostPort });
             const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
             await runCoreCommand(
                 engine,
@@ -602,7 +802,7 @@ export function createBoxSupervisor({
                     'PLOINKY_BOX_TARGETED_RESTART_CHANGED',
                 );
             }
-            await healthCheck(hostPort);
+            await healthCheck(hostPort, { routerBinding });
             revalidateMountedAgentLibSource(selection, { engine, containerId: container.id, runner });
             return Object.freeze({
                 identity,
@@ -612,6 +812,7 @@ export function createBoxSupervisor({
                 engine,
                 hostPort,
                 mediaHostPort,
+                routerBinding,
                 agentLib: selection,
             });
         });
@@ -622,6 +823,7 @@ export function createBoxSupervisor({
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
+            const { desired: routerBinding } = selectSavedRouterBinding(identity);
             const workspacePloinky = await updateWorkspacePloinky({
                 identity,
                 lock,
@@ -634,7 +836,7 @@ export function createBoxSupervisor({
                 insideBox: false,
                 loadImageBundle: imageBundleLoader(ownership, options.imageRef || resolveBoxImageReference(env)),
             });
-            const prepared = await reconcile({
+            const prepared = await reconcileConfiguredGraph({
                 identity,
                 ownership,
                 engine: ownership.engine,
@@ -642,12 +844,13 @@ export function createBoxSupervisor({
                 lock,
                 repositoryRoot,
                 agentLib: selection,
+                routerBinding,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
                 stdout,
                 stderr,
-            });
+            }, { priorCoreStartArgv, priorSkillScopeEnv });
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
             try {
@@ -691,6 +894,7 @@ export function createBoxSupervisor({
                     skillScopeEnv: options.restartAfterUpdate === true ? skillScopeEnv : null,
                     priorSkillScopeEnv,
                 });
+                if (options.restartAfterUpdate === true) reportRouterBinding(prepared.routerBinding);
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
                     changed, previous, workspacePloinky,
@@ -709,6 +913,272 @@ export function createBoxSupervisor({
                         && (graphMutated || prepared.action === 'replaced'),
                     restoreCoreArgv: priorCoreStartArgv,
                     restoreSkillScopeEnv: priorSkillScopeEnv,
+                });
+            }
+        });
+    }
+
+    // A failed reconcile has already restored or preserved the outer Box.
+    // Return the exact previous Box, graph, and running state from its outcome.
+    async function recoverFailedGraphReconcile({
+        identity,
+        lock,
+        ownership,
+        error,
+        priorRunning,
+        priorGraphRunning,
+        priorCoreStartArgv,
+        priorSkillScopeEnv,
+    }) {
+        const outcome = error?.boxRollback;
+        const engine = ownership.engine;
+        const failures = [];
+        let recoveredContainerId = '';
+        if (outcome?.action === 'restored') {
+            recoveredContainerId = outcome.containerId;
+        } else if (outcome?.action === 'preserved' && (outcome.oldStopAttempted || outcome.oldStartAttempted)) {
+            // The graceful stop or removal failed part way. Bring the exact
+            // previous Box back through the normal reuse lifecycle.
+            try {
+                const observed = inspect(identity);
+                const handle = observed?.state === 'owned' ? observed.handles?.container : null;
+                if (!handle || handle.id !== outcome.containerId
+                    || observed.engine?.identity !== engine.identity) {
+                    throw new Error('the previous Box changed after the failed replacement');
+                }
+                if (!priorRunning) {
+                    // A reused Box can start before its readiness proof fails.
+                    // Return it to stopped without trying to start it again.
+                    if (handle.runtime?.running === true) recoveredContainerId = handle.id;
+                } else if (handle.runtime?.running === true) {
+                    // Finish an interrupted graph stop before restarting the graph.
+                    if (priorGraphRunning) stopPloinkyLocalByContainerId(engine, handle.id, runner);
+                    recoveredContainerId = handle.id;
+                } else {
+                    const restarted = await reconcile({
+                        identity,
+                        ownership: observed,
+                        engine,
+                        runner,
+                        lock,
+                        repositoryRoot,
+                        agentLib: outcome.agentLib,
+                        routerBinding: outcome.routerBinding,
+                        imageRef: String(handle.labels?.[BOX_LABELS.imageRef] || ''),
+                        imagePolicy: 'preserve',
+                        platform,
+                        env,
+                        stdout,
+                        stderr,
+                    });
+                    restarted.finalize?.();
+                    recoveredContainerId = restarted.ownership.handles.container.id;
+                }
+            } catch (recoverError) {
+                failures.push(`previous Box recovery: ${recoverError.message}`);
+            }
+        }
+        if (recoveredContainerId && priorGraphRunning) {
+            try {
+                await restorePriorGraph({
+                    identity,
+                    engine,
+                    containerId: recoveredContainerId,
+                    hostPort: outcome.hostPort,
+                    mediaHostPort: outcome.mediaHostPort,
+                    agentLib: outcome.agentLib,
+                    routerBinding: outcome.routerBinding,
+                    coreArgv: priorCoreStartArgv,
+                    skillScopeEnv: priorSkillScopeEnv,
+                });
+            } catch (restoreError) {
+                failures.push(`prior graph restoration: ${restoreError.message}`);
+            }
+        } else if (recoveredContainerId && !priorRunning) {
+            try {
+                stopRestoredBox(engine, recoveredContainerId);
+            } catch (stopError) {
+                failures.push(`prior stopped Box restoration: ${stopError.message}`);
+            }
+        }
+        if (failures.length) {
+            throw supervisorError(
+                `${error.message}; rollback failures: ${failures.join('; ')}`,
+                'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED',
+            );
+        }
+        throw error;
+    }
+
+    /**
+     * Publish the public Router on a selected host address and port.
+     *
+     * The configured graph, its skill scope, the current image, AgentLib
+     * generation, and media port are preserved. A changed publication replaces
+     * the Box through the normal lifecycle, then the graph restarts and is
+     * health-checked through the new address before the preference is saved.
+     * A stopped graph is started. Any failure restores the previous
+     * publication, graph and running state, and saved preference.
+     */
+    async function runBindTransaction(mapping = null) {
+        return startupMutation(async (identity, lock, ownership) => {
+            // Every rejection happens before the Box, graph, or preference changes.
+            const priorCoreStartArgv = captureCoreStartArgv(identity);
+            if (!priorCoreStartArgv) {
+                throw supervisorError(
+                    'ploinky bind requires a configured workspace graph to expose; run `ploinky start AGENT` first',
+                    'PLOINKY_BOX_BIND_GRAPH_REQUIRED',
+                );
+            }
+            const priorSkillScopeEnv = validateGraphSkillScope(identity, readGraphSkillScope(identity));
+            const savedBinding = routerBindingStore.read(identity);
+            const engine = ownership.engine;
+            const container = ownership.handles?.container || null;
+            const current = container ? currentRouterPublication(container) : null;
+            const routerBinding = hostRouterBinding(mapping ?? {
+                address: ROUTER_BIND_WILDCARD,
+                hostPort: current?.hostPort ?? savedBinding?.hostPort ?? BOX_ROUTER_CONTAINER_PORT,
+            });
+            const priorRunning = container?.runtime?.running === true;
+            let priorGraphRunning = false;
+            if (priorRunning) {
+                const inbox = readInboxStatus(engine, container.id);
+                if (!inbox) {
+                    throw supervisorError(
+                        'The running Box status could not be read, so its graph state cannot be restored after a '
+                        + 'failed bind; retry when the Box has finished starting',
+                        'PLOINKY_BOX_BIND_STATUS_UNAVAILABLE',
+                    );
+                }
+                // Initialization and routing are persisted configuration. An
+                // ad hoc command can start only the outer Box after `stop`.
+                priorGraphRunning = inbox.initialized === true && inbox.routingConfigured === true
+                    && Number.isSafeInteger(inbox.runningAgents) && inbox.runningAgents > 0;
+            }
+            const imageRef = container
+                ? String(container.labels?.[BOX_LABELS.imageRef] || '')
+                : resolveBoxImageReference(env);
+            let selection;
+            if (container) {
+                // Keep the mounted AgentLib generation; bind never advances it.
+                selection = agentLibContractFromContainer(container);
+                if (selection.mode !== 'image' || priorRunning) {
+                    revalidateMountedAgentLibSource(selection, { engine, containerId: container.id, runner });
+                }
+            } else {
+                ({ selection } = await selectAgentLib({
+                    workspaceRoot: identity.workspaceRoot,
+                    branchPolicy: null,
+                    loadImageBundle: localImageBundleLoader(ownership, imageRef),
+                }));
+            }
+            stderr?.write?.(
+                `[ploinky] Applying Router binding ${describeRouterBinding(routerBinding)}; `
+                + 'the Box and workspace graph restart briefly if the publication changes...\n',
+            );
+            let prepared;
+            try {
+                prepared = await reconcile({
+                    identity,
+                    ownership,
+                    engine,
+                    runner,
+                    lock,
+                    repositoryRoot,
+                    agentLib: selection,
+                    routerBinding,
+                    imageRef,
+                    imagePolicy: 'preserve',
+                    platform,
+                    env,
+                    stdout,
+                    stderr,
+                });
+            } catch (error) {
+                await recoverFailedGraphReconcile({
+                    identity,
+                    lock,
+                    ownership,
+                    error,
+                    priorRunning,
+                    priorGraphRunning,
+                    priorCoreStartArgv,
+                    priorSkillScopeEnv,
+                });
+            }
+            const containerId = prepared.ownership.handles.container.id;
+            const graphAlreadyRunning = prepared.action === 'reused' && priorGraphRunning;
+            let graphMutated = false;
+            let bindingWriteAttempted = false;
+            try {
+                if (!graphAlreadyRunning) {
+                    await ensureBoxDependencies(engine, containerId, runner, { stdout, stderr });
+                    const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                    graphMutated = true;
+                    await startCore(
+                        engine,
+                        containerId,
+                        priorCoreStartArgv,
+                        prepared.hostPort,
+                        prepared.mediaHostPort,
+                        runner,
+                        {
+                            stdout,
+                            stderr,
+                            hostReachableIpv4,
+                            agentLib: selection,
+                            skillScopeEnv: priorSkillScopeEnv,
+                            routerBinding: prepared.routerBinding,
+                        },
+                    );
+                }
+                await healthCheck(prepared.hostPort, { routerBinding: prepared.routerBinding });
+                if (container) {
+                    revalidateMountedAgentLibSource(selection, { engine, containerId, runner });
+                } else {
+                    revalidateAgentLibSource(selection, { engine, containerId, runner });
+                    commitAgentLibSelection(identity.workspaceRoot, selection);
+                }
+                bindingWriteAttempted = true;
+                routerBindingStore.write(identity, routerBinding, lock);
+                prepared.finalize?.();
+                return Object.freeze({
+                    identity,
+                    action: prepared.action === 'reused'
+                        ? (graphMutated ? 'graph-started' : 'unchanged')
+                        : prepared.action,
+                    containerId,
+                    hostPort: prepared.hostPort,
+                    mediaHostPort: prepared.mediaHostPort,
+                    routerBinding: prepared.routerBinding,
+                    previousRouterBinding: current
+                        ? Object.freeze({ address: current.address, hostPort: current.hostPort, hosts: current.hosts })
+                        : null,
+                    savedRouterBinding: savedBinding,
+                    graphStarted: graphMutated,
+                    agentLib: selection,
+                });
+            } catch (error) {
+                await rollbackPreparedGraph({
+                    identity,
+                    prepared,
+                    ownership,
+                    containerId,
+                    error,
+                    stopGraph: graphMutated,
+                    restoreGraph: priorGraphRunning && (graphMutated || prepared.action === 'replaced'),
+                    restoreCoreArgv: priorCoreStartArgv,
+                    restoreSkillScopeEnv: priorSkillScopeEnv,
+                    restoreStopped: Boolean(container) && !priorRunning,
+                    afterRollback: bindingWriteAttempted
+                        ? () => {
+                            try {
+                                routerBindingStore.restore(identity, savedBinding, lock);
+                            } catch (restoreError) {
+                                throw new Error(`saved Router binding restoration: ${restoreError.message}`);
+                            }
+                        }
+                        : null,
                 });
             }
         });
@@ -852,8 +1322,17 @@ export function createBoxSupervisor({
                 detail: String(error.message || 'Owned Box image is incompatible'),
             });
         }
+        let routerBinding = null;
+        try {
+            routerBinding = Object.freeze({
+                ...observeContainerRouterBinding(container),
+                hostPort: parseHostPort(container.labels?.[BOX_LABELS.routerHostPort]),
+            });
+        } catch {
+            routerBinding = null;
+        }
         if (!container.runtime.running) {
-            return Object.freeze({ identity, ownership, state: 'stopped' });
+            return Object.freeze({ identity, ownership, state: 'stopped', routerBinding });
         }
         const inbox = runner.query(ownership.engine.name, [
             'container', 'exec',
@@ -869,6 +1348,7 @@ export function createBoxSupervisor({
                 ownership,
                 state: 'running-transient',
                 inbox: null,
+                routerBinding,
             });
         }
         try {
@@ -891,6 +1371,7 @@ export function createBoxSupervisor({
                 ownership,
                 state: allowlisted.initialized ? 'running-initialized' : 'running-uninitialized',
                 inbox: allowlisted,
+                routerBinding,
             });
         } catch {
             return Object.freeze({
@@ -898,6 +1379,7 @@ export function createBoxSupervisor({
                 ownership,
                 state: 'running-transient',
                 inbox: null,
+                routerBinding,
             });
         }
     }
@@ -914,16 +1396,67 @@ export function createBoxSupervisor({
         });
     }
 
+    /**
+     * Read-only bind plan. It validates exactly what apply would reject before
+     * mutation, without locks, anchors, probes, or engine changes.
+     */
+    function planBindDryRun(mapping = null) {
+        const identity = resolveIdentity();
+        const ownership = assertMutableOwnership(inspect(identity));
+        const container = ownership.handles?.container || null;
+        const graphArgv = captureCoreStartArgv(identity);
+        if (!graphArgv) {
+            throw supervisorError(
+                'ploinky bind requires a configured workspace graph to expose; run `ploinky start AGENT` first',
+                'PLOINKY_BOX_BIND_GRAPH_REQUIRED',
+            );
+        }
+        const current = container ? currentRouterPublication(container) : null;
+        const savedBinding = routerBindingStore.read(identity);
+        const routerBinding = hostRouterBinding(mapping ?? {
+            address: ROUTER_BIND_WILDCARD,
+            hostPort: current?.hostPort ?? savedBinding?.hostPort ?? BOX_ROUTER_CONTAINER_PORT,
+        });
+        const mappingText = (binding) => (
+            binding ? `${binding.address}:${binding.hostPort}:${BOX_ROUTER_CONTAINER_PORT}` : null
+        );
+        const unchangedPublication = Boolean(current) && sameRouterBinding(current, routerBinding);
+        const mediaHostPort = current?.mediaHostPort ?? BOX_MEDIA_PORT;
+        return Object.freeze({
+            command: 'bind',
+            identity: identity.instance,
+            ownership: ownership.state,
+            box: container ? (container.runtime?.running ? 'running' : 'stopped') : 'absent',
+            graph: graphArgv.slice(1, 2)[0],
+            currentMapping: mappingText(current),
+            savedMapping: mappingText(savedBinding),
+            requestedMapping: mappingText(routerBinding),
+            publications: Object.freeze([
+                `${routerBinding.address}:${routerBinding.hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
+                `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
+            ]),
+            trustedHosts: routerBinding.hosts || [],
+            browserUrls: routerBindingBrowserUrls(routerBinding),
+            boxAction: !container ? 'create' : (unchangedPublication ? 'reuse' : 'replace'),
+            image: container
+                ? `preserve ${container.runtime?.imageId || 'the current image'}`
+                : `use local ${resolveBoxImageReference(env)} without pulling`,
+            mutationPerformed: false,
+        });
+    }
+
     return Object.freeze({
         prepareBoxForCommand,
         runStartTransaction,
         runRestartTransaction,
         runTargetedRestartTransaction,
         runUpdateTransaction,
+        runBindTransaction,
         runStopTransaction,
         runDestroyTransaction,
         inspectBoxStatus,
         planDryRun,
+        planBindDryRun,
     });
 }
 
@@ -950,11 +1483,56 @@ export async function ensureBoxDependencies(engine, containerId, runner, {
     }
 }
 
+/**
+ * Human-readable effective binding and connectable URLs. The wildcard is shown
+ * as the listen address but never offered as a browser destination.
+ */
+export function formatRouterBindingLines(binding) {
+    if (!binding?.address) return [];
+    let description;
+    let urls;
+    try {
+        description = describeRouterBinding(binding);
+        urls = routerBindingBrowserUrls(binding);
+    } catch {
+        return [];
+    }
+    const lines = [`Router binding: ${description}`];
+    for (const url of urls) lines.push(`Open ${url}`);
+    if (Array.isArray(binding.hosts) && binding.hosts.length > 0) {
+        lines.push(`Trusted Router host names: ${binding.hosts.join(', ')}`);
+    }
+    if (isWildcardRouterBinding(binding) && !(binding.hosts || []).some((host) => isUsableHostIpv4(host))) {
+        lines.push('Warning: no non-loopback IPv4 address was detected on this host');
+    }
+    return lines;
+}
+
+export function formatBindResult(result) {
+    const actions = {
+        replaced: 'The Box was recreated with the new Router publication and the workspace graph was restarted.',
+        created: 'The Box was created with the Router publication and the workspace graph was started.',
+        'graph-started': 'The Router publication was already in place; the stopped workspace graph was started.',
+        unchanged: 'The Router binding was already effective; nothing was restarted.',
+    };
+    const lines = [actions[result?.action] || `Bind completed (${String(result?.action || 'unknown')}).`];
+    lines.push(...formatRouterBindingLines(result?.routerBinding));
+    if (result?.mediaHostPort) {
+        const media = `Media publication: 0.0.0.0:${result.mediaHostPort} -> ${BOX_MEDIA_PORT}/udp`;
+        lines.push(result.action === 'created' ? media : `${media} (unchanged)`);
+    }
+    lines.push(isLoopbackRouterBinding(result?.routerBinding)
+        ? 'Router access is local-only (loopback).'
+        : 'Router traffic is plain HTTP, and the bind address is not a client access rule.');
+    return `${lines.join('\n')}\n`;
+}
+
 export function formatBoxStatus(status) {
     const lines = [
         `Ploinky Box: ${status.state}`,
         `Workspace identity: ${status.identity.instance}`,
     ];
+    lines.push(...formatRouterBindingLines(status.routerBinding));
     if (status.inbox) {
         lines.push(`Core initialized: ${status.inbox.initialized ? 'yes' : 'no'}`);
         lines.push(`Routing configured: ${status.inbox.routingConfigured ? 'yes' : 'no'}`);
@@ -1058,6 +1636,7 @@ export async function runBoundedCoreStart(
         hostReachableIpv4 = '',
         agentLib = null,
         skillScopeEnv = {},
+        routerBinding = null,
     } = {},
 ) {
     if (!Array.isArray(coreArgv) || !coreArgv.includes('start')) {
@@ -1072,7 +1651,12 @@ export async function runBoundedCoreStart(
         runner,
         { stdout, stderr, timeoutMs, hostReachableIpv4, agentLib, skillScopeEnv },
     );
-    const externalRouter = `http://127.0.0.1:${hostPort}`;
+    // Core reports the Box public authority: loopback for loopback and
+    // wildcard bindings, or the selected address for a specific binding.
+    const authority = routerBinding?.address
+        ? routerBindingPublicAuthority({ address: routerBinding.address, hostPort: Number(hostPort) })
+        : `127.0.0.1:${hostPort}`;
+    const externalRouter = `http://${authority}`;
     const outputLines = String(result.stdout || '').split(/\r?\n/);
     if (!outputLines.includes(`[start] Router: ${externalRouter}`)) {
         throw supervisorError(`In-box start did not report the public Router URL ${externalRouter}`);
@@ -1085,6 +1669,7 @@ export async function runBoundedCoreStart(
 }
 
 export function checkBoxHealth(hostPort, {
+    routerBinding = null,
     httpGet,
     timeoutMs = 5_000,
     readinessTimeoutMs = 1_800_000,
@@ -1092,9 +1677,18 @@ export function checkBoxHealth(hostPort, {
     delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 } = {}) {
     const deadline = Date.now() + readinessTimeoutMs;
+    // A specific binding may not listen on loopback, so health connects through
+    // the published address and presents its exact authority.
+    const targets = routerBinding?.address
+        ? routerBindingProbeTargets({
+            address: routerBinding.address,
+            hostPort: Number(hostPort),
+            hosts: routerBinding.hosts ?? null,
+        })
+        : [{ hostname: '127.0.0.1', authority: `127.0.0.1:${hostPort}` }];
 
-    async function checkUntilReady() {
-        const result = await checkOnce();
+    async function checkUntilReady(target) {
+        const result = await checkOnce(target);
         if (result.ready) return true;
         if (!result.retryable) {
             throw supervisorError(result.message);
@@ -1105,18 +1699,18 @@ export function checkBoxHealth(hostPort, {
             );
         }
         await delay(Math.min(retryDelayMs, Math.max(0, deadline - Date.now())));
-        return checkUntilReady();
+        return checkUntilReady(target);
     }
 
-    function checkOnce() {
+    function checkOnce(target) {
         return new Promise((resolve, reject) => {
             const selectedGet = httpGet || http.get;
             try {
                 const request = selectedGet({
-                    hostname: '127.0.0.1',
+                    hostname: target.hostname,
                     port: Number(hostPort),
                     path: '/health',
-                    headers: { Host: `127.0.0.1:${hostPort}` },
+                    headers: { Host: target.authority },
                 }, (response) => {
                     let body = '';
                 response.setEncoding('utf8');
@@ -1126,7 +1720,7 @@ export function checkBoxHealth(hostPort, {
                         try {
                             const location = new URL(
                                 String(response.headers?.location || ''),
-                                `http://127.0.0.1:${hostPort}`,
+                                `http://${target.authority}`,
                             );
                             if (location.pathname === '/auth/login'
                                 && location.searchParams.get('returnTo') === '/health') {
@@ -1166,7 +1760,8 @@ export function checkBoxHealth(hostPort, {
                             resolve({
                                 ready: false,
                                 retryable: false,
-                                message: `Public Box health check was unhealthy (HTTP ${response.statusCode})`,
+                                message: `Public Box health check was unhealthy (HTTP ${response.statusCode})`
+                                    + (target.authority === `127.0.0.1:${hostPort}` ? '' : ` through ${target.authority}`),
                             });
                         } catch (error) {
                             resolve({
@@ -1190,7 +1785,10 @@ export function checkBoxHealth(hostPort, {
             });
     }
 
-    return checkUntilReady();
+    return (async () => {
+        for (const target of targets) await checkUntilReady(target);
+        return true;
+    })();
 }
 
 export const defaultBoxSupervisor = createBoxSupervisor;

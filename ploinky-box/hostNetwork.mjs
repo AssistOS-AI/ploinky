@@ -46,7 +46,7 @@ function isVirtualInterface(name) {
     return /^(?:lo|utun|tun|tap|awdl|llw|wg|tailscale|zt)/i.test(name);
 }
 
-function isContainerInterface(name) {
+export function isContainerInterface(name) {
     return /^(?:bridge|docker|podman|veth|vmnet|virbr|br-)/i.test(name);
 }
 

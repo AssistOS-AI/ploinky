@@ -7,6 +7,7 @@ import {
     captureEdgeRoutingObservationLease,
 } from '../sandbox/edgeGeneration.js';
 import { selectedRouterHostPort } from '../sandbox/routerPort.js';
+import { isTrustedPublicRouterHost } from '../utils/publicRouterHosts.mjs';
 import { deriveAgentPrincipalId } from '../utils/security/agentIdentity.js';
 import {
     AgentPortSelectorError,
@@ -81,7 +82,14 @@ function classifyHost({ host, listener, snapshot }) {
     if (LOCAL_CONTROL_HOSTS.has(host)) return { kind: 'control', host };
     if (host === MANAGED_ROUTER_HOST) return null;
     const record = snapshot.compiled?.hosts?.[host];
-    if (!record) return null;
+    if (!record) {
+        // An exact outer-host alias recorded by `ploinky bind` reaches the same
+        // control surface as loopback. It never selects an agent-root host and
+        // is not consulted by the private or managed listener branches above.
+        return isTrustedPublicRouterHost(host)
+            ? { kind: 'control', host, source: 'public-router-alias' }
+            : null;
+    }
     const selectedRoute = snapshot.routing?.routes?.[String(record.routeKey || '')];
     if (snapshot.publicationState !== 'ready' || selectedRoute?.draining === true) {
         return { kind: 'inactive-public', host, record };

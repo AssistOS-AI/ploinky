@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 
+import { isTrustedPublicRouterHost } from '../utils/publicRouterHosts.mjs';
 import { deriveSubkey } from '../utils/security/masterKey.js';
 import { isLocalAdminUser } from './auth/localService.js';
 import { resolveSessionBindingId } from './sessionBinding.js';
@@ -38,8 +39,12 @@ export function canonicalControlOrigin(req) {
     }
     if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return null;
     const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    if (!LOCAL_CONTROL_HOSTS.has(hostname)) return null;
-    return parsed.origin;
+    if (LOCAL_CONTROL_HOSTS.has(hostname)) return parsed.origin;
+    // An outer-host alias must already be spelled canonically; URL parsing
+    // would otherwise map forms such as 192.168.1.050 onto a trusted address.
+    const rawHostname = rawHost.replace(/:[0-9]{1,5}$/, '').toLowerCase();
+    if (rawHostname === hostname && isTrustedPublicRouterHost(hostname)) return parsed.origin;
+    return null;
 }
 
 function csrfMac(sessionId, origin) {

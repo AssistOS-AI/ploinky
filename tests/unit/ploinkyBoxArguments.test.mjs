@@ -227,3 +227,49 @@ test('unsupported public override surfaces reject before routing', () => {
         assert.throws(() => parseOuterArguments(argv), /not a supported public Box option/);
     }
 });
+
+test('bind routes one strict mapping or the bare wildcard form without core forwarding', () => {
+    const mapping = (address, hostPort) => ({ address, hostPort, containerPort: 8080 });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['bind'])), { kind: 'bind', mapping: null });
+    for (const [argv, expected] of [
+        [['bind', '0:8083:8080'], mapping('0.0.0.0', 8083)],
+        [['bind', '0.0.0.0:8083:8080'], mapping('0.0.0.0', 8083)],
+        [['bind', '192.168.1.50:8083:8080'], mapping('192.168.1.50', 8083)],
+        [['bind', '127.0.0.1:8083:8080'], mapping('127.0.0.1', 8083)],
+        [['bind', '0:8081:8080'], mapping('0.0.0.0', 8081)],
+        [['--debug', 'bind', '0:8083:8080'], mapping('0.0.0.0', 8083)],
+        [['bind', '-d', '0:8083:8080'], mapping('0.0.0.0', 8083)],
+    ]) {
+        assert.deepEqual(routeOuterCommand(parseOuterArguments(argv)), { kind: 'bind', mapping: expected }, argv.join(' '));
+    }
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['--dry-run', 'bind', '0:8083:8080'])), {
+        kind: 'bind-dry-run',
+        mapping: mapping('0.0.0.0', 8083),
+    });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['--dry-run', 'bind'])), {
+        kind: 'bind-dry-run',
+        mapping: null,
+    });
+});
+
+test('bind rejects extra, option-like, conflicting, and invalid arguments before routing', () => {
+    for (const [argv, pattern] of [
+        [['bind', '0:8083:8080', 'extra'], /unexpected trailing argument 'extra'/],
+        [['bind', '--dry-run', '0:8083:8080'], /does not accept option --dry-run/],
+        [['bind', '--port', '9090'], /does not accept option --port/],
+        [['--port', '9090', 'bind'], /--port is valid only before start/],
+        [['--udp-port', '17891', 'bind', '0:8083:8080'], /--udp-port is valid only before start/],
+        [['--dry-run', '--dry-run', 'bind'], /supplied more than once/],
+        [['bind', '0:8083:8081'], /8081 is the private Router listener/],
+        [['bind', '0:8083:7000'], /agent and service ports/],
+        [['bind', 'localhost:8083:8080'], /host names are not resolved/],
+        [['bind', '192.168.1.50:8083'], /exactly three fields/],
+        [['bind', '0:0:8080'], /HOST_TCP_PORT/],
+    ]) {
+        assert.throws(
+            () => routeOuterCommand(parseOuterArguments(argv)),
+            (error) => error.code === 'PLOINKY_BOX_ARGUMENT_INVALID' && pattern.test(error.message),
+            argv.join(' '),
+        );
+    }
+});

@@ -22,6 +22,16 @@ import {
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import { normalizeImageId } from '../contract/image-id.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import {
+    PUBLIC_ROUTER_HOSTS_ENV,
+    serializePublicRouterHosts,
+} from '../../cli/utils/publicRouterHosts.mjs';
+import {
+    ROUTER_BIND_LOOPBACK,
+    assertRouterBindingStateConfined,
+    normalizeRouterPublication,
+    routerBindingPublicAuthority,
+} from '../routerBinding.mjs';
 import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
     revalidateWorkspaceDataPaths,
@@ -81,10 +91,12 @@ export function containerCreateArgs({
     imageRef,
     hostPort,
     mediaHostPort = BOX_MEDIA_PORT,
+    routerBinding = null,
     repositoryRoot,
     cidfile,
     hostKind = 'native-linux',
 }) {
+    assertRouterBindingStateConfined(identity);
     const source = path.resolve(repositoryRoot);
     const seccompProfile = nestedPodmanSeccompProfileContract(source);
     if (!agentLib) {
@@ -94,12 +106,24 @@ export function containerCreateArgs({
     if (agentLibContract.mode === 'image' && agentLibContract.imageId !== normalizeImageId(imageId)) {
         throw lifecycleError('Container image does not match the selected AchillesAgentLib bundle');
     }
+    // One public Router TCP publication on the selected host address. Only a
+    // non-loopback binding records its address label and trusted outer hosts.
+    const publication = normalizeRouterPublication(
+        routerBinding ?? { address: ROUTER_BIND_LOOPBACK, hosts: null },
+    );
+    const publicAuthority = routerBindingPublicAuthority({
+        address: publication.address,
+        hostPort: Number(hostPort),
+    });
     const labels = {
         [BOX_LABELS.pathHash]: identity.pathHash,
         [BOX_LABELS.role]: BOX_ROLES.container,
         [BOX_LABELS.imageRef]: imageRef,
         [BOX_LABELS.routerHostPort]: String(hostPort),
         [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
+        ...(publication.address !== ROUTER_BIND_LOOPBACK
+            ? { [BOX_LABELS.routerBindAddress]: publication.address }
+            : {}),
         [BOX_LABELS.seccompFingerprint]: seccompProfile.fingerprint,
     };
     for (const key of BOX_DATA_KEYS) {
@@ -121,7 +145,7 @@ export function containerCreateArgs({
         '--security-opt', 'unmask=ALL',
         '--security-opt', 'label=disable',
         '--security-opt', `seccomp=${seccompProfile.path}`,
-        '--publish', `127.0.0.1:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
+        '--publish', `${publication.address}:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
         '--publish', `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
         '--tmpfs', tmpfsCreateArgument(),
         '--volume', `${source}:/opt/ploinky:ro`,
@@ -132,9 +156,12 @@ export function containerCreateArgs({
         ...agentLibMountArgs(agentLibContract),
         ...agentLibEnvArgs(agentLibContract),
         '--env', 'PLOINKY_PUBLIC_BIND=0.0.0.0',
-        '--env', `PLOINKY_PUBLIC_AUTHORITY=127.0.0.1:${hostPort}`,
+        '--env', `PLOINKY_PUBLIC_AUTHORITY=${publicAuthority}`,
         '--env', 'PLOINKY_PRIVATE_BIND=0.0.0.0',
         '--env', `PLOINKY_ROUTER_HEALTH_SOCKET=${BOX_ROUTER_HEALTH_SOCKET}`,
+        ...(publication.hosts
+            ? ['--env', `${PUBLIC_ROUTER_HOSTS_ENV}=${serializePublicRouterHosts(publication.hosts)}`]
+            : []),
         ...Object.entries(labels).flatMap(([key, value]) => ['--label', `${key}=${value}`]),
         '--cidfile', cidfile,
         imageId,

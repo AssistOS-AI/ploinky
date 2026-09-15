@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { webcrypto } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import { createNetwork, __testables as networkTestables } from '../../cli/server/webchat/network.js';
 
@@ -19,11 +21,13 @@ test('WebChat exposes folder-session controls and lazy history loading', () => {
     }
     assert.match(template, /id="sessionsBtn"[^>]*>Sessions<\/button>/);
     assert.doesNotMatch(template, /id="(?:newSessionBtn|loadSessionBtn)"/);
+    const chatAreaStart = template.indexOf('id="chatArea"');
     const chatListStart = template.indexOf('id="chatList"');
     const historyGate = template.indexOf('id="historyGate"');
     const typingIndicator = template.indexOf('id="typingIndicator"');
-    assert.ok(chatListStart >= 0 && historyGate > chatListStart && typingIndicator > historyGate);
-    assert.match(template, /class="wa-history-gate" id="historyGate" hidden/);
+    assert.ok(chatAreaStart >= 0 && historyGate > chatAreaStart
+        && chatListStart > historyGate && typingIndicator > chatListStart);
+    assert.match(template, /class="wa-history-gate" id="historyGate"[^>]*\bhidden(?:\s|>)/);
     assert.doesNotMatch(template, /id="loadHistoryBtn"/);
     assert.doesNotMatch(template, /class="wa-message in wa-history-gate"/);
     assert.doesNotMatch(template, /class="wa-message-bubble wa-history-load-button"/);
@@ -36,14 +40,14 @@ test('WebChat keeps desktop actions in the header and moves them into the mobile
     const css = read('cli/server/webchat/webchat.css');
     const header = template.slice(template.indexOf('<div class="wa-header">'), template.indexOf('</div>\n\n<div class="wa-tasks-backdrop"'));
 
-    for (const id of ['titleBar', 'runtimeModel', 'headerWorkdir', 'tasksBtn', 'skillsBtn', 'sessionsBtn', 'settingsBtn', 'logoutBtn']) {
+    for (const id of ['titleBar', 'runtimeModel', 'headerWorkdir', 'tasksBtn', 'sessionsBtn', 'settingsBtn', 'logoutBtn']) {
         assert.match(header, new RegExp(`id="${id}"`));
     }
     assert.match(template, /id="settingsMobileActions"[^>]*hidden/);
     assert.match(template, /id="settingsActionSlot"/);
     assert.match(template, /id="settingsBtn"[^>]*aria-controls="settingsPanel"/s);
     assert.match(client, /createHeaderMenu\(\{ button: settingsBtn, panel: settingsPanel \}\)/);
-    assert.match(client, /createResponsiveHeaderActions\(\{[\s\S]*actions: \[tasksBtn, skillsBtn, sessionsBtn, logoutBtn\]/);
+    assert.match(client, /createResponsiveHeaderActions\(\{[\s\S]*actions: \[tasksBtn, sessionsBtn, logoutBtn\]/);
     assert.match(css, /\.wa-header-workdir\s*\{[^}]*position:\s*absolute[^}]*top:\s*50%[^}]*left:\s*50%[^}]*transform:\s*translate\(-50%, -50%\)[^}]*text-align:\s*center/s);
     assert.match(css, /@media \(max-width: 640px\)[\s\S]*?\.wa-header-workdir\s*\{[^}]*position:\s*static[^}]*transform:\s*none[^}]*text-align:\s*left/s);
     assert.match(css, /@media \(max-width: 640px\)[\s\S]*?\.wa-settings-panel \.wa-responsive-header-action/);
@@ -226,13 +230,53 @@ test('session delivery is page-targeted while background tasks remain available 
     assert.equal(tasks[0].task.sessionId, 'session-B'); // Task drawer/log state must not drop off-view events.
 });
 
-test('WebChat tab identity is restored from sessionStorage before UUID fallback', () => {
-    const dom = read('cli/server/webchat/domSetup.js');
-    const readIndex = dom.indexOf('sessionStorage.getItem(tabStorageKey)');
-    const uuidIndex = dom.indexOf('crypto.randomUUID()', readIndex);
-    assert.ok(readIndex >= 0);
-    assert.ok(uuidIndex > readIndex);
-    assert.match(dom, /webchat_tab_id:/);
+function browserDomContext(crypto) {
+    const storage = () => {
+        const values = new Map();
+        return {
+            getItem: (key) => values.get(key) ?? null,
+            setItem: (key, value) => values.set(key, String(value)),
+            removeItem: (key) => values.delete(key),
+        };
+    };
+    const context = vm.createContext({
+        crypto,
+        URLSearchParams,
+        window: { location: { search: '' } },
+        document: {
+            body: { dataset: { agent: 'alpha', workdir: '/workspace' }, setAttribute() {} },
+            getElementById: () => null,
+            querySelector: () => null,
+        },
+        localStorage: storage(),
+        sessionStorage: storage(),
+    });
+    vm.runInContext(read('cli/server/webchat/domSetup.js').replace('export function initDom()', 'function initDom()'), context);
+    return context;
+}
+
+test('WebChat initializes on plain HTTP LAN origins and preserves tab identity on reload', () => {
+    // Non-secure browser origins retain getRandomValues but omit randomUUID.
+    const context = browserDomContext({ getRandomValues: (bytes) => webcrypto.getRandomValues(bytes) });
+    const first = vm.runInContext('initDom()', context);
+    const second = vm.runInContext('initDom()', context);
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    for (const id of [first.TAB_ID, first.PAGE_INSTANCE_ID, second.PAGE_INSTANCE_ID]) assert.match(id, uuid);
+    assert.equal(first.TAB_ID, second.TAB_ID);
+    assert.notEqual(first.PAGE_INSTANCE_ID, second.PAGE_INSTANCE_ID);
+    assert.notEqual(first.TAB_ID, first.PAGE_INSTANCE_ID);
+});
+
+test('WebChat restores its tab before requesting a fresh page UUID in secure contexts', () => {
+    const ids = ['new-tab', 'first-page', 'second-page'];
+    const context = browserDomContext({ randomUUID: () => ids.shift() });
+    const first = vm.runInContext('initDom()', context);
+    const second = vm.runInContext('initDom()', context);
+    assert.equal(first.TAB_ID, 'new-tab');
+    assert.equal(second.TAB_ID, 'new-tab');
+    assert.equal(first.PAGE_INSTANCE_ID, 'first-page');
+    assert.equal(second.PAGE_INSTANCE_ID, 'second-page');
+    assert.equal(ids.length, 0);
 });
 
 test('WebChat delegates conversation sessions to the agent protocol', () => {

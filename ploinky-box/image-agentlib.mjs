@@ -40,9 +40,12 @@ export function probeImageAgentLib(engine, imageId, runner, {
 }
 
 /** Called lazily, only when the workspace has no local library. */
-export async function loadBoxAgentLibImage({ engine, imageRef, runner, stdout, stderr }) {
+export async function loadBoxAgentLibImage({ engine, imageRef, runner, stdout, stderr, allowPull = true }) {
     let inspection = runner.query(engine.name, ['image', 'inspect', imageRef]);
     if (!inspection.ok) {
+        if (!allowPull) {
+            throw bundleError('The Box image is not available locally and this operation cannot pull images', inspection.error);
+        }
         if (typeof runner.stream === 'function') {
             const pulled = await runner.stream(engine.name, ['pull', imageRef], {
                 timeoutMs: 1_800_000, stdout, stderr,

@@ -31,6 +31,29 @@ const selection = {
     resolvedCommit: commit, sourceId: imageSourceId(imageId, fingerprint),
 };
 
+test('an offline bundle load never pulls when its image inspection fails', async () => {
+    for (const streaming of [false, true]) {
+        const calls = [];
+        const runner = {
+            query(command, args) {
+                calls.push([command, ...args]);
+                return { ok: false, status: 125, stderr: 'image is no longer present' };
+            },
+            run(command, args) { calls.push([command, ...args]); },
+            ...(streaming ? {
+                async stream(command, args) {
+                    calls.push([command, ...args]);
+                    return { ok: true };
+                },
+            } : {}),
+        };
+        await assert.rejects(() => loadBoxAgentLibImage({
+            engine, runner, imageRef: 'pinned-image', allowPull: false,
+        }), { code: 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE' });
+        assert.deepEqual(calls, [['podman', 'image', 'inspect', 'pinned-image']]);
+    }
+});
+
 test('image source has no host binds and survives reconstruction with the exact image identity', () => {
     const contract = normalizeBoxAgentLib(selection);
     assert.deepEqual(agentLibMountArgs(contract), []);

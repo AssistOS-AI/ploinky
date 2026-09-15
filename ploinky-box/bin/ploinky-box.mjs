@@ -10,7 +10,13 @@ import { updateHostPloinkySource } from '../command/hostUpdate.mjs';
 import { resolvePloinkyUpdateScope } from '../../cli/commands/ploinkyUpdateScope.js';
 import { BOX_IMAGE_OVERRIDE_ENV, BOX_IMAGE_REFERENCE, BOX_LABELS } from '../constants.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
-import { createBoxSupervisor, formatBoxStatus } from '../supervisor.mjs';
+import { isLoopbackRouterBinding } from '../routerBinding.mjs';
+import {
+    createBoxSupervisor,
+    formatBindResult,
+    formatBoxStatus,
+    formatRouterBindingLines,
+} from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 
@@ -26,6 +32,11 @@ Commands:
   ploinky restart AGENT           Restart one agent in the existing Box generation
   ploinky --udp-port PORT start AGENT [PORT]
                                   Select the media host UDP port; defaults to 7882
+  ploinky bind [ADDRESS:PORT:8080]
+                                  Publish the public Router on this host's ADDRESS and
+                                  TCP PORT; the Box and graph restart when it changes
+  ploinky --dry-run bind [ADDRESS:PORT:8080]
+                                  Show the bind plan without changing anything
   ploinky status [--verbose]      Inspect Box and core state without mutation
   ploinky stop                    Stop core services and the outer Box
   ploinky update [PATH]           Update Ploinky only when its checkout is within
@@ -42,6 +53,16 @@ Commands:
 Logs are observational: they require an already running, initialized, owned Box
 and never create, prepare, or repair one.
 
+Bind uses BIND_ADDRESS:HOST_TCP_PORT:8080. BIND_ADDRESS is 0 or 0.0.0.0 (all IPv4
+interfaces), 127.0.0.1 (restore local-only access), or an IPv4 address assigned
+to this host, never the browser machine's address. 8080 is the fixed public
+Router port inside the Box; 8081 and agent ports cannot be published. Bare bind
+uses 0.0.0.0 and the current host port. Bind requires a configured graph, starts
+it if it is stopped, keeps the current image, AgentLib source, and UDP port, and
+saves the binding for later start, restart, update, and Box recreation. A later
+"ploinky --port PORT start" keeps the saved address and saves the new port.
+Router traffic is plain HTTP, and the bind address is not a client access rule.
+
 The default Box image is ${BOX_IMAGE_REFERENCE}.
 Set ${BOX_IMAGE_OVERRIDE_ENV} to pull a different Box image reference.
 Public CLI image options, engine, instance-name, and master-key overrides are unsupported.
@@ -51,7 +72,7 @@ If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/
 
 function outerDebug(parsed, route, stdout) {
     if (!parsed.debug.enabled) return;
-    if (['help', 'status', 'stop', 'destroy', 'bash', 'dry-run'].includes(route.kind)) {
+    if (['help', 'status', 'stop', 'destroy', 'bash', 'dry-run', 'bind', 'bind-dry-run'].includes(route.kind)) {
         stdout.write('[INFO] Debug mode enabled.\n');
     }
 }
@@ -116,6 +137,11 @@ export async function runOuterCli(argv, {
         const status = selectedSupervisor.inspectBoxStatus();
         const container = status.ownership?.handles?.container;
         if (status.state === 'running-initialized' && container) {
+            // The in-Box renderer knows the canonical local authority only; a
+            // non-loopback publication is host state, so report it here.
+            if (status.routerBinding && !isLoopbackRouterBinding(status.routerBinding)) {
+                output.write(`${formatRouterBindingLines(status.routerBinding).join('\n')}\n`);
+            }
             const coreStatus = executePrepared({
                 containerId: container.id,
                 engine: status.ownership.engine,
@@ -158,6 +184,16 @@ export async function runOuterCli(argv, {
                 + `${deletedPaths.length > 0 ? deletedPaths.join(', ') : 'nothing remained to delete'}.\n`,
             );
         }
+        return 0;
+    }
+    if (route.kind === 'bind-dry-run') {
+        const plan = selectedSupervisor.planBindDryRun(route.mapping);
+        output.write(`${JSON.stringify(plan, null, 2)}\n`);
+        return 0;
+    }
+    if (route.kind === 'bind') {
+        const result = await selectedSupervisor.runBindTransaction(route.mapping);
+        output.write(formatBindResult(result));
         return 0;
     }
     if (route.kind === 'dry-run') {

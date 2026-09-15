@@ -42,6 +42,7 @@ import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, res
 import { getActiveProfile, getProfileConfig, resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
+import { PUBLIC_ROUTER_HOSTS_ENV } from '../utils/publicRouterHosts.mjs';
 import {
   sanitizeManagedMasterKeyEnvironment,
 } from '../utils/security/masterKey.js';
@@ -217,8 +218,12 @@ export function buildRouterEnv({ managedBox } = {}) {
   try { envFile = loadEnvFile() || {}; } catch (_) { envFile = {}; }
   let secrets = {};
   try { secrets = readSecretsFile() || {}; } catch (_) { secrets = {}; }
+  // Trusted outer-host aliases come only from the host-created Box environment.
+  // Workspace .env and secret files are writable through agent workspace mounts.
+  const { [PUBLIC_ROUTER_HOSTS_ENV]: _envFileHosts, ...fileEnvironment } = envFile;
+  const { [PUBLIC_ROUTER_HOSTS_ENV]: _secretHosts, ...secretEnvironment } = secrets;
   return sanitizeRouterEnvironment(
-    { ...envFile, ...secrets, ...process.env },
+    { ...fileEnvironment, ...secretEnvironment, ...process.env },
     { managedBox },
   );
 }

@@ -34,6 +34,22 @@ function isPrivateLocation(value) {
     }
 }
 
+// A redirect back to the exact origin the Router admitted for this request is
+// not a disclosure, even when that origin is a private LAN address.
+function isAdmittedOriginLocation(value, plan) {
+    const origin = String(plan?.origin || '');
+    if (!origin) return false;
+    try {
+        const location = new URL(String(value));
+        return ['http:', 'https:'].includes(location.protocol)
+            && !location.username
+            && !location.password
+            && location.origin === origin;
+    } catch (_) {
+        return false;
+    }
+}
+
 function routerCookie(setCookie) {
     return ROUTER_COOKIES.has(String(setCookie || '').split('=', 1)[0].trim());
 }
@@ -46,7 +62,8 @@ export function sanitizeResponseHeaders(headers, plan) {
         if (!name || HOP_BY_HOP.has(name) || name === 'proxy-connection') continue;
         if (ROUTER_HEADERS.has(name) || name.startsWith('x-ploinky-')) continue;
         if (name === 'location') {
-            if (isPrivateLocation(value)) continue;
+            const admittedOrigin = policy.allowRedirects === true && isAdmittedOriginLocation(value, plan);
+            if (!admittedOrigin && isPrivateLocation(value)) continue;
             if (policy.allowRedirects !== true && /^https?:/i.test(String(value || ''))) continue;
         }
         if (name === 'set-cookie') {

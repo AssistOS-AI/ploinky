@@ -11,6 +11,19 @@ import {
     BOX_USERNS,
 } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import {
+    PUBLIC_ROUTER_HOSTS_ENV,
+    parsePublicRouterHosts,
+    serializePublicRouterHosts,
+} from '../../cli/utils/publicRouterHosts.mjs';
+import {
+    ROUTER_BIND_LOOPBACK,
+    ROUTER_BIND_WILDCARD,
+    assertRouterBindingStateConfined,
+    normalizeRouterBindAddress,
+    normalizeRouterPublication,
+    routerBindingPublicAuthority,
+} from '../routerBinding.mjs';
 import { nestedPodmanSeccompProfileContract } from '../seccomp.mjs';
 import {
     agentLibBoxEnv,
@@ -161,10 +174,56 @@ function publicationError(message) {
     });
 }
 
+/**
+ * Reconstruct the public Router binding an owned Box records.
+ *
+ * A Box without the bind-address label is the legacy loopback publication and
+ * must carry no trusted outer-host list. A labelled Box must carry exactly one
+ * canonical list, and a specific address must trust itself. Publications are
+ * compared separately so labels alone never prove what the engine publishes.
+ *
+ * @returns {Readonly<{ address: string, hosts: readonly string[]|null }>}
+ */
+export function observeContainerRouterBinding(containerHandle) {
+    const labels = containerHandle?.labels || {};
+    const environment = containerHandle?.runtime?.environment || {};
+    const hasAddressLabel = Object.hasOwn(labels, BOX_LABELS.routerBindAddress);
+    const hasHosts = Object.hasOwn(environment, PUBLIC_ROUTER_HOSTS_ENV);
+    if (!hasAddressLabel) {
+        if (hasHosts) {
+            throw publicationError('Owned Box trusts outer Router hosts without a Router bind address label');
+        }
+        return Object.freeze({ address: ROUTER_BIND_LOOPBACK, hosts: null });
+    }
+    let address;
+    try {
+        address = normalizeRouterBindAddress(labels[BOX_LABELS.routerBindAddress]);
+    } catch (_) {
+        throw publicationError('Owned Box Router bind address label is invalid');
+    }
+    if (address === ROUTER_BIND_LOOPBACK) {
+        throw publicationError('Owned Box labels a loopback Router binding that must remain unlabelled');
+    }
+    if (!hasHosts) {
+        throw publicationError('Owned Box Router bind address has no trusted outer host list');
+    }
+    let hosts;
+    try {
+        hosts = parsePublicRouterHosts(environment[PUBLIC_ROUTER_HOSTS_ENV]);
+    } catch (error) {
+        throw publicationError(`Owned Box trusted outer Router hosts are invalid: ${error.message}`);
+    }
+    if (address !== ROUTER_BIND_WILDCARD && !hosts.includes(address)) {
+        throw publicationError('Owned Box trusted outer Router hosts do not include its bind address');
+    }
+    return Object.freeze({ address, hosts });
+}
+
 export function validateContainerPublications(
     containerHandle,
     expectedHostPort,
     expectedMediaHostPort = BOX_MEDIA_PORT,
+    expectedBinding = null,
 ) {
     const runtime = containerHandle?.runtime;
     const port = String(expectedHostPort);
@@ -172,11 +231,27 @@ export function validateContainerPublications(
     if (!runtime?.complete || !Array.isArray(runtime.publications) || !runtime.environment) {
         throw publicationError('Owned Box has incomplete runtime publication state');
     }
+    const observedBinding = observeContainerRouterBinding(containerHandle);
+    let binding = observedBinding;
+    if (expectedBinding) {
+        try {
+            binding = normalizeRouterPublication(expectedBinding);
+        } catch (error) {
+            throw publicationError(`Expected Router binding is invalid: ${error.message}`);
+        }
+        if (observedBinding.address !== binding.address
+            || JSON.stringify(observedBinding.hosts) !== JSON.stringify(binding.hosts)) {
+            throw publicationError(
+                'Owned Box Router binding does not match the selected binding: '
+                + `observed=${JSON.stringify(observedBinding)} expected=${JSON.stringify(binding)}`,
+            );
+        }
+    }
     const expected = [
         {
             containerPort: String(BOX_ROUTER_CONTAINER_PORT),
             protocol: 'tcp',
-            hostIp: '127.0.0.1',
+            hostIp: binding.address,
             hostPort: port,
         },
         {
@@ -199,12 +274,20 @@ export function validateContainerPublications(
     if (containerHandle.labels?.[BOX_LABELS.mediaHostPort] !== mediaPort) {
         throw publicationError('Owned Box media host-port label does not match its publication');
     }
-    if (runtime.environment.PLOINKY_PUBLIC_AUTHORITY !== `127.0.0.1:${port}`) {
+    let authority = '';
+    try {
+        authority = routerBindingPublicAuthority({ address: binding.address, hostPort: Number(port) });
+    } catch (_) {
+        throw publicationError('Owned Box host-port label is not a valid TCP port');
+    }
+    if (runtime.environment.PLOINKY_PUBLIC_AUTHORITY !== authority) {
         throw publicationError('Owned Box public authority does not match its publication');
     }
     return Object.freeze({
         hostPort: Number(port),
         mediaHostPort: Number(mediaPort),
+        address: binding.address,
+        hosts: binding.hosts,
         tcp: expected.find((item) => item.protocol === 'tcp'),
         udp: expected.find((item) => item.protocol === 'udp'),
         running: runtime.running,
@@ -217,12 +300,14 @@ export function validateContainerConfiguration(containerHandle, {
     agentLib,
     hostPort,
     mediaHostPort = BOX_MEDIA_PORT,
+    routerBinding = null,
     imageId,
     imageRef,
     repositoryRoot,
     hostKind = 'native-linux',
 }) {
-    const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort);
+    assertRouterBindingStateConfined(identity);
+    const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort, routerBinding);
     const runtime = containerHandle.runtime;
     const seccompProfile = nestedPodmanSeccompProfileContract(repositoryRoot);
     if (containerHandle.id === '' || runtime.imageId !== imageId) {
@@ -246,6 +331,9 @@ export function validateContainerConfiguration(containerHandle, {
         [BOX_LABELS.mediaHostPort]: String(mediaHostPort),
         [BOX_LABELS.seccompFingerprint]: seccompProfile.fingerprint,
     };
+    if (publication.address !== ROUTER_BIND_LOOPBACK) {
+        expectedLabels[BOX_LABELS.routerBindAddress] = publication.address;
+    }
     const selectedFingerprints = dataFingerprints || Object.fromEntries(BOX_DATA_KEYS.map((key) => [
         key,
         String(containerHandle.labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
@@ -285,9 +373,15 @@ export function validateContainerConfiguration(containerHandle, {
         ...IMAGE_CONTRACT.environment,
         ...agentLibBoxEnv(agentLibContract),
         PLOINKY_PUBLIC_BIND: '0.0.0.0',
-        PLOINKY_PUBLIC_AUTHORITY: `127.0.0.1:${hostPort}`,
+        PLOINKY_PUBLIC_AUTHORITY: routerBindingPublicAuthority({
+            address: publication.address,
+            hostPort: publication.hostPort,
+        }),
         PLOINKY_PRIVATE_BIND: '0.0.0.0',
         PLOINKY_ROUTER_HEALTH_SOCKET: BOX_ROUTER_HEALTH_SOCKET,
+        ...(publication.hosts
+            ? { [PUBLIC_ROUTER_HOSTS_ENV]: serializePublicRouterHosts(publication.hosts) }
+            : {}),
     };
     const observedEnvironment = { ...runtime.environment };
     const runtimeHostname = observedEnvironment.HOSTNAME;

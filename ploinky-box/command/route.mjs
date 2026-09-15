@@ -123,6 +123,14 @@ export function routeOuterCommand(parsed) {
             coreArgv: parsed.forwardingArgv,
         });
     }
+    // Bind changes the host-owned outer publication; it is never forwarded to
+    // the in-Box core and its dry run is a read-only host plan.
+    if (parsed.command === 'bind') {
+        return Object.freeze({
+            kind: parsed.dryRun ? 'bind-dry-run' : 'bind',
+            mapping: parsed.bind?.mapping ?? null,
+        });
+    }
     if (!parsed.command) {
         return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'repl', coreArgv: parsed.forwardingArgv });
     }

@@ -62,3 +62,26 @@ installation contracts. The adapter changes neither source manifests nor the
 selected library, and its regression tests use temporary directories and the
 existing mocked Box installer. No new package, external source, license, or
 tool installation is required.
+
+The `ploinky bind` Router publication adds no third-party package or system
+service. It uses Node.js built-ins (`node:crypto`, `node:dgram`, `node:fs`,
+`node:net`, `node:os`, and `node:path`), repository-owned modules, and the
+existing rootless Podman `--publish`, `--env`, and `--label` options; there is
+no separate host forwarding daemon. The saved binding is host-only state under
+`~/.ploinky-box/router-bindings`. Regression tests use the Node.js test runner,
+temporary directories, fake Podman runners, and fake network interfaces. Native
+verification uses the already present validated Box image and the installed
+Podman without pulling images or changing firewall, DNS, or tunnel settings.
+The publication integration test creates isolated Box generations and verifies
+real TCP/UDP listeners, LAN Host admission and loopback reversal. Run it with
+`PLOINKY_BIND_PUBLICATION_TEST_IMAGE=<immutable-local-image-id> node --test tests/integration/ploinkyBoxBindPublication.test.mjs`.
+WebChat uses the browser's built-in `crypto.getRandomValues()` when
+`crypto.randomUUID()` is unavailable on plain-HTTP LAN origins; no UUID package
+or weaker random source is introduced.
+
+The WebSkel files under `webLibs/webskel` are generated from the canonical
+https://github.com/AssistOS-AI/WebSkel source and retain its MIT LICENSE. UUID
+compatibility is implemented in that source's `utils/uuid.mjs` and used by
+`webSkel.js`; ESM and UMD outputs are regenerated with WebSkel's existing locked
+Vite build. Refresh the generated files together after its source/build tests.
+This adds no Ploinky runtime dependency or build-tool installation.
