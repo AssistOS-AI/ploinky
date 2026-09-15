@@ -13,7 +13,7 @@ Native Linux hosts use a supported baseline of Podman 5.4.0 or newer; macOS
 uses Podman Machine. Docker and arbitrary remote engines are unsupported for
 the outer Box. Git is needed to clone and update the host checkout.
 
-Before preparing, starting, or restarting a Box on Linux, Ploinky checks:
+Run `ploinky diagnose` from the workspace to check the host environment:
 
 | Requirement | What must be available |
 | --- | --- |
@@ -28,18 +28,19 @@ The current Box runs nested Podman with cgroups disabled and sets no outer CPU
 quota. Startup therefore does not require a particular host cgroup version or
 delegated `cpu`, `memory`, or `pids` controllers.
 
-Missing prerequisites produce a nonzero exit with the failed checks, bounded
-redacted diagnostics, distribution-specific installation guidance, and the next
-configuration step. This happens before the workspace lock, source selection,
-image pull, or Box creation. Ploinky does not install packages or change host
-configuration automatically. Status, logs, help, dry-run, stop, and destroy do
-not run the Linux startup gate, so inspection and cleanup remain available.
+The general host prerequisite survey runs only when `ploinky diagnose` is
+requested. Commands such as `ploinky start explorer` attempt their deployment
+directly; a deployment failure retains its original error and exit code and
+suggests running `ploinky diagnose`. The Node launcher guard, immutable image
+contract, ownership, isolation and runtime readiness checks still apply to the
+operations they protect. Ploinky never installs host packages or changes host
+security configuration automatically.
 
 For a Debian/Ubuntu installation, start with
 `sudo apt-get update && sudo apt-get install podman uidmap passt conmon crun catatonit`.
 Verify `podman --version` meets the minimum: an older distribution may need an
 OS upgrade or a supported newer package source. Install other helpers only when
-the preflight reports they are missing from the selected configuration.
+diagnostics report they are missing from the selected configuration.
 Catatonit supplies the usual `--init` helper; a custom configured init path is
 resolved by Podman rather than rejected because catatonit is absent from PATH.
 Subordinate UID/GID ranges must be allocated by an administrator without
@@ -52,6 +53,47 @@ Use the official [Node.js downloads](https://nodejs.org/en/download),
 for your distribution. The packages inside the Box are checked separately by
 its immutable image contract and entrypoint; they need not all be installed on
 the physical host.
+
+## Diagnose a failed deployment
+
+```bash
+cd /path/to/workspace
+ploinky diagnose
+ploinky --port 8082 --udp-port 7001 diagnose
+ploinky diagnose --json > diagnosis.json
+```
+
+Run diagnostics as the normal deployment account on the physical host. The
+report lists `PASS`, `FAIL`, `WARN` and `SKIP` checks, the actual commands and
+exit codes, bounded redacted errors, and a next step for each failure. Independent
+checks continue after a failure; dependent probes explain why they were skipped.
+Progress goes to stderr, so `--json` produces a machine-readable stdout report.
+Exit status is `0` for completed probes, `1` for failures and `2` when required
+probes cannot be completed. A warning about unreadable loaded AppArmor policy
+does not pretend that installed profile text proves kernel behavior.
+
+Diagnostics inspect Node/PATH, Podman and its selected helpers, subordinate
+identity mappings, devices, storage driver/configuration, login/cgroup context,
+seccomp, SELinux and AppArmor. They check the selected TCP/UDP ports, accounting
+only for the existing owned Box's reservations. Installed profile checks cover
+the nested namespace and FUSE cleanup paths that can block container startup.
+
+Runtime probes create a temporary workspace on the selected filesystem and use
+the normal image verification and Box lifecycle. They may pull the configured
+Box image if it is missing, then export its verified immutable image for the
+isolated inner stores. Host registry credentials are not copied into containers.
+The probes exercise image loading, container creation/start/exec/removal,
+mounted-file write/rename/read/unlink, registry DNS/HTTPS and a deeper Podman
+engine using the existing nested-container confinement options. This can take
+several minutes and needs temporary disk space for the image archives/stores.
+
+The active deployment is not stopped, restarted or repaired. Temporary resources
+are removed only after their identities are revalidated; cleanup failure is a
+failed diagnostic with retained-resource information. No host profile, firewall,
+storage driver or credentials are changed. Commands referencing removed test
+containers are evidence of that attempt; rerun `ploinky diagnose` to reproduce
+them. Diagnosis checks deployment infrastructure; it does not replay arbitrary
+agent install hooks, start user workloads or replace application E2E tests.
 
 ## Getting started
 
@@ -137,6 +179,7 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky bind [ADDRESS:PORT:8080]` | Publish the public Router on this machine's IPv4 `ADDRESS` (`0` for all interfaces) and TCP `PORT`; recreate the Box and restart the configured graph when the mapping changes; save the binding for later lifecycle commands |
 | `ploinky bind 127.0.0.1:PORT:8080` | Restore local-only Router access |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
+| `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and next actions |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
 | `ploinky update` / `ploinky update all [PATH]` | Pull Ploinky with `--rebase --autostash` only when its checkout is inside the selected folder (or the command is run from inside that checkout); still refresh AgentLib, agents, repositories, dependencies, and skills, then restart an already configured running workspace |
 | `ploinky destroy` | Without prompting, stop nested agents and remove the outer container; retain the host workspace and `.ploinky/box` |

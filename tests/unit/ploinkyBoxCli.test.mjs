@@ -115,6 +115,179 @@ test('help, unavailable status, and stop never prepare or invoke current core', 
     }
 });
 
+test('diagnose runs only its host diagnostic runner and preserves clean JSON and failure status', async () => {
+    const env = { PATH: '/diagnostic/bin' };
+    const output = bufferStream();
+    const errorOutput = bufferStream();
+    const calls = [];
+    const report = { exitCode: 3, checks: [{ id: 'podman', status: 'fail', command: 'podman info' }] };
+    const code = await runOuterCli(['--debug', 'diagnose', '--json'], {
+        env,
+        output,
+        errorOutput,
+        cwd: () => '/work/selected',
+        repositoryRoot: '/work/ploinky-source',
+        detectInsideBox: () => false,
+        supervisor: new Proxy({}, { get() { throw new Error('diagnose must never consult the supervisor'); } }),
+        execute() { throw new Error('diagnose must never execute a core command'); },
+        async diagnose(options) {
+            calls.push(options);
+            options.progress('Checking the deployment runtime');
+            return report;
+        },
+    });
+    assert.equal(code, 3);
+    assert.deepEqual(JSON.parse(output.value()), report);
+    assert.equal(calls.length, 1);
+    const { progress, ...request } = calls[0];
+    assert.equal(typeof progress, 'function');
+    assert.deepEqual(request, {
+        env, cwd: '/work/selected', repositoryRoot: '/work/ploinky-source',
+        explicitPort: null, explicitMediaPort: null,
+    });
+    assert.equal(errorOutput.value(), '[diagnose] Checking the deployment runtime\n');
+});
+
+test('bare diagnose formats the report with the failing command and its next action', async () => {
+    const output = bufferStream();
+    const report = {
+        workspace: '/work/selected',
+        exitCode: 1,
+        checks: [{
+            id: 'podman', label: 'Podman storage', status: 'fail',
+            command: { file: 'podman', args: ['info', '--format', 'json'] },
+            exitCode: 125, detail: 'Storage could not be opened.', next: 'Check the storage configuration.',
+        }],
+    };
+    const code = await runOuterCli(['diagnose'], {
+        env: {}, output, errorOutput: bufferStream(), detectInsideBox: () => false,
+        diagnose: async () => report,
+        supervisor: new Proxy({}, { get() { throw new Error('No Box supervisor action is permitted'); } }),
+    });
+    assert.equal(code, 1);
+    assert.match(output.value(), /\[FAIL\] Podman storage/);
+    assert.match(output.value(), /Command: podman info --format json/);
+    assert.match(output.value(), /Exit: 125/);
+    assert.match(output.value(), /Next: Check the storage configuration\./);
+});
+
+test('diagnose receives explicitly selected deployment ports without mutation', async () => {
+    const calls = [];
+    const report = { exitCode: 0, checks: [] };
+    const code = await runOuterCli(['--port', '18080', '--udp-port', '17882', 'diagnose', '--json'], {
+        env: {},
+        output: bufferStream(),
+        detectInsideBox: () => false,
+        supervisor: new Proxy({}, { get() { throw new Error('diagnose must not prepare a Box'); } }),
+        async diagnose(options) { calls.push(options); return report; },
+    });
+    assert.equal(code, 0);
+    assert.equal(calls[0].explicitPort, 18080);
+    assert.equal(calls[0].explicitMediaPort, 17882);
+});
+
+test('diagnose inside a Box explains the host requirement without forwarding or probing', async () => {
+    for (const argv of [
+        ['diagnose'], ['--debug', 'diagnose', '--json'], ['--', 'diagnose'],
+        ['--port', '18080', '--udp-port', '17882', 'diagnose'],
+    ]) {
+        const errorOutput = bufferStream();
+        const code = await runOuterCli(argv, {
+            errorOutput,
+            detectInsideBox: () => true,
+            cwd() { throw new Error('No workspace lookup is needed inside the Box'); },
+            execute() { throw new Error('Do not forward diagnose into the core'); },
+            diagnose() { throw new Error('Do not diagnose the wrong host boundary'); },
+        });
+        assert.equal(code, 1);
+        assert.match(errorOutput.value(), /must run on the physical host, outside the Box/);
+    }
+});
+
+test('deployment lifecycle failures suggest explicit diagnosis once without swallowing the error', async () => {
+    for (const [argv, method] of [
+        [['start', 'Agent'], 'runStartTransaction'],
+        [['restart'], 'runRestartTransaction'],
+        [['restart', 'Agent'], 'runTargetedRestartTransaction'],
+        [['bind'], 'runBindTransaction'],
+        [['update'], 'runUpdateTransaction'],
+        [['cli'], 'prepareBoxForCommand'],
+        [[], 'prepareBoxForCommand'],
+    ]) {
+        const failure = new Error('fixture deployment failed');
+        const errorOutput = bufferStream();
+        const supervisor = fakeSupervisor([]);
+        supervisor[method] = async () => { throw failure; };
+        await assert.rejects(runOuterCli(argv, {
+            env: {},
+            input: {},
+            output: bufferStream(),
+            errorOutput,
+            supervisor,
+            detectInsideBox: () => false,
+            updateHostSource: async () => ({ updated: false }),
+            diagnose() { throw new Error('Failures must never run diagnosis automatically'); },
+        }), error => error === failure);
+        assert.equal(errorOutput.value(),
+            'Run ploinky diagnose from this workspace for prerequisite, storage, and security-profile diagnostics.\n');
+    }
+});
+
+test('nonzero prepared execution keeps its exit code and suggests diagnosis only on failure', async () => {
+    for (const status of [0, 17]) {
+        for (const argv of [['cli'], ['cli', 'Agent'], ['list', 'agents']]) {
+            const errorOutput = bufferStream();
+            const code = await runOuterCli(argv, {
+                env: {}, input: {}, output: bufferStream(), errorOutput,
+                supervisor: fakeSupervisor([]), detectInsideBox: () => false,
+                execute: () => status,
+                diagnose() { throw new Error('Prepared commands must never run diagnosis automatically'); },
+            });
+            assert.equal(code, status);
+            assert.equal((errorOutput.value().match(/Run ploinky diagnose/g) || []).length, status ? 1 : 0);
+        }
+    }
+});
+
+test('inspection, shutdown, and diagnostic failures do not suggest deployment diagnosis', async () => {
+    for (const [argv, method] of [
+        [['status'], 'inspectBoxStatus'],
+        [['logs'], 'inspectBoxStatus'],
+        [['--dry-run', 'start', 'Agent'], 'planDryRun'],
+        [['stop'], 'runStopTransaction'],
+        [['destroy'], 'runDestroyTransaction'],
+    ]) {
+        const errorOutput = bufferStream();
+        const failure = new Error('fixture observation failure');
+        const supervisor = fakeSupervisor([]);
+        supervisor[method] = () => { throw failure; };
+        await assert.rejects(runOuterCli(argv, {
+            env: {}, input: {}, output: bufferStream(), errorOutput,
+            supervisor, detectInsideBox: () => false,
+        }), error => error === failure);
+        assert.equal(errorOutput.value(), '');
+    }
+    const errorOutput = bufferStream();
+    const failure = new Error('diagnostic runner failed');
+    await assert.rejects(runOuterCli(['diagnose'], {
+        output: bufferStream(), errorOutput, detectInsideBox: () => false,
+        diagnose() { throw failure; },
+    }), error => error === failure);
+    assert.equal(errorOutput.value(), '');
+});
+
+test('updated CLI owns the single failure hint after relaunch', async () => {
+    const errorOutput = bufferStream();
+    const code = await runOuterCli(['update'], {
+        env: {}, input: {}, output: bufferStream(), errorOutput,
+        supervisor: fakeSupervisor([]), detectInsideBox: () => false,
+        updateHostSource: async () => ({ updated: true }),
+        relaunch() { errorOutput.write('Run ploinky diagnose from the updated CLI.\n'); return 23; },
+    });
+    assert.equal(code, 23);
+    assert.equal(errorOutput.value(), 'Run ploinky diagnose from the updated CLI.\n');
+});
+
 test('running status uses the read-only core renderer without preparing the Box', async () => {
     const events = [];
     const output = bufferStream();
@@ -765,6 +938,8 @@ test('public help documents non-interactive destroy and explicit cache deletion'
     assert.match(output.value(), /destroy --delete-cache/);
     assert.match(output.value(), /ploinky update \[PATH\]/);
     assert.match(output.value(), /ploinky update all \[PATH\]/);
+    assert.match(output.value(), /ploinky diagnose \[--json\]/);
+    assert.match(output.value(), /start and restart do not run prerequisite diagnostics/);
     assert.doesNotMatch(output.value(), /--delete-volumes/);
     assert.match(output.value(), /\.ploinky\/box/);
     assert.match(output.value(), /destroy\s+Remove the outer Box without prompting/);

@@ -97,29 +97,25 @@ for (const [name, invoke] of [
     ['restart', supervisor => supervisor.runRestartTransaction(['restart'])],
     ['targeted restart', supervisor => supervisor.runTargetedRestartTransaction(['restart', 'fixture-agent'])],
     ['update', supervisor => supervisor.runUpdateTransaction(['update'])],
+    ['bind', supervisor => supervisor.runBindTransaction()],
 ]) {
-    test(`${name} rejects a failed host preflight before any workspace or runtime work`, async t => {
+    test(`${name} reaches workspace identity without automatic prerequisite probes`, async t => {
         const state = fixture(t);
         const events = [];
         const lockManager = fakeLockManager(state.root, events);
         const runner = { run() { events.push('runtime'); }, query() { events.push('query'); } };
         const env = { PATH: '/fixture/bin' };
-        const failure = new Error('Podman is unavailable. Install Podman before retrying.');
+        const failure = new Error('Workspace identity sentinel');
         const unexpected = name => () => { events.push(name); throw new Error(`Unexpected ${name}`); };
         const supervisor = createBoxSupervisor({
             platform: 'linux',
             env,
             runner,
             lockManager,
-            async checkHostPrerequisites(options) {
-                assert.equal(options.platform, 'linux');
-                assert.equal(options.runner, runner);
-                assert.equal(options.env, env);
-                events.push('preflight');
-                await Promise.resolve();
+            resolveIdentity() {
+                events.push('identity');
                 throw failure;
             },
-            resolveIdentity: unexpected('identity'),
             discover: unexpected('discovery'),
             selectAgentLib: unexpected('select-agentlib'),
             updateAgentLib: unexpected('update-agentlib'),
@@ -130,23 +126,18 @@ for (const [name, invoke] of [
         });
 
         await assert.rejects(invoke(supervisor), error => error === failure);
-        assert.deepEqual(events, ['preflight']);
+        assert.deepEqual(events, ['identity']);
         assert.equal(lockManager.acquisitions, 0);
         assert.deepEqual(fs.readdirSync(state.workspace), []);
     });
 }
 
-test('status, dry-run, stop, and destroy remain available when host prerequisites fail', async t => {
+test('status, dry-run, stop, and destroy need no prerequisite probes', async t => {
     const state = fixture(t);
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: false });
     const events = [];
-    let checks = 0;
     const supervisor = createBoxSupervisor({
         platform: 'linux',
-        checkHostPrerequisites() {
-            checks += 1;
-            throw new Error('Podman prerequisite failed');
-        },
         resolveIdentity: () => identity,
         lockManager: fakeLockManager(state.root, events),
         discover: () => ({ state: 'absent', engine: { name: 'podman' }, handles: {} }),
@@ -159,7 +150,6 @@ test('status, dry-run, stop, and destroy remain available when host prerequisite
     assert.equal(fs.existsSync(path.join(state.workspace, '.ploinky')), false);
     assert.equal((await supervisor.runStopTransaction()).action, 'absent');
     assert.equal((await supervisor.runDestroyTransaction()).action, 'absent');
-    assert.equal(checks, 0);
     assert.deepEqual(events, ['lock', 'release', 'lock', 'release']);
 });
 
@@ -170,7 +160,6 @@ test('destroying a running Box stops nested agents before the outer Box is remov
     const events = [];
     const ownership = owned(identity, { running: true });
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -199,7 +188,6 @@ test('destroy revalidates the exact container after stopping it', async (t) => {
     fs.mkdirSync(replacedRoot);
     const replacedEvents = [];
     const replaced = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(replacedRoot, replacedEvents),
@@ -224,7 +212,6 @@ test('destroy revalidates the exact container after stopping it', async (t) => {
     fs.mkdirSync(recoveryRoot);
     const recoveryEvents = [];
     const recovery = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(recoveryRoot, recoveryEvents),
@@ -251,7 +238,6 @@ test('a failed nested stop halts the Box but removes nothing', async (t) => {
     const events = [];
     const ownership = owned(identity, { running: true });
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -288,7 +274,6 @@ test('a failed outer removal retains the workspace cache data', async (t) => {
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -316,7 +301,6 @@ test('unsupported discovery happens before markerless anchor materialization', a
     const events = [];
     const lockManager = fakeLockManager(state.root, events);
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => resolveWorkspaceIdentity({ env: {}, cwd: () => state.workspace }),
         lockManager,
         discover: () => ({ state: 'unsupported', message: 'native Linux required' }),
@@ -327,7 +311,7 @@ test('unsupported discovery happens before markerless anchor materialization', a
     assert.deepEqual(events, ['lock', 'release']);
 });
 
-test('prepare checks host prerequisites before locking, then reconciles and validates dependencies', async (t) => {
+test('prepare locks and reconciles without prerequisite probes, then validates dependencies', async (t) => {
     const state = fixture(t);
     fs.mkdirSync(path.join(state.workspace, '.ploinky'));
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
@@ -337,12 +321,6 @@ test('prepare checks host prerequisites before locking, then reconciles and vali
     const imageOverride = 'registry.example.test/ploinky-box:dev';
     const runner = { run(command, args) { events.push(`run:${args.join(' ')}`); } };
     const supervisor = createBoxSupervisor({
-        async checkHostPrerequisites() {
-            assert.equal(lockManager.acquisitions, 0);
-            events.push('preflight');
-            await Promise.resolve();
-            events.push('preflight-complete');
-        },
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,
@@ -360,8 +338,6 @@ test('prepare checks host prerequisites before locking, then reconciles and vali
     assert.equal(result.containerId, ownership.handles.container.id);
     assert.equal(lockManager.acquisitions, 1);
     assert.deepEqual(events, [
-        'preflight',
-        'preflight-complete',
         'lock',
         'reconcile',
         `run:container exec --user podman --workdir /workspace ${ownership.handles.container.id} /opt/ploinky/bin/ploinky-install-deps`,
@@ -381,7 +357,6 @@ test('targeted restart preserves the exact running Box and mounted AgentLib gene
     container.labels[BOX_LABELS.routerHostPort] = '19090';
     container.labels[BOX_LABELS.mediaHostPort] = '17891';
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         env: {}, // Deliberately resolves to :latest, unlike the running Box.
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -507,7 +482,6 @@ test('targeted restart refuses stopped and uninitialized Boxes without mutation'
         ownership.handles.container.labels[BOX_LABELS.routerHostPort] = '8080';
         ownership.handles.container.labels[BOX_LABELS.mediaHostPort] = '7882';
         const supervisor = createBoxSupervisor({
-            checkHostPrerequisites: () => {},
             resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
             lockManager: fakeLockManager(caseRoot, []),
@@ -556,7 +530,6 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
         pullStrategy: 'rebase-autostash',
     });
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,
@@ -628,7 +601,6 @@ test('stop relays to ploinky-local before stopping the outer Box without depende
     const events = [];
     const ownership = owned(identity);
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -652,7 +624,6 @@ test('destroy revalidates the inspected immutable ID and retains cache data by d
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -681,7 +652,6 @@ test('explicit cache deletion happens only after the outer container is removed'
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -722,7 +692,6 @@ test('cache deletion works when the outer container is already absent', async (t
     seedBoxCache(identity);
     const events = [];
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -750,7 +719,6 @@ test('status and dry-run inspect without acquiring a lock or creating an anchor'
     const events = [];
     const lockManager = fakeLockManager(state.root, events);
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,
@@ -769,7 +737,6 @@ test('running status uses immutable-ID inbox inspection and allowlists its outpu
     const ownership = owned(identity);
     const calls = [];
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -801,7 +768,6 @@ test('running status allowlists and renders concise Cloudflare publication state
     const identity = buildWorkspaceIdentity(state.workspace, { markerFound: true });
     const ownership = owned(identity);
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -854,7 +820,6 @@ test('status reports an older owned image as incompatible while destroy remains 
     const events = [];
     const lockManager = fakeLockManager(state.root, events);
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager,
@@ -893,7 +858,6 @@ test('status reports a timed-out image probe as unknown without admitting or ent
         },
     }];
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -922,7 +886,6 @@ test('status validates the complete mount contract before entering the Box', (t)
     const ownership = owned(identity);
     let inboxQueried = false;
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         discover: () => ownership,
@@ -956,7 +919,6 @@ test('failed ploinky-local stop still stops the outer Box', async (t) => {
     const ownership = owned(identity);
     const events = [];
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -989,7 +951,6 @@ test('start selects the AgentLib source and passes the host address into the bou
     let revalidated = null;
     let committed = null;
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1043,7 +1004,6 @@ test('a source that changes during startup is not committed and is not declared 
     const agentLib = agentLibFixture(identity.workspaceRoot);
     let committed = false;
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1105,7 +1065,6 @@ test('a failed replacement restores and health-checks the prior Box graph before
     let coreCalls = 0;
     let committed = false;
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         env: {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
@@ -1508,7 +1467,6 @@ test('destroy retires retained markers and workspace lease only after exact Box 
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -1533,7 +1491,6 @@ test('repeat destroy recovers markers when the Box is already absent without rea
     fs.writeFileSync(path.join(identity.anchorPath, 'agents.json'), '{malformed retained registry');
     const events = [];
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),
@@ -1555,7 +1512,6 @@ test('failed Box removal preserves current no-wait markers and workspace lease',
     const events = [];
     const ownership = owned(identity, { running: false });
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {},
         resolveIdentity: () => identity,
         launchCwd: identity.workspaceRoot,
         lockManager: fakeLockManager(state.root, events),

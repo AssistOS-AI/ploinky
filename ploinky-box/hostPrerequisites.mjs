@@ -15,7 +15,7 @@ function readText(fsApi, filename) {
     try { return fsApi.readFileSync(filename, 'utf8'); } catch { return null; }
 }
 
-function distributionFamily(fsApi) {
+export function distributionFamily(fsApi) {
     const release = readText(fsApi, '/etc/os-release') || '';
     const names = [...release.matchAll(/^(?:ID|ID_LIKE)=["']?([^"'\r\n]+)/gm)]
         .flatMap((match) => match[1].toLowerCase().split(/\s+/));
@@ -27,7 +27,7 @@ function distributionFamily(fsApi) {
     return '';
 }
 
-function installInstruction(family, packages) {
+export function installInstruction(family, packages) {
     const mapped = packages.map((name) => name === 'uidmap'
         ? ({ fedora: 'shadow-utils', arch: 'shadow', alpine: 'shadow-subids', suse: 'shadow' }[family] || name)
         : name);
@@ -42,7 +42,7 @@ function installInstruction(family, packages) {
     return prefix ? `Run: ${prefix} ${list}.` : `Install ${list} using your distribution's package manager; see ${INSTALL_DOCS}.`;
 }
 
-function executable(fsApi, filename) {
+export function executable(fsApi, filename) {
     try {
         if (!fsApi.statSync(filename).isFile()) return false;
         fsApi.accessSync(filename, fs.constants.X_OK);
@@ -50,20 +50,20 @@ function executable(fsApi, filename) {
     } catch { return false; }
 }
 
-function onPath(fsApi, env, name) {
+export function onPath(fsApi, env, name) {
     return String(env.PATH || '').split(path.delimiter).filter(Boolean)
         .map((directory) => path.join(directory, name))
         .find((filename) => executable(fsApi, filename));
 }
 
-function supportedVersion(text) {
+export function supportedVersion(text) {
     const match = /^podman version (\d+)\.(\d+)(?:\.(\d+))?(?:[-+][\w.-]+)?\s*$/i.exec(text.trim());
     if (!match) return false;
     const [major, minor] = match.slice(1, 3).map(Number);
     return major > 5 || (major === 5 && minor >= 4);
 }
 
-function completeMapping(text) {
+export function completeMapping(text) {
     const rows = text.trim().split(/\r?\n/).map((line) => line.trim().split(/\s+/));
     let next = 0;
     for (const row of rows) {

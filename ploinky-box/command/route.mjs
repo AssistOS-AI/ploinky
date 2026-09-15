@@ -92,9 +92,23 @@ function routeStatus(parsed) {
     });
 }
 
+function routeDiagnose(parsed) {
+    if (parsed.dryRun) {
+        throw routeError('diagnose: --dry-run is not supported; diagnose runs temporary probes and cleans them up');
+    }
+    if (parsed.commandArgs.length > 1
+        || (parsed.commandArgs.length === 1 && parsed.commandArgs[0] !== '--json')) {
+        throw routeError('Usage: ploinky diagnose [--json]');
+    }
+    return Object.freeze({ kind: 'diagnose', json: parsed.commandArgs[0] === '--json' });
+}
+
 export function routeOuterCommand(parsed) {
     if (parsed.help || parsed.command === 'help') {
         return Object.freeze({ kind: 'help', topic: parsed.commandArgs });
+    }
+    if (parsed.command === 'diagnose') {
+        return routeDiagnose(parsed);
     }
     if (parsed.command === 'status') {
         return routeStatus(parsed);

@@ -38,6 +38,10 @@ Commands:
   ploinky --dry-run bind [ADDRESS:PORT:8080]
                                   Show the bind plan without changing anything
   ploinky status [--verbose]      Inspect Box and core state without mutation
+  ploinky diagnose [--json]       Check prerequisites, Podman storage, and security
+                                  profiles using temporary deployment probes
+  ploinky --port PORT --udp-port PORT diagnose
+                                  Check ports selected for a failed deployment
   ploinky stop                    Stop core services and the outer Box
   ploinky update [PATH]           Update Ploinky only when its checkout is within
   ploinky update all [PATH]       the selected folder; always refresh repos/deps/skills
@@ -52,6 +56,10 @@ Commands:
 
 Logs are observational: they require an already running, initialized, owned Box
 and never create, prepare, or repair one.
+
+Diagnose runs explicitly; start and restart do not run prerequisite diagnostics.
+It reports failing commands and next steps without changing host configuration
+or starting, stopping, or repairing the workspace's existing Box.
 
 Bind uses BIND_ADDRESS:HOST_TCP_PORT:8080. BIND_ADDRESS is 0 or 0.0.0.0 (all IPv4
 interfaces), 127.0.0.1 (restore local-only access), or an IPv4 address assigned
@@ -105,7 +113,68 @@ function executePrepared(prepared, coreArgv, {
     ), { env: engineEnv });
 }
 
-export async function runOuterCli(argv, {
+const DEPLOYMENT_DIAGNOSTIC_HINT = 'Run ploinky diagnose from this workspace for prerequisite, storage, and security-profile diagnostics.';
+const DEPLOYMENT_ROUTES = new Set(['start', 'restart', 'bind', 'update', 'generic', 'repl', 'agent-cli', 'bash']);
+
+export async function runOuterCli(argv, options = {}) {
+    const {
+        env = process.env,
+        output = process.stdout,
+        errorOutput = process.stderr,
+        execute = executeProcess,
+        detectInsideBox = isInsideBox,
+        cwd = () => process.cwd(),
+        repositoryRoot = path.resolve(import.meta.dirname, '../..'),
+        diagnose,
+    } = options;
+    if (detectInsideBox()) {
+        // Preserve unchanged core forwarding for other commands, including
+        // core-only options that the outer argument parser does not accept.
+        let command = '';
+        try { command = parseOuterArguments(argv).command; } catch (_) {}
+        if (command === 'diagnose') {
+            errorOutput.write('ploinky diagnose must run on the physical host, outside the Box. Exit this shell and run ploinky diagnose from the host workspace.\n');
+            return 1;
+        }
+        return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
+    }
+    const parsed = parseOuterArguments(argv);
+    const route = routeOuterCommand(parsed);
+    const launchDirectory = cwd();
+    if (route.kind === 'diagnose') {
+        const runDiagnosis = diagnose || (await import('../diagnose.mjs')).diagnoseWorkspace;
+        const report = await runDiagnosis({
+            env,
+            cwd: launchDirectory,
+            repositoryRoot,
+            explicitPort: parsed.explicitPort,
+            explicitMediaPort: parsed.explicitMediaPort,
+            progress: message => errorOutput.write(`[diagnose] ${message}\n`),
+        });
+        if (route.json) {
+            output.write(`${JSON.stringify(report, null, 2)}\n`);
+        } else {
+            const { formatDiagnosticReport } = await import('../diagnose.mjs');
+            output.write(formatDiagnosticReport(report));
+        }
+        return report.exitCode;
+    }
+    const dispatch = { relaunched: false };
+    try {
+        const exitCode = await runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch, options);
+        if (exitCode !== 0 && DEPLOYMENT_ROUTES.has(route.kind) && !dispatch.relaunched) {
+            errorOutput.write(`${DEPLOYMENT_DIAGNOSTIC_HINT}\n`);
+        }
+        return exitCode;
+    } catch (error) {
+        if (DEPLOYMENT_ROUTES.has(route.kind)) {
+            errorOutput.write(`${DEPLOYMENT_DIAGNOSTIC_HINT}\n`);
+        }
+        throw error;
+    }
+}
+
+async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch, {
     env = process.env,
     input = process.stdin,
     output = process.stdout,
@@ -113,19 +182,12 @@ export async function runOuterCli(argv, {
     supervisor,
     execute = executeProcess,
     executeStreaming = executeProcessStreaming,
-    detectInsideBox = isInsideBox,
     cwd = () => process.cwd(),
     repositoryRoot = path.resolve(import.meta.dirname, '../..'),
     updateHostSource = updateHostPloinkySource,
     relaunch = executeProcess,
 } = {}) {
-    if (detectInsideBox()) {
-        return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
-    }
-    const launchDirectory = cwd();
     const selectedSupervisor = supervisor || createBoxSupervisor({ env, launchCwd: launchDirectory });
-    const parsed = parseOuterArguments(argv);
-    const route = routeOuterCommand(parsed);
     const engineEnv = buildEngineProcessEnvironment(env);
     outerDebug(parsed, route, output);
 
@@ -266,6 +328,9 @@ export async function runOuterCli(argv, {
         const hostUpdate = await updateHostSource({ repositoryRoot, updateScopeRoot });
         if (hostUpdate.updated) {
             output.write('Host Ploinky checkout updated; continuing with the updated CLI.\n');
+            // The updated CLI owns diagnostics for its invocation; do not
+            // duplicate its hint when the child propagates a failure status.
+            dispatch.relaunched = true;
             return relaunch(process.execPath, [fileURLToPath(import.meta.url), ...argv], { env });
         }
         if (hostUpdate.skipped) {

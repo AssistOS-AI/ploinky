@@ -41,7 +41,8 @@ loading modules. The supported native host baseline is Podman 5.4.0+; its
 selected runtime, networking, and configured storage helpers remain external
 system prerequisites, with the effective paths read from `podman info`.
 Rootless UID/GID helpers, namespace mappings, seccomp, and FUSE/TUN device access
-are checked before Box preparation. Host cgroup versions and controller
+are surveyed by the explicit `ploinky diagnose` command. Normal deployment
+does not run this general host preflight. Host cgroup versions and controller
 delegation are not prerequisites for the current Box runtime, which disables
 nested cgroups and sets no outer CPU quota. Installation and
 configuration guidance is in [README.md](README.md#prerequisites) and in each
@@ -49,6 +50,21 @@ failure message. These checks neither install packages nor alter host settings.
 The host's configured packages retain their distribution/upstream licensing;
 none is newly vendored or redistributed by this change. Regression tests use
 fake filesystems and process runners and need no container engine.
+
+`ploinky diagnose` adds no runtime package. Its report and isolated probes use
+Node.js built-ins, the existing Podman CLI, validated Box image and bundled
+tools. Host checks read selected configuration and installed security profiles;
+they never install packages or modify policy. Deep probes may pull the existing
+configured Box image, export an OCI archive and load that exact image into
+temporary nested engines; no host registry credentials are transferred. The
+configured registry's DNS/HTTPS endpoint is tested, and unavailable or
+inapplicable checks are reported explicitly. The selected image's existing
+licenses/notices remain with the image; no new image dependency is introduced.
+Runtime tests need disk space for temporary image copies and remove only their
+verified resources. Run the command on the host, in the selected workspace;
+missing prerequisites produce bounded command/error/next-step results. The
+probe implementation can be removed without changing ordinary deployment,
+which retains the essential image, ownership, isolation and readiness contracts.
 
 The focused tests substitute container operations and require no container engine or model backend. The broader acceptance harness can optionally use an existing Podman installation to provide Linux; its environment requirements are documented with that harness. No external code, licenses, or notices were added by this component.
 

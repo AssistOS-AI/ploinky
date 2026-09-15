@@ -161,6 +161,24 @@ test('status accepts only verbose detail and preserves debug for read-only core 
     }
 });
 
+test('diagnose accepts JSON and selected ports without forwarding or starting a deployment', () => {
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['diagnose'])), { kind: 'diagnose', json: false });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['diagnose', '--json'])), { kind: 'diagnose', json: true });
+    assert.deepEqual(routeOuterCommand(parseOuterArguments(['--debug', 'diagnose', '--json'])), { kind: 'diagnose', json: true });
+    const selectedPorts = parseOuterArguments(['--port', '18080', '--udp-port', '17882', 'diagnose', '--json']);
+    assert.equal(selectedPorts.explicitPort, 18080);
+    assert.equal(selectedPorts.explicitMediaPort, 17882);
+    assert.deepEqual(routeOuterCommand(selectedPorts), { kind: 'diagnose', json: true });
+    for (const argv of [
+        ['diagnose', 'Agent'],
+        ['diagnose', '--json', '--json'],
+        ['diagnose', '--port', '8080'],
+        ['--dry-run', 'diagnose'],
+    ]) {
+        assert.throws(() => routeOuterCommand(parseOuterArguments(argv)), { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
+    }
+});
+
 test('full update routes through the host while targeted update forms remain generic', () => {
     assert.deepEqual(routeOuterCommand(parseOuterArguments(['--debug', 'update'])), {
         kind: 'update',
