@@ -54,6 +54,10 @@ const TMPFS_INSPECTED_OPTIONS = Object.freeze([
 ].sort());
 const EMPTY_LOG_BASELINE = Object.freeze({ stdout: '', stderr: '' });
 
+function storedLogs(text) {
+    return text.replace(/^(.+)$/gm, '2026-09-15T09:00:00.000000000Z $1');
+}
+
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-transaction-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -1238,8 +1242,8 @@ test('container start captures an immutable cumulative-log baseline before mutat
             calls.push(['query', ...args]);
             if (args[1] === 'logs') {
                 return started
-                    ? { ok: true, stdout: `historical\n${BOX_READY_LINE}\n`, stderr: 'old stderr\n' }
-                    : { ok: true, stdout: 'historical\n', stderr: 'old stderr\n' };
+                    ? { ok: true, stdout: storedLogs(`historical\n${BOX_READY_LINE}\n`), stderr: storedLogs('old stderr\n') }
+                    : { ok: true, stdout: storedLogs('historical\n'), stderr: storedLogs('old stderr\n') };
             }
             return { ok: true, stdout: 'running\n', stderr: '' };
         },
@@ -1253,7 +1257,7 @@ test('container start captures an immutable cumulative-log baseline before mutat
         'a'.repeat(64),
         runner,
     );
-    assert.deepEqual(baseline, { stdout: 'historical\n', stderr: 'old stderr\n' });
+    assert.deepEqual(baseline, { stdout: storedLogs('historical\n'), stderr: storedLogs('old stderr\n'), diagnostics: '' });
     assert.equal(Object.isFrozen(baseline), true);
 
     calls.length = 0;
@@ -1291,7 +1295,7 @@ test('container start captures an immutable cumulative-log baseline before mutat
 
 test('historical readiness cannot hide a current-boot runroot failure', async () => {
     const baseline = Object.freeze({
-        stdout: `[ploinky-box] first boot\n${BOX_READY_LINE}\n`,
+        stdout: storedLogs(`[ploinky-box] first boot\n${BOX_READY_LINE}\n`),
         stderr: '',
     });
     const runner = {
@@ -1300,7 +1304,7 @@ test('historical readiness cannot hide a current-boot runroot failure', async ()
                 return {
                     ok: true,
                     stdout: baseline.stdout,
-                    stderr: '[ploinky-box] SELF-CHECK FAILED: EACCES, Permission denied: /tmp/storage-run-1000\n',
+                    stderr: storedLogs('[ploinky-box] SELF-CHECK FAILED: EACCES, Permission denied: /tmp/storage-run-1000\n'),
                 };
             }
             return { ok: true, stdout: 'exited\n', stderr: '' };
@@ -1319,8 +1323,8 @@ test('historical readiness cannot hide a current-boot runroot failure', async ()
 
 test('only fresh ready output is streamed and accepted while the Box is running', async () => {
     const baseline = Object.freeze({
-        stdout: `old output\n${BOX_READY_LINE}\n`,
-        stderr: 'old diagnostic\n',
+        stdout: storedLogs(`old output\n${BOX_READY_LINE}\n`),
+        stderr: storedLogs('old diagnostic\n'),
     });
     const stdout = { value: '', write(chunk) { this.value += String(chunk); } };
     const stderr = { value: '', write(chunk) { this.value += String(chunk); } };
@@ -1333,8 +1337,8 @@ test('only fresh ready output is streamed and accepted while the Box is running'
                     ? { ok: true, ...baseline }
                     : {
                         ok: true,
-                        stdout: `${baseline.stdout}current boot\n${BOX_READY_LINE}\n`,
-                        stderr: `${baseline.stderr}current diagnostic\n`,
+                        stdout: baseline.stdout + storedLogs(`current boot\n${BOX_READY_LINE}\n`),
+                        stderr: baseline.stderr + storedLogs('current diagnostic\n'),
                     };
             }
             return { ok: true, stdout: 'running\n', stderr: '' };
@@ -1356,7 +1360,7 @@ test('a fresh ready marker never overrides a terminal state from the same poll',
     const runner = {
         query(_command, args) {
             if (args[1] === 'logs') {
-                return { ok: true, stdout: `${BOX_READY_LINE}\n`, stderr: 'boot exited\n' };
+                return { ok: true, stdout: storedLogs(`${BOX_READY_LINE}\n`), stderr: storedLogs('boot exited\n') };
             }
             return { ok: true, stdout: 'exited\n', stderr: '' };
         },
@@ -1373,8 +1377,8 @@ test('a fresh ready marker never overrides a terminal state from the same poll',
 
 test('readiness fails closed when either cumulative log stream drifts', async () => {
     for (const stream of ['stdout', 'stderr']) {
-        const baseline = { stdout: 'stdout-before\n', stderr: 'stderr-before\n' };
-        const current = { ...baseline, [stream]: `${stream}-different\n` };
+        const baseline = { stdout: storedLogs('stdout-before\n'), stderr: storedLogs('stderr-before\n') };
+        const current = { ...baseline, [stream]: storedLogs(`${stream}-different\n`) };
         const runner = {
             query(_command, args) {
                 if (args[1] === 'logs') return { ok: true, ...current };
@@ -1396,7 +1400,7 @@ test('readiness cannot succeed without a running-state proof', async () => {
     const runner = {
         query(_command, args) {
             if (args[1] === 'logs') {
-                return { ok: true, stdout: `${BOX_READY_LINE}\n`, stderr: '' };
+                return { ok: true, stdout: storedLogs(`${BOX_READY_LINE}\n`), stderr: '' };
             }
             return { ok: false, stdout: '', stderr: 'inspect unavailable' };
         },
@@ -1426,7 +1430,7 @@ test('readiness failure rereads bounded container self-check diagnostics after e
                 return {
                     ok: true,
                     stdout: '',
-                    stderr: '[ploinky-box] SELF-CHECK FAILED: inner runtime is unavailable\n',
+                    stderr: storedLogs('[ploinky-box] SELF-CHECK FAILED: inner runtime is unavailable\n'),
                 };
             }
             return { ok: true, stdout: 'exited\n', stderr: '' };
@@ -1448,7 +1452,7 @@ test('readiness explains legacy TUN self-check failures as an access problem', a
                 return {
                     ok: true,
                     stdout: '',
-                    stderr: '[ploinky-box] SELF-CHECK FAILED: /dev/net/tun not present\n',
+                    stderr: storedLogs('[ploinky-box] SELF-CHECK FAILED: /dev/net/tun not present\n'),
                 };
             }
             return { ok: true, stdout: 'exited\n', stderr: '' };
@@ -1473,11 +1477,11 @@ test('readiness streams each Box log line once before readiness', async () => {
             if (args[1] === 'logs') {
                 logReads += 1;
                 return logReads === 1
-                    ? { ok: true, stdout: '[ploinky-box] Starting runtime self-checks\n', stderr: '' }
+                    ? { ok: true, stdout: storedLogs('[ploinky-box] Starting runtime self-checks\n'), stderr: '' }
                     : {
                         ok: true,
-                        stdout: `[ploinky-box] Starting runtime self-checks\n${BOX_READY_LINE}\n`,
-                        stderr: '[ploinky-box] diagnostic\n',
+                        stdout: storedLogs(`[ploinky-box] Starting runtime self-checks\n${BOX_READY_LINE}\n`),
+                        stderr: storedLogs('[ploinky-box] diagnostic\n'),
                     };
             }
             return { ok: true, stdout: 'running\n', stderr: '' };

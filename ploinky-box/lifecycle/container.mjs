@@ -27,14 +27,19 @@ import {
     revalidateWorkspaceDataPaths,
     workspaceDataMountArgs,
 } from '../workspace-data.mjs';
+import {
+    emitContainerLogDiagnostics,
+    readContainerLogs,
+    renderContainerLogs,
+} from './container-logs.mjs';
 
 function lifecycleError(message, code = 'PLOINKY_BOX_LIFECYCLE_FAILED', cause) {
     return new PloinkyBoxError(message, { code, cause });
 }
 
 function containerLogDiagnostic(logs, limit = 2048) {
-    const text = [logs?.stdout, logs?.stderr]
-        .map((value) => String(value || '').trim())
+    const text = [logs?.stdout, logs?.stderr, logs?.diagnostics]
+        .map((value) => renderContainerLogs(value).trim())
         .filter(Boolean)
         .join('\n')
         .replace(/\s+/g, ' ');
@@ -52,7 +57,7 @@ function writeLogDelta(output, currentValue, previousValue) {
     const current = String(currentValue || '');
     const previous = String(previousValue || '');
     if (!current || current === previous) return current;
-    output?.write?.(current.slice(previous.length));
+    output?.write?.(renderContainerLogs(current.slice(previous.length)));
     return current;
 }
 
@@ -189,7 +194,7 @@ export function stopPloinkyLocalByContainerId(engine, containerId, runner) {
 
 export function captureContainerLogBaseline(engine, containerId, runner) {
     const id = assertImmutableContainerId(containerId, 'capture container logs');
-    const logs = runner.query(engine.name, ['container', 'logs', id]);
+    const logs = readContainerLogs(engine, id, runner);
     if (!logs?.ok) {
         throw lifecycleError(
             `Could not capture Box container logs before start; ${containerLogDiagnostic(logs)}`,
@@ -200,6 +205,7 @@ export function captureContainerLogBaseline(engine, containerId, runner) {
     return Object.freeze({
         stdout: String(logs.stdout || ''),
         stderr: String(logs.stderr || ''),
+        diagnostics: String(logs.diagnostics || ''),
     });
 }
 
@@ -216,6 +222,7 @@ function validateLogBaseline(logBaseline) {
     return {
         stdout: logBaseline.stdout,
         stderr: logBaseline.stderr,
+        diagnostics: String(logBaseline.diagnostics || ''),
     };
 }
 
@@ -241,9 +248,12 @@ export async function waitForReadyLine(engine, containerId, runner, {
     let emittedStdout = '';
     let emittedStderr = '';
     let lastCurrentLogs = null;
+    const seenDiagnostics = new Set();
+    emitContainerLogDiagnostics(baseline.diagnostics, stderr, seenDiagnostics);
 
     function readCurrentBootLogs() {
-        const logs = runner.query(engine.name, ['container', 'logs', id]);
+        const logs = readContainerLogs(engine, id, runner);
+        emitContainerLogDiagnostics(logs?.diagnostics, stderr, seenDiagnostics);
         if (!logs?.ok) return { ok: false, result: logs };
         const cumulativeStdout = String(logs.stdout || '');
         const cumulativeStderr = String(logs.stderr || '');
@@ -280,7 +290,7 @@ export async function waitForReadyLine(engine, containerId, runner, {
         if (state?.ok
             && status === 'running'
             && logs.ok
-            && logs.logs.stdout.split(/\r?\n/).includes(readyLine)) {
+            && renderContainerLogs(logs.logs.stdout).split(/\r?\n/).includes(readyLine)) {
             return;
         }
         await delay(intervalMs);

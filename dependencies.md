@@ -22,6 +22,18 @@ and `node:util`) and the existing diagnostic sanitizer. They add no third-party
 dependencies or installation requirements. Their regression tests use the
 existing fake Podman runner and Node.js test runner.
 
+Box readiness separates stored container records from host diagnostics using
+the existing Podman CLI's `container logs --timestamps` format. It adds no
+packages or system services. Podman 5.4.0+ remains the supported native host
+baseline; stored timestamps are retained for history checks, and host log-reader
+errors prevent readiness even when the command exits successfully. The format
+is defined by [Podman's log writer](https://github.com/containers/podman/blob/v5.8.6/libpod/logs/log.go).
+Focused regression tests use Node.js built-ins. The opt-in native regression
+uses an existing immutable local image with `/bin/sh` and the installed Podman
+to check journald and k8s-file logging. It creates and removes only its labelled
+fixtures, without image pulls, published ports or host mounts. Run it with
+`PLOINKY_LOG_TEST_IMAGE=<immutable-image-id> node --test tests/integration/ploinkyBoxLogDiagnostics.test.mjs`.
+
 The native Linux host preflight adds no third-party code or packages. It uses
 Node.js filesystem/path APIs, the existing bounded process runner, and the
 existing diagnostic sanitizer. The public launcher requires Node.js 22+ before
