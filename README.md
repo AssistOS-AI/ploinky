@@ -4,7 +4,7 @@ Ploinky is a lightweight runtime for AI agents. It is technology‑agnostic: an 
 
 Beyond a single agent, Ploinky supports a multi‑agent workspace. Each agent runs in its own container. A local web router serves a simple web app and proxies API calls to the containers, so you can build applications that orchestrate multiple agents. A companion cloud component (in progress) will host multiple such custom apps, each with its own agents and routes.
 
-See [local instruction skills](docs/local-instruction-skills.md) for launch scope metadata, RoboTeam's catalog boundary, and compatibility installation that preserves local edits.
+See [local instruction skills](docs/local-instruction-skills.md) for launch scope metadata, RoboTeam's catalog boundary, and skill installation that preserves local edits. Default and manifest skills use relative symlinks. During update, skills removed from a readable source are also removed from manifest selections and unchanged managed links.
 
 ## Prerequisites
 

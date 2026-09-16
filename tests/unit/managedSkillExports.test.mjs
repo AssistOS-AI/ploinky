@@ -101,3 +101,36 @@ test('prototype-shaped names remain data and another exporter cannot replace own
     assert.deepEqual(sync({ sources: [{ ...sources[0], name: 'constructor' }] }).installed, ['constructor']);
     assert.equal(fs.existsSync(output), false);
 });
+
+test('symlink exports migrate owned copies, expose source edits and remove dangling links', t => {
+    const { source, output, sync } = fixture(t);
+    sync();
+    assert.ok(fs.lstatSync(output).isDirectory());
+    const migrated = sync({ mode: 'symlink' });
+    assert.deepEqual(migrated.installed, ['demo']);
+    assert.ok(fs.lstatSync(output).isSymbolicLink());
+    assert.equal(path.isAbsolute(fs.readlinkSync(output)), false);
+    assert.equal(fs.realpathSync(output), source);
+    fs.writeFileSync(path.join(source, 'helper.sh'), 'changed source');
+    assert.equal(fs.readFileSync(path.join(output, 'helper.sh'), 'utf8'), 'changed source');
+    assert.deepEqual(sync({ mode: 'symlink' }).unchanged, ['demo']);
+    fs.rmSync(source, { recursive: true });
+    assert.deepEqual(sync({ sources: [], mode: 'symlink' }).removed, ['demo']);
+    assert.throws(() => fs.lstatSync(output), { code: 'ENOENT' });
+});
+
+test('symlink migration preserves edited copies and user-retargeted links', t => {
+    const { root, source, output, sync } = fixture(t);
+    sync();
+    fs.writeFileSync(path.join(output, 'helper.sh'), 'my copy');
+    assert.equal(sync({ mode: 'symlink' }).diagnostics[0].reason, 'edited-output-preserved');
+    fs.writeFileSync(path.join(output, 'helper.sh'), fs.readFileSync(path.join(source, 'helper.sh')));
+    sync({ mode: 'symlink' });
+    const replacement = path.join(root, 'replacement');
+    fs.mkdirSync(replacement);
+    fs.unlinkSync(output);
+    fs.symlinkSync(replacement, output);
+    assert.equal(sync({ sources: [], mode: 'symlink' }).diagnostics[0].reason, 'edited-output-preserved');
+    assert.equal(fs.realpathSync(output), replacement);
+    assert.ok(fs.existsSync(path.join(source, 'SKILL.md')));
+});

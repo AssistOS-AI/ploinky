@@ -83,6 +83,7 @@ function refreshDefaultSkillsInPloinkyRepo(repoName, {
 
     const result = skillsSvc.installDefaultSkills(normalizedDefaultSkillsRepoName, {
         targetRoot: repoPath,
+        pruneMissing: true,
     });
 
     return {
@@ -485,7 +486,11 @@ async function updateAllRepos(folderPath, options = {}) {
             try {
                 const result = skillsSvc.installSkillsFromManifest(manifestPath, {
                     targetRoot: manifestFolder,
+                    pruneMissing: true,
                 });
+                for (const entry of result.prunedSkills || []) {
+                    console.log(`    Removed missing skill '${entry.skill}' from '${entry.repository}' in the manifest.`);
+                }
                 const reposLabel = result.repoCount ? ` from ${result.repoCount} repos` : '';
                 const skillNames = result.skills.join(', ');
                 const folderLabel = path.relative(projectsRoot, manifestFolder) || path.basename(manifestFolder);

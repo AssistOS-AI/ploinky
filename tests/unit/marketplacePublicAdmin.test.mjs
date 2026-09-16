@@ -142,3 +142,19 @@ test('Marketplace skill recommendations prefer the workspace checkout over insta
     assert.equal(repo.kind, 'skills');
     assert.deepEqual(repo.skillSource, { source: path.join(workspace, 'DocumentationSkills'), origin: 'workspace' });
 });
+
+test('Marketplace includes valid unregistered workspace skills without a remote URL', async () => {
+    const root = path.join(workspace, 'LocalOnlySkills');
+    fs.mkdirSync(path.join(root, '.git'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'skills/local-example'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'skills/incomplete'));
+    fs.writeFileSync(path.join(root, 'skills/local-example/SKILL.md'), '---\nname: local-example\ndescription: Local example\n---\n');
+    const res = await request({ method: 'GET' });
+    assert.equal(res.status, 200);
+    const repo = res.body.marketplace.repositories.find(item => item.name === 'LocalOnlySkills');
+    assert.equal(repo.kind, 'skills');
+    assert.equal(repo.url, root);
+    assert.deepEqual(repo.warnings, ['skills/incomplete: missing SKILL.md']);
+    assert.deepEqual(repo.skillSource, { source: root, origin: 'workspace' });
+    assert.equal(res.body.marketplace.repositories.filter(item => item.name === 'DocumentationSkills').length, 1);
+});

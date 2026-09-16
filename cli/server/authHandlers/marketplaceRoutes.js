@@ -328,13 +328,14 @@ function buildMarketplaceState(user = null, options = {}) {
         if (!repoName) continue;
         activeAgentsByRepo.set(repoName, (activeAgentsByRepo.get(repoName) || 0) + 1);
     }
+    const skillRepos = new Map(reposSvc.getSkillRepositoryRecommendations().map(repo => [repo.name, repo]));
     const bootRepos = new Set(reposSvc.getDefaultBootRepos().map(repo => repo.name));
-    const repoNames = new Set([...Object.keys(predefined), ...Object.keys(sources), ...installed, ...listAgentRepositoryNames()]);
+    const repoNames = new Set([...Object.keys(predefined), ...Object.keys(sources), ...installed, ...listAgentRepositoryNames(), ...skillRepos.keys()]);
     const repositories = [...repoNames].sort((left, right) => left.localeCompare(right)).map((name) => {
         const predefinedEntry = predefined[name] || {};
         const sourceEntry = sources[name] || {};
-        const kind = predefinedEntry.kind || sourceEntry.kind || reposSvc.classifyRepoKind(name);
-        const url = predefinedEntry.url || sourceEntry.url || '';
+        const kind = skillRepos.get(name)?.kind || predefinedEntry.kind || sourceEntry.kind || reposSvc.classifyRepoKind(name);
+        const url = predefinedEntry.url || sourceEntry.url || skillRepos.get(name)?.url || '';
         const localPath = workspaceAgentRepositoryPath(name);
         // Expose a portable workspace label, not the physical host path.
         const workspacePath = localPath ? path.posix.join('/workspace', path.basename(localPath)) : '';
@@ -345,7 +346,7 @@ function buildMarketplaceState(user = null, options = {}) {
             url,
             description: predefinedEntry.description || '',
             kind,
-            ...(kind === 'skills' ? { skillSource: resolveSkillRepositorySource(name, url) } : {}),
+            ...(['skills', 'mixed'].includes(kind) ? { skillSource: resolveSkillRepositorySource(name, url), warnings: skillRepos.get(name)?.warnings || [] } : {}),
             installed: installed.has(name),
             default: bootRepos.has(name),
             branch: sourceEntry.branch || '',

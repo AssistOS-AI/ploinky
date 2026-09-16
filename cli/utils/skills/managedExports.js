@@ -56,7 +56,7 @@ function readLedger(agents) {
  * Retired trees stay outside the skill root, including for writes through old
  * open descriptors. A failed publication therefore never requires data loss.
  */
-export function syncManagedSkillExports({ folder, owner, sources, beforeMove = null, afterMove = null }) {
+export function syncManagedSkillExports({ folder, owner, sources, mode = 'copy', beforeMove = null, afterMove = null }) {
     if (!owner || !Array.isArray(sources)) throw new Error('Skill exports require an owner and sources array');
     const incoming = new Map();
     for (const source of sources) {
@@ -92,12 +92,19 @@ export function syncManagedSkillExports({ folder, owner, sources, beforeMove = n
             if (record && record.owner !== owner) { diagnose(name, 'owned-by-other-export'); continue; }
             if (present && !record) { diagnose(name, 'unrecorded-output-preserved'); continue; }
             if (!present && record && wanted) { diagnose(name, 'removed-output-preserved'); continue; }
-            if (present && (!fs.lstatSync(destination).isDirectory() || skillTreeDigest(destination) !== record.digest)) { diagnose(name, 'edited-output-preserved'); continue; }
+            if (present && (!(record.kind === 'symlink' ? fs.lstatSync(destination).isSymbolicLink() : fs.lstatSync(destination).isDirectory()) || skillTreeDigest(destination) !== record.digest)) { diagnose(name, 'edited-output-preserved'); continue; }
             let staged;
             let digest;
             if (wanted) {
                 staged = path.join(staging, name);
                 let valid = false;
+                if (mode === 'symlink') {
+                    const target = fs.realpathSync(wanted.path);
+                    if (!fs.statSync(path.join(target, 'SKILL.md')).isFile()) throw new Error('Skill descriptor is missing');
+                    fs.symlinkSync(path.relative(skills, target), staged, 'dir');
+                    digest = skillTreeDigest(staged);
+                    valid = true;
+                }
                 for (let attempt = 0; attempt < 3 && !valid; attempt++) {
                     const before = skillTreeDigest(wanted.path);
                     copyFreshSkillTree(wanted.path, staged);
@@ -126,7 +133,7 @@ export function syncManagedSkillExports({ folder, owner, sources, beforeMove = n
                 if (exists(destination)) { diagnose(name, 'concurrent-output-preserved', { backup }); continue; }
                 try { fs.renameSync(staged, destination); }
                 catch (error) { if (backup && !exists(destination)) fs.renameSync(backup, destination); throw error; }
-                ledger.entries[name] = { owner, digest, source: wanted.source ?? null };
+                ledger.entries[name] = { owner, digest, kind: mode === 'symlink' ? 'symlink' : 'directory', source: wanted.source ?? null };
                 result.installed.push(name);
             } else {
                 delete ledger.entries[name];

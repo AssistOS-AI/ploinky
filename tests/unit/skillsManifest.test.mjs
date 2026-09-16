@@ -496,7 +496,8 @@ test('dirty cache branch changes fail without resetting changes or replacing ins
         });
         assert.equal(git(cache, 'branch', '--show-current'), 'main');
         assert.equal(fs.readFileSync(changedFile, 'utf8'), '# local changes\n');
-        assert.equal(fs.readFileSync(skillPath, 'utf8'), '# original\n');
+        assert.ok(fs.lstatSync(path.dirname(skillPath)).isSymbolicLink());
+        assert.equal(fs.readFileSync(skillPath, 'utf8'), '# local changes\n');
     });
 });
 
@@ -546,7 +547,7 @@ test('non-Git cache directories are preserved and identified for manual recovery
     });
 });
 
-test('removed upstream skills retain installed content and identify available replacement skills', () => {
+test('strict manifest installation reports removed upstream skills without changing selections', () => {
     withCachedSource('ManifestRenamedSkill', ({ source, entry, manifest, skillPath, install, updateManifest }) => {
         install();
         git(source, 'mv', 'skills/shared', 'skills/renamed');
@@ -559,7 +560,8 @@ test('removed upstream skills retain installed content and identify available re
                 assert.match(error.message, /Available skills: renamed/);
                 return true;
             });
-            assert.equal(fs.readFileSync(skillPath, 'utf8'), '# original\n');
+            assert.ok(fs.lstatSync(path.dirname(skillPath)).isSymbolicLink());
+            assert.equal(fs.existsSync(skillPath), false);
         }
         updateManifest({ ...entry, skills: ['renamed'] });
         const result = install();
@@ -708,5 +710,85 @@ test('findWorkspaceFoldersWithSkillsManifest skips hidden and ignored workspace 
         assert.deepEqual(folders, expected);
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
+
+test('manifest exports prefer dirty workspace skills over the managed copy without pulling', () => {
+    const name = 'WorkspacePreferredSkills';
+    const local = path.join(suiteWorkspace, name);
+    const cached = path.join(REPOS_DIR, name);
+    const target = path.join(suiteWorkspace, 'workspace-preferred-target');
+    try {
+        createSkillRepo(local, { example: { 'SKILL.md': '---\nname: example\ndescription: Local skill\n---\nlocal\n' } });
+        createSkillRepo(cached, { example: { 'SKILL.md': 'cached version\n' } });
+        const file = path.join(local, 'skills/example/SKILL.md');
+        fs.appendFileSync(file, 'Uncommitted local edit\n');
+        fs.mkdirSync(target);
+        const manifest = createManifest(target, [{ url: 'https://example.invalid/WorkspacePreferredSkills.git', name, skills: ['example'] }]);
+        const result = installSkillsFromManifest(manifest, { targetRoot: target });
+        assert.equal(result.repos[0].source, local);
+        assert.match(fs.readFileSync(path.join(target, '.agents/skills/example/SKILL.md'), 'utf8'), /Uncommitted local edit/);
+        assert.equal(fs.readFileSync(path.join(cached, 'skills/example/SKILL.md'), 'utf8'), 'cached version\n');
+        execFileSync('git', ['checkout', '--detach'], { cwd: local, stdio: 'ignore' });
+        assert.equal(installSkillsFromManifest(manifest, { targetRoot: target }).repos[0].source, local);
+    } finally {
+        for (const directory of [local, cached, target]) fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('update pruning removes missing selections and their dangling symlinks, including the final skill', () => {
+    const name = 'PrunedWorkspaceSkills';
+    const source = path.join(suiteWorkspace, name);
+    const target = path.join(suiteWorkspace, 'pruned-workspace-target');
+    try {
+        createSkillRepo(source, {
+            keep: { 'SKILL.md': '# Keep\n' },
+            removed: { 'SKILL.md': '# Removed\n' },
+        });
+        fs.mkdirSync(target);
+        const manifest = createManifest(target, [{ name, url: source, skills: ['keep', 'removed'], note: 'preserved' }]);
+        const install = options => installSkillsFromManifest(manifest, { targetRoot: target, ...options });
+        install();
+        const link = path.join(target, '.agents/skills/removed');
+        assert.ok(fs.lstatSync(link).isSymbolicLink());
+        const original = fs.readFileSync(manifest, 'utf8');
+        fs.rmSync(path.join(source, 'skills/removed'), { recursive: true });
+        assert.throws(() => install(), /was not found/);
+        assert.equal(fs.readFileSync(manifest, 'utf8'), original);
+        const result = install({ pruneMissing: true });
+        assert.deepEqual(result.prunedSkills, [{ repository: name, skill: 'removed' }]);
+        assert.deepEqual(JSON.parse(fs.readFileSync(manifest, 'utf8')), [
+            { name, url: source, skills: ['keep'], note: 'preserved' },
+        ]);
+        assert.throws(() => fs.lstatSync(link), { code: 'ENOENT' });
+        assert.ok(fs.lstatSync(path.join(target, '.agents/skills/keep')).isSymbolicLink());
+        fs.rmSync(path.join(source, 'skills'), { recursive: true });
+        install({ pruneMissing: true });
+        assert.deepEqual(JSON.parse(fs.readFileSync(manifest, 'utf8'))[0].skills, []);
+        assert.deepEqual(fs.readdirSync(path.join(target, '.agents/skills')), []);
+    } finally {
+        fs.rmSync(source, { recursive: true, force: true });
+        fs.rmSync(target, { recursive: true, force: true });
+    }
+});
+
+test('update pruning preserves manifests and links when a source cannot be read', () => {
+    const name = 'UnavailableWorkspaceSkills';
+    const source = path.join(suiteWorkspace, name);
+    const target = path.join(suiteWorkspace, 'unavailable-workspace-target');
+    try {
+        createSkillRepo(source, { keep: { 'SKILL.md': '# Keep\n' } });
+        fs.mkdirSync(target);
+        const manifest = createManifest(target, [{ name, url: source, skills: ['keep'] }]);
+        installSkillsFromManifest(manifest, { targetRoot: target });
+        const original = fs.readFileSync(manifest, 'utf8');
+        fs.rmSync(path.join(source, 'skills'), { recursive: true });
+        fs.writeFileSync(path.join(source, 'skills'), 'not a directory');
+        assert.throws(() => installSkillsFromManifest(manifest, { targetRoot: target, pruneMissing: true }), /No skills/);
+        assert.equal(fs.readFileSync(manifest, 'utf8'), original);
+        assert.ok(fs.lstatSync(path.join(target, '.agents/skills/keep')).isSymbolicLink());
+    } finally {
+        fs.rmSync(source, { recursive: true, force: true });
+        fs.rmSync(target, { recursive: true, force: true });
     }
 });

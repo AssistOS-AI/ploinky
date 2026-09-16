@@ -1,6 +1,8 @@
 import fs from 'fs';
+import { randomUUID } from 'node:crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { resolveSkillRepositorySource } from '../utils/skillRepositorySource.js';
 import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import * as reposSvc from '../utils/repos.js';
 import { runGitCommand, sanitizeGitDiagnostic } from '../utils/gitCommand.js';
@@ -20,8 +22,13 @@ const SKILLS_DISCOVERY_IGNORED_DIRS = new Set(['.git', 'node_modules', 'globalDe
 const GITIGNORE_MARKER_START = '# >>> ploinky default-skills >>>';
 const GITIGNORE_MARKER_END = '# <<< ploinky default-skills <<<';
 
+function skillRepositoryPath(name, url = '') {
+    const preferred = resolveSkillRepositorySource(name, url);
+    return preferred.origin === 'workspace' ? preferred.source : resolveAgentRepositoryPath(name);
+}
+
 function ensureRepoCloned(repoName) {
-    const repoPath = resolveAgentRepositoryPath(repoName);
+    const repoPath = skillRepositoryPath(repoName);
     if (fs.existsSync(repoPath)) return repoPath;
     const result = reposSvc.addRepo(repoName, null);
     return result.path;
@@ -32,6 +39,19 @@ function listSkillDirectories(skillsRoot) {
         .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
         .filter(entry => fs.existsSync(path.join(skillsRoot, entry.name, 'SKILL.md')))
         .map(entry => entry.name);
+}
+
+function availableRepoSkills(repoPath, { allowMissing = false } = {}) {
+    const skillsRoot = path.join(repoPath, 'skills');
+    try {
+        if (!fs.statSync(skillsRoot).isDirectory()) throw new Error(`No skills/ folder in repo '${path.basename(repoPath)}' (expected ${skillsRoot}).`);
+        return listSkillDirectories(skillsRoot);
+    } catch (error) {
+        if (allowMissing && error.code === 'ENOENT' && reposSvc.isGitRepository(repoPath)
+            && !fs.lstatSync(skillsRoot, { throwIfNoEntry: false })) return [];
+        if (error.code === 'ENOENT') throw new Error(`No skills/ folder in repo '${path.basename(repoPath)}' (expected ${skillsRoot}).`);
+        throw error;
+    }
 }
 
 function normalizeSkillName(value, context) {
@@ -66,10 +86,10 @@ function normalizeManifestEntry(entry, index, manifestPath) {
     return { url, name, branch, skills };
 }
 
-function parseSkillsManifest(rawPath) {
+function parseSkillsManifest(rawPath, contents) {
     let rawManifest;
     try {
-        rawManifest = fs.readFileSync(rawPath, 'utf8');
+        rawManifest = contents ?? fs.readFileSync(rawPath, 'utf8');
     } catch (err) {
         throw new Error(`Cannot read skills manifest '${rawPath}': ${err?.message || String(err)}`);
     }
@@ -124,7 +144,7 @@ function readCachedRepoSource(repoPath) {
 }
 
 function skillSourceError(manifestPath, entry, error) {
-    const repoPath = resolveAgentRepositoryPath(entry.name);
+    const repoPath = skillRepositoryPath(entry.name, entry.url);
     return new Error(sanitizeGitDiagnostic(
         `Skills manifest '${manifestPath}', source repo '${entry.name}' ` +
         `(URL '${entry.url}', requested branch '${entry.branch || '(unspecified; cached branch or remote default)'}', ` +
@@ -133,7 +153,7 @@ function skillSourceError(manifestPath, entry, error) {
 }
 
 function registerManifestCacheBranch(entry, cacheBranches) {
-    const repoPath = path.resolve(resolveAgentRepositoryPath(entry.name));
+    const repoPath = path.resolve(skillRepositoryPath(entry.name, entry.url));
     let cacheIdentity;
     try {
         const stat = fs.statSync(repoPath);
@@ -155,9 +175,16 @@ function registerManifestCacheBranch(entry, cacheBranches) {
 }
 
 function ensureManifestRepoCached(entry) {
-    const repoPath = resolveAgentRepositoryPath(entry.name);
+    const repoPath = skillRepositoryPath(entry.name, entry.url);
     if (entry.branch) {
         runGitCommand(['check-ref-format', '--branch', entry.branch], { stdio: 'pipe' });
+    }
+    if (resolveSkillRepositorySource(entry.name, entry.url).origin === 'workspace') {
+        const actualBranch = String(runGitCommand(['-C', repoPath, 'branch', '--show-current'], { stdio: 'pipe' })).trim() || null;
+        if (entry.branch && actualBranch !== entry.branch) {
+            throw new Error(`Workspace repository is on '${actualBranch}', not requested branch '${entry.branch}'.`);
+        }
+        return { repoPath, branch: actualBranch, source: repoPath };
     }
     if (fs.existsSync(repoPath)) {
         if (!reposSvc.isGitRepository(repoPath)) {
@@ -255,12 +282,14 @@ export function readSkillsManifest(manifestPath) {
     return parseSkillsManifest(manifestPath);
 }
 
-export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
+export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissing = false } = {}) {
     if (!manifestPath || typeof manifestPath !== 'string') {
         throw new Error('Missing skills manifest path.');
     }
 
-    const entries = parseSkillsManifest(manifestPath);
+    const originalManifest = fs.readFileSync(manifestPath, 'utf8');
+    const entries = parseSkillsManifest(manifestPath, originalManifest);
+    const prunedSkills = [];
 
     const destRoot = targetRoot || process.cwd();
     const sourceRepos = [];
@@ -284,11 +313,13 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
             const { repoPath, branch, source } = ensureManifestRepoCached(entry);
             registerManifestCacheBranch(entry, cacheBranches);
             const skillsRoot = path.join(repoPath, 'skills');
-            if (!fs.existsSync(skillsRoot) || !fs.statSync(skillsRoot).isDirectory()) {
-                throw new Error(`No skills/ folder in source repo '${entry.name}' (expected ${skillsRoot}).`);
-            }
-            const availableSkills = listSkillDirectories(skillsRoot);
+            const availableSkills = availableRepoSkills(repoPath, { allowMissing: pruneMissing });
             const available = new Set(availableSkills);
+            if (pruneMissing) {
+                const missing = entry.skills.filter(skill => !available.has(skill));
+                prunedSkills.push(...missing.map(skill => ({ repository: entry.name, skill })));
+                entry.skills = entry.skills.filter(skill => available.has(skill));
+            }
             for (const skill of entry.skills) {
                 if (!available.has(skill)) {
                     const choices = availableSkills.slice(0, 20).join(', ') || '(none)';
@@ -319,18 +350,39 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
         }
     }
 
+    const verifyManifest = () => {
+        if (fs.readFileSync(manifestPath, 'utf8') !== originalManifest) {
+            throw new Error(`Skills manifest changed during update: ${manifestPath}`);
+        }
+    };
+    if (prunedSkills.length) verifyManifest();
     const incomingSkills = Array.from(skillSource.keys());
     const isGitRepoTarget = reposSvc.isGitRepository(destRoot);
     const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
     const managedExport = syncManagedSkillExports({
         folder: destRoot,
         owner: 'manifest',
+        mode: 'symlink',
         sources: [...skillSource.entries()].map(([name, source]) => ({
             name, path: path.join(source.repoPath, 'skills', name),
             source: { name: source.source, url: sanitizeGitDiagnostic(source.entry.url), branch: source.entry.branch },
         })),
     });
     reportExportDiagnostics(managedExport);
+
+    if (prunedSkills.length) {
+        const updated = JSON.parse(originalManifest).map((entry, index) => ({ ...entry, skills: entries[index].skills }));
+        const temporary = `${manifestPath}.${randomUUID()}.tmp`;
+        try {
+            fs.writeFileSync(temporary, JSON.stringify(updated, null, 2) + '\n', {
+                flag: 'wx', mode: fs.statSync(manifestPath).mode & 0o777,
+            });
+            verifyManifest();
+            fs.renameSync(temporary, manifestPath);
+        } finally {
+            fs.rmSync(temporary, { force: true });
+        }
+    }
 
     const claudeLink = ensureClaudeSymlink(destRoot);
     let gitignoreUpdated = false;
@@ -360,6 +412,7 @@ export function installSkillsFromManifest(manifestPath, { targetRoot } = {}) {
         symlinkCreated: claudeLink.changed,
         claudeLink,
         duplicateSkills: skillConflicts,
+        prunedSkills,
         managedExport,
         legacyMigration: { migratedSkills: [], skippedExistingSkills: [] },
     };
@@ -434,7 +487,7 @@ function ensureClaudeSymlink(destRoot) {
     return { changed: false, mode: 'preserved' };
 }
 
-export function installDefaultSkills(repoName, { only, skip, targetRoot } = {}) {
+export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMissing = false } = {}) {
     if (!repoName || typeof repoName !== 'string') {
         throw new Error('Missing repository name.');
     }
@@ -467,16 +520,13 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot } = {}) 
     }
 
     const skillsRoot = path.join(repoPath, 'skills');
-    if (!fs.existsSync(skillsRoot) || !fs.statSync(skillsRoot).isDirectory()) {
-        throw new Error(`No skills/ folder in repo '${repoName}' (expected ${skillsRoot}).`);
-    }
-
-    const skills = listSkillDirectories(skillsRoot);
+    const skills = availableRepoSkills(repoPath, { allowMissing: pruneMissing });
 
     const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
     const managedExport = syncManagedSkillExports({
         folder: destRoot,
         owner: `defaults:${repoName}`,
+        mode: 'symlink',
         sources: skills.map(name => ({ name, path: path.join(skillsRoot, name), source: { name: repoName } })),
     });
     reportExportDiagnostics(managedExport);

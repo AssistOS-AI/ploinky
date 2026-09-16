@@ -201,7 +201,7 @@ function runAggregateUpdateChild(workspaceRoot, body) {
                     sourcePath: path.join(workspaceRoot, '.fixtures', 'default-skills-source'),
                     files: defaultSkillsHasSkills
                         ? { 'skills/defaultSkill/SKILL.md': '# Default skill\\n' }
-                        : { 'README.md': '# default skills\\n' },
+                        : { 'skills': 'Not a skills directory\\n' },
                 },
                 {
                     name: 'DocumentationSkills',
@@ -363,8 +363,11 @@ test('default installer updates only proven owned output and preserves subsequen
         installDefaultSkills(repoName, { targetRoot: root });
         fs.writeFileSync(path.join(repoRoot, 'skills', 'demo', 'helper'), 'two');
         const refreshed = installDefaultSkills(repoName, { targetRoot: root });
-        assert.deepEqual(refreshed.managedExport.installed, ['demo']);
+        assert.deepEqual(refreshed.managedExport.unchanged, ['demo']);
+        assert.ok(fs.lstatSync(output).isSymbolicLink());
         assert.equal(fs.readFileSync(path.join(output, 'helper'), 'utf8'), 'two');
+        fs.unlinkSync(output);
+        fs.mkdirSync(output);
         fs.writeFileSync(path.join(output, 'helper'), 'user edit');
         fs.writeFileSync(path.join(repoRoot, 'skills', 'demo', 'helper'), 'three');
         const preserved = installDefaultSkills(repoName, { targetRoot: root });
@@ -834,11 +837,7 @@ test('updateAllRepos installs later skills manifests after an earlier manifest f
             setupAggregateRepoFixture();
             const badManifestPath = path.join(workspaceRoot, 'aa-invalid', 'ploinky-skills-manifest.json');
             const validFolder = path.join(workspaceRoot, 'zz-valid');
-            writeFile(badManifestPath, JSON.stringify([{
-                name: 'DocumentationSkills',
-                url: path.join(workspaceRoot, '.fixtures', 'documentation-skills-source'),
-                skills: ['removedSkill'],
-            }]));
+            writeFile(badManifestPath, '{invalid json');
             writeFile(path.join(validFolder, 'ploinky-skills-manifest.json'), JSON.stringify([{
                 name: 'DocumentationSkills',
                 url: path.join(workspaceRoot, '.fixtures', 'documentation-skills-source'),
@@ -851,9 +850,7 @@ test('updateAllRepos installs later skills manifests after an earlier manifest f
 
             assert.equal(result.failed.length, 1);
             assert.equal(result.failed[0].repoName, 'aa-invalid skills');
-            assert.match(result.failed[0].message, /Skill 'removedSkill' was not found/);
-            assert.match(result.failed[0].message, /source repo 'DocumentationSkills'/);
-            assert.match(result.failed[0].message, /Available skills: documentationSkill/);
+            assert.match(result.failed[0].message, /Invalid JSON/);
             assert.equal(fs.readFileSync(path.join(
                 validFolder, '.agents', 'skills', 'documentationSkill', 'SKILL.md',
             ), 'utf8'), '# Documentation skill\n');
@@ -1076,5 +1073,38 @@ test('installDefaultSkills preserves independent legacy .claude skills and conte
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(repoRoot, { recursive: true, force: true });
+    }
+});
+
+test('updateAllRepos prunes deleted upstream skills from manifests and removes manifest and default links', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-update-prune-'));
+    try {
+        runAggregateUpdateChild(workspaceRoot, String.raw`
+            const fixture = setupAggregateRepoFixture();
+            const source = path.join(workspaceRoot, '.fixtures', 'documentation-skills-source');
+            const project = path.join(workspaceRoot, 'project');
+            const manifest = path.join(project, 'ploinky-skills-manifest.json');
+            writeFile(manifest, JSON.stringify([{
+                name: 'DocumentationSkills', url: source, skills: ['documentationSkill'], note: 'keep',
+            }]));
+            const first = await captureUpdate(() => updateAllRepos(workspaceRoot, { interactiveSession: true }));
+            assert.deepEqual(first.result.failed, []);
+            const link = path.join(project, '.agents/skills/documentationSkill');
+            const defaultLink = path.join(fixture.installedRepoPath, '.agents/skills/documentationSkill');
+            assert.ok(fs.lstatSync(link).isSymbolicLink());
+            assert.ok(fs.lstatSync(defaultLink).isSymbolicLink());
+            execFileSync('git', ['rm', '-r', 'skills'], { cwd: source, stdio: 'ignore' });
+            execFileSync('git', ['commit', '-m', 'remove final skill'], { cwd: source, stdio: 'ignore' });
+            const second = await captureUpdate(() => updateAllRepos(workspaceRoot, { interactiveSession: true }));
+            assert.deepEqual(second.result.failed, []);
+            assert.deepEqual(JSON.parse(fs.readFileSync(manifest, 'utf8')), [
+                { name: 'DocumentationSkills', url: source, skills: [], note: 'keep' },
+            ]);
+            assert.throws(() => fs.lstatSync(link), { code: 'ENOENT' });
+            assert.throws(() => fs.lstatSync(defaultLink), { code: 'ENOENT' });
+            assert.ok(second.stdout.some(line => line.includes("Removed missing skill 'documentationSkill'")));
+        `);
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
     }
 });

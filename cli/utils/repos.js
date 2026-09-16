@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
+import { listWorkspaceSkillRepositories, resolveSkillRepositorySource } from './skillRepositorySource.js';
 import { PLOINKY_DIR } from './config.js';
 import { listAgentRepositoryNames, resolveAgentRepositoryPath, workspaceAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { isAgentRepositoryUnregistered, setAgentRepositoryRegistered } from './agentRepositoryRegistration.mjs';
@@ -154,11 +155,29 @@ export function getPredefinedRepos() {
     return PREDEFINED_REPOS;
 }
 
+export function getSkillRepositoryRecommendations(options = {}) {
+    const local = new Map(listWorkspaceSkillRepositories(options).map(repo => [repo.name, repo]));
+    const sources = getRepoSources();
+    const names = new Set([...Object.keys(PREDEFINED_REPOS), ...Object.keys(sources), ...getInstalledRepos(), ...local.keys()]);
+    return [...names].sort((a, b) => a.localeCompare(b)).flatMap(name => {
+        const preset = PREDEFINED_REPOS[name] || {};
+        const registered = sources[name] || {};
+        const declared = preset.kind || registered.kind;
+        const kind = local.has(name) ? (['agents', 'mixed'].includes(declared) ? 'mixed' : 'skills') : declared || classifyRepoKind(name);
+        if (!['skills', 'mixed'].includes(kind)) return [];
+        const url = preset.url || registered.url || local.get(name)?.source || '';
+        if (!url) return [];
+        return [{ name, url, kind, description: preset.description || '',
+            branch: registered.branch || '', warnings: local.get(name)?.warnings || [], skillSource: resolveSkillRepositorySource(name, url, options) }];
+    });
+}
+
 export function classifyRepoKind(repoName) {
     const declared = PREDEFINED_REPOS[repoName]?.kind;
     if (declared) return declared;
 
-    const repoPath = resolveAgentRepositoryPath(repoName);
+    const preferred = resolveSkillRepositorySource(repoName, '');
+    const repoPath = preferred.origin === 'workspace' ? preferred.source : resolveAgentRepositoryPath(repoName);
     if (!fs.existsSync(repoPath)) return 'unknown';
 
     let hasSkills = false;
