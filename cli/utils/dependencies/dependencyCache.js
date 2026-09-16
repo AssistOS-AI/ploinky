@@ -325,13 +325,16 @@ export function isGlobalCacheValid(cachePath, {
 }
 
 export function isAgentCacheValid(cachePath, {
-    runtimeKey, mergedPackageHash, installer = null, mcpSdk = activeBoxMcpSdkBundle(),
+    runtimeKey, mergedPackageHash, agentPackageHash, installer = null, mcpSdk = activeBoxMcpSdkBundle(),
 }) {
     const stamp = readStamp(cachePath);
     if (!stamp) return { valid: false, reason: 'stamp missing' };
     if (stamp.version !== STAMP_VERSION) return { valid: false, reason: `stamp version ${stamp.version} != ${STAMP_VERSION}` };
     if (stamp.runtimeKey !== runtimeKey) return { valid: false, reason: `runtime key mismatch (${stamp.runtimeKey} != ${runtimeKey})` };
     if (stamp.mergedPackageHash !== mergedPackageHash) return { valid: false, reason: 'mergedPackageHash changed' };
+    if (agentPackageHash !== undefined && stamp.agentPackageHash !== agentPackageHash) {
+        return { valid: false, reason: 'package.json changed' };
+    }
     const installerReason = installerMismatchReason(stamp, installer);
     if (installerReason) return { valid: false, reason: installerReason };
     const marker = path.join(cachePath, 'node_modules', CORE_MARKER_MODULE);
@@ -856,7 +859,6 @@ export function prepareAgentCache({
     image = '',
     runtime = null,
     agentLib = null,
-    refresh = Boolean(dependencyRefreshOperation()),
 } = {}) {
     const mcpSdk = activeBoxMcpSdkBundle();
     const sdkStamp = mcpSdk ? { mcpSdk: boxMcpSdkStampSection(mcpSdk) } : {};
@@ -883,11 +885,11 @@ export function prepareAgentCache({
     const globalPackageHash = hashMergedPackage(globalPkg);
     const cachePath = getAgentCachePath(repoName, agentName, runtimeKey);
     const completed = dependencyRefreshOperation();
-    const refreshKey = `${cachePath}:${mergedPackageHash}`;
+    const refreshKey = `${cachePath}:${mergedPackageHash}:${agentPackageHash}`;
     if (!force && completed?.has(refreshKey)) return completed.get(refreshKey);
 
-    if (!force && !(refresh && agentPkg)) {
-        const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, installer: expectedInstaller, mcpSdk });
+    if (!force) {
+        const check = isAgentCacheValid(cachePath, { runtimeKey, mergedPackageHash, agentPackageHash, installer: expectedInstaller, mcpSdk });
         const linkCheck = check.valid
             ? isAgentLibLinkValid(cachePath, { runtimeKey, agentLib: selection })
             : { valid: false, reason: check.reason };
@@ -923,8 +925,7 @@ export function prepareAgentCache({
 
     const lock = acquireLock(cachePath);
     try {
-        const operation = !force && agentPkg
-            ? agentDependencyNpmOperation(cachePath, { runtimeKey, installer: expectedInstaller }) : 'install';
+        const operation = 'install';
         ensureCacheDir(cachePath);
         fs.rmSync(stampPath(cachePath), { force: true });
         if (operation === 'install') seedFromGlobalCache(globalCachePath, cachePath, {
@@ -938,7 +939,7 @@ export function prepareAgentCache({
             path.join(cachePath, 'package.json'),
             JSON.stringify(mergedPkg, null, 2),
         );
-        if (agentPkg && (refresh || !mcpSdk || needsNpmInstall(mergedPkg))) {
+        if (agentPkg && (!mcpSdk || needsNpmInstall(mergedPkg))) {
             installWithSelectedProviders(cachePath, mergedPkg, mcpSdk, selection, runtimeKey,
                 (cwd, options) => backend.install(cwd, { ...options, operation }));
         }
@@ -962,14 +963,6 @@ export function prepareAgentCache({
     }
 }
 
-export function agentDependencyNpmOperation(cachePath, { runtimeKey, installer = null }) {
-    const stamp = readStamp(cachePath);
-    // A seeded directory alone is not a completed agent installation. Ignore
-    // the manifest hash here: npm update also reconciles changed dependencies.
-    return stamp?.version === STAMP_VERSION && stamp.runtimeKey === runtimeKey
-        && stamp.agentPackageHash && !installerMismatchReason(stamp, installer)
-        && fs.existsSync(nodeModulesDir(cachePath)) ? 'update' : 'install';
-}
 
 /**
  * Resolve and validate the exact agent cache that a running container should
@@ -1002,6 +995,7 @@ export function inspectAgentCache({
     const cache = isAgentCacheValid(cachePath, {
         runtimeKey,
         mergedPackageHash,
+        agentPackageHash: agentPackagePath ? hashFile(agentPackagePath) : null,
         installer: expectedInstaller,
     });
     if (!cache.valid) {

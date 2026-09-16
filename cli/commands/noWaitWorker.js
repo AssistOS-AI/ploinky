@@ -1808,6 +1808,7 @@ async function main() {
                 });
                 const adopted = lifecycle.targetState === 'ready'
                     && !hasAgentPackageJson(agentPath)
+                    && !manifest['link-install']?.length
                     && !['default', 'bridge'].includes(profileResolution.network.mode);
                 return {
                     manifest,

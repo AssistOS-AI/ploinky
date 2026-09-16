@@ -30,7 +30,6 @@ import {
     shouldSeedAgentCacheWithHardlinks,
     shouldSeedAgentCacheWithSystemCopy,
     seedFromGlobalCache,
-    agentDependencyNpmOperation,
 } from '../../cli/utils/dependencies/dependencyCache.js';
 import { withDependencyRefresh, dependencyRefreshOperation, hasAgentPackageJson } from '../../cli/utils/dependencies/dependencyRefresh.mjs';
 
@@ -44,22 +43,6 @@ test('dependency refresh recognizes root and legacy code package manifests', (t)
     assert.equal(hasAgentPackageJson(root), false);
     fs.writeFileSync(path.join(root, 'code/package.json'), '{}');
     assert.equal(hasAgentPackageJson(root), true);
-});
-
-test('agent npm selection requires a successful compatible install, not an unchanged manifest', (t) => {
-    const dir = tempDir();
-    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-    const runtimeKey = 'container-linux-x64-glibc-node24';
-    const installer = { image: 'node:24', runtimeFamily: 'container' };
-    const options = { runtimeKey, installer };
-    assert.equal(agentDependencyNpmOperation(dir, options), 'install');
-    ensureCacheDir(dir);
-    assert.equal(agentDependencyNpmOperation(dir, options), 'install');
-    writeStamp(dir, { runtimeKey, installer, agentPackageHash: 'previous-manifest' });
-    assert.equal(agentDependencyNpmOperation(dir, options), 'update');
-    assert.equal(agentDependencyNpmOperation(dir, { runtimeKey, installer: { ...installer, image: 'node:26' } }), 'install');
-    fs.rmSync(stampPath(dir));
-    assert.equal(agentDependencyNpmOperation(dir, options), 'install');
 });
 
 test('dependency refresh state is isolated per command and shared across nested graph visits', async () => {

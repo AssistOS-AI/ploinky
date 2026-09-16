@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { prepareLinkedRepositories } from '../../cli/utils/linkInstall.mjs';
 
 import {
     appendLegacyAgentDataGuards,
@@ -12,6 +13,7 @@ import {
     codeRelativeMountPath,
     collectManifestVolumeEntries,
     ensurePodmanStagedCodeDir,
+    ensurePodmanStagedAgentLibDir,
     ensureManifestVolumeHostPath,
     manifestVolumeMountSuffix,
     mergeNodeOptions,
@@ -19,6 +21,29 @@ import {
     podmanMountSuffix,
     resolveReusablePodmanStagedMounts,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
+
+test('link-install stages Agent links without occupying the agent code linked directory', t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'linked-staging-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const code = path.join(root, 'agent');
+    const deps = path.join(root, 'cache/node_modules');
+    const source = path.join(root, 'Library');
+    for (const dir of [path.join(code, 'linked'), deps, path.join(source, '.git')]) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(code, 'linked/keep.txt'), 'agent-owned');
+    const linkedRepositories = prepareLinkedRepositories({ 'link-install': ['https://github.com/example/Library.git'] }, {
+        workspaceRoot: root, writable: true,
+        execFile: () => 'https://github.com/example/Library.git',
+    });
+    const runtimeRoot = path.join(root, 'runtime');
+    const staged = ensurePodmanStagedAgentLibDir('test', deps, { runtimeRoot, linkedRepositories });
+    assert.equal(fs.readlinkSync(path.join(staged, 'linked/Library')), '/workspace/Library');
+    const stagedCode = ensurePodmanStagedCodeDir('test', code, deps, new Map(), { runtimeRoot });
+    assert.equal(fs.readFileSync(path.join(stagedCode, 'linked/keep.txt'), 'utf8'), 'agent-owned');
+    assert.equal(fs.existsSync(path.join(code, 'linked/Library')), false);
+    const mounts = buildPodmanStagedTargetMounts({ agentCodePath: code, nodeModulesDir: deps, linkedRepositories, codeReadOnly: true });
+    assert.deepEqual(mounts.find(m => m.source === source), { source, target: '/workspace/Library', ro: false });
+    assert.equal(mounts.find(m => m.source === code).ro, true);
+});
 import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';
 import {
     assertManifestStorageAdmission,

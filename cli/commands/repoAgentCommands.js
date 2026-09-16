@@ -8,12 +8,9 @@ import * as agentsSvc from '../utils/agents.js';
 import * as skillsSvc from './skills.js';
 import * as workspaceSvc from '../utils/workspace.js';
 import {
-    resolveMovingGitDepCommits,
     resolvePloinkyRoot,
     updatePloinkySelf,
 } from './updateService.js';
-import { invalidateDepsCacheForMovingGitDeps } from '../utils/dependencies/dependencyCache.js';
-import { readGlobalDepsPackage } from '../utils/dependencies/dependencyInstaller.js';
 import { collectAgentsSummary } from '../utils/status.js';
 import { findAgent } from '../utils/utils.js';
 import { updateWorkspaceAgentLibSource } from '../../ploinky-box/agentlib-source.mjs';
@@ -195,19 +192,6 @@ async function refreshAgentLibSourceForUpdate(failed, {
         const message = err?.message || String(err);
         failed.push({ repoName: 'achillesAgentLib', message });
         console.error(`  ✗ achillesAgentLib: ${message}`);
-    }
-    // The npm caches under .ploinky/deps are keyed on package.json spec strings,
-    // so a moving git ref (mcp-sdk `#main`) that advanced upstream would serve a
-    // stale copy. This stays independent of the AgentLib source.
-    try {
-        const gitDepCommits = resolveMovingGitDepCommits(readGlobalDepsPackage().dependencies);
-        const invalidation = invalidateDepsCacheForMovingGitDeps(gitDepCommits);
-        if (invalidation.invalidated) {
-            const changedLabel = invalidation.changed.length ? invalidation.changed.join(', ') : 'initial';
-            console.log(`  ✓ Dependency caches invalidated (moving git deps changed: ${changedLabel}); agents reinstall on next start.`);
-        }
-    } catch (err) {
-        console.error(`  ✗ dependency cache invalidation: ${err?.message || err}`);
     }
     return result;
 }

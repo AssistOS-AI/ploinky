@@ -135,7 +135,7 @@ function agentPackage(root, pkg) {
     return filename;
 }
 
-test('lifecycle refresh installs once, updates unchanged manifests, and retries failed installs', (t) => {
+test('lifecycle commands reuse unchanged manifests and install changed manifests', (t) => {
     let fail = false;
     const f = boxEnvironment(t, { onInstall() { if (fail) throw new Error('fixture npm failed'); } });
     const options = { ...prepareOptions, repoName: 'refresh', agentName: 'agent',
@@ -150,12 +150,13 @@ test('lifecycle refresh installs once, updates unchanged manifests, and retries 
     fs.writeFileSync(sentinel, 'existing installed tree');
     for (const command of ['enable', 'update', 'reinstall', 'start']) {
         withDependencyRefresh(command, () => {
-            assert.equal(cache.prepareAgentCache(options).operation, 'update');
+            assert.equal(cache.prepareAgentCache(options).reused, true);
             assert.equal(fs.readFileSync(sentinel, 'utf8'), 'existing installed tree');
         });
     }
-    assert.deepEqual(f.installs.map(entry => entry.operation), ['install', 'update', 'update', 'update', 'update']);
+    assert.deepEqual(f.installs.map(entry => entry.operation), ['install']);
     assert.equal(cache.inspectAgentCache(options).valid, true);
+    fs.writeFileSync(options.agentPackagePath, JSON.stringify({ dependencies: { example: '^2.0.0' } }));
     fail = true;
     withDependencyRefresh('update', () => {
         assert.throws(() => cache.prepareAgentCache(options), /fixture npm failed/);

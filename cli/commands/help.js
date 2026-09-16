@@ -67,8 +67,10 @@ function mainHelpText(surface) {
 ${lifecycleHelpLines(surface).join('\n')}
   restart                        Restart enabled agents + Router
   reinstall <agentName>          Re-create a running agent container (destructive)
-  Agent dependencies: update/start/enable/reinstall run npm install on first
-  preparation, then npm update for agents with package.json, even if unchanged.
+  Agent dependencies: update/start/enable/reinstall reuse valid installs.
+  npm install runs for a changed package.json or a missing/invalid cache.
+  manifest link-install: Git URL array; clone missing workspace repos only.
+  /Agent/linked/<repo> links to /workspace/<checkout>; global agents can edit it.
   logs tail [router|agent] [--startup]
                                  Follow Router or one agent's logs
   logs last [<N>] [router|agent] [--startup]
