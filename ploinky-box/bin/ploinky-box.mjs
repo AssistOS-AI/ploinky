@@ -42,6 +42,10 @@ Commands:
                                   profiles using temporary deployment probes
   ploinky --port PORT --udp-port PORT diagnose
                                   Check ports selected for a failed deployment
+  ploinky repair [--dry-run] [--json]
+                                  Apply supported user-level fixes, recheck, and
+                                  list remaining manual or administrator actions
+  ploinky --dry-run repair        Show the repair plan without applying fixes
   ploinky stop                    Stop core services and the outer Box
   ploinky update [PATH]           Update Ploinky only when its checkout is within
   ploinky update all [PATH]       the selected folder; always refresh repos/deps/skills
@@ -60,6 +64,10 @@ and never create, prepare, or repair one.
 Diagnose runs explicitly; start and restart do not run prerequisite diagnostics.
 It reports failing commands and next steps without changing host configuration
 or starting, stopping, or repairing the workspace's existing Box.
+
+Repair applies only supported fixes for the current user and never invokes sudo.
+Both reports distinguish automatic fixes, manual user actions, and actions that
+require administrator privileges. Diagnose and repair must run on the host.
 
 Bind uses BIND_ADDRESS:HOST_TCP_PORT:8080. BIND_ADDRESS is 0 or 0.0.0.0 (all IPv4
 interfaces), 127.0.0.1 (restore local-only access), or an IPv4 address assigned
@@ -126,14 +134,15 @@ export async function runOuterCli(argv, options = {}) {
         cwd = () => process.cwd(),
         repositoryRoot = path.resolve(import.meta.dirname, '../..'),
         diagnose,
+        repair,
     } = options;
     if (detectInsideBox()) {
         // Preserve unchanged core forwarding for other commands, including
         // core-only options that the outer argument parser does not accept.
         let command = '';
         try { command = parseOuterArguments(argv).command; } catch (_) {}
-        if (command === 'diagnose') {
-            errorOutput.write('ploinky diagnose must run on the physical host, outside the Box. Exit this shell and run ploinky diagnose from the host workspace.\n');
+        if (command === 'diagnose' || command === 'repair') {
+            errorOutput.write(`ploinky ${command} must run on the physical host, outside the Box. Exit this shell and run ploinky ${command} from the host workspace.\n`);
             return 1;
         }
         return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
@@ -156,6 +165,25 @@ export async function runOuterCli(argv, options = {}) {
         } else {
             const { formatDiagnosticReport } = await import('../diagnose.mjs');
             output.write(formatDiagnosticReport(report));
+        }
+        return report.exitCode;
+    }
+    if (route.kind === 'repair') {
+        const runRepair = repair || (await import('../repair.mjs')).repairWorkspace;
+        const report = await runRepair({
+            env,
+            cwd: launchDirectory,
+            repositoryRoot,
+            explicitPort: parsed.explicitPort,
+            explicitMediaPort: parsed.explicitMediaPort,
+            dryRun: route.dryRun,
+            progress: message => errorOutput.write(`[repair] ${message}\n`),
+        });
+        if (route.json) {
+            output.write(`${JSON.stringify(report, null, 2)}\n`);
+        } else {
+            const { formatRepairReport } = await import('../repair.mjs');
+            output.write(formatRepairReport(report));
         }
         return report.exitCode;
     }

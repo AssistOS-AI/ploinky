@@ -103,12 +103,32 @@ function routeDiagnose(parsed) {
     return Object.freeze({ kind: 'diagnose', json: parsed.commandArgs[0] === '--json' });
 }
 
+function routeRepair(parsed) {
+    let dryRun = parsed.dryRun;
+    let json = false;
+    for (const argument of parsed.commandArgs) {
+        if (argument === '--dry-run') {
+            if (dryRun) throw routeError('repair: --dry-run was supplied more than once');
+            dryRun = true;
+        } else if (argument === '--json') {
+            if (json) throw routeError('repair: --json was supplied more than once');
+            json = true;
+        } else {
+            throw routeError('Usage: ploinky repair [--dry-run] [--json]');
+        }
+    }
+    return Object.freeze({ kind: 'repair', dryRun, json });
+}
+
 export function routeOuterCommand(parsed) {
     if (parsed.help || parsed.command === 'help') {
         return Object.freeze({ kind: 'help', topic: parsed.commandArgs });
     }
     if (parsed.command === 'diagnose') {
         return routeDiagnose(parsed);
+    }
+    if (parsed.command === 'repair') {
+        return routeRepair(parsed);
     }
     if (parsed.command === 'status') {
         return routeStatus(parsed);

@@ -41,7 +41,7 @@ loading modules. The supported native host baseline is Podman 5.4.0+; its
 selected runtime, networking, and configured storage helpers remain external
 system prerequisites, with the effective paths read from `podman info`.
 Rootless UID/GID helpers, namespace mappings, seccomp, and FUSE/TUN device access
-are surveyed by the explicit `ploinky diagnose` command. Normal deployment
+are surveyed by the explicit `ploinky diagnose` and `ploinky repair` commands. Normal deployment
 does not run this general host preflight. Host cgroup versions and controller
 delegation are not prerequisites for the current Box runtime, which disables
 nested cgroups and sets no outer CPU quota. Installation and
@@ -65,6 +65,27 @@ verified resources. Run the command on the host, in the selected workspace;
 missing prerequisites produce bounded command/error/next-step results. The
 probe implementation can be removed without changing ordinary deployment,
 which retains the essential image, ownership, isolation and readiness contracts.
+
+Privilege classification and `ploinky repair` add no third-party dependencies.
+They use Node.js 22+ built-ins, repository-owned identity/lock/diagnostic code,
+and the existing Podman CLI. Repair runs bounded argument-array probes before
+each supported operation, never invokes sudo, and never executes remediation
+text. Missing or incompatible host tools remain diagnostic failures with
+separate administrator or user instructions. The only new Podman mutations are
+pulling an absent configured registry image and, on macOS, starting an existing
+selected rootless Machine. Existing cached images and Machine configuration are
+preserved. The binding-file permission repair uses Node.js file descriptors
+and filesystem APIs; it does not add a chmod subprocess dependency.
+
+Repair's inspection-only preview uses the installed engine's current-state
+queries without creating a Machine or temporary deployment containers. Its
+post-repair verification reuses the existing full diagnostic probes and their
+image/space requirements. Node's built-in test runner covers these operations
+using fake engines and temporary user-owned files, without a running VM or
+container engine. The remediation catalog and repair module can be removed
+without changing ordinary deployment. Package installation suggestions are
+instructions only; the selected system packages retain their upstream and
+distribution licensing and no external tool or policy is newly bundled.
 
 The focused tests substitute container operations and require no container engine or model backend. The broader acceptance harness can optionally use an existing Podman installation to provide Linux; its environment requirements are documented with that harness. No external code, licenses, or notices were added by this component.
 

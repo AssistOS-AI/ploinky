@@ -28,8 +28,8 @@ The current Box runs nested Podman with cgroups disabled and sets no outer CPU
 quota. Startup therefore does not require a particular host cgroup version or
 delegated `cpu`, `memory`, or `pids` controllers.
 
-The general host prerequisite survey runs only when `ploinky diagnose` is
-requested. Commands such as `ploinky start explorer` attempt their deployment
+The general host prerequisite survey runs when `ploinky diagnose` or
+`ploinky repair` is requested. Commands such as `ploinky start explorer` attempt their deployment
 directly; a deployment failure retains its original error and exit code and
 suggests running `ploinky diagnose`. The Node launcher guard, immutable image
 contract, ownership, isolation and runtime readiness checks still apply to the
@@ -72,6 +72,23 @@ Exit status is `0` for completed probes, `1` for failures and `2` when required
 probes cannot be completed. A warning about unreadable loaded AppArmor policy
 does not pretend that installed profile text proves kernel behavior.
 
+Each failed or warning check links to remediation actions with explicit
+privilege and automation labels:
+
+| Label | How to proceed |
+| --- | --- |
+| `AUTO (no sudo)` | Run `ploinky repair` to apply the supported action after fresh safety checks |
+| `MANUAL (no sudo)` | Follow the instructions as your normal user; the action needs your choice or review |
+| `SUDO REQUIRED` | Ask an administrator to perform the listed system change or inspection |
+| `MANUAL (privilege undetermined)` | Inspect the reported cause first; the evidence does not yet establish which privilege is needed |
+
+Required administrator actions are grouped separately from optional
+administrator diagnostics. An unreadable AppArmor policy or a missing literal
+source rule alone is not a deployment blocker. A confirmed policy denial needs
+administrator review. Installing system packages, allocating subordinate IDs,
+and changing host device or security policy require administrator privileges.
+Personal PATH, connection, port and storage choices remain manual user actions.
+
 Diagnostics inspect Node/PATH, Podman and its selected helpers, subordinate
 identity mappings, devices, storage driver/configuration, login/cgroup context,
 seccomp, SELinux and AppArmor. They check the selected TCP/UDP ports, accounting
@@ -94,6 +111,48 @@ storage driver or credentials are changed. Commands referencing removed test
 containers are evidence of that attempt; rerun `ploinky diagnose` to reproduce
 them. Diagnosis checks deployment infrastructure; it does not replay arbitrary
 agent install hooks, start user workloads or replace application E2E tests.
+
+## Repair user-level deployment issues
+
+```bash
+cd /path/to/workspace
+ploinky repair --dry-run
+ploinky repair
+ploinky --port 8082 --udp-port 7001 repair
+ploinky repair --json > repair.json
+```
+
+Run repair on the physical host as the regular deployment account. It rejects
+execution as root and never invokes `sudo`. It first inspects the current
+environment, applies eligible actions under the selected workspace's mutation
+lock, then runs the full deployment diagnostics to verify the result. The
+supported automatic actions are:
+
+| Action | Eligibility and scope |
+| --- | --- |
+| Restrict saved Router binding permissions | Remove group/other permission bits from the exact validated, user-owned binding file. Shared-writable records, unsafe paths, and foreign ownership require manual review. File content stays intact. |
+| Download a missing Box image | Pull the configured qualified registry reference only after confirming it is absent and the rootless engine is usable. Cached images are not refreshed. |
+| Start an existing Podman Machine on macOS | Start the selected stopped Machine only after verifying its rootless settings and unchanged selection. No Machine is created or reconfigured. |
+
+`--dry-run` previews those actions using inspection only: no repairs, mutation
+lock, or temporary deployment probes. `ploinky --dry-run repair` is equivalent.
+The regular command runs full diagnostic probes after its repairs, even if no
+automatic action was eligible. These probes have the temporary-resource and
+image-download behavior described above; a preview does not prove deployment
+readiness.
+
+The final report shows each repair outcome and the remaining actions, including
+a separate list of required administrator steps. Run those steps separately,
+then rerun `ploinky diagnose`. Optional administrator inspections stay optional.
+An unresolved manual user action can still block deployment even when no sudo
+steps remain. Repair exits nonzero if an action failed, verification failed, or
+required probes could not be completed. The JSON report includes `before`,
+`after`, `outcomes`, `remainingActions`, `sudoRequired`, and `exitCode`.
+
+Repair never restarts the active workspace, edits host profiles, resets Podman
+storage, terminates conflicting listeners, changes registry credentials, or
+executes diagnostic hint text as shell commands. Ordinary deployment commands
+suggest `ploinky diagnose` on failure; they do not invoke repairs automatically.
 
 ## Getting started
 
@@ -179,7 +238,8 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky bind [ADDRESS:PORT:8080]` | Publish the public Router on this machine's IPv4 `ADDRESS` (`0` for all interfaces) and TCP `PORT`; recreate the Box and restart the configured graph when the mapping changes; save the binding for later lifecycle commands |
 | `ploinky bind 127.0.0.1:PORT:8080` | Restore local-only Router access |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
-| `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and next actions |
+| `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and actions labelled by privilege and automation eligibility |
+| `ploinky repair [--dry-run] [--json]` | Apply supported normal-user fixes, verify with diagnostics, and list remaining manual and sudo-required actions; `--dry-run` only inspects and previews |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
 | `ploinky update` / `ploinky update all [PATH]` | Pull Ploinky with `--rebase --autostash` only when its checkout is inside the selected folder (or the command is run from inside that checkout); still refresh AgentLib, agents, repositories, dependencies, and skills, then restart an already configured running workspace |
 | `ploinky destroy` | Without prompting, stop nested agents and remove the outer container; retain the host workspace and `.ploinky/box` |

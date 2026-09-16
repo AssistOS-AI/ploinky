@@ -179,6 +179,51 @@ test('diagnose accepts JSON and selected ports without forwarding or starting a 
     }
 });
 
+test('repair accepts explicit user repairs, dry-run plans, JSON, and deployment ports', () => {
+    for (const [argv, dryRun, json] of [
+        [['repair'], false, false],
+        [['repair', '--json'], false, true],
+        [['repair', '--dry-run'], true, false],
+        [['repair', '--dry-run', '--json'], true, true],
+        [['repair', '--json', '--dry-run'], true, true],
+        [['--dry-run', 'repair'], true, false],
+        [['--debug', '--dry-run', 'repair', '--json'], true, true],
+        [['--', 'repair', '--dry-run', '--json'], true, true],
+    ]) {
+        assert.deepEqual(routeOuterCommand(parseOuterArguments(argv)), { kind: 'repair', dryRun, json });
+    }
+    const selectedPorts = parseOuterArguments(['--port', '18080', '--udp-port', '17882', 'repair', '--json']);
+    assert.equal(selectedPorts.explicitPort, 18080);
+    assert.equal(selectedPorts.explicitMediaPort, 17882);
+    assert.deepEqual(routeOuterCommand(selectedPorts), { kind: 'repair', dryRun: false, json: true });
+});
+
+test('repair rejects ambiguous, malformed, and unsupported options before running fixes', () => {
+    for (const argv of [
+        ['repair', 'Agent'],
+        ['repair', '--json', '--json'],
+        ['repair', '--dry-run', '--dry-run'],
+        ['--dry-run', 'repair', '--dry-run'],
+        ['--dry-run', '--dry-run', 'repair'],
+        ['repair', '--json=true'],
+        ['repair', '--dry-run=true'],
+        ['repair', '--force'],
+        ['repair', '--sudo'],
+        ['repair', '--port', '8080'],
+        ['repair', '--udp-port', '17882'],
+        ['--port', '0', 'repair'],
+        ['--udp-port', '65536', 'repair'],
+        ['--port', '18080', '--port', '18081', 'repair'],
+        ['--udp-port', '17882', '--udp-port', '17883', 'repair'],
+    ]) {
+        assert.throws(
+            () => routeOuterCommand(parseOuterArguments(argv)),
+            { code: 'PLOINKY_BOX_ARGUMENT_INVALID' },
+            argv.join(' '),
+        );
+    }
+});
+
 test('full update routes through the host while targeted update forms remain generic', () => {
     assert.deepEqual(routeOuterCommand(parseOuterArguments(['--debug', 'update'])), {
         kind: 'update',
