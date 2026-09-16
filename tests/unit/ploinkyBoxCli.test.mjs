@@ -204,6 +204,126 @@ test('diagnose inside a Box explains the host requirement without forwarding or 
     }
 });
 
+test('repair dispatch preserves JSON and repair status without preparing or forwarding to the Box', async () => {
+    for (const dryRun of [false, true]) {
+        const env = { PATH: '/repair/bin' };
+        const output = bufferStream();
+        const errorOutput = bufferStream();
+        const calls = [];
+        const report = { exitCode: 2, dryRun, actions: [], remaining: { administrator: ['Install Podman'] } };
+        const code = await runOuterCli([
+            '--debug', '--port', '18080', '--udp-port', '17882', 'repair',
+            ...(dryRun ? ['--dry-run'] : []), '--json',
+        ], {
+            env,
+            output,
+            errorOutput,
+            cwd: () => '/work/selected',
+            repositoryRoot: '/work/ploinky-source',
+            detectInsideBox: () => false,
+            supervisor: new Proxy({}, { get() { throw new Error('repair must not use the lifecycle supervisor'); } }),
+            execute() { throw new Error('repair must not forward core or sudo commands'); },
+            diagnose() { throw new Error('The repair runner owns any diagnosis'); },
+            async repair(options) {
+                calls.push(options);
+                options.progress('Rechecking remaining issues');
+                return report;
+            },
+        });
+        assert.equal(code, 2);
+        assert.deepEqual(JSON.parse(output.value()), report);
+        assert.equal(calls.length, 1);
+        const { progress, ...request } = calls[0];
+        assert.equal(typeof progress, 'function');
+        assert.deepEqual(request, {
+            env, cwd: '/work/selected', repositoryRoot: '/work/ploinky-source',
+            explicitPort: 18080, explicitMediaPort: 17882, dryRun,
+        });
+        assert.equal(errorOutput.value(), '[repair] Rechecking remaining issues\n');
+    }
+});
+
+test('global repair dry-run reaches the repair planner without a lifecycle dry run', async () => {
+    const calls = [];
+    const code = await runOuterCli(['--dry-run', 'repair', '--json'], {
+        output: bufferStream(),
+        detectInsideBox: () => false,
+        supervisor: new Proxy({}, { get() { throw new Error('No lifecycle plan is permitted'); } }),
+        async repair(options) { calls.push(options); return { exitCode: 0, dryRun: true }; },
+    });
+    assert.equal(code, 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].dryRun, true);
+});
+
+test('bare repair renders applied user actions and remaining administrator commands', async () => {
+    const output = bufferStream();
+    const action = { id: 'enable-device-fuse', mode: 'manual', requiresSudo: true, required: true,
+        title: 'Enable the host fuse device', instructions: 'Ask an administrator to load the missing module.',
+        commands: [{ file: 'sudo', args: ['modprobe', 'fuse'] }] };
+    const report = { exitCode: 1, workspace: '/work/selected', dryRun: false,
+        outcomes: [{ status: 'applied', title: 'Make the saved binding private', detail: 'Group and other access removed.' }],
+        after: { exitCode: 1, checks: [{ id: 'host.device.fuse', label: '/dev/fuse', status: 'fail', detail: 'Device unavailable.' }] },
+        remainingActions: [action], sudoRequired: [action] };
+    const code = await runOuterCli(['repair'], {
+        env: {}, output, errorOutput: bufferStream(), detectInsideBox: () => false,
+        supervisor: new Proxy({}, { get() { throw new Error('Repair output must not consult the supervisor'); } }),
+        repair: async () => report,
+    });
+    assert.equal(code, 1);
+    assert.match(output.value(), /APPLIED.*no sudo/);
+    assert.match(output.value(), /Verification: 1 failed check/);
+    assert.match(output.value(), /SUDO REQUIRED/);
+    assert.match(output.value(), /Command: sudo modprobe fuse/);
+});
+
+test('repair inside a Box explains the host boundary without invoking a repair or core command', async () => {
+    for (const argv of [
+        ['repair'], ['repair', '--dry-run', '--json'], ['--debug', 'repair'],
+        ['--dry-run', 'repair'], ['--', 'repair'],
+        ['--port', '18080', '--udp-port', '17882', 'repair'],
+    ]) {
+        const output = bufferStream();
+        const errorOutput = bufferStream();
+        const code = await runOuterCli(argv, {
+            output,
+            errorOutput,
+            detectInsideBox: () => true,
+            cwd() { throw new Error('No workspace lookup is needed inside the Box'); },
+            execute() { throw new Error('Do not forward repair into the core'); },
+            repair() { throw new Error('Do not repair the wrong host boundary'); },
+        });
+        assert.equal(code, 1);
+        assert.equal(output.value(), '');
+        assert.match(errorOutput.value(), /ploinky repair must run on the physical host, outside the Box/);
+    }
+});
+
+test('invalid repair options fail before launching its runner or any Box action', async () => {
+    for (const argv of [
+        ['repair', '--json', '--json'], ['--dry-run', 'repair', '--dry-run'],
+        ['repair', '--sudo'], ['repair', '--port', '8080'],
+    ]) {
+        await assert.rejects(runOuterCli(argv, {
+            output: bufferStream(), errorOutput: bufferStream(), detectInsideBox: () => false,
+            supervisor: new Proxy({}, { get() { throw new Error('Invalid arguments must not consult the supervisor'); } }),
+            repair() { throw new Error('Invalid arguments must not invoke repair'); },
+            execute() { throw new Error('Invalid arguments must not execute commands'); },
+        }), { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
+    }
+});
+
+test('repair runner failures propagate without repeating a deployment hint or applying fallback repairs', async () => {
+    const errorOutput = bufferStream();
+    const failure = new Error('fixture repair failure');
+    await assert.rejects(runOuterCli(['repair'], {
+        output: bufferStream(), errorOutput, detectInsideBox: () => false,
+        repair() { throw failure; },
+        execute() { throw new Error('Failed repairs must not execute a fallback command'); },
+    }), error => error === failure);
+    assert.equal(errorOutput.value(), '');
+});
+
 test('deployment lifecycle failures suggest explicit diagnosis once without swallowing the error', async () => {
     for (const [argv, method] of [
         [['start', 'Agent'], 'runStartTransaction'],
@@ -227,6 +347,7 @@ test('deployment lifecycle failures suggest explicit diagnosis once without swal
             detectInsideBox: () => false,
             updateHostSource: async () => ({ updated: false }),
             diagnose() { throw new Error('Failures must never run diagnosis automatically'); },
+            repair() { throw new Error('Failures must never apply repairs automatically'); },
         }), error => error === failure);
         assert.equal(errorOutput.value(),
             'Run ploinky diagnose from this workspace for prerequisite, storage, and security-profile diagnostics.\n');
@@ -939,6 +1060,8 @@ test('public help documents non-interactive destroy and explicit cache deletion'
     assert.match(output.value(), /ploinky update \[PATH\]/);
     assert.match(output.value(), /ploinky update all \[PATH\]/);
     assert.match(output.value(), /ploinky diagnose \[--json\]/);
+    assert.match(output.value(), /ploinky repair \[--dry-run\] \[--json\]/);
+    assert.match(output.value(), /never invokes sudo/);
     assert.match(output.value(), /start and restart do not run prerequisite diagnostics/);
     assert.doesNotMatch(output.value(), /--delete-volumes/);
     assert.match(output.value(), /\.ploinky\/box/);

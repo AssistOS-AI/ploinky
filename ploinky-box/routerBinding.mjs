@@ -469,6 +469,7 @@ export function createRouterBindingStore({
     }
 
     function normalizeRecord(identity, record) {
+        exactIdentity(identity);
         if (!record || typeof record !== 'object' || Array.isArray(record)
             || Object.getPrototypeOf(record) !== Object.prototype
             || JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(RECORD_KEYS)) {
@@ -625,5 +626,5 @@ export function createRouterBindingStore({
         else clear(identity, lock);
     }
 
-    return Object.freeze({ directory, pathFor: targetFor, assertConfined, read, write, clear, restore });
+    return Object.freeze({ directory, pathFor: targetFor, assertConfined, validateRecord: normalizeRecord, read, write, clear, restore });
 }

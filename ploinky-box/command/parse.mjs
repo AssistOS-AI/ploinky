@@ -153,11 +153,11 @@ export function parseOuterArguments(argv) {
         break;
     }
 
-    if (explicitPort !== null && !['start', 'diagnose'].includes(commandToken?.text)) {
-        throw argumentError('--port is valid only before start or diagnose');
+    if (explicitPort !== null && !['start', 'diagnose', 'repair'].includes(commandToken?.text)) {
+        throw argumentError('--port is valid only before start, diagnose, or repair');
     }
-    if (explicitMediaPort !== null && !['start', 'diagnose'].includes(commandToken?.text)) {
-        throw argumentError('--udp-port is valid only before start or diagnose');
+    if (explicitMediaPort !== null && !['start', 'diagnose', 'repair'].includes(commandToken?.text)) {
+        throw argumentError('--udp-port is valid only before start, diagnose, or repair');
     }
     const classificationArgv = tokens.map((token) => token.text);
     const command = commandToken?.text || '';

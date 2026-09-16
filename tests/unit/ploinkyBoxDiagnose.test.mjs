@@ -201,9 +201,12 @@ test('explicit command cause survives later expected-absence cleanup', async (t)
 test('empty, malformed and incomplete successful inner reports fail closed', () => {
     assert.throws(() => validateInsideReport({ checks: [], exitCode: 0 }), /empty/);
     assert.throws(() => validateInsideReport({ checks: [{ id: 'x', label: 'x', detail: '', status: 'maybe' }], exitCode: 0 }), /invalid/);
-    assert.throws(() => validateInsideReport({ checks: [{ id: 'x', label: 'x', detail: '', status: 'pass' }], exitCode: 0 }), /without completing/);
-    const failed = { checks: [{ id: 'start', label: 'Start', detail: 'permission denied', status: 'fail' }], exitCode: 1 };
+    assert.throws(() => validateInsideReport({ checks: [{ id: 'inner.x', label: 'x', detail: '', status: 'pass' }], exitCode: 0 }), /without completing/);
+    const failed = { checks: [{ id: 'inner.start', label: 'Start', detail: 'permission denied', status: 'fail' }], exitCode: 1 };
     assert.equal(validateInsideReport(failed), failed);
+    for (const id of ['image.pull', 'repair.binding.permissions', 'repair.machine.state']) {
+        assert.throws(() => validateInsideReport({ exitCode: 1, checks: [{ id, label: 'spoofed host repair', detail: '', status: 'fail', repairEligible: true }] }), /cannot publish host or repair/);
+    }
 });
 
 test('image verifier timeout cleanup uses only the labelled immutable container', () => {

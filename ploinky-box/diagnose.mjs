@@ -20,6 +20,9 @@ import { createRouterBindingStore, assertRouterBindingAssignable } from './route
 import { collectHostDiagnostics } from './diagnose/host.mjs';
 import { collectCurrentWorkspaceDiagnostics } from './diagnose/current.mjs';
 import { inspectWorkspaceDataPaths } from './workspace-data.mjs';
+import { collectRepairAssessments } from './repair/automatic.mjs';
+import { annotateRemediations, formatRemediationActions } from './diagnose/remediations.mjs';
+import { distributionFamily } from './hostPrerequisites.mjs';
 
 const LIMIT = 4000;
 const clean = (value) => sanitizeAuthorityDiagnostic(String(value ?? ''), { limit: LIMIT });
@@ -100,13 +103,25 @@ export function formatDiagnosticReport(report) {
         if (check.exitCode !== undefined && check.exitCode !== null) lines.push(`  Exit: ${check.exitCode}`);
         if (check.detail) lines.push(`  ${clean(check.detail).replaceAll('\n', '\n  ')}`);
         if (check.next) lines.push(`  Next: ${clean(check.next)}`);
+        for (const id of check.actionIds || []) {
+            const action = report.actions?.find((entry) => entry.id === id);
+            if (!action) continue;
+            const mode = action.mode === 'automatic' ? 'AUTO — no sudo'
+                : action.requiresSudo === true ? 'SUDO REQUIRED'
+                    : action.requiresSudo === false ? 'MANUAL — no sudo' : 'MANUAL — privilege undetermined';
+            lines.push(`  Remedy: [${mode}] ${clean(action.title)}${action.required ? '' : ' (conditional/optional)'}`);
+        }
     }
     const totals = Object.fromEntries(['pass', 'fail', 'warn', 'skip'].map((status) => [status, report.checks.filter((check) => check.status === status).length]));
     lines.push(`\n${totals.pass} passed, ${totals.fail} failed, ${totals.warn} warnings, ${totals.skip} skipped.`);
-    lines.push(report.exitCode === 0
+    lines.push(report.inspectionOnly
+        ? 'Inspection only: full runtime probes are deferred until repair verification.'
+        : report.exitCode === 0
         ? 'Deployment environment probes passed. Agent application behavior and external services still need their own checks.'
         : 'Diagnosis found failures or could not complete required probes. Follow the reported next steps and rerun ploinky diagnose.');
     lines.push('Commands referring to diagnostic container IDs record the completed attempt. Rerun ploinky diagnose to reproduce them in new isolated containers.');
+    const actions = formatRemediationActions(report.actions || []);
+    if (actions) lines.push(`\n${actions.trimEnd()}`);
     return `${lines.join('\n')}\n`;
 }
 
@@ -233,6 +248,9 @@ export function validateInsideReport(report) {
             || (check.command && (typeof check.command.file !== 'string' || !Array.isArray(check.command.args)
                 || check.command.args.some((value) => typeof value !== 'string')))) {
             throw new Error('Inner diagnostics returned an invalid check record');
+        }
+        if (!check.id.startsWith('inner.') && !check.id.startsWith('nested-engine.')) {
+            throw new Error('Inner diagnostics cannot publish host or repair check identities');
         }
         ids.add(check.id);
     }
@@ -384,6 +402,8 @@ export async function diagnoseWorkspace({
     runtimeChecks = collectRuntimeDiagnostics, currentChecks = collectCurrentWorkspaceDiagnostics,
     discover = discoverBoxOwnership, checkPublications = preflightPublications,
     bindingStore = createRouterBindingStore(), admitCurrentBox = validateCurrentBox,
+    inspectionOnly = false, repairAssessments = collectRepairAssessments,
+    homeDirectory, fsApi = fs, uid = process.getuid?.(),
 } = {}) {
     const checks = [], commands = [];
     const runner = createDiagnosticRunner(suppliedRunner || createProcessRunner({ env: buildEngineProcessEnvironment(env) }), commands, { progress });
@@ -405,7 +425,7 @@ export async function diagnoseWorkspace({
             return null;
         }
     };
-    const host = await stage('host.scan', 'Collect host prerequisites and settings', async () => hostChecks({ runner, env, platform }));
+    const host = await stage('host.scan', 'Collect host prerequisites and settings', async () => hostChecks({ runner, env, platform, fsApi, uid }));
     if (host?.checks) checks.push(...host.checks);
     let identity;
     await stage('workspace.identity', 'Resolve the selected workspace', async () => {
@@ -461,7 +481,7 @@ export async function diagnoseWorkspace({
             });
         }
     }
-    if (ownership && host?.engineUsable) {
+    if (!inspectionOnly && ownership && host?.engineUsable) {
         const before = checks.length;
         await stage('runtime.probes', 'Run isolated deployment command probes', async () => {
             await runtimeChecks({ identity, repositoryRoot, env, platform, runner, checks, progress, stage });
@@ -476,10 +496,20 @@ export async function diagnoseWorkspace({
         }
     } else {
         checks.push({ id: 'runtime.probes', label: 'Isolated deployment command probes', status: 'skip',
-            detail: 'Required host or workspace checks failed.', next: 'Fix the failed prerequisites and rerun ploinky diagnose.' });
+            detail: inspectionOnly ? 'Deferred for the repair preview; no diagnostic containers are created.' : 'Required host or workspace checks failed.',
+            next: inspectionOnly ? 'Full probes run after ploinky repair, or directly with ploinky diagnose.' : 'Fix the failed prerequisites and rerun ploinky diagnose.' });
+    }
+    if (identity) {
+        try {
+            checks.push(...await repairAssessments({ identity, host, runner, env, platform, homeDirectory, fsApi, uid }));
+        } catch (error) {
+            checks.push({ id: 'repair.assessment', label: 'Assess automatic user repairs', status: 'fail',
+                detail: failureDetail(error), next: 'Inspect this assessment failure before attempting any automatic repair.' });
+        }
     }
     const exitCode = checks.some((check) => check.status === 'fail') ? 1
-        : checks.some((check) => ['runtime.probes', 'box.inner'].includes(check.id) && check.status === 'skip') ? 2 : 0;
-    return { version: 1, workspace: identity ? clean(identity.workspaceRoot) : null, platform, exitCode, checks, commands };
+        : !inspectionOnly && checks.some((check) => ['runtime.probes', 'box.inner'].includes(check.id) && check.status === 'skip') ? 2 : 0;
+    return annotateRemediations({ version: 1, workspace: identity ? clean(identity.workspaceRoot) : null, platform, exitCode, inspectionOnly, checks, commands },
+        { context: { packageFamily: platform === 'linux' ? distributionFamily(fsApi) : '' } });
 }
 import crypto from 'node:crypto';
