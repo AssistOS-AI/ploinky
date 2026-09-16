@@ -2,15 +2,20 @@ import crypto from 'node:crypto';
 
 import { verifyJws, createMemoryReplayCache } from '../../Agent/lib/jwtVerify.mjs';
 import { computeRchHttp, sha256RawBodyHash } from '../../Agent/lib/requestHash.mjs';
+import { parseRouterOriginList } from '../../Agent/lib/routerOrigins.mjs';
 import {
     PRIVATE_ROUTER_AUDIENCE,
     currentEnabledAgentIdentity,
 } from '../sandbox/edgeGeneration.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { derivePrivateAgentRequestSecret } from '../utils/security/masterKey.js';
+import { commitRoutePlan } from './edgeRoutePlan.js';
 
 const PRIVATE_ASSERTION_HEADER = 'ploinky-agent-assertion';
 const PRIVATE_BODY_MAX_BYTES = 10 * 1024 * 1024;
+const RUNTIME_ORIGINS_PATH = '/api/edge/runtime-origins';
+const RUNTIME_ORIGINS_SCHEMA_VERSION = 1;
+const ACTIVATION_ID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const replayCache = createMemoryReplayCache({ maxSize: 8192 });
 
 export function createTurnCredentialRateLimiter({
@@ -102,6 +107,17 @@ function callerAclForPlan(plan) {
                 anyCurrentCaller: true,
                 methods: ['GET'],
                 paths: ['/api/edge/workspace-metrics'],
+            };
+        }
+        if (plan.operation === 'runtime-origins') {
+            // Non-secret workspace metadata: any exact current agent may read
+            // it, but still only with a fresh, replay-protected assertion.
+            return {
+                operation: plan.operation,
+                callers: [],
+                anyCurrentCaller: true,
+                methods: ['GET'],
+                paths: [RUNTIME_ORIGINS_PATH],
             };
         }
         if (plan.operation === 'workspace-logs') {
@@ -317,11 +333,103 @@ export function sendPrivateError(res, error) {
     res.end(body);
 }
 
-export { PRIVATE_ASSERTION_HEADER, replayCache as privateAssertionReplayCache };
+function runtimeOriginsError(status, code, message) {
+    const error = new Error(message);
+    error.code = code;
+    error.status = status;
+    return error;
+}
+
+/**
+ * The active generation's direct Router origins, derived only from the exact
+ * lease snapshot captured for this request. Mutable sources and the advisory
+ * topology file are never consulted, so a prepared or failed candidate cannot
+ * leak into the answer.
+ */
+export function buildRuntimeRouterOriginsResponse(plan) {
+    if (!plan?.ok || plan.listener !== 'private' || plan.kind !== 'private-operation'
+        || plan.operation !== 'runtime-origins') {
+        throw runtimeOriginsError(403, 'PRIVATE_LISTENER_REQUIRED', 'runtime origins require the private operation plan');
+    }
+    const lease = plan.lease;
+    const generation = String(lease?.id || '');
+    const activationId = String(lease?.activationId || '');
+    if (!/^sha256:[a-f0-9]{64}$/.test(generation) || !ACTIVATION_ID_PATTERN.test(activationId)
+        || lease?.snapshot !== plan.snapshot || plan.snapshot?.generation !== generation) {
+        throw runtimeOriginsError(503, 'RUNTIME_ORIGINS_LEASE_INVALID', 'runtime origins require one exact active lease');
+    }
+    if (!Array.isArray(plan.snapshot.routerOrigins)) {
+        // Captured before public Router hosts were a generation source.
+        throw runtimeOriginsError(503, 'RUNTIME_ORIGINS_UNSUPPORTED_GENERATION', 'active generation carries no Router origins');
+    }
+    let routerOrigins;
+    try {
+        routerOrigins = parseRouterOriginList(plan.snapshot.routerOrigins);
+    } catch (_) {
+        throw runtimeOriginsError(503, 'RUNTIME_ORIGINS_INVALID', 'active generation Router origins are invalid');
+    }
+    return {
+        schemaVersion: RUNTIME_ORIGINS_SCHEMA_VERSION,
+        authorizationGeneration: generation,
+        activationId,
+        routerOrigins: [...routerOrigins],
+    };
+}
+
+/**
+ * Reply to an already authorized runtime-origins request. The lease is
+ * revalidated synchronously immediately before the response is written, so a
+ * selector change after capture returns 503 rather than a retired answer.
+ */
+export function sendRuntimeRouterOrigins(res, {
+    plan,
+    body = Buffer.alloc(0),
+    callerIdentity = null,
+    audit = () => {},
+} = {}) {
+    let envelope;
+    try {
+        if (!Buffer.isBuffer(body) || body.length !== 0) {
+            throw runtimeOriginsError(400, 'RUNTIME_ORIGINS_REQUEST_INVALID', 'runtime origins request has a body');
+        }
+        envelope = buildRuntimeRouterOriginsResponse(plan);
+    } catch (error) {
+        audit('runtime_origins_rejected', { code: error?.code || 'RUNTIME_ORIGINS_FAILED' });
+        sendPrivateError(res, error);
+        return false;
+    }
+    const payload = Buffer.from(JSON.stringify(envelope));
+    if (!commitRoutePlan(plan)) {
+        audit('runtime_origins_rejected', { code: 'edge_generation_changed' });
+        sendPrivateError(res, runtimeOriginsError(503, 'edge_generation_changed', 'edge generation changed'));
+        return false;
+    }
+    res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Content-Length': payload.length,
+        'Cache-Control': 'no-store',
+    });
+    res.end(payload);
+    audit('runtime_origins_served', {
+        callerAgentId: String(callerIdentity?.agentId || ''),
+        generation: envelope.authorizationGeneration,
+        origins: envelope.routerOrigins.length,
+    });
+    return true;
+}
+
+export {
+    PRIVATE_ASSERTION_HEADER,
+    RUNTIME_ORIGINS_PATH,
+    RUNTIME_ORIGINS_SCHEMA_VERSION,
+    replayCache as privateAssertionReplayCache,
+};
 
 export default {
     authorizePrivateRoutePlan,
+    buildRuntimeRouterOriginsResponse,
     mintTurnCredentials,
     readPrivateRequestBody,
     sendPrivateError,
+    sendRuntimeRouterOrigins,
 };

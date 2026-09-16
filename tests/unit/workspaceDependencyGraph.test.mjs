@@ -596,7 +596,7 @@ test('static preinstall failure is fatal before startup providers can run', () =
     assert.doesNotMatch(source, /Preinstall failed:|Preinstall hook error:/);
 });
 
-test('workspace router TCP listener and both inactive graph preparations precede every agent startup', () => {
+test('workspace Router generation reader and both inactive graph preparations precede every agent startup', () => {
     const source = startWorkspace.toString();
     const routerIndex = source.indexOf('await ensureRouterReadyForStart({');
     const generationIndex = source.indexOf('ensureGraphNodesEnabled(dependencyGraph, reg, {');
@@ -617,7 +617,13 @@ test('workspace router TCP listener and both inactive graph preparations precede
         'the graph selector must activate only after semantic readiness',
     );
     assert.match(source, /Existing router TCP listener is ready/);
-    assert.doesNotMatch(source, /Unix socket|router\.sock/);
+    assert.match(source, /await ensureRouterGenerationReady\(\{/);
+    assert.match(source, /readHealth: \(\) => readRouterGenerationHealth\(\{/);
+    assert.match(source, /stopRouter: killRouterIfRunning/);
+    assert.ok(
+        source.indexOf('routerReadyForStart = true') > source.indexOf('await ensureRouterGenerationReady({'),
+        'a listening daemon must not be marked ready before its loaded reader format is confirmed',
+    );
     assert.match(source, /finally\s*\{\s*releaseWorkspaceStartLock\(workspaceStartLock\)/);
 });
 

@@ -54,7 +54,11 @@ function trustHosts(t, hosts) {
     );
 }
 
-function routedWorkspace(t) {
+// The host-created Box environment is fixed for its lifetime, and each
+// generation captures that exact list. Tests therefore select trusted hosts
+// before capturing a generation, as a rebind does by recreating the Box.
+function routedWorkspace(t, { hosts } = {}) {
+    trustHosts(t, hosts);
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-public-router-hosts-'));
     t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
     const ploinkyDir = path.join(workspace, '.ploinky');
@@ -181,13 +185,17 @@ test('runtime lookup trusts exact entries only and fails closed on malformed sta
 });
 
 test('an exact trusted LAN Host reaches the public control surface with its own authority', (t) => {
-    routedWorkspace(t);
-    trustHosts(t, undefined);
+    const workspace = routedWorkspace(t);
     const before = plan({ host: '192.168.1.63:18080' });
     assert.equal(before.status, 421);
     assert.equal(before.code, 'UNKNOWN_HOST');
 
     process.env[PUBLIC_ROUTER_HOSTS_ENV] = serializePublicRouterHosts(['192.168.1.63', 'apparatus.local']);
+    // A generation captured for another host list never serves this Box.
+    const stale = plan({ host: '192.168.1.63:18080' });
+    assert.equal(stale.status, 503);
+    assert.equal(stale.code, 'EDGE_GENERATION_RUNTIME_MISMATCH');
+    applyEdgeRoutingGeneration({ workspaceRoot: workspace, reason: 'public-router-host-rebind', publicationState: 'ready' });
     const lan = plan({ host: '192.168.1.63:18080' });
     assert.equal(lan.ok, true);
     assert.equal(lan.kind, 'agent-root');
@@ -209,8 +217,7 @@ test('an exact trusted LAN Host reaches the public control surface with its own 
 });
 
 test('unknown, malformed-policy, private, managed, and forged-header Hosts stay rejected', (t) => {
-    routedWorkspace(t);
-    trustHosts(t, ['192.168.1.63']);
+    const workspace = routedWorkspace(t, { hosts: ['192.168.1.63'] });
     for (const host of ['192.168.1.64:18080', 'attacker.test', '192.168.1.63.attacker.test', 'apparatus', '0.0.0.0:18080']) {
         const denied = plan({ host });
         assert.equal(denied.ok, false, host);
@@ -236,14 +243,22 @@ test('unknown, malformed-policy, private, managed, and forged-header Hosts stay 
     });
     assert.deepEqual(forgedAuthority.forwarding, { authority: '192.168.1.63:18080', protocol: 'http' });
 
+    // Malformed protected state fails closed at request time and can never be
+    // captured as a generation's host list.
     process.env[PUBLIC_ROUTER_HOSTS_ENV] = '["192.168.1.63", "attacker.test"]';
-    assert.equal(plan({ host: '192.168.1.63:18080' }).code, 'UNKNOWN_HOST');
-    assert.equal(plan({ host: 'attacker.test' }).code, 'UNKNOWN_HOST');
+    assert.equal(plan({ host: '192.168.1.63:18080' }).code, 'EDGE_GENERATION_RUNTIME_MISMATCH');
+    assert.equal(plan({ host: 'attacker.test' }).code, 'EDGE_GENERATION_RUNTIME_MISMATCH');
+    assert.equal(isTrustedPublicRouterHost('192.168.1.63'), false);
+    assert.equal(isTrustedPublicRouterHost('attacker.test'), false);
+    assert.throws(
+        () => applyEdgeRoutingGeneration({ workspaceRoot: workspace, reason: 'malformed-public-router-hosts' }),
+        (error) => error.code === 'EDGE_GENERATION_INVALID' && /public Router binding hosts are invalid/.test(error.message),
+    );
+    assert.equal(plan({ host: 'attacker.test' }).ok, false);
 });
 
 test('agent-port plans and WebSocket upgrades admit only the exact trusted LAN origin', async (t) => {
-    routedWorkspace(t);
-    trustHosts(t, ['192.168.1.63']);
+    routedWorkspace(t, { hosts: ['192.168.1.63'] });
     const url = '/base-agent-additional-server/alpha/7000/socket';
     const httpPlan = plan({ host: '192.168.1.63:18080', url });
     assert.equal(httpPlan.ok, true);

@@ -22,16 +22,44 @@ import {
     sendJson,
     sessionTokenService,
     SSO_AUTH_COOKIE_NAME,
+    wantsJsonResponse,
 } from './shared.js';
 import {
     resolveAuthContextForRoutePlan,
     waitForAgentRedirectReady,
 } from './authContext.js';
 import {
+    renderAuthErrorHtml,
     renderLoggedOutHtml,
     renderLogoutConfirmationHtml,
     renderSsoLoginHtml,
 } from './authPages.js';
+import { LOGIN_FAILURE, resolvePublicLoginError } from './loginErrors.js';
+
+// Router-generated configuration messages; provider text is never echoed.
+const SSO_NOT_CONFIGURED_MESSAGES = new Set([
+    'SSO is not configured (no provider agent configured)',
+    'SSO is not configured (incomplete config values)',
+]);
+
+function sendLoginFailure(req, res, failure, { origin = '', returnTo = '', agent = '', prompt = '' } = {}) {
+    if (wantsJsonResponse(req, '/auth/login')) {
+        sendJson(res, failure.status, { ok: false, error: failure.code, detail: failure.detail });
+        return;
+    }
+    res.writeHead(failure.status, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+    });
+    res.end(renderAuthErrorHtml({
+        title: failure.title,
+        detail: failure.detail,
+        origin,
+        retryReturnTo: failure.retryable ? returnTo : '',
+        retryAgent: agent,
+        retryPrompt: prompt,
+    }));
+}
 
 function loginBindingCookieName(state, baseUrl) {
     const prefix = baseUrl.startsWith('https:') ? '__Host-' : '';
@@ -183,14 +211,38 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             }
             const returnTo = normalizeRelativePath(parsedUrl.searchParams.get('returnTo') || '/', '/');
             const prompt = parsedUrl.searchParams.get('prompt') || undefined;
+            const explicitAgent = String(parsedUrl.searchParams.get('agent') || '').trim();
             if (!requireCurrentGeneration(res, routePlan)) return true;
-            const login = await authService.beginLogin({ baseUrl, returnTo, prompt });
+            let login;
+            try {
+                login = await authService.beginLogin({ baseUrl, returnTo, prompt });
+            } catch (err) {
+                const rejection = resolvePublicLoginError(err);
+                if (!rejection) throw err;
+                // The origin is the Router-validated browser origin; no state,
+                // callback URL, or provider message is logged or rendered.
+                appendLog('auth_login_rejected', {
+                    code: rejection.code,
+                    status: rejection.status,
+                    stage: 'begin-login',
+                    generation: String(routePlan.lease.id || ''),
+                    origin: baseUrl,
+                });
+                sendLoginFailure(req, res, rejection, {
+                    origin: baseUrl,
+                    returnTo,
+                    agent: authContext.record
+                        && explicitAgent === (authContext.boundHostRouteKey || authContext.routeKey)
+                        ? explicitAgent : '',
+                    prompt,
+                });
+                return true;
+            }
             if (!requireCurrentGeneration(res, routePlan)) return true;
             if (login.restartLogin === true) {
                 const restartUrl = new URL('/auth/login', login.canonicalLoginOrigin);
                 restartUrl.searchParams.set('returnTo', returnTo);
                 if (prompt) restartUrl.searchParams.set('prompt', prompt);
-                const explicitAgent = String(parsedUrl.searchParams.get('agent') || '').trim();
                 if (explicitAgent) {
                     if (!authContext.record
                         || explicitAgent !== (authContext.boundHostRouteKey || authContext.routeKey)) {
@@ -529,16 +581,21 @@ export async function handleAuthRoutes(req, res, parsedUrl, { routePlan = null }
             return true;
         }
     } catch (err) {
-        appendLog('auth_error', { error: err?.message || String(err) });
+        // Router log only; the public response below never carries this text.
+        appendLog('auth_error', { error: String(err?.message || err).slice(0, 512) });
         if (['Invalid or expired authorization state', 'Invalid authorization browser binding'].includes(err?.message)) {
             sendJson(res, 400, { ok: false, error: 'invalid_authorization_browser' });
             return true;
         }
-        if ((err?.message || '').includes('SSO is not configured')) {
-            sendJson(res, 503, { ok: false, error: 'sso_not_configured', detail: err?.message || String(err) });
+        if (SSO_NOT_CONFIGURED_MESSAGES.has(err?.message)) {
+            sendJson(res, 503, { ok: false, error: 'sso_not_configured', detail: err.message });
             return true;
         }
-        sendJson(res, 500, { ok: false, error: 'auth_failure', detail: err?.message || String(err) });
+        if (pathname === '/auth/login') {
+            sendLoginFailure(req, res, LOGIN_FAILURE);
+            return true;
+        }
+        sendJson(res, 500, { ok: false, error: 'auth_failure', detail: 'Authentication could not be completed.' });
         return true;
     }
     res.writeHead(404); res.end('Not Found');

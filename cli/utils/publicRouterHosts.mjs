@@ -7,6 +7,7 @@
 // admits them only as exact matches. Request headers, the Box's own network
 // identity, and agent configuration can never extend this list.
 
+import { canonicalRouterOriginList } from '../../Agent/lib/routerOrigins.mjs';
 import { isUsableHostIpv4 } from '../../ploinky-box/hostNetwork.mjs';
 
 export const PUBLIC_ROUTER_HOSTS_ENV = 'PLOINKY_PUBLIC_ROUTER_HOSTS';
@@ -169,8 +170,41 @@ export function isTrustedPublicRouterHost(host, env = process.env) {
     return typeof host === 'string' && host !== '' && readPublicRouterHosts(env).hosts.has(host);
 }
 
+/**
+ * The protected host list as immutable generation input. Missing state is an
+ * empty list. Unlike the request-time check, malformed state is an error: a
+ * captured generation must never silently record a different trust set.
+ *
+ * @param {Record<string, string|undefined>} [env]
+ * @returns {readonly string[]}
+ */
+export function capturePublicRouterHosts(env = process.env) {
+    const raw = env?.[PUBLIC_ROUTER_HOSTS_ENV];
+    if (raw === undefined || raw === '') return Object.freeze([]);
+    return parsePublicRouterHosts(String(raw));
+}
+
+/**
+ * Exact direct-binding origins for trusted outer hosts and the selected outer
+ * Router port. Direct bindings serve plain HTTP; loopback needs no entry and a
+ * wildcard is never an origin, because the host list admits neither.
+ *
+ * @param {readonly string[]} hosts
+ * @param {number} hostPort
+ * @returns {readonly string[]}
+ */
+export function deriveRouterOrigins(hosts, hostPort) {
+    if (!Number.isSafeInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+        throw hostsError('Router origins require the selected outer Router port');
+    }
+    const canonicalHosts = parsePublicRouterHosts(serializePublicRouterHosts(hosts));
+    return canonicalRouterOriginList(canonicalHosts.map((host) => new URL(`http://${host}:${hostPort}`).origin));
+}
+
 export default {
     PUBLIC_ROUTER_HOSTS_ENV,
+    capturePublicRouterHosts,
+    deriveRouterOrigins,
     isTrustedPublicRouterHost,
     normalizePublicRouterHost,
     parsePublicRouterHosts,

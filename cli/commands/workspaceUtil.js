@@ -44,6 +44,10 @@ import { loadEnvFile } from '../utils/security/secretInjector.js';
 import { readSecretsFile } from '../utils/security/encryptedSecretsFile.js';
 import { PUBLIC_ROUTER_HOSTS_ENV } from '../utils/publicRouterHosts.mjs';
 import {
+  ensureRouterGenerationReady,
+  readRouterGenerationHealth,
+} from '../utils/runtime/routerGenerationReadiness.mjs';
+import {
   sanitizeManagedMasterKeyEnvironment,
 } from '../utils/security/masterKey.js';
 import { getExposedNames, getManifestEnvNames } from '../utils/security/secretVars.js';
@@ -2028,31 +2032,29 @@ async function startWorkspace(staticAgentArg, portArg, {
       routes: routingCandidate.routes || {},
     }, { coordinate: false });
     console.log(`Static: agent=${utils.colorize(staticAgent, 'cyan')} port=${utils.colorize(String(staticPort), 'yellow')}`);
-    try {
-      await waitForRouterReady(staticPort, null, 300);
-      routerReadyForStart = true;
-      routerPortForStart = staticPort;
-      routerContainerForStart = container;
-      console.log('[start] Existing router TCP listener is ready.');
-      return container;
-    } catch (_) {
-      // No TCP listener exists. Replace only the router process.
-    }
-    if (typeof killRouterIfRunning === 'function') {
-      try { killRouterIfRunning(); } catch (_) {}
-    }
-    const runningDir = RUNNING_DIR;
-    fs.mkdirSync(runningDir, { recursive: true });
-    const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
-    const routerPidFile = path.join(runningDir, 'router.pid');
-    const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
-    try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
-    child.unref();
-    await waitForRouterReady(staticPort, child);
+    const routerHealthSocket = buildRouterEnv().PLOINKY_ROUTER_HEALTH_SOCKET
+      || path.join(PLOINKY_DIR, 'run', 'router-health.sock');
+    const readyRouter = await ensureRouterGenerationReady({
+      waitForListener: (child, timeoutMs) => waitForRouterReady(staticPort, child, timeoutMs),
+      readHealth: () => readRouterGenerationHealth({ socketPath: routerHealthSocket }),
+      stopRouter: killRouterIfRunning,
+      onReload: () => console.log('[start] Reloading Router before preparing the current routing generation format.'),
+      spawnRouter: () => {
+        const runningDir = RUNNING_DIR;
+        fs.mkdirSync(runningDir, { recursive: true });
+        const routerPath = path.resolve(__dirname, '../server/Watchdog.js');
+        const routerPidFile = path.join(runningDir, 'router.pid');
+        const child = spawnWatchdog(routerPath, staticPort, routerPidFile);
+        try { fs.writeFileSync(routerPidFile, String(child.pid)); } catch (_) {}
+        child.unref();
+        return child;
+      },
+    });
     routerReadyForStart = true;
     routerPortForStart = staticPort;
     routerContainerForStart = container;
-    console.log(`[start] Watchdog launched in background (pid ${child.pid}); router TCP listener is ready.`);
+    if (readyRouter.reused) console.log('[start] Existing router TCP listener is ready; routing generation format verified.');
+    else console.log(`[start] Watchdog launched in background (pid ${readyRouter.child.pid}); router generation reader is ready.`);
     return container;
   };
     if (staticAgentArg) {

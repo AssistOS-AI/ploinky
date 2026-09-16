@@ -17,6 +17,13 @@ import { resolveAgentAuthPolicy } from '../utils/manifestAuth.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
 import {
+    capturePublicRouterHosts,
+    deriveRouterOrigins,
+    parsePublicRouterHosts,
+    serializePublicRouterHosts,
+} from '../utils/publicRouterHosts.mjs';
+import { parseRouterOriginList } from '../../Agent/lib/routerOrigins.mjs';
+import {
     INITIAL_MEDIA_HOST_PORT,
     parseMediaHostPort,
     parseRouterHostPort,
@@ -1070,6 +1077,32 @@ function compileGeneration({ routing, policy, desired, agents, manifests }) {
     };
 }
 
+function capturedPublicRouterHosts() {
+    try {
+        return capturePublicRouterHosts();
+    } catch (error) {
+        throw edgeError(`protected public Router binding hosts are invalid: ${error?.message || error}`);
+    }
+}
+
+// Physical publication inputs owned by the host-created Box. The public host
+// list and outer Router port together determine the direct-binding origins, so
+// both are immutable generation sources rather than values read while serving.
+function captureRuntimeBindingSources() {
+    const routerHostPort = selectedRouterHostPort();
+    const mediaHostPort = selectedMediaHostPort();
+    const routerPublicHosts = capturedPublicRouterHosts();
+    return {
+        routerHostPort,
+        routerHostPortBytes: Buffer.from(String(routerHostPort), 'utf8'),
+        mediaHostPort,
+        mediaHostPortBytes: Buffer.from(String(mediaHostPort), 'utf8'),
+        routerPublicHosts,
+        routerPublicHostsBytes: Buffer.from(serializePublicRouterHosts(routerPublicHosts), 'utf8'),
+        routerOrigins: deriveRouterOrigins(routerPublicHosts, routerHostPort),
+    };
+}
+
 function collectCapturedSources(paths) {
     const routingBytes = readExact(paths.routingFile, { label: 'routing.json' });
     const policyBytes = readExact(paths.policyFile, { label: 'policy-state.json' });
@@ -1079,10 +1112,15 @@ function collectCapturedSources(paths) {
     const policy = parseJsonBytes(policyBytes, 'policy-state.json');
     const desired = parseJsonBytes(desiredBytes, 'edge desired state');
     const agents = parseJsonBytes(agentsBytes, 'agents.json');
-    const routerHostPort = selectedRouterHostPort();
-    const routerHostPortBytes = Buffer.from(String(routerHostPort), 'utf8');
-    const mediaHostPort = selectedMediaHostPort();
-    const mediaHostPortBytes = Buffer.from(String(mediaHostPort), 'utf8');
+    const {
+        routerHostPort,
+        routerHostPortBytes,
+        mediaHostPort,
+        mediaHostPortBytes,
+        routerPublicHosts,
+        routerPublicHostsBytes,
+        routerOrigins,
+    } = captureRuntimeBindingSources();
     const manifestBytes = {};
     const manifests = {};
     for (const [routeKey, route] of Object.entries(routing?.routes || {}).sort(([left], [right]) => left.localeCompare(right))) {
@@ -1100,6 +1138,7 @@ function collectCapturedSources(paths) {
         ['agents.json', agentsBytes],
         ['router-host-port', routerHostPortBytes],
         ['media-host-port', mediaHostPortBytes],
+        ['router-public-hosts', routerPublicHostsBytes],
         ...Object.entries(manifestBytes).sort(([left], [right]) => left.localeCompare(right)).map(([routeKey, bytes]) => [`manifest:${routeKey}`, bytes]),
     ];
     return {
@@ -1112,6 +1151,8 @@ function collectCapturedSources(paths) {
         manifests,
         routerHostPort,
         mediaHostPort,
+        routerPublicHosts,
+        routerOrigins,
         compiled: semantic.compiled,
         bytes: {
             routingBytes,
@@ -1120,6 +1161,7 @@ function collectCapturedSources(paths) {
             agentsBytes,
             routerHostPortBytes,
             mediaHostPortBytes,
+            routerPublicHostsBytes,
             manifestBytes,
         },
     };
@@ -1149,10 +1191,15 @@ function collectCandidateSources(paths, {
     const parsedPolicy = parseJsonBytes(policyBytes, 'policy-state.json');
     const parsedDesired = parseJsonBytes(desiredBytes, 'edge desired state');
     const parsedAgents = parseJsonBytes(agentsBytes, 'agents.json');
-    const routerHostPort = selectedRouterHostPort();
-    const routerHostPortBytes = Buffer.from(String(routerHostPort), 'utf8');
-    const mediaHostPort = selectedMediaHostPort();
-    const mediaHostPortBytes = Buffer.from(String(mediaHostPort), 'utf8');
+    const {
+        routerHostPort,
+        routerHostPortBytes,
+        mediaHostPort,
+        mediaHostPortBytes,
+        routerPublicHosts,
+        routerPublicHostsBytes,
+        routerOrigins,
+    } = captureRuntimeBindingSources();
     const exactManifestBytes = {};
     const manifests = {};
     for (const [routeKey, route] of Object.entries(parsedRouting?.routes || {}).sort(([left], [right]) => left.localeCompare(right))) {
@@ -1179,6 +1226,7 @@ function collectCandidateSources(paths, {
         ['agents.json', agentsBytes],
         ['router-host-port', routerHostPortBytes],
         ['media-host-port', mediaHostPortBytes],
+        ['router-public-hosts', routerPublicHostsBytes],
         ...Object.entries(exactManifestBytes).sort(([left], [right]) => left.localeCompare(right))
             .map(([routeKey, bytes]) => [`manifest:${routeKey}`, bytes]),
     ];
@@ -1192,6 +1240,8 @@ function collectCandidateSources(paths, {
         manifests,
         routerHostPort,
         mediaHostPort,
+        routerPublicHosts,
+        routerOrigins,
         compiled: semantic.compiled,
         bytes: {
             routingBytes,
@@ -1200,6 +1250,7 @@ function collectCandidateSources(paths, {
             agentsBytes,
             routerHostPortBytes,
             mediaHostPortBytes,
+            routerPublicHostsBytes,
             manifestBytes: exactManifestBytes,
         },
     };
@@ -1580,6 +1631,9 @@ function sourceDigests(captured) {
         ...(captured.bytes.mediaHostPortBytes
             ? { mediaHostPort: sourceDigest(captured.bytes.mediaHostPortBytes) }
             : {}),
+        ...(captured.bytes.routerPublicHostsBytes
+            ? { routerPublicHosts: sourceDigest(captured.bytes.routerPublicHostsBytes) }
+            : {}),
         manifests: Object.fromEntries(
             Object.entries(captured.bytes.manifestBytes).sort(([left], [right]) => left.localeCompare(right))
                 .map(([key, bytes]) => [key, sourceDigest(bytes)]),
@@ -1624,6 +1678,7 @@ function lifecycleBindingDigest(captured) {
         desired: digests.desired,
         routerHostPort: digests.routerHostPort,
         mediaHostPort: digests.mediaHostPort,
+        routerPublicHosts: digests.routerPublicHosts,
         manifests: digests.manifests,
     })));
 }
@@ -1657,7 +1712,7 @@ function lifecycleBindingChangeLabels(prepared, captured) {
     }
 
     const capturedDigests = sourceDigests(captured);
-    for (const source of ['policy', 'desired', 'routerHostPort', 'mediaHostPort']) {
+    for (const source of ['policy', 'desired', 'routerHostPort', 'mediaHostPort', 'routerPublicHosts']) {
         if (prepared.sourceDigests?.[source] !== capturedDigests[source]) {
             labels.push(source);
         }
@@ -1912,6 +1967,7 @@ function buildGenerationDocument(captured) {
             agents: captured.bytes.agentsBytes.toString('base64'),
             routerHostPort: captured.bytes.routerHostPortBytes.toString('base64'),
             mediaHostPort: captured.bytes.mediaHostPortBytes.toString('base64'),
+            routerPublicHosts: captured.bytes.routerPublicHostsBytes.toString('base64'),
             manifests: Object.fromEntries(
                 Object.entries(captured.bytes.manifestBytes).sort(([left], [right]) => left.localeCompare(right))
                     .map(([key, bytes]) => [key, bytes.toString('base64')]),
@@ -1955,6 +2011,8 @@ function capturedGenerationSnapshot(captured, publicationState) {
         manifests: captured.manifests,
         routerHostPort: captured.routerHostPort,
         mediaHostPort: captured.mediaHostPort,
+        routerPublicHosts: captured.routerPublicHosts,
+        routerOrigins: captured.routerOrigins,
         compiled: captured.compiled,
     });
 }
@@ -1977,8 +2035,14 @@ function decodeGenerationSources(document) {
         'agents',
         'routerHostPort',
         'mediaHostPort',
+        'routerPublicHosts',
         'manifests',
     ]), 'generation sources');
+    // Optional sources are additive: every writer that captured public Router
+    // hosts also captured the media port, so the reverse shape was never valid.
+    if (sources.routerPublicHosts !== undefined && sources.mediaHostPort === undefined) {
+        throw edgeError('generation public Router hosts source requires its media host-port source', 'EDGE_GENERATION_CORRUPT');
+    }
     const manifestSources = assertObject(sources.manifests, 'generation manifest sources');
     const manifestBytes = Object.fromEntries(Object.entries(manifestSources).sort(([left], [right]) => left.localeCompare(right)).map(([routeKey, value]) => {
         if (!routeKey || RESERVED_OBJECT_KEYS.has(routeKey)) throw edgeError('generation manifest source key is invalid', 'EDGE_GENERATION_CORRUPT');
@@ -1993,6 +2057,9 @@ function decodeGenerationSources(document) {
         ...(sources.mediaHostPort === undefined
             ? {}
             : { mediaHostPortBytes: decodeCanonicalBase64(sources.mediaHostPort, 'generation media host-port source') }),
+        ...(sources.routerPublicHosts === undefined
+            ? {}
+            : { routerPublicHostsBytes: decodeCanonicalBase64(sources.routerPublicHosts, 'generation public Router hosts source') }),
         manifestBytes,
     };
 }
@@ -2022,6 +2089,18 @@ function reconstructGeneration(document, selector) {
             });
         } catch (error) {
             throw edgeError(`captured media host port is invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
+        }
+    }
+    // A generation captured before public Router hosts were a source has no
+    // origin capability. Never derive one for it from today's environment.
+    let routerPublicHosts = null;
+    let routerOrigins = null;
+    if (bytes.routerPublicHostsBytes) {
+        try {
+            routerPublicHosts = parsePublicRouterHosts(bytes.routerPublicHostsBytes.toString('utf8'));
+            routerOrigins = deriveRouterOrigins(routerPublicHosts, routerHostPort);
+        } catch (error) {
+            throw edgeError(`captured public Router hosts are invalid: ${error?.message || error}`, 'EDGE_GENERATION_CORRUPT');
         }
     }
     const manifests = Object.fromEntries(Object.entries(bytes.manifestBytes).map(([routeKey, value]) => (
@@ -2054,6 +2133,7 @@ function reconstructGeneration(document, selector) {
         ['agents.json', bytes.agentsBytes],
         ['router-host-port', bytes.routerHostPortBytes],
         ...(bytes.mediaHostPortBytes ? [['media-host-port', bytes.mediaHostPortBytes]] : []),
+        ...(bytes.routerPublicHostsBytes ? [['router-public-hosts', bytes.routerPublicHostsBytes]] : []),
         ...Object.entries(bytes.manifestBytes).sort(([left], [right]) => left.localeCompare(right)).map(([routeKey, value]) => [`manifest:${routeKey}`, value]),
     ];
     if (digestParts(parts) !== selector.generation) {
@@ -2101,6 +2181,8 @@ function reconstructGeneration(document, selector) {
         manifests,
         routerHostPort,
         mediaHostPort,
+        routerPublicHosts,
+        routerOrigins,
         compiled: legacyCompiledShape ? storedCompiled : semantic.compiled,
     };
 }
@@ -2165,14 +2247,22 @@ function topologyMedia(desired, mediaHostPort) {
     return media;
 }
 
+// A generation without the captured source has no origin capability, and its
+// topology omits the field so consumers can tell legacy from an empty list.
+function topologyRouterOrigins(generation) {
+    return Array.isArray(generation.routerOrigins) ? [...generation.routerOrigins] : undefined;
+}
+
 function topologyConfigurationGeneration(generation) {
     // Hash only the stable, non-secret configuration consumers can observe.
     // Runtime targets, active locators, policy state, and publication readiness
     // are intentionally represented by the separate authorization/publication
     // generations below.
     const media = topologyMedia(generation.desired, generation.mediaHostPort);
+    const routerOrigins = topologyRouterOrigins(generation);
     const configuration = {
         ...(media ? { media } : {}),
+        ...(routerOrigins ? { routerOrigins } : {}),
     };
     return sourceDigest(Buffer.from(stableStringify(configuration)));
 }
@@ -2183,6 +2273,7 @@ function writeTopologyForGeneration(paths, generation, publicationState, options
         previousPublication = Number(JSON.parse(fs.readFileSync(paths.topologyCurrentFile, 'utf8')).publicationGeneration || 0);
     } catch (_) {}
     const media = topologyMedia(generation.desired, generation.mediaHostPort);
+    const routerOrigins = topologyRouterOrigins(generation);
     const topology = {
         configurationGeneration: topologyConfigurationGeneration(generation),
         // Router uses this private snapshot binding and never returns it from
@@ -2191,6 +2282,10 @@ function writeTopologyForGeneration(paths, generation, publicationState, options
         publicationGeneration: previousPublication + 1,
         state: publicationState,
         ...(media ? { media } : {}),
+        // Advisory discovery only. This file is published before the selector
+        // commit, so consumers confirm active origins through the private
+        // runtime-origins operation before relying on them.
+        ...(routerOrigins ? { routerOrigins } : {}),
     };
     fs.mkdirSync(paths.topologyGenerationsDir, { recursive: true });
     const topologyName = `${generation.generation.replace(/^sha256:/, '')}-${topology.publicationGeneration}.json`;
@@ -2290,20 +2385,7 @@ export function applyEdgeRoutingGeneration(options = {}) {
             activationId: crypto.randomUUID(),
             activatedAt: new Date().toISOString(),
         });
-        const generation = deepFreeze({
-            schemaVersion: EDGE_GENERATION_SCHEMA_VERSION,
-            generation: captured.generation,
-            publicationState,
-            sourceDigests: sourceDigests(captured),
-            routing: captured.routing,
-            policy: captured.policy,
-            desired: captured.desired,
-            agents: captured.agents,
-            manifests: captured.manifests,
-            routerHostPort: captured.routerHostPort,
-            mediaHostPort: captured.mediaHostPort,
-            compiled: captured.compiled,
-        });
+        const generation = capturedGenerationSnapshot(captured, publicationState);
         // A validated immutable candidate remains the selected generation even
         // while authorization is inactive. Keep the last active generation
         // separately so a failed non-reloadable restart is required again on
@@ -2711,6 +2793,18 @@ export function applyEdgeDesiredStateFile(candidateFile, options = {}) {
     });
 }
 
+// A generation binds the public hosts the Box was created with. Legacy
+// generations carry none and remain loadable without gaining a capability.
+function routerPublicHostsMatchRuntime(generation) {
+    if (!Array.isArray(generation?.routerPublicHosts)) return true;
+    try {
+        return serializePublicRouterHosts(capturePublicRouterHosts())
+            === serializePublicRouterHosts(generation.routerPublicHosts);
+    } catch (_) {
+        return false;
+    }
+}
+
 export function loadActiveEdgeRoutingGeneration(options = {}) {
     const paths = resolveEdgeGenerationPaths(options);
     const selector = readSelector(paths);
@@ -2740,6 +2834,12 @@ export function loadActiveEdgeRoutingGeneration(options = {}) {
     if (generation.mediaHostPort !== selectedMediaHostPort()) {
         throw edgeError(
             'active edge routing generation was compiled for a different physical media host port; coordinated apply is required',
+            'EDGE_GENERATION_RUNTIME_MISMATCH',
+        );
+    }
+    if (!routerPublicHostsMatchRuntime(generation)) {
+        throw edgeError(
+            'active edge routing generation was compiled for different public Router hosts; coordinated apply is required',
             'EDGE_GENERATION_RUNTIME_MISMATCH',
         );
     }
@@ -2908,6 +3008,12 @@ export function captureEdgeRoutingObservationLease({ expectedGeneration, ...opti
         if (generation.mediaHostPort !== selectedMediaHostPort()) {
             throw edgeError(
                 'registered Router authority observation generation targets a different physical media port',
+                'EDGE_GENERATION_RUNTIME_MISMATCH',
+            );
+        }
+        if (!routerPublicHostsMatchRuntime(generation)) {
+            throw edgeError(
+                'registered Router authority observation generation targets different public Router hosts',
                 'EDGE_GENERATION_RUNTIME_MISMATCH',
             );
         }
@@ -3107,6 +3213,13 @@ export function readCurrentEdgeTopology(options = {}) {
         || !/^sha256:[a-f0-9]{64}$/.test(String(document.configurationGeneration || ''))
         || !/^sha256:[a-f0-9]{64}$/.test(String(document.authorizationGeneration || ''))) {
         throw edgeError('edge topology has an unsupported or invalid schema', 'EDGE_TOPOLOGY_INVALID');
+    }
+    if (Object.hasOwn(document, 'routerOrigins')) {
+        try {
+            parseRouterOriginList(document.routerOrigins);
+        } catch (_) {
+            throw edgeError('edge topology Router origins are invalid', 'EDGE_TOPOLOGY_INVALID');
+        }
     }
     return deepFreeze(document);
 }
