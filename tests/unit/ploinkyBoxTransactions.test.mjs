@@ -400,6 +400,10 @@ function harness(state, {
                         images: imagesLabel.slice(imagesLabel.indexOf('=') + 1),
                     },
                 });
+                if (args.includes('--network')) {
+                    current.runtime.createCommand.push('--network', args[args.indexOf('--network') + 1]);
+                    current.runtime.networkMode = 'pasta';
+                }
             }
             if (args[0] === 'container' && args[1] === 'start') current.runtime.running = true;
             if (args[0] === 'container' && args[1] === 'stop') current.runtime.running = false;
@@ -1545,6 +1549,44 @@ function lifecycleContainer(state, running = true) {
         id: 'e'.repeat(64), running,
     });
 }
+
+test('native pasta migration replaces a legacy Box, verifies IPv4 mode, and then reuses it', async (t) => {
+    const state = fixture(t);
+    const initial = lifecycleContainer(state);
+    initial.runtime.networkMode = 'pasta';
+    const h = harness(state, { initial });
+    const engine = { name: 'podman', identity: 'engine', hostKind: 'native-linux', rootlessNetworkCmd: 'pasta' };
+    const args = { ...reconciliationArguments(state, h, initial), engine, imagePolicy: 'preserve' };
+    const migrated = await reconcileBoxContainer(args, h.seams);
+    assert.equal(migrated.action, 'replaced');
+    assert.notEqual(migrated.containerId, initial.id);
+    assert.equal(h.current().runtime.networkMode, 'pasta');
+    assert.ok(h.current().runtime.createCommand.includes('pasta:--ipv4-only'));
+    migrated.finalize();
+    const callsBefore = h.calls.length;
+    const reused = await reconcileBoxContainer({
+        ...args, ownership: { state: 'owned', handles: { container: h.current() } },
+    }, h.seams);
+    assert.equal(reused.action, 'reused');
+    assert.equal(h.calls.slice(callsBefore).some((call) => call.includes('create') || call.includes('stop')), false);
+});
+
+test('a failed native pasta migration restores the exact legacy network contract', async (t) => {
+    const state = fixture(t);
+    const initial = lifecycleContainer(state);
+    initial.runtime.networkMode = 'pasta';
+    const h = harness(state, { initial, failCandidateReady: true });
+    await assert.rejects(reconcileBoxContainer({
+        ...reconciliationArguments(state, h, initial), imagePolicy: 'preserve',
+        engine: { name: 'podman', identity: 'engine', hostKind: 'native-linux', rootlessNetworkCmd: 'pasta' },
+    }, h.seams), /ready timeout/);
+    const creates = h.calls.filter((call) => call.includes('create'));
+    assert.equal(creates.length, 2);
+    assert.ok(creates[0].includes('pasta:--ipv4-only'));
+    assert.equal(creates[1].includes('--network'), false);
+    assert.equal(h.current().runtime.imageId, initial.runtime.imageId);
+    assert.equal(h.current().runtime.running, true);
+});
 
 test('fresh creation, stopped reuse and replacement retire only the quiescent inner lease before start', async (t) => {
     for (const scenario of ['fresh', 'stopped', 'replacement', 'running']) {

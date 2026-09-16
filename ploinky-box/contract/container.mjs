@@ -32,6 +32,7 @@ import {
 } from './agentlib.mjs';
 import { IMAGE_CONTRACT } from './image.mjs';
 import { normalizeImageId } from './image-id.mjs';
+import { assertBoxNetworkMode } from './network.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
 const INCOMPATIBLE_BOX_GUIDANCE = "; back up any Box-only data, then run 'ploinky stop'"
@@ -134,6 +135,7 @@ export function normalizeContainerRuntime(record) {
         ),
         imageId: String(record?.Image ?? record?.ImageID ?? '').trim(),
         configuredImage: String(config?.Image ?? '').trim(),
+        networkMode: String(hostConfig?.NetworkMode ?? ''),
         user: String(config?.User ?? ''),
         environment: envMap(config?.Env),
         createCommand: Array.isArray(config?.CreateCommand)
@@ -305,10 +307,12 @@ export function validateContainerConfiguration(containerHandle, {
     imageRef,
     repositoryRoot,
     hostKind = 'native-linux',
+    networkMode,
 }) {
     assertRouterBindingStateConfined(identity);
     const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort, routerBinding);
     const runtime = containerHandle.runtime;
+    assertBoxNetworkMode(runtime, networkMode);
     const seccompProfile = nestedPodmanSeccompProfileContract(repositoryRoot);
     if (containerHandle.id === '' || runtime.imageId !== imageId) {
         throw publicationError('Owned Box image ID does not match the validated immutable image');

@@ -145,6 +145,18 @@ test('discovery accepts native Linux and the default macOS Podman Machine', (t) 
     ]);
 });
 
+test('discovery retains the selected rootless helper without guessing from platform or installed binaries', (t) => {
+    const identity = identityFixture(t);
+    for (const helper of ['pasta', 'slirp4netns']) {
+        const info = podmanInfo();
+        info.host.rootlessNetworkCmd = helper;
+        const runner = fakeRunner(identity, { podman: info });
+        const result = discoverBoxOwnership(identity, { platform: 'linux', env: {}, runner });
+        assert.equal(result.engine.rootlessNetworkCmd, helper);
+        assertOnlyPodmanExactInspect(runner, identity);
+    }
+});
+
 test('discovery rejects unsupported, rootful, and remote engines before inspection', (t) => {
     const identity = identityFixture(t);
     const unsupportedRunner = fakeRunner(identity);

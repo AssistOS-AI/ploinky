@@ -490,6 +490,14 @@ trusted names are part of the Box configuration, a later `start`, `restart`, or
 `update` recreates the Box when this machine's addresses or name change. A
 specific address that is no longer assigned must be bound again.
 
+On native Linux when Podman selects pasta, the Box explicitly uses IPv4-only
+pasta networking. This keeps an IPv4 wildcard binding from also accepting IPv6
+`localhost` connections that the IPv4 Router cannot serve. Existing Boxes using
+default pasta are recreated by the next lifecycle reconciliation; status and
+teardown remain available, and a failed replacement can restore the previous
+network contract. Podman Machine and configured slirp4netns retain their engine
+network defaults.
+
 Each routing generation captures that host list together with the selected outer
 Router port as immutable source input, so a rebind, port change, or rollback
 produces a different generation. The Router refuses an active generation that was

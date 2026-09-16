@@ -357,7 +357,12 @@ export function discoverBoxOwnership(identity, {
     return {
         state: ownership.state,
         message: ownership.message || '',
-        engine: Object.freeze({ name: 'podman', identity: podman.identity, hostKind }),
+        engine: Object.freeze({
+            name: 'podman', identity: podman.identity, hostKind,
+            rootlessNetworkCmd: String(nestedValue(podman.info, [
+                ['host', 'rootlessNetworkCmd'], ['Host', 'RootlessNetworkCmd'],
+            ]) || ''),
+        }),
         handles: ownership.handles || null,
         engines: { podman },
     };

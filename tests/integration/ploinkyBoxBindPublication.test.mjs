@@ -238,6 +238,18 @@ test('native Box Router publications preserve the public-only boundary across bi
             await assert.rejects(() => request('127.0.0.1', hostPort), 'a specific LAN publication must not listen on loopback');
         } else {
             assert.deepEqual(await request('127.0.0.1', hostPort), { status: 200, body: token });
+            assert.deepEqual(await request('localhost', hostPort), { status: 200, body: token });
+            if (engine.rootlessNetworkCmd === 'pasta') {
+                assert.ok(handle.runtime.createCommand.includes('pasta:--ipv4-only'));
+                // A dual-stack pasta socket can accept ::1 and then reset the
+                // HTTP stream, preventing browser localhost fallback to IPv4.
+                await assert.rejects(() => new Promise((resolve, reject) => {
+                    const socket = net.createConnection({ host: '::1', port: hostPort });
+                    socket.once('connect', () => { socket.destroy(); resolve(); });
+                    socket.once('error', reject);
+                    socket.setTimeout(1500, () => socket.destroy(new Error('IPv6 listener probe timed out')));
+                }), { code: 'ECONNREFUSED' });
+            }
         }
         result.finalize();
         if (binding) {

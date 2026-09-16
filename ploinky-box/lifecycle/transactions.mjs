@@ -25,6 +25,7 @@ import { discoverBoxOwnership } from '../engine/discovery.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { probeImageAgentLib } from '../image-agentlib.mjs';
 import { normalizeImageId } from '../contract/image-id.mjs';
+import { observedBoxNetworkMode, selectedBoxNetworkMode } from '../contract/network.mjs';
 import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
 import { retireQuiescentBoxEdgePreparation } from '../edgePreparationCleanup.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
@@ -100,6 +101,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         imageId,
         repositoryRoot,
         hostKind: engine.hostKind,
+        networkMode: observedBoxNetworkMode(container.runtime),
         dataFingerprints,
         agentLib,
         running: container.runtime.running === true,
@@ -143,6 +145,7 @@ async function pullBoxImage(engine, imageRef, runner, {
 
 async function createAndStart({
     engine,
+    networkMode = selectedBoxNetworkMode(engine),
     identity,
     image,
     imageRef,
@@ -194,6 +197,7 @@ async function createAndStart({
         repositoryRoot,
         cidfile,
         hostKind: engine.hostKind,
+        networkMode,
     }));
     let containerId;
     try {
@@ -222,6 +226,7 @@ async function createAndStart({
         imageRef,
         repositoryRoot,
         hostKind: engine.hostKind,
+        networkMode,
         dataFingerprints: dataState.fingerprints,
         agentLib,
     });
@@ -260,6 +265,7 @@ async function restoreOldContainer({
         identity,
         image: { immutableId: old.imageId },
         imageRef: old.imageRef,
+        networkMode: old.networkMode,
         hostPort: old.hostPort,
         mediaHostPort: old.mediaHostPort,
         routerBinding: old.routerBinding,
@@ -384,7 +390,8 @@ export async function reconcileBoxContainer({
         || !isDeepStrictEqual(currentDataState.fingerprints, old.dataFingerprints)
     );
     const requiresReplacement = Boolean(old) && (
-        old.hostPort !== portPlan.hostPort
+        old.networkMode !== selectedBoxNetworkMode(engine)
+        || old.hostPort !== portPlan.hostPort
         || old.mediaHostPort !== portPlan.mediaHostPort
         // Podman cannot change the published address or the Box environment in
         // place, so an address-only or trusted-host change is a replacement.

@@ -21,6 +21,7 @@ import {
 } from '../contract/agentlib.mjs';
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import { normalizeImageId } from '../contract/image-id.mjs';
+import { PASTA_IPV4_NETWORK } from '../contract/network.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import {
     PUBLIC_ROUTER_HOSTS_ENV,
@@ -95,10 +96,14 @@ export function containerCreateArgs({
     repositoryRoot,
     cidfile,
     hostKind = 'native-linux',
+    networkMode = null,
 }) {
     assertRouterBindingStateConfined(identity);
     const source = path.resolve(repositoryRoot);
     const seccompProfile = nestedPodmanSeccompProfileContract(source);
+    if (networkMode !== null && networkMode !== PASTA_IPV4_NETWORK) {
+        throw lifecycleError('Container creation requires a supported outer network mode');
+    }
     if (!agentLib) {
         throw lifecycleError('Container creation requires a selected achillesAgentLib source');
     }
@@ -145,6 +150,7 @@ export function containerCreateArgs({
         '--security-opt', 'unmask=ALL',
         '--security-opt', 'label=disable',
         '--security-opt', `seccomp=${seccompProfile.path}`,
+        ...(networkMode ? ['--network', networkMode] : []),
         '--publish', `${publication.address}:${hostPort}:${BOX_ROUTER_CONTAINER_PORT}/tcp`,
         '--publish', `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
         '--tmpfs', tmpfsCreateArgument(),
