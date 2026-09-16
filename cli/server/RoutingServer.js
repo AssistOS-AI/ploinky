@@ -49,8 +49,10 @@ import {
     mintTurnCredentials,
     readPrivateRequestBody,
     sendPrivateError,
+    sendRuntimeRouterOrigins,
 } from './privateRouter.js';
 import { createListenerInterfaceClassifier } from './listenerInterfaceClassifier.js';
+import { ROUTER_GENERATION_SOURCE_FORMAT } from '../utils/runtime/routerGenerationReadiness.mjs';
 import {
     classifyPrivateListenerRequest,
     createPrivateListenerSet,
@@ -860,6 +862,15 @@ async function processPrivateRequest(req, res) {
         }
         return;
     }
+    if (routePlan.kind === 'private-operation' && routePlan.operation === 'runtime-origins') {
+        sendRuntimeRouterOrigins(res, {
+            plan: routePlan,
+            body,
+            callerIdentity: req.privateAgentIdentity,
+            audit: (event, value) => appendLog(event, value),
+        });
+        return;
+    }
     if (routePlan.kind === 'private-operation' && routePlan.operation === 'workspace-metrics') {
         if (!commitRoutePlan(routePlan)) {
             sendJsonResponse(res, 503, { error: 'edge_generation_changed' }, { 'Cache-Control': 'no-store' });
@@ -905,6 +916,7 @@ function detailedHealthData() {
     try { edgePublication = cloudflaredRouterIntegration.getStatus(); } catch (_) {}
     return {
         status: 'healthy',
+        generationSourceFormat: ROUTER_GENERATION_SOURCE_FORMAT,
         uptime: process.uptime(),
         timestamp: new Date().toISOString(),
         pid: process.pid,

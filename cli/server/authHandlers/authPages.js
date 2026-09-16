@@ -266,6 +266,49 @@ function renderLogoutConfirmationHtml({
 </html>`;
 }
 
+/**
+ * Fixed-wording sign-in failure page. Callers pass only catalog text, an
+ * already validated normalized origin, a normalized relative return path, and
+ * the selected agent and prompt. No provider text or callback data is rendered.
+ */
+function renderAuthErrorHtml({
+    title = 'Sign-in could not be started',
+    detail = 'Sign-in could not be started.',
+    origin = '',
+    retryReturnTo = '',
+    retryAgent = '',
+    retryPrompt = '',
+} = {}) {
+    const safeTitle = escapeHtml(title);
+    const retryUrl = retryReturnTo
+        ? `/auth/login?returnTo=${encodeURIComponent(normalizeRelativePath(retryReturnTo, '/'))}`
+            + (retryAgent ? `&agent=${encodeURIComponent(retryAgent)}` : '')
+            + (retryPrompt ? `&prompt=${encodeURIComponent(retryPrompt)}` : '')
+        : '';
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${safeTitle}</title>
+  <style>
+    ${getAuthPageStyles()}
+  </style>
+</head>
+<body>
+  <main class="auth-shell">
+    <section class="auth-card" aria-labelledby="auth-error-title">
+      <div class="auth-kicker">Workspace Access</div>
+      <h1 id="auth-error-title">${safeTitle}</h1>
+      <div class="auth-error" role="alert">${escapeHtml(detail)}</div>
+      ${origin ? `<div class="auth-meta">Address: ${escapeHtml(origin)}</div>` : ''}
+      ${retryUrl ? `<a class="auth-btn" href="${escapeHtml(retryUrl)}">Try again</a>` : ''}
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
 function renderSsoLoginHtml({ agentName, returnTo = '/', redirectUrl = '' } = {}) {
     const safeAgent = escapeHtml(agentName || 'application');
     const safeReturnTo = escapeHtml(normalizeRelativePath(returnTo, '/'));
@@ -308,6 +351,7 @@ function renderSsoLoginHtml({ agentName, returnTo = '/', redirectUrl = '' } = {}
 }
 
 export {
+    renderAuthErrorHtml,
     renderLoggedOutHtml,
     renderLogoutConfirmationHtml,
     renderSsoLoginHtml,

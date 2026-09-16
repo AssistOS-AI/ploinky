@@ -107,6 +107,7 @@ add('internal-agent-control', '*', '/*/__agent/*', 'cli/server/RoutingServer.js:
 for (const [id, method, path, line] of [
   ['private-workspace-logs', 'POST', '/api/edge/workspace-logs', 689],
   ['private-workspace-metrics', 'GET', '/api/edge/workspace-metrics?follow=1', 707],
+  ['private-runtime-origins', 'GET', '/api/edge/runtime-origins', 733],
   ['private-turn-credentials', 'POST', '/api/edge/turn-credentials', 725],
 ]) add(id, method, path, `cli/server/edgeRoutePlan.js:${line}`, 'private', 'Private listener only, generation-bound agent assertion, ACL and replay. Public TCP has no handler; user roles including admin cannot use private API.', { gap: 'Only public-boundary negative probe; never expose/connect private 8081 or borrow agent credentials.' });
 for (const path of ['/metrics', '/health/internal', '/admin', '/admin/*']) add(`reserved-${path.replaceAll('/', '-')}`, '*', path, 'cli/server/RoutingServer.js:251', 'private', 'Reserved/router-owned name, but no executable public handler. Not counted as a tested live authorization endpoint.');

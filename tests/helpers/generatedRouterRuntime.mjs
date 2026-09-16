@@ -19,16 +19,21 @@ export function installGeneratedRouterRuntime({
     publicAuthority = '127.0.0.1:19090',
     requestAuthority = publicAuthority,
     listenerClass = 'public',
+    edgeTopologyFile = '/run/ploinky/edge-topology/current.json',
+    generationId = '66666666-7777-4888-8999-aaaaaaaaaaaa',
+    instanceId = '11111111-2222-4333-8444-555555555555',
+    internalRouterUrl = 'http://127.0.0.1:8081',
+    assignProcessEnv = true,
 } = {}) {
     const parsed = new URL(origin);
     sequence += 1;
     const payload = createGeneratedRouterDescriptorPayload({
         agentPrincipal,
         attestationId: `sha256:${'3'.repeat(64)}`,
-        edgeTopologyFile: '/run/ploinky/edge-topology/current.json',
-        generationId: '66666666-7777-4888-8999-aaaaaaaaaaaa',
-        instanceId: '11111111-2222-4333-8444-555555555555',
-        internalRouterUrl: 'http://127.0.0.1:8081',
+        edgeTopologyFile,
+        generationId,
+        instanceId,
+        internalRouterUrl,
         issuedAtUnixMs: 1785456000000 + sequence,
         launchId: `bbbbbbbb-cccc-4ddd-8eee-${String(sequence).padStart(12, '0')}`,
         listenerClass,
@@ -59,6 +64,6 @@ export function installGeneratedRouterRuntime({
         PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_PUBLIC_KEY: 'generated',
         PLOINKY_ENV_SOURCE_PLOINKY_AGENT_API_KEY: 'generated',
     };
-    Object.assign(process.env, env);
+    if (assignProcessEnv) Object.assign(process.env, env);
     return Object.freeze({ descriptorFile, env: Object.freeze(env), payload });
 }

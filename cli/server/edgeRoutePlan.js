@@ -730,6 +730,27 @@ export function resolveEdgeRoutePlan({
                 snapshot,
             };
         }
+        if (pathname === '/api/edge/runtime-origins') {
+            // Exact metadata read: the raw target must be the bare path, with no
+            // query (not even an empty `?`), fragment, or normalized alias.
+            if (String(req?.method || '').toUpperCase() !== 'GET'
+                || url.search || String(req?.url || '') !== pathname) {
+                return deny(400, 'RUNTIME_ORIGINS_REQUEST_INVALID', { lease, hostSelection });
+            }
+            return {
+                matched: true,
+                ok: true,
+                kind: 'private-operation',
+                operation: 'runtime-origins',
+                listener,
+                host,
+                hostSelection,
+                pathname,
+                parsedUrl: url,
+                lease,
+                snapshot,
+            };
+        }
         if (pathname === '/api/edge/turn-credentials') {
             return {
                 matched: true,

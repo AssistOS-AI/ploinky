@@ -1722,3 +1722,146 @@ test('SSO callback maps provider client rejection without exposing provider deta
         });
     }
 });
+
+test('SSO login maps only approved provider-neutral rejections to fixed public wording', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    const original = authService.beginLogin;
+    t.after(() => { authService.beginLogin = original; });
+    const leak = 'private provider detail <script>alert(1)</script> https://pgx:3000/auth/callback?state=secret-state';
+    const expected = {
+        invalid_redirect_uri: [400, 'The sign-in callback address is invalid.'],
+        redirect_origin_not_allowed: [403, 'Sign-in is not enabled for this address. Use a configured workspace address or contact the workspace administrator.'],
+        browser_origin_not_allowed: [403, 'This address is not enabled for authentication.'],
+        auth_origin_topology_unavailable: [503, 'The workspace authentication addresses are temporarily unavailable. Try again after the workspace is ready.'],
+        auth_origin_topology_invalid: [503, 'The workspace authentication configuration is invalid. Contact the workspace administrator.'],
+    };
+    const login = async ({ code, statusCode, message = leak, accept }) => {
+        authService.beginLogin = async () => { throw Object.assign(new Error(message), { code, statusCode }); };
+        const req = makeRequest({ url: '/auth/login?returnTo=%2Fexplorer%2F%3Fview%3Dlist', accept });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+        assert.equal(res.getHeader('set-cookie'), undefined, 'a rejected login issues no state or cookies');
+        assert.doesNotMatch(res.body, /private provider detail|secret-state|<script>/);
+        return res;
+    };
+
+    for (const [code, [status, detail]] of Object.entries(expected)) {
+        const json = await login({ code, statusCode: status, accept: 'application/json' });
+        assert.equal(json.statusCode, status, code);
+        assert.deepEqual(JSON.parse(json.body), { ok: false, error: code, detail }, code);
+
+        const html = await login({ code, statusCode: status, accept: 'text/html,application/xhtml+xml,*/*;q=0.8' });
+        assert.equal(html.statusCode, status, code);
+        assert.match(String(html.getHeader('content-type')), /^text\/html/);
+        assert.equal(html.getHeader('cache-control'), 'no-store');
+        assert.ok(html.body.includes(detail), code);
+        assert.match(html.body, /role="alert"/);
+        assert.match(html.body, /<div class="auth-meta">Address: http:\/\/localhost<\/div>/);
+        if (code === 'auth_origin_topology_unavailable') {
+            assert.match(html.body, /href="\/auth\/login\?returnTo=%2Fexplorer%2F%3Fview%3Dlist">Try again</);
+        } else {
+            assert.doesNotMatch(html.body, /Try again/);
+        }
+    }
+
+    for (const [code, statusCode] of [
+        ['redirect_origin_not_allowed', 500],
+        ['redirect_origin_not_allowed', '403'],
+        ['redirect_origin_not_allowed', 400],
+        ['auth_origin_topology_invalid', undefined],
+        ['internal_error', 500],
+        ['provider_specific_rejection', 403],
+        ['__proto__', 403],
+        [undefined, undefined],
+    ]) {
+        const json = await login({ code, statusCode, accept: 'application/json' });
+        assert.equal(json.statusCode, 500, `${code}/${statusCode}`);
+        assert.deepEqual(JSON.parse(json.body), { ok: false, error: 'auth_failure', detail: 'Sign-in could not be started.' });
+        const html = await login({ code, statusCode, accept: 'text/html' });
+        assert.equal(html.statusCode, 500);
+        assert.match(html.body, /Sign-in could not be started\./);
+        assert.doesNotMatch(html.body, /Address:|Try again/);
+    }
+});
+
+test('temporary login retries preserve secondary-agent selection and the requested prompt', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'none' });
+    const routePlan = createRoutePlan();
+    routePlan.snapshot.agents.webAssist.auth = { mode: 'sso' };
+    const calls = [];
+    let unavailable = true;
+    t.mock.method(authService, 'beginLogin', async (options) => {
+        calls.push(options);
+        if (unavailable) {
+            throw Object.assign(new Error('private metadata failure'), {
+                code: 'auth_origin_topology_unavailable', statusCode: 503,
+            });
+        }
+        return { redirectUrl: '/identity/login', state: 's'.repeat(22), browserBinding: 'test-proof', expiresAt: Date.now() + 60000 };
+    });
+    const dispatch = async (url) => {
+        const req = makeRequest({ url, accept: 'text/html' });
+        const res = new MockResponse();
+        await authHandlers.handleAuthRoutes(req, res, new URL(url, 'http://localhost'), { routePlan });
+        return res;
+    };
+
+    for (const [returnTo, prompt, expectedReturnTo] of [
+        ['/webAssist/?view=list', 'login', '/webAssist/?view=list'],
+        ['//evil.example/path', 'login"><script>alert(1)</script>&agent=missing', '/'],
+    ]) {
+        unavailable = true;
+        const query = new URLSearchParams({
+            agent: 'webAssist', returnTo, prompt,
+            state: 'must-not-retry', code: 'must-not-retry', callback: 'https://evil.example/',
+        });
+        const rejected = await dispatch(`/auth/login?${query}`);
+        assert.equal(rejected.statusCode, 503);
+        assert.equal(rejected.getHeader('set-cookie'), undefined);
+        assert.doesNotMatch(rejected.body, /must-not-retry|private metadata failure|evil\.example|<script>/);
+        const href = rejected.body.match(/href="([^"]+)">Try again/)[1].replaceAll('&amp;', '&');
+        const retry = new URL(href, 'http://localhost');
+        assert.equal(retry.origin, 'http://localhost');
+        assert.equal(retry.pathname, '/auth/login');
+        assert.deepEqual(Object.fromEntries(retry.searchParams), {
+            returnTo: expectedReturnTo, agent: 'webAssist', prompt,
+        });
+
+        unavailable = false;
+        const retried = await dispatch(`${retry.pathname}${retry.search}`);
+        assert.equal(retried.statusCode, 200, retried.body);
+        assert.match(retried.body, /Single Sign-On/);
+        assert.ok(retried.getHeader('set-cookie'));
+        assert.equal(calls.at(-1).prompt, prompt);
+        assert.equal(calls.at(-1).returnTo, expectedReturnTo);
+    }
+    assert.equal(calls.length, 4, 'both retries reached the selected agent login');
+    assert.equal((await dispatch('/auth/login?returnTo=%2FwebAssist%2F')).statusCode, 404,
+        'the return path alone does not recover secondary-agent selection');
+});
+
+test('Router authentication failures never echo arbitrary error messages', async (t) => {
+    const { authHandlers, authService, createRoutePlan } = await withAuthModules(t, { staticAuthMode: 'sso' });
+    const originals = { handleCallback: authService.handleCallback, beginLogin: authService.beginLogin };
+    t.after(() => Object.assign(authService, originals));
+    authService.handleCallback = async () => { throw new Error('SSO is not configured <b>provider supplied</b>'); };
+    const req = makeRequest({
+        url: '/auth/callback?code=test-code&state=test-state-12345678901',
+        cookie: 'ploinky_sso_login_test-state-12345678901=test-browser-proof',
+    });
+    const res = new MockResponse();
+    await authHandlers.handleAuthRoutes(req, res, new URL(req.url, 'http://localhost'), { routePlan: createRoutePlan() });
+    assert.equal(res.statusCode, 500);
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: 'auth_failure', detail: 'Authentication could not be completed.' });
+
+    authService.beginLogin = async () => { throw new Error('SSO is not configured (no provider agent configured)'); };
+    const configReq = makeRequest({ url: '/auth/login' });
+    const configRes = new MockResponse();
+    await authHandlers.handleAuthRoutes(configReq, configRes, new URL(configReq.url, 'http://localhost'), { routePlan: createRoutePlan() });
+    assert.equal(configRes.statusCode, 503);
+    assert.deepEqual(JSON.parse(configRes.body), {
+        ok: false,
+        error: 'sso_not_configured',
+        detail: 'SSO is not configured (no provider agent configured)',
+    });
+});

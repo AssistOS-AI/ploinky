@@ -490,6 +490,33 @@ trusted names are part of the Box configuration, a later `start`, `restart`, or
 `update` recreates the Box when this machine's addresses or name change. A
 specific address that is no longer assigned must be bound again.
 
+Each routing generation captures that host list together with the selected outer
+Router port as immutable source input, so a rebind, port change, or rollback
+produces a different generation. The Router refuses an active generation that was
+captured for another host list with `503 EDGE_GENERATION_RUNTIME_MISMATCH` until
+the restarted graph commits its own. From the same inputs Ploinky derives the
+exact direct-binding origins, for example `http://192.168.1.50:8083` and
+`http://<hostname>:8083`, and publishes them as the sorted `routerOrigins` array
+in the agent-readable edge topology. A loopback-only binding publishes an empty
+array, the wildcard itself is never an origin, and a generation captured before
+this field existed publishes none. The topology file is advisory, because it is
+written before the routing selector commits. An agent that relies on these
+origins for a decision reads them from the private listener with a fresh private
+assertion, for example through `/Agent/lib/runtimeRouterOrigins.mjs`:
+`GET /api/edge/runtime-origins` answers only from the active routing lease with
+`{ schemaVersion, authorizationGeneration, activationId, routerOrigins }` and
+`Cache-Control: no-store`, and fails closed with `503` while routing is inactive
+or changing. Ploinky only reports these origins; each agent decides whether to
+trust them. Cloudflare agent-root host names are not included.
+
+After an in-place Ploinky source update, `ploinky start` checks the running
+Router's generation-reader compatibility through its existing local health
+socket. If the reader is older or cannot be verified, startup stops it and
+verifies a replacement before preparing the new routing generation. A compatible
+Router is reused. If replacement fails, startup leaves routing inactive and
+does not publish the new generation format. A full `ploinky restart` also reloads
+the Router; adding an agent alone is not a legacy-generation migration.
+
 WebChat creates its tab and page identities with cryptographic browser randomness
 on both loopback and plain-HTTP LAN origins; it does not require the
 secure-context-only `crypto.randomUUID()` method.
