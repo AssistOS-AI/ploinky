@@ -1,4 +1,5 @@
 import { sanitizeAuthorityDiagnostic } from '../../cli/sandbox/authorityCommandDiagnostics.mjs';
+import { boxWorkspaceExecOptions, boxWorkspacePath } from '../contract/workspace-root.mjs';
 
 const TIMEOUT_MS = 10_000;
 const MAX_AGENTS = 128;
@@ -8,11 +9,15 @@ const STATUS_PATH = '/opt/ploinky/ploinky-box/inbox/readStatus.mjs';
 
 // Only registry keys and immutable container IDs leave the Box. Never print
 // complete agent records, configuration, environment variables, or credentials.
+// The workspace root arrives as the script's only argument, never as code.
 export const CURRENT_REGISTRY_SCRIPT = `
 const fs = require('node:fs');
+const path = require('node:path');
 let fd;
 try {
-    const root = '/workspace/.ploinky';
+    const workspace = process.argv[1];
+    if (typeof workspace !== 'string' || !path.isAbsolute(workspace) || path.normalize(workspace) !== workspace) throw Error('Workspace root argument is not a clean absolute path');
+    const root = path.join(workspace, '.ploinky');
     const parent = fs.lstatSync(root);
     if (!parent.isDirectory() || parent.isSymbolicLink()) throw Error('Registry directory is not a regular directory');
     const filename = root + '/agents.json';
@@ -62,10 +67,11 @@ function hasNestedPodmanSettings(record) {
 }
 
 /** Inspect an already-owned Box without starting/stopping its graph or agents. */
-export function collectCurrentWorkspaceDiagnostics({ runner, containerId } = {}) {
+export function collectCurrentWorkspaceDiagnostics({ runner, containerId, workspaceRoot } = {}) {
     if (!ID_PATTERN.test(containerId || '')) throw new TypeError('Current workspace diagnostics require one canonical Box container ID');
+    const registryPath = boxWorkspacePath(workspaceRoot, '.ploinky/agents.json');
     const checks = [];
-    const prefix = ['container', 'exec', '--user', 'podman', '--workdir', '/workspace', containerId];
+    const prefix = ['container', 'exec', '--user', 'podman', ...boxWorkspaceExecOptions(workspaceRoot), containerId];
     const query = (args) => {
         const command = { file: 'podman', args: [...prefix, ...args] };
         let result;
@@ -106,7 +112,7 @@ export function collectCurrentWorkspaceDiagnostics({ runner, containerId } = {})
         if (status.warnings.length > MAX_AGENTS) add('current.graph.warnings.truncated', 'Additional graph warnings', 'warn', `Only the first ${MAX_AGENTS} of ${status.warnings.length} warnings are shown.`);
     }
 
-    const snapshot = query(['node', '-e', CURRENT_REGISTRY_SCRIPT]);
+    const snapshot = query(['node', '-e', CURRENT_REGISTRY_SCRIPT, workspaceRoot]);
     const records = snapshot.result.ok ? parseJson(snapshot.result.stdout) : null;
     if (!snapshot.result.ok && validStatus && status.trackedAgents === 0 && !status.routingConfigured
         && /Registry snapshot failed: ENOENT\b/.test(String(snapshot.result.stderr || ''))) {
@@ -121,7 +127,7 @@ export function collectCurrentWorkspaceDiagnostics({ runner, containerId } = {})
     if (!validRecords) {
         add('current.registry', 'Current tracked container identities', 'fail',
             snapshot.result.ok ? 'Filtered agent identity snapshot was malformed, duplicated, or exceeded its bound.' : failure(snapshot.result),
-            { ...snapshot, next: 'Inspect the regular /workspace/.ploinky/agents.json registry and its access permissions; no guessed agent container will be inspected.' });
+            { ...snapshot, next: `Inspect the regular ${registryPath} registry and its access permissions; no guessed agent container will be inspected.` });
         return checks;
     }
     add('current.registry', 'Current tracked container identities', 'pass', `${records.length} complete Podman identities were selected; agent configuration and environment values were not emitted.`, snapshot);

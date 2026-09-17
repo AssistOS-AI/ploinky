@@ -108,6 +108,7 @@ function executePrepared(prepared, coreArgv, {
         prepared.containerId,
         coreArgv,
         {
+            workspaceRoot: prepared.identity?.workspaceRoot,
             hostPort: prepared.hostPort,
             skillScopeEnv: prepared.identity && launchCwd ? buildHostSkillScope(prepared.identity.workspaceRoot, launchCwd) : {},
             mediaHostPort: prepared.mediaHostPort,
@@ -233,6 +234,7 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
                 output.write(`${formatRouterBindingLines(status.routerBinding).join('\n')}\n`);
             }
             const coreStatus = executePrepared({
+                identity: status.identity,
                 containerId: container.id,
                 engine: status.ownership.engine,
                 hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),
@@ -332,6 +334,7 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
             return 1;
         }
         return executePrepared({
+            identity: status.identity,
             containerId: container.id,
             engine,
             hostPort: Number(container.labels?.[BOX_LABELS.routerHostPort]),

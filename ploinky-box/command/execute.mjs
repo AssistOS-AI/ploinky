@@ -1,6 +1,7 @@
 import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 
+import { boxWorkspaceExecOptions } from '../contract/workspace-root.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { parseHostPort } from '../ports.mjs';
 
@@ -10,6 +11,7 @@ function signalExitCode(signal) {
 }
 
 export function buildContainerExecArgs(containerId, commandArgv, {
+    workspaceRoot,
     hostPort,
     skillScopeEnv = {},
     mediaHostPort,
@@ -20,6 +22,7 @@ export function buildContainerExecArgs(containerId, commandArgv, {
     logStream = false,
     colorOutput = false,
 } = {}) {
+    const workdir = boxWorkspaceExecOptions(workspaceRoot);
     const args = ['container', 'exec'];
     if (logStream) {
         args.push('--interactive');
@@ -37,7 +40,7 @@ export function buildContainerExecArgs(containerId, commandArgv, {
         ...(colorOutput === true ? ['--env', 'PLOINKY_COLOR=1'] : []),
         ...Object.entries(skillScopeEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         '--user', 'podman',
-        '--workdir', '/workspace',
+        ...workdir,
         containerId,
         shell ? '/bin/bash' : '/opt/ploinky/bin/ploinky-local',
         ...commandArgv,

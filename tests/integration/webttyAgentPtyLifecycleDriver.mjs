@@ -9,6 +9,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 
 import { buildAgentWorkerEnvironment } from '../../cli/server/webtty/agentWorkerEnvironment.mjs';
+import { boxWorkspacePath, readBoxWorkspaceRoot } from '../../ploinky-box/contract/workspace-root.mjs';
 import {
     WEBTTY_SHELL_PROMPT,
     bashExecutableLookupFailed,
@@ -1120,9 +1121,9 @@ function removeAgentExact(containerId) {
     );
 }
 
-function runSymlinkBindInspection(imageId, runId) {
-    const realSource = `/workspace/.phase0-bind-real-${runId}`;
-    const symlinkSource = `/workspace/.phase0-bind-link-${runId}`;
+function runSymlinkBindInspection(imageId, runId, workspaceRoot) {
+    const realSource = boxWorkspacePath(workspaceRoot, `.phase0-bind-real-${runId}`);
+    const symlinkSource = boxWorkspacePath(workspaceRoot, `.phase0-bind-link-${runId}`);
     const name = `phase0-bind-${runId}`;
     let containerId = '';
     let realSourceCreated = false;
@@ -2075,6 +2076,8 @@ async function runMatrix(config) {
     assert.match(config.cliExecMode, /^(?:persistent-session|no-session)$/);
     cliExecMode = config.cliExecMode;
     const runId = `wtty-${process.pid}-${crypto.randomBytes(5).toString('hex')}`;
+    // The Box runs this driver with its workspace mounted at the workspace's own path.
+    const workspaceRoot = readBoxWorkspaceRoot(process.env);
     const runtime = inventory(config.agentImage);
     process.stderr.write(`phase0-inventory:${JSON.stringify(runtime)}\n`);
     assert.equal(runtime.rootless, true);
@@ -2100,7 +2103,7 @@ async function runMatrix(config) {
         owned.push(shellId);
         stage = 'symlink-bind-inspection';
         process.stderr.write(`phase0-stage:${stage}\n`);
-        const symlinkBind = runSymlinkBindInspection(runtime.imageId, runId);
+        const symlinkBind = runSymlinkBindInspection(runtime.imageId, runId, workspaceRoot);
         stage = config.firstCandidate === 'cli' ? 'root-normal' : 'rest-candidate';
         let rest = null;
         if (config.firstCandidate !== 'cli') {
@@ -2189,7 +2192,7 @@ async function runMatrix(config) {
         process.stderr.write(`phase0-stage:${stage}\n`);
         const sameName = await runSameNameReplacement(runtime.imageId, runId);
         audits.push(sameName.audit);
-        const recordPath = `/workspace/.phase0-webtty-recovery-${runId}.json`;
+        const recordPath = boxWorkspacePath(workspaceRoot, `.phase0-webtty-recovery-${runId}.json`);
         stage = 'worker-crash-recovery';
         process.stderr.write(`phase0-stage:${stage}\n`);
         const workerCrash = await runWorkerCrash({

@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { boxWorkspacePath } from './contract/workspace-root.mjs';
+
 export const SKILL_SCOPE_ENV_NAMES = Object.freeze(['PLOINKY_SKILL_SCOPE', 'PLOINKY_SKILL_SCOPE_VERSION', 'PLOINKY_HOST_LAUNCH_CWD']);
 
 function relativeWithin(root, directory) {
@@ -11,6 +13,8 @@ function relativeWithin(root, directory) {
 
 // Called by the host command, never with browser/session request data. This is
 // per invocation metadata and does not participate in Box identity or reuse.
+// Containment is proven on canonical paths; the Box path then keeps the
+// selected workspace spelling, which is the Box bind destination.
 export function buildHostSkillScope(workspaceRoot, launchCwd) {
     const root = fs.realpathSync(workspaceRoot);
     const launch = fs.realpathSync(launchCwd);
@@ -18,7 +22,7 @@ export function buildHostSkillScope(workspaceRoot, launchCwd) {
     const relative = relativeWithin(root, launch);
     return {
         PLOINKY_SKILL_SCOPE_VERSION: '1',
-        PLOINKY_SKILL_SCOPE: path.posix.join('/workspace', relative.split(path.sep).join('/')),
+        PLOINKY_SKILL_SCOPE: boxWorkspacePath(workspaceRoot, relative.split(path.sep).join('/')),
         PLOINKY_HOST_LAUNCH_CWD: launch,
     };
 }

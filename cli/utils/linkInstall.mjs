@@ -75,7 +75,9 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
         if (!fs.lstatSync(source).isDirectory() || fs.realpathSync(source) !== source || origin(source) !== repo.identity) {
             throw new Error(`link-install repository identity changed: ${repo.name}`);
         }
-        return { name: repo.name, source, target: `/workspace/${path.basename(source)}`,
+        // The checkout keeps its workspace path in the agent runtime, matching
+        // the same-path project grant of global and development agents.
+        return { name: repo.name, source, target: source,
             link: `linked/${repo.name}`, readOnly: !writable };
     });
 }

@@ -156,3 +156,11 @@ test('a symlinked .ploinky state directory supports private master-key creation'
     assert.equal(fs.statSync(path.join(foreign, 'master-key')).mode & 0o777, 0o600);
     assert.equal(fs.lstatSync(path.join(root, '.ploinky')).isSymbolicLink(), true);
 });
+
+test('master-key access has no fixed default workspace root', () => {
+    for (const workspaceRoot of [undefined, '', 'relative/root']) {
+        assert.throws(() => workspaceMasterKeyPath(workspaceRoot), /absolute workspace root/);
+        assert.throws(() => readWorkspaceMasterKey({ workspaceRoot }), /absolute workspace root/);
+        assert.throws(() => initializeWorkspaceMasterKey({ workspaceRoot }), /absolute workspace root/);
+    }
+});

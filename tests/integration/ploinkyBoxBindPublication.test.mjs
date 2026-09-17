@@ -177,7 +177,7 @@ test('native Box Router publications preserve the public-only boundary across bi
                 assert.equal(record.Name.replace(/^\//, ''), identity.instance);
                 assert.equal(record.Config.Labels[BOX_LABELS.pathHash], identity.pathHash);
                 assert.equal(normalizeImageId(record.Image), imageId);
-                assert.ok(record.Mounts.some((mount) => mount.Source === workspace && mount.Destination === '/workspace'));
+                assert.ok(record.Mounts.some((mount) => mount.Source === workspace && mount.Destination === workspace));
                 runner.run('podman', ['container', 'rm', '--force', '--time', '0', handle.id]);
             }
             assert.equal(discoverBoxOwnership(identity, { runner }).state, 'absent');
@@ -225,8 +225,8 @@ test('native Box Router publications preserve the public-only boundary across bi
         assert.ok(handle.runtime.createCommand.includes(BOX_USERNS));
         assert.equal(handle.runtime.mounts.find((mount) => mount.destination === '/opt/ploinky').rw, false);
         runner.run('podman', [
-            'container', 'exec', '--detach', '--user', 'podman', '--workdir', '/workspace', handle.id,
-            '/usr/local/bin/node', '/workspace/bind-publication-fixture.mjs',
+            'container', 'exec', '--detach', '--user', 'podman', '--workdir', identity.workspaceRoot, handle.id,
+            '/usr/local/bin/node', path.join(identity.workspaceRoot, 'bind-publication-fixture.mjs'),
         ]);
         const connectAddress = selected.address === '0.0.0.0' ? address : selected.address;
         await waitForHttp(connectAddress, hostPort, token);

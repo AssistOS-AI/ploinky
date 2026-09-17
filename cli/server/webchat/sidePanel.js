@@ -33,6 +33,7 @@ export function createSidePanel({
 }, {
     markdown,
     workspaceBase = '',
+    workspaceRoot = '',
     webchatBasePath = '/webchat',
     workspaceFileIndex = null,
     sendQuickCommand = null,
@@ -175,6 +176,7 @@ export function createSidePanel({
         container.innerHTML = renderMarkdown(markdown, text);
         enhanceWorkspaceFileLinks(container, {
             workspaceBase,
+            workspaceRoot,
             webchatBasePath,
             fileIndex: workspaceFileIndex,
         });
@@ -295,6 +297,7 @@ export function createSidePanel({
             container.innerHTML = renderMarkdown(markdown, text);
             enhanceWorkspaceFileLinks(container, {
                 workspaceBase,
+                workspaceRoot,
                 webchatBasePath,
                 fileIndex: workspaceFileIndex,
             });
@@ -587,6 +590,7 @@ export function createSidePanel({
         for (const container of containers) {
             enhanceWorkspaceFileLinks(container, {
                 workspaceBase,
+                workspaceRoot,
                 webchatBasePath,
                 fileIndex: workspaceFileIndex,
             });

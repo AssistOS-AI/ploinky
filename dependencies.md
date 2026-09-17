@@ -1,5 +1,12 @@
 # Dependencies for graph skill scope persistence
 
+Host-path workspace mounts, path admission, diagnostics, and their tests use
+Node.js 22+ built-ins and repository-owned modules. They introduce no new
+packages, external source, or system tools. Native verification uses the
+existing rootless Podman runtime and a locally rebuilt Box image; no image
+publication or shared deployment is required. The companion image patch keeps
+the image's existing pinned dependencies and licenses unchanged.
+
 AchillesAgentLib source selection and Box bundle verification use Node.js built-ins
 and add no third-party packages. The existing library is pinned in
 `ploinky-box/dependencies.lock.json` and bundled by the `container-image-builds`

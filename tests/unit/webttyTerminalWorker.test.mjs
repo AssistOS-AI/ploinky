@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { buildShellEnvironment } from '../../core-services/webtty/environment.mjs';
-import { TerminalWorker } from '../../core-services/webtty/terminal-worker.mjs';
+import { TerminalWorker, runTerminalWorker } from '../../core-services/webtty/terminal-worker.mjs';
 import { WEBTTY_PROTOCOL_LIMITS, workerMessage } from '../../core-services/webtty/worker-protocol.mjs';
 
 const TERMINAL_ID = 'abcdefghijklmnopqrstuvwx';
+// The trusted root the Router places in the worker's fixed environment.
+const WORKSPACE_ROOT = '/home/user/work space/proiect';
+const SHELL_ENV = buildShellEnvironment({}, { workspaceRoot: WORKSPACE_ROOT });
 const PTY_IDENTITY = Object.freeze({
     pid: 4242,
     startToken: 'linux-proc:123456',
@@ -17,8 +23,9 @@ const PTY_IDENTITY = Object.freeze({
 });
 
 class FakeProcess extends EventEmitter {
-    constructor() {
+    constructor({ env = { PLOINKY_WORKSPACE_ROOT: WORKSPACE_ROOT } } = {}) {
         super();
+        this.env = env;
         this.connected = true;
         this.sent = [];
         this.exitCode = null;
@@ -67,23 +74,25 @@ function init(overrides = {}) {
         cwdRelative: 'repo/src',
         cols: 80,
         rows: 24,
-        shellEnv: buildShellEnvironment(),
+        shellEnv: SHELL_ENV,
         ...overrides,
     });
 }
 
 function harness(overrides = {}) {
-    const processApi = new FakeProcess();
+    const processApi = overrides.processApi || new FakeProcess();
     const terminal = fakePty();
     const spawnCalls = [];
     const signals = [];
     const worker = new TerminalWorker({
         processApi,
-        resolveDirectory: overrides.resolveDirectory || ((relative) => ({
-            relativePath: relative,
-            absolutePath: '/workspace/repo/src',
-            workspaceRealPath: '/workspace',
-        })),
+        ...(overrides.defaultDirectoryResolver ? {} : {
+            resolveDirectory: overrides.resolveDirectory || ((relative) => ({
+                relativePath: relative,
+                absolutePath: `${WORKSPACE_ROOT}/repo/src`,
+                workspaceRealPath: WORKSPACE_ROOT,
+            })),
+        }),
         loadNodePty: overrides.loadNodePty || (() => ({
             spawn(shell, args, options) {
                 spawnCalls.push({ shell, args, options });
@@ -110,8 +119,8 @@ test('one init creates one fixed bash PTY after cwd revalidation and reports evi
             name: 'xterm-256color',
             cols: 80,
             rows: 24,
-            cwd: '/workspace/repo/src',
-            env: buildShellEnvironment(),
+            cwd: `${WORKSPACE_ROOT}/repo/src`,
+            env: SHELL_ENV,
         },
     });
     assert.deepEqual(h.processApi.sent[0], workerMessage('ready', TERMINAL_ID, {
@@ -255,7 +264,7 @@ test('cwd and environment failures happen before loading native bytes', async ()
 
     const altered = harness();
     await assert.rejects(() => altered.worker.initialize(init({
-        shellEnv: { ...buildShellEnvironment(), ROUTER_SECRET: 'secret' },
+        shellEnv: { ...SHELL_ENV, ROUTER_SECRET: 'secret' },
     })));
     assert.equal(altered.spawnCalls.length, 0);
 });
@@ -270,4 +279,41 @@ test('normal native exit reports once and disposes without group signaling', asy
     assert.deepEqual(h.processApi.sent.filter((message) => message.type === 'exit'), [
         workerMessage('exit', TERMINAL_ID, { exitCode: 7, signal: 0, category: 'clean' }),
     ]);
+});
+
+test('the worker resolves cwd and validates its shell environment against its own trusted root', async (t) => {
+    const parent = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky webtty worker ')));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const root = path.join(parent, 'project ăîș');
+    fs.mkdirSync(path.join(root, 'repo', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(parent, 'outside'));
+    fs.symlinkSync(path.join(parent, 'outside'), path.join(root, 'escape'));
+    const processApi = new FakeProcess({ env: { PLOINKY_WORKSPACE_ROOT: root } });
+    const shellEnv = buildShellEnvironment({}, { workspaceRoot: root });
+
+    const h = harness({ processApi, defaultDirectoryResolver: true });
+    await h.worker.initialize(init({ cwdRelative: 'repo/src', shellEnv }));
+    assert.equal(h.spawnCalls[0].options.cwd, path.join(root, 'repo', 'src'));
+    assert.equal(h.spawnCalls[0].options.env.PLOINKY_WORKSPACE_ROOT, root);
+
+    const escaping = harness({ processApi: new FakeProcess({ env: { PLOINKY_WORKSPACE_ROOT: root } }), defaultDirectoryResolver: true });
+    await escaping.worker.initialize(init({ cwdRelative: 'escape', shellEnv }));
+    assert.equal(escaping.spawnCalls.length, 0);
+    assert.ok(escaping.processApi.sent.some((message) => message.category === 'cwd-validation'));
+
+    // A shell environment prepared for another root is not this worker's.
+    const foreign = harness({ processApi: new FakeProcess({ env: { PLOINKY_WORKSPACE_ROOT: root } }), defaultDirectoryResolver: true });
+    await assert.rejects(() => foreign.worker.initialize(init({ cwdRelative: 'repo/src', shellEnv: SHELL_ENV })));
+    assert.equal(foreign.spawnCalls.length, 0);
+});
+
+test('a worker process without a valid trusted workspace root never starts', () => {
+    for (const env of [{}, { PLOINKY_WORKSPACE_ROOT: '' }, { PLOINKY_WORKSPACE_ROOT: 'relative' }]) {
+        const processApi = new FakeProcess({ env });
+        const worker = runTerminalWorker({ processApi, argv: [`--ploinky-webtty-marker=${'m'.repeat(32)}`] });
+        assert.equal(worker, null);
+        assert.equal(processApi.exitCode, 1);
+        assert.equal(processApi.connected, false);
+        assert.equal(processApi.listenerCount('message'), 0);
+    }
 });

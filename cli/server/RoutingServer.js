@@ -102,7 +102,7 @@ import {
     isDelegatedAgentOpenAiCall,
     handleDelegatedAgentOpenAiCall,
 } from './agentOpenAiDelegation.js';
-import { PLOINKY_DIR } from '../utils/config.js';
+import { PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import { deriveAgentRequestSecret } from '../utils/security/masterKey.js';
 import { createCloudflaredRouterIntegration } from '../../ploinky-box/cloudflared/index.mjs';
 import { requestAgentCard } from './agentCardFanout.js';
@@ -174,6 +174,7 @@ const webttyProviderLocality = resolveWebttyProviderLocality({
     }),
 });
 const webttySessionManager = new WebttySessionManager({
+    workspaceRoot: PLOINKY_WORKSPACE_ROOT,
     agentProviderAvailable: webttyProviderLocality.agentAvailable,
     audit: (event, value) => appendLog(event, value),
 });

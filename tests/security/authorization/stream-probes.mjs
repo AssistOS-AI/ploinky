@@ -9,7 +9,9 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 export function terminalFixtureNames(prefix) {
   assert.match(prefix, /^authz-[a-z0-9-]{8,80}$/, 'Terminal fixture prefix must be a generated, shell-safe test identifier');
   const directory = `${prefix}-terminal`;
-  return { directory, host: path.join(WORKSPACE, directory), container: `/workspace/${directory}` };
+  // The Box terminal sees the workspace at the same absolute path as the host.
+  const host = path.join(WORKSPACE, directory);
+  return { directory, host, container: host };
 }
 
 export function markerCommand(prefix, marker) {

@@ -74,9 +74,10 @@ function inBoxStateHash(containerId, harness) {
             "const c=require('node:crypto'),f=require('node:fs'),p=require('node:path');",
             "const h=c.createHash('sha256');",
             "function w(root,d=root){for(const n of f.readdirSync(d).sort()){const x=p.join(d,n),s=f.lstatSync(x);h.update(p.relative(root,x)+'\\0'+s.mode+'\\0');if(s.isDirectory())w(root,x);else if(s.isFile())h.update(f.readFileSync(x));else if(s.isSymbolicLink())h.update(f.readlinkSync(x));}}",
-            "for(const root of ['/workspace','/opt/ploinky/node_modules','/home/podman/.local/share/containers']){h.update(root+'\\0');w(root)}",
+            "for(const root of process.argv.slice(1)){h.update(root+'\\0');w(root)}",
             "process.stdout.write(h.digest('hex'));",
         ].join(''),
+        harness.identity.workspaceRoot, '/opt/ploinky/node_modules', '/home/podman/.local/share/containers',
     ]);
 }
 
@@ -84,10 +85,11 @@ function nestedAgent(containerId, harness) {
     return JSON.parse(execInBox(harness.runner, containerId, [
         '/usr/local/bin/node', '-e', [
             "const f=require('node:fs');",
-            "const a=JSON.parse(f.readFileSync('/workspace/.ploinky/agents.json'));",
+            "const a=JSON.parse(f.readFileSync(process.argv[1]+'/.ploinky/agents.json'));",
             "const e=Object.entries(a).find(([,v])=>v&&v.runtime==='podman'&&/^[a-f0-9]{64}$/.test(v.containerId||''));",
             "if(!e)process.exit(4);process.stdout.write(JSON.stringify({name:e[0],id:e[1].containerId}));",
         ].join(''),
+        harness.identity.workspaceRoot,
     ]));
 }
 
@@ -123,11 +125,12 @@ test('installed public shims honor only the environment image override through t
         explicitPort: startRoute.hostPort,
         explicitMediaPort: startRoute.mediaHostPort,
     });
+    const masterKeyPath = path.join(harness.identity.workspaceRoot, '.ploinky', 'master-key');
     const initialKeyHash = execInBox(harness.runner, prepared.containerId, [
-        'sha256sum', '/workspace/.ploinky/master-key',
+        'sha256sum', masterKeyPath,
     ]).split(/\s/)[0];
     const initialKeyFile = execInBox(harness.runner, prepared.containerId, [
-        'cat', '/workspace/.ploinky/master-key',
+        'cat', masterKeyPath,
     ]);
     assert.match(initialKeyFile, /^[a-f0-9]{64}$/);
     assert.equal(initialKeyFile.includes('HOST_MASTER_KEY_CANARY'), false);
@@ -220,7 +223,12 @@ test('installed public shims honor only the environment image override through t
         assert.match(rejected.stderr, /not a supported public Box option/);
     }
 
-    stageSmokeGraph({ graph, containerId: prepared.containerId, runner: harness.runner });
+    stageSmokeGraph({
+        graph,
+        containerId: prepared.containerId,
+        runner: harness.runner,
+        workspaceRoot: harness.identity.workspaceRoot,
+    });
     const markerProbe = execInBox(harness.runner, prepared.containerId, [
         '/usr/local/bin/node', '--input-type=module', '-e',
         "import { isInsideBox } from '/opt/ploinky/ploinky-box/lib/boxMarker.mjs'; process.stdout.write(isInsideBox() ? 'inside' : 'outside');",
@@ -288,9 +296,10 @@ test('installed public shims honor only the environment image override through t
     ]);
     execInBox(harness.runner, runningId, [
         'bash', '-c', [
-            'printf workspace-retained > /workspace/t28-workspace-canary',
+            'printf workspace-retained > "$1/t28-workspace-canary"',
             'printf dependencies-retained > /opt/ploinky/node_modules/t28-dependencies-canary',
         ].join('; '),
+        'bash', harness.identity.workspaceRoot,
     ]);
     // Exercise the public running-destroy path: it must stop the nested graph
     // itself before removing the outer Box.
@@ -306,11 +315,11 @@ test('installed public shims honor only the environment image override through t
     const currentId = String(JSON.parse(inspected.stdout)[0]?.Id || '');
     assert.match(currentId, /^[a-f0-9]{64}$/);
     const recreatedKeyHash = execInBox(harness.runner, currentId, [
-        'sha256sum', '/workspace/.ploinky/master-key',
+        'sha256sum', masterKeyPath,
     ]).split(/\s/)[0];
     assert.equal(recreatedKeyHash, initialKeyHash);
     assert.equal(execInBox(harness.runner, currentId, [
-        'cat', '/workspace/t28-workspace-canary',
+        'cat', path.join(harness.identity.workspaceRoot, 't28-workspace-canary'),
     ]), 'workspace-retained');
     assert.equal(execInBox(harness.runner, currentId, [
         'cat', '/opt/ploinky/node_modules/t28-dependencies-canary',

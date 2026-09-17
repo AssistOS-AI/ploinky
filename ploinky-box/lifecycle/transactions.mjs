@@ -26,6 +26,7 @@ import { PloinkyBoxError } from '../errors.mjs';
 import { probeImageAgentLib } from '../image-agentlib.mjs';
 import { normalizeImageId } from '../contract/image-id.mjs';
 import { observedBoxNetworkMode, selectedBoxNetworkMode } from '../contract/network.mjs';
+import { assertBoxWorkspaceRoot } from '../contract/workspace-root.mjs';
 import { retireQuiescentBoxWorkspaceStartLock } from '../noWaitCleanup.mjs';
 import { retireQuiescentBoxEdgePreparation } from '../edgePreparationCleanup.mjs';
 import { fingerprintSource, sourceIdHash } from '../../agentlib/fingerprint.mjs';
@@ -306,6 +307,10 @@ export async function reconcileBoxContainer({
     stderr = process.stderr,
 }, seams = {}) {
     lock.assertHeld(identity.instance);
+    // The workspace root becomes the Box bind, working directory, and reserved
+    // environment. Reject an unmountable root before any image, cache, or
+    // container mutation, including removal of an existing Box.
+    assertBoxWorkspaceRoot(identity.workspaceRoot);
     if (!['absent', 'owned'].includes(ownership?.state)) {
         throw transactionError(`Cannot mutate Box ownership state ${ownership?.state || 'unknown'}`);
     }
@@ -529,7 +534,9 @@ export async function reconcileBoxContainer({
         if (old) {
             if (currentContainer.runtime.running) {
                 oldStopAttempted = true;
-                dependencies.stopPloinkyLocal(engine, currentContainer.id, runner);
+                dependencies.stopPloinkyLocal(engine, currentContainer.id, runner, {
+                    workspaceRoot: identity.workspaceRoot,
+                });
                 runner.run(engine.name, ['container', 'stop', '--time', '30', currentContainer.id]);
             }
             dependencies.removeContainer(engine, currentContainer.id, runner);

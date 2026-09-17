@@ -17,7 +17,7 @@ function init(overrides = {}) {
         cwdRelative: 'repo/src',
         cols: 80,
         rows: 24,
-        shellEnv: buildShellEnvironment(),
+        shellEnv: buildShellEnvironment({}, { workspaceRoot: '/home/user/project' }),
         ...overrides,
     });
 }
@@ -67,7 +67,7 @@ test('input, cwd, dimensions, and environment are byte-bounded', () => {
     assert.throws(() => validateRouterToWorkerMessage(init({ cols: 1 })));
     assert.throws(() => validateRouterToWorkerMessage(init({ rows: WEBTTY_PROTOCOL_LIMITS.maxRows + 1 })));
     assert.throws(() => validateRouterToWorkerMessage(init({ cwdRelative: 'x'.repeat(WEBTTY_PROTOCOL_LIMITS.maxCwdBytes + 1) })));
-    assert.throws(() => validateRouterToWorkerMessage(init({ shellEnv: { ...buildShellEnvironment(), AUTH_TOKEN: '\0' } })));
+    assert.throws(() => validateRouterToWorkerMessage(init({ shellEnv: { ...buildShellEnvironment({}, { workspaceRoot: '/home/user/project' }), AUTH_TOKEN: '\0' } })));
     assert.throws(() => validateRouterToWorkerMessage(
         workerMessage('input', TERMINAL_ID, { data: '💥'.repeat((WEBTTY_PROTOCOL_LIMITS.maxInputBytes / 4) + 1) }),
         { initialized: true },
@@ -76,6 +76,22 @@ test('input, cwd, dimensions, and environment are byte-bounded', () => {
         workerMessage('resize', TERMINAL_ID, { cols: Number.MAX_SAFE_INTEGER, rows: -1 }),
         { initialized: true },
     ));
+});
+
+test('the reserved workspace environment admits long host paths while other values stay bounded', () => {
+    const workspaceRoot = `/home/user/${Array(20).fill('project-'.repeat(20)).join('/')}`;
+    const shellEnv = buildShellEnvironment({}, { workspaceRoot });
+    assert.ok(Buffer.byteLength(workspaceRoot) > WEBTTY_PROTOCOL_LIMITS.maxEnvironmentValueBytes);
+    assert.equal(validateRouterToWorkerMessage(init({ shellEnv })).shellEnv.PLOINKY_WORKSPACE_ROOT, workspaceRoot);
+    for (const environment of [
+        { ...shellEnv, LANG: 'x'.repeat(WEBTTY_PROTOCOL_LIMITS.maxEnvironmentValueBytes + 1) },
+        { ...shellEnv, PLOINKY_WORKSPACE_ROOT: `/${'x'.repeat(WEBTTY_PROTOCOL_LIMITS.maxCwdBytes)}` },
+    ]) {
+        assert.throws(
+            () => validateRouterToWorkerMessage(init({ shellEnv: environment })),
+            (error) => error.code === 'WEBTTY_WORKER_PROTOCOL_INVALID' && error.category === 'environment',
+        );
+    }
 });
 
 test('worker messages have strict shapes, evidence, bounds, and categories', () => {
@@ -118,6 +134,6 @@ test('worker messages have strict shapes, evidence, bounds, and categories', () 
         category: 'secret-details',
     })));
     assert.throws(() => validateWorkerToRouterMessage(workerMessage('error', TERMINAL_ID, {
-        category: 'stack: /workspace/.ploinky/.secrets',
+        category: 'stack: /home/user/project/.ploinky/.secrets',
     })));
 });

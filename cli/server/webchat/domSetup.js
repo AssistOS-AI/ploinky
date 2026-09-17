@@ -79,6 +79,8 @@ export function initDom() {
     const basePath = (body.dataset.base || '').replace(/\/$/, '') || '';
     const agentQuery = (body.dataset.agentQuery || '').trim();
     const workdir = (body.dataset.workdir || '').trim();
+    // The trusted workspace root admits absolute file references beneath it.
+    const workspaceRoot = body.dataset.workspaceRoot || '';
     let workspaceBase = '';
     try {
         workspaceBase = decodeURIComponent((body.dataset.workspaceBase || '').trim());
@@ -216,6 +218,7 @@ export function initDom() {
         agentName,
         displayName: appTitle,
         workdir,
+        workspaceRoot,
         workspaceBase,
         launchConfig,
         toEndpoint,

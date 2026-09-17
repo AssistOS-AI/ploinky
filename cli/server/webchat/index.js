@@ -26,6 +26,7 @@ const {
     markdown,
     basePath,
     workspaceBase,
+    workspaceRoot,
     toEndpoint,
     showBanner,
     hideBanner,
@@ -103,6 +104,7 @@ const sidePanelApi = createSidePanel({
 }, {
     markdown,
     workspaceBase,
+    workspaceRoot,
     webchatBasePath: basePath,
     workspaceFileIndex,
     sendQuickCommand: (command) => network?.sendQuickCommand(command) || false,
@@ -140,6 +142,7 @@ const messages = createMessages({
 }, {
     markdown,
     workspaceBase,
+    workspaceRoot,
     webchatBasePath: basePath,
     workspaceFileIndex,
     initialViewMoreLineLimit: 1000,

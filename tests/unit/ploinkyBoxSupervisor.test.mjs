@@ -72,7 +72,7 @@ function owned(identity, { running = true, id = 'a'.repeat(64) } = {}) {
                 runtime: {
                     running,
                     imageId: 'b'.repeat(64),
-                    mounts: agentLibFixtureMounts(agentLib),
+                    mounts: agentLibFixtureMounts(agentLib, identity.workspaceRoot),
                 },
             },
         },
@@ -340,7 +340,7 @@ test('prepare locks and reconciles without prerequisite probes, then validates d
     assert.deepEqual(events, [
         'lock',
         'reconcile',
-        `run:container exec --user podman --workdir /workspace ${ownership.handles.container.id} /opt/ploinky/bin/ploinky-install-deps`,
+        `run:container exec --user podman --workdir ${identity.workspaceRoot} ${ownership.handles.container.id} /opt/ploinky/bin/ploinky-install-deps`,
         'release',
     ]);
 });
@@ -526,7 +526,7 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
         updated: true,
         skipped: false,
         repoPath: path.join(identity.workspaceRoot, 'ploinky'),
-        boxRepoPath: '/workspace/ploinky',
+        boxRepoPath: path.join(identity.workspaceRoot, 'ploinky'),
         pullStrategy: 'rebase-autostash',
     });
     const supervisor = createBoxSupervisor({
@@ -570,7 +570,8 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
             assert.equal(engine, ownership.engine);
             assert.equal(containerId, ownership.handles.container.id);
             assert.deepEqual(argv, ['update']);
-            assert.equal(options.updateExcludedRepoPath, '/workspace/ploinky');
+            assert.equal(options.workspaceRoot, identity.workspaceRoot);
+            assert.equal(options.updateExcludedRepoPath, path.join(identity.workspaceRoot, 'ploinky'));
             events.push('core-update');
         },
         revalidateAgentLibSource() {
@@ -612,6 +613,8 @@ test('stop relays to ploinky-local before stopping the outer Box without depende
     const localStop = events.findIndex((value) => (
         value.includes('/opt/ploinky/bin/ploinky-local stop')
     ));
+    assert.equal(events[localStop],
+        `container exec --user podman --workdir ${identity.workspaceRoot} ${ownership.handles.container.id} /opt/ploinky/bin/ploinky-local stop`);
     const outerStop = events.findIndex((value) => value.includes('container stop --time 30'));
     assert.ok(localStop >= 0 && localStop < outerStop);
 });
@@ -756,6 +759,10 @@ test('running status uses immutable-ID inbox inspection and allowlists its outpu
     const result = supervisor.inspectBoxStatus();
     assert.equal(result.state, 'running-initialized');
     assert.equal(calls[0].includes(ownership.handles.container.id), true);
+    assert.deepEqual(calls[0].slice(0, 6), [
+        'podman', 'container', 'exec', '--user', 'podman', '--workdir',
+    ]);
+    assert.equal(calls[0][6], identity.workspaceRoot);
     assert.equal(JSON.stringify(result).includes('must-not-cross'), false);
     assert.equal(formatBoxStatus(result).includes('must-not-cross'), false);
     assert.equal(result.inbox.cloudflarePublication.state, 'unstarted');
@@ -894,7 +901,7 @@ test('status validates the complete mount contract before entering the Box', (t)
             assert.equal(desired.identity.workspaceRoot, state.workspace);
             assert.equal(desired.repositoryRoot, state.root);
             throw new Error(
-                "Owned Box mount /workspace is incompatible; back up any Box-only data, then run 'ploinky stop' and 'ploinky destroy' before retrying",
+                `Owned Box mount ${state.workspace} is incompatible; back up any Box-only data, then run 'ploinky stop' and 'ploinky destroy' before retrying`,
             );
         },
         repositoryRoot: state.root,
@@ -1147,6 +1154,7 @@ test('bounded start requires the external Router URL and preserves normalized ar
             },
         },
         {
+            workspaceRoot: boundedRoot,
             stdout: output,
             stderr: output,
             timeoutMs: 1000,
@@ -1168,7 +1176,7 @@ test('bounded start requires the external Router URL and preserves normalized ar
         '--env', `PLOINKY_AGENTLIB_FINGERPRINT=${boundedAgentLib.fingerprint}`,
         '--env', 'PLOINKY_AGENTLIB_COMMIT=',
         '--env', `PLOINKY_AGENTLIB_SOURCE_ID=${boundedAgentLib.sourceIdHash}`,
-        '--user', 'podman', '--workdir', '/workspace',
+        '--user', 'podman', '--workdir', boundedRoot,
     ]);
     assert.equal(calls[0][2].stdout, output);
     assert.equal(calls[0][2].stderr, output);
@@ -1188,7 +1196,7 @@ test('bounded start requires the external Router URL and preserves normalized ar
                 };
             },
         },
-        { stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
+        { workspaceRoot: boundedRoot, stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
     );
     assert.equal(defaultTimeoutCalls[0].timeoutMs, 1_800_000);
     assert.equal(
@@ -1209,8 +1217,18 @@ test('bounded start requires the external Router URL and preserves normalized ar
     await assert.rejects(() => runBoundedCoreStart(
         { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 19090, 17891,
         { stream: async () => ({ ok: true, status: 0, stdout: '[start] Router: http://127.0.0.1:8080\n', stderr: '' }) },
-        { stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
+        { workspaceRoot: boundedRoot, stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
     ), /public Router URL/);
+
+    // The in-Box command always runs from the selected workspace root; it has
+    // no fixed fallback working directory.
+    for (const workspaceRoot of [undefined, '', 'relative', `${boundedRoot}:extra`]) {
+        await assert.rejects(() => runBoundedCoreStart(
+            { name: 'podman' }, 'a'.repeat(64), ['start', 'Agent', '8080'], 8080, 7882,
+            { stream: async () => { throw new Error('an invalid workspace root must fail before Podman'); } },
+            { workspaceRoot, stdout: { write() {} }, stderr: { write() {} }, agentLib: boundedAgentLib },
+        ), (error) => error.code === 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID');
+    }
 
     // A start without a selected source is a contract error, not a start that
     // lets the in-Box core resolve achillesAgentLib for itself.
@@ -1238,12 +1256,13 @@ test('bounded update excludes the exact workspace Ploinky checkout already handl
             },
         },
         {
+            workspaceRoot: root,
             agentLib: agentLibFixture(root),
-            updateExcludedRepoPath: '/workspace/ploinky',
+            updateExcludedRepoPath: path.join(root, 'ploinky'),
         },
     );
     const exclusionIndex = calls[0][1].indexOf(
-        'PLOINKY_UPDATED_WORKSPACE_CHECKOUT=/workspace/ploinky',
+        `PLOINKY_UPDATED_WORKSPACE_CHECKOUT=${path.join(root, 'ploinky')}`,
     );
     assert.ok(exclusionIndex > 0);
     assert.equal(calls[0][1][exclusionIndex - 1], '--env');
@@ -1521,4 +1540,42 @@ test('failed Box removal preserves current no-wait markers and workspace lease',
     await assert.rejects(() => supervisor.runDestroyTransaction(ownership.handles.container.id), /removal failed/);
     assert.equal(fs.existsSync(files.markerPath), true);
     assert.equal(fs.existsSync(files.lockPath), true);
+});
+
+test('an unmountable workspace path fails before locking inspection, anchoring, or Box mutation', async (t) => {
+    const state = fixture(t);
+    const selected = path.join(state.root, 'pro:ject');
+    fs.mkdirSync(selected);
+    const identity = buildWorkspaceIdentity(selected, { markerFound: false });
+    for (const [name, invoke] of [
+        ['prepare', supervisor => supervisor.prepareBoxForCommand()],
+        ['start', supervisor => supervisor.runStartTransaction(['start', 'fixture-agent'])],
+        ['restart', supervisor => supervisor.runRestartTransaction(['restart'])],
+        ['update', supervisor => supervisor.runUpdateTransaction(['update'])],
+        ['bind', supervisor => supervisor.runBindTransaction()],
+        ['stop', supervisor => supervisor.runStopTransaction()],
+        ['destroy', supervisor => supervisor.runDestroyTransaction()],
+    ]) {
+        const events = [];
+        const unexpected = label => () => { events.push(label); throw new Error(`Unexpected ${label}`); };
+        const supervisor = createBoxSupervisor({
+            resolveIdentity: () => identity,
+            launchCwd: selected,
+            lockManager: fakeLockManager(path.join(state.root, name.replace(/\s/g, '-')), events),
+            discover: unexpected('discovery'),
+            selectAgentLib: unexpected('select-agentlib'),
+            updateAgentLib: unexpected('update-agentlib'),
+            updateWorkspacePloinky: unexpected('update-ploinky'),
+            reconcile: unexpected('reconcile'),
+            startCore: unexpected('start-core'),
+            runCoreCommand: unexpected('core-command'),
+            runner: { run: unexpected('runtime'), query: unexpected('query') },
+        });
+        fs.mkdirSync(path.join(state.root, name.replace(/\s/g, '-')));
+        await assert.rejects(invoke(supervisor), (error) => (
+            error.code === 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID' && /contains ':'/.test(error.message)
+        ), name);
+        assert.deepEqual(events, ['lock', 'release'], name);
+        assert.equal(fs.existsSync(path.join(selected, '.ploinky')), false, name);
+    }
 });

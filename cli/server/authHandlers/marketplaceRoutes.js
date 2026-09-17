@@ -337,8 +337,9 @@ function buildMarketplaceState(user = null, options = {}) {
         const kind = skillRepos.get(name)?.kind || predefinedEntry.kind || sourceEntry.kind || reposSvc.classifyRepoKind(name);
         const url = predefinedEntry.url || sourceEntry.url || skillRepos.get(name)?.url || '';
         const localPath = workspaceAgentRepositoryPath(name);
-        // Expose a portable workspace label, not the physical host path.
-        const workspacePath = localPath ? path.posix.join('/workspace', path.basename(localPath)) : '';
+        // Expose a workspace-relative label for the checkout, never an assumed
+        // runtime mount prefix or the physical host path.
+        const workspacePath = localPath ? `./${path.basename(localPath)}` : '';
         return {
             name,
             displayName: workspacePath || name,

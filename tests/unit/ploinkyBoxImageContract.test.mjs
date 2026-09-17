@@ -138,6 +138,28 @@ test('images with stale or unexpected labels hard-cut before any binary probe ma
     );
 });
 
+test('the immutable image carries no workspace path and a fixed-workspace image is rejected before probes', () => {
+    assert.equal(IMAGE_CONTRACT.workdir, '/');
+    assert.equal(Object.hasOwn(IMAGE_CONTRACT.environment, 'PLOINKY_WORKSPACE_ROOT'), false);
+    const staleWorkdir = validRecord();
+    staleWorkdir[0].Config.WorkingDir = '/workspace';
+    assert.throws(
+        () => validateImageContract(normalizeImageInspect(staleWorkdir), 'old-runtime', { availableBinaries: binaries }),
+        /Config\.WorkingDir; expected "\/", observed "\/workspace"/,
+    );
+    const bakedRoot = validRecord();
+    bakedRoot[0].Config.Env.push('PLOINKY_WORKSPACE_ROOT=/workspace');
+    assert.throws(
+        () => validateImageContract(normalizeImageInspect(bakedRoot), 'old-runtime', { availableBinaries: binaries }),
+        /Config\.Env/,
+    );
+    for (const record of [staleWorkdir, bakedRoot]) {
+        const runner = admissionRunner({ firstRecord: record });
+        assert.throws(() => inspectAndValidateImage('podman', 'old-runtime', runner), /Config\.(?:WorkingDir|Env)/);
+        assert.deepEqual(runner.calls.map(({ args }) => args.slice(0, 2)), [['image', 'inspect']]);
+    }
+});
+
 test('an existing owned image is probed by immutable ID and re-inspected before admission', () => {
     const record = validRecord();
     const runner = admissionRunner({ firstRecord: record });

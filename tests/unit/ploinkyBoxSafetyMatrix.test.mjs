@@ -39,7 +39,7 @@ function owned(identity, { running = true, agentLib = agentLibFixture(identity.w
                     [BOX_LABELS.routerHostPort]: '8080',
                     [BOX_LABELS.mediaHostPort]: '7882',
                 },
-                runtime: { running, mounts: agentLibFixtureMounts(agentLib) },
+                runtime: { running, mounts: agentLibFixtureMounts(agentLib, identity.workspaceRoot) },
             },
         },
     };
@@ -322,6 +322,7 @@ test('master-key and arbitrary host canaries cannot cross outer or agent boundar
         cidfile: '/private/lock/candidate.cid',
     });
     const execArgs = buildContainerExecArgs('a'.repeat(64), ['status'], {
+        workspaceRoot: identity.workspaceRoot,
         hostPort: 8080,
         mediaHostPort: 7882,
     });

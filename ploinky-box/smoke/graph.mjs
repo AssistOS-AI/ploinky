@@ -2,6 +2,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import {
+    boxWorkspaceEnvironment,
+    boxWorkspaceExecOptions,
+    boxWorkspacePath,
+} from '../contract/workspace-root.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 
 export const SMOKE_GRAPH_REPOSITORIES = Object.freeze([
@@ -150,18 +155,20 @@ export function stageSmokeGraph({
     engine = 'podman',
     containerId,
     runner,
+    workspaceRoot,
 } = {}) {
     if (!/^[a-f0-9]{12,64}$/.test(String(containerId || ''))) {
         throw smokeError('Smoke graph staging requires an immutable outer container ID');
     }
+    const reposDirectory = boxWorkspacePath(workspaceRoot, '.ploinky/repos');
     runner.run(engine, [
         'container', 'exec', '--user', 'podman', containerId,
-        'mkdir', '-p', '/workspace/.ploinky/repos',
+        'mkdir', '-p', reposDirectory,
     ]);
     for (const name of SMOKE_GRAPH_REPOSITORIES) {
         const repository = graph.repositories[name];
         const destinationName = SMOKE_GRAPH_DESTINATIONS[name] || name;
-        const destination = `/workspace/.ploinky/repos/${destinationName}`;
+        const destination = `${reposDirectory}/${destinationName}`;
         runner.run(engine, [
             'container', 'exec', '--user', 'podman', containerId,
             'mkdir', '-p', destination,
@@ -176,11 +183,13 @@ export function stageSmokeGraph({
         }
     }
     runner.run(engine, [
-        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
-        '--env', 'PLOINKY_WORKSPACE_ROOT=/workspace', containerId,
+        'container', 'exec', '--user', 'podman', ...boxWorkspaceExecOptions(workspaceRoot),
+        ...Object.entries(boxWorkspaceEnvironment(workspaceRoot))
+            .flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+        containerId,
         'node', '/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs',
     ]);
-    const desiredDirectory = '/workspace/.ploinky/data/edge-routing';
+    const desiredDirectory = boxWorkspacePath(workspaceRoot, '.ploinky/data/edge-routing');
     const desiredTarget = `${desiredDirectory}/desired.json`;
     const desiredCandidateTarget = `${desiredTarget}.smoke-candidate`;
     runner.run(engine, [

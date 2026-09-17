@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { readBoxWorkspaceRoot } from '../../../ploinky-box/contract/workspace-root.mjs';
 import { readWorkspaceMasterKey } from '../../../ploinky-box/entrypoint/initialize-workspace.mjs';
 import { isInsideBox } from '../../../ploinky-box/lib/boxMarker.mjs';
 
@@ -185,9 +186,9 @@ function resolveMasterKeySeed({
     workspaceRoot,
 } = {}) {
     if (usesManagedWorkspaceMasterKey(managedBox)) {
-        // The managed Box owns one fixed workspace mount. Never walk from cwd:
-        // a nested application directory must not be able to shadow this key.
-        return readWorkspaceMasterKey({ workspaceRoot: workspaceRoot || '/workspace' }).key;
+        // The managed Box owns one host-selected workspace mount. Never walk
+        // from cwd: a nested application directory must not shadow this key.
+        return readWorkspaceMasterKey({ workspaceRoot: workspaceRoot || readBoxWorkspaceRoot(process.env) }).key;
     }
     let raw = String(process.env[MASTER_KEY_VAR] || '').trim();
     if (!raw) {

@@ -33,7 +33,8 @@ test('clones only missing repositories, uses stable links and preserves local ed
     const f = fixture(t);
     const manifest = { 'link-install': [url] };
     const [mount] = prepareLinkedRepositories(manifest, f.options);
-    assert.deepEqual(mount, { name: 'Library', source: path.join(f.root, 'Library'), target: '/workspace/Library', link: 'linked/Library', readOnly: false });
+    const source = path.join(fs.realpathSync(f.root), 'Library');
+    assert.deepEqual(mount, { name: 'Library', source, target: source, link: 'linked/Library', readOnly: false });
     fs.writeFileSync(path.join(mount.source, 'local-edit'), 'keep');
     prepareLinkedRepositories(manifest, f.options);
     assert.equal(f.calls.filter(args => args.includes('clone')).length, 1);
@@ -46,7 +47,8 @@ test('matches Git origin across directory names and HTTPS/SSH forms', t => {
     const source = f.repo('checkout', 'git@github.com:example/Library.git');
     const [mount] = prepareLinkedRepositories({ 'link-install': [url] }, { ...f.options, create: false, writable: false });
     assert.equal(mount.source, source);
-    assert.equal(mount.target, '/workspace/checkout');
+    // Same-path grant: the runtime destination is the workspace checkout path.
+    assert.equal(mount.target, source);
     assert.equal(mount.link, 'linked/Library');
     assert.equal(mount.readOnly, true);
     assert.equal(f.calls.some(args => args.includes('clone')), false);

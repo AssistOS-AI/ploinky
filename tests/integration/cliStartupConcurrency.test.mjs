@@ -296,7 +296,7 @@ test('overlapping CLI starts coalesce one replacement and both attach without an
             return 0;
         },
         getAgentContainerName: () => fixture.containerName,
-        projectPath: '/workspace',
+        projectPath: fixture.workspace,
     };
 
     const first = runCliWithDependencies('achilles-cli', [], dependencies);
@@ -397,7 +397,7 @@ test('maintenance coalescing does not conflate unrelated runtime identities', {
             return 0;
         },
         getAgentContainerName: (agentName) => `${agentName}-container`,
-        projectPath: '/workspace',
+        projectPath: '/home/user/project',
     };
 
     const alpha = runCliWithDependencies('alpha', [], dependencies);

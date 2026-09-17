@@ -122,6 +122,11 @@ function classify(check, report, context) {
             clean(check.next) || 'Inspect this failed repair operation and its recorded error before rerunning repair. Verify ownership and the exact affected resource first; no automatic retry or privilege requirement can be inferred from this execution failure alone.');
     }
     if (id === 'repair.binding.permissions') return bindingAction(check);
+    // Workspace path details are user paths; never classify them by their words.
+    if (id === 'workspace.path') return manual('select-mountable-workspace-path', 'Use a workspace path the Box can mount at the same path', false,
+        'The Box mounts the workspace at its own absolute path. Move or clone the workspace to a directory whose path passes this check and run Ploinky there. Repair never moves workspaces or adds mounts.');
+    if (id === 'workspace.git') return manual('keep-git-metadata-in-workspace', 'Keep Git metadata inside the workspace', false,
+        'Replace each reported linked worktree or separated Git directory with a regular clone inside the workspace, or run Git for it on the host. Repair never mounts additional host paths.');
     if (id === 'repair.machine.state') return check.code === 'MACHINE_STOPPED_ELIGIBLE' && check.repairEligible === true
         ? automatic('start-podman-machine', 'Start the verified stopped Podman Machine',
             'Run ploinky repair to start only the existing selected rootless Machine after revalidating its identity and settings. It does not create or reconfigure a Machine.') : ACTIONS.machine;

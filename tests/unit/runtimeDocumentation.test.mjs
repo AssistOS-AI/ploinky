@@ -81,7 +81,7 @@ test('active runtime documentation separates durable caches from disposable nest
         // Nested container state is disposable, so agent data belongs in binds.
         assert.match(
             content,
-            /persistent agent data must use explicit `\/workspace` binds/i,
+            /persistent agent data must use explicit workspace binds/i,
             relativePath,
         );
         assert.match(content, /discarded (?:with|when) the outer/i, relativePath);
@@ -106,5 +106,18 @@ test('direct/core cutover documentation uses the explicit old core entry', () =>
         assert.match(content, /node cli\/index\.js destroy/, relativePath);
         assert.match(content, /node cli\/index\.js network prune/, relativePath);
         assert.match(content, /public [`']?ploinky[`']? wrapper[\s\S]*outer runtime|outside a managed box[\s\S]*outer supervisor/i, relativePath);
+    }
+});
+
+test('active runtime documentation describes the same-path workspace mount without a fixed root', () => {
+    for (const relativePath of [
+        'README.md',
+        'docs/code-derived-agent-lifecycle.md',
+        'container/README.md',
+    ]) {
+        const content = read(relativePath).replace(/\s+/g, ' ');
+        assert.doesNotMatch(content, /in `\/workspace`|at `\/workspace`|workdir `\/workspace`|working directory `\/workspace`/i, relativePath);
+        assert.match(content, /same absolute path/i, relativePath);
+        assert.match(content, /PLOINKY_WORKSPACE_ROOT/, relativePath);
     }
 });

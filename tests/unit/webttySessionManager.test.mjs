@@ -2,8 +2,12 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
+import { buildShellEnvironment } from '../../core-services/webtty/environment.mjs';
 import { WebttySessionManager } from '../../cli/server/webtty/sessionManager.mjs';
 import { terminalTargetRouteBinding } from '../../cli/server/webtty/terminalTargetResolver.mjs';
+
+// The Router's workspace root is the host-selected path mounted at itself.
+const WORKSPACE_ROOT = '/home/user/work space/proiect';
 
 const LEASE = Object.freeze({
     mode: 'local',
@@ -65,7 +69,7 @@ function lease(name, userId = 'local:admin') {
 function terminalTargets(relativePath = 'Projects') {
     const directory = Object.freeze({
         relativePath,
-        absolutePath: `/workspace/${relativePath}`,
+        absolutePath: `${WORKSPACE_ROOT}/${relativePath}`,
         identity: Object.freeze({ dev: '1', ino: '2' }),
     });
     return Object.freeze([
@@ -75,7 +79,7 @@ function terminalTargets(relativePath = 'Projects') {
             label: 'Ploinky Box',
             detail: 'Workspace runtime',
             access: 'rw',
-            cwdDisplay: `/workspace/${relativePath}`,
+            cwdDisplay: `${WORKSPACE_ROOT}/${relativePath}`,
         }),
         Object.freeze({
             kind: 'agent',
@@ -258,6 +262,7 @@ function recordStore() {
 
 async function createManager(t, options = {}) {
     const manager = new WebttySessionManager({
+        workspaceRoot: WORKSPACE_ROOT,
         limits: {
             authenticationIntervalMs: 60_000,
             streamDetachGraceMs: 1_000,
@@ -457,7 +462,7 @@ test('synchronous auth invalidation rejects discovery and session admission with
                         label: 'Ploinky Box',
                         detail: 'Workspace runtime',
                         access: 'rw',
-                        cwdDisplay: '/workspace/Projects',
+                        cwdDisplay: `${WORKSPACE_ROOT}/Projects`,
                     }],
                 };
             },
@@ -628,6 +633,8 @@ test('worker initialization forwards only cwd, dimensions, and the fixed shell e
         rows: 30,
     });
     assert.deepEqual(Object.keys(worker.startFields).sort(), ['cols', 'cwdRelative', 'rows', 'shellEnv']);
+    assert.deepEqual(worker.startFields.shellEnv, buildShellEnvironment({}, { workspaceRoot: WORKSPACE_ROOT }));
+    assert.equal(worker.startFields.shellEnv.PLOINKY_WORKSPACE_ROOT, WORKSPACE_ROOT);
     assert.equal(worker.startFields.cwdRelative, 'Projects');
     assert.equal(worker.startFields.cols, 90);
     assert.equal(worker.startFields.rows, 30);
@@ -1130,6 +1137,7 @@ test('idle and absolute lifetimes reclaim sessions at their configured bounds', 
         let now = 1_000;
         const worker = new FakeWorker();
         const manager = new WebttySessionManager({
+            workspaceRoot: WORKSPACE_ROOT,
             now: () => now,
             limits: { authenticationIntervalMs: 60_000, idleLifetimeMs: 10, absoluteLifetimeMs: 100 },
             auth: authAdapter(),
@@ -1147,6 +1155,7 @@ test('idle and absolute lifetimes reclaim sessions at their configured bounds', 
     await t.test('absolute', async (t2) => {
         let now = 2_000;
         const manager = new WebttySessionManager({
+            workspaceRoot: WORKSPACE_ROOT,
             now: () => now,
             limits: { authenticationIntervalMs: 60_000, idleLifetimeMs: 100, absoluteLifetimeMs: 10 },
             auth: authAdapter(),
@@ -1167,6 +1176,7 @@ test('validated PTY output refreshes idle activity while absolute lifetime remai
     let now = 3_000;
     const worker = new FakeWorker();
     const manager = new WebttySessionManager({
+        workspaceRoot: WORKSPACE_ROOT,
         now: () => now,
         limits: {
             authenticationIntervalMs: 60_000,
@@ -1939,4 +1949,14 @@ test('final authentication revalidation rejects a terminal that lost authority d
     );
     assert.equal(worker.closed, 1);
     assert.equal(manager.activeCount(), 0);
+});
+
+test('the session manager requires an explicit clean workspace root', () => {
+    for (const workspaceRoot of [undefined, '', 'relative', '/home/user/project/', '/home/user/../project']) {
+        assert.throws(() => new WebttySessionManager({
+            workspaceRoot,
+            recordStore: recordStore(),
+            workerFactory: () => new FakeWorker(),
+        }), { code: 'WEBTTY_CWD_INVALID' });
+    }
 });

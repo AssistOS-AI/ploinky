@@ -16,8 +16,10 @@ test('launch scope is canonical and bounded independently of workspace identity'
     const right = path.join(workspace, 'right');
     fs.mkdirSync(left); fs.mkdirSync(right);
     const identity = buildWorkspaceIdentity(workspace);
-    assert.equal(buildHostSkillScope(workspace, left).PLOINKY_SKILL_SCOPE, '/workspace/left');
-    assert.equal(buildHostSkillScope(workspace, right).PLOINKY_SKILL_SCOPE, '/workspace/right');
+    // The Box mounts the workspace at its own path, so the scope is that path.
+    assert.equal(buildHostSkillScope(workspace, left).PLOINKY_SKILL_SCOPE, path.join(workspace, 'left'));
+    assert.equal(buildHostSkillScope(workspace, right).PLOINKY_SKILL_SCOPE, path.join(workspace, 'right'));
+    assert.equal(buildHostSkillScope(workspace, workspace).PLOINKY_SKILL_SCOPE, workspace);
     assert.equal(identity.instance, buildWorkspaceIdentity(workspace).instance);
     fs.symlinkSync(outside, path.join(workspace, 'escape'));
     assert.throws(() => buildHostSkillScope(workspace, path.join(workspace, 'escape')), /outside/);
@@ -39,15 +41,33 @@ test('two CLI invocations reuse one Box while forwarding their own trusted launc
         const status = await runOuterCli(['cli', 'sample'], { supervisor, cwd: () => path.join(workspace, name), detectInsideBox: () => false, input: {}, output: { write() {} }, execute: (_command, args) => { calls.push(args); return 0; } });
         assert.equal(status, 0);
     }
-    assert.ok(calls[0].includes('PLOINKY_SKILL_SCOPE=/workspace/left'));
-    assert.ok(calls[1].includes('PLOINKY_SKILL_SCOPE=/workspace/right'));
+    assert.ok(calls[0].includes(`PLOINKY_SKILL_SCOPE=${path.join(workspace, 'left')}`));
+    assert.ok(calls[1].includes(`PLOINKY_SKILL_SCOPE=${path.join(workspace, 'right')}`));
     assert.ok(calls.every(args => args.includes('same-box')));
-    assert.ok(calls.every(args => args[args.indexOf('--workdir') + 1] === '/workspace'));
+    assert.ok(calls.every(args => args[args.indexOf('--workdir') + 1] === workspace));
 });
 
 test('scope metadata uses engine env arguments without new mounts or cwd changes', () => {
-    const args = buildContainerExecArgs('box', ['start', 'example'], { hostPort: 8080, mediaHostPort: 7882, skillScopeEnv: { PLOINKY_SKILL_SCOPE: '/workspace/repo with spaces', PLOINKY_SKILL_SCOPE_VERSION: '1' } });
-    assert.ok(args.includes('PLOINKY_SKILL_SCOPE=/workspace/repo with spaces'));
+    const root = '/home/user/project';
+    const args = buildContainerExecArgs('box', ['start', 'example'], { workspaceRoot: root, hostPort: 8080, mediaHostPort: 7882, skillScopeEnv: { PLOINKY_SKILL_SCOPE: `${root}/repo with spaces`, PLOINKY_SKILL_SCOPE_VERSION: '1' } });
+    assert.ok(args.includes(`PLOINKY_SKILL_SCOPE=${root}/repo with spaces`));
     assert.equal(args.includes('--volume'), false);
-    assert.equal(args[args.indexOf('--workdir') + 1], '/workspace');
+    assert.equal(args[args.indexOf('--workdir') + 1], root);
+});
+
+test('a symlink-selected workspace keeps its selected Box spelling while containment uses canonical paths', t => {
+    const parent = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skill-scope-link-')));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const canonical = path.join(parent, 'project');
+    const sibling = path.join(parent, 'project-other');
+    const selected = path.join(parent, 'selected project');
+    fs.mkdirSync(path.join(canonical, 'nested dir'), { recursive: true });
+    fs.mkdirSync(sibling);
+    fs.symlinkSync(canonical, selected, 'dir');
+    const scope = buildHostSkillScope(selected, path.join(selected, 'nested dir'));
+    assert.equal(scope.PLOINKY_SKILL_SCOPE, path.join(selected, 'nested dir'));
+    assert.equal(scope.PLOINKY_HOST_LAUNCH_CWD, path.join(canonical, 'nested dir'));
+    // A sibling whose name extends the root is outside it.
+    assert.throws(() => buildHostSkillScope(canonical, sibling), /outside/);
+    assert.throws(() => buildHostSkillScope(selected, sibling), /outside/);
 });

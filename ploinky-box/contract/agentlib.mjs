@@ -2,8 +2,8 @@
 //
 // One selected host directory is exposed to the Box twice: once at the stable
 // runtime path every mount namespace agrees on, and once as a read-only shadow
-// over the alias the broad writable `/workspace` bind would otherwise expose.
-// Without that second bind the same inode stays writable through `/workspace`
+// over the alias the broad writable workspace bind would otherwise expose.
+// Without that second bind the same inode stays writable through the workspace
 // and the stable read-only mount is not a real confinement boundary.
 
 import path from 'node:path';
@@ -15,9 +15,10 @@ import {
     imageSourceId,
 } from '../../agentlib/contract.mjs';
 import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
-import { BOX_AGENTLIB_LABELS, BOX_WORKSPACE_MOUNT } from '../constants.mjs';
+import { BOX_AGENTLIB_LABELS } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { normalizeImageId } from './image-id.mjs';
+import { boxWorkspacePath } from './workspace-root.mjs';
 
 function agentLibContractError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE' });
@@ -74,30 +75,45 @@ export function normalizeBoxAgentLib(selection) {
         sourceIdHash: identityHash,
         ...(imageId ? { imageId } : {}),
         stablePath: AGENTLIB_STABLE_MOUNT_PATH,
-        aliasPath: mode === 'image' ? null : path.posix.join(BOX_WORKSPACE_MOUNT, sourceRelativePath),
     });
 }
 
+/**
+ * The Box path at which the writable workspace bind also exposes the selected
+ * source. The contract records it workspace-relative; the alias exists only
+ * for one selected workspace root.
+ *
+ * @param {Readonly<object>} contract
+ * @param {string} workspaceRoot
+ * @returns {string}
+ */
+export function agentLibAliasPath(contract, workspaceRoot) {
+    if (contract.mode === 'image') {
+        throw agentLibContractError('An image AgentLib selection has no workspace alias');
+    }
+    return boxWorkspacePath(workspaceRoot, contract.sourceRelativePath);
+}
+
 /** The two exact read-only binds, keyed by container destination. */
-export function expectedAgentLibMounts(contract) {
+export function expectedAgentLibMounts(contract, workspaceRoot) {
     if (contract.mode === 'image') return {};
     return {
         [contract.stablePath]: { source: contract.sourceDir, rw: false },
-        [contract.aliasPath]: { source: contract.sourceDir, rw: false },
+        [agentLibAliasPath(contract, workspaceRoot)]: { source: contract.sourceDir, rw: false },
     };
 }
 
 /**
  * Mount arguments for `container create`.
  *
- * The alias shadow must be rendered after the writable `/workspace` bind so the
+ * The alias shadow must be rendered after the writable workspace bind so the
  * read-only mount lands on top of it.
  */
-export function agentLibMountArgs(contract) {
+export function agentLibMountArgs(contract, workspaceRoot) {
     if (contract.mode === 'image') return [];
     return [
         '--volume', `${contract.sourceDir}:${contract.stablePath}:ro`,
-        '--volume', `${contract.sourceDir}:${contract.aliasPath}:ro`,
+        '--volume', `${contract.sourceDir}:${agentLibAliasPath(contract, workspaceRoot)}:ro`,
     ];
 }
 
@@ -175,7 +191,6 @@ export function agentLibContractFromContainer(container) {
         commit,
         sourceIdHash: sourceIdHashValue,
         stablePath: AGENTLIB_STABLE_MOUNT_PATH,
-        aliasPath: path.posix.join(BOX_WORKSPACE_MOUNT, sourceRelativePath),
     });
 }
 

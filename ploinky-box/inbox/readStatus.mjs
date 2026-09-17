@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { readBoxWorkspaceRoot } from '../contract/workspace-root.mjs';
 import { createProcessRunner } from '../process.mjs';
 import { serializeCloudflarePublicationStatus } from '../cloudflared/status.mjs';
 
@@ -50,10 +51,13 @@ function readCloudflarePublicationStatus(ploinkyRoot, fsApi, warnings) {
 }
 
 export function readInboxStatus({
-    workspaceRoot = '/workspace',
+    workspaceRoot,
     fsApi = fs,
     runner = createProcessRunner(),
 } = {}) {
+    if (typeof workspaceRoot !== 'string' || !path.isAbsolute(workspaceRoot)) {
+        throw new TypeError('Box inbox status requires an absolute workspace root');
+    }
     const root = path.resolve(workspaceRoot);
     const ploinkyRoot = path.join(root, '.ploinky');
     const warnings = [];
@@ -125,5 +129,5 @@ export function readInboxStatus({
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
 if (invokedPath === fileURLToPath(import.meta.url)) {
-    process.stdout.write(`${JSON.stringify(readInboxStatus())}\n`);
+    process.stdout.write(`${JSON.stringify(readInboxStatus({ workspaceRoot: readBoxWorkspaceRoot(process.env) }))}\n`);
 }

@@ -8,6 +8,7 @@ import {
     resolvePloinkyUpdateScope,
 } from '../../cli/commands/ploinkyUpdateScope.js';
 import { isGitRepo, updatePloinkySelf } from '../../cli/commands/updateService.js';
+import { boxWorkspacePath } from '../contract/workspace-root.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createMutationLockManager } from '../locks.mjs';
 
@@ -36,14 +37,14 @@ function skippedWorkspaceUpdate(repoPath, reason, extra = {}) {
     });
 }
 
-function workspaceCheckoutBoxPath(canonicalWorkspace, canonicalRepo) {
+// Containment is proven on canonical paths; the Box path keeps the selected
+// workspace spelling, which is where the Box mounts the workspace.
+function workspaceCheckoutBoxPath(workspaceRoot, canonicalWorkspace, canonicalRepo) {
     if (!pathContains(canonicalWorkspace, canonicalRepo)) {
         throw workspaceUpdateError('Selected Ploinky checkout escaped the locked workspace');
     }
     const relative = path.relative(canonicalWorkspace, canonicalRepo);
-    return relative
-        ? path.posix.join('/workspace', ...relative.split(path.sep))
-        : '/workspace';
+    return boxWorkspacePath(workspaceRoot, relative.split(path.sep).join('/'));
 }
 
 export function hostSourceLockIdentity(repositoryRoot, {
@@ -238,7 +239,7 @@ export function updateWorkspacePloinkySource({
                 found: true,
                 duplicateOfHost: true,
                 updateScopeRoot: canonicalScope,
-                boxRepoPath: workspaceCheckoutBoxPath(canonicalWorkspace, canonicalRepo),
+                boxRepoPath: workspaceCheckoutBoxPath(identity.workspaceRoot, canonicalWorkspace, canonicalRepo),
             },
         );
     }
@@ -263,7 +264,7 @@ export function updateWorkspacePloinkySource({
         found: true,
         repoPath: canonicalRepo,
         updateScopeRoot: canonicalScope,
-        boxRepoPath: workspaceCheckoutBoxPath(canonicalWorkspace, canonicalRepo),
+        boxRepoPath: workspaceCheckoutBoxPath(identity.workspaceRoot, canonicalWorkspace, canonicalRepo),
         pullStrategy: 'rebase-autostash',
     });
 }

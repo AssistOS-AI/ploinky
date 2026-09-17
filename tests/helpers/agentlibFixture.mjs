@@ -88,8 +88,8 @@ export function agentLibFixtureEnv(contract) {
 }
 
 /** The two observed bind mounts an existing Box must report for `contract`. */
-export function agentLibFixtureMounts(contract) {
-    return Object.entries(expectedAgentLibMounts(contract)).map(([destination, expected]) => ({
+export function agentLibFixtureMounts(contract, workspaceRoot) {
+    return Object.entries(expectedAgentLibMounts(contract, workspaceRoot)).map(([destination, expected]) => ({
         type: 'bind',
         name: '',
         source: expected.source,

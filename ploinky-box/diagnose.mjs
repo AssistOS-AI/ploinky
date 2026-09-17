@@ -11,6 +11,11 @@ import { buildWorkspaceIdentity, resolveWorkspaceIdentity } from './identity.mjs
 import { IMAGE_OBSERVATION_UNAVAILABLE, inspectAndValidateImage, normalizeImageInspect, validateImageContract } from './contract/image.mjs';
 import { observeContainerRouterBinding, validateContainerConfiguration } from './contract/container.mjs';
 import { agentLibContractFromContainer } from './contract/agentlib.mjs';
+import {
+    assertBoxWorkspaceRoot,
+    boxWorkspaceExecOptions,
+    boxWorkspacePath,
+} from './contract/workspace-root.mjs';
 import { probeImageAgentLib } from './image-agentlib.mjs';
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
 import { createMutationLockManager } from './locks.mjs';
@@ -19,6 +24,7 @@ import { buildEngineProcessEnvironment, createProcessRunner } from './process.mj
 import { createRouterBindingStore, assertRouterBindingAssignable } from './routerBinding.mjs';
 import { collectHostDiagnostics } from './diagnose/host.mjs';
 import { collectCurrentWorkspaceDiagnostics } from './diagnose/current.mjs';
+import { findExternalGitMetadata } from './diagnose/gitMetadata.mjs';
 import { inspectWorkspaceDataPaths } from './workspace-data.mjs';
 import { collectRepairAssessments } from './repair/automatic.mjs';
 import { annotateRemediations, formatRemediationActions } from './diagnose/remediations.mjs';
@@ -37,6 +43,9 @@ const QUERY_WRAPPER_FAILURE_CODES = new Set([
 
 export function diagnosticAdvice(value) {
     const message = String(value || '');
+    if (/Ploinky Box cannot use the workspace path/.test(message)) {
+        return 'The workspace is mounted at its own absolute path inside the Box. Move or clone the workspace to a directory whose absolute path passes this check, then run Ploinky from there; no Box-owned location or mount syntax exception is available.';
+    }
     if (/TCP.*already in use|UDP.*already in use/i.test(message)) {
         return 'Use ss -ltnu (or lsof -i on macOS) to identify the listener. Select an available --port/--udp-port or stop only the known conflicting service, then rerun diagnose with the same port options.';
     }
@@ -350,10 +359,11 @@ export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env,
         });
         if (!prepared) return;
         await stage('box.inner', 'Exercise inner Podman storage, networking and nested-engine containers', async () => {
-            const result = await runner.stream('podman', ['container', 'exec', '--user', 'podman', '--workdir', '/workspace',
+            const result = await runner.stream('podman', ['container', 'exec', '--user', 'podman',
+                ...boxWorkspaceExecOptions(fixture.workspaceRoot),
                 '--env', 'PLOINKY_DIAGNOSE_ISOLATED=1',
                 ownedId, '/usr/local/bin/node', '/opt/ploinky/ploinky-box/diagnose/inside.mjs', runtimeImageRef,
-                '--image-archive', '/workspace/diagnostic-image.tar', '--image-id', imageId],
+                '--image-archive', boxWorkspacePath(fixture.workspaceRoot, 'diagnostic-image.tar'), '--image-id', imageId],
             { timeoutMs: 900_000 });
             let report;
             try { report = JSON.parse(result.stdout); } catch { throw new Error(`Inner diagnostic report unavailable: ${result.stderr || result.stdout}`); }
@@ -377,7 +387,7 @@ export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env,
                 const record = inspectRecord(runner, id);
                 if (record.Image.replace(/^sha256:/, '') !== imageId.replace(/^sha256:/, '')
                     || record.Config?.Labels?.[BOX_LABELS.pathHash] !== fixture.pathHash
-                    || !record.Mounts?.some((mount) => mount.Source === fixture.workspaceRoot && mount.Destination === '/workspace')) {
+                    || !record.Mounts?.some((mount) => mount.Source === fixture.workspaceRoot && mount.Destination === fixture.workspaceRoot)) {
                     throw new Error('Diagnostic container changed; cleanup refused');
                 }
                 runner.run('podman', ['container', 'rm', '--force', '--time', '0', id]);
@@ -393,6 +403,27 @@ export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env,
             });
         }
     }
+}
+
+const GIT_METADATA_LABEL = 'Git metadata readable inside the Box';
+const MAX_GIT_METADATA_REPORTED = 10;
+
+function gitMetadataCheck(workspaceRoot, fsApi) {
+    let external;
+    try {
+        external = findExternalGitMetadata(workspaceRoot, { fsApi });
+    } catch (error) {
+        return { id: 'workspace.git', label: GIT_METADATA_LABEL, status: 'warn', detail: failureDetail(error),
+            next: 'Inspect the reported error; Git metadata outside the workspace cannot be read inside the Box.' };
+    }
+    if (!external.length) {
+        return { id: 'workspace.git', label: GIT_METADATA_LABEL, status: 'pass',
+            detail: 'Checked repositories keep their Git metadata inside the workspace.' };
+    }
+    const listed = external.slice(0, MAX_GIT_METADATA_REPORTED).map(({ repository, metadata }) => `${repository}: ${metadata}`);
+    if (external.length > listed.length) listed.push(`${external.length - listed.length} more repositories are not shown.`);
+    return { id: 'workspace.git', label: GIT_METADATA_LABEL, status: 'warn', detail: clean(listed.join('\n')),
+        next: 'These repositories keep Git metadata outside the workspace path, which the Box does not mount. Git commands for them fail inside the Box; use a regular clone inside the workspace or run Git for them on the host.' };
 }
 
 export async function diagnoseWorkspace({
@@ -432,6 +463,13 @@ export async function diagnoseWorkspace({
         identity = resolveWorkspaceIdentity({ env, cwd: () => typeof cwd === 'function' ? cwd() : cwd });
         return identity.workspaceRoot;
     });
+    if (identity) {
+        const mountable = await stage('workspace.path', 'Check that the workspace path can be mounted at the same path in the Box', async () => {
+            assertBoxWorkspaceRoot(identity.workspaceRoot);
+            return 'The workspace bind, Box working directory, and workspace root all use this exact path.';
+        });
+        if (mountable) checks.push(gitMetadataCheck(identity.workspaceRoot, fsApi));
+    }
     let ownership;
     if (identity && (host?.engineUsable || host?.engineInfo?.host?.security?.rootless === true)) {
         ownership = await stage('workspace.ownership', 'Inspect the selected Box ownership', async () => {
@@ -476,7 +514,7 @@ export async function diagnoseWorkspace({
         const current = ownership.handles?.container;
         if (current?.runtime?.running) {
             await stage('workspace.current', 'Inspect running graph and nested Podman settings', async () => {
-                checks.push(...await currentChecks({ runner, containerId: current.id }));
+                checks.push(...await currentChecks({ runner, containerId: current.id, workspaceRoot: identity.workspaceRoot }));
                 return 'Inspected the current workspace without changing workloads.';
             });
         }

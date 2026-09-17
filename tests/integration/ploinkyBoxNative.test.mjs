@@ -13,7 +13,14 @@ import {
     BOX_TMPFS,
     BOX_USERNS,
 } from '../../ploinky-box/constants.mjs';
-import { AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
+import {
+    AGENTLIB_ENV,
+    AGENTLIB_STABLE_MOUNT_PATH,
+    canonicalAgentLibRemote,
+    imageSourceId,
+} from '../../agentlib/contract.mjs';
+import { sourceIdHash } from '../../agentlib/fingerprint.mjs';
+import { normalizeImageId } from '../../ploinky-box/contract/image-id.mjs';
 import { resolveWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import {
     removeContainerById,
@@ -67,7 +74,7 @@ function reserveUdpPortIfAvailable(port) {
 
 function queryInBox(harness, containerId, argv) {
     return harness.runner.query('podman', [
-        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
+        'container', 'exec', '--user', 'podman', '--workdir', harness.identity.workspaceRoot,
         containerId, ...argv,
     ], { timeoutMs: 120_000 });
 }
@@ -75,13 +82,14 @@ function queryInBox(harness, containerId, argv) {
 function findNestedExplorer(harness, containerId) {
     return JSON.parse(execInBox(harness.runner, containerId, [
         '/usr/local/bin/node', '-e', [
-            "const f=require('node:fs');",
-            "const a=JSON.parse(f.readFileSync('/workspace/.ploinky/agents.json'));",
-            "const r=JSON.parse(f.readFileSync('/workspace/.ploinky/routing.json'));",
+            "const f=require('node:fs');const root=process.argv[1];",
+            "const a=JSON.parse(f.readFileSync(root+'/.ploinky/agents.json'));",
+            "const r=JSON.parse(f.readFileSync(root+'/.ploinky/routing.json'));",
             "const name=r.static&&r.static.container;const v=name&&a[name];",
             "if(!v||v.repoName!=='AchillesIDE'||v.agentName!=='explorer'||v.runtime!=='podman'||!(/^[a-f0-9]{64}$/.test(v.containerId||'')))process.exit(4);",
             "process.stdout.write(JSON.stringify({name,id:v.containerId,repoName:v.repoName,agentName:v.agentName}));",
         ].join(''),
+        harness.identity.workspaceRoot,
     ]));
 }
 
@@ -128,24 +136,51 @@ function repeatedArgument(argv, option) {
 
 function assertExactOuterStorage(harness, containerId, repositoryRoot) {
     const record = boxInspection(harness, containerId);
+    const workspaceRoot = harness.identity.workspaceRoot;
+    const localAgentLib = path.join(workspaceRoot, 'achillesAgentLib');
+    const hasLocalAgentLib = fs.existsSync(localAgentLib);
+    const labels = record.Config?.Labels || {};
+    assert.equal(labels[BOX_AGENTLIB_LABELS.mode], hasLocalAgentLib ? 'local' : 'image');
     const agentLibSourceRelativePath = String(
-        record.Config?.Labels?.[BOX_AGENTLIB_LABELS.sourceRelativePath] || '',
+        labels[BOX_AGENTLIB_LABELS.sourceRelativePath] || '',
     );
-    assert.match(
-        agentLibSourceRelativePath,
-        /^\.ploinky\/agentlib\/generations\/[A-Za-z0-9._-]+$/,
-        'the native fixture must use one managed AgentLib generation',
-    );
-    const agentLibSource = fs.realpathSync(path.join(
-        harness.identity.workspaceRoot,
-        agentLibSourceRelativePath,
-    ));
-    assert.equal(
-        path.relative(harness.identity.workspaceRoot, agentLibSource).startsWith('..'),
-        false,
-        'the selected AgentLib generation must remain inside the exact workspace',
-    );
-    const agentLibAlias = `/workspace/${agentLibSourceRelativePath}`;
+    assert.equal(agentLibSourceRelativePath, hasLocalAgentLib ? 'achillesAgentLib' : 'image');
+    const fingerprint = labels[BOX_AGENTLIB_LABELS.fingerprint];
+    assert.match(fingerprint, /^[a-f0-9]{64}$/);
+    assert.match(labels[BOX_AGENTLIB_LABELS.sourceIdHash], /^[a-f0-9]{64}$/);
+    const expectedAgentLibMounts = [];
+    if (hasLocalAgentLib) {
+        const source = fs.realpathSync(localAgentLib);
+        assert.equal(source, localAgentLib, 'the fixture selects one real workspace-local AgentLib directory');
+        expectedAgentLibMounts.push(
+            { type: 'bind', source, destination: AGENTLIB_STABLE_MOUNT_PATH, rw: false },
+            { type: 'bind', source, destination: localAgentLib, rw: false },
+        );
+    } else {
+        assert.equal(labels[BOX_AGENTLIB_LABELS.commit], canonicalAgentLibRemote().commit);
+        assert.equal(labels[BOX_AGENTLIB_LABELS.sourceIdHash],
+            sourceIdHash(imageSourceId(normalizeImageId(record.Image), fingerprint)));
+        assert.equal(fs.existsSync(path.join(workspaceRoot, '.ploinky', 'agentlib')), false,
+            'image selection must not materialize managed AgentLib state');
+    }
+    for (const [name, value] of Object.entries({
+        [AGENTLIB_ENV.dir]: AGENTLIB_STABLE_MOUNT_PATH,
+        [AGENTLIB_ENV.mode]: hasLocalAgentLib ? 'local' : 'image',
+        [AGENTLIB_ENV.fingerprint]: fingerprint,
+        [AGENTLIB_ENV.commit]: labels[BOX_AGENTLIB_LABELS.commit],
+        [AGENTLIB_ENV.sourceId]: labels[BOX_AGENTLIB_LABELS.sourceIdHash],
+    })) {
+        assert.deepEqual(record.Config.Env.filter((entry) => entry.startsWith(`${name}=`)), [`${name}=${value}`]);
+    }
+    // The selected workspace is its own Box path: bind destination, working
+    // directory, reserved environment, and physical shell cwd all agree.
+    assert.equal(record.Config?.WorkingDir, workspaceRoot);
+    assert.equal((record.Config?.Env || []).filter((entry) => entry.startsWith('PLOINKY_WORKSPACE_ROOT=')).length, 1);
+    assert.ok((record.Config?.Env || []).includes(`PLOINKY_WORKSPACE_ROOT=${workspaceRoot}`));
+    if (record.State?.Running === true) {
+        assert.equal(execInBox(harness.runner, containerId, ['pwd', '-P']), workspaceRoot);
+        assert.equal(execInBox(harness.runner, containerId, ['printenv', 'PLOINKY_WORKSPACE_ROOT']), workspaceRoot);
+    }
     const transientMounts = record.Mounts.filter((mount) => (
         String(mount.Destination || '') === BOX_TMPFS.destination
     ));
@@ -180,24 +215,13 @@ function assertExactOuterStorage(harness, containerId, repositoryRoot) {
         { type: 'bind', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
         {
             type: 'bind',
-            source: agentLibSource,
-            destination: AGENTLIB_STABLE_MOUNT_PATH,
-            rw: false,
-        },
-        {
-            type: 'bind',
             source: harness.identity.dataPaths.dependencies,
             destination: '/opt/ploinky/node_modules',
             rw: true,
         },
-        { type: 'bind', source: harness.identity.workspaceRoot, destination: '/workspace', rw: true },
-        {
-            type: 'bind',
-            source: agentLibSource,
-            destination: agentLibAlias,
-            rw: false,
-        },
-    ]);
+        { type: 'bind', source: workspaceRoot, destination: workspaceRoot, rw: true },
+        ...expectedAgentLibMounts,
+    ].sort((left, right) => left.destination.localeCompare(right.destination)));
     const inspectedTmpfs = record.HostConfig?.Tmpfs;
     assert.deepEqual(Object.keys(inspectedTmpfs || {}), [BOX_TMPFS.destination]);
     const runtimeOptions = String(inspectedTmpfs[BOX_TMPFS.destination]).split(',');
@@ -289,6 +313,27 @@ function readDependencyCacheFile(harness, relativePath) {
     ).trim();
 }
 
+// Core bootstrap also runs for stop. These graphless fixtures contain empty
+// installed repositories so the real stop/replacement path has no optional
+// application sources to fetch. The full smoke graph uses its own staging.
+function prepareGraphlessBootRepositories(harness, containerId) {
+    execInBox(harness.runner, containerId, [
+        'node', '--input-type=module', '-e', [
+            "import assert from 'node:assert/strict';",
+            "import fs from 'node:fs';",
+            "import path from 'node:path';",
+            "import { getDefaultBootRepos } from '/opt/ploinky/cli/utils/repos.js';",
+            "const root=path.join(process.env.PLOINKY_WORKSPACE_ROOT,'.ploinky','repos');",
+            'for(const {name} of getDefaultBootRepos()){',
+            'const directory=path.join(root,name);',
+            'assert.equal(path.dirname(directory),root);',
+            'fs.mkdirSync(directory,{recursive:true});',
+            'assert.deepEqual(fs.readdirSync(directory),[]);',
+            '}',
+        ].join(''),
+    ]);
+}
+
 test('a stopped Box restarts on the same outer ID with a fresh tmpfs boot', {
     timeout: 30 * 60_000,
 }, async (t) => {
@@ -306,6 +351,7 @@ test('a stopped Box restarts on the same outer ID with a fresh tmpfs boot', {
         imageRef: candidateReference,
     });
     const containerId = started.containerId;
+    prepareGraphlessBootRepositories(harness, containerId);
     assert.match(containerId, /^[a-f0-9]{64}$/);
     assertIntendedNestedStorage(harness, containerId);
     assertExactOuterStorage(harness, containerId, repositoryRoot);
@@ -375,6 +421,13 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     fs.writeFileSync(path.join(harness.workspace, 'host-visible.txt'), 'host-visible');
     fs.mkdirSync(path.join(harness.workspace, 'host-visible-folder'));
     fs.writeFileSync(path.join(harness.child, 'host-visible-child.txt'), 'host-visible-child');
+    // Host-written absolute symlinks: an in-workspace target keeps its path in
+    // the Box, while a target outside the workspace gains no grant.
+    const inTreeLink = path.join(harness.child, 'absolute-in-tree-link');
+    const externalLink = path.join(harness.workspace, 'absolute-external-link');
+    fs.symlinkSync(path.join(harness.workspace, 'host-visible.txt'), inTreeLink);
+    fs.writeFileSync(path.join(harness.root, 'outside-workspace.txt'), 'outside-workspace');
+    fs.symlinkSync(path.join(harness.root, 'outside-workspace.txt'), externalLink);
     const graph = readSmokeGraphInputs(process.env, { runner: harness.runner });
     const selectedMediaHostPort = 17891;
     const startRoute = routeOuterCommand(parseOuterArguments([
@@ -396,8 +449,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.match(candidateImageId, /^(?:sha256:)?[a-f0-9]{64}$/);
     assert.equal(fs.existsSync(path.join(harness.workspace, '.ploinky')), true);
     assert.deepEqual(fs.readdirSync(path.join(harness.workspace, '.ploinky')).sort(),
-        ['agentlib', 'box', 'master-key'],
-        'the host identity anchor must retain only AgentLib state, the Box master key, and cache root');
+        ['box', 'master-key'],
+        'image-backed AgentLib creates no source state beside the Box master key and cache root');
     assert.equal(fs.existsSync(path.join(harness.child, '.ploinky')), false);
     // Workspace-backed persistence: both cache directories exist on the real
     // host, back the Box through exact bind mounts, and no named volume exists.
@@ -426,12 +479,21 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(prepared.ownership.handles.container.runtime.publications
         .some((entry) => entry.containerPort === '8081'), false);
     assert.equal(execInBox(harness.runner, prepared.containerId, [
-        'cat', '/workspace/host-visible.txt',
+        'cat', path.join(harness.identity.workspaceRoot, 'host-visible.txt'),
     ]), 'host-visible');
     assert.equal(execInBox(harness.runner, prepared.containerId, [
-        'test', '-d', '/workspace/host-visible-folder',
+        'test', '-d', path.join(harness.identity.workspaceRoot, 'host-visible-folder'),
     ]), '');
-    stageSmokeGraph({ graph, containerId: prepared.containerId, runner: harness.runner });
+    assert.equal(execInBox(harness.runner, prepared.containerId, ['cat', inTreeLink]), 'host-visible');
+    const boxExternal = queryInBox(harness, prepared.containerId, ['cat', externalLink]);
+    assert.equal(boxExternal.ok, false);
+    assert.equal(boxExternal.stdout.includes('outside-workspace'), false);
+    stageSmokeGraph({
+        graph,
+        containerId: prepared.containerId,
+        runner: harness.runner,
+        workspaceRoot: harness.identity.workspaceRoot,
+    });
 
     harness.useChild();
     const childIdentity = harness.resolveIdentity();
@@ -450,6 +512,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         genericPrepared.containerId,
         generic.coreArgv,
         {
+            workspaceRoot: genericPrepared.identity.workspaceRoot,
             hostPort: genericPrepared.hostPort,
             mediaHostPort: genericPrepared.mediaHostPort,
         },
@@ -462,6 +525,7 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         isolatedBoxOptions(candidateReference, lifecyclePorts),
     );
     const replArgs = buildContainerExecArgs(replPrepared.containerId, repl.coreArgv, {
+        workspaceRoot: replPrepared.identity.workspaceRoot,
         hostPort: replPrepared.hostPort,
         mediaHostPort: replPrepared.mediaHostPort,
         interactive: true,
@@ -475,20 +539,21 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         'bash', '-c', [
             'mkdir -p /tmp/ploinky-repl-no-which-path',
             'ln -sf /usr/bin/ls /tmp/ploinky-repl-no-which-path/ls',
-            "PATH=/tmp/ploinky-repl-no-which-path /usr/local/bin/node --input-type=module -e \"const m=await import('/opt/ploinky/cli/commands/llmSystemCommands.js');const ok=await m.handleSystemCommand('ls',['/workspace/host-visible.txt']);if(!ok)process.exit(42)\"",
+            "PATH=/tmp/ploinky-repl-no-which-path /usr/local/bin/node --input-type=module -e \"const m=await import('/opt/ploinky/cli/commands/llmSystemCommands.js');const ok=await m.handleSystemCommand('ls',[process.argv[1]]);if(!ok)process.exit(42)\" \"$1\"",
         ].join(' && '),
+        'bash', path.join(harness.identity.workspaceRoot, 'host-visible.txt'),
     ]);
     assert.equal(directExternal.ok, true, directExternal.stderr);
     assert.match(directExternal.stdout, /host-visible\.txt/);
 
+    const masterKeyPath = path.join(harness.identity.workspaceRoot, '.ploinky', 'master-key');
     const keyEvidence = execInBox(harness.runner, prepared.containerId, [
-        'bash', '-c', 'stat -c %a /workspace/.ploinky/master-key; sha256sum /workspace/.ploinky/master-key',
+        'bash', '-c', 'stat -c %a "$1"; sha256sum "$1"', 'bash', masterKeyPath,
     ]).split(/\n/);
     assert.equal(keyEvidence[0], '600');
     assert.match(keyEvidence[1], /^[a-f0-9]{64}\s/);
     // The Box materializes mcp-sdk from the immutable image bundle only.
-    // achillesAgentLib is the direct-mounted workspace source, so it has no
-    // pinned Box checkout to inspect.
+    // With no local checkout, achillesAgentLib stays in its protected image tree.
     for (const [repository, revision] of [
         ['mcp-sdk', '7efe9d17f52a625743e411089d3a6879f6f89156'],
     ]) {
@@ -499,8 +564,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
             ].join(''),
         ]), revision);
     }
-    // The selected source is present read-only at the stable path, and the
-    // retired Box-installed copy is absent.
+    // The selected bundle is present at the stable path, and no writable
+    // dependency-cache copy can shadow it.
     assert.match(
         execInBox(harness.runner, prepared.containerId, [
             'node', '-e', "process.stdout.write(require('/opt/ploinky-agentlib/package.json').name)",
@@ -510,13 +575,20 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(execInBox(harness.runner, prepared.containerId, [
         'test', '!', '-e', '/opt/ploinky/node_modules/achillesAgentLib',
     ]), '');
-    assert.notEqual(
-        execInBox(harness.runner, prepared.containerId, [
-            'bash', '-c', 'touch /opt/ploinky-agentlib/tamper 2>&1; echo $?',
-        ]).trim(),
-        '0',
-        'the direct AgentLib mount must be read-only inside the Box',
-    );
+    const protectedLibraryWrite = queryInBox(harness, prepared.containerId, [
+        'node', '-e', [
+            "const assert=require('node:assert/strict');const fs=require('node:fs');",
+            "assert.throws(()=>fs.writeFileSync('/opt/ploinky-agentlib/tamper','must-not-write',{flag:'wx'}),{code:'EACCES'});",
+            "assert.equal(fs.existsSync('/opt/ploinky-agentlib/tamper'),false);",
+        ].join(''),
+    ]);
+    assert.equal(protectedLibraryWrite.ok, true, protectedLibraryWrite.stderr);
+    const verifiedBundle = JSON.parse(execInBox(harness.runner, prepared.containerId, [
+        'node', '/opt/ploinky/agentlib/image-bundle.mjs', 'verify',
+        '--expected-commit', canonicalAgentLibRemote().commit,
+    ]));
+    assert.equal(verifiedBundle.fingerprint,
+        boxInspection(harness, prepared.containerId).Config.Labels[BOX_AGENTLIB_LABELS.fingerprint]);
     const innerInfo = JSON.parse(execInBox(harness.runner, prepared.containerId, [
         'podman', 'info', '--format', 'json',
     ]));
@@ -568,23 +640,33 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     const agent = findNestedExplorer(harness, started.containerId);
     assert.equal(agent.repoName, 'AchillesIDE');
     assert.equal(agent.agentName, 'explorer');
+    // The global agent sees host files at their host paths.
     assert.equal(execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'exec', agent.id,
-        'cat', '/workspace/host-visible.txt',
+        'cat', path.join(harness.identity.workspaceRoot, 'host-visible.txt'),
     ]), 'host-visible');
     assert.equal(execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'exec', agent.id,
-        'cat', '/workspace/child/host-visible-child.txt',
+        'cat', path.join(harness.child, 'host-visible-child.txt'),
     ]), 'host-visible-child');
+    assert.equal(execInBox(harness.runner, started.containerId, [
+        'podman', 'container', 'exec', agent.id, 'cat', inTreeLink,
+    ]), 'host-visible');
+    const agentExternal = queryInBox(harness, started.containerId, [
+        'podman', 'container', 'exec', agent.id, 'cat', externalLink,
+    ]);
+    assert.equal(agentExternal.ok, false);
+    assert.equal(agentExternal.stdout.includes('outside-workspace'), false);
     execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'exec', agent.id,
         '/bin/sh', '-c', [
-            'mkdir -p /workspace/agent-created-folder',
-            'printf agent-created > /workspace/agent-created-folder/from-agent.txt',
-            'mkdir -p /workspace/child/agent-created-nested',
-            'printf nested-agent-created > /workspace/child/agent-created-nested/from-agent.txt',
-            'printf persisted > /workspace/.ploinky/from-agent.txt',
+            'mkdir -p "$1/agent-created-folder"',
+            'printf agent-created > "$1/agent-created-folder/from-agent.txt"',
+            'mkdir -p "$2/agent-created-nested"',
+            'printf nested-agent-created > "$2/agent-created-nested/from-agent.txt"',
+            'printf persisted > "$1/.ploinky/from-agent.txt"',
         ].join('; '),
+        'sh', harness.identity.workspaceRoot, harness.child,
     ]);
     assert.equal(fs.readFileSync(
         path.join(harness.workspace, 'agent-created-folder', 'from-agent.txt'),
@@ -623,13 +705,14 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     ), 'nested-retained');
     execInBox(harness.runner, started.containerId, [
         'bash', '-c', [
-            "printf workspace-retained > /workspace/t26-workspace-canary",
+            'printf workspace-retained > "$1/t26-workspace-canary"',
             "printf dependencies-retained > /opt/ploinky/node_modules/t26-dependencies-canary",
             "printf 'corrupt\\n' > /opt/ploinky/node_modules/.ploinky-box-dependencies.json",
             // mcp-sdk is now the only Box-installed dependency; achillesAgentLib
             // arrives as a read-only direct mount the Box never installs.
             'chmod 500 /opt/ploinky/node_modules/mcp-sdk',
         ].join('; '),
+        'bash', harness.identity.workspaceRoot,
     ]);
     assert.equal(fs.readFileSync(
         path.join(harness.workspace, 't26-workspace-canary'),
@@ -660,11 +743,11 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
         isolatedBoxOptions(candidateReference, lifecyclePorts),
     );
     const recreatedKeyEvidence = execInBox(harness.runner, recreated.containerId, [
-        'sha256sum', '/workspace/.ploinky/master-key',
+        'sha256sum', masterKeyPath,
     ]);
     assert.equal(recreatedKeyEvidence.split(/\s/)[0], keyEvidence[1].split(/\s/)[0]);
     assert.equal(execInBox(harness.runner, recreated.containerId, [
-        'cat', '/workspace/t26-workspace-canary',
+        'cat', path.join(harness.identity.workspaceRoot, 't26-workspace-canary'),
     ]), 'workspace-retained');
     assert.equal(execInBox(harness.runner, recreated.containerId, [
         'cat', '/opt/ploinky/node_modules/t26-dependencies-canary',
@@ -723,8 +806,8 @@ test('rootless Podman exercises the complete public lifecycle on one workspace i
     assert.equal(execInBox(harness.runner, rebuilt.containerId, [
         'test', '-d', '/opt/ploinky/node_modules/mcp-sdk',
     ]), '');
-    // The retired Box-installed copy must be absent, and the direct mount must
-    // carry the selected package, read-only.
+    // The dependency cache contains no AgentLib copy; the protected image
+    // bundle still supplies the selected package at its stable path.
     assert.equal(execInBox(harness.runner, rebuilt.containerId, [
         'test', '!', '-e', '/opt/ploinky/node_modules/achillesAgentLib',
     ]), '');
@@ -833,6 +916,7 @@ test('the workspace-backed image store unpacks and reuses layers on the physical
     const prepared = await harness.supervisor.prepareBoxForCommand(
         isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.imageStore),
     );
+    prepareGraphlessBootRepositories(harness, prepared.containerId);
     assertExactOuterStorage(harness, prepared.containerId, repositoryRoot);
     assertNoOwnedNamedVolume(harness);
     assertIntendedNestedStorage(harness, prepared.containerId);
@@ -894,6 +978,7 @@ test('a replaced live bind source recreates the outer Box before further writes'
     const prepared = await harness.supervisor.prepareBoxForCommand(
         isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.bindReplacement),
     );
+    prepareGraphlessBootRepositories(harness, prepared.containerId);
     const originalState = inspectWorkspaceDataPaths({ identity: harness.identity });
     const displaced = path.join(harness.root, 'displaced-dependencies');
 
@@ -990,8 +1075,10 @@ test('failed candidate replacement restores the validated old Box', {
     const original = await harness.supervisor.prepareBoxForCommand(
         isolatedBoxOptions(candidateReference, ISOLATED_BOX_PORTS.failedReplacementOriginal),
     );
+    prepareGraphlessBootRepositories(harness, original.containerId);
     execInBox(harness.runner, original.containerId, [
-        'bash', '-c', 'printf replacement-retained > /workspace/replacement-canary',
+        'bash', '-c', 'printf replacement-retained > "$1/replacement-canary"',
+        'bash', harness.identity.workspaceRoot,
     ]);
     execInBox(harness.runner, original.containerId, [
         'bash', '-c', 'printf cache-retained > /opt/ploinky/node_modules/replacement-cache-canary',
@@ -1026,7 +1113,7 @@ test('failed candidate replacement restores the validated old Box', {
     assertExactOuterStorage(harness, restored.ownership.handles.container.id, repositoryRoot);
     assertNoOwnedNamedVolume(harness);
     assert.equal(execInBox(harness.runner, restored.ownership.handles.container.id, [
-        'cat', '/workspace/replacement-canary',
+        'cat', path.join(harness.identity.workspaceRoot, 'replacement-canary'),
     ]), 'replacement-retained');
     assert.equal(execInBox(harness.runner, restored.ownership.handles.container.id, [
         'cat', '/opt/ploinky/node_modules/replacement-cache-canary',

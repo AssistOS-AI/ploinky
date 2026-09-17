@@ -62,9 +62,10 @@ export async function inspectDeploymentTarget({ env = process.env, inspectBox = 
     assert.ok(/^[a-f0-9]{64}$/.test(inspected?.Id || '') && inspected?.State?.Running === true,
         'The selected Box must have a full immutable ID and be running.');
     const boxStartedAt = new Date(timestamp(inspected.State.StartedAt, 'Box start time')).toISOString();
-    const mounts = (inspected.Mounts || []).filter(item => item.Destination === '/workspace');
+    // The Box mounts its workspace at the workspace's own absolute path.
+    const mounts = (inspected.Mounts || []).filter(item => item.Destination === workspaceRoot);
     assert.ok(mounts.length === 1 && mounts[0].Type === 'bind' && mounts[0].RW === true,
-        'The Box must have exactly one writable workspace bind mount.');
+        'The Box must have exactly one writable workspace bind mount at the workspace path.');
     assert.ok(await directory(mounts[0].Source, 'Box workspace source') === workspaceRoot,
         'The Box belongs to a different workspace.');
     const publication = { containerPort: '8080/tcp', hostIp: '127.0.0.1', hostPort: url.port };

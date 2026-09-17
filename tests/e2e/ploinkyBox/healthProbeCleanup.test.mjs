@@ -143,12 +143,14 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
         explicitPort: 19098,
         explicitMediaPort: 17902,
     });
+    // The fixture lives in the workspace bind at its own absolute path.
+    const probeBoxRoot = path.join(harness.identity.workspaceRoot, 'health-probe-native');
     execInBox(harness.runner, prepared.containerId, [
-        'mkdir', '-p', '/workspace/health-probe-native',
+        'mkdir', '-p', probeBoxRoot,
     ]);
     const stagedProbe = harness.runner.query('podman', [
         'container', 'cp', `${probeRoot}/.`,
-        `${prepared.containerId}:/workspace/health-probe-native`,
+        `${prepared.containerId}:${probeBoxRoot}`,
     ], { timeoutMs: 120_000 });
     assert.equal(
         stagedProbe.ok,
@@ -173,9 +175,9 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
         execInBox(harness.runner, prepared.containerId, [
             'podman', 'run', '-d', '--init', '--name', containerName,
             '--userns=keep-id:uid=1000,gid=1000', '--user', '1000:1000',
-            '-v', '/workspace/health-probe-native/code:/code:ro',
-            '-v', '/workspace/health-probe-native/Agent:/Agent:ro',
-            '-v', '/workspace/health-probe-native/control:/run/ploinky-health-probes',
+            '-v', `${probeBoxRoot}/code:/code:ro`,
+            '-v', `${probeBoxRoot}/Agent:/Agent:ro`,
+            '-v', `${probeBoxRoot}/control:/run/ploinky-health-probes`,
             '-e', 'PLOINKY_HEALTH_PROBE_BROKER=1',
             '-e', 'PATH=/code/slow-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
             '--entrypoint', '/Agent/server/AgentEntrypoint.sh',
@@ -185,7 +187,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
         targetExists = true;
         execInBox(harness.runner, prepared.containerId, [
             '/usr/local/bin/node', '-e', WAIT_FOR_BROKER_SCRIPT,
-            '/workspace/health-probe-native/control/.broker-ready',
+            `${probeBoxRoot}/control/.broker-ready`,
         ]);
     };
     const inspectTarget = () => JSON.parse(execInBox(harness.runner, prepared.containerId, [
@@ -209,7 +211,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
     const submitRequest = ({ token, script, timeout, killAfter, cancelMode = 'none' }) => (
         JSON.parse(execInBox(harness.runner, prepared.containerId, [
             '/usr/local/bin/node', '-e', SUBMIT_REQUEST_SCRIPT,
-            '/workspace/health-probe-native/control', token, script,
+            `${probeBoxRoot}/control`, token, script,
             String(timeout), String(killAfter), cancelMode,
         ], { timeoutMs: 60_000 }))
     );
@@ -249,7 +251,7 @@ test('native mounted broker probes leave zero nested exec sessions and allow rep
     startTarget();
     assertNoTargetExecSessions('after startup');
     const decoyPid = execInBox(harness.runner, prepared.containerId, [
-        'cat', '/workspace/health-probe-native/control/decoy.pid',
+        'cat', `${probeBoxRoot}/control/decoy.pid`,
     ]);
     assert.match(decoyPid, /^\d+$/, 'the unrelated same-named process must have started');
 

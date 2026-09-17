@@ -32,7 +32,7 @@ outer runtime.
 | Invocation | Documented effect |
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
-| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
+| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in the workspace directory, at its host path |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
@@ -56,11 +56,15 @@ marker content at `/etc/ploinky-box`:
 assistos/ploinky-box
 ```
 
-The configuration also requires user `podman`, working directory `/workspace`, the
-`/usr/local/bin/ploinky-box-entrypoint` entrypoint, the exact runtime
-environment validated by `ploinky-box/contract/image.mjs`, and no default
-command or image-declared volumes. The image is source-free; the selected
-Ploinky checkout is mounted read-only at `/opt/ploinky`.
+The configuration also requires user `podman`, the neutral working directory `/`,
+the `/usr/local/bin/ploinky-box-entrypoint` entrypoint, the exact runtime
+environment validated by `ploinky-box/contract/image.mjs` (which contains no
+workspace root), and no default command or image-declared volumes. The image is
+source-free; the selected Ploinky checkout is mounted read-only at `/opt/ploinky`.
+Each created box receives its selected workspace path as the working directory
+and `PLOINKY_WORKSPACE_ROOT`; the entrypoint rejects a missing root or a working
+directory that differs from it before preparing anything. Images and boxes from
+the former fixed `/workspace` layout fail this validation and are not migrated.
 
 Creating a missing box unconditionally pulls the selected reference, validates
 its complete configuration, resolves its local image ID, and creates the box from
@@ -106,7 +110,7 @@ Each instance has four durable host binds and one transient `/tmp` tmpfs:
 | Host source or type | Box destination | Mode and lifetime |
 | --- | --- | --- |
 | Ploinky repository root | `/opt/ploinky` | Read-only durable bind |
-| Canonical workspace root | `/workspace` | Read-write durable bind |
+| Selected workspace root | The same absolute path | Read-write durable bind; also the box working directory and `PLOINKY_WORKSPACE_ROOT` |
 | `<workspace>/.ploinky/box/dependencies` | `/opt/ploinky/node_modules` | Read-write durable bind |
 | `<workspace>/.ploinky/box/images` | `/home/podman/.local/share/ploinky-images` | Read-write durable bind |
 | tmpfs | `/tmp` | `rw,exec,nosuid,nodev,mode=1777,notmpcopyup`; recreated empty on every outer boot |
@@ -121,7 +125,7 @@ Nested container records, writable layers, networks, and inner Podman named
 volumes are deliberately not persisted. They live on the outer container's
 writable layer under `/home/podman/.local/share/containers/storage` and are
 discarded when the outer container is removed, so persistent agent data must use
-explicit `/workspace` binds.
+explicit workspace binds.
 
 The outer Box owns no engine volume. Retired labelled volumes are inert and are
 never attached, rewritten, or removed automatically. Ploinky inventories the
@@ -192,9 +196,9 @@ outer-image rebuild.
 
 The outer runtime runs as `podman` and contains Bash, Node 24, npm/npx, Git,
 and functional rootless nested Podman. It receives the devices and security
-configuration required by that nested runtime. An explicit `--mount DIR` is a
-writable host grant at `/workspace/mounted`; TCP publication is always the fixed
-loopback Router mapping and LAN listen mode does not exist.
+configuration required by that nested runtime. There is no additional host
+mount option; TCP publication is always the fixed loopback Router mapping and
+LAN listen mode does not exist.
 
 Ordinary agent images intentionally contain neither Podman nor Docker and are
 not granted control of sibling containers. Inside a marked box, every

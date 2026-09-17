@@ -22,6 +22,12 @@ import {
 import { validateContainerConfiguration } from '../contract/container.mjs';
 import { normalizeImageId } from '../contract/image-id.mjs';
 import { PASTA_IPV4_NETWORK } from '../contract/network.mjs';
+import {
+    assertBoxWorkspaceRoot,
+    boxWorkspaceEnvironment,
+    boxWorkspaceExecOptions,
+    boxWorkspaceVolume,
+} from '../contract/workspace-root.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import {
     PUBLIC_ROUTER_HOSTS_ENV,
@@ -99,6 +105,7 @@ export function containerCreateArgs({
     networkMode = null,
 }) {
     assertRouterBindingStateConfined(identity);
+    const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
     const source = path.resolve(repositoryRoot);
     const seccompProfile = nestedPodmanSeccompProfileContract(source);
     if (networkMode !== null && networkMode !== PASTA_IPV4_NETWORK) {
@@ -155,11 +162,16 @@ export function containerCreateArgs({
         '--publish', `0.0.0.0:${mediaHostPort}:${BOX_MEDIA_PORT}/udp`,
         '--tmpfs', tmpfsCreateArgument(),
         '--volume', `${source}:/opt/ploinky:ro`,
-        '--volume', `${identity.workspaceRoot}:/workspace`,
+        // The selected workspace keeps its host path inside the Box, which is
+        // also the Box working directory and its reserved workspace root.
+        '--volume', boxWorkspaceVolume(workspaceRoot),
         ...workspaceDataMountArgs(identity),
         // The AgentLib binds come last so the read-only alias shadow lands on
-        // top of the writable /workspace bind that also exposes that path.
-        ...agentLibMountArgs(agentLibContract),
+        // top of the writable workspace bind that also exposes that path.
+        ...agentLibMountArgs(agentLibContract, workspaceRoot),
+        '--workdir', workspaceRoot,
+        ...Object.entries(boxWorkspaceEnvironment(workspaceRoot))
+            .flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         ...agentLibEnvArgs(agentLibContract),
         '--env', 'PLOINKY_PUBLIC_BIND=0.0.0.0',
         '--env', `PLOINKY_PUBLIC_AUTHORITY=${publicAuthority}`,
@@ -213,12 +225,13 @@ export function removeContainerById(engine, containerId, runner) {
     runner.run(engine.name, ['container', 'rm', '-f', id]);
 }
 
-export function stopPloinkyLocalByContainerId(engine, containerId, runner) {
+export function stopPloinkyLocalByContainerId(engine, containerId, runner, { workspaceRoot } = {}) {
     const id = assertImmutableContainerId(containerId, 'relay ploinky-local stop');
+    const workdir = boxWorkspaceExecOptions(workspaceRoot);
     runner.run(engine.name, [
         'container', 'exec',
         '--user', 'podman',
-        '--workdir', '/workspace',
+        ...workdir,
         id,
         '/opt/ploinky/bin/ploinky-local',
         'stop',

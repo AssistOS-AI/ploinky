@@ -51,7 +51,9 @@ function labelsOf(record) {
     return record?.Labels || record?.labels || {};
 }
 
-export function managedNetworkWorkspaceHash(workspaceRoot = '/workspace') {
+// The Box names managed networks from its workspace root, which is the
+// selected host path mounted at itself; there is no fixed default root.
+export function managedNetworkWorkspaceHash(workspaceRoot) {
     const root = String(workspaceRoot || '').trim();
     if (!root.startsWith('/')) throw new Error('managed network workspace root must be absolute');
     return hash12(root);

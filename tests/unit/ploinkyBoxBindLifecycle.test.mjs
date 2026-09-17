@@ -111,12 +111,14 @@ function containerHandle(state, {
             imageId,
             configuredImage: imageId,
             user: 'podman',
+            workingDir: state.identity.workspaceRoot,
             createCommand: [
                 'podman', 'container', 'create', '--init', '--userns', BOX_USERNS,
                 '--device', '/dev/fuse', '--device', '/dev/net/tun', '--tmpfs', TMPFS_CREATE_ARGUMENT,
             ],
             environment: {
                 ...IMAGE_CONTRACT.environment,
+                PLOINKY_WORKSPACE_ROOT: state.identity.workspaceRoot,
                 ...agentLibFixtureEnv(state.agentLib),
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
@@ -148,8 +150,8 @@ function containerHandle(state, {
                 { type: 'bind', name: '', source: state.identity.dataPaths.images, destination: '/home/podman/.local/share/ploinky-images', rw: true },
                 { type: 'bind', name: '', source: state.root, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: state.identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
-                { type: 'bind', name: '', source: state.identity.workspaceRoot, destination: '/workspace', rw: true },
-                ...agentLibFixtureMounts(state.agentLib),
+                { type: 'bind', name: '', source: state.identity.workspaceRoot, destination: state.identity.workspaceRoot, rw: true },
+                ...agentLibFixtureMounts(state.agentLib, state.identity.workspaceRoot),
             ],
         },
     };
@@ -984,7 +986,7 @@ test('a failed health proof restores the previous publication, graph, and saved 
         inOrder(events, [
             'start-core',
             'health:0.0.0.0',
-            `run:container exec --user podman --workdir /workspace ${candidate.id} /opt/ploinky/bin/ploinky-local stop`,
+            `run:container exec --user podman --workdir ${box.identity.workspaceRoot} ${candidate.id} /opt/ploinky/bin/ploinky-local stop`,
             'outer-rollback',
             `restore-core:${OLD_ID}:start explorer 8080`,
             'health:127.0.0.1',
@@ -1073,7 +1075,7 @@ test('a failed bind on a stopped Box returns the restored Box to its stopped sta
     assert.equal(events.some((event) => event.startsWith('query:')), false);
     const stops = events.filter((event) => /ploinky-local stop$|container stop --time 30/.test(event));
     assert.deepEqual(stops, [
-        `run:container exec --user podman --workdir /workspace ${restoredId} /opt/ploinky/bin/ploinky-local stop`,
+        `run:container exec --user podman --workdir ${box.identity.workspaceRoot} ${restoredId} /opt/ploinky/bin/ploinky-local stop`,
         `run:container stop --time 30 ${restoredId}`,
     ]);
 });
@@ -1240,7 +1242,9 @@ test('bounded start expects the public authority of a specific binding', async (
     const reporting = (line) => ({
         async stream() { return { ok: true, status: 0, stdout: `${line}\n`, stderr: '' }; },
     });
-    const options = (routerBinding) => ({ stdout: { write() {} }, stderr: { write() {} }, agentLib, routerBinding });
+    const options = (routerBinding) => ({
+        workspaceRoot: root, stdout: { write() {} }, stderr: { write() {} }, agentLib, routerBinding,
+    });
     const specific = { address: '192.168.1.63', hostPort: 8083, hosts: ['192.168.1.63'] };
     await runBoundedCoreStart(
         { name: 'podman' }, 'a'.repeat(64), ['start', 'explorer', '8080'], 8083, 7882,
@@ -1305,7 +1309,7 @@ test('the public CLI dispatches bind and its dry run only to the host supervisor
         inspectBoxStatus() {
             return {
                 state: 'running-initialized',
-                identity: { instance: 'ploinky-box-workspace-123456789abc' },
+                identity: { instance: 'ploinky-box-workspace-123456789abc', workspaceRoot: '/home/user/workspace' },
                 routerBinding: wildcard(),
                 ownership: {
                     state: 'owned',

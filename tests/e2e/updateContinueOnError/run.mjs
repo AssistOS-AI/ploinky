@@ -104,8 +104,10 @@ async function main(rawOptions) {
     const reposRoot = path.join(workspace, '.ploinky', 'repos');
     const metadataPath = path.join(workspace, '.ploinky', 'repo_sources.json');
     const sourcePaths = Object.fromEntries(['advance', 'branch', 'alternate'].map(name => [name, path.join(sourceParent, name)]));
+    // The Box mounts the workspace at its own path, so in-Box origins are the
+    // workspace paths themselves.
     const sourceUrls = Object.fromEntries(Object.entries(sourcePaths).map(([name, localPath]) => (
-        [name, '/workspace/' + path.relative(workspace, localPath).split(path.sep).join('/')]
+        [name, path.join(workspace, path.relative(workspace, localPath))]
     )));
     const cacheNames = { failed: 'AAUpdateE2EFailed-' + runId, branch: 'MMUpdateE2EBranch-' + runId,
         conflict: 'MMUpdateE2EConflict-' + runId, later: 'ZZUpdateE2ELater-' + runId };
@@ -242,7 +244,7 @@ async function main(rawOptions) {
                     origin: git(localPath, ['remote', 'get-url', 'origin']), head: head(localPath) }]
             )));
             observations.manifests = Object.fromEntries(Object.entries(folders).map(([name, folder]) => (
-                [name, { hostPath: manifestPath(folder), inBoxPath: '/workspace/' + path.relative(workspace, manifestPath(folder)),
+                [name, { hostPath: manifestPath(folder), inBoxPath: path.join(workspace, path.relative(workspace, manifestPath(folder))),
                     contents: JSON.parse(fs.readFileSync(manifestPath(folder), 'utf8')) }]
             )));
             writeObservations();

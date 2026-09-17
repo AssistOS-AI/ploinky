@@ -2,6 +2,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import {
+    boxWorkspaceEnvironment,
+    boxWorkspaceExecOptions,
+    boxWorkspacePath,
+} from './contract/workspace-root.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 
 export const BOX_EDGE_DESIRED_FILE = 'edge-desired.json';
@@ -101,6 +106,7 @@ export function stageWorkspaceEdgeDesired({
     engine,
     containerId,
     runner,
+    workspaceRoot,
 } = {}) {
     if (!candidate) return Object.freeze({ staged: false });
     if (!/^[a-f0-9]{12,64}$/.test(String(containerId || ''))) {
@@ -111,13 +117,15 @@ export function stageWorkspaceEdgeDesired({
     }
 
     const engineName = String(engine?.name || engine || '');
-    const desiredDirectory = '/workspace/.ploinky/data/edge-routing';
+    const desiredDirectory = boxWorkspacePath(workspaceRoot, '.ploinky/data/edge-routing');
     const desiredTarget = `${desiredDirectory}/desired.json`;
     const stagedTarget = `${desiredTarget}.box-candidate`;
 
     runner.run(engineName, [
-        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
-        '--env', 'PLOINKY_WORKSPACE_ROOT=/workspace', containerId,
+        'container', 'exec', '--user', 'podman', ...boxWorkspaceExecOptions(workspaceRoot),
+        ...Object.entries(boxWorkspaceEnvironment(workspaceRoot))
+            .flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+        containerId,
         'node', '/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs',
     ]);
     runner.run(engineName, [

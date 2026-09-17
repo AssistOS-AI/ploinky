@@ -118,6 +118,7 @@ function containerHandle({
             imageId,
             configuredImage: imageId,
             user: 'podman',
+            workingDir: identity.workspaceRoot,
             createCommand: [
                 'podman', 'container', 'create',
                 '--init',
@@ -127,6 +128,7 @@ function containerHandle({
             ],
             environment: {
                 ...IMAGE_CONTRACT.environment,
+                PLOINKY_WORKSPACE_ROOT: identity.workspaceRoot,
                 ...agentLibFixtureEnv(agentLib),
                 PLOINKY_PRIVATE_BIND: '0.0.0.0',
                 PLOINKY_PUBLIC_BIND: '0.0.0.0',
@@ -157,8 +159,8 @@ function containerHandle({
                 { type: 'bind', name: '', source: identity.dataPaths.images, destination: '/home/podman/.local/share/ploinky-images', rw: true },
                 { type: 'bind', name: '', source: repositoryRoot, destination: '/opt/ploinky', rw: false },
                 { type: 'bind', name: '', source: identity.dataPaths.dependencies, destination: '/opt/ploinky/node_modules', rw: true },
-                { type: 'bind', name: '', source: identity.workspaceRoot, destination: '/workspace', rw: true },
-                ...agentLibFixtureMounts(agentLib),
+                { type: 'bind', name: '', source: identity.workspaceRoot, destination: identity.workspaceRoot, rw: true },
+                ...agentLibFixtureMounts(agentLib, identity.workspaceRoot),
             ],
         },
     };
@@ -437,8 +439,8 @@ function harness(state, {
         removeContainer(engine, id, selectedRunner) {
             selectedRunner.run(engine.name, ['container', 'rm', '-f', id]);
         },
-        stopPloinkyLocal(engine, id) {
-            calls.push(['seam', 'stop-ploinky-local', engine.name, id]);
+        stopPloinkyLocal(engine, id, _runner, options) {
+            calls.push(['seam', 'stop-ploinky-local', engine.name, id, options?.workspaceRoot]);
             if (failLocalStop) throw new Error('ploinky-local stop failed');
         },
         async startAndWaitReady(engine, id, selectedRunner) {
@@ -585,27 +587,37 @@ test('container argv is exact, unprivileged, and ends with immutable image ID', 
         '--userns', BOX_USERNS,
     ]);
     assert.equal(args.filter((value) => value.endsWith(':U')).length, 0);
-    assert.equal(args.includes(`${state.identity.workspaceRoot}:/workspace`), true);
-    assert.equal(args.some((value) => value === `${state.identity.workspaceRoot}:/workspace:U`), false);
+    const workspaceRoot = state.identity.workspaceRoot;
+    assert.equal(args.includes(`${workspaceRoot}:${workspaceRoot}`), true);
+    assert.equal(args.some((value) => value === `${workspaceRoot}:${workspaceRoot}:U`), false);
+    // The immutable image has no workspace path: the created Box receives the
+    // selected root as its working directory and reserved environment.
+    assert.deepEqual(args.flatMap((value, index) => (value === '--workdir' ? [args[index + 1]] : [])), [
+        workspaceRoot,
+    ]);
+    assert.deepEqual(args.filter((value) => value.startsWith('PLOINKY_WORKSPACE_ROOT=')), [
+        `PLOINKY_WORKSPACE_ROOT=${workspaceRoot}`,
+    ]);
+    assert.equal(args.some((value) => /(?:^|:)\/workspace(?:\/|:|$)/.test(value)), false);
 
     // Exactly six durable binds and one transient tmpfs, with no named volume.
     // The two achillesAgentLib binds come last and are both read-only: the
-    // stable runtime path, then the shadow over the writable /workspace alias
+    // stable runtime path, then the shadow over the writable workspace alias
     // that would otherwise leave the same inode writable.
     const mountArgs = args.flatMap((value, index) => (
         value === '--volume' ? [args[index + 1]] : []
     ));
     assert.deepEqual(mountArgs, [
         `${state.root}:/opt/ploinky:ro`,
-        `${state.identity.workspaceRoot}:/workspace`,
+        `${workspaceRoot}:${workspaceRoot}`,
         `${state.identity.dataPaths.dependencies}:/opt/ploinky/node_modules`,
         `${state.identity.dataPaths.images}:/home/podman/.local/share/ploinky-images`,
         `${state.agentLib.sourceDir}:/opt/ploinky-agentlib:ro`,
-        `${state.agentLib.sourceDir}:/workspace/achillesAgentLib:ro`,
+        `${state.agentLib.sourceDir}:${workspaceRoot}/achillesAgentLib:ro`,
     ]);
     assert.ok(
-        mountArgs.indexOf(`${state.identity.workspaceRoot}:/workspace`)
-        < mountArgs.indexOf(`${state.agentLib.sourceDir}:/workspace/achillesAgentLib:ro`),
+        mountArgs.indexOf(`${workspaceRoot}:${workspaceRoot}`)
+        < mountArgs.indexOf(`${state.agentLib.sourceDir}:${workspaceRoot}/achillesAgentLib:ro`),
         'the alias shadow must be applied after the writable workspace bind',
     );
     assert.equal(args.includes(`PLOINKY_AGENTLIB_DIR=/opt/ploinky-agentlib`), true);
@@ -726,7 +738,7 @@ test('container validation rejects retired named-volume mounts and user-namespac
     // A Box created by the retired design is never adopted; the operator is
     // told to destroy it, and the guidance must not name a removed flag.
     for (const destination of [
-        '/workspace',
+        state.identity.workspaceRoot,
         '/opt/ploinky/node_modules',
         '/home/podman/.local/share/ploinky-images',
     ]) {
@@ -744,7 +756,7 @@ test('container validation rejects retired named-volume mounts and user-namespac
         ));
         assert.throws(
             () => validateContainerConfiguration(retiredMount, desired),
-            (error) => new RegExp(`mount ${destination} is incompatible`).test(error.message)
+            (error) => error.message.includes(`mount ${destination} is incompatible`)
                 && /ploinky destroy/.test(error.message)
                 && !/--delete-volumes/.test(error.message),
         );
@@ -1183,6 +1195,8 @@ test('successful replacement gracefully stops core before stopping and removing 
     assert.equal(result.action, 'replaced');
     const events = h.calls.map((call) => call.join(' '));
     const graceful = events.findIndex((value) => value.includes('seam stop-ploinky-local'));
+    assert.equal(h.calls[graceful].at(-1), state.identity.workspaceRoot,
+        'the graceful inner stop runs from the selected workspace root');
     const outerStop = events.findIndex((value) => value.includes('container stop --time 30'));
     const removal = events.findIndex((value) => value.includes('container rm -f'));
     const creation = events.findIndex((value) => value.includes('container create'));
@@ -1715,4 +1729,196 @@ test('absence from another engine or with a retained handle cannot authorize lea
         assert.equal(fs.existsSync(preparationPath), true);
         assert.equal(h.calls.some((call) => call.includes('rm') || call.includes('create')), false);
     }
+});
+
+function sameWorkspaceDesired(state) {
+    return {
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'a'.repeat(64),
+        imageRef: 'runtime',
+        hostPort: 19090,
+    };
+}
+
+test('admission requires the exact same-path workspace bind, working directory, and root', (t) => {
+    const state = fixture(t);
+    const desired = sameWorkspaceDesired(state);
+    const root = state.identity.workspaceRoot;
+    const exact = () => containerHandle({ ...desired, id: 'b'.repeat(64) });
+    assert.doesNotThrow(() => validateContainerConfiguration(exact(), desired));
+
+    const replaceWorkspaceMount = (handle, replacement) => {
+        handle.runtime.mounts = handle.runtime.mounts.flatMap((mount) => (
+            mount.destination === root ? replacement(mount) : [mount]
+        ));
+    };
+    const otherRoot = path.join(state.root, 'other-workspace');
+    fs.mkdirSync(otherRoot);
+    const cases = [
+        ['stale fixed-path layout', /environment allowlist is incompatible/, (handle) => {
+            handle.runtime.environment.PLOINKY_WORKSPACE_ROOT = '/workspace';
+            handle.runtime.workingDir = '/workspace';
+            replaceWorkspaceMount(handle, (mount) => [{ ...mount, destination: '/workspace' }]);
+        }],
+        ['stale fixed-path bind with current environment', /mount .* is incompatible/, (handle) => {
+            replaceWorkspaceMount(handle, (mount) => [{ ...mount, destination: '/workspace' }]);
+        }],
+        ['additional fixed-path grant', /mount set is incompatible/, (handle) => {
+            handle.runtime.mounts.push({ type: 'bind', name: '', source: root, destination: '/workspace', rw: true });
+        }],
+        ['another workspace root', /environment allowlist is incompatible/, (handle) => {
+            handle.runtime.environment.PLOINKY_WORKSPACE_ROOT = otherRoot;
+            handle.runtime.workingDir = otherRoot;
+            replaceWorkspaceMount(handle, (mount) => [{ ...mount, source: otherRoot, destination: otherRoot }]);
+        }],
+        ['bind source differs from its destination', /mount .* is incompatible/, (handle) => {
+            replaceWorkspaceMount(handle, (mount) => [{ ...mount, source: otherRoot }]);
+        }],
+        ['read-only workspace bind', /mount .* is incompatible/, (handle) => {
+            replaceWorkspaceMount(handle, (mount) => [{ ...mount, rw: false }]);
+        }],
+        ['missing workspace bind', /mount set is incompatible/, (handle) => {
+            replaceWorkspaceMount(handle, () => []);
+        }],
+        ['missing workspace root environment', /environment allowlist is incompatible/, (handle) => {
+            delete handle.runtime.environment.PLOINKY_WORKSPACE_ROOT;
+        }],
+        ['neutral image working directory', /working directory is not its workspace root/, (handle) => {
+            handle.runtime.workingDir = '/';
+        }],
+        ['working directory below the root', /working directory is not its workspace root/, (handle) => {
+            handle.runtime.workingDir = path.join(root, 'nested');
+        }],
+    ];
+    for (const [name, pattern, mutate] of cases) {
+        const handle = exact();
+        mutate(handle);
+        assert.throws(() => validateContainerConfiguration(handle, desired), pattern, name);
+    }
+    assert.throws(() => validateContainerConfiguration(exact(), {
+        ...desired,
+        identity: buildWorkspaceIdentity(otherRoot, { markerFound: true }),
+    }), /incompatible/, 'a Box is never admitted for another workspace identity');
+});
+
+test('the AgentLib alias shadow follows the selected workspace root', (t) => {
+    const state = fixture(t);
+    const desired = sameWorkspaceDesired(state);
+    const handle = containerHandle({ ...desired, id: 'b'.repeat(64) });
+    const root = state.identity.workspaceRoot;
+    const alias = handle.runtime.mounts.find((mount) => mount.destination === `${root}/achillesAgentLib`);
+    assert.deepEqual(alias, {
+        type: 'bind', name: '', source: state.agentLib.sourceDir, destination: `${root}/achillesAgentLib`, rw: false,
+    });
+    assert.doesNotThrow(() => validateContainerConfiguration(handle, desired));
+    // A writable alias, or one left at the retired fixed path, is a bypass.
+    const writable = containerHandle({ ...desired, id: 'b'.repeat(64) });
+    writable.runtime.mounts = writable.runtime.mounts.map((mount) => (
+        mount.destination === alias.destination ? { ...mount, rw: true } : mount
+    ));
+    assert.throws(() => validateContainerConfiguration(writable, desired), /mount .*achillesAgentLib is incompatible/);
+    const retired = containerHandle({ ...desired, id: 'b'.repeat(64) });
+    retired.runtime.mounts = retired.runtime.mounts.map((mount) => (
+        mount.destination === alias.destination ? { ...mount, destination: '/workspace/achillesAgentLib' } : mount
+    ));
+    assert.throws(() => validateContainerConfiguration(retired, desired), /mount .*achillesAgentLib is incompatible/);
+});
+
+test('an unmountable workspace root is rejected before any engine, image, or data mutation', async (t) => {
+    const state = fixture(t);
+    const initial = lifecycleContainer(state);
+    const colonWorkspace = path.join(state.root, 'pro:ject');
+    fs.mkdirSync(path.join(colonWorkspace, '.ploinky'), { recursive: true });
+    const colonState = {
+        ...state,
+        identity: buildWorkspaceIdentity(colonWorkspace, { markerFound: true }),
+    };
+    colonState.lock = { ...state.lock, assertHeld(instance) { assert.equal(instance, colonState.identity.instance); } };
+    const h = harness(colonState, { initial, realDataPaths: true });
+    await assert.rejects(
+        reconcileBoxContainer(reconciliationArguments(colonState, h, initial, true), h.seams),
+        (error) => error.code === 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID' && /contains ':'/.test(error.message),
+    );
+    assert.deepEqual(h.calls, []);
+    assert.equal(h.current(), initial);
+    assert.equal(dataDirectoriesExist(colonState.identity), false);
+    assert.throws(() => containerCreateArgs({
+        identity: colonState.identity,
+        dataFingerprints: DATA_FINGERPRINTS,
+        agentLib: state.agentLib,
+        imageId: 'a'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 19090,
+        repositoryRoot: state.root,
+        cidfile: path.join(state.lock.path, 'candidate.cid'),
+    }), /contains ':'/);
+});
+
+test('create arguments carry spaces, Unicode, metacharacters, and symlink selections as exact values', (t) => {
+    const state = fixture(t);
+    const unusual = path.join(state.root, "proiect ăîș $(touch owned);'\"&|*");
+    const target = path.join(state.root, 'canonical project');
+    const link = path.join(state.root, 'selected link');
+    fs.mkdirSync(path.join(unusual, '.ploinky'), { recursive: true });
+    fs.mkdirSync(path.join(target, '.ploinky'), { recursive: true });
+    fs.symlinkSync(target, link, 'dir');
+    for (const selected of [unusual, link]) {
+        const identity = buildWorkspaceIdentity(selected, { markerFound: true });
+        const canonical = fs.realpathSync(selected);
+        const agentLib = agentLibFixture(canonical);
+        assert.equal(agentLib.sourceDir, path.join(canonical, 'achillesAgentLib'));
+        const args = containerCreateArgs({
+            identity,
+            dataFingerprints: DATA_FINGERPRINTS,
+            agentLib,
+            imageId: 'a'.repeat(64),
+            imageRef: BOX_IMAGE_REFERENCE,
+            hostPort: 19090,
+            repositoryRoot: state.root,
+            cidfile: path.join(state.lock.path, 'candidate.cid'),
+        });
+        assert.equal(args.filter((value) => value === `${selected}:${selected}`).length, 1);
+        assert.equal(args[args.indexOf('--workdir') + 1], selected);
+        assert.equal(args.includes(`PLOINKY_WORKSPACE_ROOT=${selected}`), true);
+        // Containment was proven on the canonical source; the alias keeps the
+        // selected spelling that the Box actually mounts.
+        assert.equal(args.includes(`${agentLib.sourceDir}:${selected}/achillesAgentLib:ro`), true);
+        const handle = containerHandle({
+            identity, agentLib, repositoryRoot: state.root, imageId: 'a'.repeat(64),
+            imageRef: 'runtime', hostPort: 19090, id: 'b'.repeat(64),
+        });
+        assert.doesNotThrow(() => validateContainerConfiguration(handle, {
+            identity, agentLib, repositoryRoot: state.root, imageId: 'a'.repeat(64), imageRef: 'runtime', hostPort: 19090,
+        }));
+    }
+    assert.equal(fs.existsSync(path.join(state.root, 'owned')), false);
+    assert.equal(fs.existsSync('owned'), false);
+});
+
+test('two workspaces render independent identities and same-path binds', (t) => {
+    const state = fixture(t);
+    const first = path.join(state.root, 'project');
+    const second = path.join(state.root, 'project-other');
+    const identities = [first, second].map((root) => {
+        fs.mkdirSync(path.join(root, '.ploinky'), { recursive: true });
+        return buildWorkspaceIdentity(root, { markerFound: true });
+    });
+    assert.notEqual(identities[0].instance, identities[1].instance);
+    assert.notEqual(identities[0].pathHash, identities[1].pathHash);
+    const rendered = identities.map((identity) => containerCreateArgs({
+        identity,
+        dataFingerprints: DATA_FINGERPRINTS,
+        agentLib: agentLibFixture(identity.workspaceRoot),
+        imageId: 'a'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 19090,
+        repositoryRoot: state.root,
+        cidfile: path.join(state.lock.path, 'candidate.cid'),
+    }));
+    assert.equal(rendered[0].includes(`${first}:${first}`), true);
+    assert.equal(rendered[0].some((value) => value.includes(second)), false);
+    assert.equal(rendered[1].includes(`${second}:${second}`), true);
+    assert.equal(rendered[1].some((value) => value.startsWith(`${first}:`) || value === `PLOINKY_WORKSPACE_ROOT=${first}`), false);
 });

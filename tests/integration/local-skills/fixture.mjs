@@ -58,11 +58,9 @@ export async function fixture(t) {
     await fs.mkdir(scopeRoot, { recursive: true });
     await fs.mkdir(sibling);
     const host = buildHostSkillScope(workspaceRoot, scopeRoot);
-    assert.equal(host.PLOINKY_SKILL_SCOPE, '/workspace/launch');
-    // Translate the container workspace back to this disposable filesystem.
-    const local = buildLocalSkillScope(workspaceRoot, workspaceRoot, {
-        ...host, PLOINKY_SKILL_SCOPE: path.join(workspaceRoot, path.posix.relative('/workspace', host.PLOINKY_SKILL_SCOPE)),
-    });
+    // The Box mounts the workspace at its own path, so the host scope needs no translation.
+    assert.equal(host.PLOINKY_SKILL_SCOPE, scopeRoot);
+    const local = buildLocalSkillScope(workspaceRoot, workspaceRoot, host);
     const store = new RobotStore({ dataDir: path.join(root, 'private') });
     const robot = await store.create({ name: 'acceptance' });
     const home = path.join(store.robotPath(robot.id), 'home');

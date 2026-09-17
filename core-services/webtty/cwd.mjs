@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const WEBTTY_WORKSPACE_ROOT = '/workspace';
 export const WEBTTY_MAX_CWD_BYTES = 4 * 1024;
 
 export function cwdError(category) {
@@ -68,27 +67,35 @@ function isContained(rootRealPath, candidateRealPath, pathApi) {
     return candidateRealPath === rootRealPath || candidateRealPath.startsWith(`${rootRealPath}${pathApi.sep}`);
 }
 
-export function resolveWorkspaceRoot({
-    workspaceRoot = WEBTTY_WORKSPACE_ROOT,
-    fsApi = fs,
-    pathApi = path,
-} = {}) {
-    if (workspaceRoot !== WEBTTY_WORKSPACE_ROOT && !pathApi.isAbsolute(workspaceRoot)) {
+// The workspace root is always the explicit, trusted Router root. There is no
+// fixed default, and a malformed root is never normalized into another path.
+export function assertWebttyWorkspaceRoot(workspaceRoot) {
+    if (typeof workspaceRoot !== 'string' || !path.posix.isAbsolute(workspaceRoot)
+        || workspaceRoot.includes('\0') || path.posix.normalize(workspaceRoot) !== workspaceRoot
+        || (workspaceRoot !== '/' && workspaceRoot.endsWith('/'))) {
         throw cwdError('workspace-root');
     }
+    return workspaceRoot;
+}
+
+export function resolveWorkspaceRoot({
+    workspaceRoot,
+    fsApi = fs,
+} = {}) {
+    assertWebttyWorkspaceRoot(workspaceRoot);
     const rootRealPath = realpath(fsApi, workspaceRoot);
     requireDirectory(fsApi, rootRealPath, 'workspace-root');
     return rootRealPath;
 }
 
 export function resolveWorkspaceDirectory(requested, {
-    workspaceRoot = WEBTTY_WORKSPACE_ROOT,
+    workspaceRoot,
     workspaceRealPath,
     fsApi = fs,
     pathApi = path,
 } = {}) {
     const relativePath = normalizeCwdRelative(requested);
-    const rootRealPath = workspaceRealPath || resolveWorkspaceRoot({ workspaceRoot, fsApi, pathApi });
+    const rootRealPath = workspaceRealPath || resolveWorkspaceRoot({ workspaceRoot, fsApi });
     if (!pathApi.isAbsolute(rootRealPath)) throw cwdError('workspace-root');
     const lexicalCandidate = pathApi.resolve(rootRealPath, ...relativePath.split('/').filter(Boolean));
     if (!isContained(rootRealPath, lexicalCandidate, pathApi)) throw cwdError('traversal');

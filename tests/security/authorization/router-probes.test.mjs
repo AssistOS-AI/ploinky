@@ -46,7 +46,7 @@ test('Unprivileged source path disclosure is regression failure, never normalize
     user: principal, permissions: { canManage: false }, agents: [],
     repositories: [{ skillSource: { source, origin: 'installed' } }],
   } });
-  for (const source of ['/workspace/.ploinky/repos/Skills', 'C:\\workspace\\Skills']) {
+  for (const source of ['/Users/danielsava/work/testExplorerFresh/.ploinky/repos/Skills', 'C:\\workspace\\Skills']) {
     const issues = inspectMarketplaceAuthorization(response(source), principal);
     assert.ok(issues.some(issue => issue.includes('absolute local filesystem path')));
     assert.ok(!JSON.stringify(issues).includes(source), 'Finding must not echo path values');
@@ -97,7 +97,8 @@ test('Terminal fixture and marker command reject shell/path injection before any
   const prefix = 'authz-12345678-abcd';
   const fixture = terminalFixtureNames(prefix);
   assert.equal(fixture.host, `/Users/danielsava/work/testExplorerFresh/${prefix}-terminal`);
-  assert.equal(markerCommand(prefix, `${prefix}-positive`), `printf '%s\\n' '${prefix}-positive' > '/workspace/${prefix}-terminal/marker.txt'\n`);
+  assert.equal(fixture.container, fixture.host);
+  assert.equal(markerCommand(prefix, `${prefix}-positive`), `printf '%s\\n' '${prefix}-positive' > '/Users/danielsava/work/testExplorerFresh/${prefix}-terminal/marker.txt'\n`);
   for (const value of ['../escape', 'authz-1234;id', 'authz-1234$(id)', 'authz-1234/../escape', "authz-1234'quoted", 'authz-1234\nline']) {
     assert.throws(() => terminalFixtureNames(value), /shell-safe/);
     assert.throws(() => markerCommand(prefix, value), /generated literal/);

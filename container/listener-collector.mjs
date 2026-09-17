@@ -167,7 +167,7 @@ function nestedContainers({ run, outerContainer }) {
 export function collectManagedNetworkInventory({
     run,
     outerContainer,
-    workspaceRoot = '/workspace',
+    workspaceRoot,
 } = {}) {
     const boxName = String(outerContainer || '').trim();
     if (!boxName) throw new Error('outerContainer is required for managed-network collection');
@@ -207,7 +207,7 @@ export function assertManagedNetworkInventoryCurrent({
     run,
     outerContainer,
     expected,
-    workspaceRoot = '/workspace',
+    workspaceRoot,
 } = {}) {
     const current = collectManagedNetworkInventory({ run, outerContainer, workspaceRoot });
     if (!sameManagedNetworkGeneration(expected, current)) {
@@ -255,7 +255,7 @@ export function collectBoxListenerInventory({
     outerContainer,
     run,
     verifyTools = true,
-    workspaceRoot = '/workspace',
+    workspaceRoot,
 } = {}) {
     const name = String(outerContainer || '').trim();
     if (!name) throw new Error('outerContainer is required for listener collection');

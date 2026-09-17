@@ -115,10 +115,15 @@ function validateEnvironment(shellEnv) {
         throw workerProtocolError('environment');
     }
     for (const [key, value] of entries) {
+        // The host-selected workspace can occupy a full filesystem path;
+        // other fixed environment values keep their smaller wire bound.
+        const maxValueBytes = key === 'PLOINKY_WORKSPACE_ROOT'
+            ? WEBTTY_PROTOCOL_LIMITS.maxCwdBytes
+            : WEBTTY_PROTOCOL_LIMITS.maxEnvironmentValueBytes;
         if (!/^[A-Z][A-Z0-9_]*$/.test(key)
             || utf8Bytes(key) > 64
             || utf8Bytes(value) < 0
-            || utf8Bytes(value) > WEBTTY_PROTOCOL_LIMITS.maxEnvironmentValueBytes
+            || utf8Bytes(value) > maxValueBytes
             || value.includes('\0')) {
             throw workerProtocolError('environment');
         }

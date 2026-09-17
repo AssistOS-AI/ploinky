@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { sanitizeAuthorityDiagnostic } from '../../cli/sandbox/authorityCommandDiagnostics.mjs';
+import { readBoxWorkspaceRoot } from '../contract/workspace-root.mjs';
 import { createProcessRunner } from '../process.mjs';
 import { NESTED_PODMAN_SECCOMP_BOX_PATH } from '../seccomp.mjs';
 
@@ -76,7 +77,7 @@ export async function runInsideDiagnostics({
     nestedEngine = false,
     fsApi = fs,
     tempRoot = os.tmpdir(),
-    dataRoot = '/workspace',
+    dataRoot,
     runId = crypto.randomUUID(),
     progress = (message) => process.stderr.write(`${message}\n`),
 } = {}) {
@@ -250,7 +251,8 @@ export async function runInsideDiagnostics({
         if (!nestedEngine) {
             // Agent data is a workspace bind in deployment. Keep this graphroot
             // on the same filesystem instead of adding an artificial FUSE-on-FUSE layer.
-            dataScratch = fsApi.mkdtempSync(path.join(dataRoot, `ploinky-diagnose-data-${runId}-`));
+            const selectedDataRoot = dataRoot ?? readBoxWorkspaceRoot(process.env);
+            dataScratch = fsApi.mkdtempSync(path.join(selectedDataRoot, `ploinky-diagnose-data-${runId}-`));
             fsApi.chmodSync(dataScratch, 0o700);
             await probeContainer('engine', [
                 '--cap-add', 'SYS_ADMIN', '--cap-add', 'NET_ADMIN', '--device', '/dev/fuse', '--device', '/dev/net/tun',

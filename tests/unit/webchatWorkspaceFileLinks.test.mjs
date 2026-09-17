@@ -15,24 +15,83 @@ function fileIndex(...paths) {
     return { has: (filePath) => files.has(filePath) };
 }
 
+const WORKSPACE_ROOT = '/home/user/project';
+
 test('workspace file detection recognizes common assistant path forms', () => {
     const text = [
         'Created report.md and docs/summary.json.',
         'Read src/main.mjs next.',
-        'The image is /workspace/assets/chart.png:12.',
+        'The image is /home/user/project/assets/chart.png:12.',
         'See Dockerfile for the container setup.',
     ].join('\n');
 
     assert.deepEqual(
-        findWorkspaceFileCandidates(text).map(({ raw, path, line }) => ({ raw, path, line })),
+        findWorkspaceFileCandidates(text, { workspaceRoot: WORKSPACE_ROOT })
+            .map(({ raw, path, line, rootRelative }) => ({ raw, path, line, rootRelative })),
         [
-            { raw: 'report.md', path: 'report.md', line: null },
-            { raw: 'docs/summary.json', path: 'docs/summary.json', line: null },
-            { raw: 'src/main.mjs', path: 'src/main.mjs', line: null },
-            { raw: '/workspace/assets/chart.png:12', path: 'assets/chart.png', line: 12 },
-            { raw: 'Dockerfile', path: 'Dockerfile', line: null },
+            { raw: 'report.md', path: 'report.md', line: null, rootRelative: false },
+            { raw: 'docs/summary.json', path: 'docs/summary.json', line: null, rootRelative: false },
+            { raw: 'src/main.mjs', path: 'src/main.mjs', line: null, rootRelative: false },
+            { raw: '/home/user/project/assets/chart.png:12', path: 'assets/chart.png', line: 12, rootRelative: true },
+            { raw: 'Dockerfile', path: 'Dockerfile', line: null, rootRelative: false },
         ],
     );
+});
+
+test('absolute references link only strictly beneath the trusted workspace root', () => {
+    const accepted = normalizeWorkspaceFileCandidate('/home/user/project/src/app.mjs', { workspaceRoot: WORKSPACE_ROOT });
+    assert.equal(accepted.path, 'src/app.mjs');
+    assert.equal(accepted.rootRelative, true);
+    for (const candidate of [
+        '/home/user/project',
+        '/home/user/project/',
+        '/home/user/project-other/src/app.mjs',
+        '/home/user/projectx/app.mjs',
+        '/home/user/project/../secret.md',
+        '/home/user/project/src/../../secret.md',
+        '/workspace/src/app.mjs',
+        '/etc/passwd.txt',
+    ]) {
+        assert.equal(normalizeWorkspaceFileCandidate(candidate, { workspaceRoot: WORKSPACE_ROOT }), null, candidate);
+    }
+    // Absolute text is never admitted without a clean trusted root.
+    for (const workspaceRoot of ['', '/', 'relative', '/home/user/project/', '/home/../user']) {
+        assert.equal(normalizeWorkspaceFileCandidate('/home/user/project/src/app.mjs', { workspaceRoot }), null, workspaceRoot);
+    }
+    // A host workspace literally named /workspace is an ordinary root.
+    assert.equal(normalizeWorkspaceFileCandidate('/workspace/src/app.mjs', { workspaceRoot: '/workspace' }).path, 'src/app.mjs');
+    assert.equal(
+        buildWorkspaceFileUrl('/home/user/project/sub dir/a b.md', 'sub dir', { workspaceRoot: WORKSPACE_ROOT }),
+        '/workspace-files/sub%20dir/a%20b.md',
+    );
+    assert.equal(
+        buildWorkspaceFileUrl('/home/user/project/other/a.md', 'sub', { workspaceRoot: WORKSPACE_ROOT }),
+        '/workspace-files/other/a.md',
+    );
+    assert.equal(buildWorkspaceFileUrl('/home/user/project-other/a.md', 'sub', { workspaceRoot: WORKSPACE_ROOT }), null);
+});
+
+test('absolute references preserve literal host prefixes and file names', () => {
+    for (const workspaceRoot of [
+        '/home/user/my project',
+        '/home/user/p(1)[draft]+$',
+        '/home/user/quoted" and \'unicode ăîș',
+        '/home/user/back\\slash',
+    ]) {
+        const absolutePath = `${workspaceRoot}/reports/final.md:12:4`;
+        const candidates = findWorkspaceFileCandidates(`Wrote ${absolutePath}.`, { workspaceRoot });
+        assert.equal(candidates.length, 1, workspaceRoot);
+        assert.equal(candidates[0].raw, absolutePath);
+        assert.equal(candidates[0].path, 'reports/final.md');
+        assert.equal(candidates[0].rootRelative, true);
+        assert.equal(candidates[0].line, 12);
+        assert.equal(candidates[0].column, 4);
+        assert.equal(buildWorkspaceFileUrl(absolutePath, 'other', { workspaceRoot }), '/workspace-files/reports/final.md');
+    }
+    const options = { workspaceRoot: WORKSPACE_ROOT };
+    assert.equal(buildWorkspaceFileUrl(`${WORKSPACE_ROOT}/@notes.md`, '', options), '/workspace-files/%40notes.md');
+    assert.equal(buildWorkspaceFileUrl(`${WORKSPACE_ROOT}/./notes.md`, '', options), null);
+    assert.equal(buildWorkspaceFileUrl('@notes.md'), '/workspace-files/notes.md', 'relative alias is retained');
 });
 
 test('workspace file detection accepts spaced inline-code paths without consuming surrounding prose', () => {
@@ -228,6 +287,41 @@ test('workspace file enhancement normalizes relative Markdown file links', () =>
     }
 });
 
+test('absolute Markdown links use the trusted host root and current file index', () => {
+    const originalWindow = globalThis.window;
+    globalThis.window = { location: { origin: 'https://example.test' } };
+    try {
+        const workspaceRoot = '/home/user/my project (draft)';
+        const paths = [
+            `${workspaceRoot}/project/reports/final.md`,
+            `${workspaceRoot}/other/final.md`,
+            `${workspaceRoot}-other/project/reports/final.md`,
+        ];
+        const anchors = paths.map((filePath) => ({
+            href: `https://example.test${filePath.split('/').map(encodeURIComponent).join('/')}`,
+            dataset: {},
+            classList: { add() {} },
+        }));
+        const originalHrefs = anchors.map((anchor) => anchor.href);
+        const container = {
+            ownerDocument: { createTreeWalker: () => ({ nextNode: () => null }) },
+            querySelectorAll: () => anchors,
+        };
+        enhanceWorkspaceFileLinks(container, {
+            workspaceBase: 'project',
+            workspaceRoot,
+            fileIndex: fileIndex('reports/final.md', 'other/final.md'),
+        });
+        assert.equal(anchors[0].href, '/workspace-files/project/reports/final.md');
+        assert.equal(anchors[0].dataset.wcFilePath, 'project/reports/final.md');
+        assert.equal(anchors[0].dataset.wcFile, 'true');
+        assert.equal(anchors[1].href, originalHrefs[1], 'outside the indexed base');
+        assert.equal(anchors[2].href, originalHrefs[2], 'outside the trusted root');
+    } finally {
+        globalThis.window = originalWindow;
+    }
+});
+
 test('workspace file enhancement turns removed automatic links back into text', () => {
     const parent = {
         replacement: null,
@@ -251,4 +345,92 @@ test('workspace file enhancement turns removed automatic links back into text', 
     enhanceWorkspaceFileLinks(container, { fileIndex: fileIndex() });
 
     assert.equal(parent.replacement.nodeValue, 'reports/removed.md');
+});
+
+function fakeTextDocument(text) {
+    const parent = {
+        tagName: 'P',
+        parentElement: null,
+        replacement: null,
+        replaceChild(next) { this.replacement = next; },
+    };
+    const textNode = { nodeValue: text, parentElement: parent, parentNode: parent };
+    const documentRef = {
+        createTreeWalker() {
+            let emitted = false;
+            return { nextNode() { if (emitted) return null; emitted = true; return textNode; } };
+        },
+        createDocumentFragment() {
+            return { children: [], appendChild(child) { this.children.push(child); } };
+        },
+        createTextNode(value) { return { nodeValue: value }; },
+        createElement(tagName) {
+            return { tagName: tagName.toUpperCase(), className: '', dataset: {}, textContent: '', title: '', href: '' };
+        },
+    };
+    return { parent, container: { ownerDocument: documentRef, querySelectorAll: () => [] } };
+}
+
+test('absolute references beneath the root link root-relative known files only', () => {
+    const { parent, container } = fakeTextDocument([
+        'Wrote /home/user/project/project/reports/final.md,',
+        '/home/user/project/other/outside.md,',
+        '/home/user/project-other/project/reports/final.md,',
+        'and /home/user/project/project/missing.md.',
+    ].join(' '));
+    const count = enhanceWorkspaceFileLinks(container, {
+        workspaceBase: 'project',
+        workspaceRoot: WORKSPACE_ROOT,
+        fileIndex: fileIndex('reports/final.md', 'other/outside.md', 'missing-elsewhere.md'),
+    });
+    assert.equal(count, 1);
+    const anchors = parent.replacement.children.filter((child) => child.tagName === 'A');
+    assert.deepEqual(anchors.map((anchor) => [anchor.textContent, anchor.href, anchor.dataset.wcFilePath, anchor.dataset.wcFileRootRelative]), [[
+        '/home/user/project/project/reports/final.md',
+        '/workspace-files/project/reports/final.md',
+        'project/reports/final.md',
+        'true',
+    ]]);
+});
+
+test('external absolute references with spaces cannot link a known relative suffix', () => {
+    for (const text of [
+        '/home/outsider/other project/note.md',
+        'Read /home/outsider/other project/note.md next.',
+        'Read "/home/outsider/other project/note.md" next.',
+        'Read /home/outsider/other project/README next.',
+    ]) {
+        const { container } = fakeTextDocument(text);
+        assert.equal(enhanceWorkspaceFileLinks(container, {
+            workspaceRoot: WORKSPACE_ROOT,
+            fileIndex: fileIndex('project/note.md', 'project/README'),
+        }), 0, text);
+    }
+    const text = 'Created project/note.md. Read /home/outsider/other project/note.md; then docs/next.md and /home/user/project/ready.md.';
+    assert.deepEqual(findWorkspaceFileCandidates(text, { workspaceRoot: WORKSPACE_ROOT }).map(({ path }) => path), [
+        'project/note.md', 'docs/next.md', 'ready.md',
+    ]);
+    assert.deepEqual(findWorkspaceFileCandidates('Read /home/outsider/report.md and project/note.md.').map(({ path }) => path), [
+        'project/note.md',
+    ]);
+});
+
+test('auto links for root-relative references are reconciled against the current index', () => {
+    const anchor = {
+        textContent: '/home/user/project/project/reports/final.md',
+        dataset: { wcAutoFile: 'true', wcFilePath: 'project/reports/final.md', wcFileRootRelative: 'true' },
+        parentNode: { replaced: null, replaceChild(next) { this.replaced = next; } },
+    };
+    const container = {
+        ownerDocument: {
+            createTreeWalker: () => ({ nextNode: () => null }),
+            createTextNode: (value) => ({ nodeValue: value }),
+        },
+        querySelectorAll: (selector) => (selector.includes('auto-file') ? [anchor] : []),
+    };
+    enhanceWorkspaceFileLinks(container, { workspaceBase: 'project', workspaceRoot: WORKSPACE_ROOT, fileIndex: fileIndex('reports/final.md') });
+    assert.equal(anchor.parentNode.replaced, null);
+    // The root-relative path is not reinterpreted as base-relative text.
+    enhanceWorkspaceFileLinks(container, { workspaceBase: 'project', workspaceRoot: WORKSPACE_ROOT, fileIndex: fileIndex('project/reports/final.md') });
+    assert.deepEqual(anchor.parentNode.replaced, { nodeValue: '/home/user/project/project/reports/final.md' });
 });

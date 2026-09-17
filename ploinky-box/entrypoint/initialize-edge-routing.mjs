@@ -1,15 +1,19 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { initializeFreshEdgeRoutingSources } from '../../cli/sandbox/edgeGeneration.js';
+import { readBoxWorkspaceRoot } from '../contract/workspace-root.mjs';
 
-export function initializeBoxEdgeRouting({
-    workspaceRoot = process.env.PLOINKY_WORKSPACE_ROOT || '/workspace',
+export async function initializeBoxEdgeRouting({
+    workspaceRoot = readBoxWorkspaceRoot(process.env),
 } = {}) {
     const resolvedRoot = path.resolve(String(workspaceRoot || ''));
     if (!path.isAbsolute(String(workspaceRoot || ''))) {
         throw new Error('PLOINKY_WORKSPACE_ROOT must be an absolute path');
     }
+    // Loading edge generation resolves CLI configuration, which derives a root
+    // from the working directory when none is set. The host-selected root is
+    // therefore read and validated before that module is loaded.
+    const { initializeFreshEdgeRoutingSources } = await import('../../cli/sandbox/edgeGeneration.js');
     return initializeFreshEdgeRoutingSources({ workspaceRoot: resolvedRoot });
 }
 
@@ -20,7 +24,7 @@ function isDirectExecution() {
 
 if (isDirectExecution()) {
     try {
-        const result = initializeBoxEdgeRouting();
+        const result = await initializeBoxEdgeRouting();
         process.stdout.write(
             `[ploinky-box] Edge routing baseline ${result.initialized ? 'initialized' : 'already complete'}.\n`,
         );

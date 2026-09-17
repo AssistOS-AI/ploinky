@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { readBoxWorkspaceRoot } from '../contract/workspace-root.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 
 const MASTER_KEY_PATTERN = /^[a-f0-9]{64}$/;
@@ -130,15 +131,23 @@ function removeCreatedTargetIfUnchanged(target, descriptor, openedFingerprint, f
     }
 }
 
-export function workspaceMasterKeyPath(workspaceRoot = '/workspace') {
-    return path.join(path.resolve(workspaceRoot), PLOINKY_DIRECTORY, MASTER_KEY_FILE);
+// The workspace root is always explicit: the Box has no fixed workspace path.
+function selectedWorkspaceRoot(workspaceRoot) {
+    if (typeof workspaceRoot !== 'string' || !path.isAbsolute(workspaceRoot)) {
+        throw initializerError('Workspace master-key access requires an absolute workspace root');
+    }
+    return path.resolve(workspaceRoot);
+}
+
+export function workspaceMasterKeyPath(workspaceRoot) {
+    return path.join(selectedWorkspaceRoot(workspaceRoot), PLOINKY_DIRECTORY, MASTER_KEY_FILE);
 }
 
 export function readWorkspaceMasterKey({
-    workspaceRoot = '/workspace',
+    workspaceRoot,
     fsApi = fs,
 } = {}) {
-    const root = path.resolve(workspaceRoot);
+    const root = selectedWorkspaceRoot(workspaceRoot);
     const ploinkyDirectory = path.join(root, PLOINKY_DIRECTORY);
     const target = path.join(ploinkyDirectory, MASTER_KEY_FILE);
     try {
@@ -154,11 +163,11 @@ export function readWorkspaceMasterKey({
 }
 
 export function initializeWorkspaceMasterKey({
-    workspaceRoot = '/workspace',
+    workspaceRoot,
     fsApi = fs,
     randomBytes = crypto.randomBytes,
 } = {}) {
-    const root = path.resolve(workspaceRoot);
+    const root = selectedWorkspaceRoot(workspaceRoot);
     const rootBefore = inspectDirectory(root, fsApi);
     const stateDirectory = ensurePloinkyDirectory(root, fsApi);
     const target = path.join(stateDirectory.path, MASTER_KEY_FILE);
@@ -230,7 +239,7 @@ export function initializeWorkspaceMasterKey({
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
 if (invokedPath === fileURLToPath(import.meta.url)) {
     try {
-        initializeWorkspaceMasterKey();
+        initializeWorkspaceMasterKey({ workspaceRoot: readBoxWorkspaceRoot(process.env) });
     } catch (error) {
         process.stderr.write(`ploinky-box workspace initialization failed: ${error.message}\n`);
         process.exitCode = 1;

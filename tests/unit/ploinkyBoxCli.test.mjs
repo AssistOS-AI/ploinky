@@ -32,8 +32,14 @@ function execEnvAssignments(args) {
     return values;
 }
 
+// A real selected workspace whose path has characters a shell would reinterpret.
+const WORKSPACE_ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ploinky box cli ăîș $(id);'-")));
+test.after(() => fs.rmSync(WORKSPACE_ROOT, { recursive: true, force: true }));
+
 function fakeSupervisor(events, { statusState = 'absent' } = {}) {
+    const identity = { instance: 'ploinky-box-workspace-123456789abc', workspaceRoot: WORKSPACE_ROOT };
     const prepared = {
+        identity,
         containerId: 'a'.repeat(64),
         engine: { name: 'podman' },
         hostPort: 19090,
@@ -41,7 +47,7 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
     };
     const status = {
         state: statusState,
-        identity: { instance: 'ploinky-box-workspace-123456789abc' },
+        identity,
         ownership: statusState === 'running-initialized'
             ? {
                 state: 'owned',
@@ -72,7 +78,7 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
                 containerId: id,
                 deletedCache: options?.deleteCache === true,
                 deletedPaths: options?.deleteCache
-                    ? ['/workspace/.ploinky/box/dependencies', '/workspace/.ploinky/box/images']
+                    ? [`${WORKSPACE_ROOT}/.ploinky/box/dependencies`, `${WORKSPACE_ROOT}/.ploinky/box/images`]
                     : [],
             };
         },
@@ -359,7 +365,7 @@ test('nonzero prepared execution keeps its exit code and suggests diagnosis only
         for (const argv of [['cli'], ['cli', 'Agent'], ['list', 'agents']]) {
             const errorOutput = bufferStream();
             const code = await runOuterCli(argv, {
-                env: {}, input: {}, output: bufferStream(), errorOutput,
+                env: {}, input: {}, output: bufferStream(), errorOutput, cwd: () => WORKSPACE_ROOT,
                 supervisor: fakeSupervisor([]), detectInsideBox: () => false,
                 execute: () => status,
                 diagnose() { throw new Error('Prepared commands must never run diagnosis automatically'); },
@@ -430,6 +436,7 @@ test('running status uses the read-only core renderer without preparing the Box'
     assert.deepEqual(events[1][2].slice(-2), [
         '/opt/ploinky/bin/ploinky-local', 'status',
     ]);
+    assert.equal(events[1][2][events[1][2].indexOf('--workdir') + 1], WORKSPACE_ROOT);
     assert.equal(output.value(), '');
 });
 
@@ -646,6 +653,7 @@ test('generic forwarding prepares under the supervisor then execs the fixed targ
     };
     const code = await runOuterCli(['list', '--debug', 'agents'], {
         env,
+        cwd: () => WORKSPACE_ROOT,
         input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
         execute(command, args, options) { events.push(['execute', command, args, options]); return 23; },
@@ -656,14 +664,20 @@ test('generic forwarding prepares under the supervisor then execs the fixed targ
     assert.deepEqual(events[1][2].slice(-4), [
         '/opt/ploinky/bin/ploinky-local', 'list', '--debug', 'agents',
     ]);
-    assert.deepEqual(events[1][2].slice(0, 8), [
+    assert.deepEqual(events[1][2].slice(0, 6), [
         'container', 'exec',
         '--env', 'PLOINKY_ROUTER_HOST_PORT=19090',
         '--env', 'PLOINKY_MEDIA_HOST_PORT=17891',
-        '--user', 'podman',
+    ]);
+    const user = events[1][2].indexOf('--user');
+    assert.deepEqual(events[1][2].slice(user, user + 5), [
+        '--user', 'podman', '--workdir', WORKSPACE_ROOT, 'a'.repeat(64),
     ]);
     assert.equal(JSON.stringify(events[1][3]).includes('HOST_CANARY'), false);
     assert.equal(JSON.stringify(events[1][3]).includes('UNRELATED_CANARY'), false);
+    // The launch scope is the selected host path itself inside the Box.
+    assert.equal(execEnvAssignments(events[1][2]).includes(`PLOINKY_SKILL_SCOPE=${WORKSPACE_ROOT}`), true);
+    assert.equal(execEnvAssignments(events[1][2]).includes(`PLOINKY_HOST_LAUNCH_CWD=${WORKSPACE_ROOT}`), true);
 });
 
 test('logs forward into an already running initialized Box without preparing it', async () => {
@@ -766,7 +780,7 @@ test('full update refreshes in-Box state then restarts an already configured wor
                 found: true,
                 updated: true,
                 skipped: false,
-                repoPath: '/workspace/ploinky',
+                repoPath: '/home/user/workspace/ploinky',
                 pullStrategy: 'rebase-autostash',
             },
         };
@@ -799,7 +813,7 @@ test('full update refreshes in-Box state then restarts an already configured wor
             updateScopeRoot: UPDATE_SCOPE_ROOT,
         }],
     ]);
-    assert.match(output.value(), /Workspace Ploinky checkout at \/workspace\/ploinky is updated/);
+    assert.match(output.value(), /Workspace Ploinky checkout at \/home\/user\/workspace\/ploinky is updated/);
     assert.match(output.value(), /git pull --rebase --autostash/);
     assert.match(output.value(), /were restarted coherently/);
 });
@@ -938,6 +952,7 @@ test('targeted update forms retain generic forwarding without a host pull', asyn
         const events = [];
         const code = await runOuterCli(argv, {
             env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            cwd: () => WORKSPACE_ROOT,
             supervisor: fakeSupervisor(events),
             async updateHostSource() { throw new Error('targeted update must not pull host source'); },
             execute(command, args) { events.push(['execute', command, args]); return 0; },
@@ -950,16 +965,19 @@ test('targeted update forms retain generic forwarding without a host pull', asyn
 
 test('TTY flags appear only for interactive commands with both terminal ends', async () => {
     assert.deepEqual(buildContainerExecArgs('a'.repeat(64), [], {
+        workspaceRoot: WORKSPACE_ROOT,
         hostPort: 19090,
         mediaHostPort: 17891,
         interactive: true, inputIsTty: true, outputIsTty: true, shell: true,
     }).slice(0, 4), ['container', 'exec', '--interactive', '--tty']);
     assert.equal(buildContainerExecArgs('a'.repeat(64), [], {
+        workspaceRoot: WORKSPACE_ROOT,
         hostPort: 19090,
         mediaHostPort: 17891,
         interactive: true, inputIsTty: false, outputIsTty: true,
     }).includes('--tty'), false);
     const logArgs = buildContainerExecArgs('a'.repeat(64), ['logs', 'tail'], {
+        workspaceRoot: WORKSPACE_ROOT,
         hostPort: 19090,
         mediaHostPort: 17891,
         logStream: true,
@@ -970,6 +988,7 @@ test('TTY flags appear only for interactive commands with both terminal ends', a
     assert.equal(logArgs.includes('--tty'), false);
     assert.ok(logArgs.includes('PLOINKY_BOX_LOG_STREAM=1'));
     const colorArgs = buildContainerExecArgs('a'.repeat(64), ['status'], {
+        workspaceRoot: WORKSPACE_ROOT,
         hostPort: 19090,
         mediaHostPort: 17891,
         colorOutput: true,
@@ -984,6 +1003,7 @@ test('TTY flags appear only for interactive commands with both terminal ends', a
     const events = [];
     await runOuterCli(['cli'], {
         env: {}, input: { isTTY: true }, output: bufferStream(true), errorOutput: bufferStream(true),
+        cwd: () => WORKSPACE_ROOT,
         supervisor: fakeSupervisor(events),
         execute(command, args) { events.push([command, args]); return 0; },
     });

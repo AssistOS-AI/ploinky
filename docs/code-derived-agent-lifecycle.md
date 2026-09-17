@@ -54,7 +54,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 | Invocation | Documented effect |
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
-| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
+| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in the workspace directory, at its host path |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky status` | Inspect outer contract/publishes/health and running core status without mutation |
@@ -67,7 +67,7 @@ All relative paths below are relative to the workspace directory where `ploinky`
 
 ### Outer runtime configuration
 
-The default release channel is the mutable `docker.io/assistos/ploinky-box:latest` reference. The source-owned image must satisfy the complete outer runtime configuration checked by `ploinky-box/contract/image.mjs`, including an empty image-label set, the exact `assistos/ploinky-box` marker, user `podman`, workdir `/workspace`, the box entrypoint, its allowlisted environment, and no image command or declared volumes.
+The default release channel is the mutable `docker.io/assistos/ploinky-box:latest` reference. The source-owned image must satisfy the complete outer runtime configuration checked by `ploinky-box/contract/image.mjs`, including an empty image-label set, the exact `assistos/ploinky-box` marker, user `podman`, the neutral workdir `/`, the box entrypoint, its allowlisted environment without a workspace root, and no image command or declared volumes. Container creation supplies `--workdir` and `PLOINKY_WORKSPACE_ROOT` set to the selected workspace path, and admission requires both together with the same-path workspace bind.
 
 Every non-help host invocation canonicalizes the current directory and derives `ploinky-box-<sanitized-basename>-<12-character-SHA256-path-hash>`. No public name or engine selector participates. The supervisor finds each Podman or Docker executable on `PATH`, requires the selected rootless Podman engine to answer, inventories the exact Box container, and rejects Docker exact-name conflicts. Duplicate containers, foreign labels, or an unknown engine probe fail closed. The outer Box owns no engine volume.
 
@@ -76,7 +76,7 @@ The outer storage boundary has four durable host binds and one transient `/tmp` 
 | Host source or type | Box destination | Contract |
 | --- | --- | --- |
 | Ploinky repository root | `/opt/ploinky` | Read-only bind |
-| Canonical workspace root | `/workspace` | Read-write bind |
+| Selected workspace root | The same absolute path | Read-write bind; also the Box working directory and `PLOINKY_WORKSPACE_ROOT` |
 | `<workspace>/.ploinky/box/dependencies` | `/opt/ploinky/node_modules` | Read-write bind |
 | `<workspace>/.ploinky/box/images` | `/home/podman/.local/share/ploinky-images` | Read-write bind |
 | tmpfs | `/tmp` | `rw,exec,nosuid,nodev,mode=1777,notmpcopyup`; empty each outer boot |
@@ -541,14 +541,14 @@ Nested container records no longer survive their box. The inner Podman graphroot
 
 | State | Survives `stop` | Survives `destroy` |
 | --- | --- | --- |
-| Host workspace at `/workspace` | Yes | Yes; never deleted by any destroy path |
+| Host workspace at its own absolute path | Yes | Yes; never deleted by any destroy path |
 | Dependency-cache bind at `/opt/ploinky/node_modules` | Yes | Yes, unless `--delete-cache` |
 | Nested-image-cache bind at `/home/podman/.local/share/ploinky-images` | Yes | Yes, unless `--delete-cache` |
 | Nested container records and writable layers | Yes | No |
 | Inner Podman named volumes | Yes | No |
 | Transient runtime metadata under `/tmp/storage-run-1000` | No; `/tmp` is fresh each boot | No |
 
-Those records, layers, networks, and inner named volumes are discarded with the outer box, so persistent agent data must use explicit `/workspace` binds. Destroy first stops nested agents through the in-box helper; if that stop fails the outer box is halted but nothing is removed, leaving a stopped box and its cache data for inspection and retry. A retained managed record at startup now indicates that storage isolation failed rather than ordinary leftovers.
+Those records, layers, networks, and inner named volumes are discarded with the outer box, so persistent agent data must use explicit workspace binds. Destroy first stops nested agents through the in-box helper; if that stop fails the outer box is halted but nothing is removed, leaving a stopped box and its cache data for inspection and retry. A retained managed record at startup now indicates that storage isolation failed rather than ordinary leftovers.
 
 ## Host Sandbox Runtimes
 

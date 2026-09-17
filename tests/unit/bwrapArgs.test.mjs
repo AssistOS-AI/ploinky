@@ -152,7 +152,7 @@ test('bwrap rejects a project bind sourced below a protected legacy root', () =>
     );
 });
 
-test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind', () => {
+test('global bwrap preserves writable project source and protects code and dependency grants', () => {
     const root = tempDir();
     try {
         const agentCodePath = path.join(root, '.ploinky', 'repos', 'repo', 'agent');
@@ -184,7 +184,8 @@ test('buildBwrapArgs overlays protected workspace paths read-only after cwd bind
 
         assert.ok(hasRoBind(args, agentCodePath, '/code'));
         assert.ok(hasRoBind(args, cacheRoot));
-        assert.ok(hasRoBind(args, agentCodePath));
+        assert.equal(hasRoBind(args, agentCodePath), false,
+            'global project source remains writable through its same-path project grant');
         assert.ok(hasBind(args, root));
         assert.ok(hasBind(args, agentHomeDir, '/root'));
         assert.ok(hasRoBind(args, nodeRuntimePath, '/opt/ploinky-node'));

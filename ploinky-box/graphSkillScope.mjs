@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { boxWorkspacePath, relativeBoxWorkspacePath } from './contract/workspace-root.mjs';
 import { PloinkyBoxError } from './errors.mjs';
 import { buildHostSkillScope } from './skillScope.mjs';
 
@@ -57,7 +58,7 @@ function normalizeRecord(identity, record) {
     const root = fs.realpathSync(identity.workspaceRoot);
     return Object.freeze({
         PLOINKY_SKILL_SCOPE_VERSION: '1',
-        PLOINKY_SKILL_SCOPE: path.posix.join('/workspace', relative),
+        PLOINKY_SKILL_SCOPE: boxWorkspacePath(identity.workspaceRoot, relative),
         PLOINKY_HOST_LAUNCH_CWD: path.join(root, ...relative.split('/')),
     });
 }
@@ -136,7 +137,7 @@ export function writeGraphSkillScope(identity, scopeEnv, lock) {
     const record = {
         version: 1,
         instance: identity.instance,
-        launchRelativePath: path.posix.relative('/workspace', current.PLOINKY_SKILL_SCOPE),
+        launchRelativePath: relativeBoxWorkspacePath(identity.workspaceRoot, current.PLOINKY_SKILL_SCOPE),
     };
     const temporary = `${target}.${crypto.randomUUID()}.tmp`;
     try {

@@ -62,20 +62,22 @@ test('smoke graph pins only the required Explorer repositories and stages their 
     assert.deepEqual(graph.args, ['start', 'AchillesIDE/explorer', '19090']);
 
     const containerId = 'b'.repeat(64);
-    stageSmokeGraph({ graph, containerId, runner });
+    const workspaceRoot = '/home/user/smoke workspace';
+    stageSmokeGraph({ graph, containerId, runner, workspaceRoot });
     const copyCalls = calls.filter((call) => call[1] === 'container' && call[2] === 'cp');
     assert.ok(copyCalls.some((call) => call.at(-1) === (
-        `${containerId}:/workspace/.ploinky/repos/AchillesIDE`
+        `${containerId}:${workspaceRoot}/.ploinky/repos/AchillesIDE`
     )));
     assert.ok(copyCalls.every((call) => !call.at(-1).endsWith('/AssistOSExplorer')));
     assert.deepEqual(copyCalls.filter((call) => call.at(-1).includes('/repos/'))
         .map((call) => call.at(-1)), [
         'AchillesIDE', 'UmamiAgent', 'AchillesCLI', 'proxies', 'container-image-builds',
-    ].map((name) => `${containerId}:/workspace/.ploinky/repos/${name}`));
+    ].map((name) => `${containerId}:${workspaceRoot}/.ploinky/repos/${name}`));
     assert.ok(copyCalls.some((call) => call.at(-1).endsWith('/desired.json.smoke-candidate')));
     const initializeIndex = calls.findIndex((call) => (
         call.includes('/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs')
-        && call.includes('PLOINKY_WORKSPACE_ROOT=/workspace')
+        && call.includes(`PLOINKY_WORKSPACE_ROOT=${workspaceRoot}`)
+        && call[call.indexOf('--workdir') + 1] === workspaceRoot
     ));
     const desiredCopyIndex = calls.findIndex((call) => (
         call[1] === 'container'
@@ -87,6 +89,7 @@ test('smoke graph pins only the required Explorer repositories and stages their 
     assert.throws(() => stageSmokeGraph({
         graph,
         containerId,
+        workspaceRoot,
         runner: {
             ...runner,
             query(command, args) {

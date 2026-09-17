@@ -34,6 +34,7 @@ import {
     validateContainerPublications,
 } from './contract/container.mjs';
 import { IMAGE_OBSERVATION_UNAVAILABLE, inspectAndValidateExistingImage } from './contract/image.mjs';
+import { assertBoxWorkspaceRoot, boxWorkspaceExecOptions } from './contract/workspace-root.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import {
     readWorkspaceEdgeDesired,
@@ -316,11 +317,11 @@ export function createBoxSupervisor({
         for (const line of formatRouterBindingLines(binding)) stdout?.write?.(`[ploinky] ${line}\n`);
     }
 
-    function readInboxStatus(engine, containerId) {
+    function readInboxStatus(engine, containerId, workspaceRoot) {
         const inbox = runner.query(engine.name, [
             'container', 'exec',
             '--user', 'podman',
-            '--workdir', '/workspace',
+            ...boxWorkspaceExecOptions(workspaceRoot),
             containerId,
             '/usr/local/bin/node',
             '/opt/ploinky/ploinky-box/inbox/readStatus.mjs',
@@ -352,6 +353,9 @@ export function createBoxSupervisor({
             resolveIdentity,
             lockManager,
             beforeAnchor(identity) {
+                // The selected path is also the Box mount and working directory;
+                // an unmountable path fails before the workspace is anchored.
+                assertBoxWorkspaceRoot(identity.workspaceRoot);
                 return authorize(inspect(identity));
             },
             execute,
@@ -396,14 +400,14 @@ export function createBoxSupervisor({
             });
             const containerId = prepared.ownership.handles.container.id;
             try {
-                await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+                await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 prepared.finalize?.();
                 return Object.freeze({
                     identity, ...prepared, containerId, engine: ownership.engine, agentLib: selection,
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
-                    prepared, ownership, containerId, error,
+                    identity, prepared, ownership, containerId, error,
                     stopGraph: false,
                     restoreGraph: false,
                 });
@@ -436,6 +440,7 @@ export function createBoxSupervisor({
             mediaHostPort,
             runner,
             {
+                workspaceRoot: identity.workspaceRoot,
                 stdout,
                 stderr,
                 hostReachableIpv4,
@@ -447,9 +452,9 @@ export function createBoxSupervisor({
     }
 
     // Return a restored Box to the stopped state it had before a failed bind.
-    function stopRestoredBox(engine, containerId) {
+    function stopRestoredBox(identity, engine, containerId) {
         try {
-            stopPloinkyLocalByContainerId(engine, containerId, runner);
+            stopPloinkyLocalByContainerId(engine, containerId, runner, { workspaceRoot: identity.workspaceRoot });
         } finally {
             runner.run(engine.name, ['container', 'stop', '--time', '30', containerId]);
         }
@@ -472,7 +477,9 @@ export function createBoxSupervisor({
         let candidateStopError = null;
         if (stopGraph) {
             try {
-                stopPloinkyLocalByContainerId(ownership.engine, containerId, runner);
+                stopPloinkyLocalByContainerId(ownership.engine, containerId, runner, {
+                    workspaceRoot: identity.workspaceRoot,
+                });
             } catch (stopError) {
                 candidateStopError = stopError;
             }
@@ -506,7 +513,7 @@ export function createBoxSupervisor({
             }
         } else if (restoreStopped && outerRollback?.containerId && failures.length === 0) {
             try {
-                stopRestoredBox(ownership.engine, outerRollback.containerId);
+                stopRestoredBox(identity, ownership.engine, outerRollback.containerId);
             } catch (stopError) {
                 failures.push(`prior stopped Box restoration: ${stopError.message}`);
             }
@@ -613,7 +620,7 @@ export function createBoxSupervisor({
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
             try {
-                await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+                await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 const edgeDesired = readEdgeDesired(identity);
                 if (edgeDesired) {
                     stageEdgeDesired({
@@ -621,6 +628,7 @@ export function createBoxSupervisor({
                         engine: ownership.engine,
                         containerId,
                         runner,
+                        workspaceRoot: identity.workspaceRoot,
                     });
                 }
                 const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
@@ -633,6 +641,7 @@ export function createBoxSupervisor({
                     prepared.mediaHostPort,
                     runner,
                     {
+                        workspaceRoot: identity.workspaceRoot,
                         stdout,
                         stderr,
                         hostReachableIpv4,
@@ -696,7 +705,7 @@ export function createBoxSupervisor({
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
             try {
-                await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+                await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 const effectiveArgs = prepared.action === 'replaced' && coreArgs.length > 1
                     ? ['restart']
                     : coreArgs;
@@ -709,7 +718,7 @@ export function createBoxSupervisor({
                     prepared.hostPort,
                     prepared.mediaHostPort,
                     runner,
-                    { stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
+                    { workspaceRoot: identity.workspaceRoot, stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
                 );
                 await completeGraphAdmission({
                     identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
@@ -790,7 +799,7 @@ export function createBoxSupervisor({
                 hostPort,
                 mediaHostPort,
                 runner,
-                { stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
+                { workspaceRoot: identity.workspaceRoot, stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
             );
 
             // Manual engine operations are outside the workspace lock. Refuse
@@ -858,7 +867,7 @@ export function createBoxSupervisor({
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
             try {
-                await ensureBoxDependencies(ownership.engine, containerId, runner, { stdout, stderr });
+                await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 await runCoreCommand(
                     ownership.engine,
                     containerId,
@@ -867,6 +876,7 @@ export function createBoxSupervisor({
                     prepared.mediaHostPort,
                     runner,
                     {
+                        workspaceRoot: identity.workspaceRoot,
                         stdout,
                         stderr,
                         agentLib: selection,
@@ -884,7 +894,7 @@ export function createBoxSupervisor({
                         prepared.hostPort,
                         prepared.mediaHostPort,
                         runner,
-                        { stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
+                        { workspaceRoot: identity.workspaceRoot, stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
                     );
                 }
                 await completeGraphAdmission({
@@ -956,7 +966,9 @@ export function createBoxSupervisor({
                     if (handle.runtime?.running === true) recoveredContainerId = handle.id;
                 } else if (handle.runtime?.running === true) {
                     // Finish an interrupted graph stop before restarting the graph.
-                    if (priorGraphRunning) stopPloinkyLocalByContainerId(engine, handle.id, runner);
+                    if (priorGraphRunning) {
+                        stopPloinkyLocalByContainerId(engine, handle.id, runner, { workspaceRoot: identity.workspaceRoot });
+                    }
                     recoveredContainerId = handle.id;
                 } else {
                     const restarted = await reconcile({
@@ -1000,7 +1012,7 @@ export function createBoxSupervisor({
             }
         } else if (recoveredContainerId && !priorRunning) {
             try {
-                stopRestoredBox(engine, recoveredContainerId);
+                stopRestoredBox(identity, engine, recoveredContainerId);
             } catch (stopError) {
                 failures.push(`prior stopped Box restoration: ${stopError.message}`);
             }
@@ -1046,7 +1058,7 @@ export function createBoxSupervisor({
             const priorRunning = container?.runtime?.running === true;
             let priorGraphRunning = false;
             if (priorRunning) {
-                const inbox = readInboxStatus(engine, container.id);
+                const inbox = readInboxStatus(engine, container.id, identity.workspaceRoot);
                 if (!inbox) {
                     throw supervisorError(
                         'The running Box status could not be read, so its graph state cannot be restored after a '
@@ -1116,7 +1128,7 @@ export function createBoxSupervisor({
             let bindingWriteAttempted = false;
             try {
                 if (!graphAlreadyRunning) {
-                    await ensureBoxDependencies(engine, containerId, runner, { stdout, stderr });
+                    await ensureBoxDependencies(engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                     const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
                     graphMutated = true;
                     await startCore(
@@ -1127,6 +1139,7 @@ export function createBoxSupervisor({
                         prepared.mediaHostPort,
                         runner,
                         {
+                            workspaceRoot: identity.workspaceRoot,
                             stdout,
                             stderr,
                             hostReachableIpv4,
@@ -1197,7 +1210,9 @@ export function createBoxSupervisor({
             if (container.runtime.running) {
                 let localStopError = null;
                 try {
-                    stopPloinkyLocalByContainerId(ownership.engine, container.id, runner);
+                    stopPloinkyLocalByContainerId(ownership.engine, container.id, runner, {
+                        workspaceRoot: identity.workspaceRoot,
+                    });
                 } catch (error) {
                     localStopError = error;
                 } finally {
@@ -1236,7 +1251,9 @@ export function createBoxSupervisor({
                 if (container.runtime.running) {
                     let innerStopError = null;
                     try {
-                        stopPloinkyLocalByContainerId(ownership.engine, container.id, runner);
+                        stopPloinkyLocalByContainerId(ownership.engine, container.id, runner, {
+                            workspaceRoot: identity.workspaceRoot,
+                        });
                     } catch (error) {
                         innerStopError = error;
                     } finally {
@@ -1341,7 +1358,7 @@ export function createBoxSupervisor({
         const inbox = runner.query(ownership.engine.name, [
             'container', 'exec',
             '--user', 'podman',
-            '--workdir', '/workspace',
+            ...boxWorkspaceExecOptions(identity.workspaceRoot),
             container.id,
             '/usr/local/bin/node',
             '/opt/ploinky/ploinky-box/inbox/readStatus.mjs',
@@ -1465,6 +1482,7 @@ export function createBoxSupervisor({
 }
 
 export async function ensureBoxDependencies(engine, containerId, runner, {
+    workspaceRoot,
     stdout = process.stdout,
     stderr = process.stderr,
     timeoutMs = 1_800_000,
@@ -1472,7 +1490,7 @@ export async function ensureBoxDependencies(engine, containerId, runner, {
     const args = [
         'container', 'exec',
         '--user', 'podman',
-        '--workdir', '/workspace',
+        ...boxWorkspaceExecOptions(workspaceRoot),
         containerId,
         '/opt/ploinky/bin/ploinky-install-deps',
     ];
@@ -1589,6 +1607,7 @@ export async function runBoundedCoreCommand(
     mediaHostPort,
     runner,
     {
+        workspaceRoot,
         stdout = process.stdout,
         stderr = process.stderr,
         timeoutMs = 1_800_000,
@@ -1615,7 +1634,7 @@ export async function runBoundedCoreCommand(
             skillScopeEnv,
         ),
         '--user', 'podman',
-        '--workdir', '/workspace',
+        ...boxWorkspaceExecOptions(workspaceRoot),
         containerId,
         '/opt/ploinky/bin/ploinky-local',
         ...coreArgv,
@@ -1634,6 +1653,7 @@ export async function runBoundedCoreStart(
     mediaHostPort,
     runner,
     {
+        workspaceRoot,
         stdout = process.stdout,
         stderr = process.stderr,
         timeoutMs = 1_800_000,
@@ -1653,7 +1673,7 @@ export async function runBoundedCoreStart(
         hostPort,
         mediaHostPort,
         runner,
-        { stdout, stderr, timeoutMs, hostReachableIpv4, agentLib, skillScopeEnv },
+        { workspaceRoot, stdout, stderr, timeoutMs, hostReachableIpv4, agentLib, skillScopeEnv },
     );
     // Core reports the Box public authority: loopback for loopback and
     // wildcard bindings, or the selected address for a specific binding.

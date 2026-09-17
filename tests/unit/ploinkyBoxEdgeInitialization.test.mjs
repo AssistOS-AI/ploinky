@@ -74,3 +74,19 @@ test('Box edge initializer rejects partial state without replacing existing auth
     assert.equal(fs.existsSync(sources.agents), false);
     assert.equal(fs.existsSync(sources.policy), false);
 });
+
+test('Box edge initializer requires the reserved workspace root and never falls back to a fixed path', (t) => {
+    const root = workspaceFixture(t);
+    const env = { ...process.env };
+    delete env.PLOINKY_WORKSPACE_ROOT;
+    const missing = spawnSync(process.execPath, [INITIALIZER], { encoding: 'utf8', env, cwd: root });
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /PLOINKY_WORKSPACE_ROOT is not set/);
+    const invalid = spawnSync(process.execPath, [INITIALIZER], {
+        encoding: 'utf8',
+        env: { ...env, PLOINKY_WORKSPACE_ROOT: `${root}:other` },
+    });
+    assert.notEqual(invalid.status, 0);
+    assert.match(invalid.stderr, /contains ':'/);
+    assert.deepEqual(fs.readdirSync(root), []);
+});

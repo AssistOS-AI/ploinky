@@ -5,15 +5,23 @@ const FILE_EXTENSIONS = Object.freeze([
     'ts', 'tsx', 'txt', 'webp', 'xml', 'yaml', 'yml',
 ]);
 const EXTENSION_PATTERN = FILE_EXTENSIONS.join('|');
+// An absolute candidate is linked only when it lies strictly beneath the
+// trusted workspace root that the page received; see normalization below.
 const BARE_FILE_RE = new RegExp(
-    `(?:^|[\\s([{<])((?:@|\\./|/workspace/)?(?:[\\p{L}\\p{N}_+.-]+/)*[\\p{L}\\p{N}_+.-]+\\.(?:${EXTENSION_PATTERN})(?::\\d+(?::\\d+)?)?)(?=$|[\\s)\\]}>.,'\";!?])`,
+    `(?:^|[\\s([{<])((?:@|\\./|/)?(?:[\\p{L}\\p{N}_+.-]+/)*[\\p{L}\\p{N}_+.-]+\\.(?:${EXTENSION_PATTERN})(?::\\d+(?::\\d+)?)?)(?=$|[\\s)\\]}>.,'\";!?])`,
     'giu',
 );
 const QUOTED_FILE_RE = new RegExp(
-    `([\"'])((?:@|\\./|/workspace/)?[^\"'\\n]{1,240}\\.(?:${EXTENSION_PATTERN})(?::\\d+(?::\\d+)?)?)\\1`,
+    `([\"'])((?:@|\\./)?[^\"'\\n]{1,240}\\.(?:${EXTENSION_PATTERN})(?::\\d+(?::\\d+)?)?)\\1`,
     'giu',
 );
-const SPECIAL_FILE_RE = /(?:^|[\s([{<])((?:@|\.\/|\/workspace\/)?(?:[\p{L}\p{N}_+.-]+\/)*(?:README|LICENSE|Dockerfile|Makefile))(?=$|[\s)\]}>.,'";!?])/giu;
+// Reserve an entire absolute reference even when its root is not ours. Its
+// whitespace-separated suffix must never become an unrelated relative link.
+const ABSOLUTE_FILE_RE = new RegExp(
+    `(?:^|[\\s([{<"'])(/[^\\r\\n"'<>,;!?]{0,4096}?(?:\\.(?:${EXTENSION_PATTERN})|/README|/LICENSE|/Dockerfile|/Makefile)(?::\\d+(?::\\d+)?)?)(?=$|[\\s)\\]}>.,'";!?])`,
+    'giu',
+);
+const SPECIAL_FILE_RE = /(?:^|[\s([{<])((?:@|\.\/|\/)?(?:[\p{L}\p{N}_+.-]+\/)*(?:README|LICENSE|Dockerfile|Makefile))(?=$|[\s)\]}>.,'";!?])/giu;
 const LINE_SUFFIX_RE = /:(\d+)(?::(\d+))?$/;
 
 const MARKDOWN_EXTENSIONS = new Set(['md', 'mdx']);
@@ -26,13 +34,23 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 function stripWorkspaceAlias(value) {
-    if (value.startsWith('/workspace/')) return value.slice('/workspace/'.length);
     if (value.startsWith('./')) return value.slice(2);
     if (value.startsWith('@')) return value.slice(1);
     return value;
 }
 
-export function normalizeWorkspaceFileCandidate(rawCandidate) {
+// The trusted workspace root is the selected host path, which is also its
+// path inside the Box. Only a clean absolute root can admit absolute text.
+function normalizeWorkspaceRoot(value) {
+    const root = String(value || '');
+    if (!root.startsWith('/') || root === '/' || root.endsWith('/') || root.includes('\0')
+        || root.split('/').slice(1).some((segment) => !segment || segment === '.' || segment === '..')) {
+        return '';
+    }
+    return root;
+}
+
+export function normalizeWorkspaceFileCandidate(rawCandidate, { workspaceRoot = '' } = {}) {
     const display = String(rawCandidate || '').trim();
     if (!display || display.includes('\0')) return null;
 
@@ -40,11 +58,18 @@ export function normalizeWorkspaceFileCandidate(rawCandidate) {
     const withoutLocation = locationMatch
         ? display.slice(0, locationMatch.index)
         : display;
-    const slashNormalized = withoutLocation.replace(/\\+/g, '/');
-    if (slashNormalized.startsWith('/') && !slashNormalized.startsWith('/workspace/')) return null;
-    const normalized = stripWorkspaceAlias(slashNormalized)
-        .replace(/^\/+/, '')
-        .replace(/\/{2,}/g, '/');
+    let candidate = withoutLocation;
+    let rootRelative = false;
+    if (candidate.startsWith('/')) {
+        // Absolute text names a workspace file only strictly beneath the root.
+        const root = normalizeWorkspaceRoot(workspaceRoot);
+        if (!root || !candidate.startsWith(`${root}/`)) return null;
+        candidate = candidate.slice(root.length + 1);
+        rootRelative = true;
+    } else {
+        candidate = stripWorkspaceAlias(candidate.replace(/\\+/g, '/'));
+    }
+    const normalized = candidate.replace(/\/{2,}/g, '/');
     if (!normalized || normalized.startsWith('/')) return null;
     const segments = normalized.split('/');
     if (segments.some((segment) => !segment || segment === '.' || segment === '..')) return null;
@@ -52,19 +77,20 @@ export function normalizeWorkspaceFileCandidate(rawCandidate) {
     return {
         display,
         path: normalized,
+        rootRelative,
         line: locationMatch ? Number.parseInt(locationMatch[1], 10) : null,
         column: locationMatch?.[2] ? Number.parseInt(locationMatch[2], 10) : null,
     };
 }
 
-function pushMatches(text, regex, groupIndex, matches) {
+function pushMatches(text, regex, groupIndex, matches, options) {
     regex.lastIndex = 0;
     let match;
     while ((match = regex.exec(text)) !== null) {
         const value = match[groupIndex];
         const offset = match[0].indexOf(value);
         const start = match.index + Math.max(0, offset);
-        const normalized = normalizeWorkspaceFileCandidate(value);
+        const normalized = normalizeWorkspaceFileCandidate(value, options);
         if (!normalized) continue;
         matches.push({
             ...normalized,
@@ -75,20 +101,36 @@ function pushMatches(text, regex, groupIndex, matches) {
     }
 }
 
-export function findWorkspaceFileCandidates(text, { allowWholeTextWithSpaces = false } = {}) {
+export function findWorkspaceFileCandidates(text, { allowWholeTextWithSpaces = false, workspaceRoot = '' } = {}) {
     const input = String(text || '');
     if (!input) return [];
     const matches = [];
+    const options = { workspaceRoot };
+    const absoluteRanges = [...input.matchAll(ABSOLUTE_FILE_RE)].map((match) => {
+        const start = match.index + match[0].indexOf(match[1]);
+        return { start, end: start + match[1].length };
+    });
 
-    pushMatches(input, QUOTED_FILE_RE, 2, matches);
-    pushMatches(input, BARE_FILE_RE, 1, matches);
-    pushMatches(input, SPECIAL_FILE_RE, 1, matches);
+    const root = normalizeWorkspaceRoot(workspaceRoot);
+    if (root) {
+        // Match the trusted prefix literally: host directories may contain
+        // spaces, quotes, backslashes, or punctuation outside the bare grammar.
+        const escapedRoot = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const rootedFileRe = new RegExp(
+            `(?:^|[\\s([{<"'])(${escapedRoot}/(?:[\\p{L}\\p{N}_@+.-]+/)*(?:[\\p{L}\\p{N}_@+.-]+\\.(?:${EXTENSION_PATTERN})|README|LICENSE|Dockerfile|Makefile)(?::\\d+(?::\\d+)?)?)(?=$|[\\s)\\]}>.,'";!?])`,
+            'giu',
+        );
+        pushMatches(input, rootedFileRe, 1, matches, options);
+    }
+    pushMatches(input, QUOTED_FILE_RE, 2, matches, options);
+    pushMatches(input, BARE_FILE_RE, 1, matches, options);
+    pushMatches(input, SPECIAL_FILE_RE, 1, matches, options);
 
     if (allowWholeTextWithSpaces) {
         const trimmed = input.trim();
         const fullPathRe = new RegExp(`\\.(?:${EXTENSION_PATTERN})(?::\\d+(?::\\d+)?)?$`, 'iu');
         if (trimmed.length <= 240 && fullPathRe.test(trimmed)) {
-            const normalized = normalizeWorkspaceFileCandidate(trimmed);
+            const normalized = normalizeWorkspaceFileCandidate(trimmed, options);
             if (normalized) {
                 const start = input.indexOf(trimmed);
                 matches.push({
@@ -106,6 +148,7 @@ export function findWorkspaceFileCandidates(text, { allowWholeTextWithSpaces = f
     let occupiedUntil = -1;
     for (const match of matches) {
         if (match.start < occupiedUntil) continue;
+        if (absoluteRanges.some((range) => match.start > range.start && match.end <= range.end)) continue;
         deduplicated.push(match);
         occupiedUntil = match.end;
     }
@@ -118,11 +161,11 @@ function normalizeRelativeBase(value) {
         .replace(/^\/+|\/+$/g, '');
 }
 
-export function buildWorkspaceFileUrl(filePath, workspaceBase = '') {
-    const normalized = normalizeWorkspaceFileCandidate(filePath);
-    if (!normalized) return null;
+function workspaceFileHref(normalized, workspaceBase) {
     const base = normalizeRelativeBase(workspaceBase);
+    // A path proven beneath the workspace root is already root-relative.
     const relativePath = base
+        && !normalized.rootRelative
         && normalized.path !== base
         && !normalized.path.startsWith(`${base}/`)
         ? `${base}/${normalized.path}`
@@ -134,8 +177,13 @@ export function buildWorkspaceFileUrl(filePath, workspaceBase = '') {
     return `/workspace-files/${encoded}`;
 }
 
-export function workspaceFilePreviewKind(filePath) {
-    const normalized = normalizeWorkspaceFileCandidate(filePath);
+export function buildWorkspaceFileUrl(filePath, workspaceBase = '', { workspaceRoot = '' } = {}) {
+    const normalized = normalizeWorkspaceFileCandidate(filePath, { workspaceRoot });
+    return normalized ? workspaceFileHref(normalized, workspaceBase) : null;
+}
+
+export function workspaceFilePreviewKind(filePath, { workspaceRoot = '' } = {}) {
+    const normalized = normalizeWorkspaceFileCandidate(filePath, { workspaceRoot });
     if (!normalized) return 'unknown';
     const name = normalized.path.split('/').pop() || '';
     const dotIndex = name.lastIndexOf('.');
@@ -167,22 +215,38 @@ function isInlineCodeNode(node) {
         && String(parent?.parentElement?.tagName || '').toUpperCase() !== 'PRE';
 }
 
-function isKnownWorkspaceFile(fileIndex, filePath, workspaceBase) {
-    if (!fileIndex || typeof fileIndex.has !== 'function') return false;
-    const normalized = normalizeWorkspaceFileCandidate(filePath);
-    if (!normalized) return false;
-    if (fileIndex.has(normalized.path)) return true;
+function isKnownNormalizedFile(fileIndex, normalized, workspaceBase) {
+    if (!fileIndex || typeof fileIndex.has !== 'function' || !normalized) return false;
     const base = normalizeRelativeBase(workspaceBase);
+    // The index is relative to the current base, so a root-relative path is
+    // known only when it lies beneath that base.
+    if (normalized.rootRelative && base) {
+        return normalized.path.startsWith(`${base}/`)
+            && fileIndex.has(normalized.path.slice(base.length + 1));
+    }
+    if (fileIndex.has(normalized.path)) return true;
     if (base && normalized.path.startsWith(`${base}/`)) {
         return fileIndex.has(normalized.path.slice(base.length + 1));
     }
     return false;
 }
 
+function isKnownWorkspaceFile(fileIndex, filePath, workspaceBase, workspaceRoot = '') {
+    return isKnownNormalizedFile(
+        fileIndex,
+        normalizeWorkspaceFileCandidate(filePath, { workspaceRoot }),
+        workspaceBase,
+    );
+}
+
+function autoAnchorFile(anchor) {
+    const path = anchor.dataset?.wcFilePath || '';
+    return path ? { path, rootRelative: anchor.dataset?.wcFileRootRelative === 'true' } : null;
+}
+
 function createFileAnchor(documentRef, match, workspaceBase, fileIndex) {
-    if (!isKnownWorkspaceFile(fileIndex, match.path, workspaceBase)) return null;
-    const href = buildWorkspaceFileUrl(match.path, workspaceBase);
-    if (!href) return null;
+    if (!isKnownNormalizedFile(fileIndex, match, workspaceBase)) return null;
+    const href = workspaceFileHref(match, workspaceBase);
     const anchor = documentRef.createElement('a');
     anchor.href = href;
     anchor.className = 'wa-workspace-file-link';
@@ -190,6 +254,7 @@ function createFileAnchor(documentRef, match, workspaceBase, fileIndex) {
     anchor.dataset.wcFile = 'true';
     anchor.dataset.wcAutoFile = 'true';
     anchor.dataset.wcFilePath = match.path;
+    if (match.rootRelative) anchor.dataset.wcFileRootRelative = 'true';
     if (match.line !== null) anchor.dataset.wcFileLine = String(match.line);
     if (match.column !== null) anchor.dataset.wcFileColumn = String(match.column);
     anchor.title = `Preview ${match.path}`;
@@ -212,14 +277,13 @@ function reconcileAutoAnchors(container, { workspaceBase, fileIndex }) {
     const anchors = container.querySelectorAll?.('a[data-wc-auto-file="true"]') || [];
     for (const anchor of anchors) {
         if (anchor.dataset?.wcAutoFile !== 'true') continue;
-        const filePath = anchor.dataset?.wcFilePath || '';
-        if (isKnownWorkspaceFile(fileIndex, filePath, workspaceBase)) continue;
+        if (isKnownNormalizedFile(fileIndex, autoAnchorFile(anchor), workspaceBase)) continue;
         const text = container.ownerDocument.createTextNode(anchor.textContent || '');
         anchor.parentNode?.replaceChild?.(text, anchor);
     }
 }
 
-function enhanceExistingAnchors(container, { workspaceBase, webchatBasePath, fileIndex }) {
+function enhanceExistingAnchors(container, { workspaceBase, workspaceRoot, webchatBasePath, fileIndex }) {
     const anchors = container.querySelectorAll?.('a[data-wc-link="true"]') || [];
     for (const anchor of anchors) {
         if (anchor.dataset?.wcAutoFile === 'true') continue;
@@ -239,17 +303,21 @@ function enhanceExistingAnchors(container, { workspaceBase, webchatBasePath, fil
                 const base = `${String(webchatBasePath || '/webchat').replace(/\/+$/, '')}/`;
                 if (url.origin === window.location.origin && url.pathname.startsWith(base)) {
                     candidate = decodeURIComponent(url.pathname.slice(base.length));
+                } else if (url.origin === window.location.origin) {
+                    // Markdown turns an absolute filesystem reference into a
+                    // same-origin URL. Admit it through the same trusted root.
+                    candidate = decodeURIComponent(url.pathname);
                 }
             }
         } catch (_) {
             continue;
         }
-        if (workspaceFilePreviewKind(candidate) === 'unknown') continue;
-        if (!isKnownWorkspaceFile(fileIndex, candidate, workspaceBase)) {
+        if (workspaceFilePreviewKind(candidate, { workspaceRoot }) === 'unknown') continue;
+        if (!isKnownWorkspaceFile(fileIndex, candidate, workspaceBase, workspaceRoot)) {
             restoreExistingAnchor(anchor);
             continue;
         }
-        const href = buildWorkspaceFileUrl(candidate, alreadyWorkspaceRelative ? '' : workspaceBase);
+        const href = buildWorkspaceFileUrl(candidate, alreadyWorkspaceRelative ? '' : workspaceBase, { workspaceRoot });
         if (!href) continue;
         if (anchor.dataset.wcFileEnhanced !== 'true') {
             anchor.dataset.wcOriginalHref = anchor.getAttribute?.('href') || anchor.href;
@@ -257,19 +325,20 @@ function enhanceExistingAnchors(container, { workspaceBase, webchatBasePath, fil
         anchor.href = href;
         anchor.dataset.wcFile = 'true';
         anchor.dataset.wcFileEnhanced = 'true';
-        anchor.dataset.wcFilePath = normalizeWorkspaceFileCandidate(candidate)?.path || candidate;
+        anchor.dataset.wcFilePath = normalizeWorkspaceFileCandidate(candidate, { workspaceRoot })?.path || candidate;
         anchor.classList?.add?.('wa-workspace-file-link');
     }
 }
 
 export function enhanceWorkspaceFileLinks(container, {
     workspaceBase = '',
+    workspaceRoot = '',
     webchatBasePath = '/webchat',
     fileIndex = null,
 } = {}) {
     if (!container || !container.ownerDocument) return 0;
     reconcileAutoAnchors(container, { workspaceBase, fileIndex });
-    enhanceExistingAnchors(container, { workspaceBase, webchatBasePath, fileIndex });
+    enhanceExistingAnchors(container, { workspaceBase, workspaceRoot, webchatBasePath, fileIndex });
 
     const documentRef = container.ownerDocument;
     const walker = documentRef.createTreeWalker(container, 4);
@@ -283,6 +352,7 @@ export function enhanceWorkspaceFileLinks(container, {
         const text = textNode.nodeValue || '';
         const matches = findWorkspaceFileCandidates(text, {
             allowWholeTextWithSpaces: isInlineCodeNode(textNode),
+            workspaceRoot,
         });
         if (!matches.length) continue;
 

@@ -9,10 +9,13 @@ import {
     parseAndValidateNativeProbeOutput,
 } from '../../core-services/webtty/native-runtime.mjs';
 
+// Static image metadata. An immutable image cannot carry the per-workspace
+// path, so it has a neutral working directory and no workspace root; each
+// created Box receives both from the host-selected workspace.
 export const IMAGE_CONTRACT = Object.freeze({
     user: 'podman',
     home: '/home/podman',
-    workdir: '/workspace',
+    workdir: '/',
     path: '/opt/ploinky/bin:/usr/local/bin:/usr/bin',
     entrypoint: '/usr/local/bin/ploinky-box-entrypoint',
     command: Object.freeze([]),
@@ -21,7 +24,6 @@ export const IMAGE_CONTRACT = Object.freeze({
         PATH: '/opt/ploinky/bin:/usr/local/bin:/usr/bin',
         USER: 'podman',
         HOME: '/home/podman',
-        PLOINKY_WORKSPACE_ROOT: '/workspace',
         PLOINKY_DISABLE_HOST_SANDBOX: '1',
         container: 'oci',
         _CONTAINERS_USERNS_CONFIGURED: '',

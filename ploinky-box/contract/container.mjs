@@ -33,6 +33,11 @@ import {
 import { IMAGE_CONTRACT } from './image.mjs';
 import { normalizeImageId } from './image-id.mjs';
 import { assertBoxNetworkMode } from './network.mjs';
+import {
+    assertBoxWorkspaceRoot,
+    boxWorkspaceEnvironment,
+    boxWorkspaceMount,
+} from './workspace-root.mjs';
 
 const BOX_OWNERSHIP_LABEL_PREFIX = 'io.assistos.ploinky-box.';
 const INCOMPATIBLE_BOX_GUIDANCE = "; back up any Box-only data, then run 'ploinky stop'"
@@ -137,6 +142,7 @@ export function normalizeContainerRuntime(record) {
         configuredImage: String(config?.Image ?? '').trim(),
         networkMode: String(hostConfig?.NetworkMode ?? ''),
         user: String(config?.User ?? ''),
+        workingDir: String(config?.WorkingDir ?? ''),
         environment: envMap(config?.Env),
         createCommand: Array.isArray(config?.CreateCommand)
             ? config.CreateCommand.map(String)
@@ -310,6 +316,7 @@ export function validateContainerConfiguration(containerHandle, {
     networkMode,
 }) {
     assertRouterBindingStateConfined(identity);
+    const workspaceRoot = assertBoxWorkspaceRoot(identity?.workspaceRoot);
     const publication = validateContainerPublications(containerHandle, hostPort, mediaHostPort, routerBinding);
     const runtime = containerHandle.runtime;
     assertBoxNetworkMode(runtime, networkMode);
@@ -375,6 +382,7 @@ export function validateContainerConfiguration(containerHandle, {
     }
     const expectedEnvironment = {
         ...IMAGE_CONTRACT.environment,
+        ...boxWorkspaceEnvironment(workspaceRoot),
         ...agentLibBoxEnv(agentLibContract),
         PLOINKY_PUBLIC_BIND: '0.0.0.0',
         PLOINKY_PUBLIC_AUTHORITY: routerBindingPublicAuthority({
@@ -394,6 +402,11 @@ export function validateContainerConfiguration(containerHandle, {
         || JSON.stringify(Object.fromEntries(Object.entries(observedEnvironment).sort()))
         !== JSON.stringify(Object.fromEntries(Object.entries(expectedEnvironment).sort()))) {
         throw publicationError('Owned Box environment allowlist is incompatible');
+    }
+    if (runtime.workingDir !== workspaceRoot) {
+        throw publicationError(
+            `Owned Box working directory is not its workspace root${INCOMPATIBLE_BOX_GUIDANCE}`,
+        );
     }
     const expectedSecurityOptions = [
         'unmask=all',
@@ -458,16 +471,18 @@ export function validateContainerConfiguration(containerHandle, {
         );
     }
     // Local AgentLib sources add two read-only binds to the four workspace
-    // binds. Image bundles require neither source nor alias binds.
+    // binds. Image bundles require neither source nor alias binds. The one
+    // writable workspace bind is the selected root at its own absolute path.
     // Podman currently reports the /tmp tmpfs through
     // HostConfig.Tmpfs and may additionally expose the same mount in Mounts; no
     // named, anonymous, or unrelated mount is accepted.
+    const workspaceMount = boxWorkspaceMount(workspaceRoot);
     const expectedMounts = {
         '/opt/ploinky': { source: repositoryRoot, rw: false },
-        '/workspace': { source: identity.workspaceRoot, rw: true },
+        [workspaceMount.destination]: { source: workspaceMount.source, rw: workspaceMount.rw },
         [BOX_DATA_MOUNTS.dependencies]: { source: identity.dataPaths.dependencies, rw: true },
         [BOX_DATA_MOUNTS.images]: { source: identity.dataPaths.images, rw: true },
-        ...expectedAgentLibMounts(agentLibContract),
+        ...expectedAgentLibMounts(agentLibContract, workspaceRoot),
     };
     if (!Array.isArray(runtime.mounts)) {
         throw publicationError('Owned Box mount set is incompatible');

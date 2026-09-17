@@ -45,8 +45,9 @@ export async function ownershipGuard(evidenceRoot, { sources = true } = {}) {
     assert.deepEqual(box.NetworkSettings.Ports, expected.ports);
     assert.deepEqual(Object.keys(box.NetworkSettings.Ports).sort(), ['7882/udp', '8080/tcp']);
     assert.deepEqual(box.NetworkSettings.Ports['8080/tcp'], [{ HostIp: '127.0.0.1', HostPort: '8080' }]);
-    assert.ok(box.Mounts.some(m => m.Destination === '/workspace' && m.Source === WORKSPACE));
-    for (const destination of ['/opt/ploinky', '/workspace/achillesAgentLib', '/opt/ploinky-agentlib']) {
+    // The Box mounts the workspace writable at the workspace's own absolute path.
+    assert.ok(box.Mounts.some(m => m.Destination === WORKSPACE && m.Source === WORKSPACE && m.RW === true));
+    for (const destination of ['/opt/ploinky', path.join(WORKSPACE, 'achillesAgentLib'), '/opt/ploinky-agentlib']) {
         assert.ok(box.Mounts.some(m => m.Destination === destination && m.RW === false), 'Required source mount must remain read-only');
     }
     if (sources) for (const repo of pins.repositories) {

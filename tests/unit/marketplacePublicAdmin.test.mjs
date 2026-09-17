@@ -158,3 +158,15 @@ test('Marketplace includes valid unregistered workspace skills without a remote 
     assert.deepEqual(repo.skillSource, { source: root, origin: 'workspace' });
     assert.equal(res.body.marketplace.repositories.filter(item => item.name === 'DocumentationSkills').length, 1);
 });
+
+test('Marketplace labels a workspace agent checkout relative to the workspace', async () => {
+    const checkout = path.join(workspace, 'Local Agents Checkout');
+    fs.mkdirSync(path.join(checkout, 'worker'), { recursive: true });
+    fs.writeFileSync(path.join(checkout, 'worker', 'manifest.json'), JSON.stringify({ container: 'node:22' }));
+    const res = await request({ method: 'GET' });
+    assert.equal(res.status, 200);
+    const repo = res.body.marketplace.repositories.find(item => item.name === 'Local Agents Checkout');
+    assert.equal(repo.workspacePath, './Local Agents Checkout');
+    assert.equal(repo.displayName, './Local Agents Checkout');
+    assert.equal(JSON.stringify(res.body.marketplace.repositories).includes('"/workspace/'), false);
+});

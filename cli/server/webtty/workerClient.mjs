@@ -24,9 +24,10 @@ export class WebttyWorkerClient extends EventEmitter {
     constructor({
         terminalId,
         marker,
+        workspaceRoot,
         workerPath = DEFAULT_WEBTTY_WORKER_PATH,
         forkImpl = forkDefault,
-        workerEnv = buildWorkerEnvironment(),
+        workerEnv = buildWorkerEnvironment(process.env, { workspaceRoot }),
         readProcessIdentity = readLinuxProcessIdentity,
         startupTimeoutMs = 10_000,
         closeGraceMs = 2_000,

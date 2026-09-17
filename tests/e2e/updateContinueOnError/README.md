@@ -11,7 +11,7 @@ node tests/e2e/updateContinueOnError/run.mjs \
 
 The artifact directory must not exist, its parent must already exist, and it must be outside the workspace. `--ploinky` defaults to this checkout's `bin/ploinky`. The default command timeout is 20 minutes; `--timeout-ms` accepts 1 second through 1 hour. Fixture Git commits use the human name and email configured for the selected candidate checkout.
 
-The runner prepares uniquely named local sources under `.update-e2e-<runId>`, skills-only managed caches, and four visible manifest folders. It seeds the prior installed `main` skill and a cache on `main`, then changes the manifest to request `feature`. Cache origins use `/workspace/...`, the same workspace mount used by the actual Box. It invokes the real outer `ploinky update` exactly once.
+The runner prepares uniquely named local sources under `.update-e2e-<runId>`, skills-only managed caches, and four visible manifest folders. It seeds the prior installed `main` skill and a cache on `main`, then changes the manifest to request `feature`. Cache origins use the workspace paths themselves, because the actual Box mounts the workspace at the same absolute path. It invokes the real outer `ploinky update` exactly once.
 
 The gate requires exit status zero and exactly three detailed errors: a detached managed checkout, a manifest with a conflicting source URL, and a manifest requesting a missing skill. It checks that a later checkout advances, the shared skill changes to the feature version, the conflicting cache retains its origin and commit, and a later valid manifest installs. Any unrelated update failure also fails the gate.
 

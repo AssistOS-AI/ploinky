@@ -324,8 +324,10 @@ function displayText(value, field) {
     return value;
 }
 
+// The Box shell starts in the resolved directory itself, so its display is the
+// exact path the worker spawns in and the shell reports.
 function boxTarget(directory) {
-    const cwdDisplay = directory.relativePath ? `/workspace/${directory.relativePath}` : '/workspace';
+    const cwdDisplay = directory.absolutePath;
     return Object.freeze({
         kind: 'box',
         directory,
@@ -509,7 +511,8 @@ function disambiguateAgentDisplays(targets) {
 
 export class TerminalTargetResolver {
     constructor({
-        directoryResolver = (requested) => resolveWorkspaceDirectory(requested),
+        workspaceRoot,
+        directoryResolver = (requested) => resolveWorkspaceDirectory(requested, { workspaceRoot }),
         inspectContainer = inspectExactTerminalContainer,
         workspaceIdentity = workspaceNetworkIdentity,
         supportedRuntimes = DEFAULT_SUPPORTED_RUNTIMES,

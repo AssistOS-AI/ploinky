@@ -1,4 +1,4 @@
-export function formatOuterRuntimeBanner({ runtimeName, user, cwd = '/workspace' }) {
+export function formatOuterRuntimeBanner({ runtimeName, user, cwd }) {
     return [
         "[ploinky] Entering outer runtime '" + runtimeName + "'",
         '[ploinky] user=' + user + ' cwd=' + cwd + '; exit returns to the previous prompt',

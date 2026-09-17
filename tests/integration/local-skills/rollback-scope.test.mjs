@@ -106,7 +106,7 @@ for (const differentLaunch of [false, true]) {
         assert.equal(calls[1].containerId, priorContainer);
         assert.deepEqual(calls[1].argv, ['start', 'fixture-agent', '8080']);
         assert.deepEqual(calls[1].skillScopeEnv, expectedScope,
-            'Rollback must restore the nested scope; absent metadata defaults to the whole /workspace.');
+            'Rollback must restore the nested scope; absent metadata defaults to the whole workspace.');
         assert.deepEqual(readGraphSkillScope(identity), expectedScope, 'The failed caller cannot overwrite the admitted scope.');
     });
 }

@@ -33,14 +33,26 @@ const __dirname = path.dirname(__filename);
 
 const appName = 'webchat';
 const fallbackAppPath = path.join(__dirname, '..', '..', appName);
+// Workspace paths are the selected host path inside the Box and may contain
+// any character a directory name allows, so they are escaped as attribute text.
+function escapeHtmlAttribute(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
 function renderTemplate(filenames, replacements) {
     const target = staticSrv.resolveFirstAvailable(appName, fallbackAppPath, filenames);
     if (!target) return null;
-    let html = fs.readFileSync(target, 'utf8');
-    for (const [key, value] of Object.entries(replacements || {})) {
-        html = html.split(key).join(String(value ?? ''));
-    }
-    return html;
+    const html = fs.readFileSync(target, 'utf8');
+    // Values can themselves contain template-looking directory names. Only
+    // replace placeholders from the original template, never inserted values.
+    return html.replace(/__[A-Z_]+__/g, (key) => (
+        Object.hasOwn(replacements || {}, key) ? String(replacements[key] ?? '') : key
+    ));
 }
 
 export async function handleWebChat(req, res, appConfig, appState) {
@@ -156,7 +168,8 @@ export async function handleWebChat(req, res, appConfig, appState) {
             '__RUNTIME__': effectiveConfig.runtime || 'local',
             '__BASE_PATH__': `/${appName}`,
             '__AGENT_QUERY__': agentQuery,
-            '__WORKDIR__': workspaceBase.base,
+            '__WORKDIR__': escapeHtmlAttribute(workspaceBase.base),
+            '__WORKSPACE_ROOT__': escapeHtmlAttribute(workspaceBase.root),
             '__WORKSPACE_BASE__': encodeURIComponent(workspaceBase.relativeBase || ''),
         });
         if (html) {

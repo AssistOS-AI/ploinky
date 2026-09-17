@@ -20,7 +20,7 @@ const REPOSITORY_ROOT = path.resolve(import.meta.dirname, '../..');
 
 function queryInBox(harness, containerId, argv, timeoutMs = 120_000) {
     return harness.runner.query('podman', [
-        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
+        'container', 'exec', '--user', 'podman', '--workdir', harness.identity.workspaceRoot,
         containerId, ...argv,
     ], { timeoutMs });
 }

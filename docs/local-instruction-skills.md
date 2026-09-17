@@ -9,10 +9,10 @@ The host command captures its original working directory before entering the Box
 | Variable | Value |
 | --- | --- |
 | `PLOINKY_SKILL_SCOPE_VERSION` | `1` |
-| `PLOINKY_SKILL_SCOPE` | `/workspace/project` |
+| `PLOINKY_SKILL_SCOPE` | `<workspace>/project`, at the same path inside the Box |
 | `PLOINKY_HOST_LAUNCH_CWD` | Canonical original host directory; provenance only |
 
-These values come from the host invocation, after manifest/profile/resource environment processing. A browser directory or conversation execution directory cannot set them. The Box still enters `/workspace`; `WORKSPACE_PATH` and a conversation's saved execution cwd remain separate. No filesystem grant, mount, Box identity, or same-scope reuse restriction is added.
+These values come from the host invocation, after manifest/profile/resource environment processing. A browser directory or conversation execution directory cannot set them. The Box still enters the workspace root; `WORKSPACE_PATH` and a conversation's saved execution cwd remain separate. No filesystem grant, mount, Box identity, or same-scope reuse restriction is added.
 
 Separate invocations may attach CLI processes with different bounded scopes in the same Box and even the same running agent container. An existing HTTP service retains its activation environment. Consumers persist the trusted scope with their conversation policy; changing a later process environment must not rewrite an existing conversation's policy. A later CLI invocation does not change the activation scope of an already-running HTTP service. There is no browser-supplied scope override in this contract.
 
@@ -20,7 +20,7 @@ Legacy direct `ploinky-local` or library callers without host metadata use the a
 
 Successful full-graph activation saves its scope in `.ploinky/graph-skill-scope.json` under the existing workspace mutation lock. Start, full restart, and update with restart advance this record only after health and AgentLib admission checks succeed. Plain update and ad-hoc commands leave it unchanged. A failed replacement captures and restores the preceding graph's saved scope even when the failed command was launched from another directory; the new caller's scope is never substituted for it.
 
-The saved record contains a workspace identity and a relative launch directory, with no credentials. Rollback checks the directory again before starting the old graph. Missing legacy metadata, a removed or redirected launch directory, or invalid saved state cannot silently expand discovery to `/workspace`. A successful explicit activation migrates missing metadata. If a legacy graph has no record and a candidate fails, Ploinky restores the outer Box but refuses to guess the old graph's scope; run `ploinky start AGENT` from the intended launch directory to establish it. Malformed or cross-workspace records are rejected before mutation.
+The saved record contains a workspace identity and a relative launch directory, with no credentials. Rollback checks the directory again before starting the old graph. Missing legacy metadata, a removed or redirected launch directory, or invalid saved state cannot silently expand discovery to the whole workspace. A successful explicit activation migrates missing metadata. If a legacy graph has no record and a candidate fails, Ploinky restores the outer Box but refuses to guess the old graph's scope; run `ploinky start AGENT` from the intended launch directory to establish it. Malformed or cross-workspace records are rejected before mutation.
 
 ## Compatibility installation
 

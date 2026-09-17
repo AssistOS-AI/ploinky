@@ -73,7 +73,7 @@ function bind(source, destination, rw = true) {
 }
 
 function inspectedAgent(root, containerName, record) {
-    const raw = inspected([bind(root, '/workspace', true)], {
+    const raw = inspected([bind(root, root, true)], {
         Id: record.containerId,
         Name: `/${containerName}`,
     });
@@ -202,7 +202,7 @@ test('mount translation chooses the longest source and exposes effective read-on
     const { root, selected } = fixture(t);
     const nestedSource = path.join(root, 'projects');
     const mounts = projectTerminalContainerInspect(inspected([
-        bind(root, '/workspace', true),
+        bind(root, root, true),
         bind(nestedSource, '/project-data', false),
     ])).mounts;
     const mapping = await translateWorkspaceDirectoryToMount(fs.realpathSync(selected), mounts);
@@ -230,8 +230,8 @@ test('conflicting alias access and destination shadows fail closed', async (t) =
     const { root, selected } = fixture(t);
     const cases = [
         [
-            bind(root, '/workspace-a', true),
-            bind(root, '/workspace-b', false),
+            bind(root, '/alias-a', true),
+            bind(root, '/alias-b', false),
         ],
         [
             bind(root, '/data', true),
@@ -239,15 +239,15 @@ test('conflicting alias access and destination shadows fail closed', async (t) =
             { Type: 'volume', Source: 'named', Destination: '/root/projects', RW: true, Name: 'named' },
         ],
         [
-            bind(root, '/workspace', true),
-            { Type: 'volume', Source: 'named', Destination: '/workspace/projects', RW: true, Name: 'named' },
+            bind(root, root, true),
+            { Type: 'volume', Source: 'named', Destination: path.join(root, 'projects'), RW: true, Name: 'named' },
         ],
         [
-            bind(root, '/workspace', true),
-            bind(path.join(root, '.ploinky'), '/workspace/projects', true),
+            bind(root, root, true),
+            bind(path.join(root, '.ploinky'), path.join(root, 'projects'), true),
         ],
         [
-            bind(root, '/workspace', true),
+            bind(root, root, true),
             { Type: 'bind', Source: root, Destination: '/bad', Name: '', RW: undefined },
         ],
     ];
@@ -271,7 +271,7 @@ test('discovery returns Box first and only exact current-generation live mount p
     const calls = [];
     const inspectContainer = async (runtime, id) => {
         calls.push([runtime, id]);
-        return inspected([bind(root, '/workspace', true)]);
+        return inspected([bind(root, root, true)]);
     };
     const targetResolver = resolver(root, inspectContainer);
     const plan = routePlan({
@@ -286,8 +286,8 @@ test('discovery returns Box first and only exact current-generation live mount p
     });
     assert.equal(result.agentTargetsAvailable, true);
     assert.deepEqual(result.targets.map((target) => target.kind), ['box', 'agent']);
-    assert.equal(result.targets[0].cwdDisplay, '/workspace/projects/demo');
-    assert.equal(result.targets[1].translatedCwd, '/workspace/projects/demo');
+    assert.equal(result.targets[0].cwdDisplay, fs.realpathSync(path.join(root, 'projects', 'demo')));
+    assert.equal(result.targets[1].translatedCwd, path.join(root, 'projects', 'demo'));
     assert.equal(result.targets[1].access, 'rw');
     assert.deepEqual(calls, [['podman', CONTAINER_ID]]);
 });
@@ -335,7 +335,7 @@ test('a real adapter timeout omits only that agent and retains another proven ta
                 callback(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT', killed: true }), '', '');
                 return;
             }
-            callback(null, JSON.stringify([inspected([bind(root, '/workspace', true)])]), '');
+            callback(null, JSON.stringify([inspected([bind(root, root, true)])]), '');
         },
     }));
     const result = await targetResolver.discover({
@@ -349,7 +349,7 @@ test('a real adapter timeout omits only that agent and retains another proven ta
 
 test('each exact identity, ownership, liveness, and top-level mount falsifier omits the agent', async (t) => {
     const { root } = fixture(t);
-    const validMount = bind(root, '/workspace', true);
+    const validMount = bind(root, root, true);
     const cases = [
         inspected([validMount], { Id: 'd'.repeat(64) }),
         inspected([validMount], { Name: '/wrong-name' }),
@@ -367,9 +367,9 @@ test('each exact identity, ownership, liveness, and top-level mount falsifier om
         inspected([validMount], {
             Config: { ...inspected([]).Config, User: 'a'.repeat(129) },
         }),
-        inspected([{ Type: 'volume', Source: 'named', Destination: '/workspace', RW: true, Name: 'named' }]),
-        inspected([{ Type: 'tmpfs', Source: '', Destination: '/workspace', RW: true, Name: '' }]),
-        inspected([{ Type: 'bind', Source: path.join(root, 'not-a-directory'), Destination: '/workspace', RW: true, Name: '' }]),
+        inspected([{ Type: 'volume', Source: 'named', Destination: root, RW: true, Name: 'named' }]),
+        inspected([{ Type: 'tmpfs', Source: '', Destination: root, RW: true, Name: '' }]),
+        inspected([{ Type: 'bind', Source: path.join(root, 'not-a-directory'), Destination: root, RW: true, Name: '' }]),
     ];
     for (const raw of cases) {
         const targetResolver = resolver(root, async () => raw);
@@ -384,14 +384,14 @@ test('each exact identity, ownership, liveness, and top-level mount falsifier om
 
 test('create-time revalidation rejects a target whose configured user grows past the protocol bound', async (t) => {
     const { root } = fixture(t);
-    const valid = inspected([bind(root, '/workspace', true)], {
+    const valid = inspected([bind(root, root, true)], {
         Config: { ...inspected([]).Config, User: '1000:1000' },
     });
     let inspections = 0;
     const targetResolver = resolver(root, async () => {
         inspections += 1;
         if (inspections === 1) return valid;
-        return inspected([bind(root, '/workspace', true)], {
+        return inspected([bind(root, root, true)], {
             Config: { ...inspected([]).Config, User: 'a'.repeat(129) },
         });
     });
@@ -605,7 +605,7 @@ test('discovery budget retains completed agents while aborting a slow exact insp
         }),
     };
     const targetResolver = resolver(root, (_runtime, id, { signal }) => {
-        if (id === CONTAINER_ID) return Promise.resolve(inspected([bind(root, '/workspace', true)]));
+        if (id === CONTAINER_ID) return Promise.resolve(inspected([bind(root, root, true)]));
         return new Promise((resolve, reject) => {
             signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
         });
@@ -633,7 +633,7 @@ test('generation replacement during discovery rejects the complete result', asyn
         checks += 1;
         return checks === 1;
     });
-    const targetResolver = resolver(root, async () => inspected([bind(root, '/workspace', true)]));
+    const targetResolver = resolver(root, async () => inspected([bind(root, root, true)]));
     await assert.rejects(
         targetResolver.discover({ routePlan: plan, requestedDirectory: '' }),
         (error) => error.code === 'WEBTTY_TARGET_GENERATION_STALE',
@@ -642,16 +642,16 @@ test('generation replacement during discovery rejects the complete result', asyn
 
 test('create-time revalidation repeats membership, identity, directory, mount, and access checks', async (t) => {
     const { root } = fixture(t);
-    let live = inspected([bind(root, '/workspace', true)]);
+    let live = inspected([bind(root, root, true)]);
     const targetResolver = resolver(root, async () => live);
     const plan = routePlan({ [CONTAINER_NAME]: agentRecord() });
     const discovery = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
     const offered = discovery.targets[1];
     const accepted = await targetResolver.revalidate({ routePlan: plan, target: offered });
     assert.equal(accepted.containerId, CONTAINER_ID);
-    assert.equal(accepted.translatedCwd, '/workspace/projects/demo');
+    assert.equal(accepted.translatedCwd, path.join(root, 'projects', 'demo'));
 
-    live = inspected([bind(root, '/workspace', false)]);
+    live = inspected([bind(root, root, false)]);
     await assert.rejects(
         targetResolver.revalidate({ routePlan: plan, target: offered }),
         (error) => error.code === 'WEBTTY_TARGET_STALE',
@@ -666,7 +666,7 @@ test('create-time revalidation repeats membership, identity, directory, mount, a
 
 test('create-time directory identity rejects same-path replacement', async (t) => {
     const { root } = fixture(t);
-    const targetResolver = resolver(root, async () => inspected([bind(root, '/workspace', true)]));
+    const targetResolver = resolver(root, async () => inspected([bind(root, root, true)]));
     const plan = routePlan({});
     const discovery = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
     const selected = path.join(root, 'projects', 'demo');
@@ -692,7 +692,7 @@ test('create-time directory disappearance, file replacement, and symlink escape 
             const context = fixture(subtest);
             const targetResolver = resolver(
                 context.root,
-                async () => inspected([bind(context.root, '/workspace', true)]),
+                async () => inspected([bind(context.root, context.root, true)]),
             );
             const plan = routePlan({});
             const discovery = await targetResolver.discover({
@@ -712,7 +712,7 @@ test('create-time directory disappearance, file replacement, and symlink escape 
 test('create-time directory resolution preserves systemic provider failure classification', async (t) => {
     const { root } = fixture(t);
     let resolutions = 0;
-    const targetResolver = resolver(root, async () => inspected([bind(root, '/workspace', true)]), {
+    const targetResolver = resolver(root, async () => inspected([bind(root, root, true)]), {
         directoryResolver: (requested) => {
             resolutions += 1;
             if (resolutions > 1) {
@@ -728,5 +728,28 @@ test('create-time directory resolution preserves systemic provider failure class
     await assert.rejects(
         targetResolver.revalidate({ routePlan: plan, target: discovery.targets[0] }),
         (error) => error.code === 'WEBTTY_TARGET_PROVIDER_UNAVAILABLE',
+    );
+});
+
+test('Box targets resolve through the explicit workspace root and display the worker cwd', async (t) => {
+    const { root } = fixture(t);
+    const targetResolver = new TerminalTargetResolver({
+        workspaceRoot: root,
+        inspectContainer: async () => inspected([bind(root, root, true)]),
+        workspaceIdentity: () => ({ hash: WORKSPACE_HASH, canonical: root }),
+    });
+    const plan = routePlan({ [CONTAINER_NAME]: agentRecord() });
+    const discovery = await targetResolver.discover({ routePlan: plan, requestedDirectory: 'projects/demo' });
+    const [box, agent] = discovery.targets;
+    const selected = fs.realpathSync(path.join(root, 'projects', 'demo'));
+    // The display is the directory the worker spawns in, and a same-path agent
+    // grant presents that directory at the identical path.
+    assert.equal(box.directory.absolutePath, selected);
+    assert.equal(box.cwdDisplay, selected);
+    assert.equal(agent.translatedCwd, path.join(root, 'projects', 'demo'));
+    assert.equal(box.cwdDisplay.startsWith(`${fs.realpathSync(root)}/`), true);
+    await assert.rejects(
+        new TerminalTargetResolver({ inspectContainer: async () => null }).discover({ routePlan: plan, requestedDirectory: '' }),
+        (error) => error.code === 'WEBTTY_CWD_INVALID' && error.category === 'workspace-root',
     );
 });

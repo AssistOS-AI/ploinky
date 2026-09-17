@@ -115,16 +115,24 @@ test('staging initializes all sources, verifies bytes before activation, and is 
             engine: { name: 'podman' },
             containerId,
             runner,
+            workspaceRoot: fixture.identity.workspaceRoot,
         }), {
             staged: true,
             digest: candidate.digest,
         });
     }
 
+    const root = fixture.identity.workspaceRoot;
     const firstInitialize = calls.findIndex((call) => (
         call.includes('/opt/ploinky/ploinky-box/entrypoint/initialize-edge-routing.mjs')
-        && call.includes('PLOINKY_WORKSPACE_ROOT=/workspace')
+        && call.includes(`PLOINKY_WORKSPACE_ROOT=${root}`)
+        && call[call.indexOf('--workdir') + 1] === root
     ));
+    // Every staged path is the selected workspace path inside the Box.
+    for (const call of calls.filter((entry) => entry.includes('mkdir') || entry.includes('mv'))) {
+        assert.ok(call.at(-1).startsWith(`${root}/.ploinky/data/edge-routing`), call.join(' '));
+    }
+    assert.equal(calls.some((call) => call.some((value) => /(?:^|[:=])\/workspace(?:\/|$)/.test(value))), false);
     const firstCopy = calls.findIndex((call) => call.includes('cp'));
     const stagedDigest = calls.findIndex((call) => (
         call.includes('sha256sum')
@@ -170,7 +178,16 @@ test('digest mismatch never installs the candidate', (t) => {
         engine: 'podman',
         containerId: 'b'.repeat(64),
         runner,
+        workspaceRoot: fixture.identity.workspaceRoot,
     }), /changed before in-box staging completed/);
+    const staleCalls = calls.length;
+    assert.throws(() => stageWorkspaceEdgeDesired({
+        candidate,
+        engine: 'podman',
+        containerId: 'b'.repeat(64),
+        runner,
+    }), (error) => error.code === 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID');
+    assert.equal(calls.length, staleCalls, 'a missing workspace root fails before any in-Box command');
     assert.equal(calls.some((call) => call.includes('mv')), false);
     assert.ok(calls.some((call) => (
         call.includes('rm')

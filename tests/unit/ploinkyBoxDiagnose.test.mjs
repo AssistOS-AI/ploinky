@@ -36,6 +36,35 @@ test('missing host prerequisites produce a report and skip every mutating runtim
     assert.match(formatDiagnosticReport(report), /Install Podman/);
 });
 
+test('an unmountable workspace path fails its own check with same-path guidance', async (t) => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-diagnose-path-'));
+    t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+    const root = path.join(parent, 'pro:ject');
+    fs.mkdirSync(root);
+    const report = await diagnoseWorkspace({ cwd: root, env: {},
+        runner: { query() { assert.fail('No engine calls expected'); } },
+        hostChecks: () => ({ checks: [], engineUsable: false }),
+        runtimeChecks: () => assert.fail('Runtime probes must be blocked'),
+        repairAssessments: () => [],
+    });
+    const check = report.checks.find((entry) => entry.id === 'workspace.path');
+    assert.equal(check.status, 'fail');
+    assert.match(check.detail, /contains ':'/);
+    assert.match(check.next, /mounted at its own absolute path inside the Box/);
+    assert.equal(report.exitCode, 1);
+    assert.deepEqual(fs.readdirSync(root), []);
+
+    const ordinary = path.join(parent, 'ordinary project');
+    fs.mkdirSync(ordinary);
+    const passing = await diagnoseWorkspace({ cwd: ordinary, env: {},
+        runner: { query() { assert.fail('No engine calls expected'); } },
+        hostChecks: () => ({ checks: [], engineUsable: false }),
+        runtimeChecks: () => assert.fail('Runtime probes must be blocked'),
+        repairAssessments: () => [],
+    });
+    assert.equal(passing.checks.find((entry) => entry.id === 'workspace.path').status, 'pass');
+});
+
 test('diagnostic report preserves command exit details and redacts secrets and terminal escapes', () => {
     const commands = [];
     const runner = createDiagnosticRunner({ query: () => ({ ok: false, status: 125,

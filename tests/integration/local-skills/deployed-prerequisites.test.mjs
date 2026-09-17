@@ -18,7 +18,7 @@ async function fixture(t) {
     await fs.mkdir(path.join(directory, 'test-results'), { recursive: true });
     const box = {
         Id: 'a'.repeat(64), State: { Running: true, StartedAt: '2026-09-10T13:00:00.000Z' },
-        Mounts: [{ Type: 'bind', Source: workspace, Destination: '/workspace', RW: true }],
+        Mounts: [{ Type: 'bind', Source: workspace, Destination: workspace, RW: true }],
         NetworkSettings: { Ports: { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }] } },
         HostConfig: { PortBindings: { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '8080' }] } },
     };

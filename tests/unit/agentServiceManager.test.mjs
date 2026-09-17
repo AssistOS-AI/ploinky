@@ -20,6 +20,7 @@ import {
     resolveManagedAdoptionAgentCacheMount,
     stripReservedAndRestoreRuntimeRouterEnvFlags,
 } from '../../cli/sandbox/docker/agentServiceManager.js';
+import { PROBE_CONTROL_CONTAINER_ROOT } from '../../cli/sandbox/docker/healthProbes.js';
 import { getAgentCachePath } from '../../cli/utils/dependencies/dependencyCache.js';
 import { buildRouterEndpoint } from '../../cli/sandbox/routerPort.js';
 import { BOX_MARKER_CONTENT } from '../../ploinky-box/constants.mjs';
@@ -59,6 +60,67 @@ test('static workspace agents keep project output and private HOME on distinct b
         }]);
         assert.equal(args[args.indexOf('-w') + 1], '/root');
         assert.equal(new Set(mounts.map(mount => mount.destination)).size, mounts.length);
+    }
+});
+
+test('nested agents receive the Box workspace at its host path without broader grants', () => {
+    // Inside the Box the workspace keeps its host spelling, so agent binds use it verbatim.
+    const root = "/home/user/work space/proiect ăîș $(id) 'q'";
+    const agentLibGrant = {
+        sourceDir: `${root}/achillesAgentLib`,
+        runtimePath: '/opt/ploinky-agentlib',
+        mode: 'local',
+        fingerprint: 'a1'.repeat(32),
+        commit: '',
+        sourceIdHash: 'b2'.repeat(32),
+        namespaced: true,
+    };
+    const common = {
+        containerName: 'ploinky_agent',
+        envHash: 'hash',
+        agentLibMountPath: `${root}/.ploinky/runtime/Agent`,
+        codeMountPath: `${root}/.ploinky/runtime/code`,
+        codeMountMode: ':ro',
+        sharedDir: `${root}/.data/shared`,
+        healthProbeHostDir: `${root}/.ploinky/run/health-probes/agent`,
+        agentHomeDir: `${root}/.data/agentAlias`,
+        agentLibGrant,
+    };
+    for (const runtime of ['docker', 'podman']) {
+        for (const [mode, cwd, cwdMountTarget, workdir] of [
+            ['global', root, root, '/code'],
+            ['devel', `${root}/.ploinky/repos/repo`, `${root}/.ploinky/repos/repo`, '/code'],
+            ['isolated', root, '/root', '/root'],
+        ]) {
+            const args = buildPersistentAgentRunArgs({
+                ...common, runtime, containerWorkdir: workdir, cwd, cwdMountTarget,
+            });
+            const mounts = expectedBindMountsFromArgs(args);
+            const writable = mounts.filter(mount => mount.rw).map(mount => mount.destination).sort();
+            const expectedHome = mode === 'isolated' ? '/home/agent' : '/root';
+            assert.deepEqual(writable, [
+                PROBE_CONTROL_CONTAINER_ROOT, cwdMountTarget, expectedHome, '/shared',
+            ].sort(), mode);
+            assert.deepEqual(mounts.find(mount => mount.destination === cwdMountTarget), {
+                source: cwd, destination: cwdMountTarget, rw: true,
+            });
+            assert.deepEqual(mounts.find(mount => mount.destination === expectedHome), {
+                source: `${root}/.data/agentAlias`, destination: expectedHome, rw: true,
+            });
+            // Only a bind that exposes the selected AgentLib source gets a read-only shadow.
+            const aliases = mounts.filter(mount => mount.source === agentLibGrant.sourceDir
+                && mount.destination !== agentLibGrant.runtimePath);
+            const expectedAliases = {
+                global: [`${root}/achillesAgentLib`],
+                devel: [],
+                isolated: ['/root/achillesAgentLib'],
+            }[mode];
+            assert.deepEqual(aliases.map(mount => mount.destination), expectedAliases, mode);
+            assert.ok(aliases.every(mount => mount.rw === false), mode);
+            assert.equal(mounts.some(mount => /^\/workspace(?:\/|$)/.test(mount.destination)), false);
+            assert.equal(args[args.indexOf('-w') + 1], workdir);
+            assert.equal(new Set(mounts.map(mount => mount.destination)).size, mounts.length);
+        }
     }
 });
 

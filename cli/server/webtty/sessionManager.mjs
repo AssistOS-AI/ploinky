@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 
+import { assertWebttyWorkspaceRoot } from '../../../core-services/webtty/cwd.mjs';
 import { buildShellEnvironment } from '../../../core-services/webtty/environment.mjs';
 import { WEBTTY_PROTOCOL_LIMITS } from '../../../core-services/webtty/worker-protocol.mjs';
 import {
@@ -116,10 +117,14 @@ export class WebttySessionManager {
         launchStore = new WebttyLaunchRecordStore(),
         targetResolver = null,
         agentProviderAvailable = false,
+        workspaceRoot,
         auth = DEFAULT_AUTH_ADAPTER,
         now = () => Date.now(),
         audit = () => {},
     } = {}) {
+        // The Router's trusted workspace root selects every Box terminal
+        // directory and is the only dynamic worker and shell environment value.
+        this.workspaceRoot = assertWebttyWorkspaceRoot(workspaceRoot);
         this.limits = Object.freeze({ ...WEBTTY_SESSION_LIMITS, ...limits });
         this.workerFactory = workerFactory;
         this.agentWorkerFactory = agentWorkerFactory;
@@ -142,6 +147,7 @@ export class WebttySessionManager {
         this.agentProviderReady = agentProviderAvailable === true;
         this.agentProviderDisabledCategory = this.agentProviderReady ? '' : 'provider_not_local';
         this.targetResolver = targetResolver || new TerminalTargetResolver({
+            workspaceRoot,
             isTargetQuarantined: (candidate) => this.isAgentTargetQuarantined(candidate),
         });
         this.ready = false;
@@ -488,7 +494,7 @@ export class WebttySessionManager {
         try {
             worker = target.kind === 'agent'
                 ? this.agentWorkerFactory({ terminalId: id })
-                : this.workerFactory({ terminalId: id, marker });
+                : this.workerFactory({ terminalId: id, marker, workspaceRoot: this.workspaceRoot });
         } catch (error) {
             releaseQuota();
             throw error;
@@ -706,7 +712,7 @@ export class WebttySessionManager {
                     cwdRelative: target.directory.relativePath,
                     cols,
                     rows,
-                    shellEnv: buildShellEnvironment(),
+                    shellEnv: buildShellEnvironment(process.env, { workspaceRoot: this.workspaceRoot }),
                 });
                 this.assertStartupActive(session);
                 const identity = ready.processIdentity;

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { resolveWorkspaceDirectory } from './cwd.mjs';
+import { assertWebttyWorkspaceRoot, resolveWorkspaceDirectory } from './cwd.mjs';
 import { assertExactShellEnvironment } from './environment.mjs';
 import { loadImmutableNodePty } from './native-runtime.mjs';
 import {
@@ -57,8 +57,11 @@ function outputChunks(value) {
 export class TerminalWorker {
     constructor({
         processApi = process,
-        resolveDirectory = resolveWorkspaceDirectory,
-        assertShellEnv = assertExactShellEnvironment,
+        // The Router starts the worker with a fixed environment whose only
+        // dynamic value is its trusted workspace root.
+        workspaceRoot = processApi.env?.PLOINKY_WORKSPACE_ROOT,
+        resolveDirectory = (requested) => resolveWorkspaceDirectory(requested, { workspaceRoot }),
+        assertShellEnv = (environment) => assertExactShellEnvironment(environment, { workspaceRoot }),
         loadNodePty = loadImmutableNodePty,
         capturePtyIdentityImpl = capturePtyProcessIdentity,
         signalGroupImpl = signalVerifiedPtyProcessGroup,
@@ -345,6 +348,7 @@ export function runTerminalWorker({ processApi = process, argv = processApi.argv
     let worker;
     try {
         validateInvocation(argv);
+        assertWebttyWorkspaceRoot(processApi.env?.PLOINKY_WORKSPACE_ROOT);
         worker = new TerminalWorker({ processApi });
     } catch (_) {
         processApi.exitCode = 1;

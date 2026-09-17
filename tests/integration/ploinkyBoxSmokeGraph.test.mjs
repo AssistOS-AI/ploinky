@@ -36,10 +36,13 @@ function dependencyTreeHash(harness) {
 
 function nestedResourceExists(harness, containerId, kind, name) {
     return harness.runner.query('podman', [
-        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
+        'container', 'exec', '--user', 'podman', '--workdir', harness.identity.workspaceRoot,
         containerId, 'podman', kind, 'inspect', name,
     ], { timeoutMs: 120_000 }).ok;
 }
+
+// In-Box scripts receive the workspace root as an argument, never as code.
+const REGISTRY_SCRIPT_ROOT = "const f=require('node:fs');const root=process.argv[1];";
 
 test('pinned Explorer graph starts through one immutable Box candidate', {
     timeout: 25 * 60_000,
@@ -55,17 +58,21 @@ test('pinned Explorer graph starts through one immutable Box candidate', {
         'smoke graph start must use a custom public host port');
 
     const prepared = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
+    const workspaceRoot = harness.identity.workspaceRoot;
+    const masterKeyPath = path.join(workspaceRoot, '.ploinky', 'master-key');
     stageSmokeGraph({
         graph,
         containerId: prepared.containerId,
         runner: harness.runner,
+        workspaceRoot,
     });
     const keyHash = execInBox(harness.runner, prepared.containerId, [
-        'sha256sum', '/workspace/.ploinky/master-key',
+        'sha256sum', masterKeyPath,
     ]).split(/\s/)[0];
     const keyValue = execInBox(harness.runner, prepared.containerId, [
         '/usr/local/bin/node', '-e',
-        "process.stdout.write(require('node:fs').readFileSync('/workspace/.ploinky/master-key','utf8').trim())",
+        "process.stdout.write(require('node:fs').readFileSync(process.argv[1],'utf8').trim())",
+        masterKeyPath,
     ]);
     assert.match(keyValue, /^[a-f0-9]{64}$/);
     harness.useChild();
@@ -98,12 +105,13 @@ test('pinned Explorer graph starts through one immutable Box candidate', {
 
     const graphState = JSON.parse(execInBox(harness.runner, started.containerId, [
         '/usr/local/bin/node', '-e', [
-            "const f=require('node:fs');",
-            "const a=JSON.parse(f.readFileSync('/workspace/.ploinky/agents.json'));",
+            REGISTRY_SCRIPT_ROOT,
+            "const a=JSON.parse(f.readFileSync(root+'/.ploinky/agents.json'));",
             "const agents=Object.values(a).map(({repoName,agentName})=>({repoName,agentName}));",
-            "const repositories=f.readdirSync('/workspace/.ploinky/repos');",
+            "const repositories=f.readdirSync(root+'/.ploinky/repos');",
             "process.stdout.write(JSON.stringify({agents,repositories}));",
         ].join(''),
+        workspaceRoot,
     ]));
     assert.deepEqual(graphState.agents.filter((entry) => entry.agentName === 'liveKitServerAgent'), [
         { repoName: 'AchillesIDE', agentName: 'liveKitServerAgent' },
@@ -126,11 +134,12 @@ test('pinned Explorer graph starts through one immutable Box candidate', {
     ].join('\n'));
     const agent = JSON.parse(execInBox(harness.runner, started.containerId, [
         '/usr/local/bin/node', '-e', [
-            "const f=require('node:fs');",
-            "const a=JSON.parse(f.readFileSync('/workspace/.ploinky/agents.json'));",
+            REGISTRY_SCRIPT_ROOT,
+            "const a=JSON.parse(f.readFileSync(root+'/.ploinky/agents.json'));",
             "const e=Object.entries(a).find(([,v])=>v&&v.runtime==='podman'&&/^[a-f0-9]{64}$/.test(v.containerId||''));",
             "if(!e)process.exit(4);process.stdout.write(JSON.stringify({name:e[0],id:e[1].containerId}));",
         ].join(''),
+        workspaceRoot,
     ]));
     const hosts = execInBox(harness.runner, started.containerId, [
         'podman', 'container', 'exec', agent.id, 'cat', '/etc/hosts',
@@ -182,9 +191,10 @@ test('pinned Explorer graph starts through one immutable Box candidate', {
     ]);
     execInBox(harness.runner, started.containerId, [
         'bash', '-c', [
-            'printf workspace-retained > /workspace/t27-workspace-canary',
+            'printf workspace-retained > "$1/t27-workspace-canary"',
             'printf dependencies-retained > /opt/ploinky/node_modules/t27-dependencies-canary',
         ].join('; '),
+        'bash', workspaceRoot,
     ]);
 
     waitForRouterHealth(harness.runner, started.containerId, {
@@ -208,11 +218,11 @@ test('pinned Explorer graph starts through one immutable Box candidate', {
     await harness.supervisor.runDestroyTransaction(started.containerId);
     const recreated = await harness.supervisor.prepareBoxForCommand({ imageRef: candidateReference });
     const recreatedKeyHash = execInBox(harness.runner, recreated.containerId, [
-        'sha256sum', '/workspace/.ploinky/master-key',
+        'sha256sum', masterKeyPath,
     ]).split(/\s/)[0];
     assert.equal(recreatedKeyHash, keyHash);
     assert.equal(execInBox(harness.runner, recreated.containerId, [
-        'cat', '/workspace/t27-workspace-canary',
+        'cat', path.join(workspaceRoot, 't27-workspace-canary'),
     ]), 'workspace-retained');
     assert.equal(execInBox(harness.runner, recreated.containerId, [
         'cat', '/opt/ploinky/node_modules/t27-dependencies-canary',

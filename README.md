@@ -197,11 +197,26 @@ You can use Ploinky in two ways:
 
 By default, the public entrypoint reconciles and starts one managed outer
 runtime, then runs Ploinky core inside it. The runtime mounts the local checkout
-read-only at `/opt/ploinky` and bind-mounts the canonical host launch directory
-read-write at `/workspace`. Ordinary agent containers run one level inside this
-runtime and receive that same `/workspace` bind, so host files are immediately
-visible to agents and files or directories created there by agents persist on
-the host. The dependency cache and nested image cache are bind-mounted from
+read-only at `/opt/ploinky` and bind-mounts the selected host workspace
+read-write at that same absolute path. The workspace path is also the runtime
+working directory and its `PLOINKY_WORKSPACE_ROOT`, so a workspace at
+`/home/user/project` is `/home/user/project` on the host, in the runtime, and in
+the project grant of global and development agents. Ordinary agent containers
+run one level inside this runtime and receive their project at that same path, so
+host files are immediately visible to agents and files or directories created
+there by agents persist on the host. Isolated agents keep their private project
+and home at `/root`.
+
+The workspace path must be mountable at itself: it is rejected before any Box
+change if it contains `:`, a backslash, or a control character, ends with whitespace, or
+replaces, contains, or lies inside a Box-owned location such as `/opt/ploinky`,
+`/usr`, `/etc`, `/tmp` itself, the Box home configuration and stores, or the
+`/Agent`, `/code`, `/shared`, `/root`, and `/home/agent` agent runtime paths.
+Directories below `/tmp` or `/var/tmp` remain valid workspaces. `ploinky
+diagnose` reports this check. Boxes and runtime images from the former fixed
+`/workspace` layout are incompatible: they are rejected, not migrated, and a
+Box must be recreated from an image whose working directory is `/` and whose
+environment has no workspace root. The dependency cache and nested image cache are bind-mounted from
 `<workspace>/.ploinky/box/dependencies` and `<workspace>/.ploinky/box/images`,
 so they survive destroy and recreate; nested container state does not. The outer
 runtime has four durable host binds and one transient `/tmp` tmpfs created with
@@ -231,7 +246,7 @@ A matching folder named after the registered repository takes priority; otherwis
 | Invocation | Documented effect |
 | --- | --- |
 | `ploinky` or `p-cli` | Reconcile/start outer runtime; open Ploinky REPL |
-| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in `/workspace` |
+| `ploinky cli` | Reconcile/start outer runtime; open `/bin/bash` as `podman` in the workspace directory, at its host path |
 | `ploinky cli <agent>` | Reconcile/start outer runtime; attach to that agent's manifest CLI |
 | `ploinky start ...` | Reconcile/start outer runtime; start the graph behind the fixed boundary |
 | `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
@@ -294,7 +309,7 @@ State follows these stop/start and destroy boundaries:
 
 | State | Where it lives | Survives stop/start? | Survives destroy? |
 | --- | --- | --- | --- |
-| Workspace data | Host bind at `/workspace` | Yes | Yes; no destroy path deletes it |
+| Workspace data | Host bind at the workspace's own absolute path | Yes | Yes; no destroy path deletes it |
 | Pinned dependency cache | Host bind from `.ploinky/box/dependencies` at `/opt/ploinky/node_modules` | Yes | Yes, unless `--delete-cache` |
 | Nested image cache | Host bind from `.ploinky/box/images` at `/home/podman/.local/share/ploinky-images` | Yes | Yes, unless `--delete-cache` |
 | Nested container records and writable layers | Box writable layer under `/home/podman/.local/share/containers/storage` | Yes | No |
@@ -357,9 +372,11 @@ as successful reclamation.
 
 Nested container records, writable layers, networks, and inner Podman named
 volumes are discarded with the outer Box, so persistent agent data must use
-explicit `/workspace` binds. A Box created by an older layout is not recognized
-and is not migrated: `ploinky start` reports it as incompatible, and
-`ploinky stop` followed by `ploinky destroy` removes it.
+explicit workspace binds. A Box created by an older layout, including the former
+fixed `/workspace` mount, is not recognized and is not migrated: `ploinky start`
+reports it as incompatible, and `ploinky stop` followed by `ploinky destroy`
+removes it. For a `/workspace`-layout Box, `stop` still stops the outer Box but
+reports that its in-Box stop could not run at the workspace path.
 
 Ploinky no longer creates, inspects, or deletes any outer named volume. Named
 volumes left over from an earlier layout (`-images`, `-ploinky-deps`,
@@ -386,7 +403,7 @@ recreation.
 
 The outer container is named from the canonical absolute current directory, and
 its cache directories live under that directory's `.ploinky/box`. The workspace
-is mounted at `/workspace` rather than copied into engine storage. Ploinky
+is mounted at its own absolute path rather than copied into engine storage. Ploinky
 automatically discovers whether Podman or Docker owns the exact managed
 container and fails closed on unreachable, split, or foreign state; there is no
 public `--name`, `--engine`, or `PLOINKY_BOX_ENGINE` override. Ordinary
@@ -604,7 +621,7 @@ URLs registered with an SSO provider.
 - `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the physical-host port selection (loopback unless `ploinky bind` saved another address) and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.
-- `cli`: from the managed runtime, open `/bin/bash` as `podman` in `/workspace`.
+- `cli`: from the managed runtime, open `/bin/bash` as `podman` in the workspace directory (`PLOINKY_WORKSPACE_ROOT`).
 - `cli <name> [args...]`: run the agent’s manifest CLI command interactively.
 - `shell <name>`: open interactive `/bin/sh` in the agent container.
 - WebChat is served by the running Router at `/webchat/`; the retired `webchat [--rotate]` CLI access command is no longer registered.

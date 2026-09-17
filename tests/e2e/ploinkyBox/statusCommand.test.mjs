@@ -51,9 +51,10 @@ function inBoxContentHash(containerId, harness) {
             "const c=require('node:crypto'),f=require('node:fs'),p=require('node:path');",
             "const h=c.createHash('sha256');",
             "function w(root,d=root){for(const n of f.readdirSync(d).sort()){const x=p.join(d,n),s=f.lstatSync(x);h.update(p.relative(root,x)+'\\0'+s.mode+'\\0');if(s.isDirectory())w(root,x);else if(s.isFile())h.update(f.readFileSync(x));else if(s.isSymbolicLink())h.update(f.readlinkSync(x));}}",
-            "for(const root of ['/workspace','/opt/ploinky/node_modules']){h.update(root+'\\0');w(root)}",
+            "for(const root of process.argv.slice(1)){h.update(root+'\\0');w(root)}",
             "process.stdout.write(h.digest('hex'));",
         ].join(''),
+        harness.identity.workspaceRoot, '/opt/ploinky/node_modules',
     ]);
 }
 
@@ -146,14 +147,15 @@ test('public status renders the core workspace view without mutating Box state',
     });
     execInBox(harness.runner, prepared.containerId, [
         '/usr/local/bin/node', '-e', [
-            "const f=require('node:fs');",
-            "f.mkdirSync('/workspace/.ploinky',{recursive:true});",
-            "f.writeFileSync('/workspace/.ploinky/routing.json','{\"port\":8080}\\n');",
-            "f.writeFileSync('/workspace/.ploinky/agents.json',JSON.stringify({",
+            "const f=require('node:fs');const root=process.argv[1];",
+            "f.mkdirSync(root+'/.ploinky',{recursive:true});",
+            "f.writeFileSync(root+'/.ploinky/routing.json','{\"port\":8080}\\n');",
+            "f.writeFileSync(root+'/.ploinky/agents.json',JSON.stringify({",
             "ploinky_status_probe:{type:'agent',runtime:'podman',agentName:'statusProbe',",
             "repoName:'statusProbeRepo',containerImage:'status/probe:latest',",
-            "createdAt:'2026-07-31T00:00:00.000Z',projectPath:'/workspace'}}));",
+            "createdAt:'2026-07-31T00:00:00.000Z',projectPath:root}}));",
         ].join(''),
+        harness.identity.workspaceRoot,
     ]);
     assert.equal(harness.supervisor.inspectBoxStatus().state, 'running-initialized');
 

@@ -122,7 +122,12 @@ export function requirePodmanCandidate(t, env = process.env) {
 
 export function createPodmanHarness(t, candidateReference, {
     reconcile,
+    workspaceName = 'workspace',
 } = {}) {
+    assert.equal(typeof workspaceName, 'string');
+    assert.ok(workspaceName && !['.', '..'].includes(workspaceName)
+        && path.basename(workspaceName) === workspaceName && !workspaceName.includes('\0'),
+    'native workspace name must be one literal directory name');
     const createdRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-podman-'));
     const root = fs.realpathSync(createdRoot);
     let finalCleanup = null;
@@ -131,7 +136,7 @@ export function createPodmanHarness(t, candidateReference, {
         fs.rmSync(root, { recursive: true, force: false });
         assert.equal(fs.existsSync(root), false, 'native Box fixture root must be removed');
     });
-    const workspace = path.join(root, 'workspace');
+    const workspace = path.join(root, workspaceName);
     const child = path.join(workspace, 'child');
     const lockHome = path.join(root, 'lock-home');
     fs.mkdirSync(child, { recursive: true });
@@ -156,9 +161,11 @@ export function createPodmanHarness(t, candidateReference, {
     });
     const environmentInput = {
         ...process.env,
-        HOME: lockHome,
         PATH: `${candidateProxy.directory}${path.delimiter}${process.env.PATH}`,
     };
+    // Lock state has its own explicit homeDirectory below. Keep the engine's
+    // actual home: changing it silently selects a different rootless image
+    // store and makes the already-built immutable candidate disappear.
     if (process.platform === 'darwin') {
         environmentInput.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME
             || path.join(os.homedir(), '.config');
@@ -218,9 +225,11 @@ export function createPodmanHarness(t, candidateReference, {
     };
 }
 
+// Commands run from the Box working directory, which Box creation sets to the
+// selected workspace root and container admission proves.
 export function execInBox(runner, containerId, argv, { timeoutMs = 120_000 } = {}) {
     const result = runner.query('podman', [
-        'container', 'exec', '--user', 'podman', '--workdir', '/workspace',
+        'container', 'exec', '--user', 'podman',
         containerId, ...argv,
     ], { timeoutMs });
     assert.equal(result.ok, true, `${argv.join(' ')} failed: ${result.stderr}`);

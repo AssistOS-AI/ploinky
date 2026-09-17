@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 
@@ -9,7 +10,8 @@ import {
 const BOX = 'a'.repeat(64);
 const AGENT = 'b'.repeat(64);
 const NESTED = 'c'.repeat(64);
-const PREFIX = ['container', 'exec', '--user', 'podman', '--workdir', '/workspace', BOX];
+const WORKSPACE_ROOT = '/home/user/work space/proiect ăîș';
+const PREFIX = ['container', 'exec', '--user', 'podman', '--workdir', WORKSPACE_ROOT, BOX];
 
 function fixture() {
     const status = { state: 'initialized', initialized: true, routingConfigured: true, trackedAgents: 2, runningAgents: 2, warnings: [] };
@@ -24,7 +26,7 @@ function fixture() {
         store: { graphDriverName: 'overlay', graphRoot: '/data/podman/storage', runRoot: '/run/containers/storage', configFile: '/etc/containers/storage.conf', graphOptions: { 'overlay.mount_program': '/usr/bin/fuse-overlayfs' } } };
     const calls = [];
     const responses = new Map();
-    const options = { containerId: BOX, runner: { query(file, args, settings) {
+    const options = { containerId: BOX, workspaceRoot: WORKSPACE_ROOT, runner: { query(file, args, settings) {
         assert.equal(file, 'podman');
         assert.equal(settings.timeoutMs, 10_000);
         assert.deepEqual(args.slice(0, PREFIX.length), PREFIX);
@@ -35,6 +37,7 @@ function fixture() {
         if (tail[0] === 'node' && tail[1].endsWith('/readStatus.mjs')) value = status;
         else if (tail[0] === 'node' && tail[1] === '-e') {
             assert.equal(tail[2], CURRENT_REGISTRY_SCRIPT);
+            assert.deepEqual(tail.slice(3), [WORKSPACE_ROOT]);
             value = records;
         } else if (tail[0] === 'podman' && tail[2] === 'inspect') {
             assert.equal(tail[4], CURRENT_CONTAINER_TEMPLATE);
@@ -137,7 +140,7 @@ test('malformed and duplicate filtered registries never lead to guessed containe
 test('empty inactive workspace is reported without inventing an agent deployment failure', () => {
     const state = fixture();
     Object.assign(state.status, { routingConfigured: false, trackedAgents: 0, runningAgents: 0 });
-    state.responses.set(['node', '-e', CURRENT_REGISTRY_SCRIPT].join(' '), { ok: false, status: 1, stderr: 'Registry snapshot failed: ENOENT' });
+    state.responses.set(['node', '-e', CURRENT_REGISTRY_SCRIPT, WORKSPACE_ROOT].join(' '), { ok: false, status: 1, stderr: 'Registry snapshot failed: ENOENT' });
     const checks = state.run();
     assert.equal(checks.find((check) => check.id === 'current.graph').status, 'warn');
     assert.equal(checks.find((check) => check.id === 'current.registry').status, 'skip');
@@ -152,17 +155,32 @@ test('registry snapshot script validates file type/size and emits only tracked c
     };
     const bytes = Buffer.from(JSON.stringify(registry));
     let offset = 0, output = '', error = '', exitCode;
+    const inspected = [];
     const file = { isDirectory: () => true, isFile: () => true, isSymbolicLink: () => false, dev: 1, ino: 2, size: bytes.length };
     const fsApi = {
         constants: { O_RDONLY: 0, O_NOFOLLOW: 1 },
-        lstatSync: () => file, fstatSync: () => file, openSync: () => 5, closeSync: () => {},
+        lstatSync: (target) => { inspected.push(target); return file; },
+        fstatSync: () => file, openSync: () => 5, closeSync: () => {},
         readSync(_fd, buffer, start, length) { const read = Math.min(length, bytes.length - offset); bytes.copy(buffer, start, offset, offset + read); offset += read; return read; },
     };
-    const process = { set exitCode(value) { exitCode = value; } };
-    const invoke = () => vm.runInNewContext(CURRENT_REGISTRY_SCRIPT, { require: () => fsApi, Buffer, process, console: { log: (value) => { output = value; }, error: (value) => { error = value; } } });
+    let argv = ['/usr/local/bin/node', WORKSPACE_ROOT];
+    const process = { get argv() { return argv; }, set exitCode(value) { exitCode = value; } };
+    const modules = { 'node:fs': fsApi, 'node:path': path };
+    const invoke = () => vm.runInNewContext(CURRENT_REGISTRY_SCRIPT, { require: (name) => modules[name], Buffer, process, console: { log: (value) => { output = value; }, error: (value) => { error = value; } } });
     invoke();
     assert.deepEqual(JSON.parse(output), [{ name: 'ordinary', containerId: AGENT }]);
     assert.doesNotMatch(output, /registry-secret|sensitive/);
+    // The registry is read beneath the root argument, never a fixed prefix.
+    assert.deepEqual(inspected, [`${WORKSPACE_ROOT}/.ploinky`, `${WORKSPACE_ROOT}/.ploinky/agents.json`]);
+    for (const invalid of [[], ['relative/root'], ['/home/user/../escape']]) {
+        argv = ['/usr/local/bin/node', ...invalid];
+        exitCode = undefined;
+        invoke();
+        assert.equal(exitCode, 1);
+        assert.match(error, /Workspace root argument is not a clean absolute path/);
+    }
+    argv = ['/usr/local/bin/node', WORKSPACE_ROOT];
+    offset = 0;
     file.isSymbolicLink = () => true;
     invoke();
     assert.equal(exitCode, 1);
@@ -175,4 +193,16 @@ test('registry snapshot script validates file type/size and emits only tracked c
 
 test('canonical outer Box identity is mandatory', () => {
     assert.throws(() => collectCurrentWorkspaceDiagnostics({ containerId: 'friendly-name' }), /canonical Box/);
+});
+
+test('current diagnostics require the selected workspace root before entering the Box', () => {
+    for (const workspaceRoot of [undefined, '', 'relative', '/home/user/pro:ject']) {
+        const queries = [];
+        assert.throws(() => collectCurrentWorkspaceDiagnostics({
+            containerId: BOX,
+            workspaceRoot,
+            runner: { query: (...args) => { queries.push(args); return { ok: true, stdout: '{}' }; } },
+        }), (error) => error.code === 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID');
+        assert.deepEqual(queries, []);
+    }
 });

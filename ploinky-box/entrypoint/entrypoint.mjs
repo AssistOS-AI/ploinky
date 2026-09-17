@@ -10,6 +10,7 @@ import {
     BOX_READY_LINE,
     BOX_RUNTIME_UID,
 } from '../constants.mjs';
+import { assertBoxWorkspaceRoot, readBoxWorkspaceRoot } from '../contract/workspace-root.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createProcessRunner } from '../process.mjs';
 import { initializeWorkspaceMasterKey } from './initialize-workspace.mjs';
@@ -49,10 +50,13 @@ function rooted(root, productionPath) {
         : path.join(selectedRoot, productionPath.replace(/^\/+/, ''));
 }
 
-export function entrypointPaths(root = '/') {
+// Every path is the production Box path placed under `root`. The workspace
+// root is the host-selected production path, never a path already under a
+// synthetic test root.
+export function entrypointPaths(root = '/', { workspaceRoot } = {}) {
     return Object.freeze({
         marker: rooted(root, '/etc/ploinky-box'),
-        workspace: rooted(root, '/workspace'),
+        workspace: rooted(root, assertBoxWorkspaceRoot(workspaceRoot)),
         dependencies: rooted(root, '/opt/ploinky/node_modules'),
         ploinky: rooted(root, '/opt/ploinky/bin/ploinky'),
         imageStore: rooted(root, '/home/podman/.local/share/ploinky-images'),
@@ -77,6 +81,36 @@ export function verifyEntrypointMarker(markerPath, fsApi = fs) {
     if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1
         || !bytes.equals(Buffer.from(BOX_MARKER_CONTENT))) {
         throw entrypointError('Box marker has invalid content');
+    }
+}
+
+// The host creates each Box with the workspace root as its working directory
+// and bind destination. Prove both before preparation writes anything, and
+// require the destination to be its own canonical path so every in-Box
+// consumer derives the same workspace identity from it.
+export function verifyEntrypointWorkspaceRoot(paths, {
+    cwd = () => process.cwd(),
+    fsApi = fs,
+} = {}) {
+    let observedCwd;
+    let canonical;
+    try {
+        observedCwd = cwd();
+        canonical = fsApi.realpathSync(paths.workspace);
+    } catch (error) {
+        throw entrypointError(`Unable to inspect the mounted workspace root ${paths.workspace}`, error);
+    }
+    if (observedCwd !== paths.workspace) {
+        throw entrypointError(
+            `Box working directory must be the workspace root ${JSON.stringify(paths.workspace)}; `
+            + `observed ${JSON.stringify(observedCwd)}`,
+        );
+    }
+    if (canonical !== paths.workspace) {
+        throw entrypointError(
+            `Workspace root ${JSON.stringify(paths.workspace)} must resolve to itself inside the Box; `
+            + `it resolves to ${JSON.stringify(canonical)}`,
+        );
     }
 }
 
@@ -285,6 +319,8 @@ export function resetTransientNestedRuntime(paths, {
 
 export function prepareEntrypoint({
     root = '/',
+    env = process.env,
+    cwd = () => process.cwd(),
     fsApi = fs,
     runner = createProcessRunner(),
     initialize = initializeWorkspaceMasterKey,
@@ -296,8 +332,9 @@ export function prepareEntrypoint({
     transportOptions = {},
     storageOptions = {},
 } = {}) {
-    const paths = entrypointPaths(root);
+    const paths = entrypointPaths(root, { workspaceRoot: readBoxWorkspaceRoot(env) });
     verifyEntrypointMarker(paths.marker, fsApi);
+    verifyEntrypointWorkspaceRoot(paths, { cwd, fsApi });
     validateEntrypointMounts(paths, fsApi);
     resetRuntime(paths, { fsApi });
     // Nothing may initialize or query the inner Podman store before its

@@ -56,6 +56,7 @@ import {
 import {
     assertCanonicalAgentDataPath,
     ensureAgentDataDirectory,
+    isPathWithin,
 } from '../../utils/runtime/agentDataPathPolicy.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir } from '../docker/agentHooks.js';

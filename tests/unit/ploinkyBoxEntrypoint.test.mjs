@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,12 +13,17 @@ import {
     BOX_RUNTIME_UID,
 } from '../../ploinky-box/constants.mjs';
 import {
+    BOX_RESERVED_PARENTS,
+    BOX_RESERVED_SUBTREES,
+} from '../../ploinky-box/contract/workspace-root.mjs';
+import {
     entrypointPaths,
     formatEntrypointFailure,
     prepareEntrypoint,
     resetTransientNestedRuntime,
     retireStoppedManagedContainers,
     runEntrypoint,
+    verifyEntrypointWorkspaceRoot,
 } from '../../ploinky-box/entrypoint/entrypoint.mjs';
 import {
     configureBoxTransport,
@@ -25,10 +31,14 @@ import {
     writeTransportPair,
 } from '../../ploinky-box/entrypoint/transport.mjs';
 
+// The production Box path of a host-selected workspace. Fixtures place every
+// production path under a synthetic root exactly once.
+const BOX_WORKSPACE = '/srv/ploinky projects/proiect ăîș $(id)';
+
 function fixture(t) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-entrypoint-'));
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-entrypoint-')));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const paths = entrypointPaths(root);
+    const paths = entrypointPaths(root, { workspaceRoot: BOX_WORKSPACE });
     for (const directory of [
         path.dirname(paths.marker),
         paths.workspace,
@@ -40,7 +50,13 @@ function fixture(t) {
     ]) fs.mkdirSync(directory, { recursive: true });
     fs.writeFileSync(paths.marker, BOX_MARKER_CONTENT, { mode: 0o644 });
     fs.writeFileSync(paths.ploinky, '#!/usr/bin/env bash\n', { mode: 0o755 });
-    return { root, paths };
+    // The reserved environment and working directory the host gives the Box.
+    const box = {
+        root,
+        env: { PLOINKY_WORKSPACE_ROOT: BOX_WORKSPACE },
+        cwd: () => paths.workspace,
+    };
+    return { root, paths, box };
 }
 
 // Shaped from real `podman info --format json` output captured against the
@@ -183,11 +199,11 @@ test('failure between final commits restores the complete prior transport pair',
 });
 
 test('entrypoint validates its marker and mounts before its first persistent write', (t) => {
-    const { root, paths } = fixture(t);
+    const { paths, box } = fixture(t);
     fs.writeFileSync(paths.marker, 'wrong\n');
     let initialized = false;
     assert.throws(() => prepareEntrypoint({
-        root,
+        ...box,
         initialize() { initialized = true; },
         configureTransport() { throw new Error('must not configure'); },
         installDependencies() { throw new Error('must not install'); },
@@ -198,7 +214,7 @@ test('entrypoint validates its marker and mounts before its first persistent wri
     fs.writeFileSync(paths.marker, BOX_MARKER_CONTENT);
     fs.rmSync(paths.dependencies, { recursive: true });
     fs.symlinkSync(paths.workspace, paths.dependencies);
-    assert.throws(() => prepareEntrypoint({ root }), /mount target|mount is missing/);
+    assert.throws(() => prepareEntrypoint({ ...box }), /mount target|mount is missing/);
     assert.equal(fs.existsSync(path.join(paths.workspace, '.ploinky', 'master-key')), false);
 });
 
@@ -227,7 +243,7 @@ test('transient cleanup removes only UID-keyed children and retains the tmpfs pa
 });
 
 test('full preparation creates one stable key, resets only transient runtime, and initializes pins', (t) => {
-    const { root, paths } = fixture(t);
+    const { paths, box } = fixture(t);
     // Keyed to the Box runtime UID, not the live process UID, so the reset that
     // is proven here is the exact runroot storage.conf configures.
     const transient = [
@@ -243,7 +259,7 @@ test('full preparation creates one stable key, resets only transient runtime, an
     fs.writeFileSync(persistent, 'retain');
     const events = [];
     const options = {
-        root,
+        ...box,
         runner: routeRunner({ paths }),
         installDependencies({ targetRoot, markerPath }) {
             events.push('install');
@@ -285,13 +301,13 @@ test('full preparation creates one stable key, resets only transient runtime, an
 });
 
 test('ready line is emitted exactly once and only after every required stage', (t) => {
-    const { root } = fixture(t);
+    const { box } = fixture(t);
     const events = [];
     const output = {
         write(chunk) { events.push(`output:${String(chunk).trim()}`); },
     };
     runEntrypoint({
-        root,
+        ...box,
         runner: routeRunner(),
         initialize() { events.push('initialize'); },
         configureTransport() {
@@ -585,4 +601,111 @@ test('entrypoint failure diagnostics preserve a bounded normalized cause chain',
     );
     assert.equal(formatEntrypointFailure(wrapped, { limit: 32 }).length, 32);
     assert.match(formatEntrypointFailure(wrapped, { limit: 32 }), /…$/);
+});
+
+test('entrypoint paths place the selected production workspace path under a test root once', (t) => {
+    const { root } = fixture(t);
+    assert.equal(entrypointPaths('/', { workspaceRoot: BOX_WORKSPACE }).workspace, BOX_WORKSPACE);
+    assert.equal(
+        entrypointPaths(root, { workspaceRoot: BOX_WORKSPACE }).workspace,
+        path.join(root, 'srv', 'ploinky projects', 'proiect ăîș $(id)'),
+    );
+    assert.throws(() => entrypointPaths(root), (error) => error.code === 'PLOINKY_BOX_WORKSPACE_ROOT_INVALID');
+    assert.throws(() => entrypointPaths(root, { workspaceRoot: '/workspace/../etc' }), /clean absolute form/);
+    // Every Box-owned preparation path is protected from a workspace bind.
+    const production = entrypointPaths('/', { workspaceRoot: BOX_WORKSPACE });
+    for (const [name, location] of Object.entries(production)) {
+        if (name === 'workspace') continue;
+        const reserved = BOX_RESERVED_SUBTREES.some((entry) => location === entry || location.startsWith(`${entry}/`))
+            || BOX_RESERVED_PARENTS.includes(location);
+        assert.equal(reserved, true, `${name} ${location}`);
+    }
+});
+
+test('entrypoint rejects a missing, invalid, or disagreeing workspace root before any write', (t) => {
+    const scenarios = [
+        ['missing environment', (box) => ({ ...box, env: {} }), /PLOINKY_WORKSPACE_ROOT is not set/],
+        ['empty environment', (box) => ({ ...box, env: { PLOINKY_WORKSPACE_ROOT: '' } }), /PLOINKY_WORKSPACE_ROOT is not set/],
+        ['unmountable root', (box) => ({ ...box, env: { PLOINKY_WORKSPACE_ROOT: '/srv/pro:ject' } }), /contains ':'/],
+        ['reserved root', (box) => ({ ...box, env: { PLOINKY_WORKSPACE_ROOT: '/home/podman' } }), /Box-owned location/],
+        ['working directory elsewhere', (box, paths) => ({ ...box, cwd: () => path.dirname(paths.workspace) }),
+            /working directory must be the workspace root/],
+        ['non-canonical destination', (box, paths, root) => {
+            const parent = path.dirname(paths.workspace);
+            const elsewhere = path.join(root, 'elsewhere');
+            fs.renameSync(parent, elsewhere);
+            fs.symlinkSync(elsewhere, parent, 'dir');
+            return box;
+        }, /must resolve to itself inside the Box/],
+    ];
+    for (const [name, mutate, pattern] of scenarios) {
+        const { root, paths, box } = fixture(t);
+        const stale = path.join(paths.tmp, `storage-run-${BOX_RUNTIME_UID}`);
+        fs.mkdirSync(stale, { recursive: true });
+        const events = [];
+        const options = mutate(box, paths, root);
+        assert.throws(() => prepareEntrypoint({
+            ...options,
+            resetRuntime() { events.push('reset'); },
+            configureStorage() { events.push('storage'); },
+            initialize() { events.push('initialize'); },
+            configureTransport() { events.push('transport'); },
+            retireContainers() { events.push('retire'); },
+            installDependencies() { events.push('install'); },
+        }), pattern, name);
+        assert.deepEqual(events, [], name);
+        assert.equal(fs.existsSync(stale), true, name);
+    }
+});
+
+test('entrypoint root verification requires the exact canonical working directory', (t) => {
+    const { paths } = fixture(t);
+    assert.doesNotThrow(() => verifyEntrypointWorkspaceRoot(paths, { cwd: () => paths.workspace }));
+    assert.throws(() => verifyEntrypointWorkspaceRoot(paths, { cwd: () => `${paths.workspace}-other` }),
+        /working directory must be the workspace root/);
+    fs.rmSync(paths.workspace, { recursive: true });
+    assert.throws(() => verifyEntrypointWorkspaceRoot(paths, { cwd: () => paths.workspace }),
+        /Unable to inspect the mounted workspace root/);
+});
+
+function shellEntrypointSource() {
+    return fs.readFileSync(path.resolve(import.meta.dirname, '../../ploinky-box/entrypoint/ploinky-box-entrypoint'), 'utf8');
+}
+
+function runShellRootPreflight(cwd, env) {
+    const source = shellEntrypointSource();
+    const functionText = (name) => {
+        const match = source.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}\\n`, 'm'));
+        assert.ok(match, `${name} is defined`);
+        return match[0];
+    };
+    const script = [functionText('fail'), functionText('require_workspace_root'), 'require_workspace_root', 'echo preflight-ok'].join('\n');
+    return spawnSync('bash', ['-c', script], { cwd, env: { PATH: process.env.PATH, ...env }, encoding: 'utf8' });
+}
+
+test('the image shell entrypoint proves the dynamic workspace root before preparation', (t) => {
+    const { root } = fixture(t);
+    const workspace = path.join(root, "selected ăîș $(touch owned);'");
+    const link = path.join(root, 'selected link');
+    fs.mkdirSync(workspace);
+    fs.symlinkSync(workspace, link, 'dir');
+
+    const ok = runShellRootPreflight(workspace, { PLOINKY_WORKSPACE_ROOT: workspace });
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.equal(ok.stdout.trim(), 'preflight-ok');
+    assert.equal(fs.existsSync(path.join(root, 'owned')), false);
+    for (const [env, cwd, pattern] of [
+        [{}, workspace, /PLOINKY_WORKSPACE_ROOT is not set/],
+        [{ PLOINKY_WORKSPACE_ROOT: 'relative' }, workspace, /must be an absolute path/],
+        [{ PLOINKY_WORKSPACE_ROOT: workspace }, root, /working directory .* must be PLOINKY_WORKSPACE_ROOT/],
+        [{ PLOINKY_WORKSPACE_ROOT: link }, link, /working directory .* must be PLOINKY_WORKSPACE_ROOT/],
+    ]) {
+        const failed = runShellRootPreflight(cwd, env);
+        assert.notEqual(failed.status, 0);
+        assert.match(failed.stderr, pattern);
+    }
+
+    const source = shellEntrypointSource();
+    assert.ok(source.indexOf('\nrequire_workspace_root\n') < source.indexOf('node "$PREPARE_HELPER" --prepare-only'));
+    assert.doesNotMatch(source, /\/workspace\b/);
 });

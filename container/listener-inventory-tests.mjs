@@ -32,7 +32,8 @@ import {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FULL_PROFILE = path.join(HERE, 'profiles', 'full-explorer-listeners.json');
 const ROUTING_PROFILE = path.join(HERE, 'profiles', 'routing-graph-listeners.json');
-const NETWORK_WORKSPACE_HASH = managedNetworkWorkspaceHash('/workspace');
+const WORKSPACE_ROOT = '/home/user/work space/project';
+const NETWORK_WORKSPACE_HASH = managedNetworkWorkspaceHash(WORKSPACE_ROOT);
 
 function managedNetworkFixture({
     logicalName = 'fixture',
@@ -558,6 +559,7 @@ test('collector inventories one outer namespace and each distinct nested namespa
     const calls = [];
     const result = collectBoxListenerInventory({
         outerContainer: 'box',
+        workspaceRoot: WORKSPACE_ROOT,
         run(args) {
             calls.push(args);
             if (args.includes('--eval')) return ownerProofResponse(args);
@@ -607,13 +609,14 @@ test('managed-network collector rejects a generation change around listener coll
         }
         return { status: 1, stderr: `unexpected ${args.join(' ')}` };
     };
-    const expected = collectManagedNetworkInventory({ outerContainer: 'box', run });
+    const expected = collectManagedNetworkInventory({ outerContainer: 'box', run, workspaceRoot: WORKSPACE_ROOT });
     assert.equal(expected[0].gateway, '10.89.0.1');
     assert.throws(
         () => assertManagedNetworkInventoryCurrent({
             outerContainer: 'box',
             run,
             expected,
+            workspaceRoot: WORKSPACE_ROOT,
         }),
         /managed-network generation changed while its listener generation was collected/,
     );
@@ -634,6 +637,7 @@ test('collector rejects a nested graph membership change during collection', () 
     assert.throws(
         () => collectBoxListenerInventory({
             outerContainer: 'box',
+            workspaceRoot: WORKSPACE_ROOT,
             verifyTools: false,
             run(args) {
                 if (args.includes('--eval')) return ownerProofResponse(args);
@@ -724,6 +728,7 @@ test('collector fails closed when its rootless owner cannot enter a nested netwo
     assert.throws(
         () => collectBoxListenerInventory({
             outerContainer: 'box',
+            workspaceRoot: WORKSPACE_ROOT,
             run(args) {
                 if (args.includes('--eval')) return ownerProofResponse(args);
                 if (args[4] === 'node' && args[5] === '-e') {
@@ -861,4 +866,12 @@ test('checked-in routing graph profile rejects wildcard private Router binds', (
     }, profile);
     assert.equal(result.ok, false);
     assert.match(result.errors.join('\n'), /unexpected wildcard listener.*8081/);
+});
+
+test('managed network names require the explicit Box workspace root', () => {
+    assert.throws(() => managedNetworkWorkspaceHash(), /workspace root must be absolute/);
+    assert.throws(() => managedNetworkWorkspaceHash('relative'), /workspace root must be absolute/);
+    assert.notEqual(managedNetworkWorkspaceHash('/home/user/project'), managedNetworkWorkspaceHash('/home/user/project-other'));
+    assert.throws(() => collectManagedNetworkInventory({ outerContainer: 'box', run: () => ({ status: 0, stdout: '[]' }) }),
+        /workspace root must be absolute/);
 });

@@ -208,7 +208,8 @@ test('native mounted relay serves through the exact control socket with zero OCI
             '--label', 'io.assistos.ploinky.resource=agent',
             '--label', `io.assistos.ploinky.instance-id=${effectiveInstanceId}`,
             '--label', `io.assistos.ploinky.enable-generation=${enableGeneration}`,
-            '-v', '/workspace/runtime-relay-native/Agent:/Agent:ro',
+            // The host fixture path is also its Box path.
+            '-v', `${stagedAgent}:/Agent:ro`,
             '-v', `${controlDir}:/run/ploinky-health-probes`,
             '-e', 'PLOINKY_HEALTH_PROBE_BROKER=0',
             '-e', 'PLOINKY_AGENT_ID=agent:native/runtime-relay',

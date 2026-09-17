@@ -19,15 +19,18 @@ function inspection(overrides = {}) {
             CreateCommand: [
                 'podman', 'container', 'create', '--tmpfs',
                 '/tmp:rw,exec,nosuid,nodev,mode=1777,notmpcopyup',
+                '--volume', '/secret/workspace:/secret/workspace',
+                '--workdir', '/secret/workspace',
             ],
-            Env: ['TOKEN=must-not-appear'],
+            Env: ['TOKEN=must-not-appear', 'PLOINKY_WORKSPACE_ROOT=/secret/workspace'],
+            WorkingDir: '/secret/workspace',
         },
         HostConfig: {
             Tmpfs: { '/tmp': 'rw,exec,nosuid,nodev,mode=1777,rprivate' },
         },
         Mounts: [
             {
-                Type: 'bind', Source: '/secret/workspace', Destination: '/workspace', RW: true,
+                Type: 'bind', Source: '/secret/workspace', Destination: '/secret/workspace', RW: true,
             },
             {
                 Type: 'bind', Source: '/secret/tmp-source', Name: 'secret-volume-name',

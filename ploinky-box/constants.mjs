@@ -32,10 +32,6 @@ export const BOX_LABELS = Object.freeze({
     imagesFingerprint: 'io.assistos.ploinky-box.images-fingerprint',
 });
 
-// The broad writable workspace bind. The selected achillesAgentLib source lives
-// inside it, so its alias there needs an explicit read-only shadow.
-export const BOX_WORKSPACE_MOUNT = '/workspace';
-
 // achillesAgentLib is direct-mounted from the one selected workspace source.
 // The Box never installs its own copy. `/opt/ploinky/node_modules` is the
 // workspace-backed cache where the image-bundled mcp-sdk is materialized.

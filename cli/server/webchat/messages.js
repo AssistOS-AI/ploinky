@@ -65,6 +65,7 @@ export function createMessages({
 }, {
     markdown,
     workspaceBase = '',
+    workspaceRoot = '',
     webchatBasePath = '/webchat',
     workspaceFileIndex = null,
     initialViewMoreLineLimit,
@@ -1001,6 +1002,7 @@ export function createMessages({
             } else {
                 enhanceWorkspaceFileLinks(textContainer, {
                     workspaceBase,
+                    workspaceRoot,
                     webchatBasePath,
                     fileIndex: workspaceFileIndex,
                 });
@@ -1571,6 +1573,7 @@ export function createMessages({
             if (container.closest?.('.wa-message.out')) continue;
             enhanceWorkspaceFileLinks(container, {
                 workspaceBase,
+                workspaceRoot,
                 webchatBasePath,
                 fileIndex: workspaceFileIndex,
             });

@@ -217,7 +217,7 @@ test('workspace Ploinky update skips an absent checkout and avoids pulling the h
         assert.equal(duplicate.found, true);
         assert.equal(duplicate.skipped, true);
         assert.equal(duplicate.duplicateOfHost, true);
-        assert.equal(duplicate.boxRepoPath, '/workspace/ploinky');
+        assert.equal(duplicate.boxRepoPath, path.join(workspaceRoot, 'ploinky'));
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -286,7 +286,7 @@ test('workspace Ploinky update pulls remote commits and restores dirty tracked c
 
         assert.equal(result.found, true);
         assert.equal(result.updated, true);
-        assert.equal(result.boxRepoPath, '/workspace/ploinky');
+        assert.equal(result.boxRepoPath, checkout);
         assert.equal(result.pullStrategy, 'rebase-autostash');
         assert.equal(fs.readFileSync(path.join(checkout, 'remote.txt'), 'utf8'), 'two\n');
         assert.equal(fs.readFileSync(path.join(checkout, 'local.txt'), 'utf8'), 'dirty local edit\n');

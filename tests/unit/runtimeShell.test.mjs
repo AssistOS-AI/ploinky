@@ -31,8 +31,9 @@ test('cli dispatches solely by argument arity', async () => {
 test('outer shell validates marker before tty and restores around bash', () => {
     const events = [];
     const lines = [];
+    const workspaceRoot = '/home/user/work space/proiect';
     const code = runOuterRuntimeShell({
-        env: { TOKEN: 'kept' },
+        env: { TOKEN: 'kept', PLOINKY_WORKSPACE_ROOT: workspaceRoot },
         stdin: { isTTY: true },
         stdout: { isTTY: true },
         markerPath: '/marker',
@@ -53,13 +54,13 @@ test('outer shell validates marker before tty and restores around bash', () => {
     assert.equal(code, 0);
     assert.deepEqual(lines, [
         "[ploinky] Entering outer runtime 'ploinky-box-demo'",
-        '[ploinky] user=podman cwd=/workspace; exit returns to the previous prompt',
+        `[ploinky] user=podman cwd=${workspaceRoot}; exit returns to the previous prompt`,
     ]);
     assert.deepEqual(events[0], ['suspend', { promptOnRestore: false }]);
     assert.deepEqual(events[1], {
         file: '/bin/bash',
         args: [],
-        options: { cwd: '/workspace', stdio: 'inherit', env: { TOKEN: 'kept' } },
+        options: { cwd: workspaceRoot, stdio: 'inherit', env: { TOKEN: 'kept', PLOINKY_WORKSPACE_ROOT: workspaceRoot } },
     });
     assert.equal(events[2], 'restore');
 });
@@ -164,4 +165,22 @@ test('repl cli gives bash the tty then restores history and exactly one prompt',
         'prompt',
     ]);
     registerInterface(null);
+});
+
+test('outer shell requires the reserved workspace root before suspending input or starting bash', () => {
+    for (const env of [{}, { PLOINKY_WORKSPACE_ROOT: '' }, { PLOINKY_WORKSPACE_ROOT: '/home/user/pro:ject' }]) {
+        const events = [];
+        assert.throws(() => runOuterRuntimeShell({
+            env,
+            stdin: { isTTY: true },
+            stdout: { isTTY: true },
+            isManagedRuntimeImpl: () => true,
+            runtimeName: 'ploinky-box-demo',
+            user: 'podman',
+            log: line => events.push(line),
+            prepareForExternalCommandImpl: () => { events.push('suspend'); return () => {}; },
+            spawnSyncImpl: () => { events.push('bash'); return { status: 0 }; },
+        }), /PLOINKY_WORKSPACE_ROOT/);
+        assert.deepEqual(events, []);
+    }
 });

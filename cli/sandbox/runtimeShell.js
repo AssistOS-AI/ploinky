@@ -1,5 +1,6 @@
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { readBoxWorkspaceRoot } from '../../ploinky-box/contract/workspace-root.mjs';
 import { isPloinkyBoxRuntime } from './docker/common.js';
 import * as inputState from '../commands/inputState.js';
 import { formatOuterRuntimeBanner } from './layerIdentification.js';
@@ -32,12 +33,14 @@ export function runOuterRuntimeShell({
     log = console.log,
 } = {}) {
     validateOuterRuntimeShell({ markerPath, stdin, stdout, isManagedRuntimeImpl });
-    for (const line of formatOuterRuntimeBanner({ runtimeName, user })) log(line);
+    // The Box shell opens in the host-selected workspace, mounted at its own path.
+    const workspaceRoot = readBoxWorkspaceRoot(env);
+    for (const line of formatOuterRuntimeBanner({ runtimeName, user, cwd: workspaceRoot })) log(line);
     const restore = prepareForExternalCommandImpl({ promptOnRestore: false })
         || (() => {});
     try {
         const result = spawnSyncImpl('/bin/bash', [], {
-            cwd: '/workspace',
+            cwd: workspaceRoot,
             stdio: 'inherit',
             env,
         });

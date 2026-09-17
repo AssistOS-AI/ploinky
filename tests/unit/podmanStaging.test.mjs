@@ -27,7 +27,7 @@ test('link-install stages Agent links without occupying the agent code linked di
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const code = path.join(root, 'agent');
     const deps = path.join(root, 'cache/node_modules');
-    const source = path.join(root, 'Library');
+    const source = path.join(fs.realpathSync(root), 'Library');
     for (const dir of [path.join(code, 'linked'), deps, path.join(source, '.git')]) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(code, 'linked/keep.txt'), 'agent-owned');
     const linkedRepositories = prepareLinkedRepositories({ 'link-install': ['https://github.com/example/Library.git'] }, {
@@ -36,12 +36,15 @@ test('link-install stages Agent links without occupying the agent code linked di
     });
     const runtimeRoot = path.join(root, 'runtime');
     const staged = ensurePodmanStagedAgentLibDir('test', deps, { runtimeRoot, linkedRepositories });
-    assert.equal(fs.readlinkSync(path.join(staged, 'linked/Library')), '/workspace/Library');
+    // The link target is the checkout's own workspace path, so the same absolute
+    // link resolves on the host, in the Box, and in the agent container.
+    assert.equal(fs.readlinkSync(path.join(staged, 'linked/Library')), source);
+    assert.equal(fs.realpathSync(path.join(staged, 'linked/Library')), source);
     const stagedCode = ensurePodmanStagedCodeDir('test', code, deps, new Map(), { runtimeRoot });
     assert.equal(fs.readFileSync(path.join(stagedCode, 'linked/keep.txt'), 'utf8'), 'agent-owned');
     assert.equal(fs.existsSync(path.join(code, 'linked/Library')), false);
     const mounts = buildPodmanStagedTargetMounts({ agentCodePath: code, nodeModulesDir: deps, linkedRepositories, codeReadOnly: true });
-    assert.deepEqual(mounts.find(m => m.source === source), { source, target: '/workspace/Library', ro: false });
+    assert.deepEqual(mounts.find(m => m.source === source), { source, target: source, ro: false });
     assert.equal(mounts.find(m => m.source === code).ro, true);
 });
 import { AGENTS_DATA_DIR, PLOINKY_DIR, PLOINKY_WORKSPACE_ROOT } from '../../cli/utils/config.js';

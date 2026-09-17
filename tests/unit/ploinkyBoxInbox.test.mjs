@@ -178,3 +178,21 @@ test('status exposes allowlisted counts and treats disappearing containers as tr
     assert.equal(result.warnings.some((value) => value.includes('disappeared')), true);
     assert.equal(treeHash(root), before);
 });
+
+test('inbox status has no fixed default workspace and reads only the explicit root', (t) => {
+    const root = fixture(t);
+    for (const workspaceRoot of [undefined, '', 'relative/root']) {
+        assert.throws(() => readInboxStatus({
+            workspaceRoot,
+            runner: { query() { throw new Error('must not query'); } },
+        }), /absolute workspace root/);
+    }
+    fs.mkdirSync(path.join(root, '.ploinky'));
+    fs.writeFileSync(path.join(root, '.ploinky', 'routing.json'), '{}');
+    const result = readInboxStatus({
+        workspaceRoot: root,
+        runner: { query() { throw new Error('must not query'); } },
+    });
+    assert.equal(result.initialized, true);
+    assert.equal(result.routingConfigured, true);
+});

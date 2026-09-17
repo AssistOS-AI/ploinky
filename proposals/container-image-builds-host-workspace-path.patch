@@ -1,0 +1,208 @@
+diff --git a/README.md b/README.md
+index 5176c82e17c6544939e8fae8a35e5c30d0b388fe..f70bf4d408898e5b0d6f280089c09e5591016059 100644
+--- a/README.md
++++ b/README.md
+@@ -362,16 +362,23 @@ clean `FROM scratch` stage. Its metadata is exact:
+ | Image labels | None |
+ | Marker | `/etc/ploinky-box` contains exactly `assistos/ploinky-box` followed by one newline |
+ | User | `podman` |
+-| Environment | `USER=podman`, `HOME=/home/podman`, `PLOINKY_WORKSPACE_ROOT=/workspace`, `PLOINKY_DISABLE_HOST_SANDBOX=1`, `container=oci`, `_CONTAINERS_USERNS_CONFIGURED=`, `BUILDAH_ISOLATION=chroot` |
++| Environment | `USER=podman`, `HOME=/home/podman`, `PLOINKY_DISABLE_HOST_SANDBOX=1`, `container=oci`, `_CONTAINERS_USERNS_CONFIGURED=`, `BUILDAH_ISOLATION=chroot` |
+ | `PATH` | `/opt/ploinky/bin:/usr/local/bin:/usr/bin` |
+-| Working directory | `/workspace` |
++| Working directory | `/` |
+ | Entrypoint | `/usr/local/bin/ploinky-box-entrypoint` |
+ | Default command | Absent |
+ | Declared image volumes | Absent |
+ 
++The image contains no workspace path. The supervisor mounts the selected host
++workspace `W` read-write at the same absolute path `W` inside the Box, and gives
++each created Box `--workdir W` and `PLOINKY_WORKSPACE_ROOT=W`. The entrypoint
++rejects a missing root, a working directory other than the root, or a root that
++does not resolve to itself before it prepares anything. Boxes and images from
++the former fixed `/workspace` layout are incompatible and must be recreated.
++
+ The host workspace, reusable image content, and pinned dependencies outlive one
+-outer Box. The supervisor mounts the host workspace at `/workspace` and
+-bind-mounts two workspace-backed cache directories: `.ploinky/box/dependencies` at
++outer Box. Besides the workspace bind, the supervisor bind-mounts two
++workspace-backed cache directories: `.ploinky/box/dependencies` at
+ `/opt/ploinky/node_modules` and `.ploinky/box/images` at
+ `/home/podman/.local/share/ploinky-images`. The workspace and both cache binds
+ survive stop, destroy, replacement, and recreation.
+@@ -383,14 +390,14 @@ the outer Box:
+ | --- | --- |
+ | `/home/podman/.local/share/ploinky-images` | Workspace-backed host bind from `.ploinky/box/images`; downloaded image content only |
+ | `/opt/ploinky/node_modules` | Workspace-backed host bind from `.ploinky/box/dependencies`; pinned dependency cache |
+-| `/workspace` | Durable host bind; user and agent data |
++| The selected workspace path | Durable host bind at the same absolute path; user and agent data |
+ | `/home/podman/.local/share/containers/storage` | Box writable layer; nested container records, writable layers, and inner named volumes |
+ | `/tmp/storage-run-1000` | Box tmpfs; reset on every startup |
+ 
+ The entrypoint renders `/home/podman/.config/containers/storage.conf` before the
+ first inner Podman call, pointing `imagestore` at the durable cache while
+ `graphroot` stays on the disposable writable layer with `transient_store`
+-enabled. Persistent agent data therefore belongs in `/workspace` binds, never in
++enabled. Persistent agent data therefore belongs in workspace binds, never in
+ inner Podman named volumes.
+ 
+ The first mutating call from a markerless workspace creates only an empty host
+@@ -403,7 +410,7 @@ First boot generates a mode-restricted workspace master key, validates the
+ selected local AgentLib mount or compatible image bundle, and materializes the lock-pinned MCP
+ SDK from the image bundle without network access. The key never crosses from
+ the host, is not printed, and is excluded from nested agents. It remains stable
+-with the host workspace because it is stored under `/workspace/.ploinky`.
++with the host workspace because it is stored under `<workspace>/.ploinky`.
+ Manual key edits and in-place rotation are unsupported; a new key requires a
+ distinct host workspace identity and migration of non-secret data only.
+ 
+diff --git a/images/ploinky-box/Dockerfile b/images/ploinky-box/Dockerfile
+index 26019b8f9e7dd5315059eeba44e9d2bda798f0d7..a76ccb1dea2abffd0d7237a3922457216e4e5652 100644
+--- a/images/ploinky-box/Dockerfile
++++ b/images/ploinky-box/Dockerfile
+@@ -95,18 +95,20 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ # .ploinky/box/dependencies. /home/podman/.local/share/containers/storage is left
+ # on the container writable layer so every nested container record, writable
+ # layer, and inner named volume dies with the outer Box.
++#
++# The image has no workspace directory: the supervisor binds each selected host
++# workspace at its own absolute path and supplies that path as the Box working
++# directory and PLOINKY_WORKSPACE_ROOT when it creates the container.
+ RUN rm -f /home/podman/.config/containers/containers.conf \
+         /home/podman/.config/containers/storage.conf \
+     && mkdir -p \
+         /opt/ploinky/node_modules \
+-        /workspace \
+         /run/ploinky \
+         /home/podman/.config/containers \
+         /home/podman/.local/share/containers/storage \
+         /home/podman/.local/share/ploinky-images \
+     && chown -R podman:podman \
+         /opt/ploinky \
+-        /workspace \
+         /run/ploinky \
+         /home/podman/.config \
+         /home/podman/.local/share/containers \
+@@ -279,7 +281,7 @@ RUN chown -R 0:0 \
+     && test "$(find /usr/local/lib/ploinky/webtty -type f -name '*.node' | wc -l)" -eq 1
+ 
+ USER podman
+-WORKDIR /workspace
++WORKDIR /
+ RUN node /usr/local/share/ploinky/mcp-sdk/bundle-contract.mjs verify \
+         --source /usr/local/lib/ploinky/mcp-sdk \
+     && node /usr/local/share/ploinky/agentlib/image-bundle.mjs verify \
+@@ -302,12 +304,13 @@ RUN rpm --setcaps shadow-utils
+ ENV PATH=/opt/ploinky/bin:/usr/local/bin:/usr/bin \
+     USER=podman \
+     HOME=/home/podman \
+-    PLOINKY_WORKSPACE_ROOT=/workspace \
+     PLOINKY_DISABLE_HOST_SANDBOX=1 \
+     container=oci \
+     _CONTAINERS_USERNS_CONFIGURED="" \
+     BUILDAH_ISOLATION=chroot
+ 
++# A neutral working directory: each created Box receives --workdir and
++# PLOINKY_WORKSPACE_ROOT set to its selected host workspace path.
+ USER podman
+-WORKDIR /workspace
++WORKDIR /
+ ENTRYPOINT ["/usr/local/bin/ploinky-box-entrypoint"]
+diff --git a/scripts/install-roboteam-local.mjs b/scripts/install-roboteam-local.mjs
+index 5f2aa0afea7e3321b4417de4c441a48ac66ab0dd..3e16b1dc2bcc883bb8245c5303d3e2b5a1205851 100755
+--- a/scripts/install-roboteam-local.mjs
++++ b/scripts/install-roboteam-local.mjs
+@@ -43,12 +43,25 @@ if (status.state !== 'running-initialized' || !box?.id || !engine?.name) {
+     throw new Error(`the owned Ploinky Box must be running and initialized (current state: ${status.state})`);
+ }
+ 
+-const inBoxScript = `/workspace/${relativeRepository.split(path.sep).join('/')}/scripts/install-roboteam-local-in-box.sh`;
++// The Box mounts the selected workspace at its own absolute path, so the
++// installer runs from that path rather than a fixed in-Box location.
++// Containment is checked on canonical paths; the in-Box path keeps the
++// selected workspace spelling that the Box mounts.
++const boxWorkspaceRoot = String(status.identity?.workspaceRoot || '');
++if (!path.isAbsolute(boxWorkspaceRoot)) {
++    throw new Error('the owned Ploinky Box did not report its workspace path');
++}
++const boxRelativeRepository = path.relative(fs.realpathSync(boxWorkspaceRoot), fs.realpathSync(repositoryRoot));
++if (!boxRelativeRepository || boxRelativeRepository === '..'
++    || boxRelativeRepository.startsWith(`..${path.sep}`) || path.isAbsolute(boxRelativeRepository)) {
++    throw new Error('container-image-builds must be inside the selected Ploinky Box workspace');
++}
++const inBoxScript = path.join(boxWorkspaceRoot, boxRelativeRepository, 'scripts', 'install-roboteam-local-in-box.sh');
+ const result = spawnSync(engine.name, [
+     'container', 'exec',
+     '--interactive',
+     '--user', 'podman',
+-    '--workdir', '/workspace',
++    '--workdir', boxWorkspaceRoot,
+     box.id,
+     '/bin/bash', inBoxScript, target,
+ ], {
+diff --git a/tests/image-definitions.test.mjs b/tests/image-definitions.test.mjs
+index 6a2fe1babe5b316b2c0a43c6edc7e3473c156efb..258d28cff83092bd05badf126d5f34ba955e06a9 100644
+--- a/tests/image-definitions.test.mjs
++++ b/tests/image-definitions.test.mjs
+@@ -544,7 +544,6 @@ test('ploinky-box image is a source-owned rootless Podman appliance', () => {
+     assert.match(dockerfile, /printf 'assistos\/ploinky-box\\n' > \/etc\/ploinky-box/);
+     for (const ownedTarget of [
+         '/opt/ploinky/node_modules',
+-        '/workspace',
+         '/run/ploinky',
+         '/home/podman/.config/containers',
+         '/home/podman/.local/share/containers/storage',
+@@ -554,8 +553,13 @@ test('ploinky-box image is a source-owned rootless Podman appliance', () => {
+     }
+     assert.match(
+         dockerfile,
+-        /chown -R podman:podman[\s\S]*?\/opt\/ploinky[\s\S]*?\/workspace[\s\S]*?\/run\/ploinky[\s\S]*?\/home\/podman\/\.config[\s\S]*?\/home\/podman\/\.local\/share\/containers[\s\S]*?\/home\/podman\/\.local\/share\/ploinky-images/,
++        /chown -R podman:podman[\s\S]*?\/opt\/ploinky[\s\S]*?\/run\/ploinky[\s\S]*?\/home\/podman\/\.config[\s\S]*?\/home\/podman\/\.local\/share\/containers[\s\S]*?\/home\/podman\/\.local\/share\/ploinky-images/,
+     );
++    // The immutable image carries no workspace path. The supervisor supplies
++    // the selected host path as the bind destination, working directory, and
++    // PLOINKY_WORKSPACE_ROOT of each created Box.
++    assert.doesNotMatch(dockerfile, /(?:^|\s)\/workspace(?:\s|\/|$)/m);
++    assert.doesNotMatch(dockerfile, /PLOINKY_WORKSPACE_ROOT=/);
+     assert.match(dockerfile, /chmod 0700 \/run\/ploinky/);
+     assert.match(
+         dockerfile,
+@@ -586,7 +590,6 @@ test('ploinky-box image is a source-owned rootless Podman appliance', () => {
+     for (const requiredEnv of [
+         'USER=podman',
+         'HOME=/home/podman',
+-        'PLOINKY_WORKSPACE_ROOT=/workspace',
+         'PLOINKY_DISABLE_HOST_SANDBOX=1',
+         'container=oci',
+         '_CONTAINERS_USERNS_CONFIGURED=""',
+@@ -639,7 +642,14 @@ test('ploinky-box image is a source-owned rootless Podman appliance', () => {
+     assert.equal(fs.existsSync(path.join(repoRoot, 'images/ploinky-box/entrypoint.sh')), false);
+     assert.doesNotMatch(dockerfile, /COPY images\/ploinky-box\/entrypoint\.sh/);
+     assert.match(dockerfile, /^USER podman$/m);
+-    assert.match(dockerfile, /^WORKDIR \/workspace$/m);
++    const runtimeStage = dockerfile.slice(dockerfile.indexOf('FROM scratch AS runtime'));
++    assert.match(runtimeStage, /^USER podman\nWORKDIR \/\nENTRYPOINT \["\/usr\/local\/bin\/ploinky-box-entrypoint"\]$/m);
++    const runtimeInstructions = dockerfileInstructions(runtimeStage);
++    assert.deepEqual(
++        runtimeInstructions.filter(({ keyword }) => keyword === 'WORKDIR').map(({ source }) => source.trim()),
++        ['WORKDIR /'],
++    );
++    assert.equal(instructions.some(({ keyword, source }) => keyword === 'WORKDIR' && /\/workspace\b/.test(source)), false);
+     assert.match(dockerfile, /^ENTRYPOINT \["\/usr\/local\/bin\/ploinky-box-entrypoint"\]$/m);
+     assert.equal(instructions.filter(({ keyword }) => keyword === 'VOLUME').length, 0);
+     assert.equal(instructions.filter(({ keyword }) => keyword === 'EXPOSE').length, 0);
+diff --git a/tests/roboteam-agent-supply-chain.test.mjs b/tests/roboteam-agent-supply-chain.test.mjs
+index b8e7cbcdb5f9598ade9536329af68aadc1f631ef..f2873d4815f46d33e98e22e90ff62f6ffccb4529 100644
+--- a/tests/roboteam-agent-supply-chain.test.mjs
++++ b/tests/roboteam-agent-supply-chain.test.mjs
+@@ -153,6 +153,10 @@ test('local development installer builds in the owned Box and streams GUI images
+     assert.match(localInstaller, /createBoxSupervisor/);
+     assert.match(localInstaller, /running-initialized/);
+     assert.match(localInstaller, /container', 'exec'/);
++    // The Box mounts the selected workspace at its own path: no fixed in-Box root.
++    assert.match(localInstaller, /status\.identity\?\.workspaceRoot/);
++    assert.match(localInstaller, /'--workdir', boxWorkspaceRoot/);
++    assert.doesNotMatch(localInstaller, /\/workspace\b/);
+     assert.doesNotMatch(localInstaller, /--privileged|docker\.sock|podman\.sock/);
+     assert.match(localInBoxInstaller, /podman build --pull=missing/);
+     assert.match(localInBoxInstaller, /podman save "\$image" \| podman exec --interactive "\$outer_container" \/usr\/bin\/podman load/);

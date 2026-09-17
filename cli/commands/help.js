@@ -70,7 +70,7 @@ ${lifecycleHelpLines(surface).join('\n')}
   Agent dependencies: update/start/enable/reinstall reuse valid installs.
   npm install runs for a changed package.json or a missing/invalid cache.
   manifest link-install: Git URL array; clone missing workspace repos only.
-  /Agent/linked/<repo> links to /workspace/<checkout>; global agents can edit it.
+  /Agent/linked/<repo> links to <checkout> at its workspace path; global agents can edit it.
   logs tail [router|agent] [--startup]
                                  Follow Router or one agent's logs
   logs last [<N>] [router|agent] [--startup]
