@@ -39,10 +39,10 @@ const GUEST = new Caller({ kind: 'guest', isAdmin: false, roles: ['guest'] });
 const AGENT = new Caller({ kind: 'agent', id: 'agent:a/b' });
 const DELEGATED_AGENT = new Caller({
     kind: 'agent',
-    id: 'agent:AssistOSExplorer/onlyOffice',
+    id: 'agent:OnlyOfficeAgent/onlyOffice',
     delegatedUser: { id: 'local:alice', username: 'alice', roles: ['user'] },
     delegatedTool: 'authed',
-    sourceAgentId: 'agent:AssistOSExplorer/onlyOffice',
+    sourceAgentId: 'agent:OnlyOfficeAgent/onlyOffice',
 });
 
 test('accessFromTags maps tags and rejects invalid combos', () => {

@@ -17,7 +17,7 @@ const originalPollInterval = process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS;
 
 process.chdir(tempDir);
 process.env.PLOINKY_MASTER_KEY = 'e'.repeat(64);
-process.env.PLOINKY_AGENT_ID = 'agent:AssistOSExplorer/onlyOffice';
+process.env.PLOINKY_AGENT_ID = 'agent:OnlyOfficeAgent/onlyOffice';
 process.env.PLOINKY_AGENT_SECRET = 'a'.repeat(64);
 process.env.PLOINKY_MCP_TASK_POLL_INTERVAL_MS = '10';
 

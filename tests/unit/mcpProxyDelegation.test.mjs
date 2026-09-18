@@ -89,7 +89,7 @@ const {
 const { deriveSubkey } = await import(`../../cli/utils/security/masterKey.js${moduleSuffix}`);
 const { verifyUserDelegationGrant } = await import(`../../cli/server/mcp-proxy/userDelegationGrant.js${moduleSuffix}`);
 
-const SOURCE_AGENT = 'agent:AssistOSExplorer/onlyOffice';
+const SOURCE_AGENT = 'agent:OnlyOfficeAgent/onlyOffice';
 const TARGET_ROUTE = 'dpuAgent';
 const TARGET_AGENT = 'agent:AssistOSExplorer/dpuAgent';
 const TOOL = 'dpu_confidential_get';

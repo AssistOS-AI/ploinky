@@ -82,9 +82,9 @@
     },
     {
       "id": "explorer-onlyoffice",
-      "namePattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "namePattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:AssistOSExplorer/onlyOffice"
+      "effectiveInstance": "agent:OnlyOfficeAgent/onlyOffice"
     },
     {
       "id": "explorer-webassist",
@@ -335,7 +335,7 @@
     {
       "id": "onlyoffice-control",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [7000],
       "bindClasses": ["wildcard"],
@@ -348,7 +348,7 @@
     {
       "id": "onlyoffice-editor",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [8080],
       "bindClasses": ["wildcard"],
@@ -361,7 +361,7 @@
     {
       "id": "onlyoffice-storage",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [9100],
       "bindClasses": ["loopback"],
@@ -374,7 +374,7 @@
     {
       "id": "onlyoffice-documentserver",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [80],
       "bindClasses": ["loopback"],
@@ -387,7 +387,7 @@
     {
       "id": "onlyoffice-docservice",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [8000],
       "bindClasses": ["loopback"],
@@ -400,7 +400,7 @@
     {
       "id": "onlyoffice-postgres",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [5432],
       "bindClasses": ["loopback"],
@@ -413,7 +413,7 @@
     {
       "id": "onlyoffice-rabbitmq",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [5672, 25672],
       "bindClasses": ["loopback"],
@@ -426,7 +426,7 @@
     {
       "id": "onlyoffice-epmd",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [4369],
       "bindClasses": ["loopback"],
@@ -439,7 +439,7 @@
     {
       "id": "onlyoffice-redis",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [6379],
       "bindClasses": ["loopback"],
@@ -452,7 +452,7 @@
     {
       "id": "onlyoffice-adminpanel",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_AssistOSExplorer_onlyOffice_",
+      "containerPattern": "^ploinky_OnlyOfficeAgent_onlyOffice_",
       "protocols": ["tcp"],
       "ports": [9000],
       "bindClasses": ["loopback"],

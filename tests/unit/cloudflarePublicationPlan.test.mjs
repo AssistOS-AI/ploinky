@@ -29,7 +29,7 @@ const MANAGED = Object.freeze({
 });
 const HOSTS = Object.freeze({
     'office.example.test': {
-        agent: 'AssistOSExplorer/onlyOffice',
+        agent: 'OnlyOfficeAgent/onlyOffice',
     },
     'explorer.example.test': {
         agent: 'AssistOSExplorer/explorer',

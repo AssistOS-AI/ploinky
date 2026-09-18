@@ -10,7 +10,7 @@ import {
 } from '../../cli/server/mcp-proxy/userDelegationGrant.js';
 
 const SIGNING_SECRET = crypto.randomBytes(32);
-const SOURCE_AGENT = 'agent:AssistOSExplorer/onlyOffice';
+const SOURCE_AGENT = 'agent:OnlyOfficeAgent/onlyOffice';
 const TARGET_AGENT = 'agent:AssistOSExplorer/dpuAgent';
 const TOOL = 'dpu_confidential_get';
 const USER = {

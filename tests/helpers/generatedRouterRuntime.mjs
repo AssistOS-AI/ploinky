@@ -15,7 +15,7 @@ let sequence = 0;
 export function installGeneratedRouterRuntime({
     origin,
     tempDir,
-    agentPrincipal = 'agent:AssistOSExplorer/onlyOffice',
+    agentPrincipal = 'agent:OnlyOfficeAgent/onlyOffice',
     publicAuthority = '127.0.0.1:19090',
     requestAuthority = publicAuthority,
     listenerClass = 'public',

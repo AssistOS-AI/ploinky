@@ -125,21 +125,21 @@ test('authInfoFromInvocation ignores a malformed user actor with an empty id', (
 test('authInfoFromInvocation exposes caller and delegation metadata while keeping usr authoritative', () => {
     const authInfo = authInfoFromInvocation({
         iss: 'ploinky-router',
-        sub: 'agent:AssistOSExplorer/onlyOffice',
-        actor: { kind: 'agent', id: 'agent:AssistOSExplorer/onlyOffice', roles: ['agent'] },
-        caller: { kind: 'agent', id: 'agent:AssistOSExplorer/onlyOffice', roles: ['agent'] },
+        sub: 'agent:OnlyOfficeAgent/onlyOffice',
+        actor: { kind: 'agent', id: 'agent:OnlyOfficeAgent/onlyOffice', roles: ['agent'] },
+        caller: { kind: 'agent', id: 'agent:OnlyOfficeAgent/onlyOffice', roles: ['agent'] },
         usr: { id: 'local:alice', username: 'alice', roles: ['user'] },
         delegation: {
             jti: 'delegation-1',
             scope: ['dpu:confidential:read'],
-            sourceAgentId: 'agent:AssistOSExplorer/onlyOffice'
+            sourceAgentId: 'agent:OnlyOfficeAgent/onlyOffice'
         },
         tool: 'dpu_confidential_get'
     });
 
     assert.equal(authInfo.user.id, 'local:alice');
-    assert.equal(authInfo.agent.principalId, 'agent:AssistOSExplorer/onlyOffice');
-    assert.equal(authInfo.invocation.caller.id, 'agent:AssistOSExplorer/onlyOffice');
+    assert.equal(authInfo.agent.principalId, 'agent:OnlyOfficeAgent/onlyOffice');
+    assert.equal(authInfo.invocation.caller.id, 'agent:OnlyOfficeAgent/onlyOffice');
     assert.equal(authInfo.invocation.delegation.jti, 'delegation-1');
 });
 
