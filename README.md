@@ -685,3 +685,5 @@ The cloud component will allow hosting multiple custom apps built on Ploinky, ea
 ## License
 
 MIT License - see [LICENSE](LICENSE)
+
+Repository consumers can use the shared workspace-first discovery and symlink installation API described in [local instruction skills](docs/local-instruction-skills.md#shared-repository-installation).

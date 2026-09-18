@@ -1,46 +1,16 @@
 import fs from 'node:fs';
 import { isAgentRepositoryUnregistered } from './agentRepositoryRegistration.mjs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { repositoryEntries, repositoryIdentity, repositoryOrigin, workspaceRepositoryPath, workspaceRepositories as discoverWorkspaceRepositories } from './repositorySource.mjs';
 import { PLOINKY_WORKSPACE_ROOT, REPOS_DIR } from './config.js';
 import { getPredefinedRepos, getRepoSources } from './repos.js';
 
-function directoryEntries(root) {
-    try {
-        return fs.readdirSync(root, { withFileTypes: true });
-    } catch (error) {
-        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return [];
-        throw error;
-    }
-}
-
+const directoryEntries = repositoryEntries;
 function hasAgents(candidate) {
-    return directoryEntries(candidate).some(entry => (
-        entry.isDirectory() && !entry.name.startsWith('.')
-        && fs.existsSync(path.join(candidate, entry.name, 'manifest.json'))
-    ));
+    return directoryEntries(candidate).some(entry => entry.isDirectory() && !entry.name.startsWith('.')
+        && fs.existsSync(path.join(candidate, entry.name, 'manifest.json')));
 }
-
-function repositoryIdentity(value) {
-    const raw = String(value || '').trim().replace(/^git@([^:]+):/, 'ssh://git@$1/');
-    try {
-        const url = new URL(raw);
-        const pathname = url.pathname.replace(/\/+$/, '').replace(/\.git$/, '');
-        return `${url.hostname.toLowerCase()}${url.port ? `:${url.port}` : ''}${url.hostname.toLowerCase() === 'github.com' ? pathname.toLowerCase() : pathname}`;
-    } catch {
-        return raw.replace(/\/+$/, '').replace(/\.git$/, '');
-    }
-}
-
-function originIdentity(candidate) {
-    // Do not accidentally read the parent workspace's Git origin.
-    if (!fs.existsSync(path.join(candidate, '.git'))) return '';
-    try {
-        return repositoryIdentity(execFileSync('git', ['-C', candidate, 'config', '--get', 'remote.origin.url'], {
-            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000,
-        }));
-    } catch { return ''; }
-}
+const originIdentity = repositoryOrigin;
 
 // Read lazily: repos.js also uses this module to choose installation sources.
 function registeredSources() {
@@ -48,27 +18,13 @@ function registeredSources() {
 }
 
 function workspaceRepositories() {
-    return directoryEntries(PLOINKY_WORKSPACE_ROOT)
-        .filter(entry => !entry.name.startsWith('.') && entry.name !== 'node_modules'
-            && (entry.isDirectory() || entry.isSymbolicLink()))
-        .map(entry => ({ name: entry.name, directory: path.join(PLOINKY_WORKSPACE_ROOT, entry.name) }))
-        .filter(entry => hasAgents(entry.directory));
+    return discoverWorkspaceRepositories(PLOINKY_WORKSPACE_ROOT, hasAgents);
 }
 
 // Registered aliases retain their identity even when the checkout has a different name.
 export function workspaceAgentRepositoryPath(name, { url = null } = {}) {
-    if (!name || name.startsWith('.') || name === 'node_modules'
-        || name.includes('/') || name.includes('\\')) return null;
-    const candidate = path.join(PLOINKY_WORKSPACE_ROOT, name);
-    if (hasAgents(candidate)) return candidate;
-    const source = registeredSources()[name];
-    const identity = repositoryIdentity(url || source?.url);
-    if (!identity) return null;
-    const matches = workspaceRepositories().filter(entry => originIdentity(entry.directory) === identity);
-    if (matches.length > 1) {
-        throw new Error(`Multiple workspace checkouts match repository '${name}': ${matches.map(entry => entry.name).join(', ')}`);
-    }
-    return matches[0]?.directory || null;
+    return workspaceRepositoryPath(name, { workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+        url: url || registeredSources()[name]?.url, accept: hasAgents });
 }
 
 export function resolveAgentRepositoryPath(name) {

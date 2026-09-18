@@ -1,8 +1,9 @@
 import fs from 'fs';
+import { workspaceRepositories } from './repositorySource.mjs';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { listWorkspaceSkillRepositories, resolveSkillRepositorySource } from './skillRepositorySource.js';
-import { PLOINKY_DIR } from './config.js';
+import { PLOINKY_WORKSPACE_ROOT, PLOINKY_DIR } from './config.js';
 import { listAgentRepositoryNames, resolveAgentRepositoryPath, workspaceAgentRepositoryPath } from './agentRepositorySource.mjs';
 import { isAgentRepositoryUnregistered, setAgentRepositoryRegistered } from './agentRepositoryRegistration.mjs';
 import { parseBranchPolicy } from '../../agentlib/branchPolicy.mjs';
@@ -901,4 +902,19 @@ export function ensureRepoOnBranch(name, { branch, resetRepos = false, fallback 
 
     recordRepoSource(name, resolveRepoSourceUrl(name), branch);
     return { status: 'switched', branch };
+}
+
+export function listRepositorySources() {
+    const registered = { ...PREDEFINED_REPOS, ...getRepoSources() };
+    const names = new Set([...Object.keys(registered), ...getInstalledRepos(), ...listAgentRepositoryNames(),
+        ...workspaceRepositories(PLOINKY_WORKSPACE_ROOT, candidate => fs.existsSync(path.join(candidate, '.git'))).map(entry => entry.name)]);
+    const skills = new Map(getSkillRepositoryRecommendations().map(repo => [repo.name, repo]));
+    return [...names].sort().map(name => {
+        const url = registered[name]?.url || '';
+        const agentSource = workspaceAgentRepositoryPath(name);
+        const resolved = agentSource ? { source: fs.realpathSync(agentSource), origin: 'workspace' }
+            : resolveSkillRepositorySource(name, url);
+        return { name, repoName: name, url, ...resolved, kind: skills.get(name)?.kind || classifyRepoKind(name),
+            warnings: skills.get(name)?.warnings || [] };
+    });
 }

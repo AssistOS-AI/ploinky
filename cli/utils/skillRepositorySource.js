@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { workspaceRepositoryPath } from './repositorySource.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from './config.js';
 
 // Recommendations use the workspace checkout before a managed repository.
@@ -8,7 +9,7 @@ export function resolveSkillRepositorySource(name, url, { workspaceRoot = PLOINK
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name || '')) return { source: url, origin: 'remote' };
     const workspace = fs.realpathSync(workspaceRoot);
     for (const [origin, candidate] of [
-        ['workspace', path.join(workspace, name)],
+        ['workspace', workspaceRepositoryPath(name, { workspaceRoot: workspace, url }) || path.join(workspace, name)],
         ['installed', path.join(workspace, '.ploinky', 'repos', name)],
     ]) {
         try {

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { workspaceRepositories } from './repositorySource.mjs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -47,9 +48,7 @@ export function prepareLinkedRepositories(manifest, { workspaceRoot, create = tr
         try { return repository(String(git(['-C', directory, 'config', '--get', 'remote.origin.url'])).trim()).identity; }
         catch { return null; }
     };
-    const entries = fs.readdirSync(root, { withFileTypes: true }).filter(entry =>
-        entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules');
-    const known = entries.map(entry => ({ directory: path.join(root, entry.name), identity: origin(path.join(root, entry.name)) }));
+    const known = workspaceRepositories(root).map(entry => ({ directory: entry.directory, identity: origin(entry.directory) }));
     return declarations.map(repo => {
         const matches = known.filter(entry => entry.identity === repo.identity);
         if (matches.length > 1) throw new Error(`Multiple workspace repositories match link-install ${repo.name}`);

@@ -129,3 +129,21 @@ test('Marketplace rejects agent mutation actions other than enable_agent', async
     assert.equal(response.statusCode, 403);
     assert.equal(JSON.parse(response.payload).error, 'agent_action_forbidden');
 });
+
+for (const resource of ['install', 'remove']) {
+    test(`Repository ${resource} assertion is bound to its path and operation`, () => {
+        const requestPath = `${marketplaceModule.MARKETPLACE_PATH}/${resource}`;
+        const tool = `repositories.${resource}`;
+        const rawBody = Buffer.from(resource === 'remove' ? '[]' : '{"repos":[]}');
+        const token = signAgentHttpAssertion({ method: 'POST', path: requestPath, body: rawBody,
+            targetAgent: marketplaceModule.MARKETPLACE_AGENT_TARGET, tool, env: agentEnv });
+        const options = { req: { headers: { authorization: `Bearer ${token}` } },
+            method: 'POST', tool, rawBody, requestPath };
+        assert.equal(marketplaceModule.__testables.verifyMarketplaceAgentRequest({ ...options,
+            replayCache: createMemoryReplayCache() }).callerPrincipal, caller);
+        assert.throws(() => marketplaceModule.__testables.verifyMarketplaceAgentRequest({ ...options,
+            requestPath: marketplaceModule.MARKETPLACE_PATH, replayCache: createMemoryReplayCache() }));
+        assert.throws(() => marketplaceModule.__testables.verifyMarketplaceAgentRequest({ ...options,
+            tool: 'repositories.other', replayCache: createMemoryReplayCache() }));
+    });
+}

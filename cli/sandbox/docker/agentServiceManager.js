@@ -1,3 +1,4 @@
+import { ensureRepositoryLink } from '../../utils/repositoryInstall.mjs';
 import { prepareLinkedRepositories } from '../../utils/linkInstall.mjs';
 import { resolveAgentRepositoryName } from '../../utils/agentRepositorySource.mjs';
 import { execSync, spawnSync } from 'child_process';
@@ -570,7 +571,10 @@ function ensurePodmanStagedAgentLibDir(agentName, nodeModulesDir, options = {}) 
     if (options.linkedRepositories?.length) {
         fs.mkdirSync(path.join(stagedAgentLibPath, 'linked'));
         for (const repo of options.linkedRepositories) {
-            fs.symlinkSync(repo.target, path.join(stagedAgentLibPath, repo.link), 'dir');
+            const installed = ensureRepositoryLink(path.join(stagedAgentLibPath, repo.link), repo.target, stagedAgentLibPath, {
+                linkParent: path.dirname(path.join('/Agent', repo.link)),
+            });
+            if (installed.status === 'conflict') throw new Error('link-install destination conflicts with existing content');
         }
     }
     return stagedAgentLibPath;

@@ -1,3 +1,4 @@
+import { ensureRepositoryLink } from '../repositoryInstall.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -101,7 +102,7 @@ export function syncManagedSkillExports({ folder, owner, sources, mode = 'copy',
                 if (mode === 'symlink') {
                     const target = fs.realpathSync(wanted.path);
                     if (!fs.statSync(path.join(target, 'SKILL.md')).isFile()) throw new Error('Skill descriptor is missing');
-                    fs.symlinkSync(path.relative(skills, target), staged, 'dir');
+                    ensureRepositoryLink(staged, target, folder, { linkParent: skills });
                     digest = skillTreeDigest(staged);
                     valid = true;
                 }

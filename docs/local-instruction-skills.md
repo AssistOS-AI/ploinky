@@ -37,3 +37,21 @@ Automatic local refresh reads original working files at RoboTeam's execution bou
 Workspace repository recommendations retain repositories containing skill folders without SKILL.md. Each missing descriptor produces a warning shown in Explorer and RoboTeam; only available skills can be selected. Existing descriptors still require valid names and descriptions.
 
 Automatic workspace discovery excludes repositories containing AchillesAgentLib typed descriptors (`oskill.md`, `cskill.md`, `dcgskill.md`, or `tskill.md`) under `skills/`, including nested directories and repositories that also contain SKILL.md skills. These are not incomplete instruction-skill repositories and do not produce missing-SKILL.md recommendations.
+
+## Shared repository installation
+
+Repository discovery, Marketplace, agent resolution and link-install prefer workspace Git checkouts, including a unique checkout matching the registered Git origin, before `.ploinky/repos`. Discovery never pulls a checkout. `GET /api/marketplace/list-repos` returns `repositories` with `name`, `source`, `origin`, `kind` and discovery warnings. Typed AchillesAgentLib repositories are excluded from Anthropic skill recommendations.
+
+`POST /api/marketplace/install` accepts a mixed batch:
+
+```json
+{"repos":[{"repoName":"AdvancedLanguageAgent","destination":"/workspace/project/dependencies/ALA"}],"skillRepos":[{"repoName":"DocumentationSkills","destination":"/workspace/project","skills":["review-specs"]}]}
+```
+
+A repo destination is the symlink path. Optional `sourcePath` selects a relative directory inside that repository. A skill-repository destination is the project directory; install prepares `.agents/skills`, links each selected skill folder there, and prepares `.claude` as a relative symlink to `.agents`. An empty skills array still prepares the layout. Sources must already exist in a discovered repository inside the workspace. Destinations must remain inside the workspace, including resolved parent directories.
+
+Install is additive and idempotent. It returns `results` and `conflicts`; correct links are `present`, new links are `installed`, and other existing entries are `conflict`. It never overwrites files or removes omitted selections. `POST /api/marketplace/remove` accepts an array of absolute destination paths. It removes only symlinks, including dangling links, reports missing paths as `absent`, and preserves ordinary files and directories as conflicts. Removal does not touch source files. Consumers explicitly remove their own obsolete links before installing a changed selection.
+
+Agents reuse `Agent/client/RepositoryClient.mjs` for `listRepositories`, `prepareRepository`, `install` and `remove`. Requests use the generated Router descriptor and path/body-bound signed agent assertions. Browser mutations retain administrator and CSRF checks. Mutation routes take the workspace mutation lease. Link-install and managed skill exports reuse the link publication primitive, preserving their existing staging lifecycle.
+
+Staged link-install exports calculate their relative targets from the final `/Agent/linked` location, not the staging directory. For example, `/Agent/linked/Library -> ../../workspace/Library` resolves to the existing workspace mount. The internal `linkParent` option controls both creation and idempotence checks; it is not an endpoint parameter.

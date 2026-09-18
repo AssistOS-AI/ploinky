@@ -148,25 +148,23 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function marketplaceUrl(descriptor) {
-    return resolveGeneratedRouterOperation(trustedDescriptor(descriptor), MARKETPLACE_PATH);
-}
-
 function marketplaceToolForRequest(method, body) {
+    if (method === 'POST' && body?.action === 'install_repo') return 'repositories.prepare';
     return method === 'POST' && body?.action === 'enable_agent'
         ? MARKETPLACE_ENABLE_TOOL
         : MARKETPLACE_READ_TOOL;
 }
 
-function requestMarketplace(method = 'GET', body = null, descriptor) {
+export function requestMarketplace(method = 'GET', body = null, descriptor, resource = '') {
     const verified = trustedDescriptor(descriptor);
-    const url = marketplaceUrl(verified);
+    const requestPath = MARKETPLACE_PATH + (resource ? `/${resource}` : '');
+    const url = resolveGeneratedRouterOperation(verified, requestPath);
     const httpModule = url.protocol === 'https:' ? https : http;
     const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : Buffer.alloc(0);
-    const tool = marketplaceToolForRequest(method, body);
+    const tool = ['install', 'remove'].includes(resource) ? `repositories.${resource}` : marketplaceToolForRequest(method, body);
     const assertion = signAgentHttpAssertion({
         method,
-        path: MARKETPLACE_PATH,
+        path: requestPath,
         query: '',
         body: payload,
         targetAgent: MARKETPLACE_TARGET,
@@ -177,7 +175,7 @@ function requestMarketplace(method = 'GET', body = null, descriptor) {
         const req = httpModule.request({
             hostname: url.hostname,
             port: url.port || (url.protocol === 'https:' ? 443 : 80),
-            path: MARKETPLACE_PATH,
+            path: requestPath,
             method,
             headers: {
                 host: getRouterAuthority(verified),
@@ -211,6 +209,7 @@ function requestMarketplace(method = 'GET', body = null, descriptor) {
                 resolve(json.marketplace || json);
             });
         });
+        req.setTimeout(30000, () => req.destroy(new Error('Repository request timed out')));
         req.on('error', reject);
         if (payload.length) req.write(payload);
         req.end();

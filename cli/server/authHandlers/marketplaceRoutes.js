@@ -1,5 +1,7 @@
 import fs from 'fs';
 import path from 'path';
+import { withWorkspaceMutationLease } from '../../utils/runtime/maintenanceLocks.js';
+import { installRepositoryLinks, removeRepositoryLinks } from '../../utils/repositoryInstall.mjs';
 
 import { PLOINKY_DIR } from '../../utils/config.js';
 import * as reposSvc from '../../utils/repos.js';
@@ -125,19 +127,19 @@ function readMarketplaceBody(req, { maxBytes = 1024 * 1024 } = {}) {
     });
 }
 
-function verifyMarketplaceAgentRequest({ req, method, query = '', tool, rawBody = Buffer.alloc(0), replayCache = marketplaceAssertionReplayCache }) {
+function verifyMarketplaceAgentRequest({ req, method, query = '', tool, requestPath = MARKETPLACE_PATH, rawBody = Buffer.alloc(0), replayCache = marketplaceAssertionReplayCache }) {
     const token = readAuthorizationBearer(req);
     if (!token) throw new Error('missing_agent_assertion');
     const rch = computeRchHttp({
         method,
-        path: MARKETPLACE_PATH,
+        path: requestPath,
         query,
         bodyHash: sha256RawBodyHash(rawBody),
     });
     return verifyAgentAssertion({
         token,
         method,
-        path: MARKETPLACE_PATH,
+        path: requestPath,
         tool,
         rch,
         targetAgentId: MARKETPLACE_AGENT_TARGET,
@@ -344,7 +346,8 @@ function buildMarketplaceState(user = null, options = {}) {
     }
     const skillRepos = new Map(reposSvc.getSkillRepositoryRecommendations().map(repo => [repo.name, repo]));
     const bootRepos = new Set(reposSvc.getDefaultBootRepos().map(repo => repo.name));
-    const repoNames = new Set([...Object.keys(predefined), ...Object.keys(sources), ...installed, ...listAgentRepositoryNames(), ...skillRepos.keys()]);
+    const commonRepositories = new Map(reposSvc.listRepositorySources().map(repo => [repo.name, repo]));
+    const repoNames = new Set([...commonRepositories.keys(), ...Object.keys(predefined), ...Object.keys(sources), ...installed, ...listAgentRepositoryNames(), ...skillRepos.keys()]);
     const repositories = [...repoNames].sort((left, right) => left.localeCompare(right)).map((name) => {
         const predefinedEntry = predefined[name] || {};
         const sourceEntry = sources[name] || {};
@@ -358,6 +361,7 @@ function buildMarketplaceState(user = null, options = {}) {
             name,
             displayName: workspacePath || name,
             workspacePath,
+            repositorySource: commonRepositories.get(name) || null,
             url,
             description: predefinedEntry.description || '',
             kind,
@@ -530,16 +534,21 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
     }
 
     const method = (req.method || 'GET').toUpperCase();
-    if (method === 'GET' && !route.resource) {
+    if (method === 'GET' && (!route.resource || route.resource === 'list-repos')) {
         if (readAuthorizationBearer(req)) {
             if (!ensureMarketplaceAgentRequest(req, res, {
                 method: 'GET',
                 query: parsedUrl.search ? parsedUrl.search.slice(1) : '',
                 tool: MARKETPLACE_READ_TOOL,
+                requestPath: parsedUrl.pathname,
             })) return true;
         } else {
             const authResult = await ensureMarketplaceUser(req, res, { routePlan });
             if (!authResult.ok) return true;
+        }
+        if (route.resource === 'list-repos') {
+            sendJson(res, 200, { ok: true, repositories: reposSvc.listRepositorySources() });
+            return true;
         }
         sendJson(res, 200, {
             ok: true,
@@ -554,7 +563,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
         return true;
     }
 
-    if (method === 'POST' && !route.resource) {
+    if (method === 'POST' && (!route.resource || ['install', 'remove'].includes(route.resource))) {
         const agentRequest = Boolean(readAuthorizationBearer(req));
         if (!agentRequest) {
             if (!(await ensureAdmin(req, res, parsedUrl, { routePlan }))) {
@@ -583,26 +592,37 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             return true;
         }
 
-        const action = String(body?.action || '').trim();
+        const action = route.resource || String(body?.action || '').trim();
         if (agentRequest) {
-            if (action !== 'enable_agent') {
-                sendMarketplaceError(res, 403, 'agent_action_forbidden', 'Agents may only enable installed agents.');
+            if (!['enable_agent', 'install', 'remove', 'install_repo'].includes(action)) {
+                sendMarketplaceError(res, 403, 'agent_action_forbidden', 'Unsupported agent repository action.');
                 return true;
             }
             if (!ensureMarketplaceAgentRequest(req, res, {
                 method: 'POST',
                 query: parsedUrl.search ? parsedUrl.search.slice(1) : '',
-                tool: MARKETPLACE_ENABLE_TOOL,
+                tool: action === 'enable_agent' ? MARKETPLACE_ENABLE_TOOL : action === 'install_repo' ? 'repositories.prepare' : `repositories.${action}`,
+                requestPath: parsedUrl.pathname,
                 rawBody,
             })) return true;
         }
 
         try {
+            if (action === 'install' || action === 'remove') {
+                const result = await withWorkspaceMutationLease({ operation: `repositories-${action}` }, () => {
+                    const repositories = action === 'install' ? new Map(reposSvc.listRepositorySources().filter(repo => repo.origin !== 'remote').map(repo => [repo.name, repo])) : null;
+                    return action === 'install'
+                        ? installRepositoryLinks(body, { resolveRepository: name => repositories.get(name) })
+                        : removeRepositoryLinks(body);
+                });
+                sendJson(res, 200, { ok: true, ...result });
+                return true;
+            }
             if (action === 'install_repo') {
                 const url = normalizeMarketplaceUrl(body?.url);
                 const name = normalizeOptionalMarketplaceRepoName(body?.name);
                 const branch = String(body?.branch || '').trim() || null;
-                const result = reposSvc.installRepo(url, name, branch, { stdio: 'pipe' });
+                const result = await withWorkspaceMutationLease({ operation: 'repositories-prepare' }, () => reposSvc.installRepo(url, name, branch, { stdio: 'pipe' }));
                 sendJson(res, 200, {
                     ok: true,
                     action,

@@ -36,10 +36,11 @@ test('link-install stages Agent links without occupying the agent code linked di
     });
     const runtimeRoot = path.join(root, 'runtime');
     const staged = ensurePodmanStagedAgentLibDir('test', deps, { runtimeRoot, linkedRepositories });
-    // The link target is the checkout's own workspace path, so the same absolute
-    // link resolves on the host, in the Box, and in the agent container.
-    assert.equal(fs.readlinkSync(path.join(staged, 'linked/Library')), source);
-    assert.equal(fs.realpathSync(path.join(staged, 'linked/Library')), source);
+    // The relative link resolves from its final /Agent/linked location back to
+    // the checkout's own workspace path, so the same link works on the host, in
+    // the Box, and in the agent container.
+    const linkText = fs.readlinkSync(path.join(staged, 'linked/Library'));
+    assert.equal(path.posix.resolve('/Agent/linked', linkText), source);
     const stagedCode = ensurePodmanStagedCodeDir('test', code, deps, new Map(), { runtimeRoot });
     assert.equal(fs.readFileSync(path.join(stagedCode, 'linked/keep.txt'), 'utf8'), 'agent-owned');
     assert.equal(fs.existsSync(path.join(code, 'linked/Library')), false);
