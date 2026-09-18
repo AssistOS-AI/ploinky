@@ -100,6 +100,25 @@ test('Marketplace enable uses the worker path and preserves normalized arguments
     });
 });
 
+test('Marketplace enable keeps explicit isolated and leaves a missing mode to the manifest default', async () => {
+    const calls = [];
+    const runEnableWorker = async (input) => { calls.push(input); return {}; };
+    await enableMarketplaceAgent({ agentRef: 'repo/explicit', mode: 'isolated' }, { runEnableWorker });
+    await enableMarketplaceAgent({ agentRef: 'repo/implicit' }, { runEnableWorker });
+    await enableMarketplaceAgent({ agentRef: 'repo/default', mode: 'default' }, { runEnableWorker });
+    assert.deepEqual(calls, [
+        { agentRef: 'repo/explicit', mode: 'isolated' },
+        { agentRef: 'repo/implicit', mode: '' },
+        { agentRef: 'repo/default', mode: '' },
+    ]);
+
+    const direct = [];
+    await enableMarketplaceAgent({ agentRef: 'repo/direct', mode: 'isolated' }, {
+        enable: async (...args) => { direct.push(args); return {}; },
+    });
+    assert.deepEqual(direct, [['repo/direct', 'isolated', undefined]]);
+});
+
 test('Marketplace enable serializes different workspace mutations', async () => {
     let releaseFirst;
     const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });

@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 
 import { PLOINKY_DIR } from '../../utils/config.js';
@@ -46,6 +47,8 @@ const SAFE_LIFECYCLE_ERRORS = new Map([
     ['PLOINKY_BWRAP_CAPABILITY_UNAVAILABLE', { status: 422, message: 'The required Bubblewrap capability is unavailable.' }],
     ['PLOINKY_OPEN_INTERPRETER_BOX_UNAVAILABLE', { status: 422, message: 'Open Interpreter is unavailable in this Ploinky Box.' }],
     ['PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', { status: 504, message: 'Agent activation timed out.' }],
+    ['PLOINKY_AGENT_ENABLE_MODE_UNSUPPORTED', { status: 422, message: 'The agent does not support the selected run mode.' }],
+    ['PLOINKY_MANIFEST_ENABLE_MODES_INVALID', { status: 422, message: 'The agent manifest declares invalid enable modes.' }],
 ]);
 const marketplaceEnableFlights = new Map();
 let marketplaceEnableQueue = Promise.resolve();
@@ -181,9 +184,10 @@ function normalizeMarketplaceAgentRef(value) {
     return `${parts[0]}/${parts[1]}`;
 }
 
+// An empty mode lets enableAgent apply the manifest's default enable mode.
 function normalizeMarketplaceEnableMode(value) {
-    const mode = String(value || agentsSvc.DEFAULT_ENABLE_AGENT_MODE).trim().toLowerCase();
-    if (!mode || mode === 'default') return agentsSvc.DEFAULT_ENABLE_AGENT_MODE;
+    const mode = String(value || '').trim().toLowerCase();
+    if (!mode || mode === 'default') return '';
     if (!agentsSvc.isEnableAgentMode(mode)) {
         throw new Error('invalid_enable_mode');
     }
@@ -213,7 +217,7 @@ export async function enableMarketplaceAgent(body, {
     const mode = normalizeMarketplaceEnableMode(body?.mode || body?.enableMode);
     const repoName = ref.split('/')[0];
     const result = typeof enable === 'function'
-        ? await enable(ref, mode === 'isolated' ? undefined : mode, mode === 'devel' ? repoName : undefined)
+        ? await enable(ref, mode || undefined, mode === 'devel' ? repoName : undefined)
         : await enqueueMarketplaceEnable(ref, mode, async (options) => {
             beforeEnable();
             return runEnableWorker(options);
@@ -306,6 +310,16 @@ function normalizeMarketplaceAgentStatus({ active, runtimeState, noWaitState } =
     return { status: 'unknown', detail: '' };
 }
 
+// Listing stays available when a manifest is unreadable or declares invalid
+// modes; enabling that agent reports the manifest error instead.
+function readMarketplaceEnableModes(manifestPath) {
+    try {
+        return agentsSvc.resolveManifestEnableModes(JSON.parse(fs.readFileSync(manifestPath, 'utf8')));
+    } catch {
+        return { modes: [...agentsSvc.ENABLE_AGENT_MODES], defaultMode: agentsSvc.DEFAULT_ENABLE_AGENT_MODE };
+    }
+}
+
 function buildMarketplaceState(user = null, options = {}) {
     const reposDir = path.join(PLOINKY_DIR, 'repos');
     const predefined = reposSvc.getPredefinedRepos();
@@ -392,14 +406,15 @@ function buildMarketplaceState(user = null, options = {}) {
                     : noWaitStates[enabledRecord.containerName])
                 : null;
             const lifecycle = normalizeMarketplaceAgentStatus({ active, runtimeState, noWaitState });
+            const enableModes = readMarketplaceEnableModes(agent.manifestPath);
             agents.push({
                 ref,
                 repo: agent.repo,
                 name: agent.name,
                 about: agent.about === '-' ? '' : (agent.about || ''),
                 active,
-                enableMode: enabledRecord?.runMode || agentsSvc.DEFAULT_ENABLE_AGENT_MODE,
-                enableModes: agentsSvc.ENABLE_AGENT_MODES,
+                enableMode: enabledRecord?.runMode || enableModes.defaultMode,
+                enableModes: enableModes.modes,
                 runtime: runtimeState?.backend || enabledRecord?.runtime || '',
                 status: lifecycle.status,
                 ...(lifecycle.detail ? { statusDetail: lifecycle.detail } : {}),

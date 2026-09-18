@@ -23,7 +23,7 @@ try {
     const repoName = agentRef.split('/')[0] || '';
     const result = await enableAgent(
         agentRef,
-        mode === 'isolated' ? undefined : mode,
+        mode || undefined,
         mode === 'devel' ? repoName : undefined,
     );
     parentPort?.postMessage({ ok: true, result });

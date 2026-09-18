@@ -170,3 +170,22 @@ test('Marketplace labels a workspace agent checkout relative to the workspace', 
     assert.equal(repo.displayName, './Local Agents Checkout');
     assert.equal(JSON.stringify(res.body.marketplace.repositories).includes('"/workspace/'), false);
 });
+
+test('Marketplace advertises each agent manifest enable modes and default', async () => {
+    const checkout = path.join(workspace, 'ModeAgents');
+    const manifests = {
+        restricted: { container: 'node:22', enableModes: ['global'] },
+        open: { container: 'node:22' },
+        broken: { container: 'node:22', enableModes: ['shared'] },
+    };
+    for (const [name, manifest] of Object.entries(manifests)) {
+        fs.mkdirSync(path.join(checkout, name), { recursive: true });
+        fs.writeFileSync(path.join(checkout, name, 'manifest.json'), JSON.stringify(manifest));
+    }
+    const res = await request({ method: 'GET' });
+    assert.equal(res.status, 200);
+    const agent = name => res.body.marketplace.agents.find(item => item.ref === `ModeAgents/${name}`);
+    assert.deepEqual([agent('restricted').enableModes, agent('restricted').enableMode], [['global'], 'global']);
+    assert.deepEqual([agent('open').enableModes, agent('open').enableMode], [['isolated', 'global', 'devel'], 'isolated']);
+    assert.deepEqual([agent('broken').enableModes, agent('broken').enableMode], [['isolated', 'global', 'devel'], 'isolated']);
+});

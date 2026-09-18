@@ -96,8 +96,41 @@ export function isEnableAgentMode(value) {
     return ENABLE_AGENT_MODE_SET.has(String(value || '').trim().toLowerCase());
 }
 
-function formatEnableAgentModes() {
-    return ENABLE_AGENT_MODES.join(' | ');
+function formatEnableAgentModes(modes = ENABLE_AGENT_MODES) {
+    return modes.join(' | ');
+}
+
+// A manifest may narrow the enable modes it supports with `enableModes`; the
+// first entry is the default used when no mode is requested.
+export function resolveManifestEnableModes(manifest) {
+    if (!manifest || !Object.hasOwn(manifest, 'enableModes')) {
+        return { modes: [...ENABLE_AGENT_MODES], defaultMode: DEFAULT_ENABLE_AGENT_MODE };
+    }
+    const declared = manifest.enableModes;
+    const modes = Array.isArray(declared)
+        ? declared.map((value) => String(value || '').trim().toLowerCase())
+        : [];
+    if (!modes.length || modes.some((value) => !ENABLE_AGENT_MODE_SET.has(value)) || new Set(modes).size !== modes.length) {
+        const error = new Error(`Manifest enableModes must be a nonempty list of distinct modes from: ${formatEnableAgentModes()}`);
+        error.code = 'PLOINKY_MANIFEST_ENABLE_MODES_INVALID';
+        throw error;
+    }
+    return { modes, defaultMode: modes[0] };
+}
+
+// Returns the manifest default for an empty request and rejects a known mode
+// the manifest does not support. Unknown modes pass through so the caller
+// reports them against the full mode list.
+export function resolveRequestedEnableMode(manifest, requestedMode, agentId) {
+    const { modes, defaultMode } = resolveManifestEnableModes(manifest);
+    const requested = String(requestedMode || '').trim().toLowerCase();
+    const mode = !requested || requested === 'default' ? defaultMode : requested;
+    if (isEnableAgentMode(mode) && !modes.includes(mode)) {
+        const error = new Error(`Agent '${agentId}' does not support mode '${mode}'. Allowed: ${formatEnableAgentModes(modes)}`);
+        error.code = 'PLOINKY_AGENT_ENABLE_MODE_UNSUPPORTED';
+        throw error;
+    }
+    return mode;
 }
 
 function normalizeAlias(aliasInput) {
@@ -418,7 +451,7 @@ function planAgentEnable({
         throw new Error('Local password authentication options are no longer supported.');
     }
 
-    const normalizedMode = (normalized.mode || '').toLowerCase();
+    const normalizedMode = resolveRequestedEnableMode(manifest, normalized.mode, `${repoName}/${shortAgentName}`);
     let runMode = DEFAULT_ENABLE_AGENT_MODE;
     let projectPath = '';
 
