@@ -76,6 +76,18 @@ confirm() {
     esac
 }
 
+detect_rc_file() {
+    local shell_name
+    shell_name="$(basename "${SHELL:-bash}")"
+    case "$shell_name" in
+        zsh) printf '%s' "$HOME/.zshrc" ;;
+        bash)
+            if [ "$PLATFORM" = "macos" ]; then printf '%s' "$HOME/.bash_profile"; else printf '%s' "$HOME/.bashrc"; fi
+            ;;
+        *) printf '%s' "$HOME/.profile" ;;
+    esac
+}
+
 version_ge() {
     local actual="${1#v}" required="${2#v}"
     local IFS=.
@@ -127,7 +139,19 @@ verify_sha256() {
 }
 
 # --- Node.js --------------------------------------------------------------
+persist_user_bin() {
+    local user_bin="$HOME/.local/bin" rc
+    rc="$(detect_rc_file)"
+    add_rc_block "$rc" "$user_bin"
+    export PATH="$user_bin:$PATH"
+    info "Added $user_bin to PATH in $rc"
+}
+
 install_node() {
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '  [dry-run] install Node.js %s.x into %s and add %s to PATH\n' "$NODE_MIN_MAJOR" "$NODE_DIR" "$HOME/.local/bin"
+        return 0
+    fi
     if [ "$PLATFORM" = "macos" ] && command -v brew >/dev/null 2>&1; then
         run brew install "node@${NODE_MIN_MAJOR}" || return 1
         run brew link --overwrite --force "node@${NODE_MIN_MAJOR}" || true
@@ -159,7 +183,7 @@ install_node() {
             [ -e "$NODE_DIR/bin/$b" ] && run ln -sfn "$NODE_DIR/bin/$b" "$HOME/.local/bin/$b"
         done
         rm -rf "$tmp"
-        export PATH="$HOME/.local/bin:$PATH"
+        persist_user_bin
         return 0
     fi
     rm -rf "$tmp"
@@ -175,7 +199,7 @@ check_node() {
             info "Node.js $current detected."
             return 0
         fi
-        warn "Node.js $current is older than the required v${NODE_MIN_MAJOR}."
+        info "Node.js $current is older than the required v${NODE_MIN_MAJOR}."
         if confirm "Install Node.js ${NODE_MIN_MAJOR}.x now (no sudo needed)?"; then
             if install_node; then
                 info "Node.js $(node --version 2>/dev/null) installed."
@@ -185,7 +209,7 @@ check_node() {
         warn "Install Node.js ${NODE_MIN_MAJOR}+ manually from https://nodejs.org/en/download, then rerun this script."
         return 1
     fi
-    warn "Node.js 22 or newer is required but node was not found."
+    info "Node.js 22 or newer is required but node was not found."
     if confirm "Install Node.js ${NODE_MIN_MAJOR}.x now (no sudo needed)?"; then
         if install_node; then
             info "Node.js $(node --version 2>/dev/null) installed."
@@ -202,7 +226,7 @@ check_git() {
         info "git $(git --version 2>/dev/null | awk '{print $3}') detected."
         return 0
     fi
-    warn "git is required to clone and update Ploinky but was not found."
+    info "git is required to clone and update Ploinky but was not found."
     if confirm "Install git now?"; then
         if [ "$PLATFORM" = "macos" ]; then
             if command -v brew >/dev/null 2>&1; then
@@ -255,7 +279,7 @@ install_podman_macos() {
 
 check_podman() {
     if ! command -v podman >/dev/null 2>&1; then
-        warn "Podman was not found; the rootless outer Box needs Podman."
+        info "Podman was not found; the rootless outer Box needs Podman."
         if confirm "Install Podman now? (may require administrator privileges)"; then
             if [ "$PLATFORM" = "macos" ]; then
                 install_podman_macos || true
@@ -274,7 +298,7 @@ check_podman() {
     current="$(podman --version 2>/dev/null | awk '{print $3}' || true)"
     info "Podman $current detected."
     if [ "$PLATFORM" = "linux" ] && ! version_ge "$current" "$PODMAN_MIN_VERSION"; then
-        warn "Podman $current is older than the supported baseline $PODMAN_MIN_VERSION."
+        info "Podman $current is older than the supported baseline $PODMAN_MIN_VERSION."
         if confirm "Upgrade Podman now?"; then
             install_podman_linux || true
             current="$(podman --version 2>/dev/null | awk '{print $3}' || true)"
@@ -307,7 +331,7 @@ check_bwrap() {
         info "bubblewrap (bwrap) detected."
         return 0
     fi
-    warn "bubblewrap (bwrap) was not found; the optional lite sandbox needs it."
+    info "bubblewrap (bwrap) was not found; the optional lite sandbox needs it."
     if confirm "Install bubblewrap now?"; then
         local pm
         pm="$(detect_pkg_manager || true)"
@@ -438,20 +462,13 @@ add_rc_block() {
 }
 
 setup_path() {
-    local bindir rc="" shell_name
+    local bindir rc
     if command -v ploinky >/dev/null 2>&1; then
         info "ploinky is already available at $(command -v ploinky); leaving PATH unchanged."
         return 0
     fi
     bindir="$CHECKOUT_DIR/bin"
-    shell_name="$(basename "${SHELL:-bash}")"
-    case "$shell_name" in
-        zsh) rc="$HOME/.zshrc" ;;
-        bash)
-            if [ "$PLATFORM" = "macos" ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi
-            ;;
-        *) rc="$HOME/.profile" ;;
-    esac
+    rc="$(detect_rc_file)"
     add_rc_block "$rc" "$bindir"
     export PATH="$bindir:$PATH"
     info "Added $bindir to PATH in $rc"
@@ -462,8 +479,9 @@ log "Platform: ${OS_NAME} (${ARCH})"
 if [ "$DRY_RUN" = 1 ]; then log "Dry run: no changes will be made."; fi
 
 GIT_OK=1
+NODE_OK=1
 check_git || GIT_OK=0
-check_node || true
+check_node || NODE_OK=0
 check_podman || true
 check_bwrap || true
 check_seatbelt || true
@@ -483,6 +501,10 @@ else
     warn "Ploinky could not be fully installed."
 fi
 
+if [ "$NODE_OK" != 1 ]; then
+    warn "ploinky will not run until Node.js ${NODE_MIN_MAJOR}+ is available on PATH; install it, then open a new terminal."
+fi
+
 if [ -n "$WARNINGS" ]; then
     printf 'ploinky: Review these items before starting:\n' >&2
     printf '%b' "$WARNINGS" >&2
@@ -490,12 +512,8 @@ fi
 
 cat <<'EOF'
 
-Next steps:
-  1. Open a new terminal (or source your shell rc file).
-  2. cd /path/to/your/workspace
-  3. ploinky start explorer
+Open a new terminal and run:
 
-Then open http://localhost:8080/webchat/
-
-If a prerequisite is still missing, run: ploinky diagnose
+  cd /path/to/your/workspace
+  ploinky start explorer
 EOF
