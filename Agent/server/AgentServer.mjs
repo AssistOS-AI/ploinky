@@ -17,7 +17,7 @@ import {
     verifyOpenAiModelsAuthInfoFromHeaders
 } from '../lib/invocationAuth.mjs';
 import { computeRchTool, sha256RawBodyHash } from '../lib/requestHash.mjs';
-import { describeShellFailure } from '../lib/toolError.mjs';
+import { describeShellFailure, describeShellFailureDetails } from '../lib/toolError.mjs';
 import {
     buildDefaultOpenAiChatResponse,
     buildDefaultStreamRejection
@@ -617,16 +617,18 @@ function rejectInvalidOpenAiModelsRouterToken(req, res) {
     return false;
 }
 
-function sendOpenAiError(res, statusCode, message, type = 'server_error') {
+function sendOpenAiError(res, statusCode, message, type = 'server_error', extraHeaders = {}) {
     const payload = { error: { message, type } };
     const data = Buffer.from(JSON.stringify(payload));
-    res.writeHead(statusCode, { 'Content-Type': 'application/json', 'Content-Length': data.length });
+    res.writeHead(statusCode, { 'Content-Type': 'application/json', 'Content-Length': data.length, ...extraHeaders });
     res.end(data);
 }
 
-function writeSseError(res, message, type = 'server_error') {
-    const payload = JSON.stringify({ error: { message, type } });
-    res.write(`data: ${payload}\n\n`);
+// Once the SSE headers are out, HTTP 200 is already committed, so the status a
+// handler chose for its failure can only travel inside the error frame.
+function writeSseError(res, message, type = 'server_error', status = null) {
+    const error = Number.isInteger(status) ? { message, type, status } : { message, type };
+    res.write(`data: ${JSON.stringify({ error })}\n\n`);
     res.write('data: [DONE]\n\n');
 }
 
@@ -701,7 +703,16 @@ async function handleOpenAiChatCompletions(req, res, body) {
     if (!wantsStream) {
         const result = await executeShell(openAiConfig.commandSpec, payload);
         if (result.code !== 0) {
-            sendOpenAiError(res, 500, describeShellFailure(result));
+            // A failure envelope may choose the status, error type and
+            // Retry-After of its own failure; the default stays 500.
+            const failure = describeShellFailureDetails(result);
+            sendOpenAiError(
+                res,
+                failure.status || 500,
+                failure.message,
+                failure.type || 'server_error',
+                failure.retryAfterSeconds ? { 'Retry-After': String(failure.retryAfterSeconds) } : {}
+            );
             return;
         }
         let parsed;
@@ -734,6 +745,9 @@ async function handleOpenAiChatCompletions(req, res, body) {
         stdio: ['pipe', 'pipe', 'pipe']
     });
     let stdoutBytes = 0;
+    // The last bytes the handler wrote, enough to tell whether it already
+    // terminated its own stream.
+    let stdoutTail = '';
     const stderrChunks = [];
     let timeout = null;
     if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
@@ -743,6 +757,7 @@ async function handleOpenAiChatCompletions(req, res, body) {
     }
     child.stdout.on('data', chunk => {
         stdoutBytes += chunk.length;
+        stdoutTail = (stdoutTail + chunk.toString('latin1')).slice(-64);
         res.write(chunk);
     });
     child.stderr.on('data', chunk => {
@@ -759,10 +774,16 @@ async function handleOpenAiChatCompletions(req, res, body) {
     child.on('close', (code, signal) => {
         if (timeout) clearTimeout(timeout);
         if (!res.writableEnded) {
-            if (code !== 0 && stdoutBytes === 0) {
+            // A stream the handler terminated itself is complete for the
+            // caller, whatever the exit code; nothing may follow its [DONE].
+            const terminated = /data:[ \t]*\[DONE\]\s*$/.test(stdoutTail);
+            if (code !== 0 && !terminated && !res.destroyed) {
                 const stderr = Buffer.concat(stderrChunks).toString('utf8');
-                const failure = describeShellFailure({ code, signal, stdout: '', stderr });
-                writeSseError(res, failure);
+                const failure = describeShellFailureDetails({ code, signal, stdout: '', stderr });
+                // A handler that dies after partial output must not look like
+                // a completed answer: close any half-written event, then say so.
+                if (stdoutBytes > 0) res.write('\n\n');
+                writeSseError(res, failure.message, failure.type || 'server_error', failure.status);
             }
             res.end();
         }
