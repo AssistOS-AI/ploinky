@@ -164,11 +164,13 @@ curl -fsSL https://www.ploinky.com/install.sh | bash
 
 The bootstrap installer detects Linux or macOS, checks Node.js 22+, Podman and
 Git, installs or upgrades what it can after confirmation, clones Ploinky, and
-adds the `ploinky` command to your `PATH`. It installs Ploinky into
-`~/.local/share/ploinky/src` and asks for confirmation before installing
-anything. When it cannot install a prerequisite automatically it prints the
-manual commands and continues. When it finishes, run `ploinky start explorer`
-from your workspace.
+adds the `ploinky` command to your `PATH`. It asks for confirmation before
+installing anything, reuses an existing checkout when one is present, and
+otherwise clones Ploinky into `~/.local/share/ploinky/src`. If `ploinky` is
+already on your `PATH` it leaves it untouched; otherwise it adds the checkout's
+`bin` directory to your `PATH`. When it cannot install a prerequisite
+automatically it prints the manual commands and continues. When it finishes,
+run `ploinky start explorer` from your workspace.
 
 ## Getting started
 

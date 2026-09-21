@@ -204,7 +204,7 @@
                         <button class="copy-button" type="button" data-copy-target="install-command">Copy</button>
                         <pre><code id="install-command">curl -fsSL https://www.ploinky.com/install.sh | bash</code></pre>
                     </div>
-                    <p>The script installs Ploinky into <code>~/.local/share/ploinky/src</code> and asks for confirmation before installing anything. When it cannot install a prerequisite automatically it prints the manual commands and continues. It finishes by telling you to run <code>ploinky start explorer</code> from your workspace.</p>
+                    <p>The script asks for confirmation before installing anything. It reuses an existing checkout when one is present, otherwise it clones Ploinky into <code>~/.local/share/ploinky/src</code>. If <code>ploinky</code> is already on your <code>PATH</code> it leaves it untouched; otherwise it adds the checkout's <code>bin</code> directory to your <code>PATH</code>. When it cannot install a prerequisite automatically it prints the manual commands and continues, and it finishes by telling you to run <code>ploinky start explorer</code> from your workspace.</p>
 
                     <h3>Manual installation</h3>
                     <p>Ploinky runs its rootless outer Box with Podman; Docker and arbitrary remote engines are unsupported for the outer Box. Pick your platform:</p>

@@ -6,10 +6,11 @@
 #
 # It detects Linux or macOS, checks Node.js 22+, Podman, Git and the optional
 # lite sandbox (bubblewrap on Linux, seatbelt on macOS), asks before installing
-# or upgrading what it can, clones Ploinky when needed under
-# ~/.local/share/ploinky/src, and exposes the ploinky command on your PATH.
-# Prerequisites that cannot be installed automatically become warnings with
-# manual instructions instead of blocking.
+# or upgrading what it can, and clones Ploinky under ~/.local/share/ploinky/src
+# when no checkout exists. If a ploinky command is already on PATH it is left
+# untouched; otherwise the existing or new checkout's bin directory is added to
+# PATH. Missing prerequisites become non-blocking warnings with manual
+# instructions.
 #
 set -euo pipefail
 
@@ -360,19 +361,50 @@ find_existing_checkout() {
     return 1
 }
 
+repo_from_ploinky_path() {
+    local target link
+    target="$(command -v ploinky 2>/dev/null || true)"
+    [ -n "$target" ] || return 1
+    while [ -L "$target" ]; do
+        link="$(readlink "$target" 2>/dev/null || true)"
+        [ -n "$link" ] || break
+        case "$link" in
+            /*) target="$link" ;;
+            *) target="$(dirname "$target")/$link" ;;
+        esac
+    done
+    [ "$(basename "$target")" = "ploinky" ] || return 1
+    dirname "$(dirname "$target")"
+}
+
 resolve_checkout() {
-    local existing
+    local existing derived
     existing="$(find_existing_checkout || true)"
     if [ -n "$existing" ]; then
         CHECKOUT_DIR="$existing"
         info "Found an existing Ploinky checkout at $CHECKOUT_DIR"
         return 0
     fi
+    if command -v ploinky >/dev/null 2>&1; then
+        derived="$(repo_from_ploinky_path || true)"
+        if [ -n "$derived" ]; then
+            CHECKOUT_DIR="$derived"
+            if is_ploinky_checkout "$CHECKOUT_DIR"; then
+                info "Using existing Ploinky checkout at $CHECKOUT_DIR"
+                return 0
+            fi
+            if [ -e "$CHECKOUT_DIR" ] && [ -n "$(ls -A "$CHECKOUT_DIR" 2>/dev/null)" ]; then
+                warn "ploinky is on PATH at '$derived', but that is not a Ploinky checkout; installing to $APP_ROOT/src instead."
+                CHECKOUT_DIR="$APP_ROOT/src"
+            else
+                info "Installing Ploinky into $CHECKOUT_DIR (the location ploinky resolves to on PATH)"
+            fi
+        fi
+    fi
     if is_ploinky_checkout "$CHECKOUT_DIR"; then
         info "Using existing Ploinky checkout at $CHECKOUT_DIR"
         return 0
     fi
-    info "Installing Ploinky into $CHECKOUT_DIR"
     if [ "$DRY_RUN" = 1 ]; then
         log "[dry-run] git clone ${REPO_URL} ${CHECKOUT_DIR}"
         return 0
@@ -388,8 +420,9 @@ resolve_checkout() {
 }
 
 add_rc_block() {
-    local rc="$1" bindir="$2"
-    if [ -f "$rc" ] && grep -q '>>> ploinky installer >>>' "$rc" 2>/dev/null; then
+    local rc="$1" bindir="$2" line
+    line="export PATH=\"$bindir:\$PATH\""
+    if [ -f "$rc" ] && grep -qF "$line" "$rc" 2>/dev/null; then
         return 0
     fi
     run mkdir -p "$(dirname "$rc")"
@@ -399,36 +432,29 @@ add_rc_block() {
     fi
     {
         printf '\n# >>> ploinky installer >>>\n'
-        printf 'export PATH="%s:$PATH"\n' "$bindir"
+        printf '%s\n' "$line"
         printf '# <<< ploinky installer <<<\n'
     } >> "$rc"
 }
 
 setup_path() {
-    local checkout="$1" bindir on_path=0 rc="" shell_name
-    bindir="$HOME/.local/bin"
-    case ":$PATH:" in *":$bindir:"*) on_path=1 ;; esac
-    run mkdir -p "$bindir"
-    local b
-    for b in ploinky p-cli ploinky-local ploinky-shell; do
-        if [ -e "$checkout/bin/$b" ]; then
-            run ln -sfn "$checkout/bin/$b" "$bindir/$b"
-        fi
-    done
-    export PATH="$bindir:$PATH"
-    if [ "$on_path" = 0 ]; then
-        shell_name="$(basename "${SHELL:-bash}")"
-        case "$shell_name" in
-            zsh) rc="$HOME/.zshrc" ;;
-            bash)
-                if [ "$PLATFORM" = "macos" ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi
-                ;;
-            *) rc="$HOME/.profile" ;;
-        esac
-        add_rc_block "$rc" "$bindir"
-        info "Added $bindir to PATH in $rc"
+    local bindir rc="" shell_name
+    if command -v ploinky >/dev/null 2>&1; then
+        info "ploinky is already available at $(command -v ploinky); leaving PATH unchanged."
+        return 0
     fi
-    info "Linked ploinky commands into $bindir"
+    bindir="$CHECKOUT_DIR/bin"
+    shell_name="$(basename "${SHELL:-bash}")"
+    case "$shell_name" in
+        zsh) rc="$HOME/.zshrc" ;;
+        bash)
+            if [ "$PLATFORM" = "macos" ]; then rc="$HOME/.bash_profile"; else rc="$HOME/.bashrc"; fi
+            ;;
+        *) rc="$HOME/.profile" ;;
+    esac
+    add_rc_block "$rc" "$bindir"
+    export PATH="$bindir:$PATH"
+    info "Added $bindir to PATH in $rc"
 }
 
 # --- main -----------------------------------------------------------------
@@ -447,7 +473,7 @@ CHECKOUT_OK=1
 resolve_checkout || CHECKOUT_OK=0
 
 if [ "$CHECKOUT_OK" = 1 ]; then
-    setup_path "$CHECKOUT_DIR" || true
+    setup_path || true
 fi
 
 printf '\n'
