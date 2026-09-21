@@ -11,7 +11,9 @@ See [local instruction skills](docs/local-instruction-skills.md) for launch scop
 The public `ploinky` command requires Node.js 22 or newer and rootless Podman.
 Native Linux hosts use a supported baseline of Podman 5.4.0 or newer; macOS
 uses Podman Machine. Docker and arbitrary remote engines are unsupported for
-the outer Box. Git is needed to clone and update the host checkout.
+the outer Box. Git is needed to clone and update the host checkout. The
+[bootstrap installer](#quick-install) checks these tools and installs or
+upgrades what it can.
 
 Run `ploinky diagnose` from the workspace to check the host environment:
 
@@ -153,6 +155,20 @@ Repair never restarts the active workspace, edits host profiles, resets Podman
 storage, terminates conflicting listeners, changes registry credentials, or
 executes diagnostic hint text as shell commands. Ordinary deployment commands
 suggest `ploinky diagnose` on failure; they do not invoke repairs automatically.
+
+## Quick install
+
+```bash
+curl -fsSL https://www.ploinky.com/install.sh | bash
+```
+
+The bootstrap installer detects Linux or macOS, checks Node.js 22+, Podman and
+Git, installs or upgrades what it can after confirmation, clones Ploinky, and
+adds the `ploinky` command to your `PATH`. It installs Ploinky into
+`~/.local/share/ploinky/src` and asks for confirmation before installing
+anything. When it cannot install a prerequisite automatically it prints the
+manual commands and continues. When it finishes, run `ploinky start explorer`
+from your workspace.
 
 ## Getting started
 

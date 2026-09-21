@@ -71,6 +71,41 @@
             display: block;
         }
 
+        /* Installation tabs */
+        .install-tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin: 1rem 0;
+            flex-wrap: wrap;
+        }
+        .install-tab {
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+        }
+        .install-tab.active {
+            background: var(--bg-header);
+            color: white;
+        }
+        .install-tab:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+        .install-tab.active:hover {
+            background: var(--bg-header-dark);
+        }
+        .install-content {
+            display: none;
+        }
+        .install-content.active {
+            display: block;
+        }
+
         /* Custom Scrollbar for Terminal */
         .terminal::-webkit-scrollbar {
             width: 8px;
@@ -163,33 +198,66 @@
                 <div class="doc-section">
                     <h2>Getting Started</h2>
 
-                    <h3>Prerequisites</h3>
-                    <p>Ploinky uses containers to run agents in isolated environments. Therefore, you need to have a container runtime installed on your system. Ploinky supports both Docker and Podman.</p>
-                    
-                    <h4>Docker</h4>
-                    <p>On Debian-based Linux distributions (like Ubuntu), you can install Docker with:</p>
-                    <pre><code>sudo apt-get update && sudo apt-get install docker-ce docker-ce-cli containerd.io</code></pre>
-                    <p>For other operating systems or more detailed instructions, please refer to the <a href="https://docs.docker.com/get-docker/" target="_blank" rel="noopener noreferrer">official Docker documentation</a>.</p>
+                    <h3>Install with the bootstrap script</h3>
+                    <p>The installer detects Linux or macOS, checks Node.js, Podman and Git, installs or upgrades what it can, clones Ploinky when needed, and adds the <code>ploinky</code> command to your <code>PATH</code>:</p>
+                    <div class="code-block-wrapper">
+                        <button class="copy-button" type="button" data-copy-target="install-command">Copy</button>
+                        <pre><code id="install-command">curl -fsSL https://www.ploinky.com/install.sh | bash</code></pre>
+                    </div>
+                    <p>The script installs Ploinky into <code>~/.local/share/ploinky/src</code> and asks for confirmation before installing anything. When it cannot install a prerequisite automatically it prints the manual commands and continues. It finishes by telling you to run <code>ploinky start explorer</code> from your workspace.</p>
 
-                    <h4>Podman</h4>
-                    <p>On Debian-based Linux distributions (like Ubuntu), you can install Podman with:</p>
-                    <pre><code>sudo apt-get update && sudo apt-get install podman</code></pre>
-                    <p>For other operating systems or more detailed instructions, please refer to the <a href="https://podman.io/getting-started/installation" target="_blank" rel="noopener noreferrer">official Podman documentation</a>.</p>
+                    <h3>Manual installation</h3>
+                    <p>Ploinky runs its rootless outer Box with Podman; Docker and arbitrary remote engines are unsupported for the outer Box. Pick your platform:</p>
+
+                    <div class="install-tabs">
+                        <button class="install-tab active" data-install="linux">🐧 Linux</button>
+                        <button class="install-tab" data-install="macos">🍎 macOS</button>
+                    </div>
+
+                    <div class="install-content active" data-install-content="linux">
+                        <p><strong>1. Check the required versions</strong> (Node.js 22+, Podman 5.4.0+, Git):</p>
+                        <pre><code>node --version     # need v22 or newer
+podman --version   # need 5.4.0 or newer
+git --version</code></pre>
+                        <p><strong>2. Install missing tools</strong> on Debian/Ubuntu:</p>
+                        <pre><code>sudo apt-get update
+sudo apt-get install -y git podman uidmap passt conmon crun catatonit bubblewrap</code></pre>
+                        <p>For Node.js 22 or newer, use your distribution packages or the <a href="https://nodejs.org/en/download" target="_blank" rel="noopener noreferrer">official Node.js downloads</a>. On other distributions, replace <code>apt-get</code> with your package manager (dnf, pacman, zypper, apk).</p>
+                        <p><strong>3. Clone Ploinky and add it to <code>PATH</code>:</strong></p>
+                        <pre><code>git clone https://github.com/AssistOS-AI/ploinky.git
+cd ploinky
+echo "export PATH=\"\$PATH:$(pwd)/bin\"" &gt;&gt; ~/.bashrc
+source ~/.bashrc</code></pre>
+                        <p><strong>4. Start Ploinky</strong> from your workspace:</p>
+                        <pre><code>cd /path/to/workspace
+ploinky start explorer</code></pre>
+                    </div>
+
+                    <div class="install-content" data-install-content="macos">
+                        <p><strong>1. Check the required versions</strong> (Node.js 22+, Podman with Podman Machine, Git):</p>
+                        <pre><code>node --version     # need v22 or newer
+podman --version
+git --version</code></pre>
+                        <p><strong>2. Install missing tools</strong> with <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">Homebrew</a>:</p>
+                        <pre><code>brew install node@22 git podman
+brew link --overwrite --force node@22
+podman machine init
+podman machine start</code></pre>
+                        <p>Alternatively install Node.js from the <a href="https://nodejs.org/en/download" target="_blank" rel="noopener noreferrer">official downloads</a> and Git with <code>xcode-select --install</code>.</p>
+                        <p><strong>3. Clone Ploinky and add it to <code>PATH</code>:</strong></p>
+                        <pre><code>git clone https://github.com/AssistOS-AI/ploinky.git
+cd ploinky
+echo "export PATH=\"\$PATH:$(pwd)/bin\"" &gt;&gt; ~/.zshrc
+source ~/.zshrc</code></pre>
+                        <p><strong>4. Start Ploinky</strong> from your workspace:</p>
+                        <pre><code>cd /path/to/workspace
+ploinky start explorer</code></pre>
+                    </div>
 
                     <h4>Lightweight Sandboxes (Optional)</h4>
-                    <p>On Linux, Ploinky can use <strong>bubblewrap</strong> (<code>bwrap</code>) for lightweight process sandboxing without full containers. On macOS, <strong>seatbelt</strong> (<code>sandbox-exec</code>) provides similar isolation. Set <code>"lite-sandbox": true</code> in an agent's <code>manifest.json</code> to auto-detect the host sandbox. To force podman/docker for testing, run <code>ploinky sandbox disable</code>.</p>
+                    <p>On Linux, Ploinky can use <strong>bubblewrap</strong> (<code>bwrap</code>) for lightweight process sandboxing without full containers. On macOS, <strong>seatbelt</strong> (<code>sandbox-exec</code>) provides similar isolation. Set <code>"lite-sandbox": true</code> in an agent's <code>manifest.json</code> to auto-detect the host sandbox. To force podman for testing, run <code>ploinky sandbox disable</code>.</p>
 
-                    <h3>Installation</h3>
-                    <pre><code>$ git clone https://github.com/AssistOS-AI/ploinky.git
-$ cd ploinky
-$ npm install
-$ echo 'export PATH="$PATH:/path/to/ploinky/bin"' &gt;&gt; ~/.bashrc
-$ source ~/.bashrc
-$ cd /path/to/workspace
-$ ploinky start explorer
-</code></pre>
-                    <p>The managed Box initializes the workspace master key at <code>.ploinky/master-key</code>. The <code>PLOINKY_MASTER_KEY</code> process or <code>.env</code> input is reserved for direct core-development flows that deliberately manage that seed.</p>
-                    <p>The <code>PATH</code> line points to the cloned Ploinky <code>bin</code> directory and makes <code>ploinky</code> available in new Bash sessions. Replace <code>/path/to/ploinky</code> and <code>/path/to/workspace</code> with your own locations. For Zsh, add the same line to <code>~/.zshrc</code>.</p>
+                    <p>The managed Box initializes the workspace master key at <code>.ploinky/master-key</code>. The <code>PLOINKY_MASTER_KEY</code> process or <code>.env</code> input is reserved for direct core-development flows that deliberately manage that seed. Replace <code>/path/to/workspace</code> with your own location.</p>
 
                     <div style="text-align: center; margin-top: 3rem;">
                         <a href="cli-reference.html" class="btn btn-primary">View CLI Reference</a>
@@ -375,6 +443,62 @@ $ ploinky start explorer
         // Show initial demo
         window.addEventListener('load', () => {
             setTimeout(() => showDemo('init'), 500);
+        });
+
+        // Installation platform tabs
+        const installTabs = document.querySelectorAll('.install-tab');
+        const installContents = document.querySelectorAll('.install-content');
+        installTabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                installTabs.forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                installContents.forEach(content => {
+                    content.classList.toggle('active', content.dataset.installContent === tab.dataset.install);
+                });
+            });
+        });
+
+        // Copy buttons for code blocks
+        function copyText(text) {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                return navigator.clipboard.writeText(text);
+            }
+            return new Promise((resolve, reject) => {
+                const area = document.createElement('textarea');
+                area.value = text;
+                area.setAttribute('readonly', '');
+                area.style.position = 'absolute';
+                area.style.left = '-9999px';
+                document.body.appendChild(area);
+                area.select();
+                try {
+                    document.execCommand('copy');
+                    resolve();
+                } catch (error) {
+                    reject(error);
+                } finally {
+                    document.body.removeChild(area);
+                }
+            });
+        }
+
+        document.querySelectorAll('.copy-button[data-copy-target]').forEach(button => {
+            button.addEventListener('click', () => {
+                const target = document.getElementById(button.dataset.copyTarget);
+                if (!target) return;
+                copyText(target.textContent).then(() => {
+                    const original = button.textContent;
+                    button.textContent = 'Copied!';
+                    button.classList.add('copied');
+                    setTimeout(() => {
+                        button.textContent = original;
+                        button.classList.remove('copied');
+                    }, 1500);
+                }).catch(() => {
+                    button.textContent = 'Copy failed';
+                    setTimeout(() => { button.textContent = 'Copy'; }, 1500);
+                });
+            });
         });
     </script>
 </body>
