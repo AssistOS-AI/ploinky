@@ -141,12 +141,6 @@
       "effectiveInstance": "agent:proxies/searchAgent"
     },
     {
-      "id": "default-local-llm-backend",
-      "namePattern": "^ploinky_proxies_default-local-llm_",
-      "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:proxies/default-local-llm"
-    },
-    {
       "id": "umami",
       "namePattern": "^ploinky_UmamiAgent_umamiAgent_",
       "networkModePattern": "^(?!host$|none$).+$",
@@ -309,14 +303,14 @@
     {
       "id": "standard-agentserver",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_(?:AssistOSExplorer_(?:gitAgent|dpuAgent|soplangAgent|tasksAgent|webmeetAgent|multimedia|webAssist)|AchillesCLI_(?:achilles-cli|opencodeAgent|piAgent|codexAgent|GPTResearcher)|proxies_(?:soul-gateway|searchAgent|default-local-llm)|UmamiAgent_umamiAgent)_",
+      "containerPattern": "^ploinky_(?:AssistOSExplorer_(?:gitAgent|dpuAgent|soplangAgent|tasksAgent|webmeetAgent|multimedia|webAssist)|AchillesCLI_(?:achilles-cli|opencodeAgent|piAgent|codexAgent|GPTResearcher)|proxies_(?:soul-gateway|searchAgent)|UmamiAgent_umamiAgent)_",
       "protocols": ["tcp"],
       "ports": [7000],
       "bindClasses": ["wildcard"],
       "exactOwners": ["node"],
       "reviewedSensitive": true,
-      "minMatches": 16,
-      "maxMatches": 16,
+      "minMatches": 15,
+      "maxMatches": 15,
       "rationale": "One standard AgentServer endpoint per routed Explorer dependency, isolated inside that dependency's managed namespace."
     },
     {
@@ -552,19 +546,6 @@
       "minMatches": 0,
       "maxMatches": 1,
       "rationale": "Optional SearchAgent browser pool is process-loopback-only and is never directly routed."
-    },
-    {
-      "id": "default-local-llm",
-      "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_proxies_default-local-llm_",
-      "protocols": ["tcp"],
-      "ports": [8080],
-      "bindClasses": ["loopback"],
-      "ownerPattern": "^llama-server$",
-      "reviewedSensitive": true,
-      "minMatches": 1,
-      "maxMatches": 1,
-      "rationale": "The local llama server is process-loopback-only behind its AgentServer provider adapter."
     },
     {
       "id": "private-loopback-support",

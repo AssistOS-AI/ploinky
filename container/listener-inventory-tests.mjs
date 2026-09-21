@@ -747,7 +747,7 @@ test('collector fails closed when its rootless owner cannot enter a nested netwo
 
 test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expected graph', () => {
     const profile = loadListenerProfile(FULL_PROFILE);
-    assert.equal(profile.requiredContainers.length, 19);
+    assert.equal(profile.requiredContainers.length, 18);
     const livekitContainer = profile.requiredContainers.find(entry => entry.id === 'livekit');
     const livekitName = 'ploinky_AchillesIDE_liveKitServerAgent_fixture';
     const retiredName = 'ploinky_webmeetInfra_liveKitServerAgent_fixture';
@@ -771,7 +771,8 @@ test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expe
     const privateRouter = profile.rules.find(rule => rule.id === 'router-private');
     assert.equal(privateRouter.dynamicBindSet, 'loopback-and-managed-gateways');
     assert.deepEqual(privateRouter.bindAddresses, []);
-    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').minMatches, 16);
+    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').minMatches, 15);
+    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').maxMatches, 15);
     assert.equal(profile.controlPorts.includes(7681), false);
     assert.equal(profile.requiredContainers.some(entry => (
         entry.id === 'webtty'
@@ -793,6 +794,50 @@ test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expe
         assert.equal(support.ownerPattern.test(owner), true);
         assert.equal(support.reviewedSensitive, true);
     }
+});
+
+test('full Explorer profile no longer requires the retired default-local-llm container', () => {
+    const profile = loadListenerProfile(FULL_PROFILE);
+    const retiredName = 'ploinky_proxies_default-local-llm_fixture';
+    assert.equal(profile.requiredContainers.some(entry => (
+        entry.id.startsWith('default-local-llm')
+        || entry.namePattern.test(retiredName)
+        || entry.effectiveInstance === 'agent:proxies/default-local-llm'
+    )), false);
+    assert.equal(profile.rules.some(rule => (
+        rule.id.startsWith('default-local-llm')
+        || rule.containerPattern?.test(retiredName)
+        || rule.ownerContainerPattern?.test(retiredName)
+    )), false);
+    const standard = profile.rules.find(rule => rule.id === 'standard-agentserver');
+    assert.equal(standard.containerPattern.test(retiredName), false);
+    assert.equal(standard.containerPattern.test('ploinky_proxies_soul-gateway_fixture'), true);
+    assert.equal(standard.containerPattern.test('ploinky_proxies_searchAgent_fixture'), true);
+    const standardMatches = profile.requiredContainers.filter(entry => (
+        standard.containerPattern.test(`${entry.namePattern.source.replace(/^\^/, '')}fixture`)
+    ));
+    assert.equal(standardMatches.length, standard.minMatches);
+    assert.equal(standardMatches.length, standard.maxMatches);
+});
+
+test('full Explorer profile rejects a leftover default-local-llm container as unexpected', () => {
+    const profile = loadListenerProfile(FULL_PROFILE);
+    const orphanName = 'ploinky_proxies_default-local-llm_0123abcd';
+    const orphan = container({ name: orphanName, pids: [500, 501] });
+    const result = validateListenerInventory({
+        containers: [orphan],
+        listeners: parseSsOutput(
+            'tcp LISTEN 0 511 0.0.0.0:7000 0.0.0.0:* users:(("node",pid=500,fd=18))\n'
+            + 'tcp LISTEN 0 511 127.0.0.1:8080 0.0.0.0:* users:(("llama-server",pid=501,fd=7))\n',
+            { namespace: `nested:${orphanName}`, containerName: orphanName },
+        ),
+    }, profile);
+    assert.equal(result.ok, false);
+    const errors = result.errors.join('\n');
+    assert.match(errors, new RegExp(`unexpected nested container '${orphanName}'`));
+    assert.match(errors, /unexpected wildcard listener: .*7000/);
+    assert.match(errors, /sensitive socket matched non-sensitive rule 'private-loopback-support': .*127\.0\.0\.1:8080 owner=llama-server/);
+    assert.equal(result.listeners.some(record => record.containerName === orphanName), false);
 });
 
 test('full Explorer LiveKit rules accept the migrated owner and reject media boundary violations', () => {
