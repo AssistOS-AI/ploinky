@@ -30,6 +30,18 @@ const selection = {
     sourceRelativePath: 'image', contentFingerprint: fingerprint,
     resolvedCommit: commit, sourceId: imageSourceId(imageId, fingerprint),
 };
+const missingSummary = 'The Box AchillesAgentLib bundle is missing or failed verification. '
+    + 'Build or pull a compatible Ploinky Box image containing the pinned AchillesAgentLib copy';
+
+function verificationMessage(result) {
+    try {
+        probeImageAgentLib('podman', imageId, { query: () => result });
+    } catch (error) {
+        assert.equal(error.code, 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE');
+        return error.message;
+    }
+    return assert.fail('verification must fail');
+}
 
 test('an offline bundle load never pulls when its image inspection fails', async () => {
     for (const streaming of [false, true]) {
@@ -97,6 +109,48 @@ test('immutable image probe runs offline and checks the required pin', () => {
         { ok: true, stdout: JSON.stringify({ ...metadata, fingerprint: '' }) },
     ]) assert.throws(() => probeImageAgentLib('podman', imageId, { query: () => result }),
         { code: 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE' });
+});
+
+test('a failed verification prints its own cause, not only the generic summary', () => {
+    const mismatch = 'PLOINKY_AGENTLIB_IMAGE_PIN_MISMATCH: The Box image bundles achillesAgentLib '
+        + `${'c'.repeat(40)}, but Ploinky requires ${commit}. Rebuild or select a Box image with the required pinned revision.`;
+    const missingModule = `Error: Cannot find module '${IMAGE_AGENTLIB_PROBE_PATH}'`;
+    const ownership = 'PLOINKY_AGENTLIB_IMAGE_INVALID: Image AgentLib path must be owned by root and not writable '
+        + 'by the runtime user: /opt/ploinky-agentlib/package.json.';
+    for (const [result, reason] of [
+        [{ ok: false, status: 1, stderr: `${mismatch}\n` },
+            `The verification command exited with status 1: ${mismatch}`],
+        [{ ok: false, status: 1, stderr: `${ownership}\n` },
+            `The verification command exited with status 1: ${ownership}`],
+        [{ ok: false, status: 1, stderr: ['node:internal/modules/cjs/loader:1386', '  throw err;', '  ^', '',
+            missingModule, '    at Function._resolveFilename (node:internal/modules/cjs/loader:1383:15)', '',
+            'Node.js v24.8.0', ''].join('\n') },
+        `The verification command exited with status 1: ${missingModule}`],
+        [{ ok: false, status: 126, stderr: 'crun: unknown version specified\nAuthorization: Bearer secret-verifier-token\n' },
+            'The verification command exited with status 126: crun: unknown version specified'],
+        [{ ok: false, status: 1, stderr: '', signal: 'SIGTERM',
+            error: Object.assign(new Error('spawnSync podman ETIMEDOUT'), { code: 'ETIMEDOUT' }) },
+        'The verification command timed out after 60 s.'],
+        [{ ok: false, status: 1, stderr: '', error: Object.assign(new Error('spawnSync podman ENOENT'), { code: 'ENOENT' }) },
+            'The verification command failed with ENOENT.'],
+        [{ ok: false, status: 1, stderr: '', signal: 'SIGKILL' },
+            'The verification command was terminated by SIGKILL without output.'],
+        [{ ok: false, status: 1 }, 'The verification command exited with status 1 without output.'],
+    ]) assert.equal(verificationMessage(result), `${missingSummary}. ${reason}`);
+    const redacted = verificationMessage({ ok: false, status: 125,
+        stderr: 'Error: registry login failed: token=secret-verifier-token\n' });
+    assert.match(redacted, /status 125: Error: registry login failed: token=\[REDACTED\]$/);
+    assert.doesNotMatch(redacted, /secret-verifier-token/);
+});
+
+test('rejected bundle metadata names the mismatch in the printed message', () => {
+    assert.throws(() => probeImageAgentLib('podman', imageId, {
+        query: () => ({ ok: true, stdout: JSON.stringify({ ...metadata, commit: '0'.repeat(40) }) }),
+    }), {
+        code: 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE',
+        message: new RegExp('^The Box AchillesAgentLib bundle does not match the required revision or fingerprint\\. '
+            + `Build or pull [^.]+\\. The Box image bundles achillesAgentLib 0{40}, but Ploinky requires ${commit}\\.`),
+    });
 });
 
 test('image probe delegates the inspected ID to the engine without a format gate', () => {

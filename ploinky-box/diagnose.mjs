@@ -32,8 +32,9 @@ import { distributionFamily } from './hostPrerequisites.mjs';
 
 const LIMIT = 4000;
 const clean = (value) => sanitizeAuthorityDiagnostic(String(value ?? ''), { limit: LIMIT });
-// These wrappers deliberately summarize failed queries without retaining their
-// stderr. A failed final query in the same stage supplies that missing evidence.
+// These wrappers summarize failed queries without retaining their full stderr
+// (AgentLib keeps one sanitized line). A failed final query in the same stage
+// supplies that missing evidence.
 const QUERY_WRAPPER_FAILURE_CODES = new Set([
     IMAGE_OBSERVATION_UNAVAILABLE,
     'PLOINKY_BOX_IMAGE_CONTRACT_INVALID',
