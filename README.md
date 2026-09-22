@@ -514,6 +514,9 @@ pulls or rewrites the local checkout. An invalid local directory is an error.
 When the directory is absent, the Box uses its bundled AchillesAgentLib copy at
 `/opt/ploinky-agentlib`; the host does not clone a fallback repository. The bundle
 must match `ploinky-box/dependencies.lock.json` and pass content verification.
+Creating a missing Box pulls the configured image before this selection, so the
+bundle always comes from the image that Box is created from; with an existing
+Box, selection uses the local image and pulls only when it is absent.
 An older image without a compatible bundle must be rebuilt or replaced, or a
 valid local checkout supplied. Direct host `ploinky-local` development requires
 a local checkout because the image bundle is available only inside the Box.

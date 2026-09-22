@@ -63,12 +63,22 @@ export function probeImageAgentLib(engine, imageId, runner, {
     return Object.freeze({ ...readProbe(result, expectedCommit), imageId: normalizeImageId(imageId) });
 }
 
-/** Called lazily, only when the workspace has no local library. */
-export async function loadBoxAgentLibImage({ engine, imageRef, runner, stdout, stderr, allowPull = true }) {
-    let inspection = runner.query(engine.name, ['image', 'inspect', imageRef]);
-    if (!inspection.ok) {
+/**
+ * Called lazily, only when the workspace has no local library. `refresh` pulls
+ * even when the reference exists locally: creating a missing Box pulls it
+ * anyway, so the bundle must come from those bytes, not an older local tag.
+ */
+export async function loadBoxAgentLibImage({
+    engine, imageRef, runner, stdout, stderr, allowPull = true, refresh = false,
+}) {
+    if (refresh && !allowPull) {
+        throw new PloinkyBoxError('A Box image refresh requires an operation that may pull images',
+            { code: 'PLOINKY_BOX_AGENTLIB_REFRESH_INVALID' });
+    }
+    let inspection = refresh ? null : runner.query(engine.name, ['image', 'inspect', imageRef]);
+    if (!inspection?.ok) {
         if (!allowPull) {
-            throw bundleError('The Box image is not available locally and this operation cannot pull images', inspection.error);
+            throw bundleError('The Box image is not available locally and this operation cannot pull images', inspection?.error);
         }
         if (typeof runner.stream === 'function') {
             const pulled = await runner.stream(engine.name, ['pull', imageRef], {

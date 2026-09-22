@@ -263,8 +263,13 @@ export function createBoxSupervisor({
         return discover(identity, runner, platform, env);
     }
 
+    // Creating a missing Box pulls its reference, so select the bundle from
+    // that pull rather than from whatever local tag an earlier pull left.
+    // An existing Box is reused or replaced without a selection-time pull.
     function imageBundleLoader(ownership, imageRef = resolveBoxImageReference(env)) {
-        return () => loadAgentLibImage({ engine: ownership.engine, imageRef, runner, stdout, stderr });
+        return () => loadAgentLibImage({
+            engine: ownership.engine, imageRef, runner, stdout, stderr, refresh: ownership.state === 'absent',
+        });
     }
 
     // Bind never pulls: an image bundle may come only from a local image.
