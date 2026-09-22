@@ -747,7 +747,7 @@ test('collector fails closed when its rootless owner cannot enter a nested netwo
 
 test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expected graph', () => {
     const profile = loadListenerProfile(FULL_PROFILE);
-    assert.equal(profile.requiredContainers.length, 18);
+    assert.equal(profile.requiredContainers.length, 19);
     const livekitContainer = profile.requiredContainers.find(entry => entry.id === 'livekit');
     const livekitName = 'ploinky_AchillesIDE_liveKitServerAgent_fixture';
     const retiredName = 'ploinky_webmeetInfra_liveKitServerAgent_fixture';
@@ -771,8 +771,8 @@ test('checked-in full Explorer profile pins exact LiveKit UDP ownership and expe
     const privateRouter = profile.rules.find(rule => rule.id === 'router-private');
     assert.equal(privateRouter.dynamicBindSet, 'loopback-and-managed-gateways');
     assert.deepEqual(privateRouter.bindAddresses, []);
-    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').minMatches, 15);
-    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').maxMatches, 15);
+    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').minMatches, 16);
+    assert.equal(profile.rules.find(rule => rule.id === 'standard-agentserver').maxMatches, 16);
     assert.equal(profile.controlPorts.includes(7681), false);
     assert.equal(profile.requiredContainers.some(entry => (
         entry.id === 'webtty'
@@ -813,6 +813,7 @@ test('full Explorer profile no longer requires the retired default-local-llm con
     assert.equal(standard.containerPattern.test(retiredName), false);
     assert.equal(standard.containerPattern.test('ploinky_proxies_soul-gateway_fixture'), true);
     assert.equal(standard.containerPattern.test('ploinky_proxies_searchAgent_fixture'), true);
+    assert.equal(standard.containerPattern.test('ploinky_proxies_opencode-free_fixture'), true);
     const standardMatches = profile.requiredContainers.filter(entry => (
         standard.containerPattern.test(`${entry.namePattern.source.replace(/^\^/, '')}fixture`)
     ));

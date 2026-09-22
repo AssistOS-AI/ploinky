@@ -158,9 +158,9 @@ test('MCP denial requires real authorization instead of validation, transport or
     for (const value of [response(200, { result: { ok: true } }), response(404, { error: 'forbidden' }), response(302, { error: 'forbidden' }), response(403, { ok: true }), response(500, { error: 'forbidden' }), response(200, { result: { isError: true, content: [{ type: 'text', text: 'Missing argument or task not found' }] } })]) assert.throws(() => assertAgentMcpDenied(decodeAgentMcp(value)));
 });
 test('inventory preserves every recorded runtime and disabled agents without claiming coverage', () => {
-    assert.equal(agentCatalog.length, 25);
-    assert.equal(agentCatalog.filter((a) => a.enabled).length, 18);
-    assert.equal(new Set(agentCatalog.map((a) => `${a.repo}/${a.agent}`)).size, 25);
+    assert.equal(agentCatalog.length, 26);
+    assert.equal(agentCatalog.filter((a) => a.enabled).length, 19);
+    assert.equal(new Set(agentCatalog.map((a) => `${a.repo}/${a.agent}`)).size, 26);
     assert.equal(agentCatalog.some((a) => a.agent === 'default-local-llm'), false);
     assert.equal(agentInventory.some((r) => r.agent === 'default-local-llm'), false);
     for (const a of agentCatalog) {
@@ -180,7 +180,7 @@ test('safe read probes reference declared tools and do not mutate or infer visib
 
 test('registry reconciliation rejects absent or incorrect runtime principals instead of silently omitting aliases', () => {
     const routes = Object.fromEntries(agentCatalog.filter((a) => a.enabled).map((a) => [a.agent, { agent: a.agent }]));
-    assert.equal(reconcileAgentRegistry({ routes }).keys.length, 18);
+    assert.equal(reconcileAgentRegistry({ routes }).keys.length, 19);
     assert.throws(() => reconcileAgentRegistry({ routes: {} }));
     assert.throws(() => reconcileAgentRegistry({ routes: { ...routes, alien: { agent: 'unrelated-workspace-agent' } } }));
     assert.deepEqual(reconcileAgentRegistry({ routes: { ...routes, alias: { agent: 'explorer' } } }).alternateKeys, [{ key: 'alias', agent: 'explorer' }]);
