@@ -13,11 +13,14 @@ function repoNameFromAgentRef(agentRef) {
     return sepIdx > 0 ? ref.slice(0, sepIdx) : null;
 }
 
-function policyForBootRepo(repoName, branchPolicy, staticAgent) {
+// The global --branch reaches every default boot repo, like every manifest
+// dependency repo: a boot repo can also be a dependency of the static agent
+// (AchillesCLI for explorer), and the manifest traversal keeps a checkout that
+// already exists. A repo without the branch falls back (and logs it) or aborts
+// under --branch-fallback fail.
+function policyForBootRepo(repoName, branchPolicy) {
     if (!branchPolicy) return null;
-    if (branchPolicy.repoBranches?.[repoName]) return branchPolicy;
-    const staticRepoName = repoNameFromAgentRef(staticAgent);
-    if (branchPolicy.branch && staticRepoName === repoName) return branchPolicy;
+    if (branchPolicy.repoBranches?.[repoName] || branchPolicy.branch) return branchPolicy;
     return null;
 }
 
@@ -37,12 +40,16 @@ export function prepareDefaultBootRepositories({
     const prepared = [];
     for (const { name, url } of bootRepos) {
         const repoPath = resolveAgentRepositoryPath(name);
-        const repoBranchPolicy = policyForBootRepo(name, branchPolicy, staticAgent);
+        const repoBranchPolicy = policyForBootRepo(name, branchPolicy);
         if (!fs.existsSync(repoPath)) {
             log(`Default '${name}' repository not found. Cloning...`);
             try {
                 const result = repos.ensureRepoInstalled(name, url, {
                     branchPolicy: repoBranchPolicy,
+                    // The start branch outranks a branch stored by an earlier
+                    // run (a re-clone after `uninstall repo`), as it does for
+                    // an existing checkout below.
+                    branch: repoBranchPolicy ? repos.resolveBranchForRepo(name, null, repoBranchPolicy) : undefined,
                     stdio,
                 });
                 prepared.push({ name, action: result?.status || 'cloned', branch: result?.branch || null });
@@ -68,16 +75,18 @@ export function prepareDefaultBootRepositories({
     }
 
     // The global --branch must also reach the static agent's OWN repo when the
-    // agent is named bare (e.g. `explorer`, not `AchillesIDE/explorer`).
+    // agent is named bare (e.g. `explorer`, not `AchillesIDE/explorer`) and that
+    // repo is not a default boot repo, which the loop above already handled.
     // repoNameFromAgentRef() can't resolve a bare name, and findAgent() needs the
     // repos on disk — so resolve it here, after the default repos are cloned, and
     // switch that repo to the branch (default fallback keeps it on its current
-    // branch when the branch is absent). Repo-prefixed names are already handled
-    // in the loop above via policyForBootRepo.
+    // branch when the branch is absent).
     if (branchPolicy?.branch && staticAgent && !repoNameFromAgentRef(staticAgent)) {
         try {
             const staticRepo = findAgent(String(staticAgent).trim())?.repo;
-            if (staticRepo && fs.existsSync(resolveAgentRepositoryPath(staticRepo))) {
+            const bootRepoNames = new Set(bootRepos.map(({ name }) => name));
+            if (staticRepo && !bootRepoNames.has(staticRepo)
+                && fs.existsSync(resolveAgentRepositoryPath(staticRepo))) {
                 const result = repos.ensureRepoOnBranch(staticRepo, {
                     branch: branchPolicy.branch,
                     resetRepos: branchPolicy.resetRepos || false,

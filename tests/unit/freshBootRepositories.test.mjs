@@ -8,7 +8,7 @@ import test from 'node:test';
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const expectedRepos = ['AchillesCLI', 'AchillesIDE', 'copilot-agents'];
 
-function fixture(t) {
+function fixture(t, { branches = {} } = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-fresh-boot-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
@@ -43,6 +43,9 @@ function fixture(t) {
         }
         git(['-c', 'user.name=Ploinky Fixture', '-c', 'user.email=fixture@example.invalid',
             'commit', '-q', '--allow-empty', '-m', 'Local boot fixture']);
+        for (const branch of branches[name] || []) {
+            git(['branch', branch, 'main']);
+        }
     }
     const fakeBin = path.join(root, 'bin');
     fs.mkdirSync(fakeBin);
@@ -113,6 +116,86 @@ test('fresh start explorer prepares its sources without installing or registerin
     assert.match(`${result.stdout}\n${result.stderr}`, /fixtureMissingService/);
     assertDefaultRepos(f);
     assert.equal(fs.existsSync(path.join(f.workspace, '.ploinky', 'agents.json')), false);
+});
+
+function checkoutBranch(f, repoName) {
+    return execFileSync('git', ['-C', path.join(f.workspace, '.ploinky', 'repos', repoName), 'rev-parse', '--abbrev-ref', 'HEAD'], {
+        env: f.env, encoding: 'utf8',
+    }).trim();
+}
+
+const featureBranches = { AssistOSExplorer: ['feat'], AchillesCLI: ['feat', 'cli-only'] };
+
+test('fresh start explorer --branch puts every boot repo that has the branch on it and logs the fallback of one that does not', (t) => {
+    const f = fixture(t, { branches: featureBranches });
+    const result = run(f, [path.join(repoRoot, 'cli/index.js'), 'start', 'explorer', '--branch=feat']);
+    const output = `${result.stdout}\n${result.stderr}`;
+    assert.notEqual(result.status, 0);
+    assert.match(output, /fixtureMissingService/);
+    assertDefaultRepos(f);
+    assert.equal(checkoutBranch(f, 'AchillesIDE'), 'feat');
+    // AchillesCLI is a boot repo but not the static agent's repo: F7.
+    assert.equal(checkoutBranch(f, 'AchillesCLI'), 'feat');
+    assert.equal(checkoutBranch(f, 'copilot-agents'), 'main');
+    assert.match(output, /Branch 'feat' not found on remote for 'copilot-agents'; falling back to default branch\./);
+    assert.doesNotMatch(output, /Branch 'feat' not (found on remote|available) for '(AchillesIDE|AchillesCLI)'/);
+    assert.doesNotMatch(output, /Error (cloning|switching)/);
+    const sources = JSON.parse(fs.readFileSync(path.join(f.workspace, '.ploinky', 'repo_sources.json'), 'utf8'));
+    assert.equal(sources.AchillesCLI.branch, 'feat');
+    assert.equal(sources.AchillesIDE.branch, 'feat');
+    assert.equal(sources['copilot-agents'].branch, undefined);
+});
+
+test('a boot repo cloned again after uninstall takes the new --branch, not the branch stored by the earlier start', (t) => {
+    const f = fixture(t, {
+        branches: {
+            AssistOSExplorer: ['feat', 'other'],
+            AchillesCLI: ['feat', 'other'],
+            'copilot-agents': ['feat', 'other'],
+        },
+    });
+    const first = run(f, [path.join(repoRoot, 'cli/index.js'), 'start', 'explorer', '--branch=feat']);
+    assert.match(`${first.stdout}\n${first.stderr}`, /fixtureMissingService/);
+    for (const repoName of expectedRepos) assert.equal(checkoutBranch(f, repoName), 'feat');
+    // `uninstall repo` removes the checkout and keeps its stored source. Each
+    // CLI command re-clones missing boot repos first, so the last uninstall
+    // leaves only its own repo missing; remove the other two checkouts the
+    // same way so all three reach the clone path of the next start.
+    const removed = run(f, [path.join(repoRoot, 'cli/index.js'), 'uninstall', 'repo', 'AchillesIDE']);
+    assert.equal(removed.status, 0, `${removed.stdout}\n${removed.stderr}`);
+    for (const repoName of ['AchillesCLI', 'copilot-agents']) {
+        fs.rmSync(path.join(f.workspace, '.ploinky', 'repos', repoName), { recursive: true, force: true });
+    }
+    const sources = JSON.parse(fs.readFileSync(path.join(f.workspace, '.ploinky', 'repo_sources.json'), 'utf8'));
+    for (const repoName of expectedRepos) {
+        assert.equal(fs.existsSync(path.join(f.workspace, '.ploinky', 'repos', repoName)), false, repoName);
+        assert.equal(sources[repoName].branch, 'feat', `stale stored branch for ${repoName}`);
+    }
+
+    const second = run(f, [path.join(repoRoot, 'cli/index.js'), 'start', 'explorer', '--branch=other']);
+    assert.match(`${second.stdout}\n${second.stderr}`, /fixtureMissingService/);
+    for (const repoName of expectedRepos) assert.equal(checkoutBranch(f, repoName), 'other', repoName);
+});
+
+test('fresh start explorer --branch with --branch-fallback fail aborts on a boot repo without the branch', (t) => {
+    const f = fixture(t, { branches: featureBranches });
+    const result = run(f, [path.join(repoRoot, 'cli/index.js'), 'start', 'explorer', '--branch=feat', '--branch-fallback', 'fail']);
+    const output = `${result.stdout}\n${result.stderr}`;
+    assert.notEqual(result.status, 0);
+    assert.match(output, /Branch 'feat' does not exist on remote for repo 'copilot-agents'\. Aborting \(--branch-fallback fail\)\./);
+    assert.doesNotMatch(output, /fixtureMissingService/);
+    assert.equal(fs.existsSync(path.join(f.workspace, '.ploinky', 'repos', 'copilot-agents')), false);
+    assert.equal(fs.existsSync(path.join(f.workspace, '.ploinky', 'agents.json')), false);
+});
+
+test('fresh start explorer --repo-branch overrides the global --branch for a boot repo', (t) => {
+    const f = fixture(t, { branches: featureBranches });
+    const result = run(f, [path.join(repoRoot, 'cli/index.js'), 'start', 'explorer', '--branch=feat', '--repo-branch', 'AchillesCLI=cli-only']);
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /fixtureMissingService/);
+    assert.equal(checkoutBranch(f, 'AchillesIDE'), 'feat');
+    assert.equal(checkoutBranch(f, 'AchillesCLI'), 'cli-only');
+    assert.equal(checkoutBranch(f, 'copilot-agents'), 'main');
 });
 
 test('explicit install and enable basic survive subsequent automatic bootstrap', (t) => {
