@@ -9,7 +9,7 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
-function fixture(t, { corrupt = false } = {}) {
+function fixture(t, { corrupt = false, existingBox = false } = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-image-supervisor-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
@@ -19,11 +19,15 @@ function fixture(t, { corrupt = false } = {}) {
         schemaVersion: 1, commit: canonicalAgentLibRemote().commit,
         fingerprint: 'e'.repeat(64), imageId: `sha256:${'f'.repeat(64)}`,
     };
-    const ownership = { state: 'absent', engine: { name: 'podman', identity: 'engine' }, handles: {} };
+    const engine = { name: 'podman', identity: 'engine' };
+    const ownership = existingBox
+        ? { state: 'owned', engine, handles: { container: { id: 'existing', runtime: { imageId: bundle.imageId, running: false } } } }
+        : { state: 'absent', engine, handles: {} };
     const preparedOwnership = {
         ...ownership, state: 'owned', handles: { container: { id: 'candidate', runtime: { imageId: bundle.imageId } } },
     };
     const calls = [];
+    const loads = [];
     let selections = [];
     let lockNumber = 0;
     const supervisor = createBoxSupervisor({
@@ -35,7 +39,7 @@ function fixture(t, { corrupt = false } = {}) {
             fs.mkdirSync(lockPath);
             return { path: lockPath, assertHeld() {}, release() {} };
         } },
-        loadAgentLibImage: async () => { calls.push('load-image'); return bundle; },
+        loadAgentLibImage: async (options) => { loads.push(options); calls.push('load-image'); return bundle; },
         updateWorkspacePloinky: async () => ({ changed: false }),
         runner: {
             run(_command, args) { calls.push(args.join(' ')); },
@@ -58,7 +62,7 @@ function fixture(t, { corrupt = false } = {}) {
         healthCheck: async () => { calls.push('health'); },
         stdout: { write() {} }, stderr: { write() {} },
     });
-    return { supervisor, workspace, bundle, calls, selections };
+    return { supervisor, workspace, bundle, calls, selections, loads };
 }
 
 for (const [operation, run] of [
@@ -66,6 +70,15 @@ for (const [operation, run] of [
     ['restart', supervisor => supervisor.runRestartTransaction(['restart'])],
     ['update', supervisor => supervisor.runUpdateTransaction(['update'])],
 ]) {
+    test(`${operation} refreshes the Box image before selection only when it creates the Box`, async t => {
+        for (const [existingBox, refresh] of [[false, true], [true, false]]) {
+            const state = fixture(t, { existingBox });
+            await run(state.supervisor);
+            assert.deepEqual(state.loads.map(options => [options.imageRef, options.refresh, options.allowPull]),
+                [['docker.io/assistos/ploinky-box:latest', refresh, undefined]]);
+        }
+    });
+
     test(`${operation} uses the image when no local source exists and persists admission after actual bundle verification`, async t => {
         const state = fixture(t);
         const result = await run(state.supervisor);
