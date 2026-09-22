@@ -241,8 +241,7 @@ git --version</code></pre>
                         <p><strong>2. Install missing tools</strong> with <a href="https://brew.sh" target="_blank" rel="noopener noreferrer">Homebrew</a>:</p>
                         <pre><code>brew install node@22 git podman
 brew link --overwrite --force node@22
-podman machine init
-podman machine start</code></pre>
+podman machine init --rootful=false --cpus 4 --memory 6144 --disk-size 100 --now</code></pre>
                         <p>Alternatively install Node.js from the <a href="https://nodejs.org/en/download" target="_blank" rel="noopener noreferrer">official downloads</a> and Git with <code>xcode-select --install</code>.</p>
                         <p><strong>3. Clone Ploinky and add it to <code>PATH</code>:</strong></p>
                         <pre><code>git clone https://github.com/AssistOS-AI/ploinky.git
