@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 
+import { PLOINKY_INSTALL_ROOT, canonicalAgentLibRemote } from '../agentlib/contract.mjs';
 import { buildImageSelection } from '../agentlib/source.mjs';
 import { sanitizeAuthorityDiagnostic } from '../cli/sandbox/authorityCommandDiagnostics.mjs';
 import { BOX_LABELS, BOX_MEDIA_PORT, resolveBoxImageReference } from './constants.mjs';
@@ -16,6 +17,7 @@ import {
     boxWorkspaceExecOptions,
     boxWorkspacePath,
 } from './contract/workspace-root.mjs';
+import { agentLibPinPolicy, assessAgentLibPin, readCheckoutPinContext } from './agentlib-pin.mjs';
 import { probeImageAgentLib } from './image-agentlib.mjs';
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
 import { createMutationLockManager } from './locks.mjs';
@@ -294,6 +296,47 @@ export function validateCurrentBox({ ownership, identity, repositoryRoot, runner
     if (image.immutableId !== container.runtime.imageId) throw new Error('Current Box immutable image identity changed');
 }
 
+/**
+ * Verify the image bundle without a pin, then report a difference from this
+ * checkout's lock as its own check: a warning, or a failure in strict mode.
+ * The bytes are valid either way, so the runtime probes continue.
+ */
+export async function checkImageAgentLib({ stage, checks, runner, env = process.env, repositoryRoot = PLOINKY_INSTALL_ROOT },
+    { imageId, imageRef, lockCommit, readPinContext = readCheckoutPinContext } = {}) {
+    let policy = null;
+    let policyError = null;
+    try {
+        policy = agentLibPinPolicy(env);
+    } catch (error) {
+        policyError = error;
+    }
+    let pinned;
+    const bundle = await stage('image.agentlib', 'Verify the bundled AchillesAgentLib', async () => {
+        pinned = lockCommit ?? canonicalAgentLibRemote({
+            lockPath: path.join(repositoryRoot, 'ploinky-box', 'dependencies.lock.json'),
+        }).commit;
+        return probeImageAgentLib('podman', imageId, runner, { expectedCommit: null });
+    });
+    // A misconfigured policy is the user's setting, not an image defect; the
+    // verified bundle still lets the runtime probes continue.
+    if (policyError) {
+        checks.push({ id: 'image.agentlib.pin', label: 'Bundled AchillesAgentLib matches this Ploinky pin', status: 'fail',
+            code: policyError.code, detail: clean(policyError.message),
+            next: 'Set PLOINKY_AGENTLIB_STRICT_PIN to 0 or 1, or unset it.' });
+    }
+    if (!bundle || policyError) return bundle || null;
+    const assessment = assessAgentLibPin({
+        lockCommit: pinned, bundle, imageRef, engineName: 'podman',
+        context: bundle.commit === pinned ? null : readPinContext(repositoryRoot, { imageCommit: bundle.commit }),
+    });
+    if (assessment) {
+        checks.push({ id: 'image.agentlib.pin', label: 'Bundled AchillesAgentLib matches this Ploinky pin',
+            status: policy === 'strict' ? 'fail' : 'warn',
+            detail: clean(`${assessment.summary} ${assessment.explanation}`), next: clean(assessment.fix) });
+    }
+    return bundle;
+}
+
 export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env, platform, runner, checks, progress, stage }) {
     let scratch, fixture, lock, ownedId, imageId;
     const knownIds = new Set();
@@ -318,7 +361,7 @@ export async function collectRuntimeDiagnostics({ identity, repositoryRoot, env,
         const records = JSON.parse(inspection.stdout);
         const digest = records[0]?.RepoDigests?.find((value) => value.startsWith(imageRef.replace(/:[^/:]+$/, '').split('@')[0] + '@'));
         const runtimeImageRef = digest || imageRef;
-        const bundle = await stage('image.agentlib', 'Verify the bundled AchillesAgentLib', async () => probeImageAgentLib('podman', imageId, runner));
+        const bundle = await checkImageAgentLib({ stage, checks, runner, env, repositoryRoot }, { imageId, imageRef });
         if (!bundle) return;
         scratch = fs.realpathSync(fs.mkdtempSync(path.join(identity.workspaceRoot, '.ploinky-diagnose-')));
         fs.chmodSync(scratch, 0o700);

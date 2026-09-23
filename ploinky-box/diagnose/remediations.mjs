@@ -73,6 +73,8 @@ const ACTIONS = {
         'Verify the configured Box image, immutable identity and Ploinky source revision. Use a compatible published image or rebuild the image from the supported source; do not modify running containers or relax isolation.', [command('podman', 'images')]),
     cleanup: manual('inspect-owned-diagnostic-cleanup', 'Inspect retained diagnostic resources', null,
         'Inspect only the temporary resource named in the failed check and prove its ownership before removing it. Do not prune, reset storage, or remove a similarly named workspace. Permission or policy repairs may need an administrator; ownership ambiguity must be resolved first.'),
+    pinPolicy: manual('set-agentlib-strict-pin', 'Set a supported PLOINKY_AGENTLIB_STRICT_PIN value', false,
+        'Set PLOINKY_AGENTLIB_STRICT_PIN to 0 or 1, or unset it, in the shell that runs Ploinky, then rerun ploinky diagnose. Repair never changes your environment.'),
     graph: manual('inspect-application-state', 'Inspect the current application deployment', false,
         'Inspect the named agent and its startup logs. Correct its application configuration or run the intended Ploinky start command when ready; repair does not restart agents or infer application health.', [command('ploinky', 'logs', 'last')]),
 };
@@ -127,6 +129,8 @@ function classify(check, report, context) {
         'The Box mounts the workspace at its own absolute path. Move or clone the workspace to a directory whose path passes this check and run Ploinky there. Repair never moves workspaces or adds mounts.');
     if (id === 'workspace.git') return manual('keep-git-metadata-in-workspace', 'Keep Git metadata inside the workspace', false,
         'Replace each reported linked worktree or separated Git directory with a regular clone inside the workspace, or run Git for it on the host. Repair never mounts additional host paths.');
+    // Pin details carry image references, paths, and branch names; never classify them by their words.
+    if (id === 'image.agentlib.pin') return check.code === 'PLOINKY_BOX_ARGUMENT_INVALID' ? ACTIONS.pinPolicy : ACTIONS.image;
     if (id === 'repair.machine.state') return check.code === 'MACHINE_STOPPED_ELIGIBLE' && check.repairEligible === true
         ? automatic('start-podman-machine', 'Start the verified stopped Podman Machine',
             'Run ploinky repair to start only the existing selected rootless Machine after revalidating its identity and settings. It does not create or reconfigure a Machine.') : ACTIONS.machine;

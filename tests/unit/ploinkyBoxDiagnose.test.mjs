@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
-    createDiagnosticRunner, createVerifierScope, diagnoseWorkspace,
+    checkImageAgentLib, createDiagnosticRunner, createVerifierScope, diagnoseWorkspace,
     diagnosticAdvice, formatDiagnosticReport, validateInsideReport,
 } from '../../ploinky-box/diagnose.mjs';
 import { probeImageBinaries, IMAGE_OBSERVATION_UNAVAILABLE } from '../../ploinky-box/contract/image.mjs';
@@ -153,6 +153,61 @@ test('AgentLib query wrappers retain sanitized failed command evidence', async (
     assert.equal(check.command.args[0], 'run');
     assert.match(check.detail, /crun: unknown version specified/);
     assert.doesNotMatch(JSON.stringify(report), /secret-verifier-token/);
+});
+
+async function diagnosePin(t, { env = {}, bundleCommit = 'b'.repeat(40) } = {}) {
+    const root = workspace(t);
+    const probes = [];
+    let returned;
+    const report = await diagnoseWorkspace({ cwd: root, env,
+        hostChecks: () => ({ checks: [], engineUsable: true }), discover: () => ({ state: 'absent' }),
+        bindingStore: { read: () => null }, checkPublications: async () => {}, repairAssessments: () => [],
+        runner: { query(_file, args) {
+            if (args[0] !== 'run') return absent;
+            probes.push(args);
+            return { ok: true, status: 0, stdout: JSON.stringify({ schemaVersion: 1, commit: bundleCommit, fingerprint: 'c'.repeat(64) }), stderr: '', error: null };
+        } },
+        runtimeChecks: async (context) => {
+            returned = await checkImageAgentLib(context, {
+                imageId: IMAGE, imageRef: 'docker.io/assistos/ploinky-box:latest', lockCommit: 'a'.repeat(40),
+                readPinContext: () => ({ git: false, root: '/opt/fake' }),
+            });
+        },
+    });
+    return { report, probes, returned, pin: report.checks.find((check) => check.id === 'image.agentlib.pin') };
+}
+
+test('D1 a bundled commit that differs from the lock is a diagnose warning', async (t) => {
+    const { report, probes, pin } = await diagnosePin(t);
+    assert.equal(report.checks.find((check) => check.id === 'image.agentlib').status, 'pass');
+    assert.equal(pin.status, 'warn');
+    assert.equal(report.exitCode, 0);
+    assert.equal(probes.length, 1);
+    assert.equal(probes[0].includes('--expected-commit'), false);
+    assert.match(formatDiagnosticReport(report), /\[WARN\] Bundled AchillesAgentLib matches this Ploinky pin/);
+});
+
+test('D2 the strict policy turns the pin difference into a diagnose failure', async (t) => {
+    const { report, pin } = await diagnosePin(t, { env: { PLOINKY_AGENTLIB_STRICT_PIN: '1' } });
+    assert.equal(pin.status, 'fail');
+    assert.equal(report.exitCode, 1);
+});
+
+test('D4 an invalid strict-pin value is its own failed check and the runtime probes continue', async (t) => {
+    const { report, pin, returned } = await diagnosePin(t, { env: { PLOINKY_AGENTLIB_STRICT_PIN: 'yes' } });
+    assert.equal(report.checks.find((check) => check.id === 'image.agentlib').status, 'pass');
+    assert.equal(pin.status, 'fail');
+    assert.match(pin.detail, /^PLOINKY_AGENTLIB_STRICT_PIN must be 0 or 1/);
+    assert.equal(pin.next, 'Set PLOINKY_AGENTLIB_STRICT_PIN to 0 or 1, or unset it.');
+    assert.deepEqual(pin.actionIds, ['set-agentlib-strict-pin']);
+    assert.equal(returned.commit, 'b'.repeat(40));
+    assert.equal(report.exitCode, 1);
+});
+
+test('D3 a bundled commit matching the lock adds no pin check', async (t) => {
+    const { report, pin } = await diagnosePin(t, { bundleCommit: 'a'.repeat(40) });
+    assert.equal(pin, undefined);
+    assert.equal(report.checks.find((check) => check.id === 'image.agentlib').status, 'pass');
 });
 
 test('incidental absent resources and cleanup commands do not explain unrelated filesystem failures', async (t) => {

@@ -9,14 +9,16 @@ import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
 
-function fixture(t, { corrupt = false, existingBox = false } = {}) {
+function fixture(t, {
+    corrupt = false, existingBox = false, bundleCommit = canonicalAgentLibRemote().commit, env = {}, repositoryRoot,
+} = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-image-supervisor-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const workspace = path.join(root, 'workspace');
     fs.mkdirSync(workspace);
     const identity = buildWorkspaceIdentity(workspace, { markerFound: false });
     const bundle = {
-        schemaVersion: 1, commit: canonicalAgentLibRemote().commit,
+        schemaVersion: 1, commit: bundleCommit,
         fingerprint: 'e'.repeat(64), imageId: `sha256:${'f'.repeat(64)}`,
     };
     const engine = { name: 'podman', identity: 'engine' };
@@ -31,7 +33,8 @@ function fixture(t, { corrupt = false, existingBox = false } = {}) {
     let selections = [];
     let lockNumber = 0;
     const supervisor = createBoxSupervisor({
-        checkHostPrerequisites: () => {}, env: {}, platform: 'darwin',
+        checkHostPrerequisites: () => {}, env, platform: 'darwin',
+        ...(repositoryRoot ? { repositoryRoot } : {}),
         resolveIdentity: () => identity, launchCwd: workspace,
         discover: () => ownership,
         lockManager: { async acquire() {
@@ -117,4 +120,30 @@ test('running bundle drift rolls back without persisting a successful selection'
     assert.equal(readActiveDescriptor(state.workspace), null);
     assert.equal(state.calls.includes('finalize'), false);
     assert.equal(state.calls.at(-1), 'rollback');
+});
+
+test('H1 a bundle commit that differs from the lock is selected, verified and admitted', async t => {
+    const other = '9'.repeat(40);
+    const state = fixture(t, { bundleCommit: other });
+    const result = await state.supervisor.runStartTransaction(['start', 'fixture']);
+    assert.equal(result.agentLib.resolvedCommit, other);
+    assert.equal(readActiveDescriptor(state.workspace).resolvedCommit, other);
+    const exec = state.calls.find(call => call.startsWith('exec candidate'));
+    assert.ok(exec.endsWith(`--expected-commit ${other}`), exec);
+});
+
+test('H2 the loaders receive the pin policy and the checkout that owns the lock', async t => {
+    for (const [env, policy] of [[{}, 'warn'], [{ PLOINKY_AGENTLIB_STRICT_PIN: '1' }, 'strict']]) {
+        const state = fixture(t, { env, repositoryRoot: '/fake/root' });
+        await state.supervisor.runStartTransaction(['start', 'fixture']);
+        assert.equal(state.loads[0].pinPolicy, policy);
+        assert.equal(state.loads[0].repositoryRoot, '/fake/root');
+    }
+});
+
+test('H3 an invalid strict-pin value stops start before image selection or reconciliation', async t => {
+    const state = fixture(t, { env: { PLOINKY_AGENTLIB_STRICT_PIN: 'yes' } });
+    await assert.rejects(state.supervisor.runStartTransaction(['start', 'fixture']), { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
+    assert.equal(state.calls.includes('load-image'), false);
+    assert.equal(state.calls.includes('reconcile'), false);
 });

@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import {
+    AGENTLIB_ERROR_CODES,
     canonicalAgentLibRemote,
     imageSourceId,
 } from '../../agentlib/contract.mjs';
@@ -255,4 +259,92 @@ test('running bundle verification rejects fingerprint drift and uses the admitte
     assert.throws(() => revalidateContainerAgentLib(contract, {
         ...context, runner: { query: () => ({ ok: true, stdout: JSON.stringify({ ...metadata, fingerprint: 'c'.repeat(64) }) }) },
     }), /fingerprint changed/);
+});
+
+function pinnedLoader(probeResult, options = {}) {
+    const calls = [];
+    const writes = { stdout: [], stderr: [] };
+    let contextReads = 0;
+    const runner = { query(_command, args) {
+        calls.push(args);
+        return args[0] === 'image' ? { ok: true, stdout: contractInspection(imageId) } : probeResult;
+    } };
+    const load = () => loadBoxAgentLibImage({
+        engine, runner, imageRef: 'pinned-image',
+        stdout: { write(text) { writes.stdout.push(text); } },
+        stderr: { write(text) { writes.stderr.push(text); } },
+        readPinContext: () => { contextReads += 1; return { git: false, root: '/opt/fake' }; },
+        ...options,
+    });
+    return { load, calls, writes, contextReads: () => contextReads };
+}
+
+test('L1 a bundle matching the lock loads unpinned, silently and without Git', async () => {
+    const state = pinnedLoader({ ok: true, stdout: JSON.stringify(metadata) }, {
+        readPinContext: () => assert.fail('a matching pin must not read the checkout'),
+    });
+    assert.deepEqual(await state.load(), { ...metadata, imageId });
+    const probe = state.calls.find((args) => args[0] === 'run');
+    assert.equal(probe.length, 8);
+    assert.equal(probe.at(-1), 'verify');
+    assert.deepEqual(state.writes, { stdout: [], stderr: [] });
+});
+
+test('L2 a different bundled commit warns once on stderr and continues with the image commit', async () => {
+    const other = '9'.repeat(40);
+    const state = pinnedLoader({ ok: true, stdout: JSON.stringify({ ...metadata, commit: other }) }, { pinPolicy: 'warn' });
+    const bundle = await state.load();
+    assert.equal(bundle.commit, other);
+    assert.equal(state.writes.stderr.length, 1);
+    assert.ok(state.writes.stderr[0].includes('bundles AchillesAgentLib 99999999, but this Ploinky pins'));
+    assert.ok(state.writes.stderr[0].endsWith("[ploinky] Continuing with the image's AchillesAgentLib 99999999.\n"));
+    assert.deepEqual(state.writes.stdout, []);
+    assert.equal(state.contextReads(), 1);
+});
+
+test('L3 the strict policy makes a different bundled commit fatal without a warning', async () => {
+    const state = pinnedLoader({ ok: true, stdout: JSON.stringify({ ...metadata, commit: '9'.repeat(40) }) }, { pinPolicy: 'strict' });
+    await assert.rejects(state.load(), { code: 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE' });
+    assert.deepEqual(state.writes.stderr, []);
+});
+
+test('L4 an unpinned verification failure stays fatal before any pin comparison', async () => {
+    const state = pinnedLoader({ ok: false, status: 1, stderr: 'PLOINKY_AGENTLIB_IMAGE_INVALID: metadata is not a regular file\n' });
+    await assert.rejects(state.load(), (error) => {
+        assert.equal(error.code, 'PLOINKY_BOX_AGENTLIB_INCOMPATIBLE');
+        assert.ok(error.message.startsWith('The Box AchillesAgentLib bundle is missing or failed verification'));
+        return true;
+    });
+    assert.equal(state.contextReads(), 0);
+    assert.deepEqual(state.writes.stderr, []);
+});
+
+test('L5 an unknown pin policy is rejected before any engine call, after the refresh guard', async () => {
+    const runner = { query: () => assert.fail('an invalid policy must not reach the engine') };
+    await assert.rejects(loadBoxAgentLibImage({ engine, runner, imageRef: 'pinned-image', pinPolicy: 'loud' }),
+        { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
+    await assert.rejects(loadBoxAgentLibImage({
+        engine, runner, imageRef: 'pinned-image', pinPolicy: 'loud', refresh: true, allowPull: false,
+    }), { code: 'PLOINKY_BOX_AGENTLIB_REFRESH_INVALID' });
+});
+
+test('L6 an explicit null pin omits the expected-commit argument and returns the image commit', () => {
+    let args;
+    const bundle = probeImageAgentLib('podman', imageId, { query(_command, input) {
+        args = input;
+        return { ok: true, stdout: JSON.stringify({ ...metadata, commit: '0'.repeat(40) }) };
+    } }, { expectedCommit: null });
+    assert.deepEqual(args, ['run', '--rm', '--network=none', '--pull=never', '--entrypoint=/usr/local/bin/node',
+        imageId, IMAGE_AGENTLIB_PROBE_PATH, 'verify']);
+    assert.equal(bundle.commit, '0'.repeat(40));
+});
+
+test('an unreadable checkout lock fails before any engine call', async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-pin-lock-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const fail = () => assert.fail('an unreadable lock must not reach the engine');
+    await assert.rejects(loadBoxAgentLibImage({
+        engine, imageRef: 'pinned-image', pinPolicy: 'warn', repositoryRoot: root,
+        runner: { query: fail, run: fail, stream: fail },
+    }), { code: AGENTLIB_ERROR_CODES.contractMissing });
 });

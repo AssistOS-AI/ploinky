@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
-import { AGENTLIB_ERROR_CODES, AGENTLIB_LOCAL_DIR_NAME, agentLibError, canonicalAgentLibRemote } from '../agentlib/contract.mjs';
+import { AGENTLIB_ERROR_CODES, AGENTLIB_LOCAL_DIR_NAME, agentLibError } from '../agentlib/contract.mjs';
 import { isInsideBoxRuntime } from '../agentlib/bootstrap.mjs';
 import { fingerprintSource } from '../agentlib/fingerprint.mjs';
 import {
@@ -47,8 +47,10 @@ export function readLocalGitState(sourceDir, { spawn = spawnSync } = {}) {
 /**
  * Prefer the exact local checkout, otherwise use the verified image bundle.
  * Neither path clones, fetches, creates source state, or changes a checkout.
- * Global branch policy applies to local sources; image bytes always follow the
- * canonical pinned commit. A local validation failure never probes the image.
+ * Global branch policy applies to local sources. Image bytes are selected at
+ * the commit the verified bundle reports; the image loader compares it with the
+ * dependency lock. An explicit `expectedCommit` or `remote.commit` still has to
+ * match exactly. A local validation failure never probes the image.
  */
 export async function selectWorkspaceAgentLibSource({
     workspaceRoot,
@@ -86,7 +88,7 @@ export async function selectWorkspaceAgentLibSource({
     const selection = buildImageSelection({
         workspaceRoot,
         imageBundle: bundle,
-        expectedCommit: expectedCommit || remote?.commit || canonicalAgentLibRemote({ fsApi }).commit,
+        expectedCommit: expectedCommit || remote?.commit || null,
         fsApi,
         ...(now ? { now } : {}),
     });

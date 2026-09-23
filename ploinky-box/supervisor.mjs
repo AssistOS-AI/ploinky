@@ -41,6 +41,7 @@ import {
     stageWorkspaceEdgeDesired,
 } from './edgeDesired.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import { agentLibPinPolicy } from './agentlib-pin.mjs';
 import { loadBoxAgentLibImage, revalidateContainerAgentLib } from './image-agentlib.mjs';
 import {
     HOST_REACHABLE_IPV4_ENV,
@@ -266,9 +267,11 @@ export function createBoxSupervisor({
     // Creating a missing Box pulls its reference, so select the bundle from
     // that pull rather than from whatever local tag an earlier pull left.
     // An existing Box is reused or replaced without a selection-time pull.
+    // The bundled commit is compared with this checkout's lock inside the loader.
     function imageBundleLoader(ownership, imageRef = resolveBoxImageReference(env)) {
         return () => loadAgentLibImage({
             engine: ownership.engine, imageRef, runner, stdout, stderr, refresh: ownership.state === 'absent',
+            pinPolicy: agentLibPinPolicy(env), repositoryRoot,
         });
     }
 
@@ -283,7 +286,10 @@ export function createBoxSupervisor({
                     'PLOINKY_BOX_BIND_IMAGE_UNAVAILABLE',
                 );
             }
-            return loadAgentLibImage({ engine: ownership.engine, imageRef, runner, stdout, stderr, allowPull: false });
+            return loadAgentLibImage({
+                engine: ownership.engine, imageRef, runner, stdout, stderr, allowPull: false,
+                pinPolicy: agentLibPinPolicy(env), repositoryRoot,
+            });
         };
     }
 

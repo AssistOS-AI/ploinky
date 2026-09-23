@@ -481,12 +481,12 @@ function assertNoEngineVolumeCommand(calls) {
     assert.equal(calls.some((call) => call.includes('volume')), false);
 }
 
-function imageAgentLibFixture() {
+function imageAgentLibFixture(commit = canonicalAgentLibRemote().commit) {
     const imageId = `sha256:${'f'.repeat(64)}`;
     const fingerprint = 'e'.repeat(64);
     return normalizeBoxAgentLib({
         sourceDir: '/opt/ploinky-agentlib', sourceRelativePath: 'image', mode: 'image', imageId,
-        fingerprint, commit: canonicalAgentLibRemote().commit,
+        fingerprint, commit,
         sourceId: imageSourceId(imageId, fingerprint),
     });
 }
@@ -520,6 +520,32 @@ for (const imageIdPrefix of ['', 'sha256:']) {
         assert.throws(() => validateContainerConfiguration(created, desired), /mount set is incompatible/);
     });
 }
+
+test('X1 an image commit that differs from the lock creates the Box once and is then reused', async t => {
+    const other = '9'.repeat(40);
+    const state = fixture(t);
+    fs.rmSync(state.agentLib.sourceDir, { recursive: true });
+    state.agentLib = imageAgentLibFixture(other);
+    const h = harness(state, { candidateImage: state.agentLib.imageId });
+    const probed = [];
+    h.seams.probeAgentLib = (_engine, _id, _runner, options) => {
+        probed.push(options.expectedCommit);
+        return { fingerprint: state.agentLib.fingerprint };
+    };
+    const result = await reconcileBoxContainer(reconciliationArguments(state, h, null), h.seams);
+    assert.equal(result.action, 'created');
+    assert.deepEqual(probed, [other]);
+    const create = h.calls.find(call => call[0] === 'run' && call[2] === 'container' && call[3] === 'create');
+    assert.ok(create.includes(`io.assistos.ploinky-box.agentlib-commit=${other}`));
+    assert.ok(create.includes(`PLOINKY_AGENTLIB_COMMIT=${other}`));
+    const created = h.current();
+    assert.equal(created.labels['io.assistos.ploinky-box.agentlib-commit'], other);
+    assert.equal(created.runtime.environment.PLOINKY_AGENTLIB_COMMIT, other);
+    const callsBefore = h.calls.length;
+    const reused = await reconcileBoxContainer(reconciliationArguments(state, h, created), h.seams);
+    assert.equal(reused.action, 'reused');
+    assert.equal(h.calls.slice(callsBefore).some(call => call.includes('pull') || call.includes('create')), false);
+});
 
 test('an image change after source selection preserves the old Box', async t => {
     const state = fixture(t);

@@ -105,6 +105,16 @@ test('image pin mismatch fails clearly and never clones', async () => {
     }), (error) => error.code === AGENTLIB_ERROR_CODES.imagePinMismatch && /Rebuild/.test(error.message));
 });
 
+test('S1 image selection uses the loaded bundle commit without the lock default', async () => {
+    const { root } = fixture();
+    const commit = '214ba4c3d64fd857361bf8ab56a5640c5efb30e0';
+    const { selection, mode } = await selectWorkspaceAgentLibSource({
+        workspaceRoot: root, loadImageBundle: async () => ({ ...BUNDLE, commit }),
+    });
+    assert.equal(mode, 'image');
+    assert.equal(selection.resolvedCommit, commit);
+});
+
 test('image descriptor round-trips and image identity is stable across workspaces', () => {
     const first = fixture();
     const second = fixture();

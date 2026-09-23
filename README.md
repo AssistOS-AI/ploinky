@@ -513,19 +513,30 @@ valid. It mounts the source read-only for the Box and all consumers, and never
 pulls or rewrites the local checkout. An invalid local directory is an error.
 When the directory is absent, the Box uses its bundled AchillesAgentLib copy at
 `/opt/ploinky-agentlib`; the host does not clone a fallback repository. The bundle
-must match `ploinky-box/dependencies.lock.json` and pass content verification.
+must pass content verification (metadata, root ownership, and content
+fingerprint). Its AchillesAgentLib commit should match
+`ploinky-box/dependencies.lock.json`. When it does not, Ploinky prints a warning
+on stderr that names both commits and says whether this Ploinky checkout or the
+image is most likely out of date, based on the checkout's Git metadata as of the
+last fetch. It prints a fix command and continues with the image's bundled
+commit. Set `PLOINKY_AGENTLIB_STRICT_PIN=1` to make the difference fatal, for
+example in CI or release gates; any value other than `0` or `1` is rejected
+whenever Ploinky selects the Box image's bundle.
+`ploinky diagnose` reports the difference as a warning, or as a failure in
+strict mode.
 Creating a missing Box pulls the configured image before this selection, so the
 bundle always comes from the image that Box is created from; with an existing
 Box, selection uses the local image and pulls only when it is absent.
-An older image without a compatible bundle must be rebuilt or replaced, or a
+An image without a valid bundle must be rebuilt or replaced, or a
 valid local checkout supplied. Direct host `ploinky-local` development requires
 a local checkout because the image bundle is available only inside the Box.
 
 Start, full restart, and update select the source again. Adding or removing a
 local checkout replaces the Box when the source changes. A targeted agent
 restart keeps the admitted source. Bundled library updates require a new Box
-image matching the required pin; general repository branch options do not
-change the bundled revision.
+image; until one matching the pin is available, lifecycle commands warn and use
+the image's bundled revision; general repository branch options do not change
+the bundled revision.
 
 ## Publishing the Router on a host network interface
 
