@@ -15,6 +15,8 @@ import {
     createBoxSupervisor,
     formatBindResult,
     formatBoxStatus,
+    formatGpuGrantResult,
+    formatGpuGrantStatus,
     formatRouterBindingLines,
 } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
@@ -37,6 +39,12 @@ Commands:
                                   TCP PORT; the Box and graph restart when it changes
   ploinky --dry-run bind [ADDRESS:PORT:8080]
                                   Show the bind plan without changing anything
+  ploinky gpu status              Show the GPU grant, host GPU discovery, and Box wiring
+  ploinky gpu grant nvidia --agent REPO/AGENT [--agent REPO/AGENT...]
+                                  Let the named agents request the host NVIDIA GPU;
+                                  the Box and graph restart when the wiring changes
+  ploinky gpu revoke [--agent REPO/AGENT...]
+                                  Remove the named agents, or the whole grant
   ploinky status [--verbose]      Inspect Box and core state without mutation
   ploinky diagnose [--json]       Check prerequisites, Podman storage, and security
                                   profiles using temporary deployment probes
@@ -79,6 +87,15 @@ saves the binding for later start, restart, update, and Box recreation. A later
 "ploinky --port PORT start" keeps the saved address and saves the new port.
 Router traffic is plain HTTP, and the bind address is not a client access rule.
 
+A GPU grant is an operator decision for this workspace only, saved outside the
+workspace in ~/.ploinky-box. The Box gets the NVIDIA device nodes and read-only
+driver libraries (no privileged mode or added capabilities), and only the named
+agents may request the device ploinky.local/gpu=all. A grant needs a configured
+graph once a Box exists, starts it if it is stopped, and keeps the current
+image, AgentLib source, and publication. Every start, restart, and update
+rediscovers the driver: an updated driver replaces the Box, and a failed
+discovery starts it without GPU devices, marking the grant stale for GPU agents.
+
 The default Box image is ${BOX_IMAGE_REFERENCE}.
 Set ${BOX_IMAGE_OVERRIDE_ENV} to pull a different Box image reference.
 Public CLI image options, engine, instance-name, and master-key overrides are unsupported.
@@ -88,7 +105,8 @@ If .ploinky/edge-desired.json exists, start stages it as the host-owned routing/
 
 function outerDebug(parsed, route, stdout) {
     if (!parsed.debug.enabled) return;
-    if (['help', 'status', 'stop', 'destroy', 'bash', 'dry-run', 'bind', 'bind-dry-run'].includes(route.kind)) {
+    if (['help', 'status', 'stop', 'destroy', 'bash', 'dry-run', 'bind', 'bind-dry-run',
+        'gpu-status', 'gpu-grant', 'gpu-revoke'].includes(route.kind)) {
         stdout.write('[INFO] Debug mode enabled.\n');
     }
 }
@@ -123,7 +141,9 @@ function executePrepared(prepared, coreArgv, {
 }
 
 const DEPLOYMENT_DIAGNOSTIC_HINT = 'Run ploinky diagnose from this workspace for prerequisite, storage, and security-profile diagnostics.';
-const DEPLOYMENT_ROUTES = new Set(['start', 'restart', 'bind', 'update', 'generic', 'repl', 'agent-cli', 'bash']);
+const DEPLOYMENT_ROUTES = new Set([
+    'start', 'restart', 'bind', 'gpu-grant', 'gpu-revoke', 'update', 'generic', 'repl', 'agent-cli', 'bash',
+]);
 
 export async function runOuterCli(argv, options = {}) {
     const {
@@ -286,6 +306,23 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     if (route.kind === 'bind') {
         const result = await selectedSupervisor.runBindTransaction(route.mapping);
         output.write(formatBindResult(result));
+        return 0;
+    }
+    if (route.kind === 'gpu-status') {
+        output.write(formatGpuGrantStatus(selectedSupervisor.inspectGpuGrant()));
+        return 0;
+    }
+    if (route.kind === 'gpu-grant') {
+        const result = await selectedSupervisor.runGpuGrantTransaction({
+            vendor: route.vendor,
+            agents: route.agents,
+        });
+        output.write(formatGpuGrantResult(result));
+        return 0;
+    }
+    if (route.kind === 'gpu-revoke') {
+        const result = await selectedSupervisor.runGpuRevokeTransaction({ agents: route.agents });
+        output.write(formatGpuGrantResult(result));
         return 0;
     }
     if (route.kind === 'dry-run') {

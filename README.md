@@ -270,6 +270,9 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
 | `ploinky bind [ADDRESS:PORT:8080]` | Publish the public Router on this machine's IPv4 `ADDRESS` (`0` for all interfaces) and TCP `PORT`; recreate the Box and restart the configured graph when the mapping changes; save the binding for later lifecycle commands |
 | `ploinky bind 127.0.0.1:PORT:8080` | Restore local-only Router access |
+| `ploinky gpu grant nvidia --agent REPO/AGENT` | Let the named agents request the host NVIDIA GPU; recreate the Box with the device nodes and read-only driver libraries and restart the configured graph when the wiring changes; save the grant for later lifecycle commands |
+| `ploinky gpu revoke [--agent REPO/AGENT]` | Remove the named agents, or the whole grant |
+| `ploinky gpu status` | Show the saved grant, host GPU discovery, and the Box's GPU wiring without mutation |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and actions labelled by privilege and automation eligibility |
 | `ploinky repair [--dry-run] [--json]` | Apply supported normal-user fixes, verify with diagnostics, and list remaining manual and sudo-required actions; `--dry-run` only inspects and previews |
@@ -645,6 +648,64 @@ rule: Router traffic is plain HTTP without TLS, so restrict who can reach the
 port with the host firewall or a trusted network. Bind does not change firewall
 rules, DNS, tunnels, or authentication settings, and it does not rewrite callback
 URLs registered with an SSO provider.
+
+## Granting the host GPU to named agents
+
+Agents never get host devices by default: inside a Box, runtime admission
+rejects devices, CDI, `--gpus`, host IPC, and security options. An operator can
+grant this workspace's Box the host NVIDIA GPU for named agents:
+
+```sh
+ploinky gpu status                                    # read-only: grant, host GPU, Box wiring
+ploinky gpu grant nvidia --agent local-llms/local-llm # add agents to the grant
+ploinky gpu revoke --agent local-llms/local-llm       # remove agents
+ploinky gpu revoke                                    # remove the whole grant
+```
+
+The grant is saved for this exact workspace as
+`~/.ploinky-box/gpu-grants/<box-instance>.json` with mode `0600`, outside the
+workspace because agents can write the workspace bind, and with the same
+confinement checks as Router bindings. `grant` first discovers the host GPU and
+refuses, naming the item, when a device node (`/dev/nvidia0`, `/dev/nvidiactl`,
+`/dev/nvidia-uvm`) is missing or not readable and writable by this user, when a
+driver library (`libcuda.so.1`, `libnvidia-ptxjitcompiler.so.1`,
+`libnvidia-ml.so.1`) or `nvidia-smi` is missing, or when the loaded kernel
+module and the libraries disagree (a driver updated but not yet rebooted).
+
+The Box then gets explicit `--device` flags for those nodes and read-only binds
+of each driver library under its soname in `/usr/local/nvidia/lib64` and of
+`nvidia-smi` in `/usr/local/nvidia/bin`. There is no privileged mode, no added
+capability, no host toolkit, and no Box environment change. Inside the Box the
+nested Podman reads one hookless CDI spec, `/etc/cdi/ploinky-gpu.json`, whose
+single device `ploinky.local/gpu=all` mounts those in-Box paths. A read-only
+grant marker, `/etc/ploinky-box-gpu-grant.json`, names the workspace, the
+agents, and the spec digest. An agent requests the GPU in its manifest with
+`llmRuntime.runtimePolicy.devices: [{ "type": "cdi", "value": "ploinky.local/gpu=all" }]`,
+and admission allows exactly that device only for an agent the grant names. Its
+image sets `LD_LIBRARY_PATH` and `PATH` to include `/usr/local/nvidia`.
+
+Like bind, a grant or revoke needs a configured graph once a Box exists, keeps
+the image, AgentLib generation, and publication, recreates the Box when the
+wiring changes, restarts the graph, and saves the grant only after `/health`
+answers. A failure restores the previous Box, graph, and grant, and reports that
+the previous grant is still in force. Without a Box, the grant is saved for the
+next `ploinky start`.
+
+`start`, `restart`, and `update` rediscover the driver. A driver update changes
+the wiring fingerprint (the Box label `io.assistos.ploinky-box.gpu-grant`), so
+the Box is recreated with regenerated wiring. If discovery fails, the Box starts
+without GPU devices and the grant is marked stale. Only agents that request the
+GPU then fail admission, with `GPU grant stale: <reason>; re-run ploinky gpu
+grant`. Commands that only prepare an existing Box, and `bind`, keep its current
+GPU wiring.
+
+Loopback services inside an agent container are otherwise reachable by any
+signed-in user with the Explorer capability through
+`/base-agent-additional-server/<agent>/<port>/`. An agent that runs private
+services on loopback (for example a model server) closes that relay in its
+manifest with `routerAccess.agentPorts: false`, or allows only listed container
+ports with `routerAccess.agentPorts: [7000]`. The refusal applies to every
+caller, including administrators.
 
 ## Core commands (in p-cli)
 

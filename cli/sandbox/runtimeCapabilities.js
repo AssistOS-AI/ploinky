@@ -4,7 +4,13 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { isInsideBox } from '../../ploinky-box/lib/boxMarker.mjs';
-import { BOX_MARKER_PATH } from '../../ploinky-box/constants.mjs';
+import { readBoxGpuGrant } from '../../ploinky-box/lib/gpuGrantMarker.mjs';
+import {
+    BOX_GPU_CDI_DEVICE,
+    BOX_GPU_CDI_SPEC_PATH,
+    BOX_GPU_MARKER_PATH,
+    BOX_MARKER_PATH,
+} from '../../ploinky-box/constants.mjs';
 import { NESTED_PODMAN_SECCOMP_BOX_PATH } from '../../ploinky-box/seccomp.mjs';
 import { PLOINKY_WORKSPACE_ROOT } from '../utils/config.js';
 import {
@@ -109,6 +115,55 @@ function captureBoxContext({ boxMarkerOptions, insideBox } = {}) {
         }),
         source: 'strict-marker',
     });
+}
+
+// The host GPU grant as seen from inside the Box: the read-only marker plus
+// the CDI spec it names. Captured only inside a Box; paths are recorded so the
+// pre-launch revalidation reads exactly the same files.
+function captureGpuGrantContext({ insideBox, workspaceRoot, gpuGrantOptions } = {}) {
+    if (!insideBox) return null;
+    const markerPath = String(gpuGrantOptions?.markerPath || BOX_GPU_MARKER_PATH);
+    const specPath = String(gpuGrantOptions?.specPath || BOX_GPU_CDI_SPEC_PATH);
+    const grant = readBoxGpuGrant({
+        workspaceRoot,
+        markerPath,
+        specPath,
+        ...(gpuGrantOptions?.fsApi ? { fsApi: gpuGrantOptions.fsApi } : {}),
+    });
+    return deepFreeze({ ...grant, markerPath, specPath, workspaceRoot: String(workspaceRoot || '') });
+}
+
+// A CDI request is admitted inside a Box only as the one granted device, for
+// an agent the operator named, while the grant is active for this workspace.
+function evaluateGpuGrant(context, runtimePolicy, agentId) {
+    if (!context) return null;
+    const devices = Array.isArray(runtimePolicy?.devices) ? runtimePolicy.devices : [];
+    const cdi = devices.filter((entry) => entry?.type === 'cdi');
+    if (cdi.length === 0) return null;
+    let refusal = null;
+    if (!context.present) {
+        refusal = 'this workspace has no GPU grant; on the host run '
+            + '`ploinky gpu grant nvidia --agent REPO/AGENT`';
+    } else if (!context.valid) {
+        refusal = `the Box GPU grant marker is invalid (${context.problem})`;
+    } else if (devices.length !== 1 || cdi[0].value !== BOX_GPU_CDI_DEVICE) {
+        refusal = `a GPU grant admits only the single device ${BOX_GPU_CDI_DEVICE}`;
+    } else if (context.state === 'stale') {
+        refusal = `GPU grant stale: ${context.reason}; re-run \`ploinky gpu grant\``;
+    } else if (!context.agents.includes(agentId)) {
+        refusal = `the Box GPU grant does not name ${agentId || 'this agent'}`;
+    }
+    return {
+        markerPath: context.markerPath,
+        specPath: context.specPath,
+        workspaceRoot: context.workspaceRoot,
+        present: context.present === true,
+        digest: context.digest || null,
+        fingerprint: context.fingerprint || null,
+        state: context.state || null,
+        admitted: refusal === null,
+        refusal,
+    };
 }
 
 export function manifestBytesDigest(bytes) {
@@ -318,6 +373,7 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
     manifestDigest = '',
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
     boxContext = null,
+    gpuGrantContext = null,
 } = {}) {
     const validated = validateManifestRuntimeCapabilities(manifest, {
         agentId,
@@ -363,17 +419,24 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
         volumes,
         capabilities,
     };
+    // Present only for a CDI request made inside a Box, so the descriptors of
+    // every other agent are unchanged.
+    const gpuGrant = evaluateGpuGrant(gpuGrantContext, runtimePolicy, descriptor.agentId);
+    if (gpuGrant) descriptor.gpuGrant = canonicalize(gpuGrant);
     return deepFreeze(descriptor);
 }
 
-function unsupportedDimensions(descriptor, runtimeKind) {
+function unsupportedDimensions(descriptor, runtimeKind, box = false) {
     const unsupported = [];
+    // The operator's Box GPU grant admits exactly one CDI device and nothing
+    // else: host devices, --gpus, host IPC and security options stay refused.
+    const gpuGranted = box === true && runtimeKind === 'container' && descriptor.gpuGrant?.admitted === true;
     if (descriptor.capabilities.privileged) unsupported.push('privileged');
     if (runtimeKind !== 'container' && descriptor.capabilities.nestedPodman) {
         unsupported.push('nested-podman');
     }
-    if (descriptor.capabilities.devices) unsupported.push('devices');
-    if (descriptor.capabilities.cdi) unsupported.push('cdi');
+    if (descriptor.capabilities.devices && !gpuGranted) unsupported.push('devices');
+    if (descriptor.capabilities.cdi && !gpuGranted) unsupported.push('cdi');
     if (descriptor.capabilities.gpu) unsupported.push('gpu');
     if (descriptor.capabilities.hostIpc) unsupported.push('host-ipc');
     if (descriptor.capabilities.securityOptions) unsupported.push('security-options');
@@ -399,7 +462,7 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
     }
     let box = insideBox;
     if (box === undefined) box = isInsideBox(boxMarkerOptions);
-    const unsupported = unsupportedDimensions(descriptor, runtimeKind);
+    const unsupported = unsupportedDimensions(descriptor, runtimeKind, box);
     if (!box && descriptor.capabilities.nestedPodman) unsupported.push('nested-podman-outside-box');
     // Host networking is not an ordinary Box capability: the runtime boundary
     // separately requires an exact prepared or active generation grant before
@@ -413,8 +476,11 @@ export function assertRuntimeCapabilitiesAllowed(descriptor, {
         unsupported.push('isolated-network-host-sandbox');
     }
     if ((box || runtimeKind !== 'container' || descriptor.capabilities.nestedPodman) && unsupported.length) {
+        const gpuRefusal = unsupported.includes('cdi') && descriptor.gpuGrant?.refusal
+            ? `; ${descriptor.gpuGrant.refusal}`
+            : '';
         throw new RuntimeCapabilityError(
-            `runtime capabilities are unsupported for ${box ? 'Ploinky Box' : runtimeKind}: ${unsupported.join(', ')}`,
+            `runtime capabilities are unsupported for ${box ? 'Ploinky Box' : runtimeKind}: ${unsupported.join(', ')}${gpuRefusal}`,
             {
                 context: {
                     agentId: descriptor.agentId,
@@ -442,6 +508,7 @@ export function admitManifestRuntimeCapabilities(manifest, {
     overridePolicy = null,
     boxMarkerOptions,
     insideBox,
+    gpuGrantOptions,
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
     let exactManifest = manifest;
@@ -478,6 +545,11 @@ export function admitManifestRuntimeCapabilities(manifest, {
         manifestDigest: exactDigest,
         workspaceRoot,
         boxContext,
+        gpuGrantContext: captureGpuGrantContext({
+            insideBox: boxContext.insideBox,
+            workspaceRoot,
+            gpuGrantOptions,
+        }),
     });
     assertRuntimeCapabilitiesAllowed(descriptor, {
         runtimeKind,
@@ -501,6 +573,7 @@ export function assertRuntimeAdmissionCurrent(admission, {
     runtimeKind,
     descriptor,
     boxMarkerOptions,
+    gpuGrantOptions,
 } = {}) {
     if (!admission || admission.schemaVersion !== 1 || !admission.descriptor) {
         throw new RuntimeCapabilityError('runtime admission is missing or invalid', {
@@ -539,6 +612,26 @@ export function assertRuntimeAdmissionCurrent(admission, {
         });
         if (stableDigest(currentBoxContext) !== stableDigest(admittedBoxContext)) {
             throw new RuntimeCapabilityError('Ploinky Box marker context changed after admission', {
+                code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
+                context: { agentId: admission.agentId },
+            });
+        }
+    }
+    // A GPU-admitted launch rereads the grant marker and CDI spec immediately
+    // before it runs: a revoked, stale, or replaced grant stops it here.
+    const admittedGpuGrant = admission.descriptor.gpuGrant;
+    if (admittedGpuGrant) {
+        const current = evaluateGpuGrant(captureGpuGrantContext({
+            insideBox: true,
+            workspaceRoot: admittedGpuGrant.workspaceRoot,
+            gpuGrantOptions: {
+                markerPath: admittedGpuGrant.markerPath,
+                specPath: admittedGpuGrant.specPath,
+                ...(gpuGrantOptions?.fsApi ? { fsApi: gpuGrantOptions.fsApi } : {}),
+            },
+        }), admission.descriptor.runtimePolicy, admission.descriptor.agentId);
+        if (stableDigest(current) !== stableDigest(admittedGpuGrant)) {
+            throw new RuntimeCapabilityError('Ploinky Box GPU grant changed after admission', {
                 code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
                 context: { agentId: admission.agentId },
             });

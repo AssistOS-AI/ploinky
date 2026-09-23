@@ -13,6 +13,7 @@ import {
 } from '../utils/config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
+import { normalizeAgentPortRelayPolicy } from '../server/agentPortConvention/relayPolicy.js';
 import { resolveAgentAuthPolicy } from '../utils/manifestAuth.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
@@ -783,6 +784,14 @@ function validateRoutingShape(routing, manifests) {
             }
             if (Object.prototype.hasOwnProperty.call(manifest.routerAccess || {}, 'localAuthRoles')) {
                 throw edgeError(`manifest(${routeKey}).routerAccess.localAuthRoles is unsupported; authenticated identities must supply the required capability`);
+            }
+            try {
+                normalizeAgentPortRelayPolicy(
+                    manifest?.routerAccess?.agentPorts,
+                    `manifest(${routeKey}).routerAccess.agentPorts`,
+                );
+            } catch (error) {
+                throw edgeError(error.message);
             }
         }
     }

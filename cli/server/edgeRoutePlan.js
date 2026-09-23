@@ -13,6 +13,10 @@ import {
     AgentPortSelectorError,
     parseAgentPortSelector,
 } from './agentPortConvention/parseSelector.js';
+import {
+    agentPortRelayDenial,
+    agentPortRelayPolicyFromManifest,
+} from './agentPortConvention/relayPolicy.js';
 import { normalizeHttpRouteAuthDefinition } from './httpRouteAuth.js';
 import { HttpRouteAccessPolicy } from './policy/HttpRouteAccessPolicy.js';
 import { HttpRouteAccessPath } from './policy/HttpRouteAccessPath.js';
@@ -244,6 +248,28 @@ function agentPortPlan({
             });
         }
         throw error;
+    }
+    // The agent's own relay opt-out applies to every caller, before any
+    // access decision: private loopback services stay private even to admins.
+    let relayPolicy;
+    try {
+        relayPolicy = agentPortRelayPolicyFromManifest(snapshot.manifests?.[selected.routeKey]);
+    } catch (_) {
+        return deny(503, 'POLICY_GENERATION_INVALID', {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+        });
+    }
+    const relayDenial = agentPortRelayDenial(relayPolicy, selector.port);
+    if (relayDenial) {
+        return deny(relayDenial.status, relayDenial.code, {
+            matched: true,
+            listener,
+            lease,
+            hostSelection,
+        });
     }
     const accessPolicy = snapshotPolicy(snapshot);
     if (!accessPolicy) {

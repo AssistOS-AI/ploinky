@@ -30,7 +30,22 @@ export const BOX_LABELS = Object.freeze({
     seccompFingerprint: 'io.assistos.ploinky-box.seccomp-fingerprint',
     dependenciesFingerprint: 'io.assistos.ploinky-box.dependencies-fingerprint',
     imagesFingerprint: 'io.assistos.ploinky-box.images-fingerprint',
+    // Present only for a workspace with a `ploinky gpu grant`: the fingerprint
+    // of the exact GPU wiring (devices, driver binds, CDI spec, grant marker).
+    gpuGrant: 'io.assistos.ploinky-box.gpu-grant',
 });
+
+// GPU grant wiring inside the Box. Driver libraries are bound read-only under
+// their sonames, the nested Podman resolves the one hookless CDI device from
+// the default /etc/cdi directory, and in-Box admission reads the grant marker.
+export const BOX_GPU_LIBRARY_DIRECTORY = '/usr/local/nvidia/lib64';
+export const BOX_GPU_BIN_DIRECTORY = '/usr/local/nvidia/bin';
+export const BOX_GPU_CDI_SPEC_PATH = '/etc/cdi/ploinky-gpu.json';
+export const BOX_GPU_CDI_KIND = 'ploinky.local/gpu';
+export const BOX_GPU_CDI_DEVICE = 'ploinky.local/gpu=all';
+export const BOX_GPU_MARKER_PATH = '/etc/ploinky-box-gpu-grant.json';
+// Host-only record and generation directory under `~/.ploinky-box`.
+export const GPU_GRANT_STATE_DIRECTORY = 'gpu-grants';
 
 // achillesAgentLib is direct-mounted from the one selected workspace source.
 // The Box never installs its own copy. `/opt/ploinky/node_modules` is the

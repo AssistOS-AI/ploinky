@@ -165,6 +165,19 @@ export function routeOuterCommand(parsed) {
             mapping: parsed.bind?.mapping ?? null,
         });
     }
+    // GPU grants change host-owned Box wiring; like bind they are handled by
+    // the host supervisor and never forwarded into the Box. `gpu status` is
+    // already read-only, so there is no separate dry run.
+    if (parsed.command === 'gpu') {
+        if (parsed.dryRun) {
+            throw routeError('gpu has no --dry-run; use `ploinky gpu status` to inspect without changes');
+        }
+        return Object.freeze({
+            kind: `gpu-${parsed.gpu.action}`,
+            vendor: parsed.gpu.vendor,
+            agents: parsed.gpu.agents,
+        });
+    }
     if (!parsed.command) {
         return Object.freeze({ kind: parsed.dryRun ? 'dry-run' : 'repl', coreArgv: parsed.forwardingArgv });
     }

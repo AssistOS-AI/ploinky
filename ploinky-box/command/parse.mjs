@@ -81,6 +81,46 @@ function analyzeBind(tokens, commandToken) {
     }
 }
 
+const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant VENDOR --agent REPO/AGENT [--agent REPO/AGENT...] '
+    + '| ploinky gpu revoke [--agent REPO/AGENT...]';
+
+// GPU grants are host-owned Box wiring, so the verb and its operands are
+// parsed here and never forwarded to the in-Box core.
+function analyzeGpu(tokens, commandToken) {
+    const tail = tokens.filter((token) => token.rawIndex > commandToken.rawIndex).map((token) => token.text);
+    const [action = 'status', ...rest] = tail;
+    if (action === 'status') {
+        if (rest.length) throw argumentError(`gpu status accepts no arguments; ${GPU_USAGE}`);
+        return Object.freeze({ action: 'status', vendor: null, agents: Object.freeze([]) });
+    }
+    if (action !== 'grant' && action !== 'revoke') {
+        throw argumentError(`Unknown gpu action '${action}'; ${GPU_USAGE}`);
+    }
+    let vendor = null;
+    const agents = [];
+    for (let index = 0; index < rest.length; index += 1) {
+        const text = rest[index];
+        if (text === '--agent') {
+            const value = rest[index + 1];
+            if (!value || value.startsWith('-')) throw argumentError('--agent requires REPO/AGENT');
+            agents.push(value);
+            index += 1;
+        } else if (text.startsWith('--agent=')) {
+            agents.push(text.slice('--agent='.length));
+        } else if (text.startsWith('-')) {
+            throw argumentError(`gpu ${action} does not accept option ${text}; ${GPU_USAGE}`);
+        } else if (action === 'grant' && vendor === null) {
+            vendor = text;
+        } else {
+            throw argumentError(`gpu ${action}: unexpected argument '${text}'; ${GPU_USAGE}`);
+        }
+    }
+    if (action === 'grant' && (!vendor || agents.length === 0)) {
+        throw argumentError(`gpu grant requires a VENDOR and at least one --agent REPO/AGENT; ${GPU_USAGE}`);
+    }
+    return Object.freeze({ action, vendor, agents: Object.freeze(agents) });
+}
+
 export function parseOuterArguments(argv) {
     if (!Array.isArray(argv) || argv.some((value) => typeof value !== 'string')) {
         throw new TypeError('Outer arguments must be an array of strings');
@@ -185,6 +225,7 @@ export function parseOuterArguments(argv) {
         });
     }
     const bind = command === 'bind' && !help ? analyzeBind(tokens, commandToken) : null;
+    const gpu = command === 'gpu' && !help ? analyzeGpu(tokens, commandToken) : null;
     return Object.freeze({
         rawArgv: Object.freeze(raw),
         classificationArgv: Object.freeze(classificationArgv),
@@ -203,5 +244,6 @@ export function parseOuterArguments(argv) {
         explicitMediaPort,
         start,
         bind,
+        gpu,
     });
 }

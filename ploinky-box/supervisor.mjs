@@ -41,6 +41,16 @@ import {
     stageWorkspaceEdgeDesired,
 } from './edgeDesired.mjs';
 import { PloinkyBoxError } from './errors.mjs';
+import {
+    buildGpuWiring,
+    createGpuGrantStore,
+    discoverGpu,
+    normalizeGpuAgentSelectors,
+    normalizeGpuGrant,
+    observeContainerGpuWiring,
+    resolveGpuWiring,
+    sameGpuWiring,
+} from './gpuGrant.mjs';
 import { agentLibPinPolicy } from './agentlib-pin.mjs';
 import { loadBoxAgentLibImage, revalidateContainerAgentLib } from './image-agentlib.mjs';
 import {
@@ -255,6 +265,8 @@ export function createBoxSupervisor({
     inspectBoxData = inspectWorkspaceDataPaths,
     captureCoreStartArgv = captureConfiguredCoreStartArgv,
     routerBindingStore = createRouterBindingStore(),
+    gpuGrantStore = createGpuGrantStore(),
+    discoverGpuDevices = discoverGpu,
     readNetworkInterfaces = () => os.networkInterfaces(),
     readHostname = () => os.hostname(),
     stdout = process.stdout,
@@ -328,6 +340,56 @@ export function createBoxSupervisor({
         for (const line of formatRouterBindingLines(binding)) stdout?.write?.(`[ploinky] ${line}\n`);
     }
 
+    // The saved GPU grant is authoritative for graph lifecycle commands: every
+    // start, restart and update rediscovers the host driver, so a driver update
+    // replaces the Box with regenerated wiring, and a failed discovery wires
+    // only a stale-grant marker instead of stopping the whole workspace.
+    function selectSavedGpuWiring(identity) {
+        const saved = gpuGrantStore.read(identity);
+        const desired = saved
+            ? resolveGpuWiring(identity, saved, {
+                discover: discoverGpuDevices,
+                homeDirectory: gpuGrantStore.homeDirectory,
+            })
+            : null;
+        if (desired?.state === 'stale') {
+            stderr?.write?.(
+                `[ploinky] GPU grant stale: ${desired.reason}; the Box starts without GPU devices and `
+                + 'GPU-requesting agents fail admission until `ploinky gpu grant` succeeds again\n',
+            );
+        }
+        return Object.freeze({ saved, desired });
+    }
+
+    // The admitted record always comes from the desired wiring that was passed
+    // to reconciliation. Reconciliation reuses a Box only when its fingerprint
+    // equals that wiring's, so this is the Box's wiring too, but unlike a
+    // wiring observed from the Box it carries the stale reason.
+    function admittedGpuWiring(wiring) {
+        return wiring ? { fingerprint: wiring.fingerprint, state: wiring.state, reason: wiring.reason ?? null } : null;
+    }
+
+    function savedGpuGrantUpdate(saved, desiredGpu, prepared) {
+        if (!saved || desiredGpu === undefined) return null;
+        if ((prepared?.gpu?.fingerprint ?? null) !== (desiredGpu?.fingerprint ?? null)) {
+            throw supervisorError('The Box GPU wiring does not match the desired GPU grant wiring');
+        }
+        const admitted = admittedGpuWiring(desiredGpu);
+        return saved.admitted?.fingerprint === admitted?.fingerprint
+            ? null
+            : Object.freeze({ next: saved, admitted, previous: saved });
+    }
+
+    // Generation files are only ever removed after the Box that names them is
+    // gone; failing to prune never fails the committed transaction.
+    function pruneGpuGenerations(identity, lock, keep) {
+        try {
+            gpuGrantStore.prune(identity, keep ? [keep.fingerprint] : [], lock);
+        } catch (error) {
+            stderr?.write?.(`[ploinky] Could not prune old GPU grant generations: ${error.message}\n`);
+        }
+    }
+
     function readInboxStatus(engine, containerId, workspaceRoot) {
         const inbox = runner.query(engine.name, [
             'container', 'exec',
@@ -385,6 +447,12 @@ export function createBoxSupervisor({
             const routerBinding = ownership.handles?.container
                 ? null
                 : selectSavedRouterBinding(identity, explicitPort).desired;
+            // Likewise an existing Box keeps its GPU wiring: replacing it here
+            // would leave the graph down, because ad hoc commands never
+            // restore it. Only a Box created here takes the saved grant.
+            const gpu = ownership.handles?.container
+                ? undefined
+                : selectSavedGpuWiring(identity).desired;
             // The source is selected before Box reconciliation so the mount
             // contract can be part of the Box's immutable identity.
             const { selection } = await selectAgentLib({
@@ -403,6 +471,7 @@ export function createBoxSupervisor({
                 explicitPort,
                 explicitMediaPort,
                 routerBinding,
+                gpu,
                 imageRef,
                 platform,
                 env,
@@ -554,6 +623,7 @@ export function createBoxSupervisor({
         skillScopeEnv = null,
         priorSkillScopeEnv = null,
         routerBindingUpdate = null,
+        gpuGrantUpdate = null,
     }) {
         if (requireHealth) await healthCheck(prepared.hostPort, { routerBinding: prepared.routerBinding });
         revalidateAgentLibSource(selection, {
@@ -565,6 +635,11 @@ export function createBoxSupervisor({
         if (skillScopeEnv) writeGraphSkillScope(identity, skillScopeEnv, lock);
         try {
             if (routerBindingUpdate) routerBindingStore.write(identity, routerBindingUpdate.next, lock);
+            // The admitted wiring is recorded only after the health check, as
+            // the router binding is; a failure restores the previous record.
+            if (gpuGrantUpdate) {
+                gpuGrantStore.write(identity, gpuGrantUpdate.next, lock, { admitted: gpuGrantUpdate.admitted });
+            }
             prepared.finalize?.();
         } catch (error) {
             if (skillScopeEnv) writeGraphSkillScope(identity, priorSkillScopeEnv, lock);
@@ -575,8 +650,16 @@ export function createBoxSupervisor({
                     error.message = `${error.message}; saved Router binding restoration: ${restoreError.message}`;
                 }
             }
+            if (gpuGrantUpdate) {
+                try {
+                    gpuGrantStore.restore(identity, gpuGrantUpdate.previous, lock);
+                } catch (restoreError) {
+                    error.message = `${error.message}; saved GPU grant restoration: ${restoreError.message}`;
+                }
+            }
             throw error;
         }
+        if (gpuGrantUpdate) pruneGpuGenerations(identity, lock, prepared.gpu);
     }
 
     async function reconcileConfiguredGraph(options, { priorCoreStartArgv, priorSkillScopeEnv }) {
@@ -606,6 +689,7 @@ export function createBoxSupervisor({
                 identity,
                 options.explicitPort,
             );
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -622,6 +706,7 @@ export function createBoxSupervisor({
                 explicitPort: options.explicitPort,
                 explicitMediaPort: options.explicitMediaPort,
                 routerBinding,
+                gpu,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
@@ -664,6 +749,7 @@ export function createBoxSupervisor({
                 await completeGraphAdmission({
                     identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
                     routerBindingUpdate: savedRouterBindingUpdate(savedBinding, prepared),
+                    gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
                 });
                 reportRouterBinding(prepared.routerBinding);
                 return Object.freeze({
@@ -693,6 +779,7 @@ export function createBoxSupervisor({
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
             const { desired: routerBinding } = selectSavedRouterBinding(identity);
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
             const { selection } = await selectAgentLib({
                 workspaceRoot: identity.workspaceRoot,
                 branchPolicy: options.branchPolicy || null,
@@ -707,6 +794,7 @@ export function createBoxSupervisor({
                 repositoryRoot,
                 agentLib: selection,
                 routerBinding,
+                gpu,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
@@ -733,6 +821,7 @@ export function createBoxSupervisor({
                 );
                 await completeGraphAdmission({
                     identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
+                    gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
                 });
                 reportRouterBinding(prepared.routerBinding);
                 return Object.freeze({
@@ -848,6 +937,7 @@ export function createBoxSupervisor({
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
             const { desired: routerBinding } = selectSavedRouterBinding(identity);
+            const { saved: savedGpuGrant, desired: gpu } = selectSavedGpuWiring(identity);
             const workspacePloinky = await updateWorkspacePloinky({
                 identity,
                 lock,
@@ -869,6 +959,7 @@ export function createBoxSupervisor({
                 repositoryRoot,
                 agentLib: selection,
                 routerBinding,
+                gpu,
                 imageRef: options.imageRef || resolveBoxImageReference(env),
                 platform,
                 env,
@@ -918,6 +1009,10 @@ export function createBoxSupervisor({
                     requireHealth: options.restartAfterUpdate === true,
                     skillScopeEnv: options.restartAfterUpdate === true ? skillScopeEnv : null,
                     priorSkillScopeEnv,
+                    // Without a restart there is no health proof to record against.
+                    gpuGrantUpdate: options.restartAfterUpdate === true
+                        ? savedGpuGrantUpdate(savedGpuGrant, gpu, prepared)
+                        : null,
                 });
                 if (options.restartAfterUpdate === true) reportRouterBinding(prepared.routerBinding);
                 return Object.freeze({
@@ -991,6 +1086,8 @@ export function createBoxSupervisor({
                         repositoryRoot,
                         agentLib: outcome.agentLib,
                         routerBinding: outcome.routerBinding,
+                        // Bring the previous Box back with its own GPU wiring.
+                        gpu: outcome.gpu,
                         imageRef: String(handle.labels?.[BOX_LABELS.imageRef] || ''),
                         imagePolicy: 'preserve',
                         platform,
@@ -1114,6 +1211,9 @@ export function createBoxSupervisor({
                     repositoryRoot,
                     agentLib: selection,
                     routerBinding,
+                    // Bind changes only the publication: an existing Box keeps
+                    // its GPU wiring, and only a new Box takes the saved grant.
+                    gpu: container ? undefined : selectSavedGpuWiring(identity).desired,
                     imageRef,
                     imagePolicy: 'preserve',
                     platform,
@@ -1209,6 +1309,307 @@ export function createBoxSupervisor({
                         : null,
                 });
             }
+        });
+    }
+
+    function describeGpuGrant(grant) {
+        return grant ? `${grant.vendor} for ${grant.agents.join(', ')}` : 'none';
+    }
+
+    // A failed change never reports success while the previous GPU access
+    // remains; rollback failures, if any, are appended by the rollback.
+    function gpuChangeError(verb, saved, error) {
+        const wrapped = new PloinkyBoxError(
+            `ploinky gpu ${verb} did not complete; the previous GPU grant (${describeGpuGrant(saved)}) `
+            + `is still in force: ${error.message}`,
+            { code: error?.code || 'PLOINKY_BOX_GPU_GRANT_FAILED', cause: error },
+        );
+        if (error?.boxRollback) wrapped.boxRollback = error.boxRollback;
+        return wrapped;
+    }
+
+    /**
+     * Apply a changed GPU grant, modelled on bind. The configured graph, its
+     * skill scope, image, AgentLib generation and publication are kept. A
+     * changed wiring replaces the Box through the normal lifecycle, the graph
+     * restarts and passes its health check, and only then is the grant record
+     * written. Any failure restores the previous Box, graph, running state and
+     * record. Without a Box, the record alone is saved for the next creation.
+     */
+    async function applyGpuGrantChange({ identity, lock, ownership, saved, next, gpu, verb }) {
+        const container = ownership.handles?.container || null;
+        if (!container) {
+            if (next) {
+                gpuGrantStore.write(identity, next, lock, { admitted: null });
+            } else {
+                gpuGrantStore.clear(identity, lock);
+                pruneGpuGenerations(identity, lock, null);
+            }
+            return Object.freeze({
+                identity, verb, action: 'saved', grant: next, previousGrant: saved,
+                gpu, previousGpu: null, containerId: null, graphStarted: false,
+            });
+        }
+        const priorCoreStartArgv = captureCoreStartArgv(identity);
+        if (!priorCoreStartArgv) {
+            throw supervisorError(
+                `ploinky gpu ${verb} requires a configured workspace graph to restart and health-check; `
+                + 'run `ploinky start AGENT` first',
+                'PLOINKY_BOX_GPU_GRAPH_REQUIRED',
+            );
+        }
+        const priorSkillScopeEnv = validateGraphSkillScope(identity, readGraphSkillScope(identity));
+        const engine = ownership.engine;
+        const priorRunning = container.runtime?.running === true;
+        let priorGraphRunning = false;
+        if (priorRunning) {
+            const inbox = readInboxStatus(engine, container.id, identity.workspaceRoot);
+            if (!inbox) {
+                throw supervisorError(
+                    'The running Box status could not be read, so its graph state cannot be restored after a '
+                    + `failed gpu ${verb}; retry when the Box has finished starting`,
+                    'PLOINKY_BOX_GPU_STATUS_UNAVAILABLE',
+                );
+            }
+            priorGraphRunning = inbox.initialized === true && inbox.routingConfigured === true
+                && Number.isSafeInteger(inbox.runningAgents) && inbox.runningAgents > 0;
+        }
+        const imageRef = String(container.labels?.[BOX_LABELS.imageRef] || '');
+        // Keep the mounted AgentLib generation; a grant change never advances it.
+        const selection = agentLibContractFromContainer(container);
+        if (selection.mode !== 'image' || priorRunning) {
+            revalidateMountedAgentLibSource(selection, { engine, containerId: container.id, runner });
+        }
+        const previousGpu = observeContainerGpuWiring(container, { identity });
+        stderr?.write?.(
+            `[ploinky] Applying GPU grant ${describeGpuGrant(next)}; `
+            + 'the Box and workspace graph restart briefly if the GPU wiring changes...\n',
+        );
+        let prepared;
+        try {
+            prepared = await reconcile({
+                identity,
+                ownership,
+                engine,
+                runner,
+                lock,
+                repositoryRoot,
+                agentLib: selection,
+                // An existing Box keeps its publication and ports.
+                routerBinding: null,
+                gpu,
+                imageRef,
+                imagePolicy: 'preserve',
+                platform,
+                env,
+                stdout,
+                stderr,
+            });
+        } catch (error) {
+            await recoverFailedGraphReconcile({
+                identity,
+                lock,
+                ownership,
+                error: gpuChangeError(verb, saved, error),
+                priorRunning,
+                priorGraphRunning,
+                priorCoreStartArgv,
+                priorSkillScopeEnv,
+            });
+        }
+        const containerId = prepared.ownership.handles.container.id;
+        const graphAlreadyRunning = prepared.action === 'reused' && priorGraphRunning;
+        let graphMutated = false;
+        let recordWriteAttempted = false;
+        try {
+            if (!graphAlreadyRunning) {
+                await ensureBoxDependencies(engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
+                const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
+                graphMutated = true;
+                await startCore(
+                    engine,
+                    containerId,
+                    priorCoreStartArgv,
+                    prepared.hostPort,
+                    prepared.mediaHostPort,
+                    runner,
+                    {
+                        workspaceRoot: identity.workspaceRoot,
+                        stdout,
+                        stderr,
+                        hostReachableIpv4,
+                        agentLib: selection,
+                        skillScopeEnv: priorSkillScopeEnv,
+                        routerBinding: prepared.routerBinding,
+                    },
+                );
+            }
+            await healthCheck(prepared.hostPort, { routerBinding: prepared.routerBinding });
+            revalidateMountedAgentLibSource(selection, { engine, containerId, runner });
+            if ((prepared.gpu?.fingerprint ?? null) !== (gpu?.fingerprint ?? null)) {
+                throw supervisorError('The Box GPU wiring does not match the requested GPU grant wiring');
+            }
+            recordWriteAttempted = true;
+            if (next) {
+                gpuGrantStore.write(identity, next, lock, { admitted: admittedGpuWiring(gpu) });
+            } else {
+                gpuGrantStore.clear(identity, lock);
+            }
+            prepared.finalize?.();
+        } catch (error) {
+            await rollbackPreparedGraph({
+                identity,
+                prepared,
+                ownership,
+                containerId,
+                error: gpuChangeError(verb, saved, error),
+                stopGraph: graphMutated,
+                restoreGraph: priorGraphRunning && (graphMutated || prepared.action === 'replaced'),
+                restoreCoreArgv: priorCoreStartArgv,
+                restoreSkillScopeEnv: priorSkillScopeEnv,
+                restoreStopped: !priorRunning,
+                afterRollback: recordWriteAttempted
+                    ? () => {
+                        try {
+                            gpuGrantStore.restore(identity, saved, lock);
+                        } catch (restoreError) {
+                            throw new Error(`saved GPU grant restoration: ${restoreError.message}`);
+                        }
+                    }
+                    : null,
+            });
+        }
+        pruneGpuGenerations(identity, lock, gpu);
+        return Object.freeze({
+            identity,
+            verb,
+            action: prepared.action === 'reused'
+                ? (graphMutated ? 'graph-started' : 'unchanged')
+                : prepared.action,
+            grant: next,
+            previousGrant: saved,
+            gpu: prepared.gpu,
+            previousGpu,
+            containerId,
+            graphStarted: graphMutated,
+        });
+    }
+
+    /**
+     * Grant a GPU vendor to named agents (added to any existing selectors).
+     * Discovery must succeed now; it names any missing or mismatched item.
+     */
+    async function runGpuGrantTransaction({ vendor, agents } = {}) {
+        return lockedMutation(async (identity, lock, ownership) => {
+            const saved = gpuGrantStore.read(identity);
+            const requested = normalizeGpuGrant({ vendor, agents });
+            if (saved && saved.vendor !== requested.vendor) {
+                throw supervisorError(
+                    `This workspace already grants the ${saved.vendor} GPU; run \`ploinky gpu revoke\` first`,
+                    'PLOINKY_BOX_GPU_GRANT_INVALID',
+                );
+            }
+            const next = normalizeGpuGrant({
+                vendor: requested.vendor,
+                agents: [...(saved?.agents || []), ...requested.agents],
+            });
+            const discovery = discoverGpuDevices(next.vendor);
+            const gpu = buildGpuWiring({
+                identity,
+                grant: next,
+                discovery,
+                homeDirectory: gpuGrantStore.homeDirectory,
+            });
+            return applyGpuGrantChange({ identity, lock, ownership, saved, next, gpu, verb: 'grant' });
+        });
+    }
+
+    /** Revoke named agents, or the whole grant when no agent is named. */
+    async function runGpuRevokeTransaction({ agents = [] } = {}) {
+        return lockedMutation(async (identity, lock, ownership) => {
+            const saved = gpuGrantStore.read(identity);
+            const selectors = normalizeGpuAgentSelectors(agents);
+            const container = ownership.handles?.container || null;
+            const boxGpu = container ? observeContainerGpuWiring(container, { identity }) : null;
+            if (!saved && !boxGpu) {
+                return Object.freeze({
+                    identity, verb: 'revoke', action: 'unchanged', grant: null, previousGrant: null,
+                    gpu: null, previousGpu: null, containerId: container?.id || null, graphStarted: false,
+                });
+            }
+            if (!saved && selectors.length) {
+                throw supervisorError(
+                    'No GPU grant is recorded for this workspace; run `ploinky gpu revoke` without --agent '
+                    + 'to remove the Box GPU wiring',
+                    'PLOINKY_BOX_GPU_GRANT_INVALID',
+                );
+            }
+            let next = null;
+            if (saved && selectors.length) {
+                const unknown = selectors.filter((selector) => !saved.agents.includes(selector));
+                if (unknown.length) {
+                    throw supervisorError(
+                        `The GPU grant does not name ${unknown.join(', ')}; granted: ${saved.agents.join(', ')}`,
+                        'PLOINKY_BOX_GPU_GRANT_INVALID',
+                    );
+                }
+                const remaining = saved.agents.filter((agent) => !selectors.includes(agent));
+                next = remaining.length ? normalizeGpuGrant({ vendor: saved.vendor, agents: remaining }) : null;
+            }
+            const gpu = next
+                ? resolveGpuWiring(identity, next, {
+                    discover: discoverGpuDevices,
+                    homeDirectory: gpuGrantStore.homeDirectory,
+                })
+                : null;
+            return applyGpuGrantChange({ identity, lock, ownership, saved, next, gpu, verb: 'revoke' });
+        });
+    }
+
+    /** Read-only GPU grant status: record, host discovery, and Box wiring. */
+    function inspectGpuGrant() {
+        const identity = resolveIdentity();
+        const ownership = inspect(identity);
+        const saved = gpuGrantStore.read(identity);
+        const container = ownership.state === 'owned' ? ownership.handles?.container || null : null;
+        let boxGpu = null;
+        let boxProblem = null;
+        if (container) {
+            try {
+                boxGpu = observeContainerGpuWiring(container, { identity });
+            } catch (error) {
+                boxProblem = error.message;
+            }
+        }
+        let host;
+        try {
+            const discovered = discoverGpuDevices(saved?.vendor || 'nvidia');
+            host = Object.freeze({
+                available: true,
+                vendor: discovered.vendor,
+                driverVersion: discovered.driverVersion,
+                devices: discovered.devices.map((device) => device.path),
+                libraries: discovered.libraries.map((library) => library.soname),
+            });
+        } catch (error) {
+            host = Object.freeze({ available: false, reason: error.message });
+        }
+        const desired = saved
+            ? resolveGpuWiring(identity, saved, {
+                discover: discoverGpuDevices,
+                homeDirectory: gpuGrantStore.homeDirectory,
+            })
+            : null;
+        return Object.freeze({
+            identity,
+            ownership: ownership.state,
+            box: container ? (container.runtime?.running ? 'running' : 'stopped') : 'absent',
+            grant: saved,
+            host,
+            boxGpu,
+            boxProblem,
+            desired,
+            pendingReplacement: Boolean(container) && !boxProblem && !sameGpuWiring(boxGpu, desired),
         });
     }
 
@@ -1484,12 +1885,61 @@ export function createBoxSupervisor({
         runTargetedRestartTransaction,
         runUpdateTransaction,
         runBindTransaction,
+        runGpuGrantTransaction,
+        runGpuRevokeTransaction,
+        inspectGpuGrant,
         runStopTransaction,
         runDestroyTransaction,
         inspectBoxStatus,
         planDryRun,
         planBindDryRun,
     });
+}
+
+function shortFingerprint(wiring) {
+    return wiring?.fingerprint ? wiring.fingerprint.slice(0, 12) : '';
+}
+
+function describeWiring(wiring) {
+    if (!wiring) return 'none';
+    return wiring.state === 'stale'
+        ? `stale ${shortFingerprint(wiring)}${wiring.reason ? ` (${wiring.reason})` : ''}`
+        : `active ${shortFingerprint(wiring)}`;
+}
+
+export function formatGpuGrantResult(result) {
+    const grant = result.grant
+        ? `${result.grant.vendor} for ${result.grant.agents.join(', ')}`
+        : 'none';
+    const lines = [`GPU grant for ${result.identity.instance}: ${grant}`];
+    if (result.action === 'saved') {
+        lines.push('No Box exists yet; the next `ploinky start` applies it.');
+    } else {
+        lines.push(`Box ${result.action}; GPU wiring ${describeWiring(result.gpu)}`);
+    }
+    return `${lines.join('\n')}\n`;
+}
+
+export function formatGpuGrantStatus(status) {
+    const grant = status.grant
+        ? `${status.grant.vendor} for ${status.grant.agents.join(', ')}`
+        : 'none';
+    const lines = [
+        `Workspace identity: ${status.identity.instance}`,
+        `GPU grant: ${grant}`,
+        status.host.available
+            ? `Host GPU: ${status.host.vendor} driver ${status.host.driverVersion}; devices ${status.host.devices.join(', ')}; `
+                + `libraries ${status.host.libraries.join(', ')}`
+            : `Host GPU: unavailable (${status.host.reason})`,
+        `Box: ${status.box}${status.boxProblem
+            ? `; GPU wiring is invalid (${status.boxProblem})`
+            : status.box === 'absent' ? '' : `; GPU wiring ${describeWiring(status.boxGpu)}`}`,
+    ];
+    if (status.grant) lines.push(`Desired GPU wiring: ${describeWiring(status.desired)}`);
+    if (status.pendingReplacement) {
+        lines.push('The next `ploinky start` or `ploinky restart` replaces the Box to apply the desired GPU wiring.');
+    }
+    return `${lines.join('\n')}\n`;
 }
 
 export async function ensureBoxDependencies(engine, containerId, runner, {
