@@ -45,9 +45,9 @@ export const GPU_GRANT_VENDORS = Object.freeze(['nvidia']);
 
 const BOX_BASE_DEVICES = Object.freeze(['/dev/fuse', '/dev/net/tun']);
 const NVIDIA_DEVICE_NODES = Object.freeze(['/dev/nvidia0', '/dev/nvidiactl', '/dev/nvidia-uvm']);
-// Phase 0 of the local-llm plan measured what CUDA runners actually load:
-// llama.cpp maps only libcuda, Ollama's runner also maps the PTX JIT, and
-// nvidia-smi/NVML needs libnvidia-ml. NVVM and gpucomp are bound when present.
+// Measured on CUDA workloads: the driver API library, the PTX JIT that some
+// runtimes load, and NVML for nvidia-smi are required. NVVM and gpucomp are
+// bound when present.
 const NVIDIA_REQUIRED_LIBRARIES = Object.freeze([
     'libcuda.so.1',
     'libnvidia-ptxjitcompiler.so.1',
