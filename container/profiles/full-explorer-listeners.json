@@ -141,12 +141,6 @@
       "effectiveInstance": "agent:proxies/searchAgent"
     },
     {
-      "id": "opencode-free",
-      "namePattern": "^ploinky_proxies_opencode-free_",
-      "networkModePattern": "^(?!host$|none$).+$",
-      "effectiveInstance": "agent:proxies/opencode-free"
-    },
-    {
       "id": "umami",
       "namePattern": "^ploinky_UmamiAgent_umamiAgent_",
       "networkModePattern": "^(?!host$|none$).+$",
@@ -309,14 +303,14 @@
     {
       "id": "standard-agentserver",
       "namespacePattern": "^nested:",
-      "containerPattern": "^ploinky_(?:AssistOSExplorer_(?:gitAgent|dpuAgent|soplangAgent|tasksAgent|webmeetAgent|multimedia|webAssist)|AchillesCLI_(?:achilles-cli|opencodeAgent|piAgent|codexAgent|GPTResearcher)|proxies_(?:soul-gateway|searchAgent|opencode-free)|UmamiAgent_umamiAgent)_",
+      "containerPattern": "^ploinky_(?:AssistOSExplorer_(?:gitAgent|dpuAgent|soplangAgent|tasksAgent|webmeetAgent|multimedia|webAssist)|AchillesCLI_(?:achilles-cli|opencodeAgent|piAgent|codexAgent|GPTResearcher)|proxies_(?:soul-gateway|searchAgent)|UmamiAgent_umamiAgent)_",
       "protocols": ["tcp"],
       "ports": [7000],
       "bindClasses": ["wildcard"],
       "exactOwners": ["node"],
       "reviewedSensitive": true,
-      "minMatches": 16,
-      "maxMatches": 16,
+      "minMatches": 15,
+      "maxMatches": 15,
       "rationale": "One standard AgentServer endpoint per routed Explorer dependency, isolated inside that dependency's managed namespace."
     },
     {
