@@ -1368,9 +1368,15 @@ export function createBoxSupervisor({
         }
         const priorCoreStartArgv = captureCoreStartArgv(identity);
         if (!priorCoreStartArgv) {
+            // Removing GPU access must not require starting agents first: without
+            // a Box, a revoke only clears the saved grant.
             throw supervisorError(
-                `ploinky gpu ${verb} requires a configured workspace graph to restart and health-check; `
-                + 'run `ploinky start AGENT` first',
+                verb === 'revoke'
+                    ? 'ploinky gpu revoke replaces the Box and must restart and health-check the workspace graph, '
+                        + 'and none is configured; either run `ploinky start AGENT` and revoke again, or remove the Box '
+                        + 'with `ploinky destroy` and run `ploinky gpu revoke` again, which then only clears the saved grant'
+                    : `ploinky gpu ${verb} requires a configured workspace graph to restart and health-check; `
+                        + 'run `ploinky start AGENT` first',
                 'PLOINKY_BOX_GPU_GRAPH_REQUIRED',
             );
         }

@@ -1431,3 +1431,28 @@ test('a failed revoke with no grant record names the Box GPU wiring that stays i
         },
     );
 });
+
+test('revoking on a Box without a graph points to destroy, not to starting agents', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    const box = graphBox(t, { gpu: (state) => activeWiring(state.identity) });
+    fs.rmSync(path.join(box.identity.anchorPath, 'routing.json'));
+    const events = [];
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: memoryGpuStore(events, null),
+        reconcile: async () => assert.fail('no graph'),
+    });
+    await assert.rejects(
+        () => supervisor.runGpuRevokeTransaction({ agents: [] }),
+        (error) => {
+            assert.equal(error.code, 'PLOINKY_BOX_GPU_GRAPH_REQUIRED');
+            assert.match(error.message, /ploinky destroy/);
+            assert.match(error.message, /ploinky gpu revoke/);
+            return true;
+        },
+    );
+    await assert.rejects(
+        () => supervisor.runGpuGrantTransaction({ vendor: 'nvidia', agents: [AGENT] }),
+        (error) => error.code === 'PLOINKY_BOX_GPU_GRAPH_REQUIRED' && /run `ploinky start AGENT` first/.test(error.message),
+    );
+});
