@@ -120,6 +120,26 @@ test('a declared agent-port route on a port the opt-out closes is rejected when 
     }).activate());
 });
 
+test('the closed-port check reads a route path the way the route providers do', (t) => {
+    // The providers trim the path and add a missing leading slash.
+    for (const spelling of [
+        'base-agent-additional-server/alpha/9000/*',
+        '  /base-agent-additional-server/alpha/9000/*  ',
+        ' base-agent-additional-server/alpha/9000/*\t',
+    ]) {
+        const label = JSON.stringify(spelling);
+        assert.throws(
+            () => fixture(t, { agentPorts: false, httpRoutes: [{ path: spelling, access: 'public' }] }).activate(),
+            /on agent port 9000, which routerAccess\.agentPorts closes/,
+            label,
+        );
+        assert.doesNotThrow(
+            () => fixture(t, { agentPorts: [9000], httpRoutes: [{ path: spelling, access: 'public' }] }).activate(),
+            label,
+        );
+    }
+});
+
 // Two enabled agents; only alpha opts out.
 function twoAgentFixture(t, alphaAccess, betaAccess) {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-agent-port-opt-out-two-'));

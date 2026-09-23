@@ -13,7 +13,8 @@ import {
 } from '../utils/config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
-import { AGENT_PORT_ROUTE } from '../server/agentPortConvention/parseSelector.js';
+import { AGENT_PORT_ROUTE, parseAgentPortSelector } from '../server/agentPortConvention/parseSelector.js';
+import { HttpRouteAccessPath } from '../server/policy/HttpRouteAccessPath.js';
 import { agentPortRelayDenial, normalizeAgentPortRelayPolicy } from '../server/agentPortConvention/relayPolicy.js';
 import { resolveAgentAuthPolicy } from '../utils/manifestAuth.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
@@ -811,14 +812,28 @@ function validateRoutingShape(routing, manifests) {
     }
 }
 
-/** The port of `/base-agent-additional-server/<routeKey>/<port>/...` when the relay policy closes it. */
+/**
+ * The port of `/base-agent-additional-server/<routeKey>/<port>/...` when the
+ * relay policy closes it. The path is read exactly as the route providers read
+ * it (trimmed, a leading slash added, normalized, then parsed as a selector);
+ * a path they would reject is left to them.
+ */
 function closedAgentPortRoute(pathValue, routeKey, relayPolicy) {
-    const segments = String(pathValue || '').split('/');
-    if (segments[1] !== AGENT_PORT_ROUTE || segments[2] !== routeKey || !/^[1-9][0-9]{0,4}$/.test(segments[3] || '')) {
+    const rawPath = String(pathValue || '').trim();
+    const agentRelativePath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+    if (agentRelativePath !== `/${AGENT_PORT_ROUTE}` && !agentRelativePath.startsWith(`/${AGENT_PORT_ROUTE}/`)) {
         return null;
     }
-    const port = Number(segments[3]);
-    return agentPortRelayDenial(relayPolicy, port) ? port : null;
+    const normalized = HttpRouteAccessPath.normalize(agentRelativePath);
+    if (!normalized.ok) return null;
+    let selector;
+    try {
+        selector = parseAgentPortSelector(normalized.path.endsWith('/*') ? normalized.path.slice(0, -1) : normalized.path);
+    } catch {
+        return null;
+    }
+    if (!selector || selector.agent !== routeKey) return null;
+    return agentPortRelayDenial(relayPolicy, selector.port) ? selector.port : null;
 }
 
 function routeMatchesAgent(route, agentRef) {
