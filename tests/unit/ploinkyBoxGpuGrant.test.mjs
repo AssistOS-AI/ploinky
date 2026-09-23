@@ -32,6 +32,7 @@ import {
 } from '../../ploinky-box/gpuGrant.mjs';
 import { writeGraphSkillScope } from '../../ploinky-box/graphSkillScope.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
+import { assertRouterBindingStateConfined } from '../../ploinky-box/routerBinding.mjs';
 import { readBoxGpuGrant } from '../../ploinky-box/lib/gpuGrantMarker.mjs';
 import { containerCreateArgs } from '../../ploinky-box/lifecycle/container.mjs';
 import { reconcileBoxContainer } from '../../ploinky-box/lifecycle/transactions.mjs';
@@ -373,6 +374,62 @@ test('the grant state refuses workspaces or caches that alias the host control-s
         () => state.store.read(aliased),
         (error) => error.code === 'PLOINKY_BOX_ROUTER_BINDING_STATE_INVALID' && /overlaps writable Box source/.test(error.message),
     );
+});
+
+test('the grant state refuses a workspace that is a bind-mount alias of the gpu-grants directory', (t) => {
+    const state = workspaceFixture(t);
+    const grants = path.join(state.home, '.ploinky-box', 'gpu-grants');
+    fs.mkdirSync(grants, { recursive: true, mode: 0o700 });
+    const grantsStat = fs.statSync(grants);
+    const workspace = state.identity.workspaceRoot;
+    // A bind mount shows the same device and inode under another path, which
+    // realpath cannot see; only the gpu-grants identity check catches it.
+    const fsApi = {
+        ...fs,
+        statSync(target, options) {
+            const stat = fs.statSync(target, options);
+            if (path.resolve(target) !== workspace) return stat;
+            return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { dev: grantsStat.dev, ino: grantsStat.ino });
+        },
+    };
+    assert.doesNotThrow(() => assertRouterBindingStateConfined(state.identity, { homeDirectory: state.home }));
+    assert.throws(
+        () => assertRouterBindingStateConfined(state.identity, { homeDirectory: state.home, fsApi }),
+        /overlaps writable Box source/,
+    );
+});
+
+test('an observed wiring must bind its own generation files, and a stale one nothing else', (t) => {
+    const state = boxFixture(t);
+    const wiring = activeWiring(state.identity);
+    const handle = containerHandle(state, { gpu: wiring });
+    assert.equal(observeContainerGpuWiring(handle, { identity: state.identity }).state, 'active');
+    const moved = (destination) => {
+        const copy = structuredClone(handle);
+        const mount = copy.runtime.mounts.find((entry) => entry.destination === destination);
+        mount.source = path.join(path.dirname(path.dirname(mount.source)), 'f'.repeat(64), path.basename(mount.source));
+        return copy;
+    };
+    assert.throws(() => observeContainerGpuWiring(moved(BOX_GPU_MARKER_PATH), { identity: state.identity }),
+        /grant marker is not its generation marker/);
+    assert.throws(() => observeContainerGpuWiring(moved(BOX_GPU_CDI_SPEC_PATH), { identity: state.identity }),
+        /CDI spec is not its generation spec/);
+
+    const stale = structuredClone(handle);
+    stale.runtime.mounts = stale.runtime.mounts.filter((mount) => !mount.destination.startsWith('/usr/local/nvidia/')
+        && mount.destination !== BOX_GPU_CDI_SPEC_PATH);
+    stale.runtime.createCommand = stale.runtime.createCommand.filter((arg, index, all) => !(
+        (arg === '--device' && String(all[index + 1]).startsWith('/dev/nvidia')) || String(arg).startsWith('/dev/nvidia')));
+    assert.equal(observeContainerGpuWiring(stale, { identity: state.identity }).state, 'stale');
+    const staleWithDevices = structuredClone(stale);
+    staleWithDevices.runtime.createCommand.push('--device', '/dev/nvidia0');
+    assert.throws(() => observeContainerGpuWiring(staleWithDevices, { identity: state.identity }),
+        /stale GPU grant still has GPU devices or libraries/);
+    const staleWithLibrary = structuredClone(stale);
+    staleWithLibrary.runtime.mounts.push({ type: 'bind', name: '', source: `${LIB}/libcuda.so.${DRIVER}`,
+        destination: '/usr/local/nvidia/lib64/libcuda.so.1', rw: false });
+    assert.throws(() => observeContainerGpuWiring(staleWithLibrary, { identity: state.identity }),
+        /stale GPU grant still has GPU devices or libraries/);
 });
 
 test('generation files are content addressed, private and pruned only by name', (t) => {
