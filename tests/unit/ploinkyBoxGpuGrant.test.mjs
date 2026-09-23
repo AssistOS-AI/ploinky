@@ -1456,3 +1456,104 @@ test('revoking on a Box without a graph points to destroy, not to starting agent
         (error) => error.code === 'PLOINKY_BOX_GPU_GRAPH_REQUIRED' && /run `ploinky start AGENT` first/.test(error.message),
     );
 });
+
+const GPU_REQUEST = Object.freeze({ runtimePolicy: { devices: [{ type: 'cdi', value: 'ploinky.local/gpu=all' }] } });
+
+// Records an enabled agent the way the in-Box CLI does: a registry entry in
+// agents.json and a route whose hostPath holds the manifest.
+function enableAgentRecord(box, { repo, agent, profile = 'default', manifest }) {
+    const registryPath = path.join(box.identity.anchorPath, 'agents.json');
+    const registry = fs.existsSync(registryPath) ? JSON.parse(fs.readFileSync(registryPath, 'utf8')) : { _config: {} };
+    registry[`ploinky_${repo}_${agent}`] = { type: 'agent', repoName: repo, agentName: agent, profile };
+    fs.writeFileSync(registryPath, JSON.stringify(registry));
+    const agentDirectory = path.join(box.identity.workspaceRoot, repo, agent);
+    fs.mkdirSync(agentDirectory, { recursive: true });
+    if (manifest !== undefined) {
+        fs.writeFileSync(path.join(agentDirectory, 'manifest.json'),
+            typeof manifest === 'string' ? manifest : JSON.stringify(manifest));
+    }
+    const routingPath = path.join(box.identity.anchorPath, 'routing.json');
+    const routing = JSON.parse(fs.readFileSync(routingPath, 'utf8'));
+    routing.routes[agent] = { container: `ploinky_${repo}_${agent}`, hostPath: agentDirectory, repo, agent };
+    fs.writeFileSync(routingPath, JSON.stringify(routing));
+    return agentDirectory;
+}
+
+function reconcileReached(box) {
+    return async () => {
+        throw Object.assign(new Error('reached reconcile'), {
+            boxRollback: { action: 'preserved', containerId: box.container.id, oldStopAttempted: false, oldStartAttempted: false },
+        });
+    };
+}
+
+test('revoke refuses before touching the Box while an enabled agent still requests the GPU', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    const box = graphBox(t, { gpu: (state) => activeWiring(state.identity) });
+    const PROFILED = 'tools/profiled';
+    enableAgentRecord(box, { repo: 'local-llms', agent: 'local-llm', manifest: { llmRuntime: GPU_REQUEST } });
+    enableAgentRecord(box, {
+        repo: 'tools', agent: 'profiled', profile: 'gpu', manifest: { profiles: { gpu: { llmRuntime: GPU_REQUEST } } },
+    });
+    const events = [];
+    const store = memoryGpuStore(events, Object.freeze({ vendor: 'nvidia', agents: [AGENT, PROFILED], admitted: null }));
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: store,
+        reconcile: async () => assert.fail('refused before any Box change'),
+    });
+    await assert.rejects(
+        () => supervisor.runGpuRevokeTransaction({ agents: [] }),
+        (error) => {
+            assert.equal(error.code, 'PLOINKY_BOX_GPU_AGENTS_ENABLED');
+            assert.match(error.message, /enabled agents local-llms\/local-llm, tools\/profiled request the GPU/);
+            assert.match(error.message, /`ploinky disable agent local-llms\/local-llm`/);
+            assert.match(error.message, /`ploinky destroy`/);
+            return true;
+        },
+    );
+    await assert.rejects(
+        () => supervisor.runGpuRevokeTransaction({ agents: [AGENT] }),
+        (error) => error.code === 'PLOINKY_BOX_GPU_AGENTS_ENABLED'
+            && /enabled agent local-llms\/local-llm requests the GPU/.test(error.message)
+            && !/tools\/profiled/.test(error.message),
+    );
+    assert.deepEqual(events.filter((event) => /^(run|stream|grant-|prune)/.test(event)), []);
+    assert.deepEqual(store.value.agents, [AGENT, PROFILED]);
+});
+
+test('the revoke pre-check skips agents that stay granted, request no GPU, or cannot be read', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    const box = graphBox(t, { gpu: (state) => activeWiring(state.identity) });
+    // Stays granted.
+    enableAgentRecord(box, { repo: 'local-llms', agent: 'local-llm', manifest: { llmRuntime: GPU_REQUEST } });
+    // No GPU request, or only in a profile the record does not select.
+    enableAgentRecord(box, { repo: 'tools', agent: 'cpu', manifest: { llmRuntime: { runtimePolicy: {} } } });
+    enableAgentRecord(box, { repo: 'tools', agent: 'unselected', manifest: { profiles: { gpu: { llmRuntime: GPU_REQUEST } } } });
+    // Unreadable: a symlinked manifest, invalid JSON, a directory, no manifest.
+    const linked = enableAgentRecord(box, { repo: 'tools', agent: 'linked' });
+    const target = path.join(probe.root, 'outside-manifest.json');
+    fs.writeFileSync(target, JSON.stringify({ llmRuntime: GPU_REQUEST }));
+    fs.symlinkSync(target, path.join(linked, 'manifest.json'));
+    enableAgentRecord(box, { repo: 'tools', agent: 'garbage', manifest: '{"llmRuntime": ' });
+    const directory = enableAgentRecord(box, { repo: 'tools', agent: 'directory' });
+    fs.mkdirSync(path.join(directory, 'manifest.json'));
+    enableAgentRecord(box, { repo: 'tools', agent: 'missing' });
+    const removed = ['tools/cpu', 'tools/unselected', 'tools/linked', 'tools/garbage', 'tools/directory', 'tools/missing'];
+    const events = [];
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: memoryGpuStore(events, Object.freeze({ vendor: 'nvidia', agents: [AGENT, ...removed], admitted: null })),
+        reconcile: reconcileReached(box),
+    });
+    await assert.rejects(
+        () => supervisor.runGpuRevokeTransaction({ agents: removed }),
+        (error) => error.code !== 'PLOINKY_BOX_GPU_AGENTS_ENABLED' && /reached reconcile/.test(error.message),
+    );
+    // An unreadable registry leaves the decision to the graph restart.
+    fs.writeFileSync(path.join(box.identity.anchorPath, 'agents.json'), '{"ploinky_local-llms_local-llm": ');
+    await assert.rejects(
+        () => supervisor.runGpuRevokeTransaction({ agents: [] }),
+        (error) => error.code !== 'PLOINKY_BOX_GPU_AGENTS_ENABLED' && /reached reconcile/.test(error.message),
+    );
+});

@@ -453,6 +453,75 @@ export function sameGpuWiring(left, right) {
     return (left?.fingerprint ?? null) === (right?.fingerprint ?? null);
 }
 
+export const GPU_WORKSPACE_FILE_MAX_BYTES = 1024 * 1024;
+
+const WORKSPACE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+
+// Agents can write these workspace files, so anything that is not a small,
+// non-symlink regular file holding JSON counts as absent.
+function readWorkspaceJson(fsApi, target, maxBytes) {
+    let descriptor;
+    try {
+        descriptor = fsApi.openSync(
+            target,
+            fsApi.constants.O_RDONLY | fsApi.constants.O_NOFOLLOW | fsApi.constants.O_NONBLOCK,
+        );
+    } catch {
+        return null;
+    }
+    try {
+        const stat = fsApi.fstatSync(descriptor);
+        if (!stat.isFile() || stat.size > maxBytes) return null;
+        return JSON.parse(fsApi.readFileSync(descriptor, 'utf8'));
+    } catch {
+        return null;
+    } finally {
+        fsApi.closeSync(descriptor);
+    }
+}
+
+function requestsCdiDevice(llmRuntime) {
+    const devices = llmRuntime?.runtimePolicy?.devices;
+    return Array.isArray(devices) && devices.some((entry) => entry?.type === 'cdi');
+}
+
+/**
+ * Enabled agents, as REPO/AGENT, whose manifest or selected profile requests a
+ * CDI device. Read from the workspace agent registry, the routing file (the
+ * manifest directory of each route) and the manifests. Agents can write all of
+ * these, so a caller may use the result only to refuse early; unreadable
+ * entries are skipped and admission during the graph start stays the authority.
+ */
+export function enabledCdiRequestingAgents(workspaceRoot, {
+    fsApi = fs,
+    maxBytes = GPU_WORKSPACE_FILE_MAX_BYTES,
+} = {}) {
+    const stateDirectory = path.join(String(workspaceRoot || ''), '.ploinky');
+    if (!path.isAbsolute(stateDirectory)) return [];
+    const registry = readWorkspaceJson(fsApi, path.join(stateDirectory, 'agents.json'), maxBytes);
+    if (!registry || typeof registry !== 'object' || Array.isArray(registry)) return [];
+    const routing = readWorkspaceJson(fsApi, path.join(stateDirectory, 'routing.json'), maxBytes);
+    const routes = routing?.routes && typeof routing.routes === 'object' ? Object.values(routing.routes) : [];
+    const requesting = new Set();
+    for (const record of Object.values(registry)) {
+        if (record?.type !== 'agent') continue;
+        const repo = String(record.repoName || '');
+        const agent = String(record.agentName || '');
+        if (!WORKSPACE_NAME.test(repo) || !WORKSPACE_NAME.test(agent)) continue;
+        const route = routes.find((entry) => entry?.repo === repo && entry?.agent === agent
+            && typeof entry.hostPath === 'string' && path.isAbsolute(entry.hostPath));
+        const agentDirectory = route ? route.hostPath : path.join(stateDirectory, 'repos', repo, agent);
+        const manifest = readWorkspaceJson(fsApi, path.join(agentDirectory, 'manifest.json'), maxBytes);
+        if (!manifest || typeof manifest !== 'object') continue;
+        const profiles = manifest.profiles && typeof manifest.profiles === 'object' ? manifest.profiles : {};
+        const profile = profiles[String(record.profile || 'default')];
+        if (requestsCdiDevice(manifest.llmRuntime) || requestsCdiDevice(profile?.llmRuntime)) {
+            requesting.add(`${repo}/${agent}`);
+        }
+    }
+    return [...requesting].sort();
+}
+
 /** Container create arguments for a wiring: devices, read-only binds, label. */
 export function gpuWiringCreateArgs(wiring) {
     if (!wiring) return Object.freeze({ devices: [], volumes: [], labels: {} });

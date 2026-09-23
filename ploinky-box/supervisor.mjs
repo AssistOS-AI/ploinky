@@ -45,6 +45,7 @@ import {
     buildGpuWiring,
     createGpuGrantStore,
     discoverGpu,
+    enabledCdiRequestingAgents,
     normalizeGpuAgentSelectors,
     normalizeGpuGrant,
     observeContainerGpuWiring,
@@ -1344,6 +1345,29 @@ export function createBoxSupervisor({
     }
 
     /**
+     * A revoke restarts the graph without GPU access for the agents it removes.
+     * An enabled agent that requests the GPU would then fail admission, and the
+     * transaction would replace the Box twice to restore it; refuse before any
+     * Box change instead. The graph start remains the authority for anything
+     * this workspace-file check cannot read.
+     */
+    function assertNoEnabledAgentLosesGpu(identity, next) {
+        const stranded = enabledCdiRequestingAgents(identity.workspaceRoot)
+            .filter((agentId) => !next?.agents.includes(agentId));
+        if (!stranded.length) return;
+        const one = stranded.length === 1;
+        throw supervisorError(
+            `The enabled agent${one ? '' : 's'} ${stranded.join(', ')} request${one ? 's' : ''} the GPU, and `
+            + `ploinky gpu revoke would restart the workspace graph without a grant for ${one ? 'it' : 'them'}, so `
+            + `${one ? 'its' : 'their'} start would fail admission. Disable ${one ? 'it' : 'them'} first with `
+            + `${stranded.map((agentId) => `\`ploinky disable agent ${agentId}\``).join(' and ')} and revoke again, `
+            + 'or remove the Box with `ploinky destroy` and run `ploinky gpu revoke` again, which then only clears '
+            + 'the saved grant. Nothing was changed',
+            'PLOINKY_BOX_GPU_AGENTS_ENABLED',
+        );
+    }
+
+    /**
      * Apply a changed GPU grant, modelled on bind. The configured graph, its
      * skill scope, image, AgentLib generation and publication are kept. A
      * changed wiring replaces the Box through the normal lifecycle, the graph
@@ -1380,6 +1404,7 @@ export function createBoxSupervisor({
                 'PLOINKY_BOX_GPU_GRAPH_REQUIRED',
             );
         }
+        if (verb === 'revoke') assertNoEnabledAgentLosesGpu(identity, next);
         const priorSkillScopeEnv = validateGraphSkillScope(identity, readGraphSkillScope(identity));
         const engine = ownership.engine;
         const priorRunning = container.runtime?.running === true;
