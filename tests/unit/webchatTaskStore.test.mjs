@@ -57,6 +57,20 @@ test('structured live sessions survive updates and snapshots but reject unsafe U
     }
 });
 
+test('task details links survive updates and snapshots but reject unsafe URLs', () => {
+    const details = { url: '/base-agent-additional-server/roboTeamAgent/3001/roboflow?flowId=flow_603070ca4a29b08bff4a3141', label: 'Open workflow page', logsLabel: 'View workflow logs' };
+    const parsed = parseWebchatTaskState({ __webchatTask: 1, version: 1, event: 'update',
+        task: { ...task, details: { ...details, unknown: 'drop me' } } });
+    assert.deepEqual(parsed.task.details, details);
+    const snapshot = parseWebchatTaskState({ __webchatTask: 1, version: 1, event: 'list', tasks: [parsed.task] });
+    assert.deepEqual(snapshot.tasks[0].details, details);
+    for (const url of ['javascript:alert(1)', '//evil.test/', 'https://evil.test/', 'relative/path']) {
+        const unsafe = parseWebchatTaskState({ __webchatTask: 1, version: 1, event: 'update',
+            task: { ...task, details: { url } } });
+        assert.equal(unsafe.task.details, undefined);
+    }
+});
+
 test('WebChat validates task view snapshots and live log deltas', () => {
     const view = parseWebchatTaskState({
         __webchatTask: 1,

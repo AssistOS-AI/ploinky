@@ -397,10 +397,11 @@ test('chat task summary streams inline logs and collapses to its metadata header
 
     t.after(dispose);
     const [summary, body] = bubble.children[0].children;
-    const [link, live] = body.children[0].children;
+    const [link, logs, live] = body.children[0].children;
     assert.equal(body.hidden, false);
     assert.equal(link.textContent, 'View Task Details');
     assert.equal(link.dataset.wcTaskId, task.id);
+    assert.equal(logs.hidden, true);
     assert.equal(loadRequests, 0, 'inline cards must not request task logs');
     assert.equal(body.children.length, 1, 'no inline log or composer');
     assert.equal(summary.onclick, undefined);
@@ -413,6 +414,18 @@ test('chat task summary streams inline logs and collapses to its metadata header
     assert.equal(live.href, '/example/session/');
     subscriber({ task: { ...task, liveSession: { mode: 'browser', url: 'javascript:alert(1)' } }, ready: true });
     assert.equal(live.hidden, true);
+    const flowUrl = '/base-agent-additional-server/roboTeamAgent/3001/roboflow?flowId=flow_603070ca4a29b08bff4a3141';
+    subscriber({ task: { ...task, details: { url: flowUrl, label: 'Open workflow page', logsLabel: 'View workflow logs' } }, ready: true });
+    assert.equal(link.href, flowUrl);
+    assert.equal(link.textContent, 'Open workflow page');
+    assert.equal(link.dataset.wcTaskId, undefined);
+    assert.equal(logs.hidden, false);
+    assert.equal(logs.href, `/webchat/tasks/${task.id}/view`);
+    assert.equal(logs.textContent, 'View workflow logs');
+    subscriber({ task: { ...task, details: { url: 'https://evil.example/' } }, ready: true });
+    assert.equal(link.textContent, 'View Task Details');
+    assert.equal(link.href, `/webchat/tasks/${task.id}/view`);
+    assert.equal(logs.hidden, true);
     assert.deepEqual(actions, []);
 
 });

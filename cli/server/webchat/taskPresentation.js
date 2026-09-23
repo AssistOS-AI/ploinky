@@ -1,4 +1,5 @@
 import { normalizeTaskLiveSession } from './taskLiveSession.js';
+import { normalizeTaskDetails } from './taskDetails.js';
 
 const TERMINAL_STATUSES = new Set(['finished', 'stopped', 'error']);
 const ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
@@ -181,6 +182,10 @@ export function parseTaskLogPresentation(text, task = null) {
     return parseTaskLogEntries(text, taskFinalOutputRanges(task));
 }
 
+export function taskDetailsLink(value) {
+    return normalizeTaskDetails(value);
+}
+
 function safeTaskLogUrl(rawUrl) {
     try {
         const origin = globalThis.window?.location?.origin || 'http://localhost';
@@ -299,13 +304,22 @@ export function attachTaskSummary({ bubble, taskId, taskController }) {
     link.dataset.wcLink = 'true';
     link.dataset.wcTaskId = taskId;
     link.textContent = 'View Task Details';
+    const logs = document.createElement('a');
+    logs.className = 'wa-task-log-link';
+    logs.href = taskController.getTaskViewUrl(taskId);
+    logs.target = '_blank';
+    logs.rel = 'noopener noreferrer';
+    logs.dataset.wcLink = 'true';
+    logs.dataset.wcTaskId = taskId;
+    logs.textContent = 'View task logs';
+    logs.hidden = true;
     const live = document.createElement('a');
     live.className = 'wa-task-log-link';
     live.target = '_blank';
     live.rel = 'noopener noreferrer';
     live.dataset.wcLink = 'true';
     live.hidden = true;
-    actions.append(link, live);
+    actions.append(link, logs, live);
     body.append(actions);
     panel.append(summary, body);
     const timeNode = bubble.querySelector(':scope > .wa-message-time');
@@ -320,6 +334,13 @@ export function attachTaskSummary({ bubble, taskId, taskController }) {
         status.className = `wa-task-status is-${presentation.className}`;
         status.textContent = latest.ready || task ? presentation.label : 'LOADING';
         duration.textContent = taskDurationLabel(task);
+        const details = taskDetailsLink(task?.details);
+        link.href = details ? details.url : taskController.getTaskViewUrl(taskId);
+        link.textContent = details?.label || 'View Task Details';
+        if (details) delete link.dataset.wcTaskId;
+        else link.dataset.wcTaskId = taskId;
+        logs.hidden = !details;
+        if (details) logs.textContent = details.logsLabel || 'View task logs';
         const session = normalizeTaskLiveSession(task?.liveSession);
         live.hidden = !session;
         if (session) {

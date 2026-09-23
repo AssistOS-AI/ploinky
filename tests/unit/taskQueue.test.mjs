@@ -185,8 +185,42 @@ test('TaskQueue exposes declared live controls before completion and retains the
     assert.equal(queue.getTask(id).result.metadata.continuation.handle, 'private-session-handle');
 });
 
-test('TaskQueue exposes only outputText from structured command results', async (t) => {
+test('TaskQueue exposes a declared details link and keeps its control line out of logs', async (t) => {
     const storagePath = makeTempStorage(t);
+    let finish;
+    const url = '/base-agent-additional-server/roboTeamAgent/3001/roboflow?flowId=flow_603070ca4a29b08bff4a3141';
+    const queue = new TaskQueue({ storagePath, executor: (_spec, _payload, options) => new Promise((resolve) => {
+        finish = resolve;
+        options.onStderrChunk('@@PLOINKY_TASK_CONTROL@@' + JSON.stringify({
+            details: { url, label: 'Open workflow page' },
+        }) + '\nvisible output\n');
+    }) });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    const running = await waitFor(() => queue.getTask(id)?.details && queue.getTask(id));
+    assert.equal(running.status, 'running');
+    assert.deepEqual(running.details, { url, label: 'Open workflow page' });
+    assert.equal(running.logTail, 'visible output\n');
+    finish({ code: 0, stdout: 'done', stderr: '' });
+    await waitFor(() => queue.getTask(id)?.status === 'completed');
+    assert.equal(queue.getTask(id).details.url, url);
+});
+
+test('TaskQueue ignores unsafe declared details links', async (t) => {
+    const storagePath = makeTempStorage(t);
+    let finish;
+    const queue = new TaskQueue({ storagePath, executor: (_spec, _payload, options) => new Promise((resolve) => {
+        finish = resolve;
+        options.onStderrChunk('@@PLOINKY_TASK_CONTROL@@' + JSON.stringify({ details: { url: 'https://evil.example/' } }) + '\n');
+        options.onStderrChunk('@@PLOINKY_TASK_CONTROL@@' + JSON.stringify({ details: { url: '//evil.example/' } }) + '\n');
+        options.onStderrChunk('done\n');
+    }) });
+    const { id } = queue.enqueueTask(dummyTaskConfig());
+    await waitFor(() => queue.getTask(id)?.logTail?.includes('done'));
+    assert.equal(queue.getTask(id).details, undefined);
+    finish({ code: 0, stdout: 'done', stderr: '' });
+});
+
+test('TaskQueue exposes only outputText from structured command results', async (t) => {    const storagePath = makeTempStorage(t);
     const stdout = JSON.stringify({
         ok: true,
         outputText: 'Final assistant answer',

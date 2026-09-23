@@ -7,6 +7,8 @@ const DEFAULT_MAX_LOG_TAIL_BYTES = 128 * 1024;
 const DEFAULT_CANCEL_GRACE_MS = 2000;
 const CONTINUATION_HANDLE_RE = /^[A-Za-z0-9_-]{16,200}$/;
 const TOOL_NAME_RE = /^[A-Za-z0-9._-]{1,160}$/;
+const DETAILS_URL_RE = /^\/(?!\/)[A-Za-z0-9\-._~%!$&'()*+,;=:@/?]*$/;
+const DETAILS_LABEL_MAX = 80;
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
 function parsePositiveInt(value, fallback) {
@@ -26,6 +28,16 @@ function normalizeContinuation(raw) {
     }
     return { version: 1, handle, toolName,
         ...(TOOL_NAME_RE.test(raw.messageToolName || '') ? { messageToolName: raw.messageToolName } : {}) };
+}
+
+function normalizeDetails(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const url = typeof raw.url === 'string' ? raw.url.trim() : '';
+    if (!url || url.length > 2048 || !DETAILS_URL_RE.test(url)) return null;
+    const clean = value => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, DETAILS_LABEL_MAX) : '');
+    const label = clean(raw.label);
+    const logsLabel = clean(raw.logsLabel);
+    return { url, ...(label ? { label } : {}), ...(logsLabel ? { logsLabel } : {}) };
 }
 
 function commandResult(stdout) {
@@ -141,6 +153,7 @@ export class TaskQueue {
                             : '',
                         taskMessageTool: TOOL_NAME_RE.test(entry.taskMessageTool || '') ? entry.taskMessageTool : '',
                         liveContinuation: normalizeContinuation(entry.liveContinuation),
+                        details: normalizeDetails(entry.details),
                         createdAt: entry.createdAt || new Date().toISOString(),
                         updatedAt: entry.updatedAt || entry.createdAt || new Date().toISOString(),
                         error: entry.error ?? null,
@@ -178,6 +191,7 @@ export class TaskQueue {
                 continuationTool: task.continuationTool,
                 taskMessageTool: task.taskMessageTool,
                 liveContinuation: task.liveContinuation,
+                details: task.details,
             }));
             fs.writeFileSync(this.storagePath, JSON.stringify(snapshot, null, 2));
         } catch (err) {
@@ -531,6 +545,15 @@ export class TaskQueue {
                 forwardToHostLog(process.stderr, chunk);
                 this.appendTaskLog(task.id, chunk);
             }, (raw) => {
+                const details = normalizeDetails(raw?.details);
+                if (details) {
+                    if (JSON.stringify(task.details) === JSON.stringify(details)) return;
+                    task.details = details;
+                    task.updatedAt = new Date().toISOString();
+                    task.logSeq += 1;
+                    this.persistTasks();
+                    return;
+                }
                 if (task.liveContinuation) return;
                 const continuation = normalizeContinuation(raw);
                 if (!continuation || continuation.toolName !== task.continuationTool) return;
@@ -671,6 +694,7 @@ export class TaskQueue {
             error: task.error,
             result: task.result,
             ...(task.liveContinuation ? { liveContinuation: task.liveContinuation } : {}),
+            ...(task.details ? { details: task.details } : {}),
             logTail: logSnapshot.tail,
             logSeq: logSnapshot.seq,
             logTruncated: logSnapshot.truncated
