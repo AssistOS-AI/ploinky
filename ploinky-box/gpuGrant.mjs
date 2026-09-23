@@ -797,6 +797,39 @@ export function createGpuGrantStore({
     }
 
     /**
+     * A kept wiring binds host driver files and device nodes that a driver
+     * package upgrade can remove while the running Box still pins them. They
+     * are checked before anything destructive, so a replacement is refused
+     * instead of removing the old Box and then failing to create the new one.
+     */
+    function assertKeptHostSources(wiring) {
+        const changed = (item, detail) => stateError(
+            `GPU wiring ${wiring.fingerprint} binds ${item}, which ${detail}; the host driver changed. `
+            + 'Run `ploinky restart` to rediscover the driver and regenerate the wiring.',
+        );
+        for (const mount of wiring.mounts) {
+            if (mount.destination === BOX_GPU_MARKER_PATH || mount.destination === BOX_GPU_CDI_SPEC_PATH) continue;
+            let stat;
+            try {
+                stat = fsApi.statSync(mount.source);
+                fsApi.accessSync(mount.source, fs.constants.R_OK);
+            } catch (error) {
+                throw changed(mount.source, `is missing or unreadable (${error.code || error.message})`);
+            }
+            if (!stat.isFile()) throw changed(mount.source, 'is not a regular file');
+        }
+        for (const device of wiring.devices) {
+            let stat;
+            try {
+                stat = fsApi.statSync(device);
+            } catch (error) {
+                throw changed(device, `is missing (${error.code || error.message})`);
+            }
+            if (!stat.isCharacterDevice()) throw changed(device, 'is not a character device');
+        }
+    }
+
+    /**
      * Write a wiring's spec and marker into its content-addressed generation
      * directory. An existing generation must hold byte-identical files. A wiring
      * reconstructed from a Box (kept across a replacement) carries no file
@@ -822,6 +855,7 @@ export function createGpuGrantStore({
                     );
                 }
             }
+            assertKeptHostSources(wiring);
             return;
         }
         for (const target of [stateRoot, directory, instanceDirectory(identity), generation]) {

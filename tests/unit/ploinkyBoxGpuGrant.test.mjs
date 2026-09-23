@@ -133,12 +133,27 @@ function fakeHost({
         },
     };
     return {
+        fsApi,
         discover: () => discoverNvidiaGpu({
             fsApi,
             readLdconfig: () => `${lines.length} libs found in cache\n${lines.join('\n')}\n`,
             smiCandidates: ['/usr/bin/nvidia-smi'],
         }),
     };
+}
+
+// A kept wiring's host driver files and device nodes are checked through the
+// real fs module. Tests route only those host paths to a fake host, so they
+// behave the same on machines with and without an NVIDIA driver.
+function useFakeHostFiles(t, host) {
+    const realStat = fs.statSync;
+    const realAccess = fs.accessSync;
+    const isHostPath = (target) => typeof target === 'string'
+        && (target.startsWith(`${LIB}/`) || target.startsWith('/dev/nvidia') || target === '/usr/bin/nvidia-smi');
+    t.mock.method(fs, 'statSync', (target, ...rest) => (
+        isHostPath(target) ? host.fsApi.statSync(target) : realStat.call(fs, target, ...rest)));
+    t.mock.method(fs, 'accessSync', (target, ...rest) => (
+        isHostPath(target) ? host.fsApi.accessSync(target) : realAccess.call(fs, target, ...rest)));
 }
 
 function workspaceFixture(t, name = 'workspace') {
@@ -1221,6 +1236,7 @@ function useTempHome(t, root) {
 test('a GPU Box replaced for another reason keeps its wiring through the default materialize path', async (t) => {
     const state = boxFixture(t);
     useTempHome(t, state.root);
+    useFakeHostFiles(t, fakeHost());
     const store = createGpuGrantStore();
     const wiring = activeWiring(state.identity);
     store.materialize(state.identity, wiring, state.lock);
@@ -1257,6 +1273,7 @@ function observedPrepared(box, action, events) {
 test('a repeated grant and a later start record the desired wiring when the Box is reused', async (t) => {
     const probe = boxFixture(t);
     useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
     const box = graphBox(t, { gpu: (state) => activeWiring(state.identity) });
     const events = [];
     const store = createGpuGrantStore();
@@ -1296,4 +1313,40 @@ test('revoking named agents without a record refuses instead of revoking everyth
         reconcile: async () => assert.fail('refused before reconciliation'),
     });
     await assert.rejects(() => supervisor.runGpuRevokeTransaction({ agents: [AGENT] }), /No GPU grant is recorded/);
+});
+
+test('a kept wiring whose driver files were removed refuses before the old Box is touched', async (t) => {
+    const state = boxFixture(t);
+    useTempHome(t, state.root);
+    // The Box was wired for driver 590.1; a package upgrade replaced its
+    // versioned library files with 595.91.07 ones, while the running Box pins
+    // the old inodes.
+    useFakeHostFiles(t, fakeHost());
+    const store = createGpuGrantStore();
+    const wiring = activeWiring(state.identity, { host: fakeHost({ kernel: '590.1', library: '590.1' }) });
+    const old = containerHandle(state, { gpu: wiring });
+    const h = harness(state, { initial: old });
+    const { materializeGpu: _fake, ...seams } = h.seams;
+    store.materialize(state.identity, wiring, state.lock);
+    await assert.rejects(
+        () => reconcileBoxContainer(reconcileArguments(state, h, old, { explicitPort: 8091 }), seams),
+        /libcuda\.so\.590\.1, which is missing or unreadable \(ENOENT\); the host driver changed\. Run `ploinky restart`/,
+    );
+    assert.equal(h.calls.some((call) => ['stop', 'rm', 'create'].includes(call[3])), false);
+    assert.equal(h.current(), old);
+});
+
+test('a kept wiring whose device node disappeared refuses with restart guidance', (t) => {
+    const fixture = workspaceFixture(t);
+    const wiring = activeWiring(fixture.identity, { homeDirectory: fixture.home });
+    fixture.store.materialize(fixture.identity, wiring, fixture.lock);
+    const kept = { ...wiring, files: undefined };
+    useFakeHostFiles(t, fakeHost());
+    assert.doesNotThrow(() => fixture.store.materialize(fixture.identity, kept, fixture.lock));
+    t.mock.restoreAll();
+    useFakeHostFiles(t, fakeHost({ missing: ['/dev/nvidia-uvm'] }));
+    assert.throws(
+        () => fixture.store.materialize(fixture.identity, kept, fixture.lock),
+        /binds \/dev\/nvidia-uvm, which is missing \(ENOENT\); the host driver changed/,
+    );
 });
