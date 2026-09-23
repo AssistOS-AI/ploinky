@@ -704,8 +704,11 @@ signed-in user with the Explorer capability through
 `/base-agent-additional-server/<agent>/<port>/`. An agent that runs private
 services on loopback (for example a model server) closes that relay in its
 manifest with `routerAccess.agentPorts: false`, or allows only listed container
-ports with `routerAccess.agentPorts: [7000]`. The refusal applies to every
-caller, including administrators.
+ports with `routerAccess.agentPorts: [7000]`. Leaving the field out, or setting
+it to `true` or `null`, keeps every port open. A closed port is refused for
+every caller, administrators included, and a manifest that also declares a
+`routerAccess.httpRoutes` entry on a closed agent port is rejected when the
+edge generation is compiled.
 
 ## Core commands (in p-cli)
 
