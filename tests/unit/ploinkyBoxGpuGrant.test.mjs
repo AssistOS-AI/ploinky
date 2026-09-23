@@ -1407,3 +1407,27 @@ test('a kept wiring whose device node disappeared refuses with restart guidance'
         /binds \/dev\/nvidia-uvm, which is missing \(ENOENT\); the host driver changed/,
     );
 });
+
+test('a failed revoke with no grant record names the Box GPU wiring that stays in force', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    const box = graphBox(t, { gpu: (state) => activeWiring(state.identity) });
+    const events = [];
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: memoryGpuStore(events, null),
+        reconcile: async () => {
+            throw Object.assign(new Error('candidate ready timeout'), {
+                boxRollback: { action: 'preserved', containerId: box.container.id, oldStopAttempted: false, oldStartAttempted: false },
+            });
+        },
+    });
+    const fingerprint = box.container.labels[BOX_LABELS.gpuGrant];
+    await assert.rejects(
+        () => supervisor.runGpuRevokeTransaction({ agents: [] }),
+        (error) => {
+            assert.match(error.message, new RegExp(`the Box GPU wiring ${fingerprint} \\(active\\) is still in force`));
+            assert.doesNotMatch(error.message, /\(none\)/);
+            return true;
+        },
+    );
+});

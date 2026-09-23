@@ -1316,11 +1316,26 @@ export function createBoxSupervisor({
         return grant ? `${grant.vendor} for ${grant.agents.join(', ')}` : 'none';
     }
 
+    // What stays in force after a failed change: the saved grant, or, when no
+    // record exists, the GPU wiring the Box itself still carries.
+    function describePreviousGpu(saved, boxGpu) {
+        if (saved || !boxGpu) return `the previous GPU grant (${describeGpuGrant(saved)})`;
+        return `the Box GPU wiring ${boxGpu.fingerprint} (${boxGpu.state})`;
+    }
+
+    function observedBoxGpu(container, identity) {
+        try {
+            return container ? observeContainerGpuWiring(container, { identity }) : null;
+        } catch {
+            return null;
+        }
+    }
+
     // A failed change never reports success while the previous GPU access
     // remains; rollback failures, if any, are appended by the rollback.
-    function gpuChangeError(verb, saved, error) {
+    function gpuChangeError(verb, saved, error, boxGpu = null) {
         const wrapped = new PloinkyBoxError(
-            `ploinky gpu ${verb} did not complete; the previous GPU grant (${describeGpuGrant(saved)}) `
+            `ploinky gpu ${verb} did not complete; ${describePreviousGpu(saved, boxGpu)} `
             + `is still in force: ${error.message}`,
             { code: error?.code || 'PLOINKY_BOX_GPU_GRANT_FAILED', cause: error },
         );
@@ -1338,6 +1353,7 @@ export function createBoxSupervisor({
      */
     async function applyGpuGrantChange({ identity, lock, ownership, saved, next, gpu, verb }) {
         const container = ownership.handles?.container || null;
+        const previousBoxGpu = saved ? null : observedBoxGpu(container, identity);
         if (!container) {
             if (next) {
                 gpuGrantStore.write(identity, next, lock, { admitted: null });
@@ -1410,7 +1426,7 @@ export function createBoxSupervisor({
                 identity,
                 lock,
                 ownership,
-                error: gpuChangeError(verb, saved, error),
+                error: gpuChangeError(verb, saved, error, previousBoxGpu),
                 priorRunning,
                 priorGraphRunning,
                 priorCoreStartArgv,
@@ -1462,7 +1478,7 @@ export function createBoxSupervisor({
                 prepared,
                 ownership,
                 containerId,
-                error: gpuChangeError(verb, saved, error),
+                error: gpuChangeError(verb, saved, error, previousBoxGpu),
                 stopGraph: graphMutated,
                 restoreGraph: priorGraphRunning && (graphMutated || prepared.action === 'replaced'),
                 restoreCoreArgv: priorCoreStartArgv,
