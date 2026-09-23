@@ -13,7 +13,8 @@ import {
 } from '../utils/config.js';
 import { normalizeManifestHttpRouteAccess } from '../server/policy/HttpRouteProviders.js';
 import { normalizeRequiredCapability } from '../server/authHandlers/requiredCapability.js';
-import { normalizeAgentPortRelayPolicy } from '../server/agentPortConvention/relayPolicy.js';
+import { AGENT_PORT_ROUTE } from '../server/agentPortConvention/parseSelector.js';
+import { agentPortRelayDenial, normalizeAgentPortRelayPolicy } from '../server/agentPortConvention/relayPolicy.js';
 import { resolveAgentAuthPolicy } from '../utils/manifestAuth.js';
 import { compileHttpRoutePolicy } from '../server/policy/HttpRoutePolicyCompiler.js';
 import { resolveManifestRuntimeProfile } from '../utils/runtime/profileService.js';
@@ -785,16 +786,39 @@ function validateRoutingShape(routing, manifests) {
             if (Object.prototype.hasOwnProperty.call(manifest.routerAccess || {}, 'localAuthRoles')) {
                 throw edgeError(`manifest(${routeKey}).routerAccess.localAuthRoles is unsupported; authenticated identities must supply the required capability`);
             }
+            let relayPolicy;
             try {
-                normalizeAgentPortRelayPolicy(
+                relayPolicy = normalizeAgentPortRelayPolicy(
                     manifest?.routerAccess?.agentPorts,
                     `manifest(${routeKey}).routerAccess.agentPorts`,
                 );
             } catch (error) {
                 throw edgeError(error.message);
             }
+            // A route the manifest declares on one of its own agent ports would
+            // compile and then always answer 403 if the opt-out closes that port.
+            for (const spec of asManifestHttpRouteSpecs(manifest, routeKey)) {
+                if (!isPlainObject(spec) || spec.enabled === false) continue;
+                const port = closedAgentPortRoute(spec.path, routeKey, relayPolicy);
+                if (port !== null) {
+                    throw edgeError(
+                        `manifest(${routeKey}).routerAccess.httpRoutes declares ${spec.path} on agent port ${port}, `
+                        + 'which routerAccess.agentPorts closes; open that port in agentPorts or remove the route',
+                    );
+                }
+            }
         }
     }
+}
+
+/** The port of `/base-agent-additional-server/<routeKey>/<port>/...` when the relay policy closes it. */
+function closedAgentPortRoute(pathValue, routeKey, relayPolicy) {
+    const segments = String(pathValue || '').split('/');
+    if (segments[1] !== AGENT_PORT_ROUTE || segments[2] !== routeKey || !/^[1-9][0-9]{0,4}$/.test(segments[3] || '')) {
+        return null;
+    }
+    const port = Number(segments[3]);
+    return agentPortRelayDenial(relayPolicy, port) ? port : null;
 }
 
 function routeMatchesAgent(route, agentRef) {

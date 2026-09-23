@@ -104,3 +104,18 @@ test('a declared port list relays only those ports', (t) => {
 test('a malformed opt-out is rejected when the edge generation is compiled', (t) => {
     assert.throws(fixture(t, { agentPorts: [0] }).activate, /routerAccess\.agentPorts entries must be integer TCP ports/);
 });
+
+test('a declared agent-port route on a port the opt-out closes is rejected when compiled', (t) => {
+    const route = { '/base-agent-additional-server/alpha/9000/*': 'public' };
+    assert.throws(
+        () => fixture(t, { agentPorts: false, httpRoutes: route }).activate(),
+        /routerAccess\.httpRoutes declares \/base-agent-additional-server\/alpha\/9000\/\* on agent port 9000, which routerAccess\.agentPorts closes/,
+    );
+    assert.throws(() => fixture(t, { agentPorts: [7000], httpRoutes: route }).activate(), /agent port 9000, which routerAccess\.agentPorts closes/);
+    assert.doesNotThrow(() => fixture(t, { agentPorts: [9000], httpRoutes: route }).activate());
+    assert.doesNotThrow(() => fixture(t, { httpRoutes: route }).activate());
+    assert.doesNotThrow(() => fixture(t, {
+        agentPorts: false,
+        httpRoutes: [{ path: '/base-agent-additional-server/alpha/9000/*', access: 'public', enabled: false }],
+    }).activate());
+});
