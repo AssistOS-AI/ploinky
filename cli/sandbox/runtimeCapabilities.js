@@ -23,7 +23,15 @@ import {
 export const RUNTIME_CAPABILITY_POLICY_VERSION = 'ploinky-runtime-capabilities-v1';
 const ADMITTED_DESCRIPTORS = new WeakSet();
 
-const CONTAINER_SECURITY_KEYS = new Set(['gpu', 'nestedPodman', 'privileged']);
+const CONTAINER_SECURITY_KEYS = new Set(['gpu', 'nestedPodman', 'privileged', 'shmSize']);
+// An agent's own /dev/shm size (every agent has its own IPC namespace): whole
+// MiB or GiB, from 1m to 16g.
+const SHM_SIZE_RE = /^[1-9][0-9]{0,5}[mg]$/;
+const MAX_SHM_MIB = 16 * 1024;
+
+function shmSizeMiB(value) {
+    return Number(value.slice(0, -1)) * (value.endsWith('g') ? 1024 : 1);
+}
 const DIRECT_CAPABILITY_FIELDS = new Set([
     'nestedPodman',
     'privileged',
@@ -231,6 +239,10 @@ function validateContainerSecurityBlock(value, context) {
     if (value.gpu !== undefined && typeof value.gpu !== 'boolean') {
         throw securityError('manifest.containerSecurity.gpu must be boolean', context);
     }
+    if (value.shmSize !== undefined && (typeof value.shmSize !== 'string' || !SHM_SIZE_RE.test(value.shmSize)
+        || shmSizeMiB(value.shmSize) > MAX_SHM_MIB)) {
+        throw securityError('manifest.containerSecurity.shmSize must be a size such as 512m or 2g, from 1m to 16g', context);
+    }
     if (value.privileged === true && value.nestedPodman === true) {
         throw securityError(
             'manifest.containerSecurity.privileged and nestedPodman are mutually exclusive',
@@ -242,6 +254,7 @@ function validateContainerSecurityBlock(value, context) {
         nestedPodman: value.nestedPodman === true,
         // Only when declared, so every other agent's descriptor is unchanged.
         ...(value.gpu === true ? { gpu: true } : {}),
+        ...(value.shmSize !== undefined ? { shmSize: value.shmSize } : {}),
     });
 }
 
@@ -404,6 +417,16 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
         profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
         overridePolicy,
     }, { runtime });
+    // `containerSecurity.shmSize` sizes the agent's own /dev/shm. The
+    // operator's runtime policy wins: a size it sets, and host IPC, where a
+    // size cannot apply (outside a Box; a Box refuses host IPC).
+    if (validated.containerSecurity.shmSize && runtimePolicy.resources?.shmSize === undefined
+        && runtimePolicy.ipc !== 'host') {
+        runtimePolicy = validatePolicyShape({
+            ...runtimePolicy,
+            resources: { ...(runtimePolicy.resources || {}), shmSize: validated.containerSecurity.shmSize },
+        }, 'effective.runtimePolicy', { runtime }) || {};
+    }
     // `containerSecurity.gpu` (D14, amended) attaches the one GPU device when
     // this Box's wiring names the agent; otherwise the agent starts without
     // it and is told why. An explicit CDI request in the runtime policy stays

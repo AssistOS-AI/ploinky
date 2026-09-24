@@ -4,12 +4,22 @@ const ALLOWED_PLATFORMS = new Set(['linux/amd64', 'linux/arm64']);
 const ALLOWED_DEVICE_TYPES = new Set(['cdi', 'hostDevice']);
 const ALLOWED_HOST_DEVICE_PREFIXES = ['/dev/kfd', '/dev/dri', '/dev/accel'];
 const ALLOWED_SECURITY_OPT = new Set(['label=disable']);
-const ALLOWED_IPC = new Set(['default', 'host']);
+// 'default' and 'private' both give the container its own IPC namespace and
+// /dev/shm; only an explicit 'host' shares the Box's (and is refused in a Box).
+const ALLOWED_IPC = new Set(['default', 'private', 'host']);
 const ALLOWED_GPUS_RE = /^all$|^device=[A-Za-z0-9._,-]+$/;
 const ALLOWED_CDI_RE = /^[A-Za-z0-9._/-]+=([A-Za-z0-9._,-]+|all)$/;
 const SIZE_RE = /^[0-9]+[bkmgtBKMGT]?$/;
 const CPU_RE = /^[0-9]+(\.[0-9]+)?$/;
 const MAX_PIDS_LIMIT = 1048576;
+const SIZE_UNIT_BYTES = { '': 1, b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 };
+const MIN_SHM_BYTES = 1024 ** 2;
+const MAX_SHM_BYTES = 16 * 1024 ** 3;
+
+function sizeBytes(value) {
+    const match = /^([0-9]+)([bkmgt]?)$/i.exec(String(value));
+    return match ? Number(match[1]) * SIZE_UNIT_BYTES[match[2].toLowerCase()] : NaN;
+}
 
 class RuntimePolicyError extends Error {
     constructor(message, details = {}) {
@@ -66,8 +76,11 @@ function validateResources(resources, label) {
     if (resources.cpus !== undefined && !CPU_RE.test(String(resources.cpus))) {
         throw new RuntimePolicyError(`${label}.cpus: invalid CPU value`);
     }
-    if (resources.shmSize !== undefined && !SIZE_RE.test(String(resources.shmSize))) {
-        throw new RuntimePolicyError(`${label}.shmSize: invalid size value`);
+    if (resources.shmSize !== undefined) {
+        const bytes = sizeBytes(resources.shmSize);
+        if (!SIZE_RE.test(String(resources.shmSize)) || !(bytes >= MIN_SHM_BYTES && bytes <= MAX_SHM_BYTES)) {
+            throw new RuntimePolicyError(`${label}.shmSize: must be a size from 1m to 16g`);
+        }
     }
     if (resources.pidsLimit !== undefined) {
         if (!Number.isInteger(resources.pidsLimit) || resources.pidsLimit < 1 || resources.pidsLimit > MAX_PIDS_LIMIT) {
@@ -180,6 +193,11 @@ function validatePolicyShape(policy, label, options = {}) {
         }
         normalized.ipc = policy.ipc;
     }
+    // A /dev/shm size applies to the container's own IPC namespace; podman
+    // refuses it together with host IPC.
+    if (normalized.ipc === 'host' && normalized.resources?.shmSize !== undefined) {
+        throw new RuntimePolicyError(`${label}.resources.shmSize: not allowed with host IPC`);
+    }
     const gpus = validateGpus(policy.gpus, `${label}.gpus`, options);
     if (gpus) normalized.gpus = gpus;
     return normalized;
@@ -274,9 +292,11 @@ function emitRunArgs(policy, options = {}) {
             args.push('--security-opt', opt);
         }
     }
-    if (policy.ipc && policy.ipc !== 'default') {
-        args.push('--ipc', policy.ipc);
-    }
+    // Every container gets its own IPC namespace and /dev/shm unless the
+    // policy explicitly asks for host IPC: a Box's containers.conf sets
+    // ipcns="host", which would otherwise share the Box's /dev/shm and SysV
+    // IPC with every agent.
+    args.push('--ipc', policy.ipc === 'host' ? 'host' : 'private');
     if (policy.gpus) {
         if (runtime === 'docker') {
             args.push('--gpus', policy.gpus);

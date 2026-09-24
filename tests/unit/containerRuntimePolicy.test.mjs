@@ -64,7 +64,7 @@ test('emitRunArgs emits CDI device entries for podman NVIDIA policies', () => {
         devices: [{ type: 'cdi', value: 'nvidia.com/gpu=all' }],
     }, 'policy', { runtime: 'podman' });
     const args = emitRunArgs(normalized, { runtime: 'podman' });
-    assert.deepEqual(args, ['--device', 'nvidia.com/gpu=all']);
+    assert.deepEqual(args, ['--device', 'nvidia.com/gpu=all', '--ipc', 'private']);
 });
 
 test('validatePolicyShape rejects CDI on docker by default', () => {
@@ -139,4 +139,39 @@ test('computeRuntimePolicyHash is stable for equal canonical policies and change
     assert.equal(a, b);
     const c = computeRuntimePolicyHash({ platform: 'linux/amd64', resources: { memory: '8g', cpus: '2' } });
     assert.notEqual(a, c);
+});
+
+test('every container gets its own IPC namespace unless its policy asks for host IPC', () => {
+    // A Box's containers.conf sets ipcns="host", so leaving --ipc out would
+    // share the Box's /dev/shm and SysV IPC with every other agent.
+    for (const runtime of ['podman', 'docker']) {
+        assert.deepEqual(emitRunArgs(buildEffectivePolicy({}, { runtime }), { runtime }), ['--ipc', 'private']);
+        for (const ipc of ['default', 'private']) {
+            assert.deepEqual(emitRunArgs(validatePolicyShape({ ipc }, 'policy', { runtime }), { runtime }), ['--ipc', 'private'], ipc);
+        }
+        assert.deepEqual(emitRunArgs(validatePolicyShape({ ipc: 'host' }, 'policy', { runtime }), { runtime }), ['--ipc', 'host']);
+    }
+    assert.throws(() => validatePolicyShape({ ipc: 'none' }, 'policy', { runtime: 'podman' }), /ipc/);
+    // podman refuses --shm-size with host IPC, and so does the policy.
+    assert.throws(
+        () => validatePolicyShape({ ipc: 'host', resources: { shmSize: '1g' } }, 'policy', { runtime: 'podman' }),
+        (err) => err instanceof RuntimePolicyError && /shmSize/.test(err.message),
+    );
+    const sized = validatePolicyShape({ resources: { shmSize: '2g' } }, 'policy', { runtime: 'podman' });
+    const args = emitRunArgs(sized, { runtime: 'podman' });
+    assert.deepEqual(args.slice(args.indexOf('--shm-size'), args.indexOf('--shm-size') + 2), ['--shm-size', '2g']);
+    assert.deepEqual(args.slice(-2), ['--ipc', 'private']);
+});
+
+test('a shared memory size is bounded from 1 MiB to 16 GiB', () => {
+    for (const shmSize of ['1m', '64m', '1024k', '2g', '16g', '1048576']) {
+        assert.equal(validatePolicyShape({ resources: { shmSize } }, 'policy', { runtime: 'podman' }).resources.shmSize, shmSize);
+    }
+    for (const shmSize of ['0', '0m', '1023k', '17g', '16385m', '1t', '99999999999']) {
+        assert.throws(
+            () => validatePolicyShape({ resources: { shmSize } }, 'policy', { runtime: 'podman' }),
+            (err) => err instanceof RuntimePolicyError && /shmSize/.test(err.message),
+            shmSize,
+        );
+    }
 });
