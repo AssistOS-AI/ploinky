@@ -107,17 +107,17 @@ An older basename-only Box is outside current discovery. Identify its exact owni
 
 ## Commands
 
-The command surface is split between the registry in `cli/services/commandRegistry.js` and explicit switch cases in `cli/commands/cli.js`. The registry is used for known-command checks; dispatcher-only cases such as `webchat`, `sso`, and `deps` still run because `handleCommand()` has direct cases for them.
+The command surface is split between the registry in `cli/services/commandRegistry.js` and explicit switch cases in `cli/commands/cli.js`. The registry is used for known-command checks; dispatcher-only cases such as `webchat` and `sso` still run because `handleCommand()` has direct cases for them. The retired `deps` case only prints a migration hint and fails.
 
 | Command | Main behavior |
 | --- | --- |
 | `help` | Prints generated help from `cli/services/help.js`. |
 | `install [repo] <url> [name] [branch]` / `add [repo] <url> [name] [branch]` | Clones a repo under `.ploinky/repos/<name>`, deriving the name from the URL when omitted, and stores source metadata. |
 | `uninstall [repo] <name-or-url>` / `remove [repo] <name-or-url>` | Disables enabled agents from that repo by container key, removes their runtime containers, removes `.ploinky/repos/<name>`, and preserves source metadata for reinstall. |
-| `update repo <name>` | Updates one installed repo with `git pull --rebase --autostash` or reclones a non-git repo when source metadata exists, then refreshes `AchillesCopilotBasicSkills` there when eligible. |
-| `update repos` | Updates installed Ploinky repos, refreshes runtime Achilles dependencies, and refreshes `AchillesCopilotBasicSkills` in eligible managed repos. |
-| `update all [folder]` | Updates Ploinky only when its checkout is in the selected folder (or contains the launch folder), then updates AgentLib, installed repos, managed-repo default skills, discovered workspace git repos, and default skills for discovered repos. |
-| `reinstall [agent]` / `reinstall agent <agent>` | Removes the running service for an enabled agent, recreates it with `ensureAgentService`, updates routing, and starts the router if needed. |
+| `update repo <name>` | Fast-forwards one installed repo through the verified Git update (clean, on its configured upstream, not diverged; otherwise preserved with a named skip), clones only into an absent or empty directory when source metadata exists, refreshes default skills there when eligible, and refreshes the manifest consumers of that source. Activation is recorded as pending. |
+| `update repos` | Fast-forwards installed Ploinky repos, advances the AgentLib source outside the Box, and refreshes default skills in eligible managed repos without pulling again. Activation is recorded as pending. No dependency caches are prepared. |
+| `update all [folder]` | Builds one operation set (registered repos, discovered workspace repos and declared skills sources, deduplicated by physical checkout) and fetches each checkout once; updates Ploinky only when its checkout is in the selected folder (or contains the launch folder), AgentLib, then default skills and skills manifests from the verified sources. Produces per-phase records; exits nonzero on failures or unverified required inputs and activates only when every required input verified. |
+| `reinstall [agent]` / `reinstall agent <agent>` | Resolves one exact enabled registration, issues a new rebuild token so its dependency tree is rebuilt from empty npm state, recreates the service with `ensureAgentService`, updates routing, and starts the router if needed. |
 | `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record, creates work dirs/symlinks, starts the selected runtime, verifies backend-specific liveness and readiness, and publishes its route through coordinated apply. |
 | `enable sandbox` | Outside a Ploinky box, allows host sandbox runtimes for manifests with `lite-sandbox: true`; inside a box, fails because nested Podman is forced. |
 | `disable agent <agent>` | Removes the enabled-agent record and route in an inactive generation, stops/removes the selected container or sandbox process from a captured record snapshot, commits route removal, removes symlinks, and preserves the work dir. |
@@ -152,7 +152,7 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `profile [name|list|show|validate]` | Reads or changes `.ploinky/profile` and validates profile definitions. |
 | `default-skills <repo>` | Copies repo skills into workspace `.agents/skills` and manages `.claude` alias symlinks. |
 | `sso enable|disable|status` | Binds/unbinds an SSO provider and reports SSO state. |
-| `deps prepare|status|clean` | Prepares, reports, or removes dependency caches. |
+| `deps` | Retired: prints "Dependency caches are managed automatically. Use `ploinky reinstall <agent>` to rebuild the selected agent." and exits nonzero without cache or engine work. |
 | `delete` | Legacy path that shows help. |
 | `cloud` | Dispatcher path that prints that cloud commands are unavailable in this build. |
 
@@ -444,16 +444,7 @@ Agent cache behavior:
 | Manifest has only `start` and no agent package | Container startup may skip core dependency preparation. |
 | LLM runtime manifest | Forces dependency preparation. |
 
-The `deps` command exposes this machinery:
-
-| Command | Behavior |
-| --- | --- |
-| `deps prepare` | Prepares caches for enabled agents. |
-| `deps prepare <repo>/<agent>` | Prepares caches for one agent, skipping start-only/no-package agents. |
-| `deps status` | Prints cache stamp/validity information. |
-| `deps clean <repo>/<agent>` | Removes one agent's dependency cache. |
-| `deps clean --global` | Removes global caches. |
-| `deps clean --all` | Removes all dependency caches. |
+The retired `deps` command no longer exposes this machinery. Runtimes resolve an immutable tree from `.ploinky/deps/cache-v4/` keyed by every install input; `reinstall <agent>` is the explicit rebuild.
 
 There is also a legacy `dependencyInstaller.js` path used by lifecycle code only when profile lifecycle is run without `skipInstallHooks`; the main container creation path uses `dependencyCache.js`.
 

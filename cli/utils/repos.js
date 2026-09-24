@@ -8,6 +8,9 @@ import { listAgentRepositoryNames, resolveAgentRepositoryPath, workspaceAgentRep
 import { isAgentRepositoryUnregistered, setAgentRepositoryRegistered } from './agentRepositoryRegistration.mjs';
 import { parseBranchPolicy } from '../../agentlib/branchPolicy.mjs';
 import { runGitCommand, sanitizeGitDiagnostic } from './gitCommand.js';
+import { createOperationRecord } from '../commands/updateOutcome.js';
+import { throwUnlessVerified, updateCheckoutFastForward } from './git/verifiedUpdate.js';
+import { assessGeneratedCheckoutState } from './git/generatedState.js';
 
 export const REPO_SOURCES_FILE = path.join(PLOINKY_DIR, 'repo_sources.json');
 export const ENABLED_REPOS_FILE = path.join(PLOINKY_DIR, 'enabled_repos.json');
@@ -474,7 +477,11 @@ export function uninstallRepo(target, { stdio = 'inherit' } = {}) {
     return { status: 'removed', name: repoName, path: repoPath };
 }
 
-function recloneNonGitRepo(name, repoPath, url, { branch = null, stdio = 'inherit' } = {}) {
+// A managed non-Git directory is repaired only when it is provably empty and a
+// source is known. The empty directory is removed without recursion right
+// before the fresh clone is renamed into place, so a file that appears in the
+// meantime aborts the repair instead of being deleted.
+function recloneEmptyManagedRepo(name, repoPath, url, { branch = null, stdio = 'inherit' } = {}) {
     const reposRoot = path.dirname(repoPath);
     const safeName = String(name || 'repo').replace(/[^a-zA-Z0-9_.-]+/g, '-');
     const tempPath = path.join(reposRoot, `.${safeName}.clone-${process.pid}-${Date.now()}`);
@@ -484,27 +491,63 @@ function recloneNonGitRepo(name, repoPath, url, { branch = null, stdio = 'inheri
 
     runGitCommand(args, { stdio });
 
-    let installed = false;
     try {
-        fs.rmSync(repoPath, { recursive: true, force: true });
+        if (fs.existsSync(repoPath)) fs.rmdirSync(repoPath);
         fs.renameSync(tempPath, repoPath);
-        installed = true;
-    } catch (err) {
-        if (!fs.existsSync(repoPath) && fs.existsSync(tempPath)) {
-            try {
-                fs.renameSync(tempPath, repoPath);
-                installed = true;
-            } catch (_) {}
-        }
-        throw err;
     } finally {
-        if (installed || fs.existsSync(repoPath)) {
-            try { fs.rmSync(tempPath, { recursive: true, force: true }); } catch (_) {}
-        }
+        try { fs.rmSync(tempPath, { recursive: true, force: true }); } catch (_) {}
     }
 
     recordRepoSource(name, url);
     return { recloned: true, replaced: true };
+}
+
+function directoryIsEmpty(dirPath) {
+    try {
+        return fs.readdirSync(dirPath).length === 0;
+    } catch (_) {
+        return false;
+    }
+}
+
+function nonGitRecord(name, repoPath, outcome, code, reason, extra = {}) {
+    return createOperationRecord({
+        phase: 'registered-repository',
+        id: name,
+        outcome,
+        attempted: outcome !== 'skipped',
+        code,
+        reason,
+        details: { checkout: { path: repoPath }, ...extra },
+    });
+}
+
+/**
+ * Repair a managed registered-repository directory that has no `.git`.
+ * Never deletes content: a non-empty directory is preserved and reported.
+ */
+function repairNonGitManagedRepo(name, repoPath, { localPath, stdio }) {
+    if (localPath) {
+        return nonGitRecord(name, repoPath, 'skipped', 'non-git-directory-preserved',
+            `workspace repository '${name}' at ${repoPath} is not a Git checkout; it was preserved`);
+    }
+    if (!directoryIsEmpty(repoPath)) {
+        return nonGitRecord(name, repoPath, 'skipped', 'non-git-directory-preserved',
+            `repository '${name}' at ${repoPath} is not a Git checkout and is not empty; it was preserved. `
+            + 'Inspect it and move it aside to let Ploinky clone it again.');
+    }
+    const source = resolveRepoSource(name, null);
+    if (!source?.url) {
+        return nonGitRecord(name, repoPath, 'skipped', 'non-git-source-unknown',
+            `repository '${name}' at ${repoPath} is an empty non-Git directory and no source URL is known`);
+    }
+    try {
+        recloneEmptyManagedRepo(name, repoPath, source.url, { branch: source.branch, stdio });
+    } catch (error) {
+        return nonGitRecord(name, repoPath, 'failed', 'reclone-failed', gitCommandErrorMessage(error));
+    }
+    return nonGitRecord(name, repoPath, 'changed', 'recloned-empty-directory',
+        `repository '${name}' was cloned into its empty managed directory`, { recloned: true });
 }
 
 function gitCommandErrorMessage(err) {
@@ -513,7 +556,29 @@ function gitCommandErrorMessage(err) {
     return sanitizeGitDiagnostic(err?.message || String(err));
 }
 
-export function updateRepo(name, { rebase = true, autostash = true, stdio = 'inherit', branch = null } = {}) {
+function legacyRepoResult(record) {
+    return {
+        pulled: record.outcome === 'changed' || record.outcome === 'unchanged',
+        recloned: record.details?.recloned === true,
+        replaced: record.details?.recloned === true,
+        record,
+    };
+}
+
+/**
+ * Update one registered repository and return its operation record.
+ * Never throws for a Git outcome; see `updateRepo` for the throwing form.
+ *
+ * Policy: without an explicit branch, the checkout must track the same branch
+ * on origin. With an explicit branch, the checkout must already be on that
+ * branch and is advanced from origin/<branch>.
+ */
+export function updateRegisteredRepository(name, {
+    branch = null,
+    stdio = 'inherit',
+    assessGeneratedState = assessGeneratedCheckoutState,
+    checkoutOptions = {},
+} = {}) {
     if (!name) throw new Error('Missing repository name.');
     if (isAgentRepositoryUnregistered(name)) throw new Error(`Repository '${name}' is not installed.`);
     const localPath = workspaceAgentRepositoryPath(name);
@@ -522,38 +587,28 @@ export function updateRepo(name, { rebase = true, autostash = true, stdio = 'inh
         throw new Error(`Repository '${name}' is not installed.`);
     }
     if (!isGitRepository(repoPath)) {
-        if (localPath) throw new Error(`Workspace repository '${name}' is not a git repository; refusing to replace it.`);
-        const source = resolveRepoSource(name, null);
-        if (!source?.url) {
-            throw new Error(`Repository '${name}' is not a git repository and no source URL is known.`);
-        }
-        return recloneNonGitRepo(name, repoPath, source.url, { branch: source.branch, stdio });
+        return repairNonGitManagedRepo(name, repoPath, { localPath, stdio });
     }
-    const args = ['-C', repoPath, 'pull'];
-    if (!branch) {
-        const current = currentBranch(repoPath);
-        let upstreamRef = '';
-        let upstreamRemote = '';
-        try {
-            upstreamRef = execFileSync('git', ['-C', repoPath, 'config', '--get', `branch.${current}.merge`], {
-                stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8',
-            }).trim();
-            upstreamRemote = execFileSync('git', ['-C', repoPath, 'config', '--get', `branch.${current}.remote`], {
-                stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8',
-            }).trim();
-        } catch (_) {}
-        if (upstreamRef && (upstreamRef !== `refs/heads/${current}` || upstreamRemote !== 'origin')) {
-            throw new Error(
-                sanitizeGitDiagnostic(`Repository '${name}' at '${repoPath}' is on branch '${current}' but its upstream is '${upstreamRemote}:${upstreamRef}'. `) +
-                'Refusing to pull a different source or branch into this cache; correct the upstream to the same branch on origin or specify the intended branch in the skills manifest.'
-            );
-        }
-    }
-    if (rebase) args.push('--rebase');
-    if (autostash) args.push('--autostash');
-    if (branch) args.push('--', 'origin', branch);
-    runGitCommand(args, { stdio });
-    return { pulled: true };
+    return updateCheckoutFastForward({
+        ...checkoutOptions,
+        repoPath,
+        phase: 'registered-repository',
+        id: name,
+        policy: { kind: 'registered', branch: normalizeRepoBranch(branch) },
+        assessGeneratedState,
+    });
+}
+
+/**
+ * Throwing compatibility form used by `update repo` and skills manifests.
+ * Returns `{ pulled, recloned, replaced, record }` for a verified outcome and
+ * throws a GitUpdateError carrying `.record` for any skipped, failed or
+ * uncertain outcome.
+ */
+export function updateRepo(name, { stdio = 'inherit', branch = null, assessGeneratedState = assessGeneratedCheckoutState, checkoutOptions = {} } = {}) {
+    const record = updateRegisteredRepository(name, { branch, stdio, assessGeneratedState, checkoutOptions });
+    throwUnlessVerified(record);
+    return legacyRepoResult(record);
 }
 
 export function isGitRepository(repoPath) {
@@ -644,11 +699,31 @@ export function checkGitRemoteReachable(repoPath, { remote = 'origin' } = {}) {
     }
 }
 
-export function pullGitRepo(repoPath, { rebase = true, autostash = true, stdio = 'inherit' } = {}) {
-    const args = ['-C', repoPath, 'pull'];
-    if (rebase) args.push('--rebase');
-    if (autostash) args.push('--autostash');
-    runGitCommand(args, { stdio });
+/**
+ * Update a generic workspace checkout from its configured upstream and return
+ * its operation record. An unreachable remote is a named skip.
+ */
+export function updateWorkspaceRepository(repoPath, {
+    id = repoPath,
+    aliases = [],
+    assessGeneratedState = assessGeneratedCheckoutState,
+    checkoutOptions = {},
+} = {}) {
+    return updateCheckoutFastForward({
+        ...checkoutOptions,
+        repoPath,
+        phase: 'workspace-repository',
+        id,
+        aliases,
+        policy: { kind: 'generic' },
+        probeRemote: true,
+        assessGeneratedState,
+    });
+}
+
+// Throwing compatibility form of `updateWorkspaceRepository`.
+export function pullGitRepo(repoPath, options = {}) {
+    throwUnlessVerified(updateWorkspaceRepository(repoPath, options));
     return true;
 }
 

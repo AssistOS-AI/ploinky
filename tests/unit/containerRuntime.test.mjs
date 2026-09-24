@@ -13,6 +13,8 @@ import {
     resetPreinstallRunInProcess,
 } from '../../cli/utils/runtime/lifecycleHooks.js';
 import { buildExecArgs, resolveContainerWorkdir } from '../../cli/sandbox/docker/interactive.js';
+import { agentLibRuntimeEnv } from '../../agentlib/contract.mjs';
+import { fingerprintSource } from '../../agentlib/fingerprint.mjs';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const agentServiceManagerUrl = pathToFileURL(path.join(repoRoot, 'cli/sandbox/docker/agentServiceManager.js')).href;
@@ -685,6 +687,9 @@ esac
             ],
         }));
 
+        const sourceDir = fs.realpathSync(process.env.PLOINKY_AGENTLIB_DIR || path.join(repoRoot, 'node_modules', 'achillesAgentLib'));
+        const observedSource = fingerprintSource(sourceDir);
+        const runtimeContract = agentLibRuntimeEnv({ mode: 'local', contentFingerprint: observedSource.fingerprint, sourceId: observedSource.sourceId }, sourceDir);
         const result = runModuleSnippet(
             `const { enableAgent } = await import(${JSON.stringify(pathToFileURL(path.join(repoRoot, 'cli/utils/agents.js')).href)});
 await enableAgent('repo/demo', 'global');
@@ -694,7 +699,7 @@ const agents = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ploinky', '
 const record = Object.values(agents).find((entry) => entry && entry.agentName === 'demo');
 const policyState = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.ploinky', 'data', 'router-security', 'policy-state.json'), 'utf8'));
 console.log(JSON.stringify({ record, mcpTools: policyState.mcpTools }));`,
-            { PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
+            { ...runtimeContract, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
             { cwd: workspaceDir },
         );
 

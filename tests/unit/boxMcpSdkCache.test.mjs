@@ -108,7 +108,8 @@ function boxEnvironment(t, { globalPackage = null, insideBox = true, onInstall =
                     assert.equal(Object.hasOwn(pkg[field] || {}, 'mcp-sdk'), false, `npm input still contains SDK in ${field}`);
                 }
             }
-            installs.push({ installPath, pkg, operation: args.at(-1).includes("npm 'update'") ? 'update' : 'install' });
+            assert.doesNotMatch(args.at(-1), /npm 'update'/);
+            installs.push({ installPath, pkg, operation: 'install' });
             // npm prunes extraneous entries; the production finalizer must
             // restore the validated image bundle after this operation.
             fs.rmSync(path.join(installPath, 'node_modules', 'mcp-sdk'), { recursive: true, force: true });
@@ -148,7 +149,7 @@ test('lifecycle commands reuse unchanged manifests and install changed manifests
     const installed = cache.getAgentCachePath('refresh', 'agent', runtimeKey);
     const sentinel = path.join(installed, 'node_modules', 'retained.txt');
     fs.writeFileSync(sentinel, 'existing installed tree');
-    for (const command of ['enable', 'update', 'reinstall', 'start']) {
+    for (const command of ['enable', 'reinstall', 'start']) {
         withDependencyRefresh(command, () => {
             assert.equal(cache.prepareAgentCache(options).reused, true);
             assert.equal(fs.readFileSync(sentinel, 'utf8'), 'existing installed tree');
@@ -158,7 +159,7 @@ test('lifecycle commands reuse unchanged manifests and install changed manifests
     assert.equal(cache.inspectAgentCache(options).valid, true);
     fs.writeFileSync(options.agentPackagePath, JSON.stringify({ dependencies: { example: '^2.0.0' } }));
     fail = true;
-    withDependencyRefresh('update', () => {
+    withDependencyRefresh('start', () => {
         assert.throws(() => cache.prepareAgentCache(options), /fixture npm failed/);
         assert.equal(cache.readStamp(installed), null);
         fail = false;

@@ -23,6 +23,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { fakeUpdateCore } from '../helpers/fakeUpdateCore.mjs';
 
 function fixture(t) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-box-supervisor-'));
@@ -566,14 +567,21 @@ test('update pulls a workspace Ploinky checkout under the workspace lock before 
                 finalize() { events.push('finalize'); },
             };
         },
-        async runCoreCommand(engine, containerId, argv, _hostPort, _mediaHostPort, _runner, options) {
-            assert.equal(engine, ownership.engine);
-            assert.equal(containerId, ownership.handles.container.id);
-            assert.deepEqual(argv, ['update']);
-            assert.equal(options.workspaceRoot, identity.workspaceRoot);
-            assert.equal(options.updateExcludedRepoPath, path.join(identity.workspaceRoot, 'ploinky'));
-            events.push('core-update');
-        },
+        runUpdateCore: fakeUpdateCore({
+            onCall({ engine, containerId, argv, options }) {
+                assert.equal(engine, ownership.engine);
+                assert.equal(containerId, ownership.handles.container.id);
+                assert.deepEqual(argv, ['update']);
+                assert.equal(options.workspaceRoot, identity.workspaceRoot);
+                assert.equal(options.updateExcludedRepoPath, path.join(identity.workspaceRoot, 'ploinky'));
+                // The expected context carries the exact identity and source snapshot.
+                assert.deepEqual(options.reportContext.workspace, {
+                    instance: identity.instance, workspaceRoot: identity.workspaceRoot,
+                });
+                assert.equal(options.reportContext.source.workspacePloinky.updated, true);
+                events.push('core-update');
+            },
+        }),
         revalidateAgentLibSource() {
             events.push('revalidate-agentlib');
         },

@@ -21,7 +21,23 @@ import {
     sourceIdEquals,
     sourceIdHash,
 } from '../agentlib/fingerprint.mjs';
-import { canonicalWorkspaceRoot, localCandidateExists, localCandidatePath, managedRootPath, writeActiveDescriptor } from '../agentlib/source.mjs';
+import {
+    canonicalWorkspaceRoot,
+    localCandidateExists,
+    localCandidatePath,
+    managedRootPath,
+    readActiveDescriptorText,
+    restoreActiveDescriptorText,
+    writeActiveDescriptor,
+} from '../agentlib/source.mjs';
+import {
+    formatUpdateRequestArgs,
+    mapUpdateScope,
+    parseUpdateRequest,
+    resolveUpdateFolderScope,
+    withDefaultUpdateFolder,
+    UpdateRequestError,
+} from '../cli/commands/updateRequest.js';
 import fsPromisesFree from 'node:fs';
 import {
     agentLibBoxEnv,
@@ -34,7 +50,11 @@ import {
     validateContainerPublications,
 } from './contract/container.mjs';
 import { IMAGE_OBSERVATION_UNAVAILABLE, inspectAndValidateExistingImage } from './contract/image.mjs';
-import { assertBoxWorkspaceRoot, boxWorkspaceExecOptions } from './contract/workspace-root.mjs';
+import {
+    assertBoxWorkspaceRoot,
+    boxWorkspaceExecOptions,
+    relativeBoxWorkspacePath,
+} from './contract/workspace-root.mjs';
 import { discoverBoxOwnership } from './engine/discovery.mjs';
 import {
     readWorkspaceEdgeDesired,
@@ -52,6 +72,7 @@ import { resolveWorkspaceIdentity } from './identity.mjs';
 import { retireDestroyedBoxNoWaitMarkers } from './noWaitCleanup.mjs';
 import { createMutationLockManager, withWorkspaceMutationLock } from './locks.mjs';
 import { parseHostPort } from './ports.mjs';
+import { stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
 import { buildEngineProcessEnvironment, createProcessRunner } from './process.mjs';
 import { updateWorkspacePloinkySource } from './command/hostUpdate.mjs';
 import {
@@ -59,6 +80,19 @@ import {
     stopPloinkyLocalByContainerId,
 } from './lifecycle/container.mjs';
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
+import { listUnresolvedAdmissions, runJournaledAdmission } from './update/admission.mjs';
+import { updateHostStateForLockManager } from './update/hostState.mjs';
+import { IN_BOX_NONCE_PROBE_SCRIPT, runUpdateExec } from './update/coreRunner.mjs';
+import { refreshDeferredHostExclusions } from './update/hostExclusions.mjs';
+import {
+    UPDATE_REPORT_CONTEXT_ENV,
+    UPDATE_REPORT_NONCE_ENV,
+    createOperationRecord,
+    createUpdateReportNonce,
+    decideUpdateStatus,
+    readUpdateReport,
+    removeUpdateReport,
+} from '../cli/commands/updateOutcome.js';
 import {
     ROUTER_BIND_WILDCARD,
     assertRouterBindingAssignable,
@@ -239,6 +273,15 @@ export function createBoxSupervisor({
     validateContainer = validateContainerConfiguration,
     startCore = runBoundedCoreStart,
     runCoreCommand = runBoundedCoreCommand,
+    runUpdateCore = runBoundedUpdateCommand,
+    runRestartCore = runBoundedRestartCommand,
+    refreshHostExclusions = refreshDeferredHostExclusions,
+    readReport = readUpdateReport,
+    removeReport = removeUpdateReport,
+    createReportNonce = createUpdateReportNonce,
+    probeUpdateQuiescence = ({ engine, containerId, nonce, marker, runner: selectedRunner }) => (
+        probeInBoxUpdateProcesses(engine, containerId, selectedRunner, nonce, { marker })
+    ),
     resolveHostReachableIpv4 = detectHostReachableIpv4,
     readEdgeDesired = readWorkspaceEdgeDesired,
     stageEdgeDesired = stageWorkspaceEdgeDesired,
@@ -248,6 +291,8 @@ export function createBoxSupervisor({
     updateAgentLib = updateWorkspaceAgentLibSource,
     updateWorkspacePloinky = updateWorkspacePloinkySource,
     commitAgentLibSelection = writeActiveDescriptor,
+    readAgentLibActive = readActiveDescriptorText,
+    restoreAgentLibActive = restoreActiveDescriptorText,
     revalidateAgentLibSource = defaultRevalidateAgentLibSource,
     retireDestroyedMarkers = retireDestroyedBoxNoWaitMarkers,
     destroyBoxCache = removeWorkspaceDataPaths,
@@ -255,6 +300,7 @@ export function createBoxSupervisor({
     inspectBoxData = inspectWorkspaceDataPaths,
     captureCoreStartArgv = captureConfiguredCoreStartArgv,
     routerBindingStore = createRouterBindingStore(),
+    updateHostState = updateHostStateForLockManager(lockManager),
     readNetworkInterfaces = () => os.networkInterfaces(),
     readHostname = () => os.hostname(),
     stdout = process.stdout,
@@ -483,6 +529,7 @@ export function createBoxSupervisor({
         restoreSkillScopeEnv = null,
         restoreStopped = false,
         afterRollback = null,
+        priorGraphActive = false,
     }) {
         const failures = [];
         let candidateStopError = null;
@@ -506,6 +553,8 @@ export function createBoxSupervisor({
         if (candidateStopError && !['restored', 'candidate-removed'].includes(outerRollback?.action)) {
             failures.push(`candidate graph stop: ${candidateStopError.message}`);
         }
+        let graphRestored = false;
+        let stoppedBoxRestored = false;
         if (restoreGraph && outerRollback?.agentLib && failures.length === 0) {
             try {
                 await restorePriorGraph({
@@ -519,12 +568,14 @@ export function createBoxSupervisor({
                     coreArgv: restoreCoreArgv,
                     skillScopeEnv: restoreSkillScopeEnv,
                 });
+                graphRestored = true;
             } catch (restoreError) {
                 failures.push(`prior graph restoration: ${restoreError.message}`);
             }
         } else if (restoreStopped && outerRollback?.containerId && failures.length === 0) {
             try {
                 stopRestoredBox(identity, ownership.engine, outerRollback.containerId);
+                stoppedBoxRestored = true;
             } catch (stopError) {
                 failures.push(`prior stopped Box restoration: ${stopError.message}`);
             }
@@ -536,15 +587,45 @@ export function createBoxSupervisor({
                 failures.push(stateError.message);
             }
         }
+        // Name what actually happened: a prior graph that was rebuilt and
+        // passed its checks, an untouched prior graph, or a disrupted graph
+        // that was not rebuilt and needs manual recovery.
+        const graphDisrupted = Boolean(stopGraph) || (priorGraphActive && prepared?.action === 'replaced');
+        let outcome = 'preserved';
+        if (failures.length || error?.admission?.outcome === 'recovery-required') {
+            outcome = 'recovery-required';
+        } else if (graphRestored) {
+            outcome = 'restored';
+        } else if (graphDisrupted) {
+            outcome = 'recovery-required';
+        } else if (stoppedBoxRestored || outerRollback?.action === 'restored') {
+            outcome = 'restored';
+        }
+        const activation = Object.freeze({
+            outcome,
+            graphMutated: Boolean(stopGraph),
+            boxRollback: outerRollback?.action || null,
+        });
         if (failures.length) {
-            throw supervisorError(
+            const failure = supervisorError(
                 `${error.message}; rollback failures: ${failures.join('; ')}`,
                 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED',
             );
+            failure.activation = activation;
+            if (error?.admission) failure.admission = error.admission;
+            throw failure;
         }
+        if (error && typeof error === 'object') error.activation = activation;
         throw error;
     }
 
+    /**
+     * Admit a ready candidate graph. Health and exact AgentLib identity are
+     * proven first; the metadata writes then happen inside the journaled error
+     * boundary, and `finalize` is the last step, so rollback authority lasts
+     * until settlement. Pending targeted activation is cleared only afterwards,
+     * and a failure to clear it is a warning, never a rollback.
+     */
     async function completeGraphAdmission({
         identity,
         lock,
@@ -552,8 +633,10 @@ export function createBoxSupervisor({
         selection,
         requireHealth = true,
         skillScopeEnv = null,
-        priorSkillScopeEnv = null,
         routerBindingUpdate = null,
+        operation = 'admission',
+        source = null,
+        activated = true,
     }) {
         if (requireHealth) await healthCheck(prepared.hostPort, { routerBinding: prepared.routerBinding });
         revalidateAgentLibSource(selection, {
@@ -561,25 +644,75 @@ export function createBoxSupervisor({
             containerId: prepared.ownership.handles.container.id,
             runner,
         });
-        commitAgentLibSelection(identity.workspaceRoot, selection);
-        if (skillScopeEnv) writeGraphSkillScope(identity, skillScopeEnv, lock);
-        try {
-            if (routerBindingUpdate) routerBindingStore.write(identity, routerBindingUpdate.next, lock);
-            prepared.finalize?.();
-        } catch (error) {
-            if (skillScopeEnv) writeGraphSkillScope(identity, priorSkillScopeEnv, lock);
-            if (routerBindingUpdate) {
-                try {
-                    routerBindingStore.restore(identity, routerBindingUpdate.previous, lock);
-                } catch (restoreError) {
-                    error.message = `${error.message}; saved Router binding restoration: ${restoreError.message}`;
-                }
+        const items = [{
+            name: 'agentlib-active',
+            read: () => readAgentLibActive(identity.workspaceRoot),
+            write: () => commitAgentLibSelection(identity.workspaceRoot, selection),
+            restore: prior => restoreAgentLibActive(identity.workspaceRoot, prior),
+        }];
+        if (skillScopeEnv) {
+            items.push({
+                name: 'graph-skill-scope',
+                read: () => readGraphSkillScope(identity),
+                write: () => writeGraphSkillScope(identity, skillScopeEnv, lock),
+                restore: prior => writeGraphSkillScope(identity, prior, lock),
+            });
+        }
+        if (routerBindingUpdate) {
+            items.push({
+                name: 'router-binding',
+                read: () => routerBindingStore.read(identity),
+                write: () => routerBindingStore.write(identity, routerBindingUpdate.next, lock),
+                restore: prior => routerBindingStore.restore(identity, prior, lock),
+            });
+        }
+        const admitted = await runJournaledAdmission({
+            identity,
+            store: updateHostState,
+            operation,
+            source: {
+                containerId: prepared.ownership.handles.container.id,
+                boxAction: prepared.action || null,
+                previousAgentLib: prepared.previousAgentLib?.sourceIdHash
+                    || prepared.previousAgentLib?.fingerprint || null,
+                candidateAgentLib: selection?.contentFingerprint || selection?.fingerprint || null,
+                ...(source || {}),
+            },
+            items,
+            validate: async () => {
+                lock.assertHeld(identity.instance);
+                prepared.validate?.();
+            },
+            settle: async () => {
+                lock.assertHeld(identity.instance);
+                prepared.finalize?.();
+            },
+        });
+        const warnings = [...admitted.warnings];
+        // Only an actual whole-graph activation satisfies a pending one.
+        if (activated) {
+            try {
+                updateHostState.remove('update-pending', identity.instance);
+            } catch (error) {
+                warnings.push(`the pending activation record could not be cleared: ${error.message}`);
             }
-            throw error;
+        }
+        return Object.freeze({ ...admitted, warnings: Object.freeze(warnings) });
+    }
+
+    // Reporting after settlement never reaches a rollback path.
+    function reportSettled(binding, warnings = []) {
+        try {
+            for (const warning of warnings) stderr?.write?.(`[ploinky] Warning: ${warning}\n`);
+            reportRouterBinding(binding);
+        } catch (error) {
+            try {
+                stderr?.write?.(`[ploinky] Warning: the settled result could not be reported: ${error.message}\n`);
+            } catch (_) {}
         }
     }
 
-    async function reconcileConfiguredGraph(options, { priorCoreStartArgv, priorSkillScopeEnv }) {
+    async function reconcileConfiguredGraph(options, { priorCoreStartArgv, priorSkillScopeEnv, priorGraphActive = false }) {
         const priorRunning = options.ownership.handles?.container?.runtime?.running === true;
         try {
             return await reconcile(options);
@@ -593,12 +726,14 @@ export function createBoxSupervisor({
                 priorGraphRunning: priorRunning && Boolean(priorCoreStartArgv),
                 priorCoreStartArgv,
                 priorSkillScopeEnv,
+                priorGraphActive: priorGraphActive || (priorRunning && Boolean(priorCoreStartArgv)),
             });
         }
     }
 
     async function runStartTransaction(coreArgs = [], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            await assertNoUpdateRecoveryBarrier(identity, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
@@ -630,6 +765,7 @@ export function createBoxSupervisor({
             }, { priorCoreStartArgv, priorSkillScopeEnv });
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
+            let admission = null;
             try {
                 await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 const edgeDesired = readEdgeDesired(identity);
@@ -661,13 +797,10 @@ export function createBoxSupervisor({
                         routerBinding: prepared.routerBinding,
                     },
                 );
-                await completeGraphAdmission({
-                    identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
+                admission = await completeGraphAdmission({
+                    identity, lock, prepared, selection, skillScopeEnv,
                     routerBindingUpdate: savedRouterBindingUpdate(savedBinding, prepared),
-                });
-                reportRouterBinding(prepared.routerBinding);
-                return Object.freeze({
-                    identity, ...prepared, containerId, agentLib: selection,
+                    operation: 'start',
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -684,11 +817,16 @@ export function createBoxSupervisor({
                     restoreSkillScopeEnv: priorSkillScopeEnv,
                 });
             }
+            reportSettled(prepared.routerBinding, admission?.warnings);
+            return Object.freeze({
+                identity, ...prepared, containerId, agentLib: selection,
+            });
         });
     }
 
     async function runRestartTransaction(coreArgs = ['restart'], options = {}) {
         return lockedMutation(async (identity, lock, ownership) => {
+            await assertNoUpdateRecoveryBarrier(identity, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             const priorSkillScopeEnv = readGraphSkillScope(identity);
@@ -715,6 +853,7 @@ export function createBoxSupervisor({
             }, { priorCoreStartArgv, priorSkillScopeEnv });
             const containerId = prepared.ownership.handles.container.id;
             let graphMutated = false;
+            let admission = null;
             try {
                 await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
                 const effectiveArgs = prepared.action === 'replaced' && coreArgs.length > 1
@@ -731,12 +870,8 @@ export function createBoxSupervisor({
                     runner,
                     { workspaceRoot: identity.workspaceRoot, stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
                 );
-                await completeGraphAdmission({
-                    identity, lock, ownership, prepared, selection, containerId, skillScopeEnv, priorSkillScopeEnv,
-                });
-                reportRouterBinding(prepared.routerBinding);
-                return Object.freeze({
-                    identity, ...prepared, containerId, agentLib: selection,
+                admission = await completeGraphAdmission({
+                    identity, lock, prepared, selection, skillScopeEnv, operation: 'restart',
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -753,6 +888,10 @@ export function createBoxSupervisor({
                     restoreSkillScopeEnv: priorSkillScopeEnv,
                 });
             }
+            reportSettled(prepared.routerBinding, admission?.warnings);
+            return Object.freeze({
+                identity, ...prepared, containerId, agentLib: selection,
+            });
         });
     }
 
@@ -765,6 +904,7 @@ export function createBoxSupervisor({
             );
         }
         return lockedMutation(async (identity, lock, ownership) => {
+            await assertNoUpdateRecoveryBarrier(identity, ownership);
             const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
             const status = inspectBoxStatus();
             const container = status.ownership?.handles?.container;
@@ -842,105 +982,848 @@ export function createBoxSupervisor({
         });
     }
 
-    async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
-        return lockedMutation(async (identity, lock, ownership) => {
-            const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
-            const priorCoreStartArgv = captureCoreStartArgv(identity);
-            const priorSkillScopeEnv = readGraphSkillScope(identity);
-            const { desired: routerBinding } = selectSavedRouterBinding(identity);
-            const workspacePloinky = await updateWorkspacePloinky({
-                identity,
-                lock,
-                repositoryRoot,
-                updateScopeRoot: options.updateScopeRoot || identity.workspaceRoot,
+    // Running/configured state is sampled from ownership observed under the
+    // exact workspace lock, never from a status read taken before it.
+    function sampleGraphActivity(identity, ownership) {
+        const container = ownership?.state === 'owned' ? ownership.handles?.container : null;
+        if (!container?.id || container.runtime?.running !== true) {
+            return Object.freeze({ running: false, initialized: false, routingConfigured: false, active: false });
+        }
+        const inbox = typeof runner.query === 'function'
+            ? readInboxStatus(ownership.engine, container.id, identity.workspaceRoot)
+            : null;
+        const initialized = inbox?.initialized === true;
+        const routingConfigured = inbox?.routingConfigured === true;
+        return Object.freeze({
+            running: true,
+            initialized,
+            routingConfigured,
+            active: initialized && routingConfigured,
+            // A running Box whose core state cannot be read may still serve a
+            // graph; its activation is deferred rather than declared unneeded.
+            undetermined: inbox === null,
+        });
+    }
+
+    function updatePlan(coreArgs, options) {
+        let request = options.request || null;
+        const argv = Array.isArray(coreArgs) ? coreArgs.map(String) : [];
+        const debug = options.debug === true || argv.some(argument => ['--debug', '-d'].includes(argument));
+        if (!request) {
+            const tail = stripBranchPolicyArgs(argv).filter(argument => !['--debug', '-d'].includes(argument));
+            if (tail[0] !== 'update') {
+                throw supervisorError('Update transactions require an update command', 'PLOINKY_BOX_ARGUMENT_INVALID');
+            }
+            try {
+                request = parseUpdateRequest(tail.slice(1), { cwd: launchCwd });
+            } catch (error) {
+                if (error instanceof UpdateRequestError) {
+                    throw new PloinkyBoxError(error.message, { code: 'PLOINKY_BOX_ARGUMENT_INVALID', cause: error });
+                }
+                throw error;
+            }
+        }
+        if (!['all', 'repos', 'repo'].includes(request?.kind)) {
+            throw supervisorError('Unsupported update request', 'PLOINKY_BOX_ARGUMENT_INVALID');
+        }
+        return Object.freeze({
+            request,
+            debug,
+            branchPolicy: options.branchPolicy || null,
+            branchPolicyArgs: Object.freeze([...(options.branchPolicyArgs || [])].map(String)),
+            scope: options.scope || null,
+            updateScopeRoot: options.updateScopeRoot || null,
+            hostRecords: Object.freeze([...(options.hostRecords || [])]),
+            imageRef: options.imageRef || resolveBoxImageReference(env),
+        });
+    }
+
+    // Re-resolve the folder against the exact locked workspace and map its
+    // canonical-relative path onto the Box workspace mount spelling.
+    function lockedUpdateScope(identity, plan) {
+        const request = withDefaultUpdateFolder(plan.request, launchCwd, identity.workspaceRoot);
+        if (!request.folderPath) return null;
+        let fresh;
+        try {
+            fresh = resolveUpdateFolderScope(request.folderPath, identity.workspaceRoot);
+        } catch (error) {
+            throw new PloinkyBoxError(error.message, {
+                code: error?.code === 'PLOINKY_UPDATE_SCOPE_OUTSIDE' || error?.code === 'PLOINKY_UPDATE_SCOPE_MISSING'
+                    || error?.code === 'PLOINKY_UPDATE_SCOPE_UNMAPPABLE'
+                    ? error.code
+                    : 'PLOINKY_UPDATE_SCOPE_UNMAPPABLE',
+                cause: error,
             });
-            const { selection, changed, previous } = await updateAgentLib({
+        }
+        if (plan.scope && (plan.scope.relative !== fresh.relative
+            || plan.scope.canonicalFolder !== fresh.canonicalFolder)) {
+            throw new PloinkyBoxError(
+                `update: folder '${plan.request.folder}' changed while waiting for the workspace lock; nothing was updated`,
+                { code: 'PLOINKY_UPDATE_SCOPE_CHANGED' },
+            );
+        }
+        const boxPath = mapUpdateScope(fresh.relative, identity.workspaceRoot);
+        // The mapped path must be a clean path inside the Box workspace mount.
+        relativeBoxWorkspacePath(identity.workspaceRoot, boxPath);
+        return Object.freeze({ ...fresh, boxPath });
+    }
+
+    function updateCoreArgv(plan, scope) {
+        return Object.freeze([
+            ...(plan.debug ? ['--debug'] : []),
+            ...formatUpdateRequestArgs(plan.request, { folderPath: scope?.boxPath || null }),
+            // Targeted forms keep forwarding branch policy to the in-Box core,
+            // as the generic route did; the full form consumes it here.
+            ...(plan.request.kind === 'all' ? [] : plan.branchPolicyArgs),
+        ]);
+    }
+
+    function recordPendingActivation(identity, { request, coreArgv, reason, blockedBy = [] }) {
+        const previous = updateHostState.read('update-pending', identity.instance);
+        const entries = Array.isArray(previous?.entries) ? previous.entries.slice(-19) : [];
+        entries.push({
+            request,
+            coreArgv: [...coreArgv],
+            reason,
+            blockedBy: JSON.parse(JSON.stringify(blockedBy)),
+            recordedAt: new Date().toISOString(),
+        });
+        const record = {
+            schema: 'ploinky-update-pending-activation',
+            version: 1,
+            instance: identity.instance,
+            workspaceRoot: identity.workspaceRoot,
+            reason,
+            entries,
+        };
+        updateHostState.write('update-pending', identity.instance, record);
+        return record;
+    }
+
+    function pendingActivation(identity, details, warnings) {
+        try {
+            recordPendingActivation(identity, details);
+        } catch (error) {
+            warnings.push(`the pending activation record could not be written: ${error.message}`);
+        }
+    }
+
+    // A previous update whose in-Box writer could not be proven stopped blocks
+    // every new graph mutation until the engine confirms it ended. A dead host
+    // process is never taken as that proof.
+    // Returns '' when the durable barrier was written, otherwise why not.
+    function recordRecoveryBarrier(identity, { operation, containerId, nonce, marker, cause, detail, reportPath = null }) {
+        try {
+            updateHostState.write('update-recovery', identity.instance, {
+                schema: 'ploinky-update-recovery',
+                version: 1,
+                operation,
+                instance: identity.instance,
                 workspaceRoot: identity.workspaceRoot,
-                branchPolicy: options.branchPolicy || null,
-                insideBox: false,
-                loadImageBundle: imageBundleLoader(ownership, options.imageRef || resolveBoxImageReference(env)),
+                containerId,
+                nonce,
+                marker,
+                cause,
+                detail,
+                reportPath,
+                createdAt: new Date().toISOString(),
             });
-            const prepared = await reconcileConfiguredGraph({
-                identity,
-                ownership,
-                engine: ownership.engine,
-                runner,
-                lock,
-                repositoryRoot,
-                agentLib: selection,
-                routerBinding,
-                imageRef: options.imageRef || resolveBoxImageReference(env),
-                platform,
-                env,
+            return '';
+        } catch (writeError) {
+            return writeError?.message || String(writeError);
+        }
+    }
+
+    /**
+     * Restart the graph inside the update transaction with the same bounded
+     * discipline as the in-Box update: finite TERM -> KILL escalation, an
+     * engine proof that the restart writer stopped, and a durable recovery
+     * barrier (with no rollback) when that proof is missing.
+     */
+    async function executeUpdateRestart({ identity, engine, containerId, prepared, selection, skillScopeEnv,
+        hostReachableIpv4 }) {
+        const operationId = createReportNonce();
+        const marker = `${UPDATE_OPERATION_ENV}=${operationId}`;
+        const run = await runRestartCore(
+            engine,
+            containerId,
+            ['restart'],
+            prepared.hostPort,
+            prepared.mediaHostPort,
+            runner,
+            {
+                workspaceRoot: identity.workspaceRoot,
                 stdout,
                 stderr,
-            }, { priorCoreStartArgv, priorSkillScopeEnv });
-            const containerId = prepared.ownership.handles.container.id;
-            let graphMutated = false;
+                hostReachableIpv4,
+                agentLib: selection,
+                skillScopeEnv,
+                operationId,
+            },
+        );
+        const cause = run?.cause || 'unknown';
+        if (run?.quiescence?.state !== 'confirmed') {
+            const detail = String(run?.quiescence?.detail || 'in-Box quiescence was not confirmed');
+            const barrierProblem = recordRecoveryBarrier(identity, {
+                operation: 'restart', containerId, nonce: operationId, marker, cause, detail,
+            });
+            const error = new PloinkyBoxError(
+                `The in-Box graph restart ended abnormally (${cause}) and the engine could not confirm that it `
+                + `stopped (${detail}). `
+                + (barrierProblem
+                    ? `No durable recovery record could be written (${barrierProblem}); run \`ploinky stop\` `
+                        + 'before any other mutation. '
+                    : 'A recovery record now blocks new mutations until it is confirmed stopped. ')
+                + 'The workspace graph state is unknown.',
+                { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' },
+            );
+            error.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: true, boxRollback: null });
+            error.skipRollback = true;
+            throw error;
+        }
+        if (cause !== 'exited' || run.signal || run.status !== 0) {
+            const tail = String(run?.tails?.stderr || run?.tails?.stdout || '').trim().split('\n').slice(-3).join(' | ');
+            throw supervisorError(
+                `In-box restart failed (${cause}${run?.signal ? `, ${run.signal}` : ''}`
+                + `${Number.isInteger(run?.status) ? `, status ${run.status}` : ''})${tail ? `: ${tail}` : ''}`,
+                'PLOINKY_BOX_UPDATE_RESTART_FAILED',
+            );
+        }
+        return run;
+    }
+
+    async function assertNoUpdateRecoveryBarrier(identity, ownership) {
+        const barrier = updateHostState.read('update-recovery', identity.instance);
+        if (!barrier) return [];
+        let observed;
+        try {
+            observed = await probeUpdateQuiescence({
+                engine: ownership.engine,
+                containerId: barrier.containerId,
+                nonce: barrier.nonce,
+                marker: barrier.marker || null,
+                runner,
+            });
+        } catch (error) {
+            observed = { ok: false, detail: error.message };
+        }
+        if (observed?.ok === true && !(observed.pids || []).length) {
+            updateHostState.remove('update-recovery', identity.instance);
+            return [`an earlier update (${String(barrier.nonce).slice(0, 8)}) that could not be proven stopped `
+                + 'is now confirmed stopped by the engine; its recovery record was cleared'];
+        }
+        const error = new PloinkyBoxError(
+            'An earlier update in this workspace may still be running inside the Box '
+            + `(${barrier.cause}${barrier.detail ? `: ${barrier.detail}` : ''}); no new mutation was started. `
+            + 'Wait for it to finish or run `ploinky stop`, then run the command again.',
+            { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' },
+        );
+        error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
+        throw error;
+    }
+
+    function uncertainCoreRecord(id, code, reason, details = null) {
+        return createOperationRecord({
+            phase: 'activation', id, outcome: 'uncertain', attempted: true, required: true, code, reason, details,
+        });
+    }
+
+    /**
+     * Run the in-Box update with a fresh nonce and expected context, then
+     * judge its one structured report. A nonzero exit keeps a complete
+     * report; a missing or invalid report, a signal, a timeout, an output
+     * limit or an exit status that disagrees with the report is uncertain.
+     * An in-Box writer that cannot be proven stopped leaves a durable
+     * recovery barrier and ends the transaction without further mutation.
+     */
+    async function executeCoreUpdate({ identity, prepared, engine, containerId, coreArgv, selection, skillScopeEnv,
+        updateExcludedRepoPath = '', context }) {
+        const nonce = createReportNonce();
+        const reportContext = JSON.parse(JSON.stringify(context));
+        const ploinkyDir = path.join(identity.workspaceRoot, '.ploinky');
+        const run = await runUpdateCore(
+            engine,
+            containerId,
+            coreArgv,
+            prepared.hostPort,
+            prepared.mediaHostPort,
+            runner,
+            {
+                workspaceRoot: identity.workspaceRoot,
+                stdout,
+                stderr,
+                agentLib: selection,
+                skillScopeEnv,
+                updateExcludedRepoPath,
+                reportNonce: nonce,
+                reportContext,
+            },
+        );
+        const diagnostics = {
+            cause: run?.cause || 'unknown',
+            status: Number.isInteger(run?.status) ? run.status : null,
+            signal: run?.signal || null,
+            escalation: run?.escalation || null,
+            tails: run?.tails || null,
+        };
+        const report = readReport(ploinkyDir, nonce, { expectedContext: reportContext });
+        let quiescence = run?.quiescence;
+        // An invalid completion report cannot use a client exit as evidence
+        // that its writers stopped, including with injected runner adapters.
+        if (!report.ok && quiescence?.state === 'confirmed') {
+            let observed;
             try {
-                await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
-                await runCoreCommand(
-                    ownership.engine,
-                    containerId,
-                    coreArgs,
-                    prepared.hostPort,
-                    prepared.mediaHostPort,
-                    runner,
-                    {
-                        workspaceRoot: identity.workspaceRoot,
-                        stdout,
-                        stderr,
-                        agentLib: selection,
-                        skillScopeEnv,
-                        updateExcludedRepoPath: workspacePloinky?.boxRepoPath || '',
-                    },
-                );
-                if (options.restartAfterUpdate === true) {
+                observed = await probeUpdateQuiescence({ engine, containerId, nonce,
+                    marker: `${UPDATE_REPORT_NONCE_ENV}=${nonce}`, runner });
+            } catch (error) { observed = { ok: false, detail: error.message }; }
+            quiescence = observed?.ok === true && Array.isArray(observed.pids) && !observed.pids.length
+                ? { state: 'confirmed', method: 'engine-probe' }
+                : { state: 'uncertain', detail: observed?.detail || 'the update report is invalid and writers may still run' };
+        }
+        if (quiescence?.state !== 'confirmed') {
+            const barrierProblem = recordRecoveryBarrier(identity, {
+                operation: 'update',
+                containerId,
+                nonce,
+                marker: `${UPDATE_REPORT_NONCE_ENV}=${nonce}`,
+                cause: diagnostics.cause,
+                detail: String(quiescence?.detail || 'in-Box quiescence was not confirmed'),
+                reportPath: path.join(ploinkyDir, 'running', 'update-reports', `${nonce}.json`),
+            });
+            const error = new PloinkyBoxError(
+                `The in-Box update ended abnormally (${diagnostics.cause}) and the engine could not confirm that it `
+                + `stopped (${quiescence?.detail || 'no proof'}). `
+                + (barrierProblem
+                    ? `No durable recovery record could be written (${barrierProblem}); do not start another update `
+                        + 'until the Box is stopped with `ploinky stop`. '
+                    : 'A recovery record now blocks new mutations. ')
+                + 'Its report and artifacts were retained.',
+                { code: 'PLOINKY_BOX_UPDATE_QUIESCENCE_UNCERTAIN' },
+            );
+            error.activation = Object.freeze({ outcome: 'recovery-required', graphMutated: false, boxRollback: null });
+            error.updateRecords = Object.freeze([
+                uncertainCoreRecord('in-box-update-runner', 'quiescence-unconfirmed', error.message, diagnostics),
+            ]);
+            // Nothing may touch a Box whose writer may still be running.
+            error.skipRollback = true;
+            throw error;
+        }
+        const records = [];
+        if (report.ok) {
+            records.push(...report.result.records);
+            // The in-Box core cannot see the host user's Git excludes view;
+            // refresh the exclusions it deferred here, still under the lock.
+            records.push(...refreshHostExclusions({
+                folders: report.result.deferredExclusionFolders,
+                identity,
+                env,
+            }));
+        } else {
+            records.push(uncertainCoreRecord('in-box-update-report', report.code, report.reason));
+        }
+        if (diagnostics.cause !== 'exited' || diagnostics.signal || diagnostics.status === null) {
+            records.push(uncertainCoreRecord(
+                'in-box-update-runner',
+                diagnostics.cause === 'exited' ? 'signal' : diagnostics.cause,
+                `the in-Box update did not exit normally (${diagnostics.cause}${diagnostics.signal ? `, ${diagnostics.signal}` : ''})`,
+                diagnostics,
+            ));
+        } else if (report.ok && diagnostics.status !== report.result.exitCode) {
+            records.push(uncertainCoreRecord(
+                'in-box-update-runner',
+                'exit-status-mismatch',
+                `the in-Box update exited ${diagnostics.status} but reported ${report.result.exitCode}`,
+                diagnostics,
+            ));
+        }
+        try {
+            removeReport(ploinkyDir, nonce);
+        } catch (_) {}
+        return { records, report: report.ok ? report.result : null, reportContext, run: diagnostics };
+    }
+
+    // Map a canonical host checkout path onto the Box spelling of the same
+    // workspace; a path outside the workspace has no Box spelling.
+    function boxPathForCheckout(identity, checkoutPath) {
+        if (!checkoutPath) return '';
+        try {
+            const scope = resolveUpdateFolderScope(checkoutPath, identity.workspaceRoot);
+            const boxPath = mapUpdateScope(scope.relative, identity.workspaceRoot);
+            relativeBoxWorkspacePath(identity.workspaceRoot, boxPath);
+            return boxPath;
+        } catch (_) {
+            return '';
+        }
+    }
+
+    // A verified Git writer reports a preserved or failed checkout as an
+    // operation record. Keep its evidence under this phase and requirement.
+    function gitWriterRecord(record, phase, required, fallbackId) {
+        return createOperationRecord({
+            phase,
+            id: String(record?.id || fallbackId),
+            outcome: record?.outcome || 'uncertain',
+            attempted: typeof record?.attempted === 'boolean' ? record.attempted : record?.outcome !== 'skipped',
+            required,
+            code: record?.code || '',
+            reason: record?.reason || '',
+            before: record?.before ?? null,
+            after: record?.after ?? null,
+            details: record?.details ?? null,
+        });
+    }
+
+    function workspacePloinkyRecord(result) {
+        if (!result) return null;
+        if (result.deferredToCore) return null;
+        // The workspace Ploinky checkout is a required graph input.
+        if (result.record && !['changed', 'unchanged'].includes(result.record.outcome)) {
+            return gitWriterRecord(result.record, 'workspace-ploinky', true, result.repoPath || 'workspace-ploinky');
+        }
+        const evidence = { repoPath: result.repoPath || null };
+        if (result.skipped) {
+            const code = result.duplicateOfHost ? 'duplicate-of-host'
+                : result.scopeExcluded ? 'scope-excluded' : 'not-applicable';
+            return createOperationRecord({
+                phase: 'workspace-ploinky', id: String(result.repoPath || 'workspace-ploinky'), outcome: 'skipped',
+                required: false, code, reason: result.reason || '', before: evidence,
+            });
+        }
+        return createOperationRecord({
+            phase: 'workspace-ploinky',
+            id: String(result.repoPath || 'workspace-ploinky'),
+            outcome: result.updated ? 'changed' : 'unchanged',
+            required: true,
+            before: { ...evidence, revision: result.before || null },
+            after: { ...evidence, revision: result.after || null },
+        });
+    }
+
+    function agentLibRecord({ selection, changed, previous }) {
+        const describe = value => (value
+            ? { mode: value.mode || null, fingerprint: value.contentFingerprint || value.fingerprint || null }
+            : null);
+        return createOperationRecord({
+            phase: 'agentlib',
+            id: 'achillesAgentLib',
+            outcome: changed ? 'changed' : 'unchanged',
+            required: true,
+            before: describe(previous),
+            after: describe(selection),
+        });
+    }
+
+    function activationRecord(outcome, reason = '') {
+        const mapped = {
+            restarted: 'changed',
+            'not-required': 'unchanged',
+            deferred: 'deferred',
+            restored: 'deferred',
+            'recovery-required': 'uncertain',
+        }[outcome] || 'uncertain';
+        return createOperationRecord({
+            phase: 'activation',
+            id: 'workspace-graph',
+            outcome: mapped,
+            attempted: outcome === 'restarted',
+            required: false,
+            code: outcome,
+            reason,
+        });
+    }
+
+    function updateContext({ identity, plan, scope, coreArgv, prepared, containerId, source }) {
+        return {
+            schema: 'ploinky-update-context',
+            version: 1,
+            workspace: { instance: identity.instance, workspaceRoot: identity.workspaceRoot },
+            request: plan.request,
+            coreArgv: [...coreArgv],
+            scope: scope ? { relative: scope.relative, boxPath: scope.boxPath } : null,
+            box: { containerId, action: prepared.action || null, imageId: prepared.imageId || null },
+            source,
+        };
+    }
+
+    /**
+     * Run every `ploinky update` form inside one workspace mutation
+     * transaction. The full form updates sources, reconciles the Box, runs the
+     * in-Box update and restarts and admits the graph only when the graph was
+     * active under the lock and every required input was verified. Repository
+     * forms run the in-Box command in the same transaction, never replace a
+     * Box, and defer activation instead of restarting the whole graph.
+     */
+    async function runUpdateTransaction(coreArgs = ['update'], options = {}) {
+        const plan = updatePlan(coreArgs, options);
+        return lockedMutation(async (identity, lock, ownership) => {
+            const barrierWarnings = await assertNoUpdateRecoveryBarrier(identity, ownership);
+            const scope = lockedUpdateScope(identity, plan);
+            const coreArgv = updateCoreArgv(plan, scope);
+            const priorCoreStartArgv = captureCoreStartArgv(identity);
+            const activity = sampleGraphActivity(identity, ownership);
+            const unresolvedAdmissions = listUnresolvedAdmissions(updateHostState, identity);
+            const context = { identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity };
+            const result = plan.request.kind === 'all'
+                ? await runFullUpdate(context)
+                : await runTargetedUpdate(context);
+            const records = Object.freeze([...result.records]);
+            return Object.freeze({
+                ...result,
+                records,
+                decision: decideUpdateStatus(records),
+                warnings: Object.freeze([...barrierWarnings, ...result.warnings]),
+                request: plan.request,
+                coreArgv,
+                unresolvedAdmissions,
+            });
+        });
+    }
+
+    async function runFullUpdate({ identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity }) {
+        const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
+        const priorSkillScopeEnv = readGraphSkillScope(identity);
+        const { desired: routerBinding } = selectSavedRouterBinding(identity);
+        let workspacePloinky;
+        try {
+            workspacePloinky = await updateWorkspacePloinky({
+                identity,
+                lock,
+                repositoryRoot,
+                updateScopeRoot: scope?.canonicalFolder || plan.updateScopeRoot || identity.workspaceRoot,
+            });
+        } catch (error) {
+            // A preserved (dirty, diverged, detached) or failed checkout is a
+            // named result, not an abort; any other failure still aborts.
+            if (!error?.record) throw error;
+            const repoPath = error.repoPath || error.record.details?.checkout?.path || error.record.id || null;
+            workspacePloinky = Object.freeze({
+                found: true,
+                updated: false,
+                skipped: error.record.outcome === 'skipped',
+                reason: error.record.reason || error.message,
+                repoPath,
+                // The in-Box update must not pull the same checkout again.
+                boxRepoPath: error.boxRepoPath || boxPathForCheckout(identity, repoPath),
+                record: error.record,
+            });
+        }
+        const { selection, changed, previous } = await updateAgentLib({
+            workspaceRoot: identity.workspaceRoot,
+            branchPolicy: plan.branchPolicy,
+            insideBox: false,
+            loadImageBundle: imageBundleLoader(ownership, plan.imageRef),
+        });
+        const prepared = await reconcileConfiguredGraph({
+            identity,
+            ownership,
+            engine: ownership.engine,
+            runner,
+            lock,
+            repositoryRoot,
+            agentLib: selection,
+            routerBinding,
+            imageRef: plan.imageRef,
+            platform,
+            env,
+            stdout,
+            stderr,
+        }, { priorCoreStartArgv, priorSkillScopeEnv, priorGraphActive: activity.active });
+        const containerId = prepared.ownership.handles.container.id;
+        const sourceSnapshot = {
+            skillScopes: {
+                prior: priorSkillScopeEnv?.PLOINKY_SKILL_SCOPE || null,
+                proposed: skillScopeEnv.PLOINKY_SKILL_SCOPE,
+                priorRequired: activity.active || activity.undetermined,
+            },
+            workspacePloinky: workspacePloinky
+                ? {
+                    repoPath: workspacePloinky.repoPath || null,
+                    before: workspacePloinky.before || null,
+                    after: workspacePloinky.after || null,
+                    updated: workspacePloinky.updated === true,
+                    skipped: workspacePloinky.skipped === true,
+                    delegatedBoxRepoPath: workspacePloinky.delegatedBoxRepoPath || null,
+                }
+                : null,
+            agentLib: {
+                changed: Boolean(changed),
+                mode: selection?.mode || null,
+                fingerprint: selection?.contentFingerprint || selection?.fingerprint || null,
+            },
+        };
+        const inputRecords = [
+            ...plan.hostRecords,
+            ...[workspacePloinkyRecord(workspacePloinky)].filter(Boolean),
+            agentLibRecord({ selection, changed, previous }),
+        ];
+        const warnings = [];
+        let graphMutated = false;
+        let restart = false;
+        let admission;
+        let core;
+        let decision;
+        let outcome;
+        try {
+            await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
+            core = await executeCoreUpdate({
+                identity,
+                prepared,
+                engine: ownership.engine,
+                containerId,
+                coreArgv,
+                selection,
+                skillScopeEnv,
+                updateExcludedRepoPath: workspacePloinky?.boxRepoPath || '',
+                context: updateContext({ identity, plan, scope, coreArgv, prepared, containerId, source: sourceSnapshot }),
+            });
+            if (workspacePloinky?.deferredToCore) {
+                const delegatedPath = path.resolve(workspacePloinky.delegatedBoxRepoPath);
+                const index = core.records.findIndex(record => (
+                    ['registered-repository', 'workspace-repository'].includes(record.phase)
+                    && path.resolve(record.details?.checkout?.path || record.id) === delegatedPath
+                ));
+                const record = index >= 0
+                    ? gitWriterRecord(core.records[index], 'workspace-ploinky', true, delegatedPath)
+                    : createOperationRecord({ phase: 'workspace-ploinky', id: delegatedPath,
+                        outcome: 'uncertain', required: true, code: 'workspace-ploinky-result-missing',
+                        reason: 'the in-Box update did not verify the selected workspace Ploinky checkout' });
+                if (index >= 0) core.records[index] = record;
+                else core.records.push(record);
+                workspacePloinky = { ...workspacePloinky, deferredToCore: false, record,
+                    updated: record.outcome === 'changed', skipped: record.outcome === 'skipped',
+                    before: record.before?.head || null, after: record.after?.head || null,
+                    reason: record.reason };
+                sourceSnapshot.workspacePloinky = { ...sourceSnapshot.workspacePloinky,
+                    before: workspacePloinky.before, after: workspacePloinky.after,
+                    updated: workspacePloinky.updated, outcome: record.outcome };
+            }
+            inputRecords.push(...core.records);
+            decision = decideUpdateStatus(inputRecords);
+            restart = activity.active && decision.activationAllowed;
+            // Unverified required inputs block both a graph restart and the
+            // admission of the candidate AgentLib selection and metadata, with
+            // or without an active graph; the prior selection stays in force.
+            const blocked = !decision.activationAllowed;
+            if (blocked && prepared.action === 'replaced') {
+                // The replacement already stopped the old Box (and any active
+                // graph); the candidate is not admitted. Try to reconstruct the
+                // previous Box and, if one was active, its graph instead.
+                try {
+                    await rollbackPreparedGraph({
+                        identity,
+                        prepared,
+                        ownership,
+                        containerId,
+                        error: supervisorError('Activation was blocked by unverified required update inputs',
+                            'PLOINKY_BOX_UPDATE_ACTIVATION_BLOCKED'),
+                        stopGraph: false,
+                        restoreGraph: activity.active && Boolean(prepared.previousAgentLib) && Boolean(priorCoreStartArgv),
+                        restoreCoreArgv: priorCoreStartArgv,
+                        restoreSkillScopeEnv: priorSkillScopeEnv,
+                        restoreStopped: ownership.handles?.container?.runtime?.running !== true,
+                        priorGraphActive: activity.active,
+                    });
+                } catch (rollbackError) {
+                    outcome = rollbackError?.activation?.outcome || 'recovery-required';
+                    if (rollbackError?.code === 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED') {
+                        warnings.push(rollbackError.message);
+                    }
+                }
+            } else if (blocked) {
+                lock.assertHeld(identity.instance);
+                prepared.finalize?.();
+                outcome = 'deferred';
+            } else {
+                if (restart) {
+                    // Revalidate the exact Box immediately before the graph mutation.
+                    lock.assertHeld(identity.instance);
+                    prepared.validate?.();
                     const hostReachableIpv4 = await resolveHostReachableIpv4({ platform });
                     graphMutated = true;
-                    await runCoreCommand(
-                        ownership.engine,
-                        containerId,
-                        ['restart'],
-                        prepared.hostPort,
-                        prepared.mediaHostPort,
-                        runner,
-                        { workspaceRoot: identity.workspaceRoot, stdout, stderr, hostReachableIpv4, agentLib: selection, skillScopeEnv },
-                    );
+                    await executeUpdateRestart({
+                        identity, engine: ownership.engine, containerId, prepared, selection, skillScopeEnv, hostReachableIpv4,
+                    });
                 }
-                await completeGraphAdmission({
+                admission = await completeGraphAdmission({
                     identity,
                     lock,
-                    ownership,
                     prepared,
                     selection,
-                    containerId,
-                    requireHealth: options.restartAfterUpdate === true,
-                    skillScopeEnv: options.restartAfterUpdate === true ? skillScopeEnv : null,
-                    priorSkillScopeEnv,
+                    requireHealth: restart,
+                    skillScopeEnv: restart ? skillScopeEnv : null,
+                    operation: 'update',
+                    activated: restart,
+                    source: { coreArgv: [...coreArgv], ...sourceSnapshot },
                 });
-                if (options.restartAfterUpdate === true) reportRouterBinding(prepared.routerBinding);
-                return Object.freeze({
-                    identity, ...prepared, containerId, agentLib: selection,
-                    changed, previous, workspacePloinky,
-                });
-            } catch (error) {
-                await rollbackPreparedGraph({
-                    identity,
-                    prepared,
-                    ownership,
-                    containerId,
-                    error,
-                    stopGraph: graphMutated,
-                    restoreGraph: options.restartAfterUpdate === true
-                        && Boolean(prepared.previousAgentLib)
-                        && Boolean(priorCoreStartArgv)
-                        && (graphMutated || prepared.action === 'replaced'),
-                    restoreCoreArgv: priorCoreStartArgv,
-                    restoreSkillScopeEnv: priorSkillScopeEnv,
-                });
+                outcome = restart ? 'restarted' : (activity.undetermined ? 'deferred' : 'not-required');
             }
+        } catch (error) {
+            if (error?.skipRollback) throw error;
+            // Keep the verified input outcomes in the final host result; the
+            // host prepends its own records itself.
+            if (error && typeof error === 'object' && !error.updateRecords) {
+                error.updateRecords = Object.freeze(inputRecords.slice(plan.hostRecords.length));
+            }
+            await rollbackPreparedGraph({
+                identity,
+                prepared,
+                ownership,
+                containerId,
+                error,
+                stopGraph: graphMutated,
+                restoreGraph: activity.active
+                    && Boolean(prepared.previousAgentLib)
+                    && Boolean(priorCoreStartArgv)
+                    && (graphMutated || prepared.action === 'replaced'),
+                restoreCoreArgv: priorCoreStartArgv,
+                restoreSkillScopeEnv: priorSkillScopeEnv,
+                priorGraphActive: activity.active,
+            });
+        }
+        if (restart) reportSettled(prepared.routerBinding);
+        warnings.push(...(admission?.warnings || []));
+        if (outcome === 'deferred' || !decision.activationAllowed) {
+            pendingActivation(identity, {
+                request: plan.request,
+                coreArgv,
+                blockedBy: decision.blockedBy,
+                reason: decision.activationAllowed
+                    ? 'The Box was running but its workspace graph state could not be read; '
+                        + 'updated sources may require activation.'
+                    : 'Activation was blocked because required update inputs were not verified.',
+            }, warnings);
+        }
+        const activationReason = decision.activationAllowed ? ''
+            : `blocked by ${decision.blockedBy.map(entry => `${entry.phase} ${entry.id}`).join(', ')}`;
+        return {
+            identity, ...prepared, containerId, agentLib: selection,
+            changed, previous, workspacePloinky,
+            report: core.report,
+            reportContext: core.reportContext,
+            run: core.run,
+            records: [...inputRecords, activationRecord(outcome, activationReason)],
+            activation: Object.freeze({
+                outcome,
+                sampled: activity,
+                activationAllowed: decision.activationAllowed,
+                blockedBy: decision.blockedBy,
+            }),
+            warnings: Object.freeze(warnings),
+        };
+    }
+
+    async function runTargetedUpdate({ identity, lock, ownership, plan, scope, coreArgv, priorCoreStartArgv, activity }) {
+        const skillScopeEnv = buildHostSkillScope(identity.workspaceRoot, launchCwd);
+        const priorSkillScopeEnv = readGraphSkillScope(identity);
+        // Only a Box created here needs the saved binding; an existing Box keeps
+        // its publication. Replacement is refused before any Box mutation.
+        const routerBinding = ownership.handles?.container
+            ? null
+            : selectSavedRouterBinding(identity).desired;
+        const { selection } = await selectAgentLib({
+            workspaceRoot: identity.workspaceRoot,
+            branchPolicy: null,
+            loadImageBundle: imageBundleLoader(ownership, plan.imageRef),
         });
+        // A failed reuse or start returns the Box to its prior running state
+        // through the same recovery as graph commands. The refusal to replace
+        // happens before any Box mutation.
+        const prepared = await reconcileConfiguredGraph({
+            identity,
+            ownership,
+            engine: ownership.engine,
+            runner,
+            lock,
+            repositoryRoot,
+            agentLib: selection,
+            routerBinding,
+            imageRef: plan.imageRef,
+            allowReplacement: false,
+            platform,
+            env,
+            stdout,
+            stderr,
+        }, { priorCoreStartArgv, priorSkillScopeEnv: null });
+        if (prepared.action === 'replaced') {
+            // Defense in depth for reconcilers that ignore the refusal option.
+            await rollbackPreparedGraph({
+                identity, prepared, ownership, containerId: prepared.ownership.handles.container.id,
+                error: supervisorError(
+                    'A targeted update must not replace the existing Box; run `ploinky update` or `ploinky restart`',
+                    'PLOINKY_BOX_REPLACEMENT_REFUSED',
+                ),
+                stopGraph: false,
+                restoreGraph: false,
+            });
+        }
+        const containerId = prepared.ownership.handles.container.id;
+        try {
+            await ensureBoxDependencies(ownership.engine, containerId, runner, { workspaceRoot: identity.workspaceRoot, stdout, stderr });
+            prepared.finalize?.();
+        } catch (error) {
+            await rollbackPreparedGraph({
+                identity, prepared, ownership, containerId, error,
+                stopGraph: false,
+                restoreGraph: false,
+            });
+        }
+        lock.assertHeld(identity.instance);
+        let core;
+        try {
+            core = await executeCoreUpdate({
+                identity,
+                prepared,
+                engine: ownership.engine,
+                containerId,
+                coreArgv,
+                selection,
+                skillScopeEnv,
+                context: updateContext({
+                    identity, plan, scope, coreArgv, prepared, containerId,
+                    source: { skillScopes: {
+                        prior: priorSkillScopeEnv?.PLOINKY_SKILL_SCOPE || null,
+                        proposed: skillScopeEnv.PLOINKY_SKILL_SCOPE,
+                        priorRequired: activity.active || activity.undetermined,
+                    }, agentLib: { changed: false, mode: selection?.mode || null,
+                        fingerprint: selection?.contentFingerprint || selection?.fingerprint || null } },
+                }),
+            });
+        } catch (error) {
+            if (error && typeof error === 'object' && !error.activation) {
+                error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
+            }
+            throw error;
+        }
+        const inputRecords = [...plan.hostRecords, ...core.records];
+        const decision = decideUpdateStatus(inputRecords);
+        const warnings = [];
+        let outcome = 'not-required';
+        if (activity.active || activity.undetermined) {
+            outcome = 'deferred';
+            pendingActivation(identity, {
+                request: plan.request,
+                coreArgv,
+                blockedBy: decision.blockedBy,
+                reason: activity.active
+                    ? 'A targeted update ran while the workspace graph was active; updated sources may require activation.'
+                    : 'A targeted update ran while the workspace graph state could not be read; '
+                        + 'updated sources may require activation.',
+            }, warnings);
+        }
+        return {
+            identity, ...prepared, containerId, agentLib: selection,
+            report: core.report,
+            reportContext: core.reportContext,
+            run: core.run,
+            records: [...inputRecords, activationRecord(outcome, 'targeted update forms never restart the whole graph')],
+            activation: Object.freeze({
+                outcome,
+                sampled: activity,
+                activationAllowed: decision.activationAllowed,
+                blockedBy: decision.blockedBy,
+            }),
+            warnings: Object.freeze(warnings),
+        };
     }
 
     // A failed reconcile has already restored or preserved the outer Box.
@@ -954,8 +1837,10 @@ export function createBoxSupervisor({
         priorGraphRunning,
         priorCoreStartArgv,
         priorSkillScopeEnv,
+        priorGraphActive = false,
     }) {
         const outcome = error?.boxRollback;
+        let graphRestored = false;
         const engine = ownership.engine;
         const failures = [];
         let recoveredContainerId = '';
@@ -1018,6 +1903,7 @@ export function createBoxSupervisor({
                     coreArgv: priorCoreStartArgv,
                     skillScopeEnv: priorSkillScopeEnv,
                 });
+                graphRestored = true;
             } catch (restoreError) {
                 failures.push(`prior graph restoration: ${restoreError.message}`);
             }
@@ -1028,12 +1914,28 @@ export function createBoxSupervisor({
                 failures.push(`prior stopped Box restoration: ${stopError.message}`);
             }
         }
+        // The old graph was disrupted when its Box was stopped or recreated.
+        const graphDisrupted = priorGraphActive
+            && (outcome?.action === 'restored' || outcome?.oldStopAttempted === true);
+        let activationOutcome = 'preserved';
+        if (failures.length || outcome?.action === 'failed') activationOutcome = 'recovery-required';
+        else if (graphRestored) activationOutcome = 'restored';
+        else if (graphDisrupted) activationOutcome = 'recovery-required';
+        else if (recoveredContainerId || outcome?.action === 'restored') activationOutcome = 'restored';
+        const activation = Object.freeze({
+            outcome: activationOutcome,
+            graphMutated: false,
+            boxRollback: outcome?.action || null,
+        });
         if (failures.length) {
-            throw supervisorError(
+            const failure = supervisorError(
                 `${error.message}; rollback failures: ${failures.join('; ')}`,
                 'PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED',
             );
+            failure.activation = activation;
+            throw failure;
         }
+        if (error && typeof error === 'object') error.activation = activation;
         throw error;
     }
 
@@ -1049,6 +1951,7 @@ export function createBoxSupervisor({
      */
     async function runBindTransaction(mapping = null) {
         return lockedMutation(async (identity, lock, ownership) => {
+            await assertNoUpdateRecoveryBarrier(identity, ownership);
             // Every rejection happens before the Box, graph, or preference changes.
             const priorCoreStartArgv = captureCoreStartArgv(identity);
             if (!priorCoreStartArgv) {
@@ -1477,7 +2380,30 @@ export function createBoxSupervisor({
         });
     }
 
+    /**
+     * Read-only view of host update state for this workspace: a pending
+     * activation and a recovery barrier. It never probes, locks, or clears.
+     */
+    function inspectUpdateState(identity = resolveIdentity()) {
+        const read = (kind) => {
+            try {
+                return { record: updateHostState.read(kind, identity.instance), error: null };
+            } catch (error) {
+                return { record: null, error: error.message };
+            }
+        };
+        const pending = read('update-pending');
+        const recovery = read('update-recovery');
+        return Object.freeze({
+            pendingActivation: pending.record,
+            recoveryBarrier: recovery.record,
+            errors: Object.freeze([pending.error, recovery.error].filter(Boolean)),
+        });
+    }
+
     return Object.freeze({
+        resolveWorkspaceIdentity: () => resolveIdentity(),
+        inspectUpdateState,
         prepareBoxForCommand,
         runStartTransaction,
         runRestartTransaction,
@@ -1558,6 +2484,29 @@ export function formatBindResult(result) {
         ? 'Router access is local-only (loopback).'
         : 'Router traffic is plain HTTP, and the bind address is not a client access rule.');
     return `${lines.join('\n')}\n`;
+}
+
+export function formatUpdateStateLines(state) {
+    const lines = [];
+    const pending = state?.pendingActivation;
+    if (pending) {
+        const entries = Array.isArray(pending.entries) ? pending.entries : [];
+        const blocked = entries.flatMap(entry => entry?.blockedBy || [])
+            .map(entry => `${entry.phase} ${entry.id} (${entry.code || entry.outcome})`);
+        lines.push(`Pending activation: ${pending.reason || 'updated sources may require activation'} `
+            + `(${entries.length} update${entries.length === 1 ? '' : 's'} recorded; last at `
+            + `${entries.at(-1)?.recordedAt || 'unknown time'}). Run \`ploinky restart\` to activate them.`);
+        if (blocked.length) lines.push(`Pending activation was blocked by: ${[...new Set(blocked)].join('; ')}.`);
+    }
+    const barrier = state?.recoveryBarrier;
+    if (barrier) {
+        lines.push(`Update recovery required: an earlier ${barrier.operation || 'update'} may still be running in the Box `
+            + `(${barrier.cause || 'unknown cause'}${barrier.detail ? `: ${barrier.detail}` : ''}). `
+            + 'New updates, starts, restarts and binds are blocked until the engine confirms it stopped; '
+            + 'after `ploinky stop` the next such command confirms and clears it.');
+    }
+    for (const error of state?.errors || []) lines.push(`Update state could not be read: ${error}`);
+    return lines;
 }
 
 export function formatBoxStatus(status) {
@@ -1654,6 +2603,157 @@ export async function runBoundedCoreCommand(
         throw supervisorError(`In-box ${coreArgv[0] || 'command'} failed with status ${result.status}`);
     }
     return result;
+}
+
+/**
+ * Ask the engine whether processes of one update operation still run in the
+ * Box. A stopped or removed Box cannot run them; anything the engine cannot
+ * answer is reported as not proven.
+ */
+export function probeInBoxUpdateProcesses(engine, containerId, runner, nonce, { marker = null } = {}) {
+    const inspected = runner.query(engine.name, ['container', 'inspect', '--format', '{{.State.Running}}', containerId]);
+    if (!inspected?.ok) {
+        return /no such (container|object)/i.test(String(inspected?.stderr || ''))
+            ? { ok: true, pids: [], detail: 'the Box container no longer exists' }
+            : { ok: false, detail: `Box inspection failed: ${String(inspected?.stderr || inspected?.status || '').trim()}` };
+    }
+    if (String(inspected.stdout || '').trim() === 'false') return { ok: true, pids: [], detail: 'the Box is stopped' };
+    const listed = runner.query(engine.name, [
+        'container', 'exec', '--user', 'podman', containerId,
+        '/usr/local/bin/node', '-e', IN_BOX_NONCE_PROBE_SCRIPT, marker || `${UPDATE_REPORT_NONCE_ENV}=${nonce}`,
+    ]);
+    if (!listed?.ok) return { ok: false, detail: `in-Box process listing failed: ${String(listed?.stderr || '').trim()}` };
+    try {
+        const pids = JSON.parse(String(listed.stdout || '').trim());
+        return Array.isArray(pids) ? { ok: true, pids } : { ok: false, detail: 'in-Box process listing was malformed' };
+    } catch {
+        return { ok: false, detail: 'in-Box process listing was malformed' };
+    }
+}
+
+/**
+ * Update-specific bounded core command. It carries the report nonce and the
+ * expected context, never throws on a nonzero exit (the report is judged
+ * separately), and proves in-Box quiescence after any abnormal end.
+ */
+export async function runBoundedUpdateCommand(
+    engine,
+    containerId,
+    coreArgv,
+    hostPort,
+    mediaHostPort,
+    runner,
+    {
+        workspaceRoot,
+        stdout = process.stdout,
+        stderr = process.stderr,
+        hostReachableIpv4 = '',
+        agentLib = null,
+        updateExcludedRepoPath = '',
+        skillScopeEnv = {},
+        reportNonce,
+        reportContext,
+        env = buildEngineProcessEnvironment(),
+        runnerOptions = {},
+    } = {},
+) {
+    if (!/^[0-9a-f]{32}$/.test(String(reportNonce || '')) || !reportContext) {
+        throw supervisorError('The update runner requires a report nonce and context', 'PLOINKY_BOX_UPDATE_REPORT_INVALID');
+    }
+    const args = [
+        ...boundedCoreEnvironment(
+            hostPort,
+            mediaHostPort,
+            agentLib,
+            String(hostReachableIpv4 || '').trim(),
+            updateExcludedRepoPath,
+            skillScopeEnv,
+        ),
+        '--env', `${UPDATE_REPORT_NONCE_ENV}=${reportNonce}`,
+        '--env', `${UPDATE_REPORT_CONTEXT_ENV}=${JSON.stringify(reportContext)}`,
+        '--user', 'podman',
+        ...boxWorkspaceExecOptions(workspaceRoot),
+        containerId,
+        '/opt/ploinky/bin/ploinky-local',
+        ...coreArgv,
+    ];
+    return runUpdateExec({
+        command: engine.name,
+        args,
+        env,
+        nonce: reportNonce,
+        probeOnSuccess: true,
+        stdout,
+        stderr,
+        probe: ({ nonce }) => probeInBoxUpdateProcesses(engine, containerId, runner, nonce),
+        killInBox: (pids, signal) => runner.query(engine.name, [
+            'container', 'exec', '--user', 'podman', containerId, 'kill', `-${signal}`, ...pids.map(String),
+        ]),
+        ...runnerOptions,
+    });
+}
+
+// Marks the in-Box graph restart run by an update so the engine can prove
+// whether any of its processes still run after the client ended abnormally.
+export const UPDATE_OPERATION_ENV = 'PLOINKY_UPDATE_OPERATION';
+
+/**
+ * The `restart` subprocess of an update, under the same bounded discipline as
+ * the in-Box update. Unlike the generic runner it returns every end, including
+ * a nonzero status, with its cause, bounded tails and quiescence proof.
+ */
+export async function runBoundedRestartCommand(
+    engine,
+    containerId,
+    coreArgv,
+    hostPort,
+    mediaHostPort,
+    runner,
+    {
+        workspaceRoot,
+        stdout = process.stdout,
+        stderr = process.stderr,
+        hostReachableIpv4 = '',
+        agentLib = null,
+        skillScopeEnv = {},
+        operationId,
+        env = buildEngineProcessEnvironment(),
+        runnerOptions = {},
+    } = {},
+) {
+    if (!/^[0-9a-f]{32}$/.test(String(operationId || ''))) {
+        throw supervisorError('The update restart runner requires an operation id', 'PLOINKY_BOX_UPDATE_REPORT_INVALID');
+    }
+    const normalizedHostReachableIpv4 = String(hostReachableIpv4 || '').trim();
+    if (normalizedHostReachableIpv4 && !isUsableHostIpv4(normalizedHostReachableIpv4)) {
+        throw supervisorError(
+            `${HOST_REACHABLE_IPV4_ENV} must be a usable canonical literal IPv4 address`,
+            'PLOINKY_BOX_HOST_REACHABLE_IPV4_INVALID',
+        );
+    }
+    const marker = `${UPDATE_OPERATION_ENV}=${operationId}`;
+    const args = [
+        ...boundedCoreEnvironment(hostPort, mediaHostPort, agentLib, normalizedHostReachableIpv4, '', skillScopeEnv),
+        '--env', marker,
+        '--user', 'podman',
+        ...boxWorkspaceExecOptions(workspaceRoot),
+        containerId,
+        '/opt/ploinky/bin/ploinky-local',
+        ...coreArgv,
+    ];
+    return runUpdateExec({
+        command: engine.name,
+        args,
+        env,
+        nonce: operationId,
+        stdout,
+        stderr,
+        probe: () => probeInBoxUpdateProcesses(engine, containerId, runner, operationId, { marker }),
+        killInBox: (pids, signal) => runner.query(engine.name, [
+            'container', 'exec', '--user', 'podman', containerId, 'kill', `-${signal}`, ...pids.map(String),
+        ]),
+        ...runnerOptions,
+    });
 }
 
 export async function runBoundedCoreStart(

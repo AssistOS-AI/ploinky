@@ -31,9 +31,11 @@ export function handleDefaultSkillsCommand(options = []) {
         throw new Error(USAGE);
     }
 
+    // An explicit request takes every default skill of the repository.
     const result = skillsSvc.installDefaultSkills(repoName, {
         only: flags.only,
         skip: flags.skip,
+        consumerSelection: 'all',
     });
 
     console.log(`✓ Installed ${result.skills.length} skill(s) from '${result.repoName}' into ${result.destRoot}:`);
@@ -43,9 +45,19 @@ export function handleDefaultSkillsCommand(options = []) {
     } else {
         console.log(`    - .claude → .agents (symlink)`);
     }
+    const exclusions = result.exclusions;
     if (result.gitignoreUpdated) {
-        console.log('✓ Updated .gitignore (marker block).');
-    } else {
-        console.log('  .gitignore already up to date.');
+        console.log('✓ Updated .gitignore (managed block; this folder is not in a Git worktree).');
+    } else if (exclusions?.mode === 'git' && exclusions.status === 'published') {
+        console.log('✓ Generated skill links are excluded through this worktree\'s private Git excludes file.');
+    } else if (exclusions && ['unchanged'].includes(exclusions.status)) {
+        console.log('  Local exclusions already up to date.');
+    } else if (exclusions) {
+        console.log(`  Local exclusions ${exclusions.status} (${exclusions.code}); see the warning above.`);
+    }
+    const retention = result.managedExport?.retention;
+    if (retention?.retainedBytes) {
+        const backups = Object.values(retention.backups).reduce((count, entry) => count + entry.count, 0);
+        console.log(`  Retained ${backups} prior skill output backup(s) and ${retention.staging.retained.length} staging folder(s) (${retention.retainedBytes} bytes) under .agents; they are kept for manual review.`);
     }
 }

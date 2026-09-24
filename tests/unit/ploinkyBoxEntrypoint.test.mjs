@@ -198,6 +198,55 @@ test('failure between final commits restores the complete prior transport pair',
     assert.equal(mode(paths.containersConf), 0o640);
 });
 
+test('transport rollback preserves prior inodes without requiring privilege to recreate their ownership', (t) => {
+    const { paths } = fixture(t);
+    const targets = [paths.transport, paths.containersConf];
+    for (const target of targets) {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, `prior ${path.basename(target)}\n`, { mode: 0o640 });
+    }
+    const before = targets.map(target => ({ stat: fs.statSync(target), bytes: fs.readFileSync(target, 'utf8') }));
+    let rollback = false;
+    assert.throws(() => writeTransportPair({
+        transport: { address: '10.88.0.17', interface: 'eth0' },
+        transportFile: paths.transport,
+        containersConf: paths.containersConf,
+        fsApi: { ...fs, fchownSync(...args) {
+            if (rollback) throw Object.assign(new Error('prior group cannot be assigned by this user'), { code: 'EPERM' });
+            return fs.fchownSync(...args);
+        } },
+        afterFirstCommit() { rollback = true; throw new Error('injected'); },
+    }), error => /Transport pair update failed/.test(error.message) && !/rollback failures/.test(error.message));
+    targets.forEach((target, index) => {
+        const after = fs.statSync(target);
+        assert.equal(fs.readFileSync(target, 'utf8'), before[index].bytes);
+        for (const field of ['ino', 'uid', 'gid', 'mode']) assert.equal(after[field], before[index].stat[field], field);
+        assert.equal(after.nlink, 1);
+    });
+});
+
+test('failure reserving the second prior transport file leaves both original files and no hardlink residue', (t) => {
+    const { paths } = fixture(t);
+    for (const target of [paths.transport, paths.containersConf]) {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, 'prior\n');
+    }
+    let links = 0;
+    assert.throws(() => writeTransportPair({
+        transport: { address: '10.88.0.17', interface: 'eth0' },
+        transportFile: paths.transport, containersConf: paths.containersConf,
+        fsApi: { ...fs, linkSync(...args) {
+            if (++links === 2) throw Object.assign(new Error('cannot reserve second backup'), { code: 'EIO' });
+            return fs.linkSync(...args);
+        } },
+    }), /Transport pair update failed/);
+    for (const target of [paths.transport, paths.containersConf]) {
+        assert.equal(fs.readFileSync(target, 'utf8'), 'prior\n');
+        assert.equal(fs.statSync(target).nlink, 1);
+        assert.deepEqual(fs.readdirSync(path.dirname(target)), [path.basename(target)]);
+    }
+});
+
 test('entrypoint validates its marker and mounts before its first persistent write', (t) => {
     const { paths, box } = fixture(t);
     fs.writeFileSync(paths.marker, 'wrong\n');

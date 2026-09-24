@@ -8,6 +8,16 @@ import { routeOuterCommand } from '../command/route.mjs';
 import { buildContainerExecArgs, executeProcess, executeProcessStreaming } from '../command/execute.mjs';
 import { updateHostPloinkySource } from '../command/hostUpdate.mjs';
 import { resolvePloinkyUpdateScope } from '../../cli/commands/ploinkyUpdateScope.js';
+import { resolveUpdateFolderScope, withDefaultUpdateFolder } from '../../cli/commands/updateRequest.js';
+import { buildUpdateResult, createOperationRecord } from '../../cli/commands/updateOutcome.js';
+import { PloinkyBoxError } from '../errors.mjs';
+import { createUpdateHostState } from '../update/hostState.mjs';
+import {
+    UPDATE_HANDOFF_ENV,
+    consumeRelaunchHandoff,
+    createRelaunchHandoff,
+    discardRelaunchHandoff,
+} from '../update/relaunchHandoff.mjs';
 import { BOX_IMAGE_OVERRIDE_ENV, BOX_IMAGE_REFERENCE, BOX_LABELS } from '../constants.mjs';
 import { buildEngineProcessEnvironment } from '../process.mjs';
 import { isLoopbackRouterBinding } from '../routerBinding.mjs';
@@ -16,6 +26,7 @@ import {
     formatBindResult,
     formatBoxStatus,
     formatRouterBindingLines,
+    formatUpdateStateLines,
 } from '../supervisor.mjs';
 import { isInsideBox } from '../lib/boxMarker.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
@@ -47,8 +58,9 @@ Commands:
                                   list remaining manual or administrator actions
   ploinky --dry-run repair        Show the repair plan without applying fixes
   ploinky stop                    Stop core services and the outer Box
-  ploinky update [PATH]           Update Ploinky only when its checkout is within
-  ploinky update all [PATH]       the selected folder; always refresh repos/deps/skills
+  ploinky update [PATH]           Verified fast-forward update of repos and skills
+  ploinky update all [PATH]       (Ploinky only when its checkout is within PATH)
+  ploinky update repos|repo NAME  Update registered repositories; activation is pending
   ploinky destroy                 Remove the outer Box without prompting; retain .ploinky/box
   ploinky destroy --delete-cache  Remove the outer Box and delete .ploinky/box/dependencies
                                   and .ploinky/box/images without prompting
@@ -127,7 +139,7 @@ const DEPLOYMENT_ROUTES = new Set(['start', 'restart', 'bind', 'update', 'generi
 
 export async function runOuterCli(argv, options = {}) {
     const {
-        env = process.env,
+        env: inheritedEnv = process.env,
         output = process.stdout,
         errorOutput = process.stderr,
         execute = executeProcess,
@@ -137,6 +149,12 @@ export async function runOuterCli(argv, options = {}) {
         diagnose,
         repair,
     } = options;
+    // A relaunch handoff value is consumed only by the update route and never
+    // travels further: no engine, Box, or core process receives it.
+    const updateHandoff = inheritedEnv[UPDATE_HANDOFF_ENV];
+    const env = { ...inheritedEnv };
+    delete env[UPDATE_HANDOFF_ENV];
+    if (inheritedEnv === process.env) delete process.env[UPDATE_HANDOFF_ENV];
     if (detectInsideBox()) {
         // Preserve unchanged core forwarding for other commands, including
         // core-only options that the outer argument parser does not accept.
@@ -149,8 +167,8 @@ export async function runOuterCli(argv, options = {}) {
         return execute('/opt/ploinky/bin/ploinky-local', [...argv], { env });
     }
     const parsed = parseOuterArguments(argv);
-    const route = routeOuterCommand(parsed);
     const launchDirectory = cwd();
+    const route = routeOuterCommand(parsed, { cwd: launchDirectory });
     if (route.kind === 'diagnose') {
         const runDiagnosis = diagnose || (await import('../diagnose.mjs')).diagnoseWorkspace;
         const report = await runDiagnosis({
@@ -188,10 +206,15 @@ export async function runOuterCli(argv, options = {}) {
         }
         return report.exitCode;
     }
-    const dispatch = { relaunched: false };
+    const dispatch = { relaunched: false, reported: false };
     try {
-        const exitCode = await runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch, options);
-        if (exitCode !== 0 && DEPLOYMENT_ROUTES.has(route.kind) && !dispatch.relaunched) {
+        const exitCode = await runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch, {
+            ...options,
+            env,
+            updateHandoff,
+        });
+        // A structured update result already names its failed phases.
+        if (exitCode !== 0 && DEPLOYMENT_ROUTES.has(route.kind) && !dispatch.relaunched && !dispatch.reported) {
             errorOutput.write(`${DEPLOYMENT_DIAGNOSTIC_HINT}\n`);
         }
         return exitCode;
@@ -215,7 +238,16 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     repositoryRoot = path.resolve(import.meta.dirname, '../..'),
     updateHostSource = updateHostPloinkySource,
     relaunch = executeProcess,
+    updateHostState,
+    updateHandoff,
+    handoffParentPid = process.ppid,
+    handoffNow,
+    onUpdateResult,
 } = {}) {
+    if (route.kind === 'retired') {
+        errorOutput.write(`${route.message}\n`);
+        return 1;
+    }
     const selectedSupervisor = supervisor || createBoxSupervisor({ env, launchCwd: launchDirectory });
     const engineEnv = buildEngineProcessEnvironment(env);
     outerDebug(parsed, route, output);
@@ -226,6 +258,16 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     }
     if (route.kind === 'status') {
         const status = selectedSupervisor.inspectBoxStatus();
+        // Host update state is read-only here: nothing is probed or cleared.
+        if (typeof selectedSupervisor.inspectUpdateState === 'function') {
+            let lines;
+            try {
+                lines = formatUpdateStateLines(selectedSupervisor.inspectUpdateState(status.identity));
+            } catch (error) {
+                lines = [`Update state could not be read: ${error.message}`];
+            }
+            if (lines.length) output.write(`${lines.join('\n')}\n`);
+        }
         const container = status.ownership?.handles?.container;
         if (status.state === 'running-initialized' && container) {
             // The in-Box renderer knows the canonical local authority only; a
@@ -349,56 +391,24 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
     }
 
     if (route.kind === 'update') {
-        const normalizedUpdateArgs = stripBranchPolicyArgs(parsed.commandArgs);
-        const updateScopeArg = String(normalizedUpdateArgs[0] || '');
-        const updateFolderPath = updateScopeArg.toLowerCase() === 'all'
-            ? normalizedUpdateArgs[1]
-            : updateScopeArg || undefined;
-        const updateScopeRoot = resolvePloinkyUpdateScope(updateFolderPath, { cwd });
-        output.write(`Using Ploinky update folder ${updateScopeRoot}.\n`);
-        const hostUpdate = await updateHostSource({ repositoryRoot, updateScopeRoot });
-        if (hostUpdate.updated) {
-            output.write('Host Ploinky checkout updated; continuing with the updated CLI.\n');
-            // The updated CLI owns diagnostics for its invocation; do not
-            // duplicate its hint when the child propagates a failure status.
-            dispatch.relaunched = true;
-            return relaunch(process.execPath, [fileURLToPath(import.meta.url), ...argv], { env });
-        }
-        if (hostUpdate.skipped) {
-            output.write(
-                `Host Ploinky checkout at ${hostUpdate.repoPath || repositoryRoot} was not updated: `
-                + `${hostUpdate.reason}.\n`,
-            );
-        } else {
-            output.write('Host Ploinky checkout is already up to date.\n');
-        }
-
-        const priorStatus = selectedSupervisor.inspectBoxStatus();
-        const restartAfterUpdate = priorStatus.state === 'running-initialized'
-            && priorStatus.inbox?.routingConfigured === true;
-        const updateResult = await selectedSupervisor.runUpdateTransaction(stripBranchPolicyArgs(route.coreArgv), {
-            branchPolicy: parseBranchPolicy(route.coreArgv),
-            restartAfterUpdate,
-            updateScopeRoot,
+        return runHostUpdate({
+            argv,
+            route,
+            dispatch,
+            supervisor: selectedSupervisor,
+            env,
+            output,
+            errorOutput,
+            cwd,
+            repositoryRoot,
+            updateHostSource,
+            relaunch,
+            updateHostState,
+            updateHandoff,
+            handoffParentPid,
+            handoffNow,
+            onUpdateResult,
         });
-        const workspacePloinky = updateResult?.workspacePloinky;
-        if (workspacePloinky?.found && !workspacePloinky.duplicateOfHost) {
-            if (workspacePloinky.skipped) {
-                output.write(`Workspace Ploinky checkout skipped: ${workspacePloinky.reason}.\n`);
-            } else {
-                const state = workspacePloinky.updated ? 'updated' : 'already up to date';
-                output.write(
-                    `Workspace Ploinky checkout at ${workspacePloinky.repoPath} is ${state} `
-                    + '(git pull --rebase --autostash).\n',
-                );
-            }
-        }
-        if (!restartAfterUpdate) {
-            output.write('Update complete; no configured running workspace required a restart.\n');
-            return 0;
-        }
-        output.write('Update complete; the Router and managed agents were restarted coherently.\n');
-        return 0;
     }
 
     const prepared = await selectedSupervisor.prepareBoxForCommand();
@@ -421,6 +431,313 @@ async function runRoutedOuterCli(argv, parsed, route, launchDirectory, dispatch,
         launchCwd: launchDirectory,
         engineEnv,
     });
+}
+
+const UPDATE_ACTIVATION_WORDING = Object.freeze({
+    restarted: 'Activation: the workspace graph was restarted and the Router health check passed.',
+    'not-required': 'Activation not required; no configured running workspace required a restart.',
+    deferred: 'Activation deferred; the running workspace graph was not restarted. Updated sources may require '
+        + 'activation: run `ploinky restart` to activate them.',
+    restored: 'Activation blocked; reconstruction of the previous Box and graph configuration was attempted and '
+        + 'passed its checks. It runs from the current checkouts: sources that were already pulled are not rolled back.',
+    'recovery-required': 'Activation blocked and the previous workspace graph could not be fully reconstructed; '
+        + 'manual recovery is required.',
+});
+
+const UPDATE_FAILURE_WORDING = Object.freeze({
+    preserved: 'Update failed before a new graph was activated; the previous workspace graph was left as it was. '
+        + 'Source checkouts that were already pulled are not rolled back.',
+    restored: 'Update failed; reconstruction of the previous Box and graph configuration was attempted and '
+        + 'passed its checks. It runs from the current checkouts: sources that were already pulled are not rolled back.',
+    'recovery-required': 'Update failed and the previous workspace state could not be fully reconstructed; '
+        + 'manual recovery is required.',
+});
+
+function describeRecord(record) {
+    return `${record.phase} ${record.id}: ${record.outcome}${record.code ? ` [${record.code}]` : ''}`;
+}
+
+// The final status line names every phase that was not verified.
+export function formatUpdateStatusLine(result) {
+    const unverified = result.records.filter(record => !['changed', 'unchanged'].includes(record.outcome)
+        && !(record.phase === 'activation' && record.id === 'workspace-graph'));
+    const errors = unverified.filter(record => ['failed', 'uncertain'].includes(record.outcome));
+    const skipped = unverified.filter(record => !['failed', 'uncertain'].includes(record.outcome));
+    const list = records => records.map(describeRecord).join('; ');
+    if (result.status === 'complete') return 'Update complete.';
+    if (result.status === 'complete-with-skips') return `Update complete with skips: ${list(skipped)}.`;
+    const parts = [];
+    if (errors.length) parts.push(`failed or uncertain: ${list(errors)}`);
+    if (skipped.length) parts.push(`not verified: ${list(skipped)}`);
+    const label = result.status === 'partial' ? 'Update partially failed' : 'Update failed';
+    return `${label} (exit status ${result.exitCode}): ${parts.join('; ') || 'no verified result'}.`;
+}
+
+function hostPloinkyRecord(host) {
+    if (!host) return null;
+    // The graph runs from the Box, not the host checkout: a preserved or failed
+    // host self-update never blocks activation, and only failed or uncertain
+    // outcomes make the final status nonzero.
+    if (host.record) {
+        return createOperationRecord({
+            phase: 'host-ploinky',
+            id: String(host.record.id || host.repoPath || 'host-ploinky'),
+            outcome: host.record.outcome,
+            attempted: typeof host.record.attempted === 'boolean' ? host.record.attempted : host.record.outcome !== 'skipped',
+            required: false,
+            code: host.record.code || '',
+            reason: host.record.reason || '',
+            before: host.record.before ?? null,
+            after: host.record.after ?? null,
+            details: host.record.details ?? null,
+        });
+    }
+    const evidence = value => ({ repoPath: host.repoPath || null, revision: value || null });
+    if (host.outcome === 'changed') {
+        return createOperationRecord({
+            phase: 'host-ploinky', id: String(host.repoPath || 'host-ploinky'), outcome: 'changed', required: true,
+            before: evidence(host.before), after: evidence(host.after),
+            details: { relaunched: host.relaunched === true },
+        });
+    }
+    if (host.outcome === 'skipped') {
+        return createOperationRecord({
+            phase: 'host-ploinky', id: String(host.repoPath || 'host-ploinky'), outcome: 'skipped', required: false,
+            code: 'scope-excluded', reason: host.reason || '',
+        });
+    }
+    return createOperationRecord({
+        phase: 'host-ploinky', id: String(host.repoPath || 'host-ploinky'), outcome: 'unchanged', required: true,
+    });
+}
+
+function shortRevision(value) {
+    return String(value || 'unknown').slice(0, 12);
+}
+
+function scopeError(error) {
+    return new PloinkyBoxError(error.message, {
+        code: error?.code || 'PLOINKY_UPDATE_SCOPE_UNMAPPABLE',
+        cause: error,
+    });
+}
+
+/**
+ * Host side of every `ploinky update` form. Scope is validated against the
+ * exact workspace before host self-update, Box creation or source mutation;
+ * the in-Box command runs inside the supervisor's mutation transaction, and
+ * the printed outcome comes from what that transaction actually did.
+ */
+async function runHostUpdate({
+    argv,
+    route,
+    dispatch,
+    supervisor,
+    env,
+    output,
+    cwd,
+    repositoryRoot,
+    updateHostSource,
+    relaunch,
+    updateHostState,
+    updateHandoff,
+    handoffParentPid,
+    handoffNow,
+    onUpdateResult,
+}) {
+    const identity = supervisor.resolveWorkspaceIdentity();
+    const request = withDefaultUpdateFolder(route.request, cwd(), identity.workspaceRoot);
+    let scope = null;
+    if (request.folderPath) {
+        try {
+            scope = resolveUpdateFolderScope(request.folderPath, identity.workspaceRoot);
+        } catch (error) {
+            throw scopeError(error);
+        }
+    }
+    const full = request.kind === 'all';
+    const updateScopeRoot = full
+        ? (scope ? scope.canonicalFolder : resolvePloinkyUpdateScope(undefined, { cwd }))
+        : null;
+    let store = updateHostState || null;
+    const hostState = () => {
+        store ||= createUpdateHostState();
+        return store;
+    };
+    const summary = {
+        request,
+        scope: scope ? { relative: scope.relative, canonicalFolder: scope.canonicalFolder } : null,
+        host: null,
+        workspacePloinky: null,
+        activation: null,
+    };
+
+    if (updateHandoff !== undefined) {
+        const accepted = consumeRelaunchHandoff({
+            store: hostState(),
+            value: updateHandoff,
+            argv,
+            request,
+            identity,
+            scopeRoot: updateScopeRoot,
+            parentPid: handoffParentPid,
+            ...(handoffNow ? { now: handoffNow } : {}),
+        });
+        summary.host = accepted.host;
+        output.write(
+            `Host Ploinky checkout at ${accepted.host.repoPath} was updated from `
+            + `${shortRevision(accepted.host.before)} to ${shortRevision(accepted.host.after)} before this relaunch.\n`,
+        );
+    } else if (full) {
+        output.write(`Using Ploinky update folder ${updateScopeRoot}.\n`);
+        let hostUpdate;
+        try {
+            hostUpdate = await updateHostSource({ repositoryRoot, updateScopeRoot });
+        } catch (error) {
+            // A preserved or failed host checkout is reported and the update
+            // continues: the in-Box graph does not run from the host checkout.
+            if (!error?.record) throw error;
+            hostUpdate = { updated: false, record: error.record, reason: error.message, repoPath: repositoryRoot };
+        }
+        if (hostUpdate.record && !['changed', 'unchanged'].includes(hostUpdate.record.outcome)) {
+            summary.host = {
+                outcome: hostUpdate.record.outcome,
+                record: hostUpdate.record,
+                repoPath: hostUpdate.repoPath || repositoryRoot,
+            };
+            output.write(
+                `Host Ploinky checkout at ${hostUpdate.repoPath || repositoryRoot} was not updated `
+                + `(${hostUpdate.record.outcome}${hostUpdate.record.code ? `: ${hostUpdate.record.code}` : ''}): `
+                + `${hostUpdate.record.reason || hostUpdate.reason || 'no reason recorded'}.\n`,
+            );
+        } else if (hostUpdate.updated) {
+            const handoff = createRelaunchHandoff({
+                store: hostState(),
+                argv,
+                request,
+                identity,
+                scopeRoot: updateScopeRoot,
+                host: hostUpdate,
+            });
+            output.write('Host Ploinky checkout updated; continuing with the updated CLI.\n');
+            // The updated CLI owns diagnostics for its invocation; do not
+            // duplicate its hint when the child propagates a failure status.
+            dispatch.relaunched = true;
+            let status;
+            try {
+                status = await relaunch(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
+                    env: { ...env, [UPDATE_HANDOFF_ENV]: handoff.envValue },
+                });
+            } finally {
+                let unconsumed = false;
+                try {
+                    unconsumed = discardRelaunchHandoff(hostState(), handoff.operationId);
+                } catch (_) {}
+                if (unconsumed) {
+                    output.write('The updated CLI did not accept the relaunch handoff; its result does not include '
+                        + 'the host self-update.\n');
+                }
+            }
+            if (status !== 0) {
+                output.write(
+                    `The updated CLI exited with status ${status}. The host Ploinky checkout at `
+                    + `${hostUpdate.repoPath || hostUpdate.canonicalRoot || repositoryRoot} remains updated `
+                    + `(${shortRevision(hostUpdate.before)} -> ${shortRevision(hostUpdate.after)}).\n`,
+                );
+            }
+            return status;
+        }
+        if (summary.host) {
+            // Already named from the writer's operation record.
+        } else if (hostUpdate.skipped) {
+            summary.host = { outcome: 'skipped', reason: hostUpdate.reason || '', repoPath: hostUpdate.repoPath || repositoryRoot };
+            output.write(
+                `Host Ploinky checkout at ${hostUpdate.repoPath || repositoryRoot} was not updated: `
+                + `${hostUpdate.reason}.\n`,
+            );
+        } else {
+            summary.host = { outcome: 'unchanged', repoPath: hostUpdate.repoPath || repositoryRoot };
+            output.write('Host Ploinky checkout is already up to date.\n');
+        }
+    }
+
+    const hostRecords = [hostPloinkyRecord(summary.host)].filter(Boolean);
+    let result;
+    try {
+        result = await supervisor.runUpdateTransaction(stripBranchPolicyArgs(route.coreArgv), {
+            request,
+            scope: summary.scope,
+            debug: route.debug,
+            branchPolicy: parseBranchPolicy(route.coreArgv),
+            branchPolicyArgs: route.branchPolicyArgs,
+            updateScopeRoot,
+            hostRecords,
+        });
+    } catch (error) {
+        const outcome = error?.activation?.outcome;
+        // A thrown transaction is never reported as complete, whatever
+        // verified records preceded it.
+        const failed = buildUpdateResult({
+            command: argv,
+            records: [...hostRecords, ...(error?.updateRecords || []), createOperationRecord({
+                phase: 'activation', id: 'update-transaction', outcome: 'failed', required: true,
+                code: String(error?.code || 'update-failed'), reason: String(error?.message || error),
+            })],
+        });
+        output.write(`${formatUpdateStatusLine(failed)}\n`);
+        output.write(`${UPDATE_FAILURE_WORDING[outcome]
+            || 'Update failed; the activation outcome could not be determined.'}\n`);
+        summary.activation = error?.activation || null;
+        onUpdateResult?.({ ...summary, failed: true, error, result: failed });
+        throw error;
+    }
+    const workspacePloinky = result?.workspacePloinky;
+    summary.workspacePloinky = workspacePloinky || null;
+    if (workspacePloinky?.found && !workspacePloinky.duplicateOfHost) {
+        if (workspacePloinky.skipped) {
+            output.write(`Workspace Ploinky checkout skipped: ${workspacePloinky.reason}.\n`);
+        } else {
+            const state = workspacePloinky.updated ? 'updated' : 'already up to date';
+            output.write(
+                `Workspace Ploinky checkout at ${workspacePloinky.repoPath} is ${state} `
+                + '(verified fast-forward only).\n',
+            );
+        }
+    }
+    for (const journal of result?.unresolvedAdmissions || []) {
+        output.write(
+            `Warning: an earlier ${journal.operation} admission (${journal.name}) did not settle `
+            + `(${journal.phase}); its journal was retained for recovery.\n`,
+        );
+    }
+    for (const warning of result?.warnings || []) output.write(`Warning: ${warning}.\n`);
+    // Transactions that predate structured records report only the host side.
+    const records = result?.records || hostRecords;
+    const final = buildUpdateResult({
+        command: argv,
+        records,
+        context: result?.reportContext || null,
+        agentLib: result?.agentLib
+            ? {
+                changed: Boolean(result.changed),
+                mode: result.agentLib.mode || null,
+                fingerprint: result.agentLib.contentFingerprint || result.agentLib.fingerprint || null,
+                previousFingerprint: result.previous?.contentFingerprint || result.previous?.fingerprint || null,
+            }
+            : null,
+        legacy: { activation: result?.activation ? { ...result.activation } : null },
+    });
+    const outcome = result?.activation?.outcome;
+    summary.activation = result?.activation || null;
+    output.write(`${formatUpdateStatusLine(final)}\n`);
+    output.write(`${UPDATE_ACTIVATION_WORDING[outcome] || 'The activation outcome was not reported.'}\n`);
+    if (outcome === 'deferred' && result?.activation?.blockedBy?.length) {
+        output.write(`Activation was blocked by: ${result.activation.blockedBy
+            .map(entry => `${entry.phase} ${entry.id} (${entry.code || entry.outcome})`).join('; ')}.\n`);
+    }
+    onUpdateResult?.({ ...summary, failed: final.exitCode !== 0, result: final });
+    dispatch.reported = true;
+    return final.exitCode;
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : '';

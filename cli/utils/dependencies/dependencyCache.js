@@ -41,7 +41,6 @@ export const STAMP_VERSION = 3;
 export const STAMP_FILENAME = 'stamp.json';
 export const LOCK_FILENAME = '.lock';
 export const CORE_MARKER_MODULE = 'mcp-sdk';
-export const GIT_DEPS_MARKER_FILENAME = 'git-deps.json';
 export const NPM_INSTALL_ARGS = ['install', '--no-package-lock', '--no-audit', '--no-fund'];
 const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 const LOCK_VERSION = 1;
@@ -156,120 +155,6 @@ export function writeStamp(cachePath, stamp) {
     };
     fs.writeFileSync(stampPath(cachePath), JSON.stringify(payload, null, 2));
     return payload;
-}
-
-export function gitDepsMarkerPath(depsDir = DEPS_DIR) {
-    return path.join(depsDir, GIT_DEPS_MARKER_FILENAME);
-}
-
-/**
- * Read the workspace-level moving-git-dependency marker. It records the commit
- * each moving git dependency (e.g. mcp-sdk `#main` or an explicit deploy-time override)
- * was last built against, so `ploinky update` can tell whether any of those
- * refs actually advanced even though their package.json spec strings did not.
- *
- * @param {string} [depsDir=DEPS_DIR]
- * @returns {{ commits: Record<string,string>, updatedAt?: string }|null}
- */
-export function readGitDepsMarker(depsDir = DEPS_DIR) {
-    const file = gitDepsMarkerPath(depsDir);
-    if (!fs.existsSync(file)) return null;
-    try {
-        return JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch (_) {
-        return null;
-    }
-}
-
-export function writeGitDepsMarker(depsDir = DEPS_DIR, commits = {}) {
-    fs.mkdirSync(depsDir, { recursive: true });
-    const payload = {
-        commits: { ...commits },
-        updatedAt: new Date().toISOString(),
-    };
-    fs.writeFileSync(gitDepsMarkerPath(depsDir), JSON.stringify(payload, null, 2));
-    return payload;
-}
-
-/**
- * Invalidate prepared dependency caches when any *moving* git dependency's
- * resolved commit has advanced.
- *
- * The cache validity hash is computed from the package.json dependency *spec*
- * strings, which are unchanged when a moving git ref (`#master`, `#main`)
- * advances upstream — so a stale copy would otherwise be reused. Every global
- * and agent cache embeds these dependencies, so when any resolved commit
- * changes they are all genuinely stale: removing `global/` + `agents/` forces
- * the next container start to rebuild (a fresh `npm install` re-fetches every
- * dependency, including non-tracked semver ranges). When nothing changed this
- * is a no-op, so `ploinky update` does not trigger an unnecessary reinstall.
- *
- * Commits are resolved by the caller during `ploinky update` (already online).
- * Deps that could not be resolved are simply absent from `commits` and are
- * ignored here (fail-open) — never treated as a change — and their prior marker
- * entry is preserved.
- *
- * @param {Record<string,string|null>} commits - dependency name -> resolved sha (falsy/absent = unresolved).
- * @param {object} [options]
- * @param {string} [options.depsDir=DEPS_DIR]
- * @param {Function} [options.log=debugLog]
- * @returns {{ invalidated: boolean, reason: string, changed: string[], previous: Record<string,string>|null, current?: Record<string,string>, removed?: string[] }}
- */
-export function invalidateDepsCacheForMovingGitDeps(commits, { depsDir = DEPS_DIR, log = debugLog } = {}) {
-    const resolved = {};
-    for (const [name, sha] of Object.entries(commits || {})) {
-        const value = String(sha || '').trim();
-        if (value) resolved[name] = value;
-    }
-    const names = Object.keys(resolved);
-    if (!names.length) {
-        return { invalidated: false, reason: 'no commits resolved', changed: [], previous: null };
-    }
-
-    const marker = readGitDepsMarker(depsDir);
-    // No marker yet — e.g. a fresh deploy that built caches (and created
-    // containers bind-mounting them) without ever recording commits. We have no
-    // evidence anything moved, so adopt the current commits as the baseline and
-    // do NOT wipe: deleting now would force an unnecessary rebuild and, worse,
-    // remove the node_modules dirs the existing containers bind-mount, breaking
-    // `podman start` on the next restart. Future real moves are caught once the
-    // baseline exists.
-    if (!marker) {
-        writeGitDepsMarker(depsDir, resolved);
-        return { invalidated: false, reason: 'baseline recorded', changed: [], previous: null, current: resolved };
-    }
-
-    const previous = marker.commits || {};
-    const changed = names.filter((name) => previous[name] !== resolved[name]);
-    if (changed.length === 0) {
-        return { invalidated: false, reason: 'unchanged', changed: [], previous };
-    }
-
-    // A tracked moving git dep actually advanced. Every cache embeds it, so all
-    // are stale: remove them so the next container (re)creation rebuilds from a
-    // clean `npm install` that fetches the new commit. (`ploinky update` is
-    // expected to be followed by `ploinky restart`, which recreates containers.)
-    const removed = [];
-    for (const sub of [path.join(depsDir, 'global'), path.join(depsDir, 'agents')]) {
-        if (fs.existsSync(sub)) {
-            fs.rmSync(sub, { recursive: true, force: true });
-            removed.push(sub);
-        }
-    }
-    const current = { ...previous, ...resolved };
-    writeGitDepsMarker(depsDir, current);
-    const description = changed
-        .map((name) => `${name} ${previous[name] || '(none)'} -> ${resolved[name]}`)
-        .join(', ');
-    log(`[deps-cache] invalidated dependency caches: ${description}`);
-    return {
-        invalidated: true,
-        reason: 'commits changed',
-        changed,
-        previous,
-        current,
-        removed,
-    };
 }
 
 function installerMismatchReason(stamp, expectedInstaller = null) {
@@ -589,25 +474,24 @@ function withGithubHttpsGitConfig(env = process.env, { cwd = '' } = {}) {
     };
 }
 
-function runNpmInstall(cwd, { log = debugLog, linkBoxMcpSdk = false, linkAgentLib = false, operation = 'install' } = {}) {
-    log(`[deps-cache] npm ${operation} in ${cwd}`);
-    const result = spawnSync('npm', npmInstallArgs({ linkBoxMcpSdk, linkAgentLib, operation }), {
+function runNpmInstall(cwd, { log = debugLog, linkBoxMcpSdk = false, linkAgentLib = false } = {}) {
+    log(`[deps-cache] npm install in ${cwd}`);
+    const result = spawnSync('npm', npmInstallArgs({ linkBoxMcpSdk, linkAgentLib }), {
         cwd,
         env: withGithubHttpsGitConfig(process.env, { cwd }),
         stdio: 'inherit',
         timeout: INSTALL_TIMEOUT_MS,
     });
     if (result.error) {
-        throw new Error(`npm ${operation} failed: ${result.error.message}`);
+        throw new Error(`npm install failed: ${result.error.message}`);
     }
     if (result.status !== 0) {
-        throw new Error(`npm ${operation} exited with code ${result.status}`);
+        throw new Error(`npm install exited with code ${result.status}`);
     }
 }
 
-function npmInstallArgs({ linkBoxMcpSdk = false, linkAgentLib = false, operation = 'install' } = {}) {
-    if (!['install', 'update'].includes(operation)) throw new Error(`Invalid npm operation: ${operation}`);
-    const args = [operation, ...NPM_INSTALL_ARGS.slice(1)];
+function npmInstallArgs({ linkBoxMcpSdk = false, linkAgentLib = false } = {}) {
+    const args = [...NPM_INSTALL_ARGS];
     return linkBoxMcpSdk || linkAgentLib ? [...args, '--install-links=false'] : args;
 }
 
@@ -615,9 +499,9 @@ function shellQuote(value) {
     return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-export function buildContainerInstallScript({ installDir = '/install', heartbeatSeconds = 30, linkBoxMcpSdk = false, linkAgentLib = false, operation = 'install' } = {}) {
+export function buildContainerInstallScript({ installDir = '/install', heartbeatSeconds = 30, linkBoxMcpSdk = false, linkAgentLib = false } = {}) {
     const installLabel = shellQuote(installDir);
-    const npmArgs = npmInstallArgs({ linkBoxMcpSdk, linkAgentLib, operation }).map(shellQuote).join(' ');
+    const npmArgs = npmInstallArgs({ linkBoxMcpSdk, linkAgentLib }).map(shellQuote).join(' ');
     const interval = Number.isFinite(Number(heartbeatSeconds)) && Number(heartbeatSeconds) > 0
         ? String(Number(heartbeatSeconds))
         : '30';
@@ -631,8 +515,8 @@ export function buildContainerInstallScript({ installDir = '/install', heartbeat
         '&& git config --global url.https://github.com/.insteadOf ssh://git@github.com/',
         '&& git config --global --add url.https://github.com/.insteadOf git@github.com:',
         '&& (',
-        `  printf '[deps-cache] npm ${operation} started in %s; native dependencies can take several minutes.\\n' ${installLabel};`,
-        `  (while true; do sleep ${interval}; printf '[deps-cache] npm ${operation} still running in %s at %s\\n' ${installLabel} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; done) &`,
+        `  printf '[deps-cache] npm install started in %s; native dependencies can take several minutes.\\n' ${installLabel};`,
+        `  (while true; do sleep ${interval}; printf '[deps-cache] npm install still running in %s at %s\\n' ${installLabel} "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; done) &`,
         '  heartbeat_pid=$!;',
         '  trap \'kill "$heartbeat_pid" 2>/dev/null || true\' EXIT INT TERM;',
         `  GIT_CEILING_DIRECTORIES=${installLabel} npm ${npmArgs};`,
@@ -698,7 +582,7 @@ export function buildContainerInstallRunArgs({
     ];
 }
 
-function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog, linkBoxMcpSdk = false, linkAgentLib = false, agentLibSourceDir = null, operation = 'install' } = {}) {
+function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog, linkBoxMcpSdk = false, linkAgentLib = false, agentLibSourceDir = null } = {}) {
     if (!image) {
         throw new Error('Container dependency install requires an image.');
     }
@@ -712,16 +596,16 @@ function runNpmInstallInContainer(cwd, { image, runtime = null, log = debugLog, 
         image,
         runtime: resolvedRuntime,
         shellPath,
-        installScript: buildContainerInstallScript({ linkBoxMcpSdk, linkAgentLib, operation }),
+        installScript: buildContainerInstallScript({ linkBoxMcpSdk, linkAgentLib }),
         agentLibSourceDir,
     });
-    log(`[deps-cache] npm ${operation} in container ${image} at ${cwd}`);
+    log(`[deps-cache] npm install in container ${image} at ${cwd}`);
     const result = spawnSync(resolvedRuntime, args, { stdio: 'inherit', timeout: INSTALL_TIMEOUT_MS });
     if (result.error) {
-        throw new Error(`container npm ${operation} failed: ${result.error.message}`);
+        throw new Error(`container npm install failed: ${result.error.message}`);
     }
     if (result.status !== 0) {
-        throw new Error(`container npm ${operation} exited with code ${result.status}`);
+        throw new Error(`container npm install exited with code ${result.status}`);
     }
 }
 
@@ -925,10 +809,9 @@ export function prepareAgentCache({
 
     const lock = acquireLock(cachePath);
     try {
-        const operation = 'install';
         ensureCacheDir(cachePath);
         fs.rmSync(stampPath(cachePath), { force: true });
-        if (operation === 'install') seedFromGlobalCache(globalCachePath, cachePath, {
+        seedFromGlobalCache(globalCachePath, cachePath, {
             log,
             allowHardlinks: shouldSeedAgentCacheWithHardlinks({
                 agentPackagePresent: Boolean(agentPkg),
@@ -941,7 +824,7 @@ export function prepareAgentCache({
         );
         if (agentPkg && (!mcpSdk || needsNpmInstall(mergedPkg))) {
             installWithSelectedProviders(cachePath, mergedPkg, mcpSdk, selection, runtimeKey,
-                (cwd, options) => backend.install(cwd, { ...options, operation }));
+                (cwd, options) => backend.install(cwd, options));
         }
         finalizeBoxMcpSdkCache(cachePath, mcpSdk);
         finalizeAgentLibCacheLink(cachePath, agentLibSection);
@@ -955,7 +838,7 @@ export function prepareAgentCache({
             ...sdkStamp,
         });
         log(`[deps-cache] agent cache prepared at ${cachePath}`);
-        const result = { cachePath, reused: false, stamp, mergedPackageHash, operation: agentPkg ? operation : null };
+        const result = { cachePath, reused: false, stamp, mergedPackageHash, operation: agentPkg ? 'install' : null };
         completed?.set(refreshKey, result);
         return result;
     } finally {
@@ -1073,33 +956,9 @@ export function verifyAgentCache({
     if (check.valid && linkCheck.valid) return nm;
     throw new Error(
         `prepared dependency cache is ${check.valid ? linkCheck.reason : check.reason} at ${nm}. `
-        + `Run \`ploinky deps prepare ${repoName}/${agentName}\` and try again.`
+        + 'Dependency caches are managed automatically when the agent starts; '
+        + `run \`ploinky reinstall ${agentName}\` to rebuild this agent's dependencies.`
     );
-}
-
-/**
- * Strict helper for diagnostics and explicit checks: verify that a prepared
- * agent cache is valid for the given host runtime family and return its
- * node_modules path.
- */
-export function verifyAgentCacheForFamily({
-    family,
-    repoName,
-    agentName,
-    agentCodePath,
-}) {
-    const runtimeKey = detectHostRuntimeKey(family);
-    const agentPackagePath = path.join(agentCodePath, 'package.json');
-    try {
-        return verifyAgentCache({
-            runtimeKey,
-            repoName,
-            agentName,
-            agentPackagePath,
-        });
-    } catch (err) {
-        throw new Error(`[${family}] ${agentName}: ${err.message}`);
-    }
 }
 
 /**

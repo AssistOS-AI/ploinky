@@ -84,7 +84,13 @@ import {
     getAgentCodePath,
     getAgentSkillsPath
 } from '../../utils/workspaceStructure.js';
-import { ensureAgentCacheForFamily } from '../../utils/dependencies/dependencyCache.js';
+import {
+    attachAdmittedDependencies,
+    noCacheDependencyRecord,
+    prepareRuntimeDependencies,
+    runtimeDependencyReuseProblem,
+    sandboxProcessIdentity,
+} from '../../utils/dependencies/cacheV4/runtimeDependencies.mjs';
 import {
     assertBwrapPidSlotAvailable,
     isBwrapProcessRunning,
@@ -204,24 +210,56 @@ function resolveBwrapNodeRuntime(nodeExecPath = process.execPath) {
     };
 }
 
+function bwrapNeedsDependencies(agentCodePath, manifest) {
+    const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
+    return !readManifestStartCommand(manifest) || agentHasPackageJson;
+}
+
+/**
+ * Obtain the sandbox dependency tree from the immutable store (never a
+ * legacy cache) and publish this service's reader receipt before launch.
+ */
 function resolveBwrapAgentNodeModules({
-    repoName,
-    agentName,
     agentCodePath,
     agentWorkDir,
     needsCoreDeps,
+    containerName,
+    runtimeIdentity,
+    admittedRecord,
 }) {
     if (!needsCoreDeps) {
         const fallback = path.join(agentWorkDir, 'node_modules');
         ensureAgentDataDirectory(fallback);
-        return fallback;
+        return { nodeModulesDir: fallback, record: noCacheDependencyRecord('no-core-deps', { family: 'bwrap' }), prepared: null };
     }
-    return ensureAgentCacheForFamily({
+    const prepared = prepareRuntimeDependencies({
         family: 'bwrap',
-        repoName,
-        agentName,
+        runtimeKey: detectHostRuntimeKey('bwrap'),
         agentCodePath,
+        registration: containerName,
+        admittedRecord,
+    }, {
+        consumer: {
+            kind: 'bwrap-service',
+            key: `bwrap:${containerName}:${runtimeIdentity.instanceId}:${runtimeIdentity.enableGeneration}`,
+            containerName,
+            registration: containerName,
+            phase: 'creating',
+        },
     });
+    return { nodeModulesDir: prepared.nodeModulesPath, record: prepared.record, prepared };
+}
+
+/** '' when the running sandbox already binds the desired generation. */
+function bwrapDependencyReuseProblem({ agentName, manifest, record, containerName }, deps = {}) {
+    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
+    return runtimeDependencyReuseProblem({
+        record,
+        family: 'bwrap',
+        needsDependencies: bwrapNeedsDependencies(agentCodePath, manifest),
+        agentCodePath,
+        registration: containerName,
+    }, deps);
 }
 
 function ensureBwrapAgentLibDir(instanceName, nodeModulesDir, options = {}) {
@@ -845,13 +883,15 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
     const needsCoreDeps = !startCmd || agentHasPackageJson;
-    const nodeModulesDir = resolveBwrapAgentNodeModules({
-        repoName,
-        agentName,
+    const dependencies = resolveBwrapAgentNodeModules({
         agentCodePath,
         agentWorkDir: agentHomeDir,
         needsCoreDeps,
+        containerName,
+        runtimeIdentity,
+        admittedRecord: profileRecord,
     });
+    const nodeModulesDir = dependencies.nodeModulesDir;
     const bwrapAgentRoot = path.join(BWRAP_RUNTIME_ROOT, runtimeSegment(instanceName));
     fs.mkdirSync(bwrapAgentRoot, { recursive: true });
     pruneStaleRuntimeEntries(bwrapAgentRoot);
@@ -973,7 +1013,15 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
             try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }
         }
         logHandle.discard();
+        if (!child?.pid) dependencies.prepared?.release();
         throw error;
+    }
+    if (dependencies.prepared) {
+        try {
+            dependencies.prepared.updateConsumer({ process: sandboxProcessIdentity(child.pid), phase: 'running' });
+        } catch (error) {
+            debugLog(`[bwrap] ${agentName}: dependency receipt process update deferred: ${error?.message || error}`);
+        }
     }
     console.log(`[bwrap] ${agentName}: started with PID ${child.pid}`);
 
@@ -1005,6 +1053,7 @@ function startBwrapProcess(agentName, manifest, agentPath, options = {}) {
             agentLibPath
         },
         agentLib: agentLibRuntimeRecord(grant),
+        dependencies: dependencies.record,
         config: {
             binds: [
                 { source: agentLibPath, target: '/Agent', ro: true },
@@ -1156,11 +1205,19 @@ function ensureBwrapService(agentName, manifest, agentPath, options = {}) {
             existingRecord,
             agentLibGrant(detectHostRuntimeKey('bwrap')),
         );
+        // Dependency trees are immutable generations: a changed or invalid
+        // admitted generation means a new sandbox, never a mutated bind.
+        const dependencyProblem = (desired && desired !== current) || agentLibProblem
+            ? ''
+            : bwrapDependencyReuseProblem({ agentName, manifest, record: existingRecord, containerName });
         if (desired && desired !== current) {
             console.log(`[bwrap] ${agentName}: env hash changed, restarting...`);
             stopBwrapProcess(containerName);
         } else if (agentLibProblem) {
             console.log(`[bwrap] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
+            stopBwrapProcess(containerName);
+        } else if (dependencyProblem) {
+            console.log(`[bwrap] ${agentName}: dependency generation changed (${dependencyProblem}), restarting...`);
             stopBwrapProcess(containerName);
         } else {
             debugLog(`[bwrap] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
@@ -1238,16 +1295,27 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
     const workspacePath = isolatedHome ? '/root' : projectPath;
     const sharedDir = ensureSharedHostDir();
     ensureAgentDataDirectory(agentHomeDir);
-    const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
-    const startCmd = readManifestStartCommand(manifest);
-    const needsCoreDeps = !startCmd || agentHasPackageJson;
-    const nodeModulesDir = resolveBwrapAgentNodeModules({
-        repoName,
-        agentName,
-        agentCodePath,
-        agentWorkDir: agentHomeDir,
-        needsCoreDeps,
+    const needsCoreDeps = bwrapNeedsDependencies(agentCodePath, manifest);
+    // An interactive session reuses the service's admitted generation
+    // read-only under its own receipt; it never builds or repairs a tree.
+    const attached = attachAdmittedDependencies(record, {
+        consumer: {
+            kind: 'bwrap-attachment',
+            containerName,
+            registration: containerName,
+            process: sandboxProcessIdentity(process.pid),
+        },
     });
+    let nodeModulesDir;
+    if (attached) {
+        nodeModulesDir = attached.nodeModulesPath;
+    } else if (!needsCoreDeps) {
+        nodeModulesDir = path.join(agentHomeDir, 'node_modules');
+        ensureAgentDataDirectory(nodeModulesDir);
+    } else {
+        throw new Error(`[bwrap] ${agentName}: the running service has no admitted dependency generation; restart it first`);
+    }
+    try {
     const bwrapAgentRoot = path.join(BWRAP_RUNTIME_ROOT, runtimeSegment(instanceName));
     fs.mkdirSync(bwrapAgentRoot, { recursive: true });
     const serviceAgentLibPath = record.runtimeStaging?.agentLibPath;
@@ -1326,6 +1394,9 @@ function attachBwrapInteractive(agentName, manifest, agentPath, workdir, entryCo
             fs.rmSync(agentLibPath, { recursive: true, force: true });
         } catch (_) {}
     }
+    } finally {
+        attached?.release();
+    }
 }
 
 export {
@@ -1340,6 +1411,7 @@ export {
     buildShellCommand,
     ensureBwrapAgentLibDir,
     resolveBwrapNodeRuntime,
+    bwrapDependencyReuseProblem,
     attachBwrapInteractive,
     BWRAP_PATH
 };

@@ -135,8 +135,19 @@ export function createMutationLockManager({
     }
 
     function recoverStaleLock(lockPath, ownerPath, instance) {
-        assertOwnedDirectory(lockPath, fsApi);
-        const captured = parseOwner(ownerPath, fsApi);
+        let captured;
+        try {
+            assertOwnedDirectory(lockPath, fsApi);
+            captured = parseOwner(ownerPath, fsApi);
+        } catch (error) {
+            // An acquirer publishes the lock directory before its owner file and
+            // a releaser removes the owner file first. An ownerless or vanished
+            // lock is a transient observation: keep waiting, never reclaim it.
+            if (error?.code === 'ENOENT' || error?.cause?.code === 'ENOENT') {
+                return false;
+            }
+            throw error;
+        }
         if (captured.owner.instance !== instance) {
             throw lockError(`Mutation lock identity does not match ${instance}`);
         }

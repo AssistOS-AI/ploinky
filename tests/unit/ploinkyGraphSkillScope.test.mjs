@@ -9,6 +9,7 @@ import { buildHostSkillScope } from '../../ploinky-box/skillScope.mjs';
 import { GRAPH_SKILL_SCOPE_FILE, readGraphSkillScope, validateGraphSkillScope, writeGraphSkillScope } from '../../ploinky-box/graphSkillScope.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { agentLibFixture } from '../helpers/agentlibFixture.mjs';
+import { fakeUpdateCore, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
 
 function fixture(t, { symlinkedState = false } = {}) {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-graph-scope-')));
@@ -28,7 +29,7 @@ function fixture(t, { symlinkedState = false } = {}) {
     const ownership = id => ({ state: 'owned', engine: { name: 'fixture', identity: 'fixture' }, handles: { container: { id, runtime: { running: true } } } });
     const prior = ownership('a'.repeat(64));
     const candidate = ownership('c'.repeat(64));
-    const state = { failAt: '', initial: true, calls: [], healthChecks: 0, acquisitions: 0, held: false };
+    const state = { failAt: '', initial: true, calls: [], healthChecks: 0, acquisitions: 0, held: false, configured: true };
     const lock = { assertHeld(instance) { assert.equal(instance, identity.instance); assert.equal(state.held, true); } };
     const perform = (containerId, argv, options) => {
         lock.assertHeld(identity.instance);
@@ -43,7 +44,13 @@ function fixture(t, { symlinkedState = false } = {}) {
             const directory = path.join(root, `lock-${state.acquisitions}`); fs.mkdirSync(directory);
             return { ...lock, path: directory, release() { state.held = false; } };
         } },
-        runner: { run() { return { status: 0, stdout: '', stderr: '' }; } },
+        runner: {
+            run() { return { status: 0, stdout: '', stderr: '' }; },
+            // Update samples whether the graph is active under the lock.
+            query() {
+                return { ok: true, stdout: JSON.stringify({ initialized: true, routingConfigured: state.configured }) };
+            },
+        },
         stdout: { write() {} }, stderr: { write() {} }, readEdgeDesired: () => null,
         captureCoreStartArgv: () => ['start', 'fixture', '8080'],
         selectAgentLib: async () => ({ selection: state.initial ? oldAgentLib : newAgentLib }),
@@ -58,6 +65,14 @@ function fixture(t, { symlinkedState = false } = {}) {
         resolveHostReachableIpv4: async () => '',
         startCore: async (_engine, id, argv, _port, _media, _runner, options) => perform(id, argv, options),
         runCoreCommand: async (_engine, id, argv, _port, _media, _runner, options) => perform(id, argv, options),
+        runRestartCore: fakeRestartCore(async (_engine, id, argv, _port, _media, _runner, options) => perform(id, argv, options)),
+        // The in-Box update reports success; activation then fails where requested.
+        runUpdateCore: fakeUpdateCore({
+            onCall({ containerId, argv, options }) {
+                lock.assertHeld(identity.instance);
+                state.calls.push({ containerId, argv, scope: options.skillScopeEnv });
+            },
+        }),
         healthCheck: async () => {
             state.healthChecks += 1;
             if (state.failAt === 'health' && state.calls.at(-1)?.containerId === candidate.handles.container.id) throw new Error('candidate health failed');
@@ -70,7 +85,7 @@ function fixture(t, { symlinkedState = false } = {}) {
 const activate = (supervisor, operation) => operation === 'start'
     ? supervisor.runStartTransaction(['start', 'fixture'])
     : operation === 'restart' ? supervisor.runRestartTransaction(['restart'])
-        : supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true });
+        : supervisor.runUpdateTransaction(['update']);
 
 for (const operation of ['start', 'restart', 'update']) {
     test(`${operation} accepts linked workspace state and preserves exact saved graph scope`, async t => {
@@ -149,8 +164,10 @@ for (const failure of ['health', 'finalize']) {
 test('successful whole-graph activation advances scope, while update without restart preserves it', async t => {
     const f = fixture(t);
     await f.create(f.priorScope.PLOINKY_HOST_LAUNCH_CWD).runStartTransaction(['start', 'fixture']);
+    f.state.configured = false;
     await f.create(f.candidateScope.PLOINKY_HOST_LAUNCH_CWD).runUpdateTransaction(['update']);
     assert.deepEqual(readGraphSkillScope(f.identity), f.priorScope);
+    f.state.configured = true;
     await f.create(f.candidateScope.PLOINKY_HOST_LAUNCH_CWD).runRestartTransaction(['restart']);
     assert.deepEqual(readGraphSkillScope(f.identity), f.candidateScope);
     assert.equal(fs.statSync(f.target).mode & 0o777, 0o600);

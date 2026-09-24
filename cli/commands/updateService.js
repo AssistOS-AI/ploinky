@@ -4,6 +4,13 @@ import { execFileSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 import { resolvePloinkyUpdateEligibility } from './ploinkyUpdateScope.js';
+import {
+    GIT_UPDATE_STRATEGY,
+    GitUpdateError,
+    updateCheckoutFastForward,
+} from '../utils/git/verifiedUpdate.js';
+import { acquireSourceLock, createDefaultSourceLockManager, ploinkySourceLockIdentity } from '../utils/git/sourceLock.js';
+import { assessGeneratedCheckoutState } from '../utils/git/generatedState.js';
 
 export const PLOINKY_BOX_MARKER_PATH = '/etc/ploinky-box';
 export const INTERACTIVE_PLOINKY_UPDATE_MESSAGE = [
@@ -55,19 +62,6 @@ function runGit(repoPath, args, { spawn = spawnSync, stdio = 'inherit' } = {}) {
     return result;
 }
 
-export function pullGitRepo(repoPath, {
-    rebase = true,
-    autostash = true,
-    spawn = spawnSync,
-    stdio = 'inherit',
-} = {}) {
-    const args = ['pull'];
-    if (rebase) args.push('--rebase');
-    if (autostash) args.push('--autostash');
-    runGit(repoPath, args, { spawn, stdio });
-    return true;
-}
-
 export function checkGitUpstreamUpdate(repoPath, {
     execFile = execFileSync,
     spawn = spawnSync,
@@ -106,7 +100,48 @@ export function checkGitUpstreamUpdate(repoPath, {
     };
 }
 
-export function updatePloinkySelf({
+function legacySelfUpdateResult(record, repoPath) {
+    const before = record.before?.head || null;
+    const after = record.after?.head || before;
+    if (record.outcome === 'changed' || record.outcome === 'unchanged') {
+        return {
+            updated: record.outcome === 'changed',
+            repoPath,
+            before,
+            after,
+            code: record.code,
+            pullStrategy: GIT_UPDATE_STRATEGY,
+            record,
+        };
+    }
+    if (record.outcome === 'skipped') {
+        return {
+            skipped: true,
+            reason: record.reason,
+            code: record.code,
+            repoPath,
+            before,
+            pullStrategy: GIT_UPDATE_STRATEGY,
+            record,
+        };
+    }
+    throw new GitUpdateError(record);
+}
+
+/**
+ * Update a Ploinky source checkout by a verified fast-forward.
+ *
+ * Outside the Box the mutation holds the host Ploinky source lock (the same
+ * lock manager and name as `ploinky-box/command/hostUpdate.mjs`) and releases
+ * it before returning, so it is never held across a relaunch or a workspace
+ * lock acquisition. A caller that already holds that lock passes it as
+ * `heldSourceLock` ({ lockIdentity, lock }) instead of re-acquiring it.
+ *
+ * A named Git skip (dirty, diverged, detached, ...) returns `{ skipped: true,
+ * code, reason, record }`; failed/uncertain outcomes throw a GitUpdateError
+ * carrying the operation record.
+ */
+export async function updatePloinkySelf({
     repoPath = resolvePloinkyRoot(),
     updateScopePath,
     interactiveSession = false,
@@ -114,8 +149,12 @@ export function updatePloinkySelf({
     boxMarkerPath = PLOINKY_BOX_MARKER_PATH,
     exists = fs.existsSync,
     checkUpdate = checkGitUpstreamUpdate,
-    pull = pullGitRepo,
-    getRef = getGitRef,
+    updateCheckout = updateCheckoutFastForward,
+    phase = 'host-ploinky',
+    heldSourceLock = null,
+    sourceLockManager = null,
+    checkoutOptions = {},
+    assessGeneratedState = assessGeneratedCheckoutState,
 } = {}) {
     if (updateScopePath) {
         const scope = resolvePloinkyUpdateEligibility({ repoPath, updateScopePath });
@@ -172,82 +211,32 @@ export function updatePloinkySelf({
         };
     }
 
-    const before = getRef(repoPath, 'HEAD');
-    pull(repoPath);
-    const after = getRef(repoPath, 'HEAD');
-    return {
-        updated: Boolean(before && after && before !== after),
-        repoPath,
-        before,
-        after,
-    };
-}
-
-export function parseGitDependencyRef(spec) {
-    const raw = String(spec || '').trim();
-    if (!raw) return null;
-    const isGit = /^git\+/.test(raw)
-        || /^git:\/\//.test(raw)
-        || /^git@/.test(raw)
-        || /^https?:\/\/.+\.git(#|$)/.test(raw);
-    if (!isGit) return null;
-    let url = raw.replace(/^git\+/, '');
-    let ref = '';
-    const hashIdx = url.indexOf('#');
-    if (hashIdx >= 0) {
-        ref = url.slice(hashIdx + 1);
-        url = url.slice(0, hashIdx);
+    const source = ploinkySourceLockIdentity(repoPath);
+    let lock;
+    let owned = false;
+    if (heldSourceLock) {
+        if (heldSourceLock.lockIdentity !== source.lockIdentity || typeof heldSourceLock.lock?.assertHeld !== 'function') {
+            throw new Error(`Ploinky self-update was given a source lock for a different checkout than ${source.canonicalRoot}`);
+        }
+        lock = heldSourceLock.lock;
+    } else {
+        const manager = sourceLockManager || await createDefaultSourceLockManager();
+        lock = await acquireSourceLock(manager, source.lockIdentity);
+        owned = true;
     }
-    if (/^[0-9a-f]{40}$/i.test(ref)) return null; // pinned commit cannot move
-    return { url, ref: ref || 'HEAD' };
-}
-
-/**
- * Resolve the commit a git url+ref currently points at via `git ls-remote`.
- * Returns null on any failure (offline, unknown ref, malformed output) so
- * callers fail open instead of acting on an unverified ref.
- *
- * @param {string} url
- * @param {string} ref
- * @param {object} [options]
- * @param {Function} [options.execFile=execFileSync] - injectable for tests.
- * @returns {string|null} 40-char hex sha, or null.
- */
-export function resolveGitRefCommit(url, ref, { execFile = execFileSync } = {}) {
+    let record;
     try {
-        const out = String(execFile('git', ['ls-remote', url, ref], {
-            stdio: ['ignore', 'pipe', 'pipe'],
-        }) || '').trim();
-        if (!out) return null;
-        const sha = out.split('\n')[0].trim().split(/\s+/)[0];
-        return /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
-    } catch (_) {
-        return null;
+        lock.assertHeld(source.lockIdentity);
+        record = updateCheckout({
+            ...checkoutOptions,
+            repoPath: source.canonicalRoot,
+            phase,
+            id: source.canonicalRoot,
+            policy: { kind: 'generic' },
+            assessGeneratedState,
+        });
+    } finally {
+        if (owned) lock.release();
     }
-}
-
-/**
- * Resolve the upstream commit of every *moving* git dependency in a package's
- * dependency map (e.g. mcp-sdk `#main` or an explicit deploy-time override).
- *
- * `ploinky update` uses this to detect when a moving ref advanced even though
- * its package.json spec string — and therefore the dependency-cache hash — is
- * unchanged. It resolves the authoritative upstream tip (what a fresh cache
- * `npm install` would fetch) via `git ls-remote`; `ploinky update` is already
- * online. Deps that cannot be resolved are omitted (fail-open).
- *
- * @param {Record<string,string>} dependencies - dependency name -> spec map.
- * @param {object} [options]
- * @param {Function} [options.execFile=execFileSync] - injectable for tests.
- * @returns {Record<string,string>} name -> resolved sha (only moving git deps that resolved).
- */
-export function resolveMovingGitDepCommits(dependencies, { execFile = execFileSync } = {}) {
-    const commits = {};
-    for (const [name, spec] of Object.entries(dependencies || {})) {
-        const parsed = parseGitDependencyRef(spec);
-        if (!parsed) continue;
-        const sha = resolveGitRefCommit(parsed.url, parsed.ref, { execFile });
-        if (sha) commits[name] = sha;
-    }
-    return commits;
+    return legacySelfUpdateResult(record, source.canonicalRoot);
 }

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { showHelp } from './commands/help.js';
+import { retiredCommandMessage } from './retiredCommands.js';
 import { parseStatusOptions } from './statusOptions.js';
 import { bootstrapAgentLibRuntime } from '../agentlib/bootstrap.mjs';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../agentlib/branchPolicy.mjs';
@@ -161,6 +162,12 @@ export async function launchCli(args = process.argv.slice(2), {
         return 0;
     }
     const { commandArgs, debug } = extractGlobalDebugFlag(args);
+    // Retired commands answer before any AgentLib bootstrap or core import.
+    const retired = retiredCommandMessage(commandArgs[0]);
+    if (retired) {
+        errorOutput.write(`${retired}\n`);
+        return 1;
+    }
     if (commandArgs[0] === 'status') {
         const statusOptions = parseStatusOptions(commandArgs.slice(1), { debug });
         // Status reports the selected AgentLib source, so it needs the runtime
@@ -225,6 +232,68 @@ export async function launchCli(args = process.argv.slice(2), {
         ? stripBranchPolicyArgs(args)
         : args;
     const previous = bootstrap.owned ? readActiveImpl(workspaceRoot) : null;
+
+    // Direct-core update: the exit status comes from the records, and the
+    // AgentLib activation child runs only when every required input is
+    // verified. A blocked activation leaves active.json and the staged
+    // transaction untouched and is reported with its blocking records.
+    const finishUpdateCommand = async (updateResult) => {
+        const transition = bootstrap.owned ? updateResult.agentLib : null;
+        if (!transition?.selection) return updateResult.exitCode;
+        if (!updateResult.activationAllowed) {
+            const blocking = updateResult.blockedBy
+                .map(entry => `${entry.phase} ${entry.id} (${entry.outcome}${entry.code ? `, ${entry.code}` : ''})`)
+                .join('; ');
+            errorOutput.write(`achillesAgentLib activation is pending: blocked by ${blocking}.\n`);
+            return updateResult.exitCode || 1;
+        }
+        writeTransactionImpl(workspaceRoot, transition.selection);
+        const registryModule = await import('./utils/agentRegistrySnapshot.js');
+        const registry = registryModule.readAgentRegistrySnapshot({ workspaceRoot });
+        const configured = Boolean(registry?._config?.static?.agent && registry?._config?.static?.port);
+        const action = configured ? 'restart' : 'commit';
+        const activation = spawnActivationImpl(process.execPath, [
+            fileURLToPath(import.meta.url),
+            AGENTLIB_ACTIVATE_TRANSACTION,
+            action,
+        ], {
+            stdio: 'inherit',
+            env: { ...env, PLOINKY_WORKSPACE_ROOT: workspaceRoot },
+        });
+        const succeeded = activation?.status === 0;
+        const { createOperationRecord } = await import('./commands/updateOutcome.js');
+        const { appendUpdateRecords } = await import('./commands/updateRecords.js');
+        const finalResult = appendUpdateRecords(updateResult, [createOperationRecord({
+            phase: 'activation',
+            id: 'achillesAgentLib',
+            outcome: succeeded ? 'changed' : 'failed',
+            attempted: true,
+            required: true,
+            code: succeeded ? action : 'activation-failed',
+            reason: succeeded
+                ? `achillesAgentLib activation ${action} completed`
+                : `achillesAgentLib activation failed with status ${String(activation?.status)}`,
+        })]);
+        const summary = `achillesAgentLib activation: ${succeeded ? `${action} completed` : 'failed'}; `
+            + `final update status: ${finalResult.status} (exit ${finalResult.exitCode}).\n`;
+        if (succeeded) {
+            if (finalResult.exitCode) errorOutput.write(summary);
+            else process.stdout.write(summary);
+            return finalResult.exitCode;
+        }
+        errorOutput.write(summary);
+        const activationError = new Error(
+            `achillesAgentLib activation failed with status ${String(activation?.status)}; active.json was not advanced.`,
+        );
+        activationError.result = finalResult;
+        restorePreviousDeployment(
+            activationError,
+            transition.previous || previous,
+            transition.selection,
+            action,
+        );
+        throw activationError;
+    };
     let result;
     try {
         result = await runCoreCli(effectiveArgs, { agentLibBranchPolicy: branchPolicy });
@@ -246,6 +315,12 @@ export async function launchCli(args = process.argv.slice(2), {
         throw error;
     }
 
+    if (commandArgs[0] === 'update') {
+        // Loaded lazily: help, logs and bare `cli` must not load core modules.
+        const { isUpdateResult } = await import('./commands/updateOutcome.js');
+        if (isUpdateResult(result)) return finishUpdateCommand(result);
+    }
+
     if (!bootstrap.owned) return result;
 
     if (['start', 'restart'].includes(commandArgs[0])) {
@@ -262,6 +337,8 @@ export async function launchCli(args = process.argv.slice(2), {
         }
     }
 
+    // Results without the structured update schema keep the previous
+    // activation behavior.
     const updateTransition = commandArgs[0] === 'update' ? result?.agentLib : null;
     if (!updateTransition?.selection) return result;
 

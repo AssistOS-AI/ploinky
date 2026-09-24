@@ -27,7 +27,8 @@ import {
     commitTargetedAgentRestart,
     prepareTargetedAgentRestart,
 } from './targetedAgentRestart.js';
-import { withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+import { withHeldOrAcquiredWorkspaceMutationLease, withMaintenanceLock } from '../utils/runtime/maintenanceLocks.js';
+
 import { printComponentAccess } from '../server/utils/routerEnv.js';
 import {
     getAgentContainerName,
@@ -51,13 +52,11 @@ import {
     enableRepo,
     disableRepo,
     uninstallRepo,
-    updateRepo,
-    updatePloinkyRepos,
-    updateAllRepos,
     enableAgent,
     findAgentManifest,
 } from './repoAgentCommands.js';
 import { parseStartArgs } from '../utils/repos.js';
+import { runUpdateCommand } from './updateCommand.js';
 import { parseBranchPolicy, stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
 import { importAgentLib } from '../../agentlib/runtime.mjs';
 import {
@@ -76,7 +75,7 @@ import {
     shutdownSession,
 } from './sessionControl.js';
 import { handleSsoCommand } from './ssoCommands.js';
-import { handleDepsCommand } from './depsCommands.js';
+import { retiredCommandError } from '../retiredCommands.js';
 import { disableHostSandbox, enableHostSandbox, handleSandboxCommand } from './sandboxCommands.js';
 import ClientCommands from './client.js';
 import {
@@ -89,6 +88,16 @@ import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/ro
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
 import { createNetworkLifecycleAdapter, withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
 import { inactivateEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+
+// Restart acquires the workspace mutation lease before the per-runtime
+// maintenance lock (the same order as reinstall), so dependency preparation
+// reuses the held lease and no maintenance lock is held while waiting.
+function withRestartLocks(containerName, lockOptions, fn) {
+    return withHeldOrAcquiredWorkspaceMutationLease(
+        { operation: `${lockOptions?.operation || 'restart'}:${containerName}` },
+        () => withMaintenanceLock(containerName, lockOptions, fn),
+    );
+}
 
 let llmAgentsLoadPromise = null;
 const ENABLE_AGENT_CLI_TOKENS = Object.freeze({
@@ -264,25 +273,14 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 const normalizedOptions = stripBranchPolicyArgs(options);
                 const updateBranchPolicy = agentLibBranchPolicy || parseBranchPolicy(args);
                 const interactiveSession = Boolean(inputState.getInterface?.());
-                const first = String(normalizedOptions[0] || '').trim();
-                const firstLower = first.toLowerCase();
-                if (!first || firstLower === 'all') {
-                    const folderArg = first ? String(normalizedOptions[1] || '').trim() || undefined : undefined;
-                    return updateAllRepos(folderArg, { interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
-                } else if (firstLower === 'repos' || firstLower === 'repositories') {
-                    return updatePloinkyRepos({ interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
-                } else if (firstLower === 'repo' || firstLower === 'repository') {
-                    return updateRepo(normalizedOptions[1]);
-                } else {
-                    const resolved = path.resolve(first);
-                    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-                        return updateAllRepos(first, { interactiveSession, agentLibBranchPolicy: updateBranchPolicy });
-                    } else {
-                        return updateRepo(first);
-                    }
-                }
+                // One structured result for every update form: parsed once before
+                // any mutation, run under the workspace mutation lease, a thrown
+                // error converted into a record and a host report published once.
+                return runUpdateCommand(normalizedOptions, {
+                    agentLibBranchPolicy: updateBranchPolicy,
+                    interactiveSession,
+                });
             }
-            break;
         case 'reinstall': {
             const sub = String(options[0] || '').trim();
             const target = sub.toLowerCase() === 'agent'
@@ -401,8 +399,8 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             handleSandboxCommand(options);
             break;
         case 'deps':
-            await handleDepsCommand(options);
-            break;
+            // Retired: caches are managed by lifecycle commands. No cache or engine work.
+            throw retiredCommandError('deps');
         case 'list':
             if (options[0] === 'agents') listAgents();
             else if (options[0] === 'repos') listRepos();
@@ -518,7 +516,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     if (!bwrapRunning && !containerAlsoRunning && containerPresent) {
                         console.log(`Starting (${agentRuntime}) agent '${agentName}'...`);
                         try {
-                            await withMaintenanceLock(containerName, {
+                            await withRestartLocks(containerName, {
                                 operation: 'start',
                                 metadata: {
                                     agent: resolved.shortAgentName,
@@ -569,7 +567,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     console.log(`Restarting (${agentRuntime}) agent '${agentName}'...`);
 
                     try {
-                        await withMaintenanceLock(containerName, {
+                        await withRestartLocks(containerName, {
                             operation: 'restart',
                             metadata: {
                                 agent: resolved.shortAgentName,
@@ -638,7 +636,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     const runtimeAction = 'restart';
                     console.log(`Restarting (${getRuntime()}) agent '${agentName}'...`);
                     try {
-                        await withMaintenanceLock(containerName, {
+                        await withRestartLocks(containerName, {
                             operation: runtimeAction,
                             metadata: {
                                 agent: resolved.shortAgentName,

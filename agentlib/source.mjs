@@ -431,6 +431,37 @@ export function readActiveDescriptor(workspaceRoot, fsApi = fs) {
     return validateSelectionDescriptor(parsed);
 }
 
+/**
+ * The exact bytes of `active.json`, or null when absent. Admission journals
+ * compare and restore these bytes, including prior absence, without
+ * interpreting them.
+ */
+export function readActiveDescriptorText(workspaceRoot, fsApi = fs) {
+    try {
+        return fsApi.readFileSync(activeDescriptorPath(workspaceRoot), 'utf8');
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+    }
+}
+
+/** Put back exact prior `active.json` bytes, or its absence. */
+export function restoreActiveDescriptorText(workspaceRoot, text, fsApi = fs) {
+    const target = activeDescriptorPath(workspaceRoot);
+    if (text === null || text === undefined) {
+        try {
+            fsApi.unlinkSync(target);
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+        return;
+    }
+    fsApi.mkdirSync(path.dirname(target), { recursive: true });
+    const temp = `${target}.${process.pid}.restore.tmp`;
+    fsApi.writeFileSync(temp, String(text), { mode: 0o600 });
+    fsApi.renameSync(temp, target);
+}
+
 export function readTransactionDescriptor(workspaceRoot, fsApi = fs) {
     try {
         return validateSelectionDescriptor(JSON.parse(fsApi.readFileSync(transactionDescriptorPath(workspaceRoot), 'utf8')));

@@ -1948,3 +1948,102 @@ test('two workspaces render independent identities and same-path binds', (t) => 
     assert.equal(rendered[1].includes(`${second}:${second}`), true);
     assert.equal(rendered[1].some((value) => value.startsWith(`${first}:`) || value === `PLOINKY_WORKSPACE_ROOT=${first}`), false);
 });
+
+test('a Box that needs replacement is refused before any mutation when replacement is not allowed', async (t) => {
+    const state = fixture(t);
+    const old = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 18080,
+        mediaHostPort: 17880,
+        id: 'e'.repeat(64),
+    });
+    const h = harness(state, { initial: old });
+    await assert.rejects(() => reconcileBoxContainer({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        ownership: { state: 'owned', handles: { container: old } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        // A different publication requires replacement.
+        explicitPort: 19090,
+        allowReplacement: false,
+    }, h.seams), { code: 'PLOINKY_BOX_REPLACEMENT_REFUSED' });
+    assert.equal(h.current(), old);
+    assert.equal(h.current().runtime.running, true);
+    for (const forbidden of ['preflight', 'stop-ploinky-local', 'container rm', 'container create', 'container stop', ' pull']) {
+        assert.equal(h.calls.some(call => call.join(' ').includes(forbidden)), false, forbidden);
+    }
+});
+
+test('replacement validation is non-settling while finalization ends rollback authority', async (t) => {
+    for (const settle of [false, true]) {
+        const state = fixture(t);
+        const old = containerHandle({
+            identity: state.identity,
+            agentLib: state.agentLib,
+            repositoryRoot: state.root,
+            imageId: 'd'.repeat(64),
+            imageRef: BOX_IMAGE_REFERENCE,
+            hostPort: 18080,
+            mediaHostPort: 17880,
+            id: 'e'.repeat(64),
+        });
+        const h = harness(state, { initial: old });
+        const result = await reconcileBoxContainer({
+            identity: state.identity,
+            agentLib: state.agentLib,
+            ownership: { state: 'owned', handles: { container: old } },
+            engine: { name: 'podman', identity: 'engine' },
+            runner: h.runner,
+            lock: state.lock,
+            repositoryRoot: state.root,
+            explicitPort: 19090,
+        }, h.seams);
+        assert.equal(result.action, 'replaced');
+        result.validate();
+        result.validate();
+        if (settle) {
+            result.finalize();
+            assert.throws(() => result.validate(), /already settled/);
+            assert.deepEqual(await result.rollback(), { action: 'already-settled' });
+        } else {
+            const rolledBack = await result.rollback();
+            assert.equal(rolledBack.action, 'restored');
+            assert.equal(h.current().runtime.imageId, 'd'.repeat(64));
+        }
+    }
+});
+
+test('reused Boxes expose the same exact-ownership validation without settling', async (t) => {
+    const state = fixture(t);
+    const current = containerHandle({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        repositoryRoot: state.root,
+        imageId: 'd'.repeat(64),
+        imageRef: BOX_IMAGE_REFERENCE,
+        hostPort: 8080,
+        id: 'e'.repeat(64),
+    });
+    const h = harness(state, { initial: current });
+    const result = await reconcileBoxContainer({
+        identity: state.identity,
+        agentLib: state.agentLib,
+        ownership: { state: 'owned', handles: { container: current } },
+        engine: { name: 'podman', identity: 'engine' },
+        runner: h.runner,
+        lock: state.lock,
+        repositoryRoot: state.root,
+        allowReplacement: false,
+    }, h.seams);
+    assert.equal(result.action, 'reused');
+    result.validate();
+    h.current().runtime.running = false;
+    assert.throws(() => result.validate());
+});

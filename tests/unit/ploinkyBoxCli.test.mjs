@@ -12,8 +12,8 @@ import {
     resolveBoxImageReference,
 } from '../../ploinky-box/constants.mjs';
 import { runOuterCli } from '../../ploinky-box/bin/ploinky-box.mjs';
-
-const UPDATE_SCOPE_ROOT = fs.realpathSync.native(process.cwd());
+import { createMemoryUpdateHostState, createUpdateHostState } from '../../ploinky-box/update/hostState.mjs';
+import { UPDATE_HANDOFF_ENV, createRelaunchHandoff } from '../../ploinky-box/update/relaunchHandoff.mjs';
 
 function bufferStream(isTTY = false) {
     let value = '';
@@ -65,11 +65,15 @@ function fakeSupervisor(events, { statusState = 'absent' } = {}) {
             : { state: statusState, handles: null },
     };
     return {
+        resolveWorkspaceIdentity: () => identity,
         prepareBoxForCommand: async () => { events.push('prepare'); return prepared; },
         runStartTransaction: async (argv, options) => events.push(['start', argv, options]),
         runRestartTransaction: async (argv, options) => events.push(['restart', argv, options]),
         runTargetedRestartTransaction: async (argv) => events.push(['targeted-restart', argv]),
-        runUpdateTransaction: async (argv, options) => events.push(['update-transaction', argv, options]),
+        runUpdateTransaction: async (argv, options) => {
+            events.push(['update-transaction', argv, options]);
+            return { activation: { outcome: 'not-required' } };
+        },
         runStopTransaction: async () => events.push('stop'),
         runDestroyTransaction: async (id, options) => {
             events.push(['destroy', id, options]);
@@ -345,6 +349,7 @@ test('deployment lifecycle failures suggest explicit diagnosis once without swal
         const supervisor = fakeSupervisor([]);
         supervisor[method] = async () => { throw failure; };
         await assert.rejects(runOuterCli(argv, {
+            cwd: () => supervisor.resolveWorkspaceIdentity().workspaceRoot,
             env: {},
             input: {},
             output: bufferStream(),
@@ -407,8 +412,10 @@ test('updated CLI owns the single failure hint after relaunch', async () => {
     const errorOutput = bufferStream();
     const code = await runOuterCli(['update'], {
         env: {}, input: {}, output: bufferStream(), errorOutput,
+        cwd: () => WORKSPACE_ROOT,
         supervisor: fakeSupervisor([]), detectInsideBox: () => false,
-        updateHostSource: async () => ({ updated: true }),
+        updateHostState: createMemoryUpdateHostState(),
+        updateHostSource: async () => ({ updated: true, before: 'a'.repeat(40), after: 'b'.repeat(40) }),
         relaunch() { errorOutput.write('Run ploinky diagnose from the updated CLI.\n'); return 23; },
     });
     assert.equal(code, 23);
@@ -733,21 +740,39 @@ test('logs never create, prepare, or repair a Box in any other state', async () 
     }
 });
 
-test('full update pulls the host source and relaunches before touching the Box when HEAD changes', async () => {
+const DEFAULT_BRANCH_POLICY = Object.freeze({
+    branch: null,
+    repoBranches: {},
+    fallback: 'default',
+    resetRepos: false,
+});
+
+function hostUpdateRevisions(extra = {}) {
+    return { updated: true, repoPath: '/source/ploinky', before: 'a'.repeat(40), after: 'b'.repeat(40), ...extra };
+}
+
+test('full update pulls the host source and relaunches with a validated handoff before touching the Box', async () => {
     const events = [];
     const output = bufferStream();
     const env = { PATH: '/bin', HOME: '/tmp' };
+    const store = createMemoryUpdateHostState();
+    let childEnv;
     const code = await runOuterCli(['--debug', 'update', 'all'], {
         env,
+        cwd: () => WORKSPACE_ROOT,
         input: { isTTY: false }, output, errorOutput: bufferStream(),
         supervisor: fakeSupervisor(events),
         repositoryRoot: '/source/ploinky',
+        updateHostState: store,
         async updateHostSource(options) {
             events.push(['host-update', options]);
-            return { updated: true };
+            return hostUpdateRevisions();
         },
         relaunch(command, args, options) {
-            events.push(['relaunch', command, args, options]);
+            events.push(['relaunch', command, args]);
+            childEnv = options.env;
+            // The pending record exists while the child runs.
+            assert.equal(store.list('update-handoffs').length, 1);
             return 19;
         },
         execute() { throw new Error('changed host update must not execute stale in-Box code'); },
@@ -755,118 +780,284 @@ test('full update pulls the host source and relaunches before touching the Box w
     assert.equal(code, 19);
     assert.deepEqual(events[0], ['host-update', {
         repositoryRoot: '/source/ploinky',
-        updateScopeRoot: UPDATE_SCOPE_ROOT,
+        updateScopeRoot: WORKSPACE_ROOT,
     }]);
     assert.equal(events[1][0], 'relaunch');
     assert.equal(events[1][1], process.execPath);
     assert.deepEqual(events[1][2].slice(-3), ['--debug', 'update', 'all']);
-    assert.deepEqual(events[1][3], { env });
-    assert.equal(events.includes('prepare'), false);
+    assert.equal(events.length, 2, 'the parent runs no Box preparation or update transaction');
+    // Only an opaque id and token cross the process boundary.
+    assert.deepEqual(Object.keys(childEnv).sort(), ['HOME', 'PATH', UPDATE_HANDOFF_ENV].sort());
+    assert.match(childEnv[UPDATE_HANDOFF_ENV], /^[0-9a-f]{32}:[0-9a-f]{64}$/);
+    // The child failed without consuming the record: the parent removes it and
+    // reports the host outcome itself.
+    assert.deepEqual(store.list('update-handoffs'), []);
     assert.match(output.value(), /continuing with the updated CLI/);
+    assert.match(output.value(), /did not accept the relaunch handoff/);
+    assert.match(output.value(), /updated CLI exited with status 19.*remains updated \(aaaaaaaaaaaa -> bbbbbbbbbbbb\)/);
 });
 
-test('full update refreshes in-Box state then restarts an already configured workspace', async () => {
-    const events = [];
-    const supervisor = fakeSupervisor(events, { statusState: 'running-initialized' });
-    const status = supervisor.inspectBoxStatus;
-    supervisor.inspectBoxStatus = () => ({
-        ...status(),
-        inbox: { routingConfigured: true },
-    });
-    supervisor.runUpdateTransaction = async (argv, options) => {
-        events.push(['update-transaction', argv, options]);
-        return {
-            workspacePloinky: {
-                found: true,
-                updated: true,
-                skipped: false,
-                repoPath: '/home/user/workspace/ploinky',
-                pullStrategy: 'rebase-autostash',
-            },
-        };
-    };
-    const output = bufferStream();
-    const code = await runOuterCli(['update'], {
-        env: {},
-        input: { isTTY: false }, output, errorOutput: bufferStream(),
-        supervisor,
+test('a relaunched child consumes the handoff once, skips the host pull and reports the first pull', async () => {
+    const store = createMemoryUpdateHostState();
+    const parentEvents = [];
+    const childEvents = [];
+    const childOutput = bufferStream();
+    const results = [];
+    let childStatus;
+    const argv = ['update'];
+    const parentOutput = bufferStream();
+    const code = await runOuterCli(argv, {
+        env: { PATH: '/bin' },
+        cwd: () => WORKSPACE_ROOT,
+        input: { isTTY: false }, output: parentOutput, errorOutput: bufferStream(),
+        supervisor: fakeSupervisor(parentEvents),
         repositoryRoot: '/source/ploinky',
-        async updateHostSource() {
-            events.push('host-update');
-            return { updated: false };
+        updateHostState: store,
+        updateHostSource: async () => hostUpdateRevisions(),
+        async relaunch(_command, args, { env }) {
+            childStatus = await runOuterCli(args.slice(1), {
+                env,
+                cwd: () => WORKSPACE_ROOT,
+                input: { isTTY: false }, output: childOutput, errorOutput: bufferStream(),
+                supervisor: fakeSupervisor(childEvents),
+                repositoryRoot: '/source/ploinky',
+                updateHostState: store,
+                handoffParentPid: process.pid,
+                onUpdateResult: result => results.push(result),
+                updateHostSource: async () => { throw new Error('the child must not pull the host checkout again'); },
+                relaunch() { throw new Error('the child must never relaunch again'); },
+            });
+            return childStatus;
         },
-        execute() { throw new Error('the supervisor owns the full update transaction'); },
-        relaunch() { throw new Error('unchanged host source must not relaunch'); },
     });
     assert.equal(code, 0);
-    assert.deepEqual(events, [
-        'host-update',
-        'status',
-        ['update-transaction', ['update'], {
-            branchPolicy: {
-                branch: null,
-                repoBranches: {},
-                fallback: 'default',
-                resetRepos: false,
-            },
-            restartAfterUpdate: true,
-            updateScopeRoot: UPDATE_SCOPE_ROOT,
-        }],
-    ]);
-    assert.match(output.value(), /Workspace Ploinky checkout at \/home\/user\/workspace\/ploinky is updated/);
-    assert.match(output.value(), /git pull --rebase --autostash/);
-    assert.match(output.value(), /were restarted coherently/);
+    assert.equal(childStatus, 0);
+    assert.deepEqual(parentEvents, []);
+    assert.equal(childEvents.length, 1);
+    assert.equal(childEvents[0][0], 'update-transaction');
+    assert.match(childOutput.value(), /was updated from aaaaaaaaaaaa to bbbbbbbbbbbb before this relaunch/);
+    assert.doesNotMatch(childOutput.value(), /already up to date/);
+    assert.deepEqual(results[0].host, {
+        outcome: 'changed', repoPath: '/source/ploinky', before: 'a'.repeat(40), after: 'b'.repeat(40), relaunched: true,
+    });
+    assert.deepEqual(store.list('update-handoffs'), [], 'the record was consumed exactly once');
+    assert.doesNotMatch(parentOutput.value(), /did not accept the relaunch handoff/);
 });
 
-test('full update does not restart an unconfigured workspace or continue after update failure', async () => {
+test('tampered, replayed, stale, foreign and mismatched handoffs are refused before any update work', async () => {
+    const identity = { instance: 'ploinky-box-workspace-123456789abc', workspaceRoot: WORKSPACE_ROOT };
+    const request = { kind: 'all', folder: null, folderPath: null };
+    function pending(store, overrides = {}) {
+        return createRelaunchHandoff({
+            store,
+            argv: ['update'],
+            request,
+            identity,
+            scopeRoot: WORKSPACE_ROOT,
+            host: hostUpdateRevisions(),
+            parentPid: process.pid,
+            ...overrides,
+        });
+    }
+    function child(store, value, { argv = ['update'], parentPid = process.pid, now } = {}) {
+        const events = [];
+        const promise = runOuterCli(argv, {
+            env: { [UPDATE_HANDOFF_ENV]: value },
+            cwd: () => WORKSPACE_ROOT,
+            input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            supervisor: fakeSupervisor(events),
+            updateHostState: store,
+            handoffParentPid: parentPid,
+            ...(now ? { handoffNow: now } : {}),
+            async updateHostSource() { events.push('host-update'); return { updated: false }; },
+            relaunch() { events.push('relaunch'); return 0; },
+        });
+        return { promise, events };
+    }
+    const refused = { code: 'PLOINKY_BOX_UPDATE_HANDOFF_INVALID' };
+    const cases = [
+        ['tampered token', store => child(store, `${pending(store).operationId}:${'0'.repeat(64)}`)],
+        ['malformed value', store => { pending(store); return child(store, 'not-a-handoff'); }],
+        ['stale record', store => child(store, pending(store).envValue, {
+            now: () => new Date(Date.now() + 11 * 60 * 1000),
+        })],
+        ['foreign parent', store => child(store, pending(store).envValue, { parentPid: process.pid + 100_000 })],
+        ['changed request', store => child(store, pending(store).envValue, { argv: ['update', 'repos'] })],
+        ['other workspace', store => child(store, pending(store, {
+            identity: { ...identity, instance: 'ploinky-box-other-123456789abc' },
+        }).envValue)],
+        ['other folder', store => child(store, pending(store, { scopeRoot: path.dirname(WORKSPACE_ROOT) }).envValue)],
+    ];
+    for (const [name, run] of cases) {
+        const store = createMemoryUpdateHostState();
+        const { promise, events } = run(store);
+        await assert.rejects(promise, refused, name);
+        assert.deepEqual(events, [], `${name}: no self-update, Box, or supervisor work`);
+    }
+
+    // Replay: the first child consumes the record; the same value is refused after.
+    const store = createMemoryUpdateHostState();
+    const handoff = pending(store);
+    const first = child(store, handoff.envValue);
+    assert.equal(await first.promise, 0);
+    assert.equal(first.events.length, 1);
+    const replay = child(store, handoff.envValue);
+    await assert.rejects(replay.promise, refused);
+    assert.deepEqual(replay.events, []);
+
+    // A forged record without a matching token hash is refused as well.
+    const forgedStore = createMemoryUpdateHostState();
+    const forged = pending(forgedStore);
+    const record = forgedStore.read('update-handoffs', forged.operationId);
+    record.tokenHash = 'f'.repeat(64);
+    forgedStore.write('update-handoffs', forged.operationId, record);
+    const forgedChild = child(forgedStore, forged.envValue);
+    await assert.rejects(forgedChild.promise, refused);
+    assert.deepEqual(forgedChild.events, []);
+});
+
+test('durable handoff records are private host state files consumed by atomic rename', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-handoff-home-'));
+    try {
+        const store = createUpdateHostState({ stateRoot: path.join(home, '.ploinky-box') });
+        const identity = { instance: 'ploinky-box-workspace-123456789abc', workspaceRoot: WORKSPACE_ROOT };
+        const handoff = createRelaunchHandoff({
+            store, argv: ['update'], request: { kind: 'all', folder: null, folderPath: null }, identity,
+            scopeRoot: WORKSPACE_ROOT, host: hostUpdateRevisions(), parentPid: process.pid,
+        });
+        const file = path.join(home, '.ploinky-box', 'update-handoffs', `${handoff.operationId}.json`);
+        assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+        assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
+        const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+        assert.equal(JSON.stringify(saved).includes(handoff.envValue.split(':')[1]), false, 'the token itself is never stored');
+        const code = await runOuterCli(['update'], {
+            env: { [UPDATE_HANDOFF_ENV]: handoff.envValue },
+            cwd: () => WORKSPACE_ROOT,
+            input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            supervisor: fakeSupervisor([]),
+            updateHostState: store,
+            handoffParentPid: process.pid,
+            async updateHostSource() { throw new Error('no host pull after a valid handoff'); },
+        });
+        assert.equal(code, 0);
+        assert.deepEqual(fs.readdirSync(path.dirname(file)), []);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test('full update samples activation under the transaction lock and reports its actual outcome', async () => {
+    for (const [outcome, wording] of [
+        ['restarted', /workspace graph was restarted and the Router health check passed/],
+        ['not-required', /no configured running workspace required a restart/],
+    ]) {
+        const events = [];
+        const supervisor = fakeSupervisor(events, { statusState: 'running-initialized' });
+        supervisor.runUpdateTransaction = async (argv, { hostRecords, ...options }) => {
+            assert.deepEqual(hostRecords.map(record => [record.phase, record.outcome]), [['host-ploinky', 'unchanged']]);
+            events.push(['update-transaction', argv, options]);
+            return {
+                activation: { outcome },
+                workspacePloinky: {
+                    found: true,
+                    updated: true,
+                    skipped: false,
+                    repoPath: '/home/user/workspace/ploinky',
+                    pullStrategy: 'fast-forward-only',
+                },
+            };
+        };
+        const output = bufferStream();
+        const code = await runOuterCli(['update'], {
+            env: {},
+            cwd: () => WORKSPACE_ROOT,
+            input: { isTTY: false }, output, errorOutput: bufferStream(),
+            supervisor,
+            repositoryRoot: '/source/ploinky',
+            async updateHostSource() {
+                events.push('host-update');
+                return { updated: false };
+            },
+            execute() { throw new Error('the supervisor owns the full update transaction'); },
+            relaunch() { throw new Error('unchanged host source must not relaunch'); },
+        });
+        assert.equal(code, 0);
+        // No status is sampled before the transaction; it decides under its lock.
+        assert.deepEqual(events, [
+            'host-update',
+            ['update-transaction', ['update'], {
+                request: { kind: 'all', folder: null, folderPath: null },
+                scope: null,
+                debug: false,
+                branchPolicy: DEFAULT_BRANCH_POLICY,
+                branchPolicyArgs: [],
+                updateScopeRoot: WORKSPACE_ROOT,
+            }],
+        ]);
+        assert.match(output.value(), /Workspace Ploinky checkout at \/home\/user\/workspace\/ploinky is updated/);
+        assert.match(output.value(), /is updated \(verified fast-forward only\)/);
+        assert.match(output.value(), wording);
+        assert.doesNotMatch(output.value(), /restarted coherently/);
+    }
+});
+
+test('update failure wording follows the transaction activation outcome', async () => {
+    for (const [activation, wording] of [
+        [{ outcome: 'preserved' }, /left as it was/],
+        [{ outcome: 'restored' }, /reconstruction of the previous Box and graph configuration was attempted and passed/],
+        [{ outcome: 'recovery-required' }, /manual recovery is required/],
+        [undefined, /activation outcome could not be determined/],
+    ]) {
+        const events = [];
+        const supervisor = fakeSupervisor(events, { statusState: 'absent' });
+        supervisor.runUpdateTransaction = async () => {
+            events.push('update-failed');
+            throw Object.assign(new Error('candidate update failed'), activation ? { activation } : {});
+        };
+        const output = bufferStream();
+        await assert.rejects(
+            runOuterCli(['update', 'all', '--branch=candidate', '--branch-fallback=fail'], {
+                env: {}, cwd: () => WORKSPACE_ROOT,
+                input: { isTTY: false }, output, errorOutput: bufferStream(),
+                supervisor,
+                async updateHostSource() { return { updated: false }; },
+            }),
+            /candidate update failed/,
+        );
+        assert.deepEqual(events, ['update-failed']);
+        assert.match(output.value(), wording);
+        assert.doesNotMatch(output.value(), /Update complete/);
+    }
+});
+
+test('branch policy is consumed at the host boundary for the full form', async () => {
     const events = [];
-    const output = bufferStream();
-    const code = await runOuterCli([
-        'update', 'all', '--branch=candidate', '--branch-fallback=fail',
-    ], {
-        env: {},
-        input: { isTTY: false }, output, errorOutput: bufferStream(),
-        supervisor: fakeSupervisor(events, { statusState: 'absent' }),
+    const supervisor = fakeSupervisor(events, { statusState: 'absent' });
+    supervisor.runUpdateTransaction = async (argv, { hostRecords: _hostRecords, ...options }) => {
+        events.push(['update-transaction', argv, options]);
+        return { activation: { outcome: 'not-required' } };
+    };
+    const code = await runOuterCli(['update', 'all', '--branch=candidate', '--branch-fallback=fail'], {
+        env: {}, cwd: () => WORKSPACE_ROOT,
+        input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+        supervisor,
         async updateHostSource() { return { updated: false }; },
-        execute() { throw new Error('the supervisor owns the full update transaction'); },
     });
     assert.equal(code, 0);
     assert.deepEqual(events, [
-        'status',
         ['update-transaction', ['update', 'all'], {
-            branchPolicy: {
-                branch: 'candidate',
-                repoBranches: {},
-                fallback: 'fail',
-                resetRepos: false,
-            },
-            restartAfterUpdate: false,
-            updateScopeRoot: UPDATE_SCOPE_ROOT,
+            request: { kind: 'all', folder: null, folderPath: null },
+            scope: null,
+            debug: false,
+            branchPolicy: { ...DEFAULT_BRANCH_POLICY, branch: 'candidate', fallback: 'fail' },
+            branchPolicyArgs: ['--branch=candidate', '--branch-fallback=fail'],
+            updateScopeRoot: WORKSPACE_ROOT,
         }],
     ]);
-    assert.match(output.value(), /no configured running workspace required a restart/);
-
-    const failedEvents = [];
-    const failedSupervisor = fakeSupervisor(failedEvents, { statusState: 'absent' });
-    failedSupervisor.runUpdateTransaction = async () => {
-        failedEvents.push('update-failed');
-        throw new Error('candidate update failed');
-    };
-    await assert.rejects(
-        runOuterCli(['update'], {
-            env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-            supervisor: failedSupervisor,
-            async updateHostSource() { return { updated: false }; },
-        }),
-        /candidate update failed/,
-    );
-    assert.deepEqual(failedEvents, ['status', 'update-failed']);
 });
 
 test('full update skips an out-of-scope host checkout and continues the remaining update', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-update-scope-'));
-    const scope = path.join(root, 'workspace');
-    fs.mkdirSync(scope);
+    const scope = fs.mkdtempSync(path.join(WORKSPACE_ROOT, 'scope-'));
     const events = [];
     const output = bufferStream();
     try {
@@ -892,74 +1083,116 @@ test('full update skips an out-of-scope host checkout and continues the remainin
             repositoryRoot: '/installed/ploinky',
             updateScopeRoot: fs.realpathSync.native(scope),
         }]);
-        assert.equal(events[1], 'status');
-        assert.equal(events[2][0], 'update-transaction');
-        assert.equal(events[2][2].updateScopeRoot, fs.realpathSync.native(scope));
+        assert.equal(events[1][0], 'update-transaction');
+        assert.equal(events[1][2].updateScopeRoot, fs.realpathSync.native(scope));
         assert.match(output.value(), /was not updated/);
         assert.match(output.value(), /Update complete/);
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(scope, { recursive: true, force: true });
     }
 });
 
-test('update all PATH uses PATH as the Ploinky update folder', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-update-path-'));
-    const selected = path.join(root, 'selected');
-    fs.mkdirSync(selected);
-    const events = [];
+test('folder forms resolve canonical workspace scope for relative, nested, absolute and alias spellings', async () => {
+    const base = fs.mkdtempSync(path.join(WORKSPACE_ROOT, 'folders-'));
+    const nested = path.join(base, 'projects', 'nested');
+    fs.mkdirSync(nested, { recursive: true });
+    const alias = path.join(os.tmpdir(), `ploinky-cli-alias-${process.pid}-${Date.now()}`);
+    fs.symlinkSync(nested, alias, 'dir');
     try {
-        const code = await runOuterCli(['update', 'all', 'selected'], {
-            env: {},
-            cwd: () => root,
-            input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-            supervisor: fakeSupervisor(events, { statusState: 'absent' }),
-            async updateHostSource(options) {
-                events.push(['host-update', options]);
-                return { updated: false, skipped: true, reason: 'outside scope' };
-            },
-        });
-        assert.equal(code, 0);
-        assert.equal(events[0][1].updateScopeRoot, fs.realpathSync.native(selected));
-        assert.equal(events[2][2].updateScopeRoot, fs.realpathSync.native(selected));
+        const relativeBase = path.relative(WORKSPACE_ROOT, base);
+        for (const [argv, cwdPath, folderPath] of [
+            [['update'], nested, nested],
+            [['update', 'all'], nested, nested],
+            [['update'], alias, alias],
+            [['update', 'all', path.join(relativeBase, 'projects')], WORKSPACE_ROOT, path.join(base, 'projects')],
+            [['update', 'nested'], path.join(base, 'projects'), nested],
+            [['update', nested], '/', nested],
+            [['update', 'all', alias], '/', alias],
+        ]) {
+            const events = [];
+            const code = await runOuterCli(argv, {
+                env: {},
+                cwd: () => cwdPath,
+                input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+                supervisor: fakeSupervisor(events, { statusState: 'absent' }),
+                async updateHostSource(options) {
+                    events.push(['host-update', options]);
+                    return { updated: false, skipped: true, reason: 'outside scope' };
+                },
+            });
+            assert.equal(code, 0, argv.join(' '));
+            const canonical = fs.realpathSync.native(folderPath);
+            assert.equal(events[0][1].updateScopeRoot, canonical, argv.join(' '));
+            const [, , options] = events[1];
+            assert.equal(options.request.folderPath, folderPath, argv.join(' '));
+            assert.deepEqual(options.scope, {
+                relative: path.relative(WORKSPACE_ROOT, canonical),
+                canonicalFolder: canonical,
+            }, argv.join(' '));
+            assert.equal(options.updateScopeRoot, canonical);
+        }
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(alias, { force: true });
+        fs.rmSync(base, { recursive: true, force: true });
     }
 });
 
-test('update PATH uses the documented shorthand update folder', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-update-short-path-'));
-    const events = [];
+test('outside, missing and malformed update scopes are rejected before any self-update, Box or supervisor call', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-cli-update-outside-'));
     try {
-        const code = await runOuterCli(['update', root], {
-            env: {},
-            input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
-            supervisor: fakeSupervisor(events, { statusState: 'absent' }),
-            async updateHostSource(options) {
-                events.push(['host-update', options]);
-                return { updated: false, skipped: true, reason: 'outside scope' };
-            },
-        });
-        assert.equal(code, 0);
-        assert.equal(events[0][1].updateScopeRoot, fs.realpathSync.native(root));
-        assert.equal(events[2][2].updateScopeRoot, fs.realpathSync.native(root));
+        for (const [argv, code] of [
+            [['update', 'all', outside], 'PLOINKY_UPDATE_SCOPE_OUTSIDE'],
+            [['update', outside], 'PLOINKY_UPDATE_SCOPE_OUTSIDE'],
+            [['update', 'all', path.dirname(WORKSPACE_ROOT)], 'PLOINKY_UPDATE_SCOPE_OUTSIDE'],
+            [['update', 'all', path.join(WORKSPACE_ROOT, 'missing')], 'PLOINKY_BOX_ARGUMENT_INVALID'],
+            [['update', 'repos', 'extra'], 'PLOINKY_BOX_ARGUMENT_INVALID'],
+            [['update', 'repo'], 'PLOINKY_BOX_ARGUMENT_INVALID'],
+            [['update', '--unknown'], 'PLOINKY_BOX_ARGUMENT_INVALID'],
+        ]) {
+            const events = [];
+            const supervisor = fakeSupervisor(events);
+            await assert.rejects(runOuterCli(argv, {
+                env: {},
+                cwd: () => WORKSPACE_ROOT,
+                input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+                supervisor,
+                updateHostState: createMemoryUpdateHostState(),
+                async updateHostSource() { events.push('host-update'); return { updated: true }; },
+                relaunch() { events.push('relaunch'); return 0; },
+                execute() { events.push('execute'); return 0; },
+            }), { code }, argv.join(' '));
+            assert.deepEqual(events, [], argv.join(' '));
+        }
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(outside, { recursive: true, force: true });
     }
 });
 
-test('targeted update forms retain generic forwarding without a host pull', async () => {
-    for (const argv of [['update', 'repos'], ['update', 'repo', 'demo']]) {
+test('repository-only and targeted update forms run inside the update transaction without a host pull', async () => {
+    for (const [argv, request, branchPolicyArgs] of [
+        [['update', 'repos'], { kind: 'repos' }, []],
+        [['update', 'repositories', '--reset-repos'], { kind: 'repos' }, ['--reset-repos']],
+        [['update', 'repo', 'demo'], { kind: 'repo', repoName: 'demo' }, []],
+        [['update', 'demo'], { kind: 'repo', repoName: 'demo' }, []],
+    ]) {
         const events = [];
+        const supervisor = fakeSupervisor(events);
+        supervisor.runUpdateTransaction = async (coreArgv, options) => {
+            events.push(['update-transaction', options.request, options.branchPolicyArgs]);
+            return { activation: { outcome: 'deferred' } };
+        };
+        const output = bufferStream();
         const code = await runOuterCli(argv, {
-            env: {}, input: { isTTY: false }, output: bufferStream(), errorOutput: bufferStream(),
+            env: {}, input: { isTTY: false }, output, errorOutput: bufferStream(),
             cwd: () => WORKSPACE_ROOT,
-            supervisor: fakeSupervisor(events),
+            supervisor,
             async updateHostSource() { throw new Error('targeted update must not pull host source'); },
-            execute(command, args) { events.push(['execute', command, args]); return 0; },
+            execute() { throw new Error('targeted update must not execute outside the transaction'); },
         });
         assert.equal(code, 0);
-        assert.equal(events[0], 'prepare');
-        assert.deepEqual(events[1][2].slice(-argv.length), argv);
+        assert.deepEqual(events, [['update-transaction', request, branchPolicyArgs]], argv.join(' '));
+        assert.match(output.value(), /may require activation: run `ploinky restart`/);
+        assert.doesNotMatch(output.value(), /was restarted and|health check passed/);
     }
 });
 

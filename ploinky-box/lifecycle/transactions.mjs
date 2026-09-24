@@ -301,6 +301,7 @@ export async function reconcileBoxContainer({
     routerBinding = null,
     imageRef = BOX_IMAGE_REFERENCE,
     imagePolicy = 'pull',
+    allowReplacement = true,
     platform = process.platform,
     env = process.env,
     stdout = process.stdout,
@@ -407,6 +408,16 @@ export async function reconcileBoxContainer({
         // leave the old inode mounted in a reused Box.
         || agentLibSelectionChanged(old.agentLib, desiredAgentLib)
     );
+    // Targeted commands may reuse, start, or create a Box, but must never
+    // replace one: a replacement stops its graph and they would not restart it.
+    if (old && requiresReplacement && allowReplacement !== true) {
+        throw new PloinkyBoxError(
+            'The existing Box cannot be reused for this command because its image, publication, data paths, '
+            + 'or AchillesAgentLib selection changed; nothing was replaced. Run `ploinky update` or '
+            + '`ploinky restart` to replace it coherently.',
+            { code: 'PLOINKY_BOX_REPLACEMENT_REFUSED' },
+        );
+    }
     if (old && !requiresReplacement) {
         // Reuse is valid only while the host directories are the exact bind
         // sources captured at creation. Revalidation immediately before start
@@ -463,6 +474,9 @@ export async function reconcileBoxContainer({
             routerBinding: reusedBinding,
             previousAgentLib: old.agentLib,
             previousRouterBinding: reusedBinding,
+            // Non-settling proof of the exact reused Box, for use immediately
+            // before a graph mutation or admission write.
+            validate() { validateFinalOwnership(currentContainer.id, old); },
             finalize() { validateFinalOwnership(currentContainer.id, old); },
             async rollback() {
                 // Reuse did not replace an outer resource. The supervisor owns
@@ -572,6 +586,10 @@ export async function reconcileBoxContainer({
         candidateId = created.containerId;
         const candidateDesired = oldDesired(identity, created.ownership, repositoryRoot, engine);
         let settled = false;
+        const validate = () => {
+            if (settled) throw transactionError('Box candidate was already settled or rolled back');
+            validateFinalOwnership(candidateId, candidateDesired);
+        };
         const finalize = () => {
             if (settled) return;
             validateFinalOwnership(candidateId, candidateDesired);
@@ -635,6 +653,7 @@ export async function reconcileBoxContainer({
             imageId: image.immutableId,
             previousAgentLib: old?.agentLib || null,
             previousRouterBinding: old ? routerBindingResult(old.routerBinding, old.hostPort) : null,
+            validate,
             finalize,
             rollback,
         });

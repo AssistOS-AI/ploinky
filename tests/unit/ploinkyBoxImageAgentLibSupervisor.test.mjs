@@ -8,6 +8,7 @@ import { readActiveDescriptor } from '../../agentlib/source.mjs';
 import { buildWorkspaceIdentity } from '../../ploinky-box/identity.mjs';
 import { createBoxSupervisor } from '../../ploinky-box/supervisor.mjs';
 import { writeAgentLibCheckout } from '../helpers/agentlibFixture.mjs';
+import { fakeUpdateCore, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
 
 function fixture(t, {
     corrupt = false, existingBox = false, bundleCommit = canonicalAgentLibRemote().commit, env = {}, repositoryRoot,
@@ -62,6 +63,8 @@ function fixture(t, {
         resolveHostReachableIpv4: async () => '192.168.1.12',
         startCore: async () => { calls.push('core'); },
         runCoreCommand: async () => { calls.push('core'); },
+        runRestartCore: fakeRestartCore(async () => { calls.push('core'); }),
+        runUpdateCore: fakeUpdateCore({ onCall() { calls.push('core'); } }),
         healthCheck: async () => { calls.push('health'); },
         stdout: { write() {} }, stderr: { write() {} },
     });

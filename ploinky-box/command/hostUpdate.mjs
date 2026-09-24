@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -8,22 +7,31 @@ import {
     resolvePloinkyUpdateScope,
 } from '../../cli/commands/ploinkyUpdateScope.js';
 import { isGitRepo, updatePloinkySelf } from '../../cli/commands/updateService.js';
+import { GIT_UPDATE_STRATEGY } from '../../cli/utils/git/verifiedUpdate.js';
+import { acquireSourceLock, ploinkySourceLockIdentity } from '../../cli/utils/git/sourceLock.js';
 import { boxWorkspacePath } from '../contract/workspace-root.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
 import { createMutationLockManager } from '../locks.mjs';
 
-function hostUpdateError(message, cause) {
-    return new PloinkyBoxError(message, {
-        code: 'PLOINKY_BOX_HOST_UPDATE_FAILED',
-        cause,
-    });
+// Both writers keep the operation record of a non-verified Git update on the
+// thrown error so the caller can report the exact named outcome.
+function withRecord(error, record) {
+    if (record) error.record = record;
+    return error;
 }
 
-function workspaceUpdateError(message, cause) {
-    return new PloinkyBoxError(message, {
+function hostUpdateError(message, cause, record = cause?.record) {
+    return withRecord(new PloinkyBoxError(message, {
+        code: 'PLOINKY_BOX_HOST_UPDATE_FAILED',
+        cause,
+    }), record);
+}
+
+function workspaceUpdateError(message, cause, record = cause?.record) {
+    return withRecord(new PloinkyBoxError(message, {
         code: 'PLOINKY_BOX_WORKSPACE_PLOINKY_UPDATE_FAILED',
         cause,
-    });
+    }), record);
 }
 
 function skippedWorkspaceUpdate(repoPath, reason, extra = {}) {
@@ -50,17 +58,11 @@ function workspaceCheckoutBoxPath(workspaceRoot, canonicalWorkspace, canonicalRe
 export function hostSourceLockIdentity(repositoryRoot, {
     realpath = fs.realpathSync.native,
 } = {}) {
-    let canonicalRoot;
     try {
-        canonicalRoot = realpath(repositoryRoot);
+        return ploinkySourceLockIdentity(repositoryRoot, { realpath });
     } catch (error) {
         throw hostUpdateError(`Unable to resolve the host Ploinky checkout: ${repositoryRoot}`, error);
     }
-    const digest = crypto.createHash('sha256').update(canonicalRoot).digest('hex').slice(0, 12);
-    return Object.freeze({
-        canonicalRoot,
-        lockIdentity: `ploinky-box-source-${digest}`,
-    });
 }
 
 export async function updateHostPloinkySource({
@@ -94,18 +96,30 @@ export async function updateHostPloinkySource({
             ...source,
         });
     }
-    const lock = await lockManager.acquire(source.lockIdentity);
+    const lock = await acquireSourceLock(lockManager, source.lockIdentity);
     try {
         lock.assertHeld(source.lockIdentity);
-        const result = updateSelf({
-            repoPath: source.canonicalRoot,
-            updateScopePath: scope.scopeRoot,
-            interactiveSession: false,
-            ...(boxMarkerPath ? { boxMarkerPath } : {}),
-        });
+        let result;
+        try {
+            // The source lock is already held here; the self-update reuses it
+            // instead of re-acquiring it, and it is released below before any
+            // relaunch or workspace lock acquisition by the caller.
+            result = await updateSelf({
+                repoPath: source.canonicalRoot,
+                updateScopePath: scope.scopeRoot,
+                interactiveSession: false,
+                phase: 'host-ploinky',
+                heldSourceLock: { lockIdentity: source.lockIdentity, lock },
+                ...(boxMarkerPath ? { boxMarkerPath } : {}),
+            });
+        } catch (error) {
+            throw hostUpdateError(`Unable to update the host Ploinky checkout: ${error?.message || error}`, error);
+        }
         if (result?.skipped) {
             throw hostUpdateError(
                 `Unable to update the host Ploinky checkout: ${result.reason || 'update was skipped'}`,
+                undefined,
+                result.record,
             );
         }
         return Object.freeze({
@@ -136,17 +150,16 @@ export function isPloinkySourceCheckout(repoPath, {
 }
 
 /**
- * Pull a Ploinky checkout selected by the command's canonical update folder
- * while the exact workspace mutation lock is held. A checkout containing that
- * folder, or a direct `<folder>/ploinky` checkout, is eligible. The executable's
- * own checkout is updated separately, so an identical path is not pulled twice.
+ * Select a workspace Ploinky checkout without executing its Git config on the
+ * host. The Box can write this checkout's hooks, filters and transport helpers;
+ * its Git operation therefore belongs to the in-Box update. The executable's
+ * explicitly selected source is handled separately by the trusted host writer.
  */
-export function updateWorkspacePloinkySource({
+export async function updateWorkspacePloinkySource({
     identity,
     lock,
     repositoryRoot,
     updateScopeRoot,
-    updateSelf = updatePloinkySelf,
     realpath = fs.realpathSync.native,
 } = {}) {
     if (!identity?.workspaceRoot || !identity?.instance) {
@@ -244,27 +257,15 @@ export function updateWorkspacePloinkySource({
         );
     }
 
-    let result;
-    try {
-        result = updateSelf({
-            repoPath: canonicalRepo,
-            updateScopePath: canonicalScope,
-            interactiveSession: false,
-        });
-    } catch (error) {
-        throw workspaceUpdateError(`Unable to update the workspace Ploinky checkout: ${canonicalRepo}`, error);
-    }
-    if (result?.skipped) {
-        throw workspaceUpdateError(
-            `Unable to update the workspace Ploinky checkout: ${result.reason || 'update was skipped'}`,
-        );
-    }
     return Object.freeze({
-        ...result,
         found: true,
+        updated: false,
+        deferredToCore: true,
         repoPath: canonicalRepo,
         updateScopeRoot: canonicalScope,
-        boxRepoPath: workspaceCheckoutBoxPath(identity.workspaceRoot, canonicalWorkspace, canonicalRepo),
-        pullStrategy: 'rebase-autostash',
+        // This is an inclusion, never the exclusion used for a checkout the
+        // host already updated. Core deduplicates it with ordinary discovery.
+        delegatedBoxRepoPath: workspaceCheckoutBoxPath(identity.workspaceRoot, canonicalWorkspace, canonicalRepo),
+        pullStrategy: GIT_UPDATE_STRATEGY,
     });
 }

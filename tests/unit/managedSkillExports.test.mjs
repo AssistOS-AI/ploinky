@@ -110,7 +110,7 @@ test('symlink exports migrate owned copies, expose source edits and remove dangl
     assert.deepEqual(migrated.installed, ['demo']);
     assert.ok(fs.lstatSync(output).isSymbolicLink());
     assert.equal(path.isAbsolute(fs.readlinkSync(output)), false);
-    assert.equal(fs.realpathSync(output), source);
+    assert.equal(fs.realpathSync(output), fs.realpathSync(source));
     fs.writeFileSync(path.join(source, 'helper.sh'), 'changed source');
     assert.equal(fs.readFileSync(path.join(output, 'helper.sh'), 'utf8'), 'changed source');
     assert.deepEqual(sync({ mode: 'symlink' }).unchanged, ['demo']);
@@ -131,6 +131,26 @@ test('symlink migration preserves edited copies and user-retargeted links', t =>
     fs.unlinkSync(output);
     fs.symlinkSync(replacement, output);
     assert.equal(sync({ sources: [], mode: 'symlink' }).diagnostics[0].reason, 'edited-output-preserved');
-    assert.equal(fs.realpathSync(output), replacement);
+    assert.equal(fs.realpathSync(output), fs.realpathSync(replacement));
     assert.ok(fs.existsSync(path.join(source, 'SKILL.md')));
+});
+
+test('symlink exports through an unequal-depth folder alias resolve after install and idempotent refresh', t => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'managed-skills-alias-')));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    const source = path.join(base, 'source');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, 'SKILL.md'), '# aliased\n');
+    const real = path.join(base, 'deep', 'nested', 'target');
+    fs.mkdirSync(real, { recursive: true });
+    const alias = path.join(base, 'alias');
+    fs.symlinkSync(real, alias, 'dir');
+    const sync = () => syncManagedSkillExports({ folder: alias, owner: 'manifest', mode: 'symlink',
+        sources: [{ name: 'demo', path: source, source: { name: 'fixture' } }] });
+    assert.deepEqual(sync().installed, ['demo']);
+    for (const root of [alias, real]) {
+        assert.equal(fs.readFileSync(path.join(root, '.agents/skills/demo/SKILL.md'), 'utf8'), '# aliased\n');
+    }
+    assert.deepEqual(sync().unchanged, ['demo']);
+    assert.equal(fs.realpathSync(path.join(alias, '.agents/skills/demo')), source);
 });

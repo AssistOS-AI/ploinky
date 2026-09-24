@@ -17,6 +17,7 @@ import {
     agentLibFixtureLabels,
     agentLibFixtureMounts,
 } from '../helpers/agentlibFixture.mjs';
+import { fakeUpdateCore, fakeRestartCore } from '../helpers/fakeUpdateCore.mjs';
 
 function bufferStream(isTTY = false) {
     let bytes = '';
@@ -105,6 +106,8 @@ function matrixSupervisor(identity, events) {
         },
         startCore: async () => { events.push('start-core'); },
         runCoreCommand: async () => { events.push('run-core-command'); },
+        runRestartCore: fakeRestartCore(async () => { events.push('run-core-command'); }),
+        runUpdateCore: fakeUpdateCore({ onCall() { events.push('run-core-command'); } }),
         healthCheck: async () => { events.push('health'); },
         revalidateAgentLibSource: () => { events.push('revalidate-agentlib'); },
         commitAgentLibSelection: () => { events.push('commit-agentlib'); },
@@ -125,6 +128,11 @@ test('every public verb has the required single-lock depth and release boundary'
         { name: 'destroy', argv: ['destroy'], locks: 1 },
         { name: 'start', argv: ['start', 'Agent'], locks: 1 },
         { name: 'update', argv: ['update'], locks: 1 },
+        // Repository-only and targeted updates run their in-Box command
+        // inside the same single transaction, never after a released lock.
+        { name: 'update repos', argv: ['update', 'repos'], locks: 1, lockedCore: true },
+        { name: 'update repo', argv: ['update', 'repo', 'demo'], locks: 1, lockedCore: true },
+        { name: 'update folder', argv: ['update', 'all', '.'], locks: 1, lockedCore: true },
         { name: 'repl', argv: [], locks: 1, forwarded: true },
         { name: 'bash', argv: ['cli'], locks: 1, forwarded: true },
         { name: 'agent-cli', argv: ['cli', 'Agent'], locks: 1, forwarded: true },
@@ -158,6 +166,11 @@ test('every public verb has the required single-lock depth and release boundary'
         }
         if (scenario.name === 'start') {
             assert.ok(events.indexOf('health') < events.indexOf('release'));
+        }
+        if (scenario.lockedCore) {
+            const core = events.indexOf('run-core-command');
+            assert.ok(events.indexOf('lock') < core && core < events.indexOf('release'), scenario.name);
+            assert.equal(events.includes('execute'), false, scenario.name);
         }
         if (scenario.name === 'update') {
             assert.ok(events.lastIndexOf('run-core-command') < events.indexOf('revalidate-agentlib'));

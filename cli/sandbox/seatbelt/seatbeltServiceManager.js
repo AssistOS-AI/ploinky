@@ -59,7 +59,15 @@ import {
     getAgentCodePath,
     getAgentSkillsPath
 } from '../../utils/workspaceStructure.js';
-import { ensureAgentCacheForFamily } from '../../utils/dependencies/dependencyCache.js';
+import {
+    attachAdmittedDependencies,
+    noCacheDependencyRecord,
+    prepareRuntimeDependencies,
+    runtimeDependencyReuseProblem,
+    runtimeDependencyStore,
+    sandboxProcessIdentity,
+} from '../../utils/dependencies/cacheV4/runtimeDependencies.mjs';
+import { processIdentityEnded } from '../../utils/dependencies/cacheV4/receipts.mjs';
 import {
     assertManifestEnvProfileCompleteness,
     getExposedNames,
@@ -281,7 +289,40 @@ function ensureSeatbeltAgentLibDir(agentName, nodeModulesDir) {
     return stagedAgentLibPath;
 }
 
-function ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir) {
+function seatbeltSwitchError(agentName, linkPath, consumers) {
+    const error = new Error(
+        `[seatbelt] ${agentName}: refusing to switch ${linkPath} to a different dependency generation while `
+        + `another seatbelt consumer of this source is live (${consumers.join(', ')}). `
+        + 'Stop those consumers (or run the agent in a container or bwrap runtime), then retry.',
+    );
+    error.code = 'PLOINKY_DEPS_SEATBELT_LIVE_SWITCH';
+    return error;
+}
+
+/**
+ * Live consumers that resolve dependencies through this shared source link:
+ * other running seatbelt services of the same source and live interactive
+ * attachments. Unprovable liveness counts as live.
+ */
+function liveSeatbeltSourceConsumers(linkPath, { excludeContainer = '', loadAgents = loadAgentsMap, store = null, isRunning = isBwrapProcessRunning } = {}) {
+    const sourceDir = path.dirname(linkPath);
+    const live = [];
+    for (const [name, record] of Object.entries(loadAgents() || {})) {
+        if (name === excludeContainer || record?.runtime !== 'seatbelt') continue;
+        const usesSource = (record.config?.binds || []).some((bind) => path.resolve(String(bind?.source || '/')) === sourceDir);
+        if (!usesSource) continue;
+        if (isRunning(name, { instanceId: record.instanceId, enableGeneration: record.enableGeneration })) live.push(name);
+    }
+    let receipts = [];
+    receipts = (store || runtimeDependencyStore()).listReaderReceipts();
+    for (const receipt of receipts) {
+        if (receipt?.consumer?.kind !== 'seatbelt-attachment' || receipt.consumer.sourceLink !== linkPath) continue;
+        if (!processIdentityEnded(receipt.consumer.process).ended) live.push(`attachment pid ${receipt.consumer.process?.pid}`);
+    }
+    return live;
+}
+
+function ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir, options = {}) {
     const linkPath = path.join(agentCodePath, 'node_modules');
     const expectedTarget = fs.realpathSync(nodeModulesDir);
     try {
@@ -301,6 +342,10 @@ function ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir)
                 return linkPath;
             }
             if (currentTarget) {
+                // The source-tree link is shared by every consumer of this
+                // source. Never retarget it underneath a live one.
+                const consumers = liveSeatbeltSourceConsumers(linkPath, options);
+                if (consumers.length) throw seatbeltSwitchError(agentName, linkPath, consumers);
                 fs.unlinkSync(linkPath);
             }
         } else {
@@ -310,6 +355,7 @@ function ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir)
             );
         }
     } catch (err) {
+        if (err?.code === 'PLOINKY_DEPS_SEATBELT_LIVE_SWITCH') throw err;
         if (!err || err.code !== 'ENOENT') {
             throw new Error(`[seatbelt] ${agentName}: failed to inspect ${linkPath}: ${err.message}`);
         }
@@ -428,24 +474,53 @@ function buildSeatbeltEntryCommand(agentName, manifest, profileConfig, realPaths
     return entryCmd;
 }
 
+function seatbeltNeedsDependencies(agentCodePath, manifest) {
+    const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
+    return !readManifestStartCommand(manifest) || agentHasPackageJson;
+}
+
 function resolveSeatbeltAgentNodeModules({
-    repoName,
-    agentName,
     agentCodePath,
     agentWorkDir,
     needsCoreDeps,
+    containerName,
+    runtimeIdentity,
+    admittedRecord,
 }) {
     if (!needsCoreDeps) {
         const fallback = path.join(agentWorkDir, 'node_modules');
         ensureAgentDataDirectory(fallback);
-        return fallback;
+        return { nodeModulesDir: fallback, record: noCacheDependencyRecord('no-core-deps', { family: 'seatbelt' }), prepared: null };
     }
-    return ensureAgentCacheForFamily({
+    const prepared = prepareRuntimeDependencies({
         family: 'seatbelt',
-        repoName,
-        agentName,
+        runtimeKey: detectHostRuntimeKey('seatbelt'),
         agentCodePath,
+        registration: containerName,
+        admittedRecord,
+    }, {
+        consumer: {
+            kind: 'seatbelt-service',
+            key: `seatbelt:${containerName}:${runtimeIdentity.instanceId}:${runtimeIdentity.enableGeneration}`,
+            containerName,
+            registration: containerName,
+            sourceLink: path.join(agentCodePath, 'node_modules'),
+            phase: 'creating',
+        },
     });
+    return { nodeModulesDir: prepared.nodeModulesPath, record: prepared.record, prepared };
+}
+
+/** '' when the running seatbelt service already uses the desired generation. */
+function seatbeltDependencyReuseProblem({ agentName, manifest, record, containerName }, deps = {}) {
+    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
+    return runtimeDependencyReuseProblem({
+        record,
+        family: 'seatbelt',
+        needsDependencies: seatbeltNeedsDependencies(agentCodePath, manifest),
+        agentCodePath,
+        registration: containerName,
+    }, deps);
 }
 
 function resolveSeatbeltRuntimeLayout({ agentName, alias, cwd }) {
@@ -527,14 +602,21 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const startCmd = readManifestStartCommand(manifest);
     const needsCoreDeps = !startCmd || agentHasPackageJson;
-    const nodeModulesDir = resolveSeatbeltAgentNodeModules({
-        repoName,
-        agentName,
+    const dependencies = resolveSeatbeltAgentNodeModules({
         agentCodePath,
         agentWorkDir,
         needsCoreDeps,
+        containerName,
+        runtimeIdentity,
+        admittedRecord: profileRecord,
     });
-    ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir);
+    const nodeModulesDir = dependencies.nodeModulesDir;
+    try {
+        ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir, { excludeContainer: containerName });
+    } catch (error) {
+        dependencies.prepared?.release();
+        throw error;
+    }
     const seatbeltAgentLibPath = ensureSeatbeltAgentLibDir(agentName, nodeModulesDir);
     // Seatbelt has no mount namespace, so the grant names the canonical host
     // source directly and the cache symlink targets that same path.
@@ -688,7 +770,15 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
             try { process.kill(child.pid, 'SIGKILL'); } catch (_) { }
         }
         logHandle.discard();
+        if (!child?.pid) dependencies.prepared?.release();
         throw error;
+    }
+    if (dependencies.prepared) {
+        try {
+            dependencies.prepared.updateConsumer({ process: sandboxProcessIdentity(child.pid), phase: 'running' });
+        } catch (error) {
+            debugLog(`[seatbelt] ${agentName}: dependency receipt process update deferred: ${error?.message || error}`);
+        }
     }
     console.log(`[seatbelt] ${agentName}: started with PID ${child.pid}`);
 
@@ -714,6 +804,7 @@ function startSeatbeltProcess(agentName, manifest, agentPath, options = {}) {
             agentLibPath: seatbeltAgentLibPath
         },
         agentLib: agentLibRuntimeRecord(grant),
+        dependencies: dependencies.record,
         runMode: existingRecord.runMode,
         develRepo: existingRecord.develRepo,
         profile: activeProfile,
@@ -870,11 +961,17 @@ function ensureSeatbeltService(agentName, manifest, agentPath, options = {}) {
             existingRecord,
             agentLibGrant(detectHostRuntimeKey('seatbelt')),
         );
+        const dependencyProblem = (desired && desired !== current) || agentLibProblem
+            ? ''
+            : seatbeltDependencyReuseProblem({ agentName, manifest, record: existingRecord, containerName });
         if (desired && desired !== current) {
             console.log(`[seatbelt] ${agentName}: env hash changed, restarting...`);
             stopBwrapProcess(containerName);
         } else if (agentLibProblem) {
             console.log(`[seatbelt] ${agentName}: achillesAgentLib selection changed (${agentLibProblem}), restarting...`);
+            stopBwrapProcess(containerName);
+        } else if (dependencyProblem) {
+            console.log(`[seatbelt] ${agentName}: dependency generation changed (${dependencyProblem}), restarting...`);
             stopBwrapProcess(containerName);
         } else {
             debugLog(`[seatbelt] ${agentName}: already running (PID ${getBwrapPid(containerName, runtimeIdentity)})`);
@@ -956,17 +1053,41 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
     const { instanceName, cwd, agentWorkDir } = layout;
     ensureAgentDataDirectory(agentWorkDir);
     const sharedDir = ensureSharedHostDir();
-    const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
-    const startCmd = readManifestStartCommand(manifest);
-    const needsCoreDeps = !startCmd || agentHasPackageJson;
-    const nodeModulesDir = resolveSeatbeltAgentNodeModules({
-        repoName,
-        agentName,
-        agentCodePath,
-        agentWorkDir,
-        needsCoreDeps,
+    const needsCoreDeps = seatbeltNeedsDependencies(agentCodePath, manifest);
+    const sourceLink = path.join(agentCodePath, 'node_modules');
+    // An interactive session reuses the service's admitted generation with its
+    // own receipt. It never builds a tree and never retargets the shared link.
+    const attached = attachAdmittedDependencies(record, {
+        consumer: {
+            kind: 'seatbelt-attachment',
+            containerName,
+            registration: containerName,
+            sourceLink,
+            process: sandboxProcessIdentity(process.pid),
+        },
     });
-    ensureSeatbeltCodeNodeModules(agentName, agentCodePath, nodeModulesDir);
+    let nodeModulesDir;
+    try {
+        if (attached) {
+            nodeModulesDir = attached.nodeModulesPath;
+            let linked = '';
+            try { linked = fs.realpathSync(sourceLink); } catch (_) { linked = ''; }
+            if (linked !== fs.realpathSync(nodeModulesDir)) {
+                const error = new Error(`[seatbelt] ${agentName}: ${sourceLink} does not name the service's admitted dependency generation; restart the service first`);
+                error.code = 'PLOINKY_DEPS_SEATBELT_LINK_DRIFT';
+                throw error;
+            }
+        } else if (!needsCoreDeps) {
+            nodeModulesDir = path.join(agentWorkDir, 'node_modules');
+            ensureAgentDataDirectory(nodeModulesDir);
+        } else {
+            throw new Error(`[seatbelt] ${agentName}: the running service has no admitted dependency generation; restart it first`);
+        }
+    } catch (error) {
+        attached?.release();
+        throw error;
+    }
+    try {
     // An interactive attach receives exactly the same AgentLib grant as the
     // detached service, so a shell cannot reach a different source.
     const grant = agentLibGrant(detectHostRuntimeKey('seatbelt'));
@@ -1069,6 +1190,9 @@ function attachSeatbeltInteractive(agentName, manifest, agentPath, workdir, entr
         cwd
     });
     return result.status ?? 0;
+    } finally {
+        attached?.release();
+    }
 }
 
 export {
@@ -1082,6 +1206,8 @@ export {
     getSeatbeltExtraReadPaths,
     ensureSeatbeltAgentLibDir,
     ensureSeatbeltCodeNodeModules,
+    liveSeatbeltSourceConsumers,
+    seatbeltDependencyReuseProblem,
     resolveSeatbeltRuntimeLayout,
     applySeatbeltRuntimeEnvironment,
     buildSeatbeltRuntimeBinds

@@ -61,6 +61,15 @@ import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/do
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
 import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, withMaintenanceLock, withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import {
+  issueDependencyRebuildRequest,
+  runtimeCarriesRebuildToken,
+  settleDependencyRebuildRequest,
+} from '../utils/dependencies/cacheV4/runtimeDependencies.mjs';
+import {
+  collectDependencyObjectsAfterAdmission,
+  reportDependencyCollection,
+} from '../utils/dependencies/cacheV4/collector.mjs';
+import {
   AGENTS_DATA_DIR,
   LOGS_DIR,
   PLOINKY_CWD,
@@ -2595,6 +2604,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     console.log(`[start] Server logs: ${path.join(LOGS_DIR, 'router.log')}`);
     console.log(`[start] Watchdog logs: ${path.join(LOGS_DIR, 'watchdog.log')}`);
     console.log(`[start] Router: ${buildRouterUrl(staticPort)}`);
+    reportDependencyCollection(collectDependencyObjectsAfterAdmission({ lease: workspaceStartLock, reason: 'workspace-start' }));
   } catch (e) {
     const cleanedCandidateIds = new Set();
     for (const candidate of workspaceRuntimeCandidates.reverse()) {
@@ -3085,12 +3095,14 @@ async function reinstallAgent(agentName) {
     if (!agentName) { throw new Error('Usage: reinstall <name> | reinstall agent <name>'); }
 
     const { getAgentContainerName, ensureAgentService } = dockerSvc;
+    // Reinstall targets exactly one enabled registration/alias. An ambiguous
+    // or unresolvable reference fails (nonzero) before any state changes.
     let registryRecord = null;
     try {
         registryRecord = agentsSvc.resolveEnabledAgentRecord(agentName);
     } catch (err) {
         console.error(err?.message || err);
-        return;
+        throw err;
     }
     if (!registryRecord) {
         throw new Error(`Agent '${agentName}' is not enabled. Run 'ploinky start ${agentName}' first.`);
@@ -3146,6 +3158,8 @@ async function reinstallAgent(agentName) {
         }, async () => {
           return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
             let reinstallResult = null;
+            let dependencyRebuild = null;
+            let runtimeAdmitted = false;
             try {
             const currentRegistration = agentsSvc.resolveEnabledAgentRecord(agentName);
             if (currentRegistration?.containerName !== containerName
@@ -3154,6 +3168,10 @@ async function reinstallAgent(agentName) {
                 )) {
               throw new Error(`Agent '${agentName}' changed while waiting for reinstall; retry with its current registration.`);
             }
+            // One exact logical registration gets a persistent desired rebuild
+            // request (reused while it is still pending or failed). Its runtime
+            // then builds from empty npm state, bypassing seeds.
+            dependencyRebuild = issueDependencyRebuildRequest(containerName, { lease: workspaceMutationLease });
             const short = resolved.shortAgentName;
             const agentPath = path.dirname(resolved.manifestPath);
             const edgeSelection = readEdgeRoutingSelection();
@@ -3236,10 +3254,42 @@ async function reinstallAgent(agentName) {
                 alias: registryRecord?.record?.alias || '',
                 networkLifecycleCapability,
             });
+            runtimeAdmitted = true;
 
+            // Only an activated replacement publishes its admitted reference.
+            // The runtime is already active here, so a settlement failure is
+            // reported without undoing the activation.
+            try {
+              // Admit only a replacement that actually used the request's token.
+              const applied = runtimeCarriesRebuildToken(reinstallResult?.registryRecord, dependencyRebuild.token);
+              settleDependencyRebuildRequest(containerName, dependencyRebuild.token, {
+                lease: workspaceMutationLease,
+                outcome: applied ? 'admitted' : 'failed',
+                ...(applied ? {} : { error: new Error('the activated runtime did not use the requested dependency rebuild') }),
+              });
+              if (!applied) throw new Error('the activated runtime did not use the requested dependency rebuild; the request stays retryable');
+            } catch (settleError) {
+              const recovery = new Error(`[reinstall] ${short}: runtime activated, but dependency rebuild settlement requires recovery: ${settleError?.message || settleError}`);
+              recovery.code = 'PLOINKY_DEPS_REBUILD_RECOVERY_REQUIRED';
+              recovery.cause = settleError;
+              throw recovery;
+            }
             console.log(`[reinstall] reinstalled '${short}' [container: ${newContainerName}]`);
+            reportDependencyCollection(collectDependencyObjectsAfterAdmission({ lease: workspaceMutationLease, reason: 'reinstall' }));
             } catch (error) {
+              // Activation is already committed. Report failure without
+              // destroying the admitted replacement or claiming a rollback.
+              if (runtimeAdmitted) throw error;
               cleanupFailedPreparedRuntime(reinstallResult, error, 'runtime-reinstall-readiness-failed');
+              if (dependencyRebuild) {
+                try {
+                  settleDependencyRebuildRequest(containerName, dependencyRebuild.token, {
+                    lease: workspaceMutationLease, outcome: 'failed', error,
+                  });
+                } catch (settleError) {
+                  error.message += `; dependency rebuild request could not record the failure: ${settleError?.message || settleError}`;
+                }
+              }
               throw error;
             }
           });

@@ -143,7 +143,7 @@ function stageFile(target, bytes, fsApi, uid, gid, token) {
     return staged;
 }
 
-function restoreSnapshot(target, snapshot, fsApi, token) {
+function restoreSnapshot(target, snapshot, fsApi, backup) {
     const directory = path.dirname(target);
     if (!snapshot.exists) {
         try { fsApi.unlinkSync(target); } catch (error) {
@@ -152,16 +152,15 @@ function restoreSnapshot(target, snapshot, fsApi, token) {
         fsyncDirectory(directory, fsApi);
         return;
     }
-    const staged = stageFile(
-        target,
-        snapshot.bytes,
-        fsApi,
-        snapshot.uid,
-        snapshot.gid,
-        `${token}.restore`,
-    );
-    fsApi.chmodSync(staged, snapshot.mode);
-    fsApi.renameSync(staged, target);
+    // Preserve the prior inode rather than recreate it: an unprivileged Box
+    // user can own a file whose inherited group it cannot assign with chown.
+    // If backup creation itself failed, publication never touched this target.
+    if (!backup) return;
+    const saved = fsApi.lstatSync(backup);
+    let current = null;
+    try { current = fsApi.lstatSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (current && current.dev === saved.dev && current.ino === saved.ino) fsApi.unlinkSync(backup);
+    else fsApi.renameSync(backup, target);
     fsyncDirectory(directory, fsApi);
 }
 
@@ -198,9 +197,17 @@ export function writeTransportPair({
         ].join('\n')),
     ];
     const staged = [];
+    const backups = [];
     try {
         for (let index = 0; index < files.length; index += 1) {
             staged[index] = stageFile(files[index], contents[index], fsApi, uid, gid, `${token}.${index}`);
+        }
+        for (let index = 0; index < files.length; index += 1) {
+            if (!snapshots[index].exists) continue;
+            const backup = path.join(path.dirname(files[index]), `.${path.basename(files[index])}.${token}.${index}.backup`);
+            fsApi.linkSync(files[index], backup); // Atomic no-replace reservation.
+            backups[index] = backup;
+            fsyncDirectory(path.dirname(files[index]), fsApi);
         }
         fsApi.renameSync(staged[0], files[0]);
         staged[0] = '';
@@ -210,7 +217,6 @@ export function writeTransportPair({
         staged[1] = '';
         fsyncDirectory(path.dirname(files[1]), fsApi);
         for (const target of files) fsApi.chmodSync(target, 0o600);
-        return Object.freeze({ transportFile: files[0], containersConf: files[1] });
     } catch (error) {
         for (const target of staged.filter(Boolean)) {
             try { fsApi.unlinkSync(target); } catch {}
@@ -218,7 +224,7 @@ export function writeTransportPair({
         const rollbackFailures = [];
         for (let index = 0; index < files.length; index += 1) {
             try {
-                restoreSnapshot(files[index], snapshots[index], fsApi, `${token}.${index}`);
+                restoreSnapshot(files[index], snapshots[index], fsApi, backups[index]);
             } catch (rollbackError) {
                 rollbackFailures.push(rollbackError.message);
             }
@@ -228,6 +234,10 @@ export function writeTransportPair({
             : '';
         throw transportError(`Transport pair update failed${suffix}`, error);
     }
+    // The pair is committed. A cleanup failure must not attempt a rollback
+    // after one of the only exact prior inodes has already been discarded.
+    for (const backup of backups.filter(Boolean)) fsApi.unlinkSync(backup);
+    return Object.freeze({ transportFile: files[0], containersConf: files[1] });
 }
 
 export function configureBoxTransport({

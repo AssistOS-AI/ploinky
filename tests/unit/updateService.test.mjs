@@ -7,10 +7,11 @@ import path from 'node:path';
 import {
     INTERACTIVE_PLOINKY_UPDATE_MESSAGE,
     PLOINKY_BOX_MARKER_PATH,
-    parseGitDependencyRef,
-    resolveMovingGitDepCommits,
     updatePloinkySelf,
 } from '../../cli/commands/updateService.js';
+import { createOperationRecord } from '../../cli/commands/updateOutcome.js';
+import { GitUpdateError } from '../../cli/utils/git/verifiedUpdate.js';
+import { ploinkySourceLockIdentity } from '../../cli/utils/git/sourceLock.js';
 
 function tempDir(prefix = 'ploinky-update-') {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -21,14 +22,14 @@ function writeJson(filePath, value) {
     fs.writeFileSync(filePath, JSON.stringify(value, null, 4));
 }
 
-test('interactive Ploinky self-update is deferred when upstream has a new version', () => {
+test('interactive Ploinky self-update is deferred when upstream has a new version', async () => {
     const root = tempDir();
     const warnings = [];
 
     try {
         fs.mkdirSync(path.join(root, '.git'), { recursive: true });
 
-        const result = updatePloinkySelf({
+        const result = await updatePloinkySelf({
             repoPath: root,
             interactiveSession: true,
             logger: { warn(message) { warnings.push(message); } },
@@ -39,8 +40,11 @@ test('interactive Ploinky self-update is deferred when upstream has a new versio
                     upstream: 'new-head',
                 };
             },
-            pull() {
-                throw new Error('interactive update must not pull');
+            updateCheckout() {
+                throw new Error('interactive update must not update the checkout');
+            },
+            sourceLockManager: {
+                async acquire() { throw new Error('interactive update must not take the source lock'); },
             },
         });
 
@@ -53,34 +57,136 @@ test('interactive Ploinky self-update is deferred when upstream has a new versio
     }
 });
 
-test('non-interactive Ploinky self-update pulls and reports changed HEAD', () => {
+function fakeRecord(outcome, code, { before = 'old-head', after = 'new-head' } = {}) {
+    return createOperationRecord({
+        phase: 'host-ploinky', id: 'checkout', outcome, code, reason: code,
+        before: { head: before }, after: { head: after },
+    });
+}
+
+function recordingLockManager(events) {
+    return {
+        async acquire(identity) {
+            events.push(['acquire', identity]);
+            return {
+                assertHeld(value) { events.push(['held', value]); },
+                release() { events.push(['release', identity]); },
+            };
+        },
+    };
+}
+
+test('non-interactive Ploinky self-update fast-forwards under the host source lock', async () => {
     const root = tempDir();
-    let pulled = false;
+    const events = [];
 
     try {
         fs.mkdirSync(path.join(root, '.git'), { recursive: true });
+        const expected = ploinkySourceLockIdentity(root);
 
-        const result = updatePloinkySelf({
+        const result = await updatePloinkySelf({
             repoPath: root,
-            getRef() {
-                return pulled ? 'new-head' : 'old-head';
-            },
-            pull(repoPath) {
-                assert.equal(repoPath, root);
-                pulled = true;
+            sourceLockManager: recordingLockManager(events),
+            boxMarkerPath: path.join(root, 'not-a-box'),
+            updateCheckout(options) {
+                events.push(['update', options]);
+                return fakeRecord('changed', 'fast-forward');
             },
         });
 
-        assert.equal(pulled, true);
         assert.equal(result.updated, true);
         assert.equal(result.before, 'old-head');
         assert.equal(result.after, 'new-head');
+        assert.equal(result.pullStrategy, 'fast-forward-only');
+        assert.equal(result.record.outcome, 'changed');
+        assert.deepEqual(events.map(entry => entry[0]), ['acquire', 'held', 'update', 'release']);
+        assert.equal(events[0][1], expected.lockIdentity);
+        assert.equal(events[2][1].repoPath, expected.canonicalRoot);
+        assert.equal(events[2][1].phase, 'host-ploinky');
+        assert.deepEqual(events[2][1].policy, { kind: 'generic' });
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
 });
 
-test('Ploinky self-update skips an installed checkout outside the selected folder before git', () => {
+test('Ploinky self-update returns named skips, throws other outcomes with the record and always releases the source lock', async () => {
+    const root = tempDir();
+
+    try {
+        fs.mkdirSync(path.join(root, '.git'), { recursive: true });
+        const events = [];
+        const skipped = await updatePloinkySelf({
+            repoPath: root,
+            sourceLockManager: recordingLockManager(events),
+            boxMarkerPath: path.join(root, 'not-a-box'),
+            updateCheckout: () => fakeRecord('skipped', 'dirty-worktree'),
+        });
+        assert.equal(skipped.skipped, true);
+        assert.equal(skipped.code, 'dirty-worktree');
+        assert.equal(skipped.record.outcome, 'skipped');
+        assert.equal(events.at(-1)[0], 'release');
+
+        for (const outcome of ['failed', 'uncertain']) {
+            const failureEvents = [];
+            await assert.rejects(() => updatePloinkySelf({
+                repoPath: root,
+                sourceLockManager: recordingLockManager(failureEvents),
+                boxMarkerPath: path.join(root, 'not-a-box'),
+                updateCheckout: () => fakeRecord(outcome, 'fetch-failed'),
+            }), error => {
+                assert.ok(error instanceof GitUpdateError);
+                assert.equal(error.record.outcome, outcome);
+                return true;
+            });
+            assert.equal(failureEvents.at(-1)[0], 'release');
+        }
+
+        const thrownEvents = [];
+        await assert.rejects(() => updatePloinkySelf({
+            repoPath: root,
+            sourceLockManager: recordingLockManager(thrownEvents),
+            boxMarkerPath: path.join(root, 'not-a-box'),
+            updateCheckout: () => { throw new Error('unexpected'); },
+        }), /unexpected/);
+        assert.equal(thrownEvents.at(-1)[0], 'release');
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('Ploinky self-update reuses a held source lock only for the same checkout', async () => {
+    const root = tempDir();
+    const other = tempDir();
+
+    try {
+        fs.mkdirSync(path.join(root, '.git'), { recursive: true });
+        const events = [];
+        const lock = { assertHeld(value) { events.push(['held', value]); }, release() { events.push(['release']); } };
+        const noAcquire = { async acquire() { throw new Error('a held lock must not be re-acquired'); } };
+        const identity = ploinkySourceLockIdentity(root);
+        const result = await updatePloinkySelf({
+            repoPath: root,
+            heldSourceLock: { lockIdentity: identity.lockIdentity, lock },
+            sourceLockManager: noAcquire,
+            boxMarkerPath: path.join(root, 'not-a-box'),
+            updateCheckout: () => fakeRecord('unchanged', 'current', { after: 'old-head' }),
+        });
+        assert.equal(result.updated, false);
+        assert.deepEqual(events, [['held', identity.lockIdentity]], 'a borrowed lock is not released by the self-update');
+
+        await assert.rejects(() => updatePloinkySelf({
+            repoPath: root,
+            heldSourceLock: { lockIdentity: ploinkySourceLockIdentity(other).lockIdentity, lock },
+            boxMarkerPath: path.join(root, 'not-a-box'),
+            updateCheckout: () => fakeRecord('changed', 'fast-forward'),
+        }), /source lock for a different checkout/);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(other, { recursive: true, force: true });
+    }
+});
+
+test('Ploinky self-update skips an installed checkout outside the selected folder before git', async () => {
     const root = tempDir('ploinky-update-scope-');
     const checkout = path.join(root, 'installed', 'ploinky');
     const scope = path.join(root, 'workspace');
@@ -92,13 +198,13 @@ test('Ploinky self-update skips an installed checkout outside the selected folde
     try {
         fs.mkdirSync(path.join(checkout, '.git'), { recursive: true });
         fs.mkdirSync(scope);
-        const result = updatePloinkySelf({
+        const result = await updatePloinkySelf({
             repoPath: checkout,
             updateScopePath: scope,
             logger: { warn(message) { warnings.push(message); } },
             checkUpdate: unexpected,
-            pull: unexpected,
-            getRef: unexpected,
+            updateCheckout: unexpected,
+            sourceLockManager: { acquire: unexpected },
         });
 
         assert.equal(result.skipped, true);
@@ -112,7 +218,7 @@ test('Ploinky self-update skips an installed checkout outside the selected folde
     }
 });
 
-test('Ploinky box self-update skips the read-only source before running git operations', () => {
+test('Ploinky box self-update skips the read-only source before running git operations', async () => {
     const root = tempDir();
     const warnings = [];
     const unexpected = () => {
@@ -122,7 +228,7 @@ test('Ploinky box self-update skips the read-only source before running git oper
     try {
         fs.mkdirSync(path.join(root, '.git'), { recursive: true });
 
-        const result = updatePloinkySelf({
+        const result = await updatePloinkySelf({
             repoPath: root,
             interactiveSession: true,
             exists(filePath) {
@@ -131,8 +237,8 @@ test('Ploinky box self-update skips the read-only source before running git oper
             },
             logger: { warn(message) { warnings.push(message); } },
             checkUpdate: unexpected,
-            pull: unexpected,
-            getRef: unexpected,
+            updateCheckout: unexpected,
+            sourceLockManager: { acquire: unexpected },
         });
 
         assert.deepEqual(result, {
@@ -147,94 +253,4 @@ test('Ploinky box self-update skips the read-only source before running git oper
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
-});
-
-test('parseGitDependencyRef extracts url + ref for moving git specs and strips git+', () => {
-    assert.deepEqual(
-        parseGitDependencyRef('git+https://github.com/AssistOS-AI/achillesAgentLib.git#master'),
-        { url: 'https://github.com/AssistOS-AI/achillesAgentLib.git', ref: 'master' },
-    );
-    assert.deepEqual(
-        parseGitDependencyRef('git+https://github.com/AssistOS-AI/MCPSDK.git#main'),
-        { url: 'https://github.com/AssistOS-AI/MCPSDK.git', ref: 'main' },
-    );
-    assert.deepEqual(
-        parseGitDependencyRef('git+ssh://git@github.com/o/r.git#dev'),
-        { url: 'ssh://git@github.com/o/r.git', ref: 'dev' },
-    );
-});
-
-test('parseGitDependencyRef treats a git url with no #ref as the moving default branch', () => {
-    assert.deepEqual(
-        parseGitDependencyRef('git+https://github.com/o/r.git'),
-        { url: 'https://github.com/o/r.git', ref: 'HEAD' },
-    );
-});
-
-test('parseGitDependencyRef returns null for non-git and pinned-commit specs', () => {
-    assert.equal(parseGitDependencyRef('^1.0.0'), null);
-    assert.equal(parseGitDependencyRef('1.2.3'), null);
-    assert.equal(parseGitDependencyRef(''), null);
-    assert.equal(parseGitDependencyRef(undefined), null);
-    // A 40-hex pinned commit cannot move, so it is not a "moving" ref.
-    assert.equal(
-        parseGitDependencyRef('git+https://github.com/o/r.git#0123456789abcdef0123456789abcdef01234567'),
-        null,
-    );
-});
-
-test('resolveMovingGitDepCommits resolves each moving git dep via ls-remote, skipping others', () => {
-    const calls = [];
-    const commits = resolveMovingGitDepCommits(
-        {
-            achillesAgentLib: 'git+https://github.com/AssistOS-AI/achillesAgentLib.git#master',
-            'mcp-sdk': 'git+https://github.com/AssistOS-AI/MCPSDK.git#main',
-        },
-        {
-            execFile(command, args) {
-                calls.push({ command, args });
-                const url = args[args.length - 2];
-                const ref = args[args.length - 1];
-                const sha = url.includes('MCPSDK')
-                    ? 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-                    : 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-                return `${sha}\trefs/heads/${ref}\n`;
-            },
-        },
-    );
-
-    assert.deepEqual(commits, {
-        achillesAgentLib: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        'mcp-sdk': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-    });
-    // Only the two moving git dependencies are ls-remote'd.
-    assert.equal(calls.length, 2);
-    assert.ok(calls.every((c) => c.command === 'git' && c.args[0] === 'ls-remote'));
-});
-
-test('resolveMovingGitDepCommits omits deps whose ls-remote fails (fail-open)', () => {
-    const commits = resolveMovingGitDepCommits(
-        {
-            achillesAgentLib: 'git+https://github.com/AssistOS-AI/achillesAgentLib.git#master',
-            'mcp-sdk': 'git+https://github.com/AssistOS-AI/MCPSDK.git#main',
-        },
-        {
-            execFile(command, args) {
-                if (args[args.length - 2].includes('MCPSDK')) {
-                    throw new Error('offline');
-                }
-                return 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/master\n';
-            },
-        },
-    );
-
-    assert.deepEqual(commits, { achillesAgentLib: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
-});
-
-test('resolveMovingGitDepCommits omits deps with empty/non-sha ls-remote output', () => {
-    const commits = resolveMovingGitDepCommits(
-        { achillesAgentLib: 'git+https://github.com/AssistOS-AI/achillesAgentLib.git#nope' },
-        { execFile() { return '\n'; } },
-    );
-    assert.deepEqual(commits, {});
 });

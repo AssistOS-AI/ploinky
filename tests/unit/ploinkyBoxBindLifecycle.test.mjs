@@ -1115,7 +1115,7 @@ test('start, restart, and update restore the graph when outer reconciliation fai
         const run = {
             start: () => supervisor.runStartTransaction(['start', 'explorer', '8080']),
             restart: () => supervisor.runRestartTransaction(['restart']),
-            update: () => supervisor.runUpdateTransaction(['update'], { restartAfterUpdate: true }),
+            update: () => supervisor.runUpdateTransaction(['update']),
         }[command];
         await assert.rejects(run, /replacement readiness failed/);
         inOrder(events, ['restore-graph', 'restore-health', 'release']);

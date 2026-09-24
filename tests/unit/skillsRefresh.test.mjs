@@ -10,7 +10,7 @@ import { PLOINKY_DIR, REPOS_DIR } from '../../cli/utils/config.js';
 import {
     refreshDefaultSkillsInPloinkyRepos,
 } from '../../cli/commands/repoAgentCommands.js';
-import { copySkill, installDefaultSkills } from '../../cli/commands/skills.js';
+import { installDefaultSkills } from '../../cli/commands/skills.js';
 
 function writeSkill(root, name, files) {
     const skillRoot = path.join(root, name);
@@ -188,7 +188,9 @@ function runAggregateUpdateChild(workspaceRoot, body) {
             execFileSync('git', ['clone', '--quiet', sourcePath, installedPath], { stdio: 'ignore' });
         }
 
-        function setupAggregateRepoFixture({ defaultSkillsHasSkills = true } = {}) {
+        // A managed registered directory without .git is cloned only when it
+        // is empty; non-empty content is preserved with a named skip.
+        function setupAggregateRepoFixture({ defaultSkillsHasSkills = true, staleContent = false } = {}) {
             const unique = process.pid + '-' + Date.now();
             const repoName = 'UnitAggregateRepo-' + unique;
             const providerName = 'UnitAggregateProvider-' + unique;
@@ -225,7 +227,7 @@ function runAggregateUpdateChild(workspaceRoot, body) {
                 repos: { [repoName]: sourceRepoPath },
             }, null, 2));
             mkdir(installedRepoPath);
-            writeFile(path.join(installedRepoPath, 'stale.txt'), 'stale\\n');
+            if (staleContent) writeFile(path.join(installedRepoPath, 'stale.txt'), 'stale\\n');
             for (const source of defaultSkillsSources) {
                 execFileSync('git', ['clone', '--quiet', source.sourcePath, path.join(REPOS_DIR, source.name)], {
                     stdio: 'ignore',
@@ -273,42 +275,6 @@ function runAggregateUpdateChild(workspaceRoot, body) {
     });
 }
 
-test('copySkill creates fresh output and refuses unverified replacement', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-'));
-    try {
-        const src = path.join(root, 'src-skill');
-        const dest = path.join(root, 'dest-skill');
-
-        fs.mkdirSync(src, { recursive: true });
-        fs.writeFileSync(path.join(src, 'SKILL.md'), '# Current skill\n');
-        fs.writeFileSync(path.join(src, 'tool.js'), 'export default 1;\n');
-        fs.chmodSync(path.join(src, 'tool.js'), 0o755);
-        fs.mkdirSync(path.join(src, 'assets'));
-        fs.writeFileSync(path.join(src, 'assets', 'prompt.txt'), 'nested asset\n');
-        fs.symlinkSync('SKILL.md', path.join(src, 'README.md'));
-
-        fs.mkdirSync(dest, { recursive: true });
-        fs.writeFileSync(path.join(dest, 'stale.js'), 'stale file\n');
-
-        assert.throws(() => copySkill(src, dest), /unverified/);
-        assert.equal(fs.readFileSync(path.join(dest, 'stale.js'), 'utf8'), 'stale file\n');
-        fs.rmSync(dest, { recursive: true });
-        copySkill(src, dest);
-
-        // Files from source are copied / overwritten
-        assert.equal(fs.existsSync(path.join(dest, 'SKILL.md')), true);
-        assert.equal(fs.existsSync(path.join(dest, 'tool.js')), true);
-        assert.equal(fs.readFileSync(path.join(dest, 'assets', 'prompt.txt'), 'utf8'), 'nested asset\n');
-        assert.equal(fs.statSync(path.join(dest, 'tool.js')).mode & 0o777, 0o755);
-        assert.equal(fs.lstatSync(path.join(dest, 'README.md')).isSymbolicLink(), true);
-        assert.equal(fs.readlinkSync(path.join(dest, 'README.md')), 'SKILL.md');
-        // Files only in this owned destination skill are removed
-        assert.equal(fs.existsSync(path.join(dest, 'stale.js')), false);
-    } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-    }
-});
-
 test('installDefaultSkills preserves unrecorded same-name and unrelated local skills', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skills-install-'));
     const repoName = `UnitSkills-${process.pid}-${Date.now()}-agents`;
@@ -327,15 +293,16 @@ test('installDefaultSkills preserves unrecorded same-name and unrelated local sk
         writeSkill(path.join(root, '.agents', 'skills'), 'local-only', {
             'SKILL.md': '# Local skill\n',
         });
-        fs.writeFileSync(path.join(root, '.gitignore'), [
+        const legacyBlock = [
             '# >>> ploinky default-skills >>>',
             '.claude/skills/',
             '.agents/skills/',
             '# <<< ploinky default-skills <<<',
             '',
-        ].join('\n'));
+        ].join('\n');
+        fs.writeFileSync(path.join(root, '.gitignore'), legacyBlock);
 
-        installDefaultSkills(repoName, { targetRoot: root });
+        const result = installDefaultSkills(repoName, { targetRoot: root });
 
         assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'owned', 'tool.js')), false);
         assert.equal(fs.existsSync(path.join(root, '.agents', 'skills', 'owned', 'stale.js')), true);
@@ -343,11 +310,11 @@ test('installDefaultSkills preserves unrecorded same-name and unrelated local sk
         assert.equal(fs.lstatSync(path.join(root, '.claude')).isSymbolicLink(), true);
         assert.equal(fs.readlinkSync(path.join(root, '.claude')), '.agents');
 
+        // A marker block without a write receipt may hold user edits: it is
+        // preserved byte for byte and reported instead of being rewritten.
         const gitignore = fs.readFileSync(path.join(root, '.gitignore'), 'utf8');
-        assert.match(gitignore, /^\.claude$/m);
-        assert.match(gitignore, /^\.agents\/skills\/owned\/$/m);
-        assert.doesNotMatch(gitignore, /^\.agents\/skills\/$/m);
-        assert.doesNotMatch(gitignore, /local-only/);
+        assert.equal(gitignore, legacyBlock);
+        assert.equal(result.exclusions.code, 'legacy-ignore-block-preserved');
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(repoRoot, { recursive: true, force: true });
@@ -379,7 +346,20 @@ test('default installer updates only proven owned output and preserves subsequen
     }
 });
 
+// No global or XDG excludes policy of the machine running the tests.
+function isolateGitExcludes() {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'skills-git-config-'));
+    const saved = { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM };
+    fs.writeFileSync(path.join(home, 'gitconfig'), '');
+    Object.assign(process.env, { XDG_CONFIG_HOME: home, GIT_CONFIG_GLOBAL: path.join(home, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1' });
+    return () => {
+        for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+        fs.rmSync(home, { recursive: true, force: true });
+    };
+}
+
 test('refreshDefaultSkillsInPloinkyRepos installs default skills into managed repos', () => {
+    const restoreEnvironment = isolateGitExcludes();
     const sourceRepo = `UnitDefaultSkillsRepo-${process.pid}-${Date.now()}`;
     const managedRepo = `UnitManagedRepo-${process.pid}-${Date.now()}`;
     const managedPath = path.join(REPOS_DIR, managedRepo);
@@ -414,11 +394,14 @@ test('refreshDefaultSkillsInPloinkyRepos installs default skills into managed re
         assert.equal(fs.readlinkSync(path.join(managedPath, '.claude')), '.agents');
         assert.equal(fs.existsSync(path.join(sourcePath, '.agents')), false);
 
-        const gitignore = fs.readFileSync(path.join(managedPath, '.gitignore'), 'utf8');
-        assert.match(gitignore, /^\.claude$/m);
-        assert.match(gitignore, /^\.agents\/skills\/defaultSkill\/$/m);
-        assert.doesNotMatch(gitignore, /^\.agents$/m);
+        // Git targets get private worktree exclusions, never tracked rules.
+        assert.equal(fs.existsSync(path.join(managedPath, '.gitignore')), false);
+        assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: managedPath, encoding: 'utf8' }), '');
+        const source = execFileSync('git', ['check-ignore', '-v', '.agents/skills/defaultSkill', '.claude'], { cwd: managedPath, encoding: 'utf8' });
+        assert.match(source, /ploinky-skill-exports\.exclude:\d+:\/\.agents\/skills\/defaultSkill\t/);
+        assert.match(source, /ploinky-skill-exports\.exclude:\d+:\/\.claude\t/);
     } finally {
+        restoreEnvironment();
         removeRepo(sourceRepo);
         removeRepo(managedRepo);
     }
@@ -634,8 +617,8 @@ test('updateRepo reports default skill refresh failures after updating a managed
             fs.writeFileSync(path.join(REPOS_DIR, providerName, 'agent', 'manifest.json'), JSON.stringify({
                 repos: { [repoName]: sourceRepoPath },
             }, null, 2));
+            // An empty managed directory with a known source is cloned in place.
             mkdir(installedRepoPath);
-            fs.writeFileSync(path.join(installedRepoPath, 'stale.txt'), 'stale\\n');
             for (const [index, defaultSkillsRepoPath] of defaultSkillsRepoPaths.entries()) {
                 mkdir(defaultSkillsRepoPath);
                 if (index > 0) {
@@ -669,7 +652,8 @@ test('updateRepo reports default skill refresh failures after updating a managed
             }
 
             assert.equal(fs.existsSync(path.join(installedRepoPath, 'README.md')), true);
-            assert.equal(fs.existsSync(path.join(installedRepoPath, 'stale.txt')), false);
+            assert.equal(fs.existsSync(path.join(installedRepoPath, '.git')), true);
+            assert.ok(logs.includes("✓ Repo '" + repoName + "' cloned into its empty managed directory."));
             assert.ok(logs.includes('  Default skills summary: 2/3 repo(s) refreshed.'));
         `], {
             cwd: projectRoot,
@@ -703,8 +687,10 @@ test('aggregate update commands return default skill summaries after refreshing 
             assert.equal(ploinkyResult.failed.length, 0);
             assertDefaultSkillsSummary(ploinkyResult.defaultSkills, fixture.repoName);
             assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'README.md')), true);
-            assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'stale.txt')), false);
             assert.equal(fs.existsSync(installedSkillPath), true);
+            const recloned = ploinkyResult.records.find(record => record.id === fixture.repoName);
+            assert.equal(recloned.outcome, 'changed');
+            assert.equal(recloned.code, 'recloned-empty-directory');
 
             fs.rmSync(path.join(fixture.installedRepoPath, '.agents'), { recursive: true, force: true });
             fs.rmSync(path.join(fixture.installedRepoPath, '.claude'), { recursive: true, force: true });
@@ -716,6 +702,34 @@ test('aggregate update commands return default skill summaries after refreshing 
             assertDefaultSkillsSummary(allResult.defaultSkills, fixture.repoName);
             assert.equal(fs.existsSync(installedSkillPath), true);
             assert.equal(fs.lstatSync(path.join(fixture.installedRepoPath, '.claude')).isSymbolicLink(), true);
+        `);
+    } finally {
+        fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test('aggregate updates preserve a non-empty non-Git managed directory with a named skip', () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-aggregate-non-git-preserved-'));
+
+    try {
+        runAggregateUpdateChild(workspaceRoot, `
+            const fixture = setupAggregateRepoFixture({ staleContent: true });
+            for (const invoke of [
+                () => updatePloinkyRepos({ interactiveSession: true }),
+                () => updateAllRepos(workspaceRoot, { interactiveSession: true }),
+            ]) {
+                const result = await invoke();
+                assert.equal(result.failed.length, 0);
+                const skip = result.skipped.find(entry => entry.repoName === fixture.repoName);
+                assert.ok(skip, 'the preserved directory is reported');
+                assert.equal(skip.code, 'non-git-directory-preserved');
+                const record = result.records.find(entry => entry.id === fixture.repoName);
+                assert.equal(record.outcome, 'skipped');
+                assert.equal(record.attempted, false);
+                assert.equal(fs.readFileSync(path.join(fixture.installedRepoPath, 'stale.txt'), 'utf8'), 'stale\\n');
+                assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, '.git')), false);
+                assert.equal(fs.existsSync(path.join(fixture.installedRepoPath, 'README.md')), false);
+            }
         `);
     } finally {
         fs.rmSync(workspaceRoot, { recursive: true, force: true });
@@ -757,20 +771,26 @@ for (const command of ['updatePloinkyRepos', 'updateAllRepos']) {
         }
     });
 
-    test(command + ' continues after a managed repository pull fails', () => {
+    test(command + ' continues after a managed repository update fails or is skipped', () => {
         const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-managed-update-continue-'));
 
         try {
             runAggregateUpdateChild(workspaceRoot, String.raw`
                 const fixture = setupAggregateRepoFixture();
                 const failedRepoName = 'AAFailedManaged';
+                const detachedRepoName = 'ABDetachedManaged';
                 const laterRepoName = 'ZZLaterManaged';
                 const failedRepoPath = path.join(REPOS_DIR, failedRepoName);
+                const detachedRepoPath = path.join(REPOS_DIR, detachedRepoName);
                 const laterRepoPath = path.join(REPOS_DIR, laterRepoName);
                 cloneRepo(fixture.sourceRepoPath, failedRepoPath);
+                cloneRepo(fixture.sourceRepoPath, detachedRepoPath);
                 cloneRepo(fixture.sourceRepoPath, laterRepoPath);
-                execFileSync('git', ['checkout', '--detach', '--quiet'], {
+                execFileSync('git', ['remote', 'set-url', 'origin', path.join(workspaceRoot, '.fixtures', 'missing-remote')], {
                     cwd: failedRepoPath, stdio: 'ignore',
+                });
+                execFileSync('git', ['checkout', '--detach', '--quiet'], {
+                    cwd: detachedRepoPath, stdio: 'ignore',
                 });
                 const oldHead = readHead(laterRepoPath);
                 const newHead = commitFile(fixture.sourceRepoPath, 'upstream.txt', 'updated upstream');
@@ -780,12 +800,21 @@ for (const command of ['updatePloinkyRepos', 'updateAllRepos']) {
 
                 assert.equal(result.failed.length, 1);
                 assert.equal(result.failed[0].repoName, failedRepoName);
-                assert.match(result.failed[0].message, /git .*pull .*exited with status [1-9]/);
-                assert.match(result.failed[0].message, /not currently on a branch/);
+                assert.equal(result.failed[0].code, 'fetch-failed');
+                assert.match(result.failed[0].message, /git .*fetch .*exited with status [1-9]/);
+                assert.equal(result.failed[0].record.outcome, 'failed');
+                const detached = result.skipped.find(entry => entry.repoName === detachedRepoName);
+                assert.equal(detached.code, 'detached-head');
+                assert.match(detached.reason, /not on a branch/);
                 assert.equal(readHead(failedRepoPath), oldHead);
+                assert.equal(readHead(detachedRepoPath), oldHead);
                 assert.equal(readHead(laterRepoPath), newHead, 'a later managed checkout advances');
                 assert.ok(stdout.includes('  ✓ ' + laterRepoName));
+                assert.ok(stderr.some(line => line.includes(detachedRepoName) && line.includes('detached-head')));
                 assertFinalFailureDetails(stderr, result.failed);
+                for (const name of [failedRepoName, detachedRepoName, laterRepoName]) {
+                    assert.equal(result.records.filter(record => record.id === name).length, 1, 'one record for ' + name);
+                }
             `);
         } finally {
             fs.rmSync(workspaceRoot, { recursive: true, force: true });
@@ -793,20 +822,25 @@ for (const command of ['updatePloinkyRepos', 'updateAllRepos']) {
     });
 }
 
-test('updateAllRepos continues after a workspace pull fails and retains its error details', () => {
+test('updateAllRepos continues after a workspace update fails or is skipped and retains its details', () => {
     const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-workspace-update-continue-'));
 
     try {
         runAggregateUpdateChild(workspaceRoot, String.raw`
             const fixture = setupAggregateRepoFixture();
             const failedRepoName = 'aa-workspace-failure';
+            const detachedRepoName = 'ab-workspace-detached';
             const failedRepoPath = path.join(workspaceRoot, failedRepoName);
+            const detachedRepoPath = path.join(workspaceRoot, detachedRepoName);
             const laterRepoPath = path.join(workspaceRoot, 'zz-workspace-success');
             cloneRepo(fixture.sourceRepoPath, failedRepoPath);
+            cloneRepo(fixture.sourceRepoPath, detachedRepoPath);
             cloneRepo(fixture.sourceRepoPath, laterRepoPath);
             execFileSync('git', ['checkout', '--detach', '--quiet'], {
-                cwd: failedRepoPath, stdio: 'ignore',
+                cwd: detachedRepoPath, stdio: 'ignore',
             });
+            // Untracked content the fast-forward would overwrite is preserved.
+            writeFile(path.join(failedRepoPath, 'upstream.txt'), 'local untracked content');
             const oldHead = readHead(laterRepoPath);
             const newHead = commitFile(fixture.sourceRepoPath, 'upstream.txt', 'updated upstream');
 
@@ -816,10 +850,14 @@ test('updateAllRepos continues after a workspace pull fails and retains its erro
 
             assert.equal(result.failed.length, 1);
             assert.equal(result.failed[0].repoName, failedRepoName);
-            assert.match(result.failed[0].message, /git .*pull .*exited with status [1-9]/);
-            assert.match(result.failed[0].message, /not currently on a branch/);
-            assert.equal(result.skipped.length, 0, 'the failing remote is reachable and the pull was attempted');
+            assert.equal(result.failed[0].code, 'untracked-would-be-overwritten');
+            assert.match(result.failed[0].message, /untracked files would be overwritten.*upstream\.txt/);
+            assert.equal(fs.readFileSync(path.join(failedRepoPath, 'upstream.txt'), 'utf8'), 'local untracked content');
+            const detached = result.skipped.find(entry => entry.repoName === detachedRepoName);
+            assert.equal(detached.code, 'detached-head');
+            assert.equal(result.skipped.length, 1, 'only the detached checkout is skipped');
             assert.equal(readHead(failedRepoPath), oldHead);
+            assert.equal(readHead(detachedRepoPath), oldHead);
             assert.equal(readHead(laterRepoPath), newHead, 'a later workspace checkout advances');
             assert.ok(stdout.includes('  ✓ zz-workspace-success'));
             assertFinalFailureDetails(stderr, result.failed);
@@ -897,14 +935,17 @@ for (const wrongUpstream of ['origin/main', 'secondary/feature']) {
                 writeFile(path.join(folder, 'ploinky-skills-manifest.json'), JSON.stringify([{
                     name: 'SelectedSkills', url: source, branch: 'feature', skills: ['shared'],
                 }]));
-                const { result, stderr } = await captureUpdate(() => updateAllRepos(workspaceRoot, { interactiveSession: true }));
-                assert.equal(result.failed.length, 1);
-                assert.equal(result.failed[0].repoName, 'SelectedSkills');
-                assert.match(result.failed[0].message, /Refusing to pull a different source or branch/);
+                const { result, stdout, stderr } = await captureUpdate(() => updateAllRepos(workspaceRoot, { interactiveSession: true }));
+                // The registered cache update is a named, preserved skip.
+                assert.deepEqual(result.failed, []);
+                const skip = result.skipped.find(entry => entry.repoName === 'SelectedSkills');
+                assert.equal(skip.code, 'upstream-mismatch');
+                assert.match(skip.reason, /Refusing to pull a different source or branch/);
                 assert.equal(readHead(cache), selectedHead);
                 assert.equal(fs.existsSync(path.join(cache, 'skills', 'foreign')), false);
                 assert.equal(fs.readFileSync(path.join(folder, '.agents', 'skills', 'shared', 'SKILL.md'), 'utf8'), '# feature\n');
-                assertFinalFailureDetails(stderr, result.failed);
+                assert.ok(stderr.some(line => line.includes('SelectedSkills') && line.includes('upstream-mismatch')));
+                assert.ok(stdout.some(line => line.startsWith('Update skipped:') && line.includes('SelectedSkills (upstream-mismatch)')));
             `);
         } finally {
             fs.rmSync(workspaceRoot, { recursive: true, force: true });

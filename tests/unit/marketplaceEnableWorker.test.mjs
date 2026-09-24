@@ -180,3 +180,52 @@ test('Marketplace enable worker preserves safe nested lifecycle codes', async ()
             && error.cause?.code === 'PLOINKY_BOX_RUNTIME_CAPABILITY_UNSUPPORTED',
     );
 });
+
+test('an abnormal enable worker retains its exact workspace lease; normal completion releases its own', async () => {
+    class LeasingWorker extends EventEmitter {
+        constructor() { super(); LeasingWorker.last = this; }
+        terminate() { setImmediate(() => this.emit('exit', 1)); return Promise.resolve(1); }
+    }
+    const retained = new Set();
+    const retainLease = lease => { retained.add(lease.token); return true; };
+
+    const stuck = runMarketplaceEnableWorker({ agentRef: 'repo/stuck', mode: 'global' },
+        { WorkerClass: LeasingWorker, timeoutMs: 20, retainLease });
+    LeasingWorker.last.emit('message', { type: 'workspace-lease', token: 'lease-token-1' });
+    await assert.rejects(stuck, { code: 'PLOINKY_MARKETPLACE_ENABLE_TIMEOUT', recoveryRequired: true });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual([...retained], ['lease-token-1'], 'thread termination never proves descendant quiescence');
+
+    const finished = runMarketplaceEnableWorker({ agentRef: 'repo/agent', mode: 'global' },
+        { WorkerClass: LeasingWorker, timeoutMs: 10_000, retainLease });
+    const worker = LeasingWorker.last;
+    worker.emit('message', { type: 'workspace-lease', token: 'lease-token-2' });
+    worker.emit('message', { ok: true, result: { ready: true } });
+    worker.emit('exit', 0);
+    assert.deepEqual(await finished, { ready: true });
+    assert.deepEqual([...retained], ['lease-token-1'], 'the successful worker already released its own lease');
+});
+
+test('a timed-out real Worker retains ownership while its spawned child still lives', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'marketplace-child-recovery-'));
+    const pidFile = path.join(root, 'child.pid');
+    const retained = [];
+    let pid;
+    try {
+        await assert.rejects(runMarketplaceEnableWorker({ agentRef: pidFile, mode: 'global' }, {
+            workerUrl: new URL('../fixtures/marketplace-enable-child-worker.mjs', import.meta.url),
+            timeoutMs: 750,
+            retainLease: lease => { if (lease.token) retained.push(lease.token); return true; },
+        }), error => error.code === 'PLOINKY_MARKETPLACE_ENABLE_TIMEOUT'
+            && error.recoveryRequired === true && /Stop the exact Box/.test(error.message));
+        pid = Number(fs.readFileSync(pidFile, 'utf8'));
+        process.kill(pid, 0);
+        assert.ok(retained.includes('child-worker-lease'));
+    } finally {
+        if (pid) { try { process.kill(pid, 'SIGKILL'); } catch (_) {} }
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});

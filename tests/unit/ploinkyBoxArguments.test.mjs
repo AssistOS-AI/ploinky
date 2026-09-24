@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { parseOuterArguments } from '../../ploinky-box/command/parse.mjs';
@@ -120,8 +123,8 @@ test('dispatch order keeps marker, built-ins, explicit start, REPL, bash, and ge
         [['restart', 'Agent'], 'restart'],
         [['update'], 'update'],
         [['update', 'all'], 'update'],
-        [['update', 'repos'], 'generic'],
-        [['update', 'repo', 'demo'], 'generic'],
+        [['update', 'repos'], 'update'],
+        [['update', 'repo', 'demo'], 'update'],
         [[], 'repl'],
         [['cli'], 'bash'],
         [['bash'], 'bash'],
@@ -224,34 +227,48 @@ test('repair rejects ambiguous, malformed, and unsupported options before runnin
     }
 });
 
-test('full update routes through the host while targeted update forms remain generic', () => {
-    assert.deepEqual(routeOuterCommand(parseOuterArguments(['--debug', 'update'])), {
-        kind: 'update',
-        coreArgv: ['--debug', 'update'],
-    });
-    assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', 'all', '/workspace/projects'])), {
-        kind: 'update',
-        coreArgv: ['update', 'all', '/workspace/projects'],
-    });
-    assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', process.cwd()])), {
-        kind: 'update',
-        coreArgv: ['update', process.cwd()],
-    });
-    assert.deepEqual(routeOuterCommand(parseOuterArguments([
-        'update', '--branch', 'candidate', 'all', '/workspace/projects',
-    ])), {
-        kind: 'update',
-        coreArgv: ['update', '--branch', 'candidate', 'all', '/workspace/projects'],
-    });
-    assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', 'repos'])), {
-        kind: 'generic',
-        coreArgv: ['update', 'repos'],
-    });
-    assert.deepEqual(routeOuterCommand(parseOuterArguments(['update', 'missing-managed-repo'])), {
-        kind: 'generic',
-        coreArgv: ['update', 'missing-managed-repo'],
-    });
-    assert.equal(routeOuterCommand(parseOuterArguments(['--dry-run', 'update'])).kind, 'dry-run');
+test('every update form routes through the host as one typed request parsed before mutation', () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-route-update-')));
+    try {
+        fs.mkdirSync(path.join(root, 'projects', 'nested'), { recursive: true });
+        const route = (argv) => routeOuterCommand(parseOuterArguments(argv), { cwd: root });
+        const debugRoute = route(['--debug', 'update']);
+        assert.equal(debugRoute.kind, 'update');
+        assert.equal(debugRoute.debug, true);
+        assert.deepEqual(debugRoute.request, { kind: 'all', folder: null, folderPath: null });
+        assert.deepEqual(route(['update', 'all']).request, { kind: 'all', folder: null, folderPath: null });
+        assert.deepEqual(route(['update', 'all', 'projects']).request,
+            { kind: 'all', folder: 'projects', folderPath: path.join(root, 'projects') });
+        assert.deepEqual(route(['update', path.join(root, 'projects', 'nested')]).request, {
+            kind: 'all',
+            folder: path.join(root, 'projects', 'nested'),
+            folderPath: path.join(root, 'projects', 'nested'),
+        });
+        const branch = route(['update', '--branch', 'candidate', 'all', 'projects']);
+        assert.deepEqual(branch.request, { kind: 'all', folder: 'projects', folderPath: path.join(root, 'projects') });
+        assert.deepEqual(branch.branchPolicyArgs, ['--branch', 'candidate']);
+        assert.deepEqual(route(['update', 'repos']).request, { kind: 'repos' });
+        assert.deepEqual(route(['update', 'repositories']).request, { kind: 'repos' });
+        assert.deepEqual(route(['update', 'repo', 'demo']).request, { kind: 'repo', repoName: 'demo' });
+        assert.deepEqual(route(['update', 'missing-managed-repo']).request, { kind: 'repo', repoName: 'missing-managed-repo' });
+        const targeted = route(['update', 'repos', '--repo-branch', 'demo=main', '--reset-repos']);
+        assert.equal(targeted.kind, 'update');
+        assert.deepEqual(targeted.branchPolicyArgs, ['--repo-branch', 'demo=main', '--reset-repos']);
+        assert.equal(route(['--dry-run', 'update']).kind, 'dry-run');
+        for (const argv of [
+            ['update', 'all', 'missing-folder'],
+            ['update', 'all', 'projects', 'extra'],
+            ['update', 'repos', 'extra'],
+            ['update', 'repo'],
+            ['update', 'repo', 'a', 'b'],
+            ['update', 'demo', 'extra'],
+            ['update', '--unknown'],
+        ]) {
+            assert.throws(() => route(argv), { code: 'PLOINKY_BOX_ARGUMENT_INVALID' }, argv.join(' '));
+        }
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test('destroy accepts only one explicit trailing cache-deletion flag', () => {

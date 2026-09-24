@@ -18,6 +18,9 @@ const WORKSPACE_START_LOCK_PATH = path.join(RUNNING_DIR, 'workspace-start.json')
 const WORKSPACE_START_TTL_MS = 24 * 60 * 60 * 1000;
 const LOCK_STALE_GRACE_MS = 5_000;
 const OWNED_WORKSPACE_LEASES = new WeakSet();
+// Leases this process created and has not released, so nested lifecycle code
+// can reuse the exact held lease instead of blindly reacquiring it.
+const LIVE_OWNED_WORKSPACE_LEASES = new Set();
 
 function lockPathFor(containerName) {
     // Direct replacement candidates use an immutable physical name so the
@@ -133,9 +136,13 @@ function inspectWorkspaceStartLock(attempt = 0) {
     if (!lock && Date.now() - snapshot.mtimeMs < LOCK_STALE_GRACE_MS) {
         return { active: true, stale: false, recoveryPending: true, lock: null };
     }
+    if (!lock) return { active: true, stale: false, recoveryPending: true, recoveryRequired: true, lock: null };
     const expiresAtMs = Date.parse(lock?.expiresAt || '');
     const expired = Number.isFinite(expiresAtMs) ? expiresAtMs <= Date.now() : true;
     const ownerAlive = workspaceOwnerIsActive(lock);
+    if (lock?.recoveryRequired || (lock?.requireQuiescenceOnOwnerDeath && !ownerAlive)) {
+        return { active: true, stale: false, recoveryPending: true, recoveryRequired: true, lock };
+    }
     if (ownerAlive) {
         return { active: true, stale: false, renewalOverdue: expired, lock };
     }
@@ -156,12 +163,20 @@ function workspaceMutationBusy(lock) {
 function createWorkspaceMutationLease({
     ttlMs = WORKSPACE_START_TTL_MS,
     operation = 'workspace-mutation',
+    requireQuiescenceOnOwnerDeath = false,
 } = {}) {
     const existing = inspectWorkspaceStartLock();
+    if (existing.recoveryRequired) {
+        const error = new Error('Workspace mutation recovery is required: stop the exact Box from its host workspace, '
+            + 'then start it again. A worker stopped without proof that its child processes and installer runtimes stopped.');
+        error.code = 'PLOINKY_WORKSPACE_MUTATION_RECOVERY_REQUIRED';
+        throw error;
+    }
     if (existing.active) throw workspaceMutationBusy(existing.lock);
     const now = Date.now();
     const lock = {
         operation,
+        ...(requireQuiescenceOnOwnerDeath ? { requireQuiescenceOnOwnerDeath: true } : {}),
         ownerPid: process.pid,
         ownerIdentity: readWorkspaceOwnerIdentity(process.pid),
         token: randomUUID(),
@@ -179,6 +194,7 @@ function createWorkspaceMutationLease({
         throw error;
     }
     OWNED_WORKSPACE_LEASES.add(lock);
+    LIVE_OWNED_WORKSPACE_LEASES.add(lock);
     return lock;
 }
 
@@ -186,7 +202,7 @@ export function assertWorkspaceMutationLease(lease, { runningDir = RUNNING_DIR }
     const current = lockSnapshot(WORKSPACE_START_LOCK_PATH)?.lock;
     if (!OWNED_WORKSPACE_LEASES.has(lease)
         || path.resolve(runningDir) !== path.resolve(RUNNING_DIR)
-        || current?.token !== lease.token || current?.ownerPid !== process.pid) {
+        || current?.token !== lease.token || current?.ownerPid !== process.pid || current?.recoveryRequired) {
         const error = new Error('workspace mutation requires its exact live workspace lease');
         error.code = 'PLOINKY_WORKSPACE_MUTATION_CAPABILITY_REQUIRED';
         throw error;
@@ -289,9 +305,64 @@ function renewWorkspaceMutationLease(lock, { ttlMs = WORKSPACE_START_TTL_MS } = 
 
 function releaseWorkspaceStartLock(lock) {
     if (!lock?.token) return false;
-    const removed = removeSnapshot(lockSnapshot(WORKSPACE_START_LOCK_PATH), lock.token);
+    const snapshot = lockSnapshot(WORKSPACE_START_LOCK_PATH);
+    if (snapshot?.lock?.recoveryRequired
+        || (snapshot?.lock?.requireQuiescenceOnOwnerDeath && !workspaceOwnerIsActive(snapshot.lock))) return false;
+    const removed = removeSnapshot(snapshot, lock.token);
     if (removed) OWNED_WORKSPACE_LEASES.delete(lock);
+    if (removed) LIVE_OWNED_WORKSPACE_LEASES.delete(lock);
     return removed;
+}
+
+// Thread termination is not child/runtime quiescence. Retain exactly that
+// worker's lease until the host proves the Box stopped/absent and retires it.
+function retainWorkspaceMutationLeaseForRecovery({ token, operation }, reason = 'worker termination') {
+    const snapshot = lockSnapshot(WORKSPACE_START_LOCK_PATH);
+    if (!snapshot?.lock || snapshot.lock.ownerPid !== process.pid
+        || (token ? snapshot.lock.token !== token : (!operation || snapshot.lock.operation !== operation))) return false;
+    token = snapshot.lock.token;
+    let fd;
+    try {
+        fd = fs.openSync(WORKSPACE_START_LOCK_PATH, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0));
+        const stat = fs.fstatSync(fd);
+        const [device, inode] = snapshot.fingerprint.split(':');
+        if (String(stat.dev) !== device || String(stat.ino) !== inode) return false;
+        const current = JSON.parse(fs.readFileSync(fd, 'utf8'));
+        if (current.token !== token || current.ownerPid !== process.pid) return false;
+        const bytes = JSON.stringify({ ...current, recoveryRequired: true,
+            recoveryReason: String(reason).slice(0, 256) }, null, 2);
+        fs.ftruncateSync(fd, 0);
+        fs.writeSync(fd, bytes, 0, 'utf8');
+        fs.fsyncSync(fd);
+        const after = lockSnapshot(WORKSPACE_START_LOCK_PATH)?.lock;
+        return after?.token === token && after.recoveryRequired === true;
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+/**
+ * Run under this process's held workspace mutation lease, or acquire one with
+ * the bounded wait. Callers acquire it before any maintenance lock, so a
+ * command never holds a maintenance lock while waiting for the workspace.
+ */
+async function withHeldOrAcquiredWorkspaceMutationLease(options, fn) {
+    const held = heldWorkspaceMutationLease();
+    if (held) return fn(held);
+    return withWorkspaceMutationLease(options, fn);
+}
+
+/**
+ * The workspace mutation lease this process currently holds, validated
+ * against the live lock file, or null. Never acquires anything.
+ */
+function heldWorkspaceMutationLease() {
+    for (const lease of LIVE_OWNED_WORKSPACE_LEASES) {
+        try {
+            return assertWorkspaceMutationLease(lease);
+        } catch (_) {
+            // Released out of band or replaced: not held any more.
+        }
+    }
+    return null;
 }
 
 const releaseWorkspaceMutationLease = releaseWorkspaceStartLock;
@@ -396,6 +467,9 @@ function inspectMaintenanceLock(containerName, attempt = 0) {
 
 export {
     WORKSPACE_START_LOCK_PATH,
+    heldWorkspaceMutationLease,
+    readWorkspaceOwnerIdentity,
+    withHeldOrAcquiredWorkspaceMutationLease,
     acquireMaintenanceLock,
     acquireWorkspaceMutationLease,
     createMaintenanceLock,
@@ -405,6 +479,7 @@ export {
     inspectWorkspaceStartLock,
     releaseWorkspaceStartLock,
     releaseWorkspaceMutationLease,
+    retainWorkspaceMutationLeaseForRecovery,
     renewWorkspaceMutationLease,
     removeMaintenanceLock,
     withMaintenanceLock,

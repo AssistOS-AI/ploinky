@@ -1,8 +1,7 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
 import { PloinkyBoxError } from '../errors.mjs';
 import { stripBranchPolicyArgs } from '../../agentlib/branchPolicy.mjs';
+import { retiredCommandMessage } from '../../cli/retiredCommands.js';
+import { parseUpdateRequest, UpdateRequestError } from '../../cli/commands/updateRequest.js';
 
 function routeError(message) {
     return new PloinkyBoxError(message, { code: 'PLOINKY_BOX_ARGUMENT_INVALID' });
@@ -45,32 +44,57 @@ function routeDestroy(parsed) {
     return Object.freeze({ kind: 'destroy', deleteCache: true });
 }
 
-function routeUpdate(parsed) {
+const DEBUG_TOKENS = new Set(['--debug', '-d']);
+
+// Branch-policy options in their original spelling. Targeted forms forward
+// them unchanged to the in-Box core, as the generic route did before.
+function branchPolicyArgs(args) {
+    const kept = [];
+    const list = (args || []).map(String);
+    for (let index = 0; index < list.length; index += 1) {
+        const arg = list[index];
+        if (arg === '--branch' || arg === '--repo-branch' || arg === '--branch-fallback') {
+            kept.push(arg, ...(index + 1 < list.length ? [list[index + 1]] : []));
+            index += 1;
+        } else if (arg.startsWith('--branch=') || arg.startsWith('--repo-branch=')
+            || arg.startsWith('--branch-fallback=') || arg === '--reset-repos') {
+            kept.push(arg);
+        }
+    }
+    return kept;
+}
+
+/**
+ * Every non-dry-run update form becomes one typed request, parsed once before
+ * any host self-update, Box creation or source mutation. Folder scope
+ * containment and its Box spelling are resolved later against the exact
+ * workspace identity; only syntax is decided here.
+ */
+function routeUpdate(parsed, { cwd = process.cwd() } = {}) {
     if (parsed.dryRun) {
         return Object.freeze({ kind: 'dry-run' });
     }
-    const updateArgs = stripBranchPolicyArgs(parsed.commandArgs);
-    const scope = String(updateArgs[0] || '').trim().toLowerCase();
-    if (!scope || scope === 'all') {
-        return Object.freeze({
-            kind: 'update',
-            coreArgv: parsed.forwardingArgv,
-        });
+    const commandArgs = stripBranchPolicyArgs(parsed.commandArgs);
+    const extraDebug = commandArgs.some(argument => DEBUG_TOKENS.has(argument));
+    const updateArgs = commandArgs.filter(argument => !DEBUG_TOKENS.has(argument));
+    const option = updateArgs.find(argument => argument.startsWith('-'));
+    if (option) {
+        throw routeError(`update: unsupported option '${option}'`);
     }
-    if (!['repo', 'repository', 'repos', 'repositories'].includes(scope)) {
-        try {
-            if (fs.statSync(path.resolve(updateArgs[0])).isDirectory()) {
-                return Object.freeze({
-                    kind: 'update',
-                    coreArgv: parsed.forwardingArgv,
-                });
-            }
-        } catch (_) {
-            // Core treats a non-existent bare value as a managed repo name.
+    let request;
+    try {
+        request = parseUpdateRequest(updateArgs, { cwd });
+    } catch (error) {
+        if (error instanceof UpdateRequestError) {
+            throw new PloinkyBoxError(error.message, { code: 'PLOINKY_BOX_ARGUMENT_INVALID', cause: error });
         }
+        throw error;
     }
     return Object.freeze({
-        kind: 'generic',
+        kind: 'update',
+        request,
+        debug: parsed.debug.enabled || extraDebug,
+        branchPolicyArgs: Object.freeze(branchPolicyArgs(parsed.commandArgs)),
         coreArgv: parsed.forwardingArgv,
     });
 }
@@ -120,7 +144,10 @@ function routeRepair(parsed) {
     return Object.freeze({ kind: 'repair', dryRun, json });
 }
 
-export function routeOuterCommand(parsed) {
+export function routeOuterCommand(parsed, options = {}) {
+    // Retired commands answer on the host without preparing or creating a Box.
+    const retired = retiredCommandMessage(parsed.command);
+    if (retired) return Object.freeze({ kind: 'retired', command: parsed.command, message: retired });
     if (parsed.help || parsed.command === 'help') {
         return Object.freeze({ kind: 'help', topic: parsed.commandArgs });
     }
@@ -141,7 +168,7 @@ export function routeOuterCommand(parsed) {
         return routeDestroy(parsed);
     }
     if (parsed.command === 'update') {
-        return routeUpdate(parsed);
+        return routeUpdate(parsed, options);
     }
     if (parsed.command === 'start') {
         return Object.freeze({

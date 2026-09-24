@@ -20,7 +20,8 @@ import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 // recorded durably so an operator can see what went wrong without losing the
 // already-running blocking stack.
 import fs from 'fs';
-import { withDependencyRefresh, hasAgentPackageJson } from '../utils/dependencies/dependencyRefresh.mjs';
+import { withDependencyRefresh } from '../utils/dependencies/dependencyRefresh.mjs';
+import { admittedRuntimeDependencyProblem } from '../sandbox/docker/agentServiceManager.js';
 import path from 'path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -1806,8 +1807,23 @@ async function main() {
                 const routerEndpoint = resolveRouterEndpoint(profileResolution.network.mode, {
                     explicitPort: lifecycle.routerPort || undefined,
                 });
+                // A ready host/none runtime is adopted only when it already
+                // uses the desired immutable dependency generation; otherwise
+                // the ensure path replaces it. Undeterminable means ensure.
+                let dependencyProblem;
+                try {
+                    dependencyProblem = admittedRuntimeDependencyProblem({
+                        agentName: shortAgent,
+                        manifest,
+                        profileConfig: profileResolution.profileConfig,
+                        record: lifecycle.record,
+                        containerName,
+                    });
+                } catch (error) {
+                    dependencyProblem = `dependency generation check failed: ${error?.message || error}`;
+                }
                 const adopted = lifecycle.targetState === 'ready'
-                    && !hasAgentPackageJson(agentPath)
+                    && !dependencyProblem
                     && !manifest['link-install']?.length
                     && !['default', 'bridge'].includes(profileResolution.network.mode);
                 return {

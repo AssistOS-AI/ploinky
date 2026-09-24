@@ -274,7 +274,8 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and actions labelled by privilege and automation eligibility |
 | `ploinky repair [--dry-run] [--json]` | Apply supported normal-user fixes, verify with diagnostics, and list remaining manual and sudo-required actions; `--dry-run` only inspects and previews |
 | `ploinky stop` | Stop core services, then stop outer runtime; keep `.ploinky/box` cache data |
-| `ploinky update` / `ploinky update all [PATH]` | Pull Ploinky with `--rebase --autostash` only when its checkout is inside the selected folder (or the command is run from inside that checkout); still refresh AgentLib, agents, repositories, dependencies, and skills, then restart an already configured running workspace |
+| `ploinky update` / `ploinky update all [PATH]` | Update Ploinky (only when its checkout is inside the selected folder or the command is run from inside that checkout), AgentLib, registered and discovered repositories, and skills with verified fast-forward-only Git updates, then restart an already configured running workspace when every required input verified. `PATH` must be inside the workspace. Dirty, conflicted, diverged, detached, or operation-in-progress checkouts are preserved and reported as named skips; nothing is stashed, rebased, or reset. Dependency caches are not touched |
+| `ploinky update repos` / `ploinky update repo <name>` | Update only registered repositories (or one) under the same workspace transaction; activation is recorded as pending rather than restarting the whole graph — run `ploinky restart` when ready |
 | `ploinky destroy` | Without prompting, stop nested agents and remove the outer container; retain the host workspace and `.ploinky/box` |
 | `ploinky destroy --delete-cache` | Remove the outer container without prompting, then delete only `.ploinky/box/dependencies` and `.ploinky/box/images` |
 | REPL `status`/`stop`/`destroy` | Core workspace/router/agent scope; outer runtime remains |
@@ -317,8 +318,9 @@ Prepared dependency caches bind both `achillesAgentLib` and `ploinky-agent-lib`
 to that same admitted source. After npm completes, Ploinky replaces hoisted,
 scoped, and nested copies of either package with source links and verifies them
 before admitting the cache. This also covers dependencies that use the package
-name `ploinky-agent-lib`, such as ALA. Older cache adapters are repaired under
-the cache lock without reinstalling unrelated packages. Linked local packages
+name `ploinky-agent-lib`, such as ALA. A different AgentLib identity or link
+target is a different dependency tree: Ploinky builds a new one instead of
+relinking a published tree. Linked local packages
 are inspected without changing their source. If they contain or resolve a
 different AgentLib, install those dependencies as package copies so Ploinky can
 adapt the owned cache. Runtime caches and the selected library remain read-only.
@@ -649,7 +651,7 @@ URLs registered with an SSO provider.
 ## Core commands (in p-cli)
 
 - `enable agent <name> [as <alias>]`: register an agent in `.ploinky/agents.json` (creates a minimal manifest if missing). Use `as <alias>` to spin up additional instances with unique container names.
-- `update [folderPath]`: use the current directory as the update folder, or `folderPath` when supplied. A Ploinky checkout is pulled only when it is inside that folder or contains the launch folder. Ploinky being out of scope does not stop managed repositories, discovered project repositories, dependencies, or default skills from being refreshed. AchillesAgentLib is revalidated from the local checkout or the pinned Box bundle; update never pulls a local library checkout or clones a host fallback.
+- `update [folderPath]`: use the current directory as the update folder, or `folderPath` (which must be inside the workspace) when supplied. A Ploinky checkout is updated only when it is inside that folder or contains the launch folder. Each checkout is fetched once and fast-forwarded only when it is clean, on its configured branch and upstream, and not diverged; otherwise it is preserved and reported with a named reason (for example `dirty-worktree`, `diverged`, `detached-head`, `upstream-mismatch`, `legacy-ignore-block-preserved`). Every phase (Ploinky, AgentLib, repositories, default skills, skills manifests) produces a record; the command exits nonzero when any record failed or when a required input (a repository, skills source or AgentLib that the configured graph uses) was not verified, and activation happens only when every required input verified. Update never prepares dependency caches. AchillesAgentLib is revalidated from the local checkout or the pinned Box bundle; update never pulls a local library checkout or clones a host fallback.
 - `start <staticAgent> 8080`: first core start requires a static agent; subsequent runs can just use `start`.
   - Ensures all enabled agents are running and launches the fixed inner Router on `8080`. On the host-facing public wrapper, `ploinky start <agent> <port>` treats that positional port only as the physical-host port selection (loopback unless `ploinky bind` saved another address) and still forwards inner `8080` to core.
   - Serves static files from the repository of `<staticAgent>`; non `/<agent>/...` paths are static.
@@ -667,9 +669,8 @@ Log completion offers one reference per enabled record and every offered referen
 - `stop`: stop containers recorded in `.ploinky/agents.json` (do not remove).
 - `shutdown`: stop and remove containers recorded in `.ploinky/agents.json`.
 - `destroy`: stop the router, remove workspace containers, and clear `.ploinky/deps` while preserving isolated agent data in `.data/<agent-or-alias>`.
-- `deps prepare [<repo>/<agent>]`: build the prepared node_modules cache for the current runtime.
-- `deps status`: list prepared global and per-agent caches with their runtime keys and validity.
-- `deps clean <repo>/<agent>|--global|--all`: remove a cache directory.
+- `reinstall <agent>`: recreate one exact enabled agent registration and rebuild its dependency tree from empty npm state. Other aliases and shared seeds are untouched.
+- `deps`: retired. Dependency caches are managed automatically; the command prints that hint, exits nonzero, and does no cache or engine work.
 
 The `/status` TCP control surface requires a real router-authenticated
 local-admin session on an exact local-control Host. A
@@ -679,13 +680,17 @@ session-bound CSRF proof.
 
 ## Dependency caches
 
-Node-based agents consume a prepared, runtime-keyed dependency cache. `ploinky start` prepares or reuses the cache before launching the runtime; `ploinky deps prepare` lets operators warm or refresh the same cache explicitly.
+Node-based agents consume an immutable, content-verified dependency tree. The lifecycle command that admits a runtime (`start`, `enable`, `restart`, `reinstall`) resolves the desired tree; `update` never prepares caches.
 
-- Global deps come from `ploinky/globalDeps/package.json` and land in `.ploinky/deps/global/<runtime-key>/node_modules/`.
-- Per-agent deps merge global + `<agent>/package.json` and land in `.ploinky/deps/agents/<repo>/<agent>/<runtime-key>/node_modules/`.
-- The runtime key is `<family>-<platform>-<arch>-node<major>` for host runtimes and may include a Linux container libc variant when needed, for example `container-linux-x64-musl-node20` or `container-linux-x64-glibc-node20`.
-- Agents mount the cache read-only. Startup checks the cache stamp (runtime key + merged-package hash) and prepares the cache when it is missing or stale, which may require npm, git, network access, and native build tools.
-- `bwrap`, `seatbelt`, and container runtimes all consume prepared caches now. Container caches are prepared in a short-lived install container that matches the target runtime image, then mounted read-only into the runtime container.
+- New trees live under `.ploinky/deps/cache-v4/`. Each build gets a stable `objects/<build-id>/payload/` directory that is never renamed or modified after publication. A tree is keyed by every install input: runtime family and key, the immutable image ID (not the tag) or host toolchain identity, an explicit npm policy, the effective merged package manifest, the SDK bundle and full AgentLib identity, supported Git pins, and the registration's rebuild token.
+- Every npm run starts from an empty `node_modules`. Before publication Ploinky verifies installed Git provenance against the requested full commit and hashes the actual installed tree; hidden lockfile metadata alone is not accepted as integrity.
+- Runtimes mount the tree read-only. A runtime is reused only when its admitted tree equals the desired one; a changed package, provider, image, pin or rebuild token creates a replacement runtime instead of mutating a mounted tree, and the predecessor keeps its tree until it retires.
+- A corrupt tree is marked unusable for new consumers and rebuilt automatically; it is never repaired in place.
+- `ploinky reinstall <agent>` issues a new rebuild token for that registration and rebuilds from empty npm state.
+- Legacy `.ploinky/deps/global/` and `.ploinky/deps/agents/` caches are ignored for new preparations.
+- After a successful start or reinstall, Ploinky collects only trees it can prove unreferenced: every admitted, desired, candidate and build/reader-receipt root, and every mount of every workspace container (including stopped ones), is retained, and collection is skipped entirely when the engine or any registry record cannot be read. Age or disk pressure never removes a live or unknown tree. Recognized legacy caches are removed only when nothing mounts them.
+- Downgrading: stop every runtime, build and interactive session first; leave `.ploinky/deps/cache-v4/` in place (older releases rebuild their own legacy layout and never adopt it); never run an older `ploinky deps clean` while any runtime still mounts a `cache-v4` tree. Exact rollback of earlier dependency bytes needs the retained earlier tree or runtime; `destroy` is not a cache rollback.
+- Container trees are installed in a short-lived container started from the target image ID; `bwrap` and `seatbelt` trees are installed on the host. Seatbelt refuses to switch a tree while another consumer of the same source is live.
 
 ## Notes
 

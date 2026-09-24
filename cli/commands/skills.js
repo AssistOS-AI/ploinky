@@ -1,12 +1,13 @@
 import fs from 'fs';
-import { randomUUID } from 'node:crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { resolveSkillRepositorySource } from '../utils/skillRepositorySource.js';
 import { resolveAgentRepositoryPath } from '../utils/agentRepositorySource.mjs';
 import * as reposSvc from '../utils/repos.js';
 import { runGitCommand, sanitizeGitDiagnostic } from '../utils/gitCommand.js';
-import { syncManagedSkillExports, copyFreshSkillTree } from '../utils/skills/managedExports.js';
+import { syncManagedSkillExports } from '../utils/skills/managedExports.js';
+import { createSkillExclusionPlanner } from '../utils/skills/exportExclusions.mjs';
+import { readExportLedger, refreshSkillExportExclusions } from '../utils/skills/exportTransaction.mjs';
 
 export const AGENT_SKILL_TARGETS = Object.freeze({
     'claude-code': '.claude/skills',
@@ -174,17 +175,72 @@ function registerManifestCacheBranch(entry, cacheBranches) {
     cacheBranches.set(cacheIdentity, entry);
 }
 
-function ensureManifestRepoCached(entry) {
+// Source records of the single update operation set, keyed by checkout.
+// Accepts a Map or object keyed by path, or an array of operation records.
+function sourceOutcomeLookup(sourceOutcomes) {
+    if (!sourceOutcomes) return null;
+    const byPath = new Map();
+    const pairs = Array.isArray(sourceOutcomes)
+        ? sourceOutcomes.map(record => [record?.details?.checkout?.path || record?.id, record])
+        : sourceOutcomes instanceof Map ? [...sourceOutcomes.entries()] : Object.entries(sourceOutcomes);
+    for (const [key, record] of pairs) if (key) byPath.set(canonicalPath(key), record);
+    return checkout => checkout ? byPath.get(canonicalPath(checkout)) : undefined;
+}
+
+function canonicalPath(target) {
+    try { return fs.realpathSync(target); } catch (_) { return path.resolve(target); }
+}
+
+const verifiedSourceRecord = record => record?.outcome === 'changed' || record?.outcome === 'unchanged';
+
+class SkillSourceUnavailable extends Error {
+    constructor(code, message, record = null) {
+        super(message);
+        this.code = code;
+        this.record = record;
+    }
+}
+
+// During `ploinky update` sources are never pulled here: the update's one
+// operation set already ran (or refused) each checkout. A skipped or failed
+// update left the checkout untouched, so it is used as it is but never
+// prunes ('stale'); an uncertain one is not read at all.
+function useUpdatedSource(entry, repoPath, outcomeFor) {
+    const record = outcomeFor(repoPath);
+    if (record?.outcome === 'uncertain' || (record && !verifiedSourceRecord(record) && !['skipped', 'failed'].includes(record.outcome))) {
+        throw new SkillSourceUnavailable(record.code || record.outcome, `source update ${record.outcome}: ${record.reason || record.code || 'not verified'}`, record);
+    }
+    if (record && !verifiedSourceRecord(record)) return 'stale';
+    return record ? (record.outcome === 'changed' ? 'updated' : 'current') : 'not-updated';
+}
+
+function ensureManifestRepoCached(entry, { outcomeFor = null } = {}) {
     const repoPath = skillRepositoryPath(entry.name, entry.url);
     if (entry.branch) {
         runGitCommand(['check-ref-format', '--branch', entry.branch], { stdio: 'pipe' });
     }
     if (resolveSkillRepositorySource(entry.name, entry.url).origin === 'workspace') {
+        const state = outcomeFor ? useUpdatedSource(entry, repoPath, outcomeFor) : 'workspace';
         const actualBranch = String(runGitCommand(['-C', repoPath, 'branch', '--show-current'], { stdio: 'pipe' })).trim() || null;
         if (entry.branch && actualBranch !== entry.branch) {
             throw new Error(`Workspace repository is on '${actualBranch}', not requested branch '${entry.branch}'.`);
         }
-        return { repoPath, branch: actualBranch, source: repoPath };
+        return { repoPath, branch: actualBranch, source: repoPath, state };
+    }
+    if (outcomeFor && fs.existsSync(repoPath)) {
+        if (!reposSvc.isGitRepository(repoPath)) {
+            throw new SkillSourceUnavailable('not-a-git-checkout', `Cached source is not a Git repository. Inspect '${repoPath}' and move it aside before retrying.`);
+        }
+        const actualUrl = readCachedRepoSource(repoPath);
+        if (normalizeRepoIdentity(actualUrl, repoPath) !== normalizeRepoIdentity(entry.url, process.cwd())) {
+            throw new SkillSourceUnavailable('origin-mismatch', `Cached origin URL '${actualUrl}' does not match requested URL '${entry.url}'.`);
+        }
+        const state = useUpdatedSource(entry, repoPath, outcomeFor);
+        const actualBranch = String(runGitCommand(['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], { stdio: 'pipe' })).trim();
+        if (entry.branch && actualBranch !== entry.branch) {
+            throw new SkillSourceUnavailable('branch-mismatch', `Expected branch '${entry.branch}', but cached source is on '${actualBranch}'.`);
+        }
+        return { repoPath, branch: actualBranch, source: sanitizeGitDiagnostic(actualUrl), state };
     }
     if (fs.existsSync(repoPath)) {
         if (!reposSvc.isGitRepository(repoPath)) {
@@ -217,14 +273,7 @@ function ensureManifestRepoCached(entry) {
     if (entry.branch && actualBranch !== entry.branch) {
         throw new Error(`Expected branch '${entry.branch}', but cached source is on '${actualBranch}'.`);
     }
-    return { repoPath, branch: actualBranch, source: sanitizeGitDiagnostic(readCachedRepoSource(repoPath)) };
-}
-
-// Low-level copies may only create a fresh destination; managed replacement
-// requires the recorded content/mode proof in syncManagedSkillExports.
-export function copySkill(srcDir, destDir) {
-    if (pathExists(destDir)) throw new Error(`Refusing to replace unverified skill output: ${destDir}`);
-    copyFreshSkillTree(srcDir, destDir);
+    return { repoPath, branch: actualBranch, source: sanitizeGitDiagnostic(readCachedRepoSource(repoPath)), state: 'ensured' };
 }
 
 function pathExists(targetPath) {
@@ -254,7 +303,15 @@ export function ensureGitignoreEntries(workspaceRoot, relPaths) {
     } catch (_) {
         content = '';
     }
+    const next = gitignoreWithManagedBlock(content, relPaths);
+    if (next === content) return false;
+    fs.writeFileSync(gitignorePath, next);
+    return true;
+}
 
+// Pure form of the managed block update; the skill export transaction
+// publishes its result with compare-before-write.
+export function gitignoreWithManagedBlock(content, relPaths) {
     const desired = relPaths.map(p => {
         if (p.includes('/')) return p.endsWith('/') ? p : `${p}/`;
         return p;
@@ -266,23 +323,26 @@ export function ensureGitignoreEntries(workspaceRoot, relPaths) {
         const before = content.slice(0, startIdx);
         const after = content.slice(endIdx + GITIGNORE_MARKER_END.length);
         const newBlock = `${GITIGNORE_MARKER_START}\n${desired.join('\n')}\n${GITIGNORE_MARKER_END}`;
-        const newContent = `${before}${newBlock}${after}`;
-        if (newContent === content) return false;
-        fs.writeFileSync(gitignorePath, newContent);
-        return true;
+        return `${before}${newBlock}${after}`;
     }
 
     const needsLeadingNewline = content.length > 0 && !content.endsWith('\n');
     const block = `${needsLeadingNewline ? '\n' : ''}${GITIGNORE_MARKER_START}\n${desired.join('\n')}\n${GITIGNORE_MARKER_END}\n`;
-    fs.writeFileSync(gitignorePath, content + block);
-    return true;
+    return content + block;
 }
 
 export function readSkillsManifest(manifestPath) {
     return parseSkillsManifest(manifestPath);
 }
 
-export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissing = false } = {}) {
+/** Install or refresh a folder's manifest skills as one `manifest` owner.
+ * The desired set always spans every source of the manifest.
+ * `sourceOutcomes` (during `ploinky update` or a targeted refresh) switches to
+ * consuming the single operation set: no source is pulled here, and a source
+ * whose record is skipped, failed or uncertain, or whose identity cannot be
+ * verified, is retained: its selected output is neither refreshed nor pruned.
+ */
+export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissing = false, sourceOutcomes = null } = {}) {
     if (!manifestPath || typeof manifestPath !== 'string') {
         throw new Error('Missing skills manifest path.');
     }
@@ -296,6 +356,9 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
     const skillConflicts = [];
     const skillSource = new Map();
     const cacheBranches = new Map();
+    const outcomeFor = sourceOutcomeLookup(sourceOutcomes);
+    const sourceStates = [];
+    const retainedSkills = [];
 
     for (const entry of entries) {
         try {
@@ -305,17 +368,37 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
         }
     }
 
-    for (const entry of entries) {
+    for (let entry of entries) {
         try {
             // Recheck after earlier sources have been cloned: a previously absent
             // name can now resolve to the same checkout through a filesystem alias.
             registerManifestCacheBranch(entry, cacheBranches);
-            const { repoPath, branch, source } = ensureManifestRepoCached(entry);
+            let cached;
+            let availableSkills;
+            try {
+                cached = ensureManifestRepoCached(entry, { outcomeFor });
+                availableSkills = availableRepoSkills(cached.repoPath, { allowMissing: pruneMissing || cached.state === 'stale' });
+            } catch (error) {
+                if (!outcomeFor) throw error;
+                // Failed or unknown source state never prunes output.
+                const checkoutPath = canonicalPath(skillRepositoryPath(entry.name, entry.url));
+                sourceStates.push({ name: entry.name, checkoutPath, state: 'retained', code: error.code || 'source-unavailable', reason: sanitizeGitDiagnostic(error.message) });
+                retainedSkills.push(...entry.skills);
+                continue;
+            }
+            const { repoPath, branch, source } = cached;
+            const sourceRecord = outcomeFor ? outcomeFor(repoPath) : undefined;
+            sourceStates.push({ name: entry.name, checkoutPath: canonicalPath(repoPath), state: cached.state, ...(cached.state === 'stale' ? { code: sourceRecord?.code || sourceRecord?.outcome } : {}) });
             registerManifestCacheBranch(entry, cacheBranches);
             const skillsRoot = path.join(repoPath, 'skills');
-            const availableSkills = availableRepoSkills(repoPath, { allowMissing: pruneMissing });
             const available = new Set(availableSkills);
-            if (pruneMissing) {
+            if (cached.state === 'stale') {
+                // An unrefreshed source proves nothing about removals.
+                const missing = entry.skills.filter(skill => !available.has(skill));
+                retainedSkills.push(...missing);
+                sourceStates[sourceStates.length - 1].missingRetained = missing;
+                entry = { ...entry, skills: entry.skills.filter(skill => available.has(skill)) };
+            } else if (pruneMissing) {
                 const missing = entry.skills.filter(skill => !available.has(skill));
                 prunedSkills.push(...missing.map(skill => ({ repository: entry.name, skill })));
                 entry.skills = entry.skills.filter(skill => available.has(skill));
@@ -350,15 +433,10 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
         }
     }
 
-    const verifyManifest = () => {
-        if (fs.readFileSync(manifestPath, 'utf8') !== originalManifest) {
-            throw new Error(`Skills manifest changed during update: ${manifestPath}`);
-        }
-    };
-    if (prunedSkills.length) verifyManifest();
     const incomingSkills = Array.from(skillSource.keys());
-    const isGitRepoTarget = reposSvc.isGitRepository(destRoot);
-    const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
+    // One transaction publishes the links, the pruned manifest (compared
+    // against the bytes parsed above), the .claude link and the private
+    // local exclusions for the verified owned output.
     const managedExport = syncManagedSkillExports({
         folder: destRoot,
         owner: 'manifest',
@@ -367,36 +445,33 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
             name, path: path.join(source.repoPath, 'skills', name),
             source: { name: source.source, url: sanitizeGitDiagnostic(source.entry.url), branch: source.entry.branch },
         })),
+        manifest: {
+            path: manifestPath,
+            expected: originalManifest,
+            next: prunedSkills.length
+                ? JSON.stringify(JSON.parse(originalManifest).map((entry, index) => ({ ...entry, skills: entries[index].skills })), null, 2) + '\n'
+                : null,
+            changedMessage: `Skills manifest changed during update: ${manifestPath}`,
+        },
+        claude: 'root-or-skills',
+        exclusions: skillExclusions({ nonGitBlock: false }),
+        retain: retainedSkills,
+        consumer: { selection: 'explicit', policy: 'manifest' },
+        authority: skillExportAuthority,
     });
+    const repositoryOwned = classifyRepositoryOwnedOutput(destRoot, managedExport);
     reportExportDiagnostics(managedExport);
-
-    if (prunedSkills.length) {
-        const updated = JSON.parse(originalManifest).map((entry, index) => ({ ...entry, skills: entries[index].skills }));
-        const temporary = `${manifestPath}.${randomUUID()}.tmp`;
-        try {
-            fs.writeFileSync(temporary, JSON.stringify(updated, null, 2) + '\n', {
-                flag: 'wx', mode: fs.statSync(manifestPath).mode & 0o777,
-            });
-            verifyManifest();
-            fs.renameSync(temporary, manifestPath);
-        } finally {
-            fs.rmSync(temporary, { force: true });
-        }
+    for (const state of sourceStates.filter(item => item.state === 'retained' || item.state === 'stale')) {
+        console.warn(`[skills] Source '${state.name}' was not updated${state.code ? ` (${state.code})` : ''}; nothing is pruned for it.`);
     }
-
-    const claudeLink = ensureClaudeSymlink(destRoot);
-    let gitignoreUpdated = false;
-    if (isGitRepoTarget) {
-        const gitignoreEntries = [
-            ...incomingSkills.map(skill => `${CANONICAL_SKILLS_DIR}/${skill}`),
-            CANONICAL_AGENT_DIR,
-            CLAUDE_SYMLINK,
-        ];
-        gitignoreUpdated = ensureGitignoreEntries(destRoot, gitignoreEntries);
-    }
+    const claudeLink = reportClaudeLink(destRoot, managedExport);
+    const gitignoreUpdated = nonGitBlockWritten(managedExport);
 
     return {
         manifestPath,
+        sources: sourceStates,
+        retainedSkills: managedExport.retained,
+        repositoryOwned,
         repoCount: entries.length,
         repos: sourceRepos.map((repo) => ({
             source: repo.source,
@@ -409,6 +484,7 @@ export function installSkillsFromManifest(manifestPath, { targetRoot, pruneMissi
         targets: [{ agent: 'agents', relDir: CANONICAL_SKILLS_DIR, skills: incomingSkills }],
         destRoot,
         gitignoreUpdated,
+        exclusions: managedExport.exclusions,
         symlinkCreated: claudeLink.changed,
         claudeLink,
         duplicateSkills: skillConflicts,
@@ -462,32 +538,88 @@ export function findWorkspaceFoldersWithSkillsManifest(searchRoot) {
     return folders;
 }
 
+// Preserved output that the target repository itself tracks is repository
+// content, not a conflict: classify it with the target's own Git index.
+function classifyRepositoryOwnedOutput(destRoot, managedExport) {
+    const summary = { count: 0, unchanged: [], modified: [] };
+    const candidates = managedExport.diagnostics.filter(item => item.reason === 'unrecorded-output-preserved');
+    if (!candidates.length) return summary;
+    const git = args => { try { return runGitCommand(['-C', destRoot, ...args], { stdio: 'pipe' }); } catch (error) { return error; } };
+    for (const item of candidates) {
+        const relative = `${CANONICAL_SKILLS_DIR}/${item.name}`;
+        const tracked = git(['ls-files', '-z', '--', relative]);
+        if (tracked instanceof Error || !String(tracked)) continue;
+        const clean = !(git(['diff', '--quiet', '--', relative]) instanceof Error)
+            && !String(git(['ls-files', '-z', '--others', '--exclude-standard', '--', relative]) || '');
+        item.reason = clean ? 'repository-owned-output-preserved' : 'repository-owned-output-modified-preserved';
+        (clean ? summary.unchanged : summary.modified).push(item.name);
+        summary.count += 1;
+    }
+    return summary;
+}
+
 function reportExportDiagnostics(result) {
-    for (const entry of result.diagnostics) console.warn(`[skills] '${entry.name}': ${entry.reason}; existing output preserved.`);
-}
-
-function ensureClaudeSymlink(destRoot) {
-    const claude = path.join(destRoot, CLAUDE_SYMLINK);
-    if (!pathExists(claude)) {
-        fs.symlinkSync(CANONICAL_AGENT_DIR, claude, 'dir');
-        return { changed: true, mode: 'root' };
-    }
-    if (fs.lstatSync(claude).isSymbolicLink()) {
-        return { changed: false, mode: fs.readlinkSync(claude) === CANONICAL_AGENT_DIR ? 'root' : 'preserved' };
-    }
-    if (fs.lstatSync(claude).isDirectory()) {
-        const skills = path.join(claude, 'skills');
-        if (!pathExists(skills)) {
-            fs.symlinkSync(`../${CANONICAL_SKILLS_DIR}`, skills, 'dir');
-            return { changed: true, mode: 'skills' };
+    const owned = result.diagnostics.filter(entry => entry.reason === 'repository-owned-output-preserved');
+    if (owned.length) console.log(`[skills] ${owned.length} skill(s) tracked by the target repository are kept as repository content: ${owned.map(entry => entry.name).join(', ')}.`);
+    for (const entry of result.diagnostics) {
+        if (entry.reason === 'repository-owned-output-preserved') continue;
+        if (entry.reason === 'unrecorded-output-preserved') {
+            console.warn(`[skills] '${entry.name}': existing output was not created by Ploinky and is kept; move it aside to let Ploinky install this skill.`);
+            continue;
         }
-        if (fs.lstatSync(skills).isSymbolicLink() && fs.readlinkSync(skills) === `../${CANONICAL_SKILLS_DIR}`) return { changed: false, mode: 'skills' };
+        console.warn(`[skills] '${entry.name}': ${entry.reason}; existing output preserved.`);
     }
-    console.warn(`[skills] Independent .claude content preserved at '${claude}'.`);
-    return { changed: false, mode: 'preserved' };
+    if (result.recovery?.status && result.recovery.status !== 'none') {
+        console.warn(`[skills] Interrupted skill export ${result.recovery.transaction} was ${result.recovery.status}.`);
+    }
+    const exclusions = result.exclusions;
+    if (exclusions && ['deferred', 'preserved', 'relinquished'].includes(exclusions.status)) {
+        console.warn(`[skills] Local exclusions ${exclusions.status} (${exclusions.code}): ${exclusions.reason}`);
+    }
+    for (const warning of exclusions?.warnings || []) console.warn(`[skills] ${warning.reason}`);
 }
 
-export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMissing = false } = {}) {
+// Composing a live external excludes policy requires explicit consent.
+function skillExclusions(options) {
+    return createSkillExclusionPlanner({ authorizeComposition: process.env.PLOINKY_SKILL_EXCLUDES_COMPOSE === '1', ...options });
+}
+
+const nonGitBlockWritten = managedExport => managedExport.exclusions?.mode === 'non-git' && managedExport.exclusions.status === 'published';
+
+// The transaction creates `.claude -> .agents`, or `.claude/skills` inside an
+// existing real `.claude` directory; any other .claude content is preserved.
+function reportClaudeLink(destRoot, managedExport) {
+    const claudeLink = managedExport.artifacts.claude || { changed: false, mode: 'preserved' };
+    const claude = path.join(destRoot, CLAUDE_SYMLINK);
+    if (claudeLink.mode === 'preserved' && pathExists(claude) && !fs.lstatSync(claude).isSymbolicLink()) {
+        console.warn(`[skills] Independent .claude content preserved at '${claude}'.`);
+    }
+    return claudeLink;
+}
+
+// Recorded in the export lock owner record; not a credential.
+const skillExportAuthority = { kind: 'ploinky-cli', operation: 'skills-export' };
+
+function defaultsConsumer(destRoot, owner) {
+    try {
+        const { ledger } = readExportLedger(path.join(fs.realpathSync(destRoot), CANONICAL_AGENT_DIR));
+        return {
+            recorded: ledger.consumers?.[owner] || null,
+            owned: Object.keys(ledger.entries).filter(name => ledger.entries[name]?.owner === owner),
+        };
+    } catch (_) {
+        return { recorded: null, owned: [] };
+    }
+}
+
+/** Export a source repository's default skills into a consumer folder.
+ * `consumerSelection: 'all'` (the explicit `default-skills` command) records
+ * that the consumer takes every default skill. Automatic refreshes follow the
+ * recorded policy; a legacy consumer without a record keeps its current set
+ * and is never broadened. `sourceOutcomes` makes an update consume the
+ * source's single operation record instead of touching the source.
+ */
+export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMissing = false, sourceOutcomes = null, consumerSelection = 'auto' } = {}) {
     if (!repoName || typeof repoName !== 'string') {
         throw new Error('Missing repository name.');
     }
@@ -519,28 +651,52 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMi
         throw new Error(`Repo '${repoName}' is an agents repo and has no skills/ folder.${hint}`);
     }
 
-    const skillsRoot = path.join(repoPath, 'skills');
-    const skills = availableRepoSkills(repoPath, { allowMissing: pruneMissing });
+    const outcomeFor = sourceOutcomeLookup(sourceOutcomes);
+    const record = outcomeFor ? outcomeFor(repoPath) : undefined;
+    const stale = Boolean(record) && ['skipped', 'failed'].includes(record.outcome);
+    if (record && !verifiedSourceRecord(record) && !stale) {
+        // Never pull again and never prune: the consumer keeps its output.
+        console.warn(`[skills] Default skills from '${repoName}' were not refreshed in ${destRoot} (${record.code || record.outcome}).`);
+        return {
+            repoName, repoPath, skills: [], targets: [], destRoot, gitignoreUpdated: false, exclusions: null,
+            symlinkCreated: false, claudeLink: { changed: false, mode: 'unchanged' }, legacyMigration: { migratedSkills: [], skippedExistingSkills: [] },
+            managedExport: null, sourceSkipped: { code: record.code || record.outcome, reason: record.reason || '', record },
+        };
+    }
 
-    const agentsSkillsDir = path.join(destRoot, CANONICAL_SKILLS_DIR);
+    const skillsRoot = path.join(repoPath, 'skills');
+    const available = availableRepoSkills(repoPath, { allowMissing: pruneMissing || stale });
+    const owner = `defaults:${repoName}`;
+    const consumer = defaultsConsumer(destRoot, owner);
+    // A skipped or failed source update left the checkout as it was: use it,
+    // but never prune owned output that it no longer offers.
+    const retain = stale ? consumer.owned.filter(name => !available.includes(name)) : [];
+    const all = consumerSelection === 'all' || consumer.recorded?.selection === 'all' || !consumer.owned.length;
+    const skills = all ? available : available.filter(name => consumer.owned.includes(name));
+    const notBroadened = all ? [] : available.filter(name => !consumer.owned.includes(name));
+    if (notBroadened.length) {
+        console.warn(`[skills] ${destRoot} has no recorded default-skills selection for '${repoName}'; ${notBroadened.length} new skill(s) were not added. Run 'ploinky default-skills ${repoName}' there to take every default skill.`);
+    }
+
+    // Git targets get private worktree exclusions; a non-git folder keeps a
+    // receipt-backed managed block in its own .gitignore.
     const managedExport = syncManagedSkillExports({
         folder: destRoot,
-        owner: `defaults:${repoName}`,
+        owner,
         mode: 'symlink',
         sources: skills.map(name => ({ name, path: path.join(skillsRoot, name), source: { name: repoName } })),
+        claude: 'root-or-skills',
+        exclusions: skillExclusions({ nonGitBlock: true }),
+        consumer: all ? { selection: 'all', source: repoName } : undefined,
+        retain,
+        authority: skillExportAuthority,
     });
+    const repositoryOwned = classifyRepositoryOwnedOutput(destRoot, managedExport);
     reportExportDiagnostics(managedExport);
     const legacyMigration = { migratedSkills: [], skippedExistingSkills: [] };
-
-    const claudeLink = ensureClaudeSymlink(destRoot);
-
+    const claudeLink = reportClaudeLink(destRoot, managedExport);
     const targets = [{ agent: 'agents', relDir: CANONICAL_SKILLS_DIR, skills }];
-
-    const gitignoreEntries = [
-        CLAUDE_SYMLINK,
-        ...skills.map(skill => `${CANONICAL_SKILLS_DIR}/${skill}`),
-    ];
-    const gitignoreUpdated = ensureGitignoreEntries(destRoot, gitignoreEntries);
+    const gitignoreUpdated = nonGitBlockWritten(managedExport);
 
     return {
         repoName,
@@ -549,9 +705,77 @@ export function installDefaultSkills(repoName, { only, skip, targetRoot, pruneMi
         targets,
         destRoot,
         gitignoreUpdated,
+        exclusions: managedExport.exclusions,
         symlinkCreated: claudeLink.changed,
         claudeLink,
         legacyMigration,
         managedExport,
+        repositoryOwned,
+        selection: { mode: all ? 'all' : 'legacy-unknown', notBroadened },
+        sourceState: stale ? 'stale' : record ? (record.outcome === 'changed' ? 'updated' : 'current') : (outcomeFor ? 'not-updated' : 'local'),
+        retainedSkills: managedExport.retained,
     };
+}
+
+/** Declared skill sources of the manifests in `folders`, for building the
+ * update operation set. Reads manifests only; never touches Git or network. */
+export function listDeclaredSkillSources(folders = []) {
+    const sources = [];
+    for (const folder of folders) {
+        const manifestPath = findSkillsManifestPath(folder);
+        if (!manifestPath) continue;
+        let entries;
+        try {
+            entries = parseSkillsManifest(manifestPath);
+        } catch (error) {
+            sources.push({ folder, manifestPath, error: sanitizeGitDiagnostic(error.message) });
+            continue;
+        }
+        for (const entry of entries) {
+            const resolved = resolveSkillRepositorySource(entry.name, entry.url);
+            const checkout = skillRepositoryPath(entry.name, entry.url);
+            sources.push({
+                folder,
+                manifestPath,
+                name: entry.name,
+                url: sanitizeGitDiagnostic(entry.url),
+                branch: entry.branch,
+                origin: resolved.origin === 'workspace' ? 'workspace' : 'managed',
+                checkoutPath: canonicalPath(checkout),
+                exists: fs.existsSync(checkout),
+            });
+        }
+    }
+    return sources;
+}
+
+/** Targeted refresh: re-evaluate every consumer folder whose manifest
+ * declares `sourcePath`, with its complete owner set. Nothing is pulled here;
+ * other sources are used as they are. */
+export function refreshSkillConsumersForSource({ folders = [], sourcePath, sourceOutcomes = null, pruneMissing = true } = {}) {
+    const target = canonicalPath(sourcePath);
+    const consumers = [...new Map(listDeclaredSkillSources(folders)
+        .filter(item => item.checkoutPath === target)
+        .map(item => [item.folder, item])).values()];
+    const refreshed = [];
+    const failed = [];
+    for (const consumer of consumers) {
+        try {
+            refreshed.push(installSkillsFromManifest(consumer.manifestPath, { targetRoot: consumer.folder, pruneMissing, sourceOutcomes: sourceOutcomes || new Map() }));
+        } catch (error) {
+            failed.push({ folder: consumer.folder, manifestPath: consumer.manifestPath, message: sanitizeGitDiagnostic(error.message) });
+        }
+    }
+    return { sourcePath: target, refreshed, failed };
+}
+
+/** Host-side refresh of local exclusions after a container run deferred
+ * them (`exclusions-executor-view-unverified`). Publishes only exclusion
+ * artifacts from verified owned output; no skill publication, no pulls. */
+export function refreshExportExclusions({ folder, executor = 'host' } = {}) {
+    if (!folder) throw new Error('refreshExportExclusions requires a folder');
+    return refreshSkillExportExclusions(folder, {
+        exclusions: skillExclusions({ nonGitBlock: false }),
+        authority: { kind: 'ploinky-cli', operation: 'exclusions-refresh', executor },
+    });
 }

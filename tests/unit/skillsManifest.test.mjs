@@ -204,8 +204,11 @@ test('installSkillsFromManifest installs requested skills and preserves unrelate
     }
 });
 
-test('installSkillsFromManifest adds .agents and .claude to gitignore for git repositories', () => {
+test('installSkillsFromManifest excludes owned output privately in git repositories without tracked rules', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-skill-manifest-git-ignore-'));
+    const saved = { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL };
+    fs.writeFileSync(path.join(workspace, 'gitconfig'), '');
+    Object.assign(process.env, { XDG_CONFIG_HOME: path.join(workspace, 'xdg'), GIT_CONFIG_GLOBAL: path.join(workspace, 'gitconfig') });
     const reposRoot = path.join(workspace, 'repo-sources');
     const repoA = path.join(reposRoot, 'repoA');
 
@@ -225,13 +228,15 @@ test('installSkillsFromManifest adds .agents and .claude to gitignore for git re
             manifestEntry(repoA, 'ManifestRepoGitIgnore', ['owned']),
         ]);
 
-        installSkillsFromManifest(manifestPath, { targetRoot: target });
-
-        const gitignorePath = path.join(target, '.gitignore');
-        const gitignore = fs.readFileSync(gitignorePath, 'utf8');
-        assert.equal(/(^|[\n\r])\.agents([\n\r]|$)/m.test(gitignore), true);
-        assert.equal(/(^|[\n\r])\.claude([\n\r]|$)/m.test(gitignore), true);
+        const result = installSkillsFromManifest(manifestPath, { targetRoot: target });
+        assert.equal(result.exclusions.status, 'published');
+        assert.equal(fs.existsSync(path.join(target, '.gitignore')), false);
+        // Only the user's own manifest remains visible; the whole .agents is never hidden.
+        assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: target, encoding: 'utf8' }), '?? ploinky-skills-manifest.json\n');
+        assert.throws(() => execFileSync('git', ['check-ignore', '.agents/skills/authored'], { cwd: target, stdio: 'pipe' }));
+        assert.equal(installSkillsFromManifest(manifestPath, { targetRoot: target }).exclusions.status, 'unchanged');
     } finally {
+        for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
         fs.rmSync(workspace, { recursive: true, force: true });
         removeCachedRepo('ManifestRepoGitIgnore');
     }

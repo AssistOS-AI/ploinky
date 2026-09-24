@@ -104,21 +104,25 @@ import {
 } from '../../utils/runtime/legacyAgentDataGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
-import { ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
+import { bwrapDependencyReuseProblem, ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
 import { isBwrapProcessRunning, stopBwrapProcess } from '../bwrap/bwrapFleet.js';
-import { ensureSeatbeltService } from '../seatbelt/seatbeltServiceManager.js';
+import { ensureSeatbeltService, seatbeltDependencyReuseProblem } from '../seatbelt/seatbeltServiceManager.js';
 import { detectShellForImage, SHELL_FALLBACK_DIRECT } from './shellDetection.js';
 import {
     detectRuntimeKeyForAgent,
     isNoNodeRuntimeKey,
     NO_NODE_RUNTIME_KEY,
 } from '../../utils/dependencies/dependencyRuntimeKey.js';
+import { getAgentCachePath } from '../../utils/dependencies/dependencyCache.js';
 import {
-    getAgentCachePath,
-    inspectAgentCache,
-    nodeModulesDir,
-    prepareAgentCache,
-} from '../../utils/dependencies/dependencyCache.js';
+    admittedDependencyRecord,
+    noCacheDependencyRecord,
+    prepareRuntimeDependencies,
+    runtimeDependencyReuseProblem,
+} from '../../utils/dependencies/cacheV4/runtimeDependencies.mjs';
+import { CACHE_V4_DIRNAME } from '../../utils/dependencies/cacheV4/objectStore.mjs';
+import { containerToolchainIdentity } from '../../utils/dependencies/cacheV4/installContract.mjs';
+import { DEPS_DIR } from '../../utils/config.js';
 import {
     agentLibCacheLinkProblem,
     ensureAgentLibCacheLink,
@@ -604,7 +608,7 @@ function ensurePodmanStagedCodeDir(agentName, agentCodePath, nodeModulesDir, cod
     return stagedCodePath;
 }
 
-function resolveReusablePodmanStagedMounts(existingRecord, runtimeRoot) {
+function resolveReusablePodmanStagedMounts(existingRecord, runtimeRoot, expectedNodeModulesDir = null) {
     const binds = Array.isArray(existingRecord?.config?.binds) ? existingRecord.config.binds : [];
     const resolvedRoot = path.resolve(String(runtimeRoot || ''));
     if (!resolvedRoot || !fs.existsSync(resolvedRoot)) return null;
@@ -630,6 +634,17 @@ function resolveReusablePodmanStagedMounts(existingRecord, runtimeRoot) {
     const agentLibMountPath = resolveTarget('/Agent', 'Agent');
     const codeMountPath = resolveTarget('/code', 'code');
     if (!agentLibMountPath || !codeMountPath) return null;
+    if (expectedNodeModulesDir) {
+        // Staged trees are reusable only when their dependency links still
+        // name the exact admitted payload.
+        for (const staged of [agentLibMountPath, codeMountPath]) {
+            try {
+                if (fs.readlinkSync(path.join(staged, 'node_modules')) !== expectedNodeModulesDir) return null;
+            } catch (_) {
+                return null;
+            }
+        }
+    }
     return Object.freeze({ agentLibMountPath, codeMountPath });
 }
 
@@ -1287,10 +1302,23 @@ function managedAdoptionLlmPaths(llmStartup) {
 
 function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
     const matches = new Map();
+    const storeObjects = path.join(path.resolve(DEPS_DIR), CACHE_V4_DIRNAME, 'objects');
     for (const bind of record?.config?.binds || []) {
         const source = String(bind?.source || '').trim();
         if (!source || path.basename(source) !== 'node_modules') continue;
-        const cachePath = path.dirname(path.resolve(source));
+        const nodeModulesDir = path.resolve(source);
+        const payloadPath = path.dirname(nodeModulesDir);
+        // Immutable store layout: objects/<objectId>/payload/node_modules.
+        if (path.basename(payloadPath) === 'payload' && path.dirname(path.dirname(payloadPath)) === storeObjects) {
+            matches.set(payloadPath, Object.freeze({
+                layout: 'store',
+                objectId: path.basename(path.dirname(payloadPath)),
+                payloadPath,
+                nodeModulesDir,
+            }));
+            continue;
+        }
+        const cachePath = path.dirname(nodeModulesDir);
         const runtimeKey = path.basename(cachePath);
         let expectedCachePath;
         try {
@@ -1299,9 +1327,12 @@ function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
             continue;
         }
         if (cachePath !== expectedCachePath) continue;
+        // A legacy mount is a different generation: callers replace the
+        // runtime instead of adopting it.
         matches.set(cachePath, Object.freeze({
+            layout: 'legacy',
             cachePath,
-            nodeModulesDir: path.resolve(source),
+            nodeModulesDir,
             runtimeKey,
         }));
     }
@@ -1309,6 +1340,87 @@ function resolveManagedAdoptionAgentCacheMount(record, repoName, agentName) {
         throw managedAdoptionMismatch('registered dependency mounts name more than one agent cache');
     }
     return matches.values().next().value || null;
+}
+
+/**
+ * Dependency reuse decision for any admitted runtime record (container,
+ * bwrap or seatbelt). No-wait adoption and every runtime reuse path share it.
+ */
+function admittedRuntimeDependencyProblem({ agentName, manifest, profileConfig, record, containerName }, deps = {}) {
+    const runtime = String(record?.runtime || '');
+    if (runtime === 'bwrap') return bwrapDependencyReuseProblem({ agentName, manifest, record, containerName }, deps);
+    if (runtime === 'seatbelt') return seatbeltDependencyReuseProblem({ agentName, manifest, record, containerName }, deps);
+    let image = '';
+    try {
+        image = resolveManifestImage(manifest, profileConfig, { agentName, repoName: record?.repoName });
+    } catch (_) {
+        image = String(record?.containerImage || '');
+    }
+    return containerDependencyReuseProblem({
+        agentName, manifest, profileConfig, record, runtime: runtime || getRuntime(), image, containerName,
+    }, deps);
+}
+
+/**
+ * The record that proves predecessor ownership for a same-name replacement:
+ * the exact pre-rotation record, but only for the very container ID that is
+ * still registered. Anything else falls back to the registered record (whose
+ * rotated tuple then fails the ownership proof and preserves the container).
+ */
+function selectPredecessorRemovalRecord(registeredRecord, predecessorRecord) {
+    const registeredId = String(registeredRecord?.containerId || '');
+    if (predecessorRecord && registeredId && String(predecessorRecord.containerId || '') === registeredId) {
+        return predecessorRecord;
+    }
+    return registeredRecord;
+}
+
+/** The actual container mounts include the admitted store payload read-only. */
+function hasAdmittedDependencyMount(inspected, record) {
+    const admitted = admittedDependencyRecord(record);
+    if (admitted.mode !== 'store') return true;
+    const expected = path.resolve(admitted.nodeModulesPath || '');
+    const mounts = Array.isArray(inspected?.Mounts) ? inspected.Mounts : [];
+    const matching = mounts.filter((mount) => path.resolve(String(mount?.Source || '/')) === expected);
+    return matching.length > 0 && matching.every((mount) => mount.RW === false);
+}
+
+function inspectContainerImageId(runtime, image) {
+    try {
+        return containerToolchainIdentity({ runtime, image }).identity.imageId;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Container dependency reuse decision for an admitted runtime: '' when its
+ * mounted tree is the desired immutable generation, otherwise a reason that
+ * requires replacement. Read-only (no receipts, builds or probes containers).
+ */
+function containerDependencyReuseProblem({
+    agentName,
+    manifest,
+    profileConfig,
+    record,
+    runtime,
+    image,
+    containerName,
+}, deps = {}) {
+    const agentCodePath = resolveSymlinkPath(getAgentCodePath(agentName));
+    const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
+    const llmRuntime = isLlmRuntimeManifest(manifest, profileConfig);
+    const needsDependencies = !readManifestStartCommand(manifest) || agentHasPackageJson || llmRuntime;
+    return runtimeDependencyReuseProblem({
+        record,
+        family: 'container',
+        needsDependencies,
+        agentCodePath,
+        registration: containerName,
+        engine: runtime,
+        image: llmRuntime ? (record?.containerImage || image) : image,
+        noNodeAllowed: !agentHasPackageJson && !llmRuntime,
+    }, deps);
 }
 
 // This private handoff is created only by ensureAgentService and is usable
@@ -1542,16 +1654,15 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     const agentHasPackageJson = fs.existsSync(path.join(agentCodePath, 'package.json'));
     const needsCoreDeps = !useStartEntry || agentHasPackageJson || llmRuntimeManifest;
     let preparedNodeModulesDir = path.join(agentWorkDir, 'node_modules');
+    // Every dependency tree comes from the immutable store. A healthy managed
+    // runtime is adopted only when it already mounts the desired generation;
+    // adoption is read-only and never publishes receipts or probes images.
+    let dependencyRecord = null;
+    let preparedDependencies = null;
     if (needsCoreDeps) {
-        // A healthy managed runtime already records the exact cache it has
-        // admitted and mounted. Reuse that immutable evidence: rediscovering the
-        // key would pull the image and launch a transient probe container, which
-        // would make an ordinary CLI attachment observably non-idempotent.
-        const adoptionCacheMount = adoptManagedRuntimeOnly
-            ? resolveManagedAdoptionAgentCacheMount(launchRecord, repoName, agentName)
-            : null;
+        const admittedDependencies = adoptManagedRuntimeOnly ? admittedDependencyRecord(launchRecord) : null;
         const runtimeKey = adoptManagedRuntimeOnly
-            ? (adoptionCacheMount?.runtimeKey || NO_NODE_RUNTIME_KEY)
+            ? (admittedDependencies?.runtimeKey || NO_NODE_RUNTIME_KEY)
             : detectRuntimeKeyForAgent(manifest, repoName, agentName, profileConfig, image);
         const dependencyPlan = resolveDependencyCachePreparation({
             needsCoreDeps,
@@ -1562,46 +1673,49 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         if (dependencyPlan.fatal) {
             throw new Error(`[deps] ${agentName}: ${dependencyPlan.message}.`);
         }
-        if (dependencyPlan.prepare) {
-            const agentPackagePath = agentHasPackageJson ? path.join(agentCodePath, 'package.json') : null;
-            if (adoptManagedRuntimeOnly) {
-                if (!adoptionCacheMount) {
-                    throw managedAdoptionMismatch('registered dependency cache mount is unavailable');
-                }
-                const inspected = inspectAgentCache({
-                    repoName,
-                    agentName,
-                    runtimeKey,
-                    agentPackagePath,
-                    image,
-                    runtime,
-                });
-                if (!inspected.valid) {
-                    throw managedAdoptionMismatch(`dependency cache drifted (${inspected.reason})`);
-                }
-                if (path.resolve(inspected.cachePath) !== adoptionCacheMount.cachePath) {
-                    throw managedAdoptionMismatch('registered dependency cache path drifted');
-                }
-                preparedNodeModulesDir = adoptionCacheMount.nodeModulesDir;
+        if (adoptManagedRuntimeOnly) {
+            const problem = containerDependencyReuseProblem({
+                agentName, manifest, profileConfig, record: launchRecord, runtime, image, containerName,
+            });
+            if (problem) throw managedAdoptionMismatch(`dependency generation drifted (${problem})`);
+            dependencyRecord = admittedDependencies;
+            if (dependencyPlan.prepare) {
+                preparedNodeModulesDir = admittedDependencies.nodeModulesPath;
             } else {
-                const prepared = prepareAgentCache({
-                    repoName,
-                    agentName,
-                    runtimeKey,
-                    agentPackagePath,
-                    image,
-                    runtime,
-                });
-                preparedNodeModulesDir = nodeModulesDir(prepared.cachePath);
-                debugLog(`[deps] ${agentName}: prepared dependency cache ready at ${preparedNodeModulesDir}`);
+                requireManagedAdoptionDirectory(preparedNodeModulesDir, 'agent node_modules directory');
             }
+        } else if (dependencyPlan.prepare) {
+            preparedDependencies = prepareRuntimeDependencies({
+                family: 'container',
+                runtimeKey,
+                engine: runtime,
+                image,
+                agentCodePath,
+                registration: containerName,
+                admittedRecord: launchRecord,
+            }, {
+                consumer: {
+                    kind: 'container',
+                    key: `container:${containerName}:${runtimeIdentity.instanceId}:${runtimeIdentity.enableGeneration}`,
+                    engine: runtime,
+                    containerName,
+                    registration: containerName,
+                    phase: 'creating',
+                },
+            });
+            preparedNodeModulesDir = preparedDependencies.nodeModulesPath;
+            dependencyRecord = preparedDependencies.record;
+            debugLog(`[deps] ${agentName}: dependency generation ${dependencyRecord.generationId.slice(0, 12)} ready at ${preparedNodeModulesDir} (${preparedDependencies.status})`);
         } else {
             debugLog(`[deps] ${agentName}: Skipping dependency cache prep (${dependencyPlan.reason})`);
-            if (adoptManagedRuntimeOnly) {
-                requireManagedAdoptionDirectory(preparedNodeModulesDir, 'agent node_modules directory');
-            } else if (!fs.existsSync(preparedNodeModulesDir)) {
+            if (!fs.existsSync(preparedNodeModulesDir)) {
                 ensureAgentDataDirectory(preparedNodeModulesDir);
             }
+            dependencyRecord = noCacheDependencyRecord(dependencyPlan.reason, {
+                family: 'container',
+                runtimeKey,
+                imageId: inspectContainerImageId(runtime, image),
+            });
         }
     } else {
         debugLog(`[deps] ${agentName}: Skipping dependency cache prep (uses start command, no package.json)`);
@@ -1610,6 +1724,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         } else if (!fs.existsSync(preparedNodeModulesDir)) {
             ensureAgentDataDirectory(preparedNodeModulesDir);
         }
+        dependencyRecord = adoptManagedRuntimeOnly
+            ? admittedDependencyRecord(launchRecord)
+            : noCacheDependencyRecord('no-core-deps', { family: 'container' });
     }
 
     // Manifest / profile install hook (e.g. coral-agent's installPrerequisites.sh)
@@ -1664,7 +1781,10 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
     // package-resolution adapter as dependency-bearing agents. No branch that
     // skips npm may leave an empty node_modules directory behind.
     const agentLibCachePath = path.dirname(preparedNodeModulesDir);
-    if (adoptManagedRuntimeOnly) {
+    if (dependencyRecord?.mode === 'store') {
+        // The immutable object already carries its verified AgentLib links. A
+        // mounted tree is never repaired or relinked in place.
+    } else if (adoptManagedRuntimeOnly) {
         const linkProblem = agentLibCacheLinkProblem(
             agentLibCachePath,
             containerAgentLibGrant.runtimePath,
@@ -1685,7 +1805,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
         const podmanRuntimeRoot = path.join(PODMAN_RUNTIME_ROOT, runtimeSegment(containerName));
         const reusableStagedMounts = options.reuseStagedMounts === true
-            ? resolveReusablePodmanStagedMounts(existingRecord, podmanRuntimeRoot)
+            ? resolveReusablePodmanStagedMounts(existingRecord, podmanRuntimeRoot, preparedNodeModulesDir)
             : null;
         if (reusableStagedMounts) {
             agentLibMountPath = reusableStagedMounts.agentLibMountPath;
@@ -2409,12 +2529,21 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             },
         });
         if (createdIdentityPersisted) return;
+        if (preparedDependencies) {
+            try {
+                preparedDependencies.updateConsumer({ containerId, phase: 'created' });
+            } catch (error) {
+                // The receipt already roots the object by container name.
+                debugLog(`[deps] ${agentName}: dependency receipt container update deferred: ${error?.message || error}`);
+            }
+        }
         createdRegistryRecord = {
             ...launchRecord,
             type: 'agent', agentName, repoName, runtime, containerId,
             ...(options.alias ? { alias: options.alias } : {}),
             instanceId: runtimeIdentity.instanceId,
             enableGeneration: runtimeIdentity.enableGeneration,
+            ...(dependencyRecord ? { dependencies: dependencyRecord } : {}),
             config: {
                 ...launchRecord.config,
                 binds: launch?.descriptorHostFile ? [{
@@ -2502,11 +2631,16 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
             inspectionComplete: true,
             ownershipProof: { predecessorRegistryIdentity: true },
         });
+        // A coordinated same-name replacement rotates the registered tuple
+        // before launch while the container still carries its predecessor's
+        // labels. Prove ownership with the exact pre-rotation record that
+        // ensureAgentService observed, and only for that same container ID.
+        const predecessorRecord = selectPredecessorRemovalRecord(existingRecord, options.predecessorRegistryRecord);
         const predecessorRemoval = removeContainerForRecreate(
             runtime,
             containerName,
             `startAgentContainer:${agentName}`,
-            existingRecord,
+            predecessorRecord,
         );
         cleanupReceipt = advanceCandidateLifecycle(cleanupReceipt, {
             phase: 'predecessor-removed',
@@ -2713,6 +2847,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         agentLib: agentLibRuntimeRecord(containerAgentLibGrant),
+        ...(dependencyRecord ? { dependencies: dependencyRecord } : {}),
         config: {
             binds: [
                 { source: agentLibMountPath, target: '/Agent', ro: true },
@@ -3356,8 +3491,14 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
     preferredHostPort = options.preferredHostPort;
     containerOverride = options.containerName;
     aliasOverride = options.alias;
+    // Container and bwrap runtimes compare their admitted immutable dependency
+    // generation with the desired one before any reuse. Seatbelt keeps the
+    // package-presence recreation guard: its source-tree node_modules link is
+    // shared by every consumer of that source and cannot switch generations
+    // underneath another live consumer.
     forceRecreate = options.forceRecreate === true
-        || (Boolean(dependencyRefreshOperation()) && hasAgentPackageJson(agentPath));
+        || (preflightAgentRuntime === 'seatbelt'
+            && Boolean(dependencyRefreshOperation()) && hasAgentPackageJson(agentPath));
     profileNameOverride = options.profileName;
     routerEndpointOverride = options.routerEndpoint;
     if (Object.prototype.hasOwnProperty.call(options, 'routerHost')) {
@@ -3479,11 +3620,19 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
                 repoName,
             });
             const currentEnvHash = String(existingRecord.envHash || '');
-            const sandboxRecreateReason = forceRecreate
+            let sandboxRecreateReason = forceRecreate
                 ? 'forceRecreate'
                 : (!runningAtEntry
                     ? (anyRuntimeRunning ? 'runtimeIdentityDrift' : 'sandboxRuntimeStopped')
                     : (desiredEnvHash && desiredEnvHash !== currentEnvHash ? 'envHashChanged' : null));
+            // A changed bwrap dependency generation is a new sandbox with a
+            // coordinated identity, never a rebind of the running one.
+            if (!sandboxRecreateReason
+                && (agentRuntime === 'bwrap' ? bwrapDependencyReuseProblem : seatbeltDependencyReuseProblem)(
+                    { agentName, manifest, record: existingRecord, containerName },
+                )) {
+                sandboxRecreateReason = 'dependencyGenerationChanged';
+            }
             const requiresEdgeActivation = Boolean(existingRecord?.type === 'agent' && sandboxRecreateReason);
             const runtimeIdentity = resolveReplacementRuntimeIdentity({
                 containerName,
@@ -3722,6 +3871,27 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         }
     }
 
+    // Dependency trees are immutable store generations. A changed, missing,
+    // legacy or corrupt admitted generation (or a new rebuild token) replaces
+    // the runtime; the mounted tree is never mutated. This precedes every
+    // reuse path below: host/none early return, validation-only managed
+    // adoption and prepared-lease reuse.
+    if (existingRuntimeAtEntry && !recreateReason) {
+        const dependencyProblem = containerDependencyReuseProblem({
+            agentName,
+            manifest,
+            profileConfig,
+            record: launchRecord,
+            runtime,
+            image,
+            containerName,
+        });
+        if (dependencyProblem) {
+            debugLog(`[ensureAgentService] ${agentName}: ${dependencyProblem}, recreating container`);
+            recreateReason ||= 'dependencyGenerationChanged';
+        }
+    }
+
     // LLM runtime: include architecture/catalog/digest/policy in reuse comparison.
     if (existingRuntimeAtEntry && isLlmRuntimeManifest(manifest, profileConfig)) {
         try {
@@ -3844,7 +4014,13 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             if (!hasExactAgentHomeLayout(inspectedRecords[0], desiredHomeLayout)) {
                 canReuseExisting = false;
                 recreateReason ||= 'agentHomeLayoutChanged';
+            } else if (!hasAdmittedDependencyMount(inspectedRecords[0], launchRecord)) {
+                // The record is launch authority; the actual mount topology
+                // must name the same immutable payload before early reuse.
+                canReuseExisting = false;
+                recreateReason ||= 'dependencyMountDrifted';
             }
+            if (!canReuseExisting) debugLog(`[ensureAgentService] ${agentName}: host/none reuse rejected (${recreateReason})`);
         }
         if (canReuseExisting) {
             debugLog(`[ensureAgentService] ${agentName}: returning early (container exists)`);
@@ -4036,6 +4212,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
             preservePreparedRegistryRecord,
             preparationLease: options.preparationLease,
             adoptManagedRuntimeOnly,
+            ...(existingRuntimeAtEntry && recreateReason && !targetedRestart && !preservePreparedRegistryRecord
+                ? { predecessorRegistryRecord: structuredClone(existingRecord) }
+                : {}),
             [SERVICE_NETWORK_LIFECYCLE]: {
                 runtime,
                 capability: options.networkLifecycleCapability,
@@ -4124,6 +4303,9 @@ function ensureAgentService(agentName, manifest, agentPath, options = {}) {
         instanceId: runtimeIdentity.instanceId,
         enableGeneration: runtimeIdentity.enableGeneration,
         agentLib: structuredClone(startedRecord.agentLib),
+        // The admitted dependency generation is launch authority for every
+        // later reuse decision; losing it would force a replacement per start.
+        ...(startedRecord.dependencies ? { dependencies: structuredClone(startedRecord.dependencies) } : {}),
         config: {
             binds: hasStartedBinds ? startedRecord.config.binds : [
                 { source: AGENT_LIB_PATH, target: '/Agent', ro: true },
@@ -4564,6 +4746,10 @@ export {
     resolveImplicitAgentServerPort,
     resolvePublishedPortMappings,
     resolveManagedAdoptionAgentCacheMount,
+    containerDependencyReuseProblem,
+    hasAdmittedDependencyMount,
+    admittedRuntimeDependencyProblem,
+    selectPredecessorRemovalRecord,
     resolveAgentHomeLayout,
     restartGenerationCapabilityRuntime,
     replaceRuntimeRouterEnvFlags,

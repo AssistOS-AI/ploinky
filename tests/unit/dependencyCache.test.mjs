@@ -46,7 +46,7 @@ test('dependency refresh recognizes root and legacy code package manifests', (t)
 });
 
 test('dependency refresh state is isolated per command and shared across nested graph visits', async () => {
-    for (const command of ['start', 'enable', 'update', 'reinstall']) {
+    for (const command of ['start', 'enable', 'reinstall']) {
         await withDependencyRefresh(command, async () => {
             const state = dependencyRefreshOperation();
             assert.equal(state.size, 0);
@@ -57,15 +57,10 @@ test('dependency refresh state is isolated per command and shared across nested 
         });
         assert.equal(dependencyRefreshOperation(), undefined);
     }
-    withDependencyRefresh('status', () => assert.equal(dependencyRefreshOperation(), undefined));
-});
-
-test('container update uses npm update with the same isolation flags', () => {
-    const script = buildContainerInstallScript({ operation: 'update', linkBoxMcpSdk: true });
-    assert.match(script, /npm 'update'/);
-    assert.match(script, /--no-package-lock/);
-    assert.match(script, /--install-links=false/);
-    assert.doesNotMatch(script, /npm 'install'/);
+    // `update` changes sources only; lifecycle commands prepare dependencies.
+    for (const command of ['update', 'status']) {
+        withDependencyRefresh(command, () => assert.equal(dependencyRefreshOperation(), undefined));
+    }
 });
 
 function tempDir(prefix = 'deps-cache-test-') {

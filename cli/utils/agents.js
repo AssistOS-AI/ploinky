@@ -50,6 +50,7 @@ import {
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
 import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
+import { withHeldOrAcquiredWorkspaceMutationLease } from './runtime/maintenanceLocks.js';
 import {
     admitManifestRuntimeCapabilities,
     assertRuntimeAdmissionCurrent,
@@ -752,6 +753,10 @@ export function prepareAgentEnableBatch(requests, {
 }
 
 export async function enableAgent(agentName, mode, repoNameParam, aliasParam, authModeParam, authOptions = {}) {
+    // Enabling mutates the registry and admits a runtime: hold the workspace
+    // mutation lease (reusing one this process already holds) for the whole
+    // operation, before any runtime lock.
+    return withHeldOrAcquiredWorkspaceMutationLease({ operation: 'agent-enable' }, async () => {
     let prepared;
     try {
         prepared = prepareAgentEnableBatch([{
@@ -891,6 +896,7 @@ export async function enableAgent(agentName, mode, repoNameParam, aliasParam, au
             error,
         );
     }
+    });
 }
 
 function routeKeyForEnabledRecord(record) {

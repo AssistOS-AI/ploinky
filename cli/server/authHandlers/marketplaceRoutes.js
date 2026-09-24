@@ -611,9 +611,11 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             if (action === 'install' || action === 'remove') {
                 const result = await withWorkspaceMutationLease({ operation: `repositories-${action}` }, () => {
                     const repositories = action === 'install' ? new Map(reposSvc.listRepositorySources().filter(repo => repo.origin !== 'remote').map(repo => [repo.name, repo])) : null;
+                    // Skill export locks nest inside the workspace mutation lease.
+                    const authority = { kind: 'workspace-mutation-lease', operation: `repositories-${action}` };
                     return action === 'install'
-                        ? installRepositoryLinks(body, { resolveRepository: name => repositories.get(name) })
-                        : removeRepositoryLinks(body);
+                        ? installRepositoryLinks(body, { resolveRepository: name => repositories.get(name), authority })
+                        : removeRepositoryLinks(body, { authority });
                 });
                 sendJson(res, 200, { ok: true, ...result });
                 return true;
