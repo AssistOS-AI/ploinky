@@ -371,7 +371,7 @@ export function createBoxSupervisor({
             if (access.agents.length) {
                 stderr?.write?.(
                     `[ploinky] GPU access is declared by ${access.agents.join(', ')}, but this host has no usable `
-                    + 'GPU; the Box starts without GPU devices and those agents fail admission '
+                    + 'GPU; the Box starts without GPU devices and those agents start without the GPU '
                     + '(`ploinky gpu status` shows why)\n',
                 );
             }
@@ -770,8 +770,10 @@ export function createBoxSupervisor({
                     gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
                 });
                 reportRouterBinding(prepared.routerBinding);
+                const gpuReapplied = await reapplyDeclaredGpu(identity, lock, prepared.gpu);
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
+                    ...(gpuReapplied ? { gpuReapplied } : {}),
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -842,8 +844,10 @@ export function createBoxSupervisor({
                     gpuGrantUpdate: savedGpuGrantUpdate(savedGpuGrant, gpu, prepared),
                 });
                 reportRouterBinding(prepared.routerBinding);
+                const gpuReapplied = await reapplyDeclaredGpu(identity, lock, prepared.gpu);
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
+                    ...(gpuReapplied ? { gpuReapplied } : {}),
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -1033,9 +1037,13 @@ export function createBoxSupervisor({
                         : null,
                 });
                 if (options.restartAfterUpdate === true) reportRouterBinding(prepared.routerBinding);
+                const gpuReapplied = options.restartAfterUpdate === true
+                    ? await reapplyDeclaredGpu(identity, lock, prepared.gpu)
+                    : null;
                 return Object.freeze({
                     identity, ...prepared, containerId, agentLib: selection,
                     changed, previous, workspacePloinky,
+                    ...(gpuReapplied ? { gpuReapplied } : {}),
                 });
             } catch (error) {
                 await rollbackPreparedGraph({
@@ -1351,7 +1359,8 @@ export function createBoxSupervisor({
     // remains; rollback failures, if any, are appended by the rollback.
     function gpuChangeError(verb, saved, error, boxGpu = null) {
         const wrapped = new PloinkyBoxError(
-            `ploinky gpu ${verb} did not complete; ${describePreviousGpu(saved, boxGpu)} `
+            `${verb === 'start' ? 'applying the GPU agents after start' : `ploinky gpu ${verb}`} did not complete; `
+            + `${describePreviousGpu(saved, boxGpu)} `
             + `is still in force: ${error.message}`,
             { code: error?.code || 'PLOINKY_BOX_GPU_GRANT_FAILED', cause: error },
         );
@@ -1380,6 +1389,43 @@ export function createBoxSupervisor({
             + 'the saved grant. Nothing was changed',
             'PLOINKY_BOX_GPU_AGENTS_ENABLED',
         );
+    }
+
+    /**
+     * D14 first start: the in-Box start or restart may just have installed
+     * repos whose manifests declare GPU access, after the host prepared the
+     * Box. When the effective set now differs from the wiring the Box was
+     * prepared with, replace the Box once through the grant transaction. A
+     * failure is reported and leaves the workspace running without it.
+     */
+    async function reapplyDeclaredGpu(identity, lock, preparedGpu) {
+        let selected;
+        try {
+            selected = selectSavedGpuWiring(identity);
+        } catch (error) {
+            stderr?.write?.(`[ploinky] Could not re-check the GPU agents: ${error.message}\n`);
+            return null;
+        }
+        if (sameGpuWiring(selected.desired, preparedGpu)) return null;
+        stderr?.write?.('[ploinky] The installed manifests change the GPU agents; replacing the Box once to apply them...\n');
+        try {
+            return await applyGpuGrantChange({
+                identity,
+                lock,
+                ownership: inspect(identity),
+                saved: selected.saved,
+                next: selected.saved,
+                gpu: selected.desired,
+                verb: 'start',
+                declared: selected.declared,
+            });
+        } catch (error) {
+            stderr?.write?.(
+                `[ploinky] ${error.message}; the workspace keeps running without that GPU wiring. `
+                + 'Run `ploinky start` again to retry.\n',
+            );
+            return null;
+        }
     }
 
     /**

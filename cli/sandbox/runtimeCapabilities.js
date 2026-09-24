@@ -404,16 +404,28 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
         profilePolicy: profileConfig?.llmRuntime?.runtimePolicy || null,
         overridePolicy,
     }, { runtime });
-    // `containerSecurity.gpu` implies the one GPU device (D14); admission
-    // treats it exactly like a declared CDI request for that device.
+    // `containerSecurity.gpu` (D14, amended) attaches the one GPU device when
+    // this Box's wiring names the agent; otherwise the agent starts without
+    // it and is told why. An explicit CDI request in the runtime policy stays
+    // on the strict operator path below.
     const declaresGpu = validated.containerSecurity.gpu === true;
-    if (declaresGpu) {
-        const devices = Array.isArray(runtimePolicy.devices) ? runtimePolicy.devices : [];
-        const present = devices.some((entry) => entry?.type === 'cdi' && entry.value === BOX_GPU_CDI_DEVICE);
-        runtimePolicy = validatePolicyShape({
-            ...runtimePolicy,
-            devices: present ? devices : [...devices, { type: 'cdi', value: BOX_GPU_CDI_DEVICE }],
-        }, 'effective.runtimePolicy', { runtime }) || {};
+    const requestsCdi = Array.isArray(runtimePolicy.devices)
+        && runtimePolicy.devices.some((entry) => entry?.type === 'cdi');
+    let gpuAttach = null;
+    if (declaresGpu && !requestsCdi) {
+        const probe = evaluateGpuGrant(gpuGrantContext, { devices: [{ type: 'cdi', value: BOX_GPU_CDI_DEVICE }] },
+            String(agentId || ''), { declared: true });
+        const attached = probe?.admitted === true;
+        gpuAttach = {
+            attached,
+            reason: attached ? null : (probe?.refusal || 'this agent is not running in a Ploinky Box, so no GPU is attached'),
+        };
+        if (attached) {
+            runtimePolicy = validatePolicyShape({
+                ...runtimePolicy,
+                devices: [...(runtimePolicy.devices || []), { type: 'cdi', value: BOX_GPU_CDI_DEVICE }],
+            }, 'effective.runtimePolicy', { runtime }) || {};
+        }
     }
     const networkMode = String(network?.mode || profileConfig?.network?.mode || manifest?.network?.mode || 'managed')
         .trim().toLowerCase() || 'managed';
@@ -453,6 +465,7 @@ export function resolveEffectiveRuntimeCapabilities(manifest, {
     // every other agent are unchanged.
     const gpuGrant = evaluateGpuGrant(gpuGrantContext, runtimePolicy, descriptor.agentId, { declared: declaresGpu });
     if (gpuGrant) descriptor.gpuGrant = canonicalize(gpuGrant);
+    if (gpuAttach) descriptor.gpuAttach = canonicalize(gpuAttach);
     return deepFreeze(descriptor);
 }
 
@@ -696,7 +709,14 @@ export function renderRuntimePolicyArgs(descriptor, { runtime } = {}) {
             code: 'PLOINKY_RUNTIME_INPUT_CHANGED',
         });
     }
-    return emitRunArgs(descriptor.runtimePolicy, { runtime });
+    const args = emitRunArgs(descriptor.runtimePolicy, { runtime });
+    // A manifest-declared GPU agent learns whether it got the device and, if
+    // not, what to run on the host (D14).
+    if (descriptor.gpuAttach) {
+        args.push('--env', `PLOINKY_GPU_STATUS=${descriptor.gpuAttach.attached ? 'attached' : 'unavailable'}`);
+        if (!descriptor.gpuAttach.attached) args.push('--env', `PLOINKY_GPU_REASON=${descriptor.gpuAttach.reason}`);
+    }
+    return args;
 }
 
 export function runtimeCapabilityDigest(descriptor) {

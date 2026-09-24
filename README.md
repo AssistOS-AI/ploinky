@@ -658,10 +658,15 @@ the host NVIDIA GPU in either of two ways:
 
 - Its manifest declares it at the root, next to `nestedPodman`:
   `"containerSecurity": { "gpu": true }`. Any installed repo or workspace
-  checkout can do this, and the agent then needs no host step.
+  checkout can do this, and the agent then needs no host step. It gets the
+  device when the Box's wiring names it; otherwise it still starts, without the
+  device, and its container gets `PLOINKY_GPU_STATUS=unavailable` and
+  `PLOINKY_GPU_REASON`, which says what to run on the host. So it never fails on
+  a machine without a GPU.
 - The operator grants it: `ploinky gpu grant --agent REPO/AGENT`. Such an agent
   requests the device in its manifest with
-  `llmRuntime.runtimePolicy.devices: [{ "type": "cdi", "value": "ploinky.local/gpu=all" }]`.
+  `llmRuntime.runtimePolicy.devices: [{ "type": "cdi", "value": "ploinky.local/gpu=all" }]`,
+  and admission refuses to start it when the wiring does not name it.
 
 The operator's decision overrides the manifests:
 
@@ -718,23 +723,30 @@ GPU wiring) is still in force. If a rollback step fails too, the error is
 Without a Box, the record is saved for the next `ploinky start`.
 
 While a Box exists, `revoke` first reads the workspace agent registry, routes,
-and manifests. If an enabled agent that requests the GPU would lose it, it
-refuses before changing the Box and names `ploinky disable agent REPO/AGENT`,
-or `ploinky destroy` followed by `ploinky gpu revoke`. Agents can write those
+and manifests. If an enabled agent that requests the GPU through
+`runtimePolicy.devices` would lose it, it refuses before changing the Box and
+names `ploinky disable agent REPO/AGENT`, or `ploinky destroy` followed by
+`ploinky gpu revoke`; a manifest-declared agent simply restarts without the
+GPU. Agents can write those
 workspace files, so anything this check cannot read is skipped, and admission
-during the graph restart remains the authority. A refused agent is told what to
-run: `ploinky gpu grant --agent REPO/AGENT` after a deny, `ploinky gpu grant`
-after a workspace revoke, or `ploinky start` when its repo was installed after
-the Box was last prepared.
+during the graph restart remains the authority. An agent without the GPU is
+told what to run (a manifest-declared agent in `PLOINKY_GPU_REASON`, an
+operator-path agent in its admission refusal): `ploinky gpu grant --agent
+REPO/AGENT` after a deny, `ploinky gpu grant` after a workspace revoke, or
+`ploinky start` when its repo was installed after the Box was last prepared.
 
 `start`, `restart`, and `update` rediscover the driver and re-read the
-manifests. A driver update or a changed set of GPU agents changes the wiring
-fingerprint (the Box label `io.assistos.ploinky-box.gpu-grant`), so the Box is
-recreated with regenerated wiring. If discovery fails, the Box starts without
-GPU devices: an operator grant is marked stale, and agents that request the GPU
-fail admission with `GPU grant stale: <reason>; fix the host GPU driver, then
-run ploinky restart on the host`; if only manifests ask for the GPU, the Box is
-exactly as without any GPU access. Commands that only prepare an existing Box,
+manifests, before the graph starts and again after it started (the in-Box start
+may just have installed a repo whose manifest declares the GPU; the Box is then
+replaced once more, restarting the graph once). A driver update or a changed
+set of GPU agents changes the wiring fingerprint (the Box label
+`io.assistos.ploinky-box.gpu-grant`), so the Box is recreated with regenerated
+wiring. If discovery fails, the Box starts without GPU devices: an operator
+grant is marked stale, and agents that request the GPU get `GPU grant stale:
+<reason>; fix the host GPU driver, then run ploinky restart on the host`
+(operator-path agents as a refusal, manifest-declared agents as their reason);
+if only manifests ask for the GPU, the Box is exactly as without any GPU
+access. Commands that only prepare an existing Box,
 and `bind`, keep its current GPU wiring.
 
 Loopback services inside an agent container are otherwise reachable by any

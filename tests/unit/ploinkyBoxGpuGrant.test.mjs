@@ -1668,7 +1668,7 @@ function refusedWith(pattern) {
     return (error) => error.context?.unsupported?.includes('cdi') && pattern.test(error.message);
 }
 
-test('D14 field: containerSecurity.gpu is a root-only boolean that implies only the one CDI device', async () => {
+test('D14 field: containerSecurity.gpu is a root-only boolean that attaches only the one CDI device when available', async () => {
     const { validateManifestRuntimeCapabilities, resolveEffectiveRuntimeCapabilities } = await import('../../cli/sandbox/runtimeCapabilities.js');
     assert.equal(validateManifestRuntimeCapabilities(DECLARED_MANIFEST).containerSecurity.gpu, true);
     // Only a declaring agent's validated block carries the field.
@@ -1680,9 +1680,12 @@ test('D14 field: containerSecurity.gpu is a root-only boolean that implies only 
     assert.throws(() => validateManifestRuntimeCapabilities({ profiles: { gpu: { containerSecurity: { gpu: true } } } }),
         /containerSecurity is root-only/);
     assert.throws(() => validateManifestRuntimeCapabilities({ gpu: true }), /manifest\.gpu is not a supported runtime capability field/);
+    // Outside a Box nothing can be attached: the agent is admitted without a device.
     const declared = resolveEffectiveRuntimeCapabilities(DECLARED_MANIFEST, { agentId: AGENT, workspaceRoot: '/golden/ws', runtime: 'podman' });
-    assert.deepEqual(declared.runtimePolicy.devices, [{ type: 'cdi', value: BOX_GPU_CDI_DEVICE }]);
-    // Declaring it next to the operator-path entry does not duplicate the device.
+    assert.equal((declared.runtimePolicy.devices || []).length, 0);
+    assert.equal(declared.gpuAttach.attached, false);
+    assert.match(declared.gpuAttach.reason, /not running in a Ploinky Box/);
+    // Declaring it next to the operator-path entry keeps one device, on the strict path.
     const both = resolveEffectiveRuntimeCapabilities({ ...DECLARED_MANIFEST, llmRuntime: { runtimePolicy: GRANTED_DEVICE } },
         { agentId: AGENT, workspaceRoot: '/golden/ws', runtime: 'podman' });
     assert.deepEqual(both.runtimePolicy.devices, [{ type: 'cdi', value: BOX_GPU_CDI_DEVICE }]);
@@ -1800,35 +1803,53 @@ test('D14 commands: revoke denies and grant lifts, per agent and for the whole w
     assert.deepEqual(regranted.access.sources, [{ agent: AGENT, sources: ['manifest'] }]);
 });
 
-test('D14 admission: a declaring agent is admitted by its manifest, and each refusal says what to run', async (t) => {
+function gpuEnv(args) {
+    const values = {};
+    for (let index = 0; index < args.length - 1; index += 1) {
+        if (args[index] !== '--env') continue;
+        const [key, ...rest] = args[index + 1].split('=');
+        values[key] = rest.join('=');
+    }
+    return values;
+}
+
+test('D14 admission: a declaring agent gets the device when wired, and otherwise starts without it and is told why', async (t) => {
     const gpu = await import(GPU_MODULE);
-    const home = (state) => state.home;
     const desired = (decision, declared) => (state) => gpu.resolveDesiredGpuWiring(state.identity, decision, declared, {
-        discover: () => fakeHost().discover(), homeDirectory: home(state),
+        discover: () => fakeHost().discover(), homeDirectory: state.home,
     });
-    // Admitted: the active wiring names it because its manifest declares the GPU.
+    const args = (admission) => renderRuntimePolicyArgs(admission.descriptor, { runtime: 'podman' });
+    // Attached: the active wiring names it because its manifest declares the GPU.
     const admittedBox = wiredBox(t, desired(null, [AGENT]));
     const admitted = admitManifest(admittedBox, DECLARED_MANIFEST);
     assert.equal(admitted.descriptor.gpuGrant.admitted, true);
-    assert.deepEqual(renderRuntimePolicyArgs(admitted.descriptor, { runtime: 'podman' }), ['--device', BOX_GPU_CDI_DEVICE]);
+    assert.deepEqual(args(admitted).slice(0, 2), ['--device', BOX_GPU_CDI_DEVICE]);
+    assert.deepEqual(gpuEnv(args(admitted)), { PLOINKY_GPU_STATUS: 'attached' });
+    const unavailable = (box, pattern) => {
+        const admission = admitManifest(box, DECLARED_MANIFEST);
+        assert.equal(args(admission).includes('--device'), false);
+        const env = gpuEnv(args(admission));
+        assert.equal(env.PLOINKY_GPU_STATUS, 'unavailable');
+        assert.match(env.PLOINKY_GPU_REASON, pattern);
+    };
     // Per-agent revoke: a marker-only revoked wiring names the deny.
     const deniedBox = wiredBox(t, desired({ denied: [AGENT] }, [AGENT]));
     assert.equal(deniedBox.wiring.state, 'revoked');
     assert.equal(deniedBox.wiring.devices.length, 0);
-    assert.throws(() => admitManifest(deniedBox, DECLARED_MANIFEST), refusedWith(
-        /GPU access for local-llms\/local-llm was revoked by the operator; on the host run `ploinky gpu grant --agent local-llms\/local-llm`/));
+    unavailable(deniedBox, /^GPU access for local-llms\/local-llm was revoked by the operator; on the host run `ploinky gpu grant --agent local-llms\/local-llm`$/);
     // Workspace revoke.
-    const workspaceBox = wiredBox(t, desired({ workspaceDenied: true }, [AGENT]));
-    assert.throws(() => admitManifest(workspaceBox, DECLARED_MANIFEST), refusedWith(
-        /revoked for this workspace by the operator; on the host run `ploinky gpu grant` to restore manifest defaults, or `ploinky gpu grant --agent local-llms\/local-llm`/));
+    unavailable(wiredBox(t, desired({ workspaceDenied: true }, [AGENT])),
+        /revoked for this workspace by the operator; on the host run `ploinky gpu grant` to restore manifest defaults, or `ploinky gpu grant --agent local-llms\/local-llm`/);
     // Declared after the Box was prepared: no wiring yet, or wiring for others only.
-    const notApplied = /GPU not applied to this Box yet; on the host run `ploinky start` \(`ploinky gpu status` shows whether the host has a usable GPU\)/;
-    assert.throws(() => admitManifest(wiredBox(t, null), DECLARED_MANIFEST), refusedWith(notApplied));
-    assert.throws(() => admitManifest(wiredBox(t, desired(null, ['lab/other'])), DECLARED_MANIFEST), refusedWith(notApplied));
-    // The operator path keeps its own guidance.
+    const notApplied = /^GPU not applied to this Box yet; on the host run `ploinky start` \(`ploinky gpu status` shows whether the host has a usable GPU\)$/;
+    unavailable(wiredBox(t, null), notApplied);
+    unavailable(wiredBox(t, desired(null, ['lab/other'])), notApplied);
+    // The operator path keeps its strict refusal and its own guidance.
     assert.throws(() => admitManifest(wiredBox(t, null), { llmRuntime: { runtimePolicy: GRANTED_DEVICE } }), refusedWith(
         /this workspace has no GPU grant for local-llms\/local-llm; on the host run `ploinky gpu grant --agent local-llms\/local-llm`/));
-    // Other devices stay refused even for a declaring, admitted agent.
+    assert.throws(() => admitManifest(deniedBox, { ...DECLARED_MANIFEST, llmRuntime: { runtimePolicy: GRANTED_DEVICE } }),
+        refusedWith(/was revoked by the operator/));
+    // Other devices stay refused even for a declaring, attached agent.
     for (const [extra, unsupported] of [
         [{ gpus: 'all' }, 'gpu'],
         [{ ipc: 'host' }, 'host-ipc'],
@@ -1845,7 +1866,7 @@ test('D14 admission: a declaring agent is admitted by its manifest, and each ref
     }), refusedWith(/admits only the single device ploinky\.local\/gpu=all/));
 });
 
-test('D14 GPU-less host: a declaring agent leaves the Box without GPU wiring and gets a clear refusal', async (t) => {
+test('D14 GPU-less host: a declared agent starts without the device, and its Box starts without GPU wiring', async (t) => {
     const gpu = await import(GPU_MODULE);
     const noGpu = () => { throw Object.assign(new Error('Unable to read the NVIDIA kernel module version from /proc/driver/nvidia/version'), { code: 'PLOINKY_BOX_GPU_DISCOVERY_FAILED' }); };
     const state = workspaceFixture(t);
@@ -1876,8 +1897,12 @@ test('D14 GPU-less host: a declaring agent leaves the Box without GPU wiring and
     });
     await supervisor.runStartTransaction(['start', 'explorer', '8080']);
     assert.equal(startGpu, null);
-    assert.ok(notes.some((text) => /GPU access is declared by local-llms\/local-llm, but this host has no usable GPU/.test(text)));
-    assert.throws(() => admitManifest(wiredBox(t, null), DECLARED_MANIFEST), refusedWith(/GPU not applied to this Box yet.*`ploinky gpu status`/));
+    assert.ok(notes.some((text) => /GPU access is declared by local-llms\/local-llm, but this host has no usable GPU; .* start without the GPU/.test(text)));
+    // The agent is admitted without a device and told why.
+    const admission = admitManifest(wiredBox(t, null), DECLARED_MANIFEST);
+    const env = gpuEnv(renderRuntimePolicyArgs(admission.descriptor, { runtime: 'podman' }));
+    assert.equal(env.PLOINKY_GPU_STATUS, 'unavailable');
+    assert.match(env.PLOINKY_GPU_REASON, /`ploinky gpu status` shows whether the host has a usable GPU/);
 });
 
 test('D14 no declarations and no record: no GPU wiring, as before', async (t) => {
@@ -1947,7 +1972,7 @@ test('D14 status names each GPU agent with its source, the denies and the worksp
     assert.match(off, /GPU grant: manifest defaults revoked for this workspace\nGPU agents: none/);
 });
 
-test('D14 revoke pre-check also protects an enabled agent whose manifest declares the GPU', async (t) => {
+test('D14 revoke pre-check: a manifest-declared agent does not block a revoke, since it starts without the GPU', async (t) => {
     const probe = boxFixture(t);
     useTempHome(t, probe.root);
     const box = graphBox(t, { gpu: (state) => activeWiring(state.identity) });
@@ -1956,9 +1981,45 @@ test('D14 revoke pre-check also protects an enabled agent whose manifest declare
     const supervisor = gpuSupervisor(box, events, {
         gpuGrantStore: memoryGpuStore(events),
         scanGpuAgents: () => [AGENT],
-        reconcile: async () => assert.fail('refused before any Box change'),
+        reconcile: reconcileReached(box),
     });
     await assert.rejects(() => supervisor.runGpuRevokeTransaction({ agents: [AGENT] }),
-        (error) => error.code === 'PLOINKY_BOX_GPU_AGENTS_ENABLED' && /`ploinky disable agent local-llms\/local-llm`/.test(error.message));
-    assert.equal(events.some((event) => event.startsWith('grant-')), false);
+        (error) => error.code !== 'PLOINKY_BOX_GPU_AGENTS_ENABLED' && /reached reconcile/.test(error.message));
+});
+
+test('D14 first start: a start that installs a declaring repo replaces the Box once, and only then', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    for (const [declaredAfterStart, expected] of [[[AGENT], [null, 'active']], [[], [null]]]) {
+        const box = graphBox(t);
+        const events = [];
+        const seen = [];
+        let scans = 0;
+        const supervisor = gpuSupervisor(box, events, {
+            gpuGrantStore: memoryGpuStore(events),
+            // Nothing is installed when the host prepares the Box; the in-Box
+            // start then clones the repo.
+            scanGpuAgents: () => (scans++ === 0 ? [] : declaredAfterStart),
+            async reconcile(options) {
+                seen.push(options.gpu);
+                return prepared(box, seen.length === 1 ? 'reused' : 'replaced', options.gpu, events);
+            },
+            async startCore() { events.push('start-core'); },
+            async healthCheck() { events.push('health'); },
+            selectAgentLib: async () => ({ selection: box.agentLib }),
+            commitAgentLibSelection: () => {},
+            revalidateAgentLibSource: () => {},
+        });
+        const result = await supervisor.runStartTransaction(['start', 'explorer', '8080']);
+        assert.deepEqual(seen.map((wiring) => wiring?.state ?? null), expected, JSON.stringify(declaredAfterStart));
+        if (declaredAfterStart.length) {
+            assert.deepEqual(seen[1].agents, [AGENT]);
+            assert.equal(result.gpuReapplied.action, 'replaced');
+            assert.equal(events.filter((event) => event === 'start-core').length, 2);
+        } else {
+            assert.equal(result.gpuReapplied, undefined);
+            assert.equal(events.filter((event) => event === 'start-core').length, 1);
+        }
+    }
 });

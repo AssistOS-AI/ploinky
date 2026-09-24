@@ -667,8 +667,9 @@ function requestsCdiDevice(llmRuntime) {
 }
 
 /**
- * Enabled agents, as REPO/AGENT, whose manifest declares `containerSecurity.gpu`
- * or whose manifest or selected profile requests a CDI device. Read from the workspace agent registry, the routing file (the
+ * Enabled agents, as REPO/AGENT, whose manifest or selected profile requests a
+ * CDI device (the strict operator path; a `containerSecurity.gpu` agent starts
+ * without the device instead, D14). Read from the workspace agent registry, the routing file (the
  * manifest directory of each route) and the manifests. Agents can write all of
  * these, so a caller may use the result only to refuse early; unreadable
  * entries are skipped and admission during the graph start stays the authority.
@@ -696,7 +697,7 @@ export function enabledCdiRequestingAgents(workspaceRoot, {
         if (!manifest || typeof manifest !== 'object') continue;
         const profiles = manifest.profiles && typeof manifest.profiles === 'object' ? manifest.profiles : {};
         const profile = profiles[String(record.profile || 'default')];
-        if (declaresGpu(manifest) || requestsCdiDevice(manifest.llmRuntime) || requestsCdiDevice(profile?.llmRuntime)) {
+        if (requestsCdiDevice(manifest.llmRuntime) || requestsCdiDevice(profile?.llmRuntime)) {
             requesting.add(`${repo}/${agent}`);
         }
     }
