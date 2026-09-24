@@ -798,11 +798,24 @@ export function observeContainerGpuWiring(containerHandle, { homeDirectory = os.
     }
     return Object.freeze({
         fingerprint,
-        state: active ? 'active' : 'stale',
+        state: active ? 'active' : markerOnlyState(generation),
         instance,
         devices: Object.freeze(extraDevices),
         mounts: Object.freeze(mounts),
     });
+}
+
+// A marker-only Box is stale (discovery failed) or revoked (D14: every
+// declared agent is denied). The mounts cannot tell them apart, so read the
+// Box's own generation marker, a host-only file; without it, say stale.
+function markerOnlyState(generation) {
+    if (!generation) return 'stale';
+    try {
+        const marker = JSON.parse(fs.readFileSync(path.join(generation, 'marker.json'), 'utf8'));
+        return marker?.state === 'revoked' ? 'revoked' : 'stale';
+    } catch {
+        return 'stale';
+    }
 }
 
 // ---------------------------------------------------------------------------

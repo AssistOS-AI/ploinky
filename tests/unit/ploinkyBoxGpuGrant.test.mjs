@@ -436,6 +436,29 @@ test('an observed wiring must bind its own generation files, and a stale one not
         /stale GPU grant still has GPU devices or libraries/);
 });
 
+test('D14 an observed marker-only Box is revoked when its own generation marker says so, and stale otherwise', (t) => {
+    const state = boxFixture(t);
+    const observe = (wiring) => observeContainerGpuWiring(containerHandle(state, { gpu: wiring }),
+        { identity: state.identity, homeDirectory: state.home });
+    const revokedWiring = (denials) => buildGpuWiring({
+        identity: state.identity, grant: { vendor: 'nvidia' }, revoked: true, ...denials, homeDirectory: state.home,
+    });
+    const stale = buildGpuWiring({ identity: state.identity, grant: GRANT,
+        failure: new Error('Unable to read the NVIDIA kernel module version'), homeDirectory: state.home });
+    state.store.materialize(state.identity, stale, state.lock);
+    assert.equal(observe(stale).state, 'stale');
+    const workspaceRevoked = revokedWiring({ workspaceDenied: true });
+    state.store.materialize(state.identity, workspaceRevoked, state.lock);
+    assert.equal(observe(workspaceRevoked).state, 'revoked');
+    const agentRevoked = revokedWiring({ denied: [AGENT] });
+    state.store.materialize(state.identity, agentRevoked, state.lock);
+    const observed = observe(agentRevoked);
+    assert.deepEqual([observed.fingerprint, observed.state], [agentRevoked.fingerprint, 'revoked']);
+    // Without its generation marker (pruned or unreadable) a marker-only Box reads as stale.
+    fs.rmSync(path.join(gpuGenerationDirectory(state.identity, agentRevoked.fingerprint, state.home), 'marker.json'));
+    assert.equal(observe(agentRevoked).state, 'stale');
+});
+
 test('generation files are content addressed, private and pruned only by name', (t) => {
     const state = workspaceFixture(t);
     const first = activeWiring(state.identity, { homeDirectory: state.home });
