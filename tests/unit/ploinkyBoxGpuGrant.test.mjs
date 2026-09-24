@@ -329,7 +329,11 @@ test('the grant record is private host state for one exact workspace', (t) => {
     assert.equal(path.dirname(target), path.join(state.home, '.ploinky-box', 'gpu-grants'));
     assert.equal(fs.statSync(target).mode & 0o777, 0o600);
     assert.equal(fs.statSync(state.store.directory).mode & 0o777, 0o700);
-    assert.deepEqual(state.store.read(state.identity), { vendor: 'nvidia', agents: [AGENT], admitted: null });
+    // D14 adds denies to the decision; a record without them keeps its bytes.
+    assert.deepEqual(state.store.read(state.identity),
+        { vendor: 'nvidia', agents: [AGENT], denied: [], workspaceDenied: false, admitted: null });
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(target, 'utf8'))).sort(),
+        ['admitted', 'agents', 'instance', 'pathHash', 'vendor', 'version', 'workspaceRoot']);
 
     // A record planted inside the writable workspace is never consulted.
     const planted = path.join(state.identity.workspaceRoot, '.ploinky', 'gpu-grants');
@@ -563,7 +567,7 @@ test('a stale grant fails only GPU-requesting agents, with the actionable messag
     assert.throws(
         () => admit(box, GRANTED_DEVICE),
         (error) => error.context.unsupported.includes('cdi')
-            && /GPU grant stale: .*version mismatch.*; re-run `ploinky gpu grant`/.test(error.message),
+            && /GPU grant stale: .*version mismatch.*; fix the host GPU driver, then run `ploinky restart` on the host/.test(error.message),
     );
     assert.doesNotThrow(() => admit(box, {}));
 });
@@ -902,8 +906,11 @@ function memoryGpuStore(events, initial = null) {
         read() { return value; },
         write(identity, grant, lock, { admitted = null } = {}) {
             lock.assertHeld(identity.instance);
-            events.push(`grant-write:${grant.agents.join(',')}:${admitted?.state || 'none'}`);
-            value = Object.freeze({ vendor: grant.vendor, agents: [...grant.agents], admitted });
+            const denied = [...(grant.denied || [])];
+            const workspaceDenied = grant.workspaceDenied === true;
+            events.push(`grant-write:${grant.agents.join(',')}:${admitted?.state || 'none'}`
+                + `${denied.length ? `:denied=${denied.join(',')}` : ''}${workspaceDenied ? ':workspace-denied' : ''}`);
+            value = Object.freeze({ vendor: grant.vendor, agents: [...grant.agents], denied, workspaceDenied, admitted });
             return value;
         },
         clear(identity, lock) {
@@ -1018,7 +1025,10 @@ test('grant replaces the Box, restarts the graph, proves health, then saves the 
     assert.equal(result.action, 'replaced');
     assert.equal(requested.state, 'active');
     assert.deepEqual(requested.agents, [AGENT]);
-    assert.deepEqual(store.value, { vendor: 'nvidia', agents: [AGENT], admitted: { fingerprint: requested.fingerprint, state: 'active', reason: null } });
+    assert.deepEqual(store.value, {
+        vendor: 'nvidia', agents: [AGENT], denied: [], workspaceDenied: false,
+        admitted: { fingerprint: requested.fingerprint, state: 'active', reason: null },
+    });
     inOrder(events, ['lock', 'reconcile', 'stream:/opt/ploinky/bin/ploinky-install-deps', 'start-core', 'health', 'grant-write', 'finalize', 'prune', 'release']);
     assert.match(formatGpuGrantResult(result), new RegExp(`GPU grant for ${box.identity.instance}: nvidia for ${AGENT}`));
 });
@@ -1044,7 +1054,7 @@ test('a repeated grant is idempotent: health is proven and nothing restarts', as
     assert.equal(events.some((event) => event.startsWith('run:') || event.startsWith('stream:')), false);
 });
 
-test('revoking while running removes the wiring and then clears the record', async (t) => {
+test('revoking while running removes the wiring and then records the workspace revoke', async (t) => {
     const box = graphBox(t, { gpu: (state) => activeWiring(state.identity) });
     const events = [];
     const store = memoryGpuStore(events, Object.freeze({ vendor: 'nvidia', agents: [AGENT, 'lab/other'], admitted: null }));
@@ -1062,12 +1072,20 @@ test('revoking while running removes the wiring and then clears the record', asy
     assert.deepEqual(seen[0].agents, [AGENT]);
     assert.deepEqual(store.value.agents, [AGENT]);
     assert.equal(partial.grant.agents.length, 1);
-    await assert.rejects(() => supervisor.runGpuRevokeTransaction({ agents: ['lab/unknown'] }), /does not name lab\/unknown/);
+    // D14: revoking an agent the operator never granted records a deny that
+    // would override its manifest; it declares nothing here, so the wiring stays.
+    await supervisor.runGpuRevokeTransaction({ agents: ['lab/unknown'] });
+    assert.deepEqual(seen.at(-1).agents, [AGENT]);
+    // Both per-agent revokes are recorded as denies (D14).
+    assert.deepEqual(store.value.denied, ['lab/other', 'lab/unknown']);
+    // A whole revoke withdraws every grant and persists the workspace revoke.
     const full = await supervisor.runGpuRevokeTransaction({});
     assert.equal(seen.at(-1), null);
-    assert.equal(store.value, null);
-    assert.equal(full.grant, null);
-    inOrder(events.slice(events.lastIndexOf('lock')), ['lock', 'start-core', 'health', 'grant-clear', 'finalize', 'release']);
+    assert.deepEqual({ agents: store.value.agents, denied: store.value.denied, workspaceDenied: store.value.workspaceDenied },
+        { agents: [], denied: ['lab/other', 'lab/unknown'], workspaceDenied: true });
+    assert.deepEqual(full.grant.agents, []);
+    inOrder(events.slice(events.lastIndexOf('lock')),
+        ['lock', 'start-core', 'health', 'grant-write::none:denied=lab/other,lab/unknown:workspace-denied', 'finalize', 'release']);
 });
 
 test('a failed replacement reports the previous grant still in force and restores the record', async (t) => {
@@ -1095,7 +1113,7 @@ test('a failed replacement reports the previous grant still in force and restore
             .test(error.message),
     );
     assert.equal(store.value, saved);
-    inOrder(events, ['grant-clear', 'finalize', 'outer-rollback', 'restore-graph', 'grant-restore:local-llms/local-llm']);
+    inOrder(events, ['grant-write::none:workspace-denied', 'finalize', 'outer-rollback', 'restore-graph', 'grant-restore:local-llms/local-llm']);
 });
 
 test('start rediscovers the driver: a changed fingerprint is a replacement and is recorded after health', async (t) => {
@@ -1231,7 +1249,6 @@ test('gpu commands parse strictly and route only to the host supervisor', async 
     assert.equal(routeOuterCommand(parseOuterArguments(['gpu'])).kind, 'gpu-status');
     assert.equal(routeOuterCommand(parseOuterArguments(['gpu', 'revoke'])).kind, 'gpu-revoke');
     for (const argv of [
-        ['gpu', 'grant'],
         ['gpu', 'grant', '--agent'],
         ['gpu', 'grant', '--vendor', 'nvidia', '--vendor', 'nvidia', '--agent', AGENT],
         ['gpu', 'frob'],
@@ -1299,14 +1316,13 @@ test('gpu grant takes no vendor word; --vendor is optional and checked', () => {
     ]) {
         assert.throws(() => parseOuterArguments(argv), (error) => error.code === 'PLOINKY_BOX_ARGUMENT_INVALID'
             && /gpu grant takes no VENDOR argument/.test(error.message)
-            && /ploinky gpu grant --agent REPO\/AGENT \[--agent REPO\/AGENT\.\.\.\] \[--vendor VENDOR\]/.test(error.message),
+            && /ploinky gpu grant \[--agent REPO\/AGENT\.\.\.\] \[--vendor VENDOR\]/.test(error.message),
         argv.join(' '));
     }
-    // --agent is still required.
+    // D14 reverses the short-grant rule that --agent is required: `gpu grant`
+    // alone lifts a workspace revoke so manifest defaults apply again.
     for (const argv of [['gpu', 'grant'], ['gpu', 'grant', '--vendor', 'nvidia']]) {
-        assert.throws(() => parseOuterArguments(argv),
-            (error) => error.code === 'PLOINKY_BOX_ARGUMENT_INVALID' && /gpu grant requires at least one --agent REPO\/AGENT/.test(error.message),
-            argv.join(' '));
+        assert.deepEqual(parseOuterArguments(argv).gpu, { action: 'grant', vendor: 'nvidia', agents: [] }, argv.join(' '));
     }
     // --vendor belongs to grant only.
     assert.throws(() => parseOuterArguments(['gpu', 'revoke', '--vendor', 'nvidia']), /gpu revoke does not accept option --vendor/);
@@ -1402,11 +1418,12 @@ test('a repeated grant and a later start record the desired wiring when the Box 
     const repeated = await supervisor.runGpuGrantTransaction({ vendor: 'nvidia', agents: [AGENT] });
     assert.equal(repeated.action, 'unchanged');
     assert.deepEqual(store.read(box.identity).agents, [AGENT]);
-    await assert.rejects(
-        () => gpuSupervisor(box, events, { gpuGrantStore: createGpuGrantStore(), reconcile: async () => assert.fail('refused first') })
-            .runGpuRevokeTransaction({ agents: ['lab/unknown'] }),
-        /does not name lab\/unknown/,
-    );
+    // D14: a deny of an agent that declares nothing is recorded in the real
+    // store and leaves the reused Box's wiring as it is.
+    const denied = await supervisor.runGpuRevokeTransaction({ agents: ['lab/unknown'] });
+    assert.equal(denied.action, 'unchanged');
+    assert.deepEqual(store.read(box.identity).agents, [AGENT]);
+    assert.deepEqual(store.read(box.identity).denied, ['lab/unknown']);
 });
 
 test('revoking named agents without a record refuses instead of revoking everything', async (t) => {
@@ -1500,9 +1517,15 @@ test('revoking on a Box without a graph points to destroy, not to starting agent
         },
     );
     await assert.rejects(
-        () => supervisor.runGpuGrantTransaction({ vendor: 'nvidia', agents: [AGENT] }),
+        () => supervisor.runGpuGrantTransaction({ vendor: 'nvidia', agents: ['lab/other'] }),
         (error) => error.code === 'PLOINKY_BOX_GPU_GRAPH_REQUIRED' && /run `ploinky start AGENT` first/.test(error.message),
     );
+    // A grant that leaves the Box's wiring exactly as it is needs no graph:
+    // only the record changes.
+    const same = await supervisor.runGpuGrantTransaction({ vendor: 'nvidia', agents: [AGENT] });
+    assert.equal(same.action, 'unchanged');
+    assert.equal(events.filter((event) => /^(run|stream):/.test(event)).length, 0);
+    assert.ok(events.includes('grant-write:local-llms/local-llm:active'));
 });
 
 const GPU_REQUEST = Object.freeze({ runtimePolicy: { devices: [{ type: 'cdi', value: 'ploinky.local/gpu=all' }] } });
@@ -1604,4 +1627,338 @@ test('the revoke pre-check skips agents that stay granted, request no GPU, or ca
         () => supervisor.runGpuRevokeTransaction({ agents: [] }),
         (error) => error.code !== 'PLOINKY_BOX_GPU_AGENTS_ENABLED' && /reached reconcile/.test(error.message),
     );
+});
+
+// ---------------------------------------------------------------------------
+// D14: manifest-declared GPU access (`containerSecurity.gpu`), with the
+// operator's grant and revoke as overrides. New functions are loaded
+// dynamically so each test fails on its own against the pre-D14 code.
+// ---------------------------------------------------------------------------
+
+const GPU_MODULE = '../../ploinky-box/gpuGrant.mjs';
+const DECLARED_MANIFEST = Object.freeze({ agent: 'node main.mjs', containerSecurity: { gpu: true } });
+
+function wiredBox(t, makeWiring) {
+    const state = workspaceFixture(t);
+    const wiring = makeWiring ? makeWiring(state) : null;
+    if (wiring) state.store.materialize(state.identity, wiring, state.lock);
+    const byDestination = Object.fromEntries((wiring?.mounts || []).map((mount) => [mount.destination, mount.source]));
+    const boxMarker = path.join(state.root, 'ploinky-box');
+    fs.writeFileSync(boxMarker, 'assistos/ploinky-box\n');
+    return {
+        ...state,
+        wiring,
+        markerPath: byDestination[BOX_GPU_MARKER_PATH] || path.join(state.root, 'absent-marker.json'),
+        specPath: byDestination[BOX_GPU_CDI_SPEC_PATH] || path.join(state.root, 'absent-spec.json'),
+        boxMarker,
+    };
+}
+
+function admitManifest(box, manifest, { agentId = AGENT } = {}) {
+    return admitManifestRuntimeCapabilities(manifest, {
+        agentId,
+        runtime: 'podman',
+        boxMarkerOptions: { markerPath: box.boxMarker },
+        gpuGrantOptions: { markerPath: box.markerPath, specPath: box.specPath },
+        workspaceRoot: box.identity.workspaceRoot,
+    });
+}
+
+function refusedWith(pattern) {
+    return (error) => error.context?.unsupported?.includes('cdi') && pattern.test(error.message);
+}
+
+test('D14 field: containerSecurity.gpu is a root-only boolean that implies only the one CDI device', async () => {
+    const { validateManifestRuntimeCapabilities, resolveEffectiveRuntimeCapabilities } = await import('../../cli/sandbox/runtimeCapabilities.js');
+    assert.equal(validateManifestRuntimeCapabilities(DECLARED_MANIFEST).containerSecurity.gpu, true);
+    // Only a declaring agent's validated block carries the field.
+    assert.deepEqual(validateManifestRuntimeCapabilities({ containerSecurity: { gpu: false } }).containerSecurity,
+        { privileged: false, nestedPodman: false });
+    assert.deepEqual(validateManifestRuntimeCapabilities({}).containerSecurity, { privileged: false, nestedPodman: false });
+    assert.throws(() => validateManifestRuntimeCapabilities({ containerSecurity: { gpu: 'yes' } }),
+        /manifest\.containerSecurity\.gpu must be boolean/);
+    assert.throws(() => validateManifestRuntimeCapabilities({ profiles: { gpu: { containerSecurity: { gpu: true } } } }),
+        /containerSecurity is root-only/);
+    assert.throws(() => validateManifestRuntimeCapabilities({ gpu: true }), /manifest\.gpu is not a supported runtime capability field/);
+    const declared = resolveEffectiveRuntimeCapabilities(DECLARED_MANIFEST, { agentId: AGENT, workspaceRoot: '/golden/ws', runtime: 'podman' });
+    assert.deepEqual(declared.runtimePolicy.devices, [{ type: 'cdi', value: BOX_GPU_CDI_DEVICE }]);
+    // Declaring it next to the operator-path entry does not duplicate the device.
+    const both = resolveEffectiveRuntimeCapabilities({ ...DECLARED_MANIFEST, llmRuntime: { runtimePolicy: GRANTED_DEVICE } },
+        { agentId: AGENT, workspaceRoot: '/golden/ws', runtime: 'podman' });
+    assert.deepEqual(both.runtimePolicy.devices, [{ type: 'cdi', value: BOX_GPU_CDI_DEVICE }]);
+});
+
+test('D14 golden: agents without the field, operator grants and their wiring keep their bytes', async () => {
+    const crypto = await import('node:crypto');
+    const { resolveEffectiveRuntimeCapabilities, runtimeCapabilityDigest } = await import('../../cli/sandbox/runtimeCapabilities.js');
+    const gpu = await import(GPU_MODULE);
+    assert.equal(typeof gpu.resolveDesiredGpuWiring, 'function');
+    // Values computed with the pre-D14 code (69bfdb4c) for these fixed inputs.
+    const identity = { instance: 'ploinky-box-golden-0123456789ab', pathHash: '0123456789ab', workspaceRoot: '/golden/ws' };
+    const discovery = {
+        vendor: 'nvidia', driverVersion: '595.91.07',
+        devices: [
+            { path: '/dev/nvidia0', major: 195, minor: 0 },
+            { path: '/dev/nvidiactl', major: 195, minor: 255 },
+            { path: '/dev/nvidia-uvm', major: 507, minor: 0 },
+        ],
+        libraries: [
+            { soname: 'libcuda.so.1', source: '/usr/lib/x86_64-linux-gnu/libcuda.so.595.91.07' },
+            { soname: 'libnvidia-ml.so.1', source: '/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.595.91.07' },
+        ],
+        tools: [{ name: 'nvidia-smi', source: '/usr/bin/nvidia-smi' }],
+    };
+    const sha = (text) => crypto.createHash('sha256').update(text).digest('hex');
+    const marker = (wiring) => wiring.files.find((file) => file.path.endsWith('marker.json')).content;
+    const grant = { vendor: 'nvidia', agents: [AGENT] };
+    const active = gpu.buildGpuWiring({ identity, grant, discovery, homeDirectory: '/golden/home' });
+    assert.equal(active.fingerprint, '0fead200bc4847bb01b08c9b6abebb9a8b01008aacec983bff4fd9daa3fff60f');
+    assert.equal(sha(marker(active)), '68006b1850309910a3153befe931d63f7b321477e9dff4102c12cdc0d1e3bb53');
+    const stale = gpu.buildGpuWiring({ identity, grant, failure: new Error('Unable to read the NVIDIA kernel module version'), homeDirectory: '/golden/home' });
+    assert.equal(stale.fingerprint, 'ebf1f08471ebd3facf4e93a3b40b2a3d2cde3f3b335f5f167a67568e00d7d25d');
+    assert.equal(sha(marker(stale)), 'd487cbeba75577d3fa31b92536452411b0069a8cf3ea6ea9893b3d23a55857e9');
+    // The same effective set reached through a manifest, or with a deny that
+    // hides no declared agent, keeps the operator grant's fingerprint.
+    const discover = () => discovery;
+    const viaManifest = gpu.resolveDesiredGpuWiring(identity, null, [AGENT], { discover, homeDirectory: '/golden/home' });
+    const withIneffectiveDeny = gpu.resolveDesiredGpuWiring(identity, { agents: [AGENT], denied: ['lab/cpu'] }, [],
+        { discover, homeDirectory: '/golden/home' });
+    assert.equal(viaManifest.fingerprint, active.fingerprint);
+    assert.equal(withIneffectiveDeny.fingerprint, active.fingerprint);
+    const digest = (manifest, agentId) => runtimeCapabilityDigest(resolveEffectiveRuntimeCapabilities(manifest, {
+        agentId, workspaceRoot: '/golden/ws', manifestDigest: 'sha256:golden', runtime: 'podman',
+    }));
+    assert.equal(digest({ agent: 'node server.mjs', volumes: { '.data/x': '/data' } }, 'lab/plain'),
+        'sha256:1eb1252926a3b316fcd135e23b86ca5aa4412f08826163f45a6b40eef3c513bd');
+    assert.equal(digest({ agent: 'node main.mjs', llmRuntime: { runtimePolicy: GRANTED_DEVICE } }, AGENT),
+        'sha256:49bfc698e2581667bd7ecf40507975c7a12a02defc3ca38c367d3c35b584a399');
+});
+
+test('D14 effective set: manifest, operator grant, per-agent deny, workspace deny and re-grant', async () => {
+    const { effectiveGpuAccess, normalizeGpuDecision } = await import(GPU_MODULE);
+    const DECLARED = 'lab/declared';
+    const OPERATOR = 'lab/operator';
+    const summary = (access) => ({ agents: [...access.agents], denied: [...access.denied], workspaceDenied: access.workspaceDenied });
+    // Manifest only.
+    assert.deepEqual(summary(effectiveGpuAccess(null, [DECLARED])), { agents: [DECLARED], denied: [], workspaceDenied: false });
+    assert.deepEqual(effectiveGpuAccess(null, [DECLARED]).sources, [{ agent: DECLARED, sources: ['manifest'] }]);
+    // Operator grant on top.
+    const granted = effectiveGpuAccess({ agents: [OPERATOR] }, [DECLARED]);
+    assert.deepEqual(granted.agents, [DECLARED, OPERATOR]);
+    assert.deepEqual(granted.sources, [{ agent: DECLARED, sources: ['manifest'] }, { agent: OPERATOR, sources: ['operator'] }]);
+    // A per-agent deny overrides the manifest; a deny of an undeclared agent hides nothing.
+    assert.deepEqual(summary(effectiveGpuAccess({ denied: [DECLARED] }, [DECLARED])), { agents: [], denied: [DECLARED], workspaceDenied: false });
+    assert.deepEqual(summary(effectiveGpuAccess({ denied: ['lab/cpu'] }, [DECLARED])), { agents: [DECLARED], denied: [], workspaceDenied: false });
+    // A workspace deny hides every manifest default but keeps explicit grants.
+    assert.deepEqual(summary(effectiveGpuAccess({ workspaceDenied: true }, [DECLARED])), { agents: [], denied: [], workspaceDenied: true });
+    assert.deepEqual(summary(effectiveGpuAccess({ agents: [OPERATOR], workspaceDenied: true }, [DECLARED])),
+        { agents: [OPERATOR], denied: [], workspaceDenied: true });
+    // Lifting the workspace deny restores the manifest default.
+    assert.deepEqual(summary(effectiveGpuAccess(normalizeGpuDecision({ workspaceDenied: false, denied: [] }), [DECLARED])),
+        { agents: [DECLARED], denied: [], workspaceDenied: false });
+    assert.throws(() => normalizeGpuDecision({ agents: [DECLARED], denied: [DECLARED] }), /both grant and deny/);
+    assert.equal(normalizeGpuDecision({ agents: [], denied: [], workspaceDenied: false }), null);
+});
+
+test('D14 commands: revoke denies and grant lifts, per agent and for the whole workspace', async (t) => {
+    const box = graphBox(t);
+    const events = [];
+    const store = memoryGpuStore(events);
+    const seen = [];
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: store,
+        scanGpuAgents: () => [AGENT],
+        async reconcile(options) {
+            seen.push(options.gpu);
+            return prepared(box, 'replaced', options.gpu, events);
+        },
+        async startCore() { events.push('start-core'); },
+        async healthCheck() { events.push('health'); },
+    });
+    const record = () => (store.value
+        ? { agents: store.value.agents, denied: store.value.denied, workspaceDenied: store.value.workspaceDenied }
+        : null);
+    // local-llm is declared by its manifest; nothing is enabled, so the
+    // revoke pre-check has nothing to protect.
+    await supervisor.runGpuRevokeTransaction({ agents: [AGENT] });
+    assert.deepEqual(record(), { agents: [], denied: [AGENT], workspaceDenied: false });
+    assert.equal(seen.at(-1).state, 'revoked');
+    assert.deepEqual(seen.at(-1).denied, [AGENT]);
+    await supervisor.runGpuGrantTransaction({ agents: [AGENT] });
+    assert.deepEqual(record(), { agents: [AGENT], denied: [], workspaceDenied: false });
+    assert.equal(seen.at(-1).state, 'active');
+    assert.deepEqual(seen.at(-1).agents, [AGENT]);
+    await supervisor.runGpuRevokeTransaction({});
+    assert.deepEqual(record(), { agents: [], denied: [], workspaceDenied: true });
+    assert.equal(seen.at(-1).state, 'revoked');
+    assert.equal(seen.at(-1).workspaceDenied, true);
+    // `gpu grant` alone lifts the workspace deny: the manifest default is back
+    // and no operator record remains.
+    const regranted = await supervisor.runGpuGrantTransaction({});
+    assert.equal(store.value, null);
+    assert.equal(seen.at(-1).state, 'active');
+    assert.deepEqual(regranted.access.sources, [{ agent: AGENT, sources: ['manifest'] }]);
+});
+
+test('D14 admission: a declaring agent is admitted by its manifest, and each refusal says what to run', async (t) => {
+    const gpu = await import(GPU_MODULE);
+    const home = (state) => state.home;
+    const desired = (decision, declared) => (state) => gpu.resolveDesiredGpuWiring(state.identity, decision, declared, {
+        discover: () => fakeHost().discover(), homeDirectory: home(state),
+    });
+    // Admitted: the active wiring names it because its manifest declares the GPU.
+    const admittedBox = wiredBox(t, desired(null, [AGENT]));
+    const admitted = admitManifest(admittedBox, DECLARED_MANIFEST);
+    assert.equal(admitted.descriptor.gpuGrant.admitted, true);
+    assert.deepEqual(renderRuntimePolicyArgs(admitted.descriptor, { runtime: 'podman' }), ['--device', BOX_GPU_CDI_DEVICE]);
+    // Per-agent revoke: a marker-only revoked wiring names the deny.
+    const deniedBox = wiredBox(t, desired({ denied: [AGENT] }, [AGENT]));
+    assert.equal(deniedBox.wiring.state, 'revoked');
+    assert.equal(deniedBox.wiring.devices.length, 0);
+    assert.throws(() => admitManifest(deniedBox, DECLARED_MANIFEST), refusedWith(
+        /GPU access for local-llms\/local-llm was revoked by the operator; on the host run `ploinky gpu grant --agent local-llms\/local-llm`/));
+    // Workspace revoke.
+    const workspaceBox = wiredBox(t, desired({ workspaceDenied: true }, [AGENT]));
+    assert.throws(() => admitManifest(workspaceBox, DECLARED_MANIFEST), refusedWith(
+        /revoked for this workspace by the operator; on the host run `ploinky gpu grant` to restore manifest defaults, or `ploinky gpu grant --agent local-llms\/local-llm`/));
+    // Declared after the Box was prepared: no wiring yet, or wiring for others only.
+    const notApplied = /GPU not applied to this Box yet; on the host run `ploinky start` \(`ploinky gpu status` shows whether the host has a usable GPU\)/;
+    assert.throws(() => admitManifest(wiredBox(t, null), DECLARED_MANIFEST), refusedWith(notApplied));
+    assert.throws(() => admitManifest(wiredBox(t, desired(null, ['lab/other'])), DECLARED_MANIFEST), refusedWith(notApplied));
+    // The operator path keeps its own guidance.
+    assert.throws(() => admitManifest(wiredBox(t, null), { llmRuntime: { runtimePolicy: GRANTED_DEVICE } }), refusedWith(
+        /this workspace has no GPU grant for local-llms\/local-llm; on the host run `ploinky gpu grant --agent local-llms\/local-llm`/));
+    // Other devices stay refused even for a declaring, admitted agent.
+    for (const [extra, unsupported] of [
+        [{ gpus: 'all' }, 'gpu'],
+        [{ ipc: 'host' }, 'host-ipc'],
+        [{ securityOpt: ['label=disable'] }, 'security-options'],
+    ]) {
+        // Podman already rejects --gpus when the policy is validated.
+        assert.throws(() => admitManifest(admittedBox, { ...DECLARED_MANIFEST, llmRuntime: { runtimePolicy: extra } }),
+            (error) => error.context?.unsupported?.includes(unsupported) || /does not support --gpus/.test(error.message),
+            unsupported);
+    }
+    assert.throws(() => admitManifest(admittedBox, {
+        ...DECLARED_MANIFEST,
+        llmRuntime: { runtimePolicy: { devices: [{ type: 'cdi', value: 'nvidia.com/gpu=all' }] } },
+    }), refusedWith(/admits only the single device ploinky\.local\/gpu=all/));
+});
+
+test('D14 GPU-less host: a declaring agent leaves the Box without GPU wiring and gets a clear refusal', async (t) => {
+    const gpu = await import(GPU_MODULE);
+    const noGpu = () => { throw Object.assign(new Error('Unable to read the NVIDIA kernel module version from /proc/driver/nvidia/version'), { code: 'PLOINKY_BOX_GPU_DISCOVERY_FAILED' }); };
+    const state = workspaceFixture(t);
+    // Manifest only: no wiring at all, exactly today's Box.
+    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu, homeDirectory: state.home }), null);
+    // An operator grant keeps today's stale marker.
+    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, { agents: [AGENT] }, [AGENT], { discover: noGpu, homeDirectory: state.home }).state, 'stale');
+    // gpu grant insists on a working GPU.
+    assert.throws(() => gpu.resolveDesiredGpuWiring(state.identity, null, [AGENT], { discover: noGpu, homeDirectory: state.home, strict: true }),
+        /NVIDIA kernel module version/);
+    // Start on that host: the Box is created without GPU wiring, the note names
+    // the declaring agents, and the agent is refused with the guidance.
+    const box = graphBox(t);
+    const events = [];
+    const notes = [];
+    let startGpu;
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: memoryGpuStore(events),
+        discoverGpuDevices: noGpu,
+        scanGpuAgents: () => [AGENT],
+        stderr: { write(text) { notes.push(text); } },
+        async reconcile(options) { startGpu = options.gpu; return prepared(box, 'reused', options.gpu, events); },
+        async startCore() { events.push('start-core'); },
+        async healthCheck() { events.push('health'); },
+        selectAgentLib: async () => ({ selection: box.agentLib }),
+        commitAgentLibSelection: () => {},
+        revalidateAgentLibSource: () => {},
+    });
+    await supervisor.runStartTransaction(['start', 'explorer', '8080']);
+    assert.equal(startGpu, null);
+    assert.ok(notes.some((text) => /GPU access is declared by local-llms\/local-llm, but this host has no usable GPU/.test(text)));
+    assert.throws(() => admitManifest(wiredBox(t, null), DECLARED_MANIFEST), refusedWith(/GPU not applied to this Box yet.*`ploinky gpu status`/));
+});
+
+test('D14 no declarations and no record: no GPU wiring, as before', async (t) => {
+    const gpu = await import(GPU_MODULE);
+    const state = workspaceFixture(t);
+    assert.equal(gpu.resolveDesiredGpuWiring(state.identity, null, [], {
+        discover: () => assert.fail('no discovery without a GPU agent'), homeDirectory: state.home,
+    }), null);
+    const box = graphBox(t);
+    const events = [];
+    let startGpu;
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: memoryGpuStore(events),
+        discoverGpuDevices: () => assert.fail('no discovery without a GPU agent'),
+        async reconcile(options) { startGpu = options.gpu; return prepared(box, 'reused', options.gpu, events); },
+        async startCore() { events.push('start-core'); },
+        async healthCheck() { events.push('health'); },
+        selectAgentLib: async () => ({ selection: box.agentLib }),
+        commitAgentLibSelection: () => {},
+        revalidateAgentLibSource: () => {},
+    });
+    await supervisor.runStartTransaction(['start', 'explorer', '8080']);
+    assert.equal(startGpu, null);
+    assert.equal(events.some((event) => event.startsWith('grant-')), false);
+});
+
+test('D14 scan: installed repos and workspace checkouts declare GPU access through manifests only', async (t) => {
+    const { declaredGpuAgents } = await import(GPU_MODULE);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ploinky-gpu-scan-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const write = (relative, content) => {
+        fs.mkdirSync(path.dirname(path.join(root, relative)), { recursive: true });
+        fs.writeFileSync(path.join(root, relative), typeof content === 'string' ? content : JSON.stringify(content));
+    };
+    write('.ploinky/repos/local-llms/local-llm/manifest.json', DECLARED_MANIFEST);
+    write('.ploinky/repos/local-llms/cpu/manifest.json', { containerSecurity: { gpu: false } });
+    write('.ploinky/repos/tools/broken/manifest.json', '{"containerSecurity": ');
+    write('checkout/gpu-agent/manifest.json', DECLARED_MANIFEST);
+    write('.hidden/agent/manifest.json', DECLARED_MANIFEST);
+    write('elsewhere.json', DECLARED_MANIFEST);
+    fs.mkdirSync(path.join(root, '.ploinky/repos/tools/linked'), { recursive: true });
+    fs.symlinkSync(path.join(root, 'elsewhere.json'), path.join(root, '.ploinky/repos/tools/linked/manifest.json'));
+    assert.deepEqual([...declaredGpuAgents(root)], ['checkout/gpu-agent', 'local-llms/local-llm']);
+    assert.deepEqual([...declaredGpuAgents('relative/path')], []);
+});
+
+test('D14 status names each GPU agent with its source, the denies and the workspace revoke', async () => {
+    const { effectiveGpuAccess } = await import(GPU_MODULE);
+    const base = {
+        identity: { instance: 'ploinky-box-x-000000000000' }, box: 'running', boxGpu: null, boxProblem: null,
+        host: { available: false, reason: 'no driver' }, desired: null, pendingReplacement: false,
+    };
+    const manifestOnly = formatGpuGrantStatus({ ...base, grant: null, access: effectiveGpuAccess(null, [AGENT]) });
+    assert.match(manifestOnly, /GPU grant: none\nGPU agents: local-llms\/local-llm \(manifest\)\nManifest GPU declarations: local-llms\/local-llm/);
+    const mixed = formatGpuGrantStatus({
+        ...base,
+        grant: { vendor: 'nvidia', agents: ['lab/other'], denied: [AGENT], workspaceDenied: false },
+        access: effectiveGpuAccess({ agents: ['lab/other'], denied: [AGENT] }, [AGENT]),
+    });
+    assert.match(mixed, /GPU grant: nvidia for lab\/other; denied local-llms\/local-llm/);
+    assert.match(mixed, /GPU agents: lab\/other \(operator\)/);
+    const off = formatGpuGrantStatus({
+        ...base,
+        grant: { vendor: 'nvidia', agents: [], denied: [], workspaceDenied: true },
+        access: effectiveGpuAccess({ workspaceDenied: true }, [AGENT]),
+    });
+    assert.match(off, /GPU grant: manifest defaults revoked for this workspace\nGPU agents: none/);
+});
+
+test('D14 revoke pre-check also protects an enabled agent whose manifest declares the GPU', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    const box = graphBox(t, { gpu: (state) => activeWiring(state.identity) });
+    enableAgentRecord(box, { repo: 'local-llms', agent: 'local-llm', manifest: DECLARED_MANIFEST });
+    const events = [];
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: memoryGpuStore(events),
+        scanGpuAgents: () => [AGENT],
+        reconcile: async () => assert.fail('refused before any Box change'),
+    });
+    await assert.rejects(() => supervisor.runGpuRevokeTransaction({ agents: [AGENT] }),
+        (error) => error.code === 'PLOINKY_BOX_GPU_AGENTS_ENABLED' && /`ploinky disable agent local-llms\/local-llm`/.test(error.message));
+    assert.equal(events.some((event) => event.startsWith('grant-')), false);
 });

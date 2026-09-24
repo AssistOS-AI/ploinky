@@ -1,6 +1,8 @@
-// Operator-granted GPU access for named agents in one workspace Box.
+// GPU access for named agents in one workspace Box.
 //
-// `ploinky gpu grant --agent REPO/AGENT` records the operator decision
+// Agents get the GPU through their manifest (`containerSecurity.gpu: true`,
+// D14) or through `ploinky gpu grant --agent REPO/AGENT`; `ploinky gpu revoke`
+// denies agents or turns manifest defaults off. The operator's decision lives
 // in the host-only `~/.ploinky-box/gpu-grants/<instance>.json`, never in the
 // workspace, because agents can write the workspace bind. Host discovery then
 // derives the exact wiring for the outer Box: explicit `--device` nodes, one
@@ -72,6 +74,10 @@ const RECORD_KEYS = Object.freeze([
     'version',
     'workspaceRoot',
 ]);
+// Written only when set, so a record without denies stays byte-identical.
+const OPTIONAL_RECORD_KEYS = Object.freeze(['denied', 'workspaceDenied']);
+// A workspace declares at most this many GPU agents through manifests.
+const MAX_DECLARED_GPU_AGENTS = 64;
 
 function grantError(message, code = 'PLOINKY_BOX_GPU_GRANT_INVALID', cause) {
     return new PloinkyBoxError(message, { code, cause });
@@ -147,6 +153,64 @@ export function normalizeGpuGrant(grant) {
     const agents = normalizeGpuAgentSelectors(grant.agents);
     if (agents.length === 0) throw grantError('A GPU grant names at least one agent (--agent REPO/AGENT)');
     return Object.freeze({ vendor: normalizeGpuVendor(grant.vendor), agents });
+}
+
+/**
+ * The operator's whole GPU decision for a workspace (D14): agents it granted,
+ * agents it denied (overriding their manifests), and a workspace-wide deny of
+ * manifest defaults. Null when it records nothing.
+ */
+export function normalizeGpuDecision(decision) {
+    if (!decision) return null;
+    const agents = normalizeGpuAgentSelectors(decision.agents ?? []);
+    const denied = normalizeGpuAgentSelectors(decision.denied ?? []);
+    if (agents.some((agent) => denied.includes(agent))) {
+        throw grantError('A GPU decision cannot both grant and deny the same agent');
+    }
+    if (decision.workspaceDenied !== undefined && typeof decision.workspaceDenied !== 'boolean') {
+        throw grantError('A GPU decision workspace deny must be boolean');
+    }
+    const workspaceDenied = decision.workspaceDenied === true;
+    if (!agents.length && !denied.length && !workspaceDenied) return null;
+    return Object.freeze({
+        vendor: normalizeGpuVendor(decision.vendor ?? defaultGpuVendor()),
+        agents,
+        denied,
+        workspaceDenied,
+    });
+}
+
+/**
+ * The agents a Box's GPU wiring names (D14): the operator's grants plus the
+ * manifest-declared agents, minus the operator's denies; a workspace deny
+ * hides every manifest default. `denied` and `workspaceDenied` are reported
+ * only when they hide a declared agent, so an ineffective deny never changes
+ * the wiring.
+ */
+export function effectiveGpuAccess(decision, declared = []) {
+    const normalized = normalizeGpuDecision(decision);
+    const declaredAgents = [...new Set(declared)].sort();
+    const operator = normalized?.agents ?? [];
+    const deniedAll = normalized?.denied ?? [];
+    const workspaceDenied = normalized?.workspaceDenied === true;
+    const fromManifest = workspaceDenied ? [] : declaredAgents.filter((agent) => !deniedAll.includes(agent));
+    const agents = [...new Set([...operator, ...fromManifest])].sort();
+    return Object.freeze({
+        vendor: normalized?.vendor ?? defaultGpuVendor(),
+        agents: Object.freeze(agents),
+        sources: Object.freeze(agents.map((agent) => Object.freeze({
+            agent,
+            sources: Object.freeze([
+                ...(fromManifest.includes(agent) ? ['manifest'] : []),
+                ...(operator.includes(agent) ? ['operator'] : []),
+            ]),
+        }))),
+        declared: Object.freeze(declaredAgents),
+        operatorAgents: operator,
+        denied: Object.freeze(deniedAll.filter((agent) => declaredAgents.includes(agent) && !agents.includes(agent))),
+        workspaceDenied: workspaceDenied && declaredAgents.some((agent) => !agents.includes(agent)),
+        decision: normalized,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -363,17 +427,42 @@ export function buildGpuWiring({
     grant,
     discovery = null,
     failure = null,
+    revoked = false,
+    denied = [],
+    workspaceDenied = false,
     homeDirectory = os.homedir(),
 }) {
     exactIdentity(identity);
-    const normalizedGrant = normalizeGpuGrant(grant);
-    if (!normalizedGrant) return null;
-    if (!discovery && !failure) throw grantError('GPU wiring requires a discovery result or its failure');
-    const state = discovery ? 'active' : 'stale';
-    const reason = discovery ? null : singleLine(failure?.message || failure);
+    let normalizedGrant;
+    if (revoked) {
+        // Marker-only: the effective set is empty because the operator denied
+        // declared agents, and admission must be able to say so.
+        if (discovery || failure) throw grantError('A revoked GPU wiring carries no discovery');
+        normalizedGrant = Object.freeze({
+            vendor: normalizeGpuVendor(grant?.vendor ?? defaultGpuVendor()),
+            agents: Object.freeze([]),
+        });
+    } else {
+        normalizedGrant = normalizeGpuGrant(grant);
+        if (!normalizedGrant) return null;
+        if (!discovery && !failure) throw grantError('GPU wiring requires a discovery result or its failure');
+    }
+    const deniedAgents = normalizeGpuAgentSelectors(denied);
+    if (revoked && !deniedAgents.length && !workspaceDenied) {
+        throw grantError('A revoked GPU wiring names the denied agents or the workspace deny');
+    }
+    // Present only when set, so wirings without denies keep their fingerprint
+    // and marker bytes.
+    const denials = {
+        ...(deniedAgents.length ? { denied: deniedAgents } : {}),
+        ...(workspaceDenied ? { workspaceDenied: true } : {}),
+    };
+    const state = revoked ? 'revoked' : discovery ? 'active' : 'stale';
+    const reason = discovery || revoked ? null : singleLine(failure?.message || failure);
     // The fingerprint binds the exact workspace, the operator decision and the
     // discovered driver files, so it names one generation of one workspace.
     const fingerprint = sha256(canonicalJson({
+        ...denials,
         version: 1,
         instance: identity.instance,
         pathHash: identity.pathHash,
@@ -402,6 +491,7 @@ export function buildGpuWiring({
         fingerprint,
         cdiDevice: discovery ? BOX_GPU_CDI_DEVICE : null,
         specSha256: specText ? sha256(specText) : null,
+        ...denials,
     }, null, 2)}\n`;
     const specPath = path.join(generation, 'box.json');
     const markerPath = path.join(generation, 'marker.json');
@@ -425,6 +515,8 @@ export function buildGpuWiring({
         reason,
         vendor: normalizedGrant.vendor,
         agents: normalizedGrant.agents,
+        denied: deniedAgents,
+        workspaceDenied: workspaceDenied === true,
         driverVersion: discovery?.driverVersion ?? null,
         devices: Object.freeze((discovery?.devices ?? []).map((device) => device.path)),
         mounts: Object.freeze(mounts.map((mount) => Object.freeze(mount))),
@@ -453,6 +545,38 @@ export function resolveGpuWiring(identity, grant, {
         if (error?.code !== 'PLOINKY_BOX_GPU_DISCOVERY_FAILED') throw error;
         return buildGpuWiring({ identity, grant: normalizedGrant, failure: error, homeDirectory });
     }
+}
+
+/**
+ * The Box GPU wiring D14 asks for: the effective set of `effectiveGpuAccess`,
+ * discovered when non-empty. A failed discovery keeps today's stale marker
+ * for an operator grant; when only manifests ask, the Box gets no wiring, so a
+ * host without a usable GPU keeps today's Box. An empty set whose declared
+ * agents the operator denied gets a marker-only revoked wiring.
+ */
+export function resolveDesiredGpuWiring(identity, decision, declared = [], {
+    discover = discoverGpu,
+    homeDirectory = os.homedir(),
+    strict = false,
+} = {}) {
+    const access = effectiveGpuAccess(decision, declared);
+    const denials = { denied: access.denied, workspaceDenied: access.workspaceDenied };
+    if (access.agents.length) {
+        const grant = { vendor: access.vendor, agents: access.agents };
+        let discovery;
+        try {
+            discovery = discover(access.vendor);
+        } catch (error) {
+            if (strict || error?.code !== 'PLOINKY_BOX_GPU_DISCOVERY_FAILED') throw error;
+            if (!access.operatorAgents.length) return null;
+            return buildGpuWiring({ identity, grant, failure: error, ...denials, homeDirectory });
+        }
+        return buildGpuWiring({ identity, grant, discovery, ...denials, homeDirectory });
+    }
+    if (access.denied.length || access.workspaceDenied) {
+        return buildGpuWiring({ identity, grant: { vendor: access.vendor }, revoked: true, ...denials, homeDirectory });
+    }
+    return null;
 }
 
 export function sameGpuWiring(left, right) {
@@ -486,14 +610,65 @@ function readWorkspaceJson(fsApi, target, maxBytes) {
     }
 }
 
+function declaresGpu(manifest) {
+    return manifest?.containerSecurity?.gpu === true;
+}
+
+function directoryNames(fsApi, directory, limit) {
+    try {
+        return fsApi.readdirSync(directory, { withFileTypes: true })
+            .filter((entry) => (entry.isDirectory() || entry.isSymbolicLink())
+                && !entry.name.startsWith('.') && entry.name !== 'node_modules')
+            .map((entry) => entry.name)
+            .sort()
+            .slice(0, limit);
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Agents, as REPO/AGENT, whose manifest declares `containerSecurity.gpu:
+ * true` (D14), across the installed repos (`.ploinky/repos/<repo>`) and the
+ * workspace-root checkouts (`<workspace>/<repo>`, named by directory). The
+ * manifests are agent-writable workspace files: a symlinked `manifest.json`,
+ * anything that is not a small regular JSON file, and names that are not
+ * REPO/AGENT selectors count as not declared.
+ */
+export function declaredGpuAgents(workspaceRoot, {
+    fsApi = fs,
+    maxBytes = GPU_WORKSPACE_FILE_MAX_BYTES,
+    maxEntries = 256,
+} = {}) {
+    const root = String(workspaceRoot || '');
+    if (!path.isAbsolute(root)) return [];
+    const reposDirectory = path.join(root, '.ploinky', 'repos');
+    const declared = new Set();
+    const scanRepo = (repo, repoDirectory) => {
+        for (const agent of directoryNames(fsApi, repoDirectory, maxEntries)) {
+            let selector;
+            try {
+                selector = normalizeGpuAgentSelector(`${repo}/${agent}`);
+            } catch {
+                continue;
+            }
+            const manifest = readWorkspaceJson(fsApi, path.join(repoDirectory, agent, 'manifest.json'), maxBytes);
+            if (declaresGpu(manifest)) declared.add(selector);
+        }
+    };
+    for (const repo of directoryNames(fsApi, reposDirectory, maxEntries)) scanRepo(repo, path.join(reposDirectory, repo));
+    for (const repo of directoryNames(fsApi, root, maxEntries)) scanRepo(repo, path.join(root, repo));
+    return Object.freeze([...declared].sort().slice(0, MAX_DECLARED_GPU_AGENTS));
+}
+
 function requestsCdiDevice(llmRuntime) {
     const devices = llmRuntime?.runtimePolicy?.devices;
     return Array.isArray(devices) && devices.some((entry) => entry?.type === 'cdi');
 }
 
 /**
- * Enabled agents, as REPO/AGENT, whose manifest or selected profile requests a
- * CDI device. Read from the workspace agent registry, the routing file (the
+ * Enabled agents, as REPO/AGENT, whose manifest declares `containerSecurity.gpu`
+ * or whose manifest or selected profile requests a CDI device. Read from the workspace agent registry, the routing file (the
  * manifest directory of each route) and the manifests. Agents can write all of
  * these, so a caller may use the result only to refuse early; unreadable
  * entries are skipped and admission during the graph start stays the authority.
@@ -521,7 +696,7 @@ export function enabledCdiRequestingAgents(workspaceRoot, {
         if (!manifest || typeof manifest !== 'object') continue;
         const profiles = manifest.profiles && typeof manifest.profiles === 'object' ? manifest.profiles : {};
         const profile = profiles[String(record.profile || 'default')];
-        if (requestsCdiDevice(manifest.llmRuntime) || requestsCdiDevice(profile?.llmRuntime)) {
+        if (declaresGpu(manifest) || requestsCdiDevice(manifest.llmRuntime) || requestsCdiDevice(profile?.llmRuntime)) {
             requesting.add(`${repo}/${agent}`);
         }
     }
@@ -770,7 +945,7 @@ export function createGpuGrantStore({
         if (!value || typeof value !== 'object' || Array.isArray(value)
             || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(['fingerprint', 'reason', 'state'])
             || !FINGERPRINT_RE.test(String(value.fingerprint))
-            || !['active', 'stale'].includes(value.state)
+            || !['active', 'stale', 'revoked'].includes(value.state)
             || (value.reason !== null && typeof value.reason !== 'string')) {
             throw stateError('Saved GPU grant has an invalid admitted wiring');
         }
@@ -779,9 +954,11 @@ export function createGpuGrantStore({
 
     function normalizeRecord(identity, record) {
         exactIdentity(identity);
+        const keys = record && typeof record === 'object' ? Object.keys(record) : [];
         if (!record || typeof record !== 'object' || Array.isArray(record)
             || Object.getPrototypeOf(record) !== Object.prototype
-            || JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(RECORD_KEYS)) {
+            || !RECORD_KEYS.every((key) => keys.includes(key))
+            || !keys.every((key) => RECORD_KEYS.includes(key) || OPTIONAL_RECORD_KEYS.includes(key))) {
             throw stateError('Saved GPU grant has an unsupported schema');
         }
         if (record.version !== GPU_GRANT_STATE_VERSION) {
@@ -792,13 +969,23 @@ export function createGpuGrantStore({
             || record.workspaceRoot !== identity.workspaceRoot) {
             throw stateError('Saved GPU grant belongs to another workspace');
         }
-        let grant;
+        let decision;
         try {
-            grant = normalizeGpuGrant({ vendor: record.vendor, agents: record.agents });
+            decision = normalizeGpuDecision({
+                vendor: record.vendor,
+                agents: record.agents,
+                denied: record.denied,
+                workspaceDenied: record.workspaceDenied,
+            });
+            if (Object.hasOwn(record, 'denied') && !record.denied.length) throw new Error('denied is written only when set');
+            if (Object.hasOwn(record, 'workspaceDenied') && record.workspaceDenied !== true) {
+                throw new Error('workspaceDenied is written only when set');
+            }
         } catch (error) {
             throw stateError(`Saved GPU grant is invalid: ${error.message}`, error);
         }
-        return Object.freeze({ ...grant, admitted: normalizeAdmitted(record.admitted) });
+        if (!decision) throw stateError('Saved GPU grant records no decision');
+        return Object.freeze({ ...decision, admitted: normalizeAdmitted(record.admitted) });
     }
 
     /** @returns {Readonly<object>|null} null when the workspace has no grant */
@@ -821,8 +1008,8 @@ export function createGpuGrantStore({
     function write(identity, grant, lock, { admitted = null } = {}) {
         exactIdentity(identity);
         assertLock(identity, lock);
-        const normalized = normalizeGpuGrant(grant);
-        if (!normalized) throw stateError('Saving a GPU grant requires a vendor and agents');
+        const normalized = normalizeGpuDecision(grant);
+        if (!normalized) throw stateError('Saving a GPU grant requires a grant, a deny or a workspace deny');
         const admittedValue = normalizeAdmitted(admitted);
         assertConfined(identity);
         ensurePrivateDirectory(fsApi, stateRoot);
@@ -836,6 +1023,8 @@ export function createGpuGrantStore({
             vendor: normalized.vendor,
             agents: normalized.agents,
             admitted: admittedValue,
+            ...(normalized.denied.length ? { denied: normalized.denied } : {}),
+            ...(normalized.workspaceDenied ? { workspaceDenied: true } : {}),
         };
         writePrivateFileAtomically(fsApi, directory, targetFor(identity), `${JSON.stringify(record)}\n`, () => {
             lock.assertHeld(identity.instance);

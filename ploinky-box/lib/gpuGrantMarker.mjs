@@ -34,6 +34,8 @@ const MARKER_KEYS = Object.freeze([
     'version',
     'workspaceRoot',
 ]);
+// Present only when the operator's denies hide a manifest-declared agent (D14).
+const OPTIONAL_MARKER_KEYS = Object.freeze(['denied', 'workspaceDenied']);
 const SELECTOR_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /** REPO/AGENT, the same two segments Ploinky resolves agents by. */
@@ -103,8 +105,10 @@ export function readBoxGpuGrant({
     } catch {
         return invalid('grant marker is not valid JSON');
     }
+    const keys = marker && typeof marker === 'object' ? Object.keys(marker) : [];
     if (!marker || typeof marker !== 'object' || Array.isArray(marker)
-        || JSON.stringify(Object.keys(marker).sort()) !== JSON.stringify(MARKER_KEYS)
+        || !MARKER_KEYS.every((key) => keys.includes(key))
+        || !keys.every((key) => MARKER_KEYS.includes(key) || OPTIONAL_MARKER_KEYS.includes(key))
         || marker.version !== GPU_GRANT_MARKER_VERSION
         || marker.kind !== GPU_GRANT_MARKER_KIND) {
         return invalid('grant marker has an unsupported schema');
@@ -115,12 +119,21 @@ export function readBoxGpuGrant({
         return invalid('grant marker belongs to another workspace');
     }
     let agents;
+    let denied;
     try {
         if (!Array.isArray(marker.agents)) throw new Error('agents must be a list');
         agents = marker.agents.map(normalizeGpuAgentSelector);
+        if (Object.hasOwn(marker, 'denied') && (!Array.isArray(marker.denied) || !marker.denied.length)) {
+            throw new Error('denied must be a non-empty list when present');
+        }
+        denied = (marker.denied || []).map(normalizeGpuAgentSelector);
     } catch (error) {
         return invalid(`grant marker agents are invalid: ${error.message}`);
     }
+    if (Object.hasOwn(marker, 'workspaceDenied') && marker.workspaceDenied !== true) {
+        return invalid('grant marker workspace deny is invalid');
+    }
+    const workspaceDenied = marker.workspaceDenied === true;
     if (!/^[a-f0-9]{64}$/.test(String(marker.fingerprint))) return invalid('grant marker fingerprint is invalid');
     if (marker.state === 'active') {
         if (marker.cdiDevice !== BOX_GPU_CDI_DEVICE || !specBytes
@@ -131,6 +144,11 @@ export function readBoxGpuGrant({
         if (marker.cdiDevice !== null || marker.specSha256 !== null || specBytes) {
             return invalid('stale grant marker still describes GPU wiring');
         }
+    } else if (marker.state === 'revoked') {
+        if (marker.cdiDevice !== null || marker.specSha256 !== null || specBytes || agents.length
+            || (!denied.length && !workspaceDenied)) {
+            return invalid('revoked grant marker must name only what the operator denied');
+        }
     } else {
         return invalid('grant marker state is invalid');
     }
@@ -140,6 +158,8 @@ export function readBoxGpuGrant({
         digest,
         vendor: String(marker.vendor),
         agents: Object.freeze(agents),
+        denied: Object.freeze(denied),
+        workspaceDenied,
         state: marker.state,
         reason: marker.reason === null ? null : String(marker.reason),
         fingerprint: marker.fingerprint,

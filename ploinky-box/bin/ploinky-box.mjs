@@ -39,12 +39,18 @@ Commands:
                                   TCP PORT; the Box and graph restart when it changes
   ploinky --dry-run bind [ADDRESS:PORT:8080]
                                   Show the bind plan without changing anything
-  ploinky gpu status              Show the GPU grant, host GPU discovery, and Box wiring
-  ploinky gpu grant --agent REPO/AGENT [--agent REPO/AGENT...] [--vendor VENDOR]
-                                  Let the named agents request the host NVIDIA GPU;
-                                  the Box and graph restart when the wiring changes
+  ploinky gpu status              Show GPU agents and their source, denies, host GPU
+                                  discovery, and Box wiring
+  ploinky gpu grant [--agent REPO/AGENT...] [--vendor VENDOR]
+                                  Let the named agents use the host NVIDIA GPU and lift
+                                  their denies; without --agent, lift a workspace
+                                  revoke so manifests that declare
+                                  containerSecurity.gpu get the GPU again; the Box
+                                  and graph restart when the wiring changes
   ploinky gpu revoke [--agent REPO/AGENT...]
-                                  Remove the named agents, or the whole grant
+                                  Deny the named agents, overriding their manifests;
+                                  without --agent, turn GPU access off for the whole
+                                  workspace, manifest defaults included
   ploinky status [--verbose]      Inspect Box and core state without mutation
   ploinky diagnose [--json]       Check prerequisites, Podman storage, and security
                                   profiles using temporary deployment probes

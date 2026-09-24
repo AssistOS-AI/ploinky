@@ -270,8 +270,8 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
 | `ploinky bind [ADDRESS:PORT:8080]` | Publish the public Router on this machine's IPv4 `ADDRESS` (`0` for all interfaces) and TCP `PORT`; recreate the Box and restart the configured graph when the mapping changes; save the binding for later lifecycle commands |
 | `ploinky bind 127.0.0.1:PORT:8080` | Restore local-only Router access |
-| `ploinky gpu grant --agent REPO/AGENT [--vendor VENDOR]` | Let the named agents request the host NVIDIA GPU; recreate the Box with the device nodes and read-only driver libraries and restart the configured graph when the wiring changes; save the grant for later lifecycle commands |
-| `ploinky gpu revoke [--agent REPO/AGENT]` | Remove the named agents, or the whole grant |
+| `ploinky gpu grant [--agent REPO/AGENT] [--vendor VENDOR]` | Let the named agents use the host NVIDIA GPU and lift their denies; without `--agent`, lift a workspace-wide revoke so manifest-declared agents get the GPU again; recreate the Box with the device nodes and read-only driver libraries and restart the configured graph when the wiring changes |
+| `ploinky gpu revoke [--agent REPO/AGENT]` | Deny the named agents, overriding their manifests; without `--agent`, withdraw every grant and turn manifest-declared GPU access off for the whole workspace |
 | `ploinky gpu status` | Show the saved grant, host GPU discovery, and the Box's GPU wiring without mutation |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
 | `ploinky diagnose [--json]` | Run host prerequisite/settings checks and isolated deployment command probes; report failures, commands, and actions labelled by privilege and automation eligibility |
@@ -649,31 +649,49 @@ port with the host firewall or a trusted network. Bind does not change firewall
 rules, DNS, tunnels, or authentication settings, and it does not rewrite callback
 URLs registered with an SSO provider.
 
-## Granting the host GPU to named agents
+## GPU access for agents
 
-Agents never get host devices by default: inside a Box, runtime admission
-rejects devices, CDI, `--gpus`, host IPC, and security options. An operator can
-grant this workspace's Box the host NVIDIA GPU for named agents:
+Inside a Box, runtime admission rejects devices, CDI, `--gpus`, host IPC, and
+security options, with one exception: the single CDI device
+`ploinky.local/gpu=all` for the agents the Box's GPU wiring names. An agent gets
+the host NVIDIA GPU in either of two ways:
+
+- Its manifest declares it at the root, next to `nestedPodman`:
+  `"containerSecurity": { "gpu": true }`. Any installed repo or workspace
+  checkout can do this, and the agent then needs no host step.
+- The operator grants it: `ploinky gpu grant --agent REPO/AGENT`. Such an agent
+  requests the device in its manifest with
+  `llmRuntime.runtimePolicy.devices: [{ "type": "cdi", "value": "ploinky.local/gpu=all" }]`.
+
+The operator's decision overrides the manifests:
 
 ```sh
-ploinky gpu status                                    # read-only: grant, host GPU, Box wiring
-ploinky gpu grant --agent local-llms/local-llm        # add agents to the grant
-ploinky gpu revoke --agent local-llms/local-llm       # remove agents
-ploinky gpu revoke                                    # remove the whole grant
+ploinky gpu status                                    # read-only: GPU agents and their source, denies, host GPU, Box wiring
+ploinky gpu grant --agent local-llms/local-llm        # grant an agent and lift its deny
+ploinky gpu revoke --agent local-llms/local-llm       # deny an agent, even if its manifest declares the GPU
+ploinky gpu revoke                                    # withdraw every grant; manifest-declared access off for the workspace
+ploinky gpu grant                                     # lift that workspace revoke: manifest defaults apply again
 ```
 
-`--vendor VENDOR` (or `--vendor=VENDOR`) is optional: it defaults to the only
-supported vendor, `nvidia`, and is required only if several are ever supported.
+The agents the wiring names are the manifest-declared agents minus the denied
+ones (none after a workspace revoke), plus the operator's grants. Manifests are
+read from `.ploinky/repos/<repo>/<agent>/manifest.json` and from workspace
+checkouts `<workspace>/<repo>/<agent>/manifest.json`; they are workspace files
+that agents with workspace access can write, so the operator revoke, recorded
+outside the workspace, is the override. `--vendor VENDOR` (or `--vendor=VENDOR`)
+is optional: it defaults to the only supported vendor, `nvidia`, and is required
+only if several are ever supported.
 
-The grant is saved for this exact workspace as
-`~/.ploinky-box/gpu-grants/<box-instance>.json` with mode `0600`, outside the
-workspace because agents can write the workspace bind, and with the same
-confinement checks as Router bindings. `grant` first discovers the host GPU and
-refuses, naming the item, when a device node (`/dev/nvidia0`, `/dev/nvidiactl`,
-`/dev/nvidia-uvm`) is missing or not readable and writable by this user, when a
-driver library (`libcuda.so.1`, `libnvidia-ptxjitcompiler.so.1`,
-`libnvidia-ml.so.1`) or `nvidia-smi` is missing, or when the loaded kernel
-module and the libraries disagree (a driver updated but not yet rebooted).
+The operator's grants, denies and workspace revoke are saved for this exact
+workspace as `~/.ploinky-box/gpu-grants/<box-instance>.json` with mode `0600`,
+outside the workspace because agents can write the workspace bind, and with the
+same confinement checks as Router bindings. `grant` first discovers the host GPU
+whenever an agent would get it, and refuses, naming the item, when a device node
+(`/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`) is missing or not readable
+and writable by this user, when a driver library (`libcuda.so.1`,
+`libnvidia-ptxjitcompiler.so.1`, `libnvidia-ml.so.1`) or `nvidia-smi` is
+missing, or when the loaded kernel module and the libraries disagree (a driver
+updated but not yet rebooted).
 
 The Box then gets explicit `--device` flags for those nodes and read-only binds
 of each driver library under its soname in `/usr/local/nvidia/lib64` and of
@@ -682,35 +700,42 @@ capability, no host toolkit, and no Box environment change. Inside the Box the
 nested Podman reads one hookless CDI spec, `/etc/cdi/ploinky-gpu.json`, whose
 single device `ploinky.local/gpu=all` mounts those in-Box paths. A read-only
 grant marker, `/etc/ploinky-box-gpu-grant.json`, names the workspace, the
-agents, and the spec digest. An agent requests the GPU in its manifest with
-`llmRuntime.runtimePolicy.devices: [{ "type": "cdi", "value": "ploinky.local/gpu=all" }]`,
-and admission allows exactly that device only for an agent the grant names. Its
-image sets `LD_LIBRARY_PATH` and `PATH` to include `/usr/local/nvidia`.
+agents, any denies that hide a declared agent, and the spec digest, and
+admission allows exactly that device only for an agent it names. When the
+operator's denies leave no agent, the Box gets only the marker, so admission can
+say who revoked what. The agent's image sets `LD_LIBRARY_PATH` and `PATH` to
+include `/usr/local/nvidia`.
 
-Like bind, a grant or revoke needs a configured graph once a Box exists, keeps
-the image, AgentLib generation, and publication, recreates the Box when the
-wiring changes, restarts the graph, and saves the grant only after `/health`
-answers. On a failure it rolls back: it recreates a Box with the previous wiring,
-restarts the previous graph, restores the saved grant, and reports that the
-previous grant (or, with no saved grant, the Box's previous GPU wiring) is still
-in force. If a rollback step fails too, the error is
+A grant or revoke needs a configured graph once a Box exists, unless it leaves
+the Box's wiring exactly as it is, in which case only the record changes. Like
+bind, it keeps the image, AgentLib generation, and publication, recreates the
+Box when the wiring changes, restarts the graph, and saves the record only after
+`/health` answers. On a failure it rolls back: it recreates a Box with the
+previous wiring, restarts the previous graph, restores the saved record, and
+reports that the previous grant (or, with no saved record, the Box's previous
+GPU wiring) is still in force. If a rollback step fails too, the error is
 `PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED` and lists what could not be restored.
-Without a Box, the grant is saved for the next `ploinky start`.
+Without a Box, the record is saved for the next `ploinky start`.
 
 While a Box exists, `revoke` first reads the workspace agent registry, routes,
-and manifests. If an enabled agent that requests the GPU would lose the grant,
-it refuses before changing the Box and names `ploinky disable agent REPO/AGENT`,
+and manifests. If an enabled agent that requests the GPU would lose it, it
+refuses before changing the Box and names `ploinky disable agent REPO/AGENT`,
 or `ploinky destroy` followed by `ploinky gpu revoke`. Agents can write those
 workspace files, so anything this check cannot read is skipped, and admission
-during the graph restart remains the authority.
+during the graph restart remains the authority. A refused agent is told what to
+run: `ploinky gpu grant --agent REPO/AGENT` after a deny, `ploinky gpu grant`
+after a workspace revoke, or `ploinky start` when its repo was installed after
+the Box was last prepared.
 
-`start`, `restart`, and `update` rediscover the driver. A driver update changes
-the wiring fingerprint (the Box label `io.assistos.ploinky-box.gpu-grant`), so
-the Box is recreated with regenerated wiring. If discovery fails, the Box starts
-without GPU devices and the grant is marked stale. Only agents that request the
-GPU then fail admission, with `GPU grant stale: <reason>; re-run ploinky gpu
-grant`. Commands that only prepare an existing Box, and `bind`, keep its current
-GPU wiring.
+`start`, `restart`, and `update` rediscover the driver and re-read the
+manifests. A driver update or a changed set of GPU agents changes the wiring
+fingerprint (the Box label `io.assistos.ploinky-box.gpu-grant`), so the Box is
+recreated with regenerated wiring. If discovery fails, the Box starts without
+GPU devices: an operator grant is marked stale, and agents that request the GPU
+fail admission with `GPU grant stale: <reason>; fix the host GPU driver, then
+run ploinky restart on the host`; if only manifests ask for the GPU, the Box is
+exactly as without any GPU access. Commands that only prepare an existing Box,
+and `bind`, keep its current GPU wiring.
 
 Loopback services inside an agent container are otherwise reachable by any
 signed-in user with the Explorer capability through

@@ -82,7 +82,7 @@ function analyzeBind(tokens, commandToken) {
     }
 }
 
-const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant --agent REPO/AGENT [--agent REPO/AGENT...] [--vendor VENDOR] '
+const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant [--agent REPO/AGENT...] [--vendor VENDOR] '
     + '| ploinky gpu revoke [--agent REPO/AGENT...]';
 
 // GPU grants are host-owned Box wiring, so the verb and its operands are
@@ -129,7 +129,8 @@ function analyzeGpu(tokens, commandToken) {
         }
     }
     if (action === 'grant') {
-        if (agents.length === 0) throw argumentError(`gpu grant requires at least one --agent REPO/AGENT; ${GPU_USAGE}`);
+        // Without --agent, grant lifts the workspace-wide revoke so manifest
+        // defaults apply again (D14).
         try {
             vendor = vendor === null ? defaultGpuVendor() : normalizeGpuVendor(vendor);
         } catch (error) {
