@@ -1,5 +1,6 @@
 import { BOX_ROUTER_CONTAINER_PORT } from '../constants.mjs';
 import { PloinkyBoxError } from '../errors.mjs';
+import { defaultGpuVendor, normalizeGpuVendor } from '../gpuGrant.mjs';
 import { parseHostPort } from '../ports.mjs';
 import { parseRouterBindingMapping } from '../routerBinding.mjs';
 
@@ -81,7 +82,7 @@ function analyzeBind(tokens, commandToken) {
     }
 }
 
-const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant VENDOR --agent REPO/AGENT [--agent REPO/AGENT...] '
+const GPU_USAGE = 'use: ploinky gpu status | ploinky gpu grant --agent REPO/AGENT [--agent REPO/AGENT...] [--vendor VENDOR] '
     + '| ploinky gpu revoke [--agent REPO/AGENT...]';
 
 // GPU grants are host-owned Box wiring, so the verb and its operands are
@@ -98,6 +99,10 @@ function analyzeGpu(tokens, commandToken) {
     }
     let vendor = null;
     const agents = [];
+    const setVendor = (value) => {
+        if (vendor !== null) throw argumentError(`--vendor was supplied more than once; ${GPU_USAGE}`);
+        vendor = value;
+    };
     for (let index = 0; index < rest.length; index += 1) {
         const text = rest[index];
         if (text === '--agent') {
@@ -107,16 +112,29 @@ function analyzeGpu(tokens, commandToken) {
             index += 1;
         } else if (text.startsWith('--agent=')) {
             agents.push(text.slice('--agent='.length));
+        } else if (action === 'grant' && text === '--vendor') {
+            const value = rest[index + 1];
+            if (!value || value.startsWith('-')) throw argumentError(`--vendor requires VENDOR; ${GPU_USAGE}`);
+            setVendor(value);
+            index += 1;
+        } else if (action === 'grant' && text.startsWith('--vendor=')) {
+            setVendor(text.slice('--vendor='.length));
         } else if (text.startsWith('-')) {
             throw argumentError(`gpu ${action} does not accept option ${text}; ${GPU_USAGE}`);
-        } else if (action === 'grant' && vendor === null) {
-            vendor = text;
+        } else if (action === 'grant') {
+            throw argumentError(`gpu grant takes no VENDOR argument ('${text}'); name agents with --agent and, `
+                + `when needed, the vendor with --vendor; ${GPU_USAGE}`);
         } else {
             throw argumentError(`gpu ${action}: unexpected argument '${text}'; ${GPU_USAGE}`);
         }
     }
-    if (action === 'grant' && (!vendor || agents.length === 0)) {
-        throw argumentError(`gpu grant requires a VENDOR and at least one --agent REPO/AGENT; ${GPU_USAGE}`);
+    if (action === 'grant') {
+        if (agents.length === 0) throw argumentError(`gpu grant requires at least one --agent REPO/AGENT; ${GPU_USAGE}`);
+        try {
+            vendor = vendor === null ? defaultGpuVendor() : normalizeGpuVendor(vendor);
+        } catch (error) {
+            throw argumentError(`${error.message}; ${GPU_USAGE}`);
+        }
     }
     return Object.freeze({ action, vendor, agents: Object.freeze(agents) });
 }

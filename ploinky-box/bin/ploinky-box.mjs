@@ -40,7 +40,7 @@ Commands:
   ploinky --dry-run bind [ADDRESS:PORT:8080]
                                   Show the bind plan without changing anything
   ploinky gpu status              Show the GPU grant, host GPU discovery, and Box wiring
-  ploinky gpu grant nvidia --agent REPO/AGENT [--agent REPO/AGENT...]
+  ploinky gpu grant --agent REPO/AGENT [--agent REPO/AGENT...] [--vendor VENDOR]
                                   Let the named agents request the host NVIDIA GPU;
                                   the Box and graph restart when the wiring changes
   ploinky gpu revoke [--agent REPO/AGENT...]

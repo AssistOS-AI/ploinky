@@ -1225,16 +1225,15 @@ test('gpu status reports the record, the host and a pending replacement without 
 // ---------------------------------------------------------------------------
 
 test('gpu commands parse strictly and route only to the host supervisor', async () => {
-    const grant = parseOuterArguments(['gpu', 'grant', 'nvidia', '--agent', AGENT, '--agent=lab/other']);
+    const grant = parseOuterArguments(['gpu', 'grant', '--agent', AGENT, '--agent=lab/other']);
     assert.deepEqual(grant.gpu, { action: 'grant', vendor: 'nvidia', agents: [AGENT, 'lab/other'] });
     assert.deepEqual(routeOuterCommand(grant), { kind: 'gpu-grant', vendor: 'nvidia', agents: [AGENT, 'lab/other'] });
     assert.equal(routeOuterCommand(parseOuterArguments(['gpu'])).kind, 'gpu-status');
     assert.equal(routeOuterCommand(parseOuterArguments(['gpu', 'revoke'])).kind, 'gpu-revoke');
     for (const argv of [
-        ['gpu', 'grant', 'nvidia'],
-        ['gpu', 'grant', '--agent', AGENT],
-        ['gpu', 'grant', 'nvidia', 'amd', '--agent', AGENT],
-        ['gpu', 'grant', 'nvidia', '--agent'],
+        ['gpu', 'grant'],
+        ['gpu', 'grant', '--agent'],
+        ['gpu', 'grant', '--vendor', 'nvidia', '--vendor', 'nvidia', '--agent', AGENT],
         ['gpu', 'frob'],
         ['gpu', 'status', 'extra'],
         ['gpu', 'revoke', '--force'],
@@ -1264,12 +1263,61 @@ test('gpu commands parse strictly and route only to the host supervisor', async 
         },
     };
     const execute = () => assert.fail('gpu commands are never forwarded into the Box');
-    for (const argv of [['gpu', 'grant', 'nvidia', '--agent', AGENT], ['gpu', 'revoke'], ['gpu', 'status']]) {
+    for (const argv of [['gpu', 'grant', '--agent', AGENT], ['gpu', 'revoke'], ['gpu', 'status']]) {
         const code = await runOuterCli(argv, { supervisor, execute, detectInsideBox: () => false, output, errorOutput: output, env: {} });
         assert.equal(code, 0);
     }
     assert.deepEqual(calls, [['grant', { vendor: 'nvidia', agents: [AGENT] }], ['revoke', { agents: [] }], ['status']]);
     assert.match(output.text, /Host GPU: unavailable \(no driver\)/);
+});
+
+test('gpu grant takes no vendor word; --vendor is optional and checked', () => {
+    // The only supported vendor is the default.
+    assert.deepEqual(parseOuterArguments(['gpu', 'grant', '--agent', AGENT]).gpu,
+        { action: 'grant', vendor: 'nvidia', agents: [AGENT] });
+    for (const argv of [
+        ['gpu', 'grant', '--agent', AGENT, '--vendor', 'nvidia'],
+        ['gpu', 'grant', '--vendor=nvidia', '--agent', AGENT],
+        ['gpu', 'grant', '--vendor', 'NVIDIA', '--agent', AGENT],
+    ]) {
+        assert.deepEqual(parseOuterArguments(argv).gpu, { action: 'grant', vendor: 'nvidia', agents: [AGENT] }, argv.join(' '));
+    }
+    // An unsupported or missing --vendor value is rejected with the supported list.
+    for (const argv of [
+        ['gpu', 'grant', '--agent', AGENT, '--vendor', 'amd'],
+        ['gpu', 'grant', '--agent', AGENT, '--vendor=amd'],
+    ]) {
+        assert.throws(() => parseOuterArguments(argv),
+            (error) => error.code === 'PLOINKY_BOX_ARGUMENT_INVALID' && /Unsupported GPU vendor "amd"; supported: nvidia/.test(error.message),
+            argv.join(' '));
+    }
+    assert.throws(() => parseOuterArguments(['gpu', 'grant', '--agent', AGENT, '--vendor']), /--vendor requires VENDOR/);
+    // The positional vendor of the old form is refused with the new usage.
+    for (const argv of [
+        ['gpu', 'grant', 'nvidia', '--agent', AGENT],
+        ['gpu', 'grant', '--agent', AGENT, 'nvidia'],
+    ]) {
+        assert.throws(() => parseOuterArguments(argv), (error) => error.code === 'PLOINKY_BOX_ARGUMENT_INVALID'
+            && /gpu grant takes no VENDOR argument/.test(error.message)
+            && /ploinky gpu grant --agent REPO\/AGENT \[--agent REPO\/AGENT\.\.\.\] \[--vendor VENDOR\]/.test(error.message),
+        argv.join(' '));
+    }
+    // --agent is still required.
+    for (const argv of [['gpu', 'grant'], ['gpu', 'grant', '--vendor', 'nvidia']]) {
+        assert.throws(() => parseOuterArguments(argv),
+            (error) => error.code === 'PLOINKY_BOX_ARGUMENT_INVALID' && /gpu grant requires at least one --agent REPO\/AGENT/.test(error.message),
+            argv.join(' '));
+    }
+    // --vendor belongs to grant only.
+    assert.throws(() => parseOuterArguments(['gpu', 'revoke', '--vendor', 'nvidia']), /gpu revoke does not accept option --vendor/);
+});
+
+test('the default GPU vendor is the only supported one; several require --vendor', async () => {
+    const { GPU_GRANT_VENDORS, defaultGpuVendor } = await import('../../ploinky-box/gpuGrant.mjs');
+    assert.equal(typeof defaultGpuVendor, 'function');
+    assert.deepEqual([...GPU_GRANT_VENDORS], ['nvidia']);
+    assert.equal(defaultGpuVendor(), 'nvidia');
+    assert.throws(() => defaultGpuVendor(['nvidia', 'amd']), /choose one with --vendor; supported: nvidia, amd/);
 });
 
 // ---------------------------------------------------------------------------

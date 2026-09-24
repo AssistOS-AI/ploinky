@@ -143,7 +143,7 @@ function evaluateGpuGrant(context, runtimePolicy, agentId) {
     let refusal = null;
     if (!context.present) {
         refusal = 'this workspace has no GPU grant; on the host run '
-            + '`ploinky gpu grant nvidia --agent REPO/AGENT`';
+            + '`ploinky gpu grant --agent REPO/AGENT`';
     } else if (!context.valid) {
         refusal = `the Box GPU grant marker is invalid (${context.problem})`;
     } else if (devices.length !== 1 || cdi[0].value !== BOX_GPU_CDI_DEVICE) {

@@ -270,7 +270,7 @@ A matching folder named after the registered repository takes priority; otherwis
 | `ploinky --port <tcp> --udp-port <udp> start ...` | Select the physical Router TCP and media UDP ports; in-Box targets remain `8080/tcp` and `7882/udp` |
 | `ploinky bind [ADDRESS:PORT:8080]` | Publish the public Router on this machine's IPv4 `ADDRESS` (`0` for all interfaces) and TCP `PORT`; recreate the Box and restart the configured graph when the mapping changes; save the binding for later lifecycle commands |
 | `ploinky bind 127.0.0.1:PORT:8080` | Restore local-only Router access |
-| `ploinky gpu grant nvidia --agent REPO/AGENT` | Let the named agents request the host NVIDIA GPU; recreate the Box with the device nodes and read-only driver libraries and restart the configured graph when the wiring changes; save the grant for later lifecycle commands |
+| `ploinky gpu grant --agent REPO/AGENT [--vendor VENDOR]` | Let the named agents request the host NVIDIA GPU; recreate the Box with the device nodes and read-only driver libraries and restart the configured graph when the wiring changes; save the grant for later lifecycle commands |
 | `ploinky gpu revoke [--agent REPO/AGENT]` | Remove the named agents, or the whole grant |
 | `ploinky gpu status` | Show the saved grant, host GPU discovery, and the Box's GPU wiring without mutation |
 | `ploinky status` | Inspect outer configuration/publishes/health and running core status without mutation |
@@ -657,10 +657,13 @@ grant this workspace's Box the host NVIDIA GPU for named agents:
 
 ```sh
 ploinky gpu status                                    # read-only: grant, host GPU, Box wiring
-ploinky gpu grant nvidia --agent local-llms/local-llm # add agents to the grant
+ploinky gpu grant --agent local-llms/local-llm        # add agents to the grant
 ploinky gpu revoke --agent local-llms/local-llm       # remove agents
 ploinky gpu revoke                                    # remove the whole grant
 ```
+
+`--vendor VENDOR` (or `--vendor=VENDOR`) is optional: it defaults to the only
+supported vendor, `nvidia`, and is required only if several are ever supported.
 
 The grant is saved for this exact workspace as
 `~/.ploinky-box/gpu-grants/<box-instance>.json` with mode `0600`, outside the

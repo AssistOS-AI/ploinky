@@ -1,6 +1,6 @@
 // Operator-granted GPU access for named agents in one workspace Box.
 //
-// `ploinky gpu grant nvidia --agent REPO/AGENT` records the operator decision
+// `ploinky gpu grant --agent REPO/AGENT` records the operator decision
 // in the host-only `~/.ploinky-box/gpu-grants/<instance>.json`, never in the
 // workspace, because agents can write the workspace bind. Host discovery then
 // derives the exact wiring for the outer Box: explicit `--device` nodes, one
@@ -110,6 +110,12 @@ function exactIdentity(identity) {
         throw stateError('GPU grant state requires the exact workspace identity');
     }
     return identity;
+}
+
+/** The vendor a grant uses when --vendor is omitted: the only supported one. */
+export function defaultGpuVendor(vendors = GPU_GRANT_VENDORS) {
+    if (vendors.length === 1) return vendors[0];
+    throw grantError(`Several GPU vendors are supported; choose one with --vendor; supported: ${vendors.join(', ')}`);
 }
 
 export function normalizeGpuVendor(value) {
