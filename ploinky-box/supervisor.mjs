@@ -242,6 +242,15 @@ function revalidateMountedAgentLibSource(selection, context) {
     return selection;
 }
 
+// D14 first start: the in-Box no-wait workers outlive the start that launched
+// them. They pull images (bounded by the in-Box image pull timeout, 30 minutes)
+// and then take the edge-generation lock to publish their agent, which the
+// graph stop of a Box replacement also needs. The host waits for them, a little
+// longer than that pull bound, before replacing the Box.
+const NO_WAIT_WORKER_SCRIPT = '/opt/ploinky/cli/commands/noWaitWorker.js';
+const NO_WAIT_SETTLE_TIMEOUT_MS = 31 * 60 * 1000;
+const NO_WAIT_POLL_MS = 5000;
+
 export function createBoxSupervisor({
     runner = createProcessRunner({ env: buildEngineProcessEnvironment() }),
     lockManager = createMutationLockManager(),
@@ -275,6 +284,9 @@ export function createBoxSupervisor({
     gpuGrantStore = createGpuGrantStore(),
     discoverGpuDevices = discoverGpu,
     scanGpuAgents = declaredGpuAgents,
+    countNoWaitWorkers = null,
+    waitDelay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    now = () => Date.now(),
     readNetworkInterfaces = () => os.networkInterfaces(),
     readHostname = () => os.hostname(),
     stdout = process.stdout,
@@ -1391,12 +1403,57 @@ export function createBoxSupervisor({
         );
     }
 
+    // The number of no-wait workers running in the Box, or null when it
+    // cannot be read.
+    function countBoxNoWaitWorkers(engine, containerId) {
+        if (countNoWaitWorkers) return countNoWaitWorkers(engine, containerId);
+        const result = runner.query(engine.name, [
+            'container', 'exec', '--user', 'podman', containerId,
+            '/usr/bin/pgrep', '-c', '-f', NO_WAIT_WORKER_SCRIPT,
+        ]);
+        const text = String(result?.stdout || '').trim();
+        // pgrep exits 1 when nothing matches, still printing the count 0.
+        if (!/^\d+$/.test(text) || !(result?.ok || (result?.status === 1 && text === '0'))) return null;
+        return Number(text);
+    }
+
+    async function waitForNoWaitLaunches(identity) {
+        const ownership = inspect(identity);
+        const container = ownership.handles?.container;
+        if (!container) return { settled: true };
+        const deadline = now() + NO_WAIT_SETTLE_TIMEOUT_MS;
+        let announced = false;
+        for (;;) {
+            const count = countBoxNoWaitWorkers(ownership.engine, container.id);
+            if (count === 0) return { settled: true };
+            if (count === null) return { settled: false, reason: 'could not count the no-wait agent launches in the Box' };
+            if (now() >= deadline) {
+                return {
+                    settled: false,
+                    reason: `${count} no-wait agent ${count === 1 ? 'launch is' : 'launches are'} still running after `
+                        + `${Math.round(NO_WAIT_SETTLE_TIMEOUT_MS / 60000)} minutes`,
+                };
+            }
+            if (!announced) {
+                stderr?.write?.(
+                    `[ploinky] Waiting for ${count} no-wait agent ${count === 1 ? 'launch' : 'launches'} (image pulls) `
+                    + 'to finish before replacing the Box to apply the GPU agents...\n',
+                );
+                announced = true;
+            }
+            await waitDelay(Math.min(NO_WAIT_POLL_MS, Math.max(0, deadline - now())));
+        }
+    }
+
     /**
      * D14 first start: the in-Box start or restart may just have installed
      * repos whose manifests declare GPU access, after the host prepared the
      * Box. When the effective set now differs from the wiring the Box was
-     * prepared with, replace the Box once through the grant transaction. A
-     * failure is reported and leaves the workspace running without it.
+     * prepared with, replace the Box once through the grant transaction, after
+     * the start's no-wait launches have finished (their image pulls, and the
+     * edge-generation lock the graph stop also needs). A failure, or launches
+     * that outlast the bound, are reported and leave the workspace running
+     * without it.
      */
     async function reapplyDeclaredGpu(identity, lock, preparedGpu) {
         let selected;
@@ -1407,6 +1464,14 @@ export function createBoxSupervisor({
             return null;
         }
         if (sameGpuWiring(selected.desired, preparedGpu)) return null;
+        const launches = await waitForNoWaitLaunches(identity);
+        if (!launches.settled) {
+            stderr?.write?.(
+                `[ploinky] The installed manifests change the GPU agents, but ${launches.reason}; the workspace keeps `
+                + 'running without that GPU wiring; run `ploinky start` again once they finish.\n',
+            );
+            return null;
+        }
         stderr?.write?.('[ploinky] The installed manifests change the GPU agents; replacing the Box once to apply them...\n');
         try {
             return await applyGpuGrantChange({

@@ -738,7 +738,10 @@ REPO/AGENT` after a deny, `ploinky gpu grant` after a workspace revoke, or
 `start`, `restart`, and `update` rediscover the driver and re-read the
 manifests, before the graph starts and again after it started (the in-Box start
 may just have installed a repo whose manifest declares the GPU; the Box is then
-replaced once more, restarting the graph once). A driver update or a changed
+replaced once more, restarting the graph once). That replacement first waits for
+the start's no-wait launches, which may still be pulling images, to finish, for
+at most 31 minutes; if they are still running then, the workspace keeps running
+without that wiring and a later `ploinky start` applies it. A driver update or a changed
 set of GPU agents changes the wiring fingerprint (the Box label
 `io.assistos.ploinky-box.gpu-grant`), so the Box is recreated with regenerated
 wiring. If discovery fails, the Box starts without GPU devices: an operator

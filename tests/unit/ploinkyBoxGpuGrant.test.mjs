@@ -2019,6 +2019,8 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
         const events = [];
         const seen = [];
         let scans = 0;
+        // The start returns while its no-wait launches (image pulls) still run.
+        const workers = [2, 1, 0];
         const supervisor = gpuSupervisor(box, events, {
             gpuGrantStore: memoryGpuStore(events),
             // Nothing is installed when the host prepares the Box; the in-Box
@@ -2026,6 +2028,7 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
             scanGpuAgents: () => (scans++ === 0 ? [] : declaredAfterStart),
             async reconcile(options) {
                 seen.push(options.gpu);
+                events.push('reconcile');
                 return prepared(box, seen.length === 1 ? 'reused' : 'replaced', options.gpu, events);
             },
             async startCore() { events.push('start-core'); },
@@ -2033,16 +2036,115 @@ test('D14 first start: a start that installs a declaring repo replaces the Box o
             selectAgentLib: async () => ({ selection: box.agentLib }),
             commitAgentLibSelection: () => {},
             revalidateAgentLibSource: () => {},
+            countNoWaitWorkers: () => {
+                const count = workers.shift();
+                events.push(`no-wait:${count}`);
+                return count;
+            },
+            waitDelay: async () => {},
         });
         const result = await supervisor.runStartTransaction(['start', 'explorer', '8080']);
         assert.deepEqual(seen.map((wiring) => wiring?.state ?? null), expected, JSON.stringify(declaredAfterStart));
+        const noWait = events.filter((event) => event.startsWith('no-wait:') || event === 'reconcile');
         if (declaredAfterStart.length) {
             assert.deepEqual(seen[1].agents, [AGENT]);
             assert.equal(result.gpuReapplied.action, 'replaced');
             assert.equal(events.filter((event) => event === 'start-core').length, 2);
+            // The Box is replaced only once no no-wait launch is left.
+            assert.deepEqual(noWait, ['reconcile', 'no-wait:2', 'no-wait:1', 'no-wait:0', 'reconcile']);
         } else {
             assert.equal(result.gpuReapplied, undefined);
             assert.equal(events.filter((event) => event === 'start-core').length, 1);
+            // No change to apply: the start never waits for its no-wait launches.
+            assert.deepEqual(noWait, ['reconcile']);
         }
+    }
+});
+
+test('D14 first start: by default the no-wait launches are counted with pgrep in the Box, as the podman user', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    const box = graphBox(t);
+    const events = [];
+    const seen = [];
+    const counts = [{ ok: true, status: 0, stdout: '2\n' }, { ok: false, status: 1, stdout: '0\n' }];
+    const pgrepCalls = [];
+    let scans = 0;
+    const supervisor = gpuSupervisor(box, events, {
+        gpuGrantStore: memoryGpuStore(events),
+        scanGpuAgents: () => (scans++ === 0 ? [] : [AGENT]),
+        async reconcile(options) {
+            seen.push(options.gpu);
+            return prepared(box, seen.length === 1 ? 'reused' : 'replaced', options.gpu, events);
+        },
+        async startCore() { events.push('start-core'); },
+        async healthCheck() { events.push('health'); },
+        selectAgentLib: async () => ({ selection: box.agentLib }),
+        commitAgentLibSelection: () => {},
+        revalidateAgentLibSource: () => {},
+        waitDelay: async () => {},
+        runner: {
+            run(_command, args) { events.push(`run:${args.join(' ')}`); },
+            async stream(_command, args) { events.push(`stream:${args.at(-1)}`); return { ok: true, status: 0 }; },
+            query(_command, args) {
+                if (args.includes('/usr/bin/pgrep')) {
+                    pgrepCalls.push(args);
+                    return counts.shift();
+                }
+                return { ok: true, status: 0, stdout: JSON.stringify({
+                    state: 'running', initialized: true, routingConfigured: true, trackedAgents: 1, runningAgents: 1, warnings: [],
+                }) };
+            },
+        },
+    });
+    const result = await supervisor.runStartTransaction(['start', 'explorer', '8080']);
+    assert.equal(result.gpuReapplied.action, 'replaced');
+    assert.equal(pgrepCalls.length, 2);
+    assert.deepEqual(pgrepCalls[0], ['container', 'exec', '--user', 'podman', box.ownership.handles.container.id,
+        '/usr/bin/pgrep', '-c', '-f', '/opt/ploinky/cli/commands/noWaitWorker.js']);
+});
+
+test('D14 first start: no-wait launches that outlast the bound, or cannot be counted, leave the Box as it is', async (t) => {
+    const probe = boxFixture(t);
+    useTempHome(t, probe.root);
+    useFakeHostFiles(t, fakeHost());
+    for (const [count, message] of [
+        [() => 1, /1 no-wait agent launch is still running after 31 minutes/],
+        [() => null, /could not count the no-wait agent launches in the Box/],
+    ]) {
+        const box = graphBox(t);
+        const events = [];
+        const seen = [];
+        const output = [];
+        let scans = 0;
+        let clock = 0;
+        const store = memoryGpuStore(events);
+        const supervisor = gpuSupervisor(box, events, {
+            gpuGrantStore: store,
+            scanGpuAgents: () => (scans++ === 0 ? [] : [AGENT]),
+            async reconcile(options) {
+                seen.push(options.gpu);
+                return prepared(box, 'reused', options.gpu, events);
+            },
+            async startCore() { events.push('start-core'); },
+            async healthCheck() { events.push('health'); },
+            selectAgentLib: async () => ({ selection: box.agentLib }),
+            commitAgentLibSelection: () => {},
+            revalidateAgentLibSource: () => {},
+            countNoWaitWorkers: count,
+            now: () => clock,
+            waitDelay: async (milliseconds) => { clock += milliseconds; },
+            stderr: { write(text) { output.push(String(text)); } },
+        });
+        const result = await supervisor.runStartTransaction(['start', 'explorer', '8080']);
+        assert.equal(seen.length, 1, 'the Box is not replaced');
+        assert.equal(result.gpuReapplied, undefined);
+        assert.equal(events.filter((event) => event === 'start-core').length, 1);
+        const text = output.join('');
+        assert.match(text, message);
+        assert.match(text, /the workspace keeps running without that GPU wiring; run `ploinky start` again once they finish/);
+        assert.equal(store.value, null, 'no GPU grant record is written');
+        assert.deepEqual(events.filter((event) => event.startsWith('grant-')), []);
     }
 });
