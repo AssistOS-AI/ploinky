@@ -89,6 +89,19 @@ export function createSidePanel({
         icon.setAttribute('width', '16');
         icon.setAttribute('height', '16');
         icon.setAttribute('viewBox', '0 0 24 24');
+        icon.setAttribute('role', 'button');
+        icon.setAttribute('tabindex', '0');
+        icon.setAttribute('aria-label', 'Open in new tab');
+        icon.setAttribute('title', 'Open in new tab');
+
+        const openInNewTab = (event) => {
+            event.preventDefault();
+            window.open(url, '_blank', 'noopener,noreferrer');
+        };
+        icon.addEventListener('click', openInNewTab);
+        icon.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') openInNewTab(event);
+        });
 
         const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         path.setAttribute('fill', 'currentColor');

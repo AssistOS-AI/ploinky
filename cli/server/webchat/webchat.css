@@ -901,7 +901,27 @@ body {
 .wa-side-panel-title-icon {
     flex: 0 0 auto;
     margin-left: 6px;
-    vertical-align: text-bottom;
+    width: 26px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--wa-border);
+    border-radius: 4px;
+    background: var(--wa-bg-panel);
+    color: var(--wa-icon-color);
+    cursor: pointer;
+    transition: color 0.2s, background 0.2s;
+}
+
+.wa-side-panel-title-icon:hover {
+    background: var(--wa-bg-hover);
+    color: var(--wa-icon-color-active);
+}
+
+.wa-side-panel-title-icon:focus-visible {
+    outline: 2px solid var(--wa-accent);
+    outline-offset: 1px;
 }
 
 .wa-side-panel-title a:hover {
