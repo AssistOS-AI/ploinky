@@ -57,13 +57,15 @@ import {
 } from '../sandbox/runtimeCapabilities.js';
 import {
     createAgentSymlinks,
-    removeAgentSymlinks,
+    getAgentCodePath,
+    getAgentSkillsPath,
     createAgentWorkDir,
     removeAgentWorkDir,
     getAgentDataDir
 } from './workspaceStructure.js';
 import {
     RESERVED_AGENT_REGISTRY_KEYS,
+    parseQualifiedAgentReference,
     resolveEnabledAgentRecordFromMap,
 } from './agentRegistryResolver.js';
 import { retireNoWaitRunMarkers } from '../commands/noWaitMarkerLifecycle.js';
@@ -1009,6 +1011,101 @@ function removeDisabledRuntimes(disabledRecords, {
     }
 }
 
+function configuredStaticRegistration(map, config, readRoutingImpl = loadRoutingConfig) {
+    const container = String(config?.static?.container || '').trim();
+    if (container) return container;
+    const reference = String(config?.static?.agent || '').trim();
+    if (!reference) return null;
+    try {
+        const selected = resolveEnabledAgentRecordFromMap(reference, map);
+        if (selected && (!selected.record.alias || selected.record.alias === reference || selected.containerName === reference)) {
+            return selected.containerName;
+        }
+    } catch (_) {}
+    const routedAlias = configuredRoutedStaticAlias(map, reference, readRoutingImpl);
+    if (routedAlias) return routedAlias;
+    // A configured bare/qualified primary can acquire additional aliases later.
+    // Without an exact routed alias, they do not replace the primary selection.
+    const primaryRecords = Object.fromEntries(Object.entries(map || {}).filter(([, record]) =>
+        record?.type === 'agent' && !String(record.alias || '').trim()));
+    try {
+        const primary = resolveEnabledAgentRecordFromMap(reference, primaryRecords);
+        if (primary) return primary.containerName;
+    } catch (_) {}
+    return null;
+}
+
+function configuredRoutedStaticAlias(map, reference, readRoutingImpl) {
+    // Workspace start normalizes an alias selection to its qualified source.
+    // Only the matching exact routed alias can distinguish that selection from
+    // a configured primary which is currently stopped and unregistered.
+    const source = parseQualifiedAgentReference(reference);
+    if (!source.qualified || source.malformed) return null;
+    let routing;
+    try { routing = readRoutingImpl(); } catch (_) { return null; }
+    const routedContainer = String(routing?.static?.container || '').trim();
+    const routedSource = parseQualifiedAgentReference(String(routing?.static?.agent || '').trim());
+    const record = map?.[routedContainer];
+    if (!record || record.type !== 'agent' || !record.alias
+        || record.repoName !== source.repoName || record.agentName !== source.agentName
+        || routedSource.malformed || routedSource.repoName !== source.repoName
+        || routedSource.agentName !== source.agentName) return null;
+    const route = routing?.routes?.[record.alias];
+    if (!route || route.container !== routedContainer || route.repo !== record.repoName
+        || route.agent !== record.agentName || route.alias !== record.alias) return null;
+    return routedContainer;
+}
+
+function sourceDirectoryIdentity(target) {
+    const realpath = fs.realpathSync(target);
+    const stat = fs.statSync(realpath, { bigint: true });
+    if (!stat.isDirectory()) throw new Error(`Agent source is not a directory: ${target}`);
+    return { realpath, device: stat.dev, inode: stat.ino };
+}
+
+function agentSourceDirectories(record) {
+    const root = path.join(resolveAgentRepositoryPath(record.repoName), record.agentName);
+    const code = path.join(root, 'code');
+    const skills = path.join(root, 'skills');
+    return {
+        code: sourceDirectoryIdentity(fs.existsSync(code) ? code : root),
+        skills: fs.existsSync(skills) ? sourceDirectoryIdentity(skills) : null,
+    };
+}
+
+function sameSourceDirectory(left, right) {
+    return Boolean(left && right && (left.realpath === right.realpath
+        || left.device === right.device && left.inode === right.inode));
+}
+
+// These two lookups are shared by source name, not owned by an individual
+// alias. Remove only a link into the retired source when no surviving exact
+// principal or physical-source consumer can still need it.
+function removeUnusedAgentSourceLinks(record, remaining) {
+    if (!record?.repoName || !record.agentName) return;
+    const survivors = Object.values(remaining || {}).filter(candidate =>
+        candidate?.type === 'agent' && candidate.agentName === record.agentName);
+    if (survivors.some(candidate => candidate.repoName === record.repoName)) return;
+    let retired;
+    try { retired = agentSourceDirectories(record); } catch (_) { return; }
+    for (const [kind, link] of [['code', getAgentCodePath(record.agentName)], ['skills', getAgentSkillsPath(record.agentName)]]) {
+        const before = fs.lstatSync(link, { bigint: true, throwIfNoEntry: false });
+        if (!before?.isSymbolicLink() || !retired[kind]) continue;
+        const text = fs.readlinkSync(link);
+        let actual;
+        try { actual = sourceDirectoryIdentity(link); } catch (_) { continue; }
+        if (!sameSourceDirectory(actual, retired[kind])) continue; // Another source or user replacement.
+        const needed = survivors.some(candidate => {
+            try { return sameSourceDirectory(actual, agentSourceDirectories(candidate)[kind]); }
+            catch (_) { return true; } // Unknown surviving source: preserve the shared lookup.
+        });
+        if (needed) continue;
+        const current = fs.lstatSync(link, { bigint: true, throwIfNoEntry: false });
+        if (current?.isSymbolicLink() && current.dev === before.dev && current.ino === before.ino
+            && fs.readlinkSync(link) === text) fs.unlinkSync(link);
+    }
+}
+
 export function disableAgent(agentRef, dependencies = {}) {
     const input = typeof agentRef === 'string' ? agentRef.trim() : '';
     if (!input) {
@@ -1033,10 +1130,12 @@ export function disableAgent(agentRef, dependencies = {}) {
     const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
     const map = loadAgentsImpl();
     const config = (map && typeof map._config === 'object') ? map._config : null;
+    const staticRegistration = configuredStaticRegistration(map, config, dependencies.readRoutingImpl);
     const directRecord = (map && map[input] && map[input].type === 'agent') ? map[input] : null;
 
     const clearStaticConfig = ({ repoName, shortName, containerName, rawInput }) => {
         if (!config || !config.static) return false;
+        if (containerName && containerName !== staticRegistration) return false;
         const comparisons = new Set();
         if (shortName) comparisons.add(String(shortName).trim().toLowerCase());
         if (repoName && shortName) {
@@ -1051,7 +1150,7 @@ export function disableAgent(agentRef, dependencies = {}) {
         const staticContainer = String(config.static.container || '').trim();
 
         const matchesAgent = staticAgent && (comparisons.has(staticAgent));
-        const matchesContainer = containerName && staticContainer && staticContainer === containerName;
+        const matchesContainer = containerName && (staticContainer === containerName || staticRegistration === containerName);
 
         if (!matchesAgent && !matchesContainer) return false;
 
@@ -1190,7 +1289,7 @@ export function disableAgent(agentRef, dependencies = {}) {
     // Remove workspace structure for the agent
     try {
         // Remove symlinks: $CWD/code/<agentName> and $CWD/skills/<agentName>
-        removeAgentSymlinks(record.agentName);
+        removeUnusedAgentSourceLinks(record, loadAgentsImpl());
 
         // Note: We don't remove the agent work directory by default to preserve data
         // Use removeAgentWorkDir(record.agentName, true) to force removal if needed
@@ -1218,11 +1317,13 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
     const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
     const map = loadAgentsImpl();
     const config = (map && typeof map._config === 'object') ? map._config : null;
+    const staticRegistration = configuredStaticRegistration(map, config, dependencies.readRoutingImpl);
     const disabled = [];
     const disabledRuntimeRecords = [];
 
     const clearStaticConfig = ({ repoName, shortName, containerName }) => {
         if (!config || !config.static) return false;
+        if (containerName && containerName !== staticRegistration) return false;
         const comparisons = new Set();
         if (shortName) comparisons.add(String(shortName).trim().toLowerCase());
         if (repoName && shortName) {
@@ -1235,7 +1336,7 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
         const staticAgent = String(config.static.agent || '').trim().toLowerCase();
         const staticContainer = String(config.static.container || '').trim();
         const matchesAgent = staticAgent && comparisons.has(staticAgent);
-        const matchesContainer = containerName && staticContainer && staticContainer === containerName;
+        const matchesContainer = containerName && (staticContainer === containerName || staticRegistration === containerName);
 
         if (!matchesAgent && !matchesContainer) return false;
 
@@ -1299,12 +1400,11 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
         abortPreparation,
     });
 
-    for (const item of disabled) {
-        if (item.status !== 'removed' || !item.shortAgentName) continue;
+    for (const item of disabledRuntimeRecords) {
         try {
-            removeAgentSymlinks(item.shortAgentName);
+            removeUnusedAgentSourceLinks(item.record, loadAgentsImpl());
         } catch (err) {
-            console.error(`Warning: Failed to remove workspace structure for ${item.shortAgentName}: ${err.message}`);
+            console.error(`Warning: Failed to remove workspace structure for ${item.record.agentName}: ${err.message}`);
         }
     }
 

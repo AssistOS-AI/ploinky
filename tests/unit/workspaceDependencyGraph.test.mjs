@@ -50,6 +50,12 @@ const {
     topologicallyGroupDependencyGraph
 } = graphModule;
 const { applyManifestDirectives, parseEnableDirective } = bootstrapModule;
+const { computeEnvHash } = await import('../../cli/sandbox/docker/common.js');
+const {
+    buildRuntimeNetworkPlan,
+    buildRuntimeRouterEnv,
+} = await import('../../cli/sandbox/docker/agentServiceManager.js');
+const { resolveManifestRuntimeProfile } = await import('../../cli/utils/runtime/profileService.js');
 const workspaceUtilModuleUrl = new URL('../../cli/commands/workspaceUtil.js', import.meta.url);
 const {
     assertStaticPreinstallSucceeded,
@@ -1310,6 +1316,7 @@ test('managed runtime hash reconstruction uses the retained signed semantic topo
         profile: {},
         extraEnv: {
             PLOINKY_NETWORK_MODE: 'default',
+            PLOINKY_HEALTH_PROBE_BROKER: '0',
             PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: 'sha256:semantic-topology',
             PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: 'ploinky.generated-local-router.v1',
             PLOINKY_ROUTER_TRANSPORT_VERSION: 'node-authority-v1',
@@ -1320,6 +1327,139 @@ test('managed runtime hash reconstruction uses the retained signed semantic topo
         },
         identity: { agentName: 'managed', repoName: 'demo' },
     });
+});
+
+function prepareRetainedBrokerRuntime({ mode, health, launchBroker, descriptorOverrides = {}, inspection = { state: 'exact' } }) {
+    writePersistedRouterPort();
+    const node = {
+        id: 'demo/broker', repoName: 'demo', shortAgentName: 'broker', alias: '',
+        agentRef: 'demo/broker', enableSpec: 'demo/broker global', profile: '', isStatic: false,
+        manifest: {
+            container: 'node:20-alpine',
+            network: { mode, ...(mode === 'bridge' ? { attachments: [{ name: 'broker-test', primary: true }] } : {}) },
+            ...(health ? { health } : {}),
+        },
+    };
+    const descriptorRoot = path.join(tempDir, '.ploinky', 'run', 'broker-hash-descriptors');
+    const descriptorFile = path.join(descriptorRoot, '12345678-1234-4234-8234-123456789abc.json');
+    fs.mkdirSync(descriptorRoot, { recursive: true });
+    fs.writeFileSync(descriptorFile, '{}', { mode: 0o600 });
+    const predecessor = {
+        type: 'agent', repoName: 'demo', agentName: 'broker', runMode: 'global', projectPath: tempDir,
+        instanceId: 'retained-instance', enableGeneration: 'retained-generation',
+        config: { binds: [{
+            source: descriptorFile, target: '/run/ploinky/router-descriptor.json',
+            ro: true, generatedRouterDescriptor: true,
+        }] },
+    };
+    const payload = {
+        agentPrincipal: 'agent:demo/broker', instanceId: predecessor.instanceId,
+        generationId: predecessor.enableGeneration, semanticTopologyDigest: 'sha256:retained-topology',
+        schema: 'ploinky.generated-local-router.v1', transportVersion: 'node-authority-v1',
+        localStreaming: 'disabled',
+    };
+    const { profileConfig, network } = resolveManifestRuntimeProfile(node.manifest);
+    const networkPlan = buildRuntimeNetworkPlan('podman', network);
+    const routerEnv = buildRuntimeRouterEnv('podman', {
+        routerEndpoint: resolveManifestRouterEndpoint(node.manifest, { explicitPort: 8080 }),
+        networkMode: network.mode,
+    });
+    // Reconstruct the launcher's persisted label with an explicit broker value;
+    // the graph must independently derive that same value from the manifest.
+    const launchedHash = computeEnvHash(node.manifest, profileConfig, {
+        ...(networkPlan.requiresManagedNetwork ? {
+            PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
+            PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
+            PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
+            PLOINKY_ROUTER_LOCAL_STREAMING: payload.localStreaming,
+            PLOINKY_AGENT_PRINCIPAL: payload.agentPrincipal,
+            PLOINKY_AGENT_INSTANCE_ID: predecessor.instanceId,
+            PLOINKY_AGENT_ENABLE_GENERATION: predecessor.enableGeneration,
+        } : routerEnv),
+        ...networkPlan.hashEnv,
+        PLOINKY_HEALTH_PROBE_BROKER: launchBroker,
+    }, { agentName: node.shortAgentName, repoName: node.repoName });
+    assert.match(launchedHash, /^[a-f0-9]{64}$/);
+    const registry = { broker_container: structuredClone(predecessor) };
+    const removalReasons = [];
+    const prepared = ensureGraphNodesEnabled({ nodes: new Map([[node.id, node]]) }, registry, {
+        runtimeReplacementOptions: {
+            containerExistsImpl() { return true; },
+            isContainerRunningImpl() { return true; },
+            getRuntimeForAgentImpl() { return 'podman'; },
+            getRuntimeImpl() { return 'podman'; },
+            getContainerLabelImpl(containerName, label) {
+                assert.equal(containerName, 'broker_container');
+                assert.equal(label, 'ploinky.envhash');
+                return launchedHash;
+            },
+            retainedManagedEnvHashOptions: {
+                descriptorRoot,
+                readDescriptorFileImpl() { return { payload: { ...payload, ...descriptorOverrides } }; },
+            },
+            isLlmRuntimeManifestImpl() { return false; },
+            createNetworkLifecycleAdapterImpl() {
+                return { inspectContainerContract() { return inspection; } };
+            },
+        },
+        inactivateGeneration() {},
+        retireNoWaitMarkers() {},
+        loadRouting() { return { routes: { broker: { container: 'broker_container', repo: 'demo', agent: 'broker' } } }; },
+        saveRouting() {},
+        saveAgents() {},
+        prepareAgentEnableBatch(requests) {
+            assert.deepEqual(requests, []);
+            return { plans: [], preparedGeneration: { selector: { state: 'inactive' } } };
+        },
+        removeAgentContainerForRecreate(containerName, reason, observedPredecessor) {
+            assert.equal(containerName, 'broker_container');
+            assert.deepEqual(observedPredecessor, predecessor);
+            removalReasons.push(reason);
+        },
+        executionRecordOptions: { workspaceRoot: tempDir },
+    });
+    return { prepared, registry, predecessor, removalReasons };
+}
+
+for (const mode of ['default', 'bridge', 'host', 'none']) {
+    for (const [name, health, broker] of [
+        ['absent', undefined, '0'],
+        ['blank', { readiness: { script: '  ' }, liveness: { script: '' } }, '0'],
+        ['readiness', { readiness: { script: 'healthcheck.sh' } }, '1'],
+        ['liveness', { liveness: { script: 'healthcheck.sh' } }, '1'],
+    ]) {
+        test(`retained ${mode} runtime preserves identity with ${name} health broker scripts`, () => {
+            const { prepared, registry, predecessor, removalReasons } = prepareRetainedBrokerRuntime({
+                mode, health, launchBroker: broker,
+            });
+            assert.deepEqual(prepared.changedContainers, []);
+            assert.deepEqual(registry.broker_container, predecessor);
+            assert.deepEqual(removalReasons, []);
+        });
+    }
+    test(`retained ${mode} runtime still replaces a changed health broker setting`, () => {
+        const { prepared, removalReasons } = prepareRetainedBrokerRuntime({
+            mode, health: { readiness: { script: 'healthcheck.sh' } }, launchBroker: '0',
+        });
+        assert.deepEqual(prepared.changedContainers, ['broker_container']);
+        assert.match(removalReasons[0], /envHashChanged/);
+    });
+}
+
+for (const field of ['agentPrincipal', 'instanceId', 'generationId']) {
+    test(`retained managed runtime still rejects descriptor ${field} drift`, () => {
+        const { prepared, removalReasons } = prepareRetainedBrokerRuntime({
+            mode: 'default', launchBroker: '0', descriptorOverrides: { [field]: 'foreign' },
+        });
+        assert.deepEqual(prepared.changedContainers, ['broker_container']);
+        assert.match(removalReasons[0], /managedRouterDescriptorDrift/);
+    });
+}
+
+test('matching health broker hash still rejects foreign runtime ownership', () => {
+    assert.throws(() => prepareRetainedBrokerRuntime({
+        mode: 'default', launchBroker: '0', inspection: { state: 'foreign' },
+    }), /refusing graph replacement of foreign runtime/);
 });
 
 test('a healthy managed runtime reuses its semantic env hash instead of rotating on the ordinary hash', () => {

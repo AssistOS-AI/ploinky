@@ -21,6 +21,7 @@ import {
 import {
   buildRuntimeNetworkPlan,
   buildRuntimeRouterEnv,
+  manifestUsesHealthProbeBroker,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
 import { removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
@@ -966,6 +967,7 @@ function computeRetainedManagedEnvHash(node, record, profileConfig, runtimeNetwo
     }
     return computeEnvHashImpl(node.manifest, profileConfig, {
       ...runtimeNetworkPlan.hashEnv,
+      PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(node.manifest) ? '1' : '0',
       PLOINKY_ROUTER_SEMANTIC_TOPOLOGY_DIGEST: payload.semanticTopologyDigest,
       PLOINKY_ROUTER_DESCRIPTOR_SCHEMA: payload.schema,
       PLOINKY_ROUTER_TRANSPORT_VERSION: payload.transportVersion,
@@ -1066,7 +1068,11 @@ function graphNodeRuntimeReplacementReason(plan, {
   const baseEnvHash = computeEnvHashImpl(
     node.manifest,
     profileResolution.profileConfig,
-    { ...runtimeRouterEnv, ...runtimeNetworkPlan.hashEnv },
+    {
+      ...runtimeRouterEnv,
+      ...runtimeNetworkPlan.hashEnv,
+      PLOINKY_HEALTH_PROBE_BROKER: manifestUsesHealthProbeBroker(node.manifest) ? '1' : '0',
+    },
     { agentName: node.shortAgentName, repoName: node.repoName },
   );
   const desiredEnvHash = runtimeNetworkPlan.requiresManagedNetwork
