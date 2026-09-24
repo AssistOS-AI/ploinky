@@ -687,9 +687,19 @@ image sets `LD_LIBRARY_PATH` and `PATH` to include `/usr/local/nvidia`.
 Like bind, a grant or revoke needs a configured graph once a Box exists, keeps
 the image, AgentLib generation, and publication, recreates the Box when the
 wiring changes, restarts the graph, and saves the grant only after `/health`
-answers. A failure restores the previous Box, graph, and grant, and reports that
-the previous grant is still in force. Without a Box, the grant is saved for the
-next `ploinky start`.
+answers. On a failure it rolls back: it recreates a Box with the previous wiring,
+restarts the previous graph, restores the saved grant, and reports that the
+previous grant (or, with no saved grant, the Box's previous GPU wiring) is still
+in force. If a rollback step fails too, the error is
+`PLOINKY_BOX_TRANSACTION_ROLLBACK_FAILED` and lists what could not be restored.
+Without a Box, the grant is saved for the next `ploinky start`.
+
+While a Box exists, `revoke` first reads the workspace agent registry, routes,
+and manifests. If an enabled agent that requests the GPU would lose the grant,
+it refuses before changing the Box and names `ploinky disable agent REPO/AGENT`,
+or `ploinky destroy` followed by `ploinky gpu revoke`. Agents can write those
+workspace files, so anything this check cannot read is skipped, and admission
+during the graph restart remains the authority.
 
 `start`, `restart`, and `update` rediscover the driver. A driver update changes
 the wiring fingerprint (the Box label `io.assistos.ploinky-box.gpu-grant`), so
