@@ -287,3 +287,39 @@ test('host refresh defers repository Git includes before loading their policy', 
     assert.deepEqual([record.outcome, record.code], ['deferred', 'git-config-include-unverified']);
     assert.deepEqual(fs.readFileSync(config), before);
 });
+
+// A stray file in the freshly created export lock directory makes its release
+// fail (ENOTEMPTY) whatever the refresh itself does.
+function strayLockLiveness(folder) {
+    const lock = path.join(folder, '.agents', tx.EXPORT_LOCK);
+    return { current: () => {
+        if (fs.existsSync(lock)) fs.writeFileSync(path.join(lock, 'stray'), 'stray\n');
+        return tx.currentSkillExportIdentity();
+    } };
+}
+
+test('a host refresh whose lock release fails is failed when settled and uncertain when its result needs recovery', t => {
+    const w = workspace(t);
+    const liveness = strayLockLiveness(w.project);
+    const lock = path.join(w.project, '.agents', tx.EXPORT_LOCK);
+    // The real refresh publishes and settles its exclusions, then the release fails.
+    const [settled] = refreshDeferredHostExclusions({
+        folders: [w.boxProject], identity: w.identity,
+        refresh: (folder, options) => tx.refreshSkillExportExclusions(folder, { ...options, lock: { liveness } }),
+    });
+    assert.deepEqual([settled.outcome, settled.code], ['failed', 'SKILL_EXPORT_LOCK_RELEASE_FAILED']);
+    assert.equal(status(w.project), '', 'the settled exclusions were published before the release failed');
+    fs.rmSync(lock, { recursive: true });
+    // The same release failure after a completed result that still needs
+    // recovery keeps that result's uncertain outcome.
+    const quarantined = { id: '00000000-0000-4000-8000-000000000000', status: 'quarantined', unexpected: [{ name: 'receipt' }] };
+    const [uncertain] = refreshDeferredHostExclusions({
+        folders: [w.boxProject], identity: w.identity,
+        refresh: folder => tx.withSkillExportLocks([folder], ([handle]) => ({ folder: handle.root, exclusions: { status: 'preserved' }, transaction: quarantined, recovery: handle.recovery }), { liveness }),
+    });
+    assert.deepEqual([uncertain.outcome, uncertain.code], ['uncertain', 'SKILL_EXPORT_RECOVERY_REQUIRED']);
+    assert.equal(uncertain.details.errorCode, 'SKILL_EXPORT_LOCK_RELEASE_FAILED');
+    assert.deepEqual(uncertain.details.transaction, quarantined);
+    assert.match(uncertain.reason, /transaction quarantined.*lock could not be released/s);
+    fs.rmSync(lock, { recursive: true });
+});
