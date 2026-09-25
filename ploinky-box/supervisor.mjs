@@ -82,7 +82,7 @@ import {
 import { reconcileBoxContainer } from './lifecycle/transactions.mjs';
 import { listUnresolvedAdmissions, runJournaledAdmission } from './update/admission.mjs';
 import { updateHostStateForLockManager } from './update/hostState.mjs';
-import { IN_BOX_NONCE_PROBE_SCRIPT, runUpdateExec } from './update/coreRunner.mjs';
+import { IN_BOX_NONCE_PROBE_SCRIPT, IN_BOX_OPERATION_WRITERS_PROBE_SCRIPT, runUpdateExec } from './update/coreRunner.mjs';
 import { refreshDeferredHostExclusions } from './update/hostExclusions.mjs';
 import {
     UPDATE_REPORT_CONTEXT_ENV,
@@ -2631,7 +2631,10 @@ export async function runBoundedCoreCommand(
 /**
  * Ask the engine whether processes of one update operation still run in the
  * Box. A stopped or removed Box cannot run them; anything the engine cannot
- * answer is reported as not proven.
+ * answer is reported as not proven. An in-Box update leaves nothing running,
+ * so every process that carries its nonce is a writer. A graph restart leaves
+ * the graph running with its marker, so only the restart's own process group
+ * counts (see selectOperationWriters).
  */
 export function probeInBoxUpdateProcesses(engine, containerId, runner, nonce, { marker = null } = {}) {
     const inspected = runner.query(engine.name, ['container', 'inspect', '--format', '{{.State.Running}}', containerId]);
@@ -2643,7 +2646,9 @@ export function probeInBoxUpdateProcesses(engine, containerId, runner, nonce, { 
     if (String(inspected.stdout || '').trim() === 'false') return { ok: true, pids: [], detail: 'the Box is stopped' };
     const listed = runner.query(engine.name, [
         'container', 'exec', '--user', 'podman', containerId,
-        '/usr/local/bin/node', '-e', IN_BOX_NONCE_PROBE_SCRIPT, marker || `${UPDATE_REPORT_NONCE_ENV}=${nonce}`,
+        '/usr/local/bin/node', '-e',
+        String(marker || '').startsWith(`${UPDATE_OPERATION_ENV}=`) ? IN_BOX_OPERATION_WRITERS_PROBE_SCRIPT : IN_BOX_NONCE_PROBE_SCRIPT,
+        marker || `${UPDATE_REPORT_NONCE_ENV}=${nonce}`,
     ]);
     if (!listed?.ok) return { ok: false, detail: `in-Box process listing failed: ${String(listed?.stderr || '').trim()}` };
     try {
@@ -2717,7 +2722,8 @@ export async function runBoundedUpdateCommand(
 }
 
 // Marks the in-Box graph restart run by an update so the engine can prove
-// whether any of its processes still run after the client ended abnormally.
+// whether its writers still run after the client ended abnormally. The graph
+// it started inherits the marker too and is left running.
 export const UPDATE_OPERATION_ENV = 'PLOINKY_UPDATE_OPERATION';
 
 /**

@@ -242,3 +242,45 @@ export const IN_BOX_NONCE_PROBE_SCRIPT = [
     "if(b.toString('latin1').split('\\0').includes(needle.toString('latin1')))pids.push(Number(e));}",
     'process.stdout.write(JSON.stringify(pids));',
 ].join('');
+
+/**
+ * The writers of one engine-exec'd operation, from a snapshot of the Box's
+ * processes (`{ pid, ppid, pgid, comm, marked }`, `marked` = carries the
+ * operation marker in its environment).
+ *
+ * A graph restart leaves the graph running: the Watchdog and Router, detached
+ * no-wait workers and the engine's conmon, fuse-overlayfs, rootlessport, pasta
+ * and aardvark-dns processes all inherit the marker, and each leads its own
+ * live process group. They are the result of the operation, not its writers,
+ * and must never be signalled. The writers are the command the engine exec'd
+ * (it leads its own group and has no parent inside the Box's pid namespace)
+ * and every process still in that group, including engine clients waiting on
+ * a container, whether or not they kept the marker. After that command died,
+ * its group has no live leader. Podman's rootless pause process (catatonit)
+ * also runs in a group whose leader has exited, but it holds the user
+ * namespace of every nested container and is never a writer.
+ */
+export function selectOperationWriters(table) {
+    const live = new Set(table.map(row => row.pid));
+    const groups = new Set();
+    for (const row of table) {
+        if (!row.marked || row.comm === 'catatonit') continue;
+        if ((row.pid === row.pgid && row.ppid === 0) || !live.has(row.pgid)) groups.add(row.pgid);
+    }
+    return table.filter(row => groups.has(row.pgid) && row.comm !== 'catatonit')
+        .map(row => row.pid).sort((a, b) => a - b);
+}
+
+// Lists the writers of a graph restart (see selectOperationWriters) instead of
+// every process that inherited its marker.
+export const IN_BOX_OPERATION_WRITERS_PROBE_SCRIPT = [
+    `const selectOperationWriters=${selectOperationWriters.toString()};`,
+    "const fs=require('fs');const marker=process.argv[1];const table=[];",
+    "for(const e of fs.readdirSync('/proc')){if(!/^\\d+$/.test(e)||Number(e)===process.pid)continue;",
+    "let stat;try{stat=fs.readFileSync('/proc/'+e+'/stat','latin1');}catch{continue;}",
+    "const close=stat.lastIndexOf(')');const fields=stat.slice(close+2).split(' ');",
+    "let environ='';try{environ=fs.readFileSync('/proc/'+e+'/environ','latin1');}catch{}",
+    "table.push({pid:Number(e),ppid:Number(fields[1]),pgid:Number(fields[2]),",
+    "comm:stat.slice(stat.indexOf('(')+1,close),marked:environ.split('\\0').includes(marker)});}",
+    'process.stdout.write(JSON.stringify(selectOperationWriters(table)));',
+].join('');
