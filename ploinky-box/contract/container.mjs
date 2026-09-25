@@ -207,7 +207,7 @@ function assertBoxPloinkySource(runtime, repositoryRoot) {
 /**
  * Reconstruct the public Router binding an owned Box records.
  *
- * A Box without the bind-address label is the legacy loopback publication and
+ * A Box without the bind-address label is the loopback publication and
  * must carry no trusted outer-host list. A labelled Box must carry exactly one
  * canonical list, and a specific address must trust itself. Publications are
  * compared separately so labels alone never prove what the engine publishes.

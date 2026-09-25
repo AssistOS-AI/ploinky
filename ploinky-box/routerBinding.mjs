@@ -223,8 +223,8 @@ function hostnameAliases(hostname) {
  *
  * A specific binding trusts its own address; the wildcard trusts every usable
  * IPv4 address on a host interface other than container bridges. Both add this
- * machine's host names. Loopback needs no alias and returns null, preserving the
- * legacy Box environment.
+ * machine's host names. Loopback needs no alias and returns null, so a loopback
+ * Box environment carries no trusted-host list.
  *
  * @returns {readonly string[]|null}
  */

@@ -619,7 +619,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 } else {
                     // Recreate through the managed transaction so a manual
                     // restart cannot bypass endpoint, bridge, or ownership
-                    // validation on a stopped or legacy container.
+                    // validation on a stopped container.
                     const containerRunning = isContainerRunning(containerName);
                     const containerPresent = containerRunning || containerExists(containerName) || Boolean(registryRecord?.containerName);
                     if (!containerPresent) {
@@ -717,9 +717,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             }
             break;
         }
-        case 'delete':
-            showHelp();
-            break;
         case 'shutdown': {
             inactivateEdgeRoutingGeneration('cli-workspace-shutdown');
             console.log('[shutdown] Stopping RoutingServer...');

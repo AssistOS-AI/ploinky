@@ -91,7 +91,7 @@ function oldDesired(identity, ownership, repositoryRoot, engine) {
         String(container.labels?.[BOX_DATA_FINGERPRINT_LABELS[key]] || ''),
     ])));
     const agentLib = agentLibContractFromContainer(container);
-    // Legacy Boxes without bind metadata reconstruct as loopback publications.
+    // A Box without bind metadata is the loopback publication.
     const routerBinding = observeContainerRouterBinding(container);
     const desired = {
         identity,

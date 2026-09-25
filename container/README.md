@@ -87,9 +87,7 @@ restart, upgrade, or replacement. The supervisor does not read it as compatible 
 automatically migrate, clean, relabel, adopt, or replace it. Run `ploinky
 destroy` explicitly, then run an ordinary command to recreate the box from
 the validated runtime image while retaining both workspace-backed cache
-directories. Legacy basename-only boxes and volumes are not discoverable
-through the current identity and remain untouched for manual inspection or
-removal.
+directories.
 
 ## Instances, engines, and state
 
@@ -212,8 +210,8 @@ Every Ploinky-owned nested container carries the exact label
 retires only non-running records whose immutable registry ownership is exact,
 or superseded predecessors whose name and stable labels are exact and whose
 immutable ID and complete lifecycle pair were both replaced in the registry.
-It also retires legacy helper records whose only Ploinky label is the
-historical managed marker. Running, paused,
+It also retires stopped one-shot helpers, interrupted before their `--rm`
+cleanup, whose only Ploinky label is the managed marker. Running, paused,
 transitional, partially labelled, ambiguous, and foreign records fail the Box
 self-check without removal. Unlabelled containers, other values or near-name
 labels, nested images, nested named volumes, and retained workspace data remain
@@ -310,34 +308,6 @@ the outer box: nested container records and inner volumes live on its writable
 layer and are discarded with it, so the failure cannot repeat across a
 recreation. The workspace-backed dependency and image caches survive ordinary
 destroy, and `--delete-cache` discards those two directories too.
-
-The path-hashed supervisor does not target a legacy basename-only box. To
-release its ports, identify its owning engine and remove that exact old
-container directly without a volume-cleanup flag:
-
-```bash
-ENGINE=podman # or docker
-LEGACY_INSTANCE=ploinky-box-OLDNAME
-$ENGINE rm -f "$LEGACY_INSTANCE"
-```
-
-For a legacy direct/core cutover, invoke the old checkout's core entry
-directly before installing or invoking the new release:
-
-```sh
-node cli/index.js destroy
-node cli/index.js network prune
-```
-
-Do not use the public `ploinky` wrapper for this step: outside a box it controls
-the outer runtime, not the old core workspace. Inspect and resolve any foreign
-resources rather than adopting them. After confirming no container references
-them, remove only the exact stale `.ploinky/run/router.sock` and
-`.ploinky/run/managed-hosts` paths and the unreferenced cached image
-`docker.io/assistos/ploinky-network-gateway:1@sha256:68c47ce93d16ea1a2d03944f7b50ce82e6f2f9a26b183d2c9c7fbabcc828fb7e`.
-Before activation, revoke the retired publication connector/API tokens and
-delete its plaintext retained state. The current runtime has no migration or cleanup
-reader for it. Do not use a broad container, image, volume, or network prune.
 
 ## Smoke and release ordering
 
