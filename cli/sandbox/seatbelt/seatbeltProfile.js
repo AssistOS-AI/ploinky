@@ -15,7 +15,11 @@ import {
     resolveManifestVolumeHostPath,
 } from '../../utils/runtime/manifestVolumePolicy.js';
 import { protectedControllerStateRoots } from '../../utils/runtime/controllerStateGuards.js';
-import { isPathWithin, projectedCanonicalPath } from '../../utils/runtime/agentDataPathPolicy.js';
+import {
+    AGENT_DATA_POLICY_CODE,
+    isPathWithin,
+    projectedCanonicalPath,
+} from '../../utils/runtime/agentDataPathPolicy.js';
 
 const SEATBELT_PROFILES_DIR = path.join(PLOINKY_DIR, 'seatbelt-profiles');
 
@@ -290,8 +294,16 @@ function normalizePathList(paths) {
 }
 
 // Seatbelt matches the path it resolves, so a rule must name both spellings.
+// A dangling link has no canonical spelling and nothing to write through; its
+// lexical rule still covers the link entry itself.
 function pathAliases(value) {
-    return Array.from(new Set([path.resolve(value), projectedCanonicalPath(value)]));
+    const lexical = path.resolve(value);
+    try {
+        return Array.from(new Set([lexical, projectedCanonicalPath(value)]));
+    } catch (error) {
+        if (error?.code === AGENT_DATA_POLICY_CODE) return [lexical];
+        throw error;
+    }
 }
 
 function pathAncestors(value) {

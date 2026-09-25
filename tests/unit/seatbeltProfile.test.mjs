@@ -502,3 +502,35 @@ test('generated profile keeps writable agent code writable without reopening the
         }
     }
 });
+
+test('buildSeatbeltProfile keeps a dangling protected link lexical and overrides write grants inside the controller root', () => {
+    const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-dangling-')));
+    try {
+        const codeDir = path.join(workspace, '.ploinky', 'repos', 'repo', 'agent');
+        const logsDir = path.join(workspace, '.ploinky', 'logs');
+        fs.mkdirSync(codeDir, { recursive: true });
+        fs.symlinkSync(path.join(workspace, '.ploinky', 'deps', 'store', 'collected', 'node_modules'), path.join(codeDir, 'node_modules'));
+        const profile = buildSeatbeltProfile({
+            agentLibGrant: seatbeltGrantFor(workspace),
+            agentCodePath: codeDir,
+            agentLibPath: path.join(workspace, 'Agent'),
+            nodeModulesDir: path.join(workspace, '.ploinky', 'deps', 'store', 'node_modules'),
+            agentWorkDir: path.join(workspace, '.data', 'agent'),
+            sharedDir: path.join(workspace, '.data', 'shared'),
+            cwd: workspace,
+            skillsPath: null,
+            codeReadOnly: true,
+            skillsReadOnly: true,
+            volumes: {},
+            workspaceRoot: workspace,
+            extraWritePaths: [logsDir],
+        });
+        assert.ok(profile.includes(`(subpath ${JSON.stringify(path.join(codeDir, 'node_modules'))})`));
+        // A caller-supplied write path inside the controller root is granted
+        // first and then overridden by the controller root denial.
+        assert.ok(profile.indexOf(`(allow file-write* (subpath ${JSON.stringify(logsDir)}))`)
+            < profile.indexOf('; Controller root is read-only'));
+    } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    }
+});
