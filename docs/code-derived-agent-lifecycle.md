@@ -110,7 +110,6 @@ The command surface is split between the registry in `cli/services/commandRegist
 | `enable agent <agent> [global|devel <repo>]` | Resolves an agent manifest, writes an enabled-agent record, creates work dirs/symlinks, starts the selected runtime, verifies backend-specific liveness and readiness, and publishes its route through coordinated apply. |
 | `enable sandbox` | Outside a Ploinky box, allows host sandbox runtimes for manifests with `lite-sandbox: true`; inside a box, fails because nested Podman is forced. |
 | `disable agent <agent>` | Removes the enabled-agent record and route in an inactive generation, stops/removes the selected container or sandbox process from a captured record snapshot, commits route removal, removes symlinks, and preserves the work dir. |
-| `disable agents-all` | Removes all selected enabled-agent records and routes in one inactive generation, then tears down their runtime instances from captured record snapshots. |
 | `disable sandbox` | Disables host sandbox runtimes, causing `lite-sandbox` agents to fall back to containers; this is already the forced box state. |
 | `sandbox status|enable|disable` | Reads or changes the host-sandbox toggle outside a box; inside a box, status reports forced nested Podman and enable cannot persist an override. |
 | `start [agent] [8080] [branch flags]` | Ensures repos/agents/dependencies, starts dependency graph services, writes routing, and launches the fixed inner Router watchdog. The public wrapper consumes any selected physical-host port and forwards inner `8080`. |

@@ -398,12 +398,6 @@ function showDetailedHelp(topic, subtopic, subsubtopic, { surface = 'core' } = {
                     syntax: 'disable [agent] <agentName>',
                     description: 'Remove an enabled agent from .ploinky/agents.json, then stop and remove its runtime instance',
                     examples: [ 'disable demo', 'disable agent repoName/demo' ]
-                },
-                'agents-all': {
-                    syntax: 'disable agents-all',
-                    description: 'Disable all enabled agents from .ploinky/agents.json and remove their runtime instances',
-                    examples: [ 'disable agents-all' ],
-                    notes: 'Registry entries are removed before runtime instances are stopped so the watchdog does not restart them.'
                 }
             }
         },
