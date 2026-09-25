@@ -305,6 +305,21 @@ export function acquireNetworkLifecycleLock({
     };
 }
 
+/**
+ * True only when the lock names an owner PID that no longer exists (ESRCH).
+ * Such a lock becomes reclaimable once its stale-owner grace has passed.
+ */
+export function networkLifecycleLockOwnerStopped({ lockPath = LOCK_PATH } = {}) {
+    const pid = Number(readLockOwner(lockPath)?.pid);
+    if (!Number.isSafeInteger(pid) || pid < 1) return false;
+    try {
+        process.kill(pid, 0);
+        return false;
+    } catch (error) {
+        return error?.code === 'ESRCH';
+    }
+}
+
 export function assertNetworkLifecycleCapability(capability, {
     lockPath = LOCK_PATH,
 } = {}) {
@@ -368,6 +383,34 @@ export function withNetworkLifecycleLock(callback, options = {}) {
     }
     lock.release();
     return result;
+}
+
+/**
+ * withNetworkLifecycleLock for a lifecycle step that may follow a killed
+ * owner (an update rollback's stop or start). A lock whose owner no longer
+ * exists is reclaimable only after its stale-owner grace, so only then is the
+ * grace waited out. The owner is re-checked before every retry: a live owner,
+ * including one that took the lock during that wait, fails fast. The callback
+ * runs once.
+ */
+export function withNetworkLifecycleLockReclaimingStoppedOwner(callback, options = {}) {
+    let entered = false;
+    const run = (capability) => {
+        entered = true;
+        return callback(capability);
+    };
+    const deadline = Date.now() + NETWORK_LOCK_STALE_GRACE_MS + 1_000;
+    const pollMs = Math.max(10, Number(options.pollMs || 50));
+    while (true) {
+        try {
+            return withNetworkLifecycleLock(run, { ...options, waitMs: 0 });
+        } catch (error) {
+            if (entered || error?.code !== 'PLOINKY_NETWORK_LIFECYCLE_BUSY'
+                || !networkLifecycleLockOwnerStopped({ lockPath: options.lockPath })
+                || Date.now() >= deadline) throw error;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(pollMs, Math.max(1, deadline - Date.now())));
+        }
+    }
 }
 
 // CLI startup can wait behind another agent's asynchronous readiness work.

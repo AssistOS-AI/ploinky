@@ -24,7 +24,7 @@ import {
   manifestUsesHealthProbeBroker,
   resolvePublishedPortMappings,
 } from '../sandbox/docker/agentServiceManager.js';
-import { removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
+import { inspectExactContainer, removeExactRegisteredContainer } from '../sandbox/docker/containerFleet.js';
 import { isBwrapProcessRunning } from '../sandbox/bwrap/bwrapFleet.js';
 import * as inputState from './inputState.js';
 import { MAX_NO_WAIT_BARRIER_ENTRIES, MAX_NO_WAIT_WAVE_INDEX } from './noWaitWorker.js';
@@ -37,6 +37,7 @@ import {
   exactNoWaitImmutableIdentity,
 } from './noWaitWorkerArgs.js';
 import { retireNoWaitRunMarkers } from './noWaitMarkerLifecycle.js';
+import { acquireSettledWorkspaceMutationLease, inspectLiveNoWaitWorkers } from './noWaitRunSettlement.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
@@ -60,7 +61,14 @@ import {
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
-import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, runWithWorkspaceMutationLease, withMaintenanceLock, withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import {
+  createWorkspaceMutationLease,
+  releaseWorkspaceMutationLease,
+  releaseWorkspaceStartLock,
+  runWithWorkspaceMutationLease,
+  withMaintenanceLock,
+  withWorkspaceMutationLease,
+} from '../utils/runtime/maintenanceLocks.js';
 import {
   issueDependencyRebuildRequest,
   runtimeCarriesRebuildToken,
@@ -92,13 +100,14 @@ import {
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
+  readEdgeRoutingPreparationOwner,
   readEdgeRoutingSelection,
   retireAbandonedAgentPreparation,
   retireAbandonedWorkspaceStartPreparation,
   withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
-import { retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
+import { readRuntimeCandidate, retireRuntimeCandidate } from '../sandbox/runtimeCandidateStore.js';
 import {
   finalizeStartupRoutes,
   partitionAdditionalStartupAgents,
@@ -113,6 +122,7 @@ import {
   NETWORK_LOCK_WAIT_MS,
   withNetworkLifecycleLock,
   withNetworkLifecycleLockAsync,
+  withNetworkLifecycleLockReclaimingStoppedOwner,
 } from '../sandbox/networkLifecycle.js';
 import { networkContractHash } from '../sandbox/networkContract.js';
 import {
@@ -987,15 +997,45 @@ function removeGraphContainerForRecreate(containerName, label, predecessorRecord
   containerExistsImpl = dockerSvc.containerExists,
   getRuntimeImpl = dockerSvc.getRuntime,
   removeExactRegisteredContainerImpl = removeExactRegisteredContainer,
+  readRuntimeCandidateImpl = readRuntimeCandidate,
+  retireRuntimeCandidateImpl = retireRuntimeCandidate,
+  inspectExactContainerImpl = inspectExactContainer,
 } = {}) {
-  if (!containerExistsImpl(containerName)) return { removed: false, state: 'absent' };
+  // A staged predecessor whose launcher never published it (a no-wait worker
+  // that stopped or was superseded) has no registered container ID. Its launch
+  // receipt, or else the container's exact workspace, instance, generation and
+  // launch identity, proves ownership instead, exactly as for a reinstall whose
+  // launcher died before persisting the ID.
+  const unpublished = !/^[a-f0-9]{64}$/.test(String(predecessorRecord?.containerId || ''));
+  if (!containerExistsImpl(containerName)) {
+    // Nothing to remove by name. The launch receipt is the only recovery
+    // evidence, so it is retired only when its own engine positively reports
+    // the exact recorded ID missing. An unavailable engine, a timeout or any
+    // other inspection failure is unknown and leaves the receipt in place.
+    if (unpublished) {
+      try {
+        const receipt = readRuntimeCandidateImpl(containerName, predecessorRecord);
+        if (receipt && inspectExactContainerImpl(receipt.runtime, receipt.containerId) === null) {
+          retireRuntimeCandidateImpl(receipt);
+        }
+      } catch (_) {}
+    }
+    return { removed: false, state: 'absent' };
+  }
   try {
-    const result = removeExactRegisteredContainerImpl(containerName, predecessorRecord, {
-      runtime: getRuntimeImpl(),
-    });
+    const receipt = unpublished ? readRuntimeCandidateImpl(containerName, predecessorRecord) : null;
+    const result = removeExactRegisteredContainerImpl(
+      containerName,
+      receipt ? { ...predecessorRecord, ...receipt.registryRecord } : predecessorRecord,
+      {
+        runtime: getRuntimeImpl(),
+        ...(unpublished && !receipt ? { recoverIncompleteIdentity: true } : {}),
+      },
+    );
     if (result?.removed !== true) {
       throw new Error(`exact predecessor removal returned '${result?.state || 'unknown'}'`);
     }
+    if (receipt) retireRuntimeCandidateImpl(receipt);
     clearLivenessStateImpl(containerName);
     return result;
   } catch (cause) {
@@ -1260,6 +1300,20 @@ export function assertWorkspaceGraphAdmissionsCurrent(admissions) {
   return admissions;
 }
 
+// Match on every immutable field, never on the container name alone: only the
+// exact staged tuple the worker was launched with can let it resume.
+function supersededNoWaitRunFor(runs, containerName, record) {
+  const alias = record?.alias === undefined || record?.alias === null ? '' : record.alias;
+  return (Array.isArray(runs) ? runs : []).find(({ identity } = {}) => (
+    identity?.containerName === containerName
+      && identity.instanceId === record?.instanceId
+      && identity.enableGeneration === record?.enableGeneration
+      && identity.repoName === record?.repoName
+      && identity.shortAgent === record?.agentName
+      && identity.alias === alias
+  )) || null;
+}
+
 function ensureGraphNodesEnabled(graph, reg, {
   prepareAgentEnableBatch = agentsSvc.prepareAgentEnableBatch,
   removeAgentContainerForRecreate = removeGraphContainerForRecreate,
@@ -1275,6 +1329,7 @@ function ensureGraphNodesEnabled(graph, reg, {
   runtimeReplacementOptions,
   executionRecordOptions,
   additionalNodes = [],
+  supersededNoWaitRuns = [],
 } = {}) {
   const nodes = [
     ...Array.from(graph?.nodes?.values?.() || []),
@@ -1306,9 +1361,16 @@ function ensureGraphNodesEnabled(graph, reg, {
     const executionChanged = executionRecordDiffers(existing.rec, expectedExecution);
     const profileChanged = Boolean(node.profile && existing.rec.profile !== node.profile);
     const preliminary = { node, existing, expectedExecution, executionChanged, profileChanged };
-    const runtimeReason = executionChanged || profileChanged
-      ? ''
-      : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+    // A stalled worker of an earlier start still holds this exact staged
+    // identity and would resume under any generation that carries it again, so
+    // the identity always rotates and its unpublished runtime is removed.
+    const superseded = supersededNoWaitRunFor(supersededNoWaitRuns, existing.key, existing.rec);
+    let runtimeReason = '';
+    if (!executionChanged && !profileChanged) {
+      runtimeReason = superseded
+        ? 'noWaitRunSuperseded'
+        : String(runtimeReplacementReason(preliminary, runtimeReplacementOptions) || '');
+    }
     existingPlans.push({
       ...preliminary,
       runtimeReason,
@@ -1994,17 +2056,29 @@ async function startWorkspace(staticAgentArg, portArg, {
   // Only the final post-provider lease may authorize runtime targets.
   resetPreinstallRunInProcess();
   // A previous start may have returned while its no-wait workers are still
-  // activating routes. Serialize with them using the same bounded wait they
-  // use for startup, then revalidate the admitted graph under the lease.
-  const workspaceStartLock = await acquireWorkspaceMutationLease({ operation: 'workspace-start' });
+  // creating and activating runtimes. Wait until none can still make progress
+  // (they need the lease, so the wait holds none), then revalidate the
+  // admitted graph under the lease.
+  const workspaceStartLock = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' });
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
   try {
   // Everything below is this start's own work: nested lifecycle code reuses
-  // this lease, and nothing else in the process can.
-  return await runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+  // this lease, and nothing else in the process can. A rollback start can
+  // follow a killed start at once: wait out only that dead owner's stale
+  // network-lock grace, never a live owner.
+  return await runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
+  // No earlier no-wait worker still alive here can change anything while this
+  // start holds the workspace lease and network lock, and none has published.
+  // Whether a stop or a source change stalled it or it became able to
+  // progress just after the settle, staging rotates its identity.
+  const supersededNoWaitRuns = inspectLiveNoWaitWorkers();
+  if (supersededNoWaitRuns.length) {
+    console.log(`[start] Superseding ${supersededNoWaitRuns.length} live no-wait worker(s) of an earlier start: ${supersededNoWaitRuns
+      .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
+  }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
   const workspaceConfigForAuth = workspaceSvc.getConfig() || {};
   const graphSsoConfig = resolveWorkspaceGraphSsoConfig(lockedStart.graph, workspaceConfigForAuth.sso);
@@ -2170,6 +2244,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     let preparedGraph = ensureGraphNodesEnabled(dependencyGraph, reg, {
       deferredNodeIds: waitClassification.noWait,
       additionalNodes: extraRuntimeNodes,
+      supersededNoWaitRuns,
     });
     workspacePreparationLease = preparedGraph?.preparedGeneration?.preparationLease || null;
     if (preparedGraph?.preparedGeneration?.selector?.state !== 'inactive') {
@@ -2244,6 +2319,7 @@ async function startWorkspace(staticAgentArg, portArg, {
       {
         deferredNodeIds: waitClassification.noWait,
         additionalNodes: extraRuntimeNodes,
+        graphEnableOptions: { supersededNoWaitRuns },
       },
     );
     preparedGraph = postProviderPreparation.preparedGraph;
@@ -2659,23 +2735,90 @@ async function startWorkspace(staticAgentArg, portArg, {
 
 /**
  * Restarts replace the selector and stop the Router and agents before
- * startWorkspace runs. Settle a stopped start's graph preparation first, so an
- * unretirable lease is refused while the running graph is still untouched.
+ * startWorkspace runs. First wait for the previous start's no-wait workers,
+ * whose half-created runtimes the stop could neither see nor remove, then
+ * settle a stopped start's graph preparation under that same lease, so that
+ * either refusal happens while the running graph is still untouched.
  */
-async function retireAbandonedStartPreparationBeforeRestart() {
-  return withWorkspaceMutationLease({ operation: 'workspace-restart' }, (workspaceMutationLease) => (
-    withNetworkLifecycleLock((networkLifecycleCapability) => {
-      const result = retireAbandonedWorkspaceStartPreparation({
-        workspaceRoot: PLOINKY_WORKSPACE_ROOT,
-        workspaceMutationLease,
-        networkLifecycleCapability,
-      });
-      if (result.retired) {
-        console.log(`[restart] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
-      }
-      return result;
-    })
-  ));
+async function settleWorkspaceBeforeRestart() {
+  const workspaceMutationLease = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' });
+  let callbackError = null;
+  try {
+    // Bound as this restart's own lease, like every lease owner without a callback.
+    return runWithWorkspaceMutationLease(workspaceMutationLease, () => (
+      withNetworkLifecycleLockReclaimingStoppedOwner((networkLifecycleCapability) => {
+        const result = retireAbandonedWorkspaceStartPreparation({
+          workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+          workspaceMutationLease,
+          networkLifecycleCapability,
+        });
+        if (result.retired) {
+          console.log(`[restart] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
+        }
+        return result;
+      })
+    ));
+  } catch (error) {
+    callbackError = error;
+    throw error;
+  } finally {
+    if (!releaseWorkspaceMutationLease(workspaceMutationLease)) {
+      const releaseError = new Error("workspace mutation 'workspace-restart' could not release its exact lease");
+      releaseError.code = 'workspace_mutation_lock_release_failed';
+      if (callbackError) callbackError.message += `; ${releaseError.message}`;
+      else throw releaseError;
+    }
+  }
+}
+
+/**
+ * `stop` replaces the selector that binds a killed start's graph preparation,
+ * after which only a stopped Box can retire that lease. Retire it before the
+ * rewrite, on exactly the proof start and restart require, but never at the
+ * cost of the stop: a busy lease or lock, a live owner or any mismatch leaves
+ * the preparation in place and the stop continues.
+ */
+function retireAbandonedStartPreparationBeforeStop({ log = (message) => console.log(message) } = {}) {
+  let owner;
+  try {
+    owner = readEdgeRoutingPreparationOwner({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  } catch (error) {
+    log(`[stop] Could not inspect the routing preparation lease: ${error?.message || error}`);
+    return { retired: false };
+  }
+  if (!owner) return { retired: false };
+  const leftInPlace = (why) => {
+    log(`[stop] Left the routing preparation of pid ${owner.pid} (${owner.reason}) in place: ${why}`);
+    return { retired: false };
+  };
+  let workspaceMutationLease;
+  try {
+    workspaceMutationLease = createWorkspaceMutationLease({ operation: 'workspace-stop' });
+  } catch (error) {
+    return leftInPlace(error?.message || String(error));
+  }
+  try {
+    const retire = (networkLifecycleCapability) => retireAbandonedWorkspaceStartPreparation({
+      workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+      workspaceMutationLease,
+      networkLifecycleCapability,
+    });
+    // A killed start leaves its network lock behind, reclaimable once the
+    // stale-owner grace has passed. Wait out that grace, never a live owner.
+    const result = runWithWorkspaceMutationLease(workspaceMutationLease, () => (
+      withNetworkLifecycleLockReclaimingStoppedOwner(retire)
+    ));
+    if (result.retired) {
+      log(`[stop] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
+    }
+    return result;
+  } catch (error) {
+    return leftInPlace(error?.message || String(error));
+  } finally {
+    let released = false;
+    try { released = releaseWorkspaceMutationLease(workspaceMutationLease); } catch (_) {}
+    if (!released) log('[stop] Could not release the workspace lease taken to inspect the routing preparation.');
+  }
 }
 
 export function admitDirectAgentRuntimeManifest(manifest, {
@@ -3357,7 +3500,8 @@ export {
   resolveAndPersistStartRouterPort,
   resolveGraphNodeExecutionRecord,
   resolveRetainedGraphNodeExecutionRecord,
-  retireAbandonedStartPreparationBeforeRestart,
+  retireAbandonedStartPreparationBeforeStop,
+  settleWorkspaceBeforeRestart,
   waitForRouterReady,
   waitForManifestReadiness,
   waitForReadinessEntries,

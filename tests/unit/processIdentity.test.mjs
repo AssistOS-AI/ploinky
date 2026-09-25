@@ -183,6 +183,26 @@ test('foreign executables, same-basename scripts, missing and unknown flags fail
     }
 });
 
+test('the exact bound run under another executable or worker script path is unproven, never foreign', () => {
+    // A Node upgrade or another install path changes argv[0] or argv[1] of a
+    // worker that is still exactly the bound run.
+    for (const argv of [
+        workerArgv({ executable: '/opt/homebrew/Cellar/node/99.0.0/bin/node' }),
+        workerArgv({ worker: '/other/install/cli/commands/noWaitWorker.js' }),
+    ]) {
+        assert.throws(() => prove(argv), (error) => error.code === 'PROCESS_IDENTITY_UNPROVEN'
+            && error.foreign !== true && /different executable or worker script path/.test(error.message));
+    }
+    // Any other run identity, or no worker arguments at all, is a reused PID.
+    for (const argv of [
+        workerArgv({ executable: '/other/node', instanceId: 'dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee' }),
+        ['/usr/bin/python', '/tmp/unrelated.py'],
+        workerArgv({ instanceId: 'dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee' }),
+    ]) {
+        assert.throws(() => prove(argv), (error) => error.code === 'PROCESS_IDENTITY_UNPROVEN' && error.foreign === true);
+    }
+});
+
 test('duplicate flags fail whether the expected value appears first or last', () => {
     const tokens = workerTokens();
     for (const duplicate of [

@@ -14,7 +14,8 @@ import { runLogCommand } from './logCommands.js';
 import { activeForegroundSignal } from './foregroundCommand.js';
 import {
     startWorkspace,
-    retireAbandonedStartPreparationBeforeRestart,
+    retireAbandonedStartPreparationBeforeStop,
+    settleWorkspaceBeforeRestart,
     runCli,
     runShell,
     reinstallAgent,
@@ -87,7 +88,7 @@ import {
 import { resolvePersistedRouterPort, resolveRouterEndpoint } from '../sandbox/routerPort.js';
 import { runOuterRuntimeShell } from '../sandbox/runtimeShell.js';
 import { createNetworkLifecycleAdapter, withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
-import { inactivateEdgeRoutingGeneration } from '../sandbox/edgeGeneration.js';
+import { inactivateEdgeRoutingGeneration, inactivateEdgeRoutingGenerationForStop } from '../sandbox/edgeGeneration.js';
 
 // Restart acquires the workspace mutation lease before the per-runtime
 // maintenance lock (the same order as reinstall), so dependency preparation
@@ -436,7 +437,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 if (!cfg || !cfg.static || !cfg.static.agent || !cfg.static.port) {
                     throw new Error('restart router: start is not configured. Run: start <staticAgent> <port> first.');
                 }
-                await retireAbandonedStartPreparationBeforeRestart();
+                await settleWorkspaceBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-router-restart');
                 console.log('[restart] Restarting RoutingServer (containers untouched)...');
                 resolvePersistedRouterPort();
@@ -703,7 +704,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                     throw new Error('restart: start is not configured. Run: start <staticAgent> <port>');
                 }
                 resolvePersistedRouterPort();
-                await retireAbandonedStartPreparationBeforeRestart();
+                await settleWorkspaceBeforeRestart();
                 inactivateEdgeRoutingGeneration('cli-workspace-restart');
                 console.log('[restart] Stopping Router and configured agents...');
                 killRouterIfRunning();
@@ -738,7 +739,13 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
                 showHelp(['stop']);
                 break;
             }
-            inactivateEdgeRoutingGeneration('cli-workspace-stop');
+            // Stop is the documented recovery, so this retirement never
+            // refuses it; it only runs before the selector rewrite below.
+            retireAbandonedStartPreparationBeforeStop();
+            const stopSelection = inactivateEdgeRoutingGenerationForStop('cli-workspace-stop');
+            if (stopSelection.preserved) {
+                console.log(`[stop] Kept the inactive routing selector of stopped workspace start pid ${stopSelection.pid}; the next start retires its preparation.`);
+            }
             console.log('[stop] Stopping RoutingServer...');
             killRouterIfRunning();
             console.log('[stop] Stopping configured agent containers...');

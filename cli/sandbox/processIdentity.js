@@ -162,9 +162,12 @@ export function readProcessStartIdentity(pid, {
     return '';
 }
 
-export function processIdentityError(message, { stale = false } = {}) {
+// `foreign` marks a live process whose readable identity is not the bound
+// worker: its PID was reused, so the bound worker itself has stopped.
+export function processIdentityError(message, { stale = false, foreign = false } = {}) {
     const error = new Error(message);
     error.code = stale ? 'PROCESS_IDENTITY_STALE' : 'PROCESS_IDENTITY_UNPROVEN';
+    if (foreign) error.foreign = true;
     return error;
 }
 
@@ -206,24 +209,34 @@ export function proveWorkerProcessIdentity({
 
     const expectedExecutable = String(executablePath || '');
     const expectedWorker = String(workerScriptPath || '');
-    if (!pathApi.isAbsolute(expectedExecutable)
-        || !pathApi.isAbsolute(expectedWorker)
-        || argv[0] !== expectedExecutable
-        || argv[1] !== expectedWorker) {
-        throw processIdentityError(`worker process ${pid} does not run the expected executable and worker script`);
-    }
+    const exactLaunch = pathApi.isAbsolute(expectedExecutable)
+        && pathApi.isAbsolute(expectedWorker)
+        && argv[0] === expectedExecutable
+        && argv[1] === expectedWorker;
 
     let parsed;
     try {
         parsed = parseNoWaitWorkerArgs(argv.slice(2), { runningDir, pathApi });
     } catch (error) {
-        throw processIdentityError(`worker process ${pid} has invalid arguments: ${error.message}`);
+        throw processIdentityError(exactLaunch
+            ? `worker process ${pid} has invalid arguments: ${error.message}`
+            : `worker process ${pid} does not run the expected executable and worker script`, { foreign: true });
     }
     const expected = identity || {};
     if (!NO_WAIT_IMMUTABLE_IDENTITY_FIELDS.every((field) => (
         parsed.identity[field] === expected[field]
     ))) {
-        throw processIdentityError(`worker process ${pid} does not match the bound no-wait run`);
+        throw processIdentityError(exactLaunch
+            ? `worker process ${pid} does not match the bound no-wait run`
+            : `worker process ${pid} does not run the expected executable and worker script`, { foreign: true });
+    }
+    if (!exactLaunch) {
+        // The exact bound run identity under another Node executable or worker
+        // script path (a Node upgrade, another install path) is that run's
+        // worker, not a reused PID: unproven here, never foreign.
+        throw processIdentityError(
+            `worker process ${pid} carries the bound no-wait run under a different executable or worker script path`,
+        );
     }
     return Object.freeze({
         proof: 'structured-argv',

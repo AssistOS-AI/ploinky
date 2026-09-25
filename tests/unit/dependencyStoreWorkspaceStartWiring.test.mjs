@@ -42,6 +42,7 @@ function startFixture(t) {
     // The lease start binds as its operation's own, for nested reuse.
     let boundLease = null;
     const networkCapability = Object.freeze({ tag: 'network-capability' });
+    const stalledNoWaitRuns = [];
     const preparedRecord = Object.freeze({ ...registration(), instanceId: 'prepared-instance', enableGeneration: 'prepared-generation' });
     const staticNode = { id: 'repo/demo', repoName: 'repo', shortAgentName: 'demo', manifestPath, agentPath, isStatic: true };
     const graph = { nodes: new Map([[staticNode.id, staticNode]]), staticNodeId: staticNode.id };
@@ -88,13 +89,14 @@ function startFixture(t) {
         getProfileConfig: () => ({}),
         preflightWorkspaceStartRuntimeCapabilities: () => ({ admissions: ['admitted'], graph, registry, additionalNodes: [] }),
         resetPreinstallRunInProcess: () => {},
-        acquireWorkspaceMutationLease: async (options) => { calls.push(['acquireLease', options.operation]); return workspaceLease; },
+        acquireSettledWorkspaceMutationLease: async (options) => { calls.push(['acquireLease', options.operation]); return workspaceLease; },
+        inspectLiveNoWaitWorkers: () => { calls.push(['inspectStalled']); return stalledNoWaitRuns; },
         releaseWorkspaceStartLock: (lease) => calls.push(['releaseLease', lease === workspaceLease]),
         runWithWorkspaceMutationLease: async (lease, fn) => {
             boundLease = lease;
             try { return await fn(); } finally { boundLease = null; }
         },
-        withNetworkLifecycleLock: async (callback) => callback(networkCapability),
+        withNetworkLifecycleLockReclaimingStoppedOwner: async (callback) => callback(networkCapability),
         assertWorkspaceGraphAdmissionsCurrent: () => {},
         resolveWorkspaceGraphSsoConfig: () => null,
         initializeFreshEdgeRoutingSources: () => {},
@@ -109,13 +111,13 @@ function startFixture(t) {
         resolveStaticRouterContainerName: () => CONTAINER,
         deduplicateAgentRegistry: (value) => ({ ...value }),
         classifyDependencyGraphWaitMode: () => ({ noWait: new Set() }),
-        ensureGraphNodesEnabled: () => {
-            calls.push(['ensureGraphNodesEnabled']);
+        ensureGraphNodesEnabled: (dependencyGraph, reg, options) => {
+            calls.push(['ensureGraphNodesEnabled', options]);
             return { preparedGeneration: { preparationLease: earlyLease, selector: { state: 'inactive' } } };
         },
         applyStartupConfigProvidersForGraph: async () => ({ providers: [], applied: [], warnings: [] }),
-        reprepareGraphAfterStartupProviders: (dependencyGraph, reg, prepared) => {
-            calls.push(['reprepare', prepared.preparedGeneration.preparationLease === earlyLease]);
+        reprepareGraphAfterStartupProviders: (dependencyGraph, reg, prepared, options) => {
+            calls.push(['reprepare', prepared.preparedGeneration.preparationLease === earlyLease, options]);
             return { preparedGraph: { preparedGeneration: { preparationLease: postProviderLease, selector: { state: 'inactive' } } }, preparedContainerNames: [] };
         },
         topologicallyGroupDependencyGraph: () => [[staticNode.id]],
@@ -147,7 +149,7 @@ function startFixture(t) {
         reportDependencyCollection: (value) => value,
         abortEdgeRoutingPreparation: (lease, options) => calls.push(['abortPreparation', lease, options]),
     };
-    return { collaborators, calls, earlyLease, postProviderLease, workspaceLease, networkCapability, preparedRecord, ensureResult, registry: () => registry };
+    return { collaborators, calls, earlyLease, postProviderLease, workspaceLease, networkCapability, preparedRecord, ensureResult, stalledNoWaitRuns, registry: () => registry };
 }
 
 test('workspace start settles an abandoned graph preparation under its leases before replacing the selector', async (t) => {
@@ -160,6 +162,21 @@ test('workspace start settles an abandoned graph preparation under its leases be
     const [, options] = fixture.calls[retireIndex];
     assert.equal(options.workspaceMutationLease, fixture.workspaceLease, 'the exact held workspace start lease authorizes retirement');
     assert.equal(options.networkLifecycleCapability, fixture.networkCapability);
+});
+
+test('workspace start supersedes the stalled no-wait workers it finds under its leases in both graph preparations', async (t) => {
+    const fixture = startFixture(t);
+    const stalled = Object.freeze({ containerName: CONTAINER, runId: '11111111-2222-4333-8444-555555555555', pid: 4242, identity: Object.freeze({ containerName: CONTAINER }) });
+    fixture.stalledNoWaitRuns.push(stalled);
+    await sandbox(fixture.collaborators)('repo/demo', '8080', {});
+    const names = fixture.calls.map(([name]) => name);
+    assert.ok(names.indexOf('inspectStalled') > names.indexOf('acquireLease'), 'stalled workers are read under the settled workspace lease');
+    assert.ok(names.indexOf('inspectStalled') < names.indexOf('retirePreparation'), 'and before any selector or graph mutation');
+    const [, enableOptions] = fixture.calls.find(([name]) => name === 'ensureGraphNodesEnabled');
+    assert.deepEqual(enableOptions.supersededNoWaitRuns, [stalled]);
+    const [, , reprepareOptions] = fixture.calls.find(([name]) => name === 'reprepare');
+    assert.deepEqual(reprepareOptions.graphEnableOptions.supersededNoWaitRuns, [stalled],
+        'the post-provider preparation keeps superseding them');
 });
 
 test('a refused abandoned preparation stops workspace start before any selector, routing or graph mutation', async (t) => {

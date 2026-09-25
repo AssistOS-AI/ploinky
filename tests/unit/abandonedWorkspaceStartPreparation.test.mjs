@@ -18,7 +18,7 @@ const edgeModuleUrl = new URL('../../cli/sandbox/edgeGeneration.js', import.meta
 const edge = await import(edgeModuleUrl);
 const locks = await import('../../cli/utils/runtime/maintenanceLocks.js');
 const network = await import('../../cli/sandbox/networkLifecycle.js');
-const { retireAbandonedStartPreparationBeforeRestart } = await import('../../cli/commands/workspaceUtil.js');
+const { settleWorkspaceBeforeRestart } = await import('../../cli/commands/workspaceUtil.js');
 
 const START_REASON = 'workspace-graph-enable-prelaunch';
 const HOST_RECOVERY = /`ploinky stop`, then run `ploinky start`/;
@@ -261,14 +261,14 @@ test('retirement requires the live workspace lease and network capability', asyn
 test('restart settles a killed start preparation under its own serialized leases', async () => {
     const { paths } = await deadOwnerPreparation();
     const state = snapshot(paths);
-    assert.equal((await retireAbandonedStartPreparationBeforeRestart()).retired, true);
+    assert.equal((await settleWorkspaceBeforeRestart()).retired, true);
     state.assertOnlyLeaseRemoved();
     assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false, 'restart releases its workspace lease before starting');
 
     const drifted = await deadOwnerPreparation();
     edge.inactivateEdgeRoutingGeneration('workspace-start-prepare', { workspaceRoot: workspace });
     const driftedState = snapshot(drifted.paths);
-    await assert.rejects(retireAbandonedStartPreparationBeforeRestart(), { code: 'EDGE_PREPARATION_BUSY', message: HOST_RECOVERY });
+    await assert.rejects(settleWorkspaceBeforeRestart(), { code: 'EDGE_PREPARATION_BUSY', message: HOST_RECOVERY });
     driftedState.assertUnchanged();
     assert.equal(fs.existsSync(locks.WORKSPACE_START_LOCK_PATH), false, 'a refused restart releases its workspace lease');
 });

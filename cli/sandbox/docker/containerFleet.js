@@ -639,6 +639,7 @@ export {
     forceStopContainers,
     getContainerCandidates,
     gracefulStopContainer,
+    inspectExactContainer,
     listAllContainerNames,
     removeExactContainerAndDescriptor,
     stopAndRemove,
