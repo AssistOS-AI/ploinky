@@ -202,16 +202,19 @@ export function inspectInFlightNoWaitWorkers(options = {}) {
 }
 
 /**
- * Live workers of earlier starts that cannot progress now, for example after a
- * stop or a source change. They are not waited for, but they are not gone: if
- * the next generation carried their staged identity again they would resume
- * beside the next start's own launch. The next start supersedes them by
- * rotating that identity; each entry carries the worker's exact identity.
+ * Every live worker of an earlier start, with its exact identity. After the
+ * settle, a start holding the workspace lease and network lock finds only
+ * workers that cannot change anything while it holds them: ones a stop or a
+ * source change stalled, or one that became able to progress just after the
+ * settle's check. None has published, and any of them would resume beside the
+ * start's own launch under a generation that carried its staged identity
+ * again, so the start supersedes them all by rotating that identity.
  */
-export function inspectStalledNoWaitWorkers(options = {}) {
+export function inspectLiveNoWaitWorkers(options = {}) {
     return classifyLiveNoWaitWorkers(options)
-        .filter((worker) => !worker.canProgress)
-        .map(({ containerName, runId, pid, identity }) => Object.freeze({ containerName, runId, pid, identity }));
+        .map(({ containerName, runId, pid, identity, canProgress }) => Object.freeze({
+            containerName, runId, pid, identity, canProgress,
+        }));
 }
 
 function describeWorkers(workers) {

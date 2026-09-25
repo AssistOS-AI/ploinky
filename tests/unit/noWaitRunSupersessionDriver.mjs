@@ -86,7 +86,7 @@ async function run() {
         const settlement = await cli('commands/noWaitRunSettlement.js');
         return {
             inFlight: settlement.inspectInFlightNoWaitWorkers(),
-            stalled: settlement.inspectStalledNoWaitWorkers(),
+            live: settlement.inspectLiveNoWaitWorkers(),
         };
     }
     if (phase === 'next-start') {
@@ -98,7 +98,7 @@ async function run() {
         const { resolveWorkspaceDependencyGraph } = await cli('utils/workspaceDependencyGraph.js');
         const { mergeRoutingConfig } = await cli('server/routingFile.js');
         return underStartLocks('workspace-start', async (networkLifecycleCapability) => {
-            const superseded = argument.supersede === false ? [] : settlement.inspectStalledNoWaitWorkers();
+            const superseded = argument.supersede === false ? [] : settlement.inspectLiveNoWaitWorkers();
             const registry = readJson(agentsFile);
             const graph = resolveWorkspaceDependencyGraph({ staticAgentRef: 'repo/demo', registry });
             let staged;

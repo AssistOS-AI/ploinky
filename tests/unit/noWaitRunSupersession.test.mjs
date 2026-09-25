@@ -140,8 +140,8 @@ async function stalledEarlierWorker(t) {
     changeOtherManifest(w);
     const inspected = w.drive('inspect');
     assert.deepEqual(inspected.inFlight, [], 'a source change stalls it, so a restart does not wait');
-    assert.deepEqual(inspected.stalled.map(({ containerName, pid }) => ({ containerName, pid })),
-        [{ containerName: CONTAINER, pid: worker.child.pid }]);
+    assert.deepEqual(inspected.live.map(({ containerName, pid, canProgress }) => ({ containerName, pid, canProgress })),
+        [{ containerName: CONTAINER, pid: worker.child.pid, canProgress: false }]);
     return { w, worker, firstContainerId: ensured.containerId };
 }
 
@@ -172,12 +172,39 @@ test('the next start supersedes a stalled earlier worker: its runtime is removed
     assert.deepEqual(containers(w), { [next.launchedContainerId]: 'running' }, 'the next start\'s runtime survives');
 });
 
+test('a live earlier worker that became able to progress after the settle is superseded too', async (t) => {
+    // The restart's settle found nothing in flight; before the start took its
+    // network lock a coordinated write made this worker's generation current
+    // again. Under the start's locks it still cannot act, and it must not
+    // resume once they are released.
+    const w = workspace(t);
+    w.drive('setup');
+    const ensured = w.drive('worker-ensure');
+    const worker = await earlierStartWorker(t, w);
+    const inspected = w.drive('inspect');
+    assert.deepEqual(inspected.live.map(({ pid, canProgress }) => ({ pid, canProgress })),
+        [{ pid: worker.child.pid, canProgress: true }]);
+    const callsBefore = w.engine.calls().length;
+    const next = w.drive('next-start', { runtimeCurrent: true });
+    assert.equal(next.staged, true, JSON.stringify(next));
+    assert.deepEqual(next.superseded, [{ containerName: CONTAINER, pid: worker.child.pid }]);
+    assert.notEqual(next.record.instanceId, 'demo-instance');
+    assert.deepEqual(w.engine.calls().slice(callsBefore).filter(([command]) => command === 'rm'),
+        [['rm', '-f', ensured.containerId]]);
+    const released = w.engine.calls().length;
+    worker.release();
+    assert.equal(await worker.exited, 1, worker.output());
+    assert.match(worker.status().error.message, /requires the exact staged registry identity/);
+    assert.deepEqual(w.engine.calls().slice(released).filter(([command]) => DESTRUCTIVE.has(command)), []);
+    assert.deepEqual(containers(w), { [next.launchedContainerId]: 'running' });
+});
+
 test('without a stalled earlier worker the same next start keeps the staged identity', async (t) => {
     const w = workspace(t);
     w.drive('setup');
     w.drive('worker-ensure');
     changeOtherManifest(w);
-    assert.deepEqual(w.drive('inspect'), { inFlight: [], stalled: [] }, 'no earlier worker is alive');
+    assert.deepEqual(w.drive('inspect'), { inFlight: [], live: [] }, 'no earlier worker is alive');
     const next = w.drive('next-start', { runtimeCurrent: true });
     assert.equal(next.staged, true, JSON.stringify(next));
     assert.deepEqual(next.superseded, []);

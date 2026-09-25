@@ -90,7 +90,7 @@ function startFixture(t) {
         preflightWorkspaceStartRuntimeCapabilities: () => ({ admissions: ['admitted'], graph, registry, additionalNodes: [] }),
         resetPreinstallRunInProcess: () => {},
         acquireSettledWorkspaceMutationLease: async (options) => { calls.push(['acquireLease', options.operation]); return workspaceLease; },
-        inspectStalledNoWaitWorkers: () => { calls.push(['inspectStalled']); return stalledNoWaitRuns; },
+        inspectLiveNoWaitWorkers: () => { calls.push(['inspectStalled']); return stalledNoWaitRuns; },
         releaseWorkspaceStartLock: (lease) => calls.push(['releaseLease', lease === workspaceLease]),
         runWithWorkspaceMutationLease: async (lease, fn) => {
             boundLease = lease;

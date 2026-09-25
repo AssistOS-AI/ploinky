@@ -37,7 +37,7 @@ import {
   exactNoWaitImmutableIdentity,
 } from './noWaitWorkerArgs.js';
 import { retireNoWaitRunMarkers } from './noWaitMarkerLifecycle.js';
-import { acquireSettledWorkspaceMutationLease, inspectStalledNoWaitWorkers } from './noWaitRunSettlement.js';
+import { acquireSettledWorkspaceMutationLease, inspectLiveNoWaitWorkers } from './noWaitRunSettlement.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
@@ -2055,12 +2055,13 @@ async function startWorkspace(staticAgentArg, portArg, {
   return await runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLockReclaimingStoppedOwner(async (networkLifecycleCapability) => {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
-  // Earlier no-wait workers still alive here cannot progress (a stop or a
-  // source change stalled them), and cannot while this start holds the
-  // workspace lease and network lock. Staging rotates their identities.
-  const supersededNoWaitRuns = inspectStalledNoWaitWorkers();
+  // No earlier no-wait worker still alive here can change anything while this
+  // start holds the workspace lease and network lock, and none has published.
+  // Whether a stop or a source change stalled it or it became able to
+  // progress just after the settle, staging rotates its identity.
+  const supersededNoWaitRuns = inspectLiveNoWaitWorkers();
   if (supersededNoWaitRuns.length) {
-    console.log(`[start] Superseding ${supersededNoWaitRuns.length} stalled no-wait worker(s) of an earlier start: ${supersededNoWaitRuns
+    console.log(`[start] Superseding ${supersededNoWaitRuns.length} live no-wait worker(s) of an earlier start: ${supersededNoWaitRuns
       .map(({ containerName, pid }) => `${containerName} (${pid ? `pid ${pid}` : 'pid not yet published'})`).join(', ')}`);
   }
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
