@@ -60,7 +60,7 @@ import {
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
-import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, withMaintenanceLock, withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, runWithWorkspaceMutationLease, withMaintenanceLock, withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
 import {
   issueDependencyRebuildRequest,
   runtimeCarriesRebuildToken,
@@ -2000,7 +2000,9 @@ async function startWorkspace(staticAgentArg, portArg, {
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
   try {
-  return await withNetworkLifecycleLock(async (networkLifecycleCapability) => {
+  // Everything below is this start's own work: nested lifecycle code reuses
+  // this lease, and nothing else in the process can.
+  return await runWithWorkspaceMutationLease(workspaceStartLock, () => withNetworkLifecycleLock(async (networkLifecycleCapability) => {
   try {
   assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions);
   const lockedStart = preflightWorkspaceStartRuntimeCapabilities(staticAgentArg);
@@ -2649,7 +2651,7 @@ async function startWorkspace(staticAgentArg, portArg, {
     }
     throw new Error(`start (workspace) failed: ${message}`);
   }
-  });
+  }));
   } finally {
     releaseWorkspaceStartLock(workspaceStartLock);
   }

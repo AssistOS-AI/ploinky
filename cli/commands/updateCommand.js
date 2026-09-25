@@ -3,6 +3,7 @@ import {
     acquireWorkspaceMutationLease,
     assertWorkspaceMutationLease,
     releaseWorkspaceMutationLease,
+    runWithWorkspaceMutationLease,
 } from '../utils/runtime/maintenanceLocks.js';
 import { isInsideBoxRuntime } from '../../agentlib/bootstrap.mjs';
 import { parseUpdateRequest } from './updateRequest.js';
@@ -85,11 +86,15 @@ export async function runUpdateCommand(normalizedOptions = [], {
         try {
             const options = { interactiveSession, agentLibBranchPolicy, command,
                 delegatedWorkspacePloinkyPath: reportRequest?.context?.source?.workspacePloinky?.delegatedBoxRepoPath || null };
-            result = await withUpdateSkillScopes(reportRequest?.context?.source?.skillScopes, async () => {
-                if (request.kind === 'repos') return handlers.updatePloinkyRepos(options);
-                if (request.kind === 'repo') return handlers.updateRepoResult(request.repoName, { command });
-                return handlers.updateAllRepos(request.folderPath || undefined, options);
-            });
+            // Pin refresh and restarts inside the update reuse this lease.
+            result = await runWithWorkspaceMutationLease(lease, () => withUpdateSkillScopes(
+                reportRequest?.context?.source?.skillScopes,
+                async () => {
+                    if (request.kind === 'repos') return handlers.updatePloinkyRepos(options);
+                    if (request.kind === 'repo') return handlers.updateRepoResult(request.repoName, { command });
+                    return handlers.updateAllRepos(request.folderPath || undefined, options);
+                },
+            ));
         } finally {
             if (ownsLease && !releaseWorkspaceMutationLease(lease)) releaseFailed = true;
         }
