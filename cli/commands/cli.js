@@ -850,54 +850,6 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
     }
 }
 
-async function disableAllAgents() {
-    const agentsMap = workspaceSvc.loadAgents();
-    const enabledAgents = Object.entries(agentsMap || {})
-        .filter(([containerName, record]) => containerName !== '_config' && record && record.type === 'agent');
-
-    if (!enabledAgents.length) {
-        console.log('No enabled agents found in this workspace.');
-        return;
-    }
-
-    const summary = {
-        removed: 0,
-        notFound: 0,
-        ambiguous: 0,
-        staticRemoved: 0,
-        unchanged: 0,
-        failed: 0,
-    };
-
-    for (const [containerName] of enabledAgents) {
-        try {
-            const result = await agentsSvc.disableAgent(containerName);
-            switch (result?.status) {
-                case 'removed':
-                    summary.removed += 1;
-                    break;
-                case 'not-found':
-                    summary.notFound += 1;
-                    break;
-                case 'ambiguous':
-                    summary.ambiguous += 1;
-                    break;
-                case 'static-removed':
-                    summary.staticRemoved += 1;
-                    break;
-                default:
-                    summary.unchanged += 1;
-                    break;
-            }
-        } catch (error) {
-            summary.failed += 1;
-            console.error(`- Failed to disable '${containerName}': ${error?.message || error}`);
-        }
-    }
-
-    console.log(`Disable agents-all summary: removed=${summary.removed}, not-found=${summary.notFound}, ambiguous=${summary.ambiguous}, static-removed=${summary.staticRemoved}, unchanged=${summary.unchanged}, failed=${summary.failed}`);
-}
-
 export {
     handleCommand,
     getAgentNames,
