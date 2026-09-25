@@ -646,6 +646,60 @@ export const scenarios = [
         },
     },
     {
+        name: 'a failure whose rollback stops stays pending with both errors and is recovered by the next export',
+        run({ mod, tmp }) {
+            const fixture = crashFixture(mod, tmp);
+            const backups = path.join(fixture.folder, '.agents', '.ploinky-export-backups');
+            const aside = path.join(fixture.base, 'backups-aside');
+            let moved = null;
+            // The rollback cannot reach the backup it must restore: the
+            // backup directory is replaced by a file, so it stops (ENOTDIR).
+            const afterMove = ({ name }) => {
+                moved = name;
+                fs.renameSync(backups, aside);
+                write(backups, 'not a directory\n');
+                throw Object.assign(new Error('injected failure after move'), { code: 'INJECTED' });
+            };
+            assert.throws(() => fixture.run(200, { hooks: { afterMove } }), error => {
+                assert.equal(error.code, 'SKILL_EXPORT_RECOVERY_REQUIRED');
+                assert.equal(error.cause.code, 'INJECTED', 'the original failure is kept');
+                assert.equal(error.rollbackError.code, 'ENOTDIR');
+                assert.match(error.message, /injected failure after move.*ENOTDIR.*remains pending/s);
+                assert.equal(error.skillExportRecovery.status, 'pending');
+                assert.equal(error.skillExportRecovery.transaction, error.transaction);
+                return true;
+            });
+            const state = mod.readSkillExportTransactionState(fixture.folder, { liveness: liveness(300) });
+            assert.equal(state.pending?.phase, 'prepared');
+            assert.deepEqual(state.quarantined, []);
+            fs.rmSync(backups);
+            fs.renameSync(aside, backups);
+            assert.ok(fs.readdirSync(backups).some(entry => entry.startsWith(`${moved}-prior-tx-`)), 'the moved output is retained');
+            assertUserFiles(fixture.folder);
+            const next = fixture.run(300, { dead: [200] });
+            assert.equal(next.recovery.status, 'rolled-back');
+            assert.equal(next.transaction.status, 'committed');
+            assertAfterState(mod, fixture);
+        },
+    },
+    {
+        name: 'a failure before the commit point that rolls back cleanly keeps its error and stays retryable',
+        run({ mod, tmp }) {
+            const fixture = crashFixture(mod, tmp);
+            const afterMove = () => { throw Object.assign(new Error('injected failure after move'), { code: 'INJECTED' }); };
+            assert.throws(() => fixture.run(200, { hooks: { afterMove } }), error => {
+                assert.equal(error.code, 'INJECTED');
+                assert.equal(error.skillExportRecovery.status, 'rolled-back');
+                assert.deepEqual(error.skillExportRecovery.unexpected, []);
+                return true;
+            });
+            assertBeforeState(mod, fixture);
+            assert.equal(mod.readSkillExportTransactionState(fixture.folder, { liveness: liveness(300) }).pending, null);
+            fixture.run(300);
+            assertAfterState(mod, fixture);
+        },
+    },
+    {
         name: 'marketplace install owns only links it creates and removal touches only owned output',
         run({ mod, tmp }) {
             const base = tmp('market');

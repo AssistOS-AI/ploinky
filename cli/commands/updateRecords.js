@@ -86,10 +86,28 @@ function exclusionSummary(outcome) {
     return { status: outcome.status || null, mode: outcome.mode || null, code: outcome.code || null };
 }
 
-// A thrown export whose journal stays pending has not failed: its outputs are
-// between two states until recovery completes, so the record is uncertain.
-function thrownExportOutcome(error) {
-    return error?.code === 'SKILL_EXPORT_RECOVERY_REQUIRED' ? 'uncertain' : 'failed';
+// A thrown export whose journal stays pending, or whose rollback quarantined
+// output it could not restore, has not failed: its outputs need recovery, so
+// the record is uncertain. Only a throw that rolled back cleanly, or that
+// never started a transaction, is failed. The thrown code stays in details.
+function thrownExportFields(error, fallbackCode) {
+    const code = String(error?.code || fallbackCode);
+    const reason = String(error?.message || error);
+    const recovery = error?.skillExportRecovery || null;
+    const status = recovery?.status || null;
+    const details = { errorCode: code, recovery: status ? { status, transaction: recovery.transaction || null } : null };
+    if (code === 'SKILL_EXPORT_RECOVERY_REQUIRED' || status === 'pending') {
+        return { outcome: 'uncertain', code: 'SKILL_EXPORT_RECOVERY_REQUIRED', reason, details };
+    }
+    if (status === 'quarantined') {
+        return {
+            outcome: 'uncertain',
+            code: 'SKILL_EXPORT_RECOVERY_REQUIRED',
+            reason: `${reason}; skill export transaction ${recovery.transaction} was quarantined with output it could not restore. Existing state is preserved for recovery.`,
+            details,
+        };
+    }
+    return { outcome: 'failed', code, reason, details };
 }
 
 export function defaultSkillsRecord(entry) {
@@ -98,12 +116,11 @@ export function defaultSkillsRecord(entry) {
     const id = `${source}->${target}`;
     const base = { phase: 'default-skills', id };
     if (entry.error) {
+        const { details, ...thrown } = thrownExportFields(entry.error, 'default-skills-failed');
         return createOperationRecord({
             ...base,
-            outcome: thrownExportOutcome(entry.error),
-            code: String(entry.error?.code || 'default-skills-failed'),
-            reason: String(entry.error?.message || entry.error),
-            details: { target, source, targetPath: entry.repoPath || null },
+            ...thrown,
+            details: { target, source, targetPath: entry.repoPath || null, ...details },
         });
     }
     if (entry.sourceSkipped) {
@@ -164,12 +181,11 @@ export function defaultSkillsRecord(entry) {
 export function skillsManifestRecord({ folder, manifestPath, label, result = null, error = null }) {
     const base = { phase: 'skills-manifest', id: folder };
     if (error) {
+        const { details, ...thrown } = thrownExportFields(error, 'skills-manifest-failed');
         return createOperationRecord({
             ...base,
-            outcome: thrownExportOutcome(error),
-            code: String(error?.code || 'skills-manifest-failed'),
-            reason: String(error?.message || error),
-            details: { folder, manifestPath, label },
+            ...thrown,
+            details: { folder, manifestPath, label, ...details },
         });
     }
     const exported = result?.managedExport || {};

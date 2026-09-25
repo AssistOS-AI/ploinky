@@ -1518,10 +1518,24 @@ export function publishSkillExports(handle, spec) {
         } catch (error) {
             if (handle.abandoned) throw error;
             // In-process failure before the commit point: roll back now.
-            const unexpected = undoPaths(handle, journal, context);
-            if (unexpected.length) quarantine(handle, journal, unexpected);
-            else finishJournal(handle, journal);
-            error.skillExportRecovery = { status: unexpected.length ? 'quarantined' : 'rolled-back', transaction, unexpected };
+            let unexpected = [];
+            let rollbackError = null;
+            try {
+                unexpected = undoPaths(handle, journal, context);
+                if (unexpected.length) quarantine(handle, journal, unexpected);
+                else finishJournal(handle, journal);
+            } catch (stopped) {
+                if (handle.abandoned) throw stopped;
+                rollbackError = stopped;
+            }
+            // A rollback that stopped with the journal still present leaves
+            // the transaction pending: it needs recovery; it has not failed.
+            if (rollbackError && exists(journalPath(handle))) {
+                throw skillExportError('SKILL_EXPORT_RECOVERY_REQUIRED',
+                    `Skill export transaction ${transaction} failed before its commit point (${error.message}) and its rollback stopped (${rollbackError.message}); it remains pending for recovery.`,
+                    { outcome: 'recovery-required', transaction, cause: error, rollbackError, skillExportRecovery: { status: 'pending', transaction, unexpected } });
+            }
+            error.skillExportRecovery = { status: unexpected.length ? 'quarantined' : 'rolled-back', transaction, unexpected, ...(rollbackError ? { rollbackError } : {}) };
             throw error;
         }
         crashPoint(context, 'after-metadata-journal');
