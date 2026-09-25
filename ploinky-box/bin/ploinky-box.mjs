@@ -450,6 +450,8 @@ const UPDATE_FAILURE_WORDING = Object.freeze({
         + 'recover it from this workspace with `ploinky stop`, then `ploinky start`.',
     'not-started': 'Update did not start in this workspace: its mutation lock could not be acquired, '
         + 'so the workspace graph and its registered repositories were left as they were.',
+    'source-mismatch': 'Update did not start in this workspace: its Box runs another Ploinky checkout, so no '
+        + 'source checkout was pulled and the workspace graph was left as it was.',
 });
 
 function describeRecord(record) {
@@ -588,6 +590,23 @@ async function runHostUpdate({
             + `${shortRevision(accepted.host.before)} to ${shortRevision(accepted.host.after)} before this relaunch.\n`,
         );
     } else if (full) {
+        // A Box that runs another checkout refuses this command under the
+        // lock anyway; refuse before the host self-update pulls this checkout.
+        try {
+            supervisor.assertUpdateSourceMatchesBox?.(identity);
+        } catch (error) {
+            const refused = buildUpdateResult({
+                command: argv,
+                records: [createOperationRecord({
+                    phase: 'activation', id: 'update-transaction', outcome: 'failed', required: true,
+                    code: String(error?.code || 'update-failed'), reason: String(error?.message || error),
+                })],
+            });
+            output.write(`${formatUpdateStatusLine(refused)}\n`);
+            output.write(`${UPDATE_FAILURE_WORDING['source-mismatch']}\n`);
+            onUpdateResult?.({ ...summary, failed: true, error, result: refused });
+            throw error;
+        }
         output.write(`Using Ploinky update folder ${updateScopeRoot}.\n`);
         let hostUpdate;
         try {
