@@ -45,11 +45,17 @@ import {
     prepareAdditiveEdgeRoutingGeneration,
     prepareEdgeRoutingGeneration,
     prepareHostModeCapabilityForInactiveGeneration,
+    readEdgeRoutingSelection,
+    resolveEdgeGenerationPaths,
     withEdgeGenerationApplyLock,
 } from '../sandbox/edgeGeneration.js';
 import { applyEdgeRoutingGeneration } from '../sandbox/coordinatedEdgeApply.js';
 import { resolveManifestStartup } from './runtime/manifestStartup.js';
-import { withNetworkLifecycleLock } from '../sandbox/networkLifecycle.js';
+import {
+    NETWORK_LOCK_WAIT_MS,
+    withNetworkLifecycleLock,
+    withNetworkLifecycleLockAsync,
+} from '../sandbox/networkLifecycle.js';
 import { withHeldOrAcquiredWorkspaceMutationLease } from './runtime/maintenanceLocks.js';
 import {
     admitManifestRuntimeCapabilities,
@@ -925,6 +931,99 @@ function removeDisabledRoutes(routing, disabledRecords) {
     return next;
 }
 
+// Disabling rewrites the registry, routing sources and edge selector, then
+// removes a runtime. Serialize it like every other lifecycle transaction: the
+// workspace mutation lease first (no-wait workers take the network lock only
+// inside it), then a bounded wait for the network lifecycle lock. Both stay
+// held across registry resolution, staging, physical removal and the selector
+// commit, so a disable that waited never writes back a stale registry and its
+// removal and commit inherit the network capability instead of failing fast.
+function withAgentDisableLocks(operation, dependencies, callback) {
+    const withWorkspaceLease = dependencies.withWorkspaceLeaseImpl || withHeldOrAcquiredWorkspaceMutationLease;
+    const withNetworkLock = dependencies.withNetworkLockImpl || withNetworkLifecycleLockAsync;
+    const leaseOptions = dependencies.workspaceLeaseWaitMs === undefined
+        ? { operation }
+        : { operation, waitTimeoutMs: dependencies.workspaceLeaseWaitMs };
+    return withWorkspaceLease(leaseOptions, () => withNetworkLock(
+        () => callback(),
+        { waitMs: dependencies.networkLockWaitMs ?? NETWORK_LOCK_WAIT_MS },
+    ));
+}
+
+// The edge generation digest covers the raw registry and routing bytes, so a
+// rollback restores exactly what was read; re-serialized objects could select
+// a different generation than the one this disable inactivated.
+function snapshotDisableSources() {
+    const paths = resolveEdgeGenerationPaths();
+    const capture = (file) => {
+        try {
+            return { bytes: fs.readFileSync(file), mode: fs.statSync(file).mode & 0o777 };
+        } catch (error) {
+            if (error?.code === 'ENOENT') return null;
+            throw error;
+        }
+    };
+    let selector = null;
+    try { selector = readEdgeRoutingSelection().selector; } catch (_) {}
+    return {
+        selector,
+        files: [paths.agentsFile, paths.routingFile].map((file) => [file, capture(file)]),
+    };
+}
+
+function restoreDisableSources(snapshot) {
+    for (const [file, saved] of snapshot?.files || []) {
+        if (!saved) {
+            fs.rmSync(file, { force: true });
+            continue;
+        }
+        const temporary = `${file}.${process.pid}.${Date.now()}.restore.tmp`;
+        fs.writeFileSync(temporary, saved.bytes, { mode: saved.mode });
+        fs.renameSync(temporary, file);
+    }
+}
+
+// Runtime removal was refused before any runtime was signalled or removed, so
+// the disable did not happen. Restore the exact registry and routing bytes and,
+// when this disable inactivated an active generation, reactivate exactly that
+// generation. Anything that cannot be proven identical stays inactive.
+function rollBackRefusedAgentDisable(prepared, snapshot, refusal, {
+    message,
+    reason,
+    withApplyLock = withEdgeGenerationApplyLock,
+    abortPreparation = abortEdgeRoutingPreparation,
+    applyGeneration = applyEdgeRoutingGeneration,
+    inactivateGeneration = inactivateEdgeRoutingGeneration,
+    restoreSourcesImpl = restoreDisableSources,
+} = {}) {
+    let restored = false;
+    let outcome;
+    try {
+        withApplyLock((applyLockCapability) => {
+            abortPreparation(prepared?.preparationLease, { reason, applyLockCapability });
+            restoreSourcesImpl(snapshot);
+            restored = true;
+        }, { preparationLease: prepared?.preparationLease });
+        const prior = snapshot?.selector;
+        if (prior?.state === 'active' && prior.generation) {
+            applyGeneration({ reason, expectedGeneration: prior.generation });
+            outcome = 'its registration and routing were restored';
+        } else {
+            outcome = 'its registration and routing were restored; the routing generation was not active before this disable and stays inactive';
+        }
+    } catch (restoreError) {
+        try { inactivateGeneration(`${reason}-failed`, { preserveSelectedGeneration: true }); } catch (_) {}
+        try { abortPreparation(prepared?.preparationLease, { reason: `${reason}-failed` }); } catch (_) {}
+        outcome = restored
+            ? `its registration and routing were restored, but the prior routing generation could not be reactivated (${restoreError?.message || restoreError}); routing stays inactive`
+            : `restoring its prior registration failed (${restoreError?.message || restoreError}); routing stays inactive`;
+    }
+    const error = new Error(`${message}: runtime removal was refused before the runtime was touched (${refusal?.message || refusal}); ${outcome}`);
+    error.code = 'PLOINKY_AGENT_DISABLE_REFUSED';
+    error.cause = refusal;
+    return error;
+}
+
 function stageAgentDisableGeneration(map, disabledRecords, {
     reason,
     inactivateGeneration = inactivateEdgeRoutingGeneration,
@@ -989,8 +1088,10 @@ function removeDisabledRuntimes(disabledRecords, {
 } = {}) {
     const containerTargets = [];
     const containerRecords = {};
+    let sandboxSignalled = false;
     for (const { containerName, record } of disabledRecords) {
         if (isSandboxRuntimeImpl(record?.runtime)) {
+            sandboxSignalled = true;
             stopSandboxImpl(containerName);
             if (sandboxRunningImpl(containerName)) {
                 throw new Error(`sandbox runtime '${containerName}' is still running`);
@@ -1000,14 +1101,30 @@ function removeDisabledRuntimes(disabledRecords, {
             containerRecords[containerName] = record;
         }
     }
+    const preserved = new Map();
+    const onPreserved = (entry) => { preserved.set(entry.name, entry); };
+    let removed = [];
     if (containerTargets.length === 1) {
-        stopAndRemoveImpl(containerTargets[0], { records: containerRecords });
+        removed = stopAndRemoveImpl(containerTargets[0], { records: containerRecords, onPreserved }) || [];
     } else if (containerTargets.length > 1) {
-        stopAndRemoveManyImpl(containerTargets, { records: containerRecords });
+        removed = stopAndRemoveManyImpl(containerTargets, { records: containerRecords, onPreserved }) || [];
     }
     const retained = containerTargets.filter((containerName) => containerExistsImpl(containerName));
     if (retained.length) {
-        throw new Error(`runtime removal left existing container(s): ${retained.join(', ')}`);
+        const reasons = retained
+            .filter((containerName) => preserved.has(containerName))
+            .map((containerName) => `${containerName}: ${preserved.get(containerName).error?.message || 'preserved'}`);
+        const error = new Error(`runtime removal left existing container(s): ${retained.join(', ')}`
+            + (reasons.length ? ` (${reasons.join('; ')})` : ''));
+        // Untouched only on positive evidence: nothing was signalled or
+        // removed, and every retained runtime was refused before its first
+        // signal. Anything else leaves uncertain runtime state and fails closed.
+        if (!sandboxSignalled && removed.length === 0
+            && [...preserved.values()].every((entry) => entry.runtimeTouched === false)
+            && retained.every((containerName) => preserved.get(containerName)?.runtimeTouched === false)) {
+            error.runtimeUntouched = true;
+        }
+        throw error;
     }
 }
 
@@ -1106,7 +1223,7 @@ function removeUnusedAgentSourceLinks(record, remaining) {
     }
 }
 
-export function disableAgent(agentRef, dependencies = {}) {
+export async function disableAgent(agentRef, dependencies = {}) {
     const input = typeof agentRef === 'string' ? agentRef.trim() : '';
     if (!input) {
         throw new Error("disable agent: missing agent name. Usage: disable <agentName>");
@@ -1124,10 +1241,18 @@ export function disableAgent(agentRef, dependencies = {}) {
         [targetRepo, targetAgent] = parts;
     }
 
+    return withAgentDisableLocks('agent-disable', dependencies, () => disableAgentLocked(
+        { input, hasNamespace, targetRepo, targetAgent },
+        dependencies,
+    ));
+}
+
+function disableAgentLocked({ input, hasNamespace, targetRepo, targetAgent }, dependencies) {
     const loadAgentsImpl = dependencies.loadAgentsImpl || loadAgents;
     const applyGeneration = dependencies.applyGeneration || applyEdgeRoutingGeneration;
     const inactivateGeneration = dependencies.inactivateGeneration || inactivateEdgeRoutingGeneration;
     const abortPreparation = dependencies.abortPreparation || abortEdgeRoutingPreparation;
+    const snapshotSources = dependencies.snapshotSourcesImpl || snapshotDisableSources;
     const map = loadAgentsImpl();
     const config = (map && typeof map._config === 'object') ? map._config : null;
     const staticRegistration = configuredStaticRegistration(map, config, dependencies.readRoutingImpl);
@@ -1206,6 +1331,7 @@ export function disableAgent(agentRef, dependencies = {}) {
                     repoName: targetRepo || '',
                 },
             }] : [];
+            const sourceSnapshot = snapshotSources();
             const prepared = stageAgentDisableGeneration(map, disabledStaticRecords, {
                 ...dependencies,
                 inactivateGeneration,
@@ -1214,6 +1340,16 @@ export function disableAgent(agentRef, dependencies = {}) {
             try {
                 removeDisabledRuntimes(disabledStaticRecords, dependencies);
             } catch (error) {
+                if (error?.runtimeUntouched === true) {
+                    throw rollBackRefusedAgentDisable(prepared, sourceSnapshot, error, {
+                        ...dependencies,
+                        applyGeneration,
+                        inactivateGeneration,
+                        abortPreparation,
+                        message: `disable agent: static runtime '${staticContainer}' was not disabled`,
+                        reason: 'agent-disable-static-runtime-removal-refused',
+                    });
+                }
                 try {
                     inactivateGeneration('agent-disable-static-runtime-removal-failed', {
                         preserveSelectedGeneration: true,
@@ -1263,6 +1399,7 @@ export function disableAgent(agentRef, dependencies = {}) {
     });
 
     const disabledRecords = [{ containerName, record }];
+    const sourceSnapshot = snapshotSources();
     const prepared = stageAgentDisableGeneration(map, disabledRecords, {
         ...dependencies,
         inactivateGeneration,
@@ -1271,6 +1408,16 @@ export function disableAgent(agentRef, dependencies = {}) {
     try {
         removeDisabledRuntimes(disabledRecords, dependencies);
     } catch (error) {
+        if (error?.runtimeUntouched === true) {
+            throw rollBackRefusedAgentDisable(prepared, sourceSnapshot, error, {
+                ...dependencies,
+                applyGeneration,
+                inactivateGeneration,
+                abortPreparation,
+                message: `disable agent: '${containerName}' was not disabled`,
+                reason: 'agent-disable-runtime-removal-refused',
+            });
+        }
         try {
             inactivateGeneration('agent-disable-runtime-removal-failed', {
                 preserveSelectedGeneration: true,
@@ -1305,12 +1452,19 @@ export function disableAgent(agentRef, dependencies = {}) {
     };
 }
 
-export function disableAgentContainers(containerNames = [], dependencies = {}) {
+export async function disableAgentContainers(containerNames = [], dependencies = {}) {
     const targets = Array.from(new Set((containerNames || [])
         .map(name => String(name || '').trim())
         .filter(Boolean)));
     if (!targets.length) return [];
 
+    return withAgentDisableLocks('agent-disable-batch', dependencies, () => disableAgentContainersLocked(
+        targets,
+        dependencies,
+    ));
+}
+
+function disableAgentContainersLocked(targets, dependencies) {
     const loadAgentsImpl = dependencies.loadAgentsImpl || loadAgents;
     const applyGeneration = dependencies.applyGeneration || applyEdgeRoutingGeneration;
     const inactivateGeneration = dependencies.inactivateGeneration || inactivateEdgeRoutingGeneration;
@@ -1377,6 +1531,7 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
 
     if (!disabledRuntimeRecords.length) return disabled;
     const disabledRecords = disabledRuntimeRecords;
+    const sourceSnapshot = (dependencies.snapshotSourcesImpl || snapshotDisableSources)();
     const prepared = stageAgentDisableGeneration(map, disabledRecords, {
         ...dependencies,
         inactivateGeneration,
@@ -1385,6 +1540,16 @@ export function disableAgentContainers(containerNames = [], dependencies = {}) {
     try {
         removeDisabledRuntimes(disabledRecords, dependencies);
     } catch (error) {
+        if (error?.runtimeUntouched === true) {
+            throw rollBackRefusedAgentDisable(prepared, sourceSnapshot, error, {
+                ...dependencies,
+                applyGeneration,
+                inactivateGeneration,
+                abortPreparation,
+                message: 'disable agents: no container was disabled',
+                reason: 'agent-disable-batch-runtime-removal-refused',
+            });
+        }
         try {
             inactivateGeneration('agent-disable-batch-runtime-removal-failed', {
                 preserveSelectedGeneration: true,

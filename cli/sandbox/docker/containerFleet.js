@@ -202,7 +202,22 @@ function controlSucceeded(result) {
     return !result?.error && result?.status === 0;
 }
 
-function removeExactContainerAndDescriptor(name, record, runtime, {
+// A refusal raised before the first relay retirement, signal, or removal is
+// marked `runtimeUntouched`, so a caller that staged registry changes can roll
+// them back. Any other failure stays unmarked and must be treated as touched.
+function removeExactContainerAndDescriptor(name, record, runtime, options = {}) {
+    const progress = { runtimeTouched: false };
+    try {
+        return removeExactContainerAndDescriptorOnce(name, record, runtime, options, progress);
+    } catch (error) {
+        if (!progress.runtimeTouched && error && typeof error === 'object') {
+            error.runtimeUntouched = true;
+        }
+        throw error;
+    }
+}
+
+function removeExactContainerAndDescriptorOnce(name, record, runtime, {
     fast = false,
     remove = true,
     inspect = inspectExactContainer,
@@ -214,7 +229,7 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
     retireRelay = retireRuntimeRelaySocket,
     recoverIncompleteIdentity = false,
     onRecoveredIdentity = null,
-} = {}) {
+} = {}, progress) {
     let expectedId = String(record?.containerId || '').trim();
     const incompleteId = !IMMUTABLE_CONTAINER_ID.test(expectedId);
     if (incompleteId && !recoverIncompleteIdentity) {
@@ -314,6 +329,7 @@ function removeExactContainerAndDescriptor(name, record, runtime, {
         }
 
         try {
+            progress.runtimeTouched = true;
             if (inspected?.State?.Running === true) {
                 // Retire the projected pathname while the producer is still alive.
                 // On macOS nested Podman, metadata and unlink can both become
@@ -500,8 +516,13 @@ function stopConfiguredAgents({ fast = false } = {}) {
     return [...bwrapStopped, ...stoppedContainers];
 }
 
-function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
+// `onPreserved` receives every container left in place. `runtimeTouched` is
+// false only when the refusal provably happened before any signal or removal.
+function stopAndRemoveMany(names, { fast = false, records = null, onPreserved = null } = {}) {
     if (!Array.isArray(names) || !names.length) return [];
+    const preserve = (name, error, runtimeTouched) => {
+        if (typeof onPreserved === 'function') onPreserved({ name, error, runtimeTouched });
+    };
 
     const agents = {
         ...(loadAgents() || {}),
@@ -534,6 +555,7 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
         const record = agents?.[name];
         if (!record) {
             console.log(`${prefix} Preserved ${name}: no exact registry record.`);
+            preserve(name, new Error('no exact registry record'), false);
             continue;
         }
         try {
@@ -549,6 +571,7 @@ function stopAndRemoveMany(names, { fast = false, records = null } = {}) {
             }
         } catch (error) {
             console.log(`${prefix} Preserved ${name}: ${error?.message || error}`);
+            preserve(name, error, error?.runtimeUntouched !== true);
         }
     }
 

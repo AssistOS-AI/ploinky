@@ -256,7 +256,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             break;
         case 'remove':
         case 'uninstall':
-            uninstallRepo(parseUninstallRepoTarget(options));
+            await uninstallRepo(parseUninstallRepoTarget(options));
             break;
         case 'vars':
             handleVarsCommand();
@@ -344,7 +344,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
             }
 
             try {
-                const result = agentsSvc.disableAgent(target);
+                const result = await agentsSvc.disableAgent(target);
                 switch (result.status) {
                     case 'removed':
                         console.log(`✓ Agent '${result.shortAgentName}' from repo '${result.repoName}' disabled.`);
@@ -850,7 +850,7 @@ async function dispatchCommand(args, { agentLibBranchPolicy = null } = {}) {
     }
 }
 
-function disableAllAgents() {
+async function disableAllAgents() {
     const agentsMap = workspaceSvc.loadAgents();
     const enabledAgents = Object.entries(agentsMap || {})
         .filter(([containerName, record]) => containerName !== '_config' && record && record.type === 'agent');
@@ -871,7 +871,7 @@ function disableAllAgents() {
 
     for (const [containerName] of enabledAgents) {
         try {
-            const result = agentsSvc.disableAgent(containerName);
+            const result = await agentsSvc.disableAgent(containerName);
             switch (result?.status) {
                 case 'removed':
                     summary.removed += 1;

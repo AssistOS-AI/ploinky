@@ -227,7 +227,7 @@ export async function enableMarketplaceAgent(body, {
     return { ref, mode, result };
 }
 
-function disableMarketplaceAgentsForRepo(repoName) {
+async function disableMarketplaceAgentsForRepo(repoName) {
     const targetRepo = String(repoName || '').trim();
     if (!targetRepo) return [];
     const containerNames = Object.entries(workspaceSvc.loadAgents())
@@ -637,7 +637,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
             if (action === 'uninstall_repo') {
                 const target = String(body?.target || body?.name || '').trim();
                 const repoName = reposSvc.resolveInstalledRepoTarget(target);
-                const disabledAgents = disableMarketplaceAgentsForRepo(repoName);
+                const disabledAgents = await disableMarketplaceAgentsForRepo(repoName);
                 const result = {
                     ...reposSvc.uninstallRepo(repoName, { stdio: 'pipe' }),
                     disabledAgents
@@ -664,7 +664,7 @@ export async function handleMarketplaceRoutes(req, res, parsedUrl, {
 
             if (action === 'disable_agent') {
                 const ref = normalizeMarketplaceAgentRef(body?.agentRef);
-                const result = agentsSvc.disableAgent(ref);
+                const result = await agentsSvc.disableAgent(ref);
                 if (result?.status && result.status !== 'removed' && result.status !== 'static-removed') {
                     sendMarketplaceError(res, 409, 'agent_disable_blocked', result.status);
                     return true;

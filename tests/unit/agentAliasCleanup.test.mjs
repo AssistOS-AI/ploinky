@@ -75,11 +75,11 @@ function linksPreserved(f) {
     }
 }
 
-test('single alias disable preserves both shared source lookups and the configured primary', () => {
+test('single alias disable preserves both shared source lookups and the configured primary', async () => {
     const f = fixture({ staticAgent: true });
     f.registry()._config.static.agent = f.agentName;
     const primary = structuredClone(f.registry().primary), config = structuredClone(f.registry()._config);
-    assert.equal(disableAgent('alias-a', f.dependencies).status, 'removed');
+    assert.equal((await disableAgent('alias-a', f.dependencies)).status, 'removed');
     linksPreserved(f);
     assert.deepEqual(f.registry().primary, primary);
     assert.deepEqual(f.registry()._config, config);
@@ -87,23 +87,23 @@ test('single alias disable preserves both shared source lookups and the configur
     assert.deepEqual(f.removed, ['alias_a']);
 });
 
-test('disabling the exact primary clears static selection while surviving aliases retain their lookups', () => {
+test('disabling the exact primary clears static selection while surviving aliases retain their lookups', async () => {
     const f = fixture({ staticAgent: true });
     f.registry()._config.static.agent = f.agentName;
-    disableAgent('primary', f.dependencies);
+    await disableAgent('primary', f.dependencies);
     assert.deepEqual(f.registry()._config, { preserved: true });
     assert.ok(f.registry().alias_a && f.registry().alias_b);
     linksPreserved(f);
 });
 
-test('batch alias disable preserves the primary lookups; disabling the final owner removes only its links', () => {
+test('batch alias disable preserves the primary lookups; disabling the final owner removes only its links', async () => {
     const f = fixture({ staticAgent: true });
     const config = structuredClone(f.registry()._config);
-    disableAgentContainers(['alias_a', 'alias_b'], f.dependencies);
+    await disableAgentContainers(['alias_a', 'alias_b'], f.dependencies);
     linksPreserved(f);
     assert.deepEqual(f.registry()._config, config);
     assert.ok(f.registry().primary);
-    assert.equal(disableAgent('primary', f.dependencies).status, 'removed');
+    assert.equal((await disableAgent('primary', f.dependencies)).status, 'removed');
     assert.deepEqual(f.registry()._config, { preserved: true });
     for (const link of f.links) {
         assert.equal(fs.lstatSync(link.path, { throwIfNoEntry: false }), undefined);
@@ -111,44 +111,44 @@ test('batch alias disable preserves the primary lookups; disabling the final own
     }
 });
 
-test('last owner cleanup does not remove another repository same-name lookup', () => {
+test('last owner cleanup does not remove another repository same-name lookup', async () => {
     const f = fixture({ otherRepo: true, linkOwner: 'two' });
-    disableAgentContainers(['alias_a', 'alias_b'], f.dependencies);
+    await disableAgentContainers(['alias_a', 'alias_b'], f.dependencies);
     linksPreserved(f);
     assert.equal(f.registry().primary.repoName, f.two);
 });
 
-test('an unrelated same-name registration does not retain a removed source owned lookup', () => {
+test('an unrelated same-name registration does not retain a removed source owned lookup', async () => {
     const f = fixture({ otherRepo: true, linkOwner: 'one' });
-    disableAgentContainers(['alias_a', 'alias_b'], f.dependencies);
+    await disableAgentContainers(['alias_a', 'alias_b'], f.dependencies);
     assert.equal(f.registry().primary.repoName, f.two);
     for (const link of f.links) assert.equal(fs.lstatSync(link.path, { throwIfNoEntry: false }), undefined);
 });
 
-test('a registered repository alias of the same physical source retains the shared lookups', () => {
+test('a registered repository alias of the same physical source retains the shared lookups', async () => {
     const f = fixture({ otherRepo: true, linkOwner: 'one' });
     const aliasRoot = path.dirname(f.source(f.two));
     fs.rmSync(aliasRoot, { recursive: true });
     fs.symlinkSync(path.dirname(f.source(f.one)), aliasRoot);
-    disableAgentContainers(['alias_a', 'alias_b'], f.dependencies);
+    await disableAgentContainers(['alias_a', 'alias_b'], f.dependencies);
     linksPreserved(f);
 });
 
-test('an explicitly selected static alias is cleared only when that registration is disabled', () => {
+test('an explicitly selected static alias is cleared only when that registration is disabled', async () => {
     const f = fixture({ staticAgent: true, selectedAlias: true });
-    disableAgent('alias-b', f.dependencies);
+    await disableAgent('alias-b', f.dependencies);
     assert.equal(f.registry()._config.static.agent, 'alias-a');
-    disableAgentContainers(['alias_a'], f.dependencies);
+    await disableAgentContainers(['alias_a'], f.dependencies);
     assert.deepEqual(f.registry()._config, { preserved: true });
     linksPreserved(f);
 });
 
-test('removing aliases does not clear a configured ordinary primary that is currently stopped and unregistered', () => {
+test('removing aliases does not clear a configured ordinary primary that is currently stopped and unregistered', async () => {
     const f = fixture({ staticAgent: true });
     delete f.registry().primary;
     const selection = structuredClone(f.registry()._config.static);
-    disableAgent('alias-b', f.dependencies);
-    disableAgent('alias-a', f.dependencies);
+    await disableAgent('alias-b', f.dependencies);
+    await disableAgent('alias-a', f.dependencies);
     assert.deepEqual(f.registry()._config.static, selection);
 });
 
@@ -165,10 +165,10 @@ function normalizedStaticAliasFixture() {
 }
 
 for (const mode of ['single', 'batch']) {
-    test(`${mode} disable clears a normalized static alias selected by normal workspace start`, () => {
+    test(`${mode} disable clears a normalized static alias selected by normal workspace start`, async () => {
         const f = normalizedStaticAliasFixture();
-        if (mode === 'single') disableAgent('alias-a', f.dependencies);
-        else disableAgentContainers(['alias_a'], f.dependencies);
+        if (mode === 'single') await disableAgent('alias-a', f.dependencies);
+        else await disableAgentContainers(['alias_a'], f.dependencies);
         assert.deepEqual(f.registry()._config, { preserved: true });
         assert.equal(f.routing().static, undefined);
         assert.equal(f.registry().alias_a, undefined);
@@ -176,12 +176,12 @@ for (const mode of ['single', 'batch']) {
     });
 
     for (const target of ['primary', 'alias_a']) {
-        test(`${mode} disable attributes normalized static selection to its routed alias after enabling a primary: ${target}`, () => {
+        test(`${mode} disable attributes normalized static selection to its routed alias after enabling a primary: ${target}`, async () => {
             const f = fixture({ staticAgent: true });
             f.routing().static = { agent: `${f.one}/${f.agentName}`, container: 'alias_a' };
             const selection = structuredClone(f.registry()._config.static);
-            if (mode === 'single') disableAgent(target, f.dependencies);
-            else disableAgentContainers([target], f.dependencies);
+            if (mode === 'single') await disableAgent(target, f.dependencies);
+            else await disableAgentContainers([target], f.dependencies);
             if (target === 'primary') {
                 assert.deepEqual(f.registry()._config.static, selection);
                 assert.equal(f.routing().static.container, 'alias_a');
@@ -204,11 +204,11 @@ for (const [name, alter] of [
     ['stale route container', f => { f.routing().routes['alias-a'].container = 'old_alias_a'; }],
     ['missing route', f => { delete f.routing().routes['alias-a']; }],
 ]) {
-    test(`a ${name} cannot attribute a configured primary to an alias`, () => {
+    test(`a ${name} cannot attribute a configured primary to an alias`, async () => {
         const f = normalizedStaticAliasFixture();
         alter(f);
         const selection = structuredClone(f.registry()._config.static);
-        disableAgent('alias-a', f.dependencies);
+        await disableAgent('alias-a', f.dependencies);
         assert.deepEqual(f.registry()._config.static, selection);
     });
 }

@@ -546,14 +546,14 @@ function disableRepo(repoName) {
     return result;
 }
 
-function uninstallRepo(target) {
+async function uninstallRepo(target) {
     if (!target) throw new Error('Usage: uninstall repo <name|url>');
     const repoName = reposSvc.resolveInstalledRepoTarget(target);
     const agents = workspaceSvc.loadAgents();
     const containerNames = Object.entries(agents || {})
         .filter(([, record]) => record && record.type === 'agent' && record.repoName === repoName && record.agentName)
         .map(([containerName]) => containerName);
-    const disabledAgents = agentsSvc.disableAgentContainers(containerNames);
+    const disabledAgents = await agentsSvc.disableAgentContainers(containerNames);
     const result = reposSvc.uninstallRepo(repoName);
     console.log(`✓ Repository '${repoName}' uninstalled.`);
     return { ...result, disabledAgents };
