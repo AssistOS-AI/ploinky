@@ -160,15 +160,19 @@ export function assertManifestVolumeStoragePolicy(source, {
     const resolvedSource = path.isAbsolute(String(source))
         ? path.resolve(String(source))
         : path.resolve(root, String(source));
+    // The whole controller root is off limits to manifest volumes: it holds
+    // Router and edge state, the dependency store, the registry and secrets.
+    // Agent data lives under `.data`; a broad workspace volume still reaches
+    // the root only through the read-only controller guards.
     const protectedRoots = [
-        path.join(root, '.ploinky', 'data'),
+        path.join(root, '.ploinky'),
     ];
     const canonicalSource = projectedCanonicalPath(resolvedSource);
     for (const protectedRoot of protectedRoots) {
         const canonicalProtected = canonicalProtectedPath(protectedRoot);
         if (isPathWithin(resolvedSource, protectedRoot)
             || isPathWithin(canonicalSource, canonicalProtected)) {
-            throw policyError(`manifest volume source '${source}' targets protected controller state`, {
+            throw policyError(`manifest volume source '${source}' targets the protected controller root`, {
                 source: String(source),
                 resolvedSource,
                 protectedRoot,

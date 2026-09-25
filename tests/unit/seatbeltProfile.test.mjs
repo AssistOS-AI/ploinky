@@ -65,7 +65,7 @@ test('buildSeatbeltProfile grants root and parent literals for scoped paths', ()
         codeReadOnly: false,
         skillsReadOnly: true,
         volumes: {
-            '.ploinky/repos/webassist/data': '/data',
+            '.data/webassist/data': '/data',
             'workspace-data/uploads': '/uploads',
         },
         workspaceRoot: '/Users/alice/workspace',
@@ -81,7 +81,7 @@ test('buildSeatbeltProfile grants root and parent literals for scoped paths', ()
     assert.ok(profile.includes('(subpath "/opt/homebrew")'));
     assert.ok(profile.includes('(subpath "/Users/alice/workspace/.ploinky/logs")'));
     assert.ok(profile.includes('(allow file-write* (subpath "/Users/alice/workspace/.ploinky/logs"))'));
-    assert.ok(profile.includes('(subpath "/Users/alice/workspace/.ploinky/repos/webassist/data")'));
+    assert.ok(profile.includes('(subpath "/Users/alice/workspace/.data/webassist/data")'));
     assert.ok(profile.includes('(subpath "/Users/alice/workspace/workspace-data/uploads")'));
     assert.ok(profile.includes('(allow file-write* (subpath "/Users/alice/workspace/workspace-data/uploads"))'));
 });

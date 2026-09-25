@@ -120,25 +120,39 @@ test('manifest data paths are revalidated after creation and before reuse after 
     }
 });
 
-test('manifest policy rejects lexical, absolute, normalized, and symlinked controller state roots', () => {
+test('manifest policy rejects every lexical, absolute, normalized, and symlinked controller-root source', () => {
     const { root, cleanup } = fixture();
     try {
         fs.mkdirSync(path.join(root, '.ploinky', 'data', 'secret'), { recursive: true });
+        fs.mkdirSync(path.join(root, '.ploinky', 'deps', 'store', 'objects'), { recursive: true });
+        fs.writeFileSync(path.join(root, '.ploinky', '.secrets'), 'SECRET=value\n');
         fs.symlinkSync(path.join(root, '.ploinky', 'data'), path.join(root, 'state-link'));
+        fs.symlinkSync(path.join(root, '.ploinky', 'deps'), path.join(root, 'deps-link'));
         for (const source of [
+            '.ploinky',
+            '.ploinky/',
             '.ploinky/data',
             '.ploinky/other/../data/secret',
             path.join(root, '.ploinky', 'data', 'router-security'),
+            '.ploinky/deps/store',
+            '.ploinky/deps/store/objects',
+            '.ploinky/.secrets',
+            '.ploinky/agents',
+            '.ploinky/repos',
+            '.ploinky/running',
             'state-link/secret',
+            'deps-link/store',
         ]) {
             policyFailure(() => assertManifestVolumeStoragePolicy(source, { workspaceRoot: root }));
         }
         fs.symlinkSync(path.join(root, '.ploinky', 'data', 'missing-state'), path.join(root, 'dangling-link'));
         policyFailure(() => assertManifestVolumeStoragePolicy('dangling-link', { workspaceRoot: root }));
         assert.equal(
-            assertManifestVolumeStoragePolicy('.ploinky/repos', { workspaceRoot: root }),
-            path.join(root, '.ploinky', 'repos'),
+            assertManifestVolumeStoragePolicy('.data/demo/state', { workspaceRoot: root }),
+            path.join(root, '.data', 'demo', 'state'),
         );
+        assert.equal(assertManifestVolumeStoragePolicy('.', { workspaceRoot: root }), root,
+            'a broad workspace volume reaches the controller root only through the read-only guards');
     } finally {
         cleanup();
     }
