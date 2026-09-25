@@ -365,10 +365,16 @@ export function prepareEntrypoint({
 
 export function runEntrypoint({
     output = process.stdout,
+    errorOutput = process.stderr,
     selfCheck = () => {},
     ...options
 } = {}) {
     const prepared = prepareEntrypoint(options);
+    // A committed transport pair whose old backups could not be removed is
+    // usable; the next committed write retries the cleanup.
+    for (const warning of prepared.transport?.warnings || []) {
+        errorOutput.write(`[ploinky-box] WARNING: ${warning}\n`);
+    }
     selfCheck(prepared);
     output.write(`${BOX_READY_LINE}\n`);
     return prepared;

@@ -349,6 +349,31 @@ test('full preparation creates one stable key, resets only transient runtime, an
     assert.deepEqual(fs.readFileSync(envPath), envBytes);
 });
 
+test('transport cleanup warnings are reported before readiness without failing the Box', (t) => {
+    const { box } = fixture(t);
+    const events = [];
+    runEntrypoint({
+        ...box,
+        runner: routeRunner(),
+        initialize() {},
+        configureTransport() {
+            return { address: '10.88.0.17', interface: 'eth0', warnings: ['transport backup /run/x.backup could not be removed: EIO'] };
+        },
+        configureStorage() { return { storageConf: '/home/podman/.config/containers/storage.conf' }; },
+        resetRuntime() {},
+        retireContainers() {},
+        installDependencies() {},
+        selfCheck() { events.push('self-check'); },
+        errorOutput: { write(chunk) { events.push(`error:${String(chunk).trim()}`); } },
+        output: { write(chunk) { events.push(`output:${String(chunk).trim()}`); } },
+    });
+    assert.deepEqual(events, [
+        '[ploinky-box] WARNING: transport backup /run/x.backup could not be removed: EIO',
+        'self-check',
+        `output:${BOX_READY_LINE}`,
+    ].map((event) => (event.startsWith('[ploinky-box]') ? `error:${event}` : event)));
+});
+
 test('ready line is emitted exactly once and only after every required stage', (t) => {
     const { box } = fixture(t);
     const events = [];

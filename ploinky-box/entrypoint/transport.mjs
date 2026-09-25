@@ -235,9 +235,49 @@ export function writeTransportPair({
         throw transportError(`Transport pair update failed${suffix}`, error);
     }
     // The pair is committed. A cleanup failure must not attempt a rollback
-    // after one of the only exact prior inodes has already been discarded.
-    for (const backup of backups.filter(Boolean)) fsApi.unlinkSync(backup);
-    return Object.freeze({ transportFile: files[0], containersConf: files[1] });
+    // after one of the only exact prior inodes has already been discarded,
+    // and must not report the committed pair as failed: it is a warning, and
+    // the next committed write removes the leftover backups.
+    const warnings = [];
+    for (let index = 0; index < files.length; index += 1) {
+        for (const backup of committedBackups(files[index], index, backups[index], fsApi, uid, warnings)) {
+            try {
+                fsApi.unlinkSync(backup);
+            } catch (error) {
+                if (error.code !== 'ENOENT') {
+                    warnings.push(`transport backup ${backup} could not be removed: ${error.message}`);
+                }
+            }
+        }
+    }
+    return Object.freeze({ transportFile: files[0], containersConf: files[1], warnings: Object.freeze(warnings) });
+}
+
+// This write's own backup plus backups an earlier committed write left behind:
+// exact `.<name>.<token>.<index>.backup` siblings that are regular files of the
+// Box user. They are prior-inode links that nothing reads again.
+function committedBackups(target, index, ownBackup, fsApi, uid, warnings) {
+    const directory = path.dirname(target);
+    const name = path.basename(target).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`^\\.${name}\\.[0-9a-f]{20}\\.${index}\\.backup$`);
+    const found = new Set(ownBackup ? [ownBackup] : []);
+    let entries = [];
+    try {
+        entries = fsApi.readdirSync(directory);
+    } catch (error) {
+        warnings.push(`transport directory ${directory} could not be listed for backup cleanup: ${error.message}`);
+    }
+    for (const entry of entries) {
+        if (!pattern.test(entry)) continue;
+        const candidate = path.join(directory, entry);
+        try {
+            const stat = fsApi.lstatSync(candidate);
+            if (stat.isFile() && !stat.isSymbolicLink() && (uid === null || stat.uid === uid)) found.add(candidate);
+        } catch (_) {
+            // Removed concurrently; nothing to clean.
+        }
+    }
+    return [...found];
 }
 
 export function configureBoxTransport({
