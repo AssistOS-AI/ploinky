@@ -558,7 +558,7 @@ test('coordinated graph topology precedes startup preinstall and config provider
 
 test('canonical startup validates provider binding under the workspace lock before mutation and persists it before the Router', () => {
     const source = startWorkspace.toString();
-    const lock = source.indexOf("await acquireWorkspaceMutationLease({ operation: 'workspace-start' })");
+    const lock = source.indexOf("await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' })");
     const admission = source.indexOf('assertWorkspaceGraphAdmissionsCurrent(admittedStart.admissions)');
     const resolution = source.indexOf('resolveWorkspaceGraphSsoConfig(lockedStart.graph');
     const inactivation = source.indexOf("inactivateEdgeRoutingGeneration('workspace-start-prepare'");
@@ -608,7 +608,7 @@ test('workspace Router generation reader and both inactive graph preparations pr
     const generationIndex = source.indexOf('ensureGraphNodesEnabled(dependencyGraph, reg, {');
     const finalPreparationIndex = source.indexOf('reprepareGraphAfterStartupProviders(');
     const launchIndex = source.indexOf('ensureAgentService(shortAgentName');
-    const lockIndex = source.indexOf("await acquireWorkspaceMutationLease({ operation: 'workspace-start' })");
+    const lockIndex = source.indexOf("await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' })");
 
     assert.ok(lockIndex >= 0 && lockIndex < routerIndex, 'workspace start must suppress watchdog container reconciliation before router startup');
     assert.ok(routerIndex >= 0, 'workspace start must establish the router listener');

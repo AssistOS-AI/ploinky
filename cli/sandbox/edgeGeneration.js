@@ -2971,6 +2971,16 @@ export function readEdgeRoutingSelection(options = {}) {
     return deepFreeze({ selector, paths });
 }
 
+/**
+ * Observe who owns the outstanding preparation lease, or null. This grants
+ * nothing: every retirement or apply still validates the lease under the
+ * apply lock.
+ */
+export function readEdgeRoutingPreparationOwner(options = {}) {
+    const lease = readPreparationLease(resolveEdgeGenerationPaths(options));
+    return lease ? deepFreeze({ pid: lease.pid, reason: lease.reason, mode: lease.mode }) : null;
+}
+
 export function captureEdgeRoutingLease(options = {}) {
     const active = loadActiveEdgeRoutingGeneration(options);
     const generationId = active.selector.generation;

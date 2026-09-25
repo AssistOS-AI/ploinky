@@ -85,7 +85,7 @@ function startFixture(t) {
         getProfileConfig: () => ({}),
         preflightWorkspaceStartRuntimeCapabilities: () => ({ admissions: ['admitted'], graph, registry, additionalNodes: [] }),
         resetPreinstallRunInProcess: () => {},
-        acquireWorkspaceMutationLease: async (options) => { calls.push(['acquireLease', options.operation]); return workspaceLease; },
+        acquireSettledWorkspaceMutationLease: async (options) => { calls.push(['acquireLease', options.operation]); return workspaceLease; },
         releaseWorkspaceStartLock: (lease) => calls.push(['releaseLease', lease === workspaceLease]),
         withNetworkLifecycleLock: async (callback) => callback(networkCapability),
         assertWorkspaceGraphAdmissionsCurrent: () => {},

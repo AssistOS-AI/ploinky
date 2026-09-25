@@ -305,6 +305,21 @@ export function acquireNetworkLifecycleLock({
     };
 }
 
+/**
+ * True only when the lock names an owner PID that no longer exists (ESRCH).
+ * Such a lock becomes reclaimable once its stale-owner grace has passed.
+ */
+export function networkLifecycleLockOwnerStopped({ lockPath = LOCK_PATH } = {}) {
+    const pid = Number(readLockOwner(lockPath)?.pid);
+    if (!Number.isSafeInteger(pid) || pid < 1) return false;
+    try {
+        process.kill(pid, 0);
+        return false;
+    } catch (error) {
+        return error?.code === 'ESRCH';
+    }
+}
+
 export function assertNetworkLifecycleCapability(capability, {
     lockPath = LOCK_PATH,
 } = {}) {

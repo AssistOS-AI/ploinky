@@ -162,9 +162,12 @@ export function readProcessStartIdentity(pid, {
     return '';
 }
 
-export function processIdentityError(message, { stale = false } = {}) {
+// `foreign` marks a live process whose readable identity is not the bound
+// worker: its PID was reused, so the bound worker itself has stopped.
+export function processIdentityError(message, { stale = false, foreign = false } = {}) {
     const error = new Error(message);
     error.code = stale ? 'PROCESS_IDENTITY_STALE' : 'PROCESS_IDENTITY_UNPROVEN';
+    if (foreign) error.foreign = true;
     return error;
 }
 
@@ -210,20 +213,22 @@ export function proveWorkerProcessIdentity({
         || !pathApi.isAbsolute(expectedWorker)
         || argv[0] !== expectedExecutable
         || argv[1] !== expectedWorker) {
-        throw processIdentityError(`worker process ${pid} does not run the expected executable and worker script`);
+        throw processIdentityError(`worker process ${pid} does not run the expected executable and worker script`, {
+            foreign: true,
+        });
     }
 
     let parsed;
     try {
         parsed = parseNoWaitWorkerArgs(argv.slice(2), { runningDir, pathApi });
     } catch (error) {
-        throw processIdentityError(`worker process ${pid} has invalid arguments: ${error.message}`);
+        throw processIdentityError(`worker process ${pid} has invalid arguments: ${error.message}`, { foreign: true });
     }
     const expected = identity || {};
     if (!NO_WAIT_IMMUTABLE_IDENTITY_FIELDS.every((field) => (
         parsed.identity[field] === expected[field]
     ))) {
-        throw processIdentityError(`worker process ${pid} does not match the bound no-wait run`);
+        throw processIdentityError(`worker process ${pid} does not match the bound no-wait run`, { foreign: true });
     }
     return Object.freeze({
         proof: 'structured-argv',

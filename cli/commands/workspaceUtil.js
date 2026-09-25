@@ -37,6 +37,7 @@ import {
   exactNoWaitImmutableIdentity,
 } from './noWaitWorkerArgs.js';
 import { retireNoWaitRunMarkers } from './noWaitMarkerLifecycle.js';
+import { acquireSettledWorkspaceMutationLease } from './noWaitRunSettlement.js';
 import { prepareDefaultBootRepositories } from './ploinkyboot.js';
 import { prepareManifestRepositories, resolveWorkspaceGraphSsoConfig } from '../utils/runtime/bootstrapManifest.js';
 import { buildLifecycleHookEnv, executeHostHook, markPreinstallRunInProcess, resetPreinstallRunInProcess, isInlineCommand } from '../utils/runtime/lifecycleHooks.js';
@@ -60,7 +61,13 @@ import {
 import { resolveAgentExecutionMode, resolveAgentReadinessProtocol, resolveManifestReadinessWaitOptions } from '../utils/runtime/startupReadiness.js';
 import { normalizeProbeConfig, runContainerScriptReadiness } from '../sandbox/docker/healthProbes.js';
 import { applyStartupConfigProvidersForGraph } from '../sandbox/startupConfigProviders.js';
-import { acquireWorkspaceMutationLease, releaseWorkspaceStartLock, withMaintenanceLock, withWorkspaceMutationLease } from '../utils/runtime/maintenanceLocks.js';
+import {
+  createWorkspaceMutationLease,
+  releaseWorkspaceMutationLease,
+  releaseWorkspaceStartLock,
+  withMaintenanceLock,
+  withWorkspaceMutationLease,
+} from '../utils/runtime/maintenanceLocks.js';
 import {
   issueDependencyRebuildRequest,
   runtimeCarriesRebuildToken,
@@ -92,6 +99,7 @@ import {
   initializeFreshEdgeRoutingSources,
   inactivateEdgeRoutingGeneration,
   prepareHostModeCapabilityForInactiveGeneration,
+  readEdgeRoutingPreparationOwner,
   readEdgeRoutingSelection,
   retireAbandonedAgentPreparation,
   retireAbandonedWorkspaceStartPreparation,
@@ -110,7 +118,9 @@ import {
 } from '../server/utils/agentReadiness.js';
 import {
   createNetworkLifecycleAdapter,
+  NETWORK_LOCK_STALE_GRACE_MS,
   NETWORK_LOCK_WAIT_MS,
+  networkLifecycleLockOwnerStopped,
   withNetworkLifecycleLock,
   withNetworkLifecycleLockAsync,
 } from '../sandbox/networkLifecycle.js';
@@ -1994,9 +2004,10 @@ async function startWorkspace(staticAgentArg, portArg, {
   // Only the final post-provider lease may authorize runtime targets.
   resetPreinstallRunInProcess();
   // A previous start may have returned while its no-wait workers are still
-  // activating routes. Serialize with them using the same bounded wait they
-  // use for startup, then revalidate the admitted graph under the lease.
-  const workspaceStartLock = await acquireWorkspaceMutationLease({ operation: 'workspace-start' });
+  // creating and activating runtimes. Wait until none can still make progress
+  // (they need the lease, so the wait holds none), then revalidate the
+  // admitted graph under the lease.
+  const workspaceStartLock = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-start' });
   let workspacePreparationLease = null;
   const workspaceRuntimeCandidates = [];
   try {
@@ -2657,12 +2668,16 @@ async function startWorkspace(staticAgentArg, portArg, {
 
 /**
  * Restarts replace the selector and stop the Router and agents before
- * startWorkspace runs. Settle a stopped start's graph preparation first, so an
- * unretirable lease is refused while the running graph is still untouched.
+ * startWorkspace runs. First wait for the previous start's no-wait workers,
+ * whose half-created runtimes the stop could neither see nor remove, then
+ * settle a stopped start's graph preparation under that same lease, so that
+ * either refusal happens while the running graph is still untouched.
  */
-async function retireAbandonedStartPreparationBeforeRestart() {
-  return withWorkspaceMutationLease({ operation: 'workspace-restart' }, (workspaceMutationLease) => (
-    withNetworkLifecycleLock((networkLifecycleCapability) => {
+async function settleWorkspaceBeforeRestart() {
+  const workspaceMutationLease = await acquireSettledWorkspaceMutationLease({ operation: 'workspace-restart' });
+  let callbackError = null;
+  try {
+    return withNetworkLifecycleLock((networkLifecycleCapability) => {
       const result = retireAbandonedWorkspaceStartPreparation({
         workspaceRoot: PLOINKY_WORKSPACE_ROOT,
         workspaceMutationLease,
@@ -2672,8 +2687,72 @@ async function retireAbandonedStartPreparationBeforeRestart() {
         console.log(`[restart] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
       }
       return result;
-    })
-  ));
+    });
+  } catch (error) {
+    callbackError = error;
+    throw error;
+  } finally {
+    if (!releaseWorkspaceMutationLease(workspaceMutationLease)) {
+      const releaseError = new Error("workspace mutation 'workspace-restart' could not release its exact lease");
+      releaseError.code = 'workspace_mutation_lock_release_failed';
+      if (callbackError) callbackError.message += `; ${releaseError.message}`;
+      else throw releaseError;
+    }
+  }
+}
+
+/**
+ * `stop` replaces the selector that binds a killed start's graph preparation,
+ * after which only a stopped Box can retire that lease. Retire it before the
+ * rewrite, on exactly the proof start and restart require, but never at the
+ * cost of the stop: a busy lease or lock, a live owner or any mismatch leaves
+ * the preparation in place and the stop continues.
+ */
+function retireAbandonedStartPreparationBeforeStop({ log = (message) => console.log(message) } = {}) {
+  let owner;
+  try {
+    owner = readEdgeRoutingPreparationOwner({ workspaceRoot: PLOINKY_WORKSPACE_ROOT });
+  } catch (error) {
+    log(`[stop] Could not inspect the routing preparation lease: ${error?.message || error}`);
+    return { retired: false };
+  }
+  if (!owner) return { retired: false };
+  const leftInPlace = (why) => {
+    log(`[stop] Left the routing preparation of pid ${owner.pid} (${owner.reason}) in place: ${why}`);
+    return { retired: false };
+  };
+  let workspaceMutationLease;
+  try {
+    workspaceMutationLease = createWorkspaceMutationLease({ operation: 'workspace-stop' });
+  } catch (error) {
+    return leftInPlace(error?.message || String(error));
+  }
+  try {
+    const retire = (networkLifecycleCapability) => retireAbandonedWorkspaceStartPreparation({
+      workspaceRoot: PLOINKY_WORKSPACE_ROOT,
+      workspaceMutationLease,
+      networkLifecycleCapability,
+    });
+    let result;
+    try {
+      result = withNetworkLifecycleLock(retire);
+    } catch (error) {
+      // A killed start leaves its network lock behind, reclaimable once the
+      // stale-owner grace has passed. Wait out that grace, never a live owner.
+      if (error?.code !== 'PLOINKY_NETWORK_LIFECYCLE_BUSY' || !networkLifecycleLockOwnerStopped()) throw error;
+      result = withNetworkLifecycleLock(retire, { waitMs: NETWORK_LOCK_STALE_GRACE_MS + 1_000 });
+    }
+    if (result.retired) {
+      log(`[stop] Retired the routing preparation of stopped workspace start pid ${result.pid}.`);
+    }
+    return result;
+  } catch (error) {
+    return leftInPlace(error?.message || String(error));
+  } finally {
+    let released = false;
+    try { released = releaseWorkspaceMutationLease(workspaceMutationLease); } catch (_) {}
+    if (!released) log('[stop] Could not release the workspace lease taken to inspect the routing preparation.');
+  }
 }
 
 export function admitDirectAgentRuntimeManifest(manifest, {
@@ -3355,7 +3434,8 @@ export {
   resolveAndPersistStartRouterPort,
   resolveGraphNodeExecutionRecord,
   resolveRetainedGraphNodeExecutionRecord,
-  retireAbandonedStartPreparationBeforeRestart,
+  retireAbandonedStartPreparationBeforeStop,
+  settleWorkspaceBeforeRestart,
   waitForRouterReady,
   waitForManifestReadiness,
   waitForReadinessEntries,
