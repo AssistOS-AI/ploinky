@@ -1112,6 +1112,13 @@ export function createBoxSupervisor({
     // every new graph mutation until the engine confirms it ended. A dead host
     // process is never taken as that proof.
     // Returns '' when the durable barrier was written, otherwise why not.
+    function isRecoveryBarrier(barrier, identity) {
+        return barrier?.schema === 'ploinky-update-recovery' && barrier.version === 1
+            && barrier.instance === identity.instance && barrier.workspaceRoot === identity.workspaceRoot
+            && /^[a-f0-9]{64}$/.test(String(barrier.containerId || ''))
+            && typeof barrier.nonce === 'string' && barrier.nonce.length > 0;
+    }
+
     function recordRecoveryBarrier(identity, { operation, containerId, nonce, marker, cause, detail, reportPath = null }) {
         try {
             updateHostState.write('update-recovery', identity.instance, {
@@ -1195,6 +1202,22 @@ export function createBoxSupervisor({
     async function assertNoUpdateRecoveryBarrier(identity, ownership) {
         const barrier = updateHostState.read('update-recovery', identity.instance);
         if (!barrier) return [];
+        if (!isRecoveryBarrier(barrier, identity)) {
+            // A record this writer did not produce cannot name the writer to
+            // probe. Only a stopped or absent Box proves no in-Box writer runs.
+            const container = ownership?.handles?.container || null;
+            if (!container || container.runtime?.running === false) {
+                updateHostState.remove('update-recovery', identity.instance);
+                return ['a malformed update recovery record was cleared because the Box is stopped'];
+            }
+            const error = new PloinkyBoxError(
+                'The update recovery record for this workspace is malformed, so no earlier in-Box update can be '
+                + 'proven stopped; no new mutation was started. Run `ploinky stop`, then run the command again.',
+                { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' },
+            );
+            error.activation = Object.freeze({ outcome: 'preserved', graphMutated: false, boxRollback: null });
+            throw error;
+        }
         let observed;
         try {
             observed = await probeUpdateQuiescence({

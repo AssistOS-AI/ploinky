@@ -27,6 +27,15 @@ const optionalFailure = () => createOperationRecord({
     phase: 'default-skills', id: 'optional-skills', outcome: 'failed', required: false, code: 'fetch-failed',
 });
 
+// A barrier exactly as the supervisor writes it, re-addressed to one workspace.
+function barrierFor(identity, fields) {
+    return {
+        schema: 'ploinky-update-recovery', version: 1, operation: 'update',
+        containerId: CONTAINER_ID, marker: null, detail: '', reportPath: null, ...fields,
+        instance: identity.instance, workspaceRoot: identity.workspaceRoot,
+    };
+}
+
 function scenario(t, {
     graph = { running: true, configured: true },
     core = {},
@@ -212,14 +221,14 @@ test('an unproven in-Box writer leaves a recovery barrier that blocks the next m
         supervisor => supervisor.runRestartTransaction(['restart']),
     ]) {
         const next = scenario(t, { store, probe: () => ({ ok: true, pids: [12] }) });
-        store.write('update-recovery', next.identity.instance, barrier);
+        store.write('update-recovery', next.identity.instance, barrierFor(next.identity, barrier));
         await assert.rejects(run(next.supervisor), { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' });
         assert.deepEqual(next.events, ['lock', 'probe', 'release']);
     }
 
     stillRunning = false;
     const cleared = scenario(t, { store, probe: () => ({ ok: true, pids: [] }) });
-    store.write('update-recovery', cleared.identity.instance, barrier);
+    store.write('update-recovery', cleared.identity.instance, barrierFor(cleared.identity, barrier));
     const result = await cleared.supervisor.runUpdateTransaction(['update']);
     assert.match(result.warnings.join('\n'), /confirmed stopped by the engine/);
     assert.equal(store.read('update-recovery', cleared.identity.instance), null);
@@ -228,12 +237,41 @@ test('an unproven in-Box writer leaves a recovery barrier that blocks the next m
 test('an unanswerable engine probe keeps the barrier', async (t) => {
     const store = createMemoryUpdateHostState();
     const fixture = scenario(t, { store, probe: () => ({ ok: false, detail: 'engine unavailable' }) });
-    store.write('update-recovery', fixture.identity.instance, {
-        instance: fixture.identity.instance, containerId: CONTAINER_ID, nonce: 'b'.repeat(32), cause: 'signal:SIGINT',
-    });
+    store.write('update-recovery', fixture.identity.instance, barrierFor(fixture.identity, {
+        nonce: 'b'.repeat(32), cause: 'signal:SIGINT',
+    }));
     await assert.rejects(fixture.supervisor.runUpdateTransaction(['update']), /may still be running/);
     assert.notEqual(store.read('update-recovery', fixture.identity.instance), null);
 });
+
+for (const [label, mutate] of [
+    ['without a schema', ({ schema, ...rest }) => rest],
+    ['for another workspace', barrier => ({ ...barrier, workspaceRoot: `${barrier.workspaceRoot}-other` })],
+    ['naming a short container ID', barrier => ({ ...barrier, containerId: CONTAINER_ID.slice(0, 12) })],
+]) {
+    test(`a recovery barrier ${label} is never probed and blocks a running Box`, async (t) => {
+        const store = createMemoryUpdateHostState();
+        const fixture = scenario(t, { store, probe: () => ({ ok: true, pids: [] }) });
+        const malformed = mutate(barrierFor(fixture.identity, { nonce: 'd'.repeat(32), cause: 'timeout' }));
+        store.write('update-recovery', fixture.identity.instance, malformed);
+        await assert.rejects(fixture.supervisor.runUpdateTransaction(['update']), (error) => {
+            assert.equal(error.code, 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED');
+            assert.match(error.message, /recovery record for this workspace is malformed[\s\S]*`ploinky stop`/);
+            return true;
+        });
+        assert.deepEqual(fixture.events, ['lock', 'release'], 'a record that cannot name its writer is not probed');
+        assert.deepEqual(store.read('update-recovery', fixture.identity.instance), malformed);
+
+        const stopped = scenario(t, { store, graph: { running: false, configured: true } });
+        store.write('update-recovery', stopped.identity.instance, mutate(barrierFor(stopped.identity, {
+            nonce: 'd'.repeat(32), cause: 'timeout',
+        })));
+        const result = await stopped.supervisor.runUpdateTransaction(['update']);
+        assert.match(result.warnings.join('\n'), /malformed update recovery record was cleared because the Box is stopped/);
+        assert.equal(store.read('update-recovery', stopped.identity.instance), null);
+        assert.equal(stopped.events.includes('probe'), false);
+    });
+}
 
 // Aggregate results through the public host dispatch with a real supervisor.
 async function dispatch(fixture, argv = ['update'], options = {}) {
@@ -466,9 +504,9 @@ test('a barrier that cannot be written still never rolls back a Box whose writer
 test('the recovery barrier also blocks bind before any Box work', async (t) => {
     const store = createMemoryUpdateHostState();
     const fixture = scenario(t, { store, probe: () => ({ ok: true, pids: [9] }) });
-    store.write('update-recovery', fixture.identity.instance, {
-        instance: fixture.identity.instance, containerId: CONTAINER_ID, nonce: 'c'.repeat(32), cause: 'timeout',
-    });
+    store.write('update-recovery', fixture.identity.instance, barrierFor(fixture.identity, {
+        nonce: 'c'.repeat(32), cause: 'timeout',
+    }));
     await assert.rejects(fixture.supervisor.runBindTransaction(), { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' });
     assert.deepEqual(fixture.events, ['lock', 'probe', 'release']);
 });
@@ -496,7 +534,7 @@ test('a restart that cannot be proven stopped leaves a restart barrier and is ne
         assert.equal(options.marker, barrier.marker, 'the barrier is re-checked with the restart marker');
         return { ok: true, pids: [3] };
     } });
-    store.write('update-recovery', next.identity.instance, barrier);
+    store.write('update-recovery', next.identity.instance, barrierFor(next.identity, barrier));
     await assert.rejects(next.supervisor.runUpdateTransaction(['update']), { code: 'PLOINKY_BOX_UPDATE_RECOVERY_REQUIRED' });
 });
 
