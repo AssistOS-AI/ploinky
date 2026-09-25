@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import { AGENTLIB_STABLE_MOUNT_PATH } from '../../agentlib/contract.mjs';
 import {
-    appendLegacyAgentDataGuards,
+    appendControllerStateGuards,
     buildPersistentAgentRunArgs,
     buildPodmanStagedTargetMounts,
     ensurePodmanStagedAgentLibDir,
@@ -111,14 +111,16 @@ const LAYOUTS = [
     { name: 'devel', cwd: ws => path.join(ws, '.ploinky', 'repos', 'demoRepo'), target: ws => path.join(ws, '.ploinky', 'repos', 'demoRepo'), workdir: '/code' },
 ];
 
-// Fresh workspaces have no retired .ploinky/data or .ploinky/shared roots;
-// migrated workspaces still do. The controller guards differ between the two.
-for (const layout of LAYOUTS) for (const legacyRoots of [false, true]) {
-    const variant = `${layout.name}${legacyRoots ? ' with legacy data roots' : ''}`;
+// A workspace whose Router or edge state exists has a .ploinky/data root; a
+// fresh one does not. The controller guards differ between the two.
+for (const layout of LAYOUTS) for (const stateRoot of [false, true]) {
+    const variant = `${layout.name}${stateRoot ? ' with controller state' : ''}`;
     test(`real podman: production ${variant} run arguments keep every dependency store object immutable`, { skip: !IMAGE_ID && `podman with a local ${IMAGE} image is required` }, (t) => {
         const workspace = tempRoot(t, 'depstore-podman-');
-        if (legacyRoots) {
-            for (const key of ['data', 'shared']) fs.mkdirSync(path.join(workspace, '.ploinky', key), { recursive: true });
+        const policyState = path.join(workspace, '.ploinky', 'data', 'router-security', 'policy-state.json');
+        if (stateRoot) {
+            fs.mkdirSync(path.dirname(policyState), { recursive: true });
+            fs.writeFileSync(policyState, '{"state":"controller"}\n');
         }
         const agentLib = makeAgentLib(workspace, { name: 'ploinky/node_modules/achillesAgentLib' });
         const provider = containerProvider({ imageId: IMAGE_ID, engine: 'podman', agentLib });
@@ -135,7 +137,7 @@ for (const layout of LAYOUTS) for (const legacyRoots of [false, true]) {
         assertObjectValid(store, other);
 
         const agentName = 'demo';
-        const containerName = `ploinky_depstore_ro_${layout.name}${legacyRoots ? "_legacy" : ""}_${process.pid}_${Date.now()}`;
+        const containerName = `ploinky_depstore_ro_${layout.name}${stateRoot ? "_state" : ""}_${process.pid}_${Date.now()}`;
         const cwd = layout.cwd(workspace);
         const cwdMountTarget = layout.target(workspace);
         const agentCodePath = path.join(workspace, '.ploinky', 'repos', 'demoRepo', agentName);
@@ -146,7 +148,7 @@ for (const layout of LAYOUTS) for (const legacyRoots of [false, true]) {
         fs.writeFileSync(path.join(agentCodePath, 'index.js'), 'export default 1;\n');
 
         // Same sequence as the Podman start path: staged Agent and code trees,
-        // the persistent run arguments, staged target mounts, then legacy guards.
+        // the persistent run arguments, staged target mounts, then controller guards.
         const nodeModulesDir = own.built.nodeModulesPath;
         const runtimeRoot = path.join(workspace, '.ploinky', 'container-runtime', containerName);
         const args = buildPersistentAgentRunArgs({
@@ -182,7 +184,7 @@ for (const layout of LAYOUTS) for (const legacyRoots of [false, true]) {
         })) {
             args.push('-v', `${mount.source}:${mount.target}${podmanMountSuffix(mount.ro)}`);
         }
-        appendLegacyAgentDataGuards(args, 'podman', { workspaceRoot: workspace, canonicalRuntimeWorkspaceGuards: false });
+        appendControllerStateGuards(args, 'podman', { workspaceRoot: workspace, canonicalRuntimeWorkspaceGuards: false });
 
         // A store path is reachable beyond its own read-only bind only through the
         // writable project bind; this is its spelling there, if it has one.
@@ -221,6 +223,21 @@ for (const layout of LAYOUTS) for (const legacyRoots of [false, true]) {
         }
         // global and isolated expose the store through the project bind; devel does not.
         assert.equal(storeProbes.length, projectAlias(store.paths.root) ? 7 : 0);
+        // The same bind exposes the rest of the controller root: it stays
+        // read-only, and Router/edge state stays unreadable.
+        const controllerAlias = projectAlias(path.join(workspace, '.ploinky'));
+        const controllerProbes = controllerAlias ? [
+            ['controller-new-file', `echo tampered > ${controllerAlias}/tampered`],
+            ['controller-new-dir', `mkdir ${controllerAlias}/tampered-dir`],
+            ['controller-rename-deps', `mv ${controllerAlias}/deps ${controllerAlias}/deps-moved`],
+            ...(stateRoot ? [
+                ['state-read', `cat ${controllerAlias}/data/router-security/policy-state.json`],
+                ['state-write', `echo tampered > ${controllerAlias}/data/router-security/policy-state.json`],
+            ] : [
+                ['state-create', `mkdir ${controllerAlias}/data`],
+            ]),
+        ] : [];
+        assert.equal(controllerProbes.length, layout.name === 'devel' ? 0 : (stateRoot ? 5 : 4));
         const controls = [
             ['control-project', `echo control > ${cwdMountTarget}/control.txt`],
         ];
@@ -229,19 +246,22 @@ for (const layout of LAYOUTS) for (const legacyRoots of [false, true]) {
             'set -u',
             'echo "READ left-pad $(cat /code/node_modules/left-pad/index.js)"',
             'echo "READ agentlib $(cat /code/node_modules/achillesAgentLib/package.json)"',
-            ...probeScript([...ownProbes, ...storeProbes, ...controls]),
+            ...probeScript([...ownProbes, ...storeProbes, ...controllerProbes, ...controls]),
         ].join('\n'));
 
         assert.equal(reads.get('left-pad'), 'module.exports = "left-pad:m1";', logs);
         assert.match(reads.get('agentlib') || '', /ploinky-agent-lib/, logs);
-        for (const [label] of [...ownProbes, ...storeProbes]) {
-            assert.equal(probes.get(label), 'DENIED', `${variant}: ${label} must not modify the cache store\n${logs}`);
+        for (const [label] of [...ownProbes, ...storeProbes, ...controllerProbes]) {
+            assert.equal(probes.get(label), 'DENIED', `${variant}: ${label} must not modify the cache store or controller state\n${logs}`);
         }
         // The attempts are meaningful only if the writable project bind is writable.
         assert.equal(probes.get('control-project'), 'OK', logs);
         assert.equal(fs.readFileSync(path.join(cwd, 'control.txt'), 'utf8'), 'control\n');
 
         assert.deepEqual(snapshotTree(store.paths.root), storeBefore, `${variant}: host cache store bytes, modes and links unchanged`);
+        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'tampered')), false);
+        assert.equal(fs.existsSync(path.join(workspace, '.ploinky', 'data')), stateRoot);
+        if (stateRoot) assert.equal(fs.readFileSync(policyState, 'utf8'), '{"state":"controller"}\n');
         assertObjectValid(store, own);
         assertObjectValid(store, other);
     });

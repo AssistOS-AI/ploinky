@@ -13,12 +13,12 @@ import {
     validateAgentDataKey,
 } from '../../cli/utils/runtime/agentDataPathPolicy.js';
 import {
-    ensureLegacyAgentGuardSources,
-    legacyAgentGuardMounts,
-    legacyAgentGuardTargets,
+    ensureControllerGuardSources,
+    controllerGuardMounts,
+    controllerGuardTargets,
     normalizeRuntimeMountTarget,
-    prepareLegacyGuardMountpointCleanup,
-} from '../../cli/utils/runtime/legacyAgentDataGuards.js';
+    prepareControllerGuardMountpointCleanup,
+} from '../../cli/utils/runtime/controllerStateGuards.js';
 import {
     ensureManifestVolumeHostPath,
     resolveManifestVolumeHostPath,
@@ -51,14 +51,13 @@ test('equivalent guard-parent targets tighten every bind and reject conflicting 
             { hostPath: controllerDir, runtimePath: '/framework/', readOnly: true },
             { hostPath: controllerDir, runtimePath: '/framework/././', readOnly: false },
         ];
-        const targets = legacyAgentGuardTargets(bindings, { workspaceRoot: root });
-        const mounts = legacyAgentGuardMounts(targets, { workspaceRoot: root, bindings });
+        const targets = controllerGuardTargets(bindings, { workspaceRoot: root });
+        const mounts = controllerGuardMounts(targets, { workspaceRoot: root, bindings });
         const parent = mounts.find(mount => mount.target === '/framework');
         assert.equal(parent.readOnly, true);
         assert.equal(parent.replaceExisting, true);
         assert.equal(mounts.filter(mount => mount.target === '/framework').length, 1);
-        assert.equal(mounts.some(mount => mount.target === '/framework/shared'), false);
-        policyFailure(() => legacyAgentGuardMounts(targets, {
+        policyFailure(() => controllerGuardMounts(targets, {
             workspaceRoot: root,
             bindings: [...bindings, { hostPath: root, runtimePath: '/framework/.' }],
         }));
@@ -121,21 +120,20 @@ test('manifest data paths are revalidated after creation and before reuse after 
     }
 });
 
-test('manifest policy rejects lexical, absolute, normalized, and symlinked legacy roots', () => {
+test('manifest policy rejects lexical, absolute, normalized, and symlinked controller state roots', () => {
     const { root, cleanup } = fixture();
     try {
         fs.mkdirSync(path.join(root, '.ploinky', 'data', 'secret'), { recursive: true });
-        fs.mkdirSync(path.join(root, '.ploinky', 'shared'), { recursive: true });
-        fs.symlinkSync(path.join(root, '.ploinky', 'data'), path.join(root, 'legacy-link'));
+        fs.symlinkSync(path.join(root, '.ploinky', 'data'), path.join(root, 'state-link'));
         for (const source of [
             '.ploinky/data',
             '.ploinky/other/../data/secret',
-            path.join(root, '.ploinky', 'shared'),
-            'legacy-link/secret',
+            path.join(root, '.ploinky', 'data', 'router-security'),
+            'state-link/secret',
         ]) {
             policyFailure(() => assertManifestVolumeStoragePolicy(source, { workspaceRoot: root }));
         }
-        fs.symlinkSync(path.join(root, '.ploinky', 'missing-legacy'), path.join(root, 'dangling-link'));
+        fs.symlinkSync(path.join(root, '.ploinky', 'data', 'missing-state'), path.join(root, 'dangling-link'));
         policyFailure(() => assertManifestVolumeStoragePolicy('dangling-link', { workspaceRoot: root }));
         assert.equal(
             assertManifestVolumeStoragePolicy('.ploinky/repos', { workspaceRoot: root }),
@@ -146,27 +144,18 @@ test('manifest policy rejects lexical, absolute, normalized, and symlinked legac
     }
 });
 
-test('legacy guard targets are derived from broad mounts without creating legacy roots', () => {
+test('controller guard targets are derived from broad mounts without creating the state root', () => {
     const { root, cleanup } = fixture();
     try {
-        const targets = legacyAgentGuardTargets([
+        const targets = controllerGuardTargets([
             { hostPath: root, runtimePath: '/workspace' },
         ], { workspaceRoot: root });
-        assert.deepEqual(targets.map(entry => entry.target), [
-            '/workspace/.ploinky/data',
-            '/workspace/.ploinky/shared',
-        ]);
-        assert.deepEqual(targets.map(entry => entry.parentTarget), [
-            '/workspace/.ploinky',
-            '/workspace/.ploinky',
-        ]);
-        assert.deepEqual(targets.map(entry => entry.protectedParentHostPath), [
-            path.join(root, '.ploinky'),
-            path.join(root, '.ploinky'),
-        ]);
-        const sources = ensureLegacyAgentGuardSources({ workspaceRoot: root });
+        assert.deepEqual(targets.map(entry => entry.target), ['/workspace/.ploinky/data']);
+        assert.deepEqual(targets.map(entry => entry.parentTarget), ['/workspace/.ploinky']);
+        assert.deepEqual(targets.map(entry => entry.protectedParentHostPath), [path.join(root, '.ploinky')]);
+        const sources = ensureControllerGuardSources({ workspaceRoot: root });
+        assert.deepEqual(Array.from(sources.keys()), ['data']);
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data')), false);
-        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
         for (const source of sources.values()) {
             assert.equal(fs.readdirSync(source).length, 0);
             assert.equal(fs.statSync(source).mode & 0o777, 0o555);
@@ -181,27 +170,25 @@ test('legacy guard targets are derived from broad mounts without creating legacy
     }
 });
 
-test('legacy guard mountpoint cleanup removes only empty roots created after admission', () => {
+test('controller guard mountpoint cleanup removes only an empty state root created after admission', () => {
     const { root, cleanup } = fixture();
     try {
         const controllerData = path.join(root, '.ploinky', 'data');
-        const legacyShared = path.join(root, '.ploinky', 'shared');
-        fs.mkdirSync(path.join(controllerData, 'edge-routing'), { recursive: true });
-        const cleanupMountpoints = prepareLegacyGuardMountpointCleanup({ workspaceRoot: root });
-        fs.mkdirSync(legacyShared, { recursive: true });
+        fs.mkdirSync(path.join(root, '.ploinky'), { recursive: true });
+        const cleanupMountpoints = prepareControllerGuardMountpointCleanup({ workspaceRoot: root });
+        fs.mkdirSync(controllerData, { recursive: true });
         cleanupMountpoints();
-        assert.equal(fs.existsSync(legacyShared), false);
-        assert.equal(fs.existsSync(controllerData), true);
+        assert.equal(fs.existsSync(controllerData), false);
 
-        fs.mkdirSync(legacyShared, { recursive: true });
-        const preserveExisting = prepareLegacyGuardMountpointCleanup({ workspaceRoot: root });
+        fs.mkdirSync(path.join(controllerData, 'edge-routing'), { recursive: true });
+        const preserveExisting = prepareControllerGuardMountpointCleanup({ workspaceRoot: root });
         preserveExisting();
-        assert.equal(fs.existsSync(legacyShared), true);
+        assert.equal(fs.existsSync(path.join(controllerData, 'edge-routing')), true);
 
-        fs.rmSync(legacyShared, { recursive: true });
-        const rejectUnexpectedData = prepareLegacyGuardMountpointCleanup({ workspaceRoot: root });
-        fs.mkdirSync(legacyShared, { recursive: true });
-        fs.writeFileSync(path.join(legacyShared, 'unexpected'), 'data');
+        fs.rmSync(controllerData, { recursive: true });
+        const rejectUnexpectedData = prepareControllerGuardMountpointCleanup({ workspaceRoot: root });
+        fs.mkdirSync(controllerData, { recursive: true });
+        fs.writeFileSync(path.join(controllerData, 'unexpected'), 'data');
         assert.throws(rejectUnexpectedData, error => (
             error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION'
         ));
@@ -210,11 +197,11 @@ test('legacy guard mountpoint cleanup removes only empty roots created after adm
     }
 });
 
-test('legacy guard planning neither creates a missing controller parent nor mounts absent children', () => {
+test('controller guard planning neither creates a missing controller parent nor mounts absent children', () => {
     const { root, cleanup } = fixture();
     try {
-        const targets = legacyAgentGuardTargets([{ hostPath: root, runtimePath: '/workspace' }], { workspaceRoot: root });
-        const mounts = legacyAgentGuardMounts(targets, { workspaceRoot: root });
+        const targets = controllerGuardTargets([{ hostPath: root, runtimePath: '/workspace' }], { workspaceRoot: root });
+        const mounts = controllerGuardMounts(targets, { workspaceRoot: root });
         assert.deepEqual(mounts.map(mount => mount.target), ['/workspace/.ploinky']);
         assert.deepEqual(fs.readdirSync(mounts[0].source), []);
         assert.equal(fs.existsSync(path.join(root, '.ploinky')), false);
@@ -223,12 +210,12 @@ test('legacy guard planning neither creates a missing controller parent nor moun
     }
 });
 
-test('legacy guard admission rejects protected-root child binds, including canonical aliases', () => {
+test('controller guard admission rejects protected-root child binds, including canonical aliases', () => {
     const { root, cleanup } = fixture();
     try {
-        const protectedChild = path.join(root, '.ploinky', 'data', 'legacy-agent');
+        const protectedChild = path.join(root, '.ploinky', 'data', 'router-security');
         fs.mkdirSync(protectedChild, { recursive: true });
-        const alias = path.join(root, 'legacy-agent-alias');
+        const alias = path.join(root, 'router-security-alias');
         fs.symlinkSync(protectedChild, alias);
 
         for (const [hostPath, runtimePath] of [
@@ -236,9 +223,9 @@ test('legacy guard admission rejects protected-root child binds, including canon
             [alias, '/aliased-project'],
         ]) {
             assert.throws(
-                () => legacyAgentGuardTargets([{ hostPath, runtimePath }], { workspaceRoot: root }),
+                () => controllerGuardTargets([{ hostPath, runtimePath }], { workspaceRoot: root }),
                 error => error?.code === 'PLOINKY_AGENT_DATA_POLICY_VIOLATION'
-                    && /inside protected legacy agent data/.test(error.message),
+                    && /inside protected controller state/.test(error.message),
             );
         }
     } finally {
@@ -246,37 +233,37 @@ test('legacy guard admission rejects protected-root child binds, including canon
     }
 });
 
-test('legacy guard parents follow canonical aliases without replacing a read-only code grant', () => {
+test('controller guard parents follow canonical aliases without replacing a read-only code grant', () => {
     const { root, cleanup } = fixture();
     try {
         const code = path.join(root, 'code');
-        fs.mkdirSync(path.join(code, 'legacy-data'), { recursive: true });
+        fs.mkdirSync(path.join(code, 'state-data'), { recursive: true });
         fs.mkdirSync(path.join(root, '.ploinky'));
-        fs.symlinkSync('../code/legacy-data', path.join(root, '.ploinky', 'data'));
+        fs.symlinkSync('../code/state-data', path.join(root, '.ploinky', 'data'));
         const bindings = [
             { hostPath: root, runtimePath: '/workspace' },
             { hostPath: code, runtimePath: '/code', readOnly: true },
         ];
-        const targets = legacyAgentGuardTargets(bindings, { workspaceRoot: root });
-        const aliased = targets.find(guard => guard.target === '/code/legacy-data');
+        const targets = controllerGuardTargets(bindings, { workspaceRoot: root });
+        const aliased = targets.find(guard => guard.target === '/code/state-data');
         assert.equal(aliased.protectedParentHostPath, code);
         assert.equal(aliased.parentTarget, '/code');
-        const mounts = legacyAgentGuardMounts(targets, { workspaceRoot: root, bindings });
+        const mounts = controllerGuardMounts(targets, { workspaceRoot: root, bindings });
         assert.equal(mounts.some(mount => mount.target === '/code'), false);
         assert.ok(mounts.some(mount => mount.target === '/workspace/.ploinky' && mount.readOnly));
         assert.ok(mounts.some(mount => mount.target === '/workspace/code' && !mount.readOnly));
-        assert.ok(mounts.some(mount => mount.target === '/code/legacy-data' && mount.readOnly));
+        assert.ok(mounts.some(mount => mount.target === '/code/state-data' && mount.readOnly));
     } finally { cleanup(); }
 });
 
-test('legacy guard ancestors remain pinned without making the project read-only', () => {
+test('controller guard ancestors remain pinned without making the project read-only', () => {
     const { root, cleanup } = fixture();
     try {
         const workspaceRoot = path.join(root, 'projects', 'current');
         fs.mkdirSync(path.join(workspaceRoot, '.ploinky', 'data'), { recursive: true });
         const bindings = [{ hostPath: root, runtimePath: '/home' }];
-        const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
-        const mounts = legacyAgentGuardMounts(targets, { workspaceRoot, bindings });
+        const targets = controllerGuardTargets(bindings, { workspaceRoot });
+        const mounts = controllerGuardMounts(targets, { workspaceRoot, bindings });
         assert.deepEqual(mounts.filter(mount => mount.parent).map(mount => [mount.target, mount.readOnly]), [
             ['/home/projects', false],
             ['/home/projects/current', false],
@@ -287,7 +274,7 @@ test('legacy guard ancestors remain pinned without making the project read-only'
 
 for (const workspaceAlias of [false, true]) {
     for (const existingChildren of [false, true]) {
-        test(`legacy guards accept controller aliases with workspace alias=${workspaceAlias}, existing children=${existingChildren}`, () => {
+        test(`controller guards accept controller aliases with workspace alias=${workspaceAlias}, existing children=${existingChildren}`, () => {
             const { root, cleanup } = fixture();
             try {
                 const physicalWorkspace = path.join(root, 'project');
@@ -300,7 +287,7 @@ for (const workspaceAlias of [false, true]) {
                 if (workspaceAlias) fs.symlinkSync('project', workspaceRoot);
                 for (const directory of [physicalWorkspace, framework, running]) fs.chmodSync(directory, 0o770);
                 if (existingChildren) {
-                    for (const key of ['data', 'shared']) fs.mkdirSync(path.join(framework, key));
+                    fs.mkdirSync(path.join(framework, 'data'));
                 }
                 const preservedPaths = [workspaceRoot, physicalWorkspace, framework, running,
                     path.join(physicalWorkspace, '.ploinky'), path.join(framework, 'running')];
@@ -314,23 +301,20 @@ for (const workspaceAlias of [false, true]) {
                     { hostPath: root, runtimePath: '/home' },
                     { hostPath: workspaceRoot, runtimePath: '/workspace' },
                 ];
-                const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
+                const targets = controllerGuardTargets(bindings, { workspaceRoot });
                 assert.deepEqual(targets.map(guard => guard.target), [
-                    '/home/project/.state/data', '/home/project/.state/shared',
-                    '/workspace/.state/data', '/workspace/.state/shared',
+                    '/home/project/.state/data', '/workspace/.state/data',
                 ]);
-                const mounts = legacyAgentGuardMounts(targets, { workspaceRoot, bindings });
+                const mounts = controllerGuardMounts(targets, { workspaceRoot, bindings });
                 assert.deepEqual(mounts.filter(mount => mount.parent).map(mount => [mount.target, mount.readOnly]), [
                     ['/home/project', false], ['/workspace/.state', true], ['/home/project/.state', true],
                 ]);
                 assert.deepEqual(mounts.filter(mount => !mount.parent).map(mount => [mount.target, mount.readOnly]),
                     existingChildren ? targets.map(guard => [guard.target, true]) : []);
-                for (const key of ['data', 'shared']) {
-                    assert.equal(fs.existsSync(path.join(framework, key)), existingChildren);
-                    policyFailure(() => legacyAgentGuardTargets([
-                        { hostPath: path.join(workspaceRoot, '.ploinky', key, 'child'), runtimePath: '/leak' },
-                    ], { workspaceRoot }));
-                }
+                assert.equal(fs.existsSync(path.join(framework, 'data')), existingChildren);
+                policyFailure(() => controllerGuardTargets([
+                    { hostPath: path.join(workspaceRoot, '.ploinky', 'data', 'child'), runtimePath: '/leak' },
+                ], { workspaceRoot }));
                 assert.deepEqual(identities(), before);
             } finally { cleanup(); }
         });
@@ -338,7 +322,7 @@ for (const workspaceAlias of [false, true]) {
 }
 
 for (const frameworkAlias of [false, true]) {
-    test(`legacy guard admission rejects indirect writable aliases with controller alias=${frameworkAlias}`, () => {
+    test(`controller guard admission rejects indirect writable aliases with controller alias=${frameworkAlias}`, () => {
         const { root, cleanup } = fixture();
         try {
             const framework = path.join(root, 'framework');
@@ -349,7 +333,7 @@ for (const frameworkAlias of [false, true]) {
             } else fs.mkdirSync(path.join(root, '.ploinky'));
             fs.symlinkSync('framework', path.join(root, 'alias'));
             fs.symlinkSync('../alias/data', path.join(root, '.ploinky', 'data'));
-            policyFailure(() => legacyAgentGuardTargets([
+            policyFailure(() => controllerGuardTargets([
                 { hostPath: root, runtimePath: '/workspace' },
             ], { workspaceRoot: root }));
             assert.deepEqual(fs.readdirSync(path.join(framework, 'data')), []);

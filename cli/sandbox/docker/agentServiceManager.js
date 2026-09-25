@@ -96,12 +96,12 @@ import {
     ensureAgentDataDirectory,
 } from '../../utils/runtime/agentDataPathPolicy.js';
 import {
-    legacyAgentGuardMounts,
-    legacyAgentGuardTargets,
+    controllerGuardMounts,
+    controllerGuardTargets,
     normalizeRuntimeMountTarget,
-    prepareLegacyGuardMountpointCleanup,
-    protectedLegacyAgentRoots,
-} from '../../utils/runtime/legacyAgentDataGuards.js';
+    prepareControllerGuardMountpointCleanup,
+    protectedControllerStateRoots,
+} from '../../utils/runtime/controllerStateGuards.js';
 import { deriveAgentPrincipalId } from '../../utils/security/agentIdentity.js';
 import { ensureSharedHostDir, runPostinstallHook } from './agentHooks.js';
 import { bwrapDependencyReuseProblem, ensureBwrapService } from '../bwrap/bwrapServiceManager.js';
@@ -1068,7 +1068,7 @@ function appendExactManagedBindMount(args, value) {
     return true;
 }
 
-function appendLegacyAgentDataGuards(args, runtime, {
+function appendControllerStateGuards(args, runtime, {
     workspaceRoot,
     canonicalRuntimeWorkspaceGuards = isPloinkyBoxRuntime(),
 } = {}) {
@@ -1078,12 +1078,12 @@ function appendLegacyAgentDataGuards(args, runtime, {
         readOnly: !mount.rw,
     }));
     const guardOptions = { workspaceRoot, bindings };
-    const targets = legacyAgentGuardTargets(bindings, guardOptions);
+    const targets = controllerGuardTargets(bindings, guardOptions);
     // Narrow repository grants can still cause the container engine to create
     // the canonical workspace parents. Guard those synthetic parents too so
     // the retired paths remain read-only even when no broad bind exposes them.
     if (!targets.length && canonicalRuntimeWorkspaceGuards) {
-        for (const protectedRoot of protectedLegacyAgentRoots(workspaceRoot)) {
+        for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
             targets.push(Object.freeze({
                 key: protectedRoot.key,
                 target: protectedRoot.hostPath,
@@ -1091,7 +1091,7 @@ function appendLegacyAgentDataGuards(args, runtime, {
             }));
         }
     }
-    for (const guard of legacyAgentGuardMounts(targets, guardOptions)) {
+    for (const guard of controllerGuardMounts(targets, guardOptions)) {
         if (guard.replaceExisting) {
             for (let index = 0; index < args.length - 1; index += 1) {
                 if (args[index] !== '-v' && args[index] !== '--volume') continue;
@@ -1984,9 +1984,9 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         args.push('-v', `${resourcePlan.persistentStorage.hostPath}:${resourcePlan.persistentStorage.containerPath}${runtime === 'podman' ? ':z' : ''}`);
     }
 
-    // Apply opaque legacy-root guards after every broad, manifest, staged, and
+    // Apply controller-state guards after every broad, manifest, staged, and
     // resource bind so no later agent-controlled mount can expose old state.
-    appendLegacyAgentDataGuards(args, runtime);
+    appendControllerStateGuards(args, runtime);
 
     const envStrings = [
         ...buildEnvFlags(manifest, profileConfig, { agentName, repoName, profileName: activeProfile, forRuntime: true }),
@@ -2375,24 +2375,24 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         }
     };
 
-    let cleanupLegacyGuardMountpointsAfterStart = null;
-    const prepareLegacyGuardMountpointCleanupBeforeStart = () => {
-        if (cleanupLegacyGuardMountpointsAfterStart) {
-            throw new Error('legacy guard mountpoint cleanup is already pending');
+    let pendingGuardMountpointCleanup = null;
+    const prepareGuardMountpointCleanupBeforeStart = () => {
+        if (pendingGuardMountpointCleanup) {
+            throw new Error('controller guard mountpoint cleanup is already pending');
         }
-        cleanupLegacyGuardMountpointsAfterStart = prepareLegacyGuardMountpointCleanup();
+        pendingGuardMountpointCleanup = prepareControllerGuardMountpointCleanup();
     };
-    const cleanupLegacyGuardMountpointCleanupAfterStart = () => {
-        const cleanup = cleanupLegacyGuardMountpointsAfterStart;
-        cleanupLegacyGuardMountpointsAfterStart = null;
-        if (!cleanup) throw new Error('legacy guard mountpoint cleanup was not prepared before runtime start');
+    const cleanupGuardMountpointsAfterStart = () => {
+        const cleanup = pendingGuardMountpointCleanup;
+        pendingGuardMountpointCleanup = null;
+        if (!cleanup) throw new Error('controller guard mountpoint cleanup was not prepared before runtime start');
         cleanup();
     };
 
     const preStartGeneratedRouterLaunch = ({ launch }) => {
         if (!launch) throw new Error('managed generated-local launch is missing before runtime start');
         launch.generationLease.checkpoint('pre-runtime');
-        prepareLegacyGuardMountpointCleanupBeforeStart();
+        prepareGuardMountpointCleanupBeforeStart();
     };
 
     const finalizeGeneratedRouterLaunch = ({ launch, record }) => {
@@ -2466,7 +2466,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
         // Per-request directories remain untouched and fail closed separately.
         prepareHealthProbeHostDirForLaunch(containerName);
         const res = withNetworkLifecycleLock(() => {
-            const cleanupLegacyMountpoints = prepareLegacyGuardMountpointCleanup();
+            const cleanupGuardMountpoints = prepareControllerGuardMountpointCleanup();
             try {
                 const res = spawnSync(runtime, createArgs, { stdio: ['inherit', 'pipe', 'inherit'], encoding: 'utf8' });
                 if (res.status === 0) {
@@ -2480,7 +2480,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 }
                 return res;
             } finally {
-                cleanupLegacyMountpoints();
+                cleanupGuardMountpoints();
             }
         }, { waitMs: 15 * 60 * 1000 });
         if (res.status !== 0) throw new Error(`${runtime} create failed with code ${res.status}`);
@@ -2608,7 +2608,7 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 createContainer,
                 prepareLaunch: prepareGeneratedRouterLaunch,
                 preStartLaunch: preStartGeneratedRouterLaunch,
-                postStartLaunch: cleanupLegacyGuardMountpointCleanupAfterStart,
+                postStartLaunch: cleanupGuardMountpointsAfterStart,
                 finalizeLaunch: finalizeGeneratedRouterLaunch,
                 onContainerCreated: recordCreatedIdentity,
             });
@@ -2654,8 +2654,8 @@ function startAgentContainer(agentName, manifest, agentPath, options = {}) {
                 runtimeIdentity,
                 expectedContainerId: createdId,
                 onCreated: recordCreatedIdentity,
-                beforeStart: prepareLegacyGuardMountpointCleanupBeforeStart,
-                afterStart: cleanupLegacyGuardMountpointCleanupAfterStart,
+                beforeStart: prepareGuardMountpointCleanupBeforeStart,
+                afterStart: cleanupGuardMountpointsAfterStart,
             }) || '');
         }, { waitMs: 15 * 60 * 1000 });
     }
@@ -4714,7 +4714,7 @@ export function isGenerationCapabilityRuntimeEffective({
 
 export {
     assertPodmanCodeMountAllowed,
-    appendLegacyAgentDataGuards,
+    appendControllerStateGuards,
     appendExactManagedBindMount,
     appendUniquePortMapping,
     buildPersistentAgentRunArgs,

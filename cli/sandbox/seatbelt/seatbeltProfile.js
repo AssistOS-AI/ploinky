@@ -15,7 +15,7 @@ import {
     normalizeManifestVolumeHostPaths,
     resolveManifestVolumeHostPath,
 } from '../../utils/runtime/manifestVolumePolicy.js';
-import { protectedLegacyAgentRoots } from '../../utils/runtime/legacyAgentDataGuards.js';
+import { protectedControllerStateRoots } from '../../utils/runtime/controllerStateGuards.js';
 import { projectedCanonicalPath } from '../../utils/runtime/agentDataPathPolicy.js';
 
 const SEATBELT_PROFILES_DIR = path.join(PLOINKY_DIR, 'seatbelt-profiles');
@@ -65,8 +65,8 @@ function buildSeatbeltProfile(options) {
         };
     });
     const writableVolumes = volumeAccess.filter(entry => !entry.readOnly).map(entry => entry.hostPath);
-    const protectedLegacyRoots = Array.from(new Set(
-        protectedLegacyAgentRoots(workspaceRoot).flatMap(entry => [
+    const protectedControllerRoots = Array.from(new Set(
+        protectedControllerStateRoots(workspaceRoot).flatMap(entry => [
             entry.hostPath,
             projectedCanonicalPath(entry.hostPath),
         ]),
@@ -87,7 +87,7 @@ function buildSeatbeltProfile(options) {
         // path-based and therefore applies through every workspace alias that
         // reaches the same directory.
         { kind: 'subpath', path: grant.sourceDir },
-        ...protectedLegacyRoots.map(value => ({ kind: 'subpath', path: value })),
+        ...protectedControllerRoots.map(value => ({ kind: 'subpath', path: value })),
     ];
     const lines = [];
     lines.push('(version 1)');
@@ -227,9 +227,9 @@ function buildSeatbeltProfile(options) {
         lines.push('');
     }
 
-    lines.push('; Protected legacy agent data is opaque even through a broad workspace grant');
+    lines.push('; Protected controller state is opaque even through a broad workspace grant');
     lines.push('(deny file-read*');
-    for (const protectedRoot of protectedLegacyRoots) {
+    for (const protectedRoot of protectedControllerRoots) {
         lines.push(`    (subpath ${sbplQuote(protectedRoot)})`);
     }
     lines.push(')');

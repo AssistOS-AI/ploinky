@@ -7,7 +7,7 @@ import path from 'node:path';
 import { prepareLinkedRepositories } from '../../cli/utils/linkInstall.mjs';
 
 import {
-    appendLegacyAgentDataGuards,
+    appendControllerStateGuards,
     assertPodmanCodeMountAllowed,
     buildPodmanStagedTargetMounts,
     codeRelativeMountPath,
@@ -53,7 +53,7 @@ import {
     assertManifestStorageAdmission,
     resolveManifestVolumeHostPath,
 } from '../../cli/utils/runtime/manifestVolumePolicy.js';
-import { prepareLegacyGuardMountpointCleanup } from '../../cli/utils/runtime/legacyAgentDataGuards.js';
+import { prepareControllerGuardMountpointCleanup } from '../../cli/utils/runtime/controllerStateGuards.js';
 import { buildInteractiveAgentCreateCommand } from '../../cli/sandbox/docker/interactive.js';
 import {
     prepareFreshRuntimeRoot,
@@ -412,7 +412,7 @@ test('read-only manifest volumes are enforced across container runtimes', () => 
     assert.equal(manifestVolumeMountSuffix('docker', hostPath, {}), '');
 });
 
-test('manifest volume host paths accept canonical data and external sources but reject legacy storage', () => {
+test('manifest volume host paths accept canonical data and external sources but reject controller state', () => {
     assert.equal(
         resolveManifestVolumeHostPath('.data/demo/state'),
         path.join(AGENTS_DATA_DIR, 'demo', 'state'),
@@ -427,8 +427,8 @@ test('manifest volume host paths accept canonical data and external sources but 
         resolveManifestVolumeHostPath(absoluteVolume),
         path.resolve(absoluteVolume),
     );
-    for (const legacy of ['.ploinky/data/demo/state', '.ploinky/shared/file']) {
-        assert.throws(() => resolveManifestVolumeHostPath(legacy), error => {
+    for (const controllerState of ['.ploinky/data/demo/state', '.ploinky/data/router-security/policy-state.json']) {
+        assert.throws(() => resolveManifestVolumeHostPath(controllerState), error => {
             assert.equal(error.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
             return true;
         });
@@ -443,7 +443,7 @@ test('manifest admission validates both root and selected profile volumes', () =
     }), true);
     for (const [manifest, profile] of [
         [{ volumes: { '.ploinky/data/root-owned': '/data' } }, null],
-        [{}, { volumes: { '.ploinky/shared/profile-owned': '/shared-old' } }],
+        [{}, { volumes: { '.ploinky/data/edge-routing': '/edge-routing' } }],
     ]) {
         assert.throws(() => assertManifestStorageAdmission(manifest, profile), error => {
             assert.equal(error.code, 'PLOINKY_AGENT_DATA_POLICY_VIOLATION');
@@ -652,34 +652,32 @@ test('real podman run with rw code keeps dependency cache read-only (dev profile
     }
 });
 
-test('real podman run keeps controller legacy trees opaque while controller writes remain possible', { skip: !hasLocalPodmanBusybox() }, () => {
-    const root = tempDir('podman-legacy-guard-');
+test('real podman run keeps controller state opaque and the controller root read-only while controller writes remain possible', { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = tempDir('podman-state-guard-');
     try {
         const protectedTrees = [
             path.join(root, '.ploinky', 'data', 'edge-routing'),
             path.join(root, '.ploinky', 'data', 'edge-publication'),
             path.join(root, '.ploinky', 'data', 'router-security'),
-            path.join(root, '.ploinky', 'shared'),
         ];
         for (const directory of protectedTrees) {
             fs.mkdirSync(directory, { recursive: true });
             fs.writeFileSync(path.join(directory, 'sentinel'), 'controller');
         }
+        const storeObjects = path.join(root, '.ploinky', 'deps', 'store', 'objects');
+        fs.mkdirSync(storeObjects, { recursive: true });
+        fs.writeFileSync(path.join(storeObjects, 'sentinel'), 'store');
         const runtimeArgs = ['run', '--rm', '-v', `${root}:/workspace:z`];
-        const guards = appendLegacyAgentDataGuards(runtimeArgs, 'podman', { workspaceRoot: root });
-        assert.deepEqual(guards.map(guard => guard.target), [
-            '/workspace/.ploinky/data',
-            '/workspace/.ploinky/shared',
-        ]);
+        const guards = appendControllerStateGuards(runtimeArgs, 'podman', { workspaceRoot: root });
+        assert.deepEqual(guards.map(guard => guard.target), ['/workspace/.ploinky/data']);
         const script = [
             'test -z "$(ls -A /workspace/.ploinky/data)"',
-            'test -z "$(ls -A /workspace/.ploinky/shared)"',
             'if cat /workspace/.ploinky/data/edge-routing/sentinel 2>/dev/null; then exit 31; fi',
-            'if cat /workspace/.ploinky/shared/sentinel 2>/dev/null; then exit 32; fi',
+            'test "$(cat /workspace/.ploinky/deps/store/objects/sentinel)" = store',
             'if touch /workspace/.ploinky/data/exposed 2>/dev/null; then exit 33; fi',
-            'if touch /workspace/.ploinky/shared/exposed 2>/dev/null; then exit 34; fi',
+            'if touch /workspace/.ploinky/deps/store/objects/sentinel /workspace/.ploinky/deps/store/objects/exposed 2>/dev/null; then exit 34; fi',
             'if mkdir /workspace/.ploinky/data/exposed-dir 2>/dev/null; then exit 35; fi',
-            'if mkdir /workspace/.ploinky/shared/exposed-dir 2>/dev/null; then exit 36; fi',
+            'if mkdir /workspace/.ploinky/exposed-dir 2>/dev/null; then exit 36; fi',
             'if mv /workspace/.ploinky /workspace/moved 2>/dev/null; then exit 37; fi',
             'if rm -rf /workspace/.ploinky 2>/dev/null; then exit 38; fi',
             'if ln -sfn /workspace/replacement /workspace/.ploinky 2>/dev/null; then exit 39; fi',
@@ -699,9 +697,10 @@ test('real podman run keeps controller legacy trees opaque while controller writ
             assert.equal(fs.readFileSync(path.join(directory, 'controller-after'), 'utf8'), 'updated');
         }
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data', 'exposed')), false);
-        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared', 'exposed')), false);
+        assert.equal(fs.readFileSync(path.join(storeObjects, 'sentinel'), 'utf8'), 'store');
+        assert.equal(fs.existsSync(path.join(storeObjects, 'exposed')), false);
         assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data', 'exposed-dir')), false);
-        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared', 'exposed-dir')), false);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'exposed-dir')), false);
         assert.equal(fs.existsSync(path.join(root, 'moved')), false);
         assert.equal(fs.existsSync(path.join(root, 'project-write')), true);
     } finally {
@@ -709,48 +708,48 @@ test('real podman run keeps controller legacy trees opaque while controller writ
     }
 });
 
-test('real podman create keeps an absent shared root absent and uncreatable after mountpoint cleanup', { skip: !hasLocalPodmanBusybox() }, () => {
-    const root = tempDir('podman-missing-legacy-guard-');
-    const containerName = `ploinky_missing_legacy_guard_${process.pid}_${Date.now()}`;
+test('real podman create keeps an absent state root absent and uncreatable after mountpoint cleanup', { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = tempDir('podman-missing-state-guard-');
+    const containerName = `ploinky_missing_state_guard_${process.pid}_${Date.now()}`;
     try {
-        const controllerData = path.join(root, '.ploinky', 'data', 'edge-routing');
-        fs.mkdirSync(controllerData, { recursive: true });
-        fs.writeFileSync(path.join(controllerData, 'sentinel'), 'controller');
+        const storeObjects = path.join(root, '.ploinky', 'deps', 'store', 'objects');
+        fs.mkdirSync(storeObjects, { recursive: true });
+        fs.writeFileSync(path.join(storeObjects, 'sentinel'), 'store');
         fs.chmodSync(path.join(root, '.ploinky'), 0o777);
 
         const runtimeArgs = [
             'create', '--name', containerName, '--user', '1000:1000',
             '-v', `${root}:/workspace:z`,
         ];
-        appendLegacyAgentDataGuards(runtimeArgs, 'podman', { workspaceRoot: root });
+        appendControllerStateGuards(runtimeArgs, 'podman', { workspaceRoot: root });
         const mounts = runtimeArgs.filter((_value, index) => runtimeArgs[index - 1] === '-v');
         assert.ok(mounts.includes(`${fs.realpathSync(path.join(root, '.ploinky'))}:/workspace/.ploinky:z,ro`));
-        assert.equal(mounts.some(value => value.includes(':/workspace/.ploinky/shared:')), false);
+        assert.equal(mounts.some(value => value.includes(':/workspace/.ploinky/data:')), false);
 
-        const cleanupMountpoints = prepareLegacyGuardMountpointCleanup({ workspaceRoot: root });
+        const cleanupMountpoints = prepareControllerGuardMountpointCleanup({ workspaceRoot: root });
         const created = spawnSync('podman', [
             ...runtimeArgs,
             'docker.io/library/busybox:1.36', 'sh', '-lc', 'sleep 30',
         ], { encoding: 'utf8' });
         assert.equal(created.status, 0, created.stderr || created.stdout);
         cleanupMountpoints();
-        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data')), false);
 
         const started = spawnSync('podman', ['start', containerName], { encoding: 'utf8' });
         assert.equal(started.status, 0, started.stderr || started.stdout);
         const probe = spawnSync('podman', [
             'exec', containerName, 'sh', '-lc', [
-                'test ! -e /workspace/.ploinky/shared',
-                'if mkdir /workspace/.ploinky/shared 2>/tmp/shared-error; then exit 41; fi',
-                'grep -qi "read-only" /tmp/shared-error',
-                'test -z "$(ls -A /workspace/.ploinky/data)"',
-                'if mkdir /workspace/.ploinky/data/exposed 2>/dev/null; then exit 42; fi',
-                'echo MISSING_LEGACY_OPAQUE_OK',
+                'test ! -e /workspace/.ploinky/data',
+                'if mkdir /workspace/.ploinky/data 2>/tmp/data-error; then exit 41; fi',
+                'grep -qi "read-only" /tmp/data-error',
+                'if touch /workspace/.ploinky/deps/store/objects/exposed 2>/dev/null; then exit 42; fi',
+                'echo MISSING_STATE_OPAQUE_OK',
             ].join('; '),
         ], { encoding: 'utf8' });
         assert.equal(probe.status, 0, probe.stderr || probe.stdout);
-        assert.match(probe.stdout, /MISSING_LEGACY_OPAQUE_OK/);
-        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
+        assert.match(probe.stdout, /MISSING_STATE_OPAQUE_OK/);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'data')), false);
+        assert.equal(fs.existsSync(path.join(storeObjects, 'exposed')), false);
     } finally {
         spawnSync('podman', ['rm', '-f', containerName], { stdio: 'ignore' });
         fs.rmSync(root, { recursive: true, force: true });
@@ -766,41 +765,41 @@ test('real podman guards ancestor renames while leaving project and data writes 
         fs.mkdirSync(path.join(workspaceRoot, '.data', 'demo'), { recursive: true });
         fs.writeFileSync(path.join(controllerData, 'sentinel'), 'controller');
         const args = ['run', '--rm', '-v', `${root}:/home:z`];
-        appendLegacyAgentDataGuards(args, 'podman', { workspaceRoot });
+        appendControllerStateGuards(args, 'podman', { workspaceRoot });
         const result = spawnSync('podman', [...args, 'docker.io/library/busybox:1.36', 'sh', '-c', [
             'set -eu',
             'if mv /home/projects /home/moved; then exit 81; fi',
             'if mv /home/projects/current /home/projects/moved; then exit 82; fi',
             'if mv /home/projects/current/.ploinky /home/projects/current/moved; then exit 83; fi',
-            'if mkdir /home/projects/current/.ploinky/shared; then exit 84; fi',
+            'if mkdir /home/projects/current/.ploinky/new-dir; then exit 84; fi',
             'touch /home/projects/current/project-write /home/projects/current/.data/demo/persisted',
             'echo ANCESTOR_GUARD_OK',
         ].join('; ')], { encoding: 'utf8' });
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.match(result.stdout, /ANCESTOR_GUARD_OK/);
         assert.equal(fs.readFileSync(path.join(controllerData, 'sentinel'), 'utf8'), 'controller');
-        assert.equal(fs.existsSync(path.join(workspaceRoot, '.ploinky', 'shared')), false);
+        assert.equal(fs.existsSync(path.join(workspaceRoot, '.ploinky', 'new-dir')), false);
         assert.equal(fs.existsSync(path.join(workspaceRoot, 'project-write')), true);
         assert.equal(fs.existsSync(path.join(workspaceRoot, '.data', 'demo', 'persisted')), true);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 for (const parentTarget of ['/framework', '/framework/', '/framework/.', '/framework/././']) {
-test(`real podman keeps legacy aliases opaque and coalesces parent bind ${parentTarget}`, { skip: !hasLocalPodmanBusybox() }, () => {
-    const root = fs.realpathSync(tempDir('podman-legacy-alias-'));
+test(`real podman keeps controller-state aliases opaque and coalesces parent bind ${parentTarget}`, { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = fs.realpathSync(tempDir('podman-state-alias-'));
     try {
         const code = path.join(root, 'code');
-        fs.mkdirSync(path.join(code, 'legacy-data'), { recursive: true });
+        fs.mkdirSync(path.join(code, 'state-data'), { recursive: true });
         fs.mkdirSync(path.join(root, '.ploinky'));
-        fs.symlinkSync('../code/legacy-data', path.join(root, '.ploinky', 'data'));
+        fs.symlinkSync('../code/state-data', path.join(root, '.ploinky', 'data'));
         fs.writeFileSync(path.join(code, 'source'), 'source');
-        fs.writeFileSync(path.join(code, 'legacy-data', 'sentinel'), 'controller');
+        fs.writeFileSync(path.join(code, 'state-data', 'sentinel'), 'controller');
         const args = [
             'run', '--rm', '-v', `${root}:/workspace:z`,
             '-v', `${path.join(root, '.ploinky')}:${parentTarget}:z`,
             '-v', `${code}:/code:z,ro`,
         ];
-        appendLegacyAgentDataGuards(args, 'podman', { workspaceRoot: root });
+        appendControllerStateGuards(args, 'podman', { workspaceRoot: root });
         const mounts = args.filter((_value, index) => args[index - 1] === '-v');
         assert.equal(mounts.filter(value => value.includes(':/code:')).length, 1);
         assert.equal(mounts.filter(value => value.includes(':/framework:')).length, 1);
@@ -808,45 +807,41 @@ test(`real podman keeps legacy aliases opaque and coalesces parent bind ${parent
         const result = spawnSync('podman', [...args, 'docker.io/library/busybox:1.36', 'sh', '-c', [
             'set -eu',
             'test "$(cat /code/source)" = source',
-            'test -z "$(ls -A /code/legacy-data)"',
+            'test -z "$(ls -A /code/state-data)"',
             'test -z "$(ls -A /workspace/.ploinky/data)"',
-            'if cat /code/legacy-data/sentinel; then exit 85; fi',
+            'if cat /code/state-data/sentinel; then exit 85; fi',
             'if touch /code/source; then exit 86; fi',
             'if mv /workspace/code /workspace/moved; then exit 87; fi',
             'if mv /workspace/.ploinky /workspace/moved; then exit 88; fi',
             'if rm /workspace/.ploinky/data; then exit 89; fi',
-            'if mkdir /framework/shared; then exit 90; fi',
+            'if mkdir /framework/new-dir; then exit 90; fi',
             'touch /workspace/project-write',
             'echo ALIAS_GUARD_OK',
         ].join('; ')], { encoding: 'utf8' });
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.match(result.stdout, /ALIAS_GUARD_OK/);
-        assert.equal(fs.readFileSync(path.join(code, 'legacy-data', 'sentinel'), 'utf8'), 'controller');
+        assert.equal(fs.readFileSync(path.join(code, 'state-data', 'sentinel'), 'utf8'), 'controller');
         assert.equal(fs.lstatSync(path.join(root, '.ploinky', 'data')).isSymbolicLink(), true);
-        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'new-dir')), false);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 }
 
-test('real docker run uses production final guards for both legacy roots', { skip: !hasLocalDockerBusybox() }, () => {
-    const root = tempDir('docker-legacy-guard-');
+test('real docker run uses production final guards for controller state and the controller root', { skip: !hasLocalDockerBusybox() }, () => {
+    const root = tempDir('docker-state-guard-');
     try {
-        for (const relative of ['.ploinky/data', '.ploinky/shared']) {
-            const directory = path.join(root, relative);
-            fs.mkdirSync(directory, { recursive: true });
-            fs.writeFileSync(path.join(directory, 'sentinel'), 'controller');
-        }
+        const directory = path.join(root, '.ploinky', 'data');
+        fs.mkdirSync(directory, { recursive: true });
+        fs.writeFileSync(path.join(directory, 'sentinel'), 'controller');
         const runtimeArgs = ['run', '--rm', '-v', `${root}:/workspace`];
-        appendLegacyAgentDataGuards(runtimeArgs, 'docker', { workspaceRoot: root });
+        appendControllerStateGuards(runtimeArgs, 'docker', { workspaceRoot: root });
         const probe = [
             'test -z "$(ls -A /workspace/.ploinky/data)"',
-            'test -z "$(ls -A /workspace/.ploinky/shared)"',
             'if cat /workspace/.ploinky/data/sentinel 2>/dev/null; then exit 51; fi',
-            'if cat /workspace/.ploinky/shared/sentinel 2>/dev/null; then exit 52; fi',
             'if touch /workspace/.ploinky/data/file 2>/dev/null; then exit 53; fi',
-            'if touch /workspace/.ploinky/shared/file 2>/dev/null; then exit 54; fi',
+            'if touch /workspace/.ploinky/file 2>/dev/null; then exit 54; fi',
             'if mkdir /workspace/.ploinky/data/dir 2>/dev/null; then exit 55; fi',
-            'if mkdir /workspace/.ploinky/shared/dir 2>/dev/null; then exit 56; fi',
+            'if mkdir /workspace/.ploinky/dir 2>/dev/null; then exit 56; fi',
             'if mv /workspace/.ploinky /workspace/moved 2>/dev/null; then exit 57; fi',
             'if rm -rf /workspace/.ploinky 2>/dev/null; then exit 58; fi',
             'echo DOCKER_OPAQUE_OK',
@@ -863,8 +858,8 @@ test('real docker run uses production final guards for both legacy roots', { ski
 });
 
 for (const projectIsControllerParent of [false, true]) {
-test(`real interactive podman protects absent shared with ${projectIsControllerParent ? 'noncanonical controller-parent' : 'workspace'} bind`, { skip: !hasLocalPodmanBusybox() }, () => {
-    const root = fs.realpathSync(tempDir('podman-interactive-legacy-'));
+test(`real interactive podman keeps the controller root read-only with ${projectIsControllerParent ? 'noncanonical controller-parent' : 'workspace'} bind`, { skip: !hasLocalPodmanBusybox() }, () => {
+    const root = fs.realpathSync(tempDir('podman-interactive-state-'));
     const containerName = `ploinky_interactive_guard_${process.pid}_${Date.now()}`;
     try {
         const controllerData = path.join(root, '.ploinky', 'data');
@@ -895,8 +890,8 @@ test(`real interactive podman protects absent shared with ${projectIsControllerP
         assert.equal(started.status, 0, started.stderr || started.stdout);
         const probe = spawnSync('podman', ['exec', containerName, 'sh', '-lc', [
             'set -eu',
-            'test ! -e "$1/.ploinky/shared"',
-            'if mkdir "$1/.ploinky/shared" 2>/dev/null; then exit 71; fi',
+            'test ! -e "$1/.ploinky/new-dir"',
+            'if mkdir "$1/.ploinky/new-dir" 2>/dev/null; then exit 71; fi',
             'if cat "$1/.ploinky/data/sentinel" 2>/dev/null; then exit 72; fi',
             'if touch "$1/.ploinky/data/escaped" 2>/dev/null; then exit 73; fi',
             'if mv "$1/.ploinky" "$1/moved" 2>/dev/null; then exit 74; fi',
@@ -906,7 +901,7 @@ test(`real interactive podman protects absent shared with ${projectIsControllerP
         ].join('; '), 'probe', root], { encoding: 'utf8' });
         assert.equal(probe.status, 0, probe.stderr || probe.stdout);
         assert.match(probe.stdout, /INTERACTIVE_GUARD_OK/);
-        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'shared')), false);
+        assert.equal(fs.existsSync(path.join(root, '.ploinky', 'new-dir')), false);
         assert.equal(fs.existsSync(path.join(homeDir, 'persisted')), true);
         assert.equal(fs.readFileSync(path.join(controllerData, 'sentinel'), 'utf8'), 'controller');
     } finally {
@@ -920,7 +915,7 @@ test('persistent runtime production wiring appends guards after all writable mou
     const source = fs.readFileSync(new URL('../../cli/sandbox/docker/agentServiceManager.js', import.meta.url), 'utf8');
     assert.match(
         source,
-        /for \(const \{ resolvedHostPath[\s\S]*resourcePlan\.persistentStorage[\s\S]*appendLegacyAgentDataGuards\(args, runtime\);[\s\S]*const envStrings/,
+        /for \(const \{ resolvedHostPath[\s\S]*resourcePlan\.persistentStorage[\s\S]*appendControllerStateGuards\(args, runtime\);[\s\S]*const envStrings/,
     );
 });
 

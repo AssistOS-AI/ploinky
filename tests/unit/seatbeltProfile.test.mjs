@@ -111,7 +111,8 @@ test('buildSeatbeltProfile does not grant writes to read-only manifest volumes',
     assert.doesNotMatch(profile, /\(allow file-write\* \(subpath "\/Users\/alice\/workspace\/\.data\/secret"\)\)/);
     assert.match(profile, /\(deny file-write\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.data\/secret"\)/);
     assert.match(profile, /\(deny file-write\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.ploinky\/data"\)/);
-    assert.match(profile, /\(deny file-read\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.ploinky\/shared"\)/);
+    assert.match(profile, /\(deny file-read\*[\s\S]*\(subpath "\/Users\/alice\/workspace\/\.ploinky\/data"\)/);
+    assert.doesNotMatch(profile, /\.ploinky\/shared/);
 });
 
 test('buildSeatbeltProfile protects read-only paths even under writable workspace', () => {
@@ -262,7 +263,7 @@ test('generated profile denies writes to read-only code, cache, and staged lib',
     }
 });
 
-test('generated profile makes both canonical aliases of legacy data roots opaque to every operation', { skip: process.platform !== 'darwin' }, () => {
+test('generated profile makes both canonical aliases of the controller state root opaque to every operation', { skip: process.platform !== 'darwin' }, () => {
     const sandboxProbe = spawnSync('sandbox-exec', ['-p', '(version 1) (allow default)', '/bin/echo', 'ok'], {
         encoding: 'utf8',
     });
@@ -270,23 +271,18 @@ test('generated profile makes both canonical aliases of legacy data roots opaque
         assert.fail(`sandbox-exec is unavailable: ${sandboxProbe.stderr || sandboxProbe.stdout}`);
     }
 
-    const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-legacy-alias-')));
-    const canonicalLegacyData = path.join(workspace, 'legacy-data-target');
-    const canonicalLegacyShared = path.join(workspace, 'legacy-shared-target');
-    const oldDataRoot = path.join(workspace, '.ploinky', 'data');
-    const oldSharedRoot = path.join(workspace, '.ploinky', 'shared');
+    const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'seatbelt-state-alias-')));
+    const canonicalStateData = path.join(workspace, 'state-data-target');
+    const stateRoot = path.join(workspace, '.ploinky', 'data');
     const agentWorkDir = path.join(workspace, '.data', 'agent');
     const sharedDir = path.join(workspace, '.data', 'shared');
     try {
-        fs.mkdirSync(path.dirname(oldDataRoot), { recursive: true });
-        fs.mkdirSync(canonicalLegacyData, { recursive: true });
-        fs.mkdirSync(canonicalLegacyShared, { recursive: true });
+        fs.mkdirSync(path.dirname(stateRoot), { recursive: true });
+        fs.mkdirSync(canonicalStateData, { recursive: true });
         fs.mkdirSync(agentWorkDir, { recursive: true });
         fs.mkdirSync(sharedDir, { recursive: true });
-        fs.writeFileSync(path.join(canonicalLegacyData, 'sentinel'), 'SECRET');
-        fs.writeFileSync(path.join(canonicalLegacyShared, 'sentinel'), 'SECRET');
-        fs.symlinkSync(canonicalLegacyData, oldDataRoot, 'dir');
-        fs.symlinkSync(canonicalLegacyShared, oldSharedRoot, 'dir');
+        fs.writeFileSync(path.join(canonicalStateData, 'sentinel'), 'SECRET');
+        fs.symlinkSync(canonicalStateData, stateRoot, 'dir');
         const agentLibSourceGrant = seatbeltGrantFor(workspace, { create: true });
         const profile = buildSeatbeltProfile({
             agentLibGrant: agentLibSourceGrant,
@@ -302,41 +298,38 @@ test('generated profile makes both canonical aliases of legacy data roots opaque
             volumes: {},
             workspaceRoot: workspace,
         });
-        assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(canonicalLegacyData).replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\)`));
-        assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(canonicalLegacyShared).replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\)`));
+        assert.match(profile, new RegExp(`\\(subpath ${JSON.stringify(canonicalStateData).replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}\\)`));
         const profilePath = path.join(workspace, 'profile.sb');
         fs.writeFileSync(profilePath, profile, 'utf8');
 
-        for (const target of [oldDataRoot, canonicalLegacyData, oldSharedRoot, canonicalLegacyShared]) {
+        for (const target of [stateRoot, canonicalStateData]) {
             const list = spawnSync('sandbox-exec', ['-f', profilePath, '/bin/ls', '-A', target], {
                 cwd: workspace,
                 encoding: 'utf8',
             });
-            assert.notEqual(list.status, 0, `unexpected legacy-root list success through ${target}`);
+            assert.notEqual(list.status, 0, `unexpected controller-state list success through ${target}`);
             const read = spawnSync('sandbox-exec', ['-f', profilePath, '/bin/cat', path.join(target, 'sentinel')], {
                 cwd: workspace,
                 encoding: 'utf8',
             });
-            assert.notEqual(read.status, 0, `unexpected legacy-root read success through ${target}`);
+            assert.notEqual(read.status, 0, `unexpected controller-state read success through ${target}`);
             const write = spawnSync('sandbox-exec', [
                 '-f', profilePath, '/bin/sh', '-c', 'echo exposed > "$1"', 'probe', path.join(target, 'created'),
             ], {
                 cwd: workspace,
                 encoding: 'utf8',
             });
-            assert.notEqual(write.status, 0, `unexpected legacy-root write success through ${target}`);
+            assert.notEqual(write.status, 0, `unexpected controller-state write success through ${target}`);
             const mkdir = spawnSync('sandbox-exec', [
                 '-f', profilePath, '/bin/mkdir', path.join(target, 'created-dir'),
             ], {
                 cwd: workspace,
                 encoding: 'utf8',
             });
-            assert.notEqual(mkdir.status, 0, `unexpected legacy-root mkdir success through ${target}`);
+            assert.notEqual(mkdir.status, 0, `unexpected controller-state mkdir success through ${target}`);
         }
-        assert.equal(fs.existsSync(path.join(canonicalLegacyData, 'created')), false);
-        assert.equal(fs.existsSync(path.join(canonicalLegacyData, 'created-dir')), false);
-        assert.equal(fs.existsSync(path.join(canonicalLegacyShared, 'created')), false);
-        assert.equal(fs.existsSync(path.join(canonicalLegacyShared, 'created-dir')), false);
+        assert.equal(fs.existsSync(path.join(canonicalStateData, 'created')), false);
+        assert.equal(fs.existsSync(path.join(canonicalStateData, 'created-dir')), false);
     } finally {
         fs.rmSync(workspace, { recursive: true, force: true });
     }

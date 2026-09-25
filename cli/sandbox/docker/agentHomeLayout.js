@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { normalizeRuntimeMountTarget } from '../../utils/runtime/legacyAgentDataGuards.js';
+import { normalizeRuntimeMountTarget } from '../../utils/runtime/controllerStateGuards.js';
 
 export function resolveAgentHomeLayout({ cwd, cwdMountTarget, agentHomeDir }) {
     const projectSource = path.resolve(cwd);

@@ -18,11 +18,14 @@ function guardError(message, context = {}) {
     return error;
 }
 
-export function protectedLegacyAgentRoots(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
+// Router security, edge routing and edge publication state live under
+// `.ploinky/data`. Agents never see it, even through a broad workspace bind;
+// the rest of the controller root (`.ploinky`, including the dependency store)
+// is pinned read-only by `controllerGuardMounts`.
+export function protectedControllerStateRoots(workspaceRoot = PLOINKY_WORKSPACE_ROOT) {
     const root = path.resolve(workspaceRoot);
     return Object.freeze([
         Object.freeze({ key: 'data', hostPath: path.join(root, '.ploinky', 'data') }),
-        Object.freeze({ key: 'shared', hostPath: path.join(root, '.ploinky', 'shared') }),
     ]);
 }
 
@@ -37,7 +40,7 @@ function guardBase(workspaceRoot) {
     return selected;
 }
 
-export function ensureLegacyAgentGuardSources({
+export function ensureControllerGuardSources({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
     const base = guardBase(workspaceRoot);
@@ -47,7 +50,7 @@ export function ensureLegacyAgentGuardSources({
     }
     fs.chmodSync(base, 0o700);
     const sources = new Map();
-    for (const protectedRoot of protectedLegacyAgentRoots(workspaceRoot)) {
+    for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
         const source = path.join(base, protectedRoot.key);
         fs.mkdirSync(source, { recursive: true, mode: 0o555 });
         if (fs.lstatSync(source).isSymbolicLink()) {
@@ -62,10 +65,10 @@ export function ensureLegacyAgentGuardSources({
     return sources;
 }
 
-export function prepareLegacyGuardMountpointCleanup({
+export function prepareControllerGuardMountpointCleanup({
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
-    const missingRoots = protectedLegacyAgentRoots(workspaceRoot)
+    const missingRoots = protectedControllerStateRoots(workspaceRoot)
         .filter(({ hostPath }) => !fs.existsSync(hostPath));
     return () => {
         for (const { hostPath } of missingRoots) {
@@ -78,7 +81,7 @@ export function prepareLegacyGuardMountpointCleanup({
             }
             if (stat.isSymbolicLink() || !stat.isDirectory() || fs.readdirSync(hostPath).length !== 0) {
                 throw guardError(
-                    `runtime created an unexpected non-empty legacy guard mountpoint '${hostPath}'`,
+                    `runtime created an unexpected non-empty controller guard mountpoint '${hostPath}'`,
                     { hostPath },
                 );
             }
@@ -104,12 +107,12 @@ function runtimeDescendant(target, relativeHostPath) {
     return normalizeRuntimeMountTarget(path.posix.join(normalizeRuntimeMountTarget(target), ...segments));
 }
 
-function legacyRootSymlinks(target) {
+function protectedRootSymlinks(target) {
     const links = [];
     let remaining = path.resolve(target).split(path.sep).filter(Boolean);
     let cursor = path.parse(path.resolve(target)).root;
     for (let depth = 0; remaining.length; depth += 1) {
-        if (depth > 256 || links.length > 40) throw guardError('legacy root has excessive symlink indirection');
+        if (depth > 256 || links.length > 40) throw guardError('protected controller root has excessive symlink indirection');
         cursor = path.join(cursor, remaining.shift());
         let entry;
         try { entry = fs.lstatSync(cursor); } catch (error) {
@@ -125,7 +128,7 @@ function legacyRootSymlinks(target) {
     return links;
 }
 
-export function legacyAgentGuardTargets(bindings, {
+export function controllerGuardTargets(bindings, {
     workspaceRoot = PLOINKY_WORKSPACE_ROOT,
 } = {}) {
     const targets = new Map();
@@ -137,22 +140,22 @@ export function legacyAgentGuardTargets(bindings, {
         const destination = normalizeRuntimeMountTarget(rawDestination);
         const source = path.resolve(rawSource);
         const canonicalSource = projectedCanonicalPath(source);
-        for (const protectedRoot of protectedLegacyAgentRoots(workspaceRoot)) {
+        for (const protectedRoot of protectedControllerStateRoots(workspaceRoot)) {
             const canonicalProtectedRoot = projectedCanonicalPath(protectedRoot.hostPath);
             // Workspace and controller aliases are allowed. Inspect indirection
             // introduced below the canonical controller root instead.
-            for (const symlink of legacyRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
+            for (const symlink of protectedRootSymlinks(path.join(frameworkRoot, protectedRoot.key))) {
                 const parent = projectedCanonicalPath(path.dirname(symlink));
                 if (binding.readOnly !== true && !isPathWithin(parent, frameworkRoot)
                     && isPathWithin(parent, canonicalSource)) {
-                    throw guardError('legacy root traverses a writable symlink outside its protected controller parent', {
+                    throw guardError('protected controller root traverses a writable symlink outside its controller parent', {
                         symlink, source, destination,
                     });
                 }
             }
             if (isPathWithin(canonicalSource, canonicalProtectedRoot)) {
                 throw guardError(
-                    `runtime bind source '${source}' is inside protected legacy agent data`,
+                    `runtime bind source '${source}' is inside protected controller state`,
                     { source, canonicalSource, protectedRoot: protectedRoot.hostPath, destination },
                 );
             }
@@ -175,14 +178,14 @@ export function legacyAgentGuardTargets(bindings, {
     return Array.from(targets.values()).sort((left, right) => left.target.localeCompare(right.target));
 }
 
-export function legacyAgentGuardMounts(targets, options = {}) {
+export function controllerGuardMounts(targets, options = {}) {
     const bindings = (options.bindings || []).map(binding => ({
         source: projectedCanonicalPath(binding.hostPath || binding.source),
         target: normalizeRuntimeMountTarget(binding.runtimePath || binding.destination),
         readOnly: binding.readOnly === true,
     }));
     if (!targets.length && !bindings.length) return [];
-    const sources = ensureLegacyAgentGuardSources(options);
+    const sources = ensureControllerGuardSources(options);
     const parents = new Map();
     const children = [];
 
@@ -227,7 +230,7 @@ export function legacyAgentGuardMounts(targets, options = {}) {
     // A mounted child alone does not stop renaming one of its ancestors and
     // recreating the old path. Pin every exposed ancestor, preserving project
     // writability, and make the controller parent itself read-only. This also
-    // protects its symlink entries when a legacy root points into a code grant.
+    // protects its symlink entries when a protected root points into a code grant.
     for (const binding of bindings) pinAncestors(frameworkRoot, binding, { readOnly: true });
     for (const guard of targets) {
         const exists = fs.existsSync(guard.protectedHostPath);

@@ -49,10 +49,10 @@ import {
     ensurePersistentStorageHostDir
 } from '../../utils/runtime/runtimeResourcePlanner.js';
 import {
-    legacyAgentGuardMounts,
-    legacyAgentGuardTargets,
+    controllerGuardMounts,
+    controllerGuardTargets,
     normalizeRuntimeMountTarget,
-} from '../../utils/runtime/legacyAgentDataGuards.js';
+} from '../../utils/runtime/controllerStateGuards.js';
 import {
     assertCanonicalAgentDataPath,
     ensureAgentDataDirectory,
@@ -392,7 +392,7 @@ function writableBwrapBinds({ agentCodePath, codeReadOnly, cwd, cwdMountTarget, 
     return binds;
 }
 
-function appendLegacyAgentDataGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
+function appendControllerStateGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_ROOT } = {}) {
     const bindings = [];
     const remainder = [];
     let insertionIndex = 0;
@@ -405,8 +405,8 @@ function appendLegacyAgentDataGuards(args, { workspaceRoot = PLOINKY_WORKSPACE_R
         });
         index += 2;
     }
-    const targets = legacyAgentGuardTargets(bindings, { workspaceRoot });
-    const guards = legacyAgentGuardMounts(targets, { workspaceRoot, bindings });
+    const targets = controllerGuardTargets(bindings, { workspaceRoot });
+    const guards = controllerGuardMounts(targets, { workspaceRoot, bindings });
     if (!guards.length) return targets;
     for (const guard of guards) {
         if (guard.replaceExisting) {
@@ -625,7 +625,7 @@ function buildBwrapArgs(options) {
     }
 
     // Apply the old-root opacity boundary after every ordinary bind.
-    appendLegacyAgentDataGuards(args, { workspaceRoot: options.workspaceRoot });
+    appendControllerStateGuards(args, { workspaceRoot: options.workspaceRoot });
 
     // Process isolation — do NOT unshare network (agents need host network)
     // NOTE: --die-with-parent is intentionally omitted. Agent processes must survive
@@ -1403,7 +1403,7 @@ export {
     ensureBwrapService,
     resolveBwrapRuntimeProfile,
     startBwrapProcess,
-    appendLegacyAgentDataGuards,
+    appendControllerStateGuards,
     mergeBwrapManifestVolumes,
     buildBwrapArgs,
     buildFullEnvMap,

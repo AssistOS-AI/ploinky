@@ -162,14 +162,13 @@ export function assertManifestVolumeStoragePolicy(source, {
         : path.resolve(root, String(source));
     const protectedRoots = [
         path.join(root, '.ploinky', 'data'),
-        path.join(root, '.ploinky', 'shared'),
     ];
     const canonicalSource = projectedCanonicalPath(resolvedSource);
     for (const protectedRoot of protectedRoots) {
         const canonicalProtected = canonicalProtectedPath(protectedRoot);
         if (isPathWithin(resolvedSource, protectedRoot)
             || isPathWithin(canonicalSource, canonicalProtected)) {
-            throw policyError(`manifest volume source '${source}' targets protected legacy agent storage`, {
+            throw policyError(`manifest volume source '${source}' targets protected controller state`, {
                 source: String(source),
                 resolvedSource,
                 protectedRoot,
